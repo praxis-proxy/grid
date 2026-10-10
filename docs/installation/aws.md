@@ -130,7 +130,7 @@ handshake, so a connect proves nothing.
 |---|---|
 | `unauthorized` pulling an image | A digest pin keeps the chart's `image.repository`. Set both. |
 | `mixed protocol is not supported for LoadBalancer` | One Service carrying UDP and TCP. Upgrade to a chart that splits signals out. |
-| CA bootstrap Job gives `401 Unauthorized` | Its ServiceAccount is gone, removed with the hook RBAC after a failed attempt. Uninstall, delete leftover `grid-ca-*`, `enrollment-serving-tls` and `grid-site-identity` Secrets in both namespaces, install again. |
+| CA bootstrap Job gives `401 Unauthorized` | A chart before this fix removed the bootstrap RBAC after a failed attempt. Upgrade to a chart that retains the RBAC, then retry with `helm upgrade`; the Job can authenticate again. |
 | A site never reaches `Available` | The hub is not accepting that site's NAT address on 6443 or 443. |
 | Signals poll but gossip never converges | The SWIM Service got a Classic load balancer, which carries no UDP. Check `platform: aws`. |
 | Peers unreachable despite correct addresses | Source ranges list VPC CIDRs rather than NAT addresses. |

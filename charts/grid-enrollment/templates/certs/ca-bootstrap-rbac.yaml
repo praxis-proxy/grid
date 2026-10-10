@@ -6,6 +6,12 @@ RBAC for the bootstrap Job: it reads and writes the CA, bundle, serving, DB
 serving, and generated credentials Secrets in this namespace only. get+create
 cover generate-if-absent; update covers ca.forceRegenerate (replace-in-place, no
 absent window).
+
+Unlike the Job, these objects are kept after both successful and failed hooks.
+Helm 3.19 and later delete earlier successful hooks marked `hook-succeeded`
+when a later hook fails, so retaining them requires `before-hook-creation`
+only. Keeping them lets a retry authenticate and recreate only the resources it
+needs.
 */}}
 apiVersion: v1
 kind: ServiceAccount
@@ -17,7 +23,7 @@ metadata:
   annotations:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-10"
-    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed
+    helm.sh/hook-delete-policy: before-hook-creation
 {{- with .Values.imagePullSecrets }}
 imagePullSecrets:
   {{- toYaml . | nindent 2 }}
@@ -33,7 +39,7 @@ metadata:
   annotations:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-10"
-    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed
+    helm.sh/hook-delete-policy: before-hook-creation
 rules:
   # create cannot be resourceName-scoped (the object does not exist yet).
   - apiGroups: [""]
@@ -109,7 +115,7 @@ metadata:
   annotations:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-10"
-    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed
+    helm.sh/hook-delete-policy: before-hook-creation
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -133,7 +139,7 @@ metadata:
   annotations:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-10"
-    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed
+    helm.sh/hook-delete-policy: before-hook-creation
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
@@ -169,7 +175,7 @@ metadata:
   annotations:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-10"
-    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed
+    helm.sh/hook-delete-policy: before-hook-creation
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role

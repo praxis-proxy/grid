@@ -42,8 +42,16 @@ helm install grid charts/grid-enrollment --namespace grid-enroll --create-namesp
   --set route.host=enrollment.apps.<cluster-domain>
 ```
 
-The bootstrap Job's RBAC is removed once the hook finishes, whether it succeeded or
-failed, so retry a failed bootstrap with `helm upgrade`, not by re-running the Job.
+The bootstrap Job's RBAC remains after both successful and failed hooks until
+the next hook run. Helm does not remove hook resources during uninstall, so the
+RBAC also remains after `helm uninstall`. This keeps it available for retries
+and avoids Helm 3.19 and later deleting earlier successful hooks when a later
+hook fails. If you uninstall the release and want to remove the privileged
+bootstrap identity, delete the `ServiceAccount`, `Role`, and `RoleBinding`
+named `<release>-grid-enrollment-ca-bootstrap` in the release namespace. When
+`hubSite.name` is set, also delete the matching `-hub-site` `Role` and
+`RoleBinding` in the hub-site namespace. Retry a failed bootstrap with
+`helm upgrade`, not by re-running the Job.
 
 `helm template` sees no cluster APIs, so `auto` renders no Route there. GitOps
 renders for OpenShift pass `--api-versions route.openshift.io/v1` (Argo CD passes
