@@ -160,7 +160,7 @@ where
 
 /// Validate the Forge document using the same binary that manages services.
 fn validate_forge_config(forge_bin: &str, config: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new(forge_bin)
+    let output = super::forge_config::command(forge_bin, config)?
         .args(["config", "validate", "--config", &config.display().to_string()])
         .output()?;
     if !output.status.success() {

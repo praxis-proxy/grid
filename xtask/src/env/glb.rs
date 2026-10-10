@@ -2460,7 +2460,7 @@ fn block_remaining(from_label: &str, reason: &str, results: &mut Vec<StepResult>
 
 /// Validate the Forge config.
 fn validate_forge_config(forge_bin: &str, config: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new(forge_bin)
+    let output = super::forge_config::command(forge_bin, config)?
         .args(["config", "validate", "--config", &config.display().to_string()])
         .output()?;
     if output.status.success() {
@@ -2476,7 +2476,7 @@ pub(crate) fn run_forge_status(
     forge_bin: &str,
     config: &Path,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let output = Command::new(forge_bin)
+    let output = super::forge_config::command(forge_bin, config)?
         .args(["status", "--config", &config.display().to_string(), "--output", "json"])
         .output()?;
     if !output.status.success() {

@@ -3826,7 +3826,7 @@ fn load_images_into_clusters(forge_bin: &Path, resolved_config: &Path) -> Result
     for cluster in CLUSTERS {
         for image in [&gateway, &operator, &vcr] {
             eprintln!("  loading {image} into {cluster}...");
-            let output = Command::new(forge_bin.as_os_str())
+            let output = super::forge_config::command(forge_bin.as_os_str(), resolved_config)?
                 .arg("--config")
                 .arg(resolved_config)
                 .args(["--non-interactive", "cluster", "load-image", cluster, image])
@@ -4574,11 +4574,12 @@ fn materialize_config(
     source: &Path,
     external_provider: Option<&ExternalProviderDescriptor>,
     external_site: Option<&str>,
+    run_id: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let content = fs::read_to_string(source)?;
     let rendered = render_config(&content, external_provider, external_site)?;
     let parent = source.parent().ok_or("source config must have parent directory")?;
-    let output = parent.join(".forge.resolved.yaml");
+    let output = parent.join(format!(".forge.resolved-{run_id}.yaml"));
     fs::write(&output, rendered)?;
     Ok(output)
 }
@@ -4775,6 +4776,7 @@ fn prepare_setup(
     ext_descriptor: Option<ExternalProviderDescriptor>,
     ext_site: Option<String>,
     ext_key_file: Option<PathBuf>,
+    run_id: &str,
 ) -> Result<CombinedSiteContext, Box<dyn std::error::Error>> {
     // Validate external provider site selection early
     if let Some(_ext) = &ext_descriptor {
@@ -4789,7 +4791,10 @@ fn prepare_setup(
     let root = super::demo_root(forge_config);
     eprintln!("Forge config: {}", forge_config.display());
     eprintln!("Demo root:    {}", root.display());
-    let resolved_config = materialize_config(forge_config, ext_descriptor.as_ref(), ext_site.as_deref())?;
+    let resolved_config = materialize_config(forge_config, ext_descriptor.as_ref(), ext_site.as_deref(), run_id)?;
+    let forge_state_dir = super::forge_config::state_dir_for_config(&resolved_config)?;
+    fs::create_dir_all(&forge_state_dir)?;
+    eprintln!("Forge state:   {}", forge_state_dir.display());
     let forge_bin = glb::resolve_forge_binary()
         .ok_or("praxis-forge binary not found")?
         .into();
@@ -4919,7 +4924,7 @@ fn deploy_setup(context: &CombinedSiteContext) -> Result<OverlayState, Box<dyn s
     );
 
     // Validate the resolved forge configuration
-    let output = Command::new(&context.forge_bin)
+    let output = super::forge_config::command(&context.forge_bin, &context.resolved_config)?
         .args(["config", "validate", "--config"])
         .arg(&context.resolved_config)
         .output()?;
@@ -4949,7 +4954,7 @@ fn deploy_setup(context: &CombinedSiteContext) -> Result<OverlayState, Box<dyn s
         total_phases
     );
 
-    let status = Command::new(&context.forge_bin)
+    let status = super::forge_config::command(&context.forge_bin, &context.resolved_config)?
         .args(["up", "--config"])
         .arg(&context.resolved_config)
         .status()?;
@@ -4978,7 +4983,7 @@ fn deploy_setup(context: &CombinedSiteContext) -> Result<OverlayState, Box<dyn s
                        stack: &str|
      -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  applying {stack} to {cluster}...");
-        let forge_status = Command::new(forge_bin)
+        let forge_status = super::forge_config::command(forge_bin, resolved_config)?
             .arg("--config")
             .arg(resolved_config)
             .args(["--non-interactive", "stack", "apply", cluster, stack])
@@ -6516,7 +6521,7 @@ fn apply_provider_gateway_stack(
     } else {
         BASE_STACK_NAME
     };
-    let status = Command::new(forge_bin)
+    let status = super::forge_config::command(forge_bin, resolved_config)?
         .arg("--config")
         .arg(resolved_config)
         .args(["--non-interactive", "stack", "apply", site, stack])
@@ -7356,7 +7361,7 @@ fn teardown_environment(context: &CombinedSiteContext) -> Result<(), Box<dyn std
         eprintln!("  [OK] removed Kind cluster {kind_name}");
     }
 
-    let status = Command::new(&context.forge_bin)
+    let status = super::forge_config::command(&context.forge_bin, &context.resolved_config)?
         .args(["down", "--config"])
         .arg(&context.resolved_config)
         .status()?;
@@ -7414,14 +7419,20 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     let ext_site = options.external_provider_site.clone();
     let ext_key_file = options.external_provider_key_file.clone();
 
-    let run_id = format_utc_timestamp();
+    let run_id = format!("{}-{}", format_utc_timestamp(), std::process::id());
     let _started_at = format_utc_iso();
     let wall_start = Instant::now();
 
     let evidence_dir = resolve_evidence_dir(forge_config, options, &run_id)?;
     fs::create_dir_all(&evidence_dir)?;
 
-    let setup_ctx = prepare_setup(forge_config, ext_descriptor.clone(), ext_site.clone(), ext_key_file);
+    let setup_ctx = prepare_setup(
+        forge_config,
+        ext_descriptor.clone(),
+        ext_site.clone(),
+        ext_key_file,
+        &run_id,
+    );
     let mut teardown_success = false;
     let mut run_error = None;
     let mut overlay_state = OverlayState::default();
@@ -8315,7 +8326,7 @@ spec:
         let source = dir.path().join("forge.yaml");
         fs::write(&source, minimal_forge_yaml()).unwrap();
         let before = fs::read_to_string(&source).unwrap();
-        drop(materialize_config(&source, Some(&ext), Some("west")).unwrap());
+        drop(materialize_config(&source, Some(&ext), Some("west"), "test-source").unwrap());
         let after = fs::read_to_string(&source).unwrap();
         assert_eq!(before, after);
     }
@@ -8327,9 +8338,9 @@ spec:
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("forge.yaml");
         fs::write(&source, minimal_forge_yaml()).unwrap();
-        drop(materialize_config(&source, Some(&ext), Some("west")).unwrap());
-        drop(materialize_config(&source, Some(&ext), Some("west")).unwrap());
-        let resolved = dir.path().join(".forge.resolved.yaml");
+        drop(materialize_config(&source, Some(&ext), Some("west"), "repeat-materialization").unwrap());
+        drop(materialize_config(&source, Some(&ext), Some("west"), "repeat-materialization").unwrap());
+        let resolved = dir.path().join(".forge.resolved-repeat-materialization.yaml");
         let content = fs::read_to_string(&resolved).unwrap();
         let config: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
         let creds = config["spec"]["stacks"][EXTERNAL_STACK_NAME]["steps"][0]["values"]["credentials"]

@@ -1,11 +1,41 @@
 //! Forge configuration materialization for local image overrides.
 
 use std::{
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use super::image_overrides;
+
+/// Return a Forge state directory scoped to one resolved topology run.
+pub(crate) fn state_dir_for_config(resolved_config: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let parent = resolved_config
+        .parent()
+        .ok_or("resolved Forge config must have a parent directory")?;
+    let run_name = resolved_config
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .filter(|name| !name.is_empty())
+        .ok_or("resolved Forge config must have a UTF-8 file stem")?;
+    Ok(parent.join(".forge").join(run_name))
+}
+
+/// Build a Forge command that cannot read or modify another topology's state.
+pub(crate) fn command(
+    binary: impl AsRef<OsStr>,
+    resolved_config: &Path,
+) -> Result<Command, Box<dyn std::error::Error>> {
+    let state_dir = state_dir_for_config(resolved_config)?;
+    fs::create_dir_all(&state_dir)?;
+    let mut command = Command::new(binary);
+    command
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .env("FORGE_STATE_DIR", &state_dir);
+    Ok(command)
+}
 
 /// Render a Forge environment with the explicitly selected demo images.
 pub(crate) fn materialize(source: &Path, output: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -132,9 +162,45 @@ fn parse_image_ref(image: &str) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{ffi::OsStr, fs, path::PathBuf};
 
-    use super::parse_image_ref;
+    use super::{command, parse_image_ref, state_dir_for_config};
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "temporary Forge configuration fixture")]
+    fn forge_commands_use_the_resolved_run_state_directory() {
+        let temp = tempfile::tempdir().expect("create fixture directory");
+        let combined_dir = temp.path().join("grid-combined-site");
+        let glb_dir = temp.path().join("grid-glb-demo");
+        fs::create_dir_all(&combined_dir).expect("create combined topology directory");
+        fs::create_dir_all(&glb_dir).expect("create GLB topology directory");
+        let combined_config = combined_dir.join(".forge.resolved-run-a.yaml");
+        let second_combined_config = combined_dir.join(".forge.resolved-run-b.yaml");
+        let glb_config = glb_dir.join(".forge.resolved-run-b.yaml");
+        fs::write(&combined_config, "kind: ForgeEnvironment\n").expect("write combined config");
+        fs::write(&second_combined_config, "kind: ForgeEnvironment\n").expect("write second combined config");
+        fs::write(&glb_config, "kind: ForgeEnvironment\n").expect("write GLB config");
+
+        let combined_state = state_dir_for_config(&combined_config).expect("scope combined state");
+        let second_combined_state = state_dir_for_config(&second_combined_config).expect("scope second combined state");
+        let glb_state = state_dir_for_config(&glb_config).expect("scope GLB state");
+        assert_ne!(combined_state, second_combined_state);
+        assert_ne!(combined_state, glb_state);
+        assert_eq!(
+            combined_state,
+            state_dir_for_config(&combined_config).expect("repeat combined state")
+        );
+
+        let forge = command("praxis-forge", &combined_config).expect("build scoped Forge command");
+        assert_eq!(forge.get_args().next(), Some(OsStr::new("--state-dir")));
+        assert_eq!(forge.get_args().nth(1), Some(combined_state.as_os_str()));
+        assert!(
+            forge.get_envs().any(|(key, value)| {
+                key == OsStr::new("FORGE_STATE_DIR") && value == Some(combined_state.as_os_str())
+            })
+        );
+        assert!(combined_state.is_dir());
+    }
 
     #[test]
     fn parses_tagged_and_untagged_images() {

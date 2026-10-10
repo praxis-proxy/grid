@@ -40,9 +40,6 @@ const FULL_SOAK_INTERVAL: Duration = Duration::from_secs(5);
 /// Successful requests between full-mode soak progress updates.
 const FULL_SOAK_PROGRESS_SAMPLES: usize = 12;
 
-/// Resolved config emitted next to the source config to preserve relative paths.
-const RESOLVED_CONFIG_NAME: &str = ".forge.resolved.yaml";
-
 /// Ordered cluster names in the global-ingress scenario environment.
 const CLUSTERS: &[&str] = &[
     "gtm-emulator",
@@ -312,7 +309,8 @@ pub(crate) fn setup(
     forge_config: &Path,
     ingress_mode: IngressMode,
 ) -> Result<SetupContext, Box<dyn std::error::Error>> {
-    let context = prepare_setup(forge_config, ingress_mode, None, None)?;
+    let run_id = format!("{}-{}", format_utc_timestamp(), std::process::id());
+    let context = prepare_setup(forge_config, ingress_mode, None, None, &run_id)?;
     deploy_setup(&context)?;
     Ok(context)
 }
@@ -327,13 +325,18 @@ fn prepare_setup(
     ingress_mode: IngressMode,
     external_provider: Option<ExternalProviderDescriptor>,
     external_key_file: Option<PathBuf>,
+    run_id: &str,
 ) -> Result<SetupContext, Box<dyn std::error::Error>> {
     let root = super::demo_root(forge_config);
     eprintln!("Forge config: {}", forge_config.display());
     eprintln!("Demo root:    {}", root.display());
+    let resolved_config = materialize_config(forge_config, ingress_mode, external_provider.as_ref(), run_id)?;
+    let forge_state_dir = super::forge_config::state_dir_for_config(&resolved_config)?;
+    fs::create_dir_all(&forge_state_dir)?;
+    eprintln!("Forge state:  {}", forge_state_dir.display());
     Ok(SetupContext {
         demo_root: root,
-        resolved_config: materialize_config(forge_config, ingress_mode, external_provider.as_ref())?,
+        resolved_config,
         forge_bin: glb::resolve_forge_binary().ok_or("praxis-forge binary not found")?,
         ingress_mode,
         external_provider,
@@ -505,7 +508,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     if ingress_mode == IngressMode::Workload && ext_descriptor.is_some() {
         return Err("external providers require the global-ingress demo mode".into());
     }
-    let run_id = format_utc_timestamp();
+    let run_id = format!("{}-{}", format_utc_timestamp(), std::process::id());
     let started_at = format_utc_iso();
     let wall_start = Instant::now();
     let mut narrator = Narrator::new();
@@ -513,7 +516,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     let evidence_dir = resolve_evidence_dir(forge_config, options, &run_id);
     fs::create_dir_all(&evidence_dir)?;
 
-    let setup_ctx = prepare_setup(forge_config, ingress_mode, ext_descriptor, ext_key_file);
+    let setup_ctx = prepare_setup(forge_config, ingress_mode, ext_descriptor, ext_key_file, &run_id);
     let mut outcome = match &setup_ctx {
         Ok(context) => match deploy_setup(context) {
             Ok(()) => demonstrate_inner(
@@ -2034,11 +2037,12 @@ fn materialize_config(
     source: &Path,
     ingress_mode: IngressMode,
     external_provider: Option<&ExternalProviderDescriptor>,
+    run_id: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let content = fs::read_to_string(source)?;
     let rendered = render_config(&content, ingress_mode, external_provider)?;
     let parent = source.parent().unwrap_or_else(|| Path::new("."));
-    let output = parent.join(RESOLVED_CONFIG_NAME);
+    let output = parent.join(format!(".forge.resolved-{run_id}.yaml"));
     fs::write(&output, rendered)?;
     Ok(output)
 }
@@ -2363,7 +2367,7 @@ fn apply_gtm_emulator_stack(forge: &str, config: &Path) -> Result<(), Box<dyn st
 
 /// Execute one Forge command and retain its output on failure.
 fn run_forge(forge: &str, config: &Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
-    let output = Command::new(forge)
+    let output = super::forge_config::command(forge, config)?
         .args(["--config", &config.display().to_string(), "--non-interactive"])
         .args(args)
         .output()?;
