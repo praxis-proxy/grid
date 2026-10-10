@@ -6,7 +6,7 @@
 //! overlay hot reload without assigning a public contract to a step count.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -52,6 +52,12 @@ const EDGE_CLUSTERS: &[&str] = &["east-edge", "west-edge"];
 
 /// SWIM LB service name in the GLB demo.
 const SWIM_LB_SERVICE: &str = "grid-operator-swim";
+
+/// Praxis edge container name in the GLB demo.
+const EDGE_GATEWAY_CONTAINER: &str = "praxis-ai";
+
+/// Routing overlay file projected into each Praxis edge pod.
+const EDGE_ROUTING_OVERLAY_PATH: &str = "/etc/praxis/routing/routing-overlay.json";
 
 /// Overlay [`ConfigMap`] name on the edge site.
 ///
@@ -3951,8 +3957,13 @@ pub(crate) fn overlay_revision(edge: &str) -> Result<String, Box<dyn std::error:
     if envelope_raw.trim().is_empty() {
         return Err(format!("{edge} overlay ConfigMap missing routing-overlay.json key").into());
     }
+    parse_overlay_envelope_revision(edge, &envelope_raw)
+}
+
+/// Parse the content-addressed revision from an operator overlay envelope.
+fn parse_overlay_envelope_revision(edge: &str, raw: &str) -> Result<String, Box<dyn std::error::Error>> {
     let envelope: serde_json::Value =
-        serde_json::from_str(&envelope_raw).map_err(|e| format!("{edge} envelope JSON parse failed: {e}"))?;
+        serde_json::from_str(raw).map_err(|error| format!("{edge} envelope JSON parse failed: {error}"))?;
     envelope
         .pointer("/revision/value")
         .and_then(serde_json::Value::as_str)
@@ -3989,6 +4000,10 @@ fn verify_edge_accepted_revision(edge: &str, revision: &str) -> Result<(), Box<d
 /// Maximum time to wait for an edge to serve a withdrawal revision.
 const EDGE_SERVING_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Maximum time to wait for a withdrawal revision to reach the edge pod's
+/// projected `ConfigMap` volume before starting the separate serving timeout.
+const EDGE_OVERLAY_PROJECTION_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Poll until the edge accepts and serves `revision` in two consecutive
 /// observations without a pod replacement or container restart.
 #[expect(
@@ -3999,36 +4014,70 @@ pub(crate) fn verify_edge_serving_revision(edge: &str, revision: &str) -> Result
     let deadline = Instant::now() + EDGE_SERVING_TIMEOUT;
     let initial = edge_pod_identity(edge)?;
     let mut stable_observations = 0_u8;
+    let mut matching_observations = VecDeque::with_capacity(2);
+    let mut recent_observations = VecDeque::with_capacity(4);
     loop {
-        let observation = edge_serving_observation(edge)?;
+        let observation = match edge_serving_observation(edge) {
+            Ok(observation) => observation,
+            Err(error) => {
+                return Err(format!(
+                    "{edge} serving observation failed; consecutive matching polls={stable_observations}; recent polls=[{}]; cause={}",
+                    recent_observations.iter().map(String::as_str).collect::<Vec<_>>().join(" | "),
+                    safe_truncate_str(&error.to_string(), 180)
+                )
+                .into());
+            },
+        };
         let current = observation.identity;
         let logs = observation.logs;
         let last = observation.last;
+        recent_observations.push_back(last.clone());
+        if recent_observations.len() > 4 {
+            recent_observations.pop_front();
+        }
         if current.uid != initial.uid || current.restart_count != initial.restart_count {
             return Err(format!(
-                "{edge} edge pod changed while waiting for serving revision {}; initial uid/restarts={}/{}, observed={}/{}, {}",
+                "{edge} edge pod changed while waiting for serving revision {}; initial uid/restarts={}/{}, observed={}/{}, recent polls=[{}]",
                 safe_truncate_str(revision, 16),
                 safe_truncate_str(&initial.uid, 12),
                 initial.restart_count,
                 safe_truncate_str(&current.uid, 12),
                 current.restart_count,
-                last,
+                recent_observations.iter().map(String::as_str).collect::<Vec<_>>().join(" | "),
             )
             .into());
         }
         if logs_prove_serving(&logs, revision) {
             stable_observations = stable_observations.saturating_add(1);
+            matching_observations.push_back(last.clone());
+            if matching_observations.len() > 2 {
+                matching_observations.pop_front();
+            }
             if stable_observations >= 2 {
+                eprintln!(
+                    "  serving → {edge}: revision={} observed twice on pod {}/restarts:{}; {} | {}",
+                    safe_truncate_str(revision, 16),
+                    safe_truncate_str(&current.uid, 12),
+                    current.restart_count,
+                    matching_observations
+                        .front()
+                        .map_or("missing first poll", String::as_str),
+                    matching_observations
+                        .back()
+                        .map_or("missing second poll", String::as_str),
+                );
                 return Ok(());
             }
         } else {
             stable_observations = 0;
+            matching_observations.clear();
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "{edge} did not serve revision {} within {EDGE_SERVING_TIMEOUT:?}; last observed {}",
+                "{edge} did not serve revision {} within {EDGE_SERVING_TIMEOUT:?}; last observed {}; consecutive matching polls={stable_observations}; recent polls=[{}]",
                 safe_truncate_str(revision, 16),
-                last
+                last,
+                recent_observations.iter().map(String::as_str).collect::<Vec<_>>().join(" | ")
             )
             .into());
         }
@@ -4188,17 +4237,65 @@ struct EdgeServingObservation {
 
 /// Read one complete edge observation for the serving-revision barrier.
 fn edge_serving_observation(edge: &str) -> Result<EdgeServingObservation, Box<dyn std::error::Error>> {
-    let logs = edge_gateway_logs(edge)?;
+    let pod = get_edge_pod_json(edge)?;
+    let identity = edge_pod_identity_from_json(edge, &pod)?;
+    let pod_name = pod
+        .pointer("/metadata/name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} edge-gateway pod has no name"))?;
+    let logs = edge_gateway_pod_logs(edge, pod_name)?;
     let last = format!(
-        "accepted_revision={} serving_revision={}",
-        extract_last_accepted_revision(&logs).unwrap_or_else(|| "none".to_owned()),
-        extract_last_serving_revision(&logs).unwrap_or_else(|| "none".to_owned())
+        "pod={}/uid:{}/restarts:{} latest_overlay_event={}",
+        safe_truncate_str(pod_name, 64),
+        safe_truncate_str(&identity.uid, 12),
+        identity.restart_count,
+        latest_overlay_event_summary(&logs),
     );
-    Ok(EdgeServingObservation {
-        identity: edge_pod_identity(edge)?,
-        logs,
-        last,
-    })
+    Ok(EdgeServingObservation { identity, logs, last })
+}
+
+/// Read bounded logs from the exact edge pod whose identity is being observed.
+fn edge_gateway_pod_logs(edge: &str, pod_name: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &kubectl_context(edge),
+            "-n",
+            GRID_SYSTEM_NS,
+            "logs",
+            pod_name,
+            "-c",
+            EDGE_GATEWAY_CONTAINER,
+            "--tail=1000",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not read {edge} gateway logs from pod {}: {}",
+            safe_truncate_str(pod_name, 64),
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 160)
+        )
+        .into());
+    }
+    String::from_utf8(output.stdout).map_err(Into::into)
+}
+
+/// Summarize the latest overlay event with its log timestamp and revisions.
+fn latest_overlay_event_summary(logs: &str) -> String {
+    let stripped = strip_csi_sgr(logs);
+    let Some(line) = stripped
+        .lines()
+        .rev()
+        .find(|line| line.contains("overlay snapshot initialized") || line.contains("overlay reloaded"))
+    else {
+        return "none".to_owned();
+    };
+    let timestamp = line.split_whitespace().next().unwrap_or("unknown-time");
+    format!(
+        "at={timestamp},accepted_revision={},serving_revision={}",
+        accepted_revision_from_line(line).unwrap_or("none"),
+        serving_revision_from_line(line).unwrap_or("none")
+    )
 }
 
 /// Testable core of the edge acceptance barrier.
@@ -4316,21 +4413,26 @@ fn extract_last_accepted_revision(logs: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Extract the most recent exact `serving_revision` value from logs.
-fn extract_last_serving_revision(logs: &str) -> Option<String> {
-    logs.lines()
-        .rev()
-        .find_map(serving_revision_from_line)
-        .map(str::to_owned)
-}
-
 /// Kubernetes pod identity used to prove hot reload did not restart the edge.
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct EdgePodIdentity {
     /// Kubernetes Pod UID.
     uid: String,
     /// Restart count for the Praxis container.
     restart_count: u64,
+}
+
+/// One observation of the distributed and mounted overlay revisions on an edge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EdgeMountedOverlayObservation {
+    /// Whether the `ConfigMap` overlay still contains the withdrawn provider.
+    provider_present: bool,
+    /// Revision currently published in the edge `ConfigMap`.
+    distributed_revision: String,
+    /// Revision read from the gateway's projected overlay file.
+    mounted_revision: String,
+    /// Ready gateway pod identity that supplied the mounted file.
+    identity: EdgePodIdentity,
 }
 
 /// Require both edge gateway pods ready and capture the primary pod identity.
@@ -4361,6 +4463,14 @@ fn check_edge_gateway_pods() -> Result<(String, EdgePodIdentity), Box<dyn std::e
 /// Read the ready Praxis pod UID and restart count from one edge cluster.
 fn edge_pod_identity(edge: &str) -> Result<EdgePodIdentity, Box<dyn std::error::Error>> {
     let pod = get_edge_pod_json(edge)?;
+    edge_pod_identity_from_json(edge, &pod)
+}
+
+/// Parse readiness and restart identity from a gateway pod response.
+fn edge_pod_identity_from_json(
+    edge: &str,
+    pod: &serde_json::Value,
+) -> Result<EdgePodIdentity, Box<dyn std::error::Error>> {
     let ready = pod
         .pointer("/status/containerStatuses/0/ready")
         .and_then(serde_json::Value::as_bool)
@@ -4409,6 +4519,58 @@ fn get_edge_pod_json(edge: &str) -> Result<serde_json::Value, Box<dyn std::error
         .and_then(serde_json::Value::as_array)
         .and_then(|items| items.first().cloned())
         .ok_or_else(|| format!("{edge} has no edge-gateway pod").into())
+}
+
+/// Read the revision from the mounted overlay in the selected ready edge pod.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one atomic observation ties mounted contents to the exact ready gateway pod"
+)]
+fn edge_mounted_overlay_observation(
+    edge: &str,
+    provider: &str,
+) -> Result<EdgeMountedOverlayObservation, Box<dyn std::error::Error>> {
+    let pod = get_edge_pod_json(edge)?;
+    let identity = edge_pod_identity_from_json(edge, &pod)?;
+    let pod_name = pod
+        .pointer("/metadata/name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} edge-gateway pod has no name"))?;
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &kubectl_context(edge),
+            "--request-timeout=10s",
+            "-n",
+            GRID_SYSTEM_NS,
+            "exec",
+            pod_name,
+            "-c",
+            EDGE_GATEWAY_CONTAINER,
+            "--",
+            "cat",
+            EDGE_ROUTING_OVERLAY_PATH,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to read {edge} mounted overlay from pod {}: {}",
+            safe_truncate_str(pod_name, 64),
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 160)
+        )
+        .into());
+    }
+    let raw = String::from_utf8(output.stdout)?;
+    let mounted_revision = parse_overlay_envelope_revision(edge, &raw)?;
+    let distributed_revision = overlay_revision(edge)?;
+    let provider_present = overlay_candidate(edge, provider)?.is_some();
+
+    Ok(EdgeMountedOverlayObservation {
+        provider_present,
+        distributed_revision,
+        mounted_revision,
+        identity,
+    })
 }
 
 /// Send an inference request and verify HTTP 200 with
@@ -4947,25 +5109,89 @@ fn wait_for_candidate_admission(
     Err(format!("timeout waiting for {provider} admission_state={expected} on {edge}; observed={observed:?}").into())
 }
 
-/// Wait until the withdrawn provider is absent and the edge serves that exact
-/// projected overlay revision.
+/// Wait until the `ConfigMap` withdrawal reaches the mounted edge overlay twice.
+fn wait_for_withdrawal_overlay_projection(
+    edge: &str,
+    provider: &str,
+) -> Result<EdgeMountedOverlayObservation, Box<dyn std::error::Error>> {
+    wait_for_stable_withdrawal_projection(
+        edge,
+        provider,
+        EDGE_OVERLAY_PROJECTION_TIMEOUT,
+        EDGE_ACCEPTANCE_POLL,
+        edge_mounted_overlay_observation,
+    )
+}
+
+/// Require the same withdrawn overlay to be published and mounted twice in a
+/// row before the separate Praxis serving timeout starts.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the bounded poll keeps revision, provider presence, pod identity, and timeout diagnostics together"
+)]
+fn wait_for_stable_withdrawal_projection(
+    edge: &str,
+    provider: &str,
+    timeout: Duration,
+    interval: Duration,
+    mut observe: impl FnMut(&str, &str) -> Result<EdgeMountedOverlayObservation, Box<dyn std::error::Error>>,
+) -> Result<EdgeMountedOverlayObservation, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut previous: Option<EdgeMountedOverlayObservation> = None;
+
+    loop {
+        let last_observation = match observe(edge, provider) {
+            Ok(observation) => {
+                let last_observation = format!(
+                    "provider_present={}, distributed_revision={}, mounted_revision={}, pod={}/restarts:{}",
+                    observation.provider_present,
+                    safe_truncate_str(&observation.distributed_revision, 16),
+                    safe_truncate_str(&observation.mounted_revision, 16),
+                    safe_truncate_str(&observation.identity.uid, 12),
+                    observation.identity.restart_count,
+                );
+                if !observation.provider_present && observation.distributed_revision == observation.mounted_revision {
+                    if previous.as_ref() == Some(&observation) {
+                        return Ok(observation);
+                    }
+                    previous = Some(observation);
+                } else {
+                    previous = None;
+                }
+                last_observation
+            },
+            Err(error) => {
+                previous = None;
+                safe_truncate_str(&error.to_string(), 220)
+            },
+        };
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{edge} withdrawal overlay was not stably projected within {timeout:?}: {last_observation}"
+            )
+            .into());
+        }
+        thread::park_timeout(interval);
+    }
+}
+
+/// Wait until the withdrawn provider is absent from the `ConfigMap` and mounted
+/// file, then start a separate timeout for Praxis to serve that revision.
 pub(crate) fn wait_for_withdrawal_serving_revision(
     edge: &str,
     provider: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    wait_for_check(
-        "withdrawal overlay candidate removal",
-        EDGE_SERVING_TIMEOUT,
-        EDGE_ACCEPTANCE_POLL,
-        || {
-            if overlay_candidate(edge, provider)?.is_some() {
-                return Err(format!("{edge} still contains withdrawn provider {provider}").into());
-            }
-            let revision = overlay_revision(edge)?;
-            verify_edge_serving_revision(edge, &revision)?;
-            Ok(revision)
-        },
-    )
+    let projection = wait_for_withdrawal_overlay_projection(edge, provider)?;
+    let revision = projection.distributed_revision;
+    eprintln!(
+        "  projected → {edge}: revision={} (pod {}, restarts {})",
+        safe_truncate_str(&revision, 16),
+        safe_truncate_str(&projection.identity.uid, 12),
+        projection.identity.restart_count
+    );
+    verify_edge_serving_revision(edge, &revision)?;
+    Ok(revision)
 }
 
 /// Require every edge in the request path to serve its own withdrawn overlay.
@@ -6544,6 +6770,132 @@ clusters:
                     overlay reloaded accepted_revision=\"current\" serving_revision=\"current\"";
         assert!(!logs_prove_serving(logs, "old"));
         assert!(logs_prove_serving(logs, "current"));
+    }
+
+    #[test]
+    fn parses_revision_from_projected_overlay_envelope() {
+        let raw = r#"{"revision":{"kind":"content_addressed","value":"revision-a"}}"#;
+        assert!(matches!(
+            parse_overlay_envelope_revision("test-edge", raw),
+            Ok(revision) if revision == "revision-a"
+        ));
+
+        let missing_revision = r#"{"revision":{"kind":"content_addressed"}}"#;
+        assert!(matches!(
+            parse_overlay_envelope_revision("test-edge", missing_revision),
+            Err(error) if error.to_string().contains("revision")
+        ));
+        assert!(matches!(
+            parse_overlay_envelope_revision("test-edge", "not-json"),
+            Err(error) if error.to_string().contains("JSON parse failed")
+        ));
+    }
+
+    #[test]
+    fn mounted_overlay_probe_uses_the_declared_gateway_container() {
+        let manifest =
+            workspace_root().join("tests/e2e/topologies/grid-glb-demo/resources/edge-gateway-deployment.yaml");
+        let manifest = fs::read_to_string(manifest).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            manifest
+                .lines()
+                .any(|line| line.trim() == format!("- name: {EDGE_GATEWAY_CONTAINER}")),
+            "mounted-overlay probe container {EDGE_GATEWAY_CONTAINER} must match the GLB edge deployment"
+        );
+    }
+
+    #[test]
+    fn latest_overlay_event_summary_keeps_timestamp_and_latest_revisions() {
+        let logs = concat!(
+            "2026-10-10T16:30:46.320316437Z INFO overlay reloaded accepted_revision=withdrawal ",
+            "serving_revision=withdrawal\n",
+            "2026-10-10T16:32:13.411953237Z INFO overlay reloaded accepted_revision=restored ",
+            "serving_revision=restored\n",
+        );
+        let summary = latest_overlay_event_summary(logs);
+        assert!(summary.contains("at=2026-10-10T16:32:13.411953237Z"));
+        assert!(summary.contains("accepted_revision=restored"));
+        assert!(summary.contains("serving_revision=restored"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the scenarios cover publication, projection, and pod replacement in sequence"
+    )]
+    fn withdrawal_projection_waits_for_matching_stable_mount_and_pod() {
+        let observations = [
+            EdgeMountedOverlayObservation {
+                provider_present: true,
+                distributed_revision: "baseline".to_owned(),
+                mounted_revision: "baseline".to_owned(),
+                identity: EdgePodIdentity {
+                    uid: "pod-a".to_owned(),
+                    restart_count: 0,
+                },
+            },
+            EdgeMountedOverlayObservation {
+                provider_present: false,
+                distributed_revision: "withdrawal".to_owned(),
+                mounted_revision: "baseline".to_owned(),
+                identity: EdgePodIdentity {
+                    uid: "pod-a".to_owned(),
+                    restart_count: 0,
+                },
+            },
+            EdgeMountedOverlayObservation {
+                provider_present: false,
+                distributed_revision: "withdrawal".to_owned(),
+                mounted_revision: "withdrawal".to_owned(),
+                identity: EdgePodIdentity {
+                    uid: "pod-a".to_owned(),
+                    restart_count: 0,
+                },
+            },
+            EdgeMountedOverlayObservation {
+                provider_present: false,
+                distributed_revision: "withdrawal".to_owned(),
+                mounted_revision: "withdrawal".to_owned(),
+                identity: EdgePodIdentity {
+                    uid: "pod-b".to_owned(),
+                    restart_count: 0,
+                },
+            },
+            EdgeMountedOverlayObservation {
+                provider_present: false,
+                distributed_revision: "withdrawal".to_owned(),
+                mounted_revision: "withdrawal".to_owned(),
+                identity: EdgePodIdentity {
+                    uid: "pod-b".to_owned(),
+                    restart_count: 0,
+                },
+            },
+        ];
+        let attempts = std::cell::Cell::new(0);
+        let result = wait_for_stable_withdrawal_projection(
+            "test-edge",
+            "test-provider",
+            Duration::from_secs(1),
+            Duration::ZERO,
+            |_, _| {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                observations
+                    .get(attempt)
+                    .cloned()
+                    .ok_or_else(|| std::io::Error::other("test observation sequence exhausted").into())
+            },
+        );
+
+        assert!(
+            result.is_ok(),
+            "expected stable mounted withdrawal revision: {result:?}"
+        );
+        let observed = result.unwrap_or_else(|_| std::process::abort());
+        assert_eq!(observed.distributed_revision, "withdrawal");
+        assert_eq!(observed.mounted_revision, "withdrawal");
+        assert_eq!(observed.identity.uid, "pod-b");
+        assert_eq!(attempts.get(), observations.len());
     }
 
     #[test]
