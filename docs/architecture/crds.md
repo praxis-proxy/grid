@@ -684,7 +684,8 @@ says nothing about whether it serves now.
 | `False` | `ScrapeTimedOut` | No scrape succeeded within `staleMetricsSeconds`, and the latest timed out. |
 | `False` | `ScrapeUnauthorized` | As above, and the latest was refused with 401 or 403. |
 | `False` | `TLSHandshakeFailed` | As above, and the latest failed TLS, including the TLS material. |
-| `False` | `ScrapeFailed` | As above, and the latest failed otherwise. The message names the class: `dns`, `connect`, `http`, `body_cap`, `parse`, or `config`. |
+| `Unknown` | `MetricsBodyTooLarge` | The endpoint answered, but its metrics HTTP response body passed the operator's 1 MiB budget. Readiness is unknown rather than false, so the provider remains a routing candidate. |
+| `False` | `ScrapeFailed` | As above, and the latest failed otherwise. The message names the class: `dns`, `connect`, `http`, `parse`, or `config`. |
 | `False` | `MetricsStale` | No scrape succeeded within `staleMetricsSeconds`, and none failed. |
 | `False` | `ProviderUnavailable` | The provider is `Unavailable`. |
 | `Unknown` | `AwaitingFirstScrape` | No scrape has succeeded yet, within the grace window. |
