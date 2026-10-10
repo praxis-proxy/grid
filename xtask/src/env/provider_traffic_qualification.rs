@@ -5818,9 +5818,23 @@ fn image_config_digest_from_manifest(manifest: &[u8]) -> Result<String, Box<dyn 
     Ok(format!("sha256:{config}"))
 }
 
-/// Translate the runtime identity recorded on a Ready Pod to a CRI image lookup.
-/// Kubernetes prefixes `imageID` with the runtime name; preserve its immutable
-/// digest and never fall back to the mutable Deployment image tag.
+/// Remove the runtime prefix from the exact container ID recorded on a Ready Pod.
+fn crictl_container_id_from_pod_container_id(container_id: &str) -> Result<&str, Box<dyn std::error::Error>> {
+    let container_id = ["containerd://", "docker://", "cri-o://"]
+        .iter()
+        .find_map(|prefix| container_id.strip_prefix(prefix))
+        .unwrap_or(container_id);
+    if container_id.is_empty()
+        || container_id.starts_with('-')
+        || container_id.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err(format!("pod containerID is not a valid CRI container identity: {container_id}").into());
+    }
+    Ok(container_id)
+}
+
+/// Translate a Kubernetes imageID into its immutable CRI image reference.
+/// Never fall back to the mutable Deployment image tag.
 fn crictl_image_reference_from_pod_image_id(image_id: &str) -> Result<&str, Box<dyn std::error::Error>> {
     let reference = ["docker-pullable://", "containerd://", "docker://"]
         .iter()
@@ -5836,30 +5850,60 @@ fn crictl_image_reference_from_pod_image_id(image_id: &str) -> Result<&str, Box<
     Ok(reference)
 }
 
-/// Read the config digest for the Ready Pod's exact image from its Kind node.
-fn node_image_config_digest(node: &str, image_id: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let runtime_reference = crictl_image_reference_from_pod_image_id(image_id)?;
+/// Read the config digest for the Ready Pod's exact container from its Kind node.
+fn node_image_config_digest(
+    node: &str,
+    container_id: &str,
+    image_id: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let runtime_container_id = crictl_container_id_from_pod_container_id(container_id)?;
     let output = Command::new("docker")
-        .args(["exec", node, "crictl", "inspecti", runtime_reference])
+        .args(["exec", node, "crictl", "inspect", runtime_container_id])
         .output()?;
     if !output.status.success() {
         return Err(format!(
-            "could not inspect Ready pod imageID {image_id} on Kind node {node}: {}",
+            "could not inspect Ready pod containerID {container_id} on Kind node {node}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )
         .into());
     }
-    image_config_digest_from_crictl_inspect(&output.stdout)
+    image_config_digest_from_crictl_container_inspect(&output.stdout, runtime_container_id, image_id)
 }
 
-/// Extract the config digest from CRI image inspection, separate from repository manifest digests.
-fn image_config_digest_from_crictl_inspect(inspect_output: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+/// Verify CRI inspected the pod's exact container and image before returning its config digest.
+fn image_config_digest_from_crictl_container_inspect(
+    inspect_output: &[u8],
+    expected_container_id: &str,
+    pod_image_id: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let details: serde_json::Value = serde_json::from_slice(inspect_output)?;
-    details
-        .pointer("/status/id")
+    let status = details
+        .get("status")
+        .ok_or_else(|| "crictl container inspection has no status".to_owned())?;
+    let inspected_container_id = status.get("id").and_then(serde_json::Value::as_str);
+    if inspected_container_id != Some(expected_container_id) {
+        return Err(format!(
+            "crictl inspected container {inspected_container_id:?}, expected Ready pod container {expected_container_id}"
+        )
+        .into());
+    }
+    let inspected_image_ref = status
+        .get("imageRef")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "crictl container inspection has no status.imageRef".to_owned())?;
+    let inspected_image_ref = crictl_image_reference_from_pod_image_id(inspected_image_ref)?;
+    let pod_image_ref = crictl_image_reference_from_pod_image_id(pod_image_id)?;
+    if inspected_image_ref != pod_image_ref {
+        return Err(format!(
+            "crictl container imageRef {inspected_image_ref} does not match Ready pod imageID {pod_image_ref}"
+        )
+        .into());
+    }
+    status
+        .get("imageId")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| "crictl image inspection has no status.id".into())
+        .ok_or_else(|| "crictl container inspection has no status.imageId config digest".into())
 }
 
 /// Whether the node's CRI config digest identifies the expected local image.
@@ -6030,12 +6074,17 @@ pub(super) fn deployment_runtime_image_evidence(
                     .and_then(serde_json::Value::as_str)
                     .filter(|image_id| !image_id.is_empty())
                     .ok_or_else(|| format!("pod {pod_name} container {name} has no runtime imageID"))?;
+                let container_id = status
+                    .get("containerID")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|container_id| !container_id.is_empty())
+                    .ok_or_else(|| format!("pod {pod_name} container {name} has no runtime containerID"))?;
                 let requested_image = requested_by_name
                     .get(name)
                     .ok_or_else(|| format!("pod {pod_name} container {name} is absent from the Deployment template"))?;
                 let expected = expected_by_image.get(requested_image);
                 let node_config_digest = expected
-                    .map(|_| node_image_config_digest(node_name, image_id))
+                    .map(|_| node_image_config_digest(node_name, container_id, image_id))
                     .transpose()
                     .map_err(|error| error.to_string())?;
                 if let (Some(expected), Some(observed)) = (expected, node_config_digest.as_ref())
@@ -6048,6 +6097,7 @@ pub(super) fn deployment_runtime_image_evidence(
                 Ok(serde_json::json!({
                     "name": name,
                     "requested": requested_image,
+                    "containerID": container_id,
                     "imageID": image_id,
                     "expectedLocalConfigDigest": expected,
                     "nodeConfigDigest": node_config_digest,
@@ -6067,6 +6117,17 @@ pub(super) fn deployment_runtime_image_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn crictl_container_inspection_fixture(container_id: &str, image_ref: &str, image_digest: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "status": {
+                "id": container_id,
+                "imageRef": image_ref,
+                "imageId": image_digest
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
 
     #[test]
     fn image_evidence_deployments_scope_consumer_to_consumer_site() {
@@ -6114,39 +6175,46 @@ mod tests {
     }
 
     #[test]
-    fn crictl_image_inspection_reads_config_digest_not_repository_manifest_digest() {
-        let inspect_output = serde_json::json!({
-            "status": {
-                "id": "sha256:local-config",
-                "repoDigests": ["docker.io/library/import-2026-10-09@sha256:runtime-manifest"]
-            }
-        });
+    fn crictl_container_inspection_reads_config_digest_and_matches_pod_identity() {
+        let container_id = "746ddc188f9744992eb6229d3933ed380c168961486897811f0423dd30c2a97c";
+        let image_id = "docker.io/library/import-2026-10-10@sha256:runtime-manifest";
+        let inspect_output = crictl_container_inspection_fixture(container_id, image_id, "sha256:local-config");
         assert_eq!(
-            image_config_digest_from_crictl_inspect(
-                &serde_json::to_vec(&inspect_output).unwrap_or_else(|_| std::process::abort()),
-            )
-            .ok(),
+            image_config_digest_from_crictl_container_inspect(&inspect_output, container_id, image_id,).ok(),
             Some("sha256:local-config".to_owned())
+        );
+
+        assert!(
+            image_config_digest_from_crictl_container_inspect(&inspect_output, "another-container", image_id,).is_err(),
+            "inspection must be tied to the Ready pod's exact container ID"
         );
     }
 
     #[test]
     fn ready_pod_image_id_detects_a_retargeted_requested_tag() {
         let requested_image = "grid-operator:qualification";
-        let ready_pod_image_id = "docker-pullable://ghcr.io/praxis-proxy/grid-operator@sha256:old-manifest";
+        let container_id = "746ddc188f9744992eb6229d3933ed380c168961486897811f0423dd30c2a97c";
+        let ready_pod_image_id = "docker-pullable://docker.io/library/import-2026-10-10@sha256:old-manifest";
         let expected_config_after_retag = "sha256:new-config";
-        let config_of_unchanged_ready_pod = "sha256:old-config";
+        let inspect_output = crictl_container_inspection_fixture(
+            container_id,
+            "docker.io/library/import-2026-10-10@sha256:old-manifest",
+            "sha256:old-config",
+        );
 
         let runtime_reference =
             crictl_image_reference_from_pod_image_id(ready_pod_image_id).unwrap_or_else(|_| std::process::abort());
 
         assert_eq!(
-            runtime_reference, "ghcr.io/praxis-proxy/grid-operator@sha256:old-manifest",
+            runtime_reference, "docker.io/library/import-2026-10-10@sha256:old-manifest",
             "the Ready pod still identifies the old image after the requested tag is retargeted"
         );
         assert_ne!(runtime_reference, requested_image);
+        let config_of_unchanged_ready_pod =
+            image_config_digest_from_crictl_container_inspect(&inspect_output, container_id, ready_pod_image_id)
+                .unwrap_or_else(|_| std::process::abort());
         assert!(
-            !image_config_digest_matches(expected_config_after_retag, config_of_unchanged_ready_pod),
+            !image_config_digest_matches(expected_config_after_retag, &config_of_unchanged_ready_pod),
             "a retargeted mutable tag must not make the old Ready pod appear to run the new local image"
         );
         assert_eq!(
