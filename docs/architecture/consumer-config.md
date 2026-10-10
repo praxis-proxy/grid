@@ -429,6 +429,7 @@ Example failure output:
 | Reason | Phase | Meaning |
 |---|---|---|
 | _(empty)_ | `Rendered` | Config rendered and `ConfigMap` applied successfully |
+| `MissingClusterEndpoint` | `Error` | A candidate cluster is missing from `consumerConfig.clusterEndpoints[]`. Candidates the operator derives are withdrawn instead, so this reports a candidate it did not derive |
 | `MissingTransport` | `Error` | A cluster endpoint has no `transport` configuration — the operator refuses to guess TLS vs plaintext |
 | `MissingSni` | `Error` | A `mutual_tls` or `tls` cluster endpoint has no (or blank) `sni`; TLS requires a server name |
 | `PlaintextWithSni` | `Error` | A `plaintext` cluster endpoint has `sni` set — `sni` does not enable TLS; use `mutual_tls` if TLS is intended |
@@ -463,6 +464,13 @@ A route candidate references a cluster with no `consumerConfig.clusterEndpoints[
 entry that could not be derived, so the operator withdrew it from this gateway.
 The message names the cluster and the reason. Add an endpoint entry for it, or
 allowlist its provider in `deriveTopology.fromProviders`.
+
+**Phase is `Error` / reason `MissingClusterEndpoint`**
+
+A route candidate references a cluster with no `consumerConfig.clusterEndpoints[]`
+entry. Add an endpoint entry for the reported cluster, or let the operator derive it
+with `deriveTopology.fromProviders`, which withdraws a candidate it cannot resolve
+rather than failing the render.
 
 **Phase is `Error` / reason `MissingTransport`**
 
