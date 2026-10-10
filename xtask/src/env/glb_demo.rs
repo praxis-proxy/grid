@@ -1655,9 +1655,16 @@ fn prove_operator_restarts(
             GRID_CLUSTERS.len()
         ));
         let previous_network_resource_version = glb::grid_network_resource_version(cluster)?;
+        let previous_edge_revisions = glb::edge_overlay_revision_baselines()?;
         restart_grid_operator(cluster)?;
-        let overlay_evidence =
-            verify_restart_overlay_recovery(expected_candidates, cluster, &previous_network_resource_version)?;
+        let edge_status_marker_resource_versions = glb::reset_edge_overlay_observation_markers()?;
+        let overlay_evidence = verify_restart_overlay_recovery(
+            expected_candidates,
+            cluster,
+            &previous_network_resource_version,
+            &previous_edge_revisions,
+            &edge_status_marker_resource_versions,
+        )?;
         let fixture = fixtures
             .get(index % fixtures.len())
             .ok_or("no affinity fixture available after Grid restart")?;
@@ -1680,11 +1687,15 @@ fn verify_restart_overlay_recovery(
     expected_candidates: usize,
     restarted_cluster: &str,
     previous_network_resource_version: &str,
+    previous_edge_revisions: &BTreeMap<String, String>,
+    edge_status_marker_resource_versions: &BTreeMap<String, String>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let evidence = glb::wait_for_edge_overlays_ready_after_restart(
         restarted_cluster,
         previous_network_resource_version,
         expected_candidates,
+        previous_edge_revisions,
+        edge_status_marker_resource_versions,
     )?;
     let serving_evidence = glb::wait_for_edge_overlays_serving_with_count(expected_candidates)?;
     Ok(format!("{evidence}; {serving_evidence}"))

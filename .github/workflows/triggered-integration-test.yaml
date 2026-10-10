@@ -1108,10 +1108,46 @@ jobs:
               ODIR="${CDIR}/overlay-recovery"
               mkdir -p "${ODIR}"
               RAW_CM="${RUNNER_TEMP}/${cluster}-overlay-configmap.json"
+              PARSE_SAFE_CM="${RUNNER_TEMP}/${cluster}-overlay-configmap-parse-safe.json"
 
               kubectl --context "${CTX}" -n grid-system get configmap grid-overlay-glb-demo-edge-gateway -o json \
                 > "${RAW_CM}" 2> "${ODIR}/configmap-fetch-error.txt" || true
               if jq -e '.data | type == "object"' "${RAW_CM}" > /dev/null 2>&1; then
+                PARSE_ERRORS='{}'
+                for key in routing-config.json routing-overlay.json; do
+                  if jq -e --arg key "${key}" '.data | has($key)' "${RAW_CM}" > /dev/null 2>&1; then
+                    if ! jq -e --arg key "${key}" \
+                      '.data[$key] | (type == "string") and (try (fromjson | true) catch false)' \
+                      "${RAW_CM}" > /dev/null 2>&1; then
+                      digest=$(jq -j --arg key "${key}" '.data[$key]' "${RAW_CM}" | sha256sum | awk '{print $1}')
+                      PARSE_ERRORS=$(jq -cn --argjson errors "${PARSE_ERRORS}" --arg key "${key}" --arg digest "${digest}" \
+                        '$errors + {($key): $digest}')
+                    fi
+                  fi
+                done
+                printf '%s\n' "${PARSE_ERRORS}" > "${ODIR}/configmap-payload-parse-errors.json"
+                if jq '
+                  . as $config_map
+                  | .data = ((.data // {}) | with_entries(
+                      select(.key == "routing-config.json" or .key == "routing-overlay.json")
+                      | . as $entry
+                      | .value = (try ($entry.value | fromjson) catch {
+                          parse_error: true,
+                          sha256: (($parse_errors | fromjson)[$entry.key])
+                        })
+                    ))
+                  | {
+                    metadata: {
+                      name: $config_map.metadata.name,
+                      namespace: $config_map.metadata.namespace,
+                      resourceVersion: $config_map.metadata.resourceVersion,
+                      creationTimestamp: $config_map.metadata.creationTimestamp,
+                      managedFields: [($config_map.metadata.managedFields // [])[] | {manager, operation, time, subresource}],
+                      annotations: (($config_map.metadata.annotations // {}) | with_entries(select(.key | startswith("grid.praxis.fast/overlay-"))))
+                    },
+                    data: .data
+                  }
+                ' --arg parse_errors "${PARSE_ERRORS}" "${RAW_CM}" > "${PARSE_SAFE_CM}"; then
                 if jq '
                   def redact:
                     if type == "object" then
@@ -1124,21 +1160,8 @@ jobs:
                     elif type == "array" then map(redact)
                     else .
                     end;
-                  {
-                    metadata: {
-                      name: .metadata.name,
-                      namespace: .metadata.namespace,
-                      resourceVersion: .metadata.resourceVersion,
-                      creationTimestamp: .metadata.creationTimestamp,
-                      managedFields: [(.metadata.managedFields // [])[] | {manager, operation, time, subresource}],
-                      annotations: ((.metadata.annotations // {}) | with_entries(select(.key | startswith("grid.praxis.fast/overlay-"))))
-                    },
-                    data: ((.data // {}) | with_entries(
-                      select(.key == "routing-config.json" or .key == "routing-overlay.json")
-                      | .value |= (try fromjson catch .)
-                    ))
-                  } | redact
-                ' "${RAW_CM}" > "${ODIR}/configmap-redacted.json"; then
+                  redact
+                ' "${PARSE_SAFE_CM}" > "${ODIR}/configmap-redacted.json"; then
                 for key in routing-config.json routing-overlay.json; do
                   if jq -e --arg key "${key}" '.data[$key] != null' "${ODIR}/configmap-redacted.json" > /dev/null; then
                     digest=$(jq -S -c --arg key "${key}" '.data[$key]' "${ODIR}/configmap-redacted.json" | sha256sum | awk '{print $1}')
@@ -1146,12 +1169,17 @@ jobs:
                   fi
                 done
                 else
+                  rm -f "${ODIR}/configmap-redacted.json"
                   echo "ConfigMap redaction failed; raw payload was not retained" > "${ODIR}/configmap-snapshot-error.txt"
+                fi
+                else
+                  echo "ConfigMap parse-safe snapshot failed; raw payload was not retained" > "${ODIR}/configmap-snapshot-error.txt"
                 fi
               else
                 echo "ConfigMap JSON was unavailable or invalid" > "${ODIR}/configmap-snapshot-error.txt"
               fi
               rm -f "${RAW_CM}"
+              rm -f "${PARSE_SAFE_CM}"
 
               kubectl --context "${CTX}" -n grid-system get pods -o json \
                 | jq '[.items[]? | select(.metadata.name | startswith("edge-gateway-")) | {
@@ -1167,11 +1195,53 @@ jobs:
                   -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
                   | awk '/^edge-gateway-/'
               )
+              : > "${ODIR}/mounted-file-observations.jsonl"
               for pod in "${GATEWAY_PODS[@]}"; do
                 for file in routing-overlay.json routing-config.json; do
+                  mount_path="/etc/praxis/routing/${file}"
                   RAW_MOUNT="${RUNNER_TEMP}/${cluster}-${pod}-${file}"
-                  kubectl --context "${CTX}" exec -n grid-system "${pod}" -c praxis-ai -- cat "/etc/praxis/routing/${file}" \
-                    > "${RAW_MOUNT}" 2> "${ODIR}/${pod}-${file}-read-error.txt" || true
+                  FILE_TARGET_FILE="${ODIR}/${pod}-${file}-file-symlink.txt"
+                  DATA_TARGET_FILE="${ODIR}/${pod}-${file}-data-symlink.txt"
+                  projection_read_started_at=$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')
+                  if kubectl --context "${CTX}" exec -n grid-system "${pod}" -c praxis-ai -- \
+                    readlink "${mount_path}" > "${FILE_TARGET_FILE}" 2> "${ODIR}/${pod}-${file}-file-symlink-error.txt"; then
+                    file_symlink_status="success"
+                  else
+                    file_symlink_status="failed"
+                  fi
+                  if kubectl --context "${CTX}" exec -n grid-system "${pod}" -c praxis-ai -- \
+                    readlink /etc/praxis/routing/..data > "${DATA_TARGET_FILE}" 2> "${ODIR}/${pod}-${file}-data-symlink-error.txt"; then
+                    data_symlink_status="success"
+                  else
+                    data_symlink_status="failed"
+                  fi
+                  projection_read_completed_at=$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')
+                  read_started_at=$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')
+                  if kubectl --context "${CTX}" exec -n grid-system "${pod}" -c praxis-ai -- cat "${mount_path}" \
+                    > "${RAW_MOUNT}" 2> "${ODIR}/${pod}-${file}-read-error.txt"; then
+                    mounted_read_status="success"
+                  else
+                    mounted_read_status="failed"
+                  fi
+                  read_completed_at=$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')
+                  file_target=$(cat "${FILE_TARGET_FILE}" 2>/dev/null || true)
+                  data_target=$(cat "${DATA_TARGET_FILE}" 2>/dev/null || true)
+                  jq -cn \
+                    --arg cluster "${cluster}" --arg pod "${pod}" --arg file "${file}" --arg path "${mount_path}" \
+                    --arg projection_read_started_at "${projection_read_started_at}" \
+                    --arg projection_read_completed_at "${projection_read_completed_at}" \
+                    --arg file_symlink_status "${file_symlink_status}" --arg data_symlink_status "${data_symlink_status}" \
+                    --arg file_target "${file_target}" --arg data_target "${data_target}" \
+                    --arg read_started_at "${read_started_at}" --arg read_completed_at "${read_completed_at}" \
+                    --arg mounted_read_status "${mounted_read_status}" \
+                    '{cluster: $cluster, pod: $pod, file: $file, path: $path,
+                      projection_read_started_at: $projection_read_started_at,
+                      projection_read_completed_at: $projection_read_completed_at,
+                      file_symlink_status: $file_symlink_status, data_symlink_status: $data_symlink_status,
+                      file_symlink_target: $file_target, data_symlink_target: $data_target,
+                      read_started_at: $read_started_at, read_completed_at: $read_completed_at,
+                      mounted_read_status: $mounted_read_status}' \
+                    >> "${ODIR}/mounted-file-observations.jsonl"
                   if jq -e 'type == "object"' "${RAW_MOUNT}" > /dev/null 2>&1; then
                     if redact_overlay_json "${RAW_MOUNT}" "${ODIR}/${pod}-${file}-redacted.json"; then
                       digest=$(jq -S -c 'def redact: if type == "object" then with_entries(if (.key | test("credential|secret|token|authorization|password|private.?key|api.?key"; "i")) then .value = "[REDACTED]" else .value |= redact end) elif type == "array" then map(redact) else . end; redact' "${RAW_MOUNT}" | sha256sum | awk '{print $1}')
@@ -1179,6 +1249,8 @@ jobs:
                     else
                       echo "Mounted file redaction failed; raw payload was not retained" > "${ODIR}/${pod}-${file}-redaction-error.txt"
                     fi
+                  elif [[ "${mounted_read_status}" != "success" ]]; then
+                    echo "Mounted-file read failed; see read error if present" > "${ODIR}/${pod}-${file}-snapshot-error.txt"
                   else
                     echo "Mounted file was unavailable or invalid JSON; see read error if present" > "${ODIR}/${pod}-${file}-snapshot-error.txt"
                   fi
