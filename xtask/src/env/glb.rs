@@ -72,6 +72,9 @@ const PRIMARY_EDGE: &str = "east-edge";
 /// Maximum time for provider state to traverse reconciliation and SWIM.
 const PROVIDER_STATE_WAIT: Duration = Duration::from_secs(180);
 
+/// Number of remote Grid sites expected in the GLB SWIM mesh.
+const EXPECTED_CONNECTED_SITES: u64 = 3;
+
 /// Maximum time for request routing to reflect an accepted overlay update.
 const DATA_PLANE_CONVERGENCE_WAIT: Duration = Duration::from_secs(45);
 
@@ -3306,6 +3309,364 @@ pub(crate) fn wait_for_edge_overlays_ready_with_count(
     Err(format!("timeout waiting for complete edge overlays: {last_error}").into())
 }
 
+/// Read the current `GridNetwork` resource version before restarting its operator.
+pub(crate) fn grid_network_resource_version(cluster: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let network = grid_network_json(cluster)?;
+    network
+        .pointer("/metadata/resourceVersion")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{cluster} GridNetwork has no metadata.resourceVersion").into())
+}
+
+/// Wait for a fresh post-restart status observation and complete, distributed
+/// overlays before starting the separate gateway-serving timeout.
+///
+/// The `GridNetwork` resource version is an observation marker, not an overlay
+/// revision. This permits a restarted operator to confirm an unchanged
+/// semantic overlay without requiring its digest to change. For each edge,
+/// the status must name the current `ConfigMap` resource version and revision.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the bounded poll keeps post-restart readiness and its diagnostics together"
+)]
+pub(crate) fn wait_for_edge_overlays_ready_after_restart(
+    restarted_cluster: &str,
+    previous_network_resource_version: &str,
+    expected_candidates: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + PROVIDER_STATE_WAIT;
+    let mut previous_snapshot: Option<String> = None;
+    let mut stable_observations = 0_u8;
+
+    loop {
+        let network = grid_network_json(restarted_cluster);
+        let (network_ready, network_snapshot) = match network {
+            Ok(network) => match grid_network_recovered_after_restart(
+                restarted_cluster,
+                &network,
+                previous_network_resource_version,
+            ) {
+                Ok(snapshot) => (true, snapshot),
+                Err(error) => (false, error),
+            },
+            Err(error) => (false, error.to_string()),
+        };
+
+        let mut edge_snapshots = Vec::new();
+        let mut edges_ready = true;
+        for edge in EDGE_CLUSTERS {
+            match read_current_edge_overlay(edge, expected_candidates) {
+                Ok(snapshot) => edge_snapshots.push(snapshot),
+                Err(error) => {
+                    edges_ready = false;
+                    edge_snapshots.push(format!("{edge}: {}", safe_truncate_str(&error.to_string(), 160)));
+                },
+            }
+        }
+
+        let current_snapshot = format!("{network_snapshot}; {}", edge_snapshots.join(", "));
+        if network_ready && edges_ready {
+            if previous_snapshot.as_ref() == Some(&current_snapshot) {
+                stable_observations = stable_observations.saturating_add(1);
+            } else {
+                previous_snapshot = Some(current_snapshot.clone());
+                stable_observations = 1;
+            }
+            if stable_observations >= 2 {
+                return Ok(format!(
+                    "post-restart GridNetwork status advanced and both edge overlays were current and stable ({})",
+                    safe_truncate_str(&current_snapshot, 200)
+                ));
+            }
+        } else {
+            previous_snapshot = None;
+            stable_observations = 0;
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "post-restart GridNetwork status and edge overlays did not converge within {PROVIDER_STATE_WAIT:?}: {}",
+                safe_truncate_str(&current_snapshot, 240)
+            )
+            .into());
+        }
+        thread::park_timeout(Duration::from_secs(1));
+    }
+}
+
+/// Read the current serialized `GridNetwork` from one cluster.
+fn grid_network_json(cluster: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let context = kubectl_context(cluster);
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "gridnetwork",
+            GRID_NETWORK_NAME,
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not read {cluster} GridNetwork: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 160)
+        )
+        .into());
+    }
+    serde_json::from_slice(&output.stdout).map_err(|error| format!("{cluster} GridNetwork JSON: {error}").into())
+}
+
+/// Check that a restarted operator has published current mesh and overlay status.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the status fields and their recovery conditions form one validation"
+)]
+fn grid_network_recovered_after_restart(
+    cluster: &str,
+    network: &serde_json::Value,
+    previous_resource_version: &str,
+) -> Result<String, String> {
+    let resource_version = network
+        .pointer("/metadata/resourceVersion")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{cluster} GridNetwork has no metadata.resourceVersion"))?;
+    let generation = network
+        .pointer("/metadata/generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{cluster} GridNetwork has no metadata.generation"))?;
+    let status = network
+        .get("status")
+        .ok_or_else(|| format!("{cluster} GridNetwork has no status"))?;
+    let observed_generation = status
+        .get("observedGeneration")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{cluster} GridNetwork status has no observedGeneration"))?;
+    let connected_sites = status
+        .get("connectedSites")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{cluster} GridNetwork status has no connectedSites"))?;
+    let phase = status
+        .get("phase")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{cluster} GridNetwork status has no phase"))?;
+
+    if resource_version == previous_resource_version {
+        return Err(format!(
+            "{cluster} GridNetwork resourceVersion is unchanged ({resource_version})"
+        ));
+    }
+    if observed_generation != generation || connected_sites != EXPECTED_CONNECTED_SITES || phase != "Active" {
+        return Err(format!(
+            "{cluster} GridNetwork status is not recovered: observedGeneration={observed_generation}/{generation}, connectedSites={connected_sites}/{EXPECTED_CONNECTED_SITES}, phase={phase}"
+        ));
+    }
+
+    Ok(format!(
+        "{cluster} GridNetwork resourceVersion={previous_resource_version}->{resource_version}, connectedSites={connected_sites}, phase={phase}"
+    ))
+}
+
+/// Current content-addressed identity and Kubernetes version for one edge overlay.
+struct CurrentEdgeOverlay {
+    /// Kubernetes resource version returned with the current `ConfigMap`.
+    resource_version: String,
+    /// Semantic digest from the envelope stored in the `ConfigMap`.
+    revision: String,
+}
+
+/// Read and validate one edge's current `ConfigMap` against its operator status.
+fn read_current_edge_overlay(edge: &str, expected_candidates: usize) -> Result<String, Box<dyn std::error::Error>> {
+    let config_map = edge_overlay_configmap_json(edge)?;
+    let overlay = parse_current_edge_overlay(edge, &config_map, expected_candidates)?;
+    let network = grid_network_json(edge)?;
+    let status = edge_overlay_status(edge, &network)?;
+    validate_edge_overlay_status(edge, status, &overlay, expected_candidates)?;
+    validate_edge_overlay_mount(edge)?;
+
+    Ok(format!(
+        "{edge}={expected_candidates} candidates, revision={}, ConfigMap resourceVersion={}, status=Distributed",
+        safe_truncate_str(&overlay.revision, 16),
+        overlay.resource_version
+    ))
+}
+
+/// Read one edge's overlay `ConfigMap` as JSON.
+fn edge_overlay_configmap_json(edge: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let context = kubectl_context(edge);
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "configmap",
+            OVERLAY_CONFIGMAP,
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not read {edge} overlay ConfigMap: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 160)
+        )
+        .into());
+    }
+    serde_json::from_slice(&output.stdout).map_err(Into::into)
+}
+
+/// Extract the semantic revision and resource version after validating candidate count.
+fn parse_current_edge_overlay(
+    edge: &str,
+    config_map: &serde_json::Value,
+    expected_candidates: usize,
+) -> Result<CurrentEdgeOverlay, Box<dyn std::error::Error>> {
+    let resource_version = config_map
+        .pointer("/metadata/resourceVersion")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} overlay ConfigMap has no resourceVersion"))?;
+    let legacy_raw = config_map
+        .pointer("/data/routing-config.json")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} overlay ConfigMap has no routing-config.json"))?;
+    let legacy: serde_json::Value = serde_json::from_str(legacy_raw)?;
+    let local_site = legacy
+        .get("local_site")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} routing-config.json has no local_site"))?;
+    let candidates = legacy
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{edge} routing-config.json has no candidates"))?;
+    if local_site != edge || candidates.len() != expected_candidates {
+        return Err(format!(
+            "{edge} overlay local_site={local_site:?}, candidates={} (expected {expected_candidates})",
+            candidates.len()
+        )
+        .into());
+    }
+
+    let revision = edge_overlay_revision_from_configmap(edge, config_map)?;
+    Ok(CurrentEdgeOverlay {
+        resource_version: resource_version.to_owned(),
+        revision,
+    })
+}
+
+/// Read the semantic revision from an edge's overlay envelope.
+fn edge_overlay_revision_from_configmap(
+    edge: &str,
+    config_map: &serde_json::Value,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let envelope_raw = config_map
+        .pointer("/data/routing-overlay.json")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} overlay ConfigMap has no routing-overlay.json"))?;
+    let envelope: serde_json::Value = serde_json::from_str(envelope_raw)?;
+    let revision = envelope
+        .pointer("/revision/value")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{edge} routing-overlay.json has no revision"))?;
+    Ok(revision.to_owned())
+}
+
+/// Find the current-generation `edge-gateway` overlay status on one edge.
+fn edge_overlay_status<'network>(
+    edge: &str,
+    network: &'network serde_json::Value,
+) -> Result<&'network serde_json::Value, Box<dyn std::error::Error>> {
+    let generation = network
+        .pointer("/metadata/generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{edge} GridNetwork has no generation"))?;
+    let status = network
+        .get("status")
+        .ok_or_else(|| format!("{edge} GridNetwork has no status"))?;
+    let observed_generation = status
+        .get("observedGeneration")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{edge} GridNetwork status has no observedGeneration"))?;
+    if observed_generation != generation {
+        return Err(format!(
+            "{edge} GridNetwork status observedGeneration={observed_generation}, expected {generation}"
+        )
+        .into());
+    }
+    let overlay_status = status
+        .get("overlayStatus")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|entries| {
+            entries.iter().find(|entry| {
+                entry.get("gatewayName").and_then(serde_json::Value::as_str) == Some("edge-gateway")
+                    && entry.get("namespace").and_then(serde_json::Value::as_str) == Some(GRID_SYSTEM_NS)
+            })
+        })
+        .ok_or_else(|| format!("{edge} GridNetwork status has no edge-gateway overlay entry"))?;
+    Ok(overlay_status)
+}
+
+/// Require the status entry to describe the current `ConfigMap` and candidate set.
+fn validate_edge_overlay_status(
+    edge: &str,
+    overlay_status: &serde_json::Value,
+    overlay: &CurrentEdgeOverlay,
+    expected_candidates: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status_resource_version = overlay_status
+        .get("configMapResourceVersion")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} overlay status has no configMapResourceVersion"))?;
+    let status_revision = overlay_status
+        .get("distributedRevision")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} overlay status has no distributedRevision"))?;
+    let status_candidate_count = overlay_status
+        .get("candidateCount")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{edge} overlay status has no candidateCount"))?;
+    let status_phase = overlay_status
+        .get("phase")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{edge} overlay status has no phase"))?;
+    if status_resource_version != overlay.resource_version
+        || status_revision != overlay.revision
+        || status_candidate_count != expected_candidates as u64
+        || status_phase != "Distributed"
+    {
+        return Err(format!(
+            "{edge} overlay status is stale: configMapResourceVersion={status_resource_version}/{}, distributedRevision={}/{}, candidateCount={status_candidate_count}/{expected_candidates}, phase={status_phase}",
+            overlay.resource_version,
+            safe_truncate_str(status_revision, 16),
+            safe_truncate_str(&overlay.revision, 16)
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Ensure the edge gateway deployment mounts the validated overlay `ConfigMap`.
+fn validate_edge_overlay_mount(edge: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let context = kubectl_context(edge);
+    let mounted = kubectl_jsonpath(
+        &context,
+        "deployment",
+        "edge-gateway",
+        "{.spec.template.spec.volumes[?(@.name=='overlay')].configMap.name}",
+    )?;
+    if mounted != OVERLAY_CONFIGMAP {
+        return Err(format!("{edge} edge-gateway mounts overlay ConfigMap {mounted:?}").into());
+    }
+    Ok(())
+}
+
 /// Validate one edge cluster's overlay content and volume projection.
 #[expect(
     clippy::too_many_lines,
@@ -6023,6 +6384,48 @@ clusters:
             error.contains("distributed_revision=unserved"),
             "missing current revision: {error}"
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the assertions cover stale, pre-restart, and recovered status cases"
+    )]
+    fn post_restart_publication_requires_fresh_active_gridnetwork_status() {
+        let network = serde_json::json!({
+            "metadata": { "resourceVersion": "42", "generation": 3 },
+            "status": {
+                "observedGeneration": 3,
+                "connectedSites": EXPECTED_CONNECTED_SITES,
+                "phase": "Active"
+            }
+        });
+
+        assert!(matches!(
+            grid_network_recovered_after_restart("east-edge", &network, "41"),
+            Ok(evidence) if evidence.contains("resourceVersion=41->42")
+        ));
+
+        let same_resource_version = grid_network_recovered_after_restart("east-edge", &network, "42");
+        assert!(
+            same_resource_version
+                .err()
+                .is_some_and(|error| error.contains("resourceVersion is unchanged")),
+            "a pre-restart observation must not satisfy the publication barrier"
+        );
+
+        let stale_generation = serde_json::json!({
+            "metadata": { "resourceVersion": "43", "generation": 4 },
+            "status": {
+                "observedGeneration": 3,
+                "connectedSites": EXPECTED_CONNECTED_SITES,
+                "phase": "Active"
+            }
+        });
+        assert!(matches!(
+            grid_network_recovered_after_restart("east-edge", &stale_generation, "42"),
+            Err(error) if error.contains("status is not recovered")
+        ));
     }
 
     #[test]

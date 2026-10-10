@@ -1631,6 +1631,10 @@ fn prove_restart_recovery_and_soak(
 }
 
 /// Restart each Grid operator and prove overlay and request recovery.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the four sequential restart proofs share fixtures and ordered evidence"
+)]
 fn prove_operator_restarts(
     narrator: &mut Narrator,
     fixtures: &[&AffinityFixture],
@@ -1650,8 +1654,10 @@ fn prove_operator_restarts(
             index + 1,
             GRID_CLUSTERS.len()
         ));
+        let previous_network_resource_version = glb::grid_network_resource_version(cluster)?;
         restart_grid_operator(cluster)?;
-        let overlay_evidence = verify_restart_overlay_recovery(expected_candidates)?;
+        let overlay_evidence =
+            verify_restart_overlay_recovery(expected_candidates, cluster, &previous_network_resource_version)?;
         let fixture = fixtures
             .get(index % fixtures.len())
             .ok_or("no affinity fixture available after Grid restart")?;
@@ -1670,8 +1676,16 @@ fn prove_operator_restarts(
 }
 
 /// Require both consumers to return to the complete, served overlay after a restart.
-fn verify_restart_overlay_recovery(expected_candidates: usize) -> Result<String, Box<dyn std::error::Error>> {
-    let evidence = glb::wait_for_edge_overlays_ready_with_count(expected_candidates)?;
+fn verify_restart_overlay_recovery(
+    expected_candidates: usize,
+    restarted_cluster: &str,
+    previous_network_resource_version: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let evidence = glb::wait_for_edge_overlays_ready_after_restart(
+        restarted_cluster,
+        previous_network_resource_version,
+        expected_candidates,
+    )?;
     let serving_evidence = glb::wait_for_edge_overlays_serving_with_count(expected_candidates)?;
     Ok(format!("{evidence}; {serving_evidence}"))
 }

@@ -999,10 +999,29 @@ jobs:
 
       - name: Collect diagnostics
         if: always()
+        env:
+          QUALIFICATION_OUTCOME: ${{ steps.qualification.outcome }}
         run: |
           set -euo pipefail
           DIAG="${DIAGNOSTICS_DIR}"
           mkdir -p "${DIAG}" "${EVIDENCE_DIR}"
+
+          redact_overlay_json() {
+            jq '
+              def redact:
+                if type == "object" then
+                  with_entries(
+                    if (.key | test("credential|secret|token|authorization|password|private.?key|api.?key"; "i"))
+                    then .value = "[REDACTED]"
+                    else .value |= redact
+                    end
+                  )
+                elif type == "array" then map(redact)
+                else .
+                end;
+              redact
+            ' "$1" > "$2"
+          }
 
           case "${QUALIFICATION}" in
             glb) DEMO_DIR="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-glb-demo" ;;
@@ -1079,6 +1098,101 @@ jobs:
                    -o -name "*.jks" -o -name "*secret*" \
                    -o -name "*credential*" -o -name "*token*" \) \
                 -type f -exec rm -f {} + 2>/dev/null || true
+            fi
+
+            # On GLB failure, compare the operator-published ConfigMap with the
+            # exact files visible to the Praxis gateway before cleanup removes
+            # the clusters. Sensitive fields are redacted before artifact write.
+            if [[ "${QUALIFICATION}" == "glb" && "${QUALIFICATION_OUTCOME}" == "failure" \
+                && ( "${cluster}" == "grid-glb-east-edge" || "${cluster}" == "grid-glb-west-edge" ) ]]; then
+              ODIR="${CDIR}/overlay-recovery"
+              mkdir -p "${ODIR}"
+              RAW_CM="${RUNNER_TEMP}/${cluster}-overlay-configmap.json"
+
+              kubectl --context "${CTX}" -n grid-system get configmap grid-overlay-glb-demo-edge-gateway -o json \
+                > "${RAW_CM}" 2> "${ODIR}/configmap-fetch-error.txt" || true
+              if jq -e '.data | type == "object"' "${RAW_CM}" > /dev/null 2>&1; then
+                if jq '
+                  def redact:
+                    if type == "object" then
+                      with_entries(
+                        if (.key | test("credential|secret|token|authorization|password|private.?key|api.?key"; "i"))
+                        then .value = "[REDACTED]"
+                        else .value |= redact
+                        end
+                      )
+                    elif type == "array" then map(redact)
+                    else .
+                    end;
+                  {
+                    metadata: {
+                      name: .metadata.name,
+                      namespace: .metadata.namespace,
+                      resourceVersion: .metadata.resourceVersion,
+                      creationTimestamp: .metadata.creationTimestamp,
+                      managedFields: [(.metadata.managedFields // [])[] | {manager, operation, time, subresource}],
+                      annotations: ((.metadata.annotations // {}) | with_entries(select(.key | startswith("grid.praxis.fast/overlay-"))))
+                    },
+                    data: ((.data // {}) | with_entries(
+                      select(.key == "routing-config.json" or .key == "routing-overlay.json")
+                      | .value |= (try fromjson catch .)
+                    ))
+                  } | redact
+                ' "${RAW_CM}" > "${ODIR}/configmap-redacted.json"; then
+                for key in routing-config.json routing-overlay.json; do
+                  if jq -e --arg key "${key}" '.data[$key] != null' "${ODIR}/configmap-redacted.json" > /dev/null; then
+                    digest=$(jq -S -c --arg key "${key}" '.data[$key]' "${ODIR}/configmap-redacted.json" | sha256sum | awk '{print $1}')
+                    printf '%s  %s\n' "${digest}" "${key}" >> "${ODIR}/configmap-payload-sha256.txt"
+                  fi
+                done
+                else
+                  echo "ConfigMap redaction failed; raw payload was not retained" > "${ODIR}/configmap-snapshot-error.txt"
+                fi
+              else
+                echo "ConfigMap JSON was unavailable or invalid" > "${ODIR}/configmap-snapshot-error.txt"
+              fi
+              rm -f "${RAW_CM}"
+
+              kubectl --context "${CTX}" -n grid-system get pods -o json \
+                | jq '[.items[]? | select(.metadata.name | startswith("edge-gateway-")) | {
+                    metadata: {name: .metadata.name, uid: .metadata.uid, creationTimestamp: .metadata.creationTimestamp},
+                    nodeName: .spec.nodeName,
+                    overlayVolume: [(.spec.volumes // [])[] | select(.name == "overlay") | {name, configMap: .configMap.name}],
+                    overlayMounts: [(.spec.containers // [])[] | {container: .name, mounts: [(.volumeMounts // [])[] | select(.name == "overlay") | {mountPath, subPath, readOnly}]}],
+                    containerStatuses: [(.status.containerStatuses // [])[] | {name, imageID, restartCount, state, lastState}]
+                  }]' > "${ODIR}/gateway-pods.json" 2> "${ODIR}/gateway-pods-error.txt" || true
+
+              mapfile -t GATEWAY_PODS < <(
+                kubectl --context "${CTX}" -n grid-system get pods \
+                  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+                  | awk '/^edge-gateway-/'
+              )
+              for pod in "${GATEWAY_PODS[@]}"; do
+                for file in routing-overlay.json routing-config.json; do
+                  RAW_MOUNT="${RUNNER_TEMP}/${cluster}-${pod}-${file}"
+                  kubectl --context "${CTX}" exec -n grid-system "${pod}" -c praxis-ai -- cat "/etc/praxis/routing/${file}" \
+                    > "${RAW_MOUNT}" 2> "${ODIR}/${pod}-${file}-read-error.txt" || true
+                  if jq -e 'type == "object"' "${RAW_MOUNT}" > /dev/null 2>&1; then
+                    if redact_overlay_json "${RAW_MOUNT}" "${ODIR}/${pod}-${file}-redacted.json"; then
+                      digest=$(jq -S -c 'def redact: if type == "object" then with_entries(if (.key | test("credential|secret|token|authorization|password|private.?key|api.?key"; "i")) then .value = "[REDACTED]" else .value |= redact end) elif type == "array" then map(redact) else . end; redact' "${RAW_MOUNT}" | sha256sum | awk '{print $1}')
+                      printf '%s  %s/%s\n' "${digest}" "${pod}" "${file}" >> "${ODIR}/mounted-file-sha256.txt"
+                    else
+                      echo "Mounted file redaction failed; raw payload was not retained" > "${ODIR}/${pod}-${file}-redaction-error.txt"
+                    fi
+                  else
+                    echo "Mounted file was unavailable or invalid JSON; see read error if present" > "${ODIR}/${pod}-${file}-snapshot-error.txt"
+                  fi
+                  rm -f "${RAW_MOUNT}"
+                done
+                kubectl --context "${CTX}" logs -n grid-system "${pod}" -c praxis-ai --tail=2000 \
+                  > "${ODIR}/${pod}-gateway-current.log" 2>&1 || true
+                kubectl --context "${CTX}" logs -n grid-system "${pod}" -c praxis-ai --previous --tail=2000 \
+                  > "${ODIR}/${pod}-gateway-previous.log" 2>&1 || true
+              done
+              kubectl --context "${CTX}" logs -n grid-system deployment/grid-operator -c operator --tail=2000 \
+                > "${ODIR}/grid-operator-current.log" 2>&1 || true
+              kubectl --context "${CTX}" logs -n grid-system deployment/grid-operator -c operator --previous --tail=2000 \
+                > "${ODIR}/grid-operator-previous.log" 2>&1 || true
             fi
 
             echo "::endgroup::"
