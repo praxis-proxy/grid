@@ -741,7 +741,7 @@ impl SignalsEndpoint {
 }
 
 /// A DNS name of letter, digit, and hyphen labels, not ending in an all-digit label.
-fn is_dns_name(host: &str) -> bool {
+pub(crate) fn is_dns_name(host: &str) -> bool {
     let label_ok = |label: &str| {
         (1..=63).contains(&label.len())
             && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')

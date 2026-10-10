@@ -224,6 +224,50 @@ controller consumer. Grid-managed runtime withdrawal must use one of the three
 live paths above; publishing an empty overlay does not change an unrelated
 static Praxis configuration.
 
+## Derived endpoint topology
+
+`consumerConfig.deriveTopology.fromProviders` lists the routing identities (a
+provider's `routingClusterRef`, else its `metadata.name`) whose declarations the
+operator may use to fill `clusterEndpoints[]` for candidates that have no
+entry. An empty list derives nothing. An `InferenceProvider` is cluster scoped
+and its `gridNetworkRef` is self asserted, so only the allowlist decides where a
+gateway dials.
+
+An explicit entry wins whole, never field by field. A candidate with no
+explicit entry that cannot be derived is withdrawn from this gateway's routes
+and named in the `consumerConfigStatus` message with a reason. With the list
+empty or `deriveTopology` absent, that is every candidate with no explicit
+entry, so removing a provider from the list withdraws its derived endpoint on
+the next render.
+
+| Candidate | Field | Source |
+|---|---|---|
+| Local site | `address` | `spec.endpoint` host and port (443 for `https`, 80 for `http`) |
+| Local site | `transport.mode` | `tls` for `https`, `plaintext` for `http` |
+| Local site | `transport.sni` | `deriveTopology.transport.sni`, else the endpoint host; an IP address or a host that is not a DNS hostname is refused |
+| Local site | `transport.caSecretRef` | `deriveTopology.transport.caSecretRef`, else the process trust store |
+| Remote site (`GridSite` must be `Active`) | `address` | `spec.egress.address` |
+| Remote site | `transport.mode` | `mutual_tls` for `Mutual`, `plaintext` for `Plaintext` |
+| Remote site | `transport.sni` | `spec.egress.tls.serverName` |
+
+`deriveTopology.transport` declares backend trust once per gateway, for every
+derived local `https` endpoint. Providers behind one shared serving gateway
+share its CA and server name, and a publisher that writes providers does not
+own either. Its mode must be `tls`, and `caSecretRef` names a Secret in the
+gateway namespace, mounted like an explicit entry's. A provider that needs
+different trust takes an explicit entry.
+
+```yaml
+consumerConfig:
+  deriveTopology:
+    fromProviders: [qwen2-7b, llama-3-8b]
+    transport:
+      mode: tls
+      sni: inference-gateway.infra.svc.cluster.local
+      caSecretRef:
+        name: serving-gateway-ca
+```
+
 ## Operational diagnostics
 
 After enabling `consumerConfig.enabled: true` for a gateway, the `GridNetwork`
@@ -385,7 +429,7 @@ Example failure output:
 | Reason | Phase | Meaning |
 |---|---|---|
 | _(empty)_ | `Rendered` | Config rendered and `ConfigMap` applied successfully |
-| `MissingClusterEndpoint` | `Error` | A candidate cluster is missing from `consumerConfig.clusterEndpoints[]` |
+| `MissingClusterEndpoint` | `Error` | A candidate cluster is missing from `consumerConfig.clusterEndpoints[]`. Candidates the operator derives are withdrawn instead, so this reports a candidate it did not derive |
 | `MissingTransport` | `Error` | A cluster endpoint has no `transport` configuration — the operator refuses to guess TLS vs plaintext |
 | `MissingSni` | `Error` | A `mutual_tls` or `tls` cluster endpoint has no (or blank) `sni`; TLS requires a server name |
 | `PlaintextWithSni` | `Error` | A `plaintext` cluster endpoint has `sni` set — `sni` does not enable TLS; use `mutual_tls` if TLS is intended |
@@ -414,11 +458,19 @@ The overlay data produced a structural error.  Check that `localSiteName` is set
 on the `GatewayRef` (or that the `GridNetwork` name is a valid site identity) and
 that all provider `routingClusterRef` values are non-empty.
 
+**A model answers 503 and the `Rendered` message says `withdrew`**
+
+A route candidate references a cluster with no `consumerConfig.clusterEndpoints[]`
+entry that could not be derived, so the operator withdrew it from this gateway.
+The message names the cluster and the reason. Add an endpoint entry for it, or
+allowlist its provider in `deriveTopology.fromProviders`.
+
 **Phase is `Error` / reason `MissingClusterEndpoint`**
 
-At least one route candidate references a cluster with no corresponding
-`consumerConfig.clusterEndpoints[]` entry.  Add an endpoint entry for the reported
-cluster before restarting or rolling out the consumer gateway.
+A route candidate references a cluster with no `consumerConfig.clusterEndpoints[]`
+entry. Add an endpoint entry for the reported cluster, or let the operator derive it
+with `deriveTopology.fromProviders`, which withdraws a candidate it cannot resolve
+rather than failing the render.
 
 **Phase is `Error` / reason `MissingTransport`**
 

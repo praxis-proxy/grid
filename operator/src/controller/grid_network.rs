@@ -8,6 +8,7 @@
 //! [`GridNetwork`]: crate::crd::grid_network::GridNetwork
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     path::Path,
@@ -35,9 +36,10 @@ use crate::{
     crd::{
         agent_tool_provider::AgentToolProvider,
         grid_network::{
-            ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork, GridNetworkPhase,
-            GridNetworkStatus, MountReconciliation, MountReconciliationPhase, MountReconciliationStatus, OverlayPhase,
-            OverlayRevisionStatus, PeerTrustMode, SignalMode, SiteIdentityStatus, TenantBudgetStatus, TransportMode,
+            ClusterEndpointConfig, ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork,
+            GridNetworkPhase, GridNetworkStatus, MountReconciliation, MountReconciliationPhase,
+            MountReconciliationStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode,
+            SiteIdentityStatus, TenantBudgetStatus, TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::{InferenceProvider, InferenceProviderStatus},
@@ -46,7 +48,8 @@ use crate::{
     readiness,
     resources::{
         consumer_config::{self, ConsumerConfigError},
-        gateway_mounts, overlay_envelope, provider_admission, provider_metrics, routing_overlay, secret,
+        derived_topology, gateway_mounts, overlay_envelope, provider_admission, provider_metrics, routing_overlay,
+        secret,
         serving_config::{self, ServingInputs, WriteDecision, WriteGate},
         tls_backend::ServerTlsConfig,
         trust_bundle::{self, CertPemStatus},
@@ -635,7 +638,6 @@ fn published_signals(
         None => None,
     }
 }
-
 
 /// The `grid_provider_ready` sample for `verdict`: 1 when it serves, 0 when not.
 fn ready_sample(verdict: &readiness::Verdict) -> signals::Observation {
@@ -2188,7 +2190,7 @@ async fn reconcile_routing_overlay_inner(
         }
 
         let timestamp = rfc3339_now();
-        let overlay = match routing_overlay::render_routing_overlay_with_admission(
+        let mut overlay = match routing_overlay::render_routing_overlay_with_admission(
             network,
             &sites,
             providers,
@@ -2220,6 +2222,27 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
+        let (cluster_endpoints, derived_summary, refused) = gateway_cluster_endpoints(
+            gw_ref,
+            &overlay.candidates,
+            &derived_topology::Declarations {
+                providers,
+                sites: &sites,
+                local_site,
+                network_name,
+                from_providers: &[],
+                transport: None,
+            },
+        );
+        if !refused.is_empty() {
+            tracing::warn!(
+                network = network_name,
+                gateway = %gw_ref.name,
+                refused = refused.len(),
+                "derivation refused candidates; withdrawing them from this gateway"
+            );
+        }
+        withdraw_refused(&mut overlay, &refused);
         let render = match render_overlay_for_gateway(&overlay, network, gw_ref) {
             Ok(r) => r,
             Err(error) => {
@@ -2285,6 +2308,7 @@ async fn reconcile_routing_overlay_inner(
                 network_name,
                 gw_ref,
                 cc,
+                &cluster_endpoints,
                 &network.spec.tls,
                 observed_generation,
                 client,
@@ -2293,7 +2317,12 @@ async fn reconcile_routing_overlay_inner(
             {
                 Ok(outcome) => {
                     if outcome.config_applied && (!credential_bearing || cc.supports_projected_credentials) {
-                        consumer_statuses.push(consumer_config_status_rendered(gw_ref, cc, observed_generation));
+                        consumer_statuses.push(consumer_config_status_rendered(
+                            gw_ref,
+                            cc,
+                            observed_generation,
+                            &derived_summary,
+                        ));
                     }
                     if let Some(status) = outcome.mount_status {
                         delegated_mount_reconciled = !status.applied_revision.is_empty();
@@ -2405,6 +2434,7 @@ async fn reconcile_routing_overlay_inner(
                 network_name,
                 gw_ref,
                 cc,
+                &cluster_endpoints,
                 &network.spec.tls,
                 observed_generation,
                 client,
@@ -2413,7 +2443,12 @@ async fn reconcile_routing_overlay_inner(
             {
                 Ok(outcome) => {
                     if outcome.config_applied && (!credential_bearing || cc.supports_projected_credentials) {
-                        consumer_statuses.push(consumer_config_status_rendered(gw_ref, cc, observed_generation));
+                        consumer_statuses.push(consumer_config_status_rendered(
+                            gw_ref,
+                            cc,
+                            observed_generation,
+                            &derived_summary,
+                        ));
                     }
                     if let Some(status) = outcome.mount_status {
                         mount_statuses.push(status);
@@ -2901,6 +2936,7 @@ async fn apply_consumer_config_for_gateway(
     network_name: &str,
     gw_ref: &GatewayRef,
     cc: &ConsumerConfig,
+    cluster_endpoints: &[ClusterEndpointConfig],
     tls: &crate::crd::grid_network::TlsConfig,
     observed_generation: i64,
     client: &Client,
@@ -2908,7 +2944,7 @@ async fn apply_consumer_config_for_gateway(
     let rendered = consumer_config::render_consumer_config_with_projected(
         overlay,
         &cc.credential_mount_base,
-        &cc.cluster_endpoints,
+        cluster_endpoints,
         &cc.tls_cert_mount_path,
         cc.listener_port,
         tls,
@@ -5135,11 +5171,68 @@ fn grid_network_status_needs_update(current: Option<&GridNetworkStatus>, desired
 // Consumer config status builders
 // ---------------------------------------------------------------------------
 
+/// One gateway's endpoint topology, status note, and refusals.
+fn gateway_cluster_endpoints<'gw>(
+    gw_ref: &'gw GatewayRef,
+    candidates: &[routing_overlay::RoutingCandidate],
+    declarations: &derived_topology::Declarations<'_>,
+) -> (
+    Cow<'gw, [ClusterEndpointConfig]>,
+    String,
+    Vec<derived_topology::Refused>,
+) {
+    // A disabled block renders nothing, so its gateway's overlay is not ours to withdraw from.
+    let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) else {
+        return (Cow::Borrowed(&[]), String::new(), Vec::new());
+    };
+    // Resolve even with nothing allowlisted, so a revoked derivation is withdrawn, not kept stale.
+    let derive = cc.derive_topology.as_ref();
+    let resolution = derived_topology::resolve(
+        candidates,
+        &cc.cluster_endpoints,
+        &derived_topology::Declarations {
+            from_providers: derive.map_or(&[][..], |derive| derive.from_providers.as_slice()),
+            transport: derive.and_then(|derive| derive.transport.as_ref()),
+            ..*declarations
+        },
+    );
+    let summary = derived_topology::derived_summary(&resolution);
+    let derived_topology::Resolution { resolved, refused } = resolution;
+    let mut derived = resolved
+        .into_values()
+        .filter(|entry| entry.origin != derived_topology::Origin::Explicit)
+        .map(|entry| entry.endpoint)
+        .peekable();
+    // Typed entries pass through whole, including ones no candidate names yet.
+    let endpoints = if derived.peek().is_none() {
+        Cow::Borrowed(cc.cluster_endpoints.as_slice())
+    } else {
+        Cow::Owned(cc.cluster_endpoints.iter().cloned().chain(derived).collect())
+    };
+    (endpoints, summary, refused)
+}
+
+/// Move refused candidates to `excluded` so one refusal does not fail the whole render.
+fn withdraw_refused(overlay: &mut routing_overlay::RoutingOverlay, refused: &[derived_topology::Refused]) {
+    if refused.is_empty() {
+        return;
+    }
+    let (withdrawn, kept): (Vec<_>, Vec<_>) = overlay.candidates.drain(..).partition(|candidate| {
+        candidate.kind == routing_overlay::CANDIDATE_KIND
+            && refused
+                .iter()
+                .any(|refusal| refusal.cluster == candidate.cluster && refusal.site == candidate.site)
+    });
+    overlay.candidates = kept;
+    overlay.excluded.extend(withdrawn);
+}
+
 /// Build a `Rendered` [`ConsumerConfigStatus`] for a successfully applied consumer config.
 pub(crate) fn consumer_config_status_rendered(
     gw_ref: &GatewayRef,
     cc: &ConsumerConfig,
     observed_generation: i64,
+    derived_summary: &str,
 ) -> ConsumerConfigStatus {
     ConsumerConfigStatus {
         gateway_name: gw_ref.name.clone(),
@@ -5147,10 +5240,17 @@ pub(crate) fn consumer_config_status_rendered(
         config_map_name: cc.config_map_name.clone(),
         phase: ConsumerConfigPhase::Rendered,
         reason: String::new(),
-        message: format!(
-            "consumer config rendered and applied to {}/{}",
-            gw_ref.namespace, cc.config_map_name
-        ),
+        message: if derived_summary.is_empty() {
+            format!(
+                "consumer config rendered and applied to {}/{}",
+                gw_ref.namespace, cc.config_map_name
+            )
+        } else {
+            format!(
+                "consumer config rendered and applied to {}/{}; {derived_summary}",
+                gw_ref.namespace, cc.config_map_name
+            )
+        },
         observed_generation,
     }
 }
@@ -6103,7 +6203,6 @@ mod tests {
             "a waiting or unconfigured provider publishes nothing"
         );
     }
-
 
     #[expect(clippy::expect_used, reason = "test fixture")]
     fn provider_with_status(status: &Value) -> InferenceProvider {
@@ -9295,11 +9394,313 @@ mod tests {
         );
     }
 
+    /// A candidate naming one cluster at one site, for the topology arm.
+    fn topology_candidate(cluster: &str, site: &str) -> routing_overlay::RoutingCandidate {
+        serde_json::from_value(serde_json::json!({
+            "kind": "inference_model",
+            "name": "model-x",
+            "site": site,
+            "cluster": cluster,
+            "fresh": true
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// An explicit entry a human typed, transport and all.
+    fn typed_endpoint(cluster: &str, address: &str) -> ClusterEndpointConfig {
+        ClusterEndpointConfig {
+            cluster: cluster.to_owned(),
+            address: address.to_owned(),
+            transport: Some(crate::crd::grid_network::EndpointTransport {
+                mode: TransportMode::Plaintext,
+                sni: None,
+                ca_secret_ref: None,
+            }),
+        }
+    }
+
+    /// Declarations with nothing to derive from, so only the arm is under test.
+    fn empty_declarations() -> derived_topology::Declarations<'static> {
+        derived_topology::Declarations {
+            providers: &[],
+            sites: &[],
+            local_site: "site-a",
+            network_name: "net",
+            from_providers: &[],
+            transport: None,
+        }
+    }
+
+    #[test]
+    fn without_derive_topology_typed_entries_pass_through_and_an_untyped_candidate_is_withdrawn() {
+        let mut gw = make_gw_ref("inference-gw", "praxis-system");
+        let typed = vec![typed_endpoint("prov-a", "a.example.invalid:8080")];
+        gw.consumer_config = Some(ConsumerConfig {
+            cluster_endpoints: typed.clone(),
+            ..make_consumer_config("praxis-consumer-config")
+        });
+        let candidates = vec![topology_candidate("prov-b", "site-b")];
+        let (endpoints, summary, refused) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
+        assert_eq!(endpoints, typed, "typed entries pass through whole");
+        assert_eq!(
+            refused.iter().map(|r| r.reason).collect::<Vec<_>>(),
+            [derived_topology::Refusal::NotAllowlisted],
+            "a candidate with no entry is withdrawn rather than failing the whole render"
+        );
+        assert_eq!(summary, "withdrew 1 (prov-b: not allowlisted)");
+    }
+
+    #[test]
+    fn a_disabled_consumer_config_withdraws_nothing() {
+        let mut gw = make_gw_ref("inference-gw", "praxis-system");
+        gw.consumer_config = Some(ConsumerConfig {
+            enabled: false,
+            ..make_consumer_config("praxis-consumer-config")
+        });
+        let candidates = vec![topology_candidate("prov-b", "site-b")];
+        let (endpoints, summary, refused) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
+        assert!(endpoints.is_empty() && summary.is_empty());
+        assert!(
+            refused.is_empty(),
+            "nothing renders, so nothing is withdrawn from its overlay"
+        );
+    }
+
+    #[test]
+    fn an_mcp_tool_candidate_is_never_withdrawn() {
+        let mut gw = make_gw_ref("inference-gw", "praxis-system");
+        gw.consumer_config = Some(make_consumer_config("praxis-consumer-config"));
+        let mut tool = topology_candidate("prov-b", "site-b");
+        tool.kind = "mcp_tool".to_owned();
+        let mut overlay = routing_overlay::RoutingOverlay {
+            network: "net".to_owned(),
+            local_site: "site-a".to_owned(),
+            candidates: vec![tool, topology_candidate("prov-b", "site-b")],
+            excluded: Vec::new(),
+            selection_policy: None,
+            generated_at: None,
+        };
+        let (_, _, refused) = gateway_cluster_endpoints(&gw, &overlay.candidates, &empty_declarations());
+        withdraw_refused(&mut overlay, &refused);
+        let kinds: Vec<&str> = overlay.candidates.iter().map(|c| c.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            ["mcp_tool"],
+            "tools render no load balancer cluster, so they need no endpoint"
+        );
+    }
+
+    #[test]
+    fn with_an_empty_allowlist_a_gateways_own_entries_pass_through_untouched() {
+        // An empty allowlist reads as no provider; typed entries pass through.
+        let mut gw = make_gw_ref("inference-gw", "praxis-system");
+        let typed = vec![typed_endpoint("prov-a", "a.example.invalid:8080")];
+        gw.consumer_config = Some(ConsumerConfig {
+            derive_topology: Some(crate::crd::grid_network::DeriveTopology {
+                from_providers: Vec::new(),
+                transport: None,
+            }),
+            cluster_endpoints: typed.clone(),
+            ..make_consumer_config("praxis-consumer-config")
+        });
+        let candidates = vec![topology_candidate("prov-a", "site-a")];
+        let (endpoints, summary, _) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
+        assert_eq!(
+            endpoints, typed,
+            "an empty allowlist derives nothing and keeps the typed entries"
+        );
+        assert!(summary.is_empty(), "nothing derived, nothing to report");
+    }
+
+    #[test]
+    fn with_derive_topology_an_unresolvable_candidate_leaves_the_topology_empty() {
+        let mut gw = make_gw_ref("inference-gw", "praxis-system");
+        gw.consumer_config = Some(ConsumerConfig {
+            derive_topology: Some(crate::crd::grid_network::DeriveTopology {
+                from_providers: vec!["prov-a".to_owned(), "prov-b".to_owned(), "prov-ghost".to_owned()],
+                transport: None,
+            }),
+            ..make_consumer_config("praxis-consumer-config")
+        });
+        let candidates = vec![topology_candidate("prov-ghost", "site-ghost")];
+        let (endpoints, summary, refused) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
+        assert!(endpoints.is_empty(), "nothing resolves");
+        assert_eq!(
+            refused,
+            [derived_topology::Refused {
+                cluster: "prov-ghost".to_owned(),
+                site: "site-ghost".to_owned(),
+                reason: derived_topology::Refusal::SiteUnknown,
+            }],
+            "the refusal names the cluster and why"
+        );
+        assert_eq!(summary, "withdrew 1 (prov-ghost: site unknown)");
+    }
+
+    #[test]
+    fn a_refused_candidate_is_withdrawn_into_excluded_rather_than_failing_the_render() {
+        let mut overlay = routing_overlay::RoutingOverlay {
+            network: "net".to_owned(),
+            local_site: "site-a".to_owned(),
+            candidates: vec![
+                topology_candidate("prov-a", "site-a"),
+                topology_candidate("prov-ghost", "site-ghost"),
+            ],
+            excluded: Vec::new(),
+            selection_policy: None,
+            generated_at: None,
+        };
+        let refused = vec![derived_topology::Refused {
+            cluster: "prov-ghost".to_owned(),
+            site: "site-ghost".to_owned(),
+            reason: derived_topology::Refusal::NotAllowlisted,
+        }];
+        withdraw_refused(&mut overlay, &refused);
+        let routed: Vec<&str> = overlay.candidates.iter().map(|c| c.cluster.as_str()).collect();
+        assert_eq!(routed, ["prov-a"], "the refused candidate leaves the route list");
+        assert_eq!(
+            overlay.excluded.len(),
+            1,
+            "and stays known, so the model answers 503 not 404"
+        );
+        assert_eq!(overlay.excluded.first().map(|c| c.cluster.as_str()), Some("prov-ghost"));
+    }
+
+    #[test]
+    fn with_derive_topology_a_typed_entry_for_no_candidate_is_kept() {
+        // The renderer emits every entry, so a later overlay can route to it without a new config.
+        let mut gw = make_gw_ref("inference-gw", "praxis-system");
+        let typed = vec![typed_endpoint("retired", "retired.example.invalid:8080")];
+        gw.consumer_config = Some(ConsumerConfig {
+            derive_topology: Some(crate::crd::grid_network::DeriveTopology {
+                from_providers: vec!["prov-a".to_owned(), "prov-b".to_owned(), "prov-ghost".to_owned()],
+                transport: None,
+            }),
+            cluster_endpoints: typed.clone(),
+            ..make_consumer_config("praxis-consumer-config")
+        });
+        let (endpoints, ..) = gateway_cluster_endpoints(&gw, &[], &empty_declarations());
+        assert_eq!(endpoints, typed);
+    }
+
+    /// A local `http` provider at `site-a` that derivation can resolve.
+    fn local_http_provider(name: &str, host: &str) -> InferenceProvider {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": name },
+            "spec": {
+                "gridNetworkRef": "net",
+                "providerKind": "self_hosted",
+                "backendKind": "local_model",
+                "endpoint": format!("http://{host}:8000"),
+                "models": [{ "name": "model-x" }]
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one real render per allowlist step")]
+    fn narrowing_and_removing_the_allowlist_withdraws_the_revoked_endpoint_from_the_render() {
+        let providers = vec![
+            local_http_provider("prov-a", "prov-a.models.svc"),
+            local_http_provider("prov-b", "prov-b.models.svc"),
+        ];
+        let declarations = derived_topology::Declarations {
+            providers: &providers,
+            ..empty_declarations()
+        };
+        let allow = |names: &[&str]| {
+            Some(crate::crd::grid_network::DeriveTopology {
+                from_providers: names.iter().map(|name| (*name).to_owned()).collect(),
+                transport: None,
+            })
+        };
+        // The typed entry keeps the inventory non-empty once every derivation is revoked.
+        let steps = [
+            (allow(&["prov-a", "prov-b"]), &["prov-a", "prov-b"][..]),
+            (allow(&["prov-a"]), &["prov-a"][..]),
+            (allow(&[]), &[][..]),
+            (None, &[][..]),
+        ];
+        for (derive_topology, live) in steps {
+            let mut gw = make_gw_ref("inference-gw", "praxis-system");
+            gw.local_site_name = Some("site-a".to_owned());
+            let cc = ConsumerConfig {
+                derive_topology,
+                cluster_endpoints: vec![typed_endpoint("typed-c", "typed-c.models.svc:8000")],
+                ..make_consumer_config("praxis-consumer-config")
+            };
+            gw.consumer_config = Some(cc.clone());
+            let mut overlay = routing_overlay::RoutingOverlay {
+                network: "net".to_owned(),
+                local_site: "site-a".to_owned(),
+                candidates: vec![
+                    topology_candidate("prov-a", "site-a"),
+                    topology_candidate("prov-b", "site-a"),
+                    topology_candidate("typed-c", "site-a"),
+                ],
+                excluded: Vec::new(),
+                selection_policy: None,
+                generated_at: None,
+            };
+            let (endpoints, summary, refused) = gateway_cluster_endpoints(&gw, &overlay.candidates, &declarations);
+            withdraw_refused(&mut overlay, &refused);
+            let render = consumer_config::render_consumer_config_with_projected(
+                &overlay,
+                &cc.credential_mount_base,
+                &endpoints,
+                &cc.tls_cert_mount_path,
+                cc.listener_port,
+                &crate::crd::grid_network::TlsConfig::default(),
+                &gw.name,
+                &gw.namespace,
+                None,
+                false,
+                false,
+            );
+            assert!(render.is_ok(), "{live:?}: the render must succeed: {render:?}");
+            let rendered = render.unwrap_or_else(|_| std::process::abort());
+            for cluster in ["prov-a", "prov-b"] {
+                let address = format!("{cluster}.models.svc:8000");
+                assert_eq!(
+                    rendered.config_yaml.contains(&address),
+                    live.contains(&cluster),
+                    "{live:?}: {address} is live only while allowlisted"
+                );
+                assert_eq!(
+                    overlay.candidates.iter().any(|c| c.cluster == cluster),
+                    live.contains(&cluster),
+                    "{live:?}: {cluster} routes only while allowlisted"
+                );
+                assert_eq!(
+                    summary.contains(&format!("{cluster}: not allowlisted")),
+                    !live.contains(&cluster),
+                    "{live:?}: the status names {cluster} once withdrawn: {summary}"
+                );
+            }
+            assert!(
+                rendered.config_yaml.contains("typed-c.models.svc:8000"),
+                "typed entries stay"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gateway_with_no_consumer_config_has_no_topology() {
+        let gw = make_gw_ref("inference-gw", "praxis-system");
+        let candidates = vec![topology_candidate("prov-a", "site-a")];
+        let (endpoints, summary, _) = gateway_cluster_endpoints(&gw, &candidates, &empty_declarations());
+        assert!(endpoints.is_empty());
+        assert!(summary.is_empty());
+    }
+
     #[test]
     fn consumer_config_status_rendered_has_rendered_phase() {
         let gw = make_gw_ref("inference-gw", "praxis-system");
         let cc = make_consumer_config("praxis-consumer-config");
-        let status = consumer_config_status_rendered(&gw, &cc, 5);
+        let status = consumer_config_status_rendered(&gw, &cc, 5, "");
         assert_eq!(
             status.phase,
             ConsumerConfigPhase::Rendered,
@@ -10006,8 +10407,8 @@ mod tests {
         let gw_b = make_gw_ref("gw-b", "ns-b");
         let cc_a = make_consumer_config("cm-a");
         let cc_b = make_consumer_config("cm-b");
-        let status_a = consumer_config_status_rendered(&gw_a, &cc_a, 1);
-        let status_b = consumer_config_status_rendered(&gw_b, &cc_b, 1);
+        let status_a = consumer_config_status_rendered(&gw_a, &cc_a, 1, "");
+        let status_b = consumer_config_status_rendered(&gw_b, &cc_b, 1, "");
         assert_eq!(status_a.gateway_name, "gw-a");
         assert_eq!(status_b.gateway_name, "gw-b");
         assert_eq!(status_a.config_map_name, "cm-a");
