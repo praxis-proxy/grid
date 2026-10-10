@@ -1197,19 +1197,31 @@ jobs:
               )
               : > "${ODIR}/mounted-file-observations.jsonl"
               for pod in "${GATEWAY_PODS[@]}"; do
+                gateway_container=$(kubectl --context "${CTX}" -n grid-system get pod "${pod}" -o json 2>/dev/null \
+                  | jq -r '[.spec.containers[]? | select(any(.volumeMounts[]?; .name == "overlay" and .mountPath == "/etc/praxis/routing")) | .name] | if length == 1 then .[0] else empty end' 2>/dev/null \
+                  || true)
+                if [[ -z "${gateway_container}" ]]; then
+                  echo "Could not uniquely identify the gateway container mounting /etc/praxis/routing" \
+                    > "${ODIR}/${pod}-overlay-container-selection-error.txt"
+                  kubectl --context "${CTX}" logs -n grid-system "${pod}" --all-containers=true --tail=2000 \
+                    > "${ODIR}/${pod}-gateway-current.log" 2>&1 || true
+                  kubectl --context "${CTX}" logs -n grid-system "${pod}" --all-containers=true --previous --tail=2000 \
+                    > "${ODIR}/${pod}-gateway-previous.log" 2>&1 || true
+                  continue
+                fi
                 for file in routing-overlay.json routing-config.json; do
                   mount_path="/etc/praxis/routing/${file}"
                   RAW_MOUNT="${RUNNER_TEMP}/${cluster}-${pod}-${file}"
                   FILE_TARGET_FILE="${ODIR}/${pod}-${file}-file-symlink.txt"
                   DATA_TARGET_FILE="${ODIR}/${pod}-${file}-data-symlink.txt"
                   projection_read_started_at=$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')
-                  if kubectl --context "${CTX}" exec -n grid-system "${pod}" -c praxis-ai -- \
+                  if kubectl --context "${CTX}" exec -n grid-system "${pod}" -c "${gateway_container}" -- \
                     readlink "${mount_path}" > "${FILE_TARGET_FILE}" 2> "${ODIR}/${pod}-${file}-file-symlink-error.txt"; then
                     file_symlink_status="success"
                   else
                     file_symlink_status="failed"
                   fi
-                  if kubectl --context "${CTX}" exec -n grid-system "${pod}" -c praxis-ai -- \
+                  if kubectl --context "${CTX}" exec -n grid-system "${pod}" -c "${gateway_container}" -- \
                     readlink /etc/praxis/routing/..data > "${DATA_TARGET_FILE}" 2> "${ODIR}/${pod}-${file}-data-symlink-error.txt"; then
                     data_symlink_status="success"
                   else
@@ -1217,7 +1229,7 @@ jobs:
                   fi
                   projection_read_completed_at=$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')
                   read_started_at=$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')
-                  if kubectl --context "${CTX}" exec -n grid-system "${pod}" -c praxis-ai -- cat "${mount_path}" \
+                  if kubectl --context "${CTX}" exec -n grid-system "${pod}" -c "${gateway_container}" -- cat "${mount_path}" \
                     > "${RAW_MOUNT}" 2> "${ODIR}/${pod}-${file}-read-error.txt"; then
                     mounted_read_status="success"
                   else
@@ -1256,9 +1268,9 @@ jobs:
                   fi
                   rm -f "${RAW_MOUNT}"
                 done
-                kubectl --context "${CTX}" logs -n grid-system "${pod}" -c praxis-ai --tail=2000 \
+                kubectl --context "${CTX}" logs -n grid-system "${pod}" -c "${gateway_container}" --tail=2000 \
                   > "${ODIR}/${pod}-gateway-current.log" 2>&1 || true
-                kubectl --context "${CTX}" logs -n grid-system "${pod}" -c praxis-ai --previous --tail=2000 \
+                kubectl --context "${CTX}" logs -n grid-system "${pod}" -c "${gateway_container}" --previous --tail=2000 \
                   > "${ODIR}/${pod}-gateway-previous.log" 2>&1 || true
               done
               kubectl --context "${CTX}" logs -n grid-system deployment/grid-operator -c operator --tail=2000 \
