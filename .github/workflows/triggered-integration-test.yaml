@@ -69,7 +69,10 @@ env:
   STATIC_WEIGHTED_SIM_IMAGE_TAG: ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
   COMBINED_SITE_SIM_IMAGE_REF: ghcr.io/neuralmagic/vllm-vcr@sha256:cf98f91f12210893f63b3afd3b1ea5bd3c35640379ce2bbf702a4cefddf9e5a4
   COMBINED_SITE_SIM_IMAGE_TAG: ghcr.io/neuralmagic/vllm-vcr:vllm0.23
-  PROBE_IMAGE_REF: curlimages/curl@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b
+  # Pin the linux/amd64 child manifest. Kind imports every platform from a
+  # multi-platform index, while this workflow runs amd64 nodes and only pulls
+  # the runner's platform into Docker.
+  PROBE_IMAGE_REF: curlimages/curl@sha256:fcff5cf7a4b895da7bd2933c914938db2b05d2113fa0d6c55b6d29930408f661
   PROBE_IMAGE_TAG: curlimages/curl:8.10.1
   # Pinned identity/date/message-suffix for the local PR-merge reconstruction
   # in resolve-source's "Resolve source" step and qualification-e2e's "Reconstruct PR
