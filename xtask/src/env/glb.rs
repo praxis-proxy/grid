@@ -90,7 +90,7 @@ const DATA_PLANE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const OVERLAY_SETTLE_WINDOW: Duration = Duration::from_secs(15);
 
 /// Runtime directory retaining the public CA used by client probes.
-const GTM_TLS_DIR: &str = ".forge/runtime/glb-tls/gtm";
+const GTM_TLS_RUNTIME_DIR: &str = "runtime/glb-tls/gtm";
 
 /// Stable HTTPS name exposed by the local GTM profile.
 const GTM_SERVER_NAME: &str = "api.grid-glb.test";
@@ -179,8 +179,9 @@ const CLIENT_BEARER_TOKEN: &str = "test-token";
 /// `peer_identity_trust` checks independently in the provider pipeline.
 pub(crate) fn prepare_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
     let demo_root = super::demo_root(Path::new("tests/e2e/topologies/grid-glb-demo/forge.yaml"));
-    stage_provider_boundary_with_mode_and_external(IngressMode::Global, None, &demo_root)
-        .and_then(|()| install_provider_boundary())
+    let forge_state_dir = Path::new(".forge");
+    stage_provider_boundary_with_mode_and_external(IngressMode::Global, None, &demo_root, forge_state_dir)
+        .and_then(|()| install_provider_boundary_with_mode_and_external(IngressMode::Global, None, forge_state_dir))
 }
 
 /// Generate identities for an ingress mode and optional external provider.
@@ -192,6 +193,7 @@ pub(crate) fn stage_provider_boundary_with_mode_and_external(
     ingress_mode: IngressMode,
     external: Option<&ExternalProviderDescriptor>,
     demo_root: &Path,
+    forge_state_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let identities = vec![
         "east-edge".to_owned(),
@@ -207,20 +209,18 @@ pub(crate) fn stage_provider_boundary_with_mode_and_external(
         wrong_ca.cert_pem,
     )?;
     if ingress_mode == IngressMode::Global {
-        stage_gtm_tls()?;
+        stage_gtm_tls(forge_state_dir)?;
     }
     let east_edge_digest = certs::certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join("east-edge-cert.pem"))?;
     let west_edge_digest = certs::certificate_sha256(&Path::new(GENERATED_CERTS_DIR).join("west-edge-cert.pem"))?;
-    stage_provider_configs_with_external(&east_edge_digest, &west_edge_digest, external, demo_root)?;
+    stage_provider_configs_with_external(
+        &east_edge_digest,
+        &west_edge_digest,
+        external,
+        demo_root,
+        forge_state_dir,
+    )?;
     Ok(())
-}
-
-/// Install staged provider identities, configs, and backend credentials.
-///
-/// The `grid-system` namespace must exist. Provider deployments may already
-/// exist or may be applied after this function returns.
-pub(crate) fn install_provider_boundary() -> Result<(), Box<dyn std::error::Error>> {
-    install_provider_boundary_with_mode_and_external(IngressMode::Global, None)
 }
 
 /// Install identities for an ingress mode and optional external provider.
@@ -232,6 +232,7 @@ pub(crate) fn install_provider_boundary() -> Result<(), Box<dyn std::error::Erro
 pub(crate) fn install_provider_boundary_with_mode_and_external(
     ingress_mode: IngressMode,
     external_key_file: Option<&Path>,
+    forge_state_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if ingress_mode == IngressMode::Global {
         ensure_demo_namespace("gtm-emulator")?;
@@ -240,11 +241,11 @@ pub(crate) fn install_provider_boundary_with_mode_and_external(
         apply_identity_tls_secret(edge, edge, EDGE_TLS_SECRET)?;
     }
     if ingress_mode == IngressMode::Global {
-        apply_gtm_tls_secret()?;
+        apply_gtm_tls_secret(forge_state_dir)?;
     }
     for provider in PROVIDER_CLUSTERS {
         let provider_credential = generate_provider_credential()?;
-        apply_provider_config(provider)?;
+        apply_provider_config(provider, forge_state_dir)?;
         apply_provider_tls_secret(provider)?;
         apply_provider_credential_secret(provider, &provider_credential)?;
         if *provider == "east-provider" {
@@ -322,6 +323,7 @@ fn stage_provider_configs_with_external(
     west_edge_digest: &str,
     external: Option<&ExternalProviderDescriptor>,
     demo_root: &Path,
+    forge_state_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for provider in PROVIDER_CLUSTERS {
         let source = demo_root.join("configs").join(provider).join("praxis.yaml");
@@ -350,7 +352,7 @@ fn stage_provider_configs_with_external(
         {
             rendered = append_openai_provider_config(&rendered, ext, &openai_candidate_id(&ext.model))?;
         }
-        let target_dir = Path::new(".forge/runtime/glb-tls/provider-configs").join(provider);
+        let target_dir = forge_state_dir.join("runtime/glb-tls/provider-configs").join(provider);
         fs::create_dir_all(&target_dir)?;
         fs::write(target_dir.join("praxis.yaml"), rendered)?;
     }
@@ -780,12 +782,12 @@ pub(crate) fn verify_external_provider_absent() -> Result<String, Box<dyn std::e
 }
 
 /// Generate a public-facing certificate for the stable local GTM name.
-fn stage_gtm_tls() -> Result<(), Box<dyn std::error::Error>> {
+fn stage_gtm_tls(forge_state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let certs_dir = Path::new(GENERATED_CERTS_DIR);
     let ca = certs::load_or_generate_ca(certs_dir)?;
     let certificate = ::certs::generate_dns_cert(&ca, "grid-glb-demo-ingress", GTM_SERVER_NAME)?;
-    let target = Path::new(GTM_TLS_DIR);
-    fs::create_dir_all(target)?;
+    let target = forge_state_dir.join(GTM_TLS_RUNTIME_DIR);
+    fs::create_dir_all(&target)?;
     fs::write(target.join("ca.crt"), &ca.cert_pem)?;
     fs::write(target.join("tls.crt"), certificate.cert_pem)?;
     fs::write(target.join("tls.key"), certificate.key_pem)?;
@@ -793,7 +795,7 @@ fn stage_gtm_tls() -> Result<(), Box<dyn std::error::Error>> {
     {
         use std::os::unix::fs::PermissionsExt as _;
 
-        fs::set_permissions(target, fs::Permissions::from_mode(0o750))?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o750))?;
         fs::set_permissions(target.join("tls.key"), fs::Permissions::from_mode(0o640))?;
     }
     Ok(())
@@ -824,8 +826,8 @@ fn apply_identity_tls_secret(
 }
 
 /// Apply the stable-name certificate used by the GTM emulator.
-fn apply_gtm_tls_secret() -> Result<(), Box<dyn std::error::Error>> {
-    let tls_dir = Path::new(GTM_TLS_DIR);
+fn apply_gtm_tls_secret(forge_state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let tls_dir = forge_state_dir.join(GTM_TLS_RUNTIME_DIR);
     apply_tls_secret_from_paths(
         "gtm-emulator",
         GTM_TLS_SECRET,
@@ -872,8 +874,9 @@ fn apply_tls_secret_from_paths(
 }
 
 /// Apply the rendered provider gateway `ConfigMap`.
-fn apply_provider_config(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = Path::new(".forge/runtime/glb-tls/provider-configs")
+fn apply_provider_config(provider: &str, forge_state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = forge_state_dir
+        .join("runtime/glb-tls/provider-configs")
         .join(provider)
         .join("praxis.yaml");
     let output = Command::new("kubectl")
@@ -1461,7 +1464,7 @@ fn run_steps(ctx: &PrereqContext, mode: DemoMode, ingress_mode: IngressMode, res
 
     // Provider gateway self-discovery.
     proof_banner("checking provider gateway self-discovery");
-    let provider_gateway_addrs = match load_provider_gateway_addresses() {
+    let provider_gateway_addrs = match load_provider_gateway_addresses(&ctx.config) {
         Ok(addrs) => addrs,
         Err(e) => {
             results.push(StepResult::fail("provider gateway addr", e.as_ref()));
@@ -3175,10 +3178,11 @@ fn find_gridsite_egress<'cfg>(
         .unwrap_or(""))
 }
 
-/// Load expected provider gateway addresses from Forge's default state file
+/// Load expected provider gateway addresses from this run's Forge state file
 /// (verifier evidence only — operators self-discover their own addresses).
-fn load_provider_gateway_addresses() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
-    let state = fs::read_to_string(".forge/state.json")?;
+fn load_provider_gateway_addresses(config: &Path) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    let state_dir = super::forge_config::state_dir_for_config(config)?;
+    let state = fs::read_to_string(state_dir.join("state.json"))?;
     parse_provider_gateway_captures(&state)
 }
 

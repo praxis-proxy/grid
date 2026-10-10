@@ -131,6 +131,8 @@ struct CombinedSiteContext {
     demo_root: PathBuf,
     /// Path to the resolved Forge config.
     resolved_config: PathBuf,
+    /// Isolated Forge state and runtime directory for this run.
+    forge_state_dir: PathBuf,
     /// Path to the forge binary.
     forge_bin: PathBuf,
     /// External provider descriptor, if enabled.
@@ -4577,9 +4579,13 @@ fn materialize_config(
     run_id: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let content = fs::read_to_string(source)?;
-    let rendered = render_config(&content, external_provider, external_site)?;
     let parent = source.parent().ok_or("source config must have parent directory")?;
     let output = parent.join(format!(".forge.resolved-{run_id}.yaml"));
+    let state_dir = super::forge_config::state_dir_for_config(&output)?;
+    let mut config: serde_yaml::Value =
+        serde_yaml::from_str(&render_config(&content, external_provider, external_site)?)?;
+    super::forge_config::rewrite_exec_runtime_paths(&mut config, &state_dir);
+    let rendered = serde_yaml::to_string(&config)?;
     fs::write(&output, rendered)?;
     Ok(output)
 }
@@ -4802,6 +4808,7 @@ fn prepare_setup(
     Ok(CombinedSiteContext {
         demo_root: root,
         resolved_config,
+        forge_state_dir,
         forge_bin,
         external_provider: ext_descriptor,
         external_provider_site: ext_site,
@@ -7433,6 +7440,12 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
         ext_key_file,
         &run_id,
     );
+    if let Ok(context) = &setup_ctx {
+        fs::write(
+            evidence_dir.join("forge-state-dir.txt"),
+            format!("{}\n", context.forge_state_dir.display()),
+        )?;
+    }
     let mut teardown_success = false;
     let mut run_error = None;
     let mut overlay_state = OverlayState::default();

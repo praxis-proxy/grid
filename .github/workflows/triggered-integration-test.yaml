@@ -1148,6 +1148,29 @@ jobs:
           OWNED_NETWORKS=()
           NETWORK_OWNER=""
 
+          resolve_run_forge_state() {
+            local topology_dir="$1"
+            local state_dir_file="${EVIDENCE_DIR}/forge-state-dir.txt"
+            local forge_state_dir=""
+
+            if [[ ! -f "${state_dir_file}" ]]; then
+              echo "::warning::Run-scoped Forge state path is absent; preserving its network"
+              CLEANUP_RESULT="partial"
+              STATE_FILE=""
+              return 0
+            fi
+            IFS= read -r forge_state_dir < "${state_dir_file}"
+            local expected_parent="${GRID_REPO}/tests/e2e/topologies/${topology_dir}/.forge"
+            if [[ "${forge_state_dir%/*}" != "${expected_parent}" ]] \
+              || ! [[ "${forge_state_dir##*/}" =~ ^\.forge\.resolved-[0-9]+-[0-9]+$ ]]; then
+              echo "::warning::Run-scoped Forge state path failed topology/run validation; preserving its network"
+              CLEANUP_RESULT="partial"
+              STATE_FILE=""
+              return 0
+            fi
+            STATE_FILE="${forge_state_dir}/state.json"
+          }
+
           case "${QUALIFICATION}" in
             glb)
               OWNED_CLUSTERS=(
@@ -1159,6 +1182,7 @@ jobs:
               )
               OWNED_NETWORKS=(grid-glb-demo-net)
               NETWORK_OWNER="grid-glb-demo"
+              resolve_run_forge_state "grid-glb-demo"
               ;;
             static-weighted)
               RESOLVED_CONFIG="${EVIDENCE_DIR}/resolved-forge.yaml"
@@ -1200,6 +1224,7 @@ jobs:
               )
               OWNED_NETWORKS=(grid-combined-site-net)
               NETWORK_OWNER="grid-combined-site"
+              resolve_run_forge_state "grid-combined-site"
               ;;
             *)
               echo "::warning::Unknown qualification '${QUALIFICATION}'; refusing cleanup"
