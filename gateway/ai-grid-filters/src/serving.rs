@@ -470,8 +470,9 @@ mod tests {
     fn the_documented_example_loads() {
         let json = include_str!("../../../examples/gateway/serving-config.json");
         let config: GridServingConfig = serde_json::from_str(json).expect("the example parses");
-        assert_eq!(config.candidates.len(), 3);
-        assert_eq!(config.peers[0].interval_ms, 500, "the local operator is polled fast");
+        assert_eq!(config.candidates.len(), 2);
+        assert_eq!(config.peers.len(), 1, "the gateway polls only its local operator");
+        assert_eq!(config.peers[0].interval_ms, 5000);
     }
 
     #[test]
