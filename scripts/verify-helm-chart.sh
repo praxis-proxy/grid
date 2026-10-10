@@ -1755,10 +1755,10 @@ if render v-enroll "$ENROLL_DIR" --namespace grid-system --set route.host=enroll
   fi
 fi
 if [ "$(helm template v-enroll "$ENROLL_DIR" --namespace grid-system --show-only templates/certs/ca-bootstrap-rbac.yaml \
-    | grep -c 'hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed')" = 3 ]; then
-  pass "enrollment: bootstrap RBAC is removed after the hook succeeds or fails"
+    | grep -c 'hook-delete-policy: before-hook-creation$')" = 3 ]; then
+  pass "enrollment: bootstrap RBAC is retained across hook runs"
 else
-  fail "enrollment: bootstrap RBAC should carry hook-succeeded"
+  fail "enrollment: bootstrap RBAC should use before-hook-creation only"
 fi
 
 # ======================================================================
