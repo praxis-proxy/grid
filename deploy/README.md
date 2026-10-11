@@ -48,6 +48,11 @@ Each directory keeps the `values.yaml` that renders it.
 - `operator/` is the platform base: an OpenShift shape with metrics TLS from the service
   CA and a NetworkPolicy, the image set through `params.env`, and the namespace left to the
   consumer. A platform operator vendors this directory and places it in its own namespace.
+  The SWIM and signals Services are `LoadBalancer`, because the operator refuses any other
+  type for the Service it advertises and peer sites reach both through it. A cluster with
+  no LoadBalancer provider leaves the operator waiting for an address and never ready. The
+  site gateway Service is named `grid-gateway`, the name the chart uses once a grid exists;
+  the `grid-operator-resources` ClusterRole grants `get` on that name only.
 - `overlays/kind/` is the standalone install for a kind cluster: plain metrics, no
   NetworkPolicy, its own `grid-system` Namespace, and the resources RoleBinding in the
   `default` namespace that the install qualification checks.
@@ -68,6 +73,11 @@ kubectl apply -k deploy/crds/
 
 # OpenShift, the platform base in its default namespace (a platform sets its own)
 kubectl apply -k deploy/operator/ -n grid-system
+
+# Another image from a consumer kustomization: use the images transformer. Merging a
+# second grid-operator-parameters ConfigMap does nothing, because the base's replacement
+# has already run by the time the merge applies.
+kustomize edit set image ghcr.io/praxis-proxy/grid-operator=ghcr.io/praxis-proxy/grid-operator:sha-<commit>
 
 # kind
 kubectl apply -k deploy/overlays/kind/

@@ -17,7 +17,7 @@ rules:
     # signals address, and gating the grant on a value that can disagree with the
     # Deployment's env is how it goes missing.
     resourceNames:
-      - "provider-gateway"
+      - "grid-gateway"
       - "grid-operator-swim"
       - "grid-operator-signals"
     verbs: ["get"]

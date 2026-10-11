@@ -8,7 +8,9 @@ metadata:
     app.kubernetes.io/instance: grid-operator
     app.kubernetes.io/version: "v0.2.0"
 spec:
-  type: "ClusterIP"
+  type: "LoadBalancer"
+  externalTrafficPolicy: "Local"
+  publishNotReadyAddresses: true
   ports:
     - name: swim-udp
       port: 7946

@@ -19,6 +19,7 @@ resources:
   - serviceaccount-metrics-scraper.yaml
   - serviceaccount.yaml
   - service-metrics.yaml
+  - service-signals.yaml
   - service-swim.yaml
 
 labels:

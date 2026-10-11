@@ -44,8 +44,10 @@ The install manifests are generated from the chart (`make generate-deploy`; CI r
 `make deploy-check`). `deploy/operator/` is the platform base: no Namespace, the image set
 through `params.env`, metrics TLS from the OpenShift service CA and a NetworkPolicy. A
 platform operator vendors it as a kustomize base and sets the namespace in its own
-kustomization. `deploy/overlays/kind/` is the standalone install with its own `grid-system`
-Namespace.
+kustomization. Its SWIM and signals Services are `LoadBalancer`, the only type the
+operator accepts for the Service it advertises, so the cluster needs a LoadBalancer
+provider. `deploy/overlays/kind/` is the standalone install with its own `grid-system`
+Namespace and ClusterIP Services.
 
 ```console
 # Standalone deployment (CRDs + operator, kind shape)
@@ -141,8 +143,10 @@ image: ghcr.io/praxis-proxy/grid-operator@sha256:8c8271aa589fbd81e346b75ae580be9
 ```
 
 **Override:** set `grid-operator-image` in `deploy/operator/params.env` (platform
-base), or set `image` in `deploy/overlays/kind/values.yaml` and run
-`make generate-deploy`, or patch the Deployment after apply:
+base; a kustomization that vendors the base uses the `images` transformer instead,
+since a merged parameters ConfigMap arrives after the base's replacement has run), or
+set `image` in `deploy/overlays/kind/values.yaml` and run `make generate-deploy`, or
+patch the Deployment after apply:
 
 ```console
 kubectl set image deployment/grid-operator \

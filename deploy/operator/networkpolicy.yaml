@@ -20,6 +20,8 @@ spec:
     - ports:
         - port: swim-udp
           protocol: UDP
+        - port: signals
+          protocol: TCP
     - from:
         - namespaceSelector:
             matchLabels:

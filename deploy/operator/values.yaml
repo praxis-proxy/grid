@@ -17,7 +17,11 @@ rbac:
 swim:
   service:
     enabled: true
-    type: ClusterIP
+    type: LoadBalancer
+signals:
+  enabled: true
+gateway:
+  serviceName: grid-gateway
 metrics:
   service:
     enabled: true
