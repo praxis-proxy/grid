@@ -820,83 +820,24 @@ const QUERY_VALUE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remov
 
 /// Why a poll ended, at the granularity a response differs by.
 ///
-/// Finer than success or failure, so "why is this peer not scored" is
-/// answerable: a refusal, a trust failure, and a 403 each call for a different
-/// response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PollOutcome {
-    /// The peer answered.
-    Ok,
-    /// No answer within the timeout.
-    Timeout,
-    /// The connection was refused or the host was unreachable.
-    Refused,
-    /// The TLS handshake or certificate verification failed.
-    Tls,
-    /// Any other transport failure.
-    Transport,
-    /// The peer answered with a 4xx.
-    ClientError,
-    /// The peer answered with a 5xx.
-    ServerError,
-    /// The body was not decodable.
-    Encoding,
-    /// This site is misconfigured for that peer.
-    Config,
-    /// The process is shutting down and the poll stood down.
-    Cancelled,
-}
-
-impl PollOutcome {
-    /// Label value, stable because dashboards and alerts are written against it.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Timeout => "timeout",
-            Self::Refused => "refused",
-            Self::Tls => "tls",
-            Self::Transport => "transport",
-            Self::ClientError => "client_error",
-            Self::ServerError => "server_error",
-            Self::Encoding => "encoding",
-            Self::Config => "config",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
-    /// Whether trying again within this round could plausibly help.
-    ///
-    /// Retrying a trust failure or a refusal to answer wastes the budget that a
-    /// genuinely transient failure needs, and turns one misconfiguration into a
-    /// burst against a peer that already said no.
-    #[must_use]
-    pub const fn is_retryable(self) -> bool {
-        matches!(
-            self,
-            Self::Timeout | Self::Refused | Self::Transport | Self::ServerError
-        )
-    }
-}
+/// The shared classification, so one retry verdict and one set of metric
+/// labels covers every client in the tree.
+pub use grid_client::RequestOutcome;
 
 /// Classify a scrape failure.
-fn classify(error: &MetricsScrapeError) -> PollOutcome {
+fn classify(error: &MetricsScrapeError) -> RequestOutcome {
     match error {
-        MetricsScrapeError::Timeout(_) => PollOutcome::Timeout,
+        MetricsScrapeError::Timeout(_) => RequestOutcome::Timeout,
         MetricsScrapeError::NonOkStatus { status, .. } => {
-            if (500..600).contains(status) {
-                PollOutcome::ServerError
-            } else {
-                PollOutcome::ClientError
-            }
+            http::StatusCode::from_u16(*status).map_or(RequestOutcome::Transport, grid_client::from_status)
         },
-        MetricsScrapeError::Encoding(_) => PollOutcome::Encoding,
-        MetricsScrapeError::BodyTooLarge(_) => PollOutcome::Transport,
+        MetricsScrapeError::Encoding(_) => RequestOutcome::Encoding,
+        MetricsScrapeError::BodyTooLarge(_) => RequestOutcome::Transport,
         MetricsScrapeError::InvalidUrl(_)
         | MetricsScrapeError::HttpWithTls(_)
         | MetricsScrapeError::TlsMaterial(_)
         | MetricsScrapeError::Credential(_)
-        | MetricsScrapeError::PlaintextCredential(_) => PollOutcome::Config,
+        | MetricsScrapeError::PlaintextCredential(_) => RequestOutcome::Config,
         MetricsScrapeError::Transport(inner) => classify_transport(&**inner),
     }
 }
@@ -908,25 +849,25 @@ fn classify(error: &MetricsScrapeError) -> PollOutcome {
 /// replaced. The chain is walked rather than the message matched, because an
 /// error string is not an interface.
 #[expect(clippy::wildcard_enum_match_arm, reason = "std::io::ErrorKind is non_exhaustive")]
-fn classify_transport(error: &(dyn std::error::Error + 'static)) -> PollOutcome {
+fn classify_transport(error: &(dyn std::error::Error + 'static)) -> RequestOutcome {
     let mut current = Some(error);
     while let Some(err) = current {
         if tls_backend::is_tls_error(err) {
-            return PollOutcome::Tls;
+            return RequestOutcome::Tls;
         }
         if let Some(io) = err.downcast_ref::<std::io::Error>() {
             return match io.kind() {
                 std::io::ErrorKind::ConnectionRefused
                 | std::io::ErrorKind::HostUnreachable
                 | std::io::ErrorKind::NetworkUnreachable
-                | std::io::ErrorKind::ConnectionReset => PollOutcome::Refused,
-                std::io::ErrorKind::TimedOut => PollOutcome::Timeout,
-                _ => PollOutcome::Transport,
+                | std::io::ErrorKind::ConnectionReset => RequestOutcome::Refused,
+                std::io::ErrorKind::TimedOut => RequestOutcome::Timeout,
+                _ => RequestOutcome::Transport,
             };
         }
         current = err.source();
     }
-    PollOutcome::Transport
+    RequestOutcome::Transport
 }
 
 /// Delay before attempt `attempt`, counting the first retry as zero.
@@ -1068,7 +1009,7 @@ impl PollPeers {
             Some(Ok(config)) => Some(config),
             Some(Err(error)) => {
                 tracing::warn!(peer, %error, "peer client config unusable; not polling");
-                guard.finish(PollOutcome::Config, 0);
+                guard.finish(RequestOutcome::Config, 0);
                 return None;
             },
             None => None,
@@ -1076,7 +1017,7 @@ impl PollPeers {
         let (outcome, result) =
             tokio::time::timeout(self.budget, self.attempt_until(peer, url, tls.as_ref(), guard.started))
                 .await
-                .unwrap_or((PollOutcome::Timeout, None));
+                .unwrap_or((RequestOutcome::Timeout, None));
         guard.finish(outcome, result.as_ref().map_or(0, |(body, _)| body.len()));
         result
     }
@@ -1119,23 +1060,23 @@ impl PollPeers {
         url: &str,
         tls: Option<&ClientTlsConfig>,
         started: Instant,
-    ) -> (PollOutcome, Option<(String, Option<SystemTime>)>) {
+    ) -> (RequestOutcome, Option<(String, Option<SystemTime>)>) {
         let attempts = self.attempts.max(1);
-        let mut outcome = PollOutcome::Transport;
+        let mut outcome = RequestOutcome::Transport;
         for attempt in 0..attempts {
             if self.shutdown.is_triggered() {
-                return (PollOutcome::Cancelled, None);
+                return (RequestOutcome::Cancelled, None);
             }
             if started.elapsed() >= self.budget {
                 break;
             }
 
             let Some(scrape) = self.scrape_or_stand_down(url, tls).await else {
-                return (PollOutcome::Cancelled, None);
+                return (RequestOutcome::Cancelled, None);
             };
 
             match scrape {
-                Ok(pair) => return (PollOutcome::Ok, Some(pair)),
+                Ok(pair) => return (RequestOutcome::Ok, Some(pair)),
                 Err(error) => {
                     outcome = classify(&error);
                     if attempt + 1 >= attempts || !outcome.is_retryable() {
@@ -1144,7 +1085,7 @@ impl PollPeers {
                     }
                     crate::metrics::record_peer_retry(peer, outcome.as_str());
                     if !self.wait_before_retry(peer, attempt, started).await {
-                        return (PollOutcome::Cancelled, None);
+                        return (RequestOutcome::Cancelled, None);
                     }
                 },
             }
@@ -1225,12 +1166,12 @@ impl<'poll> PollGuard<'poll> {
     }
 
     /// Record a poll that ran to a conclusion.
-    fn finish(&mut self, outcome: PollOutcome, bytes: usize) {
+    fn finish(&mut self, outcome: RequestOutcome, bytes: usize) {
         self.record(outcome, bytes);
     }
 
     /// Record an outcome once and only once.
-    fn record(&mut self, outcome: PollOutcome, bytes: usize) {
+    fn record(&mut self, outcome: RequestOutcome, bytes: usize) {
         if self.recorded {
             return;
         }
@@ -1244,8 +1185,8 @@ impl<'poll> PollGuard<'poll> {
         );
         // Reachability is claimed only when the poll concluded: a cancelled
         // poll learned nothing, and marking it down would fake an outage.
-        if outcome != PollOutcome::Cancelled {
-            crate::metrics::set_peer_collection_up(self.peer, outcome == PollOutcome::Ok, SystemTime::now());
+        if outcome != RequestOutcome::Cancelled {
+            crate::metrics::set_peer_collection_up(self.peer, outcome == RequestOutcome::Ok, SystemTime::now());
         }
     }
 }
@@ -1253,7 +1194,7 @@ impl<'poll> PollGuard<'poll> {
 impl Drop for PollGuard<'_> {
     fn drop(&mut self) {
         crate::metrics::peer_polls_in_flight(-1);
-        self.record(PollOutcome::Cancelled, 0);
+        self.record(RequestOutcome::Cancelled, 0);
     }
 }
 
@@ -2123,45 +2064,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_trust_failure_is_not_retried() {
-        // Retrying a certificate problem burns the budget a transient failure
-        // needs, and it will fail identically until somebody replaces a cert.
-        assert!(!PollOutcome::Tls.is_retryable());
-        assert!(!PollOutcome::Config.is_retryable());
-    }
-
-    #[test]
-    fn a_peer_declining_to_answer_is_not_retried() {
-        // A 403 is the scope rule working. Retrying it turns one misconfigured
-        // reader into a burst against a peer that already said no.
-        assert!(!PollOutcome::ClientError.is_retryable());
-    }
-
-    #[test]
-    fn transient_failures_are_retried() {
-        for outcome in [
-            PollOutcome::Timeout,
-            PollOutcome::Refused,
-            PollOutcome::Transport,
-            PollOutcome::ServerError,
-        ] {
-            assert!(outcome.is_retryable(), "{} is worth another attempt", outcome.as_str());
+    /// `status` as a scrape failure, for a table that reads in numbers.
+    fn non_ok(status: u16) -> MetricsScrapeError {
+        MetricsScrapeError::NonOkStatus {
+            status,
+            url: "https://peer/metrics".to_owned(),
         }
     }
 
     #[test]
+    fn a_throttled_peer_is_retried_where_one_that_refused_is_not() {
+        // 429 asks for less, not for nothing, and the backoff is already
+        // exponential and spread, so another attempt is what it asked for.
+        assert_eq!(classify(&non_ok(429)), RequestOutcome::Throttled);
+        assert!(classify(&non_ok(429)).is_retryable());
+        assert!(!classify(&non_ok(403)).is_retryable());
+    }
+
+    #[test]
     fn a_status_is_split_at_five_hundred() {
-        let client = classify(&MetricsScrapeError::NonOkStatus {
-            status: 403,
-            url: "https://peer/metrics".to_owned(),
-        });
-        let server = classify(&MetricsScrapeError::NonOkStatus {
-            status: 503,
-            url: "https://peer/metrics".to_owned(),
-        });
-        assert_eq!(client, PollOutcome::ClientError, "the peer answered and refused");
-        assert_eq!(server, PollOutcome::ServerError, "the peer is having a bad time");
+        let client = classify(&non_ok(403));
+        let server = classify(&non_ok(503));
+        assert_eq!(client, RequestOutcome::ClientError, "the peer answered and refused");
+        assert_eq!(server, RequestOutcome::ServerError, "the peer is having a bad time");
         assert!(!client.is_retryable() && server.is_retryable());
     }
 
@@ -2170,25 +2095,26 @@ mod tests {
         // Both arrive as transport errors and call for opposite responses, so
         // the chain is walked rather than the message matched.
         let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
-        assert_eq!(classify_transport(&refused), PollOutcome::Refused);
+        assert_eq!(classify_transport(&refused), RequestOutcome::Refused);
 
         #[cfg(not(feature = "fips"))]
         let tls_err = rustls::Error::DecryptError;
         #[cfg(feature = "fips")]
         let tls_err = openssl::error::ErrorStack::get();
-        assert_eq!(classify_transport(&tls_err), PollOutcome::Tls);
+        assert_eq!(classify_transport(&tls_err), RequestOutcome::Tls);
     }
 
     #[test]
     fn outcome_labels_are_stable() {
         // Dashboards and alert rules are written against these strings, so a
         // rename is a break for anyone already watching.
-        assert_eq!(PollOutcome::Ok.as_str(), "ok");
-        assert_eq!(PollOutcome::Timeout.as_str(), "timeout");
-        assert_eq!(PollOutcome::Refused.as_str(), "refused");
-        assert_eq!(PollOutcome::Tls.as_str(), "tls");
-        assert_eq!(PollOutcome::ClientError.as_str(), "client_error");
-        assert_eq!(PollOutcome::ServerError.as_str(), "server_error");
+        assert_eq!(RequestOutcome::Ok.as_str(), "ok");
+        assert_eq!(RequestOutcome::Timeout.as_str(), "timeout");
+        assert_eq!(RequestOutcome::Refused.as_str(), "refused");
+        assert_eq!(RequestOutcome::Tls.as_str(), "tls");
+        assert_eq!(RequestOutcome::ClientError.as_str(), "client_error");
+        assert_eq!(RequestOutcome::ServerError.as_str(), "server_error");
+        assert_eq!(RequestOutcome::Throttled.as_str(), "throttled");
     }
 
     #[test]
