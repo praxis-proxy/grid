@@ -337,7 +337,7 @@ impl Minter {
                     return Ok(response);
                 },
                 // Only an unsent request is safe to resend.
-                Err(error) if error.is_connect() && !is_tls_failure(&error) => {
+                Err(error) if grid_client::classify(&error) == grid_client::RequestOutcome::Refused => {
                     tracing::warn!(left = self.retry.left, error = %error_chain(&error), "enrollment service unreachable");
                     if !self.retry.failed().await {
                         return Err(error_chain(&error).into());
@@ -397,30 +397,6 @@ fn error_chain(error: &dyn Error) -> String {
         source = cause.source();
     }
     out
-}
-
-/// Whether `error`'s chain holds a TLS failure.
-fn is_tls_failure(error: &(dyn Error + 'static)) -> bool {
-    std::iter::successors(Some(error), |&err| {
-        // io::Error::source skips its wrapped error.
-        err.downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::get_ref)
-            .map(|inner| -> &(dyn Error + 'static) { inner })
-            .or_else(move || err.source())
-    })
-    .any(is_tls_error)
-}
-
-/// Whether `error` is a rustls error.
-#[cfg(not(feature = "fips"))]
-fn is_tls_error(error: &(dyn Error + 'static)) -> bool {
-    error.is::<rustls::Error>()
-}
-
-/// Whether `error` is an openssl error.
-#[cfg(feature = "fips")]
-fn is_tls_error(error: &(dyn Error + 'static)) -> bool {
-    error.is::<openssl::ssl::Error>() || error.is::<openssl::error::ErrorStack>()
 }
 
 /// Kubernetes-backed [`InviteSecrets`].

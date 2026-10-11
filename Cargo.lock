@@ -1383,6 +1383,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "metrics",
+ "openssl",
  "percent-encoding",
  "reqwest",
  "rustls",

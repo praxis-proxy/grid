@@ -1,6 +1,11 @@
 //! Renew the site identity before it expires, in place, with the current certificate.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Mutex, PoisonError},
+    time::Duration,
+};
 
 use k8s_openapi::{
     ByteString,
@@ -360,23 +365,51 @@ impl IdentityStore for KubeIdentity {
 pub(super) struct HttpsRenewer {
     /// The renewal URL.
     url: String,
-    /// PEM pinning the enrollment server, else the grid CA the site holds.
-    pin: Option<String>,
+    /// Where the PEM pinning the enrollment server lives, else the site's own
+    /// grid CA.
+    pin_path: Option<PathBuf>,
+    /// The last read of that file, kept so the happy path does no file work.
+    pinned: Mutex<Option<String>>,
 }
 
 impl HttpsRenewer {
-    /// A renewer for the service at `base`, pinned to `pin` or the held grid CA.
+    /// A renewer for the service at `base`, pinned to the PEM at `pin_path` or
+    /// to the held grid CA.
     #[must_use]
-    pub(super) fn new(base: &str, pin: Option<String>) -> Self {
+    pub(super) fn new(base: &str, pin_path: Option<PathBuf>) -> Self {
         Self {
             url: format!("{}{RENEW_PATH}", base.trim_end_matches('/')),
-            pin,
+            pin_path,
+            pinned: Mutex::new(None),
+        }
+    }
+
+    /// The pinning PEM, read on first use and held until a failure drops it.
+    fn pin(&self) -> Result<Option<String>, RenewError> {
+        let Some(path) = self.pin_path.as_deref() else {
+            return Ok(None);
+        };
+        let mut slot = self.pinned.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(read_pem(path).map_err(|e| RenewError::Material(error_chain(&e)))?);
+        }
+        Ok(slot.clone())
+    }
+
+    /// Drop the cached pin, so the next renewal reads the file again.
+    ///
+    /// Called on a reload, because a snapshot taken at startup would otherwise
+    /// outlive a rotated enrollment CA until the pod restarted.
+    pub(super) fn forget_pin(&self) {
+        if self.pin_path.is_some() {
+            *self.pinned.lock().unwrap_or_else(PoisonError::into_inner) = None;
         }
     }
 
     /// A client presenting `held` and trusting only the pin.
     fn client(&self, held: &Held) -> Result<reqwest::Client, RenewError> {
-        let roots = pem_roots(self.pin.as_deref().unwrap_or(&held.ca), "rotation trust")
+        let pinned = self.pin()?;
+        let roots = pem_roots(pinned.as_deref().unwrap_or(&held.ca), "rotation trust")
             .map_err(|e| RenewError::Material(e.to_string()))?;
         let identity =
             grid_client::identity(&held.cert, &held.key).map_err(|e| RenewError::Material(error_chain(&e)))?;
@@ -466,8 +499,8 @@ impl GatewayRoller for KubeGateway {
 pub struct Settings {
     /// Enrollment service base URL.
     url: String,
-    /// PEM pinning the enrollment server, when configured.
-    pin: Option<String>,
+    /// Where the PEM pinning the enrollment server lives, when configured.
+    pin_path: Option<PathBuf>,
     /// Where the identity lives when no `GridNetwork` names it.
     defaults: Target,
     /// The gateway Deployment to roll after a renewal: namespace and name.
@@ -486,7 +519,9 @@ impl Settings {
     /// Returns a message when the URL is missing or not https, or the pin is unreadable.
     pub fn from_config(config: &super::Config) -> Result<Self, String> {
         let url = renewal_url(config.url.as_deref())?;
-        let pin = config
+        // Read once here so a bad path fails at startup, then re-read per
+        // renewal so a rotation does not need a restart to take effect.
+        config
             .ca_file
             .as_deref()
             .map(read_pem)
@@ -494,7 +529,7 @@ impl Settings {
             .map_err(|e| e.to_string())?;
         Ok(Self {
             url: url.to_owned(),
-            pin,
+            pin_path: config.ca_file.clone(),
             defaults: Target {
                 site_secret: config.identity_secret.clone(),
                 ca_secret: config.ca_secret.clone(),
@@ -562,7 +597,7 @@ fn renewal_url(url: Option<&str>) -> Result<&str, String> {
 pub async fn run(client: Client, mut settings: Settings) {
     let namespace = client.default_namespace().to_owned();
     let store = KubeIdentity(Api::namespaced(client.clone(), &namespace));
-    let renewer = HttpsRenewer::new(&settings.url, settings.pin.clone());
+    let renewer = HttpsRenewer::new(&settings.url, settings.pin_path.clone());
     let gateway = settings.gateway_in(&client);
     let mut last: Option<String> = None;
     let mut failures = 0_u32;
@@ -578,30 +613,45 @@ pub async fn run(client: Client, mut settings: Settings) {
             Ok(target) => Box::pin(check_declared(&client, &store, &renewer, target, settings.install)).await,
             Err(e) => Err(RenewError::Kube(e.to_string())),
         };
-        if let (Some(renewed), Ok(target), Some(gateway)) = (rolls_after(&checked), &target, &gateway) {
-            log_roll(
-                Box::pin(roll_gateway(&store, gateway, target, renewed)).await,
-                gateway,
-                renewed,
-            );
-        }
+        roll_after_renewal(&store, gateway.as_ref(), &target, &checked).await;
         let wait = settle(&checked, &mut last, &mut failures);
-        pause(jittered(wait), &mut settings.trust_changes).await;
+        if pause(jittered(wait), &mut settings.trust_changes).await {
+            renewer.forget_pin();
+        }
+    }
+}
+
+/// Roll the gateway when a renewal replaced the identity it mounts.
+async fn roll_after_renewal(
+    store: &KubeIdentity,
+    gateway: Option<&KubeGateway>,
+    target: &Result<Target, super::EnrollError>,
+    checked: &Result<Checked, RenewError>,
+) {
+    if let (Some(renewed), Ok(target), Some(gateway)) = (rolls_after(checked), target, gateway) {
+        log_roll(
+            Box::pin(roll_gateway(store, gateway, target, renewed)).await,
+            gateway,
+            renewed,
+        );
     }
 }
 
 /// Sleep for `wait`, or until the declared peer trust changes.
-async fn pause(wait: Duration, trust_changes: &mut Option<tokio::sync::watch::Receiver<PeerTrustMode>>) {
+async fn pause(wait: Duration, trust_changes: &mut Option<tokio::sync::watch::Receiver<PeerTrustMode>>) -> bool {
     let Some(changes) = trust_changes.as_mut() else {
-        return tokio::time::sleep(wait).await;
+        tokio::time::sleep(wait).await;
+        return false;
     };
     tokio::select! {
-        () = tokio::time::sleep(wait) => {},
+        () = tokio::time::sleep(wait) => false,
         result = changes.changed() => {
             // A closed channel never changes again, so only the timer is left.
             if result.is_err() {
                 *trust_changes = None;
+                return false;
             }
+            true
         },
     }
 }

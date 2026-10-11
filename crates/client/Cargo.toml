@@ -12,7 +12,7 @@ publish = false
 [features]
 default = ["rcgen", "peer-scraper"]
 rcgen = ["certs?/rcgen", "dep:rustls", "reqwest?/rustls-no-provider"]
-fips = ["certs?/fips", "reqwest?/native-tls"]
+fips = ["certs?/fips", "dep:openssl", "reqwest?/native-tls"]
 # The pinned-peer transport and the signals poller. On by default, and off for
 # a caller that only needs a client, so a ten-line builder does not pull hyper
 # and the signals store.
@@ -46,6 +46,7 @@ httpdate = { optional = true, workspace = true }
 hyper = { optional = true, workspace = true }
 hyper-util = { optional = true, workspace = true, features = ["client", "client-legacy", "http1", "tokio"] }
 metrics = { optional = true, workspace = true }
+openssl = { optional = true, workspace = true }
 percent-encoding = { optional = true, workspace = true }
 reqwest = { workspace = true, optional = true }
 rustls = { optional = true, workspace = true }
@@ -60,6 +61,7 @@ zeroize = { workspace = true, optional = true }
 certs = { path = "../certs", default-features = false, features = ["verifier", "rcgen"] }
 rustls = { workspace = true, features = ["ring"] }
 serde_yaml = { workspace = true }
+tokio-rustls = { workspace = true }
 tokio = { workspace = true, features = [
   "io-util",
   "macros",
@@ -73,3 +75,7 @@ tokio = { workspace = true, features = [
 
 [lints]
 workspace = true
+
+[[test]]
+name = "tls_posture"
+required-features = ["reqwest-client", "rcgen"]

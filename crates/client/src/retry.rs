@@ -87,8 +87,7 @@ pub fn from_status(status: http::StatusCode) -> RequestOutcome {
     RequestOutcome::Transport
 }
 
-/// Classify a reqwest failure, reading a rejected chain as
-/// [`RequestOutcome::Refused`] because reqwest does not tell the two apart.
+/// Classify a reqwest failure.
 #[cfg(feature = "reqwest-client")]
 #[must_use]
 pub fn classify(error: &reqwest::Error) -> RequestOutcome {
@@ -97,6 +96,11 @@ pub fn classify(error: &reqwest::Error) -> RequestOutcome {
     }
     if let Some(status) = error.status() {
         return from_status(status);
+    }
+    // Before the connect check, because a rejected chain arrives as one and
+    // the two call for opposite responses.
+    if is_tls_failure(error) {
+        return RequestOutcome::Tls;
     }
     if error.is_connect() {
         return RequestOutcome::Refused;
@@ -108,6 +112,34 @@ pub fn classify(error: &reqwest::Error) -> RequestOutcome {
         return RequestOutcome::Config;
     }
     RequestOutcome::Transport
+}
+
+/// Whether `error`'s chain holds a TLS failure.
+///
+/// The chain is walked rather than the message matched, because an error
+/// string is not an interface.
+#[cfg(feature = "reqwest-client")]
+fn is_tls_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |&err| {
+        // io::Error::source skips its wrapped error.
+        err.downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .map(|inner| -> &(dyn std::error::Error + 'static) { inner })
+            .or_else(move || err.source())
+    })
+    .any(is_tls_error)
+}
+
+/// Whether `error` is a rustls error.
+#[cfg(all(feature = "reqwest-client", not(feature = "fips")))]
+fn is_tls_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.is::<rustls::Error>()
+}
+
+/// Whether `error` is an openssl error.
+#[cfg(all(feature = "reqwest-client", feature = "fips"))]
+fn is_tls_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.is::<openssl::ssl::Error>() || error.is::<openssl::error::ErrorStack>()
 }
 
 #[cfg(test)]
