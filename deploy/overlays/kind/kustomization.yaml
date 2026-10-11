@@ -6,20 +6,20 @@ kind: Kustomization
 
 resources:
   - namespace.yaml
-  - clusterrolebinding-crd.yaml
-  - clusterrolebinding-metrics-scraper.yaml
   - clusterrole-crd.yaml
   - clusterrole-metrics-scraper.yaml
   - clusterrole-resources.yaml
+  - clusterrolebinding-crd.yaml
+  - clusterrolebinding-metrics-scraper.yaml
   - deployment.yaml
+  - role-metrics-scraper-token.yaml
   - rolebinding-metrics-scraper-token.yaml
   - rolebinding-resources-default.yaml
   - rolebinding-resources.yaml
-  - role-metrics-scraper-token.yaml
-  - serviceaccount-metrics-scraper.yaml
-  - serviceaccount.yaml
   - service-metrics.yaml
   - service-swim.yaml
+  - serviceaccount-metrics-scraper.yaml
+  - serviceaccount.yaml
 
 labels:
   - pairs:

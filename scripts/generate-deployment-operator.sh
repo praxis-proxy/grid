@@ -50,7 +50,8 @@ KEEP_FILES=(values.yaml api-versions Containerfile Containerfile.ubi9)
 resource_list() {
   local dir="$1" f base
   [ -e "$dir/namespace.yaml" ] && echo "  - namespace.yaml"
-  for f in "$dir"/*.yaml; do
+  # Byte order, so the list does not depend on the generating shell's locale.
+  for f in $(LC_ALL=C ls "$dir"/*.yaml | LC_ALL=C sort); do
     base="$(basename "$f")"
     case "$base" in values.yaml|namespace.yaml|kustomization.yaml) continue ;; esac
     echo "  - $base"
