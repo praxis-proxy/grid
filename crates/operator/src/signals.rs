@@ -946,7 +946,10 @@ impl std::fmt::Debug for PeerTlsMaterial {
 /// because keying on the pins would leak an entry per rotation. Holds no
 /// socket: a config is material, not a connection.
 #[derive(Default)]
-pub struct PeerConfigs(Mutex<HashMap<String, (Vec<String>, ClientTlsConfig)>>);
+pub struct PeerConfigs(Mutex<HashMap<String, PinnedConfig>>);
+
+/// The pins a config was built for, and the config.
+type PinnedConfig = (Vec<String>, ClientTlsConfig);
 
 impl std::fmt::Debug for PeerConfigs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
