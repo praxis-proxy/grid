@@ -7,7 +7,6 @@ metadata:
   labels:
     app.kubernetes.io/name: grid-operator
     app.kubernetes.io/instance: grid-operator
-    app.kubernetes.io/version: "v0.2.0"
 rules:
   - apiGroups: [""]
     resources: ["serviceaccounts/token"]

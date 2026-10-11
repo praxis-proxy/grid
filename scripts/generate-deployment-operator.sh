@@ -70,8 +70,10 @@ render() {
     "${api_args[@]}" \
     --skip-tests \
     > "$out/all.yaml"
-  # One file per object, named <kind>-<name>.yaml. Helm-only labels go; the
-  # namespace goes too, since the kustomization sets it and a consumer overrides it.
+  # One file per object, named <kind>-<name>.yaml. Helm-only labels go, and so does the
+  # version label: the kind kustomization sets it once, and the platform base leaves it to
+  # the platform, whose image is not the chart's version. The namespace goes too, since
+  # the kustomization sets it and a consumer overrides it.
   local count
   count="$(yq eval-all '[.] | length' "$out/all.yaml")"
   local i
@@ -101,7 +103,8 @@ render() {
       | del(.metadata.labels[\"app.kubernetes.io/managed-by\"])
       | $ns_filter
       | del(.. | select(tag == \"!!map\" and has(\"helm.sh/chart\")) | .[\"helm.sh/chart\"])
-      | del(.. | select(tag == \"!!map\" and has(\"app.kubernetes.io/managed-by\")) | .[\"app.kubernetes.io/managed-by\"])" \
+      | del(.. | select(tag == \"!!map\" and has(\"app.kubernetes.io/managed-by\")) | .[\"app.kubernetes.io/managed-by\"])
+      | del(.. | select(tag == \"!!map\" and has(\"app.kubernetes.io/version\")) | .[\"app.kubernetes.io/version\"])" \
       "$out/all.yaml" > "$file"
   done
   rm -f "$out/all.yaml"
@@ -155,6 +158,7 @@ EOF
 } > "$BASE/kustomization.yaml"
 
 # The kind overlay: plain, with its own Namespace so kubectl apply -k works bare.
+APP_VERSION="$(yq '.appVersion' "$CHART/Chart.yaml")"
 KIND="$TMP_DIR/kind"
 render "$KIND" deploy/overlays/kind/values.yaml no
 cat > "$KIND/namespace.yaml" <<EOF
@@ -173,12 +177,13 @@ KIND_RESOURCES="$(resource_list "$KIND")"
   echo ""
   echo "resources:"
   echo "$KIND_RESOURCES"
-  cat <<'EOF'
+  cat <<EOF
 
 labels:
   - pairs:
       app.kubernetes.io/name: grid-operator
       app.kubernetes.io/managed-by: kustomize
+      app.kubernetes.io/version: "$APP_VERSION"
 EOF
 } > "$KIND/kustomization.yaml"
 
