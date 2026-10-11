@@ -58,7 +58,6 @@ async fn serve(material: Material) -> u16 {
     port
 }
 
-/// Read one request and answer it: a redirect for `/elsewhere`, else 200.
 async fn answer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(stream: &mut S) {
     let mut buf = [0_u8; 1024];
     let read = stream.read(&mut buf).await.unwrap_or(0);

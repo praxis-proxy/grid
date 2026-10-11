@@ -203,17 +203,23 @@ jobs:
       # fips must exclude rustls: TLS routes through system OpenSSL. ring stays
       # present at the operator level (swim gossip), outside the TLS boundary, so
       # it is asserted per-crate for certs, not operator-wide.
+      # Asserted on the printed tree, not on `-i rustls` exiting non-zero: that
+      # matches a declared-but-inactive optional dependency, and exits 0 either
+      # way on a current cargo. The openssl check is the positive control that
+      # the matcher can see a crate that really is linked.
       - name: Assert fips build excludes rustls
         run: |
+          set -eu
           for m in crates/operator/Cargo.toml crates/overlay-sync/Cargo.toml; do
-            if ! cargo tree --manifest-path "$m" --no-default-features --features fips -e normal >/dev/null; then
-              echo "cannot resolve $m for the fips check"
+            tree="$(cargo tree --manifest-path "$m" --no-default-features --features fips -e normal --target all --prefix none --format '{p}')"
+            if printf '%s\n' "$tree" | grep -qE '^rustls '; then
+              echo "fips build of $m unexpectedly links rustls" >&2
               exit 1
             fi
-            if cargo tree --manifest-path "$m" --no-default-features --features fips -e normal -i rustls >/dev/null 2>&1; then
-              echo "fips build of $m unexpectedly links rustls"
+            printf '%s\n' "$tree" | grep -qE '^openssl ' || {
+              echo "positive control failed: openssl is not in the $m fips tree" >&2
               exit 1
-            fi
+            }
           done
           echo "no rustls in fips builds"
 

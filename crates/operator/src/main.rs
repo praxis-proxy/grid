@@ -130,11 +130,24 @@ async fn main() {
     };
     let metrics_server = tokio::spawn(run_metrics_server(Arc::clone(&ready), metrics_tls));
 
-    if config.enrollment.enabled
-        && let Err(error) = Box::pin(operator::enroll::ensure_enrolled(&client, &config.enrollment)).await
-    {
-        tracing::error!(%error, "site enrollment failed");
-        std::process::exit(1);
+    // Watched before enrolling, because enrolling retries a retryable failure
+    // for as long as it keeps failing and must still answer a SIGTERM.
+    let (trigger, shutdown) = operator::shutdown::Trigger::new();
+    tokio::spawn(watch_for_termination(trigger));
+
+    if config.enrollment.enabled {
+        let enrolled = tokio::select! {
+            biased;
+            () = shutdown.triggered() => {
+                tracing::info!("stood down before enrolling");
+                return;
+            },
+            result = Box::pin(operator::enroll::ensure_enrolled(&client, &config.enrollment)) => result,
+        };
+        if let Err(error) = enrolled {
+            tracing::error!(%error, "site enrollment failed");
+            std::process::exit(1);
+        }
     }
     let GridModes {
         signal: signal_mode,
@@ -191,12 +204,6 @@ async fn main() {
     // Controllers run now. Only SWIM and what dials peers wait on the advertise address.
     let (swim_tx, swim_rx) = tokio::sync::watch::channel(SwimStage::Starting);
 
-    // A round of peer polls can be in flight when the pod is told to terminate;
-    // the trigger lets it stand down cleanly rather than being dropped mid-await.
-    // Only installed with the feature, so the default path keeps today's signal
-    // disposition unchanged.
-    let (trigger, shutdown) = operator::shutdown::Trigger::new();
-    tokio::spawn(watch_for_termination(trigger));
 
     let standing_down = stand_down(shutdown.clone(), swim_rx.clone());
     let serving = async {
@@ -269,7 +276,13 @@ async fn main() {
 /// the inbound listener drains in.
 async fn stand_down(shutdown: operator::shutdown::Shutdown, swim: SwimStartup) {
     shutdown.triggered().await;
-    if let Some(handle) = swim_settled(swim).await {
+    // Read, never awaited. SWIM sits in Starting for as long as a LoadBalancer
+    // address takes, and a site with no handle has nothing to leave.
+    let handle = match &*swim.borrow() {
+        SwimStage::Settled(handle) => handle.clone(),
+        SwimStage::Starting => None,
+    };
+    if let Some(handle) = handle {
         handle.leave(LEAVE_WAIT).await;
     }
     tokio::time::sleep(SHUTDOWN_GRACE).await;

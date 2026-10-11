@@ -202,9 +202,23 @@ struct FakeStore {
     conflict_on: Option<&'static str>,
     /// Status every dry-run create answers.
     dry_run_status: Option<u16>,
+    /// Attempts at a write, so a retry is countable.
+    create_calls: Mutex<u32>,
+    /// Attempts at a dry-run write, so a retry is countable.
+    check_calls: Mutex<u32>,
 }
 
 impl FakeStore {
+    /// Attempts at a write.
+    fn create_calls(&self) -> u32 {
+        *self.create_calls.lock().expect("lock")
+    }
+
+    /// Attempts at a dry-run write.
+    fn check_calls(&self) -> u32 {
+        *self.check_calls.lock().expect("lock")
+    }
+
     /// A store holding the site token.
     fn invited() -> Self {
         let store = Self::default();
@@ -248,6 +262,7 @@ impl Store for FakeStore {
 
     async fn create(&self, secret: &Secret) -> Result<Created, EnrollError> {
         let name = secret.metadata.name.clone().unwrap_or_default();
+        *self.create_calls.lock().expect("lock") += 1;
         if self.creates_fail {
             return Ok(Created::Retry("apiserver unavailable".to_owned()));
         }
@@ -266,6 +281,7 @@ impl Store for FakeStore {
 
     async fn check_create(&self, secret: &Secret) -> Result<Attempt<()>, EnrollError> {
         let name = secret.metadata.name.as_deref().unwrap_or_default();
+        *self.check_calls.lock().expect("lock") += 1;
         dry_run_result(
             "grid-system",
             name,
@@ -481,6 +497,11 @@ async fn transient_write_failures_keep_retrying_rather_than_lose_the_identity() 
         outcome.is_err(),
         "a transient write failure must keep retrying: {outcome:?}"
     );
+    assert!(
+        store.create_calls() > 1,
+        "pending alone would hold for a stall too: {} attempts",
+        store.create_calls()
+    );
 }
 
 #[tokio::test]
@@ -563,6 +584,11 @@ async fn a_dry_run_that_keeps_failing_transiently_never_spends_the_token() {
     assert!(
         outcome.is_err(),
         "a transient dry-run failure must keep retrying rather than fail: {outcome:?}"
+    );
+    assert!(
+        store.check_calls() > 1,
+        "pending alone would hold for a stall too: {} attempts",
+        store.check_calls()
     );
     assert_eq!(mock.calls(), 0, "the token is not sent");
 }

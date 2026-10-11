@@ -61,7 +61,6 @@ zeroize = { workspace = true, optional = true }
 certs = { path = "../certs", default-features = false, features = ["verifier", "rcgen"] }
 rustls = { workspace = true, features = ["ring"] }
 serde_yaml = { workspace = true }
-tokio-rustls = { workspace = true }
 tokio = { workspace = true, features = [
   "io-util",
   "macros",
@@ -78,4 +77,6 @@ workspace = true
 
 [[test]]
 name = "tls_posture"
-required-features = ["reqwest-client", "rcgen"]
+# peer-scraper carries tokio-rustls, which the loopback server needs. Taking it
+# from there rather than a dev-dependency keeps rustls out of a fips resolve.
+required-features = ["reqwest-client", "rcgen", "peer-scraper"]

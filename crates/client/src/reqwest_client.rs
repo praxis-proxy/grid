@@ -156,7 +156,14 @@ mod tests {
     #[test]
     fn garbage_is_reported_against_its_context() {
         let error = roots_from_pem(b"-----BEGIN CERTIFICATE-----\nnope\n", "grid CA").expect_err("must not parse");
-        assert!(error.to_string().contains("grid CA"), "{error}");
+        assert!(
+            matches!(error, BuildError::Roots { context: "grid CA", .. }),
+            "the variant and its context carry the report, not the message: {error}"
+        );
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the parse failure is the cause, so it must survive as one"
+        );
     }
 
     #[test]
