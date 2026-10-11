@@ -30,6 +30,8 @@ filter_chains:
               verify: true
             endpoints:
               - "model-a.models.svc:8443"
+            trusted_private_endpoints:
+              - "model-a.models.svc"
           - name: "prov-b"
             tls:
               ca:
@@ -38,6 +40,8 @@ filter_chains:
               verify: true
             endpoints:
               - "model-b.models.svc:8443"
+            trusted_private_endpoints:
+              - "model-b.models.svc"
 admin:
   address: "127.0.0.1:9901"
 shutdown_timeout_secs: 5
