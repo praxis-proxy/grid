@@ -10,7 +10,6 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: grid-operator-metrics-scraper
-    namespace: grid-system
 roleRef:
   kind: ClusterRole
   name: grid-operator-metrics-scraper

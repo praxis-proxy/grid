@@ -86,11 +86,13 @@ render() {
     if [ -n "$ns" ] && [ "$ns" != "$NAMESPACE_PLACEHOLDER" ]; then
       file="${file%.yaml}-$ns.yaml"
     fi
-    # The base drops every namespace; the overlay fills the operator namespace in on each
-    # namespaced object the chart left bare, so a bare kubectl apply -k lands correctly.
+    # The base drops every namespace, including ServiceAccount subject namespaces: kustomize
+    # fills an omitted subject namespace from the consumer's namespace but leaves a set one
+    # alone. The overlay fills the operator namespace in on each namespaced object the chart
+    # left bare, so a bare kubectl apply -k lands correctly.
     local ns_filter="."
     case "$strip_ns:$kind:$ns" in
-      yes:*) ns_filter="del(.metadata.namespace)" ;;
+      yes:*) ns_filter="del(.metadata.namespace) | del(.subjects[]? | select(.kind == \"ServiceAccount\" and .namespace == \"$NAMESPACE_PLACEHOLDER\") | .namespace)" ;;
       no:ClusterRole:*|no:ClusterRoleBinding:*|no:Namespace:*) ;;
       no:*:) ns_filter=".metadata.namespace = \"$NAMESPACE_PLACEHOLDER\"" ;;
     esac
