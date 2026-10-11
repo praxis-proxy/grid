@@ -20,7 +20,7 @@ use std::{sync::Arc, time::Duration};
 
 use certs::{DEFAULT_TRUST_DOMAIN, GridSpiffeClientVerifier, generate_ca, generate_site_cert, spiffe_id};
 use grid_signals::LoadStore;
-use grid_signals_client::{FetchError, PeerScraper, SignalSource as _};
+use grid_client::{FetchError, PeerScraper, SignalSource as _};
 use rustls::{
     ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _},

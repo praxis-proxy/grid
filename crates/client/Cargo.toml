@@ -1,5 +1,5 @@
 [package]
-name = "grid-signals-client"
+name = "grid-client"
 description = "Grid signal poller: the mTLS scrape transport that feeds the signals source"
 version.workspace = true
 edition.workspace = true

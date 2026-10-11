@@ -1370,6 +1370,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "grid-client"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "certs",
+ "grid-signals",
+ "http",
+ "http-body-util",
+ "httpdate",
+ "hyper",
+ "hyper-util",
+ "metrics",
+ "percent-encoding",
+ "rustls",
+ "serde",
+ "yaml_serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
 name = "grid-overlay-sync"
 version = "0.2.0"
 dependencies = [
@@ -1397,29 +1420,6 @@ name = "grid-signals"
 version = "0.2.0"
 dependencies = [
  "dashmap",
-]
-
-[[package]]
-name = "grid-signals-client"
-version = "0.2.0"
-dependencies = [
- "bytes",
- "certs",
- "grid-signals",
- "http",
- "http-body-util",
- "httpdate",
- "hyper",
- "hyper-util",
- "metrics",
- "percent-encoding",
- "rustls",
- "serde",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls",
- "tracing",
- "yaml_serde",
 ]
 
 [[package]]

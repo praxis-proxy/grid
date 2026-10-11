@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
   "crates/certs",
+  "crates/client",
   "crates/crdt",
   "crates/enrollment",
   "crates/fleet-dashboard",
@@ -10,7 +11,6 @@ members = [
   "crates/overlay-sync",
   "crates/scoring",
   "crates/signals",
-  "crates/signals-client",
   "crates/swim",
   "crates/version",
   "crates/xtask",

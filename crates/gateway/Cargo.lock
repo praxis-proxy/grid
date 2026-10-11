@@ -51,8 +51,8 @@ dependencies = [
  "dhat",
  "divan",
  "foldhash",
+ "grid-client",
  "grid-signals",
- "grid-signals-client",
  "http",
  "lru",
  "metrics",
@@ -1609,14 +1609,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "grid-signals"
-version = "0.2.0"
-dependencies = [
- "dashmap",
-]
-
-[[package]]
-name = "grid-signals-client"
+name = "grid-client"
 version = "0.2.0"
 dependencies = [
  "bytes",
@@ -1635,6 +1628,13 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+]
+
+[[package]]
+name = "grid-signals"
+version = "0.2.0"
+dependencies = [
+ "dashmap",
 ]
 
 [[package]]
