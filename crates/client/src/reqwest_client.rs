@@ -1,23 +1,14 @@
-//! Root-trust reqwest clients, built with the grid's bounds already set.
+//! Reqwest clients for an endpoint identified by its chain to the grid roots.
 //!
-//! For a caller that dials an endpoint identified by its chain to the grid
-//! roots. A caller that identifies a peer by its leaf uses [`PeerScraper`]
-//! instead, since no reqwest backend can express that check under both TLS
-//! backends.
-//!
-//! Not for a caller that wants the platform roots as well as its own. This
-//! trusts the given roots and nothing else, so a caller adding a CA on top of
-//! the system store builds its own client.
+//! Trusts only the roots given. A peer identified by its leaf uses
+//! [`PeerScraper`], and a caller wanting the platform roots builds its own.
 //!
 //! [`PeerScraper`]: crate::PeerScraper
 
 use std::time::Duration;
 
-/// How long a client waits, per phase.
-///
-/// A deadline on the whole request cannot bound a connect, so both exist. A
-/// peer that has not finished a handshake within [`Timeouts::connect`] is not
-/// answering this round, whatever the request deadline allows.
+/// How long a client waits, per phase, because a request deadline cannot
+/// bound a connect.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Timeouts {
     /// Longest wait for a connection, including the TLS handshake.
@@ -39,12 +30,8 @@ impl Timeouts {
         request: Duration::from_secs(30),
     };
 
-    /// Bounds for a caller that repeats on `interval`.
-    ///
-    /// A request that outlives its own interval is a backlog rather than a slow
-    /// answer, so the request deadline never exceeds it.
-    /// The connect bound never exceeds the request deadline, which starts at
-    /// the connect: a larger one could never fire.
+    /// Bounds for a caller that repeats on `interval`, which outlasting it
+    /// would turn into a backlog.
     #[must_use]
     pub fn for_interval(interval: Duration) -> Self {
         Self {
@@ -63,11 +50,8 @@ impl Default for Timeouts {
 /// Why a client could not be built.
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
-    /// The trust material parsed to no certificate.
-    ///
-    /// Refused at construction because an empty bundle fails closed at every
-    /// handshake instead, as an unknown issuer, which names neither the bundle
-    /// nor the reason.
+    /// The trust material parsed to no certificate, refused here so the error
+    /// names the bundle rather than an unknown issuer.
     #[error("{0} holds no certificate")]
     NoRoots(&'static str),
     /// The trust material could not be parsed.
@@ -112,9 +96,8 @@ pub fn identity(cert: &str, key: &str) -> Result<reqwest::Identity, BuildError> 
         .map_err(BuildError::Identity)
 }
 
-/// A client identity from a certificate and its key.
-///
-/// The fips backend takes the two apart where rustls takes one joined PEM.
+/// A client identity from a certificate and its key, taken apart because the
+/// fips backend wants them separate.
 ///
 /// # Errors
 ///
@@ -124,10 +107,8 @@ pub fn identity(cert: &str, key: &str) -> Result<reqwest::Identity, BuildError> 
     reqwest::Identity::from_pkcs8_pem(cert.as_bytes(), key.as_bytes()).map_err(BuildError::Identity)
 }
 
-/// A client that trusts only `roots`, over HTTPS, following no redirect.
-///
-/// Redirects are off because every grid endpoint is named directly, so a
-/// redirect is either a misconfiguration or someone else's host.
+/// A client that trusts only `roots`, over HTTPS, following no redirect
+/// because every grid endpoint is named directly.
 ///
 /// # Errors
 ///

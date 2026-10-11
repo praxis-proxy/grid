@@ -1,9 +1,7 @@
 //! What a failed request was, and whether another attempt could differ.
 
-/// The shape of a request's outcome, as a retry decision needs it.
-///
-/// Closed on purpose. A new failure mode gets a variant and an explicit
-/// verdict rather than falling into a catch-all that retries it.
+/// The shape of a request's outcome, closed so a new failure mode gets an
+/// explicit verdict rather than a catch-all that retries it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestOutcome {
     /// The peer answered.
@@ -31,13 +29,8 @@ pub enum RequestOutcome {
 }
 
 impl RequestOutcome {
-    /// Whether another attempt could plausibly differ.
-    ///
-    /// The default is no. An outcome is retryable only where something changes
-    /// between attempts: a peer that may finish, recover, or free capacity.
-    /// Retrying a trust failure or a refusal spends the budget a transient
-    /// failure needs, and turns one misconfiguration into a burst against a
-    /// peer that already said no.
+    /// Whether another attempt could plausibly differ, defaulting to no
+    /// because retrying a refusal spends a transient failure's budget.
     #[must_use]
     pub const fn is_retryable(self) -> bool {
         match self {
@@ -65,11 +58,8 @@ impl RequestOutcome {
     }
 }
 
-/// Classify a response status the caller read itself.
-///
-/// A redirect is a misconfiguration rather than an answer, because the clients
-/// this crate builds refuse to follow one, so the caller is holding a 3xx that
-/// nothing will resolve.
+/// Classify a response status the caller read itself, counting a redirect as
+/// a misconfiguration because no caller here follows one.
 #[must_use]
 pub fn from_status(status: http::StatusCode) -> RequestOutcome {
     if status == http::StatusCode::TOO_MANY_REQUESTS {
@@ -91,11 +81,8 @@ pub fn from_status(status: http::StatusCode) -> RequestOutcome {
     RequestOutcome::Transport
 }
 
-/// Classify a reqwest failure.
-///
-/// reqwest exposes no discriminator for a trust failure, so a rejected chain
-/// arrives as a connect failure and reads as [`RequestOutcome::Refused`], which
-/// retries. A caller that knows the handshake failed reports [`RequestOutcome::Tls`].
+/// Classify a reqwest failure, reading a rejected chain as
+/// [`RequestOutcome::Refused`] because reqwest does not tell the two apart.
 #[cfg(feature = "reqwest-client")]
 #[must_use]
 pub fn classify(error: &reqwest::Error) -> RequestOutcome {

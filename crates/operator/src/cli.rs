@@ -143,7 +143,7 @@ pub struct SignalsArgs {
     #[arg(
         long = "signals-peer-interval-secs",
         env = "GRID_SIGNALS_PEER_INTERVAL_SECS",
-        default_value_t = 30
+        default_value_t = 5
     )]
     pub peer_interval_secs: u64,
 
