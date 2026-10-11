@@ -513,6 +513,7 @@ impl World {
 /// A stand-in for the signed leaf, certifying `key`.
 fn cert(key: &str) -> Issued {
     Issued {
+        site_name: String::new(),
         certificate: String::new(),
         spiffe_id: String::new(),
         public_key_sha256: key.to_owned(),

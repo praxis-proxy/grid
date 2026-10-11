@@ -45,6 +45,12 @@ const CERT_LIFETIME_SECS: &str = "ENROLLMENT_CERT_LIFETIME_SECS";
 const RENEWALS_ENABLED: &str = "ENROLLMENT_ROTATION_ENABLED";
 /// Comma-separated site names issued outside enrollment, refused at mint and redeem.
 const RESERVED_SITES: &str = "ENROLLMENT_RESERVED_SITES";
+/// Whether each enrollment is recorded as a `CertificateSigningRequest`.
+#[cfg(feature = "csr-record")]
+const CSR_RECORD: &str = "ENROLLMENT_CSR_RECORD";
+/// The signer name records are filed under.
+#[cfg(feature = "csr-record")]
+const CSR_SIGNER_NAME: &str = "ENROLLMENT_CSR_SIGNER_NAME";
 /// Directory of reserved-name seeds bootstrap signed with the CA key.
 const RESERVED_SEEDS_DIR: &str = "ENROLLMENT_RESERVED_SEEDS_DIR";
 /// Server certificate presented to callers, PEM.
@@ -135,15 +141,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_unset| format!("{TLS_KEY_PATH} is required: the CA-signing service must not serve in the clear"))?;
     let tls = load_tls(&tls_cert, &tls_key, &ca.cert_pem)?;
 
+    // Boxed: the Kubernetes-RBAC authorizer builds a large future under the sar
+    // feature, kept off the startup stack frame.
+    let authorizer = Box::pin(build_authorizer()).await?;
+    #[cfg(feature = "csr-record")]
+    let recorder = load_recorder(&authorizer).await?;
     let state = Arc::new(AppState {
         store: open_store().await?,
         ca: SharedCa::new(ca),
-        // Boxed: the Kubernetes-RBAC authorizer builds a large future under the sar
-        // feature, kept off the startup stack frame.
-        authorizer: Box::pin(build_authorizer()).await?,
+        authorizer,
         cert_lifetime: load_cert_lifetime(),
         reserved_sites: load_reserved_sites()?,
         renewals_enabled: load_renewals_enabled()?,
+        #[cfg(feature = "csr-record")]
+        recorder,
     });
 
     // Reload the server certificate on an interval so a rotated TLS secret is
@@ -422,13 +433,79 @@ fn load_reserved_sites() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     Ok(sites)
 }
 
+/// A `true` or `false` variable, `default` when unset or empty.
+fn parse_bool_env(name: &str, raw: Option<&str>, default: bool) -> Result<bool, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(other) => Err(format!("{name} must be true or false, not {other:?}")),
+    }
+}
+
+/// Build the recorder when enrollments are to be recorded, sharing the
+/// authorizer's API server client when it has one.
+#[cfg(feature = "csr-record")]
+async fn load_recorder(authorizer: &Authorizer) -> Result<Option<Arc<enrollment::record::Recorder>>, String> {
+    if !parse_bool_env(CSR_RECORD, std::env::var(CSR_RECORD).ok().as_deref(), false)? {
+        return Ok(None);
+    }
+    let signer_name = csr_signer_name(std::env::var(CSR_SIGNER_NAME).ok().as_deref())?;
+    let client = match kube_client_of(authorizer) {
+        Some(client) => client,
+        None => kube::Client::try_default()
+            .await
+            .map_err(|error| format!("{CSR_RECORD}=true needs a Kubernetes client: {error}"))?,
+    };
+    let recorder = enrollment::record::Recorder::new(client, signer_name);
+    warn_missing_access(&recorder).await;
+    tracing::info!(
+        signer = recorder.signer_name(),
+        "enrollments recorded as CertificateSigningRequests"
+    );
+    Ok(Some(Arc::new(recorder)))
+}
+
+/// Say at startup which rights a record would lack, so a missing role shows
+/// before the first enrollment rather than in its log line.
+#[cfg(feature = "csr-record")]
+async fn warn_missing_access(recorder: &enrollment::record::Recorder) {
+    match Box::pin(recorder.missing_access()).await {
+        Ok(missing) if missing.is_empty() => {},
+        Ok(missing) => tracing::warn!(?missing, "records will fail: this identity lacks these rights"),
+        Err(error) => tracing::warn!(%error, "could not check the record's rights at startup"),
+    }
+}
+
+/// The signer name to file under: the variable, else the default; domain-qualified.
+#[cfg(feature = "csr-record")]
+fn csr_signer_name(raw: Option<&str>) -> Result<String, String> {
+    let name = raw
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(enrollment::record::DEFAULT_SIGNER_NAME);
+    if name.contains('/') {
+        Ok(name.to_owned())
+    } else {
+        Err(format!(
+            "{CSR_SIGNER_NAME} must be a domain-qualified signer name, not {name:?}"
+        ))
+    }
+}
+
+/// The authorizer's API server client, when it has one, so both share a pool.
+#[cfg(feature = "csr-record")]
+fn kube_client_of(authorizer: &Authorizer) -> Option<kube::Client> {
+    match authorizer {
+        #[cfg(feature = "sar")]
+        Authorizer::Kube(kube) => Some(kube.client()),
+        _other => None,
+    }
+}
+
 /// Whether renewals are signed: on unless the variable says `false`.
 fn load_renewals_enabled() -> Result<bool, String> {
-    let enabled = match std::env::var(RENEWALS_ENABLED).as_deref().map(str::trim) {
-        Err(_) | Ok("" | "true") => true,
-        Ok("false") => false,
-        Ok(other) => return Err(format!("{RENEWALS_ENABLED} must be true or false, not {other:?}")),
-    };
+    let enabled = parse_bool_env(RENEWALS_ENABLED, std::env::var(RENEWALS_ENABLED).ok().as_deref(), true)?;
     if !enabled {
         tracing::info!("rotation disabled: every rotation is refused; issued identities stay valid until they expire");
     }
@@ -519,7 +596,31 @@ async fn build_authorizer() -> Result<Authorizer, Box<dyn std::error::Error>> {
 mod tests {
     #[cfg(not(feature = "bootstrap"))]
     use super::reject_bootstrap_without_feature;
-    use super::require_db_tls;
+    use super::{parse_bool_env, require_db_tls};
+
+    #[cfg(feature = "csr-record")]
+    #[test]
+    fn the_signer_name_defaults_and_must_be_qualified() {
+        assert_eq!(super::csr_signer_name(None).as_deref(), Ok("grid.praxis.fast/site"));
+        assert_eq!(
+            super::csr_signer_name(Some(" ")).as_deref(),
+            Ok("grid.praxis.fast/site")
+        );
+        assert_eq!(
+            super::csr_signer_name(Some("example.com/x")).as_deref(),
+            Ok("example.com/x")
+        );
+        assert!(matches!(super::csr_signer_name(Some("plain")), Err(message) if message.contains("plain")));
+    }
+
+    #[test]
+    fn a_bool_variable_takes_its_default_when_unset() {
+        assert_eq!(parse_bool_env("X", None, false), Ok(false));
+        assert_eq!(parse_bool_env("X", Some(""), true), Ok(true));
+        assert_eq!(parse_bool_env("X", Some(" true "), false), Ok(true));
+        assert_eq!(parse_bool_env("X", Some("false"), true), Ok(false));
+        assert!(matches!(parse_bool_env("X", Some("yes"), false), Err(message) if message.contains("yes")));
+    }
 
     #[cfg(not(feature = "bootstrap"))]
     #[test]

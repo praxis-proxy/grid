@@ -19,6 +19,8 @@ pub mod auth;
 pub mod authz;
 pub mod ca;
 pub mod generated;
+#[cfg(feature = "csr-record")]
+pub mod record;
 pub mod seed;
 pub mod store;
 pub mod tls;

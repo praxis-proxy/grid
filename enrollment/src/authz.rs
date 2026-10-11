@@ -159,6 +159,12 @@ impl KubeAuthorizer {
         &self.namespace
     }
 
+    /// The API server client, for another in-process caller to share its pool.
+    #[must_use]
+    pub fn client(&self) -> kube::Client {
+        self.client.clone()
+    }
+
     /// Authenticate the bearer, then authorize the operation. The recorded
     /// grid-admin name is the authenticated username.
     ///

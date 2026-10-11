@@ -49,6 +49,8 @@ fn serve() -> Served {
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         reserved_sites: vec!["hub".to_owned()],
         renewals_enabled: true,
+        #[cfg(feature = "csr-record")]
+        recorder: None,
     });
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.set_nonblocking(true).expect("nonblocking");

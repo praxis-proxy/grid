@@ -11,7 +11,7 @@ name = "enrollment"
 path = "src/main.rs"
 
 [features]
-default = ["tls-rustls", "sar", "bootstrap"]
+default = ["tls-rustls", "sar", "bootstrap", "csr-record"]
 tls-rustls = [
     "certs/rcgen",
     "certs/verifier",
@@ -38,6 +38,9 @@ fips = [
 ]
 # Reuse Kubernetes RBAC for operator authorization (TokenReview + SubjectAccessReview).
 sar = ["dep:kube", "dep:k8s-openapi"]
+# Record each enrollment as a CertificateSigningRequest on the hub. Independent of
+# sar in code; the chart turns it on only under kube authz, since both need the API server.
+csr-record = ["dep:kube", "dep:k8s-openapi", "dep:pem"]
 bootstrap = ["dep:clap", "dep:kube", "dep:k8s-openapi", "dep:reqwest", "dep:zeroize"]
 
 [dependencies]
@@ -47,6 +50,7 @@ certs = { path = "../certs", default-features = false }
 clap = { workspace = true, optional = true, features = ["env"] }
 kube = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, optional = true }
+pem = { workspace = true, optional = true }
 serde = { workspace = true }
 ring = { workspace = true, optional = true }
 sqlx = { workspace = true }
@@ -77,5 +81,5 @@ socket2 = { workspace = true }
 http-body-util = { workspace = true }
 rcgen = { workspace = true }
 time = { workspace = true }
-tower = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 x509-parser = { workspace = true }
