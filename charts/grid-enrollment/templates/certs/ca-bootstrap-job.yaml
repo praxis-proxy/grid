@@ -36,6 +36,7 @@ spec:
       enableServiceLinks: false
       restartPolicy: Never
       serviceAccountName: {{ include "grid-enrollment.bootstrapServiceAccountName" . }}
+      automountServiceAccountToken: true
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

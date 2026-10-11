@@ -130,7 +130,7 @@ handshake, so a connect proves nothing.
 |---|---|
 | `unauthorized` pulling an image | A digest pin keeps the chart's `image.repository`. Set both. |
 | `mixed protocol is not supported for LoadBalancer` | One Service carrying UDP and TCP. Upgrade to a chart that splits signals out. |
-| CA bootstrap Job gives `401 Unauthorized` | A chart before this fix removed the bootstrap RBAC after a failed attempt. Upgrade to a chart that retains the RBAC, then retry with `helm upgrade`; the Job can authenticate again. |
+| CA bootstrap Job gives `401 Unauthorized` | On Helm 3.19 and later, an older chart can remove the bootstrap RBAC when the hook fails, so a Job retry loses its ServiceAccount. Upgrade to a chart that retains the RBAC, then retry with `helm upgrade`. |
 | A site never reaches `Available` | The hub is not accepting that site's NAT address on 6443 or 443. |
 | Signals poll but gossip never converges | The SWIM Service got a Classic load balancer, which carries no UDP. Check `platform: aws`. |
 | Peers unreachable despite correct addresses | Source ranges list VPC CIDRs rather than NAT addresses. |
