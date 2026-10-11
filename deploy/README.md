@@ -72,10 +72,14 @@ make deploy-check
 
 ### Install Steps
 
-The CRDs are the shared prerequisite. Apply them once:
+The CRDs and the namespace are the shared prerequisites. The base and the OpenShift
+overlay target the grid-system namespace without creating it, so a fresh cluster
+needs it first.
+The kind overlay creates its own.
 
 ```bash
 kubectl apply -k deploy/crds/
+kubectl create namespace grid-system --dry-run=client -o yaml | kubectl apply -f -
 ```
 
 Then pick one install variant. The base is the portable path and the overlays are
@@ -89,7 +93,7 @@ kubectl apply -k deploy/operator/ -n grid-system
 # or OpenShift
 kubectl apply -k deploy/overlays/openshift/ -n grid-system
 
-# or kind
+# or kind, which brings its own namespace
 kubectl apply -k deploy/overlays/kind/
 ```
 
