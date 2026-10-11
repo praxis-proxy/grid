@@ -12,7 +12,7 @@
 
 #[cfg(feature = "fips")]
 use std::sync::OnceLock;
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use hyper_util::client::legacy::connect::HttpConnector;
 #[cfg(feature = "fips")]
@@ -700,6 +700,27 @@ pub(crate) fn build_tls_client_config(
     Ok(config)
 }
 
+/// How long a held connection may sit silent before it is probed.
+///
+/// A pooled peer connection can be black-holed by a restart or a firewall
+/// losing its state, and nothing on it would notice until the next poll spent
+/// its whole timeout. Probing keeps that cost off the poll.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(15);
+
+/// Probes after [`TCP_KEEPALIVE`] before the connection is declared dead.
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+/// A TCP connector that probes an idle connection rather than trusting it.
+fn probing_connector() -> HttpConnector {
+    let mut http = HttpConnector::new();
+    // https is layered on top, so the scheme check belongs to the TLS connector.
+    http.enforce_http(false);
+    http.set_keepalive(Some(TCP_KEEPALIVE));
+    http.set_keepalive_interval(Some(TCP_KEEPALIVE));
+    http.set_keepalive_retries(Some(TCP_KEEPALIVE_RETRIES));
+    http
+}
+
 /// Build an HTTPS connector using native root certificates.
 ///
 /// # Errors
@@ -709,7 +730,7 @@ pub(crate) fn build_tls_client_config(
 pub(crate) fn build_native_connector() -> Result<HttpsConnector, MetricsScrapeError> {
     hyper_rustls::HttpsConnectorBuilder::new()
         .with_native_roots()
-        .map(|b| b.https_or_http().enable_http1().build())
+        .map(|b| b.https_or_http().enable_http1().wrap_connector(probing_connector()))
         .map_err(|e| MetricsScrapeError::Transport(e.into()))
 }
 
@@ -720,7 +741,10 @@ pub(crate) fn build_native_connector() -> Result<HttpsConnector, MetricsScrapeEr
 /// Returns [`MetricsScrapeError::Transport`] if the connector cannot be built.
 #[cfg(feature = "fips")]
 pub(crate) fn build_native_connector() -> Result<HttpsConnector, MetricsScrapeError> {
-    hyper_openssl::client::legacy::HttpsConnector::new().map_err(|e| MetricsScrapeError::Transport(e.into()))
+    let builder =
+        SslConnector::builder(SslMethod::tls_client()).map_err(|e| MetricsScrapeError::Transport(e.into()))?;
+    hyper_openssl::client::legacy::HttpsConnector::with_connector(probing_connector(), builder)
+        .map_err(|e| MetricsScrapeError::Transport(e.into()))
 }
 
 /// Build an HTTPS-only connector using a custom client TLS configuration.
@@ -738,7 +762,7 @@ pub(crate) fn build_custom_tls_connector(config: &ClientTlsConfig) -> Result<Htt
         .with_tls_config((**config).clone())
         .https_only()
         .enable_http1()
-        .build())
+        .wrap_connector(probing_connector()))
 }
 
 /// Build an HTTPS-only connector using a custom client TLS configuration.
@@ -751,9 +775,7 @@ pub(crate) fn build_custom_tls_connector(config: &ClientTlsConfig) -> Result<Htt
     let builder = config
         .connector_builder()
         .map_err(|e| MetricsScrapeError::Transport(e.into()))?;
-    let mut http = HttpConnector::new();
-    http.enforce_http(false);
-    let mut connector = hyper_openssl::client::legacy::HttpsConnector::with_connector(http, builder)
+    let mut connector = hyper_openssl::client::legacy::HttpsConnector::with_connector(probing_connector(), builder)
         .map_err(|e| MetricsScrapeError::Transport(e.into()))?;
     if config.has_leaf_rule() {
         // The leaf rule, not the certificate name, identifies the peer.
