@@ -276,16 +276,31 @@ async fn main() {
 /// the inbound listener drains in.
 async fn stand_down(shutdown: operator::shutdown::Shutdown, swim: SwimStartup) {
     shutdown.triggered().await;
-    // Read, never awaited. SWIM sits in Starting for as long as a LoadBalancer
-    // address takes, and a site with no handle has nothing to leave.
-    let handle = match &*swim.borrow() {
-        SwimStage::Settled(handle) => handle.clone(),
-        SwimStage::Starting => None,
+    let left = match settled(&swim) {
+        Some(handle) => {
+            handle.leave(LEAVE_WAIT).await;
+            true
+        },
+        None => false,
     };
-    if let Some(handle) = handle {
+    tokio::time::sleep(SHUTDOWN_GRACE).await;
+    // The work is still polled through the grace, so SWIM can finish starting
+    // and advertise this site after the read above. Leaving a runtime that
+    // appeared in that window beats making peers wait for suspicion.
+    if let Some(handle) = settled(&swim).filter(|_| !left) {
         handle.leave(LEAVE_WAIT).await;
     }
-    tokio::time::sleep(SHUTDOWN_GRACE).await;
+}
+
+/// The SWIM handle if one exists, read rather than awaited.
+///
+/// Awaiting would hold a stand-down for as long as a `LoadBalancer` address
+/// takes, which is unbounded.
+fn settled(swim: &SwimStartup) -> Option<Arc<swim_runtime::SwimHandle>> {
+    match &*swim.borrow() {
+        SwimStage::Settled(handle) => handle.clone(),
+        SwimStage::Starting => None,
+    }
 }
 
 /// How long in-flight work has after the cluster has been left.
@@ -3606,5 +3621,14 @@ mod tests {
             tokio::net::TcpStream::connect(addr).await.is_err(),
             "the listener socket must be closed once the signal is given"
         );
+    }
+
+    /// A stage with no handle has nothing to leave, at either read.
+    #[test]
+    fn a_site_with_no_swim_runtime_has_no_handle_to_leave() {
+        let (tx, rx) = tokio::sync::watch::channel(SwimStage::Starting);
+        assert!(settled(&rx).is_none(), "starting carries no handle");
+        tx.send_replace(SwimStage::Settled(None));
+        assert!(settled(&rx).is_none(), "settled without a runtime carries no handle");
     }
 }
