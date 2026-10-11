@@ -47,9 +47,9 @@ unknown, not false, and does not exclude: a provider pointed at vLLM's own
 The operator reads at most 1 MiB of the HTTP response body from one provider
 /metrics endpoint. Reaching that budget is counted as `body_cap` and leaves
 readiness unknown: the endpoint answered, so the provider is not declared down.
-On EPP endpoints that Grid scrapes, set
-`--fairness-id-metric-label-limit=0` so the client-controlled
-`fairness_id` label collapses to `other`; otherwise the
+On EPP endpoints that Grid scrapes, use an EPP release that supports
+`--fairness-id-metric-label-limit` (available in v0.10+) and set it to `0` so
+the client-controlled `fairness_id` label collapses to `other`; otherwise the
 `x-llm-d-inference-fairness-id` header can grow the exposition past the budget.
 
 The verdict is also the provider's `Ready` condition, whose reason names the
