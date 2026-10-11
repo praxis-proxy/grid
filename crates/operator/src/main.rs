@@ -196,59 +196,86 @@ async fn main() {
     // Only installed with the feature, so the default path keeps today's signal
     // disposition unchanged.
     let (trigger, shutdown) = operator::shutdown::Trigger::new();
-    if signals_enabled {
-        tokio::spawn(watch_for_termination(trigger));
-    } else {
-        drop(trigger);
-    }
+    tokio::spawn(watch_for_termination(trigger));
 
-    let result = tokio::try_join!(
-        start_swim(
-            client.clone(),
-            config.clone(),
-            Arc::clone(&ctx),
-            Arc::clone(&ready),
-            swim_tx,
-        ),
-        run_network_controller(client.clone(), Arc::clone(&ctx), swim_rx.clone()),
-        run_site_controller(client.clone()),
-        run_provider_controller(client.clone(), ctx.site_name().map(str::to_owned)),
-        run_agent_tool_provider_controller(client.clone()),
-        async { metrics_server.await? },
-        run_signals_server(
-            signals_enabled.then(|| SignalsListener {
-                bind: config.signals.addr,
-                client: client.clone(),
-                published: Published {
-                    site: ctx.signals(),
-                    peers: ctx.peers(),
-                },
-                peer_identities: ctx.peer_identities(),
-                trust,
-                max_per_peer: config.signals.max_per_peer,
-            }),
-            swim_rx.clone(),
-        ),
-        run_peer_poller(
-            signals_enabled.then(|| config.signals.clone()),
-            Arc::clone(&ctx),
-            swim_rx,
-            client.clone(),
-            shutdown.clone(),
-        ),
-        run_local_scraper(
-            signals_enabled.then(|| config.signals.scrape_interval()),
-            Arc::clone(&ctx),
-            client.clone(),
-        ),
-        run_model_discovery(Arc::clone(&ctx), client.clone()),
-    );
+    let standing_down = stand_down(shutdown.clone(), swim_rx.clone());
+    let serving = async {
+        tokio::try_join!(
+            start_swim(
+                client.clone(),
+                config.clone(),
+                Arc::clone(&ctx),
+                Arc::clone(&ready),
+                swim_tx,
+            ),
+            run_network_controller(client.clone(), Arc::clone(&ctx), swim_rx.clone()),
+            run_site_controller(client.clone()),
+            run_provider_controller(client.clone(), ctx.site_name().map(str::to_owned)),
+            run_agent_tool_provider_controller(client.clone()),
+            async { metrics_server.await? },
+            run_signals_server(
+                signals_enabled.then(|| SignalsListener {
+                    bind: config.signals.addr,
+                    client: client.clone(),
+                    published: Published {
+                        site: ctx.signals(),
+                        peers: ctx.peers(),
+                    },
+                    peer_identities: ctx.peer_identities(),
+                    trust,
+                    max_per_peer: config.signals.max_per_peer,
+                }),
+                swim_rx.clone(),
+                shutdown.clone(),
+            ),
+            run_peer_poller(
+                signals_enabled.then(|| config.signals.clone()),
+                Arc::clone(&ctx),
+                swim_rx,
+                client.clone(),
+                shutdown.clone(),
+            ),
+            run_local_scraper(
+                signals_enabled.then(|| config.signals.scrape_interval()),
+                Arc::clone(&ctx),
+                client.clone(),
+            ),
+            run_model_discovery(Arc::clone(&ctx), client.clone()),
+        )
+        .map(|_joined| ())
+    };
+
+    // Standing down wins, and dropping the work closes every connection pool
+    // it owns. The listener drains while this waits, because both sides stay
+    // polled until one of them finishes.
+    let result = tokio::select! {
+        biased;
+        () = standing_down => Ok(()),
+        result = serving => result,
+    };
 
     if let Err(e) = result {
         tracing::error!(error = %e, "controller error");
         std::process::exit(1);
     }
+    tracing::info!("stood down");
 }
+
+/// Resolve once the process should stop, after leaving the cluster.
+///
+/// Leaving first stops peers choosing this site, so the connections dropped
+/// afterwards are ones nobody is waiting on. The grace that follows is what
+/// the inbound listener drains in.
+async fn stand_down(shutdown: operator::shutdown::Shutdown, swim: SwimStartup) {
+    shutdown.triggered().await;
+    if let Some(handle) = swim_settled(swim).await {
+        handle.leave(LEAVE_WAIT).await;
+    }
+    tokio::time::sleep(SHUTDOWN_GRACE).await;
+}
+
+/// How long in-flight work has after the cluster has been left.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Where SWIM startup stands.
 #[derive(Clone)]
@@ -1353,6 +1380,7 @@ struct SignalsListener {
 async fn run_signals_server(
     listener: Option<SignalsListener>,
     swim: SwimStartup,
+    shutdown: operator::shutdown::Shutdown,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let Some(listener) = listener else {
         return Ok(());
@@ -1369,16 +1397,19 @@ async fn run_signals_server(
     // bind blip (a socket in TIME_WAIT across a rebind) must not be fatal to
     // reconcile and the metrics server through `try_join!`: a serve error logs
     // and retries rather than propagating.
-    #[expect(
-        clippy::infinite_loop,
-        reason = "serves for the process lifetime alongside the controllers"
-    )]
-    loop {
-        if let Err(error) = listener.serve_once(&app, advertised.as_deref()).await {
-            tracing::error!(%error, bind = ?listener.bind, "signals listener error; retrying");
-            tokio::time::sleep(SIGNALS_TLS_POLL).await;
+    while !shutdown.is_triggered() {
+        match listener.serve_once(&app, advertised.as_deref(), shutdown.clone()).await {
+            Ok(()) if !shutdown.is_triggered() => {
+                tracing::info!("signals TLS material changed; serving again");
+            },
+            Ok(()) => {},
+            Err(error) => {
+                tracing::error!(%error, bind = ?listener.bind, "signals listener error; retrying");
+                tokio::time::sleep(SIGNALS_TLS_POLL).await;
+            },
         }
     }
+    Ok(())
 }
 
 impl SignalsListener {
@@ -1387,6 +1418,7 @@ impl SignalsListener {
         &self,
         app: &axum::Router,
         advertised: Option<&str>,
+        shutdown: operator::shutdown::Shutdown,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (tls, own) = Box::pin(signals_identity(&self.client)).await;
         let Some(tls) = tls else {
@@ -1411,9 +1443,7 @@ impl SignalsListener {
             app: app.clone(),
             identity,
         };
-        serve_signals_tls(listener, serving, admission, changed).await?;
-        tracing::info!("signals TLS material changed; serving again");
-        Ok(())
+        serve_signals_tls(listener, serving, admission, changed, shutdown).await
     }
 }
 
@@ -1515,11 +1545,18 @@ async fn serve_signals_tls(
     serving: Serving,
     admission: Admission,
     changed: impl Future<Output = ()> + Send,
+    shutdown: operator::shutdown::Shutdown,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut changed = std::pin::pin!(changed);
     let mut shed_warned: Option<std::time::Instant> = None;
     loop {
         let accepted = tokio::select! {
+            biased;
+            () = shutdown.triggered() => {
+                // Stop accepting, then let what is already answering finish.
+                drain_connections(&admission.slots).await;
+                return Ok(());
+            },
             () = &mut changed => return Ok(()),
             accepted = listener.accept() => accepted,
         };
@@ -1538,6 +1575,23 @@ async fn serve_signals_tls(
             serve.await;
             drop(slot);
         });
+    }
+}
+
+/// Wait for every open signals connection to finish, up to [`SHUTDOWN_GRACE`].
+///
+/// Holding every permit means nothing is being served, which is the only way
+/// to know no peer is mid-answer. A peer still answering at the end of the
+/// grace loses its connection when the process goes.
+async fn drain_connections(slots: &Arc<tokio::sync::Semaphore>) {
+    let all = u32::try_from(SIGNALS_MAX_CONNECTIONS).unwrap_or(u32::MAX);
+    match tokio::time::timeout(SHUTDOWN_GRACE, slots.acquire_many(all)).await {
+        Ok(Ok(permits)) => {
+            drop(permits);
+            tracing::info!("signals: every connection closed");
+        },
+        Ok(Err(_closed)) => {},
+        Err(_elapsed) => tracing::warn!("signals: connections still open at the end of the grace"),
     }
 }
 
@@ -2881,7 +2935,13 @@ mod tests {
                 let addr = listener.local_addr().expect("fixture");
                 let (rotate, rotated) = tokio::sync::oneshot::channel::<()>();
                 let changed = async move { drop(rotated.await) };
-                let server = tokio::spawn(serve_signals_tls(listener, serving, Admission::new(8), changed));
+                let server = tokio::spawn(serve_signals_tls(
+                    listener,
+                    serving,
+                    Admission::new(8),
+                    changed,
+                    operator::shutdown::Shutdown::never(),
+                ));
                 (addr, rotate, server)
             }
         };
@@ -3448,5 +3508,89 @@ mod tests {
         let data = revision_lease_data(&lease);
         assert_eq!(parse_revision_value(&data, REVISION_HIGH_KEY), Some(20));
         assert_eq!(parse_revision_value(&data, NODE_GENERATION_HIGH_KEY), Some(40));
+    }
+
+    /// A listener fixture serving `mesh`'s CA with an east leaf, admitting west.
+    #[cfg(not(feature = "fips"))]
+    fn serving_for(mesh: &Mesh) -> Serving {
+        let leaf = certs::generate_site_cert(&mesh.ca, "east").expect("fixture");
+        let peers = operator::signals::PeerIdentities::new();
+        peers.set(BTreeMap::from([(
+            "west".to_owned(),
+            operator::signals::PeerRecord {
+                labels: gpu(),
+                pins: Vec::new(),
+            },
+        )]));
+        Serving {
+            tls: tls_backend::build_server_config(
+                mesh.ca.cert_pem.as_bytes(),
+                leaf.cert_pem.as_bytes(),
+                leaf.key_pem.as_bytes(),
+            )
+            .expect("fixture"),
+            app: ok_app(),
+            identity: SignalsIdentity {
+                peers,
+                own: None,
+                trust: operator::signals::PeerTrustMode::Spiffe,
+            },
+        }
+    }
+
+    /// The drain holds for a peer mid-answer, and gives up at the grace.
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_waits_for_an_open_connection_and_then_gives_up() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(SIGNALS_MAX_CONNECTIONS));
+        let held = Arc::clone(&slots).try_acquire_owned().expect("a slot");
+
+        let waiting = tokio::time::Instant::now();
+        drain_connections(&slots).await;
+        assert!(
+            waiting.elapsed() >= SHUTDOWN_GRACE,
+            "a peer mid-answer must hold the drain open"
+        );
+
+        drop(held);
+        let idle = tokio::time::Instant::now();
+        drain_connections(&slots).await;
+        assert!(
+            idle.elapsed() < SHUTDOWN_GRACE,
+            "with nothing open the drain must not wait out the grace"
+        );
+    }
+
+    /// The signal closes the listener, where before only SIGKILL did.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn the_listener_stops_accepting_once_the_signal_is_given() {
+        let mesh = Mesh::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("fixture");
+        let addr = listener.local_addr().expect("fixture");
+        let (trigger, shutdown) = operator::shutdown::Trigger::new();
+        let server = tokio::spawn(serve_signals_tls(
+            listener,
+            serving_for(&mesh),
+            Admission::new(8),
+            std::future::pending(),
+            shutdown,
+        ));
+
+        let mut polling = mesh.connect(addr).await;
+        assert!(get(&mut polling).await.starts_with(b"HTTP/1.1 200"), "serves before");
+        // Closed so the drain has nothing to wait for; the drain's own test
+        // covers a peer that is still answering.
+        drop(polling);
+
+        trigger.trigger();
+        server
+            .await
+            .expect("server task")
+            .expect("the listener stands down cleanly");
+
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "the listener socket must be closed once the signal is given"
+        );
     }
 }
