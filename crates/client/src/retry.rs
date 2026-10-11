@@ -34,8 +34,14 @@ impl RequestOutcome {
     #[must_use]
     pub const fn is_retryable(self) -> bool {
         match self {
-            Self::Timeout | Self::Refused | Self::Transport | Self::ServerError | Self::Throttled => true,
-            Self::Ok | Self::Tls | Self::ClientError | Self::Encoding | Self::Config | Self::Cancelled => false,
+            Self::Timeout | Self::Refused | Self::Transport | Self::ServerError => true,
+            Self::Ok
+            | Self::Tls
+            | Self::ClientError
+            | Self::Throttled
+            | Self::Encoding
+            | Self::Config
+            | Self::Cancelled => false,
         }
     }
 
@@ -134,7 +140,6 @@ mod tests {
                     | RequestOutcome::Refused
                     | RequestOutcome::Transport
                     | RequestOutcome::ServerError
-                    | RequestOutcome::Throttled
             );
             assert_eq!(outcome.is_retryable(), expected, "{}", outcome.as_str());
         }
@@ -146,9 +151,11 @@ mod tests {
     }
 
     #[test]
-    fn throttling_retries_where_the_rest_of_4xx_does_not() {
+    fn throttling_is_told_apart_from_a_refusal_without_being_retried() {
+        // Retrying a 429 on a schedule the peer did not ask for amplifies
+        // against it. Honouring Retry-After is what would earn the retry.
         assert_eq!(from_status(status(429)), RequestOutcome::Throttled);
-        assert!(from_status(status(429)).is_retryable());
+        assert!(!from_status(status(429)).is_retryable());
         assert_eq!(from_status(status(403)), RequestOutcome::ClientError);
         assert!(!from_status(status(403)).is_retryable());
     }

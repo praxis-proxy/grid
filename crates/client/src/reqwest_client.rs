@@ -55,7 +55,7 @@ pub enum BuildError {
     #[error("{0} holds no certificate")]
     NoRoots(&'static str),
     /// The trust material could not be parsed.
-    #[error("parsing {context}: {source}")]
+    #[error("parsing {context}")]
     Roots {
         /// What the material was for, for whoever reads the log.
         context: &'static str,
@@ -69,6 +69,12 @@ pub enum BuildError {
     /// reqwest refused the configuration.
     #[error("building the client: {0}")]
     Client(#[source] reqwest::Error),
+    /// No rustls crypto provider is installed in the process.
+    ///
+    /// Checked here because reqwest panics instead of returning, and the
+    /// release profile aborts rather than unwinds.
+    #[error("no rustls crypto provider is installed")]
+    NoProvider,
 }
 
 /// Parse a PEM bundle into roots, refusing an empty one.
@@ -112,12 +118,17 @@ pub fn identity(cert: &str, key: &str) -> Result<reqwest::Identity, BuildError> 
 ///
 /// # Errors
 ///
-/// [`BuildError::Client`] when reqwest refuses the configuration.
+/// [`BuildError::Client`] when reqwest refuses the configuration, and
+/// [`BuildError::NoProvider`] when no rustls provider is installed.
 pub fn trusted_client(
     roots: Vec<reqwest::Certificate>,
     identity: Option<reqwest::Identity>,
     timeouts: Timeouts,
 ) -> Result<reqwest::Client, BuildError> {
+    #[cfg(not(feature = "fips"))]
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        return Err(BuildError::NoProvider);
+    }
     let mut builder = reqwest::Client::builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())

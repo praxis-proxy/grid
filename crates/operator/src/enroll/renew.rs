@@ -378,9 +378,10 @@ impl HttpsRenewer {
     fn client(&self, held: &Held) -> Result<reqwest::Client, RenewError> {
         let roots = pem_roots(self.pin.as_deref().unwrap_or(&held.ca), "rotation trust")
             .map_err(|e| RenewError::Material(e.to_string()))?;
-        let identity = grid_client::identity(&held.cert, &held.key).map_err(|e| RenewError::Material(e.to_string()))?;
-        grid_client::trusted_client(roots, Some(identity), grid_client::Timeouts::DEFAULT)
-            .map_err(|e| RenewError::Material(e.to_string()))
+        let identity =
+            grid_client::identity(&held.cert, &held.key).map_err(|e| RenewError::Material(error_chain(&e)))?;
+        grid_client::trusted_client(roots, Some(identity), grid_client::Timeouts::ENROLLMENT)
+            .map_err(|e| RenewError::Material(error_chain(&e)))
     }
 }
 

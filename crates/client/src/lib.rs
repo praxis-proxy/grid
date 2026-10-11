@@ -14,6 +14,11 @@
 //! The signals poller, which writes each scraped exposition into the
 //! `grid-signals` `LoadStore`, also lives here.
 
+#[cfg(all(feature = "rcgen", feature = "fips"))]
+compile_error!("features `rcgen` and `fips` are mutually exclusive");
+#[cfg(all(feature = "reqwest-client", not(any(feature = "rcgen", feature = "fips"))))]
+compile_error!("`reqwest-client` needs one of `rcgen` or `fips` to pick a TLS backend");
+
 #[cfg(feature = "peer-scraper")]
 mod mtls;
 #[cfg(feature = "peer-scraper")]

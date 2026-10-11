@@ -11,7 +11,7 @@ publish = false
 # forwards fips here instead of naming a backend itself.
 [features]
 default = ["rcgen", "peer-scraper"]
-rcgen = ["certs?/rcgen", "reqwest?/rustls-no-provider"]
+rcgen = ["certs?/rcgen", "dep:rustls", "reqwest?/rustls-no-provider"]
 fips = ["certs?/fips", "reqwest?/native-tls"]
 # The pinned-peer transport and the signals poller. On by default, and off for
 # a caller that only needs a client, so a ten-line builder does not pull hyper

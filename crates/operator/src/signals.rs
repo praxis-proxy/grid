@@ -818,18 +818,19 @@ pub(crate) fn is_dialable_ip(ip: IpAddr) -> bool {
 /// Everything outside the RFC 3986 unreserved set is escaped in a query value.
 const QUERY_VALUE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
 
-/// Why a poll ended, at the granularity a response differs by.
-///
-/// The shared classification, so one retry verdict and one set of metric
-/// labels covers every client in the tree.
-pub use grid_client::RequestOutcome;
+use grid_client::RequestOutcome;
 
 /// Classify a scrape failure.
 fn classify(error: &MetricsScrapeError) -> RequestOutcome {
     match error {
         MetricsScrapeError::Timeout(_) => RequestOutcome::Timeout,
         MetricsScrapeError::NonOkStatus { status, .. } => {
-            http::StatusCode::from_u16(*status).map_or(RequestOutcome::Transport, grid_client::from_status)
+            match http::StatusCode::from_u16(*status).map(grid_client::from_status) {
+                // A 2xx carried in an error means the scrape failed while the
+                // status said it worked, so nothing was answered.
+                Ok(RequestOutcome::Ok) | Err(_) => RequestOutcome::Transport,
+                Ok(outcome) => outcome,
+            }
         },
         MetricsScrapeError::Encoding(_) => RequestOutcome::Encoding,
         MetricsScrapeError::BodyTooLarge(_) => RequestOutcome::Transport,
@@ -2073,12 +2074,17 @@ mod tests {
     }
 
     #[test]
-    fn a_throttled_peer_is_retried_where_one_that_refused_is_not() {
-        // 429 asks for less, not for nothing, and the backoff is already
-        // exponential and spread, so another attempt is what it asked for.
+    fn a_throttled_peer_is_named_without_being_hit_again_this_round() {
+        // Three attempts at a 50ms base is not the schedule a 429 asked for.
         assert_eq!(classify(&non_ok(429)), RequestOutcome::Throttled);
-        assert!(classify(&non_ok(429)).is_retryable());
+        assert!(!classify(&non_ok(429)).is_retryable());
         assert!(!classify(&non_ok(403)).is_retryable());
+    }
+
+    #[test]
+    fn a_success_status_carried_in_an_error_is_not_read_as_an_answer() {
+        // Marking the peer up here would publish a round that scraped nothing.
+        assert_eq!(classify(&non_ok(204)), RequestOutcome::Transport);
     }
 
     #[test]
