@@ -682,13 +682,13 @@ pub(crate) fn cleanup_validation_resources(context: &str) -> Result<(), Box<dyn 
 // Install/RBAC validation helpers
 // ---------------------------------------------------------------------------
 
-/// Apply the operator install manifests from `deploy/operator/`.
+/// Apply the kind install overlay from `deploy/overlays/kind/`.
 pub(crate) fn apply_install_manifests(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     let status = Command::new("kubectl")
-        .args(["apply", "--context", context, "-k", "deploy/operator/"])
+        .args(["apply", "--context", context, "-k", "deploy/overlays/kind/"])
         .status()?;
     if !status.success() {
-        return Err("failed to apply install manifests from deploy/operator/".into());
+        return Err("failed to apply install manifests from deploy/overlays/kind/".into());
     }
     Ok(())
 }
@@ -701,7 +701,7 @@ pub(crate) fn cleanup_install_manifests(context: &str) -> Result<(), Box<dyn std
             "--context",
             context,
             "-k",
-            "deploy/operator/",
+            "deploy/overlays/kind/",
             "--ignore-not-found",
         ])
         .status()?;

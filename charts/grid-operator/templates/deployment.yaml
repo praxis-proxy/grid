@@ -56,6 +56,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            {{- /* Namespace-bearing values expand this at start, so a kustomize consumer can move the install. */}}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: GRID_SWIM_BIND_ADDR
               value: {{ .Values.swim.bindAddress | quote }}
             {{- if eq (toString .Values.swim.requireKey) "false" }}
@@ -92,7 +97,7 @@ spec:
               value: {{ .Values.gateway.serviceName | quote }}
             {{- end }}
             - name: GRID_GATEWAY_NAMESPACE
-              value: {{ .Values.gateway.namespace | default .Release.Namespace | quote }}
+              value: {{ .Values.gateway.namespace | default "$(POD_NAMESPACE)" | quote }}
             {{- with .Values.gateway.port }}
             - name: GRID_GATEWAY_PORT
               value: {{ . | quote }}
@@ -112,12 +117,12 @@ spec:
             - name: GRID_METRICS_SCRAPER_SERVICE_ACCOUNT
               value: {{ printf "%s-metrics-scraper" (include "grid-operator.fullname" .) | quote }}
             - name: GRID_METRICS_SCRAPER_NAMESPACE
-              value: {{ .Release.Namespace | quote }}
+              value: "$(POD_NAMESPACE)"
             {{- end }}
             {{- if (.Values.signals).enabled }}
             - name: GRID_SIGNALS_LOCAL_ADDR
               {{- /* Follows whichever Service carries the port: the signals one when rendered, else SWIM. */}}
-              value: {{ printf "%s-%s.%s.svc:%v" (include "grid-operator.fullname" .) (ternary "signals" "swim" .Values.signals.service.enabled) .Release.Namespace .Values.signals.port | quote }}
+              value: {{ printf "%s-%s.$(POD_NAMESPACE).svc:%v" (include "grid-operator.fullname" .) (ternary "signals" "swim" .Values.signals.service.enabled) .Values.signals.port | quote }}
             {{- if .Values.signals.service.enabled }}
             - name: GRID_SIGNALS_SERVICE_NAME
               value: {{ printf "%s-signals" (include "grid-operator.fullname" .) | quote }}

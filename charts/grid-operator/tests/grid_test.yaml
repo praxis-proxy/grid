@@ -97,7 +97,7 @@ tests:
           content: {name: GRID_SWIM_SEEDS, value: "192.0.2.10:7946,192.0.2.11:7946"}
       - contains:
           path: spec.template.spec.containers[0].env
-          content: {name: GRID_SIGNALS_LOCAL_ADDR, value: "RELEASE-NAME-grid-operator-signals.NAMESPACE.svc:9091"}
+          content: {name: GRID_SIGNALS_LOCAL_ADDR, value: "RELEASE-NAME-grid-operator-signals.$(POD_NAMESPACE).svc:9091"}
 
   - it: leaves signals off until grid.id is set
     template: templates/deployment.yaml
@@ -107,7 +107,7 @@ tests:
     asserts:
       - notContains:
           path: spec.template.spec.containers[0].env
-          content: {name: GRID_SIGNALS_LOCAL_ADDR, value: "RELEASE-NAME-grid-operator-signals.NAMESPACE.svc:9091"}
+          content: {name: GRID_SIGNALS_LOCAL_ADDR, value: "RELEASE-NAME-grid-operator-signals.$(POD_NAMESPACE).svc:9091"}
 
   - it: keeps the old keys when both are set
     template: templates/deployment.yaml

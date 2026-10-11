@@ -100,6 +100,9 @@ jobs:
       - name: Check CRD manifests match the Rust CRD types
         run: make crds-check
 
+      - name: Check install manifests match the chart
+        run: make deploy-check
+
   # ----------------------------------------------------------------------------
   # Unit tests
   # ----------------------------------------------------------------------------

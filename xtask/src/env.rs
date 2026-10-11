@@ -943,7 +943,7 @@ pub(crate) enum Action {
 
     /// Verify the operator install/RBAC package in Kind.
     ///
-    /// Applies the install manifests from `deploy/operator/`, runs positive and
+    /// Applies the kind install overlay from `deploy/overlays/kind/`, runs positive and
     /// negative `kubectl auth can-i` checks against the `grid-operator`
     /// `ServiceAccount`, then spawns an out-of-cluster operator and proves RBAC
     /// is sufficient for a minimal reconcile (status written, overlay `ConfigMap`
@@ -5778,7 +5778,7 @@ fn env_verify_crd_schema() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Verify the operator install/RBAC package in Kind.
 ///
-/// Applies `deploy/operator/` manifests, runs `kubectl auth can-i` checks for
+/// Applies `deploy/overlays/kind/`, runs `kubectl auth can-i` checks for
 /// positive and negative permission expectations, then spawns an out-of-cluster
 /// operator to prove RBAC is sufficient for a minimal reconcile.
 /// Positive `kubectl auth can-i` checks for the installed operator RBAC.

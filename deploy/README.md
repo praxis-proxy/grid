@@ -42,20 +42,35 @@ kubectl --dry-run=server create -k deploy/crds/
 
 ## Operator Installation
 
-### Prerequisites
+The install manifests are generated from `charts/grid-operator`; do not hand-edit them.
+Each directory keeps the `values.yaml` that renders it.
 
-1. Kubernetes cluster with admin access
-2. kubectl configured for the target cluster
+- `operator/` is the platform base: an OpenShift shape with metrics TLS from the service
+  CA and a NetworkPolicy, the image set through `params.env`, and the namespace left to the
+  consumer. A platform operator vendors this directory and places it in its own namespace.
+- `overlays/kind/` is the standalone install for a kind cluster: plain metrics, no
+  NetworkPolicy, its own `grid-system` Namespace, and the resources RoleBinding in the
+  `default` namespace that the install qualification checks.
+
+```bash
+# Regenerate after a chart change (writes deploy/operator and deploy/overlays/kind)
+make generate-deploy
+
+# Check that the committed manifests match the chart (runs in CI)
+make deploy-check
+```
 
 ### Install Steps
 
 ```bash
-# Full install: CRDs + operator
-kubectl apply -k deploy/
-
-# Or step-by-step:
+# CRDs first
 kubectl apply -k deploy/crds/
-kubectl apply -k deploy/operator/
+
+# OpenShift, into a namespace of your choice
+kubectl apply -k deploy/operator/ -n grid-system
+
+# kind
+kubectl apply -k deploy/overlays/kind/
 
 # Verify operator is running
 kubectl get pods -n grid-system
@@ -67,9 +82,9 @@ kubectl logs -n grid-system deployment/grid-operator
 The operator uses a split RBAC model:
 
 - **Cluster-scoped**: CRD access via ClusterRole `grid-operator-crd`
-- **Namespace-scoped**: Secret/ConfigMap access via ClusterRole `grid-operator-resources` bound to specific namespaces
+- **Namespace-scoped**: Secret/ConfigMap access via ClusterRole `grid-operator-resources` bound in the operator namespace, plus every namespace listed under `resourceNamespaces` in the directory's `values.yaml`
 
-By default, the operator can access Secrets and ConfigMaps in the `default` namespace. To grant access to additional namespaces:
+To grant access to another namespace without regenerating:
 
 ```bash
 kubectl create rolebinding grid-operator-resources \
@@ -80,20 +95,12 @@ kubectl create rolebinding grid-operator-resources \
 
 ## Image Configuration
 
-The checked-in operator `Deployment` references the published project image,
-pinned to an immutable digest:
-
-- `ghcr.io/praxis-proxy/grid-operator@sha256:8c8271aa589fbd81e346b75ae580be9e8085c3b283b4e6a99e2b9adcea73e12d`
-
-Release notes provide the immutable digest for each released version. Do not
-use `latest` as an installation contract.
-
-The local Kind validation path continues to use:
-
-- `grid-operator:latest`
-
-For Kind validation, the xtask harness builds and loads the image automatically.
-For production, use a versioned release tag or immutable digest.
+The generated `Deployment` references the chart's release image, `ghcr.io/praxis-proxy/grid-operator`
+at the chart `appVersion`. `deploy/operator/params.env` carries the same value under
+`grid-operator-image`, and the kustomization replaces the Deployment image from it, so a
+platform operator sets the image by rewriting that one key. Release notes provide the
+immutable digest for each released version; pin it there or in `values.yaml` when an
+installation contract needs one.
 
 ## Praxis AI Gateway Deployment
 
