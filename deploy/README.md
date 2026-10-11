@@ -82,10 +82,15 @@ kubectl apply -k deploy/operator/ -n grid-system
 # OpenShift
 kubectl apply -k deploy/overlays/openshift/ -n grid-system
 
-# Another image from a consumer kustomization: use the images transformer. Merging a
-# second grid-operator-parameters ConfigMap does nothing, because the base's replacement
-# has already run by the time the merge applies.
-kustomize edit set image ghcr.io/praxis-proxy/grid-operator=ghcr.io/praxis-proxy/grid-operator:sha-<commit>
+# Another image from a consumer kustomization that vendors the base: use the images
+# transformer in that kustomization's directory. Merging a second grid-operator-parameters
+# ConfigMap does nothing, because the base's replacement has already run by the time the
+# merge applies.
+(cd path/to/consumer-kustomization && kustomize edit set image ghcr.io/praxis-proxy/grid-operator=ghcr.io/praxis-proxy/grid-operator:sha-<commit>)
+
+# Applying over a Deployment another installer created (the chart, or the hand-maintained
+# manifests before they were generated): delete that Deployment first. Its selector is
+# immutable and the chart's selector carries the instance label.
 
 # kind
 kubectl apply -k deploy/overlays/kind/
