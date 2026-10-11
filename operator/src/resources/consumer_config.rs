@@ -1234,6 +1234,7 @@ fn render_cluster_entry(
     tls_cert_mount_path: &str,
 ) -> Result<String, ConsumerConfigError> {
     let quoted_addr = yaml_scalar(&ep.address).unwrap_or_else(|_| "\"\"".to_owned());
+    let trusted_private = render_trusted_private(&ep.address);
 
     let transport = ep
         .transport
@@ -1275,7 +1276,7 @@ fn render_cluster_entry(
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    sni: {quoted_sni}\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    verify: true\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  endpoints:\n\
-                \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    - {quoted_addr}"
+                \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    - {quoted_addr}{trusted_private}"
             ))
         },
         TransportMode::Tls => {
@@ -1300,7 +1301,7 @@ fn render_cluster_entry(
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    sni: {quoted_sni}\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    verify: true\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  endpoints:\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    - {quoted_addr}"
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    - {quoted_addr}{trusted_private}"
             ))
         },
         TransportMode::Plaintext => {
@@ -1317,10 +1318,25 @@ fn render_cluster_entry(
             Ok(format!(
                 "          - name: {quoted_name}\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  endpoints:\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    - {quoted_addr}"
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    - {quoted_addr}{trusted_private}"
             ))
         },
     }
+}
+
+/// Praxis refuses a hostname endpoint that resolves to a private address unless the
+/// cluster lists it as trusted. Cluster-local Services always do, so every hostname
+/// endpoint is listed; an IP literal is never resolved and needs no entry.
+fn render_trusted_private(address: &str) -> String {
+    let host = address
+        .rsplit_once(':')
+        .map_or(address, |(host, _port)| host)
+        .trim_matches(|c| c == '[' || c == ']');
+    if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
+        return String::new();
+    }
+    let quoted = yaml_scalar(host).unwrap_or_else(|_| "\"\"".to_owned());
+    format!("\n            trusted_private_endpoints:\n              - {quoted}")
 }
 
 /// Compute the `file:` path for a credential entry.
@@ -1390,6 +1406,16 @@ mod tests {
             routing_overlay::{ProjectedCredential, ProjectedCredentialRef},
         },
     };
+
+    #[test]
+    fn hostname_endpoints_are_trusted_private_and_ip_literals_are_not() {
+        let hostname = render_trusted_private("svc.ns.svc.cluster.local:443");
+        assert!(hostname.contains("trusted_private_endpoints:"));
+        assert!(hostname.contains("- \"svc.ns.svc.cluster.local\""));
+        assert!(!hostname.contains(":443"));
+        assert_eq!(render_trusted_private("192.168.1.150:8080"), "");
+        assert_eq!(render_trusted_private("[fd00::1]:8080"), "");
+    }
 
     // -----------------------------------------------------------------------
     // Test utilities
