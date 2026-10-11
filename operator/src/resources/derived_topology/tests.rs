@@ -284,8 +284,8 @@ fn a_site_in_another_network_is_not_a_source() {
 }
 
 #[test]
-fn a_mutual_egress_with_no_server_name_derives_no_server_name() {
-    // A hand-written Mutual site may omit serverName; leave SNI unset for the renderer to refuse.
+fn a_mutual_egress_with_no_server_name_is_refused() {
+    // The renderer refuses mutual TLS with no SNI for the whole document, so withdraw the one candidate.
     let sites = vec![
         site("site-a", None),
         site(
@@ -294,15 +294,34 @@ fn a_mutual_egress_with_no_server_name_derives_no_server_name() {
         ),
     ];
     let candidates = vec![candidate("prov-b", "site-b")];
-    let resolved = resolve(&candidates, &[], &decl(&[], &sites, "site-a"));
-    let transport = resolved
-        .get("prov-b")
-        .and_then(|got| got.endpoint.transport.clone())
-        .expect("transport");
-    assert_eq!(transport.mode, TransportMode::MutualTls);
-    assert!(
-        transport.sni.is_none(),
-        "derivation supplied an SNI the site never declared, so the hop would verify an invented name"
+    let resolution = resolve(&candidates, &[], &decl(&[], &sites, "site-a"));
+    assert!(resolution.get("prov-b").is_none(), "no endpoint without a server name");
+    assert_eq!(
+        resolution.refused.first().map(|refused| refused.reason),
+        Some(Refusal::NoServerName)
+    );
+}
+
+#[test]
+fn an_active_site_from_an_older_generation_is_refused() {
+    // The egress changed after the probe, so Active describes another address.
+    let mut changed = site(
+        "site-b",
+        Some(
+            serde_json::json!({ "address": "moved.grid.example.invalid:8443", "tls": { "mode": "Mutual", "serverName": "site-b.grid.internal" } }),
+        ),
+    );
+    changed.metadata.generation = Some(2);
+    if let Some(status) = changed.status.as_mut() {
+        status.observed_generation = 1;
+    }
+    let sites = vec![site("site-a", None), changed];
+    let candidates = vec![candidate("prov-b", "site-b")];
+    let resolution = resolve(&candidates, &[], &decl(&[], &sites, "site-a"));
+    assert!(resolution.get("prov-b").is_none(), "an unprobed address is not derived");
+    assert_eq!(
+        resolution.refused.first().map(|refused| refused.reason),
+        Some(Refusal::SiteNotProbed)
     );
 }
 
@@ -313,14 +332,14 @@ fn a_blank_server_name_is_treated_as_undeclared() {
         site("site-b", Some(mutual_egress("site-b.grid.example.invalid:8443", "   "))),
     ];
     let candidates = vec![candidate("prov-b", "site-b")];
-    let resolved = resolve(&candidates, &[], &decl(&[], &sites, "site-a"));
-    let transport = resolved
-        .get("prov-b")
-        .and_then(|got| got.endpoint.transport.clone())
-        .expect("transport");
+    let resolution = resolve(&candidates, &[], &decl(&[], &sites, "site-a"));
     assert!(
-        transport.sni.is_none(),
-        "a blank server name must not reach the renderer as a present one"
+        resolution.get("prov-b").is_none(),
+        "a blank server name is no server name"
+    );
+    assert_eq!(
+        resolution.refused.first().map(|refused| refused.reason),
+        Some(Refusal::NoServerName)
     );
 }
 

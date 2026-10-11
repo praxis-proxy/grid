@@ -46,8 +46,12 @@ pub(crate) enum Refusal {
     SiteUnknown,
     /// The site is not `Active`, so its address was never probed.
     SiteNotActive,
+    /// The site's spec changed since its last probe, so its address is unprobed.
+    SiteNotProbed,
     /// The site declares no egress address.
     NoEgress,
+    /// A mutual TLS hop with no server name, which the renderer refuses.
+    NoServerName,
     /// The endpoint URL has no usable scheme or host.
     EndpointUnusable,
     /// The URL declares a port it cannot represent.
@@ -69,7 +73,9 @@ impl Refusal {
             Self::ClusterAtTwoSites => "cluster at two sites",
             Self::SiteUnknown => "site unknown",
             Self::SiteNotActive => "site not active",
+            Self::SiteNotProbed => "site not probed at this generation",
             Self::NoEgress => "no egress",
+            Self::NoServerName => "no server name",
             Self::EndpointUnusable => "endpoint unusable",
             Self::EndpointPort => "endpoint port",
             Self::ServerNameNeeded => "server name needed",
@@ -293,6 +299,28 @@ fn derive_local(
 
 /// Derive a remote provider-hop entry from the provider site's `GridSite`.
 fn derive_remote(cluster: &str, site: &str, sites: &[GridSite], network_name: &str) -> Result<Resolved, Refusal> {
+    let site = probed_site(site, sites, network_name)?;
+    let egress = site.spec.egress.as_ref().ok_or(Refusal::NoEgress)?;
+    let address = egress.address.trim();
+    if address.is_empty() {
+        return Err(Refusal::NoEgress);
+    }
+    let transport = hop_transport(&egress.tls);
+    if transport.mode == TransportMode::MutualTls && transport.sni.is_none() {
+        return Err(Refusal::NoServerName);
+    }
+    Ok(Resolved {
+        endpoint: ClusterEndpointConfig {
+            cluster: cluster.to_owned(),
+            address: address.to_owned(),
+            transport: Some(transport),
+        },
+        origin: Origin::DerivedRemote,
+    })
+}
+
+/// The site named `site` in this network, if a probe verified its current spec.
+fn probed_site<'site>(site: &str, sites: &'site [GridSite], network_name: &str) -> Result<&'site GridSite, Refusal> {
     let site = sites
         .iter()
         .find(|known| {
@@ -301,25 +329,15 @@ fn derive_remote(cluster: &str, site: &str, sites: &[GridSite], network_name: &s
         })
         .ok_or(Refusal::SiteUnknown)?;
     // Only an Active site's address has been probed; earlier phases carry gossip.
-    if !matches!(
-        site.status.as_ref().map(|status| &status.phase),
-        Some(crate::crd::grid_site::GridSitePhase::Active)
-    ) {
+    let status = site.status.as_ref().ok_or(Refusal::SiteNotActive)?;
+    if status.phase != crate::crd::grid_site::GridSitePhase::Active {
         return Err(Refusal::SiteNotActive);
     }
-    let egress = site.spec.egress.as_ref().ok_or(Refusal::NoEgress)?;
-    let address = egress.address.trim();
-    if address.is_empty() {
-        return Err(Refusal::NoEgress);
+    // Active for an older spec says nothing about the address now declared.
+    if status.observed_generation != site.metadata.generation.unwrap_or(0) {
+        return Err(Refusal::SiteNotProbed);
     }
-    Ok(Resolved {
-        endpoint: ClusterEndpointConfig {
-            cluster: cluster.to_owned(),
-            address: address.to_owned(),
-            transport: Some(hop_transport(&egress.tls)),
-        },
-        origin: Origin::DerivedRemote,
-    })
+    Ok(site)
 }
 
 /// Transport for a provider hop. No CA: the consumer's grid identity carries trust.
