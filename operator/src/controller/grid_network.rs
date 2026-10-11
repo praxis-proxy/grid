@@ -2462,7 +2462,10 @@ async fn reconcile_routing_overlay_inner(
                         error = %e,
                         "consumer Praxis config render/apply failed; recorded in status"
                     );
-                    consumer_statuses.push(consumer_config_status_error(gw_ref, cc, &e, observed_generation));
+                    consumer_statuses.push(with_derived_summary(
+                        consumer_config_status_error(gw_ref, cc, &e, observed_generation),
+                        &derived_summary,
+                    ));
                     let delegation = cc.mount_reconciliation.as_ref().filter(|mounts| mounts.enabled);
                     mount_statuses.push(mount_reconciliation_status_error(
                         gw_ref,
@@ -5225,6 +5228,14 @@ fn withdraw_refused(overlay: &mut routing_overlay::RoutingOverlay, refused: &[de
     });
     overlay.candidates = kept;
     overlay.excluded.extend(withdrawn);
+}
+
+/// Append what derivation resolved and withdrew, so a failed render says which clusters and why.
+fn with_derived_summary(mut status: ConsumerConfigStatus, derived_summary: &str) -> ConsumerConfigStatus {
+    if !derived_summary.is_empty() {
+        status.message = format!("{}; {derived_summary}", status.message);
+    }
+    status
 }
 
 /// Build a `Rendered` [`ConsumerConfigStatus`] for a successfully applied consumer config.
@@ -10201,6 +10212,20 @@ mod tests {
             vec![json!({"name": "grid-credential", "$patch": "delete"})]
         );
         assert_mount_ownership_test_deployment_unchanged(&deployment, &original);
+    }
+
+    #[test]
+    fn a_failed_render_status_names_the_withdrawn_clusters() {
+        let gw = make_gw_ref("inference-gw", "praxis-system");
+        let cc = make_consumer_config("praxis-consumer-config");
+        let err = OperatorError::ConsumerConfigRender(ConsumerConfigError::NoClusterEndpoints);
+        let status = with_derived_summary(
+            consumer_config_status_error(&gw, &cc, &err, 1),
+            "withdrew 1 (prov-a: not allowlisted)",
+        );
+        assert!(status.message.contains("prov-a: not allowlisted"), "{}", status.message);
+        let bare = with_derived_summary(consumer_config_status_error(&gw, &cc, &err, 1), "");
+        assert!(!bare.message.ends_with("; "), "no empty suffix: {}", bare.message);
     }
 
     #[test]
