@@ -12,8 +12,8 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use grid_signals::{LoadStore, now_ms};
 use grid_client::{PollHandle, PollerConfig};
+use grid_signals::{LoadStore, now_ms};
 use praxis_filter::FilterError;
 
 use crate::{

@@ -14,17 +14,24 @@
 //! The signals poller, which writes each scraped exposition into the
 //! `grid-signals` `LoadStore`, also lives here.
 
+#[cfg(feature = "peer-scraper")]
 mod mtls;
+#[cfg(feature = "peer-scraper")]
 mod poller;
 #[cfg(feature = "reqwest-client")]
 mod reqwest_client;
 mod retry;
+#[cfg(feature = "peer-scraper")]
 mod scrape;
 
+#[cfg(feature = "peer-scraper")]
 mod feedback;
 
+#[cfg(feature = "peer-scraper")]
 pub use feedback::Reporter;
+#[cfg(feature = "peer-scraper")]
 pub use mtls::{MtlsError, PeerScraper};
+#[cfg(feature = "peer-scraper")]
 pub use poller::{
     FetchError, PinnedTls, PollHandle, PollerConfig, Scrape, SignalSource, build_url, deserialize_interval_ms, spawn,
     spawn_from_config, spawn_on_thread, spawn_on_thread_held,
@@ -33,4 +40,4 @@ pub use poller::{
 pub use reqwest_client::{BuildError, Timeouts, identity, roots_from_pem, trusted_client};
 #[cfg(feature = "reqwest-client")]
 pub use retry::classify;
-pub use retry::{Outcome, from_status};
+pub use retry::{RequestOutcome, from_status};

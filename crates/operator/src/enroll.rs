@@ -275,13 +275,8 @@ fn read_anchors(path: &Path) -> Result<String, EnrollError> {
 }
 
 /// The certificates in `pem`, refusing a bundle with none.
-fn pem_roots(pem: &str, name: &str) -> Result<Vec<reqwest::Certificate>, EnrollError> {
-    let roots = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
-        .map_err(|e| EnrollError::Config(format!("{name}: {e}")))?;
-    if roots.is_empty() {
-        return Err(EnrollError::Config(format!("{name} holds no certificate")));
-    }
-    Ok(roots)
+fn pem_roots(pem: &str, name: &'static str) -> Result<Vec<reqwest::Certificate>, EnrollError> {
+    grid_client::roots_from_pem(pem.as_bytes(), name).map_err(|e| EnrollError::Config(error_chain(&e)))
 }
 
 /// A non-blank setting, or a config error naming it.
@@ -847,8 +842,8 @@ async fn keep_existing_ca<S: Store + Sync>(
 
 /// A client that trusts only `roots`.
 fn http_client(roots: Vec<reqwest::Certificate>) -> Result<reqwest::Client, EnrollError> {
-    grid_client::trusted_client(roots, None, grid_client::Timeouts::DEFAULT)
-        .map_err(|e| EnrollError::Config(e.to_string()))
+    grid_client::trusted_client(roots, None, grid_client::Timeouts::ENROLLMENT)
+        .map_err(|e| EnrollError::Config(error_chain(&e)))
 }
 
 /// Resolve the target, then enroll into it.

@@ -36,7 +36,7 @@ axum = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 certs = { path = "../certs", default-features = false }
-grid-client = { path = "../crates/client", default-features = false, features = ["reqwest-client"] }
+grid-client = { path = "../client", default-features = false, features = ["reqwest-client"] }
 crdt = { path = "../crdt" }
 swim = { path = "../swim" }
 futures = { workspace = true }

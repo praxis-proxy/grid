@@ -5,6 +5,10 @@
 //! instead, since no reqwest backend can express that check under both TLS
 //! backends.
 //!
+//! Not for a caller that wants the platform roots as well as its own. This
+//! trusts the given roots and nothing else, so a caller adding a CA on top of
+//! the system store builds its own client.
+//!
 //! [`PeerScraper`]: crate::PeerScraper
 
 use std::time::Duration;
@@ -28,15 +32,23 @@ impl Timeouts {
         connect: Duration::from_secs(5),
         request: Duration::from_secs(30),
     };
+    /// Bounds for enrollment and identity rotation, which cross sites over
+    /// whatever network the deployment has.
+    pub const ENROLLMENT: Self = Self {
+        connect: Duration::from_secs(10),
+        request: Duration::from_secs(30),
+    };
 
     /// Bounds for a caller that repeats on `interval`.
     ///
     /// A request that outlives its own interval is a backlog rather than a slow
     /// answer, so the request deadline never exceeds it.
+    /// The connect bound never exceeds the request deadline, which starts at
+    /// the connect: a larger one could never fire.
     #[must_use]
-    pub const fn for_interval(interval: Duration) -> Self {
+    pub fn for_interval(interval: Duration) -> Self {
         Self {
-            connect: Self::DEFAULT.connect,
+            connect: Self::DEFAULT.connect.min(interval),
             request: interval,
         }
     }
@@ -53,8 +65,9 @@ impl Default for Timeouts {
 pub enum BuildError {
     /// The trust material parsed to no certificate.
     ///
-    /// Refused rather than defaulted: a client built from an empty bundle
-    /// trusts the platform roots instead of the grid.
+    /// Refused at construction because an empty bundle fails closed at every
+    /// handshake instead, as an unknown issuer, which names neither the bundle
+    /// nor the reason.
     #[error("{0} holds no certificate")]
     NoRoots(&'static str),
     /// The trust material could not be parsed.
@@ -127,6 +140,7 @@ pub fn trusted_client(
     let mut builder = reqwest::Client::builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .connect_timeout(timeouts.connect)
         .timeout(timeouts.request)
         .tls_certs_only(roots);
@@ -159,6 +173,22 @@ mod tests {
         let timeouts = Timeouts::for_interval(Duration::from_secs(5));
         assert_eq!(timeouts.request, Duration::from_secs(5));
         assert_eq!(timeouts.connect, Timeouts::DEFAULT.connect);
+    }
+
+    #[test]
+    fn an_interval_under_the_connect_default_clamps_it() {
+        let timeouts = Timeouts::for_interval(Duration::from_secs(1));
+        assert_eq!(timeouts.request, Duration::from_secs(1));
+        assert_eq!(
+            timeouts.connect,
+            Duration::from_secs(1),
+            "a connect bound past the deadline never fires"
+        );
+    }
+
+    #[test]
+    fn enrollment_keeps_the_longer_handshake_budget() {
+        assert!(Timeouts::ENROLLMENT.connect > Timeouts::DEFAULT.connect);
     }
 
     #[test]

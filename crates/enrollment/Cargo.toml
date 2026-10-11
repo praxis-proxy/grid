@@ -47,7 +47,7 @@ bootstrap = ["dep:clap", "dep:kube", "dep:k8s-openapi", "dep:reqwest", "dep:grid
 version.workspace = true
 axum = { workspace = true }
 certs = { path = "../certs", default-features = false }
-grid-client = { path = "../crates/client", default-features = false, features = ["reqwest-client"], optional = true }
+grid-client = { path = "../client", default-features = false, features = ["reqwest-client"], optional = true }
 clap = { workspace = true, optional = true, features = ["env"] }
 kube = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, optional = true }

@@ -16,6 +16,7 @@ grid-signals = { path = "../../../signals" }
 # poller and cert issuance are real dependencies, not just test ones.
 grid-client = { path = "../../../client", default-features = false, features = [
   "fips",
+  "peer-scraper",
 ] }
 certs = { path = "../../../certs", default-features = false, features = ["verifier", "fips"] }
 serde.workspace = true

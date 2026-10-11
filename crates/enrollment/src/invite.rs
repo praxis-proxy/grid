@@ -129,7 +129,7 @@ fn http_client(ca_pem: &[u8]) -> Result<reqwest::Client, BoxError> {
     Ok(grid_client::trusted_client(
         roots,
         None,
-        grid_client::Timeouts::DEFAULT,
+        grid_client::Timeouts::ENROLLMENT,
     )?)
 }
 
