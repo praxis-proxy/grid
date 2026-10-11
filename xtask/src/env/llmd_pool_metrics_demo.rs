@@ -120,7 +120,7 @@ const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.4.0";
 const DEFAULT_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.4";
 
 /// Default EPP image reference required by this demo.
-const DEFAULT_EPP_IMAGE: &str = "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0";
+const DEFAULT_EPP_IMAGE: &str = "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.11.0";
 
 /// Default deterministic llm-d-sim image reference required by this demo.
 const DEFAULT_VCR_IMAGE: &str = "llm-d-inference-sim:deterministic";
