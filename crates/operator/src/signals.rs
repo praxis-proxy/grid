@@ -10,7 +10,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     net::{IpAddr, Ipv6Addr},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, PoisonError, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -774,7 +774,7 @@ pub fn dialable_signals_endpoint(member: &MemberRecord, fallback_port: u16) -> O
 }
 
 /// Refused `(site, endpoint)` pairs already warned, bounded.
-static REFUSED_WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(String, String)>>> =
+static REFUSED_WARNED: std::sync::LazyLock<Mutex<std::collections::HashSet<(String, String)>>> =
     std::sync::LazyLock::new(Default::default);
 
 /// Refused pairs remembered before the set starts over.
@@ -783,7 +783,7 @@ const REFUSED_WARNED_MAX: usize = 1_024;
 /// Warn about a refused endpoint the first time a peer gossips it, `true` when warned.
 fn warn_refused_once(site: &str, endpoint: &str) -> bool {
     let endpoint: String = endpoint.chars().take(128).collect();
-    let mut warned = REFUSED_WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut warned = REFUSED_WARNED.lock().unwrap_or_else(PoisonError::into_inner);
     if warned.len() >= REFUSED_WARNED_MAX {
         warned.clear();
     }
@@ -939,6 +939,21 @@ impl std::fmt::Debug for PeerTlsMaterial {
     }
 }
 
+/// Per-peer client TLS configs, with the pins each was built for.
+///
+/// Building one parses a private key, so it is held across rounds rather than
+/// rebuilt per peer per round. Keyed by peer with the pins in the value,
+/// because keying on the pins would leak an entry per rotation. Holds no
+/// socket: a config is material, not a connection.
+#[derive(Default)]
+pub struct PeerConfigs(Mutex<HashMap<String, (Vec<String>, ClientTlsConfig)>>);
+
+impl std::fmt::Debug for PeerConfigs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerConfigs").finish_non_exhaustive()
+    }
+}
+
 /// Reads each peer's signals endpoint over HTTP.
 pub struct PollPeers {
     /// Per-attempt request timeout.
@@ -968,6 +983,8 @@ pub struct PollPeers {
     pub budget: Duration,
     /// Duration past which a poll is counted as slow.
     pub slow_after: Duration,
+    /// Per-peer client TLS configs, held across rounds.
+    pub configs: PeerConfigs,
     /// Signal that the process is stopping.
     ///
     /// Lets an in-flight round stand down cleanly; dropping the future instead
@@ -990,6 +1007,7 @@ impl Default for PollPeers {
             slow_after: Duration::from_secs(1),
             shutdown: crate::shutdown::Shutdown::never(),
             trust: PeerTrustMode::Pin,
+            configs: PeerConfigs::default(),
         }
     }
 }
@@ -1005,15 +1023,13 @@ impl PollPeers {
         // used to leave the in-flight gauge counting a poll that had ended.
         let mut guard = PollGuard::enter(peer, self.slow_after);
 
-        // Once per peer, not per attempt: this parses a private key.
-        let tls = match self.tls.as_ref().map(|m| peer_client_config(m, self.trust, peer, pins)) {
-            Some(Ok(config)) => Some(config),
-            Some(Err(error)) => {
+        let tls = match self.peer_config(peer, pins) {
+            Ok(config) => config,
+            Err(error) => {
                 tracing::warn!(peer, %error, "peer client config unusable; not polling");
                 guard.finish(RequestOutcome::Config, 0);
                 return None;
             },
-            None => None,
         };
         let (outcome, result) =
             tokio::time::timeout(self.budget, self.attempt_until(peer, url, tls.as_ref(), guard.started))
@@ -1021,6 +1037,52 @@ impl PollPeers {
                 .unwrap_or((RequestOutcome::Timeout, None));
         guard.finish(outcome, result.as_ref().map_or(0, |(body, _)| body.len()));
         result
+    }
+
+    /// The client config for `peer`, built on first use and whenever its pins
+    /// change.
+    ///
+    /// The build runs outside the lock; a concurrent builder for the same peer
+    /// loses the race harmlessly and the stored config is replaced.
+    fn peer_config(&self, peer: &str, pins: &[String]) -> Result<Option<ClientTlsConfig>, MetricsScrapeError> {
+        let Some(material) = self.tls.as_ref() else {
+            return Ok(None);
+        };
+        let held = self
+            .configs
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(peer)
+            .and_then(|(held, config)| (held == pins).then(|| Arc::clone(config)));
+        if let Some(config) = held {
+            return Ok(Some(config));
+        }
+        let config = peer_client_config(material, self.trust, peer, pins)?;
+        self.configs
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(peer.to_owned(), (pins.to_vec(), Arc::clone(&config)));
+        Ok(Some(config))
+    }
+
+    /// Drop the configs of peers no longer in the grid.
+    ///
+    /// Without this a departed peer keeps its material for the life of the
+    /// process.
+    fn retain_configs(&self, current: &[(String, String, Vec<String>)]) {
+        self.configs
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|peer, _| current.iter().any(|(name, ..)| name == peer));
+    }
+
+    /// How many peer configs are held.
+    #[cfg(all(test, not(feature = "fips")))]
+    fn held_configs(&self) -> usize {
+        self.configs.0.lock().unwrap_or_else(PoisonError::into_inner).len()
     }
 
     /// One request, abandoned if the process is stopping.
@@ -1119,15 +1181,15 @@ impl PollPeers {
             .collect::<Vec<_>>()
             .join("&");
 
-        let fetches = peer_urls(sites, &collect_query)
-            .into_iter()
-            .map(|(peer, url, pins)| async move {
-                let (body, date) = self.poll_one(&peer, &url, &pins).await?;
-                let now_ms = wall_millis(SystemTime::now(), Duration::ZERO);
-                let mut observations = bound_peer(stamp_origin(parse(&body), &peer), &peer);
-                reexpress_peer_ages(&mut observations, date, now_ms);
-                Some((peer, observations))
-            });
+        let targets = peer_urls(sites, &collect_query);
+        self.retain_configs(&targets);
+        let fetches = targets.into_iter().map(|(peer, url, pins)| async move {
+            let (body, date) = self.poll_one(&peer, &url, &pins).await?;
+            let now_ms = wall_millis(SystemTime::now(), Duration::ZERO);
+            let mut observations = bound_peer(stamp_origin(parse(&body), &peer), &peer);
+            reexpress_peer_ages(&mut observations, date, now_ms);
+            Some((peer, observations))
+        });
 
         // A failed peer is absent, not empty, so silence stays distinct from nothing to report.
         let mut done = futures::stream::iter(fetches).buffer_unordered(self.concurrency.max(1));
@@ -2108,6 +2170,61 @@ mod tests {
         #[cfg(feature = "fips")]
         let tls_err = openssl::error::ErrorStack::get();
         assert_eq!(classify_transport(&tls_err), RequestOutcome::Tls);
+    }
+
+    /// Peer TLS material from a throwaway CA, for the config cache tests.
+    #[cfg(not(feature = "fips"))]
+    fn test_material() -> Arc<PeerTlsMaterial> {
+        let ca = certs::generate_ca("cache-ca").expect("a CA");
+        let leaf = certs::generate_site_cert(&ca, "local").expect("a leaf");
+        Arc::new(PeerTlsMaterial {
+            ca: ca.cert_pem.into_bytes(),
+            identity: Some(PeerClientIdentity {
+                cert: leaf.cert_pem.into_bytes(),
+                key: zeroize::Zeroizing::new(leaf.key_pem.into_bytes()),
+            }),
+        })
+    }
+
+    #[test]
+    #[cfg(not(feature = "fips"))]
+    fn a_peer_config_is_held_across_rounds_and_rebuilt_when_its_pins_change() {
+        let poll = PollPeers {
+            tls: Some(test_material()),
+            trust: PeerTrustMode::Pin,
+            ..PollPeers::default()
+        };
+        let pins = vec!["a".repeat(64)];
+        let first = poll.peer_config("east", &pins).expect("built").expect("a config");
+        let again = poll.peer_config("east", &pins).expect("built").expect("a config");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "building twice parses the private key twice"
+        );
+        assert_eq!(poll.held_configs(), 1);
+
+        // A rotation replaces the entry rather than adding one.
+        let rotated = vec!["b".repeat(64)];
+        let after = poll.peer_config("east", &rotated).expect("built").expect("a config");
+        assert!(!Arc::ptr_eq(&first, &after), "rotated pins must not reuse the config");
+        assert_eq!(poll.held_configs(), 1, "keyed by peer, not by pin set");
+    }
+
+    #[test]
+    #[cfg(not(feature = "fips"))]
+    fn a_departed_peer_does_not_keep_its_config() {
+        let poll = PollPeers {
+            tls: Some(test_material()),
+            trust: PeerTrustMode::Pin,
+            ..PollPeers::default()
+        };
+        let pins = vec!["a".repeat(64)];
+        drop(poll.peer_config("east", &pins).expect("built"));
+        drop(poll.peer_config("west", &pins).expect("built"));
+        assert_eq!(poll.held_configs(), 2);
+
+        poll.retain_configs(&[("east".to_owned(), String::new(), pins)]);
+        assert_eq!(poll.held_configs(), 1, "west left the grid and took its material");
     }
 
     #[test]

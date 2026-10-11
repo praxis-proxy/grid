@@ -857,6 +857,9 @@ fn build_rule_client_config(
     let mut config = build_tls_client_config(ca_pem, client_cert_pem, client_key_pem)?;
     let verifier = leaf_rule_verifier(ca_pem, rule, config.crypto_provider().signature_verification_algorithms)?;
     config.dangerous().set_certificate_verifier(Arc::new(verifier));
+    // A resumed handshake carries no Certificate message, so the verifier above
+    // would not run and a rotated leaf would stay reachable on its ticket.
+    config.resumption = rustls::client::Resumption::disabled();
     Ok(Arc::new(config))
 }
 

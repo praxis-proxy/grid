@@ -16,6 +16,7 @@ use kube::{
     api::{ListParams, Patch, PatchParams},
 };
 use reqwest::StatusCode;
+use sha2::{Digest as _, Sha256};
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
@@ -372,6 +373,9 @@ pub(super) struct HttpsRenewer {
     pin_path: Option<PathBuf>,
     /// The last read of that file, kept so the happy path does no file work.
     pinned: Mutex<Option<String>>,
+    /// The client, with a digest of the material it presents. Rebuilt when that
+    /// material changes and otherwise held, so a retry keeps the warm pool.
+    held: Mutex<Option<([u8; 32], reqwest::Client)>>,
 }
 
 impl HttpsRenewer {
@@ -383,6 +387,7 @@ impl HttpsRenewer {
             url: format!("{}{RENEW_PATH}", base.trim_end_matches('/')),
             pin_path,
             pinned: Mutex::new(None),
+            held: Mutex::new(None),
         }
     }
 
@@ -405,18 +410,40 @@ impl HttpsRenewer {
     pub(super) fn forget_pin(&self) {
         if self.pin_path.is_some() {
             *self.pinned.lock().unwrap_or_else(PoisonError::into_inner) = None;
+            // The client embeds the roots it was built from.
+            *self.held.lock().unwrap_or_else(PoisonError::into_inner) = None;
         }
     }
 
     /// A client presenting `held` and trusting only the pin.
+    ///
+    /// Built once per distinct trust anchor and identity. A renewal replaces the
+    /// identity, so the next call builds a new client and the pool it replaces
+    /// goes with the old entry.
     fn client(&self, held: &Held) -> Result<reqwest::Client, RenewError> {
         let pinned = self.pin()?;
-        let roots = pem_roots(pinned.as_deref().unwrap_or(&held.ca), "rotation trust")
-            .map_err(|e| RenewError::Material(e.to_string()))?;
+        let trust = pinned.as_deref().unwrap_or(&held.ca);
+        let key: [u8; 32] = Sha256::new()
+            .chain_update(trust.as_bytes())
+            .chain_update(held.cert.as_bytes())
+            .finalize()
+            .into();
+        let cached = self
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(|(stored, client)| (*stored == key).then(|| client.clone()));
+        if let Some(client) = cached {
+            return Ok(client);
+        }
+        let roots = pem_roots(trust, "rotation trust").map_err(|e| RenewError::Material(e.to_string()))?;
         let identity =
             grid_client::identity(&held.cert, &held.key).map_err(|e| RenewError::Material(error_chain(&e)))?;
-        grid_client::trusted_client(roots, Some(identity), grid_client::Timeouts::ENROLLMENT)
-            .map_err(|e| RenewError::Material(error_chain(&e)))
+        let client = grid_client::trusted_client(roots, Some(identity), grid_client::Timeouts::ENROLLMENT)
+            .map_err(|e| RenewError::Material(error_chain(&e)))?;
+        *self.held.lock().unwrap_or_else(PoisonError::into_inner) = Some((key, client.clone()));
+        Ok(client)
     }
 }
 

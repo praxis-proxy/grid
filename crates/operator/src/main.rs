@@ -2458,6 +2458,7 @@ async fn peer_source(
         slow_after: std::time::Duration::from_millis(settings.peer_slow_ms),
         shutdown,
         trust,
+        configs: operator::signals::PeerConfigs::default(),
     })
 }
 
