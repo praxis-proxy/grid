@@ -847,14 +847,8 @@ async fn keep_existing_ca<S: Store + Sync>(
 
 /// A client that trusts only `roots`.
 fn http_client(roots: Vec<reqwest::Certificate>) -> Result<reqwest::Client, EnrollError> {
-    reqwest::Client::builder()
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .tls_certs_only(roots)
-        .build()
-        .map_err(|e| EnrollError::Config(format!("building the enrollment client: {e}")))
+    grid_client::trusted_client(roots, None, grid_client::Timeouts::DEFAULT)
+        .map_err(|e| EnrollError::Config(e.to_string()))
 }
 
 /// Resolve the target, then enroll into it.

@@ -378,30 +378,10 @@ impl HttpsRenewer {
     fn client(&self, held: &Held) -> Result<reqwest::Client, RenewError> {
         let roots = pem_roots(self.pin.as_deref().unwrap_or(&held.ca), "rotation trust")
             .map_err(|e| RenewError::Material(e.to_string()))?;
-        let identity = client_identity(&held.cert, &held.key)
-            .map_err(|e| RenewError::Material(format!("client identity: {}", error_chain(&e))))?;
-        reqwest::Client::builder()
-            .https_only(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .tls_certs_only(roots)
-            .identity(identity)
-            .build()
-            .map_err(|e| RenewError::Material(format!("rotation client: {e}")))
+        let identity = grid_client::identity(&held.cert, &held.key).map_err(|e| RenewError::Material(e.to_string()))?;
+        grid_client::trusted_client(roots, Some(identity), grid_client::Timeouts::DEFAULT)
+            .map_err(|e| RenewError::Material(e.to_string()))
     }
-}
-
-/// The client identity: rustls takes one PEM, native-tls (fips) the certificate and key apart.
-#[cfg(not(feature = "fips"))]
-fn client_identity(cert: &str, key: &str) -> Result<reqwest::Identity, reqwest::Error> {
-    reqwest::Identity::from_pem(Zeroizing::new(format!("{cert}{key}")).as_bytes())
-}
-
-/// The client identity: rustls takes one PEM, native-tls (fips) the certificate and key apart.
-#[cfg(feature = "fips")]
-fn client_identity(cert: &str, key: &str) -> Result<reqwest::Identity, reqwest::Error> {
-    reqwest::Identity::from_pkcs8_pem(cert.as_bytes(), key.as_bytes())
 }
 
 impl Renewer for HttpsRenewer {

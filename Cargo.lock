@@ -959,6 +959,7 @@ dependencies = [
  "axum-server",
  "certs",
  "clap",
+ "grid-client",
  "http-body-util",
  "k8s-openapi",
  "kube",
@@ -1383,6 +1384,7 @@ dependencies = [
  "hyper-util",
  "metrics",
  "percent-encoding",
+ "reqwest",
  "rustls",
  "serde",
  "yaml_serde",
@@ -1390,6 +1392,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -2514,6 +2517,7 @@ dependencies = [
  "clap",
  "crdt",
  "futures",
+ "grid-client",
  "http",
  "http-body-util",
  "httpdate",

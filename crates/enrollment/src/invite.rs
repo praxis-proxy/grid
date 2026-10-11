@@ -125,17 +125,12 @@ fn parse_invites(json: &str) -> Result<Vec<EnrollmentTokenRequest>, BoxError> {
 
 /// A client that trusts only the pinned bundle.
 fn http_client(ca_pem: &[u8]) -> Result<reqwest::Client, BoxError> {
-    let roots = reqwest::Certificate::from_pem_bundle(ca_pem)?;
-    if roots.is_empty() {
-        return Err("enrollment CA bundle holds no certificate".into());
-    }
-    Ok(reqwest::Client::builder()
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .tls_certs_only(roots)
-        .build()?)
+    let roots = grid_client::roots_from_pem(ca_pem, "the enrollment CA bundle")?;
+    Ok(grid_client::trusted_client(
+        roots,
+        None,
+        grid_client::Timeouts::DEFAULT,
+    )?)
 }
 
 /// Capped exponential retry schedule.
