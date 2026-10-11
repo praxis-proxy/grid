@@ -1,8 +1,9 @@
 # Values that render deploy/operator from charts/grid-operator. This is the platform base:
-# an OpenShift cluster where a platform operator vendors the directory, sets the image
-# through params.env and places every object in its own namespace. Site intent (the grid,
-# the site, providers, enrollment) comes from the GridNetwork and GridSite objects an
-# administrator creates afterwards, never from here.
+# a platform operator vendors the directory, sets the image through params.env and places
+# every object in its own namespace. It assumes no platform; a flavor under
+# deploy/overlays/<name>/values.yaml layers a platform's values on top of these. Site intent
+# (the grid, the site, providers, enrollment) comes from the GridNetwork and GridSite objects
+# an administrator creates afterwards, never from here.
 #
 # Regenerate with `make generate-deploy`; CI runs `make deploy-check`.
 fullnameOverride: grid-operator
@@ -26,8 +27,7 @@ metrics:
   service:
     enabled: true
   tls:
-    source: serviceCA
-networkPolicy:
-  enabled: true
+    # Every grid site has an enrolled identity, and a platform flavor may pick its own CA.
+    source: siteIdentity
 serviceMonitor:
   enabled: false

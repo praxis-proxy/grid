@@ -42,12 +42,13 @@ for the full values reference.
 
 The install manifests are generated from the chart (`make generate-deploy`; CI runs
 `make deploy-check`). `deploy/operator/` is the platform base: no Namespace, the image set
-through `params.env`, metrics TLS from the OpenShift service CA and a NetworkPolicy. A
-platform operator vendors it as a kustomize base and sets the namespace in its own
-kustomization. Its SWIM and signals Services are `LoadBalancer`, the only type the
-operator accepts for the Service it advertises, so the cluster needs a LoadBalancer
-provider. `deploy/overlays/kind/` is the standalone install with its own `grid-system`
-Namespace and ClusterIP Services.
+through `params.env`, metrics TLS from the enrolled site identity, no platform assumptions.
+`deploy/overlays/openshift/` is its OpenShift flavor, the base values plus a delta: metrics
+TLS from the service CA and a NetworkPolicy. A platform operator vendors the base or a
+flavor as a kustomize base and sets the namespace in its own kustomization. The SWIM and
+signals Services are `LoadBalancer`, the only type the operator accepts for the Service it
+advertises, so the cluster needs a LoadBalancer provider. `deploy/overlays/kind/` is the
+standalone install with its own `grid-system` Namespace and ClusterIP Services.
 
 ```console
 # Standalone deployment (CRDs + operator, kind shape)

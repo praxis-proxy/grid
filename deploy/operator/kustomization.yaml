@@ -12,7 +12,6 @@ resources:
   - clusterrole-metrics-scraper.yaml
   - clusterrole-resources.yaml
   - deployment.yaml
-  - networkpolicy.yaml
   - rolebinding-metrics-scraper-token.yaml
   - rolebinding-resources.yaml
   - role-metrics-scraper-token.yaml

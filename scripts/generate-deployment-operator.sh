@@ -1,15 +1,19 @@
 #!/bin/bash
 # Generate the operator install manifests from charts/grid-operator.
 #
-# Renders the chart twice and writes one YAML file per object:
-#   deploy/operator        the platform base: OpenShift, image through params.env,
-#                          namespace left to the kustomize consumer
-#   deploy/overlays/kind   the standalone install xtask applies to a kind cluster
-# Each directory keeps its values.yaml as the render input. With --check, writes
-# nothing and fails if the committed files differ from what the chart renders.
+# Renders the chart once per directory and writes one YAML file per object:
+#   deploy/operator            the platform base: image through params.env, namespace
+#                              left to the kustomize consumer, no platform assumptions
+#   deploy/overlays/<flavor>   a platform flavor of the base, rendered from the base
+#                              values plus the flavor's values.yaml as a delta, with the
+#                              API versions in its optional api-versions file
+#   deploy/overlays/kind       the standalone install xtask applies to a kind cluster,
+#                              rendered from its own values.yaml alone
+# With --check, writes nothing and fails if the committed files differ from what the
+# chart renders.
 #
 # Usage:
-#   ./scripts/generate-deployment-operator.sh           # regenerate both directories
+#   ./scripts/generate-deployment-operator.sh           # regenerate every directory
 #   ./scripts/generate-deployment-operator.sh --check   # verify only, for CI
 set -euo pipefail
 
@@ -40,7 +44,7 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 # Files the generator never touches in a target directory.
-KEEP_FILES=(values.yaml Containerfile Containerfile.ubi9)
+KEEP_FILES=(values.yaml api-versions Containerfile Containerfile.ubi9)
 
 # The rendered objects in a directory, as kustomization resource lines, namespace first.
 resource_list() {
@@ -53,20 +57,26 @@ resource_list() {
   done
 }
 
-# render <out-dir> <values> <strip-namespace> <api-versions...>
+# render <out-dir> <values...> -- <strip-namespace> <api-versions...>
+# Values files merge in order, so a flavor's file is a delta on the base's.
 # strip-namespace=yes drops metadata.namespace from every object, for a base whose
 # kustomization sets the namespace and whose consumer overrides it. The kind overlay keeps
 # the rendered namespaces, since one RoleBinding lives outside the operator namespace.
 render() {
-  local out="$1" values="$2" strip_ns="$3"
-  shift 3
+  local out="$1"
+  shift
+  local values_args=()
+  while [ "$1" != "--" ]; do values_args+=(--values "$1"); shift; done
+  shift
+  local strip_ns="$1"
+  shift
   local api_args=()
   local v
   for v in "$@"; do api_args+=(--api-versions "$v"); done
   mkdir -p "$out"
   helm template grid-operator "$CHART" \
     --namespace "$NAMESPACE_PLACEHOLDER" \
-    --values "$values" \
+    "${values_args[@]}" \
     "${api_args[@]}" \
     --skip-tests \
     > "$out/all.yaml"
@@ -110,25 +120,33 @@ render() {
   rm -f "$out/all.yaml"
 }
 
-# The platform base: OpenShift shape, image from params.env.
-BASE="$TMP_DIR/operator"
-render "$BASE" deploy/operator/values.yaml yes security.openshift.io/v1
-IMAGE_DEFAULT="$(yq '.spec.template.spec.containers[0].image' "$BASE/deployment.yaml")"
-cat > "$BASE/params.env" <<EOF
-grid-operator-image=$IMAGE_DEFAULT
+# render_base <out-dir> <values...> -- <api-versions...>
+# A vendorable base: namespaces stripped, image through params.env with a replacement.
+render_base() {
+  local out="$1"
+  shift
+  local values=()
+  while [ "$1" != "--" ]; do values+=("$1"); shift; done
+  shift
+  render "$out" "${values[@]}" -- yes "$@"
+  local image_default
+  image_default="$(yq '.spec.template.spec.containers[0].image' "$out/deployment.yaml")"
+  cat > "$out/params.env" <<EOF
+grid-operator-image=$image_default
 EOF
-BASE_RESOURCES="$(resource_list "$BASE")"
-{
-  echo "apiVersion: kustomize.config.k8s.io/v1beta1"
-  echo "kind: Kustomization"
-  echo ""
-  echo "# Generated from charts/grid-operator by scripts/generate-deployment-operator.sh."
-  echo "# The namespace is a default; a platform operator or kubectl -n overrides it."
-  echo "namespace: $NAMESPACE_PLACEHOLDER"
-  echo ""
-  echo "resources:"
-  echo "$BASE_RESOURCES"
-  cat <<'EOF'
+  local resources
+  resources="$(resource_list "$out")"
+  {
+    echo "apiVersion: kustomize.config.k8s.io/v1beta1"
+    echo "kind: Kustomization"
+    echo ""
+    echo "# Generated from charts/grid-operator by scripts/generate-deployment-operator.sh."
+    echo "# The namespace is a default; a platform operator or kubectl -n overrides it."
+    echo "namespace: $NAMESPACE_PLACEHOLDER"
+    echo ""
+    echo "resources:"
+    echo "$resources"
+    cat <<'EOF'
 
 labels:
   - pairs:
@@ -155,12 +173,31 @@ replacements:
         fieldPaths:
           - spec.template.spec.containers.[name=operator].image
 EOF
-} > "$BASE/kustomization.yaml"
+  } > "$out/kustomization.yaml"
+}
+
+# The platform base, with no platform assumptions.
+BASE="$TMP_DIR/operator"
+render_base "$BASE" deploy/operator/values.yaml --
+
+# Every flavor: the base values plus the flavor's delta, with its API versions.
+FLAVORS=()
+for dir in deploy/overlays/*/; do
+  flavor="$(basename "$dir")"
+  [ "$flavor" = kind ] && continue
+  [ -f "$dir/values.yaml" ] || continue
+  api_versions=()
+  if [ -f "$dir/api-versions" ]; then
+    mapfile -t api_versions < <(grep -v '^\s*#' "$dir/api-versions" | grep -v '^\s*$')
+  fi
+  render_base "$TMP_DIR/$flavor" deploy/operator/values.yaml "$dir/values.yaml" -- "${api_versions[@]}"
+  FLAVORS+=("$flavor")
+done
 
 # The kind overlay: plain, with its own Namespace so kubectl apply -k works bare.
 APP_VERSION="$(yq '.appVersion' "$CHART/Chart.yaml")"
 KIND="$TMP_DIR/kind"
-render "$KIND" deploy/overlays/kind/values.yaml no
+render "$KIND" deploy/overlays/kind/values.yaml -- no
 cat > "$KIND/namespace.yaml" <<EOF
 apiVersion: v1
 kind: Namespace
@@ -219,10 +256,15 @@ sync_dir() {
 }
 
 sync_dir "$BASE" "$REPO_ROOT/deploy/operator"
+for flavor in "${FLAVORS[@]}"; do
+  sync_dir "$TMP_DIR/$flavor" "$REPO_ROOT/deploy/overlays/$flavor"
+done
 sync_dir "$KIND" "$REPO_ROOT/deploy/overlays/kind"
 
+DIRS="deploy/operator, deploy/overlays/kind"
+for flavor in "${FLAVORS[@]}"; do DIRS="$DIRS, deploy/overlays/$flavor"; done
 if $CHECK; then
-  echo "deploy/operator and deploy/overlays/kind match the chart"
+  echo "$DIRS match the chart"
 else
-  echo "wrote deploy/operator and deploy/overlays/kind"
+  echo "wrote $DIRS"
 fi

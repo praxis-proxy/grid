@@ -6,8 +6,6 @@ metadata:
   labels:
     app.kubernetes.io/name: grid-operator
     app.kubernetes.io/instance: grid-operator
-  annotations:
-    service.beta.openshift.io/serving-cert-secret-name: grid-operator-metrics-tls
 spec:
   type: ClusterIP
   ports:

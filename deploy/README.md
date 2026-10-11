@@ -45,10 +45,15 @@ kubectl --dry-run=server create -k deploy/crds/
 The install manifests are generated from `charts/grid-operator`; do not hand-edit them.
 Each directory keeps the `values.yaml` that renders it.
 
-- `operator/` is the platform base: an OpenShift shape with metrics TLS from the service
-  CA and a NetworkPolicy, the image set through `params.env`, and the namespace left to the
-  consumer. A platform operator vendors this directory and places it in its own namespace.
-  The SWIM and signals Services are `LoadBalancer`, because the operator refuses any other
+- `operator/` is the platform base: the image set through `params.env`, the namespace left
+  to the consumer, metrics TLS from the enrolled site identity, and no platform assumptions.
+  A platform operator vendors this directory, or a flavor of it, and places it in its own
+  namespace.
+- `overlays/<flavor>/` is a platform flavor of the base: the base values plus the flavor's
+  `values.yaml` as a delta, rendered against the API versions in its `api-versions` file.
+  `overlays/openshift/` takes metrics TLS from the service CA and adds a NetworkPolicy that
+  admits the platform's monitoring namespaces. Add a flavor by adding a directory.
+- The SWIM and signals Services are `LoadBalancer`, because the operator refuses any other
   type for the Service it advertises and peer sites reach both through it. A cluster with
   no LoadBalancer provider leaves the operator waiting for an address and never ready. The
   site gateway Service is named `grid-gateway`, the name the chart uses once a grid exists;
@@ -58,7 +63,7 @@ Each directory keeps the `values.yaml` that renders it.
   `default` namespace that the install qualification checks.
 
 ```bash
-# Regenerate after a chart change (writes deploy/operator and deploy/overlays/kind)
+# Regenerate after a chart change (writes deploy/operator and every deploy/overlays directory)
 make generate-deploy
 
 # Check that the committed manifests match the chart (runs in CI)
@@ -71,8 +76,11 @@ make deploy-check
 # CRDs first
 kubectl apply -k deploy/crds/
 
-# OpenShift, the platform base in its default namespace (a platform sets its own)
+# The platform base in its default namespace (a platform sets its own)
 kubectl apply -k deploy/operator/ -n grid-system
+
+# OpenShift
+kubectl apply -k deploy/overlays/openshift/ -n grid-system
 
 # Another image from a consumer kustomization: use the images transformer. Merging a
 # second grid-operator-parameters ConfigMap does nothing, because the base's replacement
