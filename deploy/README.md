@@ -72,28 +72,48 @@ make deploy-check
 
 ### Install Steps
 
-```bash
-# CRDs first
-kubectl apply -k deploy/crds/
+The CRDs are the shared prerequisite. Apply them once:
 
-# The platform base in its default namespace (a platform sets its own)
+```bash
+kubectl apply -k deploy/crds/
+```
+
+Then pick one install variant. The base is the portable path and the overlays are
+flavors of it, so applying more than one to a cluster layers a flavor's settings over
+the same operator resources.
+
+```bash
+# Portable, in its default namespace (a platform sets its own)
 kubectl apply -k deploy/operator/ -n grid-system
 
-# OpenShift
+# or OpenShift
 kubectl apply -k deploy/overlays/openshift/ -n grid-system
 
-# Another image from a consumer kustomization that vendors the base: use the images
-# transformer in that kustomization's directory. Merging a second grid-operator-parameters
-# ConfigMap does nothing, because the base's replacement has already run by the time the
-# merge applies.
-(cd path/to/consumer-kustomization && kustomize edit set image ghcr.io/praxis-proxy/grid-operator=ghcr.io/praxis-proxy/grid-operator:sha-<commit>)
-
-# Applying over a Deployment another installer created (the chart, or the hand-maintained
-# manifests before they were generated): delete that Deployment first. Its selector is
-# immutable and the chart's selector carries the instance label.
-
-# kind
+# or kind
 kubectl apply -k deploy/overlays/kind/
+```
+
+To run a different image from a consumer kustomization that vendors the base, use the
+images transformer in that kustomization's directory. Merging a second
+grid-operator-parameters ConfigMap does nothing, because the base's replacement has
+already run by the time the merge applies.
+
+```bash
+(cd path/to/consumer-kustomization && kustomize edit set image ghcr.io/praxis-proxy/grid-operator=ghcr.io/praxis-proxy/grid-operator:sha-<commit>)
+```
+
+A Deployment another installer created, the chart or the hand-maintained manifests
+before they were generated, may carry a different selector. A selector is immutable, so
+delete that Deployment first only when it differs from the target:
+
+```bash
+kubectl get deployment grid-operator -n grid-system \
+  -o jsonpath='{.spec.selector.matchLabels}'
+kubectl kustomize deploy/operator/ |
+  yq 'select(.kind == "Deployment") | .spec.selector.matchLabels'
+```
+
+Matching selectors apply in place and need no delete.
 
 # Verify operator is running
 kubectl get pods -n grid-system
