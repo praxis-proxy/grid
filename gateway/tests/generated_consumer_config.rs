@@ -18,9 +18,9 @@ mod tests {
     /// Bound on how long the test waits for the listener.
     const TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// credential_inject as consumer_config.rs renders it for a bearer-token provider:
+    /// `credential_inject` as `consumer_config.rs` renders it for a bearer-token provider:
     /// projected mode with no inline credentials. A static terminal stands in for the
-    /// load_balancer, whose private-endpoint gate needs an RFC1918 resolver.
+    /// `load_balancer`, whose private-endpoint gate needs an RFC1918 resolver.
     fn write_config(port: u16, mount_base: &str) -> io::Result<PathBuf> {
         let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("generated-consumer-config.yaml");
         let yaml = format!(
@@ -92,17 +92,20 @@ filter_chains:
             if Instant::now() >= deadline {
                 break false;
             }
-            while let Ok(line) = lines.try_recv() {
+            // Drains output and paces the poll; a closed channel means the child is exiting.
+            if let Ok(line) = lines.recv_timeout(Duration::from_millis(100)) {
                 output.push(line);
             }
-            thread::sleep(Duration::from_millis(100));
         };
         drop(child.kill());
         child.wait()?;
         while let Ok(line) = lines.try_recv() {
             output.push(line);
         }
-        assert!(listening, "the generated consumer config did not start a listener: {output:#?}");
+        assert!(
+            listening,
+            "the generated consumer config did not start a listener: {output:#?}"
+        );
         Ok(())
     }
 }
