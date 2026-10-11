@@ -161,6 +161,7 @@ try_template "$CHART_DIR" "SWIM LoadBalancer" \
   --set swim.service.loadBalancerIP=10.0.0.1
 SIG_RENDER=$(helm template v-sig "$CHART_DIR" --namespace grid-system --set signals.enabled=true \
   --set swim.service.enabled=true --set swim.service.type=LoadBalancer 2>&1 || true)
+# shellcheck disable=SC2016 # the rendered value is the literal $(POD_NAMESPACE)
 if grep -q 'value: "v-sig-grid-operator-signals.$(POD_NAMESPACE).svc:9091"' <<<"$SIG_RENDER" \
   && grep -q 'value: "v-sig-grid-operator-signals"' <<<"$SIG_RENDER" \
   && grep -A3 -- '- name: signals' <<<"$SIG_RENDER" | matches 'targetPort: signals'; then
@@ -302,6 +303,7 @@ echo "=== Gateway discovery namespace ==="
 # consumer can move the install without rewriting the env.
 if render verify-gwns "$CHART_DIR" --namespace release-ns --show-only templates/deployment.yaml; then
   GW_NS=$(grep -A1 'name: GRID_GATEWAY_NAMESPACE' <<<"$RENDERED" | awk '/value:/{print $2}' | tr -d '"')
+  # shellcheck disable=SC2016 # the rendered value is the literal $(POD_NAMESPACE)
   if [ "$GW_NS" = '$(POD_NAMESPACE)' ] \
     && grep -A3 'name: POD_NAMESPACE' <<<"$RENDERED" | matches 'fieldPath: metadata.namespace'; then
     pass "gateway namespace defaults to the pod namespace from the downward API"
