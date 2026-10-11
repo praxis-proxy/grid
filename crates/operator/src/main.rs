@@ -258,6 +258,7 @@ async fn main() {
         tracing::error!(error = %e, "controller error");
         std::process::exit(1);
     }
+    // The one line that distinguishes a clean exit from a SIGKILL in pod logs.
     tracing::info!("stood down");
 }
 
@@ -1588,7 +1589,7 @@ async fn drain_connections(slots: &Arc<tokio::sync::Semaphore>) {
     match tokio::time::timeout(SHUTDOWN_GRACE, slots.acquire_many(all)).await {
         Ok(Ok(permits)) => {
             drop(permits);
-            tracing::info!("signals: every connection closed");
+            tracing::debug!("signals: every connection closed");
         },
         Ok(Err(_closed)) => {},
         Err(_elapsed) => tracing::warn!("signals: connections still open at the end of the grace"),
@@ -2512,7 +2513,7 @@ async fn peer_source(
         slow_after: std::time::Duration::from_millis(settings.peer_slow_ms),
         shutdown,
         trust,
-        configs: operator::signals::PeerConfigs::default(),
+        transports: operator::signals::PeerTransports::default(),
     })
 }
 

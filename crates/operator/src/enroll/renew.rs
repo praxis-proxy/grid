@@ -426,6 +426,7 @@ impl HttpsRenewer {
         let key: [u8; 32] = Sha256::new()
             .chain_update(trust.as_bytes())
             .chain_update(held.cert.as_bytes())
+            .chain_update(&held.key)
             .finalize()
             .into();
         let cached = self
@@ -548,8 +549,8 @@ impl Settings {
     /// Returns a message when the URL is missing or not https, or the pin is unreadable.
     pub fn from_config(config: &super::Config) -> Result<Self, String> {
         let url = renewal_url(config.url.as_deref())?;
-        // Read once here so a bad path fails at startup, then re-read per
-        // renewal so a rotation does not need a restart to take effect.
+        // Read here so a bad path fails at startup. The renewer holds the PEM
+        // from first use until a reload clears it.
         config
             .ca_file
             .as_deref()

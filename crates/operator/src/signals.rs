@@ -952,14 +952,15 @@ const PEER_POOL_IDLE: Duration = Duration::from_secs(20);
 /// expired certificate stays reachable.
 const PEER_TRANSPORT_MAX_AGE: Duration = Duration::from_mins(1);
 
-/// Per-peer client TLS configs, with the pins each was built for.
+/// Per-peer transports, with the pins each was built for.
 ///
-/// Building one parses a private key, so it is held across rounds rather than
-/// rebuilt per peer per round. Keyed by peer with the pins in the value,
-/// because keying on the pins would leak an entry per rotation. Holds no
-/// socket: a config is material, not a connection.
+/// Held across rounds because building one parses a private key and opens a
+/// connection. Keyed by peer with the pins in the value, because keying on the
+/// pins would leak an entry per rotation. Each entry owns a connection pool,
+/// so an entry is dropped once its peer leaves the grid or its transport
+/// reaches its age.
 #[derive(Default)]
-pub struct PeerConfigs(Mutex<HashMap<String, HeldTransport>>);
+pub struct PeerTransports(Mutex<HashMap<String, HeldTransport>>);
 
 /// A peer's transport, the pins it was built for, and when it was built.
 struct HeldTransport {
@@ -971,9 +972,9 @@ struct HeldTransport {
     built: Instant,
 }
 
-impl std::fmt::Debug for PeerConfigs {
+impl std::fmt::Debug for PeerTransports {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PeerConfigs").finish_non_exhaustive()
+        f.debug_struct("PeerTransports").finish_non_exhaustive()
     }
 }
 
@@ -1006,8 +1007,8 @@ pub struct PollPeers {
     pub budget: Duration,
     /// Duration past which a poll is counted as slow.
     pub slow_after: Duration,
-    /// Per-peer client TLS configs, held across rounds.
-    pub configs: PeerConfigs,
+    /// Per-peer transports, held across rounds.
+    pub transports: PeerTransports,
     /// Signal that the process is stopping.
     ///
     /// Lets an in-flight round stand down cleanly; dropping the future instead
@@ -1030,7 +1031,7 @@ impl Default for PollPeers {
             slow_after: Duration::from_secs(1),
             shutdown: crate::shutdown::Shutdown::never(),
             trust: PeerTrustMode::Pin,
-            configs: PeerConfigs::default(),
+            transports: PeerTransports::default(),
         }
     }
 }
@@ -1069,7 +1070,7 @@ impl PollPeers {
     /// loses the race harmlessly and the stored config is replaced.
     fn peer_transport(&self, peer: &str, pins: &[String]) -> Result<Arc<PeerTransport>, MetricsScrapeError> {
         let held = self
-            .configs
+            .transports
             .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1084,7 +1085,7 @@ impl PollPeers {
             None => None,
         };
         let transport = Arc::new(PeerTransport::new(config.as_ref(), Some(PEER_POOL_IDLE))?);
-        self.configs.0.lock().unwrap_or_else(PoisonError::into_inner).insert(
+        self.transports.0.lock().unwrap_or_else(PoisonError::into_inner).insert(
             peer.to_owned(),
             HeldTransport {
                 pins: pins.to_vec(),
@@ -1095,22 +1096,22 @@ impl PollPeers {
         Ok(transport)
     }
 
-    /// Drop the configs of peers no longer in the grid.
+    /// Drop the transports of peers no longer in the grid.
     ///
     /// Without this a departed peer keeps its material for the life of the
     /// process.
-    fn retain_configs(&self, current: &[(String, String, Vec<String>)]) {
-        self.configs
+    fn retain_transports(&self, current: &[(String, String, Vec<String>)]) {
+        self.transports
             .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|peer, _| current.iter().any(|(name, ..)| name == peer));
     }
 
-    /// How many peer configs are held.
+    /// How many peer transports are held.
     #[cfg(all(test, not(feature = "fips")))]
-    fn held_configs(&self) -> usize {
-        self.configs.0.lock().unwrap_or_else(PoisonError::into_inner).len()
+    fn held_transports(&self) -> usize {
+        self.transports.0.lock().unwrap_or_else(PoisonError::into_inner).len()
     }
 
     /// One request, abandoned if the process is stopping.
@@ -1210,7 +1211,7 @@ impl PollPeers {
             .join("&");
 
         let targets = peer_urls(sites, &collect_query);
-        self.retain_configs(&targets);
+        self.retain_transports(&targets);
         let fetches = targets.into_iter().map(|(peer, url, pins)| async move {
             let (body, date) = self.poll_one(&peer, &url, &pins).await?;
             let now_ms = wall_millis(SystemTime::now(), Duration::ZERO);
@@ -2229,14 +2230,14 @@ mod tests {
             Arc::ptr_eq(&first, &again),
             "building twice parses the private key and reopens the connection"
         );
-        assert_eq!(poll.held_configs(), 1);
+        assert_eq!(poll.held_transports(), 1);
 
         // A rotation replaces the entry rather than adding one, and takes the
         // old pool with it.
         let rotated = vec!["b".repeat(64)];
         let after = poll.peer_transport("east", &rotated).expect("built");
         assert!(!Arc::ptr_eq(&first, &after), "rotated pins must not reuse the socket");
-        assert_eq!(poll.held_configs(), 1, "keyed by peer, not by pin set");
+        assert_eq!(poll.held_transports(), 1, "keyed by peer, not by pin set");
     }
 
     #[test]
@@ -2254,7 +2255,7 @@ mod tests {
         let aged = Instant::now()
             .checked_sub(PEER_TRANSPORT_MAX_AGE + Duration::from_secs(1))
             .expect("a time before the bound");
-        let mut held = poll.configs.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut held = poll.transports.0.lock().unwrap_or_else(PoisonError::into_inner);
         held.get_mut("east").expect("an entry").built = aged;
         drop(held);
 
@@ -2263,7 +2264,11 @@ mod tests {
             !Arc::ptr_eq(&first, &after),
             "an aged transport must be rebuilt, or a pooled connection is never verified again"
         );
-        assert_eq!(poll.held_configs(), 1, "the rebuild replaces rather than accumulates");
+        assert_eq!(
+            poll.held_transports(),
+            1,
+            "the rebuild replaces rather than accumulates"
+        );
     }
 
     #[test]
@@ -2277,10 +2282,10 @@ mod tests {
         let pins = vec!["a".repeat(64)];
         drop(poll.peer_transport("east", &pins).expect("built"));
         drop(poll.peer_transport("west", &pins).expect("built"));
-        assert_eq!(poll.held_configs(), 2);
+        assert_eq!(poll.held_transports(), 2);
 
-        poll.retain_configs(&[("east".to_owned(), String::new(), pins)]);
-        assert_eq!(poll.held_configs(), 1, "west left the grid and took its material");
+        poll.retain_transports(&[("east".to_owned(), String::new(), pins)]);
+        assert_eq!(poll.held_transports(), 1, "west left the grid and took its material");
     }
 
     #[test]
