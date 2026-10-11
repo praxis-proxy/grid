@@ -108,7 +108,9 @@ pub fn classify(error: &reqwest::Error) -> RequestOutcome {
     if error.is_decode() {
         return RequestOutcome::Encoding;
     }
-    if error.is_builder() {
+    // A redirect error only reaches here for a caller that set a redirect
+    // limit; the clients built here hand the 3xx back instead.
+    if error.is_builder() || error.is_redirect() {
         return RequestOutcome::Config;
     }
     RequestOutcome::Transport
@@ -143,8 +145,7 @@ fn is_tls_error(error: &(dyn std::error::Error + 'static)) -> bool {
 }
 
 #[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::expect_used, reason = "tests")]
+#[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
 

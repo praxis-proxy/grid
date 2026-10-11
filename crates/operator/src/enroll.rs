@@ -26,13 +26,9 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Retry schedule per startup step.
 const STEP_BACKOFF: Backoff = Backoff {
-    attempts: 10,
     initial: Duration::from_secs(2),
     max: Duration::from_secs(60),
 };
-
-/// Deadline for the whole run.
-const ENROLL_DEADLINE: Duration = Duration::from_secs(15 * 60);
 
 /// `app.kubernetes.io/managed-by` on the Secrets enrollment writes.
 const MANAGED_BY: &str = "grid-operator";
@@ -120,17 +116,6 @@ pub enum EnrollError {
     #[error("enrollment failed after the request was sent ({0}). The token may be spent. {SPENT}")]
     MaybeSpent(String),
 
-    /// A pre-send step exhausted its retries.
-    #[error("{what} failed after {attempts} attempts: {last}")]
-    Exhausted {
-        /// The step that failed.
-        what: &'static str,
-        /// Attempts made.
-        attempts: u32,
-        /// The last failure.
-        last: String,
-    },
-
     /// The service answered with an unusable certificate.
     #[error("enrollment response invalid ({0}). The token is spent. {SPENT}")]
     InvalidResponse(String),
@@ -142,17 +127,11 @@ pub enum EnrollError {
     /// A Kubernetes call failed in a way retrying cannot fix.
     #[error("kubernetes: {0}")]
     Kube(String),
-
-    /// The whole run passed its deadline, in seconds.
-    #[error("enrollment did not finish within {0}s. A token already sent may be spent. {SPENT}")]
-    TimedOut(u64),
 }
 
-/// Capped exponential retry schedule.
+/// Capped exponential retry schedule, without an attempt limit.
 #[derive(Clone, Copy, Debug)]
 struct Backoff {
-    /// Total attempts, including the first.
-    attempts: u32,
     /// Delay after the first failure.
     initial: Duration,
     /// Delay cap.
@@ -160,12 +139,31 @@ struct Backoff {
 }
 
 impl Backoff {
-    /// Delay after failed attempt `attempt` (1-based).
+    /// Delay after failed attempt `attempt` (1-based), spread by [`jittered`].
     fn delay(self, attempt: u32) -> Duration {
-        self.initial
-            .saturating_mul(2_u32.saturating_pow(attempt.saturating_sub(1)))
-            .min(self.max)
+        jittered(
+            self.initial
+                .saturating_mul(2_u32.saturating_pow(attempt.saturating_sub(1)))
+                .min(self.max),
+        )
     }
+}
+
+/// `wait` plus up to a tenth of itself, so independent sites that failed
+/// together do not come back in step and herd on the enrollment service.
+pub(crate) fn jittered(wait: Duration) -> Duration {
+    let spread = u64::from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos(),
+    );
+    let tenth = wait
+        .as_millis()
+        .checked_div(10)
+        .and_then(|ms| u64::try_from(ms).ok())
+        .unwrap_or(0);
+    wait.saturating_add(Duration::from_millis(spread.checked_rem(tenth).unwrap_or(0)))
 }
 
 /// One attempt's result.
@@ -183,23 +181,18 @@ where
     Fut: Future<Output = Result<Attempt<T>, EnrollError>> + Send,
     T: Send,
 {
-    let mut last = String::new();
-    for n in 1..=backoff.attempts {
+    let mut failures = 0_u32;
+    loop {
         match attempt().await? {
             Attempt::Done(value) => return Ok(value),
-            Attempt::Retry(reason) => last = reason,
-        }
-        if n < backoff.attempts {
-            let delay = backoff.delay(n);
-            tracing::warn!(what, attempt = n, retry_in_ms = delay.as_millis(), error = %last, "retrying");
-            tokio::time::sleep(delay).await;
+            Attempt::Retry(reason) => {
+                failures = failures.saturating_add(1);
+                let delay = backoff.delay(failures);
+                tracing::warn!(what, attempt = failures, retry_in_ms = delay.as_millis(), error = %reason, "retrying");
+                tokio::time::sleep(delay).await;
+            },
         }
     }
-    Err(EnrollError::Exhausted {
-        what,
-        attempts: backoff.attempts,
-        last,
-    })
 }
 
 /// Validated settings.
@@ -867,9 +860,7 @@ async fn run(client: &Client, settings: &Settings) -> Result<(), EnrollError> {
 /// Returns [`EnrollError`] when enrollment does not complete.
 pub async fn ensure_enrolled(client: &Client, config: &Config) -> Result<(), EnrollError> {
     let settings = Settings::from_config(config)?;
-    tokio::time::timeout(ENROLL_DEADLINE, Box::pin(run(client, &settings)))
-        .await
-        .map_err(|_elapsed| EnrollError::TimedOut(ENROLL_DEADLINE.as_secs()))?
+    Box::pin(run(client, &settings)).await
 }
 
 pub mod renew;

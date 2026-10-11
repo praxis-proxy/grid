@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use grid_client::{RequestOutcome, Timeouts, classify, roots_from_pem, trusted_client};
+use grid_client::{RequestOutcome, Timeouts, classify, from_status, roots_from_pem, trusted_client};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -51,14 +51,28 @@ async fn serve(material: Material) -> u16 {
                 let Ok(mut tls) = acceptor.accept(stream).await else {
                     return;
                 };
-                let mut buf = [0_u8; 1024];
-                let _read = tls.read(&mut buf).await;
-                let _written = tls.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await;
-                let _flushed = tls.shutdown().await;
+                answer(&mut tls).await;
             }));
         }
     }));
     port
+}
+
+/// Read one request and answer it: a redirect for `/elsewhere`, else 200.
+async fn answer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(stream: &mut S) {
+    let mut buf = [0_u8; 1024];
+    let read = stream.read(&mut buf).await.unwrap_or(0);
+    let wants_redirect = buf
+        .get(..read)
+        .and_then(|req| std::str::from_utf8(req).ok())
+        .is_some_and(|req| req.contains("/elsewhere"));
+    let body: &[u8] = if wants_redirect {
+        b"HTTP/1.1 302 Found\r\nlocation: https://example.invalid/\r\ncontent-length: 0\r\n\r\n"
+    } else {
+        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"
+    };
+    let _written = stream.write_all(body).await;
+    let _flushed = stream.shutdown().await;
 }
 
 #[tokio::test]
@@ -109,4 +123,25 @@ async fn plaintext_is_refused() {
         .await
         .expect_err("https_only must refuse an http url");
     assert!(!classify(&error).is_retryable(), "{error}");
+}
+
+#[tokio::test]
+async fn a_redirect_is_handed_back_rather_than_followed() {
+    let material = material();
+    let roots = roots_from_pem(material.ca_pem.as_bytes(), "test CA").expect("roots");
+    let port = serve(material).await;
+
+    let client = trusted_client(roots, None, Timeouts::DEFAULT).expect("a client");
+    let response = client
+        .get(format!("https://localhost:{port}/elsewhere"))
+        .send()
+        .await
+        .expect("a refused redirect is an answer, not an error");
+    assert_eq!(response.status(), 302, "the client must not chase the location");
+    assert_eq!(
+        from_status(response.status()),
+        RequestOutcome::Config,
+        "nothing will resolve a 3xx the client will not follow"
+    );
+    assert!(!from_status(response.status()).is_retryable());
 }

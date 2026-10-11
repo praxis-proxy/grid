@@ -19,7 +19,9 @@ use reqwest::StatusCode;
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
-use super::{Enrollment, EnrollmentRequest, ErrorBody, Target, error_chain, pem_roots, read_capped, read_pem};
+use super::{
+    Enrollment, EnrollmentRequest, ErrorBody, Target, error_chain, jittered, pem_roots, read_capped, read_pem,
+};
 use crate::{
     controller::grid_network::GridModes,
     crd::grid_network::{GridNetwork, PeerTrustMode},
@@ -785,22 +787,6 @@ fn retry_delay(failures: u32) -> Duration {
     RETRY_INITIAL
         .saturating_mul(2_u32.saturating_pow(failures.saturating_sub(1)))
         .min(RETRY_MAX)
-}
-
-/// `wait` plus up to a tenth more, so sites enrolled together do not renew in step.
-fn jittered(wait: Duration) -> Duration {
-    let spread = u64::from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos(),
-    );
-    let tenth = wait
-        .as_millis()
-        .checked_div(10)
-        .and_then(|ms| u64::try_from(ms).ok())
-        .unwrap_or(0);
-    wait.saturating_add(Duration::from_millis(spread.checked_rem(tenth).unwrap_or(0)))
 }
 
 #[cfg(test)]
