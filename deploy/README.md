@@ -66,7 +66,7 @@ make deploy-check
 # CRDs first
 kubectl apply -k deploy/crds/
 
-# OpenShift, into a namespace of your choice
+# OpenShift, the platform base in its default namespace (a platform sets its own)
 kubectl apply -k deploy/operator/ -n grid-system
 
 # kind
