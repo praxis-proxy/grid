@@ -1,16 +1,21 @@
 [package]
 name = "grid-client"
-description = "Grid signal poller: the mTLS scrape transport that feeds the signals source"
+description = "Outbound HTTP transport for the grid: client construction, bounds, and retry classification"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
 
+# The reqwest TLS backend follows this crate's backend feature, so a caller
+# forwards fips here instead of naming a backend itself.
 [features]
 default = ["rcgen"]
-rcgen = ["certs/rcgen"]
-fips = ["certs/fips"]
+rcgen = ["certs/rcgen", "reqwest?/rustls-no-provider"]
+fips = ["certs/fips", "reqwest?/native-tls"]
+# Root-trust reqwest clients, for callers that dial enrollment rather than a
+# pinned peer. Off by default so the data plane does not build reqwest.
+reqwest-client = ["dep:reqwest", "dep:zeroize"]
 
 [dependencies]
 grid-signals = { path = "../signals" }
@@ -23,12 +28,14 @@ hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["client", "client-legacy", "http1", "tokio"] }
 metrics = { workspace = true }
 percent-encoding = { workspace = true }
+reqwest = { workspace = true, optional = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 certs = { path = "../certs", default-features = false, features = ["verifier", "rcgen"] }
