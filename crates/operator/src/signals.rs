@@ -19,7 +19,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 pub use crate::crd::grid_network::PeerTrustMode;
 use crate::{
-    metrics_scraper::{MetricsScrapeError, scrape_metrics_with_date},
+    metrics_scraper::{MetricsScrapeError, PeerTransport, scrape_peer},
     resources::tls_backend::{self, ClientTlsConfig},
     swim::MemberRecord,
 };
@@ -939,6 +939,19 @@ impl std::fmt::Debug for PeerTlsMaterial {
     }
 }
 
+/// How long an unused peer connection is kept.
+///
+/// Above the poll interval so a round reuses the last one, and below the idle
+/// window a stateful firewall between clusters is likely to enforce.
+const PEER_POOL_IDLE: Duration = Duration::from_secs(20);
+
+/// How long a peer transport may live before it is rebuilt.
+///
+/// A pooled connection is verified once, when it is made. Rebuilding forces a
+/// fresh handshake, and so a fresh leaf check, bounding how long a revoked or
+/// expired certificate stays reachable.
+const PEER_TRANSPORT_MAX_AGE: Duration = Duration::from_mins(1);
+
 /// Per-peer client TLS configs, with the pins each was built for.
 ///
 /// Building one parses a private key, so it is held across rounds rather than
@@ -946,10 +959,17 @@ impl std::fmt::Debug for PeerTlsMaterial {
 /// because keying on the pins would leak an entry per rotation. Holds no
 /// socket: a config is material, not a connection.
 #[derive(Default)]
-pub struct PeerConfigs(Mutex<HashMap<String, PinnedConfig>>);
+pub struct PeerConfigs(Mutex<HashMap<String, HeldTransport>>);
 
-/// The pins a config was built for, and the config.
-type PinnedConfig = (Vec<String>, ClientTlsConfig);
+/// A peer's transport, the pins it was built for, and when it was built.
+struct HeldTransport {
+    /// The pins the transport verifies against.
+    pins: Vec<String>,
+    /// The client, whose pool outlives a round.
+    transport: Arc<PeerTransport>,
+    /// When it was built, which bounds how long a connection may live.
+    built: Instant,
+}
 
 impl std::fmt::Debug for PeerConfigs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1026,8 +1046,8 @@ impl PollPeers {
         // used to leave the in-flight gauge counting a poll that had ended.
         let mut guard = PollGuard::enter(peer, self.slow_after);
 
-        let tls = match self.peer_config(peer, pins) {
-            Ok(config) => config,
+        let transport = match self.peer_transport(peer, pins) {
+            Ok(transport) => transport,
             Err(error) => {
                 tracing::warn!(peer, %error, "peer client config unusable; not polling");
                 guard.finish(RequestOutcome::Config, 0);
@@ -1035,7 +1055,7 @@ impl PollPeers {
             },
         };
         let (outcome, result) =
-            tokio::time::timeout(self.budget, self.attempt_until(peer, url, tls.as_ref(), guard.started))
+            tokio::time::timeout(self.budget, self.attempt_until(peer, url, &transport, guard.started))
                 .await
                 .unwrap_or((RequestOutcome::Timeout, None));
         guard.finish(outcome, result.as_ref().map_or(0, |(body, _)| body.len()));
@@ -1047,27 +1067,32 @@ impl PollPeers {
     ///
     /// The build runs outside the lock; a concurrent builder for the same peer
     /// loses the race harmlessly and the stored config is replaced.
-    fn peer_config(&self, peer: &str, pins: &[String]) -> Result<Option<ClientTlsConfig>, MetricsScrapeError> {
-        let Some(material) = self.tls.as_ref() else {
-            return Ok(None);
-        };
+    fn peer_transport(&self, peer: &str, pins: &[String]) -> Result<Arc<PeerTransport>, MetricsScrapeError> {
         let held = self
             .configs
             .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(peer)
-            .and_then(|(held, config)| (held == pins).then(|| Arc::clone(config)));
-        if let Some(config) = held {
-            return Ok(Some(config));
+            .filter(|held| held.pins == pins && held.built.elapsed() < PEER_TRANSPORT_MAX_AGE)
+            .map(|held| Arc::clone(&held.transport));
+        if let Some(transport) = held {
+            return Ok(transport);
         }
-        let config = peer_client_config(material, self.trust, peer, pins)?;
-        self.configs
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(peer.to_owned(), (pins.to_vec(), Arc::clone(&config)));
-        Ok(Some(config))
+        let config = match self.tls.as_ref() {
+            Some(material) => Some(peer_client_config(material, self.trust, peer, pins)?),
+            None => None,
+        };
+        let transport = Arc::new(PeerTransport::new(config.as_ref(), Some(PEER_POOL_IDLE))?);
+        self.configs.0.lock().unwrap_or_else(PoisonError::into_inner).insert(
+            peer.to_owned(),
+            HeldTransport {
+                pins: pins.to_vec(),
+                transport: Arc::clone(&transport),
+                built: Instant::now(),
+            },
+        );
+        Ok(transport)
     }
 
     /// Drop the configs of peers no longer in the grid.
@@ -1096,12 +1121,12 @@ impl PollPeers {
     async fn scrape_or_stand_down(
         &self,
         url: &str,
-        tls: Option<&ClientTlsConfig>,
+        transport: &PeerTransport,
     ) -> Option<Result<(String, Option<SystemTime>), MetricsScrapeError>> {
         tokio::select! {
             biased;
             () = self.shutdown.triggered() => None,
-            result = scrape_metrics_with_date(url, self.timeout, tls.cloned()) => Some(result),
+            result = scrape_peer(url, self.timeout, transport) => Some(result),
         }
     }
 
@@ -1124,7 +1149,7 @@ impl PollPeers {
         &self,
         peer: &str,
         url: &str,
-        tls: Option<&ClientTlsConfig>,
+        transport: &PeerTransport,
         started: Instant,
     ) -> (RequestOutcome, Option<(String, Option<SystemTime>)>) {
         let attempts = self.attempts.max(1);
@@ -1137,7 +1162,7 @@ impl PollPeers {
                 break;
             }
 
-            let Some(scrape) = self.scrape_or_stand_down(url, tls).await else {
+            let Some(scrape) = self.scrape_or_stand_down(url, transport).await else {
                 return (RequestOutcome::Cancelled, None);
             };
 
@@ -2191,26 +2216,54 @@ mod tests {
 
     #[test]
     #[cfg(not(feature = "fips"))]
-    fn a_peer_config_is_held_across_rounds_and_rebuilt_when_its_pins_change() {
+    fn a_peer_transport_is_held_across_rounds_and_rebuilt_when_its_pins_change() {
         let poll = PollPeers {
             tls: Some(test_material()),
             trust: PeerTrustMode::Pin,
             ..PollPeers::default()
         };
         let pins = vec!["a".repeat(64)];
-        let first = poll.peer_config("east", &pins).expect("built").expect("a config");
-        let again = poll.peer_config("east", &pins).expect("built").expect("a config");
+        let first = poll.peer_transport("east", &pins).expect("built");
+        let again = poll.peer_transport("east", &pins).expect("built");
         assert!(
             Arc::ptr_eq(&first, &again),
-            "building twice parses the private key twice"
+            "building twice parses the private key and reopens the connection"
         );
         assert_eq!(poll.held_configs(), 1);
 
-        // A rotation replaces the entry rather than adding one.
+        // A rotation replaces the entry rather than adding one, and takes the
+        // old pool with it.
         let rotated = vec!["b".repeat(64)];
-        let after = poll.peer_config("east", &rotated).expect("built").expect("a config");
-        assert!(!Arc::ptr_eq(&first, &after), "rotated pins must not reuse the config");
+        let after = poll.peer_transport("east", &rotated).expect("built");
+        assert!(!Arc::ptr_eq(&first, &after), "rotated pins must not reuse the socket");
         assert_eq!(poll.held_configs(), 1, "keyed by peer, not by pin set");
+    }
+
+    #[test]
+    #[cfg(not(feature = "fips"))]
+    fn a_transport_past_its_age_is_rebuilt_so_the_leaf_is_checked_again() {
+        let poll = PollPeers {
+            tls: Some(test_material()),
+            trust: PeerTrustMode::Pin,
+            ..PollPeers::default()
+        };
+        let pins = vec!["a".repeat(64)];
+        let first = poll.peer_transport("east", &pins).expect("built");
+
+        // Age the entry past the bound without waiting for it.
+        let aged = Instant::now()
+            .checked_sub(PEER_TRANSPORT_MAX_AGE + Duration::from_secs(1))
+            .expect("a time before the bound");
+        let mut held = poll.configs.0.lock().unwrap_or_else(PoisonError::into_inner);
+        held.get_mut("east").expect("an entry").built = aged;
+        drop(held);
+
+        let after = poll.peer_transport("east", &pins).expect("built");
+        assert!(
+            !Arc::ptr_eq(&first, &after),
+            "an aged transport must be rebuilt, or a pooled connection is never verified again"
+        );
+        assert_eq!(poll.held_configs(), 1, "the rebuild replaces rather than accumulates");
     }
 
     #[test]
@@ -2222,8 +2275,8 @@ mod tests {
             ..PollPeers::default()
         };
         let pins = vec!["a".repeat(64)];
-        drop(poll.peer_config("east", &pins).expect("built"));
-        drop(poll.peer_config("west", &pins).expect("built"));
+        drop(poll.peer_transport("east", &pins).expect("built"));
+        drop(poll.peer_transport("west", &pins).expect("built"));
         assert_eq!(poll.held_configs(), 2);
 
         poll.retain_configs(&[("east".to_owned(), String::new(), pins)]);
