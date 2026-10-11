@@ -1,0 +1,108 @@
+//! The operator's generated consumer config must build filter pipelines in this binary,
+//! so a praxis-ai filter schema the render emits and the pinned crate rejects fails here.
+#[cfg(test)]
+mod tests {
+    use std::{
+        error::Error,
+        io::{self, BufRead as _, BufReader, Read},
+        net::{TcpListener, TcpStream},
+        path::PathBuf,
+        process::{Child, Command, Stdio},
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    /// Bound on how long the test waits for the listener.
+    const TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// credential_inject as consumer_config.rs renders it for a bearer-token provider:
+    /// projected mode with no inline credentials. A static terminal stands in for the
+    /// load_balancer, whose private-endpoint gate needs an RFC1918 resolver.
+    fn write_config(port: u16, mount_base: &str) -> io::Result<PathBuf> {
+        let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("generated-consumer-config.yaml");
+        let yaml = format!(
+            r#"admin:
+  address: "127.0.0.1:0"
+listeners:
+  - name: public
+    address: "127.0.0.1:{port}"
+    filter_chains: [consumer-chain]
+filter_chains:
+  - name: consumer-chain
+    filters:
+      - filter: json_body_field
+        field: model
+        header: X-Model
+      - filter: credential_inject
+        credentials: []
+        projected_credential_mount_base: "{mount_base}"
+      - filter: static_response
+        status: 200
+"#
+        );
+        std::fs::write(&path, yaml)?;
+        Ok(path)
+    }
+
+    fn spawn(config: PathBuf) -> io::Result<(Child, mpsc::Receiver<String>)> {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_grid-gateway"))
+            .arg("--config")
+            .arg(config)
+            .env("RUST_LOG", "info")
+            .env_remove("GRID_SERVING_CONFIG")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let (lines_tx, lines_rx) = mpsc::channel();
+        let missing = || io::Error::other("child output not piped");
+        forward(child.stdout.take().ok_or_else(missing)?, lines_tx.clone());
+        forward(child.stderr.take().ok_or_else(missing)?, lines_tx);
+        Ok((child, lines_rx))
+    }
+
+    fn forward(reader: impl Read + Send + 'static, lines: mpsc::Sender<String>) {
+        thread::spawn(move || {
+            for line in BufReader::new(reader).lines().map_while(Result::ok) {
+                drop(lines.send(line));
+            }
+        });
+    }
+
+    #[test]
+    fn the_generated_consumer_filters_build() -> TestResult {
+        let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let mount_base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("grid-credentials");
+        std::fs::create_dir_all(&mount_base)?;
+        let (mut child, lines) = spawn(write_config(port, &mount_base.display().to_string())?)?;
+
+        // The listener only opens once every filter in the chain has been built.
+        let deadline = Instant::now() + TIMEOUT;
+        let mut output = Vec::new();
+        let listening = loop {
+            if TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_millis(200)).is_ok() {
+                break true;
+            }
+            if let Some(status) = child.try_wait()? {
+                output.push(format!("gateway exited: {status}"));
+                break false;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            while let Ok(line) = lines.try_recv() {
+                output.push(line);
+            }
+            thread::sleep(Duration::from_millis(100));
+        };
+        drop(child.kill());
+        child.wait()?;
+        while let Ok(line) = lines.try_recv() {
+            output.push(line);
+        }
+        assert!(listening, "the generated consumer config did not start a listener: {output:#?}");
+        Ok(())
+    }
+}

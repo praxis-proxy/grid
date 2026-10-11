@@ -319,7 +319,7 @@ praxis-proxy = { version = "0.7.3", features = ["otel", "spiffe"] }
 praxis-proxy-filter = "0.7.3"
 praxis-proxy-core = "0.7.3"
 opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["tls-provider-agnostic"] }
-praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "17b41771fcd53b22ab5c6f9badede0de9021404c", default-features = false, features = ["opentelemetry"] }
+praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "75e8662d8a4705391e7cce6e79c08e4e9cd826a0", default-features = false, features = ["opentelemetry"] }
 ai-grid-filters = { path = "ai-grid-filters" }
 tracing = "0.1.44"
 praxis-protocol = { version = "0.7.3", package = "praxis-proxy-protocol" }
