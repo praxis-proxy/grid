@@ -71,6 +71,32 @@ filter_chains:
         });
     }
 
+    /// Whether the child opens `port` before it exits or the deadline passes, with its output.
+    fn wait_for_listener(
+        child: &mut Child,
+        lines: &mpsc::Receiver<String>,
+        port: u16,
+    ) -> io::Result<(bool, Vec<String>)> {
+        let started = Instant::now();
+        let mut output = Vec::new();
+        loop {
+            if TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_millis(200)).is_ok() {
+                return Ok((true, output));
+            }
+            if let Some(status) = child.try_wait()? {
+                output.push(format!("gateway exited: {status}"));
+                return Ok((false, output));
+            }
+            if started.elapsed() >= TIMEOUT {
+                return Ok((false, output));
+            }
+            // Drains output and paces the poll; a closed channel means the child is exiting.
+            if let Ok(line) = lines.recv_timeout(Duration::from_millis(100)) {
+                output.push(line);
+            }
+        }
+    }
+
     #[test]
     fn the_generated_consumer_filters_build() -> TestResult {
         let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
@@ -79,24 +105,7 @@ filter_chains:
         let (mut child, lines) = spawn(write_config(port, &mount_base.display().to_string())?)?;
 
         // The listener only opens once every filter in the chain has been built.
-        let deadline = Instant::now() + TIMEOUT;
-        let mut output = Vec::new();
-        let listening = loop {
-            if TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_millis(200)).is_ok() {
-                break true;
-            }
-            if let Some(status) = child.try_wait()? {
-                output.push(format!("gateway exited: {status}"));
-                break false;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            // Drains output and paces the poll; a closed channel means the child is exiting.
-            if let Ok(line) = lines.recv_timeout(Duration::from_millis(100)) {
-                output.push(line);
-            }
-        };
+        let (listening, mut output) = wait_for_listener(&mut child, &lines, port)?;
         drop(child.kill());
         child.wait()?;
         while let Ok(line) = lines.try_recv() {
