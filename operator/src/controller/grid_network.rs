@@ -9898,6 +9898,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refused_delegated_deployment_read_reports_forbidden() {
+        let gateway = make_gw_ref("inference-gw", "praxis-system");
+        let delegation = MountReconciliation {
+            enabled: true,
+            deployment_name: Some("inference-gw".to_owned()),
+            container_name: "praxis".to_owned(),
+        };
+        let rendered = consumer_config::ConsumerRenderResult {
+            config_yaml: "listeners: []".to_owned(),
+            requirements: Vec::new(),
+        };
+        let result = Box::pin(reconcile_delegated_gateway(
+            &rendered,
+            "production",
+            &gateway,
+            &make_consumer_config("consumer-config"),
+            &delegation,
+            &make_serving_tls(),
+            7,
+            &apiserver_answering(403),
+        ))
+        .await;
+        // A 403 on the Deployment read must not reconcile.
+        let error = result.err().unwrap_or_else(|| std::process::abort());
+        let status = mount_reconciliation_status_error(&gateway, None, &error, 7);
+        assert_eq!(status.reason, "DeploymentForbidden", "{}", status.message);
+        assert!(status.message.contains("refused get"), "{}", status.message);
+    }
+
+    #[tokio::test]
     async fn a_refused_delegated_deployment_patch_reports_forbidden() -> Result<(), Box<dyn std::error::Error>> {
         let gateway = make_gw_ref("inference-gw", "praxis-system");
         for (code, reason) in [(403, "DeploymentForbidden"), (500, "DeploymentPatchFailed")] {
