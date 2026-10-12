@@ -409,13 +409,21 @@ mod tests {
         apply(&mut network, &update);
         let receipts = BTreeMap::from([(first.epoch, instant)]);
         let other = fold(&network, &report("b", 1, 0, false), "t1", &receipts, instant).expect("other");
-        assert_eq!(standing(&other), "True");
+        assert_eq!(
+            standing(&other),
+            "True",
+            "another replica's clean report cannot clear fresh rejection"
+        );
         apply(&mut network, &other);
         let restart = fold(&network, &report("c", 1, 0, false), "t2", &BTreeMap::new(), instant).expect("restart");
         assert_eq!(standing(&restart), "Unknown", "new epoch cannot refute old epoch");
         apply(&mut network, &restart);
         let recovered = fold(&network, &report("a", 2, 1, false), "t3", &receipts, instant).expect("recovery");
-        assert_eq!(standing(&recovered), "False");
+        assert_eq!(
+            standing(&recovered),
+            "False",
+            "newer clean evidence from the rejecting epoch proves recovery"
+        );
     }
 
     #[test]
@@ -424,10 +432,14 @@ mod tests {
         let report = report("a", 1, 3, false);
         let instant = Instant::now();
         let update = fold(&network, &report, "t0", &BTreeMap::new(), instant).expect("counter delta");
-        assert_eq!(standing(&update), "True");
+        assert_eq!(
+            standing(&update),
+            "True",
+            "new skew takes precedence over a claimed clean observation"
+        );
         apply(&mut network, &update);
         let duplicate = fold(&network, &report, "t1", &BTreeMap::new(), instant).expect("exact duplicate");
-        assert!(!duplicate.fresh);
+        assert!(!duplicate.fresh, "an exact replay must not renew the receipt");
         assert_eq!(
             standing(&duplicate),
             "Unknown",
@@ -437,7 +449,10 @@ mod tests {
             rejected: true,
             ..report.clone()
         };
-        assert!(fold(&network, &conflicting, "t2", &BTreeMap::new(), instant).is_err());
+        assert!(
+            fold(&network, &conflicting, "t2", &BTreeMap::new(), instant).is_err(),
+            "changed evidence at the same sequence must be rejected"
+        );
         assert!(
             fold(
                 &network,
@@ -450,7 +465,8 @@ mod tests {
                 &BTreeMap::new(),
                 instant
             )
-            .is_err()
+            .is_err(),
+            "a newer sequence must not regress the cumulative skew counter"
         );
     }
 
@@ -468,8 +484,15 @@ mod tests {
         }
         let overflow =
             fold(&network, &report("f", 1, 1, true), "t1", &BTreeMap::new(), instant).expect("overflow flag");
-        assert!(overflow.overflow && overflow.evidence.reports.len() == MAX_REPORTERS);
-        assert_eq!(standing(&overflow), "Unknown");
+        assert!(
+            overflow.overflow && overflow.evidence.reports.len() == MAX_REPORTERS,
+            "overflow retains all bounded unresolved evidence"
+        );
+        assert_eq!(
+            standing(&overflow),
+            "Unknown",
+            "capacity exhaustion cannot claim complete rejection coverage"
+        );
         apply(&mut network, &overflow);
         for number in 0..MAX_REPORTERS {
             let report = IngestReport {
@@ -497,8 +520,11 @@ mod tests {
         let receipts = BTreeMap::from([(report.epoch.clone(), instant)]);
         let expired = instant.checked_add(FRESHNESS).expect("bounded instant");
         let stale = fold(&network, &report, "t1", &receipts, expired).expect("duplicate");
-        assert_eq!(standing(&stale), "Unknown");
-        assert!(stale.evidence.reports[0].rejected);
+        assert_eq!(standing(&stale), "Unknown", "receipt expiry cannot prove recovery");
+        assert!(
+            stale.evidence.reports[0].rejected,
+            "expired rejection remains durable evidence"
+        );
         assert!(
             fold(
                 &network,
@@ -507,7 +533,8 @@ mod tests {
                 &receipts,
                 expired
             )
-            .is_err()
+            .is_err(),
+            "a stale lower sequence must not replace retained evidence"
         );
     }
 
@@ -515,9 +542,12 @@ mod tests {
     fn parsing_refuses_duplicates_versions_bounds_and_noncanonical_numbers() {
         let report = report("a", 1, 0, false);
         let mut headers = headers(&report);
-        assert_eq!(parse(&headers), Some(report));
+        assert_eq!(parse(&headers), Some(report), "valid canonical headers must round trip");
         headers.append(REPORT_HEADERS[0], http::HeaderValue::from_static("1"));
-        assert!(parse(&headers).is_none());
+        assert!(
+            parse(&headers).is_none(),
+            "duplicate report version headers must be rejected"
+        );
         for (name, bad) in [
             (REPORT_HEADERS[0], "2"),
             (REPORT_HEADERS[3], "01"),
@@ -526,7 +556,10 @@ mod tests {
         ] {
             let mut invalid_headers = self::headers(&self::report("a", 1, 0, false));
             invalid_headers.insert(name, http::HeaderValue::from_str(bad).expect("header"));
-            assert!(parse(&invalid_headers).is_none());
+            assert!(
+                parse(&invalid_headers).is_none(),
+                "invalid report header {name}={bad:?} must be rejected"
+            );
         }
     }
 
@@ -537,23 +570,46 @@ mod tests {
         let feedback = GatewayFeedback::new(client, shutdown);
         let bad = report("a", 1, 1, true);
         let response = feedback.respond(true, request(&bad, "")).await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert_eq!(response.headers().get(ACK_EPOCH).expect("epoch"), bad.epoch.as_str());
+        assert_eq!(
+            response.status(),
+            StatusCode::NO_CONTENT,
+            "durable rejection must be acknowledged"
+        );
+        assert_eq!(
+            response.headers().get(ACK_EPOCH).expect("epoch"),
+            bad.epoch.as_str(),
+            "the acknowledgment must identify the accepted epoch"
+        );
         assert_eq!(
             stored.lock().expect("stored")["status"]["conditions"][1]["status"],
-            "True"
+            "True",
+            "durable bad evidence must set the gateway rejection condition"
         );
         let clean = report("a", 2, 1, false);
         assert_eq!(
             feedback.respond(true, request(&clean, "")).await.status(),
-            StatusCode::NO_CONTENT
+            StatusCode::NO_CONTENT,
+            "durable newer clean evidence must be acknowledged"
         );
         let network = stored.lock().expect("stored");
-        assert_eq!(network["status"]["conditions"][1]["status"], "False");
-        assert_eq!(network["status"]["conditions"][0]["type"], "PeerAgesRejected");
-        assert_eq!(network["status"]["phase"], "Active");
+        assert_eq!(
+            network["status"]["conditions"][1]["status"], "False",
+            "same-epoch clean evidence clears the rejection"
+        );
+        assert_eq!(
+            network["status"]["conditions"][0]["type"], "PeerAgesRejected",
+            "gateway feedback preserves independent peer diagnostics"
+        );
+        assert_eq!(
+            network["status"]["phase"], "Active",
+            "diagnostic feedback cannot change network phase"
+        );
         drop(network);
-        assert_eq!(patches.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            patches.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "bad and clean reports each require one durable write"
+        );
     }
 
     #[tokio::test]
@@ -564,7 +620,8 @@ mod tests {
         let clean = report("a", 1, 0, false);
         assert_eq!(
             feedback.respond(true, request(&clean, "")).await.status(),
-            StatusCode::NO_CONTENT
+            StatusCode::NO_CONTENT,
+            "a successful live-version retry must acknowledge the accepted clean epoch"
         );
         let persisted = stored.lock().expect("stored").clone();
         assert_eq!(
@@ -580,10 +637,15 @@ mod tests {
             "a clean incoming epoch cannot erase injected unresolved evidence"
         );
         let held = feedback.receipts.lock().expect("receipts").clone();
-        assert_eq!(patches.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            patches.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one conflict requires exactly one retry"
+        );
         assert_eq!(
             feedback.respond(true, request(&clean, "")).await.status(),
-            StatusCode::NO_CONTENT
+            StatusCode::NO_CONTENT,
+            "an exact durable replay can be acknowledged again"
         );
         assert_eq!(
             *feedback.receipts.lock().expect("receipts"),
@@ -603,9 +665,13 @@ mod tests {
                     .respond(true, request(&report("a", 1, 1, true), ""))
                     .await
                     .status(),
-                StatusCode::SERVICE_UNAVAILABLE
+                StatusCode::SERVICE_UNAVAILABLE,
+                "failed or mismatched persistence must not acknowledge evidence"
             );
-            assert!(feedback.receipts.lock().expect("receipts").is_empty());
+            assert!(
+                feedback.receipts.lock().expect("receipts").is_empty(),
+                "failed persistence must not establish freshness"
+            );
         }
     }
 
@@ -617,11 +683,13 @@ mod tests {
         let bad = report("a", 1, 1, true);
         assert_eq!(
             feedback.respond(false, request(&bad, "")).await.status(),
-            StatusCode::FORBIDDEN
+            StatusCode::FORBIDDEN,
+            "a peer caller cannot report local gateway diagnostics"
         );
         assert_eq!(
             feedback.respond(true, request(&bad, "body")).await.status(),
-            StatusCode::PAYLOAD_TOO_LARGE
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "ingest reports require an empty body"
         );
         let mut malformed = request(&bad, "");
         malformed
@@ -629,9 +697,14 @@ mod tests {
             .append(REPORT_HEADERS[0], http::HeaderValue::from_static("1"));
         assert_eq!(
             feedback.respond(true, malformed).await.status(),
-            StatusCode::BAD_REQUEST
+            StatusCode::BAD_REQUEST,
+            "malformed authenticated reports must be rejected"
         );
-        assert_eq!(patches.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            patches.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "unauthorized or invalid reports never write status"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -650,9 +723,14 @@ mod tests {
                 .respond(true, request(&report("a", 1, 1, true), ""))
                 .await
                 .status(),
-            StatusCode::SERVICE_UNAVAILABLE
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stalled persistence must time out without acknowledgment"
         );
-        assert_eq!(started.elapsed(), WRITE_BUDGET);
+        assert_eq!(
+            started.elapsed(),
+            WRITE_BUDGET,
+            "the timeout bounds the entire publication"
+        );
         assert_eq!(
             feedback.publication.available_permits(),
             1,
@@ -664,7 +742,8 @@ mod tests {
                 .respond(true, request(&report("a", 1, 1, true), ""))
                 .await
                 .status(),
-            StatusCode::SERVICE_UNAVAILABLE
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shutdown must reject new publication immediately"
         );
     }
 

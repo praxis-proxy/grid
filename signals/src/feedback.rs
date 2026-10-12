@@ -82,7 +82,7 @@ mod tests {
             skew: 0,
             rejected: false,
         };
-        assert!(valid.valid());
+        assert!(valid.valid(), "bounded report must be accepted: {valid:?}");
         for invalid in [
             IngestReport {
                 replica: "a".repeat(129),
@@ -109,7 +109,7 @@ mod tests {
                 ..valid.clone()
             },
         ] {
-            assert!(!invalid.valid());
+            assert!(!invalid.valid(), "out-of-bounds report must be rejected: {invalid:?}");
         }
         assert!(
             IngestReport {
@@ -118,7 +118,8 @@ mod tests {
                 rejected: true,
                 ..valid
             }
-            .valid()
+            .valid(),
+            "terminal rejection must remain valid at the numeric bounds"
         );
     }
 }
