@@ -34,9 +34,21 @@ make generate-crds
 # Check that the committed CRDs match the Rust types (runs in CI)
 make crds-check
 
+# Generate or check the opt-in A2A CRD (requires the experimental feature)
+make generate-crds-experimental
+make crds-check-experimental
+
 # Validate CRD syntax
 kubectl --dry-run=server create -k deploy/crds/
 ```
+
+The default manifests do not install A2A. To opt in, build the operator with
+the `a2a` Cargo feature, which activates the experimental marker, then apply
+`deploy/experimental/` in addition to the stable manifests. The experimental
+Kustomization already includes `deploy/crds-experimental/`; on a
+platform-managed installation, replace `subjects[0].namespace` in
+`clusterrolebinding-crd-a2a.yaml` with the namespace of the operator before
+applying it.
 
 **Important**: Do not hand-edit CRD files. They are generated from the Rust code.
 

@@ -85,7 +85,9 @@ Before opening a release preparation pull request:
 - [ ] Run `make test` and `make doc` for the root workspace.
 - [ ] Run `cargo test --locked --manifest-path crates/gateway/Cargo.toml --workspace`
       for the separate Gateway workspace.
-- [ ] Run `make codegen-check`, `make crds-check`, and `make deploy-check`.
+- [ ] Run `make codegen-check` and `make crds-check`. When the opt-in A2A API
+      changes, also run `make crds-check-experimental`.
+- [ ] Run `make deploy-check`.
 - [ ] Run `git diff --check` and validate the release workflow with
       `actionlint`.
 - [ ] Lint and render the five release charts with their required values.

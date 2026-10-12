@@ -78,8 +78,9 @@ those targets.
 | `make doc` | Root rustdoc, including private items, with warnings denied. | Documentation / rustdoc, including documentation-only PRs. |
 | `make test` | Root workspace tests; ignored tests stay excluded. | Tests / test; separate FIPS and Gateway jobs cover their configurations. |
 | `make audit` | Root lockfile audit and dependency/license policy. | Supply Chain; Gateway policy is checked in its own workflow. |
-| `make codegen-check`, `make crds-check` | Compare generated enrollment types and CRDs with their source definitions. | Tests / lint. |
+| `make codegen-check`, `make crds-check` | Compare generated enrollment types and stable CRDs with their source definitions. | Tests / lint. |
 | `make go-types-check` | Regenerate Go API types from `deploy/crds/` and fail if the committed files differ. Rewrites `go/api/v1alpha1/zz_generated_*.go` in place — run before staging. | Check Go API types match the CRD schemas. |
+| `make crds-check-experimental` | Compare the opt-in A2A CRD with the feature-enabled Rust type. | Tests / lint when A2A changes. |
 | `make coverage-check` | 80% root line-coverage floor with documented exclusions. | Coverage / coverage. |
 | `make mutants`, `make semver`, `make publish-dry-run` | Opt-in specialist checks. | No corresponding scheduled Grid workflows. |
 
@@ -139,6 +140,8 @@ files differ; CI runs this step regardless of whether Go is in your local
 ```console
 make generate-crds
 make crds-check
+make generate-crds-experimental
+make crds-check-experimental
 make generate-api-types
 make codegen-check
 make generate-go-types

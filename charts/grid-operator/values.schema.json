@@ -104,6 +104,22 @@
         }
       }
     },
+    "experimental": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "a2a": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Render the experimental AgentToAgentProvider CRD and RBAC."
+            }
+          }
+        }
+      }
+    },
     "replicaCount": {
       "type": "integer",
       "minimum": 1,
