@@ -2555,7 +2555,7 @@ impl PeerPoller {
         }
         let polled: Vec<String> = sites.into_iter().map(|site| site.name).collect();
         self.ages.observe(&polled, &answered);
-        Box::pin(write_peer_ages(&self.client, &self.ages)).await;
+        Box::pin(write_peer_ages(&self.client, &self.ages, &self.shutdown)).await;
     }
 }
 
@@ -2564,7 +2564,28 @@ impl PeerPoller {
 /// Compared against the live status every round, so a restart, a recreated
 /// `GridNetwork` or an edited status is set right on the next round, and nothing
 /// is written while the condition already says this.
-async fn write_peer_ages(client: &Client, ages: &operator::peer_ages::PeerAges) {
+async fn write_peer_ages(
+    client: &Client,
+    ages: &operator::peer_ages::PeerAges,
+    shutdown: &operator::shutdown::Shutdown,
+) {
+    tokio::select! {
+        biased;
+        () = shutdown.triggered() => {},
+        result = tokio::time::timeout(PEER_AGES_WRITE_TIMEOUT, Box::pin(apply_peer_ages(client, ages))) => {
+            if result.is_err() {
+                tracing::warn!("peer ages condition write timed out; retrying next round");
+            }
+        },
+    }
+}
+
+/// Total lookup-and-patch budget, so diagnostic publication cannot hold peer
+/// freshness behind a slow Kubernetes API.
+const PEER_AGES_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Look up the live network and apply its peer-age condition when changed.
+async fn apply_peer_ages(client: &Client, ages: &operator::peer_ages::PeerAges) {
     let Some(network) = Box::pin(sole_network(client)).await else {
         return;
     };
@@ -2675,6 +2696,72 @@ async fn peer_tls(client: &Client) -> Option<Arc<operator::signals::PeerTlsMater
 #[allow(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_age_publication_bounds_stalled_lookups_and_patches() {
+        for stall_patch in [false, true] {
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let client = stalled_peer_ages_client(stall_patch, Arc::clone(&requests));
+            let ages = operator::peer_ages::PeerAges::default();
+            let shutdown = operator::shutdown::Shutdown::never();
+            let start = tokio::time::Instant::now();
+            let completed = tokio::time::timeout(
+                PEER_AGES_WRITE_TIMEOUT.saturating_add(std::time::Duration::from_secs(1)),
+                write_peer_ages(&client, &ages, &shutdown),
+            )
+            .await;
+            assert!(completed.is_ok(), "a stalled API must release the peer polling round");
+            assert_eq!(
+                start.elapsed(),
+                PEER_AGES_WRITE_TIMEOUT,
+                "one budget covers lookup and patch"
+            );
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::SeqCst),
+                if stall_patch { 2 } else { 1 },
+                "the test must reach the intended stalled request"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_peer_age_publication_during_lookup_or_patch() {
+        for stall_patch in [false, true] {
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let client = stalled_peer_ages_client(stall_patch, Arc::clone(&requests));
+            let ages = operator::peer_ages::PeerAges::default();
+            let (trigger, shutdown) = operator::shutdown::Trigger::new();
+            let writing = tokio::spawn(async move { write_peer_ages(&client, &ages, &shutdown).await });
+            let expected_requests = if stall_patch { 2 } else { 1 };
+            wait_for_peer_age_requests(&requests, expected_requests).await;
+            let start = tokio::time::Instant::now();
+            trigger.trigger();
+            assert!(
+                writing.await.is_ok(),
+                "a stalled diagnostic must not hold termination open"
+            );
+            assert_eq!(
+                start.elapsed(),
+                std::time::Duration::ZERO,
+                "shutdown must beat the deadline"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_already_triggered_shutdown_skips_peer_age_publication() {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client = stalled_peer_ages_client(false, Arc::clone(&requests));
+        let ages = operator::peer_ages::PeerAges::default();
+        let (trigger, shutdown) = operator::shutdown::Trigger::new();
+        trigger.trigger();
+        write_peer_ages(&client, &ages, &shutdown).await;
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "shutdown must not start a diagnostic request"
+        );
+    }
 
     #[test]
     fn a_swim_site_name_must_be_a_dns_label() {
@@ -4035,5 +4122,42 @@ mod tests {
             .rsplit_once(' ')
             .and_then(|(_, stamp)| stamp.parse().ok())
             .expect("a stamped row")
+    }
+
+    /// Wait until the mock receives a request, failing instead of spinning if
+    /// the expected lookup or patch was never made.
+    async fn wait_for_peer_age_requests(requests: &std::sync::atomic::AtomicUsize, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while requests.load(std::sync::atomic::Ordering::SeqCst) < expected {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the intended diagnostic request is reached");
+    }
+
+    /// A Kubernetes client whose list or status patch never produces a response.
+    fn stalled_peer_ages_client(stall_patch: bool, requests: Arc<std::sync::atomic::AtomicUsize>) -> Client {
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if !stall_patch || request.method() == http::Method::PATCH {
+                    std::future::pending::<()>().await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let body = serde_json::json!({
+                    "apiVersion": "grid.praxis.fast/v1alpha1",
+                    "kind": "GridNetworkList",
+                    "items": [{
+                        "apiVersion": "grid.praxis.fast/v1alpha1",
+                        "kind": "GridNetwork",
+                        "metadata": { "name": "grid", "generation": 1 },
+                        "spec": { "seeds": [], "gridId": "test-id" }
+                    }]
+                });
+                Ok::<_, std::convert::Infallible>(http::Response::new(axum::body::Body::from(body.to_string())))
+            }
+        });
+        Client::new(service, "default")
     }
 }
