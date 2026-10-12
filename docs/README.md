@@ -98,3 +98,5 @@ image preparation, execution, evidence, and cleanup.
   tracing, testing, and review conventions.
 - [Developing: Type Design](developing/type-design.md): shared Praxis guidance
   for serde, enums, newtypes, and representable states.
+- [Unicode Audit](developing/unicode-audit.md): tracked text inventory and
+  intentional Unicode exceptions.
