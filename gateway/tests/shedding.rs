@@ -30,7 +30,7 @@ mod tests {
             atomic::{AtomicBool, AtomicU8, Ordering},
         },
         thread,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use certs::{CaCert, DEFAULT_TRUST_DOMAIN, GridSpiffeClientVerifier, generate_ca, generate_site_cert};
@@ -120,10 +120,14 @@ mod tests {
                             Ok(n) => request.extend_from_slice(&buf[..n]),
                         }
                     }
-                    let body = signals(site, publishing);
-                    // Samples stamped at the Date header read as age zero.
+                    // Stamped now and dated now, as an operator serving a fresh scrape: age zero,
+                    // and each poll a new observation rather than one republished.
+                    let now = SystemTime::now();
+                    let stamp = now.duration_since(UNIX_EPOCH).map_or(0, |since| since.as_millis());
+                    let body = signals(site, publishing, stamp);
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\nDate: Thu, 01 Jan 1970 00:00:01 GMT\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 200 OK\r\nDate: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        httpdate::fmt_http_date(now),
                         body.len()
                     );
                     let _sent = tls.write_all(response.as_bytes()).and_then(|()| tls.flush());
@@ -141,7 +145,7 @@ mod tests {
     }
 
     /// What `site`'s operator publishes in `mode`: its in-flight count and its queue.
-    fn signals(site: &str, mode: u8) -> String {
+    fn signals(site: &str, mode: u8, stamp: u128) -> String {
         let labels = format!(r#"grid_site="{site}",grid_provider="pool-{site}""#);
         let (in_flight, queued) = match mode {
             FULL => (CEILING, 5),
@@ -149,7 +153,7 @@ mod tests {
             _ => (CEILING, 0),
         };
         format!(
-            "llm_d_epp_average_queue_size{{{labels}}} {queued} 1000\nllm_d_epp_average_running_requests{{{labels}}} {in_flight} 1000\nllm_d_epp_ready_endpoints{{{labels}}} 1 1000\n"
+            "llm_d_epp_average_queue_size{{{labels}}} {queued} {stamp}\nllm_d_epp_average_running_requests{{{labels}}} {in_flight} {stamp}\nllm_d_epp_ready_endpoints{{{labels}}} 1 {stamp}\n"
         )
     }
 

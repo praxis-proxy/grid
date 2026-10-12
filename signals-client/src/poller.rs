@@ -3,14 +3,14 @@
 //! A grid gateway is co-located with its operator, so it polls one local
 //! endpoint (`/v1/site/signals`) that already carries this site plus every
 //! peer the operator relays. The loop owns no transport: it takes a
-//! [`SignalSource`], so the pinned-mTLS client and the test fake share one
+//! [`SignalSource`], so the mTLS client and the test fake share one
 //! path. The operator's response `Date` is the freshness reference passed to
 //! [`LoadStore::ingest_at`], so staleness tracks the operator's clock, not the
 //! gateway's.
 
 use std::{sync::Arc, time::Duration};
 
-use grid_signals::{LoadStore, now_ms};
+use grid_signals::{Ingested, LoadStore, now_ms};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Deserialize;
 use tokio::sync::watch;
@@ -27,13 +27,14 @@ const DEFAULT_TIMEOUT_MS: u64 = 2_000;
 /// Everything escaped except the RFC 3986 unreserved set.
 const QUERY_VALUE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
 
-/// TLS material the poller presents and pins against, by path.
+/// TLS material the poller presents, by path.
 ///
-/// The gateway reads these to build the pinned client the poll loop runs on.
+/// The gateway reads these to build the client the poll loop runs on.
 /// The loop itself never sees them. Absent, the endpoint is polled as a plain
 /// client with no grid trust, which an access-enforcing operator refuses.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(clippy::struct_field_names, reason = "the keys the chart renders")]
 pub struct PinnedTls {
     /// CA bundle the operator certificate chains to.
     pub ca_path: String,
@@ -44,23 +45,14 @@ pub struct PinnedTls {
     /// Private key for `cert_path`.
     #[serde(default)]
     pub key_path: Option<String>,
-    /// Declared leaf digests the operator certificate must match. The operator
-    /// serves the site identity, so its SAN names the site rather than the
-    /// dialed host, and pinning verifies the leaf instead of the name.
-    #[serde(default)]
-    pub pins: Vec<String>,
 }
 
 /// How and how often to poll the local operator.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PollerConfig {
-    /// Signals endpoint of one peer.
-    ///
-    /// The topology is direct per-peer, not a relay: one source dials one peer and
-    /// attributes its signals to that peer's mTLS-verified identity. Verified-owner
-    /// attribution requires one site per scrape, so a relay carrying many sites is
-    /// not supported without per-site signed signals. See CROSS-SITE-POLLER.md.
+    /// Signals endpoint of this gateway's local operator, which relays every site it
+    /// collects from, each row labeled with the site it verified.
     pub endpoint: String,
     /// Poll interval, in milliseconds. Rejected when zero: the loop hands this
     /// to `tokio::time::interval`, which panics on a zero duration.
@@ -178,7 +170,7 @@ pub enum FetchError {
 
 /// A source of one exposition scrape from the local operator.
 ///
-/// Implemented once over the pinned-mTLS client the gateway builds, and once as
+/// Implemented once over the mTLS client the gateway builds, and once as
 /// a fake in tests. A bound rather than a trait object, so the call is static
 /// dispatch and the loop allocates nothing per poll.
 pub trait SignalSource {
@@ -361,6 +353,7 @@ async fn poll_loop<S, F>(
     F: Fn(&LoadStore) + Send,
 {
     let mut ticker = tokio::time::interval(interval);
+    let mut failing = false;
     // A slow poll delays the next tick instead of firing a burst to catch up.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -384,25 +377,66 @@ async fn poll_loop<S, F>(
                 if gate.wait_for(|open| *open).await.is_err() || *stop.borrow() {
                     return;
                 }
-                absorb(fetched, &store);
+                absorb(fetched, &store, &mut failing);
                 on_cycle(&store);
             },
         }
     }
 }
 
-/// Absorb one fetch, logging rather than propagating failure.
-/// Attribution keys on the crypto-verified owner from the scrape, never the
-/// payload's self-reported `grid_site` (the #160 binding).
-fn absorb(fetched: Result<Scrape, FetchError>, store: &LoadStore) {
-    match fetched {
-        Ok(scrape) => match certs::site_of_spiffe_id(&scrape.peer_identity) {
-            Some(owner) => store.ingest_at(&scrape.body, scrape.date_ms, now_ms(), owner),
-            None => {
-                tracing::warn!(id = %scrape.peer_identity, "scrape peer id is not a grid site id; dropping");
-            },
+/// Absorb one fetch, counting the outcome and logging only the transitions in and
+/// out of failure.
+fn absorb(fetched: Result<Scrape, FetchError>, store: &LoadStore, failing: &mut bool) {
+    let result = match fetched {
+        Ok(scrape) => ingest(&scrape, store),
+        Err(error) => Err((outcome(&error), error.to_string())),
+    };
+    let label = result.as_ref().map_or_else(|(label, _)| *label, |_| "ok");
+    metrics::counter!("grid_signals_poll_total", "result" => label).increment(1);
+    match (result, *failing) {
+        (Ok(ingested), true) => {
+            *failing = false;
+            tracing::info!(kept = ingested.kept, "signals poll recovered");
         },
-        Err(error) => tracing::debug!(%error, "signals poll failed; keeping last values"),
+        (Ok(_), false) => {},
+        (Err((_, error)), true) => tracing::debug!(error, "signals poll still failing; keeping last values"),
+        (Err((_, error)), false) => {
+            *failing = true;
+            tracing::warn!(error, "signals poll failing; keeping last values");
+        },
+    }
+}
+
+/// Store one scrape and record what it carried. Attribution keys on the
+/// crypto-verified owner from the scrape, never the payload's self-reported
+/// `grid_site` (the #160 binding).
+fn ingest(scrape: &Scrape, store: &LoadStore) -> Result<Ingested, (&'static str, String)> {
+    let Some(owner) = certs::site_of_spiffe_id(&scrape.peer_identity) else {
+        return Err((
+            "bad_identity",
+            format!("scrape peer id {} is not a grid site id", scrape.peer_identity),
+        ));
+    };
+    let ingested = store.ingest_at(&scrape.body, scrape.date_ms, now_ms(), owner);
+    let now_secs = u32::try_from(now_ms().saturating_div(1_000)).unwrap_or(u32::MAX);
+    metrics::gauge!("grid_signals_last_success_timestamp_seconds").set(f64::from(now_secs));
+    let bytes = u32::try_from(scrape.body.len()).unwrap_or(u32::MAX);
+    metrics::gauge!("grid_signals_response_bytes").set(f64::from(bytes));
+    for (reason, count) in ingested.dropped() {
+        if count > 0 {
+            metrics::counter!("grid_signals_ingest_dropped_total", "reason" => reason).increment(count);
+        }
+    }
+    Ok(ingested)
+}
+
+/// The counter label for a failed fetch.
+const fn outcome(error: &FetchError) -> &'static str {
+    match error {
+        FetchError::Unreachable(_) => "unreachable",
+        FetchError::TooLarge { .. } => "too_large",
+        FetchError::NoDate => "no_date",
+        FetchError::Unauthorized(_) => "unauthorized",
     }
 }
 
@@ -449,15 +483,40 @@ mod tests {
     }
 
     #[test]
-    fn tls_paths_and_pins_parse() {
+    fn tls_paths_parse_and_pins_are_refused() {
         let c = cfg(
-            "endpoint: https://operator:9091/v1/site/signals\ntls:\n  ca_path: /tls/ca.crt\n  cert_path: /tls/tls.crt\n  key_path: /tls/tls.key\n  pins:\n    - abc123\n",
+            "endpoint: https://operator:9091/v1/site/signals\ntls:\n  ca_path: /tls/ca.crt\n  cert_path: /tls/tls.crt\n  key_path: /tls/tls.key\n",
         )
         .expect("parses");
         let tls = c.tls.expect("tls present");
         assert_eq!(tls.ca_path, "/tls/ca.crt");
         assert_eq!(tls.cert_path.as_deref(), Some("/tls/tls.crt"));
-        assert_eq!(tls.pins, vec!["abc123".to_owned()]);
+        assert!(
+            cfg("endpoint: https://o/s\ntls:\n  ca_path: /ca\n  pins:\n    - abc123\n").is_err(),
+            "pins are not a poller setting"
+        );
+    }
+
+    #[test]
+    fn a_poll_outcome_is_named_and_the_failing_state_follows_transitions() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        let mut failing = false;
+        absorb(Err(FetchError::NoDate), &store, &mut failing);
+        assert!(failing, "the first failure is a transition");
+        assert_eq!(outcome(&FetchError::TooLarge { limit: 1 }), "too_large");
+        assert_eq!(outcome(&FetchError::Unauthorized(String::new())), "unauthorized");
+        assert_eq!(outcome(&FetchError::Unreachable(String::new())), "unreachable");
+        let scrape = Scrape {
+            body: format!(r#"m{{grid_site="east",grid_provider="p"}} 1 {}"#, now_ms()),
+            date_ms: now_ms(),
+            peer_identity: Arc::from(certs::spiffe_id("east").as_str()),
+        };
+        absorb(Ok(scrape), &store, &mut failing);
+        assert!(!failing, "a success clears it");
+        assert!(
+            store.latest(&LoadStore::key("east", "p"), "m").is_some(),
+            "the scrape was stored"
+        );
     }
 
     #[test]

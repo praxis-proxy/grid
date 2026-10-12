@@ -80,7 +80,12 @@ Each override takes a Secret reference, so no key material is inlined in values.
 | `db.type` | `builtin` Postgres | `external` + `db.external.connectionUrlSecretRef` |
 | `db.builtin.pvcAnnotations` | none | annotations on the builtin DB PVC, which holds every site record; under Argo CD set `argocd.argoproj.io/sync-options: Prune=false,Delete=false` |
 | `enrollment.authz` | `kube` (SAR, needs the sar-feature image) | `local` (standalone grid-admin token table) |
+| `enrollment.csrRecord.enabled` | `true` under `authz=kube`: each enrollment is recorded as a `CertificateSigningRequest`, approved and completed by the service, off the request path. The API server deletes an issued request about an hour after approval; the API server's audit log keeps the history when its policy covers these writes at `Request` level or above with a persistent backend. The service's own enrollment record is separate and always kept | `false` keeps no Kubernetes record; also the setting for Kubernetes 1.26 to 1.29, which lack the policy API |
+| `enrollment.csrRecord.signerName` | `grid.praxis.fast/site` | one per enrollment service on a cluster, since the policy admits only this release's service for it |
+| `enrollment.csrRecord.policy.enabled` | `true`: two `ValidatingAdmissionPolicies`, one letting only the service file under the signer name, one confining the service to that name (Kubernetes 1.30). Required while the record is on | `false` is refused; turn the record off on clusters without the v1 policy API |
 | `enrollment.gridAdminTokens.existingSecretRef` | generated (local authz) | pre-created token Secret (name:token lines) |
+
+The installing principal must itself hold `approve` and `sign` on the signer name, or RBAC escalation prevention refuses the record roles.
 
 ## Site invites
 

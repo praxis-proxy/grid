@@ -14,7 +14,7 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit lint gateway-lint lint-extra fmt doc audit \
-	generate-api-types codegen-check generate-crds crds-check \
+	generate-api-types codegen-check generate-crds crds-check generate-deploy deploy-check \
 	coverage coverage-check \
 	mutants semver publish-dry-run \
 	require-container-engine \
@@ -101,6 +101,15 @@ generate-crds:
 # Fail if the checked-in CRD manifests no longer match the Rust types.
 crds-check:
 	./scripts/generate-deployment-crds.sh --check
+
+# Regenerate the operator install manifests in deploy/operator (platform base) and
+# deploy/overlays/kind from charts/grid-operator and the values.yaml in each directory.
+generate-deploy:
+	./scripts/generate-deployment-operator.sh
+
+# Fail if the checked-in install manifests no longer match the chart.
+deploy-check:
+	./scripts/generate-deployment-operator.sh --check
 
 audit:
 	cargo audit

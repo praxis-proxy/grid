@@ -7,8 +7,9 @@ the consumer `intelligent_route` filter are a separate path, described in
 
 ## Site choice
 
-Each site's operator scrapes its EPP and relays its series, per provider. The gateway polls
-every site, concludes what each holds, learns each site's ceiling as the most
+Each site's operator scrapes its EPP, polls every other site's operator, and relays
+each series per provider under the site it verified. The gateway polls its local
+operator, concludes what each site holds, learns each site's ceiling as the most
 it has held with nothing waiting, and reads saturation (rho) as in-flight over that ceiling. A
 site has room while rho is below 1. Among healthy sites with room, three or more are picked
 two by ceiling taking the lower rho, two are picked between weighted by ceiling over 1 + rho,
@@ -55,11 +56,20 @@ cluster; `grid_route_selections_total{path}` for which arm each request took;
 `grid_route_shedding{model}` while a model is shed. Every routed response names its site and
 cluster in `x-grid-site` and `x-grid-backend`.
 
+The one poll every site's load arrives through: `grid_signals_poll_total{result}` (ok,
+unreachable, unauthorized, too_large, no_date, bad_identity),
+`grid_signals_last_success_timestamp_seconds`, `grid_signals_response_bytes` against the
+gateway's 1 MiB read ceiling (the operator holds the relay under 768 KiB and counts what it
+left out in `grid_signals_relay_truncated_total{store,cut}`), and `grid_signals_ingest_dropped_total{reason}` (skew,
+site_mismatch, cap, parse) for rows the operator served that the gateway refused. The
+gateway logs once when the poll starts failing and once when it recovers.
+
 ## Symptoms
 
 | Symptom | Likely cause | Action |
 |---|---|---|
 | A site is never chosen | Zero ready endpoints, or its cluster has no healthy endpoint | Check `llm_d_epp_ready_endpoints` and the gateway's cluster health log line |
+| Every remote site is unmeasured | The gateway's poll of its local operator is failing, or the operator is not collecting from peers | `grid_signals_poll_total` by result at the gateway; `grid_collection_up` and `grid_peer_signals_refused_total` at the operator |
 | A site's ceiling sits far below what its engine runs | It was queued whenever it ran high, so no sample taught | Raise `explore_floor` |
 | A small or slow site takes little | Expected: picks follow measured ceilings, and two choices never pick the busiest of three | Nothing |
 | 429 under light load | Shedding is on and `full_after_ms` or `queue_full` is too low for the engine's normal queue | Raise them, or turn shedding off |

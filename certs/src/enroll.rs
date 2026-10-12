@@ -185,8 +185,23 @@ pub fn verify_csr(csr_pem: &str) -> Result<String, EnrollError> {
     if csr_pem.len() > MAX_CSR_PEM_BYTES {
         return Err(EnrollError::TooLarge);
     }
+    one_request_block(csr_pem)?;
     let public_key_der = backend::csr_spki_der(csr_pem).map_err(map_backend_error)?;
     Ok(hex(&backend::sha256(&public_key_der)))
+}
+
+/// The PEM labels a request may carry.
+const REQUEST_LABELS: [&str; 2] = ["CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST"];
+
+/// Exactly one PEM block, and it is a request. A bundle that also carries a
+/// private key or a certificate is refused before any backend reads it, since
+/// one backend skips non-request blocks and would accept the bundle.
+fn one_request_block(csr_pem: &str) -> Result<(), EnrollError> {
+    let blocks = pem::parse_many(csr_pem).map_err(|_bad| EnrollError::Malformed)?;
+    match blocks.as_slice() {
+        [block] if REQUEST_LABELS.contains(&block.tag()) => Ok(()),
+        _other => Err(EnrollError::Malformed),
+    }
 }
 
 /// Whether `key_pem` is the private key for `cert_pem`.
@@ -566,5 +581,16 @@ mod tests {
         issued_cert
             .verify_signature(Some(ca_cert.public_key()))
             .expect("issued cert must verify against the CA");
+    }
+
+    #[test]
+    fn a_request_bundled_with_a_key_is_refused_before_any_backend_reads_it() {
+        let csr = crate::generate_csr("east").expect("csr");
+        let bundled = format!("{}{}", csr.key_pem.as_str(), csr.csr_pem);
+        assert!(matches!(verify_csr(&bundled), Err(EnrollError::Malformed)));
+        let twice = format!("{}{}", csr.csr_pem, csr.csr_pem);
+        assert!(matches!(verify_csr(&twice), Err(EnrollError::Malformed)));
+        let legacy = csr.csr_pem.replace("CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST");
+        assert!(verify_csr(&legacy).is_ok(), "the legacy label is still a request");
     }
 }

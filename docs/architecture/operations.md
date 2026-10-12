@@ -40,23 +40,23 @@ for the full values reference.
 
 **Option 2: Kustomize**
 
+The install manifests are generated from the chart (`make generate-deploy`; CI runs
+`make deploy-check`). `deploy/operator/` is the platform base: no Namespace, the image set
+through `params.env`, metrics TLS from the enrolled site identity, no platform assumptions.
+`deploy/overlays/openshift/` is its OpenShift flavor, the base values plus a delta: metrics
+TLS from the service CA and a NetworkPolicy. A platform operator vendors the base or a
+flavor as a kustomize base and sets the namespace in its own kustomization. The SWIM and
+signals Services are `LoadBalancer`, the only type the operator accepts for the Service it
+advertises, so the cluster needs a LoadBalancer provider. `deploy/overlays/kind/` is the
+standalone install with its own `grid-system` Namespace and ClusterIP Services.
+
 ```console
-# Complete AGN deployment (CRDs + `grid-operator`)
+# Standalone deployment (CRDs + operator, kind shape)
 kubectl apply -k deploy/
 
 # Or step-by-step:
 kubectl apply -k deploy/crds/
-kubectl apply -k deploy/operator/
-```
-
-**Option 2: Direct YAML**
-
-```console
-# Apply CRDs first
-kubectl apply -k deploy/crds/
-
-# Apply operator resources with Kustomize
-kubectl apply -k deploy/operator/
+kubectl apply -k deploy/overlays/kind/
 ```
 
 **Option 3: Generated CRDs (development)**
@@ -64,7 +64,7 @@ kubectl apply -k deploy/operator/
 ```console
 # Generate CRDs from source and apply directly
 cargo run -p operator --bin generate_crds | kubectl apply -f -
-kubectl apply -k deploy/operator/
+kubectl apply -k deploy/overlays/kind/
 ```
 
 For regenerating CRDs after schema changes:
@@ -92,16 +92,18 @@ See sample Custom Resource configurations:
 - `config/samples/` - standard operator sample CRs
 - `deploy/examples/single-cluster-api-provider/` - minimal example with external API
 
-The install package creates:
+The standalone install creates:
 
 | Resource | Name | Scope |
 |---|---|---|
-| `Namespace` | `grid-system` | cluster |
-| `ServiceAccount` | `grid-operator` | `grid-system` |
-| `ClusterRole` | `grid-operator-crd` | cluster |
-| `ClusterRoleBinding` | `grid-operator-crd` | cluster |
-| `ClusterRole` | `grid-operator-resources` | cluster (verb definitions only) |
-| `RoleBinding` | `grid-operator-resources` | `default` namespace |
+| `Namespace` | `grid-system` | cluster (kind overlay only) |
+| `ServiceAccount` | `grid-operator`, `grid-operator-metrics-scraper` | `grid-system` |
+| `ClusterRole` | `grid-operator-crd`, `grid-operator-metrics-scraper`, `grid-operator-resources` (verb definitions only) | cluster |
+| `ClusterRoleBinding` | `grid-operator`, `grid-operator-metrics-scraper` | cluster |
+| `RoleBinding` | `grid-operator` (resources access) | `grid-system`, plus `default` in the kind overlay |
+| `Role` and `RoleBinding` | `grid-operator-metrics-scraper-token` | `grid-system` |
+| `Service` | `grid-operator-metrics`, `grid-operator-swim` | `grid-system` |
+| `NetworkPolicy` | `grid-operator` | `grid-system` (platform base only) |
 | `Deployment` | `grid-operator` | `grid-system` |
 
 The operator runs as a single binary with multiple
@@ -141,9 +143,11 @@ Deployments should pin an immutable digest:
 image: ghcr.io/praxis-proxy/grid-operator@sha256:8c8271aa589fbd81e346b75ae580be9e8085c3b283b4e6a99e2b9adcea73e12d
 ```
 
-**Override:** replace the `image:` field in
-`deploy/operator/deployment.yaml` or patch the
-Deployment after apply:
+**Override:** set `grid-operator-image` in `deploy/operator/params.env` (platform
+base; a kustomization that vendors the base uses the `images` transformer instead,
+since a merged parameters ConfigMap arrives after the base's replacement has run), or
+set `image` in `deploy/overlays/kind/values.yaml` and run `make generate-deploy`, or
+patch the Deployment after apply:
 
 ```console
 kubectl set image deployment/grid-operator \
@@ -283,8 +287,8 @@ Add one `RoleBinding` per namespace referenced by
 
 ### Deployment configuration
 
-The `Deployment` in `deploy/operator/deployment.yaml`
-exposes SWIM configuration through environment variables:
+The generated `Deployment` (`deploy/operator/deployment.yaml`, rendered from
+`charts/grid-operator`) exposes SWIM configuration through environment variables:
 
 SWIM endpoint values accept all of these forms:
 
@@ -1011,7 +1015,7 @@ separate steps.
 **RBAC for GridSite status updates**
 
 The `GridSite` and `GridNetwork` controllers both write to `GridSite` status.
-The `grid-operator-crd` `ClusterRole` in `deploy/operator/cluster-role-crd.yaml`
+The `grid-operator-crd` `ClusterRole` in `deploy/operator/clusterrole-crd.yaml`
 includes `gridsites/status` with verbs `get` and `patch`.
 
 ## Consumer Config

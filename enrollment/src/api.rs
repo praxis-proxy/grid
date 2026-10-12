@@ -69,6 +69,10 @@ pub struct AppState {
 
     /// Whether renewals are signed. Off stops all rotation; issued identities stay valid.
     pub renewals_enabled: bool,
+
+    /// Records enrollments as `CertificateSigningRequest`s on the hub, when configured.
+    #[cfg(feature = "csr-record")]
+    pub recorder: Option<Arc<crate::record::Recorder>>,
 }
 
 /// Failures the interface can report.
@@ -483,6 +487,7 @@ async fn enroll(
         // Signed under the pinned name, with every SAN rebuilt from it.
         sign_csr(&ca, &pin.site_name, &csr, validity)
             .map(|cert| Issued {
+                site_name: pin.site_name.clone(),
                 certificate: cert.cert_pem,
                 spiffe_id: cert.spiffe_id,
                 public_key_sha256: cert.public_key_sha256,
@@ -492,6 +497,8 @@ async fn enroll(
     .await?;
 
     tracing::info!(%enrollment_id, spiffe_id = %issued.spiffe_id, "site enrolled");
+    #[cfg(feature = "csr-record")]
+    record_enrollment(&state, enrollment_id, &issued, csr);
     Ok((
         StatusCode::CREATED,
         Json(Enrollment {
@@ -504,6 +511,25 @@ async fn enroll(
             public_key_sha256: issued.public_key_sha256,
         }),
     ))
+}
+
+/// Write the enrollment's record, after the certificate is issued and off the
+/// request path, so a slow API server never delays the site's response.
+///
+/// The record is an audit entry, not a gate: a failure is logged and the
+/// enrollment stands, since the certificate is already issued.
+#[cfg(feature = "csr-record")]
+fn record_enrollment(state: &AppState, enrollment_id: Uuid, issued: &Issued, csr_pem: String) {
+    let Some(recorder) = state.recorder.as_ref() else {
+        return;
+    };
+    let record = crate::record::Record {
+        site: issued.site_name.clone(),
+        enrollment_id,
+        csr_pem,
+        cert_pem: issued.certificate.clone(),
+    };
+    crate::record::spawn(Arc::clone(recorder), record);
 }
 
 /// The client certificate the TLS handshake proved, DER, set per connection.
@@ -579,6 +605,7 @@ async fn renew(
     let signed = Box::pin(state.store.renew_and_issue(&renewal, || {
         sign_csr(&ca, &renewal.site_name, &csr, validity)
             .map(|cert| Issued {
+                site_name: renewal.site_name.clone(),
                 certificate: cert.cert_pem,
                 spiffe_id: cert.spiffe_id,
                 public_key_sha256: cert.public_key_sha256,

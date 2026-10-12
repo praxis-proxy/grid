@@ -784,10 +784,8 @@ pub struct GatewayRef {
 /// credential-bearing inference candidates are present), and a `load_balancer`
 /// section.
 ///
-/// Every cluster referenced by a projected inference candidate must have a matching
-/// `clusterEndpoints` entry.  Missing endpoint topology causes config generation
-/// to fail with status reason `MissingClusterEndpoint` instead of rendering an
-/// incomplete `load_balancer` cluster.
+/// A candidate with no `clusterEndpoints` entry, typed or derived, is withdrawn
+/// and named in status.
 ///
 /// # Security
 ///
@@ -847,14 +845,12 @@ pub struct ConsumerConfig {
     /// Endpoint topology for the generated `load_balancer` section.
     ///
     /// Each entry maps an inference candidate cluster name to a reachable endpoint
-    /// address with explicit transport configuration. Every cluster referenced
-    /// by a projected inference candidate must have a matching entry here with a
+    /// address with explicit transport configuration. Every entry needs a
     /// non-`None` `transport` field.
     ///
-    /// Missing endpoint topology causes config generation to fail with
-    /// `MissingClusterEndpoint`.  Missing transport fails with
-    /// `MissingTransport`.  Mutual-TLS transport without SNI fails with
-    /// `MissingSni`.
+    /// A candidate with no entry here, and none derived, is withdrawn from
+    /// this gateway.  Missing transport fails with `MissingTransport`.
+    /// Mutual-TLS transport without SNI fails with `MissingSni`.
     ///
     /// In production, this is populated by whoever manages the consumer gateway
     /// deployment (platform automation, the gateway operator, or a Helm chart).
@@ -875,6 +871,11 @@ pub struct ConsumerConfig {
     /// Default: `/etc/praxis/tls`.
     #[serde(default = "default_tls_cert_mount_path")]
     pub tls_cert_mount_path: String,
+
+    /// Derive the endpoint topology from the declarations of named providers,
+    /// instead of requiring a `clusterEndpoints` entry per candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derive_topology: Option<DeriveTopology>,
 
     /// Opt in to validating Secret references and reconciling required mounts
     /// into a specifically delegated gateway Deployment.
@@ -1031,12 +1032,40 @@ impl Default for ConsumerConfig {
             credential_mount_base: default_credential_mount_base(),
             config_map_name: default_consumer_config_map_name(),
             cluster_endpoints: Vec::new(),
+            derive_topology: None,
             tls_cert_mount_path: default_tls_cert_mount_path(),
             mount_reconciliation: None,
             listener_port: default_listener_port(),
             telemetry: None,
         }
     }
+}
+
+/// Providers a gateway derives its endpoint topology from. Empty derives nothing.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": "!has(self.transport) || self.transport.mode == 'tls'",
+    "message": "deriveTopology.transport mode must be tls"
+}]))]
+pub struct DeriveTopology {
+    /// Routing identities whose declarations this gateway derives from.
+    ///
+    /// Each entry is a provider's `routingClusterRef`, or its `metadata.name`
+    /// when that is unset. At most 64 entries, each named once.
+    #[schemars(
+        length(max = 64),
+        inner(length(min = 1, max = 253)),
+        extend("x-kubernetes-list-type" = "set")
+    )]
+    #[serde(default)]
+    pub from_providers: Vec<String>,
+
+    /// TLS for derived local `https` backends. Omitted uses the endpoint host and
+    /// the process trust store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<EndpointTransport>,
 }
 
 /// Explicit delegation of a gateway Deployment's generated Secret mounts.
@@ -2008,6 +2037,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn derive_topology_transport_must_be_tls() {
+        let crd = crd_json();
+        let rules = crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/gatewayRefs/items/properties/consumerConfig/properties/deriveTopology/x-kubernetes-validations",
+            )
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.get("rule").and_then(serde_json::Value::as_str)
+                    == Some("!has(self.transport) || self.transport.mode == 'tls'")),
+            "a derived backend is server-authenticated TLS or plaintext by its scheme: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn derive_topology_from_providers_is_a_bounded_set() {
+        let crd = crd_json();
+        let from_providers = crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/gatewayRefs/items/properties/consumerConfig/properties/deriveTopology/properties/fromProviders",
+            )
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            from_providers.get("maxItems").and_then(serde_json::Value::as_u64),
+            Some(64)
+        );
+        assert_eq!(
+            from_providers
+                .get("x-kubernetes-list-type")
+                .and_then(serde_json::Value::as_str),
+            Some("set"),
+            "a set refuses a duplicate at admission"
+        );
+        assert_eq!(
+            from_providers
+                .pointer("/items/minLength")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            from_providers
+                .pointer("/items/maxLength")
+                .and_then(serde_json::Value::as_u64),
+            Some(253)
+        );
     }
 
     #[test]

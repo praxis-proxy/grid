@@ -83,6 +83,10 @@ pub enum Reason {
     ScrapeUnauthorized,
     /// No successful scrape within the window, and the latest attempt failed TLS.
     TlsHandshakeFailed,
+    /// No successful scrape within the window, and the latest response passed
+    /// the body budget. The endpoint answered, so readiness is unknown rather
+    /// than false.
+    MetricsBodyTooLarge,
     /// No successful scrape within the window, and the latest attempt failed otherwise.
     ScrapeFailed,
     /// The provider itself is `Unavailable`.
@@ -105,6 +109,7 @@ impl Reason {
             Self::ScrapeTimedOut => "ScrapeTimedOut",
             Self::ScrapeUnauthorized => "ScrapeUnauthorized",
             Self::TlsHandshakeFailed => "TLSHandshakeFailed",
+            Self::MetricsBodyTooLarge => "MetricsBodyTooLarge",
             Self::ScrapeFailed => "ScrapeFailed",
             Self::ProviderUnavailable => "ProviderUnavailable",
             Self::MetricsNotConfigured => "MetricsNotConfigured",
@@ -117,7 +122,10 @@ impl Reason {
     pub const fn status(self) -> &'static str {
         match self {
             Self::Ready => "True",
-            Self::MetricsNotConfigured | Self::AwaitingFirstScrape | Self::NoLivenessCheck => "Unknown",
+            Self::MetricsNotConfigured
+            | Self::AwaitingFirstScrape
+            | Self::NoLivenessCheck
+            | Self::MetricsBodyTooLarge => "Unknown",
             Self::NoEndpointsReady
             | Self::MetricsStale
             | Self::ScrapeTimedOut
@@ -133,7 +141,10 @@ impl Reason {
     pub const fn display(self) -> &'static str {
         match self {
             Self::Ready => "Ready",
-            Self::MetricsNotConfigured | Self::AwaitingFirstScrape | Self::NoLivenessCheck => "Unknown",
+            Self::MetricsNotConfigured
+            | Self::AwaitingFirstScrape
+            | Self::NoLivenessCheck
+            | Self::MetricsBodyTooLarge => "Unknown",
             Self::NoEndpointsReady
             | Self::MetricsStale
             | Self::ScrapeTimedOut
@@ -149,7 +160,11 @@ impl Reason {
     pub const fn excludes(self) -> bool {
         !matches!(
             self,
-            Self::Ready | Self::MetricsNotConfigured | Self::AwaitingFirstScrape | Self::NoLivenessCheck
+            Self::Ready
+                | Self::MetricsNotConfigured
+                | Self::AwaitingFirstScrape
+                | Self::NoLivenessCheck
+                | Self::MetricsBodyTooLarge
         )
     }
 }
@@ -200,7 +215,8 @@ impl ScrapeClass {
             Self::Timeout => Reason::ScrapeTimedOut,
             Self::Unauthorized => Reason::ScrapeUnauthorized,
             Self::Tls => Reason::TlsHandshakeFailed,
-            Self::Dns | Self::Connect | Self::Http | Self::BodyCap | Self::Parse | Self::Config => Reason::ScrapeFailed,
+            Self::BodyCap => Reason::MetricsBodyTooLarge,
+            Self::Dns | Self::Connect | Self::Http | Self::Parse | Self::Config => Reason::ScrapeFailed,
         }
     }
 }
@@ -943,7 +959,6 @@ mod tests {
             (ScrapeClass::Dns, Reason::ScrapeFailed),
             (ScrapeClass::Connect, Reason::ScrapeFailed),
             (ScrapeClass::Http, Reason::ScrapeFailed),
-            (ScrapeClass::BodyCap, Reason::ScrapeFailed),
             (ScrapeClass::Parse, Reason::ScrapeFailed),
             (ScrapeClass::Config, Reason::ScrapeFailed),
         ];
@@ -967,6 +982,20 @@ mod tests {
             "TLSHandshakeFailed",
             "the contract's spelling"
         );
+    }
+
+    #[test]
+    fn a_body_cap_means_the_endpoint_answered_so_readiness_is_unknown() {
+        let store = ReadinessStore::default();
+        let start = Instant::now();
+        store.record_failure("p", ScrapeClass::BodyCap, start);
+        let verdict = store
+            .verdict("p", false, STALE, start + STALE + Duration::from_secs(1))
+            .expect("judged");
+        assert_eq!(verdict.reason, Reason::MetricsBodyTooLarge);
+        assert_eq!(verdict.reason.status(), "Unknown");
+        assert!(!verdict.reason.excludes(), "an answered endpoint is not down");
+        assert!(verdict.message.ends_with("body_cap"), "{}", verdict.message);
     }
 
     #[test]

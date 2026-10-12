@@ -355,6 +355,28 @@
         },
         "tolerations": {
           "type": "array"
+        },
+        "csrRecord": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "policy": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "signerName": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9.-]+/[A-Za-z0-9._-]+$"
+            }
+          }
         }
       },
       "additionalProperties": false

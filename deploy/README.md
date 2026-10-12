@@ -42,20 +42,82 @@ kubectl --dry-run=server create -k deploy/crds/
 
 ## Operator Installation
 
-### Prerequisites
+The install manifests are generated from `charts/grid-operator`; do not hand-edit them.
+Each directory keeps the `values.yaml` that renders it.
 
-1. Kubernetes cluster with admin access
-2. kubectl configured for the target cluster
+- `operator/` is the platform base: the image set through `params.env`, the namespace left
+  to the consumer, metrics TLS from the enrolled site identity, and no platform assumptions.
+  A platform operator vendors this directory, or a flavor of it, and places it in its own
+  namespace.
+- `overlays/<flavor>/` is a platform flavor of the base: the base values plus the flavor's
+  `values.yaml` as a delta, rendered against the API versions in its `api-versions` file.
+  `overlays/openshift/` takes metrics TLS from the service CA and adds a NetworkPolicy that
+  admits the platform's monitoring namespaces. Add a flavor by adding a directory.
+- The SWIM and signals Services are `LoadBalancer`, because the operator refuses any other
+  type for the Service it advertises and peer sites reach both through it. A cluster with
+  no LoadBalancer provider leaves the operator waiting for an address and never ready. The
+  site gateway Service is named `grid-gateway`, the name the chart uses once a grid exists;
+  the `grid-operator-resources` ClusterRole grants `get` on that name only.
+- `overlays/kind/` is the standalone install for a kind cluster: plain metrics, no
+  NetworkPolicy, its own `grid-system` Namespace, and the resources RoleBinding in the
+  `default` namespace that the install qualification checks.
+
+```bash
+# Regenerate after a chart change (writes deploy/operator and every deploy/overlays directory)
+make generate-deploy
+
+# Check that the committed manifests match the chart (runs in CI)
+make deploy-check
+```
 
 ### Install Steps
 
-```bash
-# Full install: CRDs + operator
-kubectl apply -k deploy/
+The CRDs and the namespace are the shared prerequisites. The base and the OpenShift
+overlay target the grid-system namespace without creating it, so a fresh cluster
+needs it first.
+The kind overlay creates its own.
 
-# Or step-by-step:
+```bash
 kubectl apply -k deploy/crds/
-kubectl apply -k deploy/operator/
+kubectl create namespace grid-system --dry-run=client -o yaml | kubectl apply -f -
+```
+
+Then pick one install variant. The base is the portable path and the overlays are
+flavors of it, so applying more than one to a cluster layers a flavor's settings over
+the same operator resources.
+
+```bash
+# Portable, in its default namespace (a platform sets its own)
+kubectl apply -k deploy/operator/ -n grid-system
+
+# or OpenShift
+kubectl apply -k deploy/overlays/openshift/ -n grid-system
+
+# or kind, which brings its own namespace
+kubectl apply -k deploy/overlays/kind/
+```
+
+To run a different image from a consumer kustomization that vendors the base, use the
+images transformer in that kustomization's directory. Merging a second
+grid-operator-parameters ConfigMap does nothing, because the base's replacement has
+already run by the time the merge applies.
+
+```bash
+(cd path/to/consumer-kustomization && kustomize edit set image ghcr.io/praxis-proxy/grid-operator=ghcr.io/praxis-proxy/grid-operator:sha-<commit>)
+```
+
+A Deployment another installer created, the chart or the hand-maintained manifests
+before they were generated, may carry a different selector. A selector is immutable, so
+delete that Deployment first only when it differs from the target:
+
+```bash
+kubectl get deployment grid-operator -n grid-system \
+  -o jsonpath='{.spec.selector.matchLabels}'
+kubectl kustomize deploy/operator/ |
+  yq 'select(.kind == "Deployment") | .spec.selector.matchLabels'
+```
+
+Matching selectors apply in place and need no delete.
 
 # Verify operator is running
 kubectl get pods -n grid-system
@@ -67,9 +129,9 @@ kubectl logs -n grid-system deployment/grid-operator
 The operator uses a split RBAC model:
 
 - **Cluster-scoped**: CRD access via ClusterRole `grid-operator-crd`
-- **Namespace-scoped**: Secret/ConfigMap access via ClusterRole `grid-operator-resources` bound to specific namespaces
+- **Namespace-scoped**: Secret/ConfigMap access via ClusterRole `grid-operator-resources` bound in the operator namespace, plus every namespace listed under `resourceNamespaces` in the directory's `values.yaml`
 
-By default, the operator can access Secrets and ConfigMaps in the `default` namespace. To grant access to additional namespaces:
+To grant access to another namespace without regenerating:
 
 ```bash
 kubectl create rolebinding grid-operator-resources \
@@ -80,20 +142,12 @@ kubectl create rolebinding grid-operator-resources \
 
 ## Image Configuration
 
-The checked-in operator `Deployment` references the published project image,
-pinned to an immutable digest:
-
-- `ghcr.io/praxis-proxy/grid-operator@sha256:8c8271aa589fbd81e346b75ae580be9e8085c3b283b4e6a99e2b9adcea73e12d`
-
-Release notes provide the immutable digest for each released version. Do not
-use `latest` as an installation contract.
-
-The local Kind validation path continues to use:
-
-- `grid-operator:latest`
-
-For Kind validation, the xtask harness builds and loads the image automatically.
-For production, use a versioned release tag or immutable digest.
+The generated `Deployment` references the chart's release image, `ghcr.io/praxis-proxy/grid-operator`
+at the chart `appVersion`. `deploy/operator/params.env` carries the same value under
+`grid-operator-image`, and the kustomization replaces the Deployment image from it, so a
+platform operator sets the image by rewriting that one key. Release notes provide the
+immutable digest for each released version; pin it there or in `values.yaml` when an
+installation contract needs one.
 
 ## Praxis AI Gateway Deployment
 

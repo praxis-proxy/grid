@@ -100,6 +100,25 @@ jobs:
       - name: Check CRD manifests match the Rust CRD types
         run: make crds-check
 
+      # The generator renders the chart with helm and splits it with yq; pin both so the
+      # check does not follow the runner image.
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.17.3
+
+      - name: Install yq
+        env:
+          YQ_VERSION: v4.54.1
+          YQ_SHA256: 8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f
+        run: |
+          curl -fsSL -o /tmp/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          echo "${YQ_SHA256}  /tmp/yq" | sha256sum -c
+          sudo install -m 0755 /tmp/yq /usr/local/bin/yq
+
+      - name: Check install manifests match the chart
+        run: make deploy-check
+
   # ----------------------------------------------------------------------------
   # Unit tests
   # ----------------------------------------------------------------------------

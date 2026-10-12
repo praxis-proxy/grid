@@ -161,7 +161,8 @@ try_template "$CHART_DIR" "SWIM LoadBalancer" \
   --set swim.service.loadBalancerIP=10.0.0.1
 SIG_RENDER=$(helm template v-sig "$CHART_DIR" --namespace grid-system --set signals.enabled=true \
   --set swim.service.enabled=true --set swim.service.type=LoadBalancer 2>&1 || true)
-if grep -q 'value: "v-sig-grid-operator-signals.grid-system.svc:9091"' <<<"$SIG_RENDER" \
+# shellcheck disable=SC2016 # the rendered value is the literal $(POD_NAMESPACE)
+if grep -q 'value: "v-sig-grid-operator-signals.$(POD_NAMESPACE).svc:9091"' <<<"$SIG_RENDER" \
   && grep -q 'value: "v-sig-grid-operator-signals"' <<<"$SIG_RENDER" \
   && grep -A3 -- '- name: signals' <<<"$SIG_RENDER" | matches 'targetPort: signals'; then
   pass "signals: own TCP Service, named to the operator, with the local gateway address"
@@ -298,12 +299,16 @@ echo ""
 echo "=== Gateway discovery namespace ==="
 # Without GRID_GATEWAY_NAMESPACE the operator reads the gateway Service in
 # grid-system and a release anywhere else gets a 403.
+# The default expands the pod's own namespace from the downward API, so a kustomize
+# consumer can move the install without rewriting the env.
 if render verify-gwns "$CHART_DIR" --namespace release-ns --show-only templates/deployment.yaml; then
   GW_NS=$(grep -A1 'name: GRID_GATEWAY_NAMESPACE' <<<"$RENDERED" | awk '/value:/{print $2}' | tr -d '"')
-  if [ "$GW_NS" = "release-ns" ]; then
-    pass "gateway namespace defaults to the release namespace"
+  # shellcheck disable=SC2016 # the rendered value is the literal $(POD_NAMESPACE)
+  if [ "$GW_NS" = '$(POD_NAMESPACE)' ] \
+    && grep -A3 'name: POD_NAMESPACE' <<<"$RENDERED" | matches 'fieldPath: metadata.namespace'; then
+    pass "gateway namespace defaults to the pod namespace from the downward API"
   else
-    fail "gateway namespace: expected release-ns, got '$GW_NS'"
+    fail "gateway namespace: expected \$(POD_NAMESPACE) from the downward API, got '$GW_NS'"
   fi
 fi
 if render verify-gwns "$CHART_DIR" --namespace release-ns --set-string gateway.namespace=edge-ns; then

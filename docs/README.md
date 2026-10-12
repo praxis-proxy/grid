@@ -22,9 +22,11 @@
   boundaries, workspace crates, and terminology.
 - [Auth and Policy](architecture/auth.md): provider authentication strategies,
   access policy, and trust model.
+- [Enrollment](architecture/enrollment.md): how a site becomes a member: parties,
+  the flow, trust boundaries, and the planned object-driven shape.
 - [Consumer Config](architecture/consumer-config.md): operator-generated
   consumer Praxis `ConfigMap` and the `GatewayRef.consumerConfig` API.
-- [OpenTelemetry](architecture/opentelemetry.md) - exporter configuration,
+- [OpenTelemetry](architecture/opentelemetry.md): exporter configuration,
   secret handling, image requirements, and the Praxis 0.7.1 trace-linkage limit.
 - [External Client Ingress](architecture/external-ingress.md): GTM/GLB edge
   selection, AGN provider routing, trust boundaries, affinity, snapshot
@@ -37,6 +39,8 @@
   you install its chart.
 - [Adding an Inference Provider](adding-provider.md): step-by-step
   workflow for in-cluster, existing-service, and external HTTPS providers.
+- [Metrics Reference](metrics.md): every metric the operator and the gateway
+  export, with types, labels, and what each one means.
 - [Operations](architecture/operations.md): local environment setup,
   validation commands, and operator workflows.
 - [CI Kind E2E](architecture/ci-kind-e2e.md): validation tiers, gate sequence,
@@ -53,20 +57,25 @@
 
 ## Integration Qualifications
 
-- [Provider Traffic Qualification](../tests/e2e/topologies/grid-provider-traffic/README.md) -
+- [Provider Traffic Qualification](../tests/e2e/topologies/grid-provider-traffic/README.md):
   proves multi-cluster discovery, accepted-overlay delivery, request-time
   round-robin selection, provider attribution, and stable routing.
-- [Static Weighted Provider Qualification](../tests/e2e/topologies/grid-static-weighted/README.md) -
+- [Static Weighted Provider Qualification](../tests/e2e/topologies/grid-static-weighted/README.md):
   proves configured capacity propagation, weighted overlay convergence,
-  proportional request selection, hot reload, and equal-weight recovery.
-- [Distributed Token Quota Qualification](../tests/e2e/topologies/grid-token-rate-limit/README.md) -
+  proportional request selection, hot reload, and equal-weight recovery. This
+  is the release qualification for `weightedRandom`, static placement, provider
+  capacity, weighted-overlay, or cross-site capacity propagation changes.
+- [Combined-site Lifecycle Qualification](../tests/e2e/topologies/grid-combined-site/README.md):
+  is the release qualification for combined-site routing, provider
+  add/remove/re-add, session fallback, rollout, trust, or lifecycle changes.
+- [Distributed Token Quota Qualification](../tests/e2e/topologies/grid-token-rate-limit/README.md):
   proves shared identity-scoped quota enforcement across gateway replicas,
   regional provider selection, expiry, restart persistence, fail-closed state
   storage, and storage-network isolation.
-- [Single-cluster Multi-gateway Qualification](../tests/e2e/topologies/grid-single-cluster-multi-gateway/README.md) -
+- [Single-cluster Multi-gateway Qualification](../tests/e2e/topologies/grid-single-cluster-multi-gateway/README.md):
   proves shared overlay delivery and independent consumer/provider gateway
   behavior within one Kind cluster and one GridSite.
-- [Provider draining](architecture/provider-draining.md) - documents graceful
+- [Provider draining](architecture/provider-draining.md): documents graceful
   provider maintenance, gateway-wide selection, and reversible drain state.
 
 These integration tests create their environments through Forge and execute
@@ -80,7 +89,7 @@ image preparation, execution, evidence, and cleanup.
 
 ## Development
 
-- [Release Process](release.md) - versioning, validation, artifact publication,
+- [Release Process](release.md): versioning, validation, artifact publication,
   and release workflow.
 - [Development](development.md): build, test, format, lint, and coverage.
 - [Conventions](conventions.md): coding style, testing requirements,

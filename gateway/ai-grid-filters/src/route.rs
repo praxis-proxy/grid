@@ -1618,6 +1618,7 @@ mod tests {
                 signals: &store,
                 now_ms: 1_000,
                 window_ms: 30_000,
+                horizon_ms: 30_000,
                 availability: &AvailabilitySettings::default(),
                 learned: &mut Learned::default(),
             },
@@ -1704,6 +1705,7 @@ mod tests {
             signals: &store,
             now_ms: 1_000,
             window_ms: 500,
+            horizon_ms: 500,
             availability: &availability,
             learned: &mut learned,
         };

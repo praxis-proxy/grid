@@ -89,6 +89,12 @@ spec:
                   fieldPath: metadata.namespace
             - name: ENROLLMENT_TOKEN_AUDIENCE
               value: {{ .Values.enrollment.tokenAudience | quote }}
+            {{- if .Values.enrollment.csrRecord.enabled }}
+            - name: ENROLLMENT_CSR_RECORD
+              value: "true"
+            - name: ENROLLMENT_CSR_SIGNER_NAME
+              value: {{ .Values.enrollment.csrRecord.signerName | quote }}
+            {{- end }}
             {{- end }}
             {{- with .Values.hubSite.name }}
             - name: ENROLLMENT_RESERVED_SITES

@@ -29,7 +29,7 @@ mod tests {
             atomic::{AtomicBool, AtomicU8, Ordering},
         },
         thread,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use certs::{CaCert, DEFAULT_TRUST_DOMAIN, GridSpiffeClientVerifier, generate_ca, generate_site_cert};
@@ -116,10 +116,14 @@ mod tests {
                             Ok(n) => request.extend_from_slice(&buf[..n]),
                         }
                     }
-                    let body = signals(site, publishing);
-                    // Samples stamped at the Date header read as age zero.
+                    // Stamped now and dated now, as an operator serving a fresh scrape: age zero,
+                    // and each poll a new observation rather than one republished.
+                    let now = SystemTime::now();
+                    let stamp = now.duration_since(UNIX_EPOCH).map_or(0, |since| since.as_millis());
+                    let body = signals(site, publishing, stamp);
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\nDate: Thu, 01 Jan 1970 00:00:01 GMT\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 200 OK\r\nDate: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        httpdate::fmt_http_date(now),
                         body.len()
                     );
                     let _sent = tls.write_all(response.as_bytes()).and_then(|()| tls.flush());
@@ -136,14 +140,14 @@ mod tests {
         }
     }
 
-    /// What `site`'s operator publishes in `mode`: an idle queue, and its readiness verdict.
-    fn signals(site: &str, mode: u8) -> String {
+    /// What `site`'s operator publishes in `mode` at `stamp`: an idle queue, and its readiness verdict.
+    fn signals(site: &str, mode: u8, stamp: u128) -> String {
         let labels = format!(r#"grid_site="{site}",grid_provider="pool-{site}""#);
-        let load = format!("llm_d_epp_average_queue_size{{{labels}}} 0 1000\n");
+        let load = format!("llm_d_epp_average_queue_size{{{labels}}} 0 {stamp}\n");
         match mode {
             OMITTED => load,
             _ => format!(
-                "{load}llm_d_epp_ready_endpoints{{{labels}}} {} 1000\n",
+                "{load}llm_d_epp_ready_endpoints{{{labels}}} {} {stamp}\n",
                 u8::from(mode == READY)
             ),
         }

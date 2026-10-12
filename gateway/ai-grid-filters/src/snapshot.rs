@@ -60,6 +60,8 @@ pub(crate) struct Inputs<'store, S: SiteSignals = LoadStore> {
     pub(crate) now_ms: i64,
     /// Freshness window, milliseconds.
     pub(crate) window_ms: i64,
+    /// Worst-of horizon behind a site's newest sample, milliseconds.
+    pub(crate) horizon_ms: i64,
     /// Availability tuning, from the filter block.
     pub(crate) availability: &'store AvailabilitySettings,
     /// Learned ceilings and smoothed saturation, kept across refreshes.
@@ -141,24 +143,25 @@ impl RouteSnapshot {
         (load, candidate, measured.is_some())
     }
 
-    /// The site over the load window, and over the settling time alone: `room_after_ms`,
-    /// stretched to reach the site's newest sample so a site polled less often than that is
+    /// The site over the horizon, and over the settling time alone: `room_after_ms`. Both are
+    /// anchored at the site's newest fresh sample, so a site polled less often than either is
     /// still judged on what it last said. Fullness is judged from the second, so one spike a
-    /// window ago does not hold a site full.
+    /// horizon ago does not hold a site full.
     fn readings<S: SiteSignals>(candidate: &RouteCandidate, inputs: &Inputs<'_, S>) -> (SiteReading, SiteReading) {
-        let over = |window_ms| Over {
+        let over = |horizon_ms| Over {
             now_ms: inputs.now_ms,
-            window_ms,
+            window_ms: inputs.window_ms,
+            horizon_ms,
             queue_full: inputs.availability.queue_full,
         };
         let reading = inputs
             .signals
-            .read(&candidate.site, &candidate.cluster, over(inputs.window_ms));
-        let newest = reading
-            .sampled_at
-            .map_or(0, |at| inputs.now_ms.saturating_sub(at).saturating_add(1));
-        let settle = inputs.availability.room_after_ms.max(newest);
-        let recent = inputs.signals.read(&candidate.site, &candidate.cluster, over(settle));
+            .read(&candidate.site, &candidate.cluster, over(inputs.horizon_ms));
+        let recent = inputs.signals.read(
+            &candidate.site,
+            &candidate.cluster,
+            over(inputs.availability.room_after_ms),
+        );
         (reading, recent)
     }
 
@@ -540,6 +543,7 @@ mod tests {
                 signals: &store,
                 now_ms: 1_000,
                 window_ms: 60_000,
+                horizon_ms: 60_000,
                 availability: &AvailabilitySettings::default(),
                 learned: &mut Learned::default(),
             },
@@ -589,6 +593,7 @@ mod tests {
                 signals: &store,
                 now_ms: 1_000,
                 window_ms: 30_000,
+                horizon_ms: 30_000,
                 availability: &AvailabilitySettings::default(),
                 learned: &mut Learned::default(),
             },
@@ -617,6 +622,7 @@ mod tests {
                 signals: &store,
                 now_ms: 2_000,
                 window_ms: 30_000,
+                horizon_ms: 30_000,
                 availability: &AvailabilitySettings::default(),
                 learned: &mut Learned::default(),
             },
@@ -642,6 +648,7 @@ mod tests {
                     signals: &store,
                     now_ms: now,
                     window_ms: 30_000,
+                    horizon_ms: 30_000,
                     availability: &AvailabilitySettings::default(),
                     learned: &mut Learned::default(),
                 },
@@ -676,6 +683,7 @@ mod tests {
                 signals: &store,
                 now_ms: 1_000,
                 window_ms: 30_000,
+                horizon_ms: 30_000,
                 availability: &AvailabilitySettings::default(),
                 learned: &mut Learned::default(),
             },
@@ -707,6 +715,7 @@ mod tests {
                 signals: &store,
                 now_ms: 1_000,
                 window_ms: 60_000,
+                horizon_ms: 60_000,
                 availability: &AvailabilitySettings::default(),
                 learned: &mut Learned::default(),
             },
@@ -741,6 +750,7 @@ mod tests {
                 signals: &store,
                 now_ms: 1_000,
                 window_ms: 60_000,
+                horizon_ms: 60_000,
                 availability: &AvailabilitySettings::default(),
                 learned: &mut Learned::default(),
             },
@@ -769,6 +779,7 @@ mod tests {
                 signals: &store,
                 now_ms: 1_000,
                 window_ms: 30_000,
+                horizon_ms: 30_000,
                 availability: &AvailabilitySettings::default(),
                 learned: &mut Learned::default(),
             },
@@ -796,6 +807,7 @@ mod tests {
                 signals: &store,
                 now_ms: 1_000,
                 window_ms: 30_000,
+                horizon_ms: 30_000,
                 availability: &AvailabilitySettings::default(),
                 learned: &mut Learned::default(),
             },
@@ -821,6 +833,7 @@ mod tests {
                 signals: &store,
                 now_ms: 1_000,
                 window_ms: 30_000,
+                horizon_ms: 30_000,
                 availability: &AvailabilitySettings::default(),
                 learned: &mut Learned::default(),
             },
@@ -851,6 +864,7 @@ mod tests {
             signals: &store,
             now_ms: 1_000,
             window_ms: 30_000,
+            horizon_ms: 30_000,
             availability: &availability,
             learned: &mut learned,
         };
@@ -1236,6 +1250,11 @@ mod tests {
 
     /// The single candidate resolved from `store` at `now_ms` over a 30s window.
     fn resolved(store: &LoadStore, now_ms: i64) -> RouteCandidate {
+        resolved_over(store, now_ms, 30_000)
+    }
+
+    /// Site a resolved at `now_ms`, fresh within 30s, looking `horizon_ms` behind its newest sample.
+    fn resolved_over(store: &LoadStore, now_ms: i64, horizon_ms: i64) -> RouteCandidate {
         let candidates = validate_candidates(vec![cand("m", "a", "pool-a")]).unwrap();
         let snapshot = RouteSnapshot::from_store(
             candidates,
@@ -1244,6 +1263,7 @@ mod tests {
                 signals: store,
                 now_ms,
                 window_ms: 30_000,
+                horizon_ms,
                 availability: &AvailabilitySettings::default(),
                 learned: &mut Learned::default(),
             },
@@ -1288,6 +1308,7 @@ mod tests {
             signals: store,
             now_ms,
             window_ms,
+            horizon_ms: window_ms,
             availability,
             learned,
         }
@@ -1346,11 +1367,12 @@ mod tests {
     }
 
     #[test]
-    fn a_site_that_genuinely_drains_reads_idle_once_the_load_ages_out() {
-        // Samples land at 1s, 2s and 3s. Read at 32.5s the 30s window starts at 2.5s, so only
-        // the trailing zero remains, and nothing was learned before: the floor is the ceiling.
-        let store = series("llm_d_epp_average_running_requests", &[120.0, 108.0, 0.0]);
-        let c = resolved(&store, 32_500);
+    fn a_site_that_genuinely_drains_reads_idle_once_the_load_leaves_the_horizon() {
+        // Samples land at 1s through 5s. A 2.5s horizon behind the newest starts at 2.5s, so
+        // only the trailing zeros remain, and nothing was learned before: the floor is the
+        // ceiling. The 30s freshness window still reaches the load; the horizon forgets it.
+        let store = series("llm_d_epp_average_running_requests", &[120.0, 108.0, 0.0, 0.0, 0.0]);
+        let c = resolved_over(&store, 32_500, 2_500);
         assert_eq!(c.rho, Some(0.0), "a drained site is idle, not pinned to an old peak");
         assert_eq!(c.capacity, Some(AvailabilitySettings::default().ceiling_floor));
     }
@@ -1377,6 +1399,7 @@ mod tests {
                 signals: &store,
                 now_ms: 1_000,
                 window_ms: 30_000,
+                horizon_ms: 30_000,
                 availability: &AvailabilitySettings::default(),
                 learned: &mut learned,
             },
@@ -1401,6 +1424,7 @@ mod tests {
                 signals: &store,
                 now_ms: 2_000,
                 window_ms: 500,
+                horizon_ms: 500,
                 availability: &AvailabilitySettings::default(),
                 learned: &mut learned,
             },
@@ -1428,6 +1452,7 @@ mod tests {
             signals: &store,
             now_ms: 1_000,
             window_ms: 30_000,
+            horizon_ms: 30_000,
             availability: &availability,
             learned: &mut learned,
         };
@@ -1454,6 +1479,7 @@ mod tests {
                 signals: &store,
                 now_ms: 1_000,
                 window_ms: 30_000,
+                horizon_ms: 30_000,
                 availability: &AvailabilitySettings::default(),
                 learned: &mut learned,
             },
@@ -1480,6 +1506,7 @@ mod tests {
                 signals: &store,
                 now_ms: 1_000,
                 window_ms: 30_000,
+                horizon_ms: 30_000,
                 availability: &AvailabilitySettings::default(),
                 learned: &mut learned,
             },
@@ -1497,6 +1524,7 @@ mod tests {
                 signals: &store,
                 now_ms: 1_000 + AvailabilitySettings::default().ceiling_half_life_ms,
                 window_ms: 500,
+                horizon_ms: 500,
                 availability: &AvailabilitySettings::default(),
                 learned: &mut learned,
             },
@@ -1522,6 +1550,7 @@ mod tests {
                 signals: &store,
                 now_ms: 1_000,
                 window_ms: 30_000,
+                horizon_ms: 30_000,
                 availability: &AvailabilitySettings::default(),
                 learned: &mut learned,
             },

@@ -1,27 +1,28 @@
 # Polling Cross-Site Load Signals
 
-A gateway prefers the least-loaded peer serving a model, so it needs each peer's
-load. Each gateway polls its peers over mutual TLS, records the readings in a
-local store, and orders cross-site candidates from it. Wire format and store:
+A gateway prefers the least-loaded site serving a model, so it needs each site's
+load. Each operator polls its peers over mutual TLS and relays what it collected;
+each gateway polls its local operator, records the readings in a local store, and
+orders cross-site candidates from it. Wire format and store:
 [Signals](signals.md). Selection: [Routing](routing.md), [Scoring](scoring.md).
 Peer identity: [Authentication](auth.md).
 
 ## The Poll Path
 
-Polling is direct per peer, not through a relay, and readings are attributed to
-one verified identity.
+The operator polls each peer directly and attributes readings to one verified
+identity. The gateway reads the operator's relay over the same mutual TLS.
 
 | Step | What happens |
 |---|---|
 | Dial | Mutual TLS to the peer's `/v1/site/signals`, both ends presenting Grid site certificates. |
 | Verify | The certificate is checked against the Grid CA and its SPIFFE identity, then the verified identity is compared to the site the poller dialed. A valid Grid peer answering for another site is refused. |
 | Read | Under a byte ceiling and a time bound, so a slow or oversized peer cannot hold the poll open or exhaust memory. |
-| Store | Keyed on the verified identity, never on anything the body carries, so no peer can inject readings as another. A body label disagreeing with the verified owner is dropped. |
-| Bound | Only the contract names and EPP pool averages the gateway routes on, a DNS-1123 `grid_provider`, a finite non-negative value (at most one for `grid_provider_ready` and `grid_provider_error_ratio`), and the peer's first 64 providers by name. Custom `signalNames` are dropped. Refusals count in `grid_peer_signals_refused_total{peer,reason}`. |
+| Store | Keyed on the verified identity, never on anything the body carries, so no peer can inject readings as another. A body label disagreeing with the verified owner is dropped. The gateway keys on the body's site label only for rows its own operator served, since that operator stamped each from the leaf it verified. |
+| Bound | The operator serves its own gateway the contract series only, cuts each target at 4096 lines and holds the body under 768 KiB, dropping whole targets past it and counting them in `grid_signals_relay_truncated_total{store,cut}`, so a flood from one provider costs the last targets rather than every site. The gateway then keeps only the contract names and EPP pool averages it routes on, a DNS-1123 `grid_provider`, a finite non-negative value (at most one for `grid_provider_ready` and `grid_provider_error_ratio`), and the peer's first 64 providers by name. Custom `signalNames` are dropped. Refusals count in `grid_peer_signals_refused_total{peer,reason}`. |
 
 A gateway polls only while serving, since one that is not serving has no routing
-decision to inform. Live connections are proportional to the serving gateways,
-not to the grid.
+decision to inform. Each gateway holds one connection, to its operator, so live
+WAN connections are proportional to the operators, not to the gateways.
 
 Poll and route meet at the store, and only there. Ordering runs off the request
 path, reading each candidate's recent worst load into a least-loaded-first list.
@@ -43,6 +44,14 @@ A scrape answering without the pool's ready-endpoint series leaves readiness
 unknown, not false, and does not exclude: a provider pointed at vLLM's own
 `/metrics` carries no such series.
 
+The operator reads at most 1 MiB of the HTTP response body from one provider
+/metrics endpoint. Reaching that budget is counted as `body_cap` and leaves
+readiness unknown: the endpoint answered, so the provider is not declared down.
+On EPP endpoints that Grid scrapes, use an EPP release that supports
+`--fairness-id-metric-label-limit` (available in v0.10+) and set it to `0` so
+the client-controlled `fairness_id` label collapses to `other`; otherwise the
+`x-llm-d-inference-fairness-id` header can grow the exposition past the budget.
+
 The verdict is also the provider's `Ready` condition, whose reason names the
 cause and, for a failed scrape, its class. See [crds.md](./crds.md).
 
@@ -52,8 +61,11 @@ while that count kept stamping, leaves selection within one poll and rejoins wit
 poll of recovery. The serving config carries the same verdict for local
 providers as `admission: none`. When every candidate for a model is excluded the
 gateway answers 503 with `Retry-After`, not 404: the model exists but cannot be
-served now. At the default 5s scrape and 5s poll, exclusion takes about 15s and
-rejoin about 10s.
+served now. At the default 5s scrape and 5s poll, exclusion of a local site takes
+about 15s and rejoin about 10s. A remote site's reading reaches the gateway through
+its operator's peer poll, so its exclusion and rejoin also wait on that poll and its
+budget: about 15s more at a 5s peer poll, and up to the 30s default poll plus its 10s
+budget otherwise.
 
 ## Provider In-flight
 

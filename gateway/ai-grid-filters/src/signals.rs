@@ -32,20 +32,22 @@ pub struct SiteReading {
     pub sampled_at: Option<i64>,
 }
 
-/// What a reading covers: the clock, how far back it looks, and the waiting per unit that
-/// counts as a backlog.
+/// What a reading covers: the clock, how old a site's newest sample may be, how far behind
+/// that sample it looks, and the waiting per unit that counts as a backlog.
 #[derive(Clone, Copy, Debug)]
 pub struct Over {
     /// Now, milliseconds.
     pub now_ms: i64,
-    /// How far back the reading looks, milliseconds.
+    /// Freshness: a site whose newest sample is older than this is unmeasured, milliseconds.
     pub window_ms: i64,
+    /// How far behind the site's newest sample the reading looks, milliseconds.
+    pub horizon_ms: i64,
     /// Waiting work per serving unit at which an instant has a backlog.
     pub queue_full: f64,
 }
 
 /// A source of site readings. Dispatch is static: the snapshot is generic over it.
 pub trait SiteSignals {
-    /// The site's reading `over` the window ending now.
+    /// The site's reading `over` the horizon behind its newest fresh sample.
     fn read(&self, site: &str, cluster: &str, over: Over) -> SiteReading;
 }

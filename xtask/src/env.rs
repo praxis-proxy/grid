@@ -943,7 +943,7 @@ pub(crate) enum Action {
 
     /// Verify the operator install/RBAC package in Kind.
     ///
-    /// Applies the install manifests from `deploy/operator/`, runs positive and
+    /// Applies the kind install overlay from `deploy/overlays/kind/`, runs positive and
     /// negative `kubectl auth can-i` checks against the `grid-operator`
     /// `ServiceAccount`, then spawns an out-of-cluster operator and proves RBAC
     /// is sufficient for a minimal reconcile (status written, overlay `ConfigMap`
@@ -978,7 +978,11 @@ pub(crate) enum Action {
     /// the edge/provider Praxis workloads. The command stages distinct east
     /// and west edge client certificates, the stable emulator ingress
     /// certificate, and the Kubernetes TLS/credential Secrets.
-    PrepareGridGlbProviderBoundary,
+    PrepareGridGlbProviderBoundary {
+        /// Resolved Forge config from the GLB setup run.
+        #[arg(long, default_value = "tests/e2e/topologies/grid-glb-demo/forge.yaml")]
+        forge_config: PathBuf,
+    },
 
     /// Verify the two-edge Praxis GTM emulator through one stable HTTPS name.
     ///
@@ -1285,11 +1289,17 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifyFailoverUnderLostPeer { config } => env_verify_failover_under_lost_peer(config),
         Action::VerifyStaleGcTtl { config } => env_verify_stale_gc_ttl(config),
         Action::VerifyOperatorInstallRbac { config, site } => env_verify_operator_install_rbac(config, site.as_deref()),
-        Action::VerifyGridGlbRouting { forge_config } => glb::verify_grid_routing(forge_config),
-        Action::PrepareGridGlbProviderBoundary => glb::prepare_provider_boundary(),
-        Action::VerifyGridGlbGtmEmulator { forge_config } => gtm_emulator::verify(forge_config),
+        Action::VerifyGridGlbRouting { forge_config } => {
+            glb::verify_grid_routing(&glb_demo::standalone_run_config(forge_config)?)
+        },
+        Action::PrepareGridGlbProviderBoundary { forge_config } => {
+            glb::prepare_provider_boundary(&glb_demo::standalone_run_config(forge_config)?)
+        },
+        Action::VerifyGridGlbGtmEmulator { forge_config } => {
+            gtm_emulator::verify(&glb_demo::standalone_run_config(forge_config)?)
+        },
         Action::DemonstrateGridGlb { forge_config, options } => {
-            glb_demo::demonstrate_with_options(forge_config, options)
+            glb_demo::demonstrate_with_options(&glb_demo::standalone_run_config(forge_config)?, options)
         },
         Action::SetupGridGlb {
             forge_config,
@@ -5778,7 +5788,7 @@ fn env_verify_crd_schema() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Verify the operator install/RBAC package in Kind.
 ///
-/// Applies `deploy/operator/` manifests, runs `kubectl auth can-i` checks for
+/// Applies `deploy/overlays/kind/`, runs `kubectl auth can-i` checks for
 /// positive and negative permission expectations, then spawns an out-of-cluster
 /// operator to prove RBAC is sufficient for a minimal reconcile.
 /// Positive `kubectl auth can-i` checks for the installed operator RBAC.

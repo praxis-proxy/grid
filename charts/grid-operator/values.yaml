@@ -216,6 +216,9 @@ signals:
 gateway:
   # -- Discover and advertise a LoadBalancer address for the site gateway.
   discoveryEnabled: true
+  # -- GridNetwork gatewayRefs[].consumerConfig for the site gateway, as the CRD
+  # takes it. Empty renders no block.
+  consumerConfig: {}
   # -- Reachable site gateway host:port override. Set this for ClusterIP or
   # NodePort Services; otherwise the operator discovers a LoadBalancer address.
   address: ""

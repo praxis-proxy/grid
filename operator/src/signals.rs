@@ -460,8 +460,43 @@ impl SignalStore {
     /// For a `Local` caller only, the site's own data plane, which is entitled
     /// to the whole grid view. Access policy scopes peer reads, not the site.
     #[must_use]
+    #[cfg(test)]
     pub fn render_unrestricted(&self, target: Option<&str>, collect: &[String]) -> (String, Duration) {
         self.render_with(target, collect, &std::collections::BTreeSet::new())
+    }
+
+    /// Render for this site's own gateway: contract series only, each target cut
+    /// at [`MAX_RENDER_LINES_PER_TARGET`], and whole targets dropped once the body
+    /// would pass `budget` bytes.
+    ///
+    /// The gateway reads every site from one response under its own byte
+    /// ceiling, past which the whole poll fails and every site goes unmeasured.
+    /// Bounding here turns that cliff into a counted loss of the last targets.
+    #[must_use]
+    pub fn render_bounded(&self, target: Option<&str>, collect: &[String], budget: usize) -> Rendered {
+        let Ok(guard) = self.inner.read() else {
+            return Rendered::default();
+        };
+        let now = Instant::now();
+        let now_wall = SystemTime::now();
+        let now_ms = wall_millis(now_wall, Duration::ZERO);
+        let mut rendered = Rendered::default();
+        for (name, held) in guard.iter() {
+            if held.expires_at <= now || target.is_some_and(|t| t != name) {
+                continue;
+            }
+            let age = now.saturating_duration_since(held.collected_at);
+            let collected_at_ms = wall_millis(now_wall, age);
+            let (block, block_oldest, cut) = render_contract_block(&held.samples, collect, collected_at_ms, now_ms);
+            rendered.lines_cut = rendered.lines_cut.saturating_add(cut);
+            if rendered.body.len().saturating_add(block.len()) > budget {
+                rendered.targets_dropped = rendered.targets_dropped.saturating_add(1);
+                continue;
+            }
+            rendered.body.push_str(&block);
+            rendered.oldest = rendered.oldest.max(block_oldest);
+        }
+        rendered
     }
 
     /// Shared render body over a precomputed set of denied targets.
@@ -706,7 +741,7 @@ impl SignalsEndpoint {
 }
 
 /// A DNS name of letter, digit, and hyphen labels, not ending in an all-digit label.
-fn is_dns_name(host: &str) -> bool {
+pub(crate) fn is_dns_name(host: &str) -> bool {
     let label_ok = |label: &str| {
         (1..=63).contains(&label.len())
             && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -1147,7 +1182,7 @@ impl PollPeers {
             .map(|(peer, url, pins)| async move {
                 let (body, date) = self.poll_one(&peer, &url, &pins).await?;
                 let now_ms = wall_millis(SystemTime::now(), Duration::ZERO);
-                let mut observations = bound_peer(retain_origin(parse(&body), &peer), &peer);
+                let mut observations = bound_peer(stamp_origin(parse(&body), &peer), &peer);
                 reexpress_peer_ages(&mut observations, date, now_ms);
                 Some((peer, observations))
             });
@@ -1345,17 +1380,84 @@ fn bound_peer(observations: Vec<Observation>, peer: &str) -> Vec<Observation> {
     kept
 }
 
-/// Keep only the observations a peer made itself.
+/// Attribute every observation to the peer this site dialed, refusing one that
+/// names a different site.
 ///
-/// A relayed copy is dropped rather than trusted, so every site's data reaches
-/// this one from the site that observed it. The publisher already scopes what it
-/// offers; checking the label on receipt means a reader does not depend on every
-/// peer having done so.
-fn retain_origin(observations: Vec<Observation>, peer: &str) -> Vec<Observation> {
-    observations
-        .into_iter()
-        .filter(|o| o.labels.get(SITE_LABEL).is_some_and(|s| s == peer))
-        .collect()
+/// Ownership comes from the verified identity on the connection, never from the
+/// body, so a peer cannot name another site and a peer need not label its own
+/// output at all. A row that does name a different site is a peer serving data
+/// on someone else's behalf, which the grid does not allow: it is refused and
+/// counted rather than silently re-attributed, so a misconfigured peer shows up
+/// as a refusal instead of as inflated numbers of its own.
+fn stamp_origin(observations: Vec<Observation>, peer: &str) -> Vec<Observation> {
+    let mut kept = Vec::with_capacity(observations.len());
+    for mut observation in observations {
+        match observation.labels.get(SITE_LABEL) {
+            Some(site) if site != peer => {
+                crate::metrics::record_peer_signal_refused(peer, "relayed_site");
+            },
+            _ => {
+                observation.labels.insert(SITE_LABEL.to_owned(), peer.to_owned());
+                kept.push(observation);
+            },
+        }
+    }
+    kept
+}
+
+/// The most a bounded render returns, three quarters of the gateway's 1 MiB read ceiling.
+pub const MAX_RELAY_BYTES: usize = 768 * 1024;
+
+/// Lines one target may contribute to a bounded render.
+pub const MAX_RENDER_LINES_PER_TARGET: usize = 4096;
+
+/// A bounded render and what it left out.
+#[derive(Debug, Default)]
+pub struct Rendered {
+    /// Exposition text, whole lines only.
+    pub body: String,
+    /// Age of the oldest sample emitted.
+    pub oldest: Duration,
+    /// Targets skipped because the body would have passed the budget.
+    pub targets_dropped: usize,
+    /// Lines cut past the per-target cap.
+    pub lines_cut: usize,
+}
+
+/// Whether `metric` is one of the series a gateway routes on.
+#[must_use]
+pub fn is_peer_signal(metric: &str) -> bool {
+    PEER_SIGNAL_NAMES.contains(&metric)
+}
+
+/// One target's contract series as exposition text, its oldest sample age, and
+/// the lines cut past [`MAX_RENDER_LINES_PER_TARGET`].
+fn render_contract_block(
+    samples: &[Observation],
+    collect: &[String],
+    collected_at_ms: i64,
+    now_ms: i64,
+) -> (String, Duration, usize) {
+    let mut block = String::new();
+    let mut oldest = Duration::ZERO;
+    let mut lines = 0_usize;
+    let mut cut = 0_usize;
+    for sample in samples.iter().filter(|sample| is_peer_signal(&sample.metric)) {
+        if !collect.is_empty() && !collect.iter().any(|c| c == &sample.metric) {
+            continue;
+        }
+        if lines >= MAX_RENDER_LINES_PER_TARGET {
+            cut = cut.saturating_add(1);
+            continue;
+        }
+        let stamp_ms = sample.timestamp_ms.unwrap_or(collected_at_ms);
+        render_sample(&mut block, sample, stamp_ms);
+        block.push('\n');
+        lines = lines.saturating_add(1);
+        let sample_age = Duration::from_millis(u64::try_from(now_ms.saturating_sub(stamp_ms)).unwrap_or(0));
+        oldest = oldest.max(sample_age);
+    }
+    (block, oldest, cut)
 }
 
 /// The largest relayed-sample age treated as plausible, one day.
@@ -1430,6 +1532,78 @@ mod tests {
             value,
             timestamp_ms: None,
         }
+    }
+
+    #[test]
+    fn a_row_naming_another_site_is_refused_not_re_attributed() {
+        // A peer serving data on another site's behalf is the chaining the grid
+        // does not allow. Re-attributing it to the dialed peer would turn a
+        // misconfigured peer into plausible numbers of its own, so it is
+        // refused and counted instead.
+        let mut claims_elsewhere = peer_sample(crate::readiness::READY_SIGNAL, "pool", 1.0);
+        claims_elsewhere
+            .labels
+            .insert(SITE_LABEL.to_owned(), "factory".to_owned());
+
+        let kept = stamp_origin(vec![claims_elsewhere], "retail");
+
+        assert!(
+            kept.is_empty(),
+            "a row naming another site must not reach this site's view"
+        );
+    }
+
+    #[test]
+    fn a_row_this_peer_labelled_correctly_is_kept() {
+        let own = peer_sample(crate::readiness::READY_SIGNAL, "pool", 1.0);
+
+        let kept = stamp_origin(vec![own], "retail");
+
+        assert_eq!(
+            kept.first().and_then(|o| o.labels.get(SITE_LABEL)).map(String::as_str),
+            Some("retail"),
+            "a correctly labelled row survives and keeps its site"
+        );
+    }
+
+    #[test]
+    fn a_sample_with_no_site_is_attributed_to_the_peer() {
+        // Previously such a sample was dropped, because attribution read the
+        // body. Attribution now comes from the connection, so the peer does not
+        // have to label its own output for this site to use it.
+        let mut unlabelled = peer_sample(crate::readiness::READY_SIGNAL, "pool", 1.0);
+        unlabelled.labels.remove(SITE_LABEL);
+
+        let stamped = stamp_origin(vec![unlabelled], "retail");
+
+        assert_eq!(
+            stamped
+                .first()
+                .and_then(|o| o.labels.get(SITE_LABEL))
+                .map(String::as_str),
+            Some("retail"),
+            "an unlabelled sample should be attributed, not dropped"
+        );
+    }
+
+    #[test]
+    fn stamping_keeps_every_sample_and_leaves_other_labels_alone() {
+        let samples = vec![
+            peer_sample(crate::readiness::READY_SIGNAL, "pool-a", 1.0),
+            peer_sample(crate::readiness::READY_SIGNAL, "pool-b", 2.0),
+        ];
+
+        let stamped = stamp_origin(samples, "retail");
+
+        assert_eq!(stamped.len(), 2, "rows the peer owns are all kept");
+        assert_eq!(
+            stamped
+                .iter()
+                .filter_map(|o| o.labels.get(PROVIDER_LABEL).map(String::as_str))
+                .collect::<Vec<_>>(),
+            ["pool-a", "pool-b"],
+            "only the site label is rewritten"
+        );
     }
 
     #[test]
@@ -1564,6 +1738,51 @@ mod tests {
             url: format!("http://{addr}{SIGNALS_PATH}"),
             pins: Vec::new(),
         }
+    }
+
+    /// A plain HTTP peer for `site` answering `body` once.
+    async fn peer_serving(site: &str, body: String) -> PeerSite {
+        PeerSite {
+            name: site.to_owned(),
+            url: serve_once(body).await,
+            pins: Vec::new(),
+        }
+    }
+
+    /// Serve `body` to the first request, returning the URL to dial.
+    async fn serve_once(body: String) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 1024];
+            drop(stream.read(&mut request).await);
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+            drop(stream.write_all(response.as_bytes()).await);
+        });
+        format!("http://{addr}{SIGNALS_PATH}")
+    }
+
+    /// Through the real poll path: a row naming another site is refused and an unlabeled row is
+    /// stamped with the dialed peer, so a relaying peer cannot speak for a third site.
+    #[tokio::test]
+    async fn a_polled_row_is_bound_to_the_dialed_peer() {
+        crate::init_process_crypto();
+        let body = "inference_pool_average_queue_size{grid_site=\"west\",grid_provider=\"pool\"} 1\n\
+                    inference_pool_average_queue_size{grid_provider=\"own\"} 2\n"
+            .to_owned();
+        let sites = [peer_serving("east", body).await];
+        let poll = PollPeers {
+            attempts: 1,
+            ..PollPeers::default()
+        };
+        let round = poll.collect(&sites).await;
+        let rows = round.get("east").expect("east polled");
+        assert_eq!(rows.len(), 1, "the row naming west is refused: {rows:?}");
+        let row = rows.first().expect("one row");
+        assert_eq!(row.labels.get(SITE_LABEL).map(String::as_str), Some("east"));
+        assert_eq!(row.labels.get("grid_provider").map(String::as_str), Some("own"));
     }
 
     /// The slow peer answers only after the fast one is published, so a round that waited would hang.
@@ -1765,6 +1984,84 @@ mod tests {
         assert_eq!(got, vec![Some(now_ms - 30_000), None, None, None]);
     }
 
+    /// `n` lines of one contract series for `target`, under distinct labels.
+    fn stocked(target: &str, n: usize) -> (String, Vec<Observation>) {
+        let samples = (0..n)
+            .map(|i| Observation {
+                metric: "inference_pool_per_pod_queue_size".to_owned(),
+                labels: BTreeMap::from([
+                    ("grid_provider".to_owned(), target.to_owned()),
+                    ("pod".to_owned(), format!("p{i}")),
+                ]),
+                value: 1.0,
+                timestamp_ms: None,
+            })
+            .collect();
+        (target.to_owned(), samples)
+    }
+
+    /// One unlabeled sample of `metric`.
+    fn plain(metric: &str) -> Observation {
+        Observation {
+            metric: metric.to_owned(),
+            labels: BTreeMap::new(),
+            value: 1.0,
+            timestamp_ms: None,
+        }
+    }
+
+    #[test]
+    fn the_bounded_render_carries_contract_series_only() {
+        let store = SignalStore::new();
+        let samples = vec![plain("vendor_private_gauge"), plain("inference_pool_ready_pods")];
+        store.refresh(
+            BTreeMap::from([("pool-a".to_owned(), samples)]),
+            Duration::from_secs(60),
+        );
+        let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES);
+        assert!(rendered.body.contains("inference_pool_ready_pods"), "{}", rendered.body);
+        assert!(
+            !rendered.body.contains("vendor_private_gauge"),
+            "a non-contract series is not relayed"
+        );
+        let (unrestricted, _) = store.render_unrestricted(None, &[]);
+        assert!(
+            unrestricted.contains("vendor_private_gauge"),
+            "the unbounded render still has it"
+        );
+    }
+
+    #[test]
+    fn a_target_past_the_line_cap_is_cut_and_the_others_still_render() {
+        let store = SignalStore::new();
+        let big = stocked("pool-big", MAX_RENDER_LINES_PER_TARGET + 10);
+        let small = stocked("pool-small", 1);
+        store.refresh(BTreeMap::from([big, small]), Duration::from_secs(60));
+        let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES);
+        let big_lines = rendered.body.lines().filter(|line| line.contains("pool-big")).count();
+        assert_eq!(big_lines, MAX_RENDER_LINES_PER_TARGET, "cut at the cap");
+        assert_eq!(rendered.lines_cut, 10);
+        assert!(rendered.body.contains("pool-small"), "the small target still renders");
+        assert_eq!(rendered.targets_dropped, 0);
+    }
+
+    #[test]
+    fn a_body_past_the_budget_drops_whole_targets_and_never_a_line() {
+        let store = SignalStore::new();
+        store.refresh(
+            BTreeMap::from([stocked("pool-a", 20), stocked("pool-b", 20)]),
+            Duration::from_secs(60),
+        );
+        let one = store.render_bounded(Some("pool-a"), &[], MAX_RELAY_BYTES).body.len();
+        // Room for one target and a bit: the second must go whole, not in part.
+        let rendered = store.render_bounded(None, &[], one + one / 2);
+        assert_eq!(rendered.targets_dropped, 1, "{}", rendered.body);
+        assert_eq!(rendered.body.len(), one, "the first target is intact");
+        assert!(rendered.body.ends_with('\n') && rendered.body.lines().all(|line| line.contains("pool-a")));
+        let all = store.render_bounded(None, &[], MAX_RELAY_BYTES);
+        assert_eq!(all.targets_dropped, 0, "under the budget nothing is dropped");
+    }
+
     #[test]
     fn a_relayed_sample_renders_its_own_age_not_the_relay_time() {
         // A sample stamped one hour ago must render an hour old even though the
@@ -1939,6 +2236,41 @@ mod tests {
     #[test]
     fn comments_and_types_are_not_samples() {
         assert_eq!(scraped().len(), 1, "one sample, no comment lines");
+    }
+
+    #[test]
+    fn a_peer_need_not_label_its_own_output() {
+        // Through the real parse path: exposition text with no grid_site, which
+        // today is dropped outright, so this is the contract statement that the
+        // connection and not the body decides ownership.
+        let observations = parse(&format!(r#"{QUEUE}{{name="pool-a"}} 3"#));
+
+        let out = stamp_origin(observations, "east");
+
+        let o = out.first().expect("the sample should survive without a site label");
+        assert_eq!(
+            o.labels.get(SITE_LABEL).map(String::as_str),
+            Some("east"),
+            "the dialed peer owns it"
+        );
+        assert_eq!(
+            o.labels.get("name").map(String::as_str),
+            Some("pool-a"),
+            "unrelated labels survive"
+        );
+    }
+
+    #[test]
+    fn a_peer_serving_another_sites_row_is_refused() {
+        // A peer relaying a third site is importing measurements it did not
+        // make. Unlike a provider mislabelling its own output, there is nothing
+        // here this site may attribute, so the row is refused rather than
+        // re-attributed to the peer that served it.
+        let observations = parse(&format!(r#"{QUEUE}{{grid_site="west",name="pool-a"}} 3"#));
+
+        let out = stamp_origin(observations, "east");
+
+        assert!(out.is_empty(), "a third site's row must not enter this site's view");
     }
 
     #[test]

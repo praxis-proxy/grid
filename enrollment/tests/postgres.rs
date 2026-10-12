@@ -57,6 +57,7 @@ fn new_token(site: &str, digest: &str) -> NewSiteToken {
 #[expect(clippy::unnecessary_wraps, reason = "matches the redeem_and_issue signer signature")]
 fn sign_for(pin: &Pin) -> Result<Issued, StoreError> {
     Ok(Issued {
+        site_name: String::new(),
         certificate: format!(
             "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----",
             pin.site_name

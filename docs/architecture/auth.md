@@ -438,9 +438,9 @@ material. It closes a connection whose response write stalls or that outlives
 five minutes. Restrict who can reach the listener with
 `loadBalancerSourceRanges` on its Service or with a NetworkPolicy.
 
-The gateway polls peers from the serving config the operator renders. It
-always checks the peer's SPIFFE ID. Under pin trust the operator also renders
-each peer's declared pins, and the gateway refuses a leaf that matches none.
+The gateway polls only its local operator, from the serving config the operator
+renders, and checks that operator's SPIFFE ID. Pins apply where the operator
+polls its peers; the gateway reads none.
 
 ### Authentication vs authorization
 

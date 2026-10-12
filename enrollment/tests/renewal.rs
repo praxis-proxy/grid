@@ -59,6 +59,8 @@ fn grid_with(reserved: &[&str], renewals_enabled: bool) -> Grid {
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         reserved_sites: reserved.iter().map(|site| (*site).to_owned()).collect(),
         renewals_enabled,
+        #[cfg(feature = "csr-record")]
+        recorder: None,
     });
     Grid {
         app: router(Arc::clone(&state)),

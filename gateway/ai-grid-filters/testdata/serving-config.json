@@ -1,7 +1,8 @@
 {
   "local_site": "site-a",
   "window_secs": 60,
-  "load_window_ms": 17000,
+  "load_window_ms": 82000,
+  "horizon_ms": 17000,
   "candidates": [
     {
       "kind": "inference_model",
@@ -20,10 +21,10 @@
   ],
   "peers": [
     {
-      "site": "site-b",
-      "addr": "203.0.113.7:9091",
-      "server_name": "site-b.grid.internal",
-      "authority": "site-b.grid.internal",
+      "site": "site-a",
+      "addr": "grid-operator-signals.grid.svc:9091",
+      "server_name": "site-a.grid.internal",
+      "authority": "site-a.grid.internal",
       "path": "/v1/site/signals",
       "interval_ms": 5000,
       "connect_timeout_ms": 2000,
