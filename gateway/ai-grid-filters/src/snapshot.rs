@@ -327,7 +327,8 @@ impl RouteSnapshot {
     /// since the exporter keeps a series until restart. `published` becomes this
     /// snapshot's pairs.
     #[must_use]
-    pub(crate) fn published(self, published: &mut BTreeSet<SitePair>) -> Self {
+    pub(crate) fn published(self, gauged: &mut Gauged) -> Self {
+        let Gauged { published, learned } = gauged;
         let mut current = BTreeSet::new();
         for (candidate, score) in self.candidates.iter().zip(&self.scores) {
             let key = (Arc::clone(&candidate.site), Arc::clone(&candidate.cluster));
@@ -348,6 +349,9 @@ impl RouteSnapshot {
             site_gauge("grid_route_site_rho", gone, f64::NAN);
             site_gauge("grid_route_site_weight", gone, f64::NAN);
             site_gauge("grid_route_site_ceiling", gone, f64::NAN);
+            // A ceiling only rises, so a pair that leaves must not keep one: a site rebuilt
+            // under the same name would resume it untaught.
+            learned.0.remove(gone);
         }
         *published = current;
         self
@@ -1524,6 +1528,50 @@ mod tests {
         );
         let rho = snapshot.candidates[0].rho.unwrap();
         assert!(rho < 0.2, "a tenth of the taught ceiling reads light, not full: {rho}");
+    }
+
+    #[test]
+    fn a_site_that_leaves_the_topology_loses_the_ceiling_it_taught() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        let mut gauged = Gauged::new();
+        let refresh = |candidates: Vec<RouteCandidate>, at_ms: i64, state: &mut Gauged| {
+            let snapshot = RouteSnapshot::from_store(
+                candidates,
+                Arc::from("hub"),
+                &mut Inputs {
+                    signals: &store,
+                    now_ms: at_ms,
+                    window_ms: 500,
+                    horizon_ms: 500,
+                    availability: &AvailabilitySettings::default(),
+                    learned: &mut state.learned,
+                },
+            );
+            snapshot.published(state)
+        };
+        let both = validate_candidates(vec![cand("m", "a", "pool-a"), cand("m", "b", "pool-b")]).unwrap();
+        with_in_flight(&store, "a", 80.0, 1_000);
+        with_in_flight(&store, "b", 80.0, 1_000);
+        let taught = refresh(both, 1_000, &mut gauged);
+        assert_eq!(taught.candidates.len(), 2, "both sites are taught");
+        // b leaves, then rejoins smaller. Keeping its ceiling would resume it untaught.
+        drop(refresh(one("a"), 1_500, &mut gauged));
+        with_in_flight(&store, "b", 2.0, 2_000);
+        let rejoined = refresh(
+            validate_candidates(vec![cand("m", "a", "pool-a"), cand("m", "b", "pool-b")]).unwrap(),
+            2_000,
+            &mut gauged,
+        );
+        let b = rejoined
+            .candidates
+            .iter()
+            .find(|candidate| &*candidate.site == "b")
+            .unwrap();
+        assert_eq!(
+            b.capacity,
+            Some(AvailabilitySettings::default().ceiling_floor),
+            "a site that rejoins starts untaught, at the floor"
+        );
     }
 
     #[test]

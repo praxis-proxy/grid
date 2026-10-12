@@ -164,7 +164,7 @@ impl Topology {
         } else {
             ordered
         };
-        ordered.shed(shedding, availability).published(&mut gauged.published)
+        ordered.shed(shedding, availability).published(gauged)
     }
 }
 
@@ -269,7 +269,7 @@ impl Control {
             topology.base.iter().cloned().collect(),
             Arc::clone(&topology.local_site),
         )
-        .published(&mut gauged.published);
+        .published(&mut gauged);
         cold_start.provider_hop_clusters = Arc::clone(&topology.provider_hop_clusters);
         Ok(Self {
             store: Arc::new(
