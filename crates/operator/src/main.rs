@@ -2555,9 +2555,25 @@ impl PeerPoller {
             return;
         }
         let polled: Vec<String> = sites.into_iter().map(|site| site.name).collect();
-        self.ages.observe(&polled, &answered);
-        Box::pin(write_peer_ages(&self.client, &self.ages, &self.shutdown)).await;
+        if observe_peer_ages(&self.ctx, &mut self.ages, &polled, &answered) {
+            Box::pin(write_peer_ages(&self.client, &self.ages, &self.shutdown)).await;
+        }
     }
+}
+
+/// Observe a round only once membership converges, so a startup snapshot cannot
+/// erase rejection evidence as if peers had left.
+fn observe_peer_ages(
+    ctx: &OperatorCtx,
+    ages: &mut operator::peer_ages::PeerAges,
+    polled: &[String],
+    answered: &BTreeMap<String, usize>,
+) -> bool {
+    if ctx.membership_hold().is_some() {
+        return false;
+    }
+    ages.observe(polled, answered);
+    true
 }
 
 /// Write the `PeerAgesRejected` condition on the sole `GridNetwork` when it changed.
@@ -2697,6 +2713,34 @@ async fn peer_tls(client: &Client) -> Option<Arc<operator::signals::PeerTlsMater
 #[allow(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn peer_age_observation_waits_for_membership_release() {
+        let client = stalled_peer_ages_client(false, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let ctx = OperatorCtx::new(client, None, operator::crd::grid_network::SignalMode::Poll).hold_membership();
+        let mut ages = operator::peer_ages::PeerAges::default();
+        ages.observe(&["east".to_owned()], &BTreeMap::from([("east".to_owned(), 1)]));
+        let previous = ages.clone();
+        let live = ages
+            .condition(&[], "t0", Some(1))
+            .expect("rejection recorded before convergence");
+        assert!(
+            !observe_peer_ages(&ctx, &mut ages, &[], &BTreeMap::new()),
+            "an empty startup snapshot must not enable status publication"
+        );
+        assert_eq!(ages, previous, "the membership hold must prevent evidence pruning");
+        ctx.release_membership();
+        assert!(
+            observe_peer_ages(&ctx, &mut ages, &[], &BTreeMap::new()),
+            "converged membership enables observation and publication"
+        );
+        assert_eq!(
+            ages.condition(std::slice::from_ref(&live), "t1", Some(1))
+                .map(|condition| condition.status),
+            Some("False".to_owned()),
+            "a genuinely empty snapshot after convergence clears rejection"
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn peer_age_publication_bounds_stalled_lookups_and_patches() {

@@ -126,6 +126,10 @@ round and does not clear the condition. The
 condition is written only when its status, its message or the generation
 changes, since each write starts a `GridNetwork` reconcile.
 
+Peer-age observation and status publication wait for the operator's existing
+membership-convergence gate, so an initial empty snapshot cannot erase a live
+rejection during restart. Signal collection continues while this gate is held.
+
 `distributedProviderCount` reflects the number of remote `InferenceProvider`
 records received from peer sites via CRDT broadcast.  Local providers and records
 from other `GridNetwork`s are excluded from the count.
