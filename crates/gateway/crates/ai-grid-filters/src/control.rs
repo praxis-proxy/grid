@@ -1620,8 +1620,18 @@ mod tests {
         );
         assert_eq!(peers.starts("east"), 1, "a refused file starts and drops no poller");
 
-        for name in ["tls.crt", "tls.key"] {
-            std::fs::write(file(name), "renewed").expect("renew");
+        {
+            let control = grid
+                .tuning()
+                .control
+                .get()
+                .and_then(Weak::upgrade)
+                .expect("the runtime attached its control");
+            let updating_identity = control.lock().expect("the fixture holds rotation together");
+            for name in ["tls.crt", "tls.key"] {
+                std::fs::write(file(name), "renewed").expect("renew");
+            }
+            drop(updating_identity);
         }
         eventually("the running config renewed", || counts().applied() == 1);
         assert_eq!(
