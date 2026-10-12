@@ -129,6 +129,8 @@ changes, since each write starts a `GridNetwork` reconcile.
 Peer-age observation and status publication wait for the operator's existing
 membership-convergence gate, so an initial empty snapshot cannot erase a live
 rejection during restart. Signal collection continues while this gate is held.
+A round begun while held cannot publish even if convergence finishes during
+collection; the next round uses the converged membership.
 
 `distributedProviderCount` reflects the number of remote `InferenceProvider`
 records received from peer sites via CRDT broadcast.  Local providers and records

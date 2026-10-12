@@ -2530,6 +2530,7 @@ impl PeerPoller {
     /// Collect from every alive peer, replace what is published for them, and say
     /// on the `GridNetwork` whose relayed ages are being rejected.
     async fn poll_once(&mut self, source: &operator::signals::PollPeers) {
+        let membership_ready = self.ctx.membership_hold().is_none();
         let Some(sites) = poll_targets(
             &self.swim.snapshot(),
             &self.ctx.peer_identities(),
@@ -2555,21 +2556,21 @@ impl PeerPoller {
             return;
         }
         let polled: Vec<String> = sites.into_iter().map(|site| site.name).collect();
-        if observe_peer_ages(&self.ctx, &mut self.ages, &polled, &answered) {
+        if observe_peer_ages(membership_ready, &mut self.ages, &polled, &answered) {
             Box::pin(write_peer_ages(&self.client, &self.ages, &self.shutdown)).await;
         }
     }
 }
 
-/// Observe a round only once membership converges, so a startup snapshot cannot
-/// erase rejection evidence as if peers had left.
+/// Observe a round only if membership converged before its target snapshot, so
+/// convergence during collection cannot make an old startup snapshot erase evidence.
 fn observe_peer_ages(
-    ctx: &OperatorCtx,
+    membership_ready: bool,
     ages: &mut operator::peer_ages::PeerAges,
     polled: &[String],
     answered: &BTreeMap<String, usize>,
 ) -> bool {
-    if ctx.membership_hold().is_some() {
+    if !membership_ready {
         return false;
     }
     ages.observe(polled, answered);
@@ -2724,15 +2725,17 @@ mod tests {
         let live = ages
             .condition(&[], "t0", Some(1))
             .expect("rejection recorded before convergence");
-        assert!(
-            !observe_peer_ages(&ctx, &mut ages, &[], &BTreeMap::new()),
-            "an empty startup snapshot must not enable status publication"
-        );
-        assert_eq!(ages, previous, "the membership hold must prevent evidence pruning");
+        let held_round = ctx.membership_hold().is_none();
         ctx.release_membership();
         assert!(
-            observe_peer_ages(&ctx, &mut ages, &[], &BTreeMap::new()),
-            "converged membership enables observation and publication"
+            !observe_peer_ages(held_round, &mut ages, &[], &BTreeMap::new()),
+            "release during collection must not make a held startup snapshot publishable"
+        );
+        assert_eq!(ages, previous, "the membership hold must prevent evidence pruning");
+        let ready_round = ctx.membership_hold().is_none();
+        assert!(
+            observe_peer_ages(ready_round, &mut ages, &[], &BTreeMap::new()),
+            "the following converged round enables observation and publication"
         );
         assert_eq!(
             ages.condition(std::slice::from_ref(&live), "t1", Some(1))
