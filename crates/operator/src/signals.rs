@@ -1559,7 +1559,7 @@ const RELAY_AGE_TOLERANCE_MS: i64 = 1_000; // the Date header's resolution
 const MAX_RELAY_AGE_MS: i64 = 86_400_000; // one day
 
 /// Carry each relayed peer sample's age into [`Observation::age`], dropping and
-/// counting as `age` each row whose age is implausible. Returns the rows kept and
+/// counting as `skew` each row whose age is implausible. Returns the rows kept and
 /// how many were dropped.
 ///
 /// Age is the peer's `Date` minus the sample's own timestamp, both on the peer
@@ -1586,7 +1586,7 @@ fn reexpress_peer_ages(
             observation.age = age;
             kept.push(observation);
         } else {
-            crate::metrics::record_peer_signal_refused(peer, "age");
+            crate::metrics::record_peer_signal_refused(peer, "skew");
             rejected = rejected.saturating_add(1);
         }
     }
@@ -2117,8 +2117,8 @@ mod tests {
         );
         assert_eq!(rejected, 2, "past a second ahead and past a day old are dropped");
         assert!(
-            refused_metric("reexpress-bounds", "age", 2),
-            "each drop is counted as age"
+            refused_metric("reexpress-bounds", "skew", 2),
+            "each drop is counted as skew"
         );
     }
 
@@ -2182,7 +2182,10 @@ mod tests {
             ["ahead-by-a-second", "a-day-old"],
             "an age under minus one second or over a day is dropped, not refreshed"
         );
-        assert!(refused_metric("age-bounds", "age", 2), "both drops are counted as age");
+        assert!(
+            refused_metric("age-bounds", "skew", 2),
+            "both drops are counted as skew"
+        );
     }
 
     #[tokio::test]

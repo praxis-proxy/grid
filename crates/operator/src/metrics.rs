@@ -524,7 +524,7 @@ pub(crate) fn forget_provider_scrapes(provider: &str) {
     }
 }
 
-/// Count a peer observation this hub refused: `relayed_site`, `age`, `name`, `provider`, `value`, or
+/// Count a peer observation this hub refused: `relayed_site`, `skew`, `name`, `provider`, `value`, or
 /// `provider_cap`.
 pub(crate) fn record_peer_signal_refused(peer: &str, reason: &str) {
     PEER_SIGNALS_REFUSED.with_label_values(&[peer, reason]).inc();

@@ -117,7 +117,7 @@ means a problem is present, as with `MemoryPressure` on a node.
 A relayed age survives a clock step on every hop, so a step alone never raises
 this condition: it points at a peer whose clock or stamping is wrong. Rejected
 rows are dropped and counted in
-`grid_peer_signals_refused_total{peer,reason="age"}`, so routing reads that
+`grid_peer_signals_refused_total{peer,reason="skew"}`, so routing reads that
 peer's providers as unmeasured. A peer that does not answer keeps its standing,
 a peer that leaves membership is dropped, and one clean answer clears it. The
 condition is written only when its status, its message or the generation
