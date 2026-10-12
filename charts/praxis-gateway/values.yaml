@@ -50,7 +50,8 @@ mountReconciliation:
   managedCredentialNames: []
   # -- Create a Role and RoleBinding in the release namespace that let the AGN
   # Operator's ServiceAccount get and patch this chart's Deployment and no other.
-  # The operator's own charts grant it no Deployment access. Set false to bring
+  # The operator's own charts grant no unrestricted Deployment access; rotation
+  # retains a grant on the named gateway. Set false to bring
   # your own Role (the README shows it), for example when the installer may not
   # create RBAC.
   rbac:

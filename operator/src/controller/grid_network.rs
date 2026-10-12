@@ -3360,8 +3360,8 @@ fn delegated_deployment_failure(
             format!(
                 "the operator's ServiceAccount may not {verb} the delegated Deployment: grant it get and patch on \
                  that one Deployment (the praxis-gateway chart renders the Role when mountReconciliation is \
-                 enabled; otherwise create one in the gateway namespace), and check that deploymentName matches, \
-                 since a name-restricted grant also refuses a Deployment that does not exist"
+                 enabled; otherwise create one in the gateway namespace), and check that deploymentName is \
+                 included in the name-restricted grant"
             ),
         )
         .into();
@@ -8978,14 +8978,14 @@ mod tests {
         }
     }
 
-    /// An apiserver `Status` with `code`, as the kube client surfaces one.
+    /// Supply controlled kube errors to test status mapping without an apiserver.
     fn api_error(code: u16) -> kube::Error {
         kube::Error::Api(Box::new(
             kube::core::Status::failure("scripted", "Scripted").with_code(code),
         ))
     }
 
-    /// A `kube::Client` whose apiserver answers every request with a `Status` of `code`.
+    /// Supply scripted apiserver responses to test error mapping through the kube client.
     fn apiserver_answering(code: u16) -> Client {
         let service = tower::service_fn(move |_req: http::Request<kube::client::Body>| async move {
             let status = json!({
@@ -9007,7 +9007,7 @@ mod tests {
         Client::new(service, "default")
     }
 
-    /// Patch the delegated Deployment against an apiserver answering `code`, returning the error it raised.
+    /// Exercise delegated patch error mapping with a scripted apiserver refusal.
     async fn patch_refused_by_apiserver(code: u16) -> Result<OperatorError, Box<dyn std::error::Error>> {
         let deployment: Deployment = serde_json::from_value(json!({
             "metadata": {"name": "inference-gw", "namespace": "praxis-system", "resourceVersion": "7"}

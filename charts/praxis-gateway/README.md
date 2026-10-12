@@ -461,7 +461,8 @@ patches its reserved volumes, the delegated Praxis config volume source, the
 named container's mounts, and rollout annotations. It preserves other
 Deployment fields and Helm resources.
 
-The operator's own charts grant it no Deployment access. With
+The operator's own charts grant no unrestricted Deployment access; certificate
+rotation retains a grant on the named gateway Deployment. With
 `mountReconciliation.enabled`, this chart renders a Role and RoleBinding in
 the release namespace that let `mountReconciliation.operator.serviceAccount`
 in `mountReconciliation.operator.namespace` (`grid-operator` in `grid-system`
@@ -472,18 +473,25 @@ to bring your own Role, for example from an installer that may not create
 RBAC; the Role to create, and what the grant still allows (`patch` is
 whole-object, not mounts-only), are in
 [Deployment access](../../docs/architecture/operations.md#deployment-access).
-Creating it needs `get` and `patch` on Deployments in the namespace already,
-which anyone who installs this chart has. The grant stays as long as
-`mountReconciliation.enabled` is set here, even after the `GridNetwork`
-stops delegating.
+The installer needs permission to create or update Roles and RoleBindings in
+this namespace and must pass Kubernetes' role-escalation and binding checks:
+it must already hold the granted `get` and `patch` permissions on the named
+Deployment, or have `escalate` on the Role, and hold its permissions or have
+`bind` on it to create the RoleBinding. Namespace `edit` access alone does
+not permit creating these RBAC objects. An authorized administrator can
+create the grant separately with `mountReconciliation.rbac.create: false`.
+The grant stays as long as `mountReconciliation.enabled` is set here, even
+after the `GridNetwork` stops delegating.
 
 Upgrading from v0.2.0 with delegation enabled: the v0.2.0 operator charts
 granted every Deployment in their resource namespaces, and that rule is
 gone. Upgrade this chart first, so the Role exists, then the operator. Out
 of order, the operator reports
 `mountReconciliationStatus[].reason: DeploymentForbidden`, patches nothing,
-keeps serving the routing overlay it already distributed, and publishes no
-new routing changes to this gateway until the Role exists.
+retains the previous populated routing overlay, and cannot publish new
+populated routes to this gateway until the Role exists. If the last provider
+disappears, the operator still publishes an empty authoritative overlay before
+mount reconciliation, so watched routes stop selecting providers.
 
 Configure the gateway chart to mount the operator-generated Praxis config.
 Keep the old Helm mounts during the first phase, then release them only after

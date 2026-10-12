@@ -218,8 +218,9 @@ cluster-wide.  It takes effect only in namespaces where a
 
 ### Deployment access
 
-Neither `ClusterRole` grants Deployments. The operator reaches a
-Deployment through two named grants only:
+Neither `ClusterRole` grants unrestricted Deployment access. With rotation
+on, the resources `ClusterRole` grants `get` and `patch` on the named gateway
+Deployment. The operator reaches Deployments through two named grants only:
 
 | Grant | Bound where | Why |
 |---|---|---|
@@ -263,9 +264,14 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ```
 
-Creating the Role needs `get` and `patch` on Deployments in that
-namespace already (Kubernetes refuses a Role its creator could not use),
-which anyone who installs the gateway has.
+The installer needs permission to create or update Roles and RoleBindings
+in the gateway namespace. Kubernetes also checks role escalation: the installer
+must hold the granted `get` and `patch` permissions on that named Deployment,
+or have `escalate` on the Role. Binding requires the Role's permissions or
+`bind` on that Role. Namespace `edit` access lets a principal deploy a gateway
+but does not grant permission to create these RBAC objects. If the installer
+lacks these permissions, set `mountReconciliation.rbac.create: false` and
+have an authorized administrator create the grant separately.
 
 What the grants still allow, as RBAC facts rather than what the operator
 chooses to do:
@@ -288,10 +294,13 @@ chooses to do:
 Without the grant, the operator gets a 403 on the Deployment read and the
 gateway's `mountReconciliationStatus[]` entry reports
 `reason: DeploymentForbidden`, naming the verb it was refused. Nothing is
-patched, the previously distributed routing overlay is retained, and new
-routing changes stop publishing to that gateway until the grant exists. A
-`deploymentName` that names no Deployment reads the same way, since RBAC
-is checked before existence.
+patched, the previous populated routing overlay is retained, and new
+populated routes stop publishing to that gateway until the grant exists. If
+the last provider disappears, an empty authoritative overlay is still
+published before mount reconciliation so watched routes stop selecting
+providers. A `deploymentName` outside the name-restricted grant also produces
+403. If the name is authorized but the Deployment does not exist, the read
+returns 404 and status reports `DeploymentMissing`.
 
 #### Upgrading from v0.2.0 with delegation enabled
 
@@ -303,9 +312,9 @@ resources ClusterRole. That rule is gone, so a v0.2.0 install with
    delegated gateway.
 2. Upgrade the operator chart, or re-apply `deploy/operator/`.
 
-Out of order, step 2 alone leaves the operator with no Deployment access
-until step 1 lands: the `DeploymentForbidden` status above, and no
-patches in between.
+Out of order, step 2 alone leaves delegated Deployments outside any remaining
+rotation grant inaccessible until step 1 lands: the `DeploymentForbidden`
+status above, and no patches in between.
 
 ### Secret access rules
 

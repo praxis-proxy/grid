@@ -10,8 +10,8 @@
 {{- fail "mountReconciliation.operator.namespace is required when mountReconciliation.rbac.create is true: name the operator ServiceAccount's namespace, or set rbac.create false and create the Role yourself" }}
 {{- end }}
 {{- $fullname := include "praxis-gateway.fullname" . }}
-{{- /* The operator's own charts grant it no Deployment access, so this Role, naming the
-       Deployment that carries the opt-in annotations, is the only one it can reach. */}}
+{{- /* This delegated-mount Role grants access only to the Deployment carrying the
+       opt-in annotations; certificate rotation has its own named grant. */}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
