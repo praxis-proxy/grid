@@ -77,6 +77,9 @@ pub struct Pin {
 /// A signed identity, returned inline from enroll and recorded as an audit row.
 #[derive(Debug, Clone)]
 pub struct Issued {
+    /// The site name bound into the certificate.
+    pub site_name: String,
+
     /// The issued certificate, PEM encoded.
     pub certificate: String,
 

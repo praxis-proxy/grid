@@ -63,6 +63,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SIGNALS_SHED.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SIGNALS_RELAY_TRUNCATED.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(MODEL_DISCOVERY_TOTAL.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r
@@ -79,6 +81,32 @@ static SIGNALS_SHED: LazyLock<IntCounterVec> = LazyLock::new(|| {
     )
     .unwrap_or_else(|_| std::process::abort())
 });
+
+/// What a bounded relay render left out, by store and by what was cut.
+static SIGNALS_RELAY_TRUNCATED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "grid_signals_relay_truncated_total",
+            "Targets dropped and lines cut from the relay served to the local gateway",
+        ),
+        &["store", "cut"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// Count what `rendered` left out of the relay for `store` (`site` or `peers`).
+pub fn record_relay_truncated(store: &str, rendered: &crate::signals::Rendered) {
+    if rendered.targets_dropped > 0 {
+        SIGNALS_RELAY_TRUNCATED
+            .with_label_values(&[store, "target"])
+            .inc_by(u64::try_from(rendered.targets_dropped).unwrap_or(u64::MAX));
+    }
+    if rendered.lines_cut > 0 {
+        SIGNALS_RELAY_TRUNCATED
+            .with_label_values(&[store, "line"])
+            .inc_by(u64::try_from(rendered.lines_cut).unwrap_or(u64::MAX));
+    }
+}
 
 /// The site identity's `notAfter`, Unix seconds; zero when the identity cannot be read.
 static SITE_IDENTITY_EXPIRY: LazyLock<IntGauge> = LazyLock::new(|| {

@@ -119,6 +119,23 @@ enrollment:
   # local: the standalone grid-admin-token table, for non-kube deploys. The table has no
   # roles, so every token in it may mint and revoke tokens and read and delete enrollments.
   authz: kube                        # kube | local
+  # Record each enrollment as a CertificateSigningRequest on this cluster, under
+  # signer grid.praxis.fast/site: created, approved on the invite's authority and
+  # completed with the issued certificate by the service, so every enrollment shows
+  # in kubectl get csr and the audit log. Needs authz=kube. The record never gates
+  # issue: a failed record is logged and the certificate stands.
+  csrRecord:
+    enabled: true
+    # Signer name the records are filed under, domain-qualified. Give each
+    # enrollment service on a cluster its own, since the admission policy below
+    # admits only this release's service for it.
+    signerName: grid.praxis.fast/site
+    policy:
+      # Two ValidatingAdmissionPolicies: only the service may file a request under
+      # the signer name, and the service may touch no other signer name. Required
+      # while the record is on. Needs admissionregistration.k8s.io/v1 (Kubernetes
+      # 1.30); on an older cluster turn the record off instead.
+      enabled: true
   # Audience a grid-admin token must be bound to under authz=kube, e.g.
   # kubectl create token <sa> --audience grid-enrollment --duration 10m.
   # Never an API-server audience (kubernetes, https://kubernetes.default.svc,

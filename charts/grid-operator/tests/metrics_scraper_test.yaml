@@ -57,7 +57,7 @@ tests:
           content: {name: GRID_METRICS_SCRAPER_SERVICE_ACCOUNT, value: RELEASE-NAME-grid-operator-metrics-scraper}
       - contains:
           path: spec.template.spec.containers[0].env
-          content: {name: GRID_METRICS_SCRAPER_NAMESPACE, value: grid}
+          content: {name: GRID_METRICS_SCRAPER_NAMESPACE, value: "$(POD_NAMESPACE)"}
 
   - it: renders nothing when rbac.create is false
     template: templates/metrics-scraper.yaml

@@ -192,4 +192,81 @@ san=$(openssl x509 -in "${WORK}/leaf.pem" -noout -ext subjectAltName 2>/dev/null
 grep -q "spiffe://grid.internal/site/site-a" <<<"${san}" || fail "leaf SAN missing the pinned SPIFFE URI"
 pass "leaf SAN carries the pinned SPIFFE URI"
 
+# The record: under kube authz every enrollment is a CertificateSigningRequest the
+# service created, approved on the invite's authority and completed with the leaf.
+# It is written off the request path, so give it a moment. Under local authz there
+# is no API server to record on, and no record must exist.
+ENROLL_ID="$(printf '%s' "${ENROLL}" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'].replace('-',''))")" \
+  || fail "enroll response has no id"
+CSR_NAME="site-a-${ENROLL_ID}"
+if [ "${AUTHZ}" = "kube" ]; then
+  # Wait for the completed record, not its creation: approval and the certificate land in later calls.
+  for _ in $(seq 1 40); do
+    kubectl --context "${CTX}" get csr "${CSR_NAME}" -o jsonpath='{.status.certificate}' 2>/dev/null | grep -q . && break
+    sleep 0.5
+  done
+  kubectl --context "${CTX}" get csr "${CSR_NAME}" -o json >"${WORK}/csr.json" \
+    || fail "no CertificateSigningRequest ${CSR_NAME} recorded for the enrollment"
+  python3 - "${WORK}/csr.json" "${WORK}/leaf.pem" <<'PY' || fail "the record does not match the enrollment"
+import base64, json, sys
+csr = json.load(open(sys.argv[1]))
+leaf = open(sys.argv[2]).read()
+spec, status = csr["spec"], csr.get("status", {})
+assert spec["signerName"] == "grid.praxis.fast/site", spec["signerName"]
+assert csr["metadata"]["labels"]["grid.praxis.fast/site-name"] == "site-a", csr["metadata"]["labels"]
+assert base64.b64decode(spec["request"]).startswith(b"-----BEGIN CERTIFICATE REQUEST-----"), "request is not the PEM"
+approved = [c for c in status.get("conditions", []) if c["type"] == "Approved"]
+assert approved and approved[0]["status"] == "True" and approved[0]["reason"] == "InviteRedeemed", status.get("conditions")
+assert base64.b64decode(status["certificate"]).decode() == leaf, "status.certificate is not the issued leaf"
+PY
+  pass "enrollment recorded as ${CSR_NAME}: approved InviteRedeemed, completed with the issued leaf"
+
+  # The admission policy: only the service may file under the grid signer name.
+  request_b64="$(base64 -w0 <"${WORK}/site.csr")"
+  if kubectl --context "${CTX}" create -f - >"${WORK}/forged.out" 2>&1 <<YAML
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: forged-site-a
+spec:
+  signerName: grid.praxis.fast/site
+  request: ${request_b64}
+  usages: ["digital signature", "server auth", "client auth"]
+YAML
+  then
+    fail "a request under the grid signer name from the test identity was admitted"
+  fi
+  grep -q "only the grid enrollment service" "${WORK}/forged.out" \
+    || fail "the forged request was refused for another reason: $(cat "${WORK}/forged.out")"
+  pass "admission refuses a request under the grid signer name from another identity"
+
+  # The service itself may touch no other signer name, even with its own rights.
+  SA="system:serviceaccount:${NS}:grid-enrollment"
+  if kubectl --context "${CTX}" --as "${SA}" create -f - >"${WORK}/other.out" 2>&1 <<YAML
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: other-signer-site-a
+spec:
+  signerName: example.com/other
+  request: ${request_b64}
+  usages: ["digital signature", "server auth", "client auth"]
+YAML
+  then
+    fail "the service account filed a request under another signer name"
+  fi
+  grep -q "only touch requests under its own signer name" "${WORK}/other.out" \
+    || fail "the other-signer request was refused for another reason: $(cat "${WORK}/other.out")"
+  pass "admission confines the service to its own signer name"
+else
+  # Watch the whole recording window, so a late record would still fail the test.
+  for _ in $(seq 1 24); do
+    if kubectl --context "${CTX}" get csr "${CSR_NAME}" >/dev/null 2>&1; then
+      fail "a CertificateSigningRequest was recorded under local authz"
+    fi
+    sleep 0.5
+  done
+  pass "no record under local authz"
+fi
+
 echo "== e2e GREEN (authz=${AUTHZ}): helm reproducible + real enroll flow verified =="

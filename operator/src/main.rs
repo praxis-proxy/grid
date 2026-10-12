@@ -173,6 +173,8 @@ async fn main() {
         local_signals_addr: config.signals.local_addr(),
         trust,
         peer_port: config.signals.peer_port,
+        peer_interval: std::time::Duration::from_secs(config.signals.peer_interval_secs),
+        peer_budget: std::time::Duration::from_secs(config.signals.peer_budget_secs),
     };
     let ctx = Arc::new(
         OperatorCtx::new(client.clone(), None, signal_mode)
@@ -2015,18 +2017,29 @@ async fn signals_handler(
 
     // Local, the site's own data plane, gets the whole grid view unscoped.
     // Access policy bounds peer reads, not the site reading itself.
-    let (mut body, mut oldest) = match &caller {
-        Caller::Local => published.site.render_unrestricted(target, &collect),
+    let (body, oldest) = match &caller {
+        Caller::Local => {
+            // One body under the gateway's read ceiling: the site first, so a
+            // flood of relayed rows can only cost the last peers, never this site.
+            let site = published
+                .site
+                .render_bounded(target, &collect, operator::signals::MAX_RELAY_BYTES);
+            // Peers relay only to Local, and the peers store carries no access map.
+            // A Peer(Some) relay would need per-target scoping added here.
+            let peers = published.peers.render_bounded(
+                target,
+                &collect,
+                operator::signals::MAX_RELAY_BYTES.saturating_sub(site.body.len()),
+            );
+            operator::metrics::record_relay_truncated("site", &site);
+            operator::metrics::record_relay_truncated("peers", &peers);
+            let mut body = site.body;
+            body.push_str(&peers.body);
+            (body, site.oldest.max(peers.oldest))
+        },
         Caller::Peer(Some(labels)) => published.site.render(target, &collect, Some(labels)),
         Caller::Peer(None) => return refused(),
     };
-    if caller == Caller::Local {
-        // Peers relay only to Local, and the peers store carries no access map.
-        // A Peer(Some) relay would need per-target scoping added here.
-        let (relayed, relayed_age) = published.peers.render_unrestricted(target, &collect);
-        body.push_str(&relayed);
-        oldest = oldest.max(relayed_age);
-    }
     served(body, oldest)
 }
 

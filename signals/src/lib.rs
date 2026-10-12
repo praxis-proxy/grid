@@ -10,4 +10,4 @@ pub mod exposition;
 
 mod signals;
 
-pub use signals::{Combine, CombinePolicy, LoadStore, Sample, now_ms};
+pub use signals::{Combine, CombinePolicy, Ingested, LoadStore, Sample, now_ms};

@@ -8,8 +8,10 @@ rust-version = "1.96"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+httpdate = "1.0.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { version = "0.10.7", package = "yaml_serde" }
+metrics = "0.24.6"
 
 [workspace.lints.rust]
 dead_code = "deny"
@@ -317,7 +319,7 @@ praxis-proxy = { version = "0.7.3", features = ["otel", "spiffe"] }
 praxis-proxy-filter = "0.7.3"
 praxis-proxy-core = "0.7.3"
 opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["tls-provider-agnostic"] }
-praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "17b41771fcd53b22ab5c6f9badede0de9021404c", default-features = false, features = ["opentelemetry"] }
+praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "75e8662d8a4705391e7cce6e79c08e4e9cd826a0", default-features = false, features = ["opentelemetry"] }
 ai-grid-filters = { path = "ai-grid-filters" }
 tracing = "0.1.44"
 praxis-protocol = { version = "0.7.3", package = "praxis-proxy-protocol" }
@@ -331,8 +333,11 @@ serde_yaml.workspace = true
 [dev-dependencies]
 # The reload test runs a real mTLS signals peer against the binary.
 certs = { path = "../certs", default-features = false, features = ["verifier"] }
+httpdate = { workspace = true }
 rustls = { version = "0.23.45", features = ["ring"] }
 tokio = { version = "1.53.1", features = ["macros"] }
+# The help-text test emits one sample per documented metric.
+metrics = { workspace = true }
 
 # machete can't see these: used as `praxis` / `praxis_core` / `praxis_filter`, not their package names.
 [package.metadata.cargo-machete]

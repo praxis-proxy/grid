@@ -63,8 +63,6 @@ pub struct PeerScraper {
     connect_timeout: Duration,
     /// Bound on the request/response.
     request_timeout: Duration,
-    /// Leaf SHA-256 digests, lowercase hex, the peer must also match, none to check the SPIFFE id only.
-    pins: Vec<String>,
 }
 
 impl PeerScraper {
@@ -122,35 +120,7 @@ impl PeerScraper {
             expected_target: expected_target.to_owned(),
             connect_timeout,
             request_timeout,
-            pins: Vec::new(),
         })
-    }
-
-    /// Also require the peer's leaf to match one of `pins`, SHA-256 hex with or without colons.
-    #[must_use]
-    pub fn with_pins(mut self, pins: &[String]) -> Self {
-        self.pins = pins
-            .iter()
-            .map(|pin| {
-                pin.chars()
-                    .filter(|ch| *ch != ':')
-                    .map(|ch| ch.to_ascii_lowercase())
-                    .collect()
-            })
-            .collect();
-        self
-    }
-
-    /// Whether `leaf` satisfies the pins, trivially when none are set.
-    fn pinned(&self, leaf: Option<&CertificateDer<'_>>) -> bool {
-        if self.pins.is_empty() {
-            return true;
-        }
-        let Some(leaf) = leaf else {
-            return false;
-        };
-        let digest: String = certs::sha256(leaf).iter().map(|byte| format!("{byte:02x}")).collect();
-        self.pins.contains(&digest)
     }
 }
 
@@ -179,9 +149,6 @@ impl SignalSource for PeerScraper {
         // stream can move into the HTTP handshake after.
         let verified_id = {
             let (_io, conn) = tls.get_ref();
-            if !self.pinned(conn.peer_certificates().and_then(<[_]>::first)) {
-                return Err(FetchError::Unauthorized("peer leaf matches no declared pin".to_owned()));
-            }
             self.verifier
                 .spiffe_id_from_peer(conn.peer_certificates())
                 .map_err(|error| FetchError::Unauthorized(format!("peer identity: {error}")))?
@@ -328,49 +295,6 @@ mod tests {
             &spiffe_id("east"),
             "attribution is the verified id"
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn declared_pins_must_match_the_peer_leaf() {
-        let ca = generate_ca("grid-ca").expect("ca");
-        let server = generate_site_cert(&ca, "east").expect("server cert");
-        let client = generate_site_cert(&ca, "poller").expect("client cert");
-        let (server_chain, server_key) = material(&server.cert_pem, &server.key_pem);
-        let leaf_pin: String = certs::sha256(server_chain.first().expect("leaf"))
-            .iter()
-            .map(|byte| format!("{byte:02X}:"))
-            .collect::<String>()
-            .trim_end_matches(':')
-            .to_owned();
-        let cases = [
-            ("no pins", Vec::new(), true),
-            ("the leaf, colon separated upper case", vec![leaf_pin], true),
-            ("another leaf", vec!["ab".repeat(32)], false),
-        ];
-        for (label, pins, accepted) in cases {
-            let addr = mock_tls_peer(server_chain.clone(), server_key.clone_key(), ok_response()).await;
-            let (client_chain, client_key) = material(&client.cert_pem, &client.key_pem);
-            install_ring();
-            let source = PeerScraper::new(
-                ca.cert_pem.as_bytes(),
-                client_chain,
-                client_key,
-                &addr,
-                sni(),
-                "east.grid.internal",
-                "/v1/site/signals",
-                &spiffe_id("east"),
-                Duration::from_secs(2),
-                Duration::from_secs(2),
-            )
-            .expect("source")
-            .with_pins(&pins);
-            let fetched = source.fetch().await;
-            assert_eq!(fetched.is_ok(), accepted, "{label}: {:?}", fetched.err());
-            if !accepted {
-                assert!(matches!(fetched, Err(FetchError::Unauthorized(_))), "{label}");
-            }
-        }
     }
 
     /// A grid-CA-signed TLS peer that sends response headers then stalls the body

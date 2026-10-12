@@ -21,6 +21,7 @@ http-body-util = { workspace = true }
 httpdate = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["client", "client-legacy", "http1", "tokio"] }
+metrics = { workspace = true }
 percent-encoding = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }

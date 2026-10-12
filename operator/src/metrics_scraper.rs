@@ -45,7 +45,11 @@ use crate::{
 // Bounded input limits
 // ---------------------------------------------------------------------------
 
-/// Maximum size for a metrics response body (1 MiB).
+/// Maximum size for a metrics response body: 1 MiB.
+///
+/// This is a deliberate memory bound for one scrape. Reaching it means the
+/// endpoint answered; it is counted as `body_cap` and leaves readiness unknown
+/// rather than treating the provider as down.
 const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 
 // ---------------------------------------------------------------------------

@@ -354,6 +354,8 @@ mod live {
             cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
             reserved_sites: Vec::new(),
             renewals_enabled: true,
+            #[cfg(feature = "csr-record")]
+            recorder: None,
         });
         listen_after(port, after, serving, router(Arc::clone(&state))).await;
         (state, minter, admin)

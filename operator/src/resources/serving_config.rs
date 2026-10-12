@@ -16,8 +16,7 @@ use crate::{
         routing_overlay::{RoutingCandidate, RoutingOverlay, overlay_labels, scoped_configmap_name},
         tls_backend::sha256,
     },
-    signals::{PeerIdentities, PeerTrustMode, SIGNALS_PATH, SignalsEndpoint, dialable_signals_endpoint},
-    swim::{MemberStatus, MembershipSnapshot},
+    signals::SIGNALS_PATH,
 };
 
 /// `ConfigMap` data key holding the serving config.
@@ -35,22 +34,50 @@ pub(crate) const MIN_WRITE_INTERVAL: Duration = Duration::from_secs(30);
 /// Store retention per series, seconds.
 const WINDOW_SECS: u64 = 60;
 
-/// Peer poll interval, the operator's default local scrape interval.
-const PEER_INTERVAL_MS: u64 = 5_000;
+/// How often the gateway polls its local operator, milliseconds.
+const GATEWAY_POLL_MS: u64 = 5_000;
 
-/// Peer connect and request timeout, milliseconds.
-const PEER_TIMEOUT_MS: u64 = 2_000;
+/// Gateway connect and request timeout to its local operator, milliseconds.
+const GATEWAY_TIMEOUT_MS: u64 = 2_000;
 
-/// The freshness window the gateway reads load over, milliseconds: the oldest a sample can
-/// be when it arrives (a scrape, a poll, and a poll timeout) plus one poll of slack, so one
-/// late poll does not turn a healthy site unknown. 17s at a 5s scrape.
-fn load_window_ms(scrape: Duration) -> i64 {
-    let scrape_ms = u64::try_from(scrape.as_millis()).unwrap_or(u64::MAX);
-    let window = PEER_INTERVAL_MS
-        .saturating_add(scrape_ms)
-        .saturating_add(PEER_TIMEOUT_MS)
-        .saturating_add(PEER_INTERVAL_MS);
+/// Margin past the producers: `Date` is truncated to the second, which under-reads age,
+/// and the gateway's fetch runs on past the `Date` it reads.
+const MARGIN_MS: u64 = 2_000;
+
+/// How many scrapes the worst-of horizon spans.
+const HORIZON_SCRAPES: u32 = 3;
+
+/// The freshness window the gateway reads load over, milliseconds.
+///
+/// The oldest a relayed sample can be when it arrives: a provider scrape, the
+/// operator's peer poll and the budget that poll may take, the gateway's own poll
+/// of the operator, and two hops of `Date` truncation. Plus one peer poll of
+/// slack, so one late poll does not turn a healthy site unknown. About 82s at the
+/// defaults. Sized shorter than one relay cycle, every remote site would be
+/// unmeasured for most of every cycle and every gateway would route to its local
+/// site in a square wave.
+fn load_window_ms(scrape: Duration, peer_interval: Duration, peer_budget: Duration) -> i64 {
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let window = ms(scrape)
+        .saturating_add(ms(peer_interval))
+        .saturating_add(ms(peer_budget))
+        .saturating_add(GATEWAY_POLL_MS)
+        .saturating_add(MARGIN_MS)
+        .saturating_add(ms(peer_interval));
     i64::try_from(window).unwrap_or(i64::MAX)
+}
+
+/// How far behind a site's newest sample the gateway reads worst load, milliseconds.
+///
+/// A few scrapes, so one spike is forgotten within seconds whatever the relay cadence.
+/// Anchored at the newest sample on the gateway, so it needs no relay term. About 17s at
+/// the defaults, the freshness window before the gateway read its local operator.
+fn horizon_ms(scrape: Duration) -> i64 {
+    let horizon = u64::try_from(scrape.as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::from(HORIZON_SCRAPES))
+        .saturating_add(MARGIN_MS);
+    i64::try_from(horizon).unwrap_or(i64::MAX)
 }
 
 /// Gateway-side cap on candidates (`validate_candidates`).
@@ -71,6 +98,8 @@ pub(crate) struct ServingConfig {
     pub(crate) window_secs: u64,
     /// Freshness window, milliseconds.
     pub(crate) load_window_ms: i64,
+    /// Worst-of horizon behind a site's newest sample, milliseconds.
+    pub(crate) horizon_ms: i64,
     /// Local site first, then by site, name, cluster.
     pub(crate) candidates: Vec<ServingCandidate>,
     /// Explicit mTLS provider gateways authorized to receive hop context.
@@ -111,10 +140,10 @@ fn admits_new(admission: &AdmissionState) -> bool {
     *admission == AdmissionState::NewAndExisting
 }
 
-/// One peer signals endpoint and the local identity material to reach it.
+/// The local operator's signals endpoint and the identity material to reach it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct ServingPeer {
-    /// Site whose SPIFFE id the peer must present.
+    /// Site whose SPIFFE id the operator must present.
     pub(crate) site: String,
     /// `host:port` to dial.
     pub(crate) addr: String,
@@ -136,9 +165,6 @@ pub(crate) struct ServingPeer {
     pub(crate) client_cert_path: String,
     /// This site's private key path.
     pub(crate) client_key_path: String,
-    /// Leaf digests the peer must also match, set only under pin trust.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub(crate) pins: Vec<String>,
 }
 
 /// Per-gateway inputs that are not in the overlay.
@@ -152,75 +178,37 @@ pub(crate) struct ServingInputs<'input> {
     pub(crate) tls_mount: &'input str,
     /// Operator-configured address of this site's own signals endpoint.
     pub(crate) local_signals_addr: Option<&'input str>,
-    /// Declared leaf digests per remote site, empty outside pin trust.
-    pub(crate) pins: &'input BTreeMap<String, Vec<String>>,
     /// How often operators scrape their providers, taken as every site's.
     pub(crate) scrape_interval: Duration,
+    /// How often the operator polls each peer.
+    pub(crate) peer_interval: Duration,
+    /// The most one peer poll may take.
+    pub(crate) peer_budget: Duration,
 }
 
-/// Render from `(site, signals endpoint)` members.
+/// Render for one gateway. Its only peer is the local operator, which relays
+/// every member it collects from.
 ///
 /// An empty candidate list is an authoritative no-route state. It must still
 /// be written so a gateway cannot retain candidates from an older config.
-pub(crate) fn render<'member, Members>(
-    overlay: &RoutingOverlay,
-    members: Members,
-    inputs: &ServingInputs<'_>,
-) -> ServingConfig
-where
-    Members: IntoIterator<Item = (&'member str, &'member str)>,
-{
+pub(crate) fn render(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> ServingConfig {
     let candidates = candidates(overlay);
-    let sites: BTreeSet<&str> = candidates.iter().map(|candidate| candidate.site.as_str()).collect();
-    let mut addrs = remote_addrs(members, &sites, &overlay.local_site, overlay.candidates.is_empty());
-    if let Some(addr) = inputs.local_signals_addr
-        && certs::validate_site_name(&overlay.local_site).is_ok()
-    {
-        addrs.insert(overlay.local_site.clone(), addr.to_owned());
-    }
-    let peers = addrs
+    let peers = inputs
+        .local_signals_addr
+        .filter(|_| certs::validate_site_name(&overlay.local_site).is_ok())
+        .map(|addr| peer(overlay.local_site.clone(), addr.to_owned(), inputs.tls_mount))
         .into_iter()
-        .map(|(site, addr)| {
-            let pins = inputs.pins.get(&site).cloned().unwrap_or_default();
-            peer(site, addr, inputs.tls_mount, pins)
-        })
         .collect();
     ServingConfig {
         local_site: overlay.local_site.clone(),
         window_secs: WINDOW_SECS,
-        load_window_ms: load_window_ms(inputs.scrape_interval),
+        load_window_ms: load_window_ms(inputs.scrape_interval, inputs.peer_interval, inputs.peer_budget),
+        horizon_ms: horizon_ms(inputs.scrape_interval),
         candidates,
         provider_hop_clusters: inputs.provider_hop_clusters.iter().cloned().collect(),
         provider_hop_sni: inputs.provider_hop_sni.clone(),
         peers,
     }
-}
-
-/// Alive members worth dialing at their signals endpoint, with pins, none over unencrypted gossip.
-pub(crate) fn dialable_members<'snap>(
-    snapshot: &'snap MembershipSnapshot,
-    identities: &PeerIdentities,
-    trust: PeerTrustMode,
-    encrypted: bool,
-    fallback_port: u16,
-) -> Vec<(&'snap str, String, Vec<String>)> {
-    if !encrypted {
-        return Vec::new();
-    }
-    snapshot
-        .members
-        .iter()
-        .filter(|member| member.status == MemberStatus::Alive)
-        .filter_map(|member| {
-            // One read admits the peer and supplies its pins.
-            let pins = match trust {
-                PeerTrustMode::Pin => Some(identities.pins_for(&member.site_id)).filter(|pins| !pins.is_empty())?,
-                PeerTrustMode::Spiffe => Vec::new(),
-            };
-            let endpoint = dialable_signals_endpoint(member, fallback_port)?;
-            Some((member.site_id.as_str(), endpoint.authority(), pins))
-        })
-        .collect()
 }
 
 /// A candidate's identity: remote after local, then site, name, cluster.
@@ -336,33 +324,8 @@ fn valid_id(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= MAX_NAME_LEN
 }
 
-/// Signals endpoint per remote candidate site, unsafe hosts refused.
-fn remote_addrs<'member, Members>(
-    members: Members,
-    sites: &BTreeSet<&str>,
-    local_site: &str,
-    include_all: bool,
-) -> BTreeMap<String, String>
-where
-    Members: IntoIterator<Item = (&'member str, &'member str)>,
-{
-    members
-        .into_iter()
-        .filter(|(site, _)| {
-            *site != local_site && (include_all || sites.contains(site)) && certs::validate_site_name(site).is_ok()
-        })
-        .filter_map(|(site, endpoint)| {
-            let Some(parsed) = SignalsEndpoint::parse(endpoint).filter(SignalsEndpoint::is_dialable) else {
-                tracing::warn!(site, endpoint, "serving config: refusing advertised peer address");
-                return None;
-            };
-            Some((site.to_owned(), parsed.authority()))
-        })
-        .collect()
-}
-
-/// One peer entry, presenting this site's own identity from `tls_mount`.
-fn peer(site: String, addr: String, tls_mount: &str, pins: Vec<String>) -> ServingPeer {
+/// The local operator entry, presenting this site's own identity from `tls_mount`.
+fn peer(site: String, addr: String, tls_mount: &str) -> ServingPeer {
     let name = format!("{site}.{}", certs::SPIFFE_TRUST_DOMAIN);
     ServingPeer {
         site,
@@ -370,13 +333,12 @@ fn peer(site: String, addr: String, tls_mount: &str, pins: Vec<String>) -> Servi
         server_name: name.clone(),
         authority: name,
         path: SIGNALS_PATH,
-        interval_ms: PEER_INTERVAL_MS,
-        connect_timeout_ms: PEER_TIMEOUT_MS,
-        request_timeout_ms: PEER_TIMEOUT_MS,
+        interval_ms: GATEWAY_POLL_MS,
+        connect_timeout_ms: GATEWAY_TIMEOUT_MS,
+        request_timeout_ms: GATEWAY_TIMEOUT_MS,
         grid_ca_path: format!("{tls_mount}/ca.crt"),
         client_cert_path: format!("{tls_mount}/tls.crt"),
         client_key_path: format!("{tls_mount}/tls.key"),
-        pins,
     }
 }
 
@@ -487,8 +449,8 @@ mod tests {
     /// Contract fixture the gateway crate parses with its own types.
     const GOLDEN: &str = include_str!("../../../gateway/ai-grid-filters/testdata/serving-config.json");
 
-    /// No pins, as under SPIFFE trust.
-    static NO_PINS: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    /// The local operator's signals Service.
+    const LOCAL_ADDR: &str = "grid-operator-signals.grid.svc:9091";
     /// No authenticated provider gateway in this fixture.
     static NO_PROVIDER_HOPS: BTreeSet<String> = BTreeSet::new();
     /// No declared provider-hop identities in the default fixture.
@@ -498,9 +460,10 @@ mod tests {
         provider_hop_clusters: &NO_PROVIDER_HOPS,
         provider_hop_sni: &NO_PROVIDER_HOP_SNI,
         tls_mount: "/etc/praxis/tls",
-        local_signals_addr: None,
-        pins: &NO_PINS,
+        local_signals_addr: Some(LOCAL_ADDR),
         scrape_interval: Duration::from_secs(5),
+        peer_interval: Duration::from_secs(30),
+        peer_budget: Duration::from_secs(10),
     };
 
     fn cand(name: &str, site: &str, cluster: &str, admission: Option<&str>) -> RoutingCandidate {
@@ -542,33 +505,55 @@ mod tests {
     #[test]
     fn the_load_window_covers_the_oldest_a_sample_can_arrive_plus_a_poll() {
         assert_eq!(
-            load_window_ms(Duration::from_secs(5)),
-            17_000,
-            "5s poll + 5s scrape + 2s timeout + 5s"
+            load_window_ms(Duration::from_secs(5), Duration::from_secs(30), Duration::from_secs(10)),
+            82_000,
+            "5s scrape + 30s peer poll + 10s budget + 5s gateway poll + 2s Date + 30s slack"
         );
-        assert_eq!(load_window_ms(Duration::from_secs(1)), 13_000);
-        let oldest_arrival = PEER_INTERVAL_MS + 5_000 + PEER_TIMEOUT_MS;
+        assert_eq!(
+            load_window_ms(Duration::from_secs(1), Duration::from_secs(30), Duration::from_secs(10)),
+            78_000
+        );
+        let oldest_arrival = 5_000 + 30_000 + 10_000 + GATEWAY_POLL_MS + MARGIN_MS;
         assert!(
-            i64::try_from(oldest_arrival).unwrap_or(i64::MAX) < load_window_ms(Duration::from_secs(5)),
+            i64::try_from(oldest_arrival).unwrap_or(i64::MAX)
+                < load_window_ms(Duration::from_secs(5), Duration::from_secs(30), Duration::from_secs(10)),
             "a sample at the worst-case age is still fresh"
         );
     }
 
     #[test]
+    fn the_window_outlasts_one_relay_cycle() {
+        let peer_interval = Duration::from_secs(30);
+        let window = load_window_ms(Duration::from_secs(5), peer_interval, Duration::from_secs(10));
+        assert!(
+            window > i64::try_from(2 * peer_interval.as_millis()).unwrap_or(i64::MAX),
+            "shorter than two relay cycles, a remote site is unmeasured for most of each cycle"
+        );
+    }
+
+    #[test]
+    fn the_horizon_spans_a_few_scrapes_and_fits_the_retention() {
+        assert_eq!(horizon_ms(Duration::from_secs(5)), 17_000, "3 scrapes + 2s margin");
+        assert!(
+            horizon_ms(Duration::from_secs(5)) <= i64::try_from(WINDOW_SECS * 1_000).unwrap_or(i64::MAX),
+            "retention evicts behind the newest sample, so it must hold the horizon"
+        );
+    }
+
+    #[test]
     fn renders_the_contract_the_gateway_parses() {
-        let members = [("site-b", "203.0.113.7:9091"), ("site-a", "198.51.100.1:9091")];
-        let config = render(&two_site(), members, &INPUTS);
+        let config = render(&two_site(), &INPUTS);
         assert_eq!(to_text(&config).expect("json"), GOLDEN.trim_end(), "golden drifted");
     }
 
     #[test]
     fn empty_overlay_renders_authoritative_no_route_config() {
-        let config = render(&overlay(Vec::new()), [("site-b", "203.0.113.7:9091")], &INPUTS);
+        let config = render(&overlay(Vec::new()), &INPUTS);
         assert!(config.candidates.is_empty(), "the empty overlay withdraws every route");
         assert_eq!(
             peer_sites(&config),
-            [("site-b", "203.0.113.7:9091")],
-            "signals pollers remain ready for restoration"
+            [("site-a", LOCAL_ADDR)],
+            "the local poller remains ready for restoration"
         );
         assert!(
             to_text(&config).expect("json").contains("\"candidates\": []"),
@@ -578,14 +563,12 @@ mod tests {
 
     #[test]
     fn output_is_independent_of_input_order() {
-        let forward = [("site-b", "203.0.113.7:9091"), ("site-c", "203.0.113.9:9091")];
-        let reverse = [("site-c", "203.0.113.9:9091"), ("site-b", "203.0.113.7:9091")];
         let mut shuffled = two_site();
         shuffled.candidates.push(cand("llama", "site-c", "pool-c", None));
         let mut ordered = two_site();
         ordered.candidates.insert(0, cand("llama", "site-c", "pool-c", None));
-        let first = to_text(&render(&shuffled, forward, &INPUTS)).expect("json");
-        let second = to_text(&render(&ordered, reverse, &INPUTS)).expect("json");
+        let first = to_text(&render(&shuffled, &INPUTS)).expect("json");
+        let second = to_text(&render(&ordered, &INPUTS)).expect("json");
         assert_eq!(first, second, "same inputs in any order render the same bytes");
     }
 
@@ -593,7 +576,7 @@ mod tests {
     fn local_candidates_lead_and_duplicates_collapse() {
         let mut dup = two_site();
         dup.candidates.push(cand("llama", "site-b", "pool-b", None));
-        let config = render(&dup, [], &INPUTS);
+        let config = render(&dup, &INPUTS);
         let order: Vec<&str> = config.candidates.iter().map(|c| c.site.as_str()).collect();
         assert_eq!(order, ["site-a", "site-b"], "local first, one entry per tuple");
     }
@@ -637,24 +620,18 @@ mod tests {
             ("uppercase site", cand("llama", "Site-B", "pool-b", None)),
         ];
         for (label, bad) in cases {
-            assert!(
-                render(&overlay(vec![bad]), [], &INPUTS).candidates.is_empty(),
-                "{label}"
-            );
+            assert!(render(&overlay(vec![bad]), &INPUTS).candidates.is_empty(), "{label}");
         }
         let mut mcp = cand("tool", "site-b", "pool-b", None);
         mcp.kind = "mcp_tool".to_owned();
-        assert!(
-            render(&overlay(vec![mcp]), [], &INPUTS).candidates.is_empty(),
-            "mcp_tool"
-        );
+        assert!(render(&overlay(vec![mcp]), &INPUTS).candidates.is_empty(), "mcp_tool");
     }
 
     #[test]
     fn an_excluded_candidate_reaches_the_serving_config_but_not_the_overlay_wire() {
         let mut source = overlay(vec![cand("llama", "site-a", "pool-a", None)]);
         source.excluded = vec![cand("llama", "site-b", "pool-b", Some("none"))];
-        let rendered = render(&source, [], &INPUTS);
+        let rendered = render(&source, &INPUTS);
         let config: serde_json::Value = serde_json::from_str(&to_text(&rendered).expect("text")).expect("json");
         let pool_b = config["candidates"]
             .as_array()
@@ -674,7 +651,7 @@ mod tests {
             .collect();
         let mut source = overlay(vec![cand("llama", "site-z", "up", None)]);
         source.excluded = excluded;
-        let rendered = render(&source, [], &INPUTS);
+        let rendered = render(&source, &INPUTS);
         assert_eq!(rendered.candidates.len(), MAX_CANDIDATES);
         assert!(
             rendered.candidates.iter().any(|c| c.cluster == "up"),
@@ -690,7 +667,6 @@ mod tests {
                 cand("llama", "site-b", "pool-b", Some("none")),
                 cand("llama", "site-d", "pool-d", Some("existing_only")),
             ]),
-            [],
             &INPUTS,
         );
         let config: serde_json::Value = serde_json::from_str(&to_text(&rendered).expect("text")).expect("json");
@@ -712,89 +688,12 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_or_irrelevant_peers_are_refused() {
-        let cases = [
-            ("loopback", "127.0.0.1:9091"),
-            ("loopback v6", "[::1]:9091"),
-            ("link local metadata", "169.254.169.254:9091"),
-            ("alibaba metadata", "100.100.100.200:9091"),
-            ("mapped loopback", "[::ffff:127.0.0.1]:9091"),
-            ("link local v6", "[fe80::1]:9091"),
-            ("unspecified", "0.0.0.0:9091"),
-            ("aws metadata v6", "[fd00:ec2::254]:9091"),
-            ("localhost", "localhost:9091"),
-            ("no host", ":9091"),
-            ("no port", "203.0.113.7"),
-            ("bare ipv6", "fd00::1"),
-            ("unbracketed ipv6 with a port", "fd00::1:9091"),
-            ("userinfo", "x@169.254.169.254:443"),
-            ("path and query", "evil.example/x?:9091"),
-        ];
-        for (label, endpoint) in cases {
-            let config = render(&two_site(), [("site-b", endpoint)], &INPUTS);
-            assert!(config.peers.is_empty(), "{label}: {endpoint} must be refused");
-        }
-        let other = render(&two_site(), [("site-z", "203.0.113.9:9091")], &INPUTS);
-        assert!(other.peers.is_empty(), "a site with no candidate is not polled");
-        let bad_name = overlay(vec![cand("llama", "Site_B", "pool-b", None)]);
-        let config = render(&bad_name, [("Site_B", "203.0.113.7:9091")], &INPUTS);
-        assert!(
-            config.candidates.is_empty() && config.peers.is_empty(),
-            "a non-DNS site name is neither a candidate nor a peer"
-        );
-    }
-
-    #[test]
-    fn routable_and_named_peers_are_kept() {
-        let members = [
-            ("site-b", "203.0.113.7:9091"),
-            ("site-c", "site-c.example.net:9091"),
-            ("site-d", "[2001:db8::1]:9091"),
-            ("site-e", "100.64.0.1:9091"),
-            ("site-f", "[fd00::5]:9091"),
-        ];
-        let mut topo = two_site();
-        for site in ["site-c", "site-d", "site-e", "site-f"] {
-            topo.candidates.push(cand("llama", site, "pool", None));
-        }
-        let config = render(&topo, members, &INPUTS);
-        assert_eq!(
-            peer_sites(&config),
-            [
-                ("site-b", "203.0.113.7:9091"),
-                ("site-c", "site-c.example.net:9091"),
-                ("site-d", "[2001:db8::1]:9091"),
-                ("site-e", "100.64.0.1:9091"),
-                ("site-f", "[fd00::5]:9091"),
-            ],
-        );
-    }
-
-    #[test]
-    fn empty_candidate_revision_keeps_peer_pollers_for_restoration() {
-        let inputs = ServingInputs {
-            local_signals_addr: Some("grid-operator-signals.grid.svc:9091"),
-            ..INPUTS
-        };
-        let empty = render(&overlay(Vec::new()), [("site-b", "203.0.113.7:9091")], &inputs);
-        assert!(empty.candidates.is_empty());
-        assert_eq!(
-            peer_sites(&empty),
-            [
-                ("site-a", "grid-operator-signals.grid.svc:9091"),
-                ("site-b", "203.0.113.7:9091"),
-            ],
-            "no-route config retains metrics connections for route restoration"
-        );
-    }
-
-    #[test]
     fn excluded_history_cannot_restore_an_authoritative_empty_revision() {
         let mut withdrawn = overlay(Vec::new());
         withdrawn
             .excluded
             .push(cand("llama", "site-b", "provider-b", Some("none")));
-        let config = render(&withdrawn, [], &INPUTS);
+        let config = render(&withdrawn, &INPUTS);
         assert!(
             config.candidates.is_empty(),
             "an empty active overlay withdraws prior excluded history"
@@ -812,7 +711,7 @@ mod tests {
             provider_hop_sni: &hop_sni,
             ..INPUTS
         };
-        let config = render(&overlay(vec![candidate]), [], &inputs);
+        let config = render(&overlay(vec![candidate]), &inputs);
         assert_eq!(config.provider_hop_clusters, ["provider-b"]);
         assert_eq!(config.provider_hop_sni, hop_sni);
         assert_eq!(config.candidates[0].stable_id.as_deref(), Some("257a9450"));
@@ -830,7 +729,7 @@ mod tests {
             ("stale first", [stale.clone(), fresh.clone()]),
             ("stale last", [fresh, stale]),
         ] {
-            let config = render(&overlay(pair.to_vec()), [], &INPUTS);
+            let config = render(&overlay(pair.to_vec()), &INPUTS);
             assert_eq!(config.candidates.len(), 1, "{label}: one entry");
             assert!(!config.candidates[0].fresh, "{label}: stale");
         }
@@ -844,7 +743,7 @@ mod tests {
             ("excluded first", [excluded.clone(), admitted.clone()]),
             ("excluded last", [admitted, excluded]),
         ] {
-            let config = render(&overlay(pair.to_vec()), [], &INPUTS);
+            let config = render(&overlay(pair.to_vec()), &INPUTS);
             assert_eq!(config.candidates.len(), 1, "{label}: one entry");
             assert_eq!(
                 config.candidates[0].admission,
@@ -854,124 +753,35 @@ mod tests {
         }
     }
 
-    fn member(site: &str, status: MemberStatus) -> crate::swim::MemberRecord {
-        crate::swim::MemberRecord {
-            site_id: site.to_owned(),
-            endpoint: format!("{site}.example.net:7946"),
-            incarnation: 1,
-            status,
-            age_secs: 0,
-            gateway_address: None,
-            site_cert_pem: None,
-            signals_address: None,
-        }
-    }
-
-    /// `pinned` declares a pin, `unpinned` does not.
-    fn one_pinned_site() -> PeerIdentities {
-        let identities = PeerIdentities::new();
-        let pinned = crate::signals::PeerRecord {
-            labels: BTreeMap::new(),
-            pins: vec!["ab".repeat(32)],
-        };
-        identities.set(BTreeMap::from([
-            ("pinned".to_owned(), pinned),
-            ("unpinned".to_owned(), crate::signals::PeerRecord::default()),
-        ]));
-        identities
-    }
-
-    /// Sites `dialable_members` keeps from a fixed membership.
-    fn dialable(trust: PeerTrustMode, encrypted: bool) -> Vec<String> {
-        let snapshot = MembershipSnapshot {
-            members: vec![
-                member("pinned", MemberStatus::Alive),
-                member("unpinned", MemberStatus::Alive),
-                member("suspect", MemberStatus::Suspect),
-            ],
-        };
-        dialable_members(&snapshot, &one_pinned_site(), trust, encrypted, 9091)
-            .into_iter()
-            .map(|(site, ..)| site.to_owned())
-            .collect()
-    }
-
     #[test]
-    fn dialable_members_dial_the_gossiped_signals_endpoint() {
-        let mut advertised = member("lb", MemberStatus::Alive);
-        advertised.signals_address = Some("[2001:db8::7]:9443".to_owned());
-        let mut v6 = member("v6", MemberStatus::Alive);
-        v6.endpoint = "[2001:db8::9]:7946".to_owned();
-        let mut junk = member("junk", MemberStatus::Alive);
-        junk.signals_address = Some("no-port".to_owned());
-        let mut smuggled = member("smuggled", MemberStatus::Alive);
-        smuggled.signals_address = Some("x@169.254.169.254:443".to_owned());
-        let snapshot = MembershipSnapshot {
-            members: vec![advertised, member("older", MemberStatus::Alive), v6, junk, smuggled],
-        };
-        let got = dialable_members(&snapshot, &PeerIdentities::new(), PeerTrustMode::Spiffe, true, 9091);
+    fn the_only_peer_is_the_local_operator() {
+        let config = render(&two_site(), &INPUTS);
         assert_eq!(
-            got,
-            [
-                ("lb", "[2001:db8::7]:9443".to_owned(), Vec::new()),
-                ("older", "older.example.net:9091".to_owned(), Vec::new()),
-                ("v6", "[2001:db8::9]:9091".to_owned(), Vec::new()),
-            ]
+            peer_sites(&config),
+            [("site-a", LOCAL_ADDR)],
+            "remote sites are read through it"
         );
-    }
-
-    #[test]
-    fn a_pinned_member_carries_the_pins_that_admitted_it() {
-        let snapshot = MembershipSnapshot {
-            members: vec![
-                member("pinned", MemberStatus::Alive),
-                member("unpinned", MemberStatus::Alive),
-            ],
-        };
-        let got = dialable_members(&snapshot, &one_pinned_site(), PeerTrustMode::Pin, true, 9091);
-        assert_eq!(
-            got,
-            [("pinned", "pinned.example.net:9091".to_owned(), vec!["ab".repeat(32)])]
-        );
-    }
-
-    #[test]
-    fn dialable_members_by_trust_mode() {
-        let (pin, spiffe) = (PeerTrustMode::Pin, PeerTrustMode::Spiffe);
-        let cases: [(&str, PeerTrustMode, bool, &[&str]); 4] = [
-            ("pin mode keeps only pinned sites", pin, true, &["pinned"]),
-            ("spiffe mode reads no pins", spiffe, true, &["pinned", "unpinned"]),
-            ("unencrypted gossip yields none", pin, false, &[]),
-            ("unencrypted gossip yields none in spiffe mode", spiffe, false, &[]),
-        ];
-        for (label, trust, encrypted, want) in cases {
-            assert_eq!(dialable(trust, encrypted), want, "{label}");
-        }
-    }
-
-    #[test]
-    fn pin_trust_carries_the_declared_pins_to_the_gateway() {
-        let pins = BTreeMap::from([("site-b".to_owned(), vec!["ab".repeat(32)])]);
-        let inputs = ServingInputs { pins: &pins, ..INPUTS };
-        let config = render(&two_site(), [("site-b", "203.0.113.7:9091")], &inputs);
         let peer = config.peers.first().expect("peer");
-        assert_eq!(peer.pins, ["ab".repeat(32)]);
-        assert!(to_text(&config).expect("json").contains("\"pins\""), "rendered");
-        let spiffe = to_text(&render(&two_site(), [("site-b", "203.0.113.7:9091")], &INPUTS));
-        assert!(!spiffe.expect("json").contains("pins"), "absent without pins");
-    }
-
-    #[test]
-    fn the_local_peer_comes_from_config_not_gossip() {
-        let inputs = ServingInputs {
-            local_signals_addr: Some("grid-operator-signals.grid.svc:9091"),
+        assert_eq!(peer.server_name, format!("site-a.{}", certs::SPIFFE_TRUST_DOMAIN));
+        assert_eq!(peer.interval_ms, GATEWAY_POLL_MS);
+        let without = ServingInputs {
+            local_signals_addr: None,
             ..INPUTS
         };
-        let gossip = [("site-a", "203.0.113.1:9091")];
-        let config = render(&two_site(), gossip, &inputs);
-        assert_eq!(peer_sites(&config), [("site-a", "grid-operator-signals.grid.svc:9091")]);
-        let without = render(&two_site(), gossip, &INPUTS);
-        assert!(without.peers.is_empty(), "gossip never names the local peer");
+        assert!(
+            render(&two_site(), &without).peers.is_empty(),
+            "no local address, no peer"
+        );
+    }
+
+    #[test]
+    fn a_non_dns_local_site_renders_no_peer() {
+        let mut bad = two_site();
+        bad.local_site = "Site_A".to_owned();
+        assert!(
+            render(&bad, &INPUTS).peers.is_empty(),
+            "the local site name is the SPIFFE id"
+        );
     }
 
     #[test]

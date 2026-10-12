@@ -8,7 +8,9 @@ seeds](../architecture/crds.md#crd-driven-swim-seeds) describes.
 
 ## Prerequisites
 
-- Kubernetes 1.26 or later, Helm 3.12 or later
+- Kubernetes 1.30 or later for the default install, which records enrollments
+  as CertificateSigningRequests behind two validating admission policies; 1.26
+  to 1.29 with `enrollment.csrRecord.enabled=false`. Helm 3.12 or later
 - etcd encryption at rest, since the CA signing key is stored in a Secret
 - An enrollment image with the default `sar` and `bootstrap` features (not a
   `--no-default-features` build)
@@ -118,6 +120,33 @@ when the identity Secret exists. If you create a GridNetwork afterward that
 names other Secrets, the operator refuses to enroll again. Point it at the
 enrolled Secrets. The operator retries connect failures for about five minutes,
 gives up after 15, and exits so Kubernetes restarts it.
+
+## 3a. Read the enrollment record
+
+Under `enrollment.authz=kube` the service records each enrollment as a
+CertificateSigningRequest on the hub, under the signer name in
+`enrollment.csrRecord.signerName`, by default `grid.praxis.fast/site`. The
+service creates it, approves it with reason `InviteRedeemed` and completes it
+with the issued certificate, off the request path, so the record never gates
+issue. The record is named `<site>-<enrollment id>`.
+
+```bash
+kubectl get csr -l grid.praxis.fast/site-name=east2
+kubectl get csr east2-9f86d081884c7d659a2feaa0c55ad015 \
+  -o jsonpath='{.status.conditions[0].reason}'
+```
+
+The API server removes an issued request about an hour after approval, so this
+is a one-hour window on recent enrollments. The API server's audit log keeps the
+history when its policy covers these writes at `Request` level or above with a
+persistent backend; the service's own enrollment record is kept regardless.
+Set `enrollment.csrRecord.enabled=false` to keep no Kubernetes record. The chart also
+installs two `ValidatingAdmissionPolicies`: only this release's service may file
+a request under its signer name, and the service may touch no other signer
+name. Run two enrollment services on one cluster with different signer names.
+The policies need `admissionregistration.k8s.io/v1`; on an older cluster turn
+the record off. The installing principal must hold `approve` and `sign` on the
+signer name, or RBAC escalation prevention refuses the record roles.
 
 ## 4. Recover a failed enrollment
 

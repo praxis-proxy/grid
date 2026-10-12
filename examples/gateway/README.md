@@ -54,6 +54,7 @@ a golden test, so the example is the contract between them.
 |---|---|
 | `local_site` | This gateway's own site. |
 | `window_secs` | How long the store keeps each series. |
-| `load_window_ms` | The freshness window selection reads, derived from the operators' scrape interval. |
+| `load_window_ms` | Freshness: a site whose newest sample is older is unmeasured. Derived from the scrape interval, the operator's peer poll and its budget. |
+| `horizon_ms` | How far behind a site's newest sample selection reads worst load, a few scrapes. |
 | `candidates[]` | One routable model per site: `kind` (always `inference_model`), `name`, `site`, `cluster` (the `load_balancer` cluster and the label its load is keyed on), `fresh`, and `admission` when the site takes no new requests. |
-| `peers[]` | One operator signals endpoint per site, sorted by site: `site`, `addr`, `server_name` and `authority` for mutual TLS, `path`, `interval_ms` (500 for the local operator, 5000 for peers), `connect_timeout_ms`, `request_timeout_ms`, the three identity paths, `pins` under pin trust, and `gateway` when the site is dialed through its own gateway rather than a cluster. |
+| `peers[]` | The local operator's signals endpoint, the one source the gateway polls: `site`, `addr`, `server_name` and `authority` for mutual TLS, `path`, `interval_ms`, `connect_timeout_ms`, `request_timeout_ms`, and the three identity paths. Remote sites arrive through it, each row labeled with the site the operator verified. |

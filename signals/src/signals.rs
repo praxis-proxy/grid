@@ -57,6 +57,12 @@ const MAX_CLOCK_SKEW_MS: i64 = 5_000;
 /// restamped fresh rather than trusted to be that old.
 const MAX_RELAY_AGE_MS: i64 = 24 * 60 * 60 * 1000;
 
+/// Two published stamps this close name one observation. A relay re-serves a sample
+/// for a whole poll cycle and a one-second `Date` restamps it on a moving clock each
+/// time, so the published stamp says whether a line is new; a publisher deriving that
+/// stamp at render can round it a millisecond either way.
+const ORIGIN_TOLERANCE_MS: u64 = 1;
+
 /// A no-skew reference-and-local clock for tests: it sits above the small stamps
 /// the tests use and well within [`MAX_RELAY_AGE_MS`] of them, so `rebase_age`
 /// restamps each sample onto its own value (an identity).
@@ -81,6 +87,34 @@ fn combine_max(_metric: &str) -> Combine {
     Combine::Max
 }
 
+/// What one ingest kept and dropped, lines counted once each.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ingested {
+    /// Lines stored.
+    pub kept: u64,
+    /// Lines stamped past the clock-skew bound.
+    pub skewed: u64,
+    /// Lines whose site label disagreed with the verified owner.
+    pub mismatched: u64,
+    /// Lines naming a provider the global or per-site cap refused.
+    pub capped: u64,
+    /// Lines that did not parse as a stamped sample.
+    pub unparsed: u64,
+}
+
+impl Ingested {
+    /// Each drop reason with its count, for a counter.
+    #[must_use]
+    pub const fn dropped(&self) -> [(&'static str, u64); 4] {
+        [
+            ("skew", self.skewed),
+            ("site_mismatch", self.mismatched),
+            ("cap", self.capped),
+            ("parse", self.unparsed),
+        ]
+    }
+}
+
 /// One observation of a series.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sample {
@@ -98,28 +132,31 @@ struct Series {
     /// The label sets already folded into the newest sample, so a republished line is
     /// not combined twice while a line under other labels is.
     newest_labels: Vec<u64>,
+    /// The newest sample's stamp as the publisher wrote it, before restamping.
+    newest_origin_ms: Option<i64>,
 }
 
 impl Series {
-    /// Append `sample` if it is newer than what is held, fold it into the newest sample
-    /// if it is another label set at the same instant, then evict past `window`.
-    fn push(&mut self, sample: Sample, labels: u64, combine: Combine, window: Duration) {
-        match self.samples.last_mut() {
-            Some(last) if sample.at_ms < last.at_ms => return,
-            Some(last) if sample.at_ms == last.at_ms => {
-                if !self.newest_labels.contains(&labels) {
-                    self.newest_labels.push(labels);
-                    last.value = match combine {
-                        Combine::Max => last.value.max(sample.value),
-                        Combine::Sum => last.value + sample.value,
-                    };
-                }
+    /// Append the observation's sample if it is newer than what is held, fold it into the
+    /// newest sample if it is another label set at the same instant or the same published
+    /// observation restamped, then evict past `window`.
+    fn push(&mut self, observation: &Observation<'_>, combine: Combine, window: Duration) {
+        let sample = observation.sample;
+        if let Some(last) = self.samples.last() {
+            let republished = self
+                .newest_origin_ms
+                .is_some_and(|held| observation.origin_ms.abs_diff(held) <= ORIGIN_TOLERANCE_MS);
+            if republished || sample.at_ms == last.at_ms {
+                self.fold(observation.labels, sample.value, combine);
                 return;
-            },
-            _ => {},
+            }
+            if sample.at_ms < last.at_ms {
+                return;
+            }
         }
         self.newest_labels.clear();
-        self.newest_labels.push(labels);
+        self.newest_labels.push(observation.labels);
+        self.newest_origin_ms = Some(observation.origin_ms);
         self.samples.push(sample);
         // Window eviction needs the window in millis. If it does not fit i64 (a
         // caller passing an implausible Duration), skip only the window cutoff; the
@@ -140,6 +177,20 @@ impl Series {
             self.samples.drain(..drop_to);
         }
     }
+
+    /// Combine `value` into the newest sample unless its label set was already folded.
+    fn fold(&mut self, labels: u64, value: f64, combine: Combine) {
+        if self.newest_labels.contains(&labels) {
+            return;
+        }
+        self.newest_labels.push(labels);
+        if let Some(last) = self.samples.last_mut() {
+            last.value = match combine {
+                Combine::Max => last.value.max(value),
+                Combine::Sum => last.value + value,
+            };
+        }
+    }
 }
 
 /// Series held for one provider, keyed by metric name.
@@ -156,10 +207,12 @@ struct Provider {
 pub struct LoadStore {
     /// Provider key to its series.
     providers: DashMap<Box<str>, Provider>,
-    /// Verified owner to the count of providers it holds, for the per-owner cap.
-    /// Keyed on the crypto-verified owner, never a self-reported value, so one
-    /// authenticated peer maps to exactly one entry. That is what makes the sub-cap
-    /// a real per-tenant bound, and a refactor must not key this on a body label.
+    /// Attributed site to the count of providers it holds, for the per-site cap.
+    /// Keyed on the crypto-verified owner, never a self-reported value, with one
+    /// exception: rows from this site's own operator carry the site that operator
+    /// attributed from its own verified poll, so for that source the label is the
+    /// owner. Keying every relayed site on the one local owner would exhaust the
+    /// cap at a few dozen sites.
     owner_providers: DashMap<Box<str>, usize>,
     /// Count of admitted providers, for the global cap. Providers are retained,
     /// never evicted, so this only grows. An atomic check-and-increment bounds it
@@ -170,6 +223,9 @@ pub struct LoadStore {
     window: Duration,
     /// How same-instant lines of one metric under different labels combine.
     combine: CombinePolicy,
+    /// This gateway's own site. A source verified as this site is its local
+    /// operator, whose rows are attributed by their label.
+    local_site: Option<Box<str>>,
 }
 
 impl LoadStore {
@@ -190,7 +246,16 @@ impl LoadStore {
             admitted: AtomicUsize::new(0),
             window,
             combine,
+            local_site: None,
         }
+    }
+
+    /// Name this gateway's own site, so rows from its local operator are
+    /// attributed by the site label that operator stamped.
+    #[must_use]
+    pub fn with_local_site(mut self, local_site: &str) -> Self {
+        self.local_site = Some(local_site.into());
+        self
     }
 
     /// The key under which a candidate's series are held.
@@ -348,45 +413,82 @@ impl LoadStore {
     /// `owner` is the peer's crypto-verified site (from mTLS): attribution keys on
     /// it, never the self-reported `grid_site` label. A line whose label disagrees
     /// is a cross-site spoof and is dropped, and a line without the label is
-    /// attributed to `owner`. The body can never choose the key.
+    /// attributed to `owner`. The one exception is this gateway's own operator,
+    /// named by [`Self::with_local_site`]: it stamped each row from the leaf it
+    /// verified, so its label is the key, owner-bound one hop earlier.
     ///
     /// New-provider admission is atomic against both caps, so concurrent pollers
     /// cannot drive the retained-provider count past the global or per-owner
     /// bound.
-    pub fn ingest_at(&self, text: &str, reference_ms: i64, local_now_ms: i64, owner: &str) {
-        let horizon = reference_ms.saturating_add(MAX_CLOCK_SKEW_MS);
+    ///
+    /// Returns what was kept and what was dropped, by reason.
+    pub fn ingest_at(&self, text: &str, reference_ms: i64, local_now_ms: i64, owner: &str) -> Ingested {
+        let scrape = ScrapeClock {
+            reference_ms,
+            local_now_ms,
+            horizon_ms: reference_ms.saturating_add(MAX_CLOCK_SKEW_MS),
+            owner,
+            local: self.local_site.as_deref() == Some(owner),
+        };
+        let mut tally = Ingested::default();
         for line in text.lines() {
-            let Some(mut observation) = parse_sample(line) else {
+            let Some(observation) = parse_sample(line) else {
+                if !line.trim().is_empty() && !line.starts_with('#') {
+                    tally.unparsed = tally.unparsed.saturating_add(1);
+                }
                 continue;
             };
-            if observation.sample.at_ms > horizon {
-                continue;
-            }
-            // #160: drop a line whose self-reported site disagrees with the
-            // verified owner; key on the owner regardless.
-            if observation.site.as_deref().is_some_and(|site| site != owner) {
-                continue;
-            }
-            observation.sample.at_ms = rebase_age(reference_ms, observation.sample.at_ms, local_now_ms);
-
-            let key = Self::key(owner, observation.cluster.as_ref());
-            let combine = (self.combine)(observation.metric);
-            match self.providers.entry(key) {
-                Entry::Occupied(mut occupied) => {
-                    push_observation(occupied.get_mut(), &observation, combine, self.window);
-                },
-                Entry::Vacant(vacant) => {
-                    // A new key: admit it against both caps while its shard is
-                    // locked, so the check and the insert cannot race a
-                    // concurrent poller into overshooting a cap.
-                    if self.admit_new_provider(owner) {
-                        let mut provider = Provider::default();
-                        push_observation(&mut provider, &observation, combine, self.window);
-                        vacant.insert(provider);
-                    }
-                },
-            }
+            let counted = match self.ingest_line(observation, &scrape) {
+                Ok(()) => &mut tally.kept,
+                Err(Dropped::Skewed) => &mut tally.skewed,
+                Err(Dropped::Mismatched) => &mut tally.mismatched,
+                Err(Dropped::Capped) => &mut tally.capped,
+            };
+            *counted = counted.saturating_add(1);
         }
+        tally
+    }
+
+    /// Attribute and store one parsed line, or say why it was dropped.
+    fn ingest_line(&self, mut observation: Observation<'_>, scrape: &ScrapeClock<'_>) -> Result<(), Dropped> {
+        if observation.sample.at_ms > scrape.horizon_ms {
+            return Err(Dropped::Skewed);
+        }
+        // #160, narrowed: from any peer the label must agree with the verified
+        // owner. From this site's own operator the label is the owner, since the
+        // operator attributed it from its own verified poll.
+        let site = match (scrape.local, observation.site.as_deref()) {
+            (true, Some(site)) => site,
+            (false, Some(site)) if site != scrape.owner => return Err(Dropped::Mismatched),
+            _ => scrape.owner,
+        };
+        observation.sample.at_ms = rebase_age(scrape.reference_ms, observation.sample.at_ms, scrape.local_now_ms);
+
+        let key = Self::key(site, observation.cluster.as_ref());
+        let combine = (self.combine)(observation.metric);
+        match self.providers.entry(key) {
+            Entry::Occupied(mut occupied) => {
+                push_observation(occupied.get_mut(), &observation, combine, self.window);
+            },
+            Entry::Vacant(vacant) => {
+                // A new key: admit it against both caps while its shard is
+                // locked, so the check and the insert cannot race a
+                // concurrent poller into overshooting a cap.
+                if !self.admit_new_provider(site) {
+                    return Err(Dropped::Capped);
+                }
+                let mut provider = Provider::default();
+                push_observation(&mut provider, &observation, combine, self.window);
+                vacant.insert(provider);
+            },
+        }
+        Ok(())
+    }
+
+    /// This gateway's own site, if named.
+    #[must_use]
+    pub fn local_site(&self) -> Option<&str> {
+        self.local_site.as_deref()
     }
 
     /// Reserve a global and a per-owner slot for one new provider, atomically.
@@ -422,14 +524,13 @@ impl LoadStore {
 /// flooding unique names.
 fn push_observation(provider: &mut Provider, observation: &Observation<'_>, combine: Combine, window: Duration) {
     if let Some(series) = provider.metrics.get_mut(observation.metric) {
-        series.push(observation.sample, observation.labels, combine, window);
+        series.push(observation, combine, window);
     } else if provider.metrics.len() < MAX_METRICS_PER_PROVIDER {
-        provider.metrics.entry(observation.metric.into()).or_default().push(
-            observation.sample,
-            observation.labels,
-            combine,
-            window,
-        );
+        provider
+            .metrics
+            .entry(observation.metric.into())
+            .or_default()
+            .push(observation, combine, window);
     }
 }
 
@@ -449,21 +550,48 @@ fn rebase_age(reference_ms: i64, sample_at_ms: i64, local_now_ms: i64) -> i64 {
     }
 }
 
+/// One scrape's clocks and verified owner, shared by every line it carries.
+struct ScrapeClock<'scrape> {
+    /// The publisher's clock, its `Date`.
+    reference_ms: i64,
+    /// This gateway's clock.
+    local_now_ms: i64,
+    /// A stamp past this is skewed beyond belief.
+    horizon_ms: i64,
+    /// The crypto-verified site on the connection.
+    owner: &'scrape str,
+    /// Whether the owner is this gateway's own operator.
+    local: bool,
+}
+
+/// Why a parsed line was not stored.
+enum Dropped {
+    /// Stamped past the clock-skew bound.
+    Skewed,
+    /// Its site label disagreed with the verified owner.
+    Mismatched,
+    /// Its provider was refused by the global or per-site cap.
+    Capped,
+}
+
 /// One exposition line resolved to its metric name, owning site and cluster, and
 /// a sample.
 struct Observation<'text> {
     /// Metric name.
     metric: &'text str,
     /// Self-reported owning site from the `grid_site` label, if the line carried
-    /// one. Only a cross-check: ingest keys on the verified owner and drops a
-    /// line whose label disagrees, so the body can never choose the key.
+    /// one. Keys the row only from this gateway's own operator, which stamped it
+    /// from the leaf it verified; from any other owner a disagreeing label drops
+    /// the line.
     site: Option<Cow<'text, str>>,
     /// Owning provider, from the `grid_provider` label.
     cluster: Cow<'text, str>,
     /// A hash of every label on the line, naming the series within the metric.
     labels: u64,
-    /// The sample this line reported.
+    /// The sample this line reported, its stamp re-expressed on the local clock.
     sample: Sample,
+    /// The stamp as published, naming the observation across restamps.
+    origin_ms: i64,
 }
 
 /// Parse one exposition line into an [`Observation`], or `None` to skip it.
@@ -495,6 +623,8 @@ fn parse_sample(line: &str) -> Option<Observation<'_>> {
             at_ms,
             value: metric.value(),
         },
+
+        origin_ms: at_ms,
     })
 }
 
@@ -959,8 +1089,9 @@ mod tests {
         // series unbounded; the count cap drops the oldest and keeps the newest.
         let store = store();
         let cap = i64::try_from(MAX_SAMPLES_PER_SERIES).expect("cap fits i64");
+        // Two apart, so no stamp reads as a republication of the one before it.
         let mut text = String::new();
-        for at_ms in 1..=(cap + 500) {
+        for at_ms in (2..=2 * (cap + 500)).step_by(2) {
             text.push_str(&line("east", "pool-a", 1.0, at_ms));
             text.push('\n');
         }
@@ -975,7 +1106,7 @@ mod tests {
         );
         assert_eq!(
             samples.last().map(|sample| sample.at_ms),
-            Some(cap + 500),
+            Some(2 * (cap + 500)),
             "the newest sample survives the cap"
         );
     }
@@ -1068,6 +1199,113 @@ mod tests {
                 .map(|sample| sample.value),
             Some(3.0),
             "an agreeing label lands under the owner"
+        );
+    }
+
+    #[test]
+    fn an_ingest_counts_what_it_kept_and_why_it_dropped_the_rest() {
+        let store = LoadStore::new(Duration::from_secs(60)).with_local_site("hub");
+        let text = [
+            r#"m{grid_site="east",grid_provider="p"} 1 1000"#,
+            r#"m{grid_site="west",grid_provider="p"} 1 1000"#,
+            r#"m{grid_site="east",grid_provider="q"} 1 9000000"#,
+            "not a sample",
+            "# HELP m a comment, not a drop",
+            "",
+        ]
+        .join("\n");
+        let tally = store.ingest_at(&text, 1_000, 1_000, "east");
+        assert_eq!(
+            tally,
+            Ingested {
+                kept: 1,
+                skewed: 1,
+                mismatched: 1,
+                capped: 0,
+                unparsed: 1,
+            }
+        );
+        assert_eq!(tally.dropped().iter().map(|(_, count)| count).sum::<u64>(), 3);
+    }
+
+    #[test]
+    fn a_sample_re_served_across_polls_is_one_observation() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        let key = LoadStore::key("a", "p");
+        let held = || {
+            store
+                .providers
+                .get(&key)
+                .expect("provider")
+                .metrics
+                .get("m")
+                .expect("metric")
+                .samples
+                .len()
+        };
+        let line = r#"m{grid_site="a",grid_provider="p"} 1 1000"#;
+        store.ingest_at(line, 1_000, 1_000, "a");
+        // The next poll re-serves the same published stamp: Date a second on, the local
+        // clock a second and a half on, so the restamp lands later than what is held.
+        store.ingest_at(line, 2_000, 2_500, "a");
+        assert_eq!(held(), 1, "a restamped republication is not a new observation");
+        store.ingest_at(r#"m{grid_site="a",grid_provider="p"} 2 6000"#, 6_000, 6_500, "a");
+        assert_eq!(held(), 2, "a new published stamp is");
+    }
+
+    #[test]
+    fn a_row_from_the_local_operator_is_attributed_by_its_label() {
+        let store = store().with_local_site("east");
+        store.ingest_at(
+            &line("west", "pool-a", 9.0, 1_000),
+            NO_SKEW_NOW_MS,
+            NO_SKEW_NOW_MS,
+            "east",
+        );
+        assert_eq!(
+            store
+                .latest(&LoadStore::key("west", "pool-a"), QUEUE)
+                .map(|sample| sample.value),
+            Some(9.0),
+            "the local operator relays west, so the row lands under west"
+        );
+        assert!(
+            store.latest(&LoadStore::key("east", "pool-a"), QUEUE).is_none(),
+            "and is not bound to the operator's own site"
+        );
+    }
+
+    #[test]
+    fn a_peer_other_than_the_local_operator_is_still_owner_bound() {
+        let store = store().with_local_site("east");
+        store.ingest_at(
+            &line("west", "pool-a", 9.0, 1_000),
+            NO_SKEW_NOW_MS,
+            NO_SKEW_NOW_MS,
+            "north",
+        );
+        assert_eq!(
+            store.provider_count(),
+            0,
+            "a non-local peer claiming another site is dropped as before"
+        );
+    }
+
+    #[test]
+    fn the_per_site_cap_follows_the_attributed_site_for_local_rows() {
+        let store = store().with_local_site("east");
+        let mut text = String::new();
+        for site in 0..3 {
+            for pool in 0..MAX_PROVIDERS_PER_OWNER {
+                text.push_str(&line(&format!("site-{site}"), &format!("pool-{pool}"), 1.0, 1_000));
+                text.push('\n');
+            }
+        }
+        store.ingest_at(&text, NO_SKEW_NOW_MS, NO_SKEW_NOW_MS, "east");
+        assert_eq!(
+            store.provider_count(),
+            3 * MAX_PROVIDERS_PER_OWNER,
+            "each relayed site gets its own cap, not one shared cap under the operator"
         );
     }
 

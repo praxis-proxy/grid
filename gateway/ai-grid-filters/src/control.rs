@@ -94,6 +94,9 @@ pub(crate) struct Topology {
     /// Freshness window the order reads, milliseconds.
     load_window_ms: i64,
 
+    /// Worst-of horizon behind a site's newest sample, milliseconds.
+    horizon_ms: i64,
+
     /// Explicitly authenticated provider-gateway hop clusters.
     provider_hop_clusters: Arc<BTreeSet<String>>,
 }
@@ -102,6 +105,9 @@ impl Topology {
     /// Validate the topology half of `config`.
     fn from_config(config: &GridServingConfig) -> Result<Self, FilterError> {
         validate_local_site(&config.local_site)?;
+        if config.horizon_ms.is_some_and(|horizon| horizon <= 0) {
+            return Err("grid: horizon_ms must be greater than zero".into());
+        }
         let base = validate_serving_candidates(config.candidates.clone())?;
         let provider_hop_clusters = validate_provider_hop_clusters(config.provider_hop_clusters.clone())?;
         for candidate in &config.candidates {
@@ -117,6 +123,7 @@ impl Topology {
             base: Arc::from(base),
             local_site: Arc::from(config.local_site.as_str()),
             load_window_ms: config.load_window_ms,
+            horizon_ms: config.horizon_ms.unwrap_or(config.load_window_ms),
             provider_hop_clusters: Arc::new(provider_hop_clusters),
         })
     }
@@ -140,6 +147,7 @@ impl Topology {
             signals: store,
             now_ms: now,
             window_ms: self.load_window_ms,
+            horizon_ms: self.horizon_ms,
             availability,
             learned: &mut gauged.learned,
         };
@@ -264,10 +272,10 @@ impl Control {
         .published(&mut gauged.published);
         cold_start.provider_hop_clusters = Arc::clone(&topology.provider_hop_clusters);
         Ok(Self {
-            store: Arc::new(LoadStore::with_combine(
-                Duration::from_secs(config.window_secs),
-                crate::signals::llm_d::combine,
-            )),
+            store: Arc::new(
+                LoadStore::with_combine(Duration::from_secs(config.window_secs), crate::signals::llm_d::combine)
+                    .with_local_site(&config.local_site),
+            ),
             snapshot: Arc::new(ArcSwap::from_pointee(cold_start)),
             topology: Arc::new(ArcSwap::from_pointee(topology)),
             swap: Arc::new(Mutex::new(gauged)),
@@ -365,6 +373,13 @@ impl Control {
                 current = self.window_secs,
                 requested = config.window_secs,
                 "grid: window_secs changes take effect on restart"
+            );
+        }
+        if self.store.local_site() != Some(config.local_site.as_str()) {
+            tracing::warn!(
+                current = ?self.store.local_site(),
+                requested = %config.local_site,
+                "grid: local_site changes take effect on restart; relayed rows drop until then"
             );
         }
         let (next, started) = self.start_changed(config, renewed)?;
@@ -759,11 +774,22 @@ mod tests {
         load: Arc<Mutex<HashMap<String, f64>>>,
         fetches: Arc<Mutex<HashMap<String, Arc<AtomicUsize>>>>,
         starts: Arc<Mutex<HashMap<String, usize>>>,
+        /// Sites each peer also serves rows for, as an operator relays what it collected.
+        relayed: Arc<Mutex<HashMap<String, Vec<String>>>>,
     }
 
     impl Peers {
         fn set_load(&self, site: &str, value: f64) {
             self.load.lock().expect("load").insert(site.to_owned(), value);
+        }
+
+        fn relay(&self, through: &str, site: &str) {
+            self.relayed
+                .lock()
+                .expect("relayed")
+                .entry(through.to_owned())
+                .or_default()
+                .push(site.to_owned());
         }
 
         fn fetches(&self, site: &str) -> usize {
@@ -795,6 +821,7 @@ mod tests {
                 let source = MockSource {
                     site: peer.site.clone(),
                     load: Arc::clone(&peers.load),
+                    relayed: Arc::clone(&peers.relayed),
                     count,
                 };
                 let fast = PollerConfig {
@@ -811,19 +838,33 @@ mod tests {
     struct MockSource {
         site: String,
         load: Arc<Mutex<HashMap<String, f64>>>,
+        relayed: Arc<Mutex<HashMap<String, Vec<String>>>>,
         count: Arc<AtomicUsize>,
     }
 
     impl SignalSource for MockSource {
         async fn fetch(&self) -> Result<Scrape, FetchError> {
             self.count.fetch_add(1, Ordering::SeqCst);
-            let value = self.load.lock().expect("load").get(&self.site).copied().unwrap_or(0.0);
+            let relayed = self
+                .relayed
+                .lock()
+                .expect("relayed")
+                .get(&self.site)
+                .cloned()
+                .unwrap_or_default();
+            let load = self.load.lock().expect("load");
             let at = now_ms();
+            let body = std::iter::once(&self.site)
+                .chain(relayed.iter())
+                .map(|site| {
+                    let value = load.get(site).copied().unwrap_or(0.0);
+                    format!(r#"{QUEUE_METRIC}{{grid_site="{site}",grid_provider="pool-{site}"}} {value} {at}"#)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            drop(load);
             Ok(Scrape {
-                body: format!(
-                    r#"{QUEUE_METRIC}{{grid_site="{site}",grid_provider="pool-{site}"}} {value} {at}"#,
-                    site = self.site
-                ),
+                body,
                 date_ms: at,
                 peer_identity: Arc::from(certs::spiffe_id(&self.site).as_str()),
             })
@@ -856,7 +897,6 @@ mod tests {
             grid_ca_path: "/etc/grid/ca.pem".to_owned(),
             client_cert_path: "/etc/grid/tls.crt".to_owned(),
             client_key_path: "/etc/grid/tls.key".to_owned(),
-            pins: Vec::new(),
             gateway: None,
         }
     }
@@ -867,6 +907,7 @@ mod tests {
             local_site: "local".to_owned(),
             window_secs: 60,
             load_window_ms: 30_000,
+            horizon_ms: None,
             candidates: sites.iter().map(|site| candidate(site)).collect(),
             provider_hop_clusters: Vec::new(),
             provider_hop_sni: BTreeMap::new(),
@@ -918,6 +959,23 @@ mod tests {
 
     fn runtime(peers: &Peers, initial: &GridServingConfig) -> crate::GridRuntime {
         crate::serving::start_runtime(initial, peers.starter()).expect("runtime starts")
+    }
+
+    #[test]
+    fn a_row_the_local_operator_relays_is_stored_under_its_own_site() {
+        let peers = Peers::default();
+        peers.set_load("local", 50.0);
+        peers.set_load("west", 5.0);
+        peers.relay("local", "west");
+        // Only the local operator is polled; west is a candidate it relays.
+        let mut initial = config(&["local", "west"]);
+        initial.peers.truncate(1);
+        let grid = runtime(&peers, &initial);
+        let snapshot = grid.snapshot();
+        eventually("west measured through the local operator", || {
+            sites(&snapshot.load()) == ["west", "local"]
+        });
+        assert_eq!(peers.fetches("west"), 0, "west itself is never dialed");
     }
 
     #[test]
@@ -978,7 +1036,6 @@ mod tests {
 
         let mut moved = config(&["east", "west"]);
         moved.peers[1].addr = "10.0.0.9:9091".to_owned();
-        moved.peers[1].pins = vec!["ab".repeat(32)];
         let outcome = grid.reload(&moved).expect("reload");
         assert_eq!(
             outcome,

@@ -1,0 +1,29 @@
+# Values that render deploy/overlays/kind from charts/grid-operator: the standalone install
+# xtask applies to a kind cluster. Plain metrics, no NetworkPolicy, and the resources
+# RoleBinding in the default namespace the install qualification checks.
+#
+# Regenerate with `make generate-deploy`; CI runs `make deploy-check`.
+fullnameOverride: grid-operator
+crds:
+  enabled: false
+image:
+  repository: ghcr.io/praxis-proxy/grid-operator
+  tag: ""
+rbac:
+  create: true
+  metricsScraper: true
+resourceNamespaces:
+  - default
+swim:
+  service:
+    enabled: true
+    type: ClusterIP
+metrics:
+  service:
+    enabled: true
+  tls:
+    enabled: false
+networkPolicy:
+  enabled: false
+serviceMonitor:
+  enabled: false

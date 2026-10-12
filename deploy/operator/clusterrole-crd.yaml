@@ -1,17 +1,12 @@
+# Source: grid-operator/templates/clusterrole-crd.yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: grid-operator-crd
   labels:
-    app.kubernetes.io/managed-by: grid-operator
+    app.kubernetes.io/name: grid-operator
+    app.kubernetes.io/instance: grid-operator
 rules:
-  # ── Grid CRDs (cluster-scoped) ──────────────────────────────────────
-  #
-  # The operator watches the Grid CRD types via kube-rs Controller::new
-  # (requires list + watch).  It reads individual resources with get and
-  # writes spec and status via server-side apply (patch).  Auto-discovery
-  # of SWIM peers requires create + update on gridsites, and delete to
-  # collect auto-discovered ones gone past staleCandidateTtlSeconds.
   - apiGroups: ["grid.praxis.fast"]
     resources:
       - agenttoolproviders
@@ -22,8 +17,6 @@ rules:
     resources:
       - gridsites
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
-
-  # Status subresources are authorized separately.
   - apiGroups: ["grid.praxis.fast"]
     resources:
       - agenttoolproviders/status

@@ -20,17 +20,17 @@ spec:
         region: pool-a
         role: combined
         siteName: pool-a
-        gatewayImage: "ghcr.io/praxis-proxy/ai:0.4.0"
+        gatewayImage: "ghcr.io/praxis-proxy/ai:0.6.0"
         operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.4"
-        eppImage: "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0"
+        eppImage: "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.11.0"
         vcrImage: "llm-d-inference-sim:deterministic"
         imagePullPolicy: IfNotPresent
         gatewayImageRepo: "ghcr.io/praxis-proxy/ai"
-        gatewayImageTag: "0.4.0"
+        gatewayImageTag: "0.6.0"
         operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
         operatorImageTag: "v0.1.4"
         eppImageRepo: "ghcr.io/llm-d/llm-d-router-endpoint-picker"
-        eppImageTag: "v0.9.0"
+        eppImageTag: "v0.11.0"
         vcrImageRepo: "llm-d-inference-sim"
         vcrImageTag: "deterministic"
         poolName: pool-a
@@ -41,17 +41,17 @@ spec:
         region: pool-b
         role: combined
         siteName: pool-b
-        gatewayImage: "ghcr.io/praxis-proxy/ai:0.4.0"
+        gatewayImage: "ghcr.io/praxis-proxy/ai:0.6.0"
         operatorImage: "ghcr.io/praxis-proxy/grid-operator:v0.1.4"
-        eppImage: "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0"
+        eppImage: "ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.11.0"
         vcrImage: "llm-d-inference-sim:deterministic"
         imagePullPolicy: IfNotPresent
         gatewayImageRepo: "ghcr.io/praxis-proxy/ai"
-        gatewayImageTag: "0.4.0"
+        gatewayImageTag: "0.6.0"
         operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
         operatorImageTag: "v0.1.4"
         eppImageRepo: "ghcr.io/llm-d/llm-d-router-endpoint-picker"
-        eppImageTag: "v0.9.0"
+        eppImageTag: "v0.11.0"
         vcrImageRepo: "llm-d-inference-sim"
         vcrImageTag: "deterministic"
         poolName: pool-b

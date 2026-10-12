@@ -55,8 +55,13 @@ pub struct GridServingConfig {
     /// Store retention per series, seconds.
     pub window_secs: u64,
 
-    /// Freshness window the router orders over, milliseconds.
+    /// Freshness window: a site whose newest sample is older is unmeasured, milliseconds.
     pub load_window_ms: i64,
+
+    /// How far behind a site's newest sample the router reads worst load, milliseconds.
+    /// Absent, the freshness window.
+    #[serde(default)]
+    pub horizon_ms: Option<i64>,
 
     /// The candidate topology: which sites serve which capabilities.
     pub candidates: Vec<CandidateConfig>,
@@ -213,10 +218,6 @@ pub struct PeerServingConfig {
 
     /// PEM file the client private key is read from.
     pub client_key_path: String,
-
-    /// Leaf SHA-256 digests the peer must also match, rendered under pin trust only.
-    #[serde(default)]
-    pub pins: Vec<String>,
 
     /// `host:port` of the peer's gateway, routed to directly; set only while the operator verified it.
     #[serde(default)]
@@ -416,14 +417,6 @@ pub(crate) fn validate_peer(peer: &PeerServingConfig) -> Result<(), FilterError>
     ServerName::try_from(peer.server_name.as_str()).map_err(|error| -> FilterError {
         format!("grid: peer {} server_name {}: {error}", peer.site, peer.server_name).into()
     })?;
-    // A SHA-256 leaf digest, colons allowed.
-    let hex_digest = |pin: &String| {
-        let digits: Vec<char> = pin.chars().filter(|ch| *ch != ':').collect();
-        digits.len() == 64 && digits.iter().all(char::is_ascii_hexdigit)
-    };
-    if let Some(pin) = peer.pins.iter().find(|pin| !hex_digest(pin)) {
-        return Err(format!("grid: peer {} pin {pin} is not a SHA-256 hex digest", peer.site).into());
-    }
     Ok(())
 }
 
@@ -458,7 +451,6 @@ fn build_scraper(peer: &PeerServingConfig) -> Result<PeerScraper, FilterError> {
         Duration::from_millis(peer.connect_timeout_ms),
         Duration::from_millis(peer.request_timeout_ms),
     )
-    .map(|scraper| scraper.with_pins(&peer.pins))
     .map_err(|error| -> FilterError { format!("grid: building scraper for {}: {error}", peer.site).into() })
 }
 
@@ -478,8 +470,9 @@ mod tests {
     fn the_documented_example_loads() {
         let json = include_str!("../../../examples/gateway/serving-config.json");
         let config: GridServingConfig = serde_json::from_str(json).expect("the example parses");
-        assert_eq!(config.candidates.len(), 3);
-        assert_eq!(config.peers[0].interval_ms, 500, "the local operator is polled fast");
+        assert_eq!(config.candidates.len(), 2);
+        assert_eq!(config.peers.len(), 1, "the gateway polls only its local operator");
+        assert_eq!(config.peers[0].interval_ms, 5000);
     }
 
     #[test]
@@ -522,17 +515,18 @@ peers:
     }
 
     #[test]
-    fn declared_pins_parse_and_default_to_none() {
+    fn a_rendered_pin_is_refused_rather_than_ignored() {
         let peer = |extra: &str| {
             format!(
                 "site: east\naddr: 10.0.0.1:9091\nserver_name: east.grid.internal\nauthority: east.grid.internal\n\
                  grid_ca_path: /ca\nclient_cert_path: /crt\nclient_key_path: /key\n{extra}"
             )
         };
-        let pinned: PeerServingConfig = serde_yaml::from_str(&peer("pins: [abcd]\n")).expect("pinned parses");
-        assert_eq!(pinned.pins, ["abcd"]);
-        let bare: PeerServingConfig = serde_yaml::from_str(&peer("")).expect("bare parses");
-        assert!(bare.pins.is_empty(), "SPIFFE only without pins");
+        serde_yaml::from_str::<PeerServingConfig>(&peer("")).expect("bare parses");
+        assert!(
+            serde_yaml::from_str::<PeerServingConfig>(&peer("pins: [abcd]\n")).is_err(),
+            "an operator still rendering pins fails the load, not silently"
+        );
     }
 
     fn valid_peer() -> PeerServingConfig {
@@ -548,30 +542,19 @@ peers:
             grid_ca_path: "/etc/grid/ca.pem".to_owned(),
             client_cert_path: "/etc/grid/tls.crt".to_owned(),
             client_key_path: "/etc/grid/tls.key".to_owned(),
-            pins: Vec::new(),
             gateway: None,
         }
     }
 
     #[test]
-    fn a_peer_with_a_bad_server_name_or_pin_is_refused_before_any_poller_starts() {
+    fn a_peer_with_a_bad_server_name_is_refused_before_any_poller_starts() {
         let mut bad_name = valid_peer();
         bad_name.server_name = "not a name".to_owned();
         assert!(
             validate_peer(&bad_name).is_err(),
             "server_name is checked from the config alone"
         );
-
-        let mut short_pin = valid_peer();
-        short_pin.pins = vec!["ab:cd".to_owned()];
-        assert!(validate_peer(&short_pin).is_err(), "a truncated pin");
-
-        let mut pinned = valid_peer();
-        pinned.pins = vec!["AB".repeat(32), format!("{}ab", "ab:".repeat(31))];
-        assert!(
-            validate_peer(&pinned).is_ok(),
-            "hex digests with or without colons, any case"
-        );
+        validate_peer(&valid_peer()).expect("a well-formed peer passes");
     }
 
     #[test]

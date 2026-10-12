@@ -1,9 +1,11 @@
+# Source: grid-operator/templates/clusterrolebinding-crd.yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: grid-operator-crd
   labels:
-    app.kubernetes.io/managed-by: grid-operator
+    app.kubernetes.io/name: grid-operator
+    app.kubernetes.io/instance: grid-operator
 subjects:
   - kind: ServiceAccount
     name: grid-operator

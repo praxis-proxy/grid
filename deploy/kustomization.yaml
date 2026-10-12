@@ -1,14 +1,14 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# Complete Grid deployment: CRDs + operator
-# Apply CRDs first, then operator resources
+# Complete standalone Grid deployment: CRDs + the kind operator overlay.
+# deploy/operator is the platform base and carries no Namespace; a platform vendors it.
 
 resources:
   # CRDs must be applied first
   - crds/
-  # Operator resources
-  - operator/
+  # Operator resources, the standalone shape with its own Namespace
+  - overlays/kind/
 
 labels:
   - pairs:

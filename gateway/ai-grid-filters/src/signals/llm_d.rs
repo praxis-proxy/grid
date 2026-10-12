@@ -110,14 +110,36 @@ impl SiteSignals for Mapped<'_> {
         let sampled_at = self.store.newest_at(&key);
         // A pool whose per-unit series stopped while its gauges kept stamping has no units:
         // the gauges are frozen, so the site is unready and nothing it says is measured.
-        if self.drained(&key, over.window_ms) {
+        if self.drained(&key, over.horizon_ms) {
             return SiteReading {
                 unready: true,
                 sampled_at,
                 ..SiteReading::default()
             };
         }
-        self.live(&key, over, sampled_at)
+        // Past the freshness window the site is unmeasured; only its standing readiness verdict holds.
+        let Some(newest) = sampled_at.filter(|at| over.now_ms.saturating_sub(*at) <= over.window_ms) else {
+            return SiteReading {
+                unready: self.unready(&key, sampled_at),
+                sampled_at,
+                ..SiteReading::default()
+            };
+        };
+        // The horizon is anchored at the newest sample, so a site polled less often than the
+        // horizon is judged on what it last said, and a spike older than the horizon is forgotten.
+        // A stamp ahead of now (skew within the ingest bound) anchors at now.
+        let lookback = over
+            .now_ms
+            .saturating_sub(newest.min(over.now_ms))
+            .saturating_add(over.horizon_ms);
+        self.live(
+            &key,
+            Over {
+                window_ms: lookback,
+                ..over
+            },
+            sampled_at,
+        )
     }
 }
 
@@ -128,6 +150,7 @@ impl Mapped<'_> {
             now_ms,
             window_ms,
             queue_full,
+            ..
         } = over;
         let worst = |metric: &str| {
             self.store
@@ -236,11 +259,12 @@ mod tests {
 
     use super::*;
 
-    /// A reading over `window_ms` at `now_ms` with `queue_full` as the backlog threshold.
+    /// A reading at `now_ms` fresh and looking back over `window_ms`, `queue_full` the backlog threshold.
     const fn over(now_ms: i64, window_ms: i64, queue_full: f64) -> Over {
         Over {
             now_ms,
             window_ms,
+            horizon_ms: window_ms,
             queue_full,
         }
     }
@@ -419,5 +443,64 @@ mod tests {
             store.ingest_at(line, 1_000, 1_000, "a");
         }
         assert_eq!(store.read("a", "pool-a", over(1_000, 30_000, 1.0)).in_flight, None);
+    }
+
+    /// A reading at `now_ms`, fresh within `window_ms`, looking `horizon_ms` behind the newest sample.
+    const fn anchored(now_ms: i64, window_ms: i64, horizon_ms: i64) -> Over {
+        Over {
+            now_ms,
+            window_ms,
+            horizon_ms,
+            queue_full: 1.0,
+        }
+    }
+
+    fn running(value: f64, at: i64) -> String {
+        format!(r#"llm_d_epp_average_running_requests{{grid_site="a",grid_provider="pool-a"}} {value} {at}"#)
+    }
+
+    fn units(at: i64) -> String {
+        format!(r#"llm_d_epp_ready_endpoints{{grid_site="a",grid_provider="pool-a"}} 1 {at}"#)
+    }
+
+    #[test]
+    fn a_site_polled_less_often_than_the_horizon_is_judged_on_its_newest_sample() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        for line in [running(10.0, 1_000), units(1_000)] {
+            store.ingest_at(&line, 1_000, 1_000, "a");
+        }
+        // 39s after its only sample, inside an 82s freshness window, a 17s horizon from now
+        // would hold nothing; anchored at the sample it holds the sample.
+        let reading = store.read("a", "pool-a", anchored(40_000, 82_000, 17_000));
+        assert_eq!(reading.in_flight, Some(10.0));
+        assert_eq!(reading.sampled_at, Some(1_000));
+    }
+
+    #[test]
+    fn a_spike_older_than_the_horizon_behind_the_newest_sample_is_forgotten() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        for (value, at) in [(100.0, 1_000), (10.0, 20_000)] {
+            for line in [running(value, at), units(at)] {
+                store.ingest_at(&line, at, at, "a");
+            }
+        }
+        // Worst over [3s, 20s] behind the newest sample: the spike at 1s has left the horizon
+        // even though the 82s freshness window from 60s still reaches it.
+        let reading = store.read("a", "pool-a", anchored(60_000, 82_000, 17_000));
+        assert_eq!(reading.in_flight, Some(10.0), "the spike is forgotten");
+        let wide = store.read("a", "pool-a", anchored(60_000, 82_000, 19_000));
+        assert_eq!(wide.in_flight, Some(100.0), "a horizon reaching the spike holds it");
+    }
+
+    #[test]
+    fn a_site_past_the_freshness_window_is_unmeasured_whatever_the_horizon() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        for line in [running(10.0, 1_000), units(1_000)] {
+            store.ingest_at(&line, 1_000, 1_000, "a");
+        }
+        let reading = store.read("a", "pool-a", anchored(90_000, 82_000, 100_000));
+        assert_eq!(reading.in_flight, None, "stale, however far the horizon reaches");
+        assert!(!reading.unready, "stale is not unready");
+        assert_eq!(reading.sampled_at, Some(1_000), "the age is still reported");
     }
 }

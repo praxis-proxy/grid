@@ -1,5 +1,53 @@
 use super::external_provider::ExternalProviderDescriptor;
 
+#[test]
+#[expect(clippy::unwrap_used, reason = "temporary standalone Forge fixture")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one fixture checks absent, unique, and ambiguous run state"
+)]
+fn standalone_glb_uses_only_an_unambiguous_live_run_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("forge.yaml");
+    std::fs::write(&source, "kind: Environment\n").unwrap();
+    assert!(
+        super::standalone_run_config(&source).is_err(),
+        "source config alone has no run state"
+    );
+
+    let first = directory.path().join(".forge.resolved-first.yaml");
+    std::fs::write(&first, "kind: Environment\n").unwrap();
+    let first_state = super::super::forge_config::state_dir_for_config(&first).unwrap();
+    std::fs::create_dir_all(&first_state).unwrap();
+    std::fs::write(first_state.join("state.json"), r#"{"clusters":[{"phase":"running"}]}"#).unwrap();
+    assert_eq!(
+        super::standalone_run_config(&source).unwrap(),
+        first,
+        "the sole live run supplies the resolved config"
+    );
+
+    let second = directory.path().join(".forge.resolved-second.yaml");
+    std::fs::write(&second, "kind: Environment\n").unwrap();
+    let second_state = super::super::forge_config::state_dir_for_config(&second).unwrap();
+    std::fs::create_dir_all(&second_state).unwrap();
+    std::fs::write(second_state.join("state.json"), r#"{"clusters":[{"phase":"gone"}]}"#).unwrap();
+    assert_eq!(
+        super::standalone_run_config(&source).unwrap(),
+        first,
+        "a stale run whose clusters are gone must not make the live run ambiguous"
+    );
+    std::fs::write(second_state.join("state.json"), r#"{"clusters":[{"phase":"running"}]}"#).unwrap();
+    assert!(
+        super::standalone_run_config(&source).is_err(),
+        "multiple live runs require an explicit resolved config"
+    );
+    assert_eq!(
+        super::standalone_run_config(&first).unwrap(),
+        first,
+        "an explicit resolved config selects its own state"
+    );
+}
+
 const MINIMAL_FORGE_CONFIG: &str = "
 apiVersion: forge.praxis.dev/v1alpha1
 kind: Environment

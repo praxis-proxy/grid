@@ -32,6 +32,8 @@ fn service() -> axum::Router {
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         reserved_sites: Vec::new(),
         renewals_enabled: true,
+        #[cfg(feature = "csr-record")]
+        recorder: None,
     }))
 }
 
@@ -45,6 +47,8 @@ fn service_reserving(store: Store, reserved: &str) -> axum::Router {
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         reserved_sites: vec![reserved.to_owned()],
         renewals_enabled: true,
+        #[cfg(feature = "csr-record")]
+        recorder: None,
     }))
 }
 
