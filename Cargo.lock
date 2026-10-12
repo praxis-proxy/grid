@@ -1096,7 +1096,6 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.10.9",
  "thiserror 2.0.21",
  "time",
@@ -1105,6 +1104,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "version",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -1415,11 +1415,11 @@ dependencies = [
  "percent-encoding",
  "rustls",
  "serde",
- "serde_yaml",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tracing",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -2138,6 +2138,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libyaml-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e126dda6f34391ab7b444f9922055facc83c07a910da3eb16f1e4d9c45dc777"
+
+[[package]]
 name = "linked-hash-map"
 version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2531,7 +2537,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
- "serde_yaml",
  "sha2 0.10.9",
  "socket2",
  "swim",
@@ -2545,6 +2550,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "version",
+ "yaml_serde",
  "zeroize",
 ]
 
@@ -3468,19 +3474,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
 name = "sha1"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4367,12 +4360,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
-
-[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4819,7 +4806,6 @@ dependencies = [
  "schemars 1.2.2",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.10.9",
  "syn 3.0.6",
  "tempfile",
@@ -4827,6 +4813,20 @@ dependencies = [
  "time",
  "toml",
  "typify",
+ "yaml_serde",
+]
+
+[[package]]
+name = "yaml_serde"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33b729a08a9a6be689bbad3e2bf8015926db54b6622cc89c3a5f7dc174b9e918"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "libyaml-rs",
+ "ryu",
+ "serde",
 ]
 
 [[package]]
