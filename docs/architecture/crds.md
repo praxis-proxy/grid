@@ -101,11 +101,46 @@ not part of this CRD.
 
 **Status fields**: `gridId`, `connectedSites`, `distributedProviderCount`,
 `observedGeneration`, `phase`, `consumerConfigStatus[]`,
-`mountReconciliationStatus[]`, `budgetStatus[]`
+`mountReconciliationStatus[]`, `budgetStatus[]`, `conditions[]`,
+`gatewayAgeReports[]`, `gatewayAgeReportOverflow`
 
 `distributedProviderCount` reflects the number of remote `InferenceProvider`
 records received from peer sites via CRDT broadcast.  Local providers and records
 from other `GridNetwork`s are excluded from the count.
+
+### Gateway age evidence
+
+`conditions[]` is a map keyed by condition type. `GatewayAgesRejected` reports
+local gateway ingest rejection under its own status manager, independently of
+peer diagnostics and normal GridNetwork reconciliation. `True` means a fresh
+gateway process has unresolved rejected ages. `False` requires genuine newer
+clean evidence from every recorded rejecting process. `Unknown` means the
+remaining evidence is stale, predates the operator restart, or reporter
+capacity was exceeded. Conditions never change network phase or routing.
+
+`gatewayAgeReports[]` retains at most 128 records keyed by random process epoch:
+replica label, sequence, cumulative skew count, original report flag, effective
+rejection state, and receipt timestamp. Live freshness uses a five-minute
+monotonic receipt window. Expiration is evaluated when another report arrives;
+if reporting stops entirely, the last condition remains until a report arrives.
+After an operator restart, persisted rejected epochs have unknown freshness
+until that same epoch submits a strictly newer observation. Wall-clock changes
+and duplicate reports cannot establish recovery or renew freshness.
+
+A clean report from another replica or replacement process never clears an
+older rejected epoch. The listener identifies the site, not authoritative pod
+membership. Once an operator has independently verified that an old process
+retired, they may explicitly remove its `gatewayAgeReports` status entry.
+The next report recomputes the condition. Silence or a timeout is insufficient
+proof of retirement.
+
+Only clean bookkeeping may be evicted to admit a new process. When all 128
+entries hold unresolved evidence, the operator persists
+`gatewayAgeReportOverflow: true` and refuses new identities; existing processes
+can still report recovery. This bounded uncertainty survives recovery and
+restart. Clear it explicitly only after verifying reporter coverage. Inspect
+status with `kubectl get gridnetwork NAME -o yaml`; status edits require RBAC
+permission for the GridNetwork status subresource.
 
 `consumerConfigStatus[]` is populated for each gateway with
 `consumerConfig.enabled: true`, reporting the outcome of the most recent

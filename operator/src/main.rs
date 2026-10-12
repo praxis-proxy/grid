@@ -222,6 +222,7 @@ async fn main() {
                 published: Published {
                     site: ctx.signals(),
                     peers: ctx.peers(),
+                    feedback: operator::gateway_ages::GatewayFeedback::new(client.clone(), shutdown.clone()),
                 },
                 peer_identities: ctx.peer_identities(),
                 trust,
@@ -1322,6 +1323,8 @@ struct SignalsIdentity {
 /// Everything this operator publishes on the signals path.
 #[derive(Clone)]
 struct Published {
+    /// Independently persisted gateway diagnostic evidence.
+    feedback: operator::gateway_ages::GatewayFeedback,
     /// This site's own signals.
     site: operator::signals::SignalStore,
     /// What peers reported about themselves.
@@ -1363,6 +1366,7 @@ async fn run_signals_server(
         .and_then(|handle| handle.signals_address().map(str::to_owned));
     let app = axum::Router::new()
         .route(operator::signals::SIGNALS_PATH, axum::routing::get(signals_handler))
+        .route(grid_signals::feedback::INGEST_PATH, axum::routing::post(ingest_handler))
         .with_state(listener.published.clone());
 
     // The opt-in listener rebinds on every material change, so a transient
@@ -1999,6 +2003,15 @@ impl<Stream: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteDeadl
     }
 }
 
+/// Accept completed ingests only from the certificate-proven local gateway.
+async fn ingest_handler(
+    axum::extract::State(published): axum::extract::State<Published>,
+    axum::Extension(caller): axum::Extension<Caller>,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    published.feedback.respond(caller == Caller::Local, request).await
+}
+
 /// Serve the coarse rollup, following the multi-target exporter pattern.
 ///
 /// `target` names one provider, `collect[]` names the signals wanted. Scope
@@ -2487,6 +2500,34 @@ async fn peer_tls(client: &Client) -> Option<Arc<operator::signals::PeerTlsMater
 #[allow(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn feedback_handler_refuses_every_peer_scope() {
+        let client = Client::new(
+            tower::service_fn(|_request: http::Request<kube::client::Body>| async {
+                std::future::pending::<Result<http::Response<axum::body::Body>, std::convert::Infallible>>().await
+            }),
+            "default",
+        );
+        let published = Published {
+            site: operator::signals::SignalStore::new(),
+            peers: operator::signals::SignalStore::new(),
+            feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
+        };
+        for caller in [Caller::Peer(None), Caller::Peer(Some(BTreeMap::new()))] {
+            let response = ingest_handler(
+                axum::extract::State(published.clone()),
+                axum::Extension(caller),
+                http::Request::new(axum::body::Body::empty()),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                http::StatusCode::FORBIDDEN,
+                "neither authorized peers nor absent identities can publish gateway status"
+            );
+        }
+    }
 
     #[test]
     fn a_swim_site_name_must_be_a_dns_label() {

@@ -930,6 +930,43 @@ spec:
                       - tenantId
                     type: object
                   type: array
+                conditions:
+                  description: Independently published signal-age diagnostic conditions.
+                  items:
+                    description: One observed condition, shaped like `metav1.Condition`.
+                    properties:
+                      lastTransitionTime:
+                        description: When `status` last changed, RFC 3339.
+                        format: date-time
+                        type: string
+                      message:
+                        default: ""
+                        description: Human-readable detail.
+                        type: string
+                      observedGeneration:
+                        description: The `metadata.generation` this was computed against.
+                        format: int64
+                        nullable: true
+                        type: integer
+                      reason:
+                        description: CamelCase reason for the status.
+                        type: string
+                      status:
+                        description: '`True`, `False`, or `Unknown`.'
+                        type: string
+                      type:
+                        description: Condition type, such as `Ready`.
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
                 connectedSites:
                   default: 0
                   description: Number of connected (Active) sites.
@@ -1017,6 +1054,59 @@ spec:
                   format: uint32
                   minimum: 0.0
                   type: integer
+                gatewayAgeReportOverflow:
+                  description: Reporter capacity was exceeded; explicit coverage verification is required.
+                  type: boolean
+                gatewayAgeReports:
+                  description: |-
+                    Gateway evidence retained until that same process reports recovery.
+                    Missing, replaced, or stale processes do not establish recovery.
+                  items:
+                    description: Last durable gateway ingest observation for one process epoch.
+                    properties:
+                      epoch:
+                        description: Random process identity, unchanged across poller reloads.
+                        pattern: ^[0-9a-f]{32}$
+                        type: string
+                      receivedAt:
+                        description: Receipt time for inspection; freshness uses the operator's monotonic clock.
+                        format: date-time
+                        type: string
+                      rejected:
+                        description: Whether this epoch has unresolved rejected ages.
+                        type: boolean
+                      replica:
+                        description: Diagnostic label; the certificate authenticates the site instead.
+                        maxLength: 128
+                        minLength: 1
+                        type: string
+                      reportedRejected:
+                        description: Original wire flag, retained to verify exact duplicates.
+                        type: boolean
+                      sequence:
+                        description: Last durably accepted sequence.
+                        format: int64
+                        minimum: 1.0
+                        type: integer
+                      skew:
+                        description: Cumulative skew rejection count.
+                        format: int64
+                        minimum: 0.0
+                        type: integer
+                    required:
+                      - epoch
+                      - receivedAt
+                      - rejected
+                      - replica
+                      - reportedRejected
+                      - sequence
+                      - skew
+                    type: object
+                  maxItems: 128
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - epoch
+                  x-kubernetes-list-type: map
                 gridId:
                   default: ""
                   description: The negotiated grid ID.

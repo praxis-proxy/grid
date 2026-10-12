@@ -10,6 +10,8 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::inference_provider::Condition;
+
 // ---------------------------------------------------------------------------
 // Routing policy
 // ---------------------------------------------------------------------------
@@ -1292,6 +1294,21 @@ pub struct SecretRef {
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GridNetworkStatus {
+    /// Independently published signal-age diagnostic conditions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["type"]))]
+    pub conditions: Vec<Condition>,
+
+    /// Gateway evidence retained until that same process reports recovery.
+    /// Missing, replaced, or stale processes do not establish recovery.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 128), extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["epoch"]))]
+    pub gateway_age_reports: Vec<GatewayAgeReport>,
+
+    /// Reporter capacity was exceeded; explicit coverage verification is required.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub gateway_age_report_overflow: bool,
+
     /// Number of connected (Active) sites.
     #[serde(default)]
     pub connected_sites: u32,
@@ -1353,6 +1370,40 @@ pub struct GridNetworkStatus {
     /// This site's identity certificate: when it expires and when rotation is due.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<SiteIdentityStatus>,
+}
+
+/// Whether a separately owned status flag can be omitted from reconciliation.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip predicate receives a borrowed field"
+)]
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+/// Last durable gateway ingest observation for one process epoch.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GatewayAgeReport {
+    /// Diagnostic label; the certificate authenticates the site instead.
+    #[schemars(length(min = 1, max = 128))]
+    pub replica: String,
+    /// Random process identity, unchanged across poller reloads.
+    #[schemars(regex(pattern = "^[0-9a-f]{32}$"))]
+    pub epoch: String,
+    /// Last durably accepted sequence.
+    #[schemars(range(min = 1))]
+    pub sequence: i64,
+    /// Cumulative skew rejection count.
+    #[schemars(range(min = 0))]
+    pub skew: i64,
+    /// Whether this epoch has unresolved rejected ages.
+    pub rejected: bool,
+    /// Original wire flag, retained to verify exact duplicates.
+    pub reported_rejected: bool,
+    /// Receipt time for inspection; freshness uses the operator's monotonic clock.
+    #[schemars(extend("format" = "date-time"))]
+    pub received_at: String,
 }
 
 /// This site's identity certificate.

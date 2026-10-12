@@ -51,6 +51,8 @@ pub mod served_models;
 pub use resources::{tls_backend::init_process_crypto, trust_bundle::sha256_fingerprint};
 /// Provider gateway address self-discovery.
 pub mod gateway;
+/// Durable gateway ingest diagnostic feedback.
+pub mod gateway_ages;
 /// Shutdown signal for unwinding in-flight work cleanly.
 pub mod shutdown;
 /// Provider signals, served as a multi-target exporter.
