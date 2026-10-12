@@ -2,7 +2,7 @@
 
 use std::{
     collections::BTreeMap,
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -41,8 +41,10 @@ const MAX_REPORTERS: usize = 128;
 pub struct GatewayFeedback {
     /// API client for the local network status.
     client: Client,
+    /// Serializes the CAS flow and receipt commit under the request budget.
+    publication: Arc<tokio::sync::Semaphore>,
     /// Updated only after durable acceptance; empty after operator restart.
-    receipts: Arc<tokio::sync::Mutex<BTreeMap<String, Instant>>>,
+    receipts: Arc<Mutex<BTreeMap<String, Instant>>>,
     /// Cancels publication when the operator terminates.
     shutdown: Shutdown,
 }
@@ -53,6 +55,7 @@ impl GatewayFeedback {
     pub fn new(client: Client, shutdown: Shutdown) -> Self {
         Self {
             client,
+            publication: Arc::new(tokio::sync::Semaphore::new(1)),
             receipts: Arc::default(),
             shutdown,
         }
@@ -78,16 +81,20 @@ impl GatewayFeedback {
             Ok(report) => report,
             Err(status) => return status.into_response(),
         };
-        let mut receipts = self.receipts.lock().await;
+        let Ok(_publication) = self.publication.acquire().await else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let receipts = self.receipts.lock().unwrap_or_else(PoisonError::into_inner).clone();
         let api: Api<GridNetwork> = Api::all(self.client.clone());
         for _attempt in 0..3 {
             match attempt(&api, &report, &receipts).await {
                 Ok((update, instant)) => {
+                    let mut accepted_receipts = self.receipts.lock().unwrap_or_else(PoisonError::into_inner);
                     if update.fresh {
-                        receipts.insert(report.epoch.clone(), instant);
+                        accepted_receipts.insert(report.epoch.clone(), instant);
                     }
-                    receipts.retain(|epoch, _| update.evidence.reports.iter().any(|row| &row.epoch == epoch));
-                    drop(receipts);
+                    accepted_receipts.retain(|epoch, _| update.evidence.reports.iter().any(|row| &row.epoch == epoch));
+                    drop(accepted_receipts);
                     return acknowledgment(&report, update.overflow);
                 },
                 Err(StatusCode::CONFLICT) => {},
@@ -572,14 +579,14 @@ mod tests {
             persisted["status"]["conditions"][1]["status"], "Unknown",
             "a clean incoming epoch cannot erase injected unresolved evidence"
         );
-        let held = feedback.receipts.lock().await.clone();
+        let held = feedback.receipts.lock().expect("receipts").clone();
         assert_eq!(patches.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(
             feedback.respond(true, request(&clean, "")).await.status(),
             StatusCode::NO_CONTENT
         );
         assert_eq!(
-            *feedback.receipts.lock().await,
+            *feedback.receipts.lock().expect("receipts"),
             held,
             "duplicate cannot renew freshness"
         );
@@ -598,7 +605,7 @@ mod tests {
                     .status(),
                 StatusCode::SERVICE_UNAVAILABLE
             );
-            assert!(feedback.receipts.lock().await.is_empty());
+            assert!(feedback.receipts.lock().expect("receipts").is_empty());
         }
     }
 
@@ -646,6 +653,11 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(started.elapsed(), WRITE_BUDGET);
+        assert_eq!(
+            feedback.publication.available_permits(),
+            1,
+            "timeout releases publication admission"
+        );
         trigger.trigger();
         assert_eq!(
             feedback
@@ -653,6 +665,31 @@ mod tests {
                 .await
                 .status(),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_admission_never_reaches_storage() {
+        let (client, _stored, patches) = mock_api(StorageMode::Normal);
+        let (_trigger, shutdown) = crate::shutdown::Trigger::new();
+        let feedback = GatewayFeedback::new(client, shutdown);
+        feedback.publication.close();
+        assert_eq!(
+            feedback
+                .respond(true, request(&report("a", 1, 1, true), ""))
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "closed publication admission must not accept or acknowledge a report"
+        );
+        assert_eq!(
+            patches.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "closed admission never writes status"
+        );
+        assert!(
+            feedback.receipts.lock().expect("receipts").is_empty(),
+            "closed admission commits no receipts"
         );
     }
 
@@ -681,12 +718,12 @@ mod tests {
         mode: StorageMode,
     ) -> (
         Client,
-        Arc<std::sync::Mutex<serde_json::Value>>,
+        Arc<Mutex<serde_json::Value>>,
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
         let mut fixture = serde_json::to_value(network()).expect("network");
         fixture["status"] = serde_json::json!({"phase":"Active","conditions":[{"type":"PeerAgesRejected","status":"True","reason":"Peer","message":"peer","lastTransitionTime":"2026-10-12T00:00:00Z"}]});
-        let stored = Arc::new(std::sync::Mutex::new(fixture));
+        let stored = Arc::new(Mutex::new(fixture));
         let patches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let service = tower::service_fn({
             let (stored, patches) = (Arc::clone(&stored), Arc::clone(&patches));
