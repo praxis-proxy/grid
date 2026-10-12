@@ -191,6 +191,8 @@ RUST_LOG for the chart's Rust binaries: log.filter when set, else log.level.
 {{- $parts := len (splitList ":" .entry) -}}
 {{- if and (hasPrefix "[" .entry) (hasSuffix "]" .entry) -}}
 {{- printf "%s:%v" .entry .port -}}
+{{- else if and (or (hasPrefix "[" .entry) (eq $parts 2)) (or (hasPrefix ":" .entry) (hasSuffix ":" .entry)) -}}
+{{- fail (printf "%s is not host:port" .entry) -}}
 {{- else if or (hasPrefix "[" .entry) (eq $parts 2) -}}
 {{- .entry -}}
 {{- else if gt $parts 2 -}}
