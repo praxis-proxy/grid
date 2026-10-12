@@ -39,6 +39,16 @@ helm install grid-operator charts/grid-operator \
   --create-namespace
 ```
 
+The A2A provider API is experimental and disabled by default. Enable it only
+with an operator image built with the `a2a` Cargo feature, which activates the
+experimental marker, and the matching chart value:
+
+```bash
+helm upgrade --install grid-operator charts/grid-operator \
+  --namespace grid-system --create-namespace \
+  --set experimental.a2a.enabled=true
+```
+
 ## Versioning
 
 The chart follows [Semantic Versioning](https://semver.org/). In
@@ -68,7 +78,7 @@ custom resources:
 ```bash
 kubectl delete crd agenttoolproviders.grid.praxis.fast \
   gridnetworks.grid.praxis.fast gridsites.grid.praxis.fast \
-  inferenceproviders.grid.praxis.fast
+  inferenceproviders.grid.praxis.fast siteinvites.grid.praxis.fast
 ```
 
 ## Upgrade
@@ -169,7 +179,7 @@ release annotation must be empty or this release:
 
 ```bash
 kubectl get crd agenttoolproviders.grid.praxis.fast gridnetworks.grid.praxis.fast \
-  gridsites.grid.praxis.fast inferenceproviders.grid.praxis.fast \
+  gridsites.grid.praxis.fast inferenceproviders.grid.praxis.fast siteinvites.grid.praxis.fast \
   -o custom-columns='NAME:.metadata.name,RELEASE:.metadata.annotations.meta\.helm\.sh/release-name'
 ```
 
@@ -183,7 +193,7 @@ helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
 With an older Helm, mark them as owned by the release, then upgrade as usual:
 
 ```bash
-RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders gridnetworks gridsites inferenceproviders; do kubectl label crd "${crd}.grid.praxis.fast" app.kubernetes.io/managed-by=Helm --overwrite; kubectl annotate crd "${crd}.grid.praxis.fast" meta.helm.sh/release-name="${RELEASE}" meta.helm.sh/release-namespace="${NAMESPACE}" --overwrite; done
+RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders gridnetworks gridsites inferenceproviders siteinvites; do kubectl label crd "${crd}.grid.praxis.fast" app.kubernetes.io/managed-by=Helm --overwrite; kubectl annotate crd "${crd}.grid.praxis.fast" meta.helm.sh/release-name="${RELEASE}" meta.helm.sh/release-namespace="${NAMESPACE}" --overwrite; done
 ```
 
 ## Names across charts
@@ -217,6 +227,7 @@ namespace names in `metricsListener.fromNamespaces`, and on OpenShift defaults t
 |-----|------|---------|-------------|
 | `crds.enabled` | bool | `true` | Install and upgrade the Grid CRDs. `false` when a platform owns them. |
 | `crds.keep` | bool | `true` | Keep the CRDs on `helm uninstall` and an Argo CD delete or prune. |
+| `experimental.a2a.enabled` | bool | `false` | Render the experimental A2A CRD and RBAC. Requires an operator image built with the `a2a` Cargo feature. |
 | `site.name` | string | `""` | This site's name, a DNS label. Defaults `swim.siteName`, and through it `enrollment.siteName`. |
 | `site.region` | string | `""` | Region on the rendered GridSite. Empty leaves it out. |
 | `site.zone` | string | `""` | Availability zone on the rendered GridSite. Empty leaves it out. |
