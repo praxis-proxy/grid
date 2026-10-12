@@ -2717,7 +2717,7 @@ mod tests {
     #[tokio::test]
     async fn peer_age_observation_waits_for_membership_release() {
         let client = stalled_peer_ages_client(false, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
-        let ctx = OperatorCtx::new(client, None, operator::crd::grid_network::SignalMode::Poll).hold_membership();
+        let ctx = OperatorCtx::new(client, None, SignalMode::Poll).hold_membership();
         let mut ages = operator::peer_ages::PeerAges::default();
         ages.observe(&["east".to_owned()], &BTreeMap::from([("east".to_owned(), 1)]));
         let previous = ages.clone();
