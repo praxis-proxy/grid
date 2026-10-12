@@ -10,9 +10,10 @@ All CRDs are cluster-scoped.
 
 ## GridNetwork
 
-The AGN logical network and top-level tenancy scope. A single
-cluster can host multiple `GridNetworks` for
-multi-tenancy.
+The AGN logical network and top-level tenancy scope. `GridNetwork` is a
+cluster-scoped CRD. The current AGN deployment supports only one
+`GridNetwork` in the cluster. The operator fails startup when it finds more
+than one; adding another after startup is not supported.
 
 ```yaml
 apiVersion: grid.praxis.fast/v1alpha1
