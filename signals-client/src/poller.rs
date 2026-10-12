@@ -176,6 +176,15 @@ pub enum FetchError {
 pub trait SignalSource {
     /// Fetch the current exposition and the operator's response `Date`.
     fn fetch(&self) -> impl Future<Output = Result<Scrape, FetchError>> + Send;
+
+    /// Report a committed ingest; absent observations may retry pending bad evidence.
+    /// Implementations must fold the observation synchronously when constructing
+    /// this future, before routing refresh or cancellation can intervene. The
+    /// returned future performs delivery only. The default is unsupported and
+    /// never acknowledges evidence.
+    fn report(&self, _ingested: Option<Ingested>) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
 }
 
 /// Append `collect[]` parameters for each metric name, percent-encoded.
@@ -342,6 +351,10 @@ where
 /// caller can rebuild derived state (the routing snapshot) on one clock with no
 /// drift between "store updated" and "state rebuilt". It stays generic over the
 /// store: the poller never names the caller's derived type.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one cancellation-aware loop sequences fetch, commit, observation, refresh and reporting"
+)]
 async fn poll_loop<S, F>(
     store: Arc<LoadStore>,
     source: S,
@@ -377,8 +390,14 @@ async fn poll_loop<S, F>(
                 if gate.wait_for(|open| *open).await.is_err() || *stop.borrow() {
                     return;
                 }
-                absorb(fetched, &store, &mut failing);
+                let ingested = absorb(fetched, &store, &mut failing);
+                let reporting = source.report(ingested);
                 on_cycle(&store);
+                tokio::select! {
+                    biased;
+                    _ = stop.changed() => return,
+                    () = reporting => {},
+                }
             },
         }
     }
@@ -386,13 +405,14 @@ async fn poll_loop<S, F>(
 
 /// Absorb one fetch, counting the outcome and logging only the transitions in and
 /// out of failure.
-fn absorb(fetched: Result<Scrape, FetchError>, store: &LoadStore, failing: &mut bool) {
+fn absorb(fetched: Result<Scrape, FetchError>, store: &LoadStore, failing: &mut bool) -> Option<Ingested> {
     let result = match fetched {
         Ok(scrape) => ingest(&scrape, store),
         Err(error) => Err((outcome(&error), error.to_string())),
     };
     let label = result.as_ref().map_or_else(|(label, _)| *label, |_| "ok");
     metrics::counter!("grid_signals_poll_total", "result" => label).increment(1);
+    let observed = result.as_ref().ok().copied();
     match (result, *failing) {
         (Ok(ingested), true) => {
             *failing = false;
@@ -405,6 +425,7 @@ fn absorb(fetched: Result<Scrape, FetchError>, store: &LoadStore, failing: &mut 
             tracing::warn!(error, "signals poll failing; keeping last values");
         },
     }
+    observed
 }
 
 /// Store one scrape and record what it carried. Attribution keys on the
@@ -450,6 +471,116 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "integration fixture coordinates cancellation during a blocked refresh"
+    )]
+    async fn committed_skew_survives_cancellation_during_refresh() {
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let reporter = Arc::new(crate::Reporter::new(certs::spiffe_id("east")).expect("reporter"));
+        let sent = Arc::new(AtomicUsize::new(0));
+        let source = ReportingSource {
+            reporter: Arc::clone(&reporter),
+            sent: Arc::clone(&sent),
+        };
+        let store = Arc::new(LoadStore::new(Duration::from_secs(30)));
+        let (stop, receiver) = watch::channel(false);
+        let (_commit, gate) = watch::channel(true);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::clone(&barrier);
+        let (reached, waiting) = tokio::sync::oneshot::channel();
+        let reached = Mutex::new(Some(reached));
+        let task = tokio::spawn(poll_loop(
+            store,
+            source,
+            Duration::from_secs(1),
+            (receiver, gate),
+            move |_store| {
+                reached
+                    .lock()
+                    .expect("reached")
+                    .take()
+                    .expect("one cycle")
+                    .send(())
+                    .expect("waiting");
+                release.wait();
+            },
+        ));
+        waiting.await.expect("refresh reached");
+        stop.send_replace(true);
+        barrier.wait();
+        task.await.expect("stopped");
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            0,
+            "cancellation wins before network report"
+        );
+        let replacement = ReportingSource {
+            reporter,
+            sent: Arc::clone(&sent),
+        };
+        replacement.report(None).await;
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            1,
+            "replacement retries genuine committed skew after failed fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn held_or_rejected_reload_folds_no_feedback_evidence() {
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let reporter = Arc::new(crate::Reporter::new(certs::spiffe_id("east")).expect("reporter"));
+        let sent = Arc::new(AtomicUsize::new(0));
+        let source = ReportingSource {
+            reporter: Arc::clone(&reporter),
+            sent: Arc::clone(&sent),
+        };
+        let store = Arc::new(LoadStore::new(Duration::from_secs(30)));
+        let (_stop, receiver) = watch::channel(false);
+        let (commit, gate) = watch::channel(false);
+        let task = tokio::spawn(poll_loop(
+            store,
+            source,
+            Duration::from_secs(1),
+            (receiver, gate),
+            |_store| {},
+        ));
+        tokio::task::yield_now().await;
+        drop(commit);
+        task.await.expect("rejected reload stopped");
+        assert!(reporter.observe(None).is_none(), "uncommitted skew was never folded");
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
+    }
+
+    /// Reporting folds synchronously and performs transport only when polled.
+    struct ReportingSource {
+        /// State shared across replacement pollers.
+        reporter: Arc<crate::Reporter>,
+        /// Reports actually transported.
+        sent: Arc<AtomicUsize>,
+    }
+
+    impl SignalSource for ReportingSource {
+        async fn fetch(&self) -> Result<Scrape, FetchError> {
+            Ok(Scrape {
+                body: line("east", "pool", 3.0, 21_000),
+                date_ms: 1_000,
+                peer_identity: Arc::from(certs::spiffe_id("east")),
+            })
+        }
+
+        fn report(&self, ingested: Option<Ingested>) -> impl Future<Output = ()> + Send {
+            let pending = self.reporter.observe(ingested);
+            async move {
+                if pending.is_some() {
+                    self.sent.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+    }
 
     fn cfg(yaml: &str) -> Result<PollerConfig, serde_yaml::Error> {
         serde_yaml::from_str(yaml)
