@@ -3343,9 +3343,9 @@ fn guarded_deployment_patch(mut patch: Value, deployment: &Deployment) -> Result
 
 /// Map an apiserver error on the delegated Deployment to what it means for the mount status.
 ///
-/// A conflict stays a kube error so the caller re-reads and retries. A 403 is a grant the
-/// operator cannot give itself, so it gets its own reason and a message that says where the
-/// grant comes from. Anything else is `fallback`.
+/// A conflict stays a kube error so the caller re-reads and retries. A 403 preserves the
+/// apiserver refusal so authorization and admission denials remain distinguishable.
+/// Anything else is `fallback`.
 fn delegated_deployment_failure(
     error: kube::Error,
     verb: &'static str,
@@ -3358,10 +3358,11 @@ fn delegated_deployment_failure(
         return mount_failure(
             "DeploymentForbidden",
             format!(
-                "the operator's ServiceAccount may not {verb} the delegated Deployment: grant it get and patch on \
-                 that one Deployment (the praxis-gateway chart renders the Role when mountReconciliation is \
-                 enabled; otherwise create one in the gateway namespace), and check that deploymentName is \
-                 included in the name-restricted grant"
+                "the apiserver refused {verb} on the delegated Deployment: {error}. Inspect the refusal for \
+                 authorization or admission-policy denial. If RBAC denied access, verify the operator's \
+                 ServiceAccount has get and patch on that one Deployment (the praxis-gateway chart renders \
+                 the Role when mountReconciliation is enabled; otherwise create one in the gateway namespace), \
+                 and check that deploymentName is included in the name-restricted grant"
             ),
         )
         .into();
@@ -9845,7 +9846,7 @@ mod tests {
     }
 
     #[test]
-    fn a_forbidden_delegated_deployment_reports_the_missing_grant() {
+    fn a_forbidden_delegated_deployment_preserves_refusal_and_grant_guidance() {
         let gateway = make_gw_ref("inference-gw", "praxis-system");
         for verb in ["get", "patch"] {
             let fallback = mount_failure("DeploymentReadFailed", "unused");
@@ -9853,18 +9854,18 @@ mod tests {
             let status = mount_reconciliation_status_error(&gateway, None, &error, 7);
             assert_eq!(
                 status.reason, "DeploymentForbidden",
-                "a 403 on {verb} is a missing grant, not a generic read or patch failure"
+                "a 403 on {verb} must report the apiserver refusal"
             );
             assert!(
-                status.message.contains(&format!("may not {verb}")) && status.message.contains("deploymentName"),
-                "the message must name the refused verb and point at deploymentName: {}",
+                status.message.contains(&format!("refused {verb}")) && status.message.contains("scripted"),
+                "the message must preserve the refused verb and apiserver explanation: {}",
                 status.message
             );
-            assert_eq!(
-                status.phase,
-                MountReconciliationPhase::Error,
-                "a missing grant is an error, not a wait"
+            assert!(
+                status.message.contains("If RBAC denied access") && status.message.contains("deploymentName"),
+                "the grant guidance must be conditional on RBAC denying access"
             );
+            assert_eq!(status.phase, MountReconciliationPhase::Error, "a refusal must not wait");
         }
     }
 
