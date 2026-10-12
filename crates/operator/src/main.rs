@@ -2530,15 +2530,16 @@ impl PeerPoller {
     /// Collect from every alive peer, replace what is published for them, and say
     /// on the `GridNetwork` whose relayed ages are being rejected.
     async fn poll_once(&mut self, source: &operator::signals::PollPeers) {
-        let sites = poll_targets(
+        let Some(sites) = poll_targets(
             &self.swim.snapshot(),
             &self.ctx.peer_identities(),
             source.trust,
             self.swim.is_encrypted(),
             self.swim.site_name(),
             self.settings.peer_port,
-        )
-        .unwrap_or_default();
+        ) else {
+            return;
+        };
         // Each peer lands as it answers, so one slow peer cannot age out the rest.
         let peers = self.ctx.peers();
         let ttl = self.settings.peer_ttl();

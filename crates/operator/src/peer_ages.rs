@@ -41,6 +41,10 @@ const MAX_NAMED_PEERS: usize = 10;
 pub struct PeerAges {
     /// Peers whose latest answer carried a rejected age.
     rejecting: BTreeSet<String>,
+    /// Current peers that answered at least once during this process.
+    observed: BTreeSet<String>,
+    /// Whether a current peer has not yet answered during this process.
+    unobserved: bool,
 }
 
 impl PeerAges {
@@ -52,7 +56,11 @@ impl PeerAges {
     /// clock, and a peer no longer polled is forgotten.
     pub fn observe(&mut self, polled: &[String], answered: &BTreeMap<String, usize>) {
         self.rejecting.retain(|peer| polled.contains(peer));
+        self.observed.retain(|peer| polled.contains(peer));
         for peer in polled {
+            if answered.contains_key(peer) {
+                self.observed.insert(peer.clone());
+            }
             match answered.get(peer) {
                 Some(0) => {
                     self.rejecting.remove(peer);
@@ -63,6 +71,7 @@ impl PeerAges {
                 None => {},
             }
         }
+        self.unobserved = polled.iter().any(|peer| !self.observed.contains(peer));
     }
 
     /// Peers whose relayed ages are being rejected, in name order.
@@ -73,11 +82,17 @@ impl PeerAges {
 
     /// The condition to write over `current`, `None` when it already says this.
     ///
+    /// A live rejection survives unobserved peers after restart because its
+    /// bounded message cannot reconstruct every peer's standing.
+    ///
     /// Unlike `Ready`, a change of message alone is written, since the message is
     /// where the peers are named. `lastTransitionTime` moves only with the status.
     #[must_use]
     pub fn condition(&self, current: &[Condition], now_rfc3339: &str, generation: Option<i64>) -> Option<Condition> {
         let held = current.iter().find(|held| held.type_ == PEER_AGES_REJECTED);
+        if self.rejecting.is_empty() && self.unobserved && held.is_some_and(|held| held.status == "True") {
+            return None;
+        }
         let (status, reason) = if self.rejecting.is_empty() {
             ("False", PEER_AGES_ACCEPTED)
         } else {
@@ -278,6 +293,67 @@ mod tests {
             None,
             "and leaves what is still true alone"
         );
+    }
+
+    #[test]
+    fn a_restart_preserves_live_rejection_until_current_peers_answer() {
+        let before = after(&PeerAges::default(), &["east", "west"], &[("east", 1), ("west", 0)]);
+        let live = before.condition(&[], "t0", Some(3)).expect("raised before restart");
+        let silent = after(&PeerAges::default(), &["east", "west"], &[]);
+        assert_eq!(
+            silent.condition(std::slice::from_ref(&live), "t1", Some(3)),
+            None,
+            "silent peers cannot refute the live rejection after restart"
+        );
+        let partial = after(&silent, &["east", "west"], &[("east", 0)]);
+        assert_eq!(
+            partial.condition(std::slice::from_ref(&live), "t2", Some(3)),
+            None,
+            "a partial clean round leaves another peer's standing unknown"
+        );
+        let clean = after(&partial, &["east", "west"], &[("west", 0)]);
+        assert_eq!(
+            clean
+                .condition(std::slice::from_ref(&live), "t3", Some(3))
+                .map(|condition| condition.status),
+            Some("False".to_owned()),
+            "clean answers across rounds establish every current peer's standing"
+        );
+    }
+
+    #[test]
+    fn a_departed_unobserved_peer_no_longer_prevents_recovery() {
+        let before = after(&PeerAges::default(), &["east", "west"], &[("west", 1)]);
+        let live = before.condition(&[], "t0", Some(3)).expect("raised before restart");
+        let partial = after(&PeerAges::default(), &["east", "west"], &[("east", 0)]);
+        let departed = after(&partial, &["east"], &[]);
+        assert_eq!(
+            departed
+                .condition(std::slice::from_ref(&live), "t1", Some(3))
+                .map(|condition| condition.status),
+            Some("False".to_owned()),
+            "a departed peer is not required to answer before recovery"
+        );
+        assert_eq!(
+            after(&partial, &[], &[])
+                .condition(std::slice::from_ref(&live), "t1", Some(3))
+                .map(|condition| condition.status),
+            Some("False".to_owned()),
+            "genuinely empty membership can clear live rejection"
+        );
+    }
+
+    #[test]
+    fn a_new_rejection_is_reported_while_other_peers_are_unobserved() {
+        let before = after(&PeerAges::default(), &["east", "west"], &[("west", 1)]);
+        let live = before.condition(&[], "t0", Some(3)).expect("raised before restart");
+        let restarted = after(&PeerAges::default(), &["east", "west"], &[("east", 1)]);
+        let condition = restarted
+            .condition(std::slice::from_ref(&live), "t1", Some(3))
+            .expect("new evidence is written despite an unobserved peer");
+        assert_eq!(condition.status, "True", "fresh rejection evidence remains reportable");
+        assert!(condition.message.contains("east"), "the newly rejecting peer is named");
+        assert_eq!(condition.last_transition_time, "t0", "rejection status has not changed");
     }
 
     #[test]

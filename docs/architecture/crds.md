@@ -120,6 +120,9 @@ rows are dropped and counted in
 `grid_peer_signals_refused_total{peer,reason="skew"}`, so routing reads that
 peer's providers as unmeasured. A peer that does not answer keeps its standing,
 a peer that leaves membership is dropped, and one clean answer clears it. The
+operator conservatively preserves an existing `True` condition after restarting
+until every currently polled peer has answered or left membership. Unavailable secure polling is not a clean
+round and does not clear the condition. The
 condition is written only when its status, its message or the generation
 changes, since each write starts a `GridNetwork` reconcile.
 
