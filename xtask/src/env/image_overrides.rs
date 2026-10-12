@@ -58,7 +58,7 @@ const DEFAULT_OPERATOR_IMAGE: &str = "grid-operator:latest";
 const DEFAULT_OVERLAY_SYNC_IMAGE: &str = "grid-overlay-sync:latest";
 
 /// Default gateway image used by the GLB demo.
-const DEFAULT_GLB_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.4.0";
+const DEFAULT_GLB_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.6.0";
 
 /// Default simulator image used by forge-based demos.
 const DEFAULT_SIM_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23";
@@ -67,7 +67,7 @@ const DEFAULT_SIM_IMAGE: &str = "ghcr.io/neuralmagic/vllm-vcr:vllm0.23";
 const DEFAULT_GLB_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.4";
 
 /// Default gateway image for workload-inference demos.
-const DEFAULT_WORKLOAD_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.4.0";
+const DEFAULT_WORKLOAD_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.6.0";
 
 /// Default operator image for workload-inference demos.
 const DEFAULT_WORKLOAD_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.4";
@@ -296,10 +296,16 @@ mod tests {
         assert_eq!(DEFAULT_MOCK_EPP_IMAGE, "localhost/praxis-ai-mock-epp:latest");
         assert_eq!(DEFAULT_OPERATOR_IMAGE, "grid-operator:latest");
         assert_eq!(DEFAULT_OVERLAY_SYNC_IMAGE, "grid-overlay-sync:latest");
-        assert_eq!(DEFAULT_GLB_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.4.0");
+        assert_eq!(
+            DEFAULT_GLB_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.6.0",
+            "GLB gateway default must use the qualified release"
+        );
         assert_eq!(DEFAULT_GLB_OPERATOR_IMAGE, "ghcr.io/praxis-proxy/grid-operator:v0.1.4");
         assert_eq!(DEFAULT_IMAGE_PULL_POLICY, "Never");
-        assert_eq!(DEFAULT_WORKLOAD_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.4.0");
+        assert_eq!(
+            DEFAULT_WORKLOAD_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.6.0",
+            "workload gateway default must use the qualified release"
+        );
         assert_eq!(
             DEFAULT_WORKLOAD_OPERATOR_IMAGE,
             "ghcr.io/praxis-proxy/grid-operator:v0.1.4"

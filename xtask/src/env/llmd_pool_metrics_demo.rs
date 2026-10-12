@@ -114,7 +114,7 @@ const GRID_NETWORK_NAME: &str = "grid-llmd-pool-metrics";
 /// combined-site demo. Both require the `peer_identity_trust`,
 /// `provider_route`, `credential_inject`, and `intelligent_route` filters
 /// which are built into the published Grid AI rollup.
-const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.4.0";
+const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.6.0";
 
 /// Default operator image tag.
 const DEFAULT_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.4";
