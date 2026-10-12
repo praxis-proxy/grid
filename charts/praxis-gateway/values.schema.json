@@ -1289,9 +1289,6 @@
                 "smoothing": {
                   "type": "number"
                 },
-                "ceiling_half_life_ms": {
-                  "type": "integer"
-                },
                 "ceiling_floor": {
                   "type": "number"
                 },

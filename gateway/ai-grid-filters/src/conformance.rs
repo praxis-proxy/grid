@@ -44,8 +44,7 @@ const MODEL: &str = "llama";
 /// The moment every run reads the store at. Samples are stamped relative to it.
 const NOW_MS: i64 = 1_000_000;
 
-/// Milliseconds between the settling refreshes. Past `room_after_ms` once a few have
-/// passed, and short enough that the learned ceiling barely decays across them.
+/// Milliseconds between the settling refreshes, past `room_after_ms` once a few have passed.
 const REFRESH_MS: i64 = 1_000;
 
 /// Measuring refreshes after the teaching one. Saturation moves by `smoothing` per
@@ -170,8 +169,6 @@ enum Phase {
 }
 
 impl Phase {
-    /// The clock the phase publishes and is read at. Measure follows Teach by one
-    /// refresh, far inside the ceiling half-life so the taught ceiling does not decay.
     /// The clock this phase publishes and is read at, given the run's freshness window.
     ///
     /// Measuring starts past the window, so the teaching sample has aged out of the
@@ -234,6 +231,68 @@ fn config(spec: &SiteSpec) -> CandidateConfig {
         name: MODEL.to_owned(),
         site: spec.site.to_owned(),
         stable_id: None,
+    }
+}
+
+/// A run a scenario drives refresh by refresh, carrying the learned state between them.
+///
+/// `snapshot` below is the fixed teach-then-measure shape most scenarios want. This is for
+/// the ones that need their own sequence over time: an idle spell, a burst, a recovery.
+pub(crate) struct Harness {
+    store: LoadStore,
+    learned: Learned,
+    availability: AvailabilitySettings,
+    window_ms: i64,
+}
+
+impl Harness {
+    /// An empty grid reading load over `window_ms`.
+    pub(crate) fn new(window_ms: i64) -> Self {
+        Self {
+            store: LoadStore::new(Duration::from_secs(600)),
+            learned: Learned::default(),
+            availability: AvailabilitySettings::default(),
+            window_ms,
+        }
+    }
+
+    /// Publish each site holding `holding` with `queued` waiting at `at_ms`, then order.
+    ///
+    /// One ready endpoint per site, so in-flight is the per-endpoint load. A whole request
+    /// waiting is what stops a sample teaching a ceiling.
+    pub(crate) fn refresh(
+        &mut self,
+        sites: &[SiteSpec],
+        at_ms: i64,
+        holding: impl Fn(&SiteSpec) -> f64,
+        queued: f64,
+    ) -> RouteSnapshot {
+        for spec in sites {
+            let labels = format!(r#"grid_site="{}",grid_provider="pool-{}""#, spec.site, spec.site);
+            let running = (holding(spec) - queued).max(0.0);
+            for (metric, value) in [
+                ("llm_d_epp_average_running_requests", running),
+                ("llm_d_epp_average_queue_size", queued),
+                ("llm_d_epp_ready_endpoints", 1.0),
+                ("llm_d_epp_flow_control_queue_size", 0.0),
+            ] {
+                let line = format!("{metric}{{{labels}}} {value} {at_ms}");
+                self.store.ingest_at(&line, at_ms, at_ms, spec.site);
+            }
+        }
+        let validated = validate_candidates(sites.iter().map(config).collect()).expect("candidates");
+        RouteSnapshot::from_store(
+            validated,
+            Arc::from(sites[0].site),
+            &mut Inputs {
+                signals: &self.store,
+                now_ms: at_ms,
+                window_ms: self.window_ms,
+                horizon_ms: self.window_ms,
+                availability: &self.availability,
+                learned: &mut self.learned,
+            },
+        )
     }
 }
 
@@ -541,8 +600,6 @@ mod tests {
     /// Scenario: heterogeneous capacity, equal speed. Exercises the learned ceiling, which is
     /// what weights a site.
     #[test]
-    #[ignore = "reproduces the zero-tolerance rho comparison: one ULP of rho decides every pair, \
-                 starving the 80-capacity site to 0.049 against a 0.133 capacity share"]
     fn heterogeneous_capacity_at_equal_speed_tracks_dispatch_share() {
         let observed = dispatch(&HETEROGENEOUS_CAPACITY, &Run::fresh(0..DRAWS));
         capacity_tracking(&observed, UNIT_TOLERANCE).expect("the draw tracks capacity");
@@ -953,8 +1010,6 @@ mod tests {
     /// decider. This reports the worst deviation from capacity share across a sweep, so a
     /// harness-sensitive scenario is visible rather than silently green at one value.
     #[test]
-    #[ignore = "fails while the rho comparison has no tolerance: the verdict moves by 0.254 across \
-                 settle values. Goes flat once any tolerance exists"]
     fn the_capacity_verdict_does_not_depend_on_settling() {
         let caps: f64 = HETEROGENEOUS_CAPACITY.iter().map(|spec| spec.capacity).sum();
         let mut worst_by_settle = Vec::new();
@@ -982,6 +1037,112 @@ mod tests {
             spread < 0.05,
             "the verdict moves with the harness's settling, by {spread:.3}: {}",
             report.join(", ")
+        );
+    }
+
+    /// An idle hour, then a burst: a grid quiet overnight and busy in the morning, which the
+    /// stepped-load lab run cannot produce. A burst teaches nothing, so the ceiling the idle
+    /// hour leaves is the one the burst is read against.
+    const IDLE_THEN_BURST: [SiteSpec; 3] = [
+        SiteSpec {
+            site: "hub",
+            capacity: 40.0,
+            enforced: 40.0,
+            in_flight: 40.0,
+        },
+        SiteSpec {
+            site: "factory",
+            capacity: 120.0,
+            enforced: 120.0,
+            in_flight: 120.0,
+        },
+        SiteSpec {
+            site: "retail",
+            capacity: 200.0,
+            enforced: 200.0,
+            in_flight: 200.0,
+        },
+    ];
+
+    /// After an idle hour the grid still tells a small site from a large one.
+    #[test]
+    fn an_idle_hour_leaves_each_site_its_own_ceiling() {
+        let mut grid = Harness::new(WINDOW_MS);
+        let hour_ms = 3_600_000;
+        // Every site carries its capacity with an empty queue, which is what teaches a ceiling.
+        grid.refresh(&IDLE_THEN_BURST, NOW_MS, |spec| spec.capacity, 0.0);
+        // An idle hour, sampled as the relay would: holding nothing, queueing nothing.
+        for minute in (10..=60).step_by(10) {
+            grid.refresh(&IDLE_THEN_BURST, NOW_MS + i64::from(minute) * 60_000, |_| 0.0, 0.0);
+        }
+        let after = grid.refresh(&IDLE_THEN_BURST, NOW_MS + hour_ms, |_| 0.0, 0.0);
+        let ceilings: Vec<f64> = after.candidates.iter().filter_map(|site| site.capacity).collect();
+        let spread =
+            ceilings.iter().fold(0.0_f64, |a, b| a.max(*b)) - ceilings.iter().fold(f64::INFINITY, |a, b| a.min(*b));
+        assert!(
+            spread > 1.0,
+            "a five-to-one capacity spread survived an idle hour as {spread:.1} of ceiling \
+             spread: {ceilings:?}"
+        );
+    }
+
+    /// The burst is measured against the ceiling the load taught, not against a floor.
+    #[test]
+    fn a_burst_after_an_idle_hour_reads_against_the_ceiling_it_taught() {
+        let mut grid = Harness::new(WINDOW_MS);
+        let hour_ms = 3_600_000;
+        grid.refresh(&IDLE_THEN_BURST, NOW_MS, |spec| spec.capacity, 0.0);
+        for minute in (10..=60).step_by(10) {
+            grid.refresh(&IDLE_THEN_BURST, NOW_MS + i64::from(minute) * 60_000, |_| 0.0, 0.0);
+        }
+        // The burst: every site carrying its capacity again, and queueing, as a burst does.
+        let mut burst = grid.refresh(&IDLE_THEN_BURST, NOW_MS + hour_ms, |spec| spec.capacity, 2.0);
+        for nth in 1..6 {
+            burst = grid.refresh(
+                &IDLE_THEN_BURST,
+                NOW_MS + hour_ms + nth * 1_000,
+                |spec| spec.capacity,
+                2.0,
+            );
+        }
+        let ceilings: Vec<f64> = burst.candidates.iter().filter_map(|site| site.capacity).collect();
+        let carried: Vec<f64> = IDLE_THEN_BURST.iter().map(|spec| spec.capacity).collect();
+        let taught_back = ceilings
+            .iter()
+            .zip(&carried)
+            .any(|(ceiling, capacity)| *ceiling > capacity / 2.0);
+        assert!(
+            taught_back,
+            "every site carried its capacity through the burst and none taught a ceiling \
+             above half of it: ceilings {ceilings:?} against capacities {carried:?}. \
+             Saturation is read against those ceilings"
+        );
+    }
+
+    /// A quarter load held half an hour reads a quarter saturated, not full: nothing brings the
+    /// ceiling down to meet the load.
+    #[test]
+    fn a_steady_quarter_load_stays_a_quarter_saturated() {
+        let sites = EQUAL_CAPACITY;
+        let quarter = |spec: &SiteSpec| spec.capacity / 4.0;
+        let mut grid = Harness::new(WINDOW_MS);
+        // The site has carried its capacity, so that is what it has learned.
+        grid.refresh(&sites, NOW_MS, |spec| spec.capacity, 0.0);
+        // Then a steady quarter of it, with nothing queued: the site is comfortable.
+        let mut snapshot = grid.refresh(&sites, NOW_MS + 5_000, quarter, 0.0);
+        for minute in 1..=30 {
+            snapshot = grid.refresh(&sites, NOW_MS + i64::from(minute) * 60_000, quarter, 0.0);
+        }
+        let ceilings: Vec<f64> = snapshot.candidates.iter().filter_map(|site| site.capacity).collect();
+        let rhos: Vec<f64> = snapshot.candidates.iter().filter_map(|site| site.rho).collect();
+        // A site holding a quarter of what it can hold is a quarter saturated. Anything
+        // approaching 1.0 is the ceiling having fallen to meet the load.
+        let worst = rhos.iter().fold(0.0_f64, |a, b| a.max(*b));
+        assert!(
+            worst < 0.5,
+            "every site has run a steady quarter of its capacity with an empty queue for half \
+             an hour, and reads {worst:.2} saturated rather than 0.25: ceilings {ceilings:?} \
+             against a capacity of 80, saturation {rhos:?}"
         );
     }
 }

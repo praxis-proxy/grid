@@ -192,14 +192,14 @@ impl RouteSnapshot {
     /// The site's learned ceiling, smoothed saturation, and fullness from its own in-flight
     /// count, or `None` when it publishes no in-flight sample in the window.
     ///
-    /// The ceiling is the most the site has held, decaying with `ceiling_half_life_ms` so a site that
-    /// shrank is not judged against a peak it no longer reaches, and floored so a quiet site
-    /// does not read as full. Saturation is in-flight over that ceiling, smoothed so one new
-    /// sample moves it by `smoothing` rather than all the way; a refresh that brings no
-    /// new sample leaves it where it was. Full is at the ceiling with a backlog, by `recent`,
-    /// for `full_after_ms`; room is no sample in `recent` showing that. The smoothing, and
-    /// reading an absent sample as absent rather than as zero load, follow Brent Salisbury's
-    /// pressure-weighted placement; the learned ceiling in place of a declared capacity is new.
+    /// The ceiling is the most the site has held with nothing waiting, floored and only ever
+    /// rising. Saturation is in-flight over it, smoothed so one new sample moves it by
+    /// `smoothing`; a refresh with no new sample leaves it alone. Full is at the ceiling with a
+    /// backlog for `full_after_ms`; room is no sample in `recent` showing that.
+    ///
+    /// The smoothing, and reading an absent sample as absent rather than as zero load, follow
+    /// Brent Salisbury's pressure-weighted placement. The learned ceiling in place of a
+    /// declared capacity is new.
     fn measured<S: SiteSignals>(
         candidate: &RouteCandidate,
         reading: &SiteReading,
@@ -212,7 +212,7 @@ impl RouteSnapshot {
         // The newest sample at or before now is the epoch a smoothing step belongs to.
         let sample_at = reading.sampled_at.map(|at| at.min(inputs.now_ms));
         let previous = inputs.learned.0.get(&key).copied();
-        let ceiling = ceiling(previous, reading, inputs.now_ms, availability);
+        let ceiling = ceiling(previous, reading, availability);
         let raw = (in_flight / ceiling).clamp(0.0, 1.0);
         let rho = smoothed(previous, sample_at, raw, availability.smoothing);
         // Congested: at the ceiling at an instant within the settling time that also had a
@@ -382,12 +382,11 @@ type SitePair = (Arc<str>, Arc<str>);
 /// What one site's own load has taught the gateway: its running ceiling and smoothed saturation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SiteLearned {
-    /// The most requests the site has been seen to hold, decayed by
-    /// [`AvailabilitySettings::ceiling_half_life_ms`].
+    /// The most requests the site has been seen to hold with nothing waiting.
     ceiling: f64,
     /// Saturation against that ceiling, smoothed by [`AvailabilitySettings::smoothing`].
     rho: f64,
-    /// When `ceiling` was last updated, for the decay.
+    /// When the site was last measured, so a spell does not resume across a gap.
     at_ms: i64,
     /// The newest sample the saturation was smoothed from, so a refresh with nothing new
     /// does not smooth again.
@@ -440,19 +439,21 @@ fn smoothed(prior: Option<SiteLearned>, sample_at: Option<i64>, raw: f64, alpha:
     }
 }
 
-/// The ceiling `reading` teaches over what `prior` held, decayed, and floored.
+/// The ceiling `reading` teaches over what `prior` held, floored. It only rises: the event a
+/// clock would approximate, a site that lost serving units, is published.
 ///
-/// In-flight counts what the engine holds waiting as well as running, so a sample taken with
-/// one whole request waiting anywhere, at the site, at its busiest unit, or held before
-/// scheduling, measures the backlog, not the capacity, and teaches no ceiling. It still reads
+/// In-flight counts waiting as well as running, so a sample with one whole request waiting
+/// anywhere measures the backlog rather than the capacity and teaches nothing. It still reads
 /// against the ceiling learned while nothing waited, where it saturates.
-fn ceiling(prior: Option<SiteLearned>, reading: &SiteReading, now_ms: i64, availability: &AvailabilitySettings) -> f64 {
-    let decayed = prior.map_or(0.0, |prior| decayed(prior, now_ms, availability.ceiling_half_life_ms));
+fn ceiling(prior: Option<SiteLearned>, reading: &SiteReading, availability: &AvailabilitySettings) -> f64 {
     let waiting = [reading.queued, reading.deepest_queue, reading.held]
         .into_iter()
         .any(|queue| queue.is_some_and(|queue| queue >= 1.0));
     let taught = if waiting { 0.0 } else { reading.in_flight.unwrap_or(0.0) };
-    decayed.max(taught).max(availability.ceiling_floor)
+    prior
+        .map_or(0.0, |prior| prior.ceiling)
+        .max(taught)
+        .max(availability.ceiling_floor)
 }
 
 /// When the site's current spell of congestion began, if it is congested at `now_ms`: carried
@@ -465,13 +466,6 @@ fn congested_since(prior: Option<SiteLearned>, congested: bool, now_ms: i64, win
             .and_then(|prior| prior.full_since)
             .unwrap_or(now_ms)
     })
-}
-
-/// `prior`'s ceiling after the time since it was set, halving every `half_life_ms`.
-fn decayed(prior: SiteLearned, now_ms: i64, half_life_ms: i64) -> f64 {
-    let elapsed = u32::try_from(now_ms.saturating_sub(prior.at_ms).max(0)).unwrap_or(u32::MAX);
-    let half_lives = f64::from(elapsed) / f64::from(u32::try_from(half_life_ms).unwrap_or(u32::MAX));
-    prior.ceiling * 0.5_f64.powf(half_lives)
 }
 
 /// Set `grid_route_site_score` for one site/cluster pair.
@@ -1414,8 +1408,7 @@ mod tests {
             Some(1.0),
             "at its ceiling a site reads as full"
         );
-        // Load falls to 10 against the remembered ceiling (40, less one second of decay):
-        // rho moves by AvailabilitySettings::default().smoothing toward 10/ceiling rather than all the way.
+        // Load falls to 10 against the remembered 40: rho moves by `smoothing`, not all the way.
         with_in_flight(&store, "a", 10.0, 2_000);
         let later = RouteSnapshot::from_store(
             one("a"),
@@ -1432,7 +1425,7 @@ mod tests {
         let ceiling = later.candidates[0].capacity.unwrap();
         assert!(
             (ceiling - 40.0).abs() < 0.1,
-            "one second barely decays a 10 minute half-life: {ceiling}"
+            "a fallen load does not move the ceiling the site taught: {ceiling}"
         );
         let rho = later.candidates[0].rho.unwrap();
         let expected = 10.0 / ceiling * AvailabilitySettings::default().smoothing
@@ -1495,45 +1488,42 @@ mod tests {
     }
 
     #[test]
-    fn the_ceiling_decays_by_its_half_life_once_load_falls_away() {
+    fn a_ceiling_outlives_the_load_that_taught_it() {
         let store = LoadStore::new(Duration::from_secs(60));
         let mut learned = Learned::default();
+        let refresh = |now_ms: i64, state: &mut Learned| {
+            RouteSnapshot::from_store(
+                one("a"),
+                Arc::from("hub"),
+                &mut Inputs {
+                    signals: &store,
+                    now_ms,
+                    window_ms: 500,
+                    horizon_ms: 500,
+                    availability: &AvailabilitySettings::default(),
+                    learned: state,
+                },
+            )
+        };
         with_in_flight(&store, "a", 80.0, 1_000);
-        RouteSnapshot::from_store(
-            one("a"),
-            Arc::from("hub"),
-            &mut Inputs {
-                signals: &store,
-                now_ms: 1_000,
-                window_ms: 30_000,
-                horizon_ms: 30_000,
-                availability: &AvailabilitySettings::default(),
-                learned: &mut learned,
-            },
+        let mut snapshot = refresh(1_000, &mut learned);
+        assert_eq!(
+            snapshot.candidates[0].capacity,
+            Some(80.0),
+            "the first sample teaches 80"
         );
-        with_in_flight(
-            &store,
-            "a",
-            10.0,
-            1_000 + AvailabilitySettings::default().ceiling_half_life_ms,
+        for minute in 1..=10 {
+            let at_ms = 1_000 + i64::from(minute) * 60_000;
+            with_in_flight(&store, "a", 8.0, at_ms);
+            snapshot = refresh(at_ms, &mut learned);
+        }
+        assert_eq!(
+            snapshot.candidates[0].capacity,
+            Some(80.0),
+            "ten minutes at a tenth of the load must not bring the taught ceiling down"
         );
-        let snap = RouteSnapshot::from_store(
-            one("a"),
-            Arc::from("hub"),
-            &mut Inputs {
-                signals: &store,
-                now_ms: 1_000 + AvailabilitySettings::default().ceiling_half_life_ms,
-                window_ms: 500,
-                horizon_ms: 500,
-                availability: &AvailabilitySettings::default(),
-                learned: &mut learned,
-            },
-        );
-        let ceiling = snap.candidates[0].capacity.unwrap();
-        assert!(
-            (ceiling - 40.0).abs() < 1e-6,
-            "80 halves to 40 after one half-life: {ceiling}"
-        );
+        let rho = snapshot.candidates[0].rho.unwrap();
+        assert!(rho < 0.2, "a tenth of the taught ceiling reads light, not full: {rho}");
     }
 
     #[test]

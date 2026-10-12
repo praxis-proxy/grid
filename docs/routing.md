@@ -638,8 +638,7 @@ praxis config, rendered from the chart's `gridServing.siteRoute.availability`, a
 | key | default | what it does |
 |---|---|---|
 | `smoothing` | 0.3 | How far one new sample moves saturation toward the new reading. |
-| `ceiling_half_life_ms` | 600000 | How long a learned ceiling takes to halve once load falls away. |
-| `ceiling_floor` | 8 | The least a ceiling can be, so a quiet site does not read as full. |
+| `ceiling_floor` | 8 | The least a ceiling can be, so a quiet site does not read as full. A ceiling only rises; nothing brings it down. |
 | `explore_floor` | 0.25 | The least share of the largest ceiling a measured site weighs, so an unproven site can prove more. |
 | `full_after_ms` | 5000 | How long a site stays at its ceiling with work waiting before it counts as full, the same for a site polled every 500 ms and one polled every 5 s. |
 | `room_after_ms` | 2000 | How long no sample may show a site at its ceiling with work waiting before a shedding model routes again. |
