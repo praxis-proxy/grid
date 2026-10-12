@@ -140,7 +140,13 @@ helm upgrade grid-operator charts/grid-operator -n grid --reuse-values \
 ```bash
 oc get gridsites                 # every site, on the hub
 oc get svc -n grid               # swim UDP and signals TCP, each with an address
+oc get gridnetworks -o custom-columns=NAME:.metadata.name,SEEDS:.spec.seeds,SITES:.status.connectedSites
 ```
+
+On every cluster, `SEEDS` must list the other sites' SWIM Service endpoints and
+`SITES` must become nonzero. Empty `spec.seeds` is valid for a standalone site
+and can report `Active`, so the phase alone does not prove the second pass
+finished.
 
 Then send a datagram to 7946/UDP and open 9091/TCP between every pair. UDP has no
 handshake, so a connect proves nothing.
