@@ -49,8 +49,11 @@ and avoids Helm 3.19 and later deleting earlier successful hooks when a later
 hook fails. If you uninstall the release and want to remove the privileged
 bootstrap identity, delete the `ServiceAccount`, `Role`, and `RoleBinding`
 named `<release>-grid-enrollment-ca-bootstrap` in the release namespace. When
-`hubSite.name` is set, also delete the matching `-hub-site` `Role` and
-`RoleBinding` in the hub-site namespace. Retry a failed bootstrap with
+`hubSite.name` is set, delete the matching `-hub-site` `Role` and `RoleBinding`
+in the hub-site namespace on every uninstall, before deleting the release
+namespace: they name the ServiceAccount only by namespace and name, so
+whoever creates that namespace again inherits their access. Retry a failed
+bootstrap with
 `helm upgrade`, not by re-running the Job.
 
 `helm template` sees no cluster APIs, so `auto` renders no Route there. GitOps
