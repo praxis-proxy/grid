@@ -178,8 +178,9 @@ above with a persistent backend.
 
 ## Direction
 
-The flow above is what ships, driven by chart values and a Job that mints the
-invites. A platform install needs the same flow driven from objects: an invite
-as a SiteInvite the provider admin creates, carrying the approval mode and the
-site's jurisdictions, and the site's join as a Grid kind the operator acts on.
-Neither kind exists yet.
+The flow above ships, driven by chart values and a Job that mints invites. The
+`SiteInvite` schema now describes the signer-side invitation object, including
+the site's jurisdictions and optional public-key binding. Its enrollment
+service reconciliation and the joining site's Grid resource are not yet
+implemented. See [SiteInvite usage](crds.md#siteinvite) for the schema and
+current limitation.

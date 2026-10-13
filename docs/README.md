@@ -14,7 +14,7 @@
 - [Provider Scoring](architecture/scoring.md): metrics input, normalization,
   stale data, and scoring implementation.
 - [Custom Resource Definitions](architecture/crds.md): complete API fields
-  and defaults, including routing configuration.
+  and defaults, including the SiteInvite API and routing configuration.
 
 ## Architecture
 

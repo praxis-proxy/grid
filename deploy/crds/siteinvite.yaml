@@ -20,7 +20,7 @@ spec:
         - jsonPath: .status.expiresAt
           name: Expires
           type: date
-      name: v1beta1
+      name: v1alpha1
       schema:
         openAPIV3Schema:
           description: Auto-generated derived type for SiteInviteSpec via `CustomResource`

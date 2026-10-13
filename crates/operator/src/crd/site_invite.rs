@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, Serialize)]
 #[kube(
     group = "grid.praxis.fast",
-    version = "v1beta1",
+    version = "v1alpha1",
     kind = "SiteInvite",
     plural = "siteinvites",
     status = "SiteInviteStatus",
