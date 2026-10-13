@@ -772,10 +772,9 @@ is enough. Public https backends can instead take `upstreamCA`.
 
 ## Upgrading
 
-The `praxis-gateway` chart changes from 0.1.4 to 0.1.5 reject previous gateway
-value names rather than ignoring them. Migrate the values before `helm upgrade`.
-These are gateway chart values; the separate CRD field rename is not part of
-this branch.
+This chart rejects previous `praxis-gateway` value names rather than ignoring
+them. Migrate the values before `helm upgrade`. These are gateway chart values;
+the separate CRD field rename is not covered here.
 
 Use this mapping:
 
