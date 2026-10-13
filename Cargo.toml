@@ -98,7 +98,7 @@ tokio-rustls = { version = "0.26.0", default-features = false, features = ["logg
 toml = "1.1.4"
 tower = "0.5.3"
 tracing = "0.1.44"
-rand = { version = "0.9.0", features = ["small_rng"] }
+rand = { version = "0.10.3", features = ["small_rng"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 uuid = { version = "1.26.0", features = ["v4"] }
 x509-parser = "0.18.0"
