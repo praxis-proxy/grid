@@ -11,6 +11,10 @@ use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use certs::{DEFAULT_TRUST_DOMAIN, GridSpiffeServerVerifier};
+use grid_signals::{
+    Ingested,
+    feedback::{ACK_EPOCH, ACK_SEQUENCE, INGEST_PATH, IngestReport, REPORT_HEADERS},
+};
 use http::{Request, header};
 use http_body_util::Empty;
 use hyper_util::rt::TokioIo;
@@ -24,6 +28,7 @@ use tokio::{net::TcpStream, time::timeout};
 use tokio_rustls::TlsConnector;
 
 use crate::{
+    Reporter,
     poller::{FetchError, Scrape, SignalSource},
     scrape::read_scrape_response,
 };
@@ -41,6 +46,9 @@ pub enum MtlsError {
     /// The process installed no rustls crypto provider to build the client on.
     #[error("no rustls crypto provider installed")]
     NoProvider,
+    /// The installed crypto provider could not supply process entropy.
+    #[error("gateway reporter entropy unavailable")]
+    Entropy,
 }
 
 /// Scrapes one peer's signals endpoint over grid mTLS, per poll.
@@ -63,6 +71,8 @@ pub struct PeerScraper {
     connect_timeout: Duration,
     /// Bound on the request/response.
     request_timeout: Duration,
+    /// Shared process evidence, absent for ordinary peer readers.
+    reporter: Option<Arc<Reporter>>,
 }
 
 impl PeerScraper {
@@ -120,17 +130,37 @@ impl PeerScraper {
             expected_target: expected_target.to_owned(),
             connect_timeout,
             request_timeout,
+            reporter: None,
         })
     }
-}
 
-impl SignalSource for PeerScraper {
+    /// Enable process-scoped feedback only for this reporter's verified operator.
+    #[must_use]
+    pub fn with_reporter(mut self, reporter: Arc<Reporter>) -> Self {
+        if self.expected_target == reporter.target {
+            self.reporter = Some(reporter);
+        }
+        self
+    }
+
+    /// Open and authorize a fresh connection before sending a bounded request.
+    async fn request(
+        &self,
+        report: Option<&IngestReport>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, FetchError> {
+        self.exchange(report).await
+    }
+
+    /// Exchange a request while freshly authenticating the dialed operator.
     #[expect(
         clippy::too_many_lines,
         clippy::large_stack_frames,
-        reason = "sequential connect, handshake, authorize, request, read over rustls/hyper types"
+        reason = "sequential authenticated TLS/HTTP exchange"
     )]
-    async fn fetch(&self) -> Result<Scrape, FetchError> {
+    async fn exchange(
+        &self,
+        report: Option<&IngestReport>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, FetchError> {
         let tcp = timeout(self.connect_timeout, TcpStream::connect(&self.addr))
             .await
             .map_err(|_elapsed| FetchError::Unreachable(format!("connect timed out to {}", self.addr)))?
@@ -169,10 +199,20 @@ impl SignalSource for PeerScraper {
             }
         });
 
-        let request = Request::builder()
-            .method(http::Method::GET)
-            .uri(&self.path)
-            .header(header::HOST, &self.authority)
+        let mut request = Request::builder()
+            .method(if report.is_some() {
+                http::Method::POST
+            } else {
+                http::Method::GET
+            })
+            .uri(report.map_or(self.path.as_str(), |_| INGEST_PATH))
+            .header(header::HOST, &self.authority);
+        if let Some(report) = report {
+            for (name, value) in REPORT_HEADERS.into_iter().zip(report.values()) {
+                request = request.header(name, value);
+            }
+        }
+        let request = request
             .body(Empty::<Bytes>::new())
             .map_err(|error| FetchError::Unreachable(error.to_string()))?;
 
@@ -181,10 +221,87 @@ impl SignalSource for PeerScraper {
             .map_err(|_elapsed| FetchError::Unreachable("request timed out".to_owned()))?
             .map_err(|error| FetchError::Unreachable(format!("request: {error}")))?;
 
-        let scraped = read_scrape_response(response, Arc::from(verified_id), self.request_timeout).await;
-        driver.abort();
-        scraped
+        drop(driver);
+        Ok(response)
     }
+}
+
+impl SignalSource for PeerScraper {
+    async fn fetch(&self) -> Result<Scrape, FetchError> {
+        let response = self.request(None).await?;
+        read_scrape_response(response, Arc::from(self.expected_target.as_str()), self.request_timeout).await
+    }
+
+    fn report(&self, ingested: Option<Ingested>) -> impl Future<Output = ()> + Send {
+        let pending = self.reporter.as_ref().and_then(|reporter| reporter.observe(ingested));
+        async move {
+            let (Some(reporter), Some(report)) = (&self.reporter, pending) else {
+                return;
+            };
+            let result = timeout(self.request_timeout, self.request(Some(&report)))
+                .await
+                .map_err(|_elapsed| FeedbackFailure::Timeout)
+                .and_then(|response| response.map_err(|_error| FeedbackFailure::Transport));
+            complete_report(reporter, &report, result);
+        }
+    }
+}
+
+/// Bounded failure classes; report identities and receiver contents are never labels.
+enum FeedbackFailure {
+    /// The feedback exchange exceeded its total budget.
+    Timeout,
+    /// Connection, authentication, or HTTP exchange failed.
+    Transport,
+    /// The receiver did not return the required status.
+    Status,
+    /// The receiver omitted, repeated, or mismatched acknowledgment metadata.
+    Acknowledgment,
+}
+
+impl FeedbackFailure {
+    /// Stable Prometheus reason label for one failed delivery attempt.
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::Status => "status",
+            Self::Acknowledgment => "acknowledgment",
+        }
+    }
+}
+
+/// Acknowledge only a matching success; count one failure while retaining retry evidence.
+fn complete_report<Body>(
+    reporter: &Reporter,
+    report: &IngestReport,
+    result: Result<http::Response<Body>, FeedbackFailure>,
+) {
+    let failure = match result {
+        Ok(response) if response.status() != http::StatusCode::NO_CONTENT => Some(FeedbackFailure::Status),
+        Ok(response) if !matches_ack(response.headers(), report) => Some(FeedbackFailure::Acknowledgment),
+        Ok(_response) => {
+            reporter.acknowledge(report);
+            None
+        },
+        Err(failure) => Some(failure),
+    };
+    if let Some(failure) = failure {
+        metrics::counter!("grid_signals_feedback_failures_total", "reason" => failure.as_str()).increment(1);
+    }
+}
+
+/// Require one exact value for each acknowledgment scalar.
+fn matches_ack(headers: &http::HeaderMap, report: &IngestReport) -> bool {
+    [
+        (ACK_EPOCH, report.epoch.clone()),
+        (ACK_SEQUENCE, report.sequence.to_string()),
+    ]
+    .into_iter()
+    .all(|(name, expected)| {
+        let mut values = headers.get_all(name).iter();
+        values.next().and_then(|value| value.to_str().ok()) == Some(expected.as_str()) && values.next().is_none()
+    })
 }
 
 #[cfg(test)]
@@ -247,6 +364,336 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         });
         addr
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_real_mutual_poll_reports_skew_then_clean_in_same_cycle() {
+        install_ring();
+        let ca = generate_ca("grid-ca").expect("ca");
+        let site = generate_site_cert(&ca, "east").expect("site");
+        let (server_chain, server_key) = material(&site.cert_pem, &site.key_pem);
+        let (client_chain, client_key) = material(&site.cert_pem, &site.key_pem);
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(ca.cert_pem.as_bytes()).expect("root"))
+            .expect("root");
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .expect("verifier");
+        let config = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(server_chain.clone(), server_key)
+            .expect("server");
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::clone(&observed);
+        let server = tokio::spawn(async move {
+            let mut gets = 0;
+            for _connection in 0..4 {
+                let (tcp, _) = listener.accept().await.expect("accept");
+                let mut tls = acceptor.accept(tcp).await.expect("mutual tls");
+                assert_eq!(
+                    tls.get_ref().1.peer_certificates(),
+                    Some(server_chain.as_slice()),
+                    "same site certificate proves local gateway"
+                );
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    tls.read_exact(&mut byte).await.expect("request");
+                    head.extend(byte);
+                    assert!(head.len() < 8192);
+                }
+                let head = String::from_utf8(head).expect("ascii");
+                let response = if head.starts_with("GET ") {
+                    gets += 1;
+                    let stamp = if gets == 1 { 21_000 } else { 1_000 };
+                    let body = format!("queue_depth{{grid_site=\"east\",grid_provider=\"pool\"}} 3 {stamp}\n");
+                    format!(
+                        "HTTP/1.1 200 OK\r\nDate: Thu, 01 Jan 1970 00:00:01 GMT\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    assert!(head.starts_with("POST /v1/site/signals/ingest "));
+                    let value = |name: &str| {
+                        head.lines()
+                            .find_map(|line| {
+                                line.split_once(": ")
+                                    .filter(|(key, _)| *key == name)
+                                    .map(|(_, value)| value.to_owned())
+                            })
+                            .expect("report header")
+                    };
+                    let epoch = value(ACK_EPOCH);
+                    let sequence = value(ACK_SEQUENCE);
+                    let skew = value("x-grid-ingest-skew");
+                    let rejected = value("x-grid-ingest-rejected");
+                    recording
+                        .lock()
+                        .expect("recording")
+                        .push((sequence.clone(), skew, rejected));
+                    format!(
+                        "HTTP/1.1 204 No Content\r\n{ACK_EPOCH}: {epoch}\r\n{ACK_SEQUENCE}: {sequence}\r\nConnection: close\r\n\r\n"
+                    )
+                };
+                tls.write_all(response.as_bytes()).await.expect("write");
+                tls.flush().await.expect("flush");
+            }
+        });
+        let reporter = Arc::new(Reporter::new(spiffe_id("east")).expect("reporter"));
+        let source = PeerScraper::new(
+            ca.cert_pem.as_bytes(),
+            client_chain,
+            client_key,
+            &addr,
+            sni(),
+            "east.grid.internal",
+            "/v1/site/signals",
+            &spiffe_id("east"),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .expect("source")
+        .with_reporter(reporter);
+        let store = grid_signals::LoadStore::new(Duration::from_secs(30));
+        for expected in [1, 0] {
+            let scrape = source.fetch().await.expect("scrape");
+            let ingested = store.ingest_at(&scrape.body, scrape.date_ms, scrape.date_ms, "east");
+            assert_eq!(ingested.skewed, expected, "actual ingest is the observation");
+            source.report(Some(ingested)).await;
+        }
+        let recorded = observed.lock().expect("observed").clone();
+        server.abort();
+        assert_eq!(
+            recorded,
+            vec![
+                ("1".to_owned(), "1".to_owned(), "true".to_owned()),
+                ("2".to_owned(), "1".to_owned(), "false".to_owned())
+            ],
+            "bad and recovery reports complete in their ingest cycles"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsupported_feedback_retains_pending_bad_without_breaking_source() {
+        let recorder = FeedbackRecorder::new();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        install_ring();
+        let ca = generate_ca("grid-ca").expect("ca");
+        let site = generate_site_cert(&ca, "east").expect("site");
+        let (server_chain, server_key) = material(&site.cert_pem, &site.key_pem);
+        let (client_chain, client_key) = material(&site.cert_pem, &site.key_pem);
+        let addr = mock_tls_peer(
+            server_chain,
+            server_key,
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        )
+        .await;
+        let reporter = Arc::new(Reporter::new(spiffe_id("east")).expect("reporter"));
+        let source = PeerScraper::new(
+            ca.cert_pem.as_bytes(),
+            client_chain,
+            client_key,
+            &addr,
+            sni(),
+            "east.grid.internal",
+            "/v1/site/signals",
+            &spiffe_id("east"),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .expect("source")
+        .with_reporter(Arc::clone(&reporter));
+        source
+            .report(Some(Ingested {
+                skewed: 1,
+                ..Ingested::default()
+            }))
+            .await;
+        assert!(
+            reporter.observe(None).expect("pending evidence").rejected,
+            "unsupported delivery must retain rejection evidence"
+        );
+        assert_eq!(
+            recorder.count("status"),
+            1,
+            "one unsupported POST counts one delivery failure"
+        );
+    }
+
+    #[test]
+    fn failed_feedback_counts_once_and_matching_success_retains_no_failure() {
+        install_ring();
+        let recorder = FeedbackRecorder::new();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let reporter = Reporter::new(spiffe_id("east")).expect("reporter");
+        let report = reporter
+            .observe(Some(Ingested {
+                skewed: 1,
+                ..Ingested::default()
+            }))
+            .expect("pending evidence");
+        for (result, reason) in [
+            (Err(FeedbackFailure::Timeout), "timeout"),
+            (Err(FeedbackFailure::Transport), "transport"),
+            (
+                Ok(feedback_response(&report, http::StatusCode::NOT_FOUND, Some("1"))),
+                "status",
+            ),
+            (
+                Ok(feedback_response(&report, http::StatusCode::NO_CONTENT, None)),
+                "acknowledgment",
+            ),
+            (
+                Ok(feedback_response(&report, http::StatusCode::NO_CONTENT, Some("2"))),
+                "acknowledgment",
+            ),
+            (
+                Ok(feedback_response(&report, http::StatusCode::NO_CONTENT, Some("01"))),
+                "acknowledgment",
+            ),
+        ] {
+            let before = recorder.count(reason);
+            complete_report(&reporter, &report, result);
+            assert_eq!(
+                recorder.count(reason),
+                before + 1,
+                "each failed attempt counts once: {reason}"
+            );
+            assert_eq!(
+                reporter.observe(None),
+                Some(report.clone()),
+                "failed delivery preserves exact pending evidence"
+            );
+        }
+        let before = recorder.total();
+        complete_report(
+            &reporter,
+            &report,
+            Ok(feedback_response(&report, http::StatusCode::NO_CONTENT, Some("1"))),
+        );
+        assert!(
+            reporter.observe(None).is_none(),
+            "a matching success acknowledges pending evidence"
+        );
+        assert_eq!(recorder.total(), before, "a successful delivery adds no failure");
+    }
+
+    /// An empty feedback response with optional exact epoch and supplied sequence.
+    fn feedback_response(
+        report: &IngestReport,
+        status: http::StatusCode,
+        sequence: Option<&str>,
+    ) -> http::Response<()> {
+        let mut response = http::Response::builder().status(status);
+        if let Some(sequence) = sequence {
+            response = response.header(ACK_EPOCH, &report.epoch).header(ACK_SEQUENCE, sequence);
+        }
+        response.body(()).expect("response")
+    }
+
+    /// Thread-local failure counters that reject unbounded or report-derived labels.
+    struct FeedbackRecorder {
+        /// Exactly the documented bounded delivery reasons.
+        counts: std::collections::BTreeMap<&'static str, Arc<std::sync::atomic::AtomicU64>>,
+    }
+
+    impl FeedbackRecorder {
+        /// Start an isolated recorder for feedback assertions.
+        fn new() -> Self {
+            Self {
+                counts: ["timeout", "transport", "status", "acknowledgment"]
+                    .into_iter()
+                    .map(|reason| (reason, Arc::default()))
+                    .collect(),
+            }
+        }
+
+        /// Current count for a documented reason.
+        fn count(&self, reason: &str) -> u64 {
+            self.counts
+                .get(reason)
+                .expect("bounded reason")
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Total emitted failure attempts.
+        fn total(&self) -> u64 {
+            self.counts.keys().map(|reason| self.count(reason)).sum()
+        }
+    }
+
+    impl metrics::Recorder for FeedbackRecorder {
+        fn describe_counter(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_gauge(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_histogram(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn register_counter(&self, key: &metrics::Key, _metadata: &metrics::Metadata<'_>) -> metrics::Counter {
+            assert_eq!(
+                key.name(),
+                "grid_signals_feedback_failures_total",
+                "feedback emits the documented counter"
+            );
+            let labels: Vec<_> = key.labels().collect();
+            assert_eq!(labels.len(), 1, "feedback must have only one bounded label");
+            let label = labels.first().expect("reason label");
+            assert_eq!(label.key(), "reason", "report contents must never be labels");
+            metrics::Counter::from_arc(Arc::clone(self.counts.get(label.value()).expect("bounded reason")))
+        }
+
+        fn register_gauge(&self, _key: &metrics::Key, _metadata: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+
+        fn register_histogram(&self, _key: &metrics::Key, _metadata: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn ambiguous_or_mismatched_acknowledgments_are_refused() {
+        let report = IngestReport {
+            replica: "gateway".to_owned(),
+            epoch: "a".repeat(32),
+            sequence: 1,
+            skew: 1,
+            rejected: true,
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(ACK_EPOCH, http::HeaderValue::from_str(&report.epoch).expect("epoch"));
+        headers.insert(ACK_SEQUENCE, http::HeaderValue::from_static("1"));
+        assert!(matches_ack(&headers, &report));
+        headers.append(ACK_SEQUENCE, http::HeaderValue::from_static("2"));
+        assert!(!matches_ack(&headers, &report));
+        headers.insert(ACK_SEQUENCE, http::HeaderValue::from_static("01"));
+        assert!(!matches_ack(&headers, &report));
     }
 
     fn ok_response() -> Vec<u8> {

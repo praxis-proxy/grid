@@ -39,3 +39,40 @@ At Tech Preview one operator serves one `GridNetwork`, and it fails to start on
 more than one rather than pick a mode for the process-global serve and poll
 paths. A reader treats a missing signal as neutral, not zero, per the signal
 mapping reference.
+
+## Gateway ingest feedback
+
+The local gateway reports completed ingests with an empty-body
+`POST /v1/site/signals/ingest` on the same authenticated signals listener. The
+server accepts only the site's own certificate (`Local`), in both pin and SPIFFE
+modes. A remote peer cannot submit gateway evidence. The report's replica label
+is diagnostic; the TLS connection supplies authorization.
+
+Version 1 uses exactly one value for each of these headers:
+
+| Header | Value |
+|---|---|
+| `x-grid-ingest-version` | `1` |
+| `x-grid-ingest-replica` | 1-128 ASCII letters, digits, dots, underscores, or hyphens |
+| `x-grid-ingest-epoch` | 32 lowercase hexadecimal characters from a random process identity |
+| `x-grid-ingest-sequence` | Positive signed 64-bit report sequence |
+| `x-grid-ingest-skew` | Non-negative signed 64-bit cumulative skew-drop count |
+| `x-grid-ingest-rejected` | `true` or `false` |
+
+The maximum sequence or counter is reserved for terminal rejected evidence;
+it cannot carry a clean report. Malformed, repeated, unsupported, or oversized
+metadata and nonempty bodies are refused. The entire server operation has a
+five-second budget, including body reading, admission, and Kubernetes writes.
+
+A `204` response echoes `x-grid-ingest-epoch` and `x-grid-ingest-sequence` only
+after the report and resulting condition have been persisted together. A
+counter increase establishes rejection even when the flag claims clean. A
+strictly newer clean report with the same cumulative counter clears only that
+process's evidence. Exact duplicates are idempotent and do not renew freshness;
+replays, changed duplicates, and decreasing counters are refused.
+
+Older gateways continue their GET-only polling. Older operators refuse the POST
+without acknowledging it. Polling remains available in either mixed-version
+case, but gateway conditions require both components and the updated
+GridNetwork CRD. The gateway retains unacknowledged evidence while feedback is
+unsupported or unavailable.

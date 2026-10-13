@@ -9,6 +9,9 @@ mod mtls;
 mod poller;
 mod scrape;
 
+mod feedback;
+
+pub use feedback::Reporter;
 pub use mtls::{MtlsError, PeerScraper};
 pub use poller::{
     FetchError, PinnedTls, PollHandle, PollerConfig, Scrape, SignalSource, build_url, deserialize_interval_ms, spawn,

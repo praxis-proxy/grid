@@ -8,6 +8,9 @@
 
 pub mod exposition;
 
+/// Gateway ingest feedback wire vocabulary.
+pub mod feedback;
+
 mod signals;
 
 pub use signals::{Combine, CombinePolicy, Ingested, LoadStore, Sample, now_ms};

@@ -16,7 +16,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use certs::spiffe_id;
-use grid_signals_client::{PeerScraper, spawn_on_thread_held};
+use grid_signals_client::{PeerScraper, Reporter, spawn_on_thread_held};
 use praxis_filter::FilterError;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
 use serde::{Deserialize, Serialize};
@@ -317,8 +317,12 @@ pub fn spawn_grid_routing(
 ) -> Result<GridRuntime, FilterError> {
     // The peer scrapers load TLS here, before the server installs the provider.
     praxis_tls::provider::install();
-    let start = Box::new(|peer: &PeerServingConfig, poller: &_, store, refresh| {
-        let scraper = build_scraper(peer)?;
+    let reporter = Arc::new(
+        Reporter::new(spiffe_id(&config.local_site))
+            .map_err(|error| -> FilterError { format!("grid: building ingest reporter: {error}").into() })?,
+    );
+    let start = Box::new(move |peer: &PeerServingConfig, poller: &_, store, refresh| {
+        let scraper = build_scraper(peer)?.with_reporter(Arc::clone(&reporter));
         spawn_on_thread_held(store, poller, scraper, refresh)
             .map_err(|error| -> FilterError { format!("grid: spawning poller for {}: {error}", peer.site).into() })
     });
