@@ -66,22 +66,23 @@ The explicit modes are:
 ### TLS to upstreams
 
 `gridIdentity.tlsSecretName` mounts the Secret containing `tls.crt` and `tls.key`;
-`gridIdentity.caSecretName` mounts the Secret containing `ca.crt`. Setting
-`tlsSecretName` requires `caSecretName`. Use the same name for both when one Secret
-holds all three files.
+`gridIdentity.caSecretName` mounts the Secret containing `ca.crt`. When it is empty,
+the chart reads `ca.crt` from `gridIdentity.tlsSecretName`. Set it only when the CA
+is in a separate Secret.
 These values do not add TLS settings to `praxis.yaml`.
 
 - **BYO:** Your `praxis.yaml` controls transport. For mTLS, set
-  `gridIdentity.tlsSecretName` and `gridIdentity.caSecretName`, and point cluster TLS paths
-  to `gridIdentity.mountPath`.
+  `gridIdentity.tlsSecretName`; set `gridIdentity.caSecretName` only when the CA is in
+  another Secret, and point cluster TLS paths to `gridIdentity.mountPath`.
 - **Operator:** `clusterEndpoints[].transport.mode: mutual_tls` makes the operator
   write those file paths into `praxis.yaml`. Set `gridIdentity.tlsSecretName` to the
-  site identity Secret and `gridIdentity.caSecretName` to the Grid CA Secret.
+  site identity Secret and set `gridIdentity.caSecretName` only when the Grid CA is
+  separate.
   `gridIdentity.mountPath` must equal
   `consumerConfig.tlsCertMountPath`
   (default: `/etc/praxis/tls`).
-- **Render:** Set `gridIdentity.tlsSecretName` and
-  `gridIdentity.caSecretName` to use mTLS. A remote-site backend without
+- **Render:** Set `gridIdentity.tlsSecretName` to use mTLS. Set
+  `gridIdentity.caSecretName` only when the CA is separate. A remote-site backend without
   `transport.mode` uses `mutual_tls` when the identity Secret is set. Without
   that identity, omitting `transport.mode` fails the install. Set the identity
   for mTLS or select `plaintext` explicitly when cleartext is intended.
@@ -274,7 +275,7 @@ Praxis AI image; these values may advance independently.
 | `praxisConfig.render.model` | string | **required** for a consumer without `praxisConfig.render.gridServing` | Model advertised on the routing candidates. |
 | `praxisConfig.render.backends` | map | **required** when rendered | Backends keyed by site, each with `endpoint` and optional `healthCheck` and `transport`. A consumer's key is the site it reaches over mutual TLS. A provider's `local` key is its one plaintext backend. The older list of `cluster`, `endpoints` entries still renders. |
 | `praxisConfig.render.backends[].site` | string | `grid.siteName` | Grid site the backend serves. A consumer's remote `mutual_tls` backend must name it, and it must differ from `grid.siteName`. Its `transport.sni` defaults to `<site>.grid.internal`. |
-| `praxisConfig.render.backends[].transport` | object | Remote site: `mutual_tls` with Grid identity; otherwise set `mode` explicitly. Provider local backend: `plaintext`. | `mode`: `mutual_tls` presents the grid identity and verifies with `gridIdentity.caSecretName`; `tls` verifies the server cert with no client cert; `plaintext` is cleartext. `sni` names the peer cert (required for `mutual_tls` and for `tls` to an IP endpoint). `ca` (`configMapName` or `secretName`, `key`) is the CA for a `tls` backend. A `tls` backend trusts, first match wins: `transport.ca`, then `upstreamCA`, then the process store, which is the `auth.validateCA` bundle when that is set. |
+| `praxisConfig.render.backends[].transport` | object | Remote site: `mutual_tls` with Grid identity; otherwise set `mode` explicitly. Provider local backend: `plaintext`. | `mode`: `mutual_tls` presents the grid identity and verifies with `gridIdentity.caSecretName`, or `gridIdentity.tlsSecretName` when the CA name is empty; `tls` verifies the server cert with no client cert; `plaintext` is cleartext. `sni` names the peer cert (required for `mutual_tls` and for `tls` to an IP endpoint). `ca` (`configMapName` or `secretName`, `key`) is the CA for a `tls` backend. A `tls` backend trusts, first match wins: `transport.ca`, then `upstreamCA`, then the process store, which is the `auth.validateCA` bundle when that is set. |
 | `praxisConfig.render.backends[].connectTimeoutMs` | int | praxis default | Connect timeout, at most `totalConnectTimeoutMs` when you set both. |
 | `praxisConfig.render.backends[].trustPrivate` | bool | `false` | Let the backend's hostname endpoints resolve to private addresses. Needs a praxis build with `trusted_private_endpoints`, which 0.7.x lacks. Over plaintext it also needs `allowPlaintextTrust`. |
 | `praxisConfig.render.role` | string | `consumer` | `provider` serves grid peers on the grid identity and forwards to one local backend. |
@@ -328,15 +329,15 @@ Praxis AI image; these values may advance independently.
 | `overlay.sidecar.image.pullPolicy` | string | `IfNotPresent` | Overlay-sync image pull policy. |
 | `overlay.sidecar.dataKey` | string | `routing-overlay.json` | Content-addressed envelope key in the overlay ConfigMap. |
 | `overlay.sidecar.resources` | object | small requests and limits | Resources for both the one-shot init container and continuous sidecar. |
-| `praxisConfig.render.gridServing.enabled` | bool | `false` | Mount the operator's serving config, set `GRID_SERVING_CONFIG`, and route with `grid_site_route`. Consumer role and `image.flavor: grid-gateway` only. Needs `gridIdentity.tlsSecretName` and `gridIdentity.caSecretName`. |
+| `praxisConfig.render.gridServing.enabled` | bool | `false` | Mount the operator's serving config, set `GRID_SERVING_CONFIG`, and route with `grid_site_route`. Consumer role and `image.flavor: grid-gateway` only. Needs `gridIdentity.tlsSecretName`; its CA defaults to that Secret. |
 | `praxisConfig.render.gridServing.networkName` | string | `""` | GridNetwork name, which with `gatewayRefName` names the operator's ConfigMap. |
 | `praxisConfig.render.gridServing.gatewayRefName` | string | release fullname | This gateway's name in the GridNetwork `gatewayRefs`. |
 | `praxisConfig.render.gridServing.configMapName` | string | `""` | Overrides `grid-serving-<networkName>-<gatewayRefName>`. Needed when that name passes 63 characters. |
 | `praxisConfig.render.gridServing.mountPath` | string | `/etc/praxis/grid-serving` | Mount directory for the ConfigMap. |
 | `praxisConfig.render.gridServing.siteRoute.availability` | object | `{}` | Site availability, rendered into the `grid_site_route` filter block with keys snake_case as the filter reads them (`shedding`, `smoothing`, `ceiling_half_life_ms`, `ceiling_floor`, `explore_floor`, `full_after_ms`, `room_after_ms`, `queue_full`). Every field defaults and `shedding` is the one switch. See `examples/gateway/grid-site-route.yaml`. |
 | `praxisConfig.render.gridServing.siteRoute.prefixAffinity` | object | `{}` | Prefix affinity tuning rendered as the filter's `prefix_affinity` (`enabled`, `threshold`, `exploration`, `prefill_tokens_per_second`, `queued_request_seconds`, `tag_key_path`). |
-| `gridIdentity.tlsSecretName` | string | `""` | Secret with `tls.crt` and `tls.key`. Non-empty mounts the identity and makes implicit render transports use mTLS. Requires `gridIdentity.caSecretName`. |
-| `gridIdentity.caSecretName` | string | `""` | Secret with public `ca.crt`. Required when `gridIdentity.tlsSecretName` is set. The Grid operator writes the CA as `grid-ca`. |
+| `gridIdentity.tlsSecretName` | string | `""` | Secret with `tls.crt` and `tls.key`. Non-empty mounts the identity and makes implicit render transports use mTLS. |
+| `gridIdentity.caSecretName` | string | `""` | Secret with public `ca.crt`. Empty uses `gridIdentity.tlsSecretName`; set it when the CA is separate. |
 | `gridIdentity.mountPath` | string | `/etc/praxis/tls` | Directory where the identity and CA keys are projected. For operator mTLS, match `consumerConfig.tlsCertMountPath`. |
 | `providerCredentials` | list | `[]` | Provider credential Secrets (`secretName`, optional `mountPath`, `optional`). `mountPath` defaults to `/run/secrets/grid-credentials/<secretName>`, matching the operator. |
 | `health.readiness` | object | admin `/ready`, else TCP on the listener port | Readiness probe. A `tcpSocket` without a port runs an HTTP check against the admin listener when the chart sees a loopback admin listener in its rendered config or `praxisConfig.byo.inline`, and otherwise targets the listener port. It asks `/healthy` when the gateway forwards to backends (rendered backends, `praxisConfig.render.gridServing`, or inline clusters), since `/ready` fails while any backend is down, and `/ready` otherwise. The check runs `/bin/sh` with `curl` or `wget`, whichever the image has; set `health.adminProbeCommand` for an image with neither. The chart refuses that fallback when a BYO inline listener serves TLS, since a TCP connect fails a TLS handshake on every probe. With a BYO ConfigMap the chart cannot see the listener, so give the probes an `httpGet` or `exec` handler when it serves TLS. Give `tcpSocket` a port or another handler to keep your own probe. Set to null to disable. |
@@ -595,7 +596,8 @@ as ready.
 When `praxisConfig.render.gridServing.enabled` is set, Helm keeps its read-only TLS projection at
 `/etc/praxis/tls` through both handoff phases because the signals poller reads
 those files. The GridNetwork's `tls.caSecretRef` and `tls.siteSecretRef` must
-match the chart's `gridIdentity.caSecretName` and `gridIdentity.tlsSecretName`; Grid validates the
+match the chart's effective CA Secret (`gridIdentity.caSecretName`, or
+`gridIdentity.tlsSecretName` when the CA name is empty) and identity Secret; Grid validates the
 mounted Secret keys and rolls the gateway when their resource versions change.
 The chart rejects a different `gridIdentity.mountPath` for Grid serving.
 
@@ -799,8 +801,8 @@ Use this mapping:
 | `gridServing.mountPath` | `praxisConfig.render.gridServing.mountPath` |
 
 `gridIdentity.tlsSecretName` names the identity Secret (`tls.crt`, `tls.key`);
-`gridIdentity.caSecretName` names the public CA Secret (`ca.crt`) and is required
-with it. The chart projects only those keys, not the CA Secret's private key.
+`gridIdentity.caSecretName` names the public CA Secret (`ca.crt`) and defaults to
+the identity Secret. The chart projects only those keys, not the CA Secret's private key.
 
 Behavior changes:
 
@@ -820,11 +822,13 @@ Behavior changes:
   targets the gateway Service by name.
 - The Grid identity is no longer mounted automatically. A provider, or a consumer with
   site backends, used to get `grid-site-identity` and `grid-ca` without any TLS values.
-  Set `gridIdentity.tlsSecretName` and `gridIdentity.caSecretName` explicitly.
-- `gridIdentity.tlsSecretName` now requires `gridIdentity.caSecretName`; the old `grid-ca`
-  default and the fallback to the identity Secret are gone, and the render fails without
-  it. Pods would otherwise hang when the identity Secret has no `ca.crt`. If one Secret
-  holds all three files, set both names to it.
+  Set `gridIdentity.tlsSecretName` explicitly; set `gridIdentity.caSecretName` only
+  when the CA is separate.
+- `gridIdentity.caSecretName` now defaults to `gridIdentity.tlsSecretName`. Set it when
+  the CA is in a separate Secret. The identity Secret must contain `ca.crt` when the
+  fallback is used.
+- A provider no longer defaults to `grid-ca`. Set `gridIdentity.caSecretName`, or put
+  `ca.crt` in the identity Secret.
 - A site backend with no `transport.mode` and no `gridIdentity.tlsSecretName` fails the
   render. It used to get mTLS automatically. Set the identity, or set
   `transport.mode: plaintext` to send it in the clear on purpose.

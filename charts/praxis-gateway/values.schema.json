@@ -1368,7 +1368,7 @@
         },
         "caSecretName": {
           "type": "string",
-          "description": "Secret holding ca.crt. Required when tlsSecretName is set."
+          "description": "Secret holding ca.crt. Empty uses tlsSecretName."
         },
         "mountPath": {
           "type": "string",

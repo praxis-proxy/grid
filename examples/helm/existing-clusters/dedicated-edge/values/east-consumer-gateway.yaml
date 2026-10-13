@@ -28,7 +28,6 @@ grid:
 
 gridIdentity:
   tlsSecretName: consumer-tls
-  caSecretName: grid-ca
 
 service:
   enabled: true

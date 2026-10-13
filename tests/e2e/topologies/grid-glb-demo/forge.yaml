@@ -360,7 +360,6 @@ spec:
                 periodSeconds: 10
             gridIdentity:
               tlsSecretName: "provider-gateway-tls"
-              caSecretName: "grid-ca"
             providerCredentials:
               - secretName: "vcr-inference-credential"
                 mountPath: "/etc/praxis/credentials/vcr-inference"
@@ -439,7 +438,6 @@ spec:
               configMapName: "grid-overlay-glb-demo-edge-gateway"
             gridIdentity:
               tlsSecretName: "edge-gateway-tls"
-              caSecretName: "grid-ca"
             podLabels:
               grid.praxis.fast/edge-site: "{{ cluster.name }}"
         - type: wait
