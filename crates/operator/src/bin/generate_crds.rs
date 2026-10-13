@@ -19,7 +19,7 @@
 use kube::CustomResourceExt as _;
 use operator::crd::{
     agent_tool_provider::AgentToolProvider, grid_network::GridNetwork, grid_site::GridSite,
-    inference_provider::InferenceProvider,
+    inference_provider::InferenceProvider, site_invite::SiteInvite,
 };
 
 fn main() {
@@ -28,6 +28,7 @@ fn main() {
         serde_json::to_value(GridNetwork::crd()),
         serde_json::to_value(GridSite::crd()),
         serde_json::to_value(InferenceProvider::crd()),
+        serde_json::to_value(SiteInvite::crd()),
     ];
     let items: Vec<serde_json::Value> = crds
         .into_iter()

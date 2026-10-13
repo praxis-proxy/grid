@@ -23,6 +23,9 @@ pub mod grid_network;
 /// [`GridSite`]: grid_site::GridSite
 pub mod grid_site;
 
+/// [`SiteInvite`] admission requests on the signer cluster.
+pub mod site_invite;
+
 /// [`InferenceProvider`] for inference backends available over the grid.
 ///
 /// [`InferenceProvider`]: inference_provider::InferenceProvider
