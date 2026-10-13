@@ -353,7 +353,7 @@ carry a sni.
 {{- $_ := set $seen .cluster true }}
 {{- $mode := (.transport).mode | default (ternary "mutual_tls" "plaintext" $tlsEnabled) }}
 {{- if and .site (not (.transport).mode) (not $tlsEnabled) }}
-{{- fail (printf "backend %q serves the remote site %q but gridIdentity.tlsSecretName is empty, so it would use plaintext. Set gridIdentity.tlsSecretName for mTLS, or set transport.mode plaintext to send it in the clear" .cluster .site) }}
+{{- fail (printf "backend %q serves the remote site %q but gridIdentity.tlsSecretName is empty, so it would use plaintext. Set gridIdentity.tlsSecretName for mTLS, or set transport.mode plaintext and site %q to send it in the clear" .cluster .site .site) }}
 {{- end }}
 {{- if eq $mode "mutual_tls" }}
 {{- if not $tlsEnabled }}

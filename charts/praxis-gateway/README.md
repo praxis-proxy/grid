@@ -831,7 +831,7 @@ Behavior changes:
   `ca.crt` in the identity Secret.
 - A site backend with no `transport.mode` and no `gridIdentity.tlsSecretName` fails the
   render. It used to get mTLS automatically. Set the identity, or set
-  `transport.mode: plaintext` to send it in the clear on purpose.
+  `transport.mode: plaintext` and the backend's `site` to send it in the clear on purpose.
 - `overlay.items` is removed. The chart mounts only `routing-overlay.json`;
   update any BYO `overlay_file` path that names `routing-config.json`.
 - `praxisConfig.render.role: provider` and `praxisConfig.render.gridServing` require
