@@ -30,8 +30,15 @@ gatewayRefs consumerConfig.enabled: true). The pod waits in ContainerCreating un
 that ConfigMap exists. If the GridNetwork sets another consumerConfig.configMapName, set the
 same name in praxisConfig.operator.configMapName.
 
-NOTE: the operator's praxis.yaml has no caller authentication. Anything that reaches the
-gateway can use inference, so keep the Service ClusterIP behind an authenticating front.
+NOTE: the operator's praxis.yaml has no caller authentication. A ClusterIP Service still
+accepts traffic from any pod allowed by the cluster network, and anything that reaches the
+gateway can use inference and any provider credentials it injects.
+{{- if not .Values.networkPolicy.enabled }}
+Enable networkPolicy and limit networkPolicy.from to the authenticating front.
+{{- else }}
+Limit networkPolicy.from to the authenticating front.
+{{- end }}
+NetworkPolicy is effective only where the CNI enforces it.
 
 mTLS to backends: if the operator's praxis.yaml uses mutual_tls, it reads tls.crt, tls.key
 and ca.crt from the GridNetwork's consumerConfig.tlsCertMountPath (default /etc/praxis/tls).
