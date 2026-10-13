@@ -1,7 +1,7 @@
 # Provider gateway on site-a. It admits only the hub.
 image:
   repository: ghcr.io/praxis-proxy/grid-gateway
-  tag: v0.1.4
+  tag: v0.2.0
 gatewayConfig:
   role: provider
   localSite: site-a

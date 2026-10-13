@@ -129,6 +129,9 @@ For Kustomize or raw manifests, see
 
 ## Getting Started
 
+[Getting started](docs/installation/getting-started.md): a hub and one site
+on two kind clusters with Helm.
+
 [Praxis demos](https://github.com/praxis-proxy/demos): deployable demonstrations
 with automated runtime
 proofs of routing, failover, security boundaries,
