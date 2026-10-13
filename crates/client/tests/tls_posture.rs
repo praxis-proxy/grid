@@ -125,6 +125,64 @@ async fn plaintext_is_refused() {
 }
 
 #[tokio::test]
+async fn a_connect_timeout_is_safe_to_retry() {
+    let material = material();
+    let roots = roots_from_pem(material.ca_pem.as_bytes(), "test CA").expect("roots");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let port = listener.local_addr().expect("an address").port();
+    let client = trusted_client(
+        roots,
+        None,
+        Timeouts {
+            connect: std::time::Duration::from_millis(100),
+            request: std::time::Duration::from_secs(5),
+        },
+    )
+    .expect("a client");
+    let (response, accepted) = tokio::join!(
+        client.get(format!("https://localhost:{port}/")).send(),
+        listener.accept()
+    );
+    let (_stream, _peer) = accepted.expect("accepted TCP");
+    let error = response.expect_err("TLS connection must time out");
+    assert!(error.is_timeout(), "{error}");
+    assert!(error.is_connect(), "{error}");
+    assert_eq!(classify(&error), RequestOutcome::Refused);
+}
+
+#[tokio::test]
+async fn a_timeout_after_sending_is_not_a_connection_refusal() {
+    let material = material();
+    let roots = roots_from_pem(material.ca_pem.as_bytes(), "test CA").expect("roots");
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(material.chain, material.key)
+        .expect("a server config");
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let port = listener.local_addr().expect("an address").port();
+    let client = trusted_client(roots, None, Timeouts::DEFAULT).expect("a client");
+    let stalled = async {
+        let (stream, _peer) = listener.accept().await.expect("accepted TCP");
+        let mut tls = acceptor.accept(stream).await.expect("TLS handshake");
+        let mut buf = [0_u8; 1024];
+        assert!(tls.read(&mut buf).await.expect("a request") > 0);
+        tls
+    };
+    let (response, _tls) = tokio::join!(
+        client
+            .get(format!("https://localhost:{port}/"))
+            .timeout(std::time::Duration::from_secs(1))
+            .send(),
+        stalled
+    );
+    let error = response.expect_err("the unanswered request must time out");
+    assert!(error.is_timeout(), "{error}");
+    assert!(!error.is_connect(), "{error}");
+    assert_eq!(classify(&error), RequestOutcome::Timeout);
+}
+
+#[tokio::test]
 async fn a_redirect_is_handed_back_rather_than_followed() {
     let material = material();
     let roots = roots_from_pem(material.ca_pem.as_bytes(), "test CA").expect("roots");

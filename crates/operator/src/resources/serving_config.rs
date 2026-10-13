@@ -52,7 +52,7 @@ const HORIZON_SCRAPES: u32 = 3;
 /// The oldest a relayed sample can be when it arrives: a provider scrape, the
 /// operator's peer poll and the budget that poll may take, the gateway's own poll
 /// of the operator, and two hops of `Date` truncation. Plus one peer poll of
-/// slack, so one late poll does not turn a healthy site unknown. About 82s at the
+/// slack, so one late poll does not turn a healthy site unknown. About 32s at the
 /// defaults. Sized shorter than one relay cycle, every remote site would be
 /// unmeasured for most of every cycle and every gateway would route to its local
 /// site in a square wave.

@@ -91,7 +91,7 @@ pub fn from_status(status: http::StatusCode) -> RequestOutcome {
 #[cfg(feature = "reqwest-client")]
 #[must_use]
 pub fn classify(error: &reqwest::Error) -> RequestOutcome {
-    if error.is_timeout() {
+    if error.is_timeout() && !error.is_connect() {
         return RequestOutcome::Timeout;
     }
     if let Some(status) = error.status() {

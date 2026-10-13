@@ -94,7 +94,56 @@ pub(crate) type ServerName = String;
 pub(crate) type HttpsConnector = hyper_rustls::HttpsConnector<HttpConnector>;
 /// HTTPS connector used by the hyper-based metrics scrape and health probe.
 #[cfg(feature = "fips")]
-pub(crate) type HttpsConnector = hyper_openssl::client::legacy::HttpsConnector<HttpConnector>;
+#[derive(Clone)]
+pub(crate) enum HttpsConnector {
+    /// Native trust for ordinary HTTP or HTTPS requests.
+    Native(hyper_openssl::client::legacy::HttpsConnector<HttpConnector>),
+    /// Grid trust: each new connection authenticates the peer without resuming a session.
+    Custom {
+        /// TCP dialer, including the pooled connection keepalive settings.
+        http: HttpConnector,
+        /// Shared roots, client identity, and peer rule.
+        config: ClientTlsConfig,
+    },
+}
+
+#[cfg(feature = "fips")]
+impl tower::Service<http::Uri> for HttpsConnector {
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Response = hyper_openssl::client::legacy::MaybeHttpsStream<hyper_util::rt::TokioIo<tokio::net::TcpStream>>;
+
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        match self {
+            Self::Native(connector) => connector.poll_ready(cx),
+            Self::Custom { http, .. } => http.poll_ready(cx).map_err(Into::into),
+        }
+    }
+
+    fn call(&mut self, req: http::Uri) -> Self::Future {
+        let (http, config) = match self {
+            Self::Native(connector) => return connector.call(req),
+            Self::Custom { http, config } => (http, config),
+        };
+        if req.scheme_str() != Some("https") {
+            return Box::pin(async { Err("custom TLS requires an HTTPS URI".into()) });
+        }
+        let connect = http.call(req.clone());
+        let config = Arc::clone(config);
+        Box::pin(async move {
+            let host = req.host().ok_or("URI missing host")?;
+            let mut configured = config.connector()?.configure()?;
+            if config.has_leaf_rule() {
+                configured.set_verify_hostname(false);
+            }
+            let ssl = configured.into_ssl(host)?;
+            let mut stream = hyper_openssl::SslStream::new(ssl, connect.await?)?;
+            // Hyper's connection pool remains reusable; new TLS connections never resume.
+            std::pin::Pin::new(&mut stream).connect().await?;
+            Ok(hyper_openssl::client::legacy::MaybeHttpsStream::Https(stream))
+        })
+    }
+}
 
 /// Established client TLS stream produced by [`connect`].
 #[cfg(not(feature = "fips"))]
@@ -744,6 +793,7 @@ pub(crate) fn build_native_connector() -> Result<HttpsConnector, MetricsScrapeEr
     let builder =
         SslConnector::builder(SslMethod::tls_client()).map_err(|e| MetricsScrapeError::Transport(e.into()))?;
     hyper_openssl::client::legacy::HttpsConnector::with_connector(probing_connector(), builder)
+        .map(HttpsConnector::Native)
         .map_err(|e| MetricsScrapeError::Transport(e.into()))
 }
 
@@ -772,19 +822,13 @@ pub(crate) fn build_custom_tls_connector(config: &ClientTlsConfig) -> Result<Htt
 /// Returns [`MetricsScrapeError::Transport`] if the connector cannot be built.
 #[cfg(feature = "fips")]
 pub(crate) fn build_custom_tls_connector(config: &ClientTlsConfig) -> Result<HttpsConnector, MetricsScrapeError> {
-    let builder = config
-        .connector_builder()
+    config
+        .connector()
         .map_err(|e| MetricsScrapeError::Transport(e.into()))?;
-    let mut connector = hyper_openssl::client::legacy::HttpsConnector::with_connector(probing_connector(), builder)
-        .map_err(|e| MetricsScrapeError::Transport(e.into()))?;
-    if config.has_leaf_rule() {
-        // The leaf rule, not the certificate name, identifies the peer.
-        connector.set_callback(|cfg, _uri| {
-            cfg.set_verify_hostname(false);
-            Ok(())
-        });
-    }
-    Ok(connector)
+    Ok(HttpsConnector::Custom {
+        http: probing_connector(),
+        config: Arc::clone(config),
+    })
 }
 
 /// What a peer's leaf must satisfy once it chains to the grid roots.
@@ -1516,4 +1560,73 @@ pub(crate) fn validate_pem_private_key(pem: &[u8]) -> Result<(), String> {
     PKey::private_key_from_pem(pem)
         .map(|_key| ())
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+#[cfg(feature = "fips")]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test setup and TLS exchanges must succeed")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario proves pooled reuse and a fully authenticated reconnect against the same server"
+    )]
+    async fn pooled_mtls_reconnects_without_resuming_a_session() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let ca = certs::generate_ca("grid").expect("CA");
+        let server = certs::generate_site_cert(&ca, "east").expect("server identity");
+        let client = certs::generate_site_cert(&ca, "west").expect("client identity");
+        let server_config = build_server_config(
+            ca.cert_pem.as_bytes(),
+            server.cert_pem.as_bytes(),
+            server.key_pem.as_bytes(),
+        )
+        .expect("server TLS");
+        let client_config = build_pinned_client_config(
+            ca.cert_pem.as_bytes(),
+            Some(client.cert_pem.as_bytes()),
+            Some(client.key_pem.as_bytes()),
+            &[certs::canonical_fingerprint(&server.cert_pem).expect("server pin")],
+        )
+        .expect("client TLS");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("listen");
+        let url = format!("https://{}/metrics", listener.local_addr().expect("address"));
+        let serve = tokio::spawn(async move {
+            for (connection, requests) in [2, 1].into_iter().enumerate() {
+                let (tcp, _) = listener.accept().await.expect("TCP");
+                let mut stream = accept(tcp, &server_config).await.expect("fresh mTLS handshake");
+                assert!(!stream.ssl().session_reused(), "each reconnect must verify the peer");
+                assert!(stream.ssl().peer_certificate().is_some(), "mTLS identity is required");
+                for request in 0..requests {
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        headers.push(stream.read_u8().await.expect("request"));
+                    }
+                    let body = format!("connection {connection}\n");
+                    let persistence = if request + 1 == requests { "close" } else { "keep-alive" };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: {persistence}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.expect("response");
+                }
+                stream.shutdown().await.expect("close");
+            }
+        });
+        let transport = crate::metrics_scraper::PeerTransport::new(Some(&client_config), Some(Duration::from_secs(8)))
+            .expect("pooled transport");
+        for connection in [0, 0, 1] {
+            let (body, _) = crate::metrics_scraper::scrape_peer(&url, Duration::from_secs(5), &transport)
+                .await
+                .expect("pooled request or fresh reconnect");
+            assert_eq!(body, format!("connection {connection}\n"));
+        }
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("server finished")
+            .expect("server task");
+    }
 }

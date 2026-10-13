@@ -204,8 +204,30 @@ async fn main() {
     // Controllers run now. Only SWIM and what dials peers wait on the advertise address.
     let (swim_tx, swim_rx) = tokio::sync::watch::channel(SwimStage::Starting);
 
+    // Stop every state writer before leaving SWIM. Otherwise the leave event can
+    // drive one last reconcile that publishes every peer as dead or tries to
+    // reconfigure a runtime that has already stopped.
+    let (writers_done_tx, writers_done) = operator::shutdown::Trigger::new();
+    let writers_shutdown = shutdown.clone();
+    let writer_client = client.clone();
+    let writer_ctx = Arc::clone(&ctx);
+    let writer_swim = swim_rx.clone();
+    let writer_site_name = ctx.site_name().map(str::to_owned);
+    let writer_scrape_interval = signals_enabled.then(|| config.signals.scrape_interval());
+    let writer_group = async move {
+        tokio::try_join!(
+            run_network_controller(writer_client.clone(), Arc::clone(&writer_ctx), writer_swim),
+            run_site_controller(writer_client.clone()),
+            run_provider_controller(writer_client.clone(), writer_site_name),
+            run_agent_tool_provider_controller(writer_client.clone()),
+            run_local_scraper(writer_scrape_interval, Arc::clone(&writer_ctx), writer_client.clone()),
+            run_model_discovery(writer_ctx, writer_client),
+        )
+        .map(|_joined| ())
+    };
+    let writers = stop_writers_on_shutdown(writers_shutdown, writers_done_tx, writer_group);
 
-    let standing_down = stand_down(shutdown.clone(), swim_rx.clone());
+    let standing_down = stand_down(shutdown.clone(), writers_done, swim_rx.clone());
     let serving = async {
         tokio::try_join!(
             start_swim(
@@ -215,10 +237,7 @@ async fn main() {
                 Arc::clone(&ready),
                 swim_tx,
             ),
-            run_network_controller(client.clone(), Arc::clone(&ctx), swim_rx.clone()),
-            run_site_controller(client.clone()),
-            run_provider_controller(client.clone(), ctx.site_name().map(str::to_owned)),
-            run_agent_tool_provider_controller(client.clone()),
+            writers,
             async { metrics_server.await? },
             run_signals_server(
                 signals_enabled.then(|| SignalsListener {
@@ -242,12 +261,6 @@ async fn main() {
                 client.clone(),
                 shutdown.clone(),
             ),
-            run_local_scraper(
-                signals_enabled.then(|| config.signals.scrape_interval()),
-                Arc::clone(&ctx),
-                client.clone(),
-            ),
-            run_model_discovery(Arc::clone(&ctx), client.clone()),
         )
         .map(|_joined| ())
     };
@@ -269,13 +282,34 @@ async fn main() {
     tracing::info!("stood down");
 }
 
-/// Resolve once the process should stop, after leaving the cluster.
+/// Cancel every state writer on shutdown, then release the leave barrier.
+async fn stop_writers_on_shutdown<E>(
+    shutdown: operator::shutdown::Shutdown,
+    done: operator::shutdown::Trigger,
+    writers: impl Future<Output = Result<(), E>>,
+) -> Result<(), E> {
+    // This drops after the unselected writer future, so observing `done` means
+    // no controller or background writer can make another state change.
+    let _done_on_drop = done;
+    tokio::select! {
+        biased;
+        () = shutdown.triggered() => Ok(()),
+        result = writers => result,
+    }
+}
+
+/// Resolve once the process should stop, after writers stop and the site leaves.
 ///
-/// Leaving first stops peers choosing this site, so the connections dropped
-/// afterwards are ones nobody is waiting on. The grace that follows is what
-/// the inbound listener drains in.
-async fn stand_down(shutdown: operator::shutdown::Shutdown, swim: SwimStartup) {
+/// Writers stop before leave so the membership change cannot drive a final
+/// degraded overlay or touch the stopped SWIM runtime. The grace that follows
+/// is what the inbound listener drains in.
+async fn stand_down(
+    shutdown: operator::shutdown::Shutdown,
+    writers_done: operator::shutdown::Shutdown,
+    swim: SwimStartup,
+) {
     shutdown.triggered().await;
+    writers_done.triggered().await;
     let left = match settled(&swim) {
         Some(handle) => {
             handle.leave(LEAVE_WAIT).await;
@@ -1569,6 +1603,10 @@ struct Serving {
 }
 
 /// Accept signals connections, deciding scope from the certificate presented.
+#[expect(
+    clippy::too_many_lines,
+    reason = "accept, admission, shutdown drain, and task ownership form one connection lifecycle"
+)]
 async fn serve_signals_tls(
     listener: tokio::net::TcpListener,
     serving: Serving,
@@ -1599,7 +1637,13 @@ async fn serve_signals_tls(
             source,
             peers: admission.peers.clone(),
         };
-        let serve = Box::pin(serve_signals_connection(serving.clone(), stream, remote, handshaking));
+        let serve = Box::pin(serve_signals_connection(
+            serving.clone(),
+            stream,
+            remote,
+            handshaking,
+            shutdown.clone(),
+        ));
         tokio::spawn(async move {
             serve.await;
             drop(slot);
@@ -1911,13 +1955,22 @@ fn site_by_spiffe(leaf: &[u8], identity: &SignalsIdentity) -> Option<(String, BT
     not(feature = "fips"),
     expect(clippy::large_stack_frames, reason = "async future over a rustls handshake")
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "handshake shutdown, authenticated admission, and HTTP serving form one connection lifecycle"
+)]
 async fn serve_signals_connection(
     serving: Serving,
     tcp: tokio::net::TcpStream,
     remote: SocketAddr,
     handshaking: Handshaking,
+    shutdown: operator::shutdown::Shutdown,
 ) {
-    let accepted = tokio::time::timeout(SIGNALS_HANDSHAKE_TIMEOUT, tls_backend::accept(tcp, &serving.tls)).await;
+    let accepted = tokio::select! {
+        biased;
+        () = shutdown.triggered() => return,
+        accepted = tokio::time::timeout(SIGNALS_HANDSHAKE_TIMEOUT, tls_backend::accept(tcp, &serving.tls)) => accepted,
+    };
     // The source cap covers only the unauthenticated phase.
     drop(handshaking.source);
     let Ok(Ok(stream)) = accepted else {
@@ -1934,14 +1987,14 @@ async fn serve_signals_connection(
             let Some(slot) = handshaking.peers.acquire(&site) else {
                 operator::metrics::record_signals_shed("peer");
                 tracing::debug!(%remote, site, "signals site at its connection cap; answering 503");
-                Box::pin(serve_http(stream, unavailable(), Caller::Peer(None), remote)).await;
+                Box::pin(serve_http(stream, unavailable(), Caller::Peer(None), remote, shutdown)).await;
                 return;
             };
             Some(slot)
         },
         (_, None) => return,
     };
-    Box::pin(serve_http(stream, serving.app, caller, remote)).await;
+    Box::pin(serve_http(stream, serving.app, caller, remote, shutdown)).await;
     drop(slot);
 }
 
@@ -1951,14 +2004,13 @@ fn unavailable() -> axum::Router {
 }
 
 /// Serve HTTP on an authenticated stream with the scope `caller` earned, bounded by every signals timeout.
-#[cfg_attr(
-    not(feature = "fips"),
-    expect(
-        clippy::large_stack_frames,
-        reason = "async future over a rustls stream and a hyper connection"
-    )
-)]
-async fn serve_http(stream: tls_backend::ServerTlsStream, app: axum::Router, caller: Caller, remote: SocketAddr) {
+async fn serve_http(
+    stream: tls_backend::ServerTlsStream,
+    app: axum::Router,
+    caller: Caller,
+    remote: SocketAddr,
+    shutdown: operator::shutdown::Shutdown,
+) {
     // A shed caller gets one answer, then the connection closes.
     let keep_alive = caller != Caller::Peer(None);
     let service = hyper::service::service_fn(move |request: http::Request<hyper::body::Incoming>| {
@@ -1973,7 +2025,7 @@ async fn serve_http(stream: tls_backend::ServerTlsStream, app: axum::Router, cal
         .header_read_timeout(SIGNALS_HEADER_READ_TIMEOUT)
         .keep_alive(keep_alive)
         .serve_connection(io, service);
-    if let Err(error) = serve_until_aged(connection, SIGNALS_MAX_CONNECTION_AGE).await {
+    if let Err(error) = Box::pin(serve_until_aged(connection, SIGNALS_MAX_CONNECTION_AGE, shutdown)).await {
         tracing::debug!(%remote, %error, "signals connection ended");
     }
 }
@@ -1982,6 +2034,7 @@ async fn serve_http(stream: tls_backend::ServerTlsStream, app: axum::Router, cal
 async fn serve_until_aged<Io, Service>(
     connection: hyper::server::conn::http1::Connection<Io, Service>,
     max_age: std::time::Duration,
+    shutdown: operator::shutdown::Shutdown,
 ) -> hyper::Result<()>
 where
     Io: hyper::rt::Read + hyper::rt::Write + Unpin,
@@ -1991,7 +2044,9 @@ where
 {
     let mut connection = std::pin::pin!(connection);
     tokio::select! {
+        biased;
         result = connection.as_mut() => return result,
+        () = shutdown.triggered() => {},
         () = tokio::time::sleep(max_age) => {},
     }
     connection.as_mut().graceful_shutdown();
@@ -2769,6 +2824,7 @@ mod tests {
             stream,
             remote,
             handshaking(&sources, &PeerSlots::new(1, 8)),
+            operator::shutdown::Shutdown::never(),
         ));
         tokio::time::timeout(SIGNALS_HANDSHAKE_TIMEOUT * 2, serve)
             .await
@@ -2812,6 +2868,24 @@ mod tests {
         east: certs::SiteCertOutput,
         /// The calling site.
         west: certs::SiteCertOutput,
+    }
+
+    /// Serve one fixture connection without lifecycle cancellation.
+    #[cfg(not(feature = "fips"))]
+    async fn serve_fixture(
+        serving: Serving,
+        stream: tokio::net::TcpStream,
+        remote: SocketAddr,
+        handshaking: Handshaking,
+    ) {
+        Box::pin(serve_signals_connection(
+            serving,
+            stream,
+            remote,
+            handshaking,
+            operator::shutdown::Shutdown::never(),
+        ))
+        .await;
     }
 
     #[cfg(not(feature = "fips"))]
@@ -2880,7 +2954,7 @@ mod tests {
                         app: app.clone(),
                         identity: identity.clone(),
                     };
-                    served.spawn(serve_signals_connection(serving, stream, remote, handshaking));
+                    served.spawn(serve_fixture(serving, stream, remote, handshaking));
                 }
                 served.join_all().await;
             });
@@ -3096,11 +3170,11 @@ mod tests {
         );
     }
 
-    /// A caller that keeps asking is closed once the connection reaches its maximum age.
-    #[tokio::test(start_paused = true)]
-    async fn a_busy_connection_closes_at_its_maximum_age() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let (mut client, server_io) = tokio::io::duplex(4096);
+    /// Serve a small successful response on an in-memory HTTP/1 connection.
+    async fn serve_ok_connection(
+        server_io: tokio::io::DuplexStream,
+        shutdown: operator::shutdown::Shutdown,
+    ) -> hyper::Result<()> {
         let service = hyper::service::service_fn(|_request: http::Request<hyper::body::Incoming>| {
             std::future::ready(Ok::<_, std::convert::Infallible>(http::Response::new(
                 http_body_util::Full::new(bytes::Bytes::from_static(b"ok")),
@@ -3110,7 +3184,44 @@ mod tests {
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(SIGNALS_HEADER_READ_TIMEOUT)
             .serve_connection(hyper_util::rt::TokioIo::new(server_io), service);
-        let server = tokio::spawn(serve_until_aged(connection, SIGNALS_MAX_CONNECTION_AGE));
+        Box::pin(serve_until_aged(connection, SIGNALS_MAX_CONNECTION_AGE, shutdown)).await
+    }
+
+    /// Serve one response whose completion the test controls.
+    async fn serve_gated_connection(
+        server_io: tokio::io::DuplexStream,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        shutdown: operator::shutdown::Shutdown,
+    ) -> hyper::Result<()> {
+        let service = hyper::service::service_fn(move |_request: http::Request<hyper::body::Incoming>| {
+            let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Full::new(
+                    bytes::Bytes::from_static(b"finished"),
+                )))
+            }
+        });
+        let connection = hyper::server::conn::http1::Builder::new()
+            .serve_connection(hyper_util::rt::TokioIo::new(server_io), service);
+        Box::pin(serve_until_aged(connection, SIGNALS_MAX_CONNECTION_AGE, shutdown)).await
+    }
+
+    /// Assert an async reader reaches EOF cleanly.
+    async fn expect_eof(stream: &mut (impl tokio::io::AsyncRead + Unpin)) {
+        use tokio::io::AsyncReadExt as _;
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).await.expect("closed connection");
+    }
+
+    /// A caller that keeps asking is closed once the connection reaches its maximum age.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_connection_closes_at_its_maximum_age() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut client, server_io) = tokio::io::duplex(4096);
+        let server = tokio::spawn(serve_ok_connection(server_io, operator::shutdown::Shutdown::never()));
         let opened = tokio::time::Instant::now();
         let mut answer = [0_u8; 256];
         loop {
@@ -3126,6 +3237,70 @@ mod tests {
             opened.elapsed() >= SIGNALS_MAX_CONNECTION_AGE,
             "closed at its age, not before"
         );
+        assert!(server.await.expect("server task").is_ok(), "a graceful close");
+    }
+
+    /// Shutdown closes an idle keep-alive without waiting for its header timer or maximum age.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_connection_closes_promptly_on_shutdown() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut client, server_io) = tokio::io::duplex(4096);
+        let (trigger, shutdown) = operator::shutdown::Trigger::new();
+        let server = tokio::spawn(serve_ok_connection(server_io, shutdown));
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: east\r\n\r\n")
+            .await
+            .expect("request");
+        let mut answer = vec![0_u8; 256];
+        let read = client.read(&mut answer).await.expect("response");
+        answer.truncate(read);
+        assert!(answer.starts_with(b"HTTP/1.1 200"), "request completed");
+
+        let stopped = tokio::time::Instant::now();
+        trigger.trigger();
+        assert!(server.await.expect("server task").is_ok(), "a graceful close");
+        assert!(
+            stopped.elapsed() < SIGNALS_HEADER_READ_TIMEOUT,
+            "shutdown must beat the idle header timer"
+        );
+        expect_eof(&mut client).await;
+    }
+
+    /// Graceful shutdown lets the request already being answered finish before closing.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_finishes_the_in_flight_response() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (mut client, server_io) = tokio::io::duplex(4096);
+        let (trigger, shutdown) = operator::shutdown::Trigger::new();
+        let server = tokio::spawn(serve_gated_connection(
+            server_io,
+            Arc::clone(&entered),
+            Arc::clone(&release),
+            shutdown,
+        ));
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: east\r\n\r\n")
+            .await
+            .expect("request");
+        entered.notified().await;
+        trigger.trigger();
+        assert!(
+            !server.is_finished(),
+            "the in-flight response holds graceful shutdown open"
+        );
+
+        release.notify_one();
+        let mut answer = Vec::new();
+        tokio::time::timeout(SIGNALS_WRITE_TIMEOUT, client.read_to_end(&mut answer))
+            .await
+            .expect("connection close bound")
+            .expect("response and EOF");
+        assert!(answer.starts_with(b"HTTP/1.1 200"), "the response completed");
+        assert!(answer.ends_with(b"finished"), "the complete body was written");
         assert!(server.await.expect("server task").is_ok(), "a graceful close");
     }
 
@@ -3607,15 +3782,19 @@ mod tests {
 
         let mut polling = mesh.connect(addr).await;
         assert!(get(&mut polling).await.starts_with(b"HTTP/1.1 200"), "serves before");
-        // Closed so the drain has nothing to wait for; the drain's own test
-        // covers a peer that is still answering.
-        drop(polling);
 
+        let started = tokio::time::Instant::now();
         trigger.trigger();
         server
             .await
             .expect("server task")
             .expect("the listener stands down cleanly");
+        assert!(
+            started.elapsed() < SHUTDOWN_GRACE,
+            "an idle connection releases its drain slot"
+        );
+
+        expect_eof(&mut polling).await;
 
         assert!(
             tokio::net::TcpStream::connect(addr).await.is_err(),
@@ -3630,5 +3809,54 @@ mod tests {
         assert!(settled(&rx).is_none(), "starting carries no handle");
         tx.send_replace(SwimStage::Settled(None));
         assert!(settled(&rx).is_none(), "settled without a runtime carries no handle");
+    }
+
+    /// Stand-down cannot start its leave grace until every state writer has stopped.
+    #[tokio::test(start_paused = true)]
+    async fn stand_down_waits_for_writers_before_the_grace() {
+        let (shutdown_tx, shutdown) = operator::shutdown::Trigger::new();
+        let (writers_done_tx, writers_done) = operator::shutdown::Trigger::new();
+        let (_swim_tx, swim) = tokio::sync::watch::channel(SwimStage::Settled(None));
+        let standing_down = tokio::spawn(stand_down(shutdown, writers_done, swim));
+
+        shutdown_tx.trigger();
+        tokio::time::advance(SHUTDOWN_GRACE * 2).await;
+        tokio::task::yield_now().await;
+        assert!(!standing_down.is_finished(), "writers hold the leave barrier");
+
+        writers_done_tx.trigger();
+        tokio::task::yield_now().await;
+        assert!(!standing_down.is_finished(), "the grace begins only after writers stop");
+        tokio::time::advance(SHUTDOWN_GRACE).await;
+        standing_down.await.expect("stand-down task");
+    }
+
+    /// The completion latch fires only after cancellation drops the writer future.
+    #[tokio::test]
+    async fn writer_completion_means_the_writers_are_dropped() {
+        struct MarkDropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for MarkDropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marker = MarkDropped(Arc::clone(&dropped));
+        let writers = async move {
+            let _marker = marker;
+            std::future::pending::<Result<(), std::convert::Infallible>>().await
+        };
+        let (shutdown_tx, shutdown) = operator::shutdown::Trigger::new();
+        let (done_tx, done) = operator::shutdown::Trigger::new();
+        let stopping = tokio::spawn(stop_writers_on_shutdown(shutdown, done_tx, writers));
+
+        shutdown_tx.trigger();
+        done.triggered().await;
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::Acquire),
+            "the writer future drops before the completion latch fires"
+        );
+        stopping.await.expect("writer group").expect("stopped");
     }
 }

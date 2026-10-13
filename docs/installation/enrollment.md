@@ -118,8 +118,10 @@ the operator does no SWIM join and no overlay.
 A restart never spends a second token, because the operator skips enrollment
 when the identity Secret exists. If you create a GridNetwork afterward that
 names other Secrets, the operator refuses to enroll again. Point it at the
-enrolled Secrets. The operator retries connect failures for about five minutes,
-gives up after 15, and exits so Kubernetes restarts it.
+enrolled Secrets. The operator retries retryable enrollment failures without an
+attempt limit or overall deadline. For `siteIdentity` installs, the startup probe
+restarts a pod still enrolling after about 16 minutes by default (96 checks, 10s
+apart); adjust `health.startup` to change that window.
 
 ## 3a. Read the enrollment record
 

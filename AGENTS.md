@@ -105,7 +105,7 @@ cargo xtask env status   # health of all components
 | `certs` | Certificate generation and provider trait |
 | `enrollment` | Site enrollment service and API types |
 | `grid-signals` | Shared load-signal store, Prometheus parser, and labels |
-| `grid-signals-client` | mTLS poller for operator site signals |
+| `grid-client` | Outbound HTTP clients and mTLS poller for operator site signals |
 | `mock-providers` | Mock OpenAI, Anthropic, Bedrock, Vertex APIs |
 | `xtask` | Dev task runner for test environments |
 | `version` | Shared build identity for binaries and container provenance |

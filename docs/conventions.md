@@ -314,10 +314,11 @@ it. The `let_underscore_future` and
 
 #### Outbound HTTP
 
-Build every outbound client through `grid-client`. It
-owns the TLS backend choice, the trust material, and
-both timeout phases, so a caller forwards the `fips`
-feature rather than naming a backend itself.
+Build reqwest clients reaching grid endpoints through grid roots with
+`grid-client`. It owns the TLS backend choice, trust material, and both timeout
+phases, so callers forward `fips` rather than naming a backend themselves.
+Platform-root provider and MCP probes, and the operator's pooled peer transport,
+use their dedicated builders outside this API.
 
 ```rust
 // Bad - a ninth client with its own bounds:

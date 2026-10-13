@@ -941,9 +941,9 @@ impl std::fmt::Debug for PeerTlsMaterial {
 
 /// How long an unused peer connection is kept.
 ///
-/// Above the poll interval so a round reuses the last one, and below the idle
-/// window a stateful firewall between clusters is likely to enforce.
-const PEER_POOL_IDLE: Duration = Duration::from_secs(20);
+/// Above the default poll interval, but below the signals listener's 10s idle
+/// timeout and the idle window a stateful firewall is likely to enforce.
+const PEER_POOL_IDLE: Duration = Duration::from_secs(8);
 
 /// How long a peer transport may live before it is rebuilt.
 ///
