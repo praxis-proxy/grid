@@ -823,6 +823,11 @@ Behavior changes:
 - Grid gateways no longer take the Helm release name automatically. Set
   `fullnameOverride` to the GridNetwork `gatewayRefs[].name` when the operator
   targets the gateway Service by name.
+- Before upgrading a provider, or a consumer with site backends, that was
+  installed without `fullnameOverride`, set `fullnameOverride` to its current
+  release name. Otherwise Helm replaces the Service, a LoadBalancer can receive
+  a new address, and the operator's `gateway.serviceName` and derived
+  `gridServing` ConfigMap name can stop matching.
 - The Grid identity is no longer mounted automatically. A provider, or a consumer with
   site backends, used to get `grid-site-identity` and `grid-ca` without any TLS values.
   Set `gridIdentity.tlsSecretName` explicitly; set `gridIdentity.caSecretName` only

@@ -864,12 +864,13 @@ kubectl delete crd gridnetworks.grid.praxis.fast \
 Service.
 
 **Cause:** The provider gateway Service name differs from the operator's
-`gateway.serviceName`. A Grid gateway uses its Helm release name by default;
-`fullnameOverride` can replace that name.
+`gateway.serviceName`. The current chart derives `{release}-praxis-gateway`
+unless `fullnameOverride` is set, while an existing installation may still use
+the release name.
 
-**Fix:** Set `fullnameOverride: provider-gateway` in the provider
-gateway values and `gateway.serviceName: provider-gateway` in the
-operator values.
+**Fix:** Before upgrading an existing provider, set `fullnameOverride` to its
+current Service name, often the release name. Then set `gateway.serviceName` to
+the same value in the operator values.
 
 ### Overlay ConfigMap not created
 
