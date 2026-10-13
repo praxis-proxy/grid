@@ -436,6 +436,8 @@ spec:
               siteName: "{{ cluster.name }}"
             overlay:
               configMapName: "grid-overlay-glb-demo-edge-gateway"
+              sidecar:
+                enabled: false
             gridIdentity:
               tlsSecretName: "edge-gateway-tls"
             podLabels:
