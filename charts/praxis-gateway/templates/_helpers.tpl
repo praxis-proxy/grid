@@ -650,7 +650,8 @@ An endpoint's host: port and one trailing root dot removed.
 Provider credential path. Use an explicit mountPath or the Grid operator default.
 */}}
 {{- define "praxis-gateway.providerCredentialPath" -}}
-{{- .mountPath | default (printf "/run/secrets/grid-credentials/%s" .secretName) -}}
+{{- $dir := trimAll "-" (regexReplaceAll "[^a-z0-9]+" (lower .secretName) "-") | trunc 63 | trimSuffix "-" -}}
+{{- .mountPath | default (printf "/run/secrets/grid-credentials/%s" $dir) -}}
 {{- end }}
 
 {{/*
