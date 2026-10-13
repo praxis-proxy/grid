@@ -133,9 +133,13 @@ if [ "${BASE_GROUP}" = "${GROUP}" ]; then
   echo "== CRDs and CRs survive =="
   CRDS_AFTER="$(uids crd)"
   CRDS_AFTER="$(grep -F ".${GROUP} " <<<"${CRDS_AFTER}" || true)"
-  [ "${CRDS_AFTER}" = "${CRDS_BEFORE}" ] || fail "CRD set or UIDs changed across upgrade:
-$(diff <(echo "${CRDS_BEFORE}") <(echo "${CRDS_AFTER}"))"
-  pass "every grid CRD kept its UID ($(wc -l <<<"${CRDS_AFTER}"))"
+  while IFS= read -r previous_crd; do
+    grep -Fxq "${previous_crd}" <<<"${CRDS_AFTER}" \
+      || fail "existing grid CRD changed or disappeared across upgrade: ${previous_crd}"
+  done <<<"${CRDS_BEFORE}"
+  [ "$(wc -l <<<"${CRDS_AFTER}")" -ge "$(wc -l <<<"${CRDS_BEFORE}")" ] \
+    || fail "grid CRDs disappeared across upgrade"
+  pass "existing grid CRDs kept their UIDs; branch CRDs were added ($(wc -l <<<"${CRDS_AFTER}"))"
   CRS_AFTER="$(for k in gridnetworks gridsites inferenceproviders; do uids "${k}.${GROUP}" -A; done)"
   [ "${CRS_AFTER}" = "${CRS_BEFORE}" ] || fail "CR set or UIDs changed across upgrade:
 $(diff <(echo "${CRS_BEFORE}") <(echo "${CRS_AFTER}"))"
