@@ -53,7 +53,7 @@ Version 1 uses exactly one value for each of these headers:
 | Header | Value |
 |---|---|
 | `x-grid-ingest-version` | `1` |
-| `x-grid-ingest-replica` | 1–128 ASCII letters, digits, dots, underscores, or hyphens |
+| `x-grid-ingest-replica` | 1-128 ASCII letters, digits, dots, underscores, or hyphens |
 | `x-grid-ingest-epoch` | 32 lowercase hexadecimal characters from a random process identity |
 | `x-grid-ingest-sequence` | Positive signed 64-bit report sequence |
 | `x-grid-ingest-skew` | Non-negative signed 64-bit cumulative skew-drop count |
