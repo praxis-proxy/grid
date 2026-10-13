@@ -42,8 +42,10 @@ Needs the `grid-gateway` image, as set in the file.
 
 The pod waits until the operator creates the ConfigMap. The operator's `praxis.yaml`
 has no caller authentication, so keep the Service as ClusterIP behind an
-authenticating front. The chart rejects `listenerTls`, `upstreamCA` and `overlay`
-with this source.
+authenticating front. This example already enables `networkPolicy`. The
+`app: authenticating-front` label is a placeholder; the front must run in this
+namespace, and you must change the selector to match it. The chart rejects
+`listenerTls`, `upstreamCA` and `overlay` with this source.
 
 ## Related examples
 

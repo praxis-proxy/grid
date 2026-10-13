@@ -11,3 +11,12 @@ gridIdentity:
   caSecretName: grid-ca
 service:
   type: ClusterIP
+
+# This example allows only pods labeled app: authenticating-front in this namespace.
+# Change the selector to match your authenticating front.
+networkPolicy:
+  enabled: true
+  from:
+    - podSelector:
+        matchLabels:
+          app: authenticating-front
