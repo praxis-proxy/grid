@@ -7,9 +7,9 @@
 
 use std::{
     collections::BTreeMap,
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     process::{Child, Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(test)]
@@ -25,6 +25,9 @@ use crate::env::{
 
 /// Maximum attempts to connect after starting port-forward.
 const PORT_FORWARD_RETRIES: u32 = 15;
+
+/// Maximum time for one `kubectl port-forward` process to open its local listener.
+const PORT_FORWARD_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Delay between port-forward readiness retries.
 const PORT_FORWARD_RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -308,21 +311,78 @@ impl PortForwardGuard {
         local_port: u16,
         svc_port: u16,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_inner(context, NAMESPACE, svc_name, local_port, svc_port, Stdio::null())
+    }
+
+    /// Start a port-forward with child diagnostics inherited by the xtask log.
+    pub(crate) fn start_with_diagnostics(
+        context: &str,
+        namespace: &str,
+        svc_name: &str,
+        local_port: u16,
+        svc_port: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_inner(context, namespace, svc_name, local_port, svc_port, Stdio::inherit())
+    }
+
+    /// Spawn a port-forward with the requested stderr handling.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the common command builder receives independent context, namespace, Service, and port settings"
+    )]
+    fn start_inner(
+        context: &str,
+        namespace: &str,
+        svc_name: &str,
+        local_port: u16,
+        svc_port: u16,
+        stderr: Stdio,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let (resource, mapping) = port_forward_args(svc_name, local_port, svc_port);
         let child = Command::new("kubectl")
             .args([
                 "--context",
                 context,
                 "-n",
-                NAMESPACE,
+                namespace,
                 "port-forward",
                 &resource,
                 &mapping,
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()?;
         Ok(Self { child: Some(child) })
+    }
+
+    /// Wait until this child is listening on its local port or report why startup failed.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "xtask is synchronous; no async runtime is available for bounded startup polling"
+    )]
+    pub(crate) fn wait_until_ready(&mut self, local_port: u16) -> Result<(), Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + PORT_FORWARD_STARTUP_TIMEOUT;
+        loop {
+            let child = self.child.as_mut().ok_or("port-forward process is no longer running")?;
+            if let Some(status) = child.try_wait()? {
+                self.child = None;
+                return Err(format!(
+                    "kubectl port-forward exited with {status} before local port {local_port} became ready"
+                )
+                .into());
+            }
+            if TcpStream::connect(format!("127.0.0.1:{local_port}")).is_ok() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "kubectl port-forward remained running but local port {local_port} did not become ready within {} seconds",
+                    PORT_FORWARD_STARTUP_TIMEOUT.as_secs()
+                )
+                .into());
+            }
+            std::thread::sleep(PORT_FORWARD_RETRY_DELAY);
+        }
     }
 
     /// Kill the port-forward process.
@@ -483,7 +543,7 @@ pub(crate) fn wait_for_port(port: u16) -> bool {
     std::thread::sleep(PORT_FORWARD_SETTLE);
 
     for _ in 0..PORT_FORWARD_RETRIES {
-        if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
             return true;
         }
         std::thread::sleep(PORT_FORWARD_RETRY_DELAY);

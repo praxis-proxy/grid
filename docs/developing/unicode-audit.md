@@ -1,7 +1,7 @@
 # Repository Unicode audit
 
 The audit covers the tracked repository text after integrating main at
-`d30fc422f0d0ac3068114d699d72745335350813`. All 921 regular files decode as
+`af82146cf9d23fa1fa5d7ffb587fb5053ca23a92`. All 926 regular files decode as
 UTF-8 and were scanned, including source, documentation, workflows, scripts,
 manifests, lockfiles, and this report. The two tracked symbolic links have ASCII
 targets:
@@ -18,7 +18,7 @@ preserved; changed runtime strings are diagnostic or assertion messages.
 
 No non-breaking spaces, typographic quotes, zero-width or bidirectional control
 characters, private-use characters, or non-ASCII identifier lookalikes remain.
-The remaining non-ASCII characters occur in 72 files and are intentional:
+The remaining non-ASCII characters occur in 73 files and are intentional:
 
 | Code points | Count | Purpose |
 |---|---:|---|
@@ -33,7 +33,7 @@ The remaining non-ASCII characters occur in 72 files and are intentional:
 | U+00B7 | 50 | Dashboard display separators and their assertions |
 | U+00AB, U+00BB | 2 | Dashboard collapse and expand controls |
 | U+00E9, U+20AC | 2 | Multibyte truncation and tool-name test fixtures |
-| U+00A7 | 1 | RFC section notation |
+| U+00A7 | 2 | RFC section notation |
 | U+274C | 1 | Visible warning in an example README |
 
 The missing-data value is `DOWN_VALUE` in the dashboard's `SitePanel.tsx`.

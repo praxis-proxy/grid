@@ -20,12 +20,18 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
 use serde::Serialize;
 
-use super::{DemoMode, GlbDemoOptions, certs, glb, kubectl, operator};
+mod cross_site;
+
+use super::{
+    DemoMode, GlbDemoOptions, certs, glb, kubectl, operator,
+    verify::{PortForwardGuard, find_free_port},
+};
 
 /// Directory where generated TLS certificates are stored.
 const CERTS_DIR: &str = "tests/env/certs";
@@ -69,6 +75,8 @@ const VCR_MODEL: &str = "Qwen/Qwen3-0.6B";
 
 /// Data-plane convergence timeout for overlay propagation.
 const DATA_PLANE_WAIT: Duration = Duration::from_secs(180);
+/// Maximum time to wait for the peer-signals LoadBalancer ingress to be assigned.
+const SIGNALS_LB_INGRESS_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Retry interval for convergence probes.
 const DATA_PLANE_INTERVAL: Duration = Duration::from_secs(1);
@@ -104,9 +112,22 @@ const RECOVERY_QUEUE_THRESHOLD: f64 = 3.0;
 const SIMULATOR_DEPLOYMENTS: &[&str] = &["vcr-1", "vcr-2"];
 /// Persistent simulator ConfigMap containing startup fake metrics.
 const SIMULATOR_CONFIGMAP: &str = "vcr-1-config";
+/// Pod template annotation for the simulator's queue metric.
+const SIMULATOR_WAITING_REQUESTS_ANNOTATION: &str = "grid.praxis.fast/fake-waiting-requests";
+/// Pod template annotation for the simulator's KV-cache metric.
+const SIMULATOR_KV_CACHE_ANNOTATION: &str = "grid.praxis.fast/fake-kv-cache-usage";
 
 /// GridNetwork resource name.
 const GRID_NETWORK_NAME: &str = "grid-llmd-pool-metrics";
+
+/// Default prefix used when materializing a run-owned Forge environment.
+const DEFAULT_CLUSTER_PREFIX: &str = "grid-llmd-pm";
+
+/// Forge derives the shared Docker network name from the environment metadata name.
+const DEFAULT_FORGE_ENV_NAME: &str = "grid-llmd-pool-metrics";
+
+/// Prefix for the clusters owned by this process.
+static RUN_CLUSTER_PREFIX: OnceLock<String> = OnceLock::new();
 
 /// Default gateway image tag.
 ///
@@ -115,6 +136,9 @@ const GRID_NETWORK_NAME: &str = "grid-llmd-pool-metrics";
 /// `provider_route`, `credential_inject`, and `intelligent_route` filters
 /// which are built into the published Grid AI rollup.
 const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.6.0";
+
+/// Default local Grid Gateway image used by the full cross-site signal proof.
+const DEFAULT_GRID_GATEWAY_IMAGE: &str = "grid-gateway:llmd-pool-metrics-demo";
 
 /// Default operator image tag.
 const DEFAULT_OPERATOR_IMAGE: &str = "ghcr.io/praxis-proxy/grid-operator:v0.1.4";
@@ -145,6 +169,29 @@ const METRICS_SERVER_TLS_SECRET: &str = "metrics-server-tls";
 
 /// Secret name holding the metrics client TLS certificate and key.
 const METRICS_CLIENT_TLS_SECRET: &str = "metrics-client-tls";
+
+/// Grid-serving consumer installed for the cross-site signal-poll proof.
+const GRID_SERVING_GATEWAY: &str = "grid-serving-gateway";
+
+/// Operator-owned serving ConfigMap consumed by the Grid-serving gateway.
+const GRID_SERVING_CONFIGMAP: &str = "grid-serving-grid-llmd-pool-metrics-grid-serving-gateway";
+
+/// Praxis Gateway HTTP service port.
+const GRID_SERVING_GATEWAY_PORT: u16 = 8080;
+
+/// Provider gateway HTTPS service port.
+const PROVIDER_GATEWAY_PORT: u16 = 8443;
+
+/// Operator metrics service port.
+const OPERATOR_METRICS_PORT: u16 = 9090;
+/// Operator peer-signal listener port exposed by the signals Service.
+const OPERATOR_SIGNALS_PORT: u16 = 9091;
+
+/// Grid Gateway's TLS metrics listener port.
+const GRID_SERVING_METRICS_PORT: u16 = 9443;
+
+/// Cluster exposing the Grid Gateway's cross-site route.
+const GRID_SERVING_SITE: &str = "pool-a";
 
 // ---------------------------------------------------------------------------
 // Context
@@ -235,6 +282,8 @@ struct DemoContext {
 struct ResolvedImages {
     /// Praxis AI gateway image (must contain Grid filters).
     gateway: String,
+    /// Grid Gateway image, required by full-mode cross-site signal proofs.
+    grid_gateway: Option<String>,
     /// Grid operator image.
     operator: String,
     /// llm-d EPP image.
@@ -380,7 +429,11 @@ pub(crate) fn run(
         MetricsTransport::DirectHttp
     };
     let scoring_flavor = ScoringFlavor::from_kv_cache_flag(kv_cache);
-    let run_id = format_utc_timestamp();
+    let run_id = format!("{}-{}", format_utc_timestamp(), std::process::id());
+    let cluster_prefix = format!("{DEFAULT_CLUSTER_PREFIX}-{}", run_id.to_ascii_lowercase());
+    RUN_CLUSTER_PREFIX
+        .set(cluster_prefix)
+        .map_err(|error| format!("llm-d pool-metrics run prefix was already initialized: {error}"))?;
     let started_at = format_utc_iso();
     let wall_start = Instant::now();
 
@@ -403,6 +456,7 @@ pub(crate) fn run(
         &run_id,
         metrics_transport,
         scoring_flavor,
+        mode,
     )?;
     let mut teardown_success = false;
     let mut run_error: Option<String> = None;
@@ -421,33 +475,62 @@ pub(crate) fn run(
                 .filter_map(|(name, proof)| (!proof.success).then_some(name.as_str()))
                 .collect();
             if !failed.is_empty() {
+                for name in &failed {
+                    if let Some(proof) = results.get(*name) {
+                        eprintln!("[PROOF][FAIL] {name}: {}", proof.description);
+                        for observation in &proof.observations {
+                            eprintln!("  [PROOF][DETAIL] {observation}");
+                        }
+                    }
+                }
                 run_error = Some(format!("proofs failed: {}", failed.join(", ")));
             }
 
             if options.teardown && (run_error.is_none() || !options.keep_on_failure) {
+                eprintln!("[CLEANUP][START] tearing down this run's Forge environment");
                 match teardown_environment(&context) {
-                    Ok(()) => teardown_success = true,
+                    Ok(()) => {
+                        teardown_success = true;
+                        eprintln!("[CLEANUP][PASS] this run's Forge environment was removed");
+                    },
                     Err(e) => {
-                        eprintln!("[WARN]  Teardown failed: {e}");
+                        eprintln!("[CLEANUP][FAIL] teardown command failed: {e}");
                         run_error = Some(match run_error {
-                            Some(prev) => format!("{prev}; teardown: {e}"),
-                            None => format!("teardown: {e}"),
+                            Some(prev) => format!("{prev}; teardown also failed: {e}"),
+                            None => format!("teardown failed: {e}"),
                         });
                     },
                 }
+            } else if options.teardown && options.keep_on_failure && run_error.is_some() {
+                eprintln!(
+                    "[CLEANUP][SKIP] preserving run-owned clusters because a proof failed and --keep-on-failure was set"
+                );
+            } else if !options.teardown {
+                eprintln!("[CLEANUP][SKIP] teardown was not requested");
             }
 
             results
         },
         Err(e) => {
-            eprintln!("[FAIL] Environment setup failed: {e}");
+            eprintln!("[SETUP][FAIL] environment deployment failed: {e}");
             run_error = Some(format!("setup failed: {e}"));
 
-            if options.teardown
-                && !options.keep_on_failure
-                && let Err(te) = teardown_environment(&context)
-            {
-                eprintln!("[WARN]  Cleanup after setup failure: {te}");
+            if options.teardown && !options.keep_on_failure {
+                eprintln!("[CLEANUP][START] attempting teardown after setup failure");
+                match teardown_environment(&context) {
+                    Ok(()) => {
+                        teardown_success = true;
+                        eprintln!("[CLEANUP][PASS] partial run environment was removed");
+                    },
+                    Err(te) => {
+                        eprintln!("[CLEANUP][FAIL] teardown after setup failure also failed: {te}");
+                        run_error = Some(format!("setup failed: {e}; cleanup also failed: {te}"));
+                    },
+                }
+            } else if options.keep_on_failure {
+                eprintln!("[CLEANUP][SKIP] preserving partial setup because --keep-on-failure was set");
+            } else {
+                eprintln!("[CLEANUP][SKIP] teardown was not requested after setup failure");
             }
 
             BTreeMap::new()
@@ -490,7 +573,7 @@ pub(crate) fn run(
     if success {
         eprintln!("DEMO PASSED  ({wall_secs:.1}s)");
     } else {
-        eprintln!("DEMO FAILED  ({wall_secs:.1}s)");
+        eprintln!("DEMO FAILED  (exit status 1, {wall_secs:.1}s)");
         if let Some(err) = &run_error {
             eprintln!("  {err}");
         }
@@ -547,14 +630,19 @@ fn write_transition_timeline(
 // ---------------------------------------------------------------------------
 
 /// Resolve inputs before creating clusters.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "setup resolves these independent topology, run, signal, and image options before any cluster exists"
+)]
 fn prepare_setup(
     forge_config: &Path,
     forge_state_dir: &Path,
     run_id: &str,
     metrics_transport: MetricsTransport,
     scoring_flavor: ScoringFlavor,
+    mode: DemoMode,
 ) -> Result<DemoContext, Box<dyn std::error::Error>> {
-    let images = resolve_images(metrics_transport)?;
+    let images = resolve_images(metrics_transport, mode == DemoMode::Full)?;
     verify_images(&images)?;
 
     let resolved_config = materialize_config_with_images(
@@ -583,8 +671,14 @@ fn prepare_setup(
 }
 
 /// Resolve image references from environment variables with defaults.
-fn resolve_images(metrics_transport: MetricsTransport) -> Result<ResolvedImages, Box<dyn std::error::Error>> {
+fn resolve_images(
+    metrics_transport: MetricsTransport,
+    include_grid_gateway: bool,
+) -> Result<ResolvedImages, Box<dyn std::error::Error>> {
     let gateway = std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| DEFAULT_GATEWAY_IMAGE.to_owned());
+    let grid_gateway = include_grid_gateway.then(|| {
+        std::env::var("GRID_XTASK_GRID_GATEWAY_IMAGE").unwrap_or_else(|_| DEFAULT_GRID_GATEWAY_IMAGE.to_owned())
+    });
     let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE").unwrap_or_else(|_| DEFAULT_OPERATOR_IMAGE.to_owned());
     let epp = std::env::var("GRID_XTASK_EPP_IMAGE").unwrap_or_else(|_| DEFAULT_EPP_IMAGE.to_owned());
     let vcr = std::env::var("GRID_XTASK_SIM_IMAGE").unwrap_or_else(|_| DEFAULT_VCR_IMAGE.to_owned());
@@ -595,6 +689,9 @@ fn resolve_images(metrics_transport: MetricsTransport) -> Result<ResolvedImages,
 
     eprintln!("  Images:");
     eprintln!("    gateway:      {gateway}");
+    if let Some(image) = &grid_gateway {
+        eprintln!("    grid-gateway: {image}");
+    }
     eprintln!("    operator:     {operator}");
     eprintln!("    epp:          {epp}");
     eprintln!("    vcr:          {vcr}");
@@ -605,6 +702,7 @@ fn resolve_images(metrics_transport: MetricsTransport) -> Result<ResolvedImages,
 
     Ok(ResolvedImages {
         gateway,
+        grid_gateway,
         operator,
         epp,
         vcr,
@@ -635,6 +733,9 @@ fn verify_images(images: &ResolvedImages) -> Result<(), Box<dyn std::error::Erro
         ("vcr", &images.vcr, "VCR"),
         ("overlay-sync", &images.overlay_sync, "OVERLAY_SYNC"),
     ];
+    if let Some(grid_gateway) = &images.grid_gateway {
+        checks.push(("grid-gateway", grid_gateway, "GRID_GATEWAY"));
+    }
     if let Some(nginx) = &images.nginx {
         checks.push(("nginx", nginx, "NGINX"));
     }
@@ -853,6 +954,10 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
 
         // Proof 4: Recovery (measured queue drain with live table)
         results.insert("recovery".to_owned(), proof_recovery(context, table_start));
+
+        // Proof 5: EPP metrics cross the operator poll relay and drive the
+        // embedded Grid Gateway's live site route without a gateway restart.
+        results.insert("cross_site_signal_poll".to_owned(), cross_site::proof(context));
     }
 
     // TLS proof stages, only in mTLS mode
@@ -1299,10 +1404,9 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
 // Pressure generator
 // ---------------------------------------------------------------------------
 
-/// Persist a deterministic queue value, then roll the simulator pods so the
-/// value is read from startup configuration rather than an in-memory admin
-/// endpoint. The EPP metric and overlay checks remain the authoritative
-/// downstream observations.
+/// Persist deterministic fake metrics and roll simulator pods from template annotations.
+/// The annotations make KV-cache-only changes alter the pod template and trigger rollout.
+/// The EPP metric and overlay checks remain the authoritative downstream observations.
 fn set_simulator_waiting_requests(
     cluster: &str,
     waiting_requests: u32,
@@ -1321,9 +1425,7 @@ fn set_simulator_waiting_requests(
             "spec": {
                 "template": {
                     "metadata": {
-                        "annotations": {
-                            "grid.praxis.fast/fake-waiting-requests": waiting_requests.to_string()
-                        }
+                        "annotations": simulator_rollout_annotations(waiting_requests, kv_cache_usage)
                     }
                 }
             }
@@ -1350,8 +1452,10 @@ fn set_simulator_waiting_requests(
             .into());
         }
         let after = deployment_generation(&ctx, deployment)?;
-        if after <= before {
-            return Err(format!("deployment/{deployment} generation did not change ({before} -> {after})").into());
+        if simulator_rollout_needed(before, after).map_err(|error| format!("deployment/{deployment}: {error}"))? {
+            eprintln!("  restarting {deployment} for simulator metric configuration");
+        } else {
+            eprintln!("  {deployment} already has the requested simulator metric configuration; no restart needed");
         }
         kubectl::wait_for_rollout_ns(&ctx, deployment, GRID_SYSTEM_NS, cluster)
             .map_err(|e| format!("wait for simulator deployment/{deployment} rollout: {e}"))?;
@@ -1395,6 +1499,25 @@ fn simulator_metrics(pressure: u32, scoring_flavor: ScoringFlavor) -> (u32, f64)
         ScoringFlavor::QueueDepth => (pressure, 0.0),
         ScoringFlavor::KvCachePressure => (0, 0.95),
     }
+}
+
+/// Return the pod-template annotations that identify the complete fake-metric state.
+fn simulator_rollout_annotations(waiting_requests: u32, kv_cache_usage: f64) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            SIMULATOR_WAITING_REQUESTS_ANNOTATION.to_owned(),
+            waiting_requests.to_string(),
+        ),
+        (SIMULATOR_KV_CACHE_ANNOTATION.to_owned(), kv_cache_usage.to_string()),
+    ])
+}
+
+/// Whether a Deployment generation change requires waiting for a new simulator rollout.
+fn simulator_rollout_needed(before: i64, after: i64) -> Result<bool, String> {
+    if after < before {
+        return Err(format!("generation moved backwards ({before} -> {after})"));
+    }
+    Ok(after > before)
 }
 
 /// Read a Deployment generation before and after a deterministic simulator
@@ -1917,8 +2040,8 @@ fn get_configmap_data_key(
 // SWIM seeding
 // ---------------------------------------------------------------------------
 
-/// Read the SWIM LoadBalancer IP for a cluster.
-fn read_swim_lb_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// Read a LoadBalancer IP for one of this run's operator Services.
+fn read_operator_lb_ip(cluster: &str, service: &str) -> Result<String, Box<dyn std::error::Error>> {
     let context = kind_context(cluster);
     let output = Command::new("kubectl")
         .args([
@@ -1928,39 +2051,70 @@ fn read_swim_lb_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error>> 
             GRID_SYSTEM_NS,
             "get",
             "svc",
-            "grid-operator-swim",
+            service,
             "-o",
             "jsonpath={.status.loadBalancer.ingress[0].ip}",
         ])
         .output()?;
     if !output.status.success() {
         return Err(format!(
-            "{cluster}: cannot read SWIM service: {}",
+            "{cluster}: cannot read {service} service: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )
         .into());
     }
     let ip = String::from_utf8(output.stdout)?.trim().to_owned();
     if ip.is_empty() {
-        return Err(format!("{cluster}: SWIM LoadBalancer has no ingress IP").into());
+        return Err(format!("{cluster}: {service} LoadBalancer has no ingress IP").into());
     }
     Ok(ip)
 }
 
+/// Read the SWIM LoadBalancer IP for a cluster.
+fn read_swim_lb_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error>> {
+    read_operator_lb_ip(cluster, "grid-operator-swim")
+}
+
+/// Read the peer-signals LoadBalancer IP for a cluster.
+fn read_signals_lb_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error>> {
+    read_operator_lb_ip(cluster, "grid-operator-signals")
+}
+
+/// Wait for MetalLB to assign ingress to the operator's peer-signals Service.
+fn wait_for_signals_lb_ip(cluster: &str, timeout: Duration) -> Result<String, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error: String;
+    loop {
+        match read_signals_lb_ip(cluster) {
+            Ok(ip) => return Ok(ip),
+            Err(error) => last_error = error.to_string(),
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{cluster}: timed out waiting {timeout:?} for grid-operator-signals ingress; last observation: {last_error}"
+            )
+            .into());
+        }
+        eprintln!("[WAIT] {cluster}: grid-operator-signals has no ingress yet: {last_error}");
+        std::thread::park_timeout(Duration::from_secs(2));
+    }
+}
+
 /// Seed SWIM membership by upgrading operators with cross-cluster seeds.
 fn seed_swim_membership() -> Result<(), Box<dyn std::error::Error>> {
-    let mut ips: Vec<(String, String)> = Vec::new();
+    let mut endpoints: Vec<(String, String, String)> = Vec::new();
     for cluster in CLUSTERS {
-        let ip = read_swim_lb_ip(cluster)?;
-        eprintln!("  {cluster}: SWIM LB IP = {ip}");
-        ips.push(((*cluster).to_owned(), ip));
+        let swim_ip = read_swim_lb_ip(cluster)?;
+        let signals_ip = wait_for_signals_lb_ip(cluster, SIGNALS_LB_INGRESS_TIMEOUT)?;
+        eprintln!("  {cluster}: SWIM LB IP = {swim_ip}; signals LB IP = {signals_ip}");
+        endpoints.push(((*cluster).to_owned(), swim_ip, signals_ip));
     }
 
-    for (cluster, this_ip) in &ips {
-        let peer_seeds: Vec<String> = ips
+    for (cluster, this_swim_ip, this_signals_ip) in &endpoints {
+        let peer_seeds: Vec<String> = endpoints
             .iter()
-            .filter(|(c, _)| c != cluster)
-            .map(|(_, ip)| format!("{ip}:7946"))
+            .filter(|(c, ..)| c != cluster)
+            .map(|(_, ip, _)| format!("{ip}:7946"))
             .collect();
         let seeds = peer_seeds.join(",");
         let context = kind_context(cluster);
@@ -1981,7 +2135,9 @@ fn seed_swim_membership() -> Result<(), Box<dyn std::error::Error>> {
                 "--set",
                 &format!("swim.siteName={cluster}"),
                 "--set",
-                &format!("swim.advertiseAddress={this_ip}:7946"),
+                &format!("swim.advertiseAddress={this_swim_ip}:7946"),
+                "--set-string",
+                &format!("signals.advertiseAddress={this_signals_ip}:{OPERATOR_SIGNALS_PORT}"),
                 "--set",
                 &format!("swim.seeds={seeds_escaped}"),
                 "--set",
@@ -2289,9 +2445,14 @@ fn load_images_into_clusters(context: &DemoContext) -> Result<(), Box<dyn std::e
         tags.push(nginx);
     }
     for cluster in CLUSTERS {
-        let kind_name = format!("grid-llmd-pm-{cluster}");
+        let kind_name = format!("{}-{cluster}", run_cluster_prefix());
         for image_tag in &tags {
             load_docker_image_into_kind(image_tag, &kind_name)?;
+        }
+        if cluster == &"pool-a"
+            && let Some(grid_gateway) = &context.images.grid_gateway
+        {
+            load_docker_image_into_kind(grid_gateway, &kind_name)?;
         }
         eprintln!("  [OK] {cluster}: all images loaded");
     }
@@ -2351,6 +2512,9 @@ fn collect_image_evidence(resolved: &ResolvedImages) -> Result<BTreeMap<String, 
         ("vcr", &resolved.vcr),
         ("overlay-sync", &resolved.overlay_sync),
     ];
+    if let Some(grid_gateway) = &resolved.grid_gateway {
+        entries.push(("grid-gateway", grid_gateway));
+    }
     if let Some(nginx) = &resolved.nginx {
         entries.push(("nginx", nginx));
     }
@@ -2390,8 +2554,18 @@ fn run_forge(
     if output.status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(format!("forge {} failed: {stderr}", args.join(" ")).into())
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let exit = output.status.code().map_or_else(
+        || "terminated by signal".to_owned(),
+        |code| format!("exit status {code}"),
+    );
+    let detail = if stderr.is_empty() {
+        "no stderr output".to_owned()
+    } else {
+        stderr
+    };
+    eprintln!("[COMMAND][FAIL] Forge command {:?} {exit}: {detail}", args.join(" "));
+    Err(format!("Forge command {} {exit}: {detail}", args.join(" ")).into())
 }
 
 /// Run a specific forge stack on a cluster.
@@ -2477,6 +2651,9 @@ fn materialize_config_with_images(
     let run_suffix = run_id.map_or_else(String::new, |id| format!(".{id}"));
     let resolved = dir.join(format!(".forge.resolved{run_suffix}.yaml"));
     let mut result = fs::read_to_string(forge_config)?;
+    if let Some(run_id) = run_id {
+        result = scope_forge_config_to_run(&result, run_id)?;
+    }
     if let Some(images) = images {
         let image_pull_policy =
             std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "IfNotPresent".to_owned());
@@ -2615,7 +2792,7 @@ fn materialize_config_with_images(
         )?;
 
         // Add TLS secret references to metricsConfig
-        let signal_anchor = "                    healthy: inference_pool_ready_pods";
+        let signal_anchor = "                    healthy: llm_d_epp_ready_endpoints";
         let tls_block = format!(
             "{signal_anchor}\n\
              \x20                 tls:\n\
@@ -2659,6 +2836,35 @@ fn materialize_config_with_images(
 
     fs::write(&resolved, result)?;
     Ok(resolved)
+}
+
+/// Scope the Forge prefix, shared Docker network, and explicit `kubectl` contexts to one run.
+fn scope_forge_config_to_run(config: &str, run_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let cluster_prefix = format!("{DEFAULT_CLUSTER_PREFIX}-{}", run_id.to_ascii_lowercase());
+    let mut scoped = checked_replace(
+        config,
+        &format!("metadata:\n  name: {DEFAULT_FORGE_ENV_NAME}"),
+        &format!("metadata:\n  name: {cluster_prefix}"),
+        1,
+        "run-scoped Forge environment and Docker network name",
+    )?;
+    scoped = checked_replace(
+        &scoped,
+        &format!("clusterPrefix: {DEFAULT_CLUSTER_PREFIX}"),
+        &format!("clusterPrefix: {cluster_prefix}"),
+        1,
+        "run-scoped Forge cluster prefix",
+    )?;
+    let default_context = format!("kind-{DEFAULT_CLUSTER_PREFIX}-{{{{ cluster.name }}}}");
+    let run_context = format!("kind-{cluster_prefix}-{{{{ cluster.name }}}}");
+    scoped = checked_replace(
+        &scoped,
+        &default_context,
+        &run_context,
+        4,
+        "run-scoped kubectl contexts",
+    )?;
+    Ok(scoped)
 }
 
 /// Split a registry image reference into repository and tag.
@@ -2842,7 +3048,12 @@ fn is_leap(y: i64) -> bool {
 
 /// Format a Kind cluster context name.
 fn kind_context(cluster: &str) -> String {
-    format!("kind-grid-llmd-pm-{cluster}")
+    format!("kind-{}-{cluster}", run_cluster_prefix())
+}
+
+/// Return this invocation's Forge cluster prefix, or the checked-in default in unit tests.
+fn run_cluster_prefix() -> &'static str {
+    RUN_CLUSTER_PREFIX.get().map_or(DEFAULT_CLUSTER_PREFIX, String::as_str)
 }
 
 /// Annotate the GridNetwork to trigger operator re-reconciliation.
@@ -4092,6 +4303,86 @@ mod tests {
     }
 
     #[test]
+    fn run_scoped_forge_config_updates_every_explicit_kubectl_context() -> Result<(), Box<dyn std::error::Error>> {
+        let config = include_str!("../../../tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml");
+        let run_id = "20261011T120000Z-12345";
+        let scoped = scope_forge_config_to_run(config, run_id)?;
+        let run_prefix = format!("{DEFAULT_CLUSTER_PREFIX}-{}", run_id.to_ascii_lowercase());
+        let run_context = format!("kind-{run_prefix}-{{{{ cluster.name }}}}");
+
+        assert!(
+            scoped.contains(&format!("metadata:\n  name: {run_prefix}")),
+            "Forge environment and network names should include the unique run prefix"
+        );
+        assert!(
+            scoped.contains(&format!("clusterPrefix: {run_prefix}")),
+            "Kind cluster names should include the unique run prefix"
+        );
+        assert_eq!(
+            scoped.matches(&run_context).count(),
+            4,
+            "every explicit kubectl context should use the run-scoped clusters"
+        );
+        assert!(
+            !scoped.contains(&format!("metadata:\n  name: {DEFAULT_FORGE_ENV_NAME}")),
+            "the shared default Forge environment must not remain in the scoped config"
+        );
+        assert!(
+            !scoped.contains(&format!("kind-{DEFAULT_CLUSTER_PREFIX}-{{{{ cluster.name }}}}")),
+            "the shared default Kind context must not remain in the scoped config"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pool_metrics_topology_enables_signal_polling_at_the_chart_root() -> Result<(), Box<dyn std::error::Error>> {
+        let config = include_str!("../../../tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml");
+        let config: serde_yaml::Value = serde_yaml::from_str(config)?;
+        let stacks = config
+            .get("spec")
+            .and_then(|spec| spec.get("stacks"))
+            .and_then(serde_yaml::Value::as_mapping)
+            .ok_or_else(|| std::io::Error::other("Forge config must contain a spec.stacks mapping"))?;
+
+        for stack_name in ["pool-a-operator-base", "pool-b-operator-base"] {
+            let stack = stacks
+                .get(serde_yaml::Value::String(stack_name.to_owned()))
+                .and_then(serde_yaml::Value::as_mapping)
+                .ok_or_else(|| std::io::Error::other(format!("{stack_name} must be a stack mapping")))?;
+            let steps = stack
+                .get(serde_yaml::Value::String("steps".to_owned()))
+                .and_then(serde_yaml::Value::as_sequence)
+                .ok_or_else(|| std::io::Error::other(format!("{stack_name}.steps must be a sequence")))?;
+            let operator = steps
+                .iter()
+                .find(|step| step.get("release").and_then(serde_yaml::Value::as_str) == Some("grid-operator"))
+                .ok_or_else(|| std::io::Error::other(format!("{stack_name} must include a grid-operator release")))?;
+            let values = operator.get("values").ok_or_else(|| {
+                std::io::Error::other(format!("{stack_name} grid-operator release must include values"))
+            })?;
+            let signals = values.get("signals").ok_or_else(|| {
+                std::io::Error::other(format!("{stack_name} grid-operator values must include signals"))
+            })?;
+
+            assert_eq!(
+                signals.get("enabled").and_then(serde_yaml::Value::as_bool),
+                Some(true),
+                "cross-site qualification must enable operator peer signals"
+            );
+            assert_eq!(
+                signals.get("peerIntervalSeconds").and_then(serde_yaml::Value::as_str),
+                Some("2"),
+                "cross-site peer signals should poll at the configured two-second interval"
+            );
+            assert!(
+                values.get("swim").and_then(|swim| swim.get("signals")).is_none(),
+                "signals configuration belongs at the chart root rather than under SWIM"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn utc_timestamp_format_is_valid() {
         let ts = format_utc_timestamp();
         assert_eq!(ts.len(), 16, "expected YYYYMMDDTHHMMSSz format");
@@ -4161,6 +4452,56 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         let config = simulator_config(queue, kv_cache);
         assert!(config.contains("waiting-requests: 0"));
         assert!(config.contains("kv-cache-usage: 0.95"));
+    }
+
+    #[test]
+    fn simulator_rollout_annotations_change_for_kv_cache_pressure() {
+        let idle = simulator_rollout_annotations(0, 0.0);
+        let pressured = simulator_rollout_annotations(0, 0.95);
+
+        assert_eq!(
+            idle.get(SIMULATOR_WAITING_REQUESTS_ANNOTATION).map(String::as_str),
+            Some("0"),
+            "idle configuration should annotate the zero queue value"
+        );
+        assert_eq!(
+            pressured.get(SIMULATOR_WAITING_REQUESTS_ANNOTATION).map(String::as_str),
+            Some("0"),
+            "KV-cache pressure must leave queue pressure unchanged"
+        );
+        assert_eq!(
+            idle.get(SIMULATOR_KV_CACHE_ANNOTATION).map(String::as_str),
+            Some("0"),
+            "idle configuration should annotate zero KV-cache use"
+        );
+        assert_eq!(
+            pressured.get(SIMULATOR_KV_CACHE_ANNOTATION).map(String::as_str),
+            Some("0.95"),
+            "KV-cache pressure should be present in the simulator pod template"
+        );
+        assert_ne!(
+            idle, pressured,
+            "KV-cache-only changes must change pod-template annotations and trigger rollout"
+        );
+    }
+
+    #[test]
+    fn unchanged_simulator_generation_does_not_require_a_rollout() {
+        assert_eq!(
+            simulator_rollout_needed(3, 3),
+            Ok(false),
+            "an unchanged generation is already current"
+        );
+        assert_eq!(
+            simulator_rollout_needed(3, 4),
+            Ok(true),
+            "a newer generation requires rollout readiness"
+        );
+        assert_eq!(
+            simulator_rollout_needed(4, 3),
+            Err("generation moved backwards (4 -> 3)".to_owned()),
+            "a generation moving backwards indicates inconsistent rollout evidence"
+        );
     }
 
     #[test]
@@ -4468,11 +4809,11 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
 
                   metricsEndpoint: \"http://llmd-epp-metrics.grid-system.svc.cluster.local:9090\"
                   signalNames:
-                    healthy: inference_pool_ready_pods
+                    healthy: llm_d_epp_ready_endpoints
 
                   metricsEndpoint: \"http://llmd-epp-metrics.grid-system.svc.cluster.local:9090\"
                   signalNames:
-                    healthy: inference_pool_ready_pods
+                    healthy: llm_d_epp_ready_endpoints
 
               scoringPolicy:
                 strategy: queueDepth
@@ -4716,14 +5057,22 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         if std::env::var("GRID_XTASK_NGINX_IMAGE").is_ok() {
             return;
         }
-        let images = resolve_images(MetricsTransport::DirectHttp).unwrap();
+        let images = resolve_images(MetricsTransport::DirectHttp, false).unwrap();
         assert!(images.nginx.is_none(), "direct-HTTP must not resolve nginx image");
+        assert!(
+            images.grid_gateway.is_none(),
+            "quick-mode inputs must not require Grid Gateway"
+        );
     }
 
     #[test]
     fn nginx_image_present_in_mtls() {
-        let images = resolve_images(MetricsTransport::MtlsProxy).unwrap();
+        let images = resolve_images(MetricsTransport::MtlsProxy, false).unwrap();
         assert!(images.nginx.is_some(), "mTLS must resolve nginx image");
         assert_eq!(images.nginx.unwrap(), DEFAULT_NGINX_IMAGE);
+        assert!(
+            images.grid_gateway.is_none(),
+            "quick-mode inputs must not require Grid Gateway"
+        );
     }
 }

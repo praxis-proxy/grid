@@ -19,8 +19,7 @@ what the gateway does with it. The fields other than `shedding` are for a sympto
 | Field | Default | Meaning |
 |---|---|---|
 | `smoothing` | 0.3 | How far one new sample moves a site's saturation toward the new reading. |
-| `ceiling_half_life_ms` | 600000 | How long a learned ceiling takes to halve once load falls away. |
-| `ceiling_floor` | 8 | The least a ceiling can be, so a quiet site does not read as full. |
+| `ceiling_floor` | 8 | The least a ceiling can be, so a quiet site does not read as full. A ceiling only rises; nothing brings it down. |
 | `explore_floor` | 0.25 | A measured site's weight is at least this share of the largest ceiling. |
 | `full_after_ms` | 5000 | How long a site must stay at its ceiling with work waiting before it counts as full. |
 | `room_after_ms` | 2000 | How long no sample may show a site at its ceiling with work waiting before a shedding model routes again. |

@@ -134,6 +134,15 @@ pub struct OperatorCtx {
     /// How often the signals loop scrapes providers; a readiness window is at least two.
     scrape_interval: Duration,
 
+    /// Duration of each network's latest provider-scrape pass.
+    ///
+    /// Used to widen the readiness window when a pass takes longer than one
+    /// scrape interval, so healthy providers are not marked stale before the
+    /// next pass can refresh them. The measurement covers only that network's
+    /// `collect_provider_signals` call; provider listing, peer registration,
+    /// and other networks' passes are excluded.
+    last_scrape_passes: std::sync::Mutex<HashMap<String, Duration>>,
+
     /// Signal transport resolved once at startup: gossip or poll.
     ///
     /// Under poll the operator stops carrying metrics in gossip and scoring the
@@ -306,6 +315,7 @@ impl OperatorCtx {
             served_models: served_models::ServedModelStore::new(),
             readiness: readiness::ReadinessStore::default(),
             scrape_interval: Duration::ZERO,
+            last_scrape_passes: std::sync::Mutex::new(HashMap::new()),
             signal_mode,
             serving_writes: WriteGate::default(),
             peer_settings: PeerSettings::default(),
@@ -395,6 +405,25 @@ impl OperatorCtx {
         self
     }
 
+    /// Record how long one network's latest provider-scrape pass took.
+    fn record_scrape_pass(&self, network: &str, duration: Duration) {
+        let mut passes = self
+            .last_scrape_passes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        passes.insert(network.to_owned(), duration);
+    }
+
+    /// The latest measured provider-scrape pass for `network`.
+    fn last_scrape_pass(&self, network: &str) -> Duration {
+        self.last_scrape_passes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(network)
+            .copied()
+            .unwrap_or(Duration::ZERO)
+    }
+
     /// Name the certificate the operator issues itself after this site, not the network.
     #[must_use]
     pub fn with_site_name(mut self, site_name: Option<String>) -> Self {
@@ -457,6 +486,7 @@ pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &
     let providers = list_all_inference_providers(client).await?;
     ctx.signals.set_access(signal_access(&providers));
     Box::pin(register_peers(ctx, client)).await?;
+    let scrape_started = Instant::now();
     Box::pin(provider_metrics::collect_provider_signals(
         network_name,
         &providers,
@@ -464,6 +494,7 @@ pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &
         &ctx.readiness,
     ))
     .await;
+    ctx.record_scrape_pass(network_name, scrape_started.elapsed());
     let collected = resolve_readiness(ctx, client, &providers, network_name);
     publish_signals(ctx, collected);
     Ok(())
@@ -651,9 +682,13 @@ fn ready_sample(verdict: &readiness::Verdict) -> signals::Observation {
 
 /// How long a provider's last good scrape stands.
 ///
-/// `staleMetricsSeconds`, else half the signal TTL, and never under two scrape
-/// intervals, so a provider is not judged stale between successful scrapes.
+/// `staleMetricsSeconds`, else half the signal TTL. The floor is one scrape
+/// interval plus the larger of one interval or the latest measured pass, so a
+/// slow pass does not make providers queued behind it stale before the next pass.
 fn readiness_stale_after(ctx: &OperatorCtx, provider: &InferenceProvider) -> Duration {
+    let interval = ctx.scrape_interval;
+    let pass = ctx.last_scrape_pass(&provider.spec.grid_network_ref);
+    let floor = interval.saturating_add(interval.max(pass));
     provider
         .spec
         .metrics_config
@@ -661,7 +696,7 @@ fn readiness_stale_after(ctx: &OperatorCtx, provider: &InferenceProvider) -> Dur
         .and_then(|mc| mc.stale_metrics_seconds)
         .filter(|secs| *secs > 0)
         .map_or_else(|| site_signals_ttl() / 2, |secs| Duration::from_secs(secs.into()))
-        .max(ctx.scrape_interval.saturating_mul(2))
+        .max(floor)
 }
 
 /// The provider's readiness verdict, `None` when it is not scraped for readiness or not yet judged.
@@ -3341,6 +3376,35 @@ fn guarded_deployment_patch(mut patch: Value, deployment: &Deployment) -> Result
     Ok(patch)
 }
 
+/// Map an apiserver error on the delegated Deployment to what it means for the mount status.
+///
+/// A conflict stays a kube error so the caller re-reads and retries. A 403 preserves the
+/// apiserver refusal so authorization and admission denials remain distinguishable.
+/// Anything else is `fallback`.
+fn delegated_deployment_failure(
+    error: kube::Error,
+    verb: &'static str,
+    fallback: crate::error::GatewayMountFailure,
+) -> OperatorError {
+    if matches!(&error, kube::Error::Api(status) if status.code == 409) {
+        return error.into();
+    }
+    if matches!(&error, kube::Error::Api(status) if status.code == 403) {
+        return mount_failure(
+            "DeploymentForbidden",
+            format!(
+                "the apiserver refused {verb} on the delegated Deployment: {error}. Inspect the refusal for \
+                 authorization or admission-policy denial. If RBAC denied access, verify the operator's \
+                 ServiceAccount has get and patch on that one Deployment (the praxis-gateway chart renders \
+                 the Role when mountReconciliation is enabled; otherwise create one in the gateway namespace), \
+                 and check that deploymentName is included in the name-restricted grant"
+            ),
+        )
+        .into();
+    }
+    fallback.into()
+}
+
 /// Preserve conflict errors so the caller can retry from a fresh Deployment read.
 async fn patch_delegated_deployment(
     deployments: &Api<Deployment>,
@@ -3350,14 +3414,13 @@ async fn patch_delegated_deployment(
     failure_message: &'static str,
 ) -> Result<(), OperatorError> {
     let patch = guarded_deployment_patch(patch, deployment)?;
-    match deployments
+    deployments
         .patch(name, &PatchParams::default(), &Patch::Strategic(patch))
         .await
-    {
-        Ok(_) => Ok(()),
-        Err(error) if matches!(&error, kube::Error::Api(status) if status.code == 409) => Err(error.into()),
-        Err(_) => Err(mount_failure("DeploymentPatchFailed", failure_message).into()),
-    }
+        .map(drop)
+        .map_err(|error| {
+            delegated_deployment_failure(error, "patch", mount_failure("DeploymentPatchFailed", failure_message))
+        })
 }
 
 /// Switch config source, Secret projections, and their revisions in one Pod-template update.
@@ -3438,10 +3501,11 @@ async fn reconcile_delegated_gateway(
         .get_opt(deployment_name)
         .await
         .map_err(|error| {
-            mount_failure(
+            let fallback = mount_failure(
                 "DeploymentReadFailed",
                 format!("could not read the delegated Deployment: {error}"),
-            )
+            );
+            delegated_deployment_failure(error, "get", fallback)
         })?
         .ok_or_else(|| mount_failure("DeploymentMissing", "the delegated Deployment does not exist"))?;
     let chart_managed_serving_tls =
@@ -6422,6 +6486,28 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort())
     }
 
+    /// Build a scraped provider whose configured staleness age is one second.
+    fn provider_with_stale_metrics(name: &str, network_ref: &str) -> InferenceProvider {
+        let mut provider = make_inference_provider(name, network_ref);
+        provider.spec.metrics_config = Some(crate::crd::inference_provider::MetricsConfig {
+            stale_metrics_seconds: Some(1),
+            ..Default::default()
+        });
+        provider
+    }
+
+    /// Record a successful readiness probe at `age` before `now`.
+    fn record_success_at_age(ctx: &OperatorCtx, key: &str, age: Duration, now: Instant) {
+        let at = now.checked_sub(age).unwrap_or_else(|| std::process::abort());
+        ctx.readiness.record_success(key, Some(1.0), None, Vec::new(), at);
+    }
+
+    /// Assert one provider's readiness floor.
+    #[track_caller]
+    fn assert_readiness_floor(ctx: &OperatorCtx, provider: &InferenceProvider, expected: Duration, message: &str) {
+        assert_eq!(readiness_stale_after(ctx, provider), expected, "{message}");
+    }
+
     fn make_grid_site(name: &str, network_ref: &str) -> GridSite {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis.fast/v1alpha1",
@@ -6572,6 +6658,108 @@ mod tests {
         assert_eq!(held.membership_hold(), Some(Action::requeue(MEMBERSHIP_HOLD_REQUEUE)));
         held.release_membership();
         assert!(held.membership_hold().is_none(), "released");
+    }
+
+    #[tokio::test]
+    async fn a_quick_scrape_pass_keeps_the_staleness_floor() {
+        let client = crate::resources::test_doubles::mock_kube_client_with_secrets(HashMap::new());
+        let ctx = OperatorCtx::new(client, None, SignalMode::default()).with_scrape_interval(Duration::from_secs(5));
+        let provider = provider_with_stale_metrics("provider-a", "net-a");
+
+        assert_readiness_floor(
+            &ctx,
+            &provider,
+            Duration::from_secs(10),
+            "before a pass is measured, two intervals remain the floor",
+        );
+        ctx.record_scrape_pass("net-a", Duration::from_secs(3));
+        assert_readiness_floor(
+            &ctx,
+            &provider,
+            Duration::from_secs(10),
+            "a pass shorter than the interval keeps the old floor",
+        );
+        ctx.record_scrape_pass("net-a", Duration::from_secs(5));
+        assert_readiness_floor(
+            &ctx,
+            &provider,
+            Duration::from_secs(10),
+            "a pass equal to the interval keeps the old floor",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_scrape_pass_widens_the_staleness_floor() {
+        let client = crate::resources::test_doubles::mock_kube_client_with_secrets(HashMap::new());
+        let ctx = OperatorCtx::new(client, None, SignalMode::default()).with_scrape_interval(Duration::from_secs(5));
+        let provider = provider_with_stale_metrics("provider-a", "net-a");
+        let sibling_network = provider_with_stale_metrics("provider-b", "net-b");
+
+        ctx.record_scrape_pass("net-a", Duration::from_secs(17));
+        assert_readiness_floor(
+            &ctx,
+            &provider,
+            Duration::from_secs(22),
+            "the floor covers one interval plus the measured pass",
+        );
+        assert_readiness_floor(
+            &ctx,
+            &sibling_network,
+            Duration::from_secs(10),
+            "another network keeps its own measured pass",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_provider_leaves_a_sibling_inside_the_widened_floor_ready() {
+        let client = crate::resources::test_doubles::mock_kube_client_with_secrets(HashMap::new());
+        let ctx = OperatorCtx::new(client, None, SignalMode::default()).with_scrape_interval(Duration::from_secs(5));
+        let timed_out = provider_with_stale_metrics("slow", "net");
+        let sibling = provider_with_stale_metrics("fast", "net");
+        let now = Instant::now();
+        record_success_at_age(&ctx, &readiness::key("net", "slow"), Duration::from_secs(23), now);
+        record_success_at_age(&ctx, &readiness::key("net", "fast"), Duration::from_secs(12), now);
+        ctx.readiness
+            .record_failure(&readiness::key("net", "slow"), readiness::ScrapeClass::Timeout, now);
+        ctx.record_scrape_pass("net", Duration::from_secs(17));
+
+        let slow_verdict = provider_readiness(&ctx, &timed_out, now).unwrap_or_else(|| std::process::abort());
+        let fast_verdict = provider_readiness(&ctx, &sibling, now).unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            slow_verdict.reason,
+            readiness::Reason::ScrapeTimedOut,
+            "{slow_verdict:?}"
+        );
+        assert_eq!(fast_verdict.reason, readiness::Reason::Ready, "{fast_verdict:?}");
+        assert!(slow_verdict.reason.excludes(), "the timed-out provider is excluded");
+        assert!(!fast_verdict.reason.excludes(), "the healthy sibling stays ready");
+    }
+
+    #[tokio::test]
+    async fn refresh_signals_records_the_measured_scrape_pass() {
+        let response = "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n"
+            .as_bytes()
+            .to_vec();
+        let endpoint =
+            crate::resources::test_doubles::start_delayed_http_server(response, Duration::from_millis(25)).await;
+        let mut provider = make_inference_provider("provider-a", "net");
+        provider.spec.endpoint = endpoint;
+        provider.spec.metrics_config = Some(crate::crd::inference_provider::MetricsConfig {
+            timeout: "1s".to_owned(),
+            ..Default::default()
+        });
+        let client = crate::resources::test_doubles::mock_kube_client_with_providers(vec![provider]);
+        let ctx =
+            OperatorCtx::new(client.clone(), None, SignalMode::default()).with_scrape_interval(Duration::from_secs(5));
+
+        refresh_signals(&ctx, &client, "net")
+            .await
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert!(
+            ctx.last_scrape_pass("net") >= Duration::from_millis(25),
+            "the scrape pass records its measured duration"
+        );
     }
 
     #[test]
@@ -8950,6 +9138,55 @@ mod tests {
         }
     }
 
+    /// Supply controlled kube errors to test status mapping without an apiserver.
+    fn api_error(code: u16) -> kube::Error {
+        kube::Error::Api(Box::new(
+            kube::core::Status::failure("scripted", "Scripted").with_code(code),
+        ))
+    }
+
+    /// Supply scripted apiserver responses to test error mapping through the kube client.
+    fn apiserver_answering(code: u16) -> Client {
+        let service = tower::service_fn(move |_req: http::Request<kube::client::Body>| async move {
+            let status = json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Failure",
+                "message": "scripted",
+                "reason": "Scripted",
+                "code": code,
+            });
+            let response = http::Response::builder()
+                .status(code)
+                .body(kube::client::Body::from(
+                    serde_json::to_vec(&status).unwrap_or_else(|_| std::process::abort()),
+                ))
+                .unwrap_or_else(|_| std::process::abort());
+            Ok::<_, std::convert::Infallible>(response)
+        });
+        Client::new(service, "default")
+    }
+
+    /// Exercise delegated patch error mapping with a scripted apiserver refusal.
+    async fn patch_refused_by_apiserver(code: u16) -> Result<OperatorError, Box<dyn std::error::Error>> {
+        let deployment: Deployment = serde_json::from_value(json!({
+            "metadata": {"name": "inference-gw", "namespace": "praxis-system", "resourceVersion": "7"}
+        }))?;
+        let deployments: Api<Deployment> = Api::namespaced(apiserver_answering(code), "praxis-system");
+        match patch_delegated_deployment(
+            &deployments,
+            "inference-gw",
+            &deployment,
+            json!({"metadata": {}}),
+            "the staged patch was refused",
+        )
+        .await
+        {
+            Ok(()) => Err(format!("a {code} from the apiserver must not look like a successful patch").into()),
+            Err(error) => Ok(error),
+        }
+    }
+
     fn make_consumer_config(cm_name: &str) -> ConsumerConfig {
         ConsumerConfig {
             enabled: true,
@@ -9765,6 +10002,104 @@ mod tests {
             assert_eq!(status.phase, expected_phase, "incorrect phase for {reason}");
             assert_eq!(status.reason, reason, "status must retain the specific failure reason");
         }
+    }
+
+    #[test]
+    fn a_forbidden_delegated_deployment_preserves_refusal_and_grant_guidance() {
+        let gateway = make_gw_ref("inference-gw", "praxis-system");
+        for verb in ["get", "patch"] {
+            let fallback = mount_failure("DeploymentReadFailed", "unused");
+            let error = delegated_deployment_failure(api_error(403), verb, fallback);
+            let status = mount_reconciliation_status_error(&gateway, None, &error, 7);
+            assert_eq!(
+                status.reason, "DeploymentForbidden",
+                "a 403 on {verb} must report the apiserver refusal"
+            );
+            assert!(
+                status.message.contains(&format!("refused {verb}")) && status.message.contains("scripted"),
+                "the message must preserve the refused verb and apiserver explanation: {}",
+                status.message
+            );
+            assert!(
+                status.message.contains("If RBAC denied access") && status.message.contains("deploymentName"),
+                "the grant guidance must be conditional on RBAC denying access"
+            );
+            assert_eq!(status.phase, MountReconciliationPhase::Error, "a refusal must not wait");
+        }
+    }
+
+    #[test]
+    fn a_conflicting_delegated_deployment_write_still_retries() {
+        let fallback = mount_failure("DeploymentPatchFailed", "unused");
+        let error = delegated_deployment_failure(api_error(409), "patch", fallback);
+        assert!(
+            error.is_conflict(),
+            "a 409 must stay a kube conflict so the caller re-reads and retries"
+        );
+    }
+
+    #[test]
+    fn other_delegated_deployment_errors_keep_the_callers_reason() {
+        let gateway = make_gw_ref("inference-gw", "praxis-system");
+        for code in [401, 404, 422, 500] {
+            let fallback = mount_failure("DeploymentPatchFailed", "the staged patch was refused");
+            let error = delegated_deployment_failure(api_error(code), "patch", fallback);
+            let status = mount_reconciliation_status_error(&gateway, None, &error, 7);
+            assert_eq!(
+                status.reason, "DeploymentPatchFailed",
+                "a {code} is the caller's own failure"
+            );
+            assert_eq!(
+                status.message, "the staged patch was refused",
+                "the caller's message is kept for a {code}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_delegated_deployment_read_reports_forbidden() {
+        let gateway = make_gw_ref("inference-gw", "praxis-system");
+        let delegation = MountReconciliation {
+            enabled: true,
+            deployment_name: Some("inference-gw".to_owned()),
+            container_name: "praxis".to_owned(),
+        };
+        let rendered = consumer_config::ConsumerRenderResult {
+            config_yaml: "listeners: []".to_owned(),
+            requirements: Vec::new(),
+        };
+        let result = Box::pin(reconcile_delegated_gateway(
+            &rendered,
+            "production",
+            &gateway,
+            &make_consumer_config("consumer-config"),
+            &delegation,
+            &make_serving_tls(),
+            7,
+            &apiserver_answering(403),
+        ))
+        .await;
+        // A 403 on the Deployment read must not reconcile.
+        let error = result.err().unwrap_or_else(|| std::process::abort());
+        let status = mount_reconciliation_status_error(&gateway, None, &error, 7);
+        assert_eq!(status.reason, "DeploymentForbidden", "{}", status.message);
+        assert!(status.message.contains("refused get"), "{}", status.message);
+    }
+
+    #[tokio::test]
+    async fn a_refused_delegated_deployment_patch_reports_forbidden() -> Result<(), Box<dyn std::error::Error>> {
+        let gateway = make_gw_ref("inference-gw", "praxis-system");
+        for (code, reason) in [(403, "DeploymentForbidden"), (500, "DeploymentPatchFailed")] {
+            let error = Box::pin(patch_refused_by_apiserver(code)).await?;
+            let status = mount_reconciliation_status_error(&gateway, None, &error, 7);
+            assert_eq!(status.reason, reason, "a {code} on patch must surface as {reason}");
+        }
+        let error = Box::pin(patch_refused_by_apiserver(409)).await?;
+        assert!(
+            error.is_conflict(),
+            "a 409 on patch must stay a conflict for the retry loop"
+        );
+        Ok(())
     }
 
     #[test]
