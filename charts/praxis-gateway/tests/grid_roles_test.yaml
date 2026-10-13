@@ -279,7 +279,7 @@ tests:
           path: spec.template.spec.containers[0].volumeMounts
           content:
             name: credential-0
-            mountPath: /run/secrets/grid-credentials/model.api-key
+            mountPath: /run/secrets/grid-credentials/model-api-key
             readOnly: true
       - contains:
           path: spec.template.spec.volumes
@@ -288,3 +288,13 @@ tests:
             secret:
               secretName: model.api-key
               optional: false
+
+  - it: truncates the default provider credential path at 63 characters
+    template: templates/deployment.yaml
+    set:
+      providerCredentials:
+        - secretName: provider-credential-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].volumeMounts[?(@.name == "credential-0")].mountPath
+          value: /run/secrets/grid-credentials/provider-credential-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
