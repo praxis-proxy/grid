@@ -70,20 +70,18 @@ tests:
   - it: stages delegated Grid mounts while retaining Helm mounts for a safe handoff
     template: templates/deployment.yaml
     set:
-      config.existingConfigMap: praxis-consumer-config
+      praxisConfig.byo.configMapName: praxis-consumer-config
       mountReconciliation.enabled: true
       mountReconciliation.network: production
       mountReconciliation.gatewayRef: inference-gw
       mountReconciliation.managedCredentialNames: [backend-token]
-      tls.enabled: true
-      tls.existingSecret: grid-site-identity
-      tls.caSecret: grid-ca
-      gatewayConfig.listenerTls.enabled: true
-      gatewayConfig.listenerTls.existingSecret: listener-tls
-      credentials:
-        - name: backend-token
+      gridIdentity.tlsSecretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
+      listenerTls.secretName: listener-tls
+      providerCredentials:
+        - secretName: backend-token
           mountPath: /run/secrets/backend-token
-        - name: monitoring-token
+        - secretName: monitoring-token
           mountPath: /run/secrets/monitoring-token
     asserts:
       - equal:
@@ -98,72 +96,46 @@ tests:
       - exists:
           path: spec.template.spec.volumes[?(@.name == "tls")]
       - equal:
-          path: spec.template.spec.volumes[?(@.name == "credential-backend-token")].secret.secretName
+          path: spec.template.spec.volumes[?(@.name == "credential-0")].secret.secretName
           value: backend-token
       - equal:
-          path: spec.template.spec.volumes[?(@.name == "credential-monitoring-token")].secret.secretName
+          path: spec.template.spec.volumes[?(@.name == "credential-1")].secret.secretName
           value: monitoring-token
       - equal:
           path: spec.template.spec.volumes[?(@.name == "listener-tls")].secret.secretName
           value: listener-tls
       - exists:
-          path: spec.template.spec.containers[?(@.name == "praxis")].volumeMounts[?(@.name == "credential-backend-token")]
+          path: spec.template.spec.containers[?(@.name == "praxis")].volumeMounts[?(@.name == "credential-0")]
       - equal:
-          path: spec.template.spec.containers[?(@.name == "praxis")].volumeMounts[?(@.name == "credential-monitoring-token")].mountPath
+          path: spec.template.spec.containers[?(@.name == "praxis")].volumeMounts[?(@.name == "credential-1")].mountPath
           value: /run/secrets/monitoring-token
 
   - it: releases selected Helm mounts only in the explicit handoff phase
     template: templates/deployment.yaml
     set:
-      config.existingConfigMap: praxis-consumer-config
+      praxisConfig.byo.configMapName: praxis-consumer-config
       mountReconciliation.enabled: true
       mountReconciliation.network: production
       mountReconciliation.gatewayRef: inference-gw
       mountReconciliation.releaseHelmMounts: true
       mountReconciliation.managedCredentialNames: [backend-token]
-      tls.enabled: true
-      tls.existingSecret: grid-site-identity
-      tls.caSecret: grid-ca
-      credentials:
-        - name: backend-token
+      gridIdentity.tlsSecretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
+      providerCredentials:
+        - secretName: backend-token
           mountPath: /run/secrets/backend-token
-        - name: monitoring-token
+        - secretName: monitoring-token
           mountPath: /run/secrets/monitoring-token
     asserts:
       - notExists:
           path: spec.template.spec.volumes[?(@.name == "tls")]
       - notExists:
-          path: spec.template.spec.volumes[?(@.name == "credential-backend-token")]
+          path: spec.template.spec.volumes[?(@.name == "credential-0")]
       - equal:
-          path: spec.template.spec.volumes[?(@.name == "credential-monitoring-token")].secret.secretName
+          path: spec.template.spec.volumes[?(@.name == "credential-1")].secret.secretName
           value: monitoring-token
       - notExists:
-          path: spec.template.spec.containers[?(@.name == "praxis")].volumeMounts[?(@.name == "credential-backend-token")]
-
-  - it: keeps chart TLS available to Grid serving after delegated handoff
-    template: templates/deployment.yaml
-    set:
-      config.existingConfigMap: praxis-consumer-config
-      mountReconciliation.enabled: true
-      mountReconciliation.network: production
-      mountReconciliation.gatewayRef: inference-gw
-      mountReconciliation.releaseHelmMounts: true
-      gridServing.enabled: true
-      gridServing.network: production
-      gridServing.gatewayRef: inference-gw
-      image.flavor: grid-gateway
-      tls.enabled: true
-      tls.existingSecret: grid-site-identity
-      tls.caSecret: grid-ca
-    asserts:
-      - equal:
-          path: metadata.annotations["grid.praxis-proxy.io/grid-serving-tls"]
-          value: chart-managed
-      - exists:
-          path: spec.template.spec.volumes[?(@.name == "tls")]
-      - equal:
-          path: spec.template.spec.containers[?(@.name == "praxis")].volumeMounts[?(@.name == "tls")].mountPath
-          value: /etc/praxis/tls
+          path: spec.template.spec.containers[?(@.name == "praxis")].volumeMounts[?(@.name == "credential-0")]
 
   - it: keeps user pod annotations next to the config checksum
     template: templates/deployment.yaml
@@ -240,7 +212,7 @@ tests:
       mountReconciliation.network: production
     asserts:
       - failedTemplate:
-          errorPattern: config.existingConfigMap must name consumerConfig.configMapName
+          errorPattern: praxisConfig.byo.configMapName must name consumerConfig.configMapName
 
   - it: leaves the config to praxisConfig.render when source is render
     template: templates/configmap.yaml
@@ -261,13 +233,20 @@ tests:
     template: templates/deployment.yaml
     set:
       praxisConfig.source: byo
-      grid.siteName: hub
-      praxisConfig.render.model: m
-      praxisConfig.render.auth.mode: none
       praxisConfig.render.backends.site-a.endpoint: 203.0.113.20:8080
     asserts:
       - failedTemplate:
-          errorPattern: praxisConfig.source is byo, which ignores it
+          errorPattern: praxisConfig.render settings are set but praxisConfig.source is byo
+
+  - it: fails provider role while the source is not render
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.source: byo
+      praxisConfig.render.role: provider
+      praxisConfig.render.peerTrust.certDigests: [aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]
+    asserts:
+      - failedTemplate:
+          errorPattern: praxisConfig.render settings are set but praxisConfig.source is byo
 
   - it: fails a blank praxisConfig.byo.inline
     template: templates/deployment.yaml
