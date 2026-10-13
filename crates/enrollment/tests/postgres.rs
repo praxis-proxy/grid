@@ -66,6 +66,19 @@ fn new_token(site: &str, digest: &str) -> NewSiteToken {
     }
 }
 
+#[tokio::test]
+async fn retrying_a_token_id_accepts_postgres_timestamp_precision() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let mut token = new_token(&unique("retry"), &unique("digest"));
+    token.token_id = Some(uuid::Uuid::new_v4());
+    token.expires_at = OffsetDateTime::now_utc().saturating_add(Duration::hours(1));
+
+    let id = store.mint_site_token(token.clone()).await.expect("first mint");
+    assert_eq!(store.mint_site_token(token).await.expect("retry mint"), id);
+}
+
 /// A signer that issues a stub certificate for the pinned name under a fresh
 /// key, standing in for the certs primitive the handler uses.
 #[expect(clippy::unnecessary_wraps, reason = "matches the redeem_and_issue signer signature")]

@@ -104,7 +104,10 @@ impl PgStore {
                 && held.try_get::<String, _>("site_name").map_err(backend)? == token.site_name
                 && held.try_get::<String, _>("grid_network_ref").map_err(backend)? == token.grid_network_ref
                 && held.try_get::<String, _>("issued_by").map_err(backend)? == token.issued_by
-                && held.try_get::<time::OffsetDateTime, _>("expires_at").map_err(backend)? == token.expires_at
+                && same_timestamp_precision(
+                    held.try_get::<time::OffsetDateTime, _>("expires_at").map_err(backend)?,
+                    token.expires_at,
+                )
                 && held.try_get::<bool, _>("allow_deleted_name").map_err(backend)? == token.allow_deleted_name
                 && held
                     .try_get::<Option<String>, _>("public_key_sha256")
@@ -546,6 +549,11 @@ fn held_from(row: &sqlx::postgres::PgRow) -> Result<Held, sqlx::Error> {
 }
 
 /// Wrap any backend failure.
+/// Postgres stores `TIMESTAMPTZ` at microsecond precision.
+fn same_timestamp_precision(left: time::OffsetDateTime, right: time::OffsetDateTime) -> bool {
+    left.unix_timestamp_nanos() / 1_000 == right.unix_timestamp_nanos() / 1_000
+}
+
 /// Convert a database error without dropping its diagnostic.
 fn backend<E: std::fmt::Display>(err: E) -> StoreError {
     StoreError::Backend(err.to_string())
