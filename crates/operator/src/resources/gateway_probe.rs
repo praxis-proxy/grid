@@ -1,6 +1,6 @@
 //! Typed gateway probe outcome and phase-transition contracts.
 //!
-//! All functions in this module are pure — no network I/O, no Kubernetes
+//! All functions in this module are pure: no network I/O, no Kubernetes
 //! access.  This separation keeps security-critical transition logic
 //! directly testable without mocks.
 

@@ -55,8 +55,8 @@ const PROVIDER_STATE_EXTENSION_VERSION_V1: u8 = 1;
 /// `GridNetwork`: that narrower scoping is [`StateBroadcast::grid_id`]'s
 /// job, since a node can publish a broadcast before joining any
 /// `GridNetwork` and so cannot always supply one. Anything broader than a
-/// single cluster's `GridNetwork`s — cross-deployment or per-peer mesh
-/// identity — remains out of scope for this constant and for `grid_id`
+/// single cluster's `GridNetwork`s (cross-deployment or per-peer mesh
+/// identity) remains out of scope for this constant and for `grid_id`
 /// alike.
 const SIGNATURE_DOMAIN: &[u8] = b"praxis-grid/swim/state-broadcast/v1";
 
@@ -134,8 +134,8 @@ pub struct StateBroadcast {
     /// Wall-clock time this broadcast was signed, in milliseconds since the
     /// Unix epoch.
     ///
-    /// `None` under the same conditions as [`signature`](Self::signature)
-    /// — no signing key configured, or the pre-rollout window. Included in
+    /// `None` under the same conditions as [`signature`](Self::signature):
+    /// no signing key configured, or the pre-rollout window. Included in
     /// [`signable_bytes`](Self::signable_bytes) so a captured signature
     /// cannot be re-attached to a forged, more-recent timestamp. A receiver
     /// holding a pinned identity for `origin_site` rejects a signature whose
@@ -161,11 +161,11 @@ pub struct StateBroadcast {
     /// `GridNetwork` reconcile on that cluster. Without this field, a
     /// signature valid for one `GridNetwork` would also verify, bit for
     /// bit, as a broadcast claiming to belong to another `GridNetwork` on
-    /// the same cluster — a cross-tenant replay that would defeat #48's
+    /// the same cluster, a cross-tenant replay that would defeat #48's
     /// stated isolation guarantee.
     ///
     /// `None` for broadcasts published before a node has joined any
-    /// `GridNetwork` (e.g. a bare gateway-address advertisement — see
+    /// `GridNetwork` (e.g. a bare gateway-address advertisement; see
     /// `publish_gateway_address_broadcast` in the operator crate), and for
     /// broadcasts from operators old enough to predate this field.
     ///
@@ -191,11 +191,11 @@ pub const MAX_PINNED_KEYS_PER_ORIGIN: usize = 2;
 ///
 /// Each value holds up to [`MAX_PINNED_KEYS_PER_ORIGIN`] raw uncompressed EC
 /// points. A broadcast's signature verifies if it is valid under **any** key
-/// in its origin's pinned set — this is what makes bounded key rotation
+/// in its origin's pinned set; this is what makes bounded key rotation
 /// possible without an instantaneous flag-day cutover: a site publishes a
 /// next key alongside its current one, callers add the next key to the pin
 /// set, and once every peer has observed the rotation the old key is
-/// dropped. Deliberately opaque to *how* a pinned identity was established —
+/// dropped. Deliberately opaque to *how* a pinned identity was established;
 /// that is an operator-level concern (see [`crate::signing`]). An origin
 /// with no entry, or an empty entry, is not yet enforced against a
 /// signature. Prefer [`crate::node::SwimNode::pin_origin`] over mutating
@@ -238,7 +238,7 @@ struct StateBroadcastV1 {
 struct BroadcastExtension {
     /// Optional data-plane gateway address.
     gateway_address: Option<String>,
-    /// Optional public site certificate PEM — never a private key.
+    /// Optional public site certificate PEM, never a private key.
     site_cert_pem: Option<String>,
     /// Optional ECDSA P-256 signature over the base payload plus the other
     /// extension fields. Absent on older peers and pre-rollout broadcasts.
@@ -299,7 +299,7 @@ struct PreCapacityBroadcastExtension {
 /// bincode is not self-describing, so decoding a three-field payload as the
 /// current six-field [`BroadcastExtension`] and the preceding five-field
 /// [`PreCapacityBroadcastExtension`] fail partway through the
-/// fourth field rather than falling back to `#[serde(default)]` — `decode`
+/// fourth field rather than falling back to `#[serde(default)]`; `decode`
 /// tries this shape before falling further back through every prior wire
 /// format, so a rolling update does not silently drop or misdecode
 /// `gateway_address`/`site_cert_pem`/`signature` from not-yet-upgraded peers.
@@ -307,7 +307,7 @@ struct PreCapacityBroadcastExtension {
 struct PreTimestampBroadcastExtension {
     /// Optional data-plane gateway address.
     gateway_address: Option<String>,
-    /// Optional public site certificate PEM — never a private key.
+    /// Optional public site certificate PEM, never a private key.
     site_cert_pem: Option<String>,
     /// Optional ECDSA P-256 signature over the base payload plus the other
     /// extension fields. Absent on older peers and pre-rollout broadcasts.
@@ -319,7 +319,7 @@ struct PreTimestampBroadcastExtension {
 ///
 /// bincode is not self-describing, so decoding a two-field payload as
 /// [`PreTimestampBroadcastExtension`] fails partway through the third field
-/// rather than falling back to `#[serde(default)]` — `decode` tries that
+/// rather than falling back to `#[serde(default)]`; `decode` tries that
 /// shape before falling further back to this one, then to the original
 /// bare-`String` format, so a rolling update does not silently drop or
 /// misdecode `gateway_address`/`site_cert_pem` from not-yet-upgraded peers.
@@ -327,7 +327,7 @@ struct PreTimestampBroadcastExtension {
 struct PreSignatureBroadcastExtension {
     /// Optional data-plane gateway address.
     gateway_address: Option<String>,
-    /// Optional public site certificate PEM — never a private key.
+    /// Optional public site certificate PEM, never a private key.
     site_cert_pem: Option<String>,
 }
 
@@ -379,7 +379,7 @@ impl StateBroadcast {
 
     /// Create a broadcast that also carries a public site certificate PEM.
     ///
-    /// The certificate must be the public certificate only — never a private key.
+    /// The certificate must be the public certificate only, never a private key.
     #[must_use]
     pub fn with_cert(mut self, site_cert_pem: Option<String>) -> Self {
         self.site_cert_pem = site_cert_pem;
@@ -401,7 +401,7 @@ impl StateBroadcast {
     /// epoch).
     ///
     /// Set this **before** computing [`signable_bytes`](Self::signable_bytes)
-    /// so the timestamp itself is covered by the signature — see
+    /// so the timestamp itself is covered by the signature; see
     /// [`signed_at_ms`](Self::signed_at_ms)'s doc comment for why an
     /// unsigned timestamp would defeat the freshness check it exists to
     /// support.
@@ -414,7 +414,7 @@ impl StateBroadcast {
     /// Attach the owning `GridNetwork` identifier.
     ///
     /// Set this **before** computing [`signable_bytes`](Self::signable_bytes)
-    /// so the identifier is covered by the signature — see
+    /// so the identifier is covered by the signature; see
     /// [`grid_id`](Self::grid_id)'s doc comment for the cross-`GridNetwork`
     /// replay this scoping closes.
     #[must_use]
@@ -617,7 +617,7 @@ impl StateBroadcast {
     /// a `BroadcastExtension` struct.  Because bincode is not self-describing,
     /// a newer extension decode does not simply come back `Ok` with
     /// `grid_id: None` when reading bytes from an older, three-field
-    /// peer — it fails partway through the missing fields.  Falls back in
+    /// peer, since it fails partway through the missing fields.  Falls back in
     /// turn to the three-field pre-timestamp extension format, then the
     /// two-field pre-signature extension format, then to the
     /// original bare-`String` format for `gateway_address`, ensuring
@@ -1049,14 +1049,14 @@ impl OriginStateHandle {
     ///
     /// Deliberately does **not** touch `tenant_spend`: this method fires on
     /// ordinary SWIM membership churn (a site marked `Suspect`/`Dead` past
-    /// its suspect/dead TTL, e.g. a pod restart or a transient partition —
+    /// its suspect/dead TTL, e.g. a pod restart or a transient partition;
     /// see `operator::swim_runtime::prune_tracked_members`), not on
     /// permanent tenant-budget retirement. `tenant_spend` is a cumulative
     /// (grow-only) ledger; wiping a site's slot here would let a tenant's
     /// `spendRatio` drop on a restart or blip and reopen an
     /// already-exhausted budget. If spend ever needs to expire, that must be
     /// an explicit budget-epoch/window reset, not a side effect of
-    /// membership eviction — tracked in
+    /// membership eviction, tracked in
     /// [grid#52](https://github.com/praxis-proxy/grid/issues/52), which also
     /// covers bounding per-tenant site-slot growth now that this path no
     /// longer prunes it.
@@ -1083,7 +1083,7 @@ impl OriginStateHandle {
 /// [`GridStateSnapshot`] that callers can observe via the watch receiver
 /// returned by [`StateBroadcastHandler::subscribe`].
 pub struct StateBroadcastHandler {
-    /// Shared merged state — written here, read by all subscribers.
+    /// Shared merged state, written here, read by all subscribers.
     state_tx: watch::Sender<GridStateSnapshot>,
 
     /// Per-origin revisions and metadata shared with the eviction control path.
@@ -1178,7 +1178,7 @@ impl StateBroadcastHandler {
     ///
     /// Clone and hold this to push pinned identities in after `self` has
     /// been moved into foca. An origin site with no entry is not yet
-    /// enforced against a signature — see [`receive_item`]'s doc comment for
+    /// enforced against a signature; see [`receive_item`]'s doc comment for
     /// the rollout-transition rationale.
     ///
     /// This is the low-level primitive [`crate::node::SwimNode::pin_origin`]
@@ -1252,7 +1252,7 @@ impl StateBroadcastHandler {
 
     /// Return the public site certificate PEM received from `site`, if any.
     ///
-    /// The returned PEM is the public certificate only — never a private key.
+    /// The returned PEM is the public certificate only, never a private key.
     #[must_use]
     pub fn cert_pem_for_site(&self, site: &str) -> Option<String> {
         self.retained
@@ -1356,7 +1356,7 @@ impl StateBroadcastHandler {
     /// pinned identity.
     ///
     /// An origin with **no** entry (or an empty entry) in the trust store
-    /// passes through unchecked — this is deliberate: it lets a
+    /// passes through unchecked. This is deliberate: it lets a
     /// signed-broadcast rollout proceed incrementally as origins are pinned
     /// one at a time, rather than requiring a synchronized flag-day
     /// cutover. Once nerdalert's key-source question (grid#75) is resolved
@@ -1430,7 +1430,7 @@ impl StateBroadcastHandler {
     ///
     /// A [`SystemTime::now`] that somehow predates the Unix epoch (a
     /// pathologically misconfigured clock) is treated as epoch zero rather
-    /// than propagating an error — every positive `signed_at_ms` then falls
+    /// than propagating an error; every positive `signed_at_ms` then falls
     /// outside the window and is rejected, failing closed rather than
     /// disabling the freshness check entirely.
     fn within_freshness_window(signed_at_ms: u64) -> bool {
@@ -1558,7 +1558,7 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
             snap.capabilities.merge(&broadcast.snapshot.capabilities);
             snap.merge_tenant_spend_from_origin(&broadcast.origin_site, &broadcast.snapshot.tenant_spend);
             // A spend-only broadcast must not run the destructive
-            // origin-provider replace below — it doesn't carry an
+            // origin-provider replace below; it doesn't carry an
             // authoritative provider list for this cycle at all.
             if carries_provider_state {
                 accepted_networks = snap.replace_origin_providers_in_networks(
@@ -3002,7 +3002,7 @@ mod tests {
     #[test]
     fn tenant_spend_only_snapshot_carries_grid_state() {
         // A broadcast can carry only a tenant_spend increment (no provider or
-        // capability change this gossip cycle) — this must NOT be classified
+        // capability change this gossip cycle), and this must NOT be classified
         // as metadata-only, or receive_item's merge path is skipped entirely
         // (regression: `is_metadata_only` originally only checked
         // providers/capabilities, silently dropping spend-only broadcasts).
@@ -3719,7 +3719,7 @@ mod tests {
     /// SWIM ingest entry point (`receive_item`, via the `receive` helper).
     ///
     /// `revision` must be unique-and-increasing per call for the same
-    /// `origin` — `receive_item` drops a same-or-lower-revision broadcast
+    /// `origin`; `receive_item` drops a same-or-lower-revision broadcast
     /// from an origin it has already seen as stale, independent of this
     /// module's own cap logic (see `receive_item`'s `latest_by_scope` check).
     fn receive_tenant_spend_broadcast(

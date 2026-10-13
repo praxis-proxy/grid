@@ -13,7 +13,7 @@
 //!   extraction, header/TLS attachment decisions): unit-tested with hand-built fixtures, no network.
 //! - **Mockable Kubernetes I/O** (`attach_tls_ca`/`attach_tls_client_identity`/`read_tls_material`'s
 //!   `Api::<Secret>::get_opt` calls and PEM parsing): unit-tested against a `tower::service_fn`-backed `kube::Client`
-//!   (see `mock_kube_client_with_secrets` in `mod tests`) — this is genuine Secret I/O, but deterministic and mockable
+//!   (see `mock_kube_client_with_secrets` in `mod tests`); this is genuine Secret I/O, but deterministic and mockable
 //!   without a real API server, so it stays at the unit tier rather than the integration tier below.
 //! - **Real network I/O** (`rmcp`/`reqwest` error introspection, the actual live probe): covered by the integration
 //!   tier against a real local HTTP listener (`mod integration_tests`), not unit-tested, since it exercises third-party
@@ -106,8 +106,8 @@ pub(crate) enum McpProbeOutcome {
 
     /// The resolved `spec.auth` bearer token contains characters that
     /// cannot be encoded into an HTTP header value, so no request was ever
-    /// sent. Fails closed rather than silently proceeding unauthenticated
-    /// — an endpoint that permits anonymous `tools/list` could otherwise
+    /// sent. Fails closed rather than silently proceeding unauthenticated:
+    /// an endpoint that permits anonymous `tools/list` could otherwise
     /// be marked `Available` without ever exercising the configured
     /// credential.
     AuthConfigInvalid,
@@ -127,7 +127,7 @@ pub(crate) enum McpProbeOutcome {
 ///
 /// Business rule: a successful probe always yields `Available` with no
 /// reason (healthy); every failure outcome maps to `Unavailable` with its
-/// own stable, machine-readable reason — mirroring how
+/// own stable, machine-readable reason, mirroring how
 /// `inference_provider::phase_from_probe` merges a health-probe outcome on
 /// top of the site-matching phase, but simpler here since there is no
 /// separate `Degraded` outcome for this probe.
@@ -157,7 +157,7 @@ pub(crate) fn phase_and_reason_from_probe(
 /// Deliberately collapses [`McpProbeOutcome::TlsConfigInvalid`]'s carried
 /// reason string to a single fixed label: that string can vary per Secret
 /// misconfiguration and is unbounded-ish, so folding it into a metric label
-/// would risk unbounded label cardinality — the same concern `grid#9`
+/// would risk unbounded label cardinality, the same concern `grid#9`
 /// documents for the phase-transition metrics.
 pub(crate) fn mcp_probe_outcome_label(outcome: &McpProbeOutcome) -> &'static str {
     match outcome {
@@ -173,7 +173,7 @@ pub(crate) fn mcp_probe_outcome_label(outcome: &McpProbeOutcome) -> &'static str
 /// Determine the `discoveredTools` value to persist after a probe attempt.
 ///
 /// Business rule: a failed probe must never wipe a previously-discovered
-/// tool list — only a successful probe overwrites it, with the freshly
+/// tool list; only a successful probe overwrites it, with the freshly
 /// discovered set (which may itself be empty, if the server genuinely
 /// advertises zero tools).
 pub(crate) fn discovered_tools_after_probe(previous: &[String], outcome: &McpProbeOutcome) -> Vec<String> {
@@ -189,7 +189,7 @@ pub(crate) fn discovered_tools_after_probe(previous: &[String], outcome: &McpPro
 
 /// Extract tool names from `rmcp`'s `tools/list` result.
 ///
-/// Pure mapping — no validation of tool schemas or descriptions, since only
+/// Pure mapping, with no validation of tool schemas or descriptions, since only
 /// the name is surfaced on `status.discoveredTools`.
 pub(crate) fn discovered_tool_names(tools: &[rmcp::model::Tool]) -> Vec<String> {
     tools.iter().map(|tool| tool.name.clone().into_owned()).collect()
@@ -214,9 +214,9 @@ fn truncate_tool_name(name: String) -> String {
 /// persisted to `status.discoveredTools`.
 ///
 /// Applies, in order: (1) per-name truncation to [`MAX_TOOL_NAME_LEN`]
-/// bytes, (2) deduplication and sorting — tool order is not semantically
+/// bytes, (2) deduplication and sorting (tool order is not semantically
 /// meaningful, and a server returning the same catalog in a different
-/// order must not trigger a status patch on a later reconcile — and (3)
+/// order must not trigger a status patch on a later reconcile), and (3)
 /// truncation of the deduplicated list to at most [`MAX_DISCOVERED_TOOLS`]
 /// entries. Keeps both the persisted Kubernetes status object and this
 /// reconciler's own memory use bounded against a server advertising an
@@ -232,13 +232,13 @@ pub(crate) fn bound_and_normalize_discovered_tools(names: Vec<String>) -> Vec<St
 /// Classify a post-connect `tools/list` call failure into a [`McpProbeOutcome`].
 ///
 /// `status` is the HTTP status code observed on the failing exchange, when
-/// one was observable (see `observed_status_from_service_error`) — `None`
+/// one was observable (see `observed_status_from_service_error`), or `None`
 /// when the failure was not HTTP-status-shaped (e.g. a deserialize or
 /// protocol-level error).
 ///
 /// Business rule: 401/403 map to [`AuthRejected`](McpProbeOutcome::AuthRejected);
 /// every other status, or no status at all, maps to
-/// [`InvalidResponse`](McpProbeOutcome::InvalidResponse) — the connection to
+/// [`InvalidResponse`](McpProbeOutcome::InvalidResponse); the connection to
 /// the endpoint was already established by this point (this function is
 /// only reached post-connect), so a failure here is a protocol/response
 /// problem, not an unreachable endpoint.
@@ -254,7 +254,7 @@ pub(crate) fn classify_list_tools_failure(status: Option<u16>) -> McpProbeOutcom
 ///
 /// Trivial in isolation, but named and tested like the rest of this
 /// module's business rules per the project's decision-logic-first testing
-/// convention — `spec.tls` presence is the single source of truth for this
+/// convention: `spec.tls` presence is the single source of truth for this
 /// choice, so this function's name is deliberately the whole rule.
 pub(crate) fn should_use_custom_tls(tls_config: Option<&EndpointTlsConfig>) -> bool {
     tls_config.is_some()
@@ -263,7 +263,7 @@ pub(crate) fn should_use_custom_tls(tls_config: Option<&EndpointTlsConfig>) -> b
 /// Build the outbound `Authorization` header for the probe request.
 ///
 /// Returns an empty map when `token` is `None` (`spec.auth` absent, manual,
-/// or not yet resolved) — the probe request carries no `Authorization`
+/// or not yet resolved); the probe request carries no `Authorization`
 /// header, matching an unauthenticated MCP server. The token value is
 /// wrapped in [`BearerToken`], which suppresses `Debug` output, so it is
 /// never visible if this map is accidentally logged.
@@ -273,8 +273,8 @@ pub(crate) fn should_use_custom_tls(tls_config: Option<&EndpointTlsConfig>) -> b
 /// Returns [`McpProbeOutcome::AuthConfigInvalid`] if `token` is `Some` but
 /// its value cannot be encoded into an HTTP header value. Fails closed
 /// rather than silently omitting the header: an endpoint that permits
-/// anonymous `tools/list` could otherwise be probed successfully — and
-/// marked `Available` — without the configured credential ever being
+/// anonymous `tools/list` could otherwise be probed successfully (and
+/// marked `Available`) without the configured credential ever being
 /// exercised.
 pub(crate) fn auth_header_map(
     token: Option<&BearerToken>,
@@ -329,11 +329,11 @@ pub(crate) enum McpUrlValidation {
 /// Business rule: only `http`/`https` URLs with a host, no embedded
 /// credentials, and no SSRF-sensitive literal-IP host are eligible for a
 /// live probe. Hostnames that are not literal IPs are deferred to the
-/// async probe's DNS resolution step — this function cannot resolve them.
+/// async probe's DNS resolution step; this function cannot resolve them.
 pub(crate) fn validate_probe_url(url: &str) -> McpUrlValidation {
     // `http::Uri`'s parser treats an empty authority (`http:///path` or
     // bare `http://`) as a hard parse error rather than a URI with a blank
-    // host, so that case is detected here before attempting to parse —
+    // host, so that case is detected here before attempting to parse;
     // otherwise it would be misreported as InvalidUrl instead of MissingHost.
     if let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))
         && (rest.is_empty() || rest.starts_with('/'))
@@ -398,7 +398,7 @@ fn normalize_mapped_ipv4(ip: IpAddr) -> IpAddr {
 /// Check DNS-resolved addresses against the SSRF block list.
 ///
 /// Used by the async probe after resolving a hostname, mirroring
-/// `praxis-ai`'s `check_resolved_addrs` — kept here (rather than inline in
+/// `praxis-ai`'s `check_resolved_addrs`, kept here (rather than inline in
 /// the probe function) so both the literal-IP path
 /// ([`validate_probe_url`]) and the resolved-hostname path share the same
 /// [`is_ssrf_sensitive`] rule.
@@ -418,7 +418,7 @@ pub(crate) fn check_resolved_addrs(addrs: &[SocketAddr]) -> bool {
 /// Downcasts `rmcp`'s boxed transport error back to the concrete
 /// `StreamableHttpError<reqwest::Error>` this crate's transport always
 /// produces. Returns `None` for any error shape that isn't HTTP-status-like
-/// (deserialize errors, closed transports, etc.) — callers treat `None` as
+/// (deserialize errors, closed transports, etc.); callers treat `None` as
 /// "no distinguishing status observed" via [`classify_list_tools_failure`].
 #[expect(clippy::wildcard_enum_match_arm, reason = "external type with many variants")]
 pub(crate) fn observed_status_from_service_error(error: &rmcp::ServiceError) -> Option<u16> {
@@ -443,7 +443,7 @@ pub(crate) fn observed_status_from_service_error(error: &rmcp::ServiceError) -> 
 /// the actual connection.
 struct ResolvedEndpoint {
     /// Present for DNS-resolved hostnames; absent for literal IPs (nothing
-    /// to pin — the literal address itself already passed [`validate_probe_url`]).
+    /// to pin; the literal address itself already passed [`validate_probe_url`]).
     hostname: Option<String>,
     /// Validated socket addresses from DNS resolution.
     addrs: Vec<SocketAddr>,
@@ -524,7 +524,7 @@ async fn build_probe_client(
 ///
 /// Delegates to [`attach_tls_ca`] and [`attach_tls_client_identity`], split
 /// out purely to keep each function within the project's complexity/line
-/// lints — the CA and client-identity halves have no shared state beyond
+/// lints; the CA and client-identity halves have no shared state beyond
 /// the builder itself.
 async fn attach_tls_material(
     builder: reqwest::ClientBuilder,
@@ -591,7 +591,7 @@ async fn attach_tls_ca(
         ));
     }
     // `reqwest::Certificate::from_pem` itself no longer needs to be a
-    // validation gate — `validate_pem_certificates` above already is —
+    // validation gate (`validate_pem_certificates` above already is),
     // but building the actual `Certificate` reqwest will use is still
     // required, and kept as defense-in-depth should a future reqwest
     // version regain stricter parsing of its own.
@@ -674,16 +674,16 @@ async fn attach_tls_client_identity(
 ///
 /// Grouped into one struct (rather than individual arguments) purely to
 /// keep [`probe_agent_tool_provider`]'s signature within the project's
-/// `too_many_arguments` lint — `kube_client` stays a separate parameter
+/// `too_many_arguments` lint; `kube_client` stays a separate parameter
 /// since callers already hold it as a long-lived `&kube::Client` distinct
 /// from this per-attempt request data.
 pub(crate) struct ProbeRequest<'request> {
-    /// `spec.endpoint` — the MCP server's HTTP(S) URL.
+    /// `spec.endpoint`, the MCP server's HTTP(S) URL.
     pub(crate) endpoint: &'request str,
     /// Total wall-clock budget for the whole probe: DNS resolution, TLS
     /// Secret material reads, connect/handshake, and the `tools/list` call
     /// combined. Enforced by a single outer `tokio::time::timeout` in
-    /// [`probe_agent_tool_provider`] — the per-phase timeouts inside it are
+    /// [`probe_agent_tool_provider`]; the per-phase timeouts inside it are
     /// defensive inner bounds, not independent budgets, so this value is
     /// never multiplied across phases.
     pub(crate) timeout: Duration,
@@ -703,12 +703,12 @@ pub(crate) struct ProbeRequest<'request> {
 /// configured), then delegates the connect/`list_tools` exchange to
 /// [`run_probe_session`].
 ///
-/// Only the first page of results is fetched — `AgentToolProvider` has no
+/// Only the first page of results is fetched; `AgentToolProvider` has no
 /// documented need for multi-page tool catalogs at this scope, and every
 /// reconcile re-probes regardless (see the CRD's staleness-note doc comment).
 ///
-/// The whole sequence — DNS resolution, TLS Secret reads, connect/handshake,
-/// and `tools/list` — is bounded by one outer `request.timeout`, so a slow
+/// The whole sequence (DNS resolution, TLS Secret reads, connect/handshake,
+/// and `tools/list`) is bounded by one outer `request.timeout`, so a slow
 /// Kubernetes API (TLS Secret fetch has no timeout of its own) or a peer
 /// that stalls at one phase cannot push total probe latency past the
 /// documented budget by combining several unbounded or independently-bounded
@@ -728,7 +728,7 @@ pub(crate) async fn probe_agent_tool_provider(
     }
 }
 
-/// The actual probe sequence, without its own overall deadline —
+/// The actual probe sequence, without its own overall deadline;
 /// [`probe_agent_tool_provider`] is the only caller and supplies the single
 /// outer `tokio::time::timeout` that bounds this function's total runtime.
 async fn probe_agent_tool_provider_unbounded(kube_client: &kube::Client, request: ProbeRequest<'_>) -> McpProbeOutcome {
@@ -764,7 +764,7 @@ async fn probe_agent_tool_provider_unbounded(kube_client: &kube::Client, request
 /// bounding both steps by `timeout`.
 ///
 /// Split out of [`probe_agent_tool_provider`] purely to keep both functions
-/// within the project's complexity/line lints — this is the
+/// within the project's complexity/line lints; this is the
 /// connect-and-call half of what was previously one larger function.
 async fn run_probe_session(
     client: reqwest::Client,
@@ -868,7 +868,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // mcp_probe_outcome_label — bounded telemetry label for grid_mcp_probe_total{outcome}
+    // mcp_probe_outcome_label: bounded telemetry label for grid_mcp_probe_total{outcome}
     // -----------------------------------------------------------------------
 
     #[test]
@@ -908,7 +908,7 @@ mod tests {
     #[test]
     fn tls_config_invalid_outcome_label_is_bounded_regardless_of_carried_reason() {
         // The label must stay bounded/enum-shaped even though the variant
-        // itself carries an unbounded-ish String — two different carried
+        // itself carries an unbounded-ish String; two different carried
         // reasons must still map to the exact same label, never leaking the
         // inner string into a metric label (unbounded cardinality risk).
         let a = mcp_probe_outcome_label(&McpProbeOutcome::TlsConfigInvalid(
@@ -920,7 +920,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // discovered_tools_after_probe — preserve-on-failure business rule
+    // discovered_tools_after_probe: preserve-on-failure business rule
     // -----------------------------------------------------------------------
 
     #[test]
@@ -994,7 +994,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // discovered_tool_names — pure extraction from rmcp::model::Tool
+    // discovered_tool_names: pure extraction from rmcp::model::Tool
     // -----------------------------------------------------------------------
 
     fn test_tool(name: &str) -> rmcp::model::Tool {
@@ -1024,7 +1024,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // classify_list_tools_failure — post-connect failure classification
+    // classify_list_tools_failure: post-connect failure classification
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1202,7 +1202,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // validate_probe_url — synchronous SSRF/scheme/format validation
+    // validate_probe_url: synchronous SSRF/scheme/format validation
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1333,7 +1333,7 @@ mod tests {
 
     #[test]
     fn regular_cluster_service_literal_ip_passes() {
-        // A normal in-cluster ClusterIP is neither loopback nor link-local —
+        // A normal in-cluster ClusterIP is neither loopback nor link-local;
         // this validation must not block ordinary in-cluster addresses.
         assert_eq!(validate_probe_url("http://10.96.0.42:8080/mcp"), McpUrlValidation::Ok);
     }
@@ -1388,12 +1388,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // TLS Secret resolution — attach_tls_ca / attach_tls_client_identity /
+    // TLS Secret resolution: attach_tls_ca / attach_tls_client_identity /
     // read_tls_material, against a mocked Kubernetes API.
     //
     // Uses a real `tower::service_fn`-backed `kube::Client` (no network) so
     // these functions' actual `Api::<Secret>::get_opt` calls, PEM parsing,
-    // and reason-mapping are the thing under test — not a hand-built
+    // and reason-mapping are the thing under test, not a hand-built
     // `McpProbeOutcome` fixture standing in for them.
     // -----------------------------------------------------------------------
 
@@ -1462,7 +1462,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // validate_pem_certificates / validate_pem_private_key — pure decision
+    // validate_pem_certificates / validate_pem_private_key: pure decision
     // logic, no Kubernetes I/O
     // -----------------------------------------------------------------------
 
@@ -1479,7 +1479,7 @@ mod tests {
     fn validate_pem_certificates_rejects_empty_input() {
         assert!(
             validate_pem_certificates(b"").is_err(),
-            "empty input contains no certificates and must be rejected — this is exactly what \
+            "empty input contains no certificates and must be rejected; this is exactly what \
              reqwest::Certificate::from_pem fails to reject on its own"
         );
     }
@@ -1511,7 +1511,7 @@ mod tests {
     }
 
     /// Installs the process-wide `rustls` crypto provider these tests need
-    /// before any `reqwest::Certificate`/`reqwest::Identity` PEM parsing —
+    /// before any `reqwest::Certificate`/`reqwest::Identity` PEM parsing;
     /// see `probe_via_pipeline_for_tests` in `integration_tests` for why.
     fn install_test_crypto_provider() {
         #[cfg(not(feature = "fips"))]
@@ -1629,7 +1629,7 @@ mod tests {
         let result = attach_tls_ca(reqwest::Client::builder(), &client, &tls, "test-provider").await;
         // An empty key value is caught earlier by read_tls_material's own
         // "key present but empty" check, before validate_pem_certificates
-        // ever runs — this asserts that ordering explicitly, since it's
+        // ever runs; this asserts that ordering explicitly, since it's
         // easy to accidentally invert.
         assert_eq!(
             result.unwrap_err(),
@@ -1794,7 +1794,7 @@ mod tests {
 }
 
 /// Integration tier: [`probe_agent_tool_provider`] against a real Streamable
-/// HTTP MCP server over a local TCP listener — no mocks below the socket.
+/// HTTP MCP server over a local TCP listener, no mocks below the socket.
 ///
 /// The pure decision logic (URL validation, outcome-to-phase mapping,
 /// discovered-tools preservation) and the TLS/Secret material attachment
@@ -1825,7 +1825,7 @@ mod integration_tests {
     ///
     /// That gate is already exhaustively covered by the fast, synchronous
     /// unit tests above (loopback, `localhost`, link-local, cloud metadata,
-    /// etc. are all proven blocked there) — and a local test server
+    /// etc. are all proven blocked there), and a local test server
     /// necessarily binds to loopback, so calling through the public
     /// entry point here would only prove the gate blocks our own test
     /// fixture, not that the resolve/connect/probe pipeline behind it
@@ -1834,8 +1834,8 @@ mod integration_tests {
     async fn probe_via_pipeline_for_tests(kube_client: &kube::Client, request: ProbeRequest<'_>) -> McpProbeOutcome {
         // reqwest's `rustls-no-provider` feature (see the workspace
         // Cargo.toml comment) means the *application* must install a
-        // process-wide crypto provider before building any `reqwest::Client`
-        // — `main.rs` does this once for the real binary; test binaries have
+        // process-wide crypto provider before building any `reqwest::Client`.
+        // `main.rs` does this once for the real binary; test binaries have
         // no equivalent entry point, so each call here does it instead.
         // Idempotent: a second install attempt just returns `Err`, which is
         // exactly what happens when multiple tests in this binary race here.
@@ -1874,7 +1874,7 @@ mod integration_tests {
         ) -> Result<ListToolsResult, rmcp::ErrorData> {
             if let Some(expected) = &self.required_bearer {
                 // rmcp threads the raw incoming `http::request::Parts` (headers
-                // included) into RequestContext::extensions — no axum
+                // included) into RequestContext::extensions, so no axum
                 // middleware needed to see what the probe actually sent.
                 let got = context
                     .extensions
@@ -1901,7 +1901,7 @@ mod integration_tests {
     /// Spawn a real [`FixedToolsServer`] on a local TCP listener and return
     /// its base MCP endpoint URL (`http://127.0.0.1:<port>/mcp`).
     ///
-    /// The spawned `axum::serve` task is never explicitly cancelled — it is
+    /// The spawned `axum::serve` task is never explicitly cancelled; it is
     /// dropped along with the `#[tokio::test]` runtime when each test
     /// function returns, mirroring the fire-and-forget test-server pattern
     /// already used by `metrics_scraper`/`tls_probe` in this crate.
@@ -1927,7 +1927,7 @@ mod integration_tests {
     /// A `kube::Client` that panics if a request is ever sent through it.
     ///
     /// Every test in this module uses `tls_config: None`, so `kube_client`
-    /// is never dereferenced by [`probe_agent_tool_provider`] — it is only
+    /// is never dereferenced by [`probe_agent_tool_provider`]; it is only
     /// used on the `spec.tls`-configured path, covered by the
     /// `attach_tls_material`/`attach_tls_ca`/`attach_tls_client_identity`/
     /// `read_tls_material` unit tests in `mod tests` above (against a
@@ -2039,7 +2039,7 @@ mod integration_tests {
             outcome,
             McpProbeOutcome::InvalidResponse,
             "an MCP-level error response (no HTTP-status-coded rejection) classifies as InvalidResponse, \
-             not AuthRejected — that distinction is covered at the unit tier by classify_list_tools_failure"
+             not AuthRejected; that distinction is covered at the unit tier by classify_list_tools_failure"
         );
     }
 }

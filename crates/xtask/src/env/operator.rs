@@ -1,7 +1,7 @@
 //! Grid operator kind validation: CRD install, operator launch, and
 //! health-aware overlay reconciliation verification.
 //!
-//! These helpers target a **local, out-of-cluster** operator run — the
+//! These helpers target a **local, out-of-cluster** operator run: the
 //! operator binary is spawned as a subprocess using the current kubeconfig
 //! context, so no container image build or push is required.
 //!
@@ -324,10 +324,10 @@ pub(crate) const SWIM_TRUST_NETWORK: &str = "op-e2e-swim-trust-net";
 /// Gateway reference name in the trust fingerprint test `GridNetwork`.
 pub(crate) const SWIM_TRUST_GW: &str = "op-e2e-swim-trust-gw";
 
-/// SWIM site identity for node A (primary — renders overlay, no TLS cert).
+/// SWIM site identity for node A (primary; renders overlay, no TLS cert).
 pub(crate) const SWIM_TRUST_SITE_A: &str = "swim-trust-a";
 
-/// SWIM site identity for node B (secondary — has TLS cert, whose promotion is tested).
+/// SWIM site identity for node B (secondary; has TLS cert, whose promotion is tested).
 pub(crate) const SWIM_TRUST_SITE_B: &str = "swim-trust-b";
 
 /// `InferenceProvider` published by site B in the trust fingerprint test.
@@ -415,11 +415,11 @@ pub(crate) const SWIM_ENCRYPT_GW: &str = "op-e2e-swim-encrypt-gw";
 
 /// Primary keyed node name (site A).
 pub(crate) const SWIM_ENCRYPT_NODE_A: &str = "swim-encrypt-a";
-/// Secondary keyed node name (site B — same key as A).
+/// Secondary keyed node name (site B, same key as A).
 pub(crate) const SWIM_ENCRYPT_NODE_B: &str = "swim-encrypt-b";
-/// Wrong-key node name (site C — different key, must be rejected).
+/// Wrong-key node name (site C, different key, must be rejected).
 pub(crate) const SWIM_ENCRYPT_NODE_WRONG: &str = "swim-encrypt-wrong";
-/// Plaintext node name (site D — no key, must be rejected by keyed cluster).
+/// Plaintext node name (site D, no key, must be rejected by keyed cluster).
 pub(crate) const SWIM_ENCRYPT_NODE_PLAIN: &str = "swim-encrypt-plain";
 
 /// `InferenceProvider` name for the primary keyed node (A).
@@ -523,7 +523,7 @@ pub(crate) const SITE_JOIN_PRIMARY_EGRESS: &str = "172.18.0.4:8443";
 ///
 /// 60 s covers two back-to-back reconcile windows plus the 5 s TCP probe timeout
 /// in the `GridSite` controller.  The assertion itself (e.g. `Connecting`) is not
-/// weakened — a longer window is required because the `Discovered → Connecting`
+/// weakened; a longer window is required because the `Discovered → Connecting`
 /// transition depends on the `GridNetwork` controller applying the egress spec,
 /// which the `GridSite` controller then reconciles.  The primary anti-flakiness
 /// measure is the cleanup in [`cleanup_site_join_resources`], which removes stale
@@ -935,8 +935,8 @@ fn generate_crd_json() -> Result<String, Box<dyn std::error::Error>> {
 ///
 /// Creates:
 /// - `GridNetwork` `op-e2e-net` with one `gatewayRef`
-/// - `InferenceProvider` `op-e2e-healthy` — valid endpoint → reconciles to `Pending`
-/// - `InferenceProvider` `op-e2e-invalid` — blank endpoint → reconciles to `Unavailable`
+/// - `InferenceProvider` `op-e2e-healthy`: valid endpoint → reconciles to `Pending`
+/// - `InferenceProvider` `op-e2e-invalid`: blank endpoint → reconciles to `Unavailable`
 pub(crate) fn apply_test_fixtures(context: &str, provider_endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
     apply_test_fixtures_for_cluster(context, provider_endpoint, TEST_HEALTHY_ROUTING_CLUSTER, "model-x")
 }
@@ -958,7 +958,7 @@ pub(crate) fn apply_test_fixtures_for_cluster(
     // falls back to the network name, which matches no candidate's site, so
     // every candidate ties at LocalityTier::Unknown and GeographyFirst
     // ordering falls through to score (tied under the noMetrics default
-    // strategy) and then to the alphabetical (site, name, cluster) tiebreak —
+    // strategy) and then to the alphabetical (site, name, cluster) tiebreak,
     // silently masking locality-order assertions instead of exercising them.
     let network = network_fixture_json(TEST_NETWORK, TEST_GATEWAY_NAME, TEST_GATEWAY_NS, routing_cluster);
     let healthy = provider_fixture_json(
@@ -978,7 +978,7 @@ pub(crate) fn apply_test_fixtures_for_cluster(
 
 /// Build a `GridNetwork` JSON fixture.
 ///
-/// `local_site_name` becomes `gatewayRefs[0].localSiteName` — the site the
+/// `local_site_name` becomes `gatewayRefs[0].localSiteName`, the site the
 /// rendered overlay treats as "local" for `GeographyFirst` locality-tier
 /// ordering. Pass the `routingClusterRef` used by the fixtures that should
 /// resolve to `LocalityTier::SameSite`.
@@ -1403,11 +1403,11 @@ pub(crate) const SITE_JOIN_GATEWAY_PORT: u16 = 19080;
 /// Spawn the Grid operator with SWIM membership enabled.
 ///
 /// Equivalent to [`spawn_operator`] but also sets:
-/// - `GRID_SWIM_BIND_ADDR` — UDP address for the SWIM listener
-/// - `GRID_SWIM_ADVERTISE_ADDR` — address peers use to reach this node
-/// - `GRID_SWIM_SITE_NAME` — stable site identity (must match `GridSite.metadata.name`)
-/// - `GRID_SWIM_SEEDS` — comma-separated seed peer addresses (empty = no seeds)
-/// - `GRID_GATEWAY_ADDRESS` — optional data-plane gateway address (omitted if `None` or empty)
+/// - `GRID_SWIM_BIND_ADDR`: UDP address for the SWIM listener
+/// - `GRID_SWIM_ADVERTISE_ADDR`: address peers use to reach this node
+/// - `GRID_SWIM_SITE_NAME`: stable site identity (must match `GridSite.metadata.name`)
+/// - `GRID_SWIM_SEEDS`: comma-separated seed peer addresses (empty = no seeds)
+/// - `GRID_GATEWAY_ADDRESS`: optional data-plane gateway address (omitted if `None` or empty)
 #[expect(
     clippy::too_many_arguments,
     reason = "each argument maps to a distinct operator env var; a wrapper struct would obscure the address model"
@@ -1651,7 +1651,7 @@ fn operator_log_files(site_name: &str) -> Result<(std::fs::File, std::fs::File),
 ///
 /// # Security invariant
 ///
-/// The key value is passed to the child process via the environment — it is
+/// The key value is passed to the child process via the environment, so it is
 /// visible to other processes on the same host (standard Unix env var rules).
 /// In Kind-based tests this is acceptable; in production use
 /// `GridNetwork.spec.tls.swimKeyRef` instead.
@@ -1723,7 +1723,7 @@ pub(crate) fn wait_for_swim_convergence(duration: Duration) {
 
 /// Apply the bare `GridNetwork` resource used by the SWIM membership validation.
 ///
-/// No `gatewayRefs` or `InferenceProvider`s are needed — the test only
+/// No `gatewayRefs` or `InferenceProvider`s are needed; the test only
 /// verifies that `status.connectedSites` and `status.phase` reflect the live
 /// SWIM snapshot from the running operators.
 pub(crate) fn apply_swim_test_network(context: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1783,7 +1783,7 @@ pub(crate) fn apply_swim_test_network_with_seeds(
 
 /// Delete resources created by the CRD-seed SWIM validation.
 ///
-/// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
+/// Safe to call before a fresh run; all deletes use `--ignore-not-found`.
 pub(crate) fn cleanup_swim_crd_seeds_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     delete_cluster_resource(context, "gridnetwork", CRD_SEEDS_TEST_NETWORK)?;
     cleanup_auto_discovered_gridsites_for_network(context, CRD_SEEDS_TEST_NETWORK);
@@ -1821,7 +1821,7 @@ pub(crate) fn apply_swim_test_provider(context: &str) -> Result<(), Box<dyn std:
 
 /// Delete resources created by the SWIM validation.
 ///
-/// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
+/// Safe to call before a fresh run; all deletes use `--ignore-not-found`.
 pub(crate) fn cleanup_swim_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     delete_cluster_resource(context, "inferenceprovider", SWIM_TEST_PROVIDER)?;
     delete_cluster_resource(context, "gridnetwork", SWIM_TEST_NETWORK)?;
@@ -1962,7 +1962,7 @@ pub(crate) fn assert_swim_peer_stays_isolated(
 ///
 /// Unlike [`assert_swim_peer_stays_isolated`], this helper does NOT require
 /// `status.observedGeneration` to appear.  It is designed for scenarios where
-/// the reconcile itself fails before reaching `update_status()` — e.g., when
+/// the reconcile itself fails before reaching `update_status()`, e.g., when
 /// `swimKeyRef` is configured but the referenced Secret does not exist.
 ///
 /// The proof is: for the entire `window`, `connectedSites` and
@@ -2071,7 +2071,7 @@ pub(crate) fn wait_for_operator_log_contains(
 /// Snapshot of a `GridNetwork` status read from the cluster.
 ///
 /// Returned by [`wait_for_gridnetwork_status`] for inspecting status before
-/// SWIM convergence — e.g. to verify isolation when no seeds are configured.
+/// SWIM convergence, e.g. to verify isolation when no seeds are configured.
 pub(crate) struct GridNetworkStatusSnapshot {
     /// Current lifecycle phase (e.g. `"Pending"`, `"Active"`).
     pub phase: String,
@@ -2143,7 +2143,7 @@ pub(crate) fn verify_swim_status(phase: &str, connected_sites: u32) -> Result<()
 /// and a cross-watch that fires only when related objects change.  When the
 /// first reconcile wave races the peer's CRDT broadcast by milliseconds, the
 /// `distributedProviderCount` is recorded as 0.  Bumping an annotation creates
-/// a watch event that triggers a fresh reconcile — by which point the CRDT
+/// a watch event that triggers a fresh reconcile, by which point the CRDT
 /// broadcast has already been received and merged into `state_snapshot()`.
 ///
 /// This is an xtask validation helper; it does not affect production behavior.
@@ -2926,7 +2926,7 @@ pub(crate) fn verify_metrics_ordering(
 /// real provider site so the overlay candidate routes to the actual provider gateway.
 ///
 /// `spec.endpoint` for each provider is `http://127.0.0.1:{east_port}` /
-/// `http://127.0.0.1:{west_port}` — the host-side port-forwards to the Python
+/// `http://127.0.0.1:{west_port}`, the host-side port-forwards to the Python
 /// metrics pods.  The operator scrapes `{endpoint}/metrics` and uses the result in
 /// scoring.  This follows the same pattern as the single-provider metrics test.
 #[expect(clippy::too_many_lines, reason = "GridNetwork + 2 InferenceProvider JSON manifests")]
@@ -3176,7 +3176,7 @@ fn apply_tls_key_missing_ca_secret(context: &str) -> Result<(), Box<dyn std::err
 /// reconcile to `Degraded` / `status.reason = "HealthCheckTlsKeyMissing"`
 /// rather than the pre-fix (incorrect) `"HealthCheckTlsSecretMissing"`.
 ///
-/// The endpoint is a placeholder — TLS resolution runs and fails before any
+/// The endpoint is a placeholder; TLS resolution runs and fails before any
 /// health probe is attempted (see `resolve_phase_and_sites`), so no live HTTP
 /// backend is required for this fixture.
 pub(crate) fn apply_provider_with_health_check_tls_key_missing_fixture(
@@ -3264,9 +3264,9 @@ const PROVIDER_GATEWAY_SVC: &str = "praxis-provider";
 /// (endpoint URL + mTLS config) instead of name-only stubs.
 ///
 /// Two cluster entries are populated:
-/// - `TEST_HEALTHY_ROUTING_CLUSTER` — the self-hosted provider gateway, reached via `NodePort` with mTLS (SNI:
+/// - `TEST_HEALTHY_ROUTING_CLUSTER`: the self-hosted provider gateway, reached via `NodePort` with mTLS (SNI:
 ///   `{cluster}.grid.internal`).
-/// - `TEST_PROVIDER_API` — the API-provider mock, reached via the in-cluster service DNS name (plain HTTP; no TLS).
+/// - `TEST_PROVIDER_API`: the API-provider mock, reached via the in-cluster service DNS name (plain HTTP; no TLS).
 ///
 /// When `NodePort` discovery fails for the provider gateway, the function falls
 /// back to a name-only stub for that cluster and logs a warning.
@@ -3494,7 +3494,7 @@ pub(crate) fn verify_operator_consumer_configmap(
 ///
 /// **Must be present:** `listeners:`, `admin:`, `filter: intelligent_route`,
 /// `filter: credential_inject`, `filter: load_balancer`, `credential:`,
-/// `secretRef:`, `file: …/{secret_name}/{secret_key}`, `endpoints:`.
+/// `secretRef:`, `file: .../{secret_name}/{secret_key}`, `endpoints:`.
 ///
 /// **Must be absent:** token value, `value:`, `filter: headers`, `request_set:`.
 #[expect(
@@ -3527,7 +3527,7 @@ pub(crate) fn verify_consumer_praxis_yaml(
     // Must be absent.
     if yaml.contains(api_token) {
         return Err(
-            "operator-generated consumer config contains token bytes — token must not appear in ConfigMap".into(),
+            "operator-generated consumer config contains token bytes; token must not appear in ConfigMap".into(),
         );
     }
     for forbidden in &["value:", "filter: headers", "request_set:"] {
@@ -3595,7 +3595,7 @@ pub(crate) fn verify_consumer_config_status_rendered(
     if raw.contains(api_token) {
         return Err(format!(
             "SECURITY VIOLATION: token bytes found in GridNetwork/{network_name} \
-             status.consumerConfigStatus — status must never contain credential token bytes"
+             status.consumerConfigStatus; status must never contain credential token bytes"
         )
         .into());
     }
@@ -3925,7 +3925,7 @@ pub(crate) fn apply_full_grid_fixtures(
 
 /// Delete all resources created by the full-grid routing validation.
 ///
-/// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
+/// Safe to call before a fresh run; all deletes use `--ignore-not-found`.
 pub(crate) fn cleanup_full_grid_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     delete_namespaced_resource(
         context,
@@ -4893,7 +4893,7 @@ pub(crate) fn validate_gridsite_events(
 
 /// Delete resources created by the SWIM overlay validation.
 ///
-/// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
+/// Safe to call before a fresh run; all deletes use `--ignore-not-found`.
 pub(crate) fn cleanup_swim_overlay_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     cleanup_test_network_resources(context, SWIM_OVERLAY_NETWORK, SWIM_OVERLAY_GW, &[SWIM_OVERLAY_PROVIDER])?;
     let secondary_k8s_name = auto_discovered_gridsite_name(SWIM_OVERLAY_NETWORK, SWIM_NODE_SECONDARY_NAME);
@@ -5363,7 +5363,7 @@ pub(crate) fn assert_no_overlay_candidate_for_model(
 
 /// Delete all resources created by the three-node SWIM mesh validation.
 ///
-/// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
+/// Safe to call before a fresh run; all deletes use `--ignore-not-found`.
 pub(crate) fn cleanup_swim_mesh_test_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     delete_namespaced_resource(
         context,
@@ -5510,8 +5510,8 @@ pub(crate) fn read_gridsite_public_cert_pem(context: &str, site_name: &str) -> O
 
 /// Apply egress address and TLS configuration to a `GridSite` spec.
 ///
-/// This allows the `GridSite` controller to advance phases naturally —
-/// use this to exercise the trust-policy-gated promotion path from the
+/// This allows the `GridSite` controller to advance phases naturally.
+/// Use this to exercise the trust-policy-gated promotion path from the
 /// auto-discovered lifecycle state.
 ///
 /// When `server_name` is `Some`, the egress TLS mode is set to `Mutual`
@@ -5745,7 +5745,7 @@ pub(crate) fn apply_swim_routing_east_fixtures(
 /// Apply the west-side fixtures for the cross-cluster SWIM routing validation.
 ///
 /// Creates on the west cluster:
-/// - [`SWIM_ROUTING_NETWORK`] `GridNetwork` without a `gatewayRef` — the peer operator reconciles this to publish its
+/// - [`SWIM_ROUTING_NETWORK`] `GridNetwork` without a `gatewayRef`; the peer operator reconciles this to publish its
 ///   CRDT state but does not write an overlay `ConfigMap` (only the east primary generates the overlay).
 /// - [`SWIM_ROUTING_WEST_PROVIDER`] `InferenceProvider` serving `west_model` with `routingClusterRef = west_site_name`.
 ///
@@ -5799,7 +5799,7 @@ pub(crate) fn apply_swim_routing_west_fixtures(
 
 /// Delete resources created by the SWIM routing validation on a given cluster.
 ///
-/// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
+/// Safe to call before a fresh run; all deletes use `--ignore-not-found`.
 /// Call once per cluster (east and west).
 pub(crate) fn cleanup_swim_routing_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     cleanup_test_network_resources(
@@ -5860,7 +5860,7 @@ pub(crate) fn verify_degraded_candidate(
         .find(|c| c["cluster"].as_str() == Some(degraded_cluster) && c["fresh"].as_bool() == Some(false))
         .ok_or_else(|| {
             format!(
-                "{degraded_cluster} has no fresh=false candidate — Degraded provider must appear as stale in overlay"
+                "{degraded_cluster} has no fresh=false candidate; Degraded provider must appear as stale in overlay"
             )
         })?;
 
@@ -5921,7 +5921,7 @@ fn multi_provider_fixture_json(
 
 /// Build the multi-provider validation `GridNetwork` fixture JSON.
 ///
-/// No single site is "local" across multiple provider sites — this
+/// No single site is "local" across multiple provider sites, so this
 /// intentionally passes `TEST_NETWORK` (not a real site name) as
 /// `local_site`, preserving the prior behavior (`localSiteName` falls back to
 /// the network name, which matches no candidate) since this validation
@@ -6292,7 +6292,7 @@ pub(crate) fn apply_gridsite(
 /// [`wait_for_gridsite_phase`] after this call confirms the expected phase is
 /// observed after reconciliation.
 ///
-/// This is xtask validation infrastructure — it simulates lifecycle states
+/// This is xtask validation infrastructure; it simulates lifecycle states
 /// that are otherwise reached through SWIM discovery, gateway reachability, and
 /// trust policy configuration.
 pub(crate) fn patch_gridsite_phase(
@@ -6396,7 +6396,7 @@ pub(crate) fn wait_for_gridsite_phase(
 ///
 /// Checks `spec.gridNetworkRef` and `spec.egress.address`, which together
 /// provide the network identity and data-plane endpoint needed for routing.
-/// The `status.phase` value is reported but not asserted here — call
+/// The `status.phase` value is reported but not asserted here; call
 /// [`wait_for_gridsite_phase`] separately to assert the lifecycle state.
 #[expect(
     clippy::too_many_lines,
@@ -6626,7 +6626,7 @@ pub(crate) fn verify_site_join_overlay(
 /// Uses [`verify_site_join_overlay`] for each check.  Bumps the [`SITE_JOIN_NETWORK`]
 /// `GridNetwork` each cycle so the controller re-renders the overlay with the most
 /// recent provider list.  This is necessary because the `InferenceProvider` informer
-/// cache may lag behind provider creation — a one-shot check right after bumping may
+/// cache may lag behind provider creation, so a one-shot check right after bumping may
 /// read a stale overlay that is missing newly-applied providers.
 #[expect(clippy::disallowed_methods, reason = "synchronous poll loop in xtask")]
 #[expect(clippy::too_many_arguments, reason = "delegates to verify_site_join_overlay")]
@@ -6820,7 +6820,7 @@ pub(crate) fn verify_auto_gridsite_fields(
 /// Assert that a `GridSite`'s `spec.egress.address` equals the expected gateway address
 /// and is distinct from the SWIM UDP bind address.
 ///
-/// Hard-fails if the egress address equals the SWIM UDP address — that would indicate
+/// Hard-fails if the egress address equals the SWIM UDP address, since that would indicate
 /// the gateway address was not propagated through the SWIM state broadcast and the site
 /// received the SWIM endpoint instead of the data-plane gateway address.
 #[expect(
@@ -6862,7 +6862,7 @@ pub(crate) fn verify_auto_gridsite_egress(
     if actual == swim_udp_addr {
         return Err(format!(
             "GridSite {site_name:?}: spec.egress.address={actual:?} equals the SWIM UDP address; \
-             expected gateway address {expected_gateway_addr:?} — \
+             expected gateway address {expected_gateway_addr:?}; \
              the data-plane gateway address was not propagated through SWIM"
         )
         .into());
@@ -6883,7 +6883,7 @@ pub(crate) fn verify_auto_gridsite_egress(
 
 /// Delete all resources created by the site-join-discovery validation on `context`.
 ///
-/// Safe to call before a fresh run — all deletes use `--ignore-not-found`.
+/// Safe to call before a fresh run; all deletes use `--ignore-not-found`.
 pub(crate) fn cleanup_site_join_resources(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     delete_namespaced_resource(
         context,
@@ -7680,7 +7680,7 @@ pub(crate) fn cleanup_stale_gc_west_resources(context: &str) -> Result<(), Box<d
 /// [`api_credential_plan_from_overlay`] (production path).
 #[derive(Debug, PartialEq)]
 pub(crate) enum ApiCredentialPlan {
-    /// `auth.manual = true` — the user manages credentials; the harness does not inject.
+    /// `auth.manual = true`: the user manages credentials; the harness does not inject.
     ///
     /// Constructed by `parse_api_credential_plan` (test-only); kept as a
     /// valid arm in [`resolve_api_credential`] for defensive completeness.
@@ -7689,7 +7689,7 @@ pub(crate) enum ApiCredentialPlan {
         expect(dead_code, reason = "constructed only by test-only parse_api_credential_plan")
     )]
     Manual,
-    /// `spec.auth` is absent — no credential injection.
+    /// `spec.auth` is absent; no credential injection.
     ///
     /// Constructed by `parse_api_credential_plan` (test-only); kept as a
     /// valid arm in [`resolve_api_credential`] for defensive completeness.
@@ -7720,10 +7720,10 @@ pub(crate) enum ApiCredentialPlan {
 /// | `manual` | `strategy` | `secret_ref` | Result |
 /// |---|---|---|---|
 /// | `true` | any | any | `Ok(Manual)` |
-/// | absent/null | — | — | `Ok(Absent)` |
-/// | `false` | `bearer_token` | present | `Ok(BearerToken { … })` |
+/// | absent/null | n/a | n/a | `Ok(Absent)` |
+/// | `false` | `bearer_token` | present | `Ok(BearerToken { ... })` |
 /// | `false` | `bearer_token` | absent | `Err("missing secretRef")` |
-/// | `false` | other | any | `Err("unsupported strategy …")` |
+/// | `false` | other | any | `Err("unsupported strategy ...")` |
 #[cfg(test)]
 #[expect(
     clippy::too_many_lines,
@@ -7783,7 +7783,7 @@ pub(crate) fn parse_api_credential_plan(
 /// 76-char line-wrapping (which would corrupt tokens longer than 57 bytes if
 /// the `data` field were used with an unwrapped subprocess).
 ///
-/// The manifest is piped via stdin to `kubectl apply` and is **not logged** —
+/// The manifest is piped via stdin to `kubectl apply` and is **not logged**;
 /// only the Secret name and key appear in xtask output.
 pub(crate) fn create_api_credential_secret(
     context: &str,
@@ -7821,7 +7821,7 @@ pub(crate) fn create_api_credential_secret(
 /// Kubernetes stores `Secret.data` values as standard base64; they are
 /// decoded here using the system `base64 -d` command so no extra crate is needed.
 ///
-/// The decoded token value is returned but **never logged** — callers
+/// The decoded token value is returned but **never logged**; callers
 /// must not print the return value.
 #[expect(clippy::too_many_lines, reason = "kubectl fetch + JSON parse + base64 decode chain")]
 pub(crate) fn read_api_credential(
@@ -7888,9 +7888,9 @@ pub(crate) fn read_api_credential(
 ///
 /// | Plan | Return |
 /// |---|---|
-/// | `Absent` | `Ok(None)` — no injection |
-/// | `Manual` | `Ok(None)` — caller manages credentials |
-/// | `BearerToken { … }` | `Ok(Some(token))` — read from k8s Secret |
+/// | `Absent` | `Ok(None)` (no injection) |
+/// | `Manual` | `Ok(None)` (caller manages credentials) |
+/// | `BearerToken { ... }` | `Ok(Some(token))` (read from k8s Secret) |
 ///
 /// The returned token is never logged; only the Secret name and key are printed.
 pub(crate) fn resolve_api_credential(
@@ -7964,7 +7964,7 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
-    // network_fixture_json — E2E harness contract (grid#60)
+    // network_fixture_json: E2E harness contract (grid#60)
     //
     // These pin the fixture-builder's wiring, not the business rule itself:
     // "local ranks before remote/API-provider under GeographyFirst" is
@@ -8033,7 +8033,7 @@ mod tests {
             value["spec"]["gatewayRefs"][0]["localSiteName"].as_str(),
             Some(TEST_NETWORK),
             "multi-provider validation has no single local site; localSiteName must stay TEST_NETWORK \
-             (matching no candidate) so candidate-presence checks aren't skewed by locality ordering — if this \
+             (matching no candidate) so candidate-presence checks aren't skewed by locality ordering; if this \
              ever changed to pass a real site name, locality ordering would silently re-engage with no signal"
         );
     }
@@ -8106,7 +8106,7 @@ mod tests {
 
     #[test]
     fn verify_degraded_candidate_accepts_when_shared_site_has_fresh_false() {
-        // Two candidates at the same site — healthy (fresh=true) and degraded (fresh=false).
+        // Two candidates at the same site, healthy (fresh=true) and degraded (fresh=false).
         // Two providers sharing routingClusterRef="site-a" produces two candidates at the same
         // site: one healthy (fresh=true) and one degraded (fresh=false).  The degraded check must find the fresh=false
         // one.
@@ -8119,7 +8119,7 @@ mod tests {
 
     #[test]
     fn verify_overlay_accepts_when_shared_site_has_fresh_true() {
-        // Two candidates at the same site — healthy (fresh=true) and degraded (fresh=false).
+        // Two candidates at the same site, healthy (fresh=true) and degraded (fresh=false).
         // The overlay check must pass because at least one candidate is fresh=true.
         let overlay = make_overlay(&[("site-a", true), ("site-a", false)]);
         assert!(
@@ -8433,7 +8433,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // verify_swim_status — pure assertion tests
+    // verify_swim_status: pure assertion tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -8517,7 +8517,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // verify_distributed_state_received — exact count assertions
+    // verify_distributed_state_received: exact count assertions
     // -----------------------------------------------------------------------
 
     #[test]
@@ -8752,7 +8752,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // verify_metrics_routing_overlay — ordering assertions
+    // verify_metrics_routing_overlay: ordering assertions
     // -----------------------------------------------------------------------
 
     fn make_metrics_overlay(site_order: &[&str]) -> serde_json::Value {
@@ -8808,13 +8808,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // bump_gridnetwork — annotation structure
+    // bump_gridnetwork: annotation structure
     // -----------------------------------------------------------------------
 
     #[test]
     fn bump_gridnetwork_builds_non_empty_annotation() {
         // The bump annotation must include a non-empty value (a Unix timestamp).
-        // This is a structural test that does not run kubectl — it verifies the
+        // This is a structural test that does not run kubectl; it verifies the
         // annotation string is well-formed so the actual bump call is predictable.
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -8829,7 +8829,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // site join / discovery — pure helper tests
+    // site join / discovery: pure helper tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -8907,7 +8907,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // parse_api_credential_plan — pure function tests
+    // parse_api_credential_plan: pure function tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -9000,7 +9000,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // api_credential_plan_from_overlay — overlay credential extraction
+    // api_credential_plan_from_overlay: overlay credential extraction
     // -----------------------------------------------------------------------
 
     fn parse_overlay(json: &serde_json::Value) -> crate::env::operator_overlay::RoutingOverlay {

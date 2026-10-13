@@ -35,7 +35,7 @@ pub fn ca_secret_data(ca: &certs::CaCert) -> BTreeMap<String, ByteString> {
 /// Read only the public certificate PEM from a site certificate Secret.
 ///
 /// Reads the `tls.crt` key from the named Secret.  The private key (`tls.key`)
-/// is deliberately not read — this function must never return private key material.
+/// is deliberately not read; this function must never return private key material.
 ///
 /// Returns `None` when the Secret does not exist or does not contain the
 /// `tls.crt` key.
@@ -89,7 +89,7 @@ impl SecretKeyLookup {
 ///
 /// Returns [`SecretKeyLookup`] so callers can distinguish a missing Secret
 /// from a Secret that exists but lacks (or has an empty) requested key.
-/// Never logs the byte content — callers handle private material.
+/// Never logs the byte content; callers handle private material.
 ///
 /// # Errors
 ///
@@ -189,7 +189,7 @@ fn contains_private_key_marker(pem: &str) -> bool {
 ///
 /// The decoded key bytes are **never** written to logs, tracing spans, error
 /// messages, or Kubernetes resources.  This function does not expose key
-/// contents in any return path — callers receive either the raw bytes or
+/// contents in any return path; callers receive either the raw bytes or
 /// `None`/`Err`.
 pub async fn read_swim_key(
     client: &kube::Client,
@@ -254,7 +254,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // read_secret_bytes — SecretMissing vs KeyMissing (grid#58)
+    // read_secret_bytes: SecretMissing vs KeyMissing (grid#58)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -341,7 +341,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // SecretKeyLookup::into_bytes — pure collapse to Option<Vec<u8>>
+    // SecretKeyLookup::into_bytes: pure collapse to Option<Vec<u8>>
     // -----------------------------------------------------------------------
 
     #[test]

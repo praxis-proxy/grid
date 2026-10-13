@@ -47,7 +47,7 @@
 //! the provider's `spec.gridNetworkRef`, then applies the provider's
 //! `spec.siteSelector.matchLabels`.  An empty selector matches all sites in
 //! the network.  Network filtering (by `spec.gridNetworkRef`) is the
-//! controller's responsibility — `sites_matching_selector` itself does not
+//! controller's responsibility; `sites_matching_selector` itself does not
 //! filter by network.
 //!
 //! [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
@@ -211,7 +211,7 @@ pub enum ProbeOutcome {
 
     /// No probe was attempted this reconcile cycle.
     ///
-    /// Preserves the site-matching phase unchanged — equivalent to the
+    /// Preserves the site-matching phase unchanged, equivalent to the
     /// pre-OP-05 behaviour.
     NotProbed,
 }
@@ -219,8 +219,8 @@ pub enum ProbeOutcome {
 impl ProbeOutcome {
     /// Derive a [`ProbeOutcome`] from an HTTP status code returned by a health probe.
     ///
-    /// A 2xx status indicates the endpoint is healthy.  Any other status —
-    /// redirects, client errors, server errors — indicates the endpoint is
+    /// A 2xx status indicates the endpoint is healthy.  Any other status
+    /// (redirects, client errors, server errors) indicates the endpoint is
     /// reachable but in a degraded state.
     ///
     /// Transport failures (connection refused, timeout, DNS error) are not
@@ -229,7 +229,7 @@ impl ProbeOutcome {
     ///
     /// | Status range | Result |
     /// |---|---|
-    /// | 200–299 | [`Healthy`] |
+    /// | 200-299 | [`Healthy`] |
     /// | any other | [`Degraded`] |
     ///
     /// [`Healthy`]: ProbeOutcome::Healthy
@@ -309,7 +309,7 @@ pub(crate) fn phase_from_matching(matching: &[String]) -> ProviderPhase {
 
 /// Build the URL to probe for a provider's health check.
 ///
-/// Returns `None` when no [`HealthCheckConfig`] is present — the provider
+/// Returns `None` when no [`HealthCheckConfig`] is present; the provider
 /// will not be probed and [`ProbeOutcome::NotProbed`] is used instead.
 ///
 /// When health check is configured:
@@ -447,7 +447,7 @@ pub(crate) fn requeue_interval_for_provider(spec: &InferenceProviderSpec) -> Dur
 ///
 /// # Timeout
 ///
-/// The entire request — including TLS handshake for `https://` — is wrapped
+/// The entire request, including TLS handshake for `https://`, is wrapped
 /// in `timeout`.  Exceeding the timeout returns [`ProbeOutcome::Unavailable`].
 ///
 /// # Failure policy
@@ -695,7 +695,7 @@ async fn resolve_phase_and_sites(
     // Run a live health probe when the spec opts in via `health_check`.
     // Providers without health_check config receive NotProbed, which
     // preserves the site-matching phase unchanged.
-    // Warn if healthCheck.endpoint is present but blank — the probe will
+    // Warn if healthCheck.endpoint is present but blank; the probe will
     // fail with Unavailable, surfacing the misconfiguration.
     if let Some(hc) = &provider.spec.health_check
         && let Some(ep) = hc.endpoint.as_deref()
@@ -753,7 +753,7 @@ async fn list_sites_for_network(client: &Client, network_ref: &str) -> Result<Ve
 /// must match (AND semantics); extra labels on the site are ignored.
 /// Returns a deterministically sorted list of matching site names.
 ///
-/// Network filtering is the caller's responsibility — pass only sites that
+/// Network filtering is the caller's responsibility; pass only sites that
 /// already belong to the relevant network.
 pub(crate) fn sites_matching_selector(provider: &InferenceProvider, sites: &[GridSite]) -> Vec<String> {
     let selector = &provider.spec.site_selector.match_labels;
@@ -981,13 +981,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // resolve_phase_and_sites — integration tier: reconcile-path TLS
+    // resolve_phase_and_sites: integration tier: reconcile-path TLS
     // failure reasons through a mocked kube::Client (grid#58)
     //
     // The unit tier (endpoint_tls.rs, secret.rs) already exercises
     // resolve_tls_config/read_secret_bytes directly. These tests instead
-    // drive the same scenario through resolve_phase_and_sites — the actual
-    // function reconcile() calls — proving the SecretMissing/KeyMissing
+    // drive the same scenario through resolve_phase_and_sites (the actual
+    // function reconcile() calls), proving the SecretMissing/KeyMissing
     // distinction survives all the way to the (phase, status.reason) pair
     // reconcile() writes to the CR, not just to an intermediate type.
     // -----------------------------------------------------------------------
@@ -1008,7 +1008,7 @@ mod tests {
 
     /// Build an HTTP 404 Kubernetes `Status` response for a named resource.
     ///
-    /// Must actually set the 404 status (not reuse [`json_ok`]'s 200) —
+    /// Must actually set the 404 status (not reuse [`json_ok`]'s 200):
     /// `kube`'s client only maps a response onto `ApiError`/`get_opt: None`
     /// when the HTTP status itself is 404; a 200 body shaped like a `Status`
     /// object is instead treated as a malformed resource and surfaces as a
@@ -1513,7 +1513,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // validate_provider_config — static validation (items 1-4)
+    // validate_provider_config: static validation (items 1-4)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1624,7 +1624,7 @@ mod tests {
     // Covered at the integration level; documented here for completeness.
 
     // -----------------------------------------------------------------------
-    // phase_from_matching — pure phase logic (items 6-7, 12)
+    // phase_from_matching: pure phase logic (items 6-7, 12)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1707,7 +1707,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // phase_from_probe — health decision function
+    // phase_from_probe: health decision function
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1785,7 +1785,7 @@ mod tests {
     #[test]
     fn degraded_is_reachable_via_phase_from_probe() {
         // Documents that Degraded IS now reachable from the controller, via
-        // phase_from_probe — in contrast to phase_from_matching which cannot
+        // phase_from_probe, in contrast to phase_from_matching which cannot
         // emit it.
         let result = phase_from_probe(ProbeOutcome::Degraded, ProviderPhase::Available);
         assert_eq!(
@@ -1796,7 +1796,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ProbeOutcome::from_http_status — HTTP status code mapping
+    // ProbeOutcome::from_http_status: HTTP status code mapping
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1902,7 +1902,7 @@ mod tests {
     fn static_config_failure_precedes_probe_result() {
         // Static config validation short-circuits before phase_from_probe is
         // called.  When validate_provider_config returns Some(_), the caller
-        // returns Unavailable immediately — no probe outcome can rescue a
+        // returns Unavailable immediately; no probe outcome can rescue a
         // provider with an invalid config.
         //
         // Simulate the precedence: if static validation fails, we would
@@ -1933,7 +1933,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // sites_matching_selector — selector matching (items 8-11)
+    // sites_matching_selector: selector matching (items 8-11)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2013,7 +2013,7 @@ mod tests {
     #[test]
     fn sites_from_other_network_match_empty_selector() {
         // Item 11 (contract doc): sites_matching_selector does NOT filter by
-        // network — that is the controller's responsibility via
+        // network; that is the controller's responsibility via
         // list_sites_for_network.  An empty selector will match any site
         // passed in, regardless of network.
         let provider = test_provider("prov", "net", &["model"]);
@@ -2116,7 +2116,7 @@ mod tests {
     // is fully unit-tested above.
 
     // -----------------------------------------------------------------------
-    // parse_duration_str — pure duration parsing
+    // parse_duration_str: pure duration parsing
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2146,7 +2146,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // parse_probe_timeout — pure timeout derivation
+    // parse_probe_timeout: pure timeout derivation
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2207,7 +2207,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // requeue_interval_for_provider — pure interval derivation
+    // requeue_interval_for_provider: pure interval derivation
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2409,7 +2409,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // probe_url_for_provider — pure URL construction
+    // probe_url_for_provider: pure URL construction
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2472,7 +2472,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // probe_url_for_provider — endpoint override
+    // probe_url_for_provider: endpoint override
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2561,7 +2561,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // requeue_interval_for_provider — healthCheck.tls triggers TLS interval
+    // requeue_interval_for_provider: healthCheck.tls triggers TLS interval
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2612,7 +2612,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // HealthCheckConfig serde — endpoint + tls fields round-trip
+    // HealthCheckConfig serde: endpoint + tls fields round-trip
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2718,7 +2718,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // TlsFailureReason — healthCheck prefix
+    // TlsFailureReason: healthCheck prefix
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2748,7 +2748,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // probe_endpoint — async, local TcpListener (no external network)
+    // probe_endpoint: async, local TcpListener (no external network)
     // -----------------------------------------------------------------------
 
     /// Start a local HTTP server on a random port that returns one canned response.
@@ -2860,7 +2860,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_unsupported_scheme_ftp_yields_unavailable() {
-        // ftp:// is not http or https — must be rejected immediately without
+        // ftp:// is not http or https, so it must be rejected immediately without
         // attempting a connection.
         let result = probe_endpoint(test_uri("ftp://example.com/file"), Duration::from_secs(1), None, None).await;
         assert_eq!(result, ProbeOutcome::Unavailable, "ftp:// must yield Unavailable");
@@ -2868,7 +2868,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_no_scheme_yields_unavailable() {
-        // A path-only URL has no scheme — URL parse may succeed but scheme is None.
+        // A path-only URL has no scheme; URL parse may succeed but scheme is None.
         let result = probe_endpoint(test_uri("/just/a/path"), Duration::from_secs(1), None, None).await;
         assert_eq!(
             result,
@@ -2913,7 +2913,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // probe_endpoint — TLS tests (real certificates, real handshakes)
+    // probe_endpoint: TLS tests (real certificates, real handshakes)
     // -----------------------------------------------------------------------
 
     /// Read a complete request and answer it under either TLS backend.
@@ -3066,7 +3066,7 @@ mod tests {
             b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()
         })
         .await;
-        // Client trusts wrong CA — handshake must fail.
+        // Client trusts wrong CA, so the handshake must fail.
         let tls_config =
             crate::metrics_scraper::build_tls_client_config(ca_wrong.cert_pem.as_bytes(), None, None).unwrap();
         let result = probe_endpoint(test_uri(&url), Duration::from_secs(5), Some(Arc::new(tls_config)), None).await;
@@ -3079,7 +3079,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_http_url_with_tls_config_yields_unavailable() {
-        // http:// URL with a TLS config is a misconfiguration — fail-closed.
+        // http:// URL with a TLS config is a misconfiguration; fail closed.
         let ca = certs::generate_ca("test-ca").unwrap();
         let tls_config = crate::metrics_scraper::build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap();
         let url = start_test_server(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await;
@@ -3092,7 +3092,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // parse_duration_str — edge cases
+    // parse_duration_str: edge cases
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3117,7 +3117,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // probe_endpoint — sequential / state isolation
+    // probe_endpoint: sequential / state isolation
     // -----------------------------------------------------------------------
 
     #[tokio::test]

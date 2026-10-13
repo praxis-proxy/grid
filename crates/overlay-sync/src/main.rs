@@ -40,7 +40,7 @@ use crate::{metrics::Metrics, status::SharedStatus, validation::ExpectedScope, w
 // CLI
 // ---------------------------------------------------------------------------
 
-/// Grid overlay sync sidecar — watches a `ConfigMap` and atomically
+/// Grid overlay sync sidecar that watches a `ConfigMap` and atomically
 /// publishes validated overlays.
 #[derive(Parser, Debug)]
 #[command(name = "grid-overlay-sync", version = version::VERSION)]
@@ -278,12 +278,12 @@ fn build_health_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Liveness probe — always healthy if the process is running.
+/// Liveness probe: always healthy if the process is running.
 async fn livez() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// Readiness probe — healthy after first valid overlay is written.
+/// Readiness probe: healthy after first valid overlay is written.
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     if state.status.is_ready() {
         (StatusCode::OK, "ready")
@@ -292,7 +292,7 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-/// Status endpoint — JSON with current sidecar state.
+/// Status endpoint: JSON with current sidecar state.
 async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
     let response = state.status.to_response();
     (

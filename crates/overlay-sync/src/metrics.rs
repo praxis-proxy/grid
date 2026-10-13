@@ -2,7 +2,7 @@
 
 //! Prometheus metrics for the overlay sync sidecar.
 //!
-//! All label values are bounded strings — never unbounded revision
+//! All label values are bounded strings, never unbounded revision
 //! hashes, resource versions, or user-supplied identifiers.
 
 use prometheus::{Gauge, IntCounterVec, IntGauge, Opts, Registry, TextEncoder};

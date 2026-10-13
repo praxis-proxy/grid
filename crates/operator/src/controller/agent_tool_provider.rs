@@ -51,19 +51,19 @@ use crate::{
 /// Requeue interval after a successful reconciliation.
 ///
 /// Matches [`inference_provider`](crate::controller::inference_provider)'s
-/// default — no `healthCheck.interval`-equivalent config exists on
+/// default; no `healthCheck.interval`-equivalent config exists on
 /// [`AgentToolProviderSpec`](crate::crd::agent_tool_provider::AgentToolProviderSpec) yet.
 const REQUEUE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Total bounded wall-clock budget for the live MCP probe: DNS resolution,
 /// TLS Secret material reads, connect/handshake, and the `tools/list` call
-/// combined — enforced as a single outer timeout in
+/// combined, enforced as a single outer timeout in
 /// [`mcp_probe::probe_agent_tool_provider`], not summed/multiplied across
 /// phases.
 ///
 /// [`AgentToolProviderSpec`](crate::crd::agent_tool_provider::AgentToolProviderSpec)
 /// has no `healthCheck.timeout`-equivalent field yet, so this is a fixed
-/// constant rather than a per-resource override — revisit if a future CRD
+/// constant rather than a per-resource override; revisit if a future CRD
 /// revision adds one.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -133,7 +133,7 @@ pub fn error_policy(_provider: Arc<AgentToolProvider>, error: &OperatorError, _c
 /// non-blank `gridNetworkRef` to be considered configured. The
 /// `gridNetworkRef` *existence* check (does the referenced `GridNetwork`
 /// actually exist) requires a Kubernetes API call and is not part of this
-/// pure function — see resolution in `resolve_phase_and_sites`.
+/// pure function; see resolution in `resolve_phase_and_sites`.
 pub(crate) fn validate_provider_config(provider: &AgentToolProvider) -> Option<&'static str> {
     if provider.spec.endpoint.trim().is_empty() {
         return Some("blank endpoint");
@@ -155,7 +155,7 @@ pub(crate) fn validate_provider_config(provider: &AgentToolProvider) -> Option<&
 /// match, and [`ProviderPhase::Available`] when at least one site matches.
 ///
 /// This function never returns [`ProviderPhase::Degraded`] or
-/// [`ProviderPhase::Unavailable`] — those are only reachable via the
+/// [`ProviderPhase::Unavailable`]; those are only reachable via the
 /// config/`GridNetwork`-missing short-circuits in `resolve_phase_and_sites`,
 /// or the live probe outcome merge (`phase_and_reason_from_probe`).
 pub(crate) fn phase_from_matching(matching: &[String]) -> ProviderPhase {
@@ -173,7 +173,7 @@ pub(crate) fn phase_from_matching(matching: &[String]) -> ProviderPhase {
 /// Returns a deterministically sorted list of matching site names.
 ///
 /// Network filtering (by `spec.gridNetworkRef`) is the caller's
-/// responsibility — this function does not filter by network, mirroring
+/// responsibility; this function does not filter by network, mirroring
 /// [`inference_provider::sites_matching_selector`](crate::controller::inference_provider::sites_matching_selector).
 pub(crate) fn sites_matching_selector(provider: &AgentToolProvider, sites: &[GridSite]) -> Vec<String> {
     let selector = &provider.spec.site_selector.match_labels;
@@ -272,7 +272,7 @@ async fn resolve_phase_and_sites(
     let site_phase = phase_from_matching(&matching);
 
     if site_phase != ProviderPhase::Available {
-        // No sites match (yet) — nothing to probe. Mirrors
+        // No sites match (yet), so nothing to probe. Mirrors
         // inference_provider's semantics: the health probe never runs
         // before the resource has anything to reach.
         return Ok((site_phase, matching, None, previous_tools));
@@ -295,7 +295,7 @@ enum CredentialProbeInput {
 /// resolve the token value.
 ///
 /// Split out of [`probe_and_merge`] purely to keep both functions within the
-/// project's complexity lints — this is the credential half of what was
+/// project's complexity lints; this is the credential half of what was
 /// previously one larger function.
 ///
 /// # Errors
@@ -452,8 +452,8 @@ async fn update_status(
     info!(name, "updated AgentToolProvider status");
 
     // Events, metrics, and transition-level logs only fire on a real phase
-    // or reason transition — never on a matchingSites/discoveredTools-only
-    // patch — so a converged provider being repeatedly re-listed doesn't
+    // or reason transition, never on a matchingSites/discoveredTools-only
+    // patch, so a converged provider being repeatedly re-listed doesn't
     // spam the Event feed or inflate the phase-transition counter.
     if is_real_transition(phase_changed, reason_changed) {
         emit_transition_telemetry(name, current_phase, &status, recorder, object_ref).await;
@@ -466,7 +466,7 @@ async fn update_status(
 /// reason transition.
 ///
 /// Split out of [`update_status`] purely to keep that function within the
-/// project's line/complexity lints — this is the transition-telemetry half
+/// project's line/complexity lints; this is the transition-telemetry half
 /// of what was previously one larger function, called only once, from the
 /// `is_real_transition` branch.
 async fn emit_transition_telemetry(
@@ -514,7 +514,7 @@ fn phase_label(phase: &ProviderPhase) -> &'static str {
 /// Synthesize a bounded telemetry reason label for Events, metrics, and logs.
 ///
 /// Business rule: when `status.reason` is set (an unhealthy phase with a
-/// diagnostic code — see [`AgentToolProviderStatus`]'s doc comment), that
+/// diagnostic code; see [`AgentToolProviderStatus`]'s doc comment), that
 /// code *is* the telemetry label, keeping a single source of truth between
 /// what a user reads on the CR and what appears in Events/metrics. When
 /// `status.reason` is `None` (a healthy phase), this synthesizes one of two
@@ -547,7 +547,7 @@ fn event_type_for_reason(reason: &str) -> EventType {
 }
 
 /// Whether a phase or reason change is a "real" transition worth surfacing
-/// via Event, metric, and transition-level log — as opposed to a status
+/// via Event, metric, and transition-level log, as opposed to a status
 /// patch driven solely by `matchingSites`/`discoveredTools` churn.
 fn is_real_transition(phase_changed: bool, reason_changed: bool) -> bool {
     phase_changed || reason_changed
@@ -556,7 +556,7 @@ fn is_real_transition(phase_changed: bool, reason_changed: bool) -> bool {
 /// Return whether the status subresource differs from the desired status.
 ///
 /// Business rule: the status subresource is only patched when `phase`,
-/// `reason`, `matchingSites`, or `discoveredTools` materially changed —
+/// `reason`, `matchingSites`, or `discoveredTools` materially changed,
 /// never on a no-op reconcile.
 fn agent_tool_provider_status_needs_update(
     current: Option<&AgentToolProviderStatus>,
@@ -591,7 +591,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // validate_provider_config — static validation
+    // validate_provider_config: static validation
     // -----------------------------------------------------------------------
 
     #[test]
@@ -644,7 +644,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // static_config_failure_reason — async wiring around validate_provider_config
+    // static_config_failure_reason: async wiring around validate_provider_config
     // and the GridNetwork-existence check, against a mocked Kubernetes API.
     // -----------------------------------------------------------------------
 
@@ -702,7 +702,7 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort())
     }
 
-    /// A `kube::Client` that panics if a request is ever sent through it —
+    /// A `kube::Client` that panics if a request is ever sent through it,
     /// used to prove `static_config_failure_reason` short-circuits on a
     /// config error *before* making any Kubernetes API call.
     fn unused_kube_client() -> Client {
@@ -748,7 +748,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // phase_from_matching — pure phase logic
+    // phase_from_matching: pure phase logic
     // -----------------------------------------------------------------------
 
     #[test]
@@ -796,7 +796,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // sites_matching_selector — selector matching
+    // sites_matching_selector: selector matching
     // -----------------------------------------------------------------------
 
     fn test_site(name: &str, network: &str) -> GridSite {
@@ -917,7 +917,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // agent_tool_provider_status_needs_update — patch-if-changed decision
+    // agent_tool_provider_status_needs_update: patch-if-changed decision
     // -----------------------------------------------------------------------
 
     fn baseline_status() -> AgentToolProviderStatus {
@@ -1001,7 +1001,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // telemetry_reason_label — synthesize a bounded telemetry label
+    // telemetry_reason_label: synthesize a bounded telemetry label
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1049,7 +1049,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // event_type_for_reason — bounded Event severity mapping
+    // event_type_for_reason: bounded Event severity mapping
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1087,7 +1087,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // is_real_transition — gates Event emission, metric recording, and
+    // is_real_transition: gates Event emission, metric recording, and
     // transition-level logging so a no-op reconcile never fires any of them
     // -----------------------------------------------------------------------
 
@@ -1121,14 +1121,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // reconcile — full orchestration against a mocked Kubernetes API.
+    // reconcile: full orchestration against a mocked Kubernetes API.
     //
     // Everything above exercises resolve_phase_and_sites/update_status's
     // constituent resolve_*/pure-logic functions in isolation. These tests
     // drive the public reconcile() entrypoint itself end-to-end, proving the
     // resolved (phase, reason, matchingSites, discoveredTools) tuple actually
     // reaches the Kubernetes API as the status PATCH body a real controller
-    // would send — the seam none of the functions above individually cover.
+    // would send, the seam none of the functions above individually cover.
     // -----------------------------------------------------------------------
 
     /// A `kube::Client` that serves `GridNetwork` GETs from an in-memory map
@@ -1136,7 +1136,7 @@ mod tests {
     /// `captured`. Any other request (a missing `GridNetwork`, the `Event`
     /// POST from `Recorder::publish`, a `GridSite` LIST) 404s: `update_status`
     /// and `emit_transition_telemetry` both already tolerate a failed event
-    /// publish by design (logged, not propagated — see `emit_transition_telemetry`),
+    /// publish by design (logged, not propagated; see `emit_transition_telemetry`),
     /// and the two scenarios below never reach `GridSite` listing at all,
     /// since both short-circuit inside `static_config_failure_reason`.
     #[expect(

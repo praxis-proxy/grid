@@ -1,16 +1,16 @@
 # Topology for out-of-cluster operator and SWIM E2E validation.
 #
 # Two kind clusters:
-#   site-a    — provider cluster; runs mock-openai backend and Praxis provider gateway.
+#   site-a:     provider cluster; runs mock-openai backend and Praxis provider gateway.
 #               InferenceProvider fixtures set routingClusterRef="site-a" so operator-
 #               generated overlay candidates carry site="site-a" and cluster="site-a".
 #               The consumer gateway load_balancer maps gateway-site-a to this cluster.
-#   consumer  — receives the operator-exported overlay and routes model requests to
+#   consumer:   receives the operator-exported overlay and routes model requests to
 #               site-a using the gateway-site-a upstream cluster.
 #
 # The operator runs OUT OF CLUSTER as a local process for all three validation commands
 # below.  SWIM runtimes (verify-swim-*) use localhost UDP sockets between local operator
-# processes — no in-cluster pod networking is required.
+# processes; no in-cluster pod networking is required.
 #
 # Setup (one-time):
 #   cargo xtask env up -c tests/env/operator-routing.toml

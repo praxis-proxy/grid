@@ -78,7 +78,7 @@ impl GCounter {
     ///
     /// Used at trust boundaries (e.g. gossip wire-ingest) where a payload's
     /// claimed origin should only ever be believed for its own contribution.
-    /// Any other slot present in `self` — legitimate or forged — is dropped,
+    /// Any other slot present in `self` (legitimate or forged) is dropped,
     /// mirroring how provider records are scoped to their claimed origin
     /// before being accepted.
     #[must_use]

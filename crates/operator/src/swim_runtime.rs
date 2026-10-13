@@ -270,7 +270,7 @@ struct TrackedMember {
     /// Public site certificate PEM for this member.
     ///
     /// Populated from the `cert_pems` map at snapshot time.
-    /// Contains only the public certificate — never a private key.
+    /// Contains only the public certificate, never a private key.
     site_cert_pem: Option<String>,
 }
 
@@ -922,7 +922,7 @@ impl SwimHandle {
     /// Return the address this runtime advertises to SWIM peers.
     ///
     /// Use this to filter the local address from `spec.seeds` before
-    /// calling [`SwimHandle::announce_seeds`] — announcing to self is harmless but
+    /// calling [`SwimHandle::announce_seeds`]; announcing to self is harmless but
     /// generates unnecessary noise.
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
@@ -961,7 +961,7 @@ impl SwimHandle {
     ///
     /// Each address in `seeds` is announced as a new SWIM peer on the next
     /// event loop turn via [`SwimNode::announce`].  Announcing to a peer that
-    /// is already a live member is idempotent — foca ignores redundant joins.
+    /// is already a live member is idempotent: foca ignores redundant joins.
     ///
     /// An empty `seeds` slice is a no-op and always returns `Ok(())`.
     ///
@@ -1224,7 +1224,7 @@ fn reconciliation_view(
 /// Returns [`SwimRuntimeError::Bind`] if the socket cannot be bound.
 #[expect(
     clippy::too_many_lines,
-    reason = "channel setup, socket bind, runtime spawn — linear startup sequence"
+    reason = "channel setup, socket bind, runtime spawn: linear startup sequence"
 )]
 pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeError> {
     let revisions = RevisionClock::new(&config.revision_lease, config.revision_renewer.clone())?;
@@ -3199,7 +3199,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // start (integration smoke test — requires tokio runtime)
+    // start (integration smoke test, requires tokio runtime)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -3377,7 +3377,7 @@ mod tests {
     ///
     /// Exercises the real production merge path: [`GridStateSnapshot::merge_tenant_spend`]
     /// as invoked by [`swim::state_broadcast::StateBroadcastHandler::receive_item`] on
-    /// every SWIM gossip round — no CRDT logic is duplicated here.
+    /// every SWIM gossip round; no CRDT logic is duplicated here.
     async fn wait_until_tenant_spend_converges(handle: &SwimHandle, tenant_id: &str, expected_cents: u64) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -3409,7 +3409,7 @@ mod tests {
         // spend for the same tenant *before* site C ever joins the mesh (a stand-in
         // for C being partitioned away while A and B kept serving traffic). C then
         // joins ("the partition heals") and must converge to the true cross-site sum
-        // purely through the real UDP-bound SWIM runtime — no manual message shuttling,
+        // purely through the real UDP-bound SWIM runtime, with no manual message shuttling,
         // unlike the lower-tier unit-level proof in `swim::node::tests`.
         let addr_a = reserve_local_addr().await;
         let addr_b = reserve_local_addr().await;
@@ -3507,8 +3507,8 @@ mod tests {
         drop((handle_b, handle_c));
     }
 
-    /// Real per-request USD cost for `tokens` at `cost_per_1k`, in integer cents —
-    /// mirrors how a gateway-side policy filter would size a spend increment from
+    /// Real per-request USD cost for `tokens` at `cost_per_1k`, in integer cents.
+    /// Mirrors how a gateway-side policy filter would size a spend increment from
     /// `scoring::BackendConfig::cost_per_1k_input` (AC5 non-goal: that filter does
     /// not exist yet, so this helper stands in for it here).
     #[expect(

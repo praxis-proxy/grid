@@ -5,8 +5,8 @@
 //! - **Accept:** valid client cert, same CA, correct organization.
 //! - **Reject (TLS layer):** no client cert.
 //! - **Reject (TLS layer):** client cert from a different/untrusted CA.
-//! - **Reject (filter layer):** client cert from the same trusted CA but wrong organization — TLS handshake succeeds;
-//!   `peer_identity_trust` rejects with HTTP 403.
+//! - **Reject (filter layer):** client cert from the same trusted CA but wrong organization (TLS handshake succeeds;
+//!   `peer_identity_trust` rejects with HTTP 403).
 
 use std::{path::Path, process::Command};
 
@@ -49,7 +49,7 @@ const HOST_CERTS_DIR: &str = "tests/env/certs";
 /// Cases 2 and 3 confirm that the gateway enforces `client_cert_mode:
 /// require` and that only certs from the generated test CA are accepted.
 /// Case 4 confirms that `peer_identity_trust` enforces organization
-/// matching at the filter level — the TLS layer alone does not reject this
+/// matching at the filter level; the TLS layer alone does not reject this
 /// cert, so the 403 must come from the filter.
 ///
 /// # Errors
@@ -595,7 +595,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // curl arg correctness — verify the bearer token is included in the
+    // curl arg correctness: verify the bearer token is included in the
     // valid-cert positive test so the mock-openai backend returns 200
     // -----------------------------------------------------------------------
 

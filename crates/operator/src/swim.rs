@@ -47,7 +47,7 @@ pub enum MemberStatus {
 /// One entry in the SWIM membership table.
 ///
 /// All fields are provided by the SWIM runtime at snapshot time.  This struct
-/// carries no live handles — it is safe to clone, serialize, or pass across
+/// carries no live handles, so it is safe to clone, serialize, or pass across
 /// thread boundaries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemberRecord {
@@ -85,7 +85,7 @@ pub struct MemberRecord {
 
     /// Public site certificate PEM received from this peer via SWIM broadcast.
     ///
-    /// Contains only the public certificate — never a private key.
+    /// Contains only the public certificate, never a private key.
     /// `None` when the peer has not yet broadcast its site certificate.
     pub site_cert_pem: Option<String>,
 
@@ -111,7 +111,7 @@ impl MemberRecord {
 /// Point-in-time view of the SWIM membership table.
 ///
 /// Produced by polling a SWIM runtime (foca, memberlist, etc.) or by injecting
-/// a static test fixture.  Holds no live handles — safe to clone and pass to
+/// a static test fixture.  Holds no live handles, so it is safe to clone and pass to
 /// pure summarization functions.
 ///
 /// # Staleness
@@ -141,9 +141,9 @@ impl MembershipSnapshot {
     ///
     /// | Snapshot state | Hint |
     /// |----------------|------|
-    /// | Empty | `None` — caller uses its own phase logic |
-    /// | ≥1 `Alive` member | `Some(Active)` — network is operational |
-    /// | Members exist, all `Suspect`/`Dead` | `Some(Degraded)` — network is impaired |
+    /// | Empty | `None` (caller uses its own phase logic) |
+    /// | ≥1 `Alive` member | `Some(Active)` (network is operational) |
+    /// | Members exist, all `Suspect`/`Dead` | `Some(Degraded)` (network is impaired) |
     ///
     /// The caller applies the hint on top of its existing phase logic, so an
     /// empty snapshot never overrides `Pending` or `Initializing`.
