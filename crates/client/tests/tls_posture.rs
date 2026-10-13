@@ -22,8 +22,9 @@ struct Material {
     key: PrivateKeyDer<'static>,
 }
 
-/// Issue a `localhost` leaf under a fresh CA.
+/// Initialize test TLS and issue a `localhost` leaf under a fresh CA.
 fn material() -> Material {
+    let _installed = rustls::crypto::ring::default_provider().install_default();
     let ca = certs::generate_ca("test-ca").expect("a CA");
     let leaf = certs::generate_dns_cert(&ca, "server", "localhost").expect("a leaf");
     Material {

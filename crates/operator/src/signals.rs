@@ -1063,11 +1063,11 @@ impl PollPeers {
         result
     }
 
-    /// The client config for `peer`, built on first use and whenever its pins
-    /// change.
+    /// The transport for `peer`, built on first use and rebuilt when its pins
+    /// change or it reaches [`PEER_TRANSPORT_MAX_AGE`].
     ///
-    /// The build runs outside the lock; a concurrent builder for the same peer
-    /// loses the race harmlessly and the stored config is replaced.
+    /// The build runs outside the lock; concurrent callers may keep different
+    /// usable transports for their rounds, and the last insert stays cached.
     fn peer_transport(&self, peer: &str, pins: &[String]) -> Result<Arc<PeerTransport>, MetricsScrapeError> {
         let held = self
             .transports

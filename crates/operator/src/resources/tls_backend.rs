@@ -18,7 +18,10 @@ use hyper_util::client::legacy::connect::HttpConnector;
 #[cfg(feature = "fips")]
 use openssl::{
     pkey::{PKey, Private},
-    ssl::{SslAcceptor, SslAcceptorBuilder, SslConnector, SslConnectorBuilder, SslMethod, SslVerifyMode, SslVersion},
+    ssl::{
+        SslAcceptor, SslAcceptorBuilder, SslConnector, SslConnectorBuilder, SslMethod, SslOptions, SslSessionCacheMode,
+        SslVerifyMode, SslVersion,
+    },
     x509::{X509, X509StoreContextRef, X509VerifyResult, store::X509StoreBuilder},
 };
 #[cfg(not(feature = "fips"))]
@@ -207,7 +210,11 @@ impl OpensslClientConfig {
         builder.set_cert_store(store.build());
         match self.rule.clone() {
             None => builder.set_verify(SslVerifyMode::PEER),
-            Some(rule) => builder.set_verify_callback(SslVerifyMode::PEER, move |ok, ctx| verify_leaf(ok, ctx, &rule)),
+            Some(rule) => {
+                builder.set_options(SslOptions::NO_TICKET);
+                builder.set_session_cache_mode(SslSessionCacheMode::OFF);
+                builder.set_verify_callback(SslVerifyMode::PEER, move |ok, ctx| verify_leaf(ok, ctx, &rule));
+            },
         }
         builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
         if let Some((certs, key)) = &self.identity {
@@ -1592,6 +1599,12 @@ mod tests {
             &[certs::canonical_fingerprint(&server.cert_pem).expect("server pin")],
         )
         .expect("client TLS");
+        let mut builder = client_config.connector_builder().expect("connector policy");
+        assert!(builder.options().contains(SslOptions::NO_TICKET));
+        assert_eq!(
+            builder.set_session_cache_mode(SslSessionCacheMode::OFF),
+            SslSessionCacheMode::OFF
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("listen");
         let url = format!("https://{}/metrics", listener.local_addr().expect("address"));
         let serve = tokio::spawn(async move {
