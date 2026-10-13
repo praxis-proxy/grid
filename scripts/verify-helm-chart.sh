@@ -998,7 +998,9 @@ if helm template v-serv "$GW_DIR" "${SERVING[@]}" --set praxisConfig.render.grid
 else
   fail "gridServing: did not derive grid-serving-grid-gw"
 fi
-try_reject_msg "$GW_DIR" "gridServing without the Grid identity (gw)" "gridIdentity.tlsSecretName" "${SERVING[@]}" --set gridIdentity.tlsSecretName=""
+try_reject_msg "$GW_DIR" "gridServing without the Grid identity (gw)" "praxisConfig.render.gridServing polls peers with the grid identity" "${SERVING[@]}" \
+  --set gridIdentity.tlsSecretName="" --set gridIdentity.caSecretName="" \
+  --set praxisConfig.render.backends[0].transport.mode=tls
 try_reject_msg "$GW_DIR" "gridServing on the provider role (gw)" "consumer role only" "${SERVING[@]}" --set praxisConfig.render.role=provider \
   --set-json "praxisConfig.render.peerTrust.certDigests=[\"$DIGEST\"]"
 try_reject_msg "$GW_DIR" "gridServing on the ai image flavor (gw)" "praxisConfig.render.gridServing needs image.flavor grid-gateway" "${SERVING[@]}" \
