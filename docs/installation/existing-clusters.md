@@ -66,7 +66,7 @@ Before running the installer, prepare the following in each cluster's
 | `consumer-praxis-config` ConfigMap | installer-managed | Created by `install.sh` from config template |
 | `provider-praxis-config` ConfigMap | installer-managed | Created by `install.sh` from config template with overlay stable IDs |
 | `consumer-tls` Secret | user-managed | TLS certificate, key, and `ca.crt` for consumer identity |
-| `provider-tls` Secret | user-managed | TLS certificate and key for provider identity |
+| `provider-tls` Secret | user-managed | TLS certificate, key, and `ca.crt` for provider identity |
 | Per-provider credential Secrets | user-managed | One Secret per inference provider backend |
 
 AGN topology CRs (`GridNetwork`, `GridSite`, `InferenceProvider`) and mock

@@ -481,7 +481,7 @@ AGN runs this chart in two roles with different values:
 ### Resource names for the AGN Operator
 
 The chart's fullname template produces `{release}-praxis-gateway` by
-default (e.g., release `provider-gateway` → Service name
+default (e.g., release `provider-gateway` gives Service name
 `provider-gateway-praxis-gateway`). Set `fullnameOverride` to control
 the exact Service name:
 
