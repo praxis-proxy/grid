@@ -71,6 +71,11 @@ uids() { # <kind> [-n ns | -A]: "name uid" lines, sorted
 echo "== base ${BASE_REF}, install with $(${INSTALL_HELM} version --short), upgrade with $(${UPGRADE_HELM} version --short) =="
 git -C "${ROOT}" worktree add --detach "${BASE}" "${BASE_REF}" >/dev/null
 
+# A later base branch may already contain the source-mode value rename. Use the base chart's values schema instead of assuming it still accepts the legacy key.
+if grep -q '^praxisConfig:' "${BASE}/charts/praxis-gateway/values.yaml"; then
+  GATEWAY_BASE_ARGS=("${GATEWAY_ARGS[@]}")
+fi
+
 crd_group() { # <chart dir>: the grid API group its GridNetwork CRD serves
   awk '/^  group: /{print $2; exit}' "$1"/templates/crds/gridnetwork.yaml "$1"/crds/gridnetwork.yaml 2>/dev/null
 }
