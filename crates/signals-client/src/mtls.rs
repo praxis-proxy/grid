@@ -238,14 +238,56 @@ impl SignalSource for PeerScraper {
             let (Some(reporter), Some(report)) = (&self.reporter, pending) else {
                 return;
             };
-            let result = timeout(self.request_timeout, self.request(Some(&report))).await;
-            if let Ok(Ok(response)) = result
-                && response.status() == http::StatusCode::NO_CONTENT
-                && matches_ack(response.headers(), &report)
-            {
-                reporter.acknowledge(&report);
-            }
+            let result = timeout(self.request_timeout, self.request(Some(&report)))
+                .await
+                .map_err(|_elapsed| FeedbackFailure::Timeout)
+                .and_then(|response| response.map_err(|_error| FeedbackFailure::Transport));
+            complete_report(reporter, &report, result);
         }
+    }
+}
+
+/// Bounded failure classes; report identities and receiver contents are never labels.
+enum FeedbackFailure {
+    /// The feedback exchange exceeded its total budget.
+    Timeout,
+    /// Connection, authentication, or HTTP exchange failed.
+    Transport,
+    /// The receiver did not return the required status.
+    Status,
+    /// The receiver omitted, repeated, or mismatched acknowledgment metadata.
+    Acknowledgment,
+}
+
+impl FeedbackFailure {
+    /// Stable Prometheus reason label for one failed delivery attempt.
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::Status => "status",
+            Self::Acknowledgment => "acknowledgment",
+        }
+    }
+}
+
+/// Acknowledge only a matching success; count one failure while retaining retry evidence.
+fn complete_report<Body>(
+    reporter: &Reporter,
+    report: &IngestReport,
+    result: Result<http::Response<Body>, FeedbackFailure>,
+) {
+    let failure = match result {
+        Ok(response) if response.status() != http::StatusCode::NO_CONTENT => Some(FeedbackFailure::Status),
+        Ok(response) if !matches_ack(response.headers(), report) => Some(FeedbackFailure::Acknowledgment),
+        Ok(_response) => {
+            reporter.acknowledge(report);
+            None
+        },
+        Err(failure) => Some(failure),
+    };
+    if let Some(failure) = failure {
+        metrics::counter!("grid_signals_feedback_failures_total", "reason" => failure.as_str()).increment(1);
     }
 }
 
@@ -441,6 +483,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unsupported_feedback_retains_pending_bad_without_breaking_source() {
+        let recorder = FeedbackRecorder::new();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
         install_ring();
         let ca = generate_ca("grid-ca").expect("ca");
         let site = generate_site_cert(&ca, "east").expect("site");
@@ -473,7 +517,164 @@ mod tests {
                 ..Ingested::default()
             }))
             .await;
-        assert!(reporter.observe(None).expect("pending evidence").rejected);
+        assert!(
+            reporter.observe(None).expect("pending evidence").rejected,
+            "unsupported delivery must retain rejection evidence"
+        );
+        assert_eq!(
+            recorder.count("status"),
+            1,
+            "one unsupported POST counts one delivery failure"
+        );
+    }
+
+    #[test]
+    fn failed_feedback_counts_once_and_matching_success_retains_no_failure() {
+        install_ring();
+        let recorder = FeedbackRecorder::new();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let reporter = Reporter::new(spiffe_id("east")).expect("reporter");
+        let report = reporter
+            .observe(Some(Ingested {
+                skewed: 1,
+                ..Ingested::default()
+            }))
+            .expect("pending evidence");
+        for (result, reason) in [
+            (Err(FeedbackFailure::Timeout), "timeout"),
+            (Err(FeedbackFailure::Transport), "transport"),
+            (
+                Ok(feedback_response(&report, http::StatusCode::NOT_FOUND, Some("1"))),
+                "status",
+            ),
+            (
+                Ok(feedback_response(&report, http::StatusCode::NO_CONTENT, None)),
+                "acknowledgment",
+            ),
+            (
+                Ok(feedback_response(&report, http::StatusCode::NO_CONTENT, Some("2"))),
+                "acknowledgment",
+            ),
+            (
+                Ok(feedback_response(&report, http::StatusCode::NO_CONTENT, Some("01"))),
+                "acknowledgment",
+            ),
+        ] {
+            let before = recorder.count(reason);
+            complete_report(&reporter, &report, result);
+            assert_eq!(
+                recorder.count(reason),
+                before + 1,
+                "each failed attempt counts once: {reason}"
+            );
+            assert_eq!(
+                reporter.observe(None),
+                Some(report.clone()),
+                "failed delivery preserves exact pending evidence"
+            );
+        }
+        let before = recorder.total();
+        complete_report(
+            &reporter,
+            &report,
+            Ok(feedback_response(&report, http::StatusCode::NO_CONTENT, Some("1"))),
+        );
+        assert!(
+            reporter.observe(None).is_none(),
+            "a matching success acknowledges pending evidence"
+        );
+        assert_eq!(recorder.total(), before, "a successful delivery adds no failure");
+    }
+
+    /// An empty feedback response with optional exact epoch and supplied sequence.
+    fn feedback_response(
+        report: &IngestReport,
+        status: http::StatusCode,
+        sequence: Option<&str>,
+    ) -> http::Response<()> {
+        let mut response = http::Response::builder().status(status);
+        if let Some(sequence) = sequence {
+            response = response.header(ACK_EPOCH, &report.epoch).header(ACK_SEQUENCE, sequence);
+        }
+        response.body(()).expect("response")
+    }
+
+    /// Thread-local failure counters that reject unbounded or report-derived labels.
+    struct FeedbackRecorder {
+        /// Exactly the documented bounded delivery reasons.
+        counts: std::collections::BTreeMap<&'static str, Arc<std::sync::atomic::AtomicU64>>,
+    }
+
+    impl FeedbackRecorder {
+        /// Start an isolated recorder for feedback assertions.
+        fn new() -> Self {
+            Self {
+                counts: ["timeout", "transport", "status", "acknowledgment"]
+                    .into_iter()
+                    .map(|reason| (reason, Arc::default()))
+                    .collect(),
+            }
+        }
+
+        /// Current count for a documented reason.
+        fn count(&self, reason: &str) -> u64 {
+            self.counts
+                .get(reason)
+                .expect("bounded reason")
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Total emitted failure attempts.
+        fn total(&self) -> u64 {
+            self.counts.keys().map(|reason| self.count(reason)).sum()
+        }
+    }
+
+    impl metrics::Recorder for FeedbackRecorder {
+        fn describe_counter(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_gauge(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_histogram(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn register_counter(&self, key: &metrics::Key, _metadata: &metrics::Metadata<'_>) -> metrics::Counter {
+            assert_eq!(
+                key.name(),
+                "grid_signals_feedback_failures_total",
+                "feedback emits the documented counter"
+            );
+            let labels: Vec<_> = key.labels().collect();
+            assert_eq!(labels.len(), 1, "feedback must have only one bounded label");
+            let label = labels.first().expect("reason label");
+            assert_eq!(label.key(), "reason", "report contents must never be labels");
+            metrics::Counter::from_arc(Arc::clone(self.counts.get(label.value()).expect("bounded reason")))
+        }
+
+        fn register_gauge(&self, _key: &metrics::Key, _metadata: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+
+        fn register_histogram(&self, _key: &metrics::Key, _metadata: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
     }
 
     #[test]

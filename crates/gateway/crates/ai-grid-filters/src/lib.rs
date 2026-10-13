@@ -41,7 +41,7 @@ pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;
 
 /// Grid counters the gateway emits, with the help text a scrape shows.
-const COUNTER_HELP: [(&str, &str); 6] = [
+const COUNTER_HELP: [(&str, &str); 7] = [
     (
         "grid_route_decisions_total",
         "Requests the gateway decided, by outcome. A refusal records an empty site and cluster.",
@@ -59,6 +59,10 @@ const COUNTER_HELP: [(&str, &str); 6] = [
     (
         "grid_signals_ingest_dropped_total",
         "Rows the operator served that the gateway refused, by reason.",
+    ),
+    (
+        "grid_signals_feedback_failures_total",
+        "Failed gateway feedback delivery attempts, by bounded reason.",
     ),
 ];
 

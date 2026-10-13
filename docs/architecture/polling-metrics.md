@@ -165,6 +165,14 @@ operator over the authenticated signals channel. Reporting has its own bounded
 exchange and does not turn a successful scrape into a failed scrape. See the
 [feedback wire contract](signals.md#gateway-ingest-feedback).
 
+`grid_signals_feedback_failures_total{reason}` counts each failed delivery
+attempt once. Its bounded reasons are `timeout` for an expired exchange budget,
+`transport` for connection, authentication, or HTTP errors, `status` for a
+non-204 response, and `acknowledgment` for missing, repeated, or mismatched
+acknowledgment metadata. A successful delivery or a cycle with no pending
+report adds no failure. Failed deliveries retain evidence for retry and do not
+fail scrapes; report contents never become metric labels.
+
 A bad observation is retained until its exact report is acknowledged. Later
 clean cycles cannot replace an unacknowledged bad report. New rejection can
 supersede an unacknowledged clean report; a delayed acknowledgment for that old
