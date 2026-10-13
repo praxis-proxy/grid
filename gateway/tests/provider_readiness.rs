@@ -352,30 +352,22 @@ mod tests {
         counts
     }
 
-    /// Paced requests until twenty in a row are served by a site `pred` accepts, and how long
-    /// until the first of them.
-    ///
-    /// Twenty, since sites are picked at random: with one rejected site of three still picked,
-    /// twenty accepted in a row has probability (2/3)^20, below 1 in 3000.
-    fn time_until(gateway: &Gateway, mut pred: impl FnMut(&str) -> bool) -> Duration {
+    /// How long until the routing snapshot marks a site's score as excluded.
+    fn time_until_excluded(gateway: &Gateway, site: &str) -> Duration {
+        let cluster = format!("pool-{site}");
+        let score = format!(r#"grid_route_site_score{{site="{site}",cluster="{cluster}"}} NaN"#);
         let start = Instant::now();
-        let mut streak = 0;
-        let mut streak_start = start;
-        while streak < 20 {
-            assert!(start.elapsed() < DEADLINE, "never settled");
-            let sent = Instant::now();
-            match gateway.request() {
-                Some((200, site, _)) if pred(&site) => {
-                    if streak == 0 {
-                        streak_start = sent;
-                    }
-                    streak += 1;
-                },
-                _ => streak = 0,
+        loop {
+            let metrics = gateway.metrics();
+            if metrics.contains(&score) {
+                return start.elapsed();
             }
+            assert!(
+                start.elapsed() < BOUND,
+                "site {site} was not excluded within {BOUND:?}; gateway metrics:\n{metrics}"
+            );
             thread::sleep(PACE);
         }
-        streak_start.duration_since(start)
     }
 
     #[test]
@@ -410,7 +402,7 @@ mod tests {
         });
         // site-b's provider goes not ready.
         site_b.mode.store(NOT_READY, Ordering::SeqCst);
-        let to_exclusion = time_until(&gateway, |site| site != "site-b");
+        let to_exclusion = time_until_excluded(&gateway, "site-b");
         assert!(
             to_exclusion <= BOUND,
             "excluded after {to_exclusion:?}, bound {BOUND:?}"
@@ -457,7 +449,22 @@ mod tests {
 
         // Back to publishing, not ready, then ready.
         site_b.mode.store(NOT_READY, Ordering::SeqCst);
-        time_until(&gateway, |site| site != "site-b");
+        let to_second_exclusion = time_until_excluded(&gateway, "site-b");
+        assert!(
+            to_second_exclusion <= BOUND,
+            "excluded after {to_second_exclusion:?}, bound {BOUND:?}"
+        );
+        let excluded_again = split(&gateway, 50);
+        assert_eq!(
+            excluded_again.get("error"),
+            None,
+            "no client errors once excluded again: {excluded_again:?}"
+        );
+        assert_eq!(
+            excluded_again.get("site-b"),
+            None,
+            "nothing to site-b once excluded again: {excluded_again:?}"
+        );
         site_b.mode.store(READY, Ordering::SeqCst);
         let start = Instant::now();
         while !gateway
