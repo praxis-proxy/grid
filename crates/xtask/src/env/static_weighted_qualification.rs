@@ -2,8 +2,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -238,6 +239,34 @@ struct GatewayStabilityEvidence {
     restart_count_before: u32,
     /// Restart count after sampling.
     restart_count_after: u32,
+}
+
+/// Original provider selector retained so every withdrawal path can restore it.
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
+struct ProviderSelectorSnapshot {
+    /// Provider site whose selector is temporarily changed.
+    site: String,
+    /// Complete original selector object from the `InferenceProvider` resource.
+    selector: serde_json::Value,
+}
+
+/// The exact revision and provider set projected into the consumer gateway pod.
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
+struct MountedOverlayEvidence {
+    /// Time the mounted file was observed by the qualification.
+    observed_at_unix_seconds: String,
+    /// Content-addressed revision read from the projected versioned envelope.
+    semantic_revision: String,
+    /// Provider sites present in the mounted envelope.
+    candidate_sites: Vec<String>,
+}
+
+/// Routing identity fields parsed from a mounted versioned overlay.
+struct ParsedMountedOverlay {
+    /// Content-addressed revision from the mounted envelope.
+    semantic_revision: String,
+    /// Provider sites present in the mounted envelope.
+    candidate_sites: Vec<String>,
 }
 
 /// Statistical request sample and its acceptance calculation.
@@ -1791,6 +1820,7 @@ fn wait_for_consumer_gateway_revision(revision: &str) -> Result<(), Box<dyn std:
     const TIMEOUT: Duration = Duration::from_secs(90);
     const POLL: Duration = Duration::from_secs(2);
     let deadline = Instant::now() + TIMEOUT;
+    let mut last_reload_rejection = None;
     loop {
         let logs = consumer_gateway_logs()?;
         let accepted = latest_log_field(&logs, "accepted_revision");
@@ -1798,22 +1828,150 @@ fn wait_for_consumer_gateway_revision(revision: &str) -> Result<(), Box<dyn std:
         if accepted.as_deref() == Some(revision) && serving.as_deref() == Some(revision) {
             return Ok(());
         }
+        if let Some(diagnostic) = latest_overlay_reload_rejection(&logs) {
+            last_reload_rejection = Some(diagnostic);
+        }
         if Instant::now() >= deadline {
-            let accepted_summary = accepted
-                .as_deref()
-                .map_or_else(|| "none".to_owned(), |value| safe_truncate_str(value, 16));
-            let serving_summary = serving
-                .as_deref()
-                .map_or_else(|| "none".to_owned(), |value| safe_truncate_str(value, 16));
+            return Err(revision_timeout_error(
+                revision,
+                accepted.as_deref(),
+                serving.as_deref(),
+                last_reload_rejection.as_deref(),
+            ));
+        }
+        std::thread::park_timeout(POLL);
+    }
+}
+
+/// Build a bounded gateway revision timeout diagnostic.
+fn revision_timeout_error(
+    revision: &str,
+    accepted: Option<&str>,
+    serving: Option<&str>,
+    rejection: Option<&str>,
+) -> Box<dyn std::error::Error> {
+    let accepted_summary = accepted.map_or_else(|| "none".to_owned(), |value| safe_truncate_str(value, 16));
+    let serving_summary = serving.map_or_else(|| "none".to_owned(), |value| safe_truncate_str(value, 16));
+    let rejection_summary = rejection.map_or_else(String::new, |diagnostic| {
+        format!("; latest overlay reload rejection: {diagnostic}")
+    });
+    format!(
+        "consumer gateway did not report accepted/serving overlay revision {} within 90s (accepted={}, serving={}){}",
+        safe_truncate_str(revision, 16),
+        accepted_summary,
+        serving_summary,
+        rejection_summary
+    )
+    .into()
+}
+
+/// Return a bounded, credential-safe summary of the latest overlay rejection.
+fn latest_overlay_reload_rejection(logs: &str) -> Option<String> {
+    let line = logs
+        .lines()
+        .rev()
+        .find(|line| line.contains("intelligent_route: overlay reload failed, retaining previous snapshot"))?;
+    let retained = latest_log_field(line, "retained_serving_revision")
+        .map_or_else(|| "unknown".to_owned(), |revision| safe_truncate_str(&revision, 16));
+    let reason = if line.contains("candidates list must not be empty") {
+        "candidates list must not be empty"
+    } else {
+        "gateway rejected an overlay replacement"
+    };
+    Some(format!("{reason}; retained serving revision={retained}"))
+}
+
+/// Parse only routing identity fields from the projected versioned overlay.
+fn parse_mounted_overlay(raw: &[u8]) -> Result<ParsedMountedOverlay, Box<dyn std::error::Error>> {
+    let overlay: serde_json::Value = serde_json::from_slice(raw)?;
+    let revision = overlay
+        .pointer("/revision/value")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("mounted routing overlay has no content-addressed revision")?
+        .to_owned();
+    let candidates = overlay
+        .pointer("/overlay/candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("mounted routing overlay has no overlay.candidates array")?;
+    let candidate_sites = candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .get("site")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or("mounted routing overlay candidate has no site")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ParsedMountedOverlay {
+        semantic_revision: revision,
+        candidate_sites,
+    })
+}
+
+/// Read and parse the exact overlay mounted in the consumer gateway pod.
+fn read_mounted_overlay() -> Result<ParsedMountedOverlay, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &cluster_context(CONSUMER_SITE),
+            "-n",
+            GRID_SYSTEM_NS,
+            "exec",
+            "deployment/consumer-gateway",
+            "-c",
+            "praxis",
+            "--",
+            "cat",
+            "/etc/praxis/routing/routing-overlay.json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "mounted file read failed: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 240)
+        )
+        .into());
+    }
+    parse_mounted_overlay(&output.stdout).map_err(|error| {
+        format!(
+            "mounted file parse failed: {}",
+            safe_truncate_str(&error.to_string(), 200)
+        )
+        .into()
+    })
+}
+
+/// Wait for the consumer's projected overlay to match a requested revision.
+fn wait_for_mounted_overlay_revision(
+    revision: &str,
+    timeout: Duration,
+) -> Result<MountedOverlayEvidence, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let observation = match read_mounted_overlay() {
+            Ok(mounted) if mounted.semantic_revision == revision => {
+                return Ok(MountedOverlayEvidence {
+                    observed_at_unix_seconds: format_utc_timestamp(),
+                    semantic_revision: mounted.semantic_revision,
+                    candidate_sites: mounted.candidate_sites,
+                });
+            },
+            Ok(mounted) => format!(
+                "mounted revision={} candidates={:?}",
+                safe_truncate_str(&mounted.semantic_revision, 16),
+                mounted.candidate_sites
+            ),
+            Err(error) => error.to_string(),
+        };
+        if Instant::now() >= deadline {
             return Err(format!(
-                "consumer gateway did not report accepted/serving overlay revision {} within {TIMEOUT:?} (accepted={}, serving={})",
+                "consumer gateway did not project overlay revision {} within {timeout:?}; {observation}",
                 safe_truncate_str(revision, 16),
-                accepted_summary,
-                serving_summary
             )
             .into());
         }
-        std::thread::park_timeout(POLL);
+        std::thread::park_timeout(Duration::from_secs(2));
     }
 }
 
@@ -2739,6 +2897,299 @@ fn apply_static_weights(weights: [u32; 3]) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// Read the original selector before temporarily withdrawing one provider.
+fn read_provider_selector(site: &str) -> Result<ProviderSelectorSnapshot, Box<dyn std::error::Error>> {
+    let value = read_provider_resource(site)?;
+    let selector = value
+        .pointer("/spec/siteSelector")
+        .filter(|selector| selector.is_object())
+        .cloned()
+        .ok_or_else(|| format!("{site}: provider has no object-valued spec.siteSelector"))?;
+    Ok(ProviderSelectorSnapshot {
+        site: site.to_owned(),
+        selector,
+    })
+}
+
+/// Read one provider resource for selector restoration evidence.
+fn read_provider_resource(site: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let context = cluster_context(site);
+    let provider = provider_resource_name(site);
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "inferenceprovider",
+            &provider,
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("{site}: provider selector unavailable").into());
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+/// Whether a provider has its saved selector and has reconciled its current generation.
+fn provider_selector_restored_and_reconciled(
+    resource: &serde_json::Value,
+    snapshot: &ProviderSelectorSnapshot,
+) -> bool {
+    let generation = resource
+        .pointer("/metadata/generation")
+        .and_then(serde_json::Value::as_i64);
+    let observed_generation = resource
+        .pointer("/status/observedGeneration")
+        .and_then(serde_json::Value::as_i64);
+    resource.pointer("/spec/siteSelector") == Some(&snapshot.selector)
+        && generation.is_some()
+        && generation == observed_generation
+}
+
+/// Whether restoration must publish a revision beyond the last observed withdrawal.
+fn restoration_requires_new_revision(last_withdrawal_revision: Option<&str>) -> bool {
+    last_withdrawal_revision.is_some()
+}
+
+/// Read and summarize one provider's selector restoration state.
+fn provider_selector_restoration_observation(snapshot: &ProviderSelectorSnapshot) -> (bool, serde_json::Value) {
+    match read_provider_resource(&snapshot.site) {
+        Ok(resource) => {
+            let generation = resource
+                .pointer("/metadata/generation")
+                .and_then(serde_json::Value::as_i64);
+            let observed_generation = resource
+                .pointer("/status/observedGeneration")
+                .and_then(serde_json::Value::as_i64);
+            let selector_matches = resource.pointer("/spec/siteSelector") == Some(&snapshot.selector);
+            let reconciled = provider_selector_restored_and_reconciled(&resource, snapshot);
+            (
+                reconciled,
+                serde_json::json!({
+                    "selector_matches": selector_matches,
+                    "generation": generation,
+                    "observed_generation": observed_generation,
+                    "reconciled": reconciled,
+                }),
+            )
+        },
+        Err(error) => (
+            false,
+            serde_json::json!({ "read_error": safe_truncate_str(&error.to_string(), 300) }),
+        ),
+    }
+}
+
+/// Wait until every restored provider selector has been reconciled by its controller.
+fn wait_for_provider_selector_restoration(
+    snapshots: &[ProviderSelectorSnapshot],
+    timeout: Duration,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut all_restored = true;
+        let mut observations = BTreeMap::new();
+        for snapshot in snapshots {
+            let (restored, observation) = provider_selector_restoration_observation(snapshot);
+            all_restored &= restored;
+            observations.insert(snapshot.site.clone(), observation);
+        }
+        let last_observation = serde_json::json!(observations);
+        if all_restored {
+            return Ok(last_observation);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "provider selectors did not return to their saved values at the observed generation: {last_observation}"
+            )
+            .into());
+        }
+        std::thread::park_timeout(Duration::from_secs(2));
+    }
+}
+
+/// Replace one provider's selector, restoring it from the saved full object later.
+fn patch_provider_selector(
+    snapshot: &ProviderSelectorSnapshot,
+    selector: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let context = cluster_context(&snapshot.site);
+    let provider = provider_resource_name(&snapshot.site);
+    let patch = serde_json::json!({"spec": {"siteSelector": selector}}).to_string();
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "patch",
+            "inferenceprovider",
+            &provider,
+            "--type",
+            "merge",
+            "-p",
+            &patch,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "{}: provider selector patch failed: {}",
+            snapshot.site,
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 300)
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Make the provider selector match no `GridSite` in this run.
+fn excluded_provider_selector(
+    snapshot: &ProviderSelectorSnapshot,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let mut selector = snapshot.selector.clone();
+    let labels = selector
+        .get_mut("matchLabels")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| format!("{}: provider selector has no matchLabels object", snapshot.site))?;
+    labels.insert(
+        "grid.praxis.fast/provider-site".to_owned(),
+        serde_json::json!(format!("{}-withdrawn-{}", run_name(), snapshot.site)),
+    );
+    Ok(selector)
+}
+
+/// Read a workload's `/metrics` endpoint through a bounded run-scoped port-forward.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the port-forward lifecycle and HTTP read form one bounded evidence operation"
+)]
+fn read_workload_metrics(
+    context: &str,
+    resource: &str,
+    remote_port: u16,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let local_port = listener.local_addr()?.port();
+    drop(listener);
+    let mapping = format!("{local_port}:{remote_port}");
+    let child = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "port-forward",
+            resource,
+            &mapping,
+            "--address",
+            "127.0.0.1",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let _port_forward = MetricsPortForward { child: Some(child) };
+    if !wait_for_local_tcp_port(local_port, Duration::from_secs(10)) {
+        return Err(format!("{resource} metrics port-forward did not become ready").into());
+    }
+
+    let url = format!("http://127.0.0.1:{local_port}/metrics");
+    let output = Command::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "2",
+            "--max-time",
+            "5",
+            &url,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "{resource} /metrics probe failed: {}",
+            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 300)
+        )
+        .into());
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+/// Find a run-scoped port-forward listener before issuing an HTTP request.
+fn wait_for_local_tcp_port(port: u16, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::park_timeout(Duration::from_millis(100));
+    }
+}
+
+/// Sum selected Prometheus counter samples without accepting an absent series.
+fn sum_counter_samples(lines: &[&str]) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    let mut found = false;
+    let mut total = 0_u64;
+    for line in lines {
+        let value = line
+            .split_whitespace()
+            .last()
+            .ok_or("malformed Prometheus counter sample")?
+            .parse::<u64>()?;
+        total = total.checked_add(value).ok_or("Prometheus counter sum overflow")?;
+        found = true;
+    }
+    Ok(found.then_some(total))
+}
+
+/// Read the successful inference count from one static-weighted backend.
+fn read_backend_success_count(site: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let context = cluster_context(site);
+    let metrics = read_workload_metrics(&context, &format!("service/vcr-inference-{site}"), 8000)?;
+    sum_counter_samples(
+        &metrics
+            .lines()
+            .filter(|line| line.starts_with("vllm:request_success_total"))
+            .collect::<Vec<_>>(),
+    )?
+    .ok_or_else(|| format!("{site}: simulator did not expose vllm:request_success_total").into())
+}
+
+/// Read completed POST requests at one provider gateway.
+fn read_provider_gateway_post_count(site: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let context = cluster_context(site);
+    let metrics = read_workload_metrics(&context, "deployment/provider-gateway", 9901)?;
+    sum_counter_samples(
+        &metrics
+            .lines()
+            .filter(|line| line.starts_with("praxis_http_requests_total{") && line.contains("method=\"POST\""))
+            .collect::<Vec<_>>(),
+    )?
+    .ok_or_else(|| format!("{site}: provider gateway did not expose a POST request counter").into())
+}
+
+/// Own a port-forward subprocess for the duration of one metrics query.
+struct MetricsPortForward {
+    /// Child process kept alive until its metrics request completes.
+    child: Option<Child>,
+}
+
+impl Drop for MetricsPortForward {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            let _kill_result = child.kill();
+            let _wait_result = child.wait();
+        }
+    }
+}
+
 /// Read the configured capacity from the local provider CR.
 fn read_configured_capacity(site: &str) -> Result<u32, Box<dyn std::error::Error>> {
     let context = cluster_context(site);
@@ -2898,6 +3349,7 @@ fn read_gateway_stability() -> Result<(String, u32), Box<dyn std::error::Error>>
 
 /// Wait until the published revision has been accepted and is serving twice.
 fn wait_for_stable_revision(revision: &str) -> Result<(String, String, u32), Box<dyn std::error::Error>> {
+    let _mounted = wait_for_mounted_overlay_revision(revision, Duration::from_secs(90))?;
     wait_for_consumer_gateway_revision(revision)?;
     let first = consumer_gateway_logs()?;
     let accepted = latest_log_field(&first, "accepted_revision").ok_or("accepted revision missing")?;
@@ -3077,11 +3529,422 @@ fn phase_requires_revision_change(phase: &str) -> bool {
     phase != "baseline"
 }
 
+/// Send one weighted-routing request and retain status and provider attribution.
+fn weighted_lifecycle_curl_args(session_id: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "curl".to_owned(),
+        "--include".to_owned(),
+        "--silent".to_owned(),
+        "--show-error".to_owned(),
+        "--max-time".to_owned(),
+        "15".to_owned(),
+        "--header".to_owned(),
+        "Content-Type: application/json".to_owned(),
+        "--header".to_owned(),
+        "Authorization: Bearer consumer-token".to_owned(),
+    ];
+    if let Some(session_id) = session_id {
+        args.extend(["--header".to_owned(), format!("X-Session-Id: {session_id}")]);
+    }
+    args.extend([
+        "--data".to_owned(),
+        r#"{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"weighted withdrawal proof"}],"max_tokens":8}"#.to_owned(),
+        "http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions".to_owned(),
+    ]);
+    args
+}
+
+/// Send one weighted-routing request and retain status and provider attribution.
+fn send_weighted_lifecycle_request(session_id: Option<&str>) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let args = weighted_lifecycle_curl_args(session_id);
+    let references: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = run_persistent_curl_probe(&cluster_context(CONSUMER_SITE), &references)?;
+    let status = response_status(&output.stdout)
+        .or_else(|| response_status(&output.stderr))
+        .ok_or_else(|| {
+            format!(
+                "weighted lifecycle response has no HTTP status: {}",
+                safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 300)
+            )
+        })?;
+    let provider = response_header(&output.stdout, "x-grid-static-weighted-provider-gateway")
+        .or_else(|| response_header(&output.stdout, "x-grid-provider-gateway"));
+    Ok(serde_json::json!({
+        "session_id": session_id,
+        "curl_exit_code": output.status.code(),
+        "http_status": status,
+        "provider": provider,
+    }))
+}
+
+/// Return the provider-site set visible in one Grid routing overlay.
+fn overlay_provider_sites(overlay: &OverlayData) -> BTreeSet<String> {
+    overlay
+        .candidates
+        .iter()
+        .map(|candidate| candidate.site.clone())
+        .filter(|site| !site.is_empty())
+        .collect()
+}
+
+/// Wait for the expected stable site set, requiring a changed revision when one is provided.
+fn wait_for_weighted_candidate_sites(
+    expected_sites: &BTreeSet<String>,
+    previous_revision: Option<&str>,
+    timeout: Duration,
+) -> Result<OverlayData, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut previous_observation: Option<(String, BTreeSet<String>)> = None;
+    let mut last_observation = String::from("not observed");
+    loop {
+        if let Ok(overlay) = read_cluster_overlay(CONSUMER_SITE) {
+            let sites = overlay_provider_sites(&overlay);
+            last_observation = format!("revision={}, sites={sites:?}", overlay.semantic_revision);
+            let observation = (overlay.semantic_revision.clone(), sites.clone());
+            if sites == *expected_sites && previous_revision.is_none_or(|revision| observation.0 != revision) {
+                if previous_observation.as_ref() == Some(&observation) {
+                    return Ok(overlay);
+                }
+                previous_observation = Some(observation);
+            } else {
+                previous_observation = None;
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "weighted overlay did not publish a new stable candidate set {expected_sites:?}: {last_observation}"
+            )
+            .into());
+        }
+        std::thread::park_timeout(Duration::from_secs(2));
+    }
+}
+
+/// Snapshot backend and provider-gateway request totals for every provider site.
+fn read_provider_activity() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let mut backends = BTreeMap::new();
+    let mut gateways = BTreeMap::new();
+    for site in ["provider-a", "provider-b", "provider-c"] {
+        backends.insert(site.to_owned(), read_backend_success_count(site)?);
+        gateways.insert(site.to_owned(), read_provider_gateway_post_count(site)?);
+    }
+    Ok(serde_json::json!({
+        "backend_success_total": backends,
+        "provider_gateway_post_total": gateways,
+    }))
+}
+
+/// Compare request counters before and after the no-route probes.
+fn provider_activity_unchanged(before: &serde_json::Value, after: &serde_json::Value) -> bool {
+    before.pointer("/backend_success_total") == after.pointer("/backend_success_total")
+        && before.pointer("/provider_gateway_post_total") == after.pointer("/provider_gateway_post_total")
+}
+
+/// Prove weighted selection withdraws every provider, serves an empty revision, and restores traffic.
+#[expect(
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps,
+    reason = "the ordered withdrawal and restoration lifecycle is one qualification proof"
+)]
+fn assert_static_weighted_withdrawal() -> AssertionResult {
+    let started = Instant::now();
+    let mut facts = BTreeMap::new();
+    let mut selectors = Vec::new();
+    let mut lifecycle_result = Ok(());
+    let mut withdrawal_patch_attempted = false;
+    let mut last_observed_withdrawal_revision = None;
+    let expected_sites = BTreeSet::from([
+        "provider-a".to_owned(),
+        "provider-b".to_owned(),
+        "provider-c".to_owned(),
+    ]);
+
+    let body_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        for site in ["provider-a", "provider-b", "provider-c"] {
+            selectors.push(read_provider_selector(site)?);
+        }
+        facts.insert("provider_selectors_before".to_owned(), serde_json::json!(selectors));
+
+        let initial = read_cluster_overlay(CONSUMER_SITE)?;
+        if overlay_provider_sites(&initial) != expected_sites {
+            return Err(format!(
+                "weighted withdrawal must start with exactly {expected_sites:?}, found {:?}",
+                overlay_provider_sites(&initial)
+            )
+            .into());
+        }
+        facts.insert(
+            "initial_overlay".to_owned(),
+            serde_json::json!({
+                "observed_at_unix_seconds": format_utc_timestamp(),
+                "semantic_revision": initial.semantic_revision,
+                "candidate_sites": overlay_provider_sites(&initial),
+            }),
+        );
+        let gateway_before = read_gateway_stability()?;
+        facts.insert("gateway_identity_before".to_owned(), serde_json::json!(gateway_before));
+        let bound_session = format!("weighted-withdrawal-{}", run_name());
+        let bound_request = send_weighted_lifecycle_request(Some(&bound_session))?;
+        let bound_provider = bound_request
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("initial affinity request has no provider attribution")?
+            .to_owned();
+        if bound_request.get("http_status").and_then(serde_json::Value::as_u64) != Some(200) {
+            return Err(format!("initial affinity request was not HTTP 200: {bound_request}").into());
+        }
+        let affinity_confirmation = send_weighted_lifecycle_request(Some(&bound_session))?;
+        if affinity_confirmation
+            .get("http_status")
+            .and_then(serde_json::Value::as_u64)
+            != Some(200)
+            || affinity_confirmation
+                .get("provider")
+                .and_then(serde_json::Value::as_str)
+                != Some(bound_provider.as_str())
+        {
+            return Err(format!(
+                "repeated X-Session-Id did not preserve the initial provider binding: initial={bound_provider}, repeat={affinity_confirmation}"
+            )
+            .into());
+        }
+        facts.insert("bound_session_id".to_owned(), serde_json::json!(bound_session));
+        facts.insert("bound_provider".to_owned(), serde_json::json!(bound_provider));
+        facts.insert("bound_request_before_withdrawal".to_owned(), bound_request);
+        facts.insert(
+            "affinity_confirmation_before_withdrawal".to_owned(),
+            affinity_confirmation,
+        );
+
+        let mut remaining_sites = expected_sites.clone();
+        let mut previous_revision = initial.semantic_revision;
+        let mut withdrawal_observations = Vec::new();
+        for snapshot in &selectors {
+            let selector = excluded_provider_selector(snapshot)?;
+            withdrawal_patch_attempted = true;
+            patch_provider_selector(snapshot, &selector)?;
+            remaining_sites.remove(&snapshot.site);
+            withdrawal_observations.push(serde_json::json!({
+                "withdrawn_site": snapshot.site,
+                "selector_patch_requested_at_unix_seconds": format_utc_timestamp(),
+                "selector": selector,
+                "expected_candidate_sites": remaining_sites.clone(),
+                "previous_semantic_revision": previous_revision.clone(),
+            }));
+            facts.insert(
+                "withdrawal_revisions".to_owned(),
+                serde_json::Value::Array(withdrawal_observations.clone()),
+            );
+            let overlay = wait_for_weighted_candidate_sites(
+                &remaining_sites,
+                Some(previous_revision.as_str()),
+                Duration::from_secs(180),
+            )?;
+            let observation = withdrawal_observations
+                .last_mut()
+                .ok_or("withdrawal observation disappeared")?;
+            observation["published_at_unix_seconds"] = serde_json::json!(format_utc_timestamp());
+            observation["semantic_revision"] = serde_json::json!(overlay.semantic_revision.clone());
+            observation["candidate_sites"] = serde_json::json!(overlay_provider_sites(&overlay));
+            last_observed_withdrawal_revision = Some(overlay.semantic_revision.clone());
+            facts.insert(
+                "withdrawal_revisions".to_owned(),
+                serde_json::Value::Array(withdrawal_observations.clone()),
+            );
+            facts.insert(
+                "last_observed_withdrawal_revision".to_owned(),
+                serde_json::json!(last_observed_withdrawal_revision),
+            );
+            previous_revision.clone_from(&overlay.semantic_revision);
+        }
+
+        let empty = read_cluster_overlay(CONSUMER_SITE)?;
+        if !empty.candidates.is_empty() {
+            return Err(format!("empty weighted overlay retained candidates: {:?}", empty.candidates).into());
+        }
+        facts.insert(
+            "empty_overlay_publication".to_owned(),
+            serde_json::json!({
+                "observed_at_unix_seconds": format_utc_timestamp(),
+                "semantic_revision": empty.semantic_revision,
+                "candidate_count": empty.candidates.len(),
+                "candidate_sites": overlay_provider_sites(&empty),
+            }),
+        );
+        let mounted_empty = wait_for_mounted_overlay_revision(&empty.semantic_revision, Duration::from_secs(90))?;
+        facts.insert("empty_overlay_mounted".to_owned(), serde_json::json!(mounted_empty));
+        let (accepted, serving, stable_observations) = wait_for_stable_revision(&empty.semantic_revision)?;
+        facts.insert(
+            "empty_overlay".to_owned(),
+            serde_json::json!({
+                "semantic_revision": empty.semantic_revision,
+                "candidate_count": empty.candidates.len(),
+                "praxis_accepted_revision": accepted,
+                "praxis_serving_revision": serving,
+                "stable_observations": stable_observations,
+            }),
+        );
+
+        let activity_before = read_provider_activity()?;
+        let no_route_unbound = send_weighted_lifecycle_request(None)?;
+        let no_route_bound = send_weighted_lifecycle_request(Some(&bound_session))?;
+        facts.insert("no_route_unbound_request".to_owned(), no_route_unbound.clone());
+        facts.insert("no_route_bound_request".to_owned(), no_route_bound.clone());
+        if [&no_route_unbound, &no_route_bound].into_iter().any(|response| {
+            response.get("http_status").and_then(serde_json::Value::as_u64) != Some(404)
+                || response.get("provider").is_some_and(|provider| !provider.is_null())
+        }) {
+            return Err(format!(
+                "empty weighted overlay did not reject both unbound and affinity-bound requests: unbound={no_route_unbound}, bound={no_route_bound}"
+            )
+            .into());
+        }
+        let activity_after = read_provider_activity()?;
+        facts.insert("provider_activity_before_no_route".to_owned(), activity_before.clone());
+        facts.insert("provider_activity_after_no_route".to_owned(), activity_after.clone());
+        if !provider_activity_unchanged(&activity_before, &activity_after) {
+            return Err("a provider gateway or backend received a request while the weighted overlay was empty".into());
+        }
+
+        let provider_a = selectors
+            .iter()
+            .find(|snapshot| snapshot.site == "provider-a")
+            .ok_or("provider-a selector snapshot is missing")?;
+        patch_provider_selector(provider_a, &provider_a.selector)?;
+        let one_provider_revision = wait_for_weighted_candidate_sites(
+            &BTreeSet::from(["provider-a".to_owned()]),
+            Some(empty.semantic_revision.as_str()),
+            Duration::from_secs(180),
+        )?;
+        let (one_provider_accepted, one_provider_serving, _) =
+            wait_for_stable_revision(&one_provider_revision.semantic_revision)?;
+        let restored_request = send_weighted_lifecycle_request(None)?;
+        if restored_request.get("http_status").and_then(serde_json::Value::as_u64) != Some(200)
+            || restored_request.get("provider").and_then(serde_json::Value::as_str) != Some("provider-a")
+        {
+            return Err(
+                format!("one-provider restoration did not route through provider-a: {restored_request}").into(),
+            );
+        }
+        facts.insert(
+            "one_provider_restoration".to_owned(),
+            serde_json::json!({
+                "semantic_revision": one_provider_revision.semantic_revision,
+                "candidate_sites": overlay_provider_sites(&one_provider_revision),
+                "praxis_accepted_revision": one_provider_accepted,
+                "praxis_serving_revision": one_provider_serving,
+                "request": restored_request,
+            }),
+        );
+        Ok(())
+    })();
+
+    if let Err(error) = body_result {
+        lifecycle_result = Err(error.to_string());
+        facts.insert("lifecycle_error".to_owned(), serde_json::json!(error.to_string()));
+    }
+
+    let mut restoration_errors = Vec::new();
+    for snapshot in &selectors {
+        if let Err(error) = patch_provider_selector(snapshot, &snapshot.selector) {
+            restoration_errors.push(format!("{}: {error}", snapshot.site));
+        }
+    }
+    facts.insert(
+        "withdrawal_patch_attempted".to_owned(),
+        serde_json::json!(withdrawal_patch_attempted),
+    );
+    facts.insert(
+        "last_observed_withdrawal_revision".to_owned(),
+        serde_json::json!(last_observed_withdrawal_revision),
+    );
+    facts.insert(
+        "selector_restoration_errors".to_owned(),
+        serde_json::json!(restoration_errors),
+    );
+    if restoration_errors.is_empty() && !selectors.is_empty() {
+        match wait_for_provider_selector_restoration(&selectors, Duration::from_secs(180)) {
+            Ok(selector_evidence) => {
+                facts.insert("provider_selector_restoration".to_owned(), selector_evidence);
+            },
+            Err(error) => restoration_errors.push(format!("provider selectors did not reconcile: {error}")),
+        }
+    }
+    if restoration_errors.is_empty() && !selectors.is_empty() {
+        let previous_revision = last_observed_withdrawal_revision.as_deref();
+        let revision_requirement = restoration_requires_new_revision(previous_revision);
+        facts.insert(
+            "restoration_requires_new_revision".to_owned(),
+            serde_json::json!(revision_requirement),
+        );
+        match wait_for_weighted_candidate_sites(&expected_sites, previous_revision, Duration::from_secs(180)) {
+            Ok(overlay) => {
+                let revision = overlay.semantic_revision.clone();
+                match wait_for_mounted_overlay_revision(&revision, Duration::from_secs(90)) {
+                    Ok(mounted) => {
+                        facts.insert("restored_overlay_mounted".to_owned(), serde_json::json!(mounted));
+                    },
+                    Err(error) => restoration_errors.push(format!("restored overlay was not mounted: {error}")),
+                }
+                match wait_for_stable_revision(&revision) {
+                    Ok((accepted, serving, stable_observations)) => {
+                        facts.insert(
+                            "all_provider_restoration".to_owned(),
+                            serde_json::json!({
+                                "semantic_revision": revision,
+                                "candidate_sites": overlay_provider_sites(&overlay),
+                                "praxis_accepted_revision": accepted,
+                                "praxis_serving_revision": serving,
+                                "stable_observations": stable_observations,
+                            }),
+                        );
+                    },
+                    Err(error) => restoration_errors.push(format!("restored overlay did not serve: {error}")),
+                }
+            },
+            Err(error) => restoration_errors.push(format!("provider candidates did not restore: {error}")),
+        }
+    }
+    if !restoration_errors.is_empty() {
+        facts.insert(
+            "selector_restoration_errors".to_owned(),
+            serde_json::json!(restoration_errors),
+        );
+        lifecycle_result = Err("provider selector restoration failed".to_owned());
+    }
+
+    if let Ok((uid, restarts)) = read_gateway_stability() {
+        facts.insert(
+            "gateway_identity_after".to_owned(),
+            serde_json::json!({"pod_uid": uid, "restart_count": restarts}),
+        );
+        if let Some(before) = facts.get("gateway_identity_before")
+            && (before.get(0).and_then(serde_json::Value::as_str) != Some(uid.as_str())
+                || before.get(1).and_then(serde_json::Value::as_u64) != Some(u64::from(restarts)))
+        {
+            lifecycle_result = Err("consumer gateway restarted during weighted withdrawal".to_owned());
+        }
+    } else {
+        lifecycle_result = Err("consumer gateway identity unavailable after weighted withdrawal".to_owned());
+    }
+
+    Ok(match lifecycle_result {
+        Ok(()) => proof_success(
+            "weighted mode served a new empty revision with no backend contact, then restored attributed traffic",
+            facts,
+            started.elapsed(),
+        ),
+        Err(error) => proof_failure(&error, facts, started.elapsed()),
+    })
+}
+
 #[cfg(test)]
 mod static_phase_policy_tests {
     use super::{
-        capacity_publication_diagnostic, parse_local_crdt_capacity, phase_requires_revision_change,
-        provider_resource_name,
+        ProviderSelectorSnapshot, capacity_publication_diagnostic, excluded_provider_selector,
+        latest_overlay_reload_rejection, parse_local_crdt_capacity, parse_mounted_overlay,
+        phase_requires_revision_change, provider_activity_unchanged, provider_resource_name,
+        provider_selector_restored_and_reconciled, restoration_requires_new_revision, sum_counter_samples,
     };
 
     #[test]
@@ -3097,6 +3960,53 @@ mod static_phase_policy_tests {
         assert_eq!(
             provider_resource_name("vcr-provider-a-provider"),
             "vcr-provider-a-provider"
+        );
+    }
+
+    #[test]
+    fn restoration_requires_revision_only_after_withdrawal_was_observed() {
+        assert!(
+            restoration_requires_new_revision(Some("withdrawal-revision")),
+            "an observed withdrawal revision must be followed by a restoration revision"
+        );
+        assert!(
+            !restoration_requires_new_revision(None),
+            "an attempted but unobserved withdrawal must not require semantic revision churn"
+        );
+    }
+
+    #[test]
+    fn provider_selector_restoration_requires_saved_selector_and_observed_generation() {
+        let snapshot = ProviderSelectorSnapshot {
+            site: "provider-a".to_owned(),
+            selector: serde_json::json!({"matchLabels": {"site": "provider-a"}}),
+        };
+        let restored_resource = |generation, observed_generation, selector: &serde_json::Value| {
+            serde_json::json!({
+                "metadata": {"generation": generation},
+                "spec": {"siteSelector": selector},
+                "status": {"observedGeneration": observed_generation}
+            })
+        };
+        let restored = restored_resource(7, 7, &snapshot.selector);
+        let unreconciled = restored_resource(8, 7, &snapshot.selector);
+        let wrong_selector = serde_json::json!({
+            "metadata": {"generation": 7},
+            "spec": {"siteSelector": {"matchLabels": {"site": "withdrawn"}}},
+            "status": {"observedGeneration": 7}
+        });
+
+        assert!(
+            provider_selector_restored_and_reconciled(&restored, &snapshot),
+            "the saved selector is restored and the controller observed the current generation"
+        );
+        assert!(
+            !provider_selector_restored_and_reconciled(&unreconciled, &snapshot),
+            "the selector is not ready while its current generation is unobserved"
+        );
+        assert!(
+            !provider_selector_restored_and_reconciled(&wrong_selector, &snapshot),
+            "a reconciled but different selector is not restored state"
         );
     }
 
@@ -3135,14 +4045,120 @@ mod static_phase_policy_tests {
             "diagnostic should report zero parseable capacity weights"
         );
     }
+
+    #[test]
+    fn weighted_withdrawal_selector_preserves_other_match_labels() {
+        let snapshot = ProviderSelectorSnapshot {
+            site: "provider-a".to_owned(),
+            selector: serde_json::json!({
+                "matchLabels": {
+                    "grid.praxis.fast/provider-site": "provider-a",
+                    "app.kubernetes.io/part-of": "static-weighted"
+                }
+            }),
+        };
+        let excluded = excluded_provider_selector(&snapshot).unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            excluded
+                .pointer("/matchLabels/app.kubernetes.io~1part-of")
+                .and_then(serde_json::Value::as_str),
+            Some("static-weighted")
+        );
+        assert_ne!(
+            excluded
+                .pointer("/matchLabels/grid.praxis.fast~1provider-site")
+                .and_then(serde_json::Value::as_str),
+            Some("provider-a")
+        );
+        assert_eq!(
+            snapshot
+                .selector
+                .pointer("/matchLabels/grid.praxis.fast~1provider-site")
+                .and_then(serde_json::Value::as_str),
+            Some("provider-a")
+        );
+    }
+
+    #[test]
+    fn backend_and_gateway_counters_sum_all_labeled_samples() {
+        let samples = [
+            "vllm:request_success_total{model=\"a\"} 7",
+            "vllm:request_success_total{model=\"b\"} 11",
+        ];
+        assert_eq!(sum_counter_samples(&samples).ok(), Some(Some(18)));
+        assert_eq!(sum_counter_samples(&[]).ok(), Some(None));
+        match sum_counter_samples(&["counter{label=\"x\"} invalid"]) {
+            Err(error) => assert!(error.to_string().contains("invalid digit")),
+            Ok(_) => std::process::abort(),
+        }
+    }
+
+    #[test]
+    fn no_route_backend_activity_requires_both_gateway_and_backend_counters_to_stay_fixed() {
+        let before = serde_json::json!({
+            "backend_success_total": {"provider-a": 12, "provider-b": 8},
+            "provider_gateway_post_total": {"provider-a": 12, "provider-b": 8}
+        });
+        let unchanged = before.clone();
+        let backend_changed = serde_json::json!({
+            "backend_success_total": {"provider-a": 13, "provider-b": 8},
+            "provider_gateway_post_total": {"provider-a": 12, "provider-b": 8}
+        });
+        let gateway_changed = serde_json::json!({
+            "backend_success_total": {"provider-a": 12, "provider-b": 8},
+            "provider_gateway_post_total": {"provider-a": 13, "provider-b": 8}
+        });
+
+        assert!(provider_activity_unchanged(&before, &unchanged));
+        assert!(!provider_activity_unchanged(&before, &backend_changed));
+        assert!(!provider_activity_unchanged(&before, &gateway_changed));
+    }
+
+    #[test]
+    fn mounted_versioned_overlay_accepts_an_authoritative_empty_candidate_set() {
+        let raw = serde_json::json!({
+            "revision": { "kind": "content_addressed", "algorithm": "sha256", "value": "empty-revision" },
+            "overlay": { "candidates": [] }
+        })
+        .to_string();
+        let parsed = parse_mounted_overlay(raw.as_bytes()).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(parsed.semantic_revision, "empty-revision");
+        assert!(parsed.candidate_sites.is_empty());
+    }
+
+    #[test]
+    fn mounted_overlay_evidence_keeps_site_attribution_and_not_raw_endpoints() {
+        let raw = serde_json::json!({
+            "revision": { "value": "three-site-revision" },
+            "overlay": {
+                "candidates": [
+                    { "site": "provider-a", "endpoint": "http://private-a" },
+                    { "site": "provider-b", "endpoint": "http://private-b" }
+                ]
+            }
+        })
+        .to_string();
+        let parsed = parse_mounted_overlay(raw.as_bytes()).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(parsed.semantic_revision, "three-site-revision");
+        assert_eq!(parsed.candidate_sites, ["provider-a", "provider-b"]);
+    }
+
+    #[test]
+    fn gateway_empty_candidate_rejection_is_reported_without_raw_log_fields() {
+        let logs = "ERROR intelligent_route: overlay reload failed, retaining previous snapshot path=/etc/praxis/routing/routing-overlay.json error=routing: candidates list must not be empty retained_serving_revision=kept-revision client_secret=private";
+        let diagnostic = latest_overlay_reload_rejection(logs).unwrap_or_else(|| std::process::abort());
+        assert!(diagnostic.contains("candidates list must not be empty"));
+        assert!(diagnostic.contains("retained serving revision=kept-revision"));
+        assert!(!diagnostic.contains("client_secret"));
+        assert!(!diagnostic.contains("private"));
+    }
 }
 
-/// Run the static-weighted proof scenarios using the assertion framework.
-///
-/// Run the infrastructure checks and three focused static-weighted phases.
+/// Run the setup checks, three weighted phases, and withdrawal/restoration proof.
 #[expect(
     clippy::too_many_lines,
-    reason = "The focused demo presents its six proof phases in order."
+    reason = "The focused demo presents its qualification scenarios in order."
 )]
 fn run_static_weighted_scenarios() -> (BTreeMap<String, ProofResult>, Vec<StaticPhaseEvidence>) {
     let mut results = BTreeMap::new();
@@ -3218,6 +4234,17 @@ fn run_static_weighted_scenarios() -> (BTreeMap<String, ProofResult>, Vec<Static
             },
         }
     }
+
+    eprintln!();
+    eprintln!(
+        "[SCENARIO {}] Withdraw weighted providers to an empty serving revision and restore traffic",
+        scenario()
+    );
+    run_and_insert(
+        &mut results,
+        "weighted_final_provider_withdrawal",
+        assert_static_weighted_withdrawal,
+    );
 
     (results, phases)
 }
@@ -4036,10 +5063,14 @@ mod tests {
             "site_auto_discovery",
             "overlay_acceptance",
             "static_weighted_baseline",
+            "static_weighted_changed",
+            "static_weighted_equal",
+            "weighted_final_provider_withdrawal",
         ];
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), 9);
         assert_eq!(names[0], "cluster_health");
         assert_eq!(names[5], "static_weighted_baseline");
+        assert_eq!(names[8], "weighted_final_provider_withdrawal");
         assert_eq!(CLUSTERS.len(), 3);
         assert_eq!(CLUSTERS, &["provider-a", "provider-b", "provider-c"]);
     }

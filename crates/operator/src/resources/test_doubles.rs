@@ -7,9 +7,11 @@
 //! Declared behind `#[cfg(test)]` at the `mod test_doubles;` site in
 //! `resources/mod.rs`, so this whole module compiles out of non-test builds.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use k8s_openapi::{ByteString, api::core::v1::Secret};
+
+use crate::crd::inference_provider::InferenceProvider;
 
 /// Build a `kube::Client` backed by an in-memory map of Secret name to
 /// `Secret`, so Secret-reading code can be exercised without a real cluster.
@@ -23,6 +25,52 @@ pub(crate) fn mock_kube_client_with_config_maps(
     config_maps: HashMap<&'static str, k8s_openapi::api::core::v1::ConfigMap>,
 ) -> kube::Client {
     mock_kube_client_with_objects(config_maps)
+}
+
+/// Build a `kube::Client` that lists the given `InferenceProvider` objects and no `GridSite` objects.
+pub(crate) fn mock_kube_client_with_providers(providers: Vec<InferenceProvider>) -> kube::Client {
+    let providers = Arc::new(providers);
+    let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+        let providers = Arc::clone(&providers);
+        async move {
+            let body = kube_list_body(req.uri().path(), providers.as_slice());
+            Ok::<_, std::convert::Infallible>(
+                http::Response::builder()
+                    .status(200)
+                    .body(kube::client::Body::from(body))
+                    .unwrap_or_else(|_| std::process::abort()),
+            )
+        }
+    });
+    kube::Client::new(service, "default")
+}
+
+/// Build the list response for a mocked Kubernetes API path.
+fn kube_list_body(path: &str, providers: &[InferenceProvider]) -> Vec<u8> {
+    let list = if path.ends_with("/inferenceproviders") {
+        serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "InferenceProviderList",
+            "metadata": {"resourceVersion": "1"},
+            "items": providers,
+        })
+    } else if path.ends_with("/gridsites") {
+        serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridSiteList",
+            "metadata": {"resourceVersion": "1"},
+            "items": [],
+        })
+    } else {
+        serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Failure",
+            "reason": "NotFound",
+            "code": 404,
+        })
+    };
+    serde_json::to_vec(&list).unwrap_or_else(|_| std::process::abort())
 }
 
 /// A `kube::Client` answering a GET by object name from `objects`, 404 otherwise.
@@ -101,12 +149,30 @@ pub(crate) fn endpoint_tls_for_ca(secret_name: &str) -> crate::crd::inference_pr
     }
 }
 
+/// Start a one-shot HTTP server that waits `delay` before writing `response`.
+pub(crate) async fn start_delayed_http_server(response: Vec<u8>, delay: Duration) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|_| std::process::abort());
+    let port = listener.local_addr().unwrap_or_else(|_| std::process::abort()).port();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0_u8; 4096];
+            drop(stream.read(&mut buf).await);
+            tokio::time::sleep(delay).await;
+            drop(stream.write_all(&response).await);
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
 /// Start a one-shot HTTPS endpoint and return its localhost URL.
 ///
 /// The endpoint consumes one HTTP request and writes `response` as a raw HTTP
 /// response. Its server certificate must be valid for `localhost`.
 #[cfg(not(feature = "fips"))]
-#[expect(clippy::too_many_lines, reason = "TLS test server setup")]
 pub(crate) async fn start_tls_http_server(server_cert_pem: &str, server_key_pem: &str, response: Vec<u8>) -> String {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -115,14 +181,13 @@ pub(crate) async fn start_tls_http_server(server_cert_pem: &str, server_key_pem:
         .collect::<Result<Vec<_>, _>>()
         .unwrap_or_else(|_| std::process::abort());
     let server_key = PrivateKeyDer::from_pem_slice(server_key_pem.as_bytes()).unwrap_or_else(|_| std::process::abort());
-    let server_config =
-        rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .unwrap_or_else(|_| std::process::abort())
-            .with_no_client_auth()
-            .with_single_cert(server_certs, server_key)
-            .unwrap_or_else(|_| std::process::abort());
-    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+    let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap_or_else(|_| std::process::abort())
+        .with_no_client_auth()
+        .with_single_cert(server_certs, server_key)
+        .unwrap_or_else(|_| std::process::abort());
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap_or_else(|_| std::process::abort());

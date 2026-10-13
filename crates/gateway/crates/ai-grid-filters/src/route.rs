@@ -48,6 +48,10 @@ const SELECTED_CANDIDATE_HEADER: &str = "x-ai-routing-candidate";
 const PROVIDER_HOP_REQUEST_ID_HEADER: &str = "x-ai-routing-request-id";
 /// Internal request header carrying the serving overlay revision.
 const OVERLAY_REVISION_HEADER: &str = "x-ai-routing-revision";
+/// Response header carrying the site selected by Grid.
+const ROUTE_SITE_HEADER: &str = "x-grid-site";
+/// Response header carrying the cluster selected by Grid.
+const ROUTE_BACKEND_HEADER: &str = "x-grid-backend";
 
 /// Whether the current serving revision permits a previous filter's choice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -403,7 +407,7 @@ impl GridSiteRouteFilter {
 
     /// Confirm or withdraw the recorded prefix by the response status, and start
     /// tagging a Responses API answer's ids with the site that served it.
-    fn settle(&self, ctx: &mut HttpFilterContext<'_>) {
+    fn settle(&self, ctx: &mut HttpFilterContext<'_>) -> Result<(), FilterError> {
         let head = ctx.response_header.as_deref();
         let success = head.is_some_and(|response| response.status.is_success());
         // A 429 can be one tenant's quota, so only a server error speaks for the site.
@@ -416,8 +420,10 @@ impl GridSiteRouteFilter {
                 .is_none_or(|encoding| encoding.as_bytes().eq_ignore_ascii_case(b"identity"))
         });
         let Some(state) = ctx.get_filter_state_mut::<RouteState>() else {
-            return;
+            return Ok(());
         };
+        // Keep the selected route after releasing the mutable borrow of filter state in `ctx`.
+        let served = state.served.clone();
         // A success means the site took the request, not that it cached the prompt yet:
         // headers can precede scheduling. A site that failed loses the prefix.
         if let Some((keys, cluster)) = state.recorded.take() {
@@ -434,12 +440,41 @@ impl GridSiteRouteFilter {
             .flatten();
         let tagging = tag.is_some();
         state.tagger = tag;
-        if let (true, Some(response)) = (tagging, ctx.response_header.as_mut()) {
-            // Tagging lengthens the body, so the length is no longer known up front.
-            response.headers.remove(http::header::CONTENT_LENGTH);
-            ctx.response_headers_modified = true;
-        }
+        finish_route_response_headers(ctx, served.as_ref(), tagging)
     }
+}
+
+/// Apply attribution and body-tagging header changes to the routed response.
+fn finish_route_response_headers(
+    ctx: &mut HttpFilterContext<'_>,
+    served: Option<&(Arc<str>, Arc<str>)>,
+    tagging: bool,
+) -> Result<(), FilterError> {
+    let Some(response) = ctx.response_header.as_mut() else {
+        return Ok(());
+    };
+    if let Some((site, cluster)) = served {
+        set_route_attribution_headers(&mut response.headers, site, cluster)?;
+        ctx.response_headers_modified = true;
+    }
+    if tagging {
+        // Tagging lengthens the body, so the length is no longer known up front.
+        response.headers.remove(http::header::CONTENT_LENGTH);
+        ctx.response_headers_modified = true;
+    }
+    Ok(())
+}
+
+/// Set trusted response attribution for the site and cluster selected by Grid.
+fn set_route_attribution_headers(headers: &mut http::HeaderMap, site: &str, cluster: &str) -> Result<(), FilterError> {
+    let site = http::HeaderValue::from_str(site)
+        .map_err(|error| -> FilterError { format!("grid_site_route: invalid selected site header: {error}").into() })?;
+    let cluster = http::HeaderValue::from_str(cluster).map_err(|error| -> FilterError {
+        format!("grid_site_route: invalid selected backend header: {error}").into()
+    })?;
+    headers.insert(http::header::HeaderName::from_static(ROUTE_SITE_HEADER), site);
+    headers.insert(http::header::HeaderName::from_static(ROUTE_BACKEND_HEADER), cluster);
+    Ok(())
 }
 
 #[async_trait]
@@ -553,7 +588,7 @@ impl HttpFilter for GridSiteRouteFilter {
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        self.settle(ctx);
+        self.settle(ctx)?;
         Ok(FilterAction::Continue)
     }
 
@@ -1936,5 +1971,32 @@ mod tests {
             Arc::from("local"),
         );
         assert!(matches!(route_decision(&active, true), RouteDecision::KeepEarlier));
+    }
+
+    #[test]
+    fn routed_response_overwrites_untrusted_attribution_with_the_selected_values() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::HeaderName::from_static(ROUTE_SITE_HEADER),
+            http::HeaderValue::from_static("untrusted-site"),
+        );
+        headers.insert(
+            http::header::HeaderName::from_static(ROUTE_BACKEND_HEADER),
+            http::HeaderValue::from_static("untrusted-backend"),
+        );
+
+        set_route_attribution_headers(&mut headers, "pool-a", "provider-a").unwrap();
+
+        assert_eq!(headers.get(ROUTE_SITE_HEADER).unwrap(), "pool-a");
+        assert_eq!(headers.get(ROUTE_BACKEND_HEADER).unwrap(), "provider-a");
+    }
+
+    #[test]
+    fn invalid_backend_attribution_does_not_partially_modify_headers() {
+        let mut headers = http::HeaderMap::new();
+
+        assert!(set_route_attribution_headers(&mut headers, "pool-a", "provider\n-a").is_err());
+        assert!(!headers.contains_key(ROUTE_SITE_HEADER));
+        assert!(!headers.contains_key(ROUTE_BACKEND_HEADER));
     }
 }

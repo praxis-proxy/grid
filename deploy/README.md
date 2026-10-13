@@ -131,6 +131,9 @@ The operator uses a split RBAC model:
 - **Cluster-scoped**: CRD access via ClusterRole `grid-operator-crd`
 - **Namespace-scoped**: Secret/ConfigMap access via ClusterRole `grid-operator-resources` bound in the operator namespace, plus every namespace listed under `resourceNamespaces` in the directory's `values.yaml`
 
+These manifests grant no Deployment access; a gateway that delegates its
+Secret mounts grants `get` and `patch` on its own Deployment, as described under
+[Deployment access](../docs/architecture/operations.md#deployment-access).
 To grant access to another namespace without regenerating:
 
 ```bash

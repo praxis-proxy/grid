@@ -241,6 +241,7 @@ fn validate_candidates_with_empty(
         validate_name(&format!("candidates[{index}].name"), &cand.name)?;
         validate_site(&format!("candidates[{index}].site"), &cand.site)?;
         validate_name(&format!("candidates[{index}].cluster"), &cand.cluster)?;
+        validate_header_value(&format!("candidates[{index}].cluster"), &cand.cluster)?;
         validate_credential(index, cand.credential.as_ref())?;
 
         if !seen.insert((cand.kind, cand.name.clone(), cand.site.clone(), cand.cluster.clone())) {
@@ -390,6 +391,14 @@ fn validate_name(field: &str, value: &str) -> Result<(), FilterError> {
     Ok(())
 }
 
+/// Validate a value that will be emitted as an HTTP response header.
+fn validate_header_value(field: &str, value: &str) -> Result<(), FilterError> {
+    http::HeaderValue::from_str(value).map_err(|error| -> FilterError {
+        format!("grid: {field} must be a valid HTTP header value: {error}").into()
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
@@ -454,6 +463,20 @@ mod tests {
         let long = "a".repeat(MAX_NAME_LEN + 1);
         let err = validate_candidates(vec![candidate("inference_model", &long, "s", "c")]).expect_err("should fail");
         assert!(err.to_string().contains("name must be"), "{err}");
+    }
+
+    /// RFC 9110 §5.5 excludes CR, LF, and NUL from HTTP field values.
+    #[test]
+    fn candidate_cluster_rejects_http_header_control_characters() {
+        let error = validate_candidates(vec![candidate("inference_model", "llama", "site-a", "gateway\n-a")])
+            .expect_err("cluster values become response headers and must reject control characters");
+
+        assert!(
+            error
+                .to_string()
+                .contains("candidates[0].cluster must be a valid HTTP header value"),
+            "invalid cluster header value should be rejected during candidate validation: {error}"
+        );
     }
 
     #[test]

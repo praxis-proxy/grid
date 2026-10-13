@@ -5,6 +5,8 @@
 //! reuses the descriptor data model and a first-admitted selection. The grid
 //! contribution is ordering the candidates by live load off the request path.
 
+#[cfg(test)]
+mod conformance;
 mod control;
 mod decisions;
 mod descriptor;

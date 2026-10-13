@@ -19,6 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::StreamExt as _;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -34,6 +35,12 @@ use crate::{
 
 /// Scrape timeout used when the provider's `metricsConfig.timeout` cannot be parsed.
 const DEFAULT_SCRAPE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum provider scrapes started at once.
+///
+/// A bounded fan-out keeps one slow endpoint from delaying its siblings while
+/// also keeping concurrent response bodies and TLS handshakes bounded.
+const PROVIDER_SCRAPE_CONCURRENCY: usize = 16;
 
 /// Metrics inserted for a provider whose configured metrics endpoint cannot be
 /// observed (scrape failed and no valid cache entry).
@@ -113,24 +120,27 @@ pub(crate) struct CollectedMetrics {
 /// the same text into [`scoring::BackendMetrics`] for local scoring. This keeps
 /// the provider's own exposition as published, minus the families every process
 /// exports about itself, so a reader concludes from the provider's raw series
-/// and `signalNames` stays a scoring concern. Fails
-/// closed on TLS: a provider whose TLS will not resolve is skipped, never
-/// scraped in plaintext, and counts as a failed scrape.
+/// and `signalNames` stays a scoring concern. Scrapes run concurrently, up to
+/// [`PROVIDER_SCRAPE_CONCURRENCY`] at once. Fails closed on TLS: a provider
+/// whose TLS will not resolve is skipped, never scraped in plaintext, and
+/// counts as a failed scrape.
 pub(crate) async fn collect_provider_signals(
     network_name: &str,
     providers: &[InferenceProvider],
     client: Option<&kube::Client>,
     readiness: &crate::readiness::ReadinessStore,
 ) {
-    for provider in providers {
-        if provider.spec.grid_network_ref != network_name {
-            continue;
-        }
+    futures::stream::iter(
+        providers
+            .iter()
+            .filter(|provider| provider.spec.grid_network_ref == network_name),
+    )
+    .for_each_concurrent(PROVIDER_SCRAPE_CONCURRENCY, |provider| async move {
         let Some(plan) = signal_scrape_plan(provider) else {
-            continue;
+            return;
         };
         let Some(name) = provider.metadata.name.as_deref() else {
-            continue;
+            return;
         };
         let key = crate::readiness::key(network_name, name);
         match scrape_provider_signals(provider, &plan, client).await {
@@ -140,7 +150,8 @@ pub(crate) async fn collect_provider_signals(
                 readiness.record_failure(&key, class, Instant::now());
             },
         }
-    }
+    })
+    .await;
 }
 
 /// Record one successful scrape: its ready-endpoint count and its declared signals.
@@ -771,6 +782,8 @@ pub(crate) fn classify_scrape_error(err: &metrics_scraper::MetricsScrapeError) -
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[test]
@@ -817,6 +830,70 @@ mod tests {
             }
         });
         format!("http://127.0.0.1:{port}")
+    }
+
+    /// Start an HTTP server that counts concurrent requests and gates the first batch on a barrier.
+    async fn start_bounded_test_server(
+        response: Vec<u8>,
+        expected_requests: usize,
+        barrier_requests: usize,
+    ) -> (String, std::sync::Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|_| std::process::abort());
+        let port = listener.local_addr().unwrap_or_else(|_| std::process::abort()).port();
+        let state = CountingServerState {
+            current: std::sync::Arc::new(AtomicUsize::new(0)),
+            peak: std::sync::Arc::new(AtomicUsize::new(0)),
+            barrier: std::sync::Arc::new(tokio::sync::Barrier::new(barrier_requests)),
+        };
+        let server_state = state.clone();
+        tokio::spawn(async move {
+            let mut accepted = 0;
+            while accepted < expected_requests {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                accepted += 1;
+                tokio::spawn(serve_counted_request(
+                    stream,
+                    response.clone(),
+                    server_state.clone(),
+                    accepted <= barrier_requests,
+                ));
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), state.peak)
+    }
+
+    /// Shared counters and barrier for bounded-scrape test requests.
+    #[derive(Clone)]
+    struct CountingServerState {
+        /// Current connection count.
+        current: std::sync::Arc<AtomicUsize>,
+        /// Peak connection count.
+        peak: std::sync::Arc<AtomicUsize>,
+        /// Barrier that releases the first request batch.
+        barrier: std::sync::Arc<tokio::sync::Barrier>,
+    }
+
+    /// Serve one request while updating the server's current and peak connection counts.
+    async fn serve_counted_request(
+        mut stream: tokio::net::TcpStream,
+        response: Vec<u8>,
+        state: CountingServerState,
+        waits_at_barrier: bool,
+    ) {
+        let CountingServerState { current, peak, barrier } = state;
+        let active = current.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(active, Ordering::SeqCst);
+        let mut buf = [0_u8; 4096];
+        drop(stream.read(&mut buf).await);
+        if waits_at_barrier {
+            barrier.wait().await;
+        }
+        drop(stream.write_all(&response).await);
+        current.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Build a raw HTTP 200 response with a text/plain body.
@@ -1268,6 +1345,73 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
         assert!(
             readiness.take_fresh("net/prov-a").is_none(),
             "invalid shared TLS material must skip the scrape"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_slow_signal_scrape_does_not_delay_its_siblings() {
+        let slow_url = crate::resources::test_doubles::start_delayed_http_server(
+            ok_response("slow_queue 0.1\n"),
+            Duration::from_millis(300),
+        )
+        .await;
+        let fast_url = start_test_server(ok_response("fast_queue 0.2\n")).await;
+        let mut slow_metrics = mc_with_queue("slow_queue");
+        slow_metrics.timeout = "100ms".to_owned();
+        let slow = provider_fixture("slow", &slow_url, Some(slow_metrics));
+        let fast = provider_fixture("fast", &fast_url, Some(mc_with_queue("fast_queue")));
+        let readiness = crate::readiness::ReadinessStore::default();
+        let started = tokio::time::Instant::now();
+
+        collect_provider_signals("net", &[slow, fast], None, &readiness).await;
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "a fast sibling must not wait for a slow provider's timeout: {elapsed:?}"
+        );
+        assert!(
+            readiness.take_fresh("net/fast").is_some(),
+            "the fast sibling still records its scrape"
+        );
+        assert!(
+            readiness.take_fresh("net/slow").is_none(),
+            "the slow provider records a failure, not a fresh sample"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_signal_scrapes_are_bounded_at_sixteen() {
+        let (endpoint, peak_connections) = start_bounded_test_server(ok_response("bounded_queue 0.1\n"), 17, 16).await;
+        let providers: Vec<_> = (0..17)
+            .map(|index| {
+                provider_fixture(
+                    &format!("provider-{index}"),
+                    &endpoint,
+                    Some(mc_with_queue("bounded_queue")),
+                )
+            })
+            .collect();
+        let readiness = crate::readiness::ReadinessStore::default();
+
+        let collected = tokio::time::timeout(
+            Duration::from_secs(2),
+            collect_provider_signals("net", &providers, None, &readiness),
+        )
+        .await;
+        assert!(collected.is_ok(), "the bounded scrape pass should finish");
+
+        for provider in &providers {
+            let name = provider.metadata.name.as_deref().unwrap_or_default();
+            assert!(
+                readiness.take_fresh(&format!("net/{name}")).is_some(),
+                "every bounded provider should complete its scrape"
+            );
+        }
+        assert_eq!(
+            peak_connections.load(Ordering::SeqCst),
+            16,
+            "seventeen providers must use at most sixteen concurrent scrapes"
         );
     }
 

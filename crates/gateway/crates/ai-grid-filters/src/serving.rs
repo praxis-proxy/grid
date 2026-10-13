@@ -90,8 +90,6 @@ pub struct GridServingConfig {
 pub struct AvailabilitySettings {
     /// Weight of the newest in-flight sample against the running saturation estimate, in (0, 1].
     pub smoothing: f64,
-    /// How long a learned ceiling takes to halve once load falls away, milliseconds, over 0.
-    pub ceiling_half_life_ms: i64,
     /// The least a learned ceiling can be, so a quiet site does not read as full, at least 1.
     pub ceiling_floor: f64,
     /// A measured site's weight is at least this share of the largest ceiling, in [0, 1].
@@ -116,7 +114,6 @@ impl Default for AvailabilitySettings {
     fn default() -> Self {
         Self {
             smoothing: 0.3,
-            ceiling_half_life_ms: 600_000,
             ceiling_floor: 8.0,
             explore_floor: 0.25,
             full_after_ms: 5_000,
@@ -143,12 +140,6 @@ impl AvailabilitySettings {
             if value < 0 {
                 return Err(format!("availability.{name} must be at least 0, got {value}"));
             }
-        }
-        if self.ceiling_half_life_ms <= 0 {
-            return Err(format!(
-                "availability.ceiling_half_life_ms must be over 0, got {}",
-                self.ceiling_half_life_ms
-            ));
         }
         if !self.ceiling_floor.is_finite() || self.ceiling_floor < 1.0 {
             return Err(format!(
