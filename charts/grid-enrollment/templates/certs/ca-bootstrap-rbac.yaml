@@ -129,8 +129,9 @@ subjects:
 {{- with .Values.hubSite.name }}
 {{- $name := printf "%s-hub-site" (include "grid-enrollment.bootstrapServiceAccountName" $) }}
 ---
-{{- /* The hub identity lands in the operator namespace. create cannot be name-scoped, so for the hook's
-lifetime this SA can create any Secret there; it already holds the CA key, so that adds little. */}}
+{{- /* The hub identity is stored in the operator namespace. Kubernetes cannot limit Secret creation to one name,
+so this ServiceAccount can create any Secret there until the next hook run or manual cleanup. It already has the CA
+key, so this extra permission adds little additional risk. */}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
