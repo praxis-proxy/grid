@@ -265,7 +265,7 @@ spec:
                 # Stable `reason` values
 
                 `reason` is `None` while the provider is healthy. When set, it is one
-                of the following stable, machine-readable strings — following the
+                of the following stable, machine-readable strings, following the
                 same naming convention as [`InferenceProvider`]'s `MetricsTls*`/
                 `HealthCheckTls*` reasons:
 

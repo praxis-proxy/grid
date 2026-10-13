@@ -6,7 +6,7 @@
 //!
 //! The credential path is:
 //! 1. `InferenceProvider.spec.auth` declares the strategy and a [`SecretRef`].
-//! 2. [`credential_plan_from_auth`] parses the spec into a [`CredentialPlan`] — pure, no I/O.
+//! 2. [`credential_plan_from_auth`] parses the spec into a [`CredentialPlan`] (pure, no I/O).
 //! 3. [`CredentialResolver`] implementations fetch the actual secret value.
 //! 4. The controller calls [`verify_credential_accessible`] during reconcile to surface missing or misconfigured
 //!    Secrets as `Unavailable` phase before routing begins.
@@ -14,8 +14,8 @@
 //! # v1 backend
 //!
 //! [`KubernetesSecretResolver`] is the v1 implementation. It reads from Kubernetes
-//! `Secret.data` using the kube API client. Future backends — Vault, External Secrets
-//! Operator, `OAuth2` token refresh, `SigV4` signing, workload identity — implement
+//! `Secret.data` using the kube API client. Future backends (Vault, External Secrets
+//! Operator, `OAuth2` token refresh, `SigV4` signing, workload identity) implement
 //! the same [`CredentialResolver`] trait without changing callers.
 //!
 //! # Security
@@ -88,18 +88,18 @@ impl CredentialFailureReason {
 
 /// The credential action derived from `InferenceProvider.spec.auth`.
 ///
-/// This is a **pure data type** — no I/O.  Build it with
+/// This is a **pure data type** with no I/O.  Build it with
 /// [`credential_plan_from_auth`], then use a [`CredentialResolver`] to
 /// fetch the actual value.
 #[derive(Debug, PartialEq)]
 pub enum CredentialPlan {
-    /// `spec.auth` is absent — no credential injection.
+    /// `spec.auth` is absent; no credential injection.
     Absent,
 
-    /// `auth.manual = true` — the user manages credentials; the operator does not inject.
+    /// `auth.manual = true`: the user manages credentials; the operator does not inject.
     Manual,
 
-    /// `auth.strategy = bearer_token` — resolve a bearer token from the referenced Secret.
+    /// `auth.strategy = bearer_token`: resolve a bearer token from the referenced Secret.
     Bearer(BearerTokenRef),
 }
 
@@ -118,7 +118,7 @@ pub struct BearerTokenRef {
 }
 
 // ---------------------------------------------------------------------------
-// BearerToken — opaque, non-logging value type
+// BearerToken: opaque, non-logging value type
 // ---------------------------------------------------------------------------
 
 /// A resolved bearer token ready for data-plane injection.
@@ -199,7 +199,7 @@ pub trait CredentialResolver {
 }
 
 // ---------------------------------------------------------------------------
-// KubernetesSecretResolver — v1 backend
+// KubernetesSecretResolver: v1 backend
 // ---------------------------------------------------------------------------
 
 /// v1 credential resolver: reads bearer tokens from Kubernetes Secrets.
@@ -256,12 +256,12 @@ impl CredentialResolver for KubernetesSecretResolver {
 }
 
 // ---------------------------------------------------------------------------
-// credential_plan_from_auth — pure function
+// credential_plan_from_auth: pure function
 // ---------------------------------------------------------------------------
 
 /// Build a [`CredentialPlan`] from `InferenceProvider.spec.auth`.
 ///
-/// This function is **pure** — no I/O.  All validation of the parsed plan
+/// This function is **pure**, with no I/O.  All validation of the parsed plan
 /// (e.g. Secret existence) is a controller responsibility; call
 /// [`verify_credential_accessible`] in the reconcile loop.
 ///
@@ -289,7 +289,7 @@ pub fn credential_plan_from_auth(auth: Option<&AuthConfig>) -> Result<Credential
             Ok(CredentialPlan::Bearer(bearer_ref))
         },
 
-        // Strategies that require per-request computation or token refresh —
+        // Strategies that require per-request computation or token refresh,
         // not yet implemented in the controller.
         AuthStrategy::Sigv4 | AuthStrategy::Oauth2 | AuthStrategy::ServiceAccount => {
             Err(OperatorError::NotFound(format!(
@@ -317,7 +317,7 @@ pub fn credential_plan_from_auth(auth: Option<&AuthConfig>) -> Result<Credential
 /// Call this only after [`credential_plan_from_auth`] has returned `Err`.
 /// Returns the machine-readable reason for surfacing in `status.reason`.
 ///
-/// Pure function — no I/O.
+/// Pure function, no I/O.
 pub fn credential_failure_reason_for_auth(auth: Option<&AuthConfig>) -> CredentialFailureReason {
     let Some(auth) = auth else {
         // credential_plan_from_auth(None) always returns Ok(Absent); reaching
@@ -382,8 +382,8 @@ fn bearer_token_ref_from_secret_ref(secret_ref: &SecretRef) -> Result<BearerToke
 ///
 /// # Returns
 ///
-/// - `Ok(None)` — credential is accessible and valid.
-/// - `Ok(Some(reason))` — credential-specific failure; the provider should be marked [`Unavailable`] with the returned
+/// - `Ok(None)`: credential is accessible and valid.
+/// - `Ok(Some(reason))`: credential-specific failure; the provider should be marked [`Unavailable`] with the returned
 ///   reason in `status.reason`.
 ///
 /// [`Unavailable`]: crate::crd::inference_provider::ProviderPhase::Unavailable
@@ -415,7 +415,7 @@ pub async fn verify_credential_accessible(
 
 /// Validate that a bearer credential Secret's data map is well-formed.
 ///
-/// Pure function — no I/O.  Checks:
+/// Pure function, no I/O.  Checks:
 /// 1. `data` is `Some` (the Secret has a `data` section).
 /// 2. `key` is present in `data`.
 /// 3. The value for `key` is valid UTF-8.
@@ -507,7 +507,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Bearer — valid
+    // Bearer: valid
     // -----------------------------------------------------------------------
 
     #[test]
@@ -525,7 +525,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Bearer — missing/invalid SecretRef
+    // Bearer: missing/invalid SecretRef
     // -----------------------------------------------------------------------
 
     #[test]
@@ -640,7 +640,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // MtlsOnly — special: no Secret needed
+    // MtlsOnly (special: no Secret needed)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -690,7 +690,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // validate_bearer_secret_data — pure UTF-8 + structure validation
+    // validate_bearer_secret_data: pure UTF-8 + structure validation
     // -----------------------------------------------------------------------
 
     fn make_data(key: &str, value: &[u8]) -> BTreeMap<String, ByteString> {
@@ -730,7 +730,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // CredentialFailureReason — reason codes
+    // CredentialFailureReason: reason codes
     // -----------------------------------------------------------------------
 
     #[test]

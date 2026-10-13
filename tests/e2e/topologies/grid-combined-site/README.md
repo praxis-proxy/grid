@@ -1,4 +1,4 @@
-# grid-combined-site — Internal E2E Topology
+# grid-combined-site: Internal E2E Topology
 
 Internal test topology for the AGN combined-site E2E scenario.
 

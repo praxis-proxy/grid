@@ -189,7 +189,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `swim.advertiseAddress` | string | `""` | Externally reachable SWIM address. Defaults to the SWIM Service LoadBalancer address, else Pod IP. |
 | `swim.requireKey` | bool | `true` | Hold SWIM traffic until the GridNetwork key loads or the network declares none. |
 | `swim.siteName` | string | `""` | Bootstrap SWIM site name. |
-| `swim.seeds` | string | `""` | Bootstrap SWIM seed endpoints (comma-separated `ip:port`, `[ipv6]:port`, or `hostname:port`). |
+| `swim.seeds` | string | `""` | Bootstrap SWIM seed endpoints, separated by spaces or commas. A bare host or address gets `swim.service.port`; `host:port` and `[ipv6]:port` are taken as given. |
 | `swim.service.enabled` | bool | `false` | Create a SWIM Service. |
 | `swim.service.type` | string | `ClusterIP` | SWIM Service type. |
 | `swim.service.port` | int | `7946` | SWIM Service port. |
@@ -197,6 +197,8 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `swim.service.loadBalancerIP` | string | `""` | Static IP for LoadBalancer. Deprecated in Kubernetes, so prefer `metallb.io/loadBalancerIPs`. |
 | `swim.service.externalTrafficPolicy` | string | `""` | External traffic policy. Defaults to Local for LoadBalancer. |
 | `swim.service.loadBalancerSourceRanges` | list | `[]` | Optional CIDRs allowed to reach the SWIM and signals LoadBalancer, where the implementation enforces them. |
+| `platform` | string | `""` | Cloud the grid runs on. `aws` asks for an NLB on both Services, since the default load balancer carries no UDP. |
+| `peers` | string | `""` | The grid's other sites, separated by spaces or commas. Each is a SWIM seed unless `grid.seeds` or `swim.seeds` is set, and each bare IPv4 address a host route in both Services' source ranges unless they set their own. That fits a peer that listens on the address it egresses from; on AWS, list the NAT addresses here and the SWIM Service hostnames in `grid.seeds`. |
 | `signals.enabled` | bool | `false` | For signalTransport poll. Adds a TCP port named `signals` to the SWIM Service and points this site's gateway at it. Needs `swim.service.enabled`. A LoadBalancer must support mixed UDP and TCP ports. |
 | `signals.port` | int | `9091` | Signals port on the SWIM Service. Peers learn the LoadBalancer address and this port over gossip. |
 | `signals.advertiseAddress` | string | `""` | Signals endpoint gossiped to peers. Set it with `swim.advertiseAddress` or a NodePort Service, where the operator discovers no LoadBalancer address. |
@@ -250,7 +252,8 @@ enrollment: {enabled: true, url: https://enroll.example.com}
 `grid.id` renders the GridNetwork, with site discovery on and its TLS Secrets pointed at
 the site identity, the grid CA, and `grid.swimKeySecretName`, plus this site's GridSite.
 `site.name` and `grid.seeds` default `swim.siteName` and `swim.seeds`, which win when set,
-and `grid.signals: poll` serves signals on the SWIM Service. The CRs need the grid CRDs
+and `grid.signals: poll` serves signals on the SWIM Service. `grid.seeds` also takes one
+string separated by spaces or commas, as `swim.seeds` does. The CRs need the grid CRDs
 first. Argo CD applies them a sync wave after the CRDs. Plain Helm cannot map them on the
 first install, so set `grid.id` on an upgrade after it, or install the grid-site chart.
 `grid.signals` and `grid.peerTrust` also set the modes the operator starts in before any

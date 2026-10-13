@@ -87,9 +87,9 @@ pub(crate) fn generate_all_in_dir(cluster_names: &[String], dir: &Path) -> Resul
 /// Generate a dedicated CA and certificates for metrics endpoint mTLS.
 ///
 /// Produces files under `{CERTS_DIR}/`:
-/// - `metrics-ca.pem` / `metrics-ca-key.pem` — metrics-only CA
-/// - `metrics-server-cert.pem` / `metrics-server-key.pem` — TLS proxy cert
-/// - `metrics-client-cert.pem` / `metrics-client-key.pem` — operator client cert
+/// - `metrics-ca.pem` / `metrics-ca-key.pem`: metrics-only CA
+/// - `metrics-server-cert.pem` / `metrics-server-key.pem`: TLS proxy cert
+/// - `metrics-client-cert.pem` / `metrics-client-key.pem`: operator client cert
 ///
 /// # Errors
 ///

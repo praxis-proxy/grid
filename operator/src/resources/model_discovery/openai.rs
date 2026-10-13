@@ -25,7 +25,7 @@ use crate::resources::{
 /// Maximum response body size, in bytes.
 ///
 /// vLLM entries carry `permission`, `root`, `parent`, and `max_model_len`,
-/// about 0.5–1 KiB each. 1 MiB leaves ~4 KiB per entry at the model cap.
+/// about 0.5 to 1 KiB each. 1 MiB leaves ~4 KiB per entry at the model cap.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// `Accept` header value for the model-listing request.

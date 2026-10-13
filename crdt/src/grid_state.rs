@@ -45,13 +45,13 @@ pub const MAX_TRACKED_TENANTS: usize = 1_024;
 /// compromised or churning origin repeatedly claiming new site identities
 /// could grow a single tenant's [`GCounter`] slot map without limit, since
 /// nothing currently removes a site's slot once recorded (dead-member
-/// eviction deliberately does not clear `tenant_spend` — see
+/// eviction deliberately does not clear `tenant_spend`; see
 /// [`GridStateSnapshot::remove_origin_tenant_spend`]'s doc comment).
 ///
 /// 256 is generous headroom for any real Grid deployment's site count (Grid's
 /// SWIM layer is documented to scale to 50,000+ nodes, but that bounds
 /// membership gossip fan-out, not the number of *distinct sites a customer
-/// actually deploys* — realistically tens, not thousands) while still
+/// actually deploys*, realistically tens, not thousands) while still
 /// bounding pathological/adversarial growth.
 pub const MAX_TENANT_SPEND_ORIGINS: usize = 256;
 
@@ -236,7 +236,7 @@ pub struct GridStateSnapshot {
     /// Each [`GCounter`] total is denominated in **cents** (`u64`) to keep
     /// the CRDT free of float-merge precision concerns; consumers convert to
     /// USD at the edge (see `operator::crd::grid_network::spend_ratio`).
-    /// This is a cross-site *visibility* signal only — Grid does not enforce
+    /// This is a cross-site *visibility* signal only; Grid does not enforce
     /// budget limits; that is a gateway-side policy-filter concern.
     ///
     /// `#[serde(default)]` so snapshots serialized before this field existed
@@ -302,8 +302,8 @@ impl GridStateSnapshot {
     ///
     /// This is the trust boundary for gossip ingest (called from
     /// `StateBroadcastHandler::receive_item`). Unlike [`merge_tenant_spend`]
-    /// — used for trusted full-snapshot-to-full-snapshot merges where every
-    /// slot is already locally attested — a single broadcast should only
+    /// (used for trusted full-snapshot-to-full-snapshot merges where every
+    /// slot is already locally attested), a single broadcast should only
     /// ever carry its own origin's contribution. Any other slot present in
     /// the payload is dropped rather than merged, so a compromised or buggy
     /// peer cannot forge another site's recorded spend by embedding extra
@@ -317,7 +317,7 @@ impl GridStateSnapshot {
     ///   origin's contribution to that tenant is silently refused.
     ///
     /// In both cases, already-tracked tenants/origins keep accepting
-    /// updates — only brand-new keys are refused at capacity — to bound
+    /// updates (only brand-new keys are refused at capacity) to bound
     /// memory growth from gossip carrying arbitrary attacker-supplied
     /// `tenant_id`s or an unbounded number of claimed origin identities.
     ///
@@ -1083,7 +1083,7 @@ mod tests {
     fn merge_tenant_spend_from_origin_drops_forged_foreign_slots() {
         // Security: a broadcast claiming origin "site-a" must not be able to
         // smuggle in an inflated slot for "site-b" and have it accepted as
-        // site-b's real contribution — that would let one compromised/buggy
+        // site-b's real contribution; that would let one compromised/buggy
         // peer forge another site's recorded spend mesh-wide.
         let mut local = GridStateSnapshot::new("site-local".to_owned());
         let mut forged = BTreeMap::new();
@@ -1110,7 +1110,7 @@ mod tests {
     #[test]
     fn merge_tenant_spend_from_origin_ignores_tenant_the_claimed_origin_never_contributed_to() {
         // The incoming counter carries only a foreign slot (no slot at all
-        // for the claimed origin) — after stripping the forged foreign slot
+        // for the claimed origin); after stripping the forged foreign slot
         // there is nothing genuine left to merge, so the tenant must not be
         // created locally at all (not even as a zero entry).
         let mut local = GridStateSnapshot::new("site-local".to_owned());

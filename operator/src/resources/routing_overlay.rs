@@ -144,7 +144,7 @@ pub(crate) fn routing_identity(provider: &InferenceProvider) -> Option<&str> {
 /// - `spec.backendKind` does not match any [`scoring::BackendKind`] variant (locality is the primary scoring signal;
 ///   unknown kinds cannot be ranked).
 ///
-/// The `BackendConfig` name is [`routing_identity`] — `spec.routingClusterRef`
+/// The `BackendConfig` name is [`routing_identity`]: `spec.routingClusterRef`
 /// if set, otherwise `metadata.name`.  Using the routing identity here ensures
 /// that score lookups in `render_routing_overlay` (which key on
 /// `candidate.cluster`, not `metadata.name`) resolve correctly.
@@ -387,7 +387,7 @@ pub(crate) fn projected_credential_from_provider(provider: &InferenceProvider) -
 /// preserved since their access patterns are provider-type properties,
 /// not site-local ones.
 ///
-/// The `endpoint` field is empty for remote CRDT providers — only the
+/// The `endpoint` field is empty for remote CRDT providers; only the
 /// scoring locality and metrics matter; the consumer gateway uses
 /// `routing_cluster` for connection, not the endpoint in the scoring record.
 pub(crate) fn remote_crdt_provider_to_backend_config(provider: &crdt::ProviderState) -> Option<scoring::BackendConfig> {
@@ -462,7 +462,7 @@ const NEUTRAL_LATENCY_MS: f64 = 2500.0;
 pub struct StaleCandidatePolicy {
     /// Maximum age (seconds) for a stale (`fresh=false`) candidate.
     ///
-    /// `None` means retain indefinitely — the conservative default until a
+    /// `None` means retain indefinitely, the conservative default until a
     /// product-level TTL setting is added.
     pub dead_member_ttl_secs: Option<u64>,
 }
@@ -473,8 +473,8 @@ pub struct StaleCandidatePolicy {
 ///
 /// | `spec.staleCandidateTtlSeconds` | `StaleCandidatePolicy.dead_member_ttl_secs` |
 /// |---|---|
-/// | `None` (absent) | `None` — retain indefinitely (default no-op) |
-/// | `Some(0)` | `None` — defensive guard; the CRD schema rejects `0` |
+/// | `None` (absent) | `None`: retain indefinitely (default no-op) |
+/// | `Some(0)` | `None`: defensive guard; the CRD schema rejects `0` |
 /// | `Some(n)` where `n >= 1` | `Some(n as u64)` |
 ///
 /// # Pure function
@@ -541,7 +541,7 @@ pub(crate) fn should_retain_candidate(fresh: bool, dead_age_secs: Option<u64>, p
 /// SWIM runtime after the age-tracking fix).  Returns `None` when:
 /// - The site is not in the snapshot (unknown peer).
 /// - The member is `Alive` (no stale age relevant to GC).
-/// - `age_secs` is `0` — conservatively treated as "age unknown" so stale candidates are not evicted during the first
+/// - `age_secs` is `0`, conservatively treated as "age unknown" so stale candidates are not evicted during the first
 ///   sub-second after transition or when a synthetic snapshot lacks age data.
 ///
 /// This is the bridge between the SWIM membership snapshot and the
@@ -552,7 +552,7 @@ pub(crate) fn dead_or_suspect_age_secs(site_id: &str, membership: Option<&Member
     match member.status {
         MemberStatus::Dead | MemberStatus::Suspect => {
             // age_secs=0 means the transition is sub-second or the snapshot lacks
-            // real runtime age data — retain conservatively.
+            // real runtime age data, so retain conservatively.
             (member.age_secs > 0).then_some(member.age_secs)
         },
         MemberStatus::Alive => None,
@@ -571,7 +571,7 @@ pub(crate) fn dead_or_suspect_age_secs(site_id: &str, membership: Option<&Member
 /// CRDT storage.
 ///
 /// When `policy.dead_member_ttl_secs` is `None` (the current default), this
-/// function is a no-op — all providers are retained regardless of age.
+/// function is a no-op: all providers are retained regardless of age.
 pub(crate) fn apply_stale_gc_filter(
     providers: &[crdt::ProviderState],
     membership: Option<&MembershipSnapshot>,
@@ -630,7 +630,7 @@ fn unmapped_provider_breakdown(backend_kind: &str, weights: &scoring::ScoringWei
 /// skipped.
 ///
 /// `Unavailable` providers are excluded (they are never emitted as candidates).
-/// All other phases — `Pending`, `Available`, `Degraded`, and absent status —
+/// All other phases (`Pending`, `Available`, `Degraded`, and absent status)
 /// are scored and included.  The `fresh` flag is set separately per candidate
 /// by [`is_candidate_fresh`] (local) or [`crdt_phase_to_fresh`] (remote).
 ///
@@ -687,7 +687,7 @@ fn provider_ordering_scores(
 /// When `metrics` is `Some`, each local provider whose name appears in the map
 /// receives live [`scoring::BackendMetrics`] via
 /// [`scoring::GridState::set_metrics`].  This is the integration seam for
-/// Prometheus-scraped data — pass `None` for static-only scoring.
+/// Prometheus-scraped data; pass `None` for static-only scoring.
 ///
 /// Remote CRDT providers receive their metrics from
 /// [`crdt_metrics_to_backend`], which applies neutral defaults for `None`
@@ -833,7 +833,7 @@ enum SiteResolution {
 
 /// A reference to a Kubernetes Secret holding a credential value.
 ///
-/// Contains only locating information — **never** the credential value itself.
+/// Contains only locating information, **never** the credential value itself.
 /// Safe to persist in a `ConfigMap`.  The xtask harness resolves the token
 /// from the referenced Secret; Praxis will eventually do this natively once
 /// native Secret-ref support lands in the `intelligent_route` filter.
@@ -914,7 +914,7 @@ pub struct RoutingCandidate {
     /// Credential reference projected by the operator, when `spec.auth`
     /// declares a bearer-token strategy.
     ///
-    /// Contains only the Secret reference — **never** the token value.
+    /// Contains only the Secret reference, **never** the token value.
     /// The xtask harness resolves the token from the Secret at config-generation
     /// time.  Praxis will eventually consume this reference natively.
     ///
@@ -1056,7 +1056,7 @@ fn build_admission_map(
 /// Enrich candidates with stable ID, locality tier, and admission state.
 ///
 /// Must be called before sorting so the sort comparator can use the
-/// enriched fields.  Rank is **not** assigned here — it depends on the
+/// enriched fields.  Rank is **not** assigned here; it depends on the
 /// final post-sort position.
 fn enrich_candidates(
     candidates: &mut [RoutingCandidate],
@@ -1236,7 +1236,7 @@ fn assign_selection_groups(candidates: &mut [RoutingCandidate], policy: crate::c
 /// `/metrics` endpoints.  When `Some`, providers present in the map receive
 /// live signal data (queue depth, KV-cache utilisation, latency P99,
 /// prefix-cache hit ratio) that shifts their scores relative to equal-locality
-/// peers.  When `None`, scoring uses locality and cost only — identical to the
+/// peers.  When `None`, scoring uses locality and cost only, identical to the
 /// static path.
 ///
 /// # Metric wiring
@@ -1246,7 +1246,7 @@ fn assign_selection_groups(candidates: &mut [RoutingCandidate], policy: crate::c
 /// without `metricsConfig` are omitted from the map and score on static
 /// signals only.
 ///
-/// Exact duplicates — same `(kind, name, site, cluster)` — are removed.
+/// Exact duplicates (same `(kind, name, site, cluster)`) are removed.
 /// Two providers that serve the same model on the same site but with
 /// different cluster identifiers are **not** deduplicated.
 ///
@@ -1688,7 +1688,7 @@ fn collect_tool_candidates(
 ///
 /// Returns [`SiteResolution::Unavailable`] when no site inventory exists,
 /// which enables the Phase 1 provider-name fallback.  Returns
-/// [`SiteResolution::Known`] otherwise — with an empty `Vec` if the
+/// [`SiteResolution::Known`] otherwise, with an empty `Vec` if the
 /// selector matched nothing, which suppresses candidate generation.
 ///
 /// An empty selector means the site that owns the provider alone, when the inventory
@@ -1735,7 +1735,7 @@ fn resolve_sites(provider: &InferenceProvider, network_sites: &[&GridSite], owni
 ///   self-hosted fallback).
 /// - [`SiteResolution::Known`] with a non-empty list: one candidate per `(model, site)` pair.
 /// - [`SiteResolution::Known`] with an empty list: the provider's selector matched no sites; **no candidates are
-///   emitted**.  This is distinct from `Unavailable` — it means the inventory exists but excluded this provider.
+///   emitted**.  This is distinct from `Unavailable`: it means the inventory exists but excluded this provider.
 ///
 /// # Errors
 ///
@@ -1823,7 +1823,7 @@ fn candidates_from_provider(
 /// [`ProviderPhase::Unavailable`].
 ///
 /// Absent status (no [`InferenceProvider`] controller yet), `Pending`,
-/// `Available`, and `Degraded` all return `false` — the provider is
+/// `Available`, and `Degraded` all return `false`, so the provider is
 /// included in the overlay.  This conservative default ensures that
 /// providers are visible before OP-02 populates their status.  The
 /// OP-02 `InferenceProvider` controller can tighten this policy once
@@ -1903,7 +1903,7 @@ fn resolve_tool_provider_sites<'prov>(
 /// | `Pending` | yes | `true` |
 /// | absent status | yes | `true` |
 /// | `Degraded` | yes | **`false`** |
-/// | `Unavailable` | no | — (excluded before this is called) |
+/// | `Unavailable` | no | n/a (excluded before this is called) |
 ///
 /// `Degraded` means the provider is reachable but partially unhealthy
 /// (e.g. high error rate, endpoint returning errors). Including it with
@@ -1913,7 +1913,7 @@ fn resolve_tool_provider_sites<'prov>(
 /// Absent status uses `true` as the conservative default so that
 /// providers are visible before OP-02 has populated their status.
 ///
-/// `Unavailable` providers never reach this function — they are excluded
+/// `Unavailable` providers never reach this function; they are excluded
 /// by [`is_explicitly_unavailable`] before candidates are generated.
 ///
 /// [`InferenceProvider`]: crate::crd::inference_provider::InferenceProvider
@@ -2513,7 +2513,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // provider_to_backend_config — mapping function
+    // provider_to_backend_config: mapping function
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2670,8 +2670,8 @@ mod tests {
     // -----------------------------------------------------------------------
     // Scoring-engine-backed ordering (OP-05c-a)
     //
-    // These tests pass `ScoringWeights::default()` — the scoring crate's
-    // legacy combined defaults (locality=3, queue=3, kv=2, …). They verify
+    // These tests pass `ScoringWeights::default()`, the scoring crate's
+    // legacy combined defaults (locality=3, queue=3, kv=2, ...). They verify
     // overlay rendering mechanics (sort stability, admission, locality tiers)
     // against the full six-signal surface. Production deploys use
     // `resolve_scoring_weights(policy)`, which returns strategy-selected
@@ -2853,7 +2853,7 @@ mod tests {
     #[test]
     fn score_ordered_with_network_region_does_not_break() {
         // Network region is threaded into score_backends. With provider regions always
-        // None (not in CRD), remote providers still score 0.5 regardless — but the
+        // None (not in CRD), remote providers still score 0.5 regardless, but the
         // call must not panic or produce wrong results.
         let network = test_network_with_region("net", "eu-west-1");
         let local = test_provider_with_backend_kind("local-prov", "net", "local");
@@ -2885,11 +2885,11 @@ mod tests {
     // local with API fallback, and the full four-kind candidate set.
     //
     // Praxis `intelligent_route` candidate contract (current wire format):
-    //   kind     — always "inference_model" for inference providers
-    //   name     — model name (used for model-based routing)
-    //   site     — site identifier (= provider name in Phase 1 no-site mode)
-    //   cluster  — Praxis load_balancer cluster name (= provider name)
-    //   fresh    — false when provider is Degraded; Praxis applies staleness penalty
+    //   kind:      always "inference_model" for inference providers
+    //   name:      model name (used for model-based routing)
+    //   site:      site identifier (= provider name in Phase 1 no-site mode)
+    //   cluster:   Praxis load_balancer cluster name (= provider name)
+    //   fresh:     false when provider is Degraded; Praxis applies staleness penalty
     //
     // Note: `endpoint` is NOT part of the candidate struct.  The cluster name is
     // the reference Praxis uses to look up the backend endpoint in its cluster
@@ -3058,7 +3058,7 @@ mod tests {
 
     #[test]
     fn all_four_backend_kinds_in_overlay_with_correct_order() {
-        // A network with one provider of each backend kind. No live metrics —
+        // A network with one provider of each backend kind. No live metrics;
         // ordering is driven entirely by locality score through the scoring
         // engine. Validates the full four-kind candidate set shape.
         let network = test_network("full-net");
@@ -3102,7 +3102,7 @@ mod tests {
         let network = test_network("recovery-net");
         let api_always_available = test_provider_with_backend_kind("prov-api", "recovery-net", "api_provider");
 
-        // Cycle 1: local is down — only API candidate.
+        // Cycle 1: local is down, only API candidate.
         let local_down =
             test_provider_with_backend_kind_and_phase("prov-local", "recovery-net", "local", "Unavailable");
         let overlay1 = render_routing_overlay(
@@ -3128,7 +3128,7 @@ mod tests {
             "API must be the only candidate when local is down"
         );
 
-        // Cycle 2: local is back — both candidates, local ranks first.
+        // Cycle 2: local is back, both candidates, local ranks first.
         let local_up = test_provider_with_backend_kind_and_phase("prov-local", "recovery-net", "local", "Available");
         let overlay2 = render_routing_overlay(
             &network,
@@ -3186,7 +3186,7 @@ mod tests {
         // `intelligent_route` filter reads from each candidate entry.
         //
         // Current candidate wire format: kind, name, site, cluster, fresh.
-        // `endpoint` is NOT in the candidate — Praxis looks up the backend
+        // `endpoint` is NOT in the candidate; Praxis looks up the backend
         // endpoint via the `cluster` name in its own load_balancer config.
         let network = test_network("json-net");
         let local_prov = test_provider_with_backend_kind("prov-a", "json-net", "local");
@@ -3234,7 +3234,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // backend_locality_score — pure mapping function
+    // backend_locality_score: pure mapping function
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3779,7 +3779,7 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort());
         assert!(
             overlay.candidates.is_empty(),
-            "selector matched nothing in a known site inventory — must emit no candidates"
+            "selector matched nothing in a known site inventory: must emit no candidates"
         );
     }
 
@@ -3838,7 +3838,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // is_candidate_fresh — pure freshness decision function
+    // is_candidate_fresh: pure freshness decision function
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3871,11 +3871,11 @@ mod tests {
         );
     }
 
-    // Unavailable is excluded before is_candidate_fresh is called — no test
+    // Unavailable is excluded before is_candidate_fresh is called; no test
     // for Unavailable freshness, as it never reaches this function.
 
     // -----------------------------------------------------------------------
-    // Provider status filtering — inclusion and fresh flag
+    // Provider status filtering: inclusion and fresh flag
     // -----------------------------------------------------------------------
 
     #[test]
@@ -4027,7 +4027,7 @@ mod tests {
 
     #[test]
     fn mixed_phases_produce_correct_fresh_values() {
-        // Available + Degraded in the same network — each candidate's fresh
+        // Available + Degraded in the same network; each candidate's fresh
         // reflects its provider's phase independently.
         let network = test_network("net");
         let available = test_provider_with_phase("avail-prov", "net", &["model-a"], "Available");
@@ -4121,13 +4121,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Stale-candidate ordering — fresh=true before fresh=false
+    // Stale-candidate ordering: fresh=true before fresh=false
     // -----------------------------------------------------------------------
 
     #[test]
     fn fresh_true_sorts_before_fresh_false_same_score_same_model() {
         // Two providers with the same backend kind (equal locality score, no metrics)
-        // serving the same model — one healthy (Available), one stale (Degraded).
+        // serving the same model, one healthy (Available), one stale (Degraded).
         // The fresh=true candidate must appear before the fresh=false one.
         let network = test_network("net");
         // test_provider uses backendKind=local for both → equal locality scores.
@@ -4165,7 +4165,7 @@ mod tests {
 
     #[test]
     fn stale_candidate_retained_not_excluded_by_sort() {
-        // Degraded provider (fresh=false) must remain in the overlay — it is kept for
+        // Degraded provider (fresh=false) must remain in the overlay; it is kept for
         // observability and as a last-resort fallback when no healthy alternative exists.
         let network = test_network("net");
         let stale = test_provider_with_phase("stale-prov", "net", &["model-x"], "Degraded");
@@ -4274,7 +4274,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ConfigMap builder — fallible serialization
+    // ConfigMap builder: fallible serialization
     // -----------------------------------------------------------------------
 
     #[test]
@@ -4370,7 +4370,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ConfigMap name — collision safety
+    // ConfigMap name: collision safety
     // -----------------------------------------------------------------------
 
     #[test]
@@ -4532,7 +4532,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Error paths — missing names (items 14–15 per coverage policy)
+    // Error paths: missing names (items 14-15 per coverage policy)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -4594,7 +4594,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_grid_state_with_metrics — integration seam for live metrics
+    // build_grid_state_with_metrics: integration seam for live metrics
     // -----------------------------------------------------------------------
 
     #[test]
@@ -4664,7 +4664,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // noMetrics strategy — overlay rendering with production default weights
+    // noMetrics strategy: overlay rendering with production default weights
     //
     // Weight resolution itself is tested in crd::grid_network::tests.
     // These tests verify overlay-level behavior: that zero weights produce
@@ -4904,7 +4904,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // render_routing_overlay metrics path — end-to-end ordering proofs
+    // render_routing_overlay metrics path: end-to-end ordering proofs
     // -----------------------------------------------------------------------
 
     #[test]
@@ -4999,7 +4999,7 @@ mod tests {
     fn render_with_provider_absent_from_metrics_map_falls_back_safely() {
         // A provider that is not present in the metrics map must not panic and must
         // still appear in the overlay.  It receives a neutral score from
-        // unmapped_provider_score — on the same scale as scored providers.
+        // unmapped_provider_score, on the same scale as scored providers.
         let known = test_provider_with_backend_kind("known-prov", "net", "local");
         let unmapped = test_provider_with_backend_kind("unmapped-prov", "net", "local");
         let network = test_network("net");
@@ -5073,7 +5073,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Score-driven routing algorithm — sort order proofs
+    // Score-driven routing algorithm: sort order proofs
     // -----------------------------------------------------------------------
 
     #[test]
@@ -5259,7 +5259,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Routing policy — backward compatibility and serialization
+    // Routing policy: backward compatibility and serialization
     // -----------------------------------------------------------------------
 
     #[test]
@@ -5348,7 +5348,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // routing_cluster_ref — overlay identity override
+    // routing_cluster_ref: overlay identity override
     // -----------------------------------------------------------------------
 
     fn test_provider_with_routing_cluster_ref(
@@ -5651,7 +5651,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // crdt_phase_to_fresh — pure mapping function
+    // crdt_phase_to_fresh: pure mapping function
     // -----------------------------------------------------------------------
 
     #[test]
@@ -5690,7 +5690,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // remote_crdt_provider_to_candidates — candidate generation
+    // remote_crdt_provider_to_candidates: candidate generation
     // -----------------------------------------------------------------------
 
     fn make_crdt_provider(
@@ -5752,7 +5752,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // remote_crdt_provider_to_backend_config — BackendConfig generation
+    // remote_crdt_provider_to_backend_config: BackendConfig generation
     // -----------------------------------------------------------------------
 
     #[test]
@@ -5805,7 +5805,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // crdt_metrics_to_backend — metrics mapping
+    // crdt_metrics_to_backend: metrics mapping
     // -----------------------------------------------------------------------
 
     #[test]
@@ -5932,7 +5932,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // render_routing_overlay integration — remote CRDT providers
+    // render_routing_overlay integration: remote CRDT providers
     // -----------------------------------------------------------------------
 
     #[test]
@@ -5999,7 +5999,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Credential projection — projected_credential_from_provider
+    // Credential projection: projected_credential_from_provider
     // -----------------------------------------------------------------------
 
     fn test_provider_with_bearer_auth(name: &str, network: &str) -> InferenceProvider {
@@ -6220,7 +6220,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // stale_policy_from_spec — spec field to policy conversion
+    // stale_policy_from_spec: spec field to policy conversion
     // -----------------------------------------------------------------------
 
     #[test]
@@ -6275,7 +6275,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // dead_or_suspect_age_secs — SWIM age extraction
+    // dead_or_suspect_age_secs: SWIM age extraction
     // -----------------------------------------------------------------------
 
     fn make_member(site_id: &str, status: MemberStatus, age_secs: u64) -> crate::swim::MemberRecord {
@@ -6342,7 +6342,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // apply_stale_gc_filter — overlay-level expiry
+    // apply_stale_gc_filter: overlay-level expiry
     // -----------------------------------------------------------------------
 
     fn make_crdt_available(site_id: &str) -> crdt::ProviderState {
@@ -6445,7 +6445,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // should_retain_candidate — stale candidate GC policy
+    // should_retain_candidate: stale candidate GC policy
     // -----------------------------------------------------------------------
 
     #[test]

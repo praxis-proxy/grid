@@ -53,8 +53,8 @@ const NAMESPACE: &str = "default";
 /// Kubernetes Deployment and Service name for the mock MCP `tools/list` server.
 ///
 /// Deployed as a real in-cluster Service (not a locally-spawned process) so
-/// that `AgentToolProvider`'s SSRF-hardened probe — which deliberately
-/// blocks loopback/link-local targets, unlike `GridSite`'s gateway probe —
+/// that `AgentToolProvider`'s SSRF-hardened probe (which deliberately
+/// blocks loopback/link-local targets, unlike `GridSite`'s gateway probe)
 /// has a legitimate, non-blocked address to discover tools from. See
 /// `cargo xtask env verify-agenttoolprovider-convergence`.
 pub(crate) const MOCK_MCP_SVC: &str = "mock-mcp-server";
@@ -506,7 +506,7 @@ spec:
 
 /// Deploy the mock MCP `tools/list` server into `cluster_name`, reusing the
 /// same `grid-mock-providers` image as the AI-provider mocks (just a
-/// different `--mcp-server` CLI mode — see `mock-providers/src/mcp.rs`).
+/// different `--mcp-server` CLI mode; see `mock-providers/src/mcp.rs`).
 ///
 /// `tools_csv` and `required_bearer` are forwarded verbatim as the mock's
 /// `--mcp-tools`/`--mcp-bearer` arguments.
@@ -612,7 +612,7 @@ spec:
 ///
 /// `NodePort` (not `ClusterIP`): the `AgentToolProvider` E2E check spawns the
 /// operator as a local out-of-cluster process (see `spawn_operator`), which
-/// cannot resolve in-cluster `.svc` DNS names or reach `ClusterIP`s — only
+/// cannot resolve in-cluster `.svc` DNS names or reach `ClusterIP`s; only
 /// the kind node's `NodePort`-mapped address is reachable from the host. No
 /// `nodePort` is pinned; callers discover the assigned port via
 /// [`service_node_port`].

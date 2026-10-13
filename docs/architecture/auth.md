@@ -94,9 +94,9 @@ gateway is often also the final-hop gateway.
 
 The `InferenceProvider` controller validates credentials during every reconcile:
 
-- Parses `spec.auth` strategy — unsupported strategies immediately drive the
+- Parses `spec.auth` strategy; unsupported strategies immediately drive the
   provider phase to `Unavailable`.
-- Validates `spec.auth.secretRef` shape — blank or missing fields drive
+- Validates `spec.auth.secretRef` shape; blank or missing fields drive
   `Unavailable` before any API call.
 - Verifies the referenced Kubernetes Secret exists, contains the declared key,
   and the key value is valid UTF-8.
@@ -117,7 +117,7 @@ The `InferenceProvider` controller validates credentials during every reconcile:
 - **Credential reference projection into the routing overlay**: when a provider's
   `spec.auth` declares `strategy: bearer_token` with a valid `secretRef`, the
   operator includes a `credential` field in every routing candidate produced for
-  that provider. The field carries `{ strategy, secretRef: { name, namespace, key } }` —
+  that provider. The field carries `{ strategy, secretRef: { name, namespace, key } }`:
   only the Secret reference, never the token value. This appears in the
   operator-produced `routing-config.json` ConfigMap.
 
@@ -522,7 +522,7 @@ Active site to `Connecting`, while connection failures demote it to
 `Unreachable`; both phases exclude its CRDT providers from routing.
 
 Private keys are never broadcast.  The operator reads only the `tls.crt` key from
-the site certificate Secret — the `tls.key` key is never accessed for broadcast
+the site certificate Secret; the `tls.key` key is never accessed for broadcast
 purposes. The local operator reads its own `tls.key` only to authenticate the
 bounded mTLS health probe. The provider gateway separately enforces peer identity
 on every request.
@@ -543,7 +543,7 @@ provider-side authorization, which are enforced separately by the data plane.
 | **AGN Operator** | Validates provider credential `secretRef`; projects credential references (never token values) into routing overlays; can render opt-in consumer Praxis `ConfigMap`; generates local CA and site cert Secrets; marks `GridSite.status.phase = Active` after the configured identity-aware gateway probe succeeds. |
 | **Gateway filters** | `intelligent_route` selects candidates and writes credential metadata; `credential_inject` reads a mounted Secret file and injects credentials per request; `peer_identity_trust` verifies peer certificate identity on provider gateways. |
 | **Deployment / platform** | Provisions gateway trust material (CA cert or cert bundle) at the path referenced by the consumer config's `ca_path`; distributes the Grid CA cert to remote clusters where gateways need to verify peer identity; configures the provider gateway's peer identity filter; manages gateway rollout when trust material changes. |
-| **Workload** | Sends requests to the Gateway, optionally with routing headers — never handles provider credentials. |
+| **Workload** | Sends requests to the Gateway, optionally with routing headers; never handles provider credentials. |
 
 `Active` GridSite status is the control-plane eligibility gate: it controls whether a remote
 site's providers appear in the routing overlay. Active means the control plane has enough

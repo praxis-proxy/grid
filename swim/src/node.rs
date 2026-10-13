@@ -1,7 +1,7 @@
 //! High-level SWIM node wrapping a [`foca::Foca`] instance.
 //!
-//! [`SwimNode`] encapsulates foca internals — codec, RNG, broadcast handler,
-//! and the [`GridRuntime`] adapter — so callers interact only with Grid-specific
+//! [`SwimNode`] encapsulates foca internals (codec, RNG, broadcast handler,
+//! and the [`GridRuntime`] adapter) so callers interact only with Grid-specific
 //! types: [`AccumulatedOutput`], [`MemberEvent`], and `GridStateSnapshot`.
 //!
 //! The runtime is **not** thread-safe; run the node from a single task and pass
@@ -227,7 +227,7 @@ impl SwimNode {
     ///
     /// If `origin` has no existing pin (or its existing pin is empty),
     /// immediately purges any state already merged from that origin via
-    /// [`evict_origin`](Self::evict_origin) before installing the new pin —
+    /// [`evict_origin`](Self::evict_origin) before installing the new pin,
     /// so state accepted from `origin` while it was unauthenticated cannot
     /// silently remain trusted once signature enforcement begins for it.
     /// Updating an *existing* non-empty pin (e.g. adding a next key during
@@ -259,7 +259,7 @@ impl SwimNode {
 
     /// Remove `origin`'s pin, returning it to unenforced (pass-through) status.
     ///
-    /// Does not purge `origin`'s currently merged state — unpinning is a
+    /// Does not purge `origin`'s currently merged state; unpinning is a
     /// deliberate relaxation, not a security event, and the state was
     /// already accepted under whatever enforcement applied when it arrived.
     pub fn unpin_origin(&self, origin: &str) {
@@ -309,7 +309,7 @@ impl SwimNode {
     /// Announce this node to a known peer, requesting membership inclusion.
     ///
     /// Any pending CRDT state broadcasts are piggybacked on the announce probe
-    /// message — call [`publish_state_broadcast`] before announcing to a new
+    /// message; call [`publish_state_broadcast`] before announcing to a new
     /// peer to propagate state eagerly.
     ///
     /// [`publish_state_broadcast`]: SwimNode::publish_state_broadcast
@@ -322,8 +322,8 @@ impl SwimNode {
 
     /// Trigger an explicit gossip round.
     ///
-    /// foca sends membership updates — including any queued CRDT state broadcasts
-    /// — to a random subset of known members.  Call this after
+    /// foca sends membership updates (including any queued CRDT state broadcasts)
+    /// to a random subset of known members.  Call this after
     /// [`publish_state_broadcast`] to propagate state without waiting for a
     /// periodic probe timer.
     ///
@@ -388,7 +388,7 @@ impl SwimNode {
     /// Return the current merged CRDT grid-state snapshot.
     ///
     /// The snapshot is updated each time a [`StateBroadcast`] is received from
-    /// a peer.  Reading is non-blocking — the value is cloned from a watch channel
+    /// a peer.  Reading is non-blocking; the value is cloned from a watch channel
     /// maintained by the internal [`StateBroadcastHandler`].
     #[must_use]
     pub fn state_snapshot(&self) -> GridStateSnapshot {
@@ -406,7 +406,7 @@ impl SwimNode {
 
     /// Return the current public site certificate PEM map from all received broadcasts.
     ///
-    /// Keyed by origin site name.  Contains only public certificate material —
+    /// Keyed by origin site name.  Contains only public certificate material,
     /// never private keys.  Updated whenever a broadcast carrying a
     /// `site_cert_pem` extension is received from a peer.
     #[must_use]
@@ -892,7 +892,7 @@ mod tests {
             from_b.extend(ob.messages);
         }
 
-        // A processes B's responses (receives ALIVE — B is now in A's member list).
+        // A processes B's responses (receives ALIVE; B is now in A's member list).
         for msg in &from_b {
             if msg.addr == id_a.socket_addr() {
                 let oa = node_a.handle_data(&msg.data);
@@ -935,7 +935,7 @@ mod tests {
     /// Flow:
     /// 1. Establish bidirectional SWIM membership (announce + ALIVE exchange).
     /// 2. A publishes a `StateBroadcast` (queued in foca's custom broadcast backlog).
-    /// 3. A calls `gossip()` — foca includes queued broadcasts in the gossip message.
+    /// 3. A calls `gossip()`, and foca includes queued broadcasts in the gossip message.
     /// 4. B processes the gossip message → `StateBroadcastHandler::receive_item` fires.
     /// 5. B's `state_snapshot()` reflects A's CRDT state.
     #[test]
@@ -958,7 +958,7 @@ mod tests {
             .publish_state_broadcast(&bc)
             .unwrap_or_else(|_| std::process::abort());
 
-        // Step 3: gossip from A — the pending broadcast is piggybacked.
+        // Step 3: gossip from A; the pending broadcast is piggybacked.
         let out_gossip = node_a.gossip();
         assert!(
             !out_gossip.messages.is_empty(),
@@ -1080,7 +1080,7 @@ mod tests {
             "B should have queue_depth=0.1 from rev=2"
         );
 
-        // Send rev=1 (stale) — B must reject it.
+        // Send rev=1 (stale); B must reject it.
         node_a
             .publish_state_broadcast(&StateBroadcast::new(
                 "site-a".to_owned(),
@@ -1128,7 +1128,7 @@ mod tests {
         }
         let before = node_b.state_snapshot();
 
-        // Feed a garbage packet — foca parses it, the handler decode fails gracefully.
+        // Feed a garbage packet; foca parses it, the handler decode fails gracefully.
         drop(node_b.handle_data(b"totally-invalid-foca-packet-garbage"));
 
         let after = node_b.state_snapshot();
@@ -1203,7 +1203,7 @@ mod tests {
     #[test]
     #[expect(
         clippy::too_many_lines,
-        reason = "establishes two independent memberships (A–C and B–C), gossips from each, verifies merged state"
+        reason = "establishes two independent memberships (A-C and B-C), gossips from each, verifies merged state"
     )]
     fn two_independent_origins_merge_correctly_at_receiver() {
         let id_a = local_id("site-a", 19_207);
@@ -1213,7 +1213,7 @@ mod tests {
         let (mut node_b, _) = make_node("site-b", 19_208);
         let (mut node_c, _) = make_node("site-c", 19_209);
 
-        // Establish A–C and B–C membership.
+        // Establish A-C and B-C membership.
         establish_membership(&mut node_a, &mut node_c, &id_a, &id_c);
         establish_membership(&mut node_b, &mut node_c, &id_b, &id_c);
 
@@ -1265,7 +1265,7 @@ mod tests {
     /// Compute a spend increment in cents from a real product cost field
     /// ([`scoring::BackendConfig::cost_per_1k_input`], mirrored here without a
     /// crate dependency to keep `swim` free of the `scoring` crate) and a
-    /// request's input token count — the same unit conversion
+    /// request's input token count, the same unit conversion
     /// `operator::crd::grid_network::spend_ratio` expects on the read side.
     fn cost_cents_for_request(cost_per_1k_input_usd: f64, input_tokens: u64) -> u64 {
         #[expect(

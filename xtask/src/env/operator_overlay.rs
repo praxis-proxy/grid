@@ -1,7 +1,7 @@
 //! Operator overlay wire-format parsing and routing config generation.
 //!
 //! This module is deliberately **self-contained**. It does not import from
-//! the `operator` crate — the `routing-config.json` JSON format is the contract
+//! the `operator` crate; the `routing-config.json` JSON format is the contract
 //! boundary between a routing overlay producer and the xtask test harness.
 //!
 //! # Wire format
@@ -61,7 +61,7 @@ pub(crate) struct RoutingOverlay {
 /// A reference to a Kubernetes Secret holding a credential value.
 ///
 /// Mirrors `operator::resources::routing_overlay::ProjectedCredentialRef`.
-/// Contains only the Secret locating information — never the token value.
+/// Contains only the Secret locating information, never the token value.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProjectedCredentialRef {
@@ -124,7 +124,7 @@ pub(crate) struct RoutingCandidate {
     /// Upstream cluster identifier supplied by the overlay.
     ///
     /// Validated to be non-blank by [`validate_overlay`].  Not used directly
-    /// in YAML generation — the xtask maps candidates to `gateway-{site}` to
+    /// in YAML generation; the xtask maps candidates to `gateway-{site}` to
     /// match the generated `load_balancer` cluster names.
     pub(crate) cluster: String,
 
@@ -179,7 +179,7 @@ pub(crate) enum OverlayError {
     BlankField(&'static str),
 
     /// The candidate kind is not `"inference_model"`.
-    #[error("unknown candidate kind {0:?} — only \"inference_model\" is supported")]
+    #[error("unknown candidate kind {0:?}; only \"inference_model\" is supported")]
     UnknownKind(String),
 }
 
@@ -244,7 +244,7 @@ fn validate_overlay(overlay: &RoutingOverlay) -> Result<(), OverlayError> {
 ///
 /// Each candidate produces five YAML lines indented to match the surrounding
 /// Praxis config structure.  The cluster reference is `gateway-{site}` rather
-/// than `candidate.cluster` — see module-level docs for the naming convention.
+/// than `candidate.cluster`; see module-level docs for the naming convention.
 ///
 /// Returns an empty string when the overlay has no candidates.
 pub(crate) fn candidates_yaml(overlay: &RoutingOverlay) -> String {
@@ -258,7 +258,7 @@ pub(crate) fn candidates_yaml(overlay: &RoutingOverlay) -> String {
 /// emitted so that a downstream `credential_inject` filter can read it
 /// from `intelligent_route.credential.*` filter metadata and inject the bearer token.
 ///
-/// Token values are **never** emitted — only the secretRef `name`,
+/// Token values are **never** emitted, only the secretRef `name`,
 /// `namespace`, and `key` fields that locate the Kubernetes Secret.
 ///
 /// # Intended config shape
@@ -685,7 +685,7 @@ mod tests {
             "secretRef.namespace must appear"
         );
         assert!(yaml.contains("key: token"), "secretRef.key must appear");
-        // Token is never emitted — only the reference that locates the Secret.
+        // Token is never emitted, only the reference that locates the Secret.
         assert!(!yaml.contains("sk-"), "token value must never appear in YAML");
         assert!(!yaml.contains("Bearer"), "token prefix must never appear in YAML");
     }

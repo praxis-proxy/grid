@@ -22,7 +22,7 @@ west-a cluster                         west-b cluster
 Provider credentials are mounted only in the provider gateway Deployment.
 Consumer and provider gateways use separate TLS Secrets and separate
 ConfigMaps. Colocation on the same cluster does not collapse the trust
-boundary — Kubernetes RBAC and separate ServiceAccount mounts enforce
+boundary; Kubernetes RBAC and separate ServiceAccount mounts enforce
 isolation.
 
 ## Values files
@@ -58,7 +58,7 @@ With per-site overrides (values files are applied after example defaults):
   --site-values east-a:consumer:/path/to/consumer-overrides.yaml
 ```
 
-Or install manually per site. **Order matters** — CRs and mock
+Or install manually per site. **Order matters**: CRs and mock
 backends must exist before the operator can produce the overlay
 that the consumer mounts:
 

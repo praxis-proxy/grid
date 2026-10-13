@@ -302,7 +302,7 @@ fn compute_raw_semantic_digest(overlay: &serde_json::Value) -> Result<String, St
 /// Compute the SHA-256 digest of the RFC 8785 canonical semantic payload.
 ///
 /// The semantic payload includes `network`, `local_site`, and `candidates`,
-/// plus `selection_policy` when present — the same fields used by the
+/// plus `selection_policy` when present, the same fields used by the
 /// operator.
 #[cfg(test)]
 fn compute_semantic_digest(overlay: &RoutingOverlay) -> Result<String, serde_json::Error> {

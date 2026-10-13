@@ -91,7 +91,7 @@ const DATA_PLANE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 /// 250-300/sec on helios08, so any window long enough to observe a handful of
 /// reconcile ticks (the operator's default requeue is much faster than that
 /// under active SWIM traffic) is enough to distinguish "stopped writing" from
-/// "still churning" — 15s is comfortably longer than that while keeping the
+/// "still churning"; 15s is comfortably longer than that while keeping the
 /// added proof step fast.
 const OVERLAY_SETTLE_WINDOW: Duration = Duration::from_secs(15);
 
@@ -592,7 +592,7 @@ fn append_openai_edge_config(
 
 /// Write a credential file with trailing CR/LF stripped to a temporary file.
 ///
-/// Returns the [`tempfile::NamedTempFile`] handle — the caller must keep it alive until
+/// Returns the [`tempfile::NamedTempFile`] handle; the caller must keep it alive until
 /// the file is no longer needed (e.g., until `kubectl` finishes reading it).
 fn write_trimmed_credential(key_file: &Path) -> Result<tempfile::NamedTempFile, Box<dyn std::error::Error>> {
     let content = fs::read(key_file).map_err(|e| format!("cannot read key file: {e}"))?;
@@ -1063,7 +1063,7 @@ pub(crate) fn verify_grid_routing_with_mode(
         let blocked_count = results.iter().filter(|r| r.status == StepStatus::Blocked).count();
         Err(format!(
             "grid-routing: {fail_count} FAIL, {blocked_count} BLOCKED \
-             — routing and provider-boundary proof incomplete"
+             (routing and provider-boundary proof incomplete)"
         )
         .into())
     } else {
@@ -1122,7 +1122,7 @@ fn check_no_latest_images(config_text: &str, forge_config: &Path) -> Result<(), 
     if !latest_images.is_empty() {
         report_latest_images(&latest_images);
         return Err(format!(
-            "{} service(s) use :latest — GLB demo requires pinned tags",
+            "{} service(s) use :latest; GLB demo requires pinned tags",
             latest_images.len()
         )
         .into());
@@ -1135,7 +1135,7 @@ fn check_no_latest_images(config_text: &str, forge_config: &Path) -> Result<(), 
     if !resource_latest.is_empty() {
         report_latest_resources(&resource_latest);
         return Err(format!(
-            "{} resource file(s) use :latest — GLB demo requires pinned tags",
+            "{} resource file(s) use :latest; GLB demo requires pinned tags",
             resource_latest.len()
         )
         .into());
@@ -1156,7 +1156,7 @@ fn report_prereq_errors(errors: &[String]) {
 fn warn_placeholder_images(placeholders: &[(String, String)]) {
     eprintln!();
     for (svc, img) in placeholders {
-        eprintln!("  WARNING: service '{svc}' uses placeholder image '{img}' — runtime assertions will be BLOCKED");
+        eprintln!("  WARNING: service '{svc}' uses placeholder image '{img}'; runtime assertions will be BLOCKED");
     }
     eprintln!();
 }
@@ -1435,7 +1435,7 @@ fn run_steps(ctx: &PrereqContext, mode: DemoMode, ingress_mode: IngressMode, res
     proof_banner("checking GridNetwork seeds");
     record_step("gridnetwork seeds", results, check_gridnetwork_seeds);
 
-    // Overlay metadata — waits for the operator status and ConfigMap
+    // Overlay metadata: waits for the operator status and ConfigMap
     // resourceVersions to converge after concurrent reconciliation.
     proof_banner("checking overlay candidate metadata");
     record_step("overlay metadata", results, || {
@@ -1611,7 +1611,7 @@ fn run_steps(ctx: &PrereqContext, mode: DemoMode, ingress_mode: IngressMode, res
         return;
     }
 
-    // Provider withdrawal drain — withdraw the provider and verify new sessions avoid it.
+    // Provider withdrawal drain: withdraw the provider and verify new sessions avoid it.
     proof_banner("withdrawing provider to verify drain routing");
     let drain_withdrawal = match withdraw_provider(PRIMARY_EDGE, &provider_a) {
         Ok((evidence, state)) => {
@@ -1625,7 +1625,7 @@ fn run_steps(ctx: &PrereqContext, mode: DemoMode, ingress_mode: IngressMode, res
         },
     };
 
-    // Drain routing verification — new sessions must avoid the withdrawn provider.
+    // Drain routing verification: new sessions must avoid the withdrawn provider.
     proof_banner("checking drain routing");
     let drain_proof = verify_new_sessions_avoid_provider(EDGE_PORT, &provider_a, 6);
     let drain_restore = restore_withdrawn_provider(PRIMARY_EDGE, &drain_withdrawal);
@@ -2080,7 +2080,7 @@ fn delete_probe_pod(context: &str, name: &str) {
 /// Run a bounded TCP probe pod and return its terminal phase and logs.
 #[expect(
     clippy::too_many_lines,
-    reason = "kubectl pod lifecycle: create, poll, collect logs — splitting obscures the sequence"
+    reason = "kubectl pod lifecycle: create, poll, collect logs; splitting obscures the sequence"
 )]
 #[expect(
     clippy::disallowed_methods,
@@ -2788,17 +2788,17 @@ fn check_overlay_metadata() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 /// Regression guard for [grid#42](https://github.com/praxis-proxy/grid/issues/42): an infinite
-/// reconcile hot-loop with three independent unconditional-write sources —
+/// reconcile hot-loop with three independent unconditional-write sources:
 /// `distribute_overlay_configmap`'s overlay `ConfigMap` apply, the `GridSite`
 /// cert-PEM status patch, and (discovered during live helios08 validation of
 /// the first two fixes) the `GridNetwork`'s own `status.overlayStatus[].renderedAt`
 /// timestamp, which was refreshed from a new clock read on every reconcile
 /// tick regardless of whether the distributed content actually changed.
 /// Each write bumped its object's `resourceVersion` and fired a watch event
-/// that re-triggered the `GridNetwork` reconciler — so the overlay
+/// that re-triggered the `GridNetwork` reconciler, so the overlay
 /// `ConfigMap`'s and/or the `GridNetwork`'s own `resourceVersion` climbed
 /// continuously (~250-300 writes/sec on the `ConfigMap`, ~13-14 writes/sec on
-/// `GridNetwork` itself, observed on helios08) and never settled —
+/// `GridNetwork` itself, observed on helios08) and never settled;
 /// [`check_overlay_metadata`]'s own resourceVersion-equality assertion would
 /// eventually see a match by chance, but the underlying churn never stopped.
 ///
@@ -2806,7 +2806,7 @@ fn check_overlay_metadata() -> Result<String, Box<dyn std::error::Error>> {
 /// its call site): this only proves stability, not initial correctness.
 /// Captures the `ConfigMap`'s and the `GridNetwork`'s current
 /// `resourceVersion`s and confirms both are unchanged after
-/// [`OVERLAY_SETTLE_WINDOW`] — proving the operator actually stopped
+/// [`OVERLAY_SETTLE_WINDOW`], proving the operator actually stopped
 /// writing to either object, rather than merely happening to observe
 /// equal resourceVersions mid-churn.
 fn check_overlay_metadata_settles() -> Result<String, Box<dyn std::error::Error>> {
@@ -2858,7 +2858,7 @@ impl WatchedResourceVersion {
     }
 
     /// Re-reads the live `resourceVersion` and errors if it moved away from
-    /// `baseline` — the observable signature of an unconditional-write
+    /// `baseline`, the observable signature of an unconditional-write
     /// reconcile hot-loop (grid#42).
     fn assert_unchanged(&self, context: &str) -> Result<(), Box<dyn std::error::Error>> {
         let current = kubectl_jsonpath(context, self.kind, self.name, "{.metadata.resourceVersion}")?;
@@ -2866,7 +2866,7 @@ impl WatchedResourceVersion {
         if current != *baseline {
             return Err(format!(
                 "{} {} resourceVersion changed from {baseline} to {current} within the \
-                 {OVERLAY_SETTLE_WINDOW:?} settle window — indicates an unconditional-write reconcile \
+                 {OVERLAY_SETTLE_WINDOW:?} settle window; indicates an unconditional-write reconcile \
                  hot-loop (grid#42), not a converged, stable overlay",
                 self.kind, self.name
             )
@@ -2999,7 +2999,7 @@ fn candidate_stable_id(candidate: &serde_json::Value) -> Result<&str, Box<dyn st
 /// Proves the operator's self-discovery path works end-to-end:
 ///
 /// 1. The `provider-gateway` Service on each provider cluster has a `LoadBalancer` IP matching the independent Forge
-///    capture (verifier evidence only — the operator does not read captures).
+///    capture (verifier evidence only; the operator does not read captures).
 /// 2. The operator deployment does **not** have `GRID_GATEWAY_ADDRESS` set from Forge captures (confirming it uses
 ///    self-discovery).
 /// 3. The remote `GridSite` egress address on the edge cluster equals the Service LB address (confirming the address
@@ -3040,9 +3040,7 @@ fn verify_no_capture_injection(cluster: &str) -> Result<(), Box<dyn std::error::
     let env_json = String::from_utf8(output.stdout)?;
     let gw_val = parse_env_var_from_json(&env_json, "GRID_GATEWAY_ADDRESS");
     if let Some(val) = &gw_val.filter(|v| !v.is_empty()) {
-        return Err(
-            format!("GRID_GATEWAY_ADDRESS on {cluster} is '{val}' — should be unset for self-discovery").into(),
-        );
+        return Err(format!("GRID_GATEWAY_ADDRESS on {cluster} is '{val}'; should be unset for self-discovery").into());
     }
     Ok(())
 }
@@ -3185,7 +3183,7 @@ fn find_gridsite_egress<'cfg>(
 }
 
 /// Load expected provider gateway addresses from this run's Forge state file
-/// (verifier evidence only — operators self-discover their own addresses).
+/// (verifier evidence only; operators self-discover their own addresses).
 fn load_provider_gateway_addresses(config: &Path) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let state_dir = super::forge_config::state_dir_for_config(config)?;
     let state = fs::read_to_string(state_dir.join("state.json"))?;
@@ -4831,7 +4829,7 @@ fn edge_gateway_logs(edge: &str) -> Result<String, Box<dyn std::error::Error>> {
 ///
 /// Handles only the `ESC [ <params> <letter>` sequences that
 /// `tracing-subscriber` emits for bold, dim, italic, color, and
-/// reset.  This is NOT a general ANSI/VT escape parser — it does
+/// reset.  This is NOT a general ANSI/VT escape parser; it does
 /// not handle OSC, DCS, APC, or multi-byte CSI final bytes.
 fn strip_csi_sgr(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -7809,7 +7807,9 @@ admin:
         );
     }
 
-    // ── write_trimmed_credential ─────────────────────────────────────
+    // -----------------------------------------------------------------
+    // write_trimmed_credential
+    // -----------------------------------------------------------------
 
     #[test]
     fn write_trimmed_credential_strips_trailing_newline() {

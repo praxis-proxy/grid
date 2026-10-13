@@ -53,4 +53,4 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Report skipped signoff check
-        run: echo "skip/signoff label present — skipping signoff check"
+        run: echo "skip/signoff label present; skipping signoff check"

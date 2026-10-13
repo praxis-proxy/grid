@@ -68,7 +68,7 @@ const HOST_CERTS_DIR: &str = "tests/env/certs";
 /// Base directory for mounted credential Secret files inside the consumer pod.
 ///
 /// Each API credential Secret is mounted at `{CREDENTIAL_MOUNT_BASE}/{secret_name}/{key}`.
-/// Token bytes never appear in Praxis `ConfigMap`s with this layout — the
+/// Token bytes never appear in Praxis `ConfigMap`s with this layout; the
 /// `credential_inject` filter reads from the mounted file path instead.
 const CREDENTIAL_MOUNT_BASE: &str = "/run/secrets/grid-credentials";
 
@@ -384,7 +384,7 @@ fn read_overlay_file(path: &Path) -> Result<RoutingOverlay, Box<dyn std::error::
 ///
 /// # Errors
 ///
-/// Returns an error when all candidates are filtered out — no locally-routable
+/// Returns an error when all candidates are filtered out, since no locally-routable
 /// route would remain, making the consumer gateway deployment useless.
 #[expect(
     clippy::too_many_lines,
@@ -650,7 +650,7 @@ fn apply_consumer_responses_config(
 /// When `overlay` is `None`, generates a static `intelligent_route` stanza from
 /// `providers` (one candidate per model per site).
 ///
-/// `intelligent_route.local_site` is always `consumer_site` — the consumer's own
+/// `intelligent_route.local_site` is always `consumer_site`, the consumer's own
 /// cluster identity.  The overlay's `local_site` field identifies the
 /// `GridNetwork`, not the consumer site, and must not be used here.
 ///
@@ -960,7 +960,7 @@ fn apply_consumer_deployment_with_credential_mount(
 ///   production the gateway would reach the provider over HTTPS using credentials managed by the operator; the kind
 ///   mock uses HTTP for simplicity.
 ///
-/// The caller passes the raw overlay (all candidates intact — no
+/// The caller passes the raw overlay (all candidates intact; no
 /// `filter_overlay_for_local_providers` is applied) so that the API-provider
 /// candidate survives into the `intelligent_route` stanza.
 ///
@@ -1029,14 +1029,14 @@ shutdown_timeout_secs: 5
     )
 }
 
-/// Build the consumer Praxis config for API-provider fallback routing — native injection mode.
+/// Build the consumer Praxis config for API-provider fallback routing (native injection mode).
 ///
 /// Unlike [`build_api_fallback_consumer_config`] which embeds the bearer token as a
 /// static string inside `filter: headers` / `request_set`, this native variant:
 ///
 /// - Emits credential `secretRef` data in the `intelligent_route` candidates block via
 ///   [`operator_overlay::candidates_yaml_with_credentials`].
-/// - Uses `filter: credential_inject` with a `file:` source pointing at the mounted Kubernetes Secret file — token
+/// - Uses `filter: credential_inject` with a `file:` source pointing at the mounted Kubernetes Secret file, so token
 ///   bytes never appear in the `ConfigMap`.
 ///
 /// **Token placement:** the bearer token is read by `credential_inject` from
@@ -1049,7 +1049,7 @@ shutdown_timeout_secs: 5
 )]
 #[expect(
     clippy::too_many_arguments,
-    reason = "distinct argument per secretRef field — collapsing would obscure the security boundary"
+    reason = "distinct argument per secretRef field; collapsing would obscure the security boundary"
 )]
 fn build_api_fallback_consumer_config_native(
     consumer_site: &str,
@@ -1069,7 +1069,7 @@ fn build_api_fallback_consumer_config_native(
            endpoints:
              - "{api_provider_endpoint}""#
     );
-    // Token read from mounted file — never embedded in this YAML.
+    // Token read from mounted file, never embedded in this YAML.
     let token_file_path = format!("{CREDENTIAL_MOUNT_BASE}/{secret_name}/{secret_key}");
 
     format!(
@@ -1107,7 +1107,7 @@ shutdown_timeout_secs: 5
     )
 }
 
-/// Deploy the consumer gateway configured for API-provider fallback — native injection mode.
+/// Deploy the consumer gateway configured for API-provider fallback (native injection mode).
 ///
 /// Uses [`build_api_fallback_consumer_config_native`] which emits credential secretRef
 /// in the `intelligent_route` candidates block and uses `filter: credential_inject`
@@ -1127,7 +1127,7 @@ shutdown_timeout_secs: 5
 )]
 #[expect(
     clippy::too_many_arguments,
-    reason = "distinct argument per secretRef field — collapsing would obscure the security boundary"
+    reason = "distinct argument per secretRef field; collapsing would obscure the security boundary"
 )]
 pub(crate) fn deploy_consumer_for_api_fallback_native(
     cfg: &EnvConfig,
@@ -1175,7 +1175,7 @@ pub(crate) fn deploy_consumer_for_api_fallback_native(
     );
     kubectl::apply_manifest(&consumer_ctx, &yaml)?;
 
-    // Mount the credential Secret as a file — the token never touches the ConfigMap.
+    // Mount the credential Secret as a file; the token never touches the ConfigMap.
     apply_consumer_deployment_with_credential_mount(&consumer_ctx, secret_name, secret_key)?;
     kubectl::rollout_restart(&consumer_ctx, "praxis-consumer")?;
     kubectl::wait_for_rollout(&consumer_ctx, "praxis-consumer", consumer_site)?;
@@ -1232,7 +1232,7 @@ pub(crate) fn deploy_consumer_from_operator_yaml(
 /// Deploy the consumer gateway configured for API-provider fallback routing.
 ///
 /// Unlike [`deploy_consumer`], this function does **not** filter the overlay for
-/// local providers — the API-provider candidate must survive into the generated
+/// local providers; the API-provider candidate must survive into the generated
 /// Praxis config.  The `api_provider_endpoint` is the in-cluster address of the
 /// mock API-provider service (e.g. `mock-api-provider.default.svc:8080`).
 #[expect(
@@ -1317,7 +1317,7 @@ pub(crate) fn deploy_consumer_for_api_fallback(
 #[expect(clippy::too_many_lines, reason = "Praxis YAML generation for all four cluster types")]
 #[expect(
     clippy::too_many_arguments,
-    reason = "distinct argument per backend kind — grouping would obscure the intended topology"
+    reason = "distinct argument per backend kind; grouping would obscure the intended topology"
 )]
 fn build_full_grid_consumer_config(
     consumer_site: &str,
@@ -1380,7 +1380,7 @@ shutdown_timeout_secs: 5
 
 /// Deploy the consumer gateway for the full-grid routing validation.
 ///
-/// Does **not** apply [`filter_overlay_for_local_providers`] — all four candidates
+/// Does **not** apply [`filter_overlay_for_local_providers`]; all four candidates
 /// (local, remote, cloud, `api_provider`) must survive into the Praxis config.
 #[expect(clippy::too_many_arguments, reason = "one endpoint per backend cluster type")]
 #[expect(
@@ -1585,7 +1585,7 @@ fn verify_full_grid_model(
 ///    through the mock API-provider.
 /// 4. **Credential proof**: the request for `api_model` uses only a consumer-level credential (`Authorization:
 ///    Bearer`); the grid consumer gateway handles routing to the API endpoint.  The mock API-provider requires a Bearer
-///    token, and the request succeeds, proving the infrastructure manages endpoint access — not the client.
+///    token, and the request succeeds, proving the infrastructure manages endpoint access, not the client.
 /// 5. **Unknown model fails cleanly**: a request for a non-existent model returns 404 or 503.
 #[expect(clippy::too_many_lines, reason = "multi-assertion E2E verification chain")]
 pub(crate) fn verify_api_fallback_e2e(
@@ -2013,8 +2013,8 @@ fn send_request_without_auth(port: u16, model: &str) -> Result<HttpResponse, Box
 /// Proves that:
 /// 1. The mock API-provider rejects requests with no `Authorization` header (status 401). This establishes that the
 ///    credential is genuinely required by the backend.
-/// 2. A request routed through the consumer gateway — which injects `Authorization: Bearer grid-api-fallback-secret`
-///    via `filter: headers / request_set` — succeeds with status 200. The client request carries **no** `Authorization`
+/// 2. A request routed through the consumer gateway (which injects `Authorization: Bearer grid-api-fallback-secret` via
+///    `filter: headers / request_set`) succeeds with status 200. The client request carries **no** `Authorization`
 ///    header; only the gateway config knows the provider credential.
 ///
 /// Together these two assertions prove transparent provider credential injection:
@@ -2037,7 +2037,7 @@ pub(crate) fn verify_credential_injection(
 ) {
     let consumer_site = "consumer";
 
-    // ── Negative proof: direct mock request without auth returns 401 ──────────
+    // Negative proof: direct mock request without auth returns 401
     match send_request_without_auth(mock_api_port, api_model) {
         Ok(resp) if resp.status == 401 => {
             tally.pass(
@@ -2051,7 +2051,7 @@ pub(crate) fn verify_credential_injection(
                 consumer_site,
                 &format!(
                     "credential injection negative proof failed: direct mock request returned {} \
-                     (expected 401 — mock should reject unauthenticated requests)",
+                     (expected 401; mock should reject unauthenticated requests)",
                     resp.status
                 ),
                 context,
@@ -2066,7 +2066,7 @@ pub(crate) fn verify_credential_injection(
         },
     }
 
-    // ── Positive proof: consumer gateway injects credential → 200 ──────────────
+    // Positive proof: consumer gateway injects credential → 200
     match send_request_without_auth(consumer_port, api_model) {
         Ok(resp) if resp.status == 200 => {
             tally.pass(
@@ -2098,7 +2098,7 @@ pub(crate) fn verify_credential_injection(
                 consumer_site,
                 &format!(
                     "credential injection positive proof failed: consumer gateway returned {} \
-                     (expected 200 — filter: headers / request_set may not be supported by \
+                     (expected 200; filter: headers / request_set may not be supported by \
                      this Praxis build, or the config was not applied correctly)\n\
                      body: {excerpt}",
                     resp.status
@@ -2702,7 +2702,7 @@ mod tests {
             "grid-system",
             "token",
         );
-        // Must use file: source — not an inline value:.
+        // Must use file: source, not an inline value:.
         assert!(
             config.contains("file: "),
             "native config must use file: source for credential_inject"

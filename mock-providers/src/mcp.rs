@@ -1,7 +1,7 @@
 //! Mock MCP (Model Context Protocol) `tools/list` server.
 //!
 //! Built on the real `rmcp` server SDK (the same crate `AgentToolProvider`'s
-//! live probe uses on the client side — see
+//! live probe uses on the client side; see
 //! `operator/src/resources/mcp_probe.rs`), not a hand-rolled JSON-RPC
 //! responder. This guarantees the mock speaks the actual Streamable HTTP
 //! wire protocol (handshake, session semantics, SSE framing) rather than an
@@ -9,7 +9,7 @@
 //!
 //! Used by `cargo xtask env verify-agenttoolprovider-convergence` as a real,
 //! deployed-in-cluster MCP endpoint for `AgentToolProvider`'s probe to
-//! discover tools from — mirroring how `openai`/`anthropic`/etc. already
+//! discover tools from, mirroring how `openai`/`anthropic`/etc. already
 //! serve as real in-cluster mocks for `InferenceProvider`.
 
 use rmcp::{
@@ -43,7 +43,7 @@ impl ServerHandler for FixedToolsServer {
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
         if let Some(expected) = &self.required_bearer {
             // rmcp threads the raw incoming `http::request::Parts` (headers
-            // included) into RequestContext::extensions — no axum middleware
+            // included) into RequestContext::extensions, so no axum middleware
             // needed to see what the probe actually sent.
             let got = context
                 .extensions
@@ -71,15 +71,15 @@ impl ServerHandler for FixedToolsServer {
 /// module) at `/mcp`.
 ///
 /// `required_bearer: None` means the server accepts any (or no)
-/// `Authorization` header — used to validate `AgentToolProvider`'s
+/// `Authorization` header, used to validate `AgentToolProvider`'s
 /// unauthenticated healthy-probe path in the E2E convergence check.
 pub fn router(tools: Vec<String>, required_bearer: Option<String>) -> axum::Router {
     let handler = FixedToolsServer { tools, required_bearer };
     // `rmcp`'s default `allowed_hosts` (`localhost`/`127.0.0.1`/`::1`) is a
     // DNS-rebinding guard aimed at servers bound to a developer's own
     // loopback interface. This mock is deployed in-cluster and reached by
-    // real probe clients over its Service DNS name or `NodePort` address —
-    // neither of which is loopback — so the default would 403 every
+    // real probe clients over its Service DNS name or `NodePort` address
+    // (neither of which is loopback), so the default would 403 every
     // legitimate probe. Disabling it is safe here: this is a disposable test
     // fixture with no browser-facing surface, not a public deployment.
     let config = StreamableHttpServerConfig::default().disable_allowed_hosts();
@@ -98,7 +98,7 @@ mod tests {
     async fn unauthenticated_request_to_mcp_path_is_routed_not_404() {
         // A full protocol round trip needs a real rmcp client (covered by
         // the operator's own integration tests against this exact server
-        // shape); this test only proves the router wiring itself — that
+        // shape); this test only proves the router wiring itself: that
         // `/mcp` is a live route, not a typo'd path silently 404ing.
         let app = router(vec!["search".to_owned()], None);
         let response = app
