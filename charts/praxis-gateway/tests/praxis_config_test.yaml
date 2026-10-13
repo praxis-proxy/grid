@@ -97,13 +97,17 @@ tests:
       - failedTemplate:
           errorPattern: gridIdentity.tlsSecretName is required when gridIdentity.caSecretName is set
 
-  - it: rejects an identity Secret without a Grid CA Secret
+  - it: uses the identity Secret for the CA when no separate Secret is set
     template: templates/deployment.yaml
     set:
       gridIdentity.tlsSecretName: grid-site-identity
     asserts:
-      - failedTemplate:
-          errorPattern: gridIdentity.caSecretName is required when gridIdentity.tlsSecretName is set
+      - equal:
+          path: spec.template.spec.volumes[?(@.name == "tls")].projected.sources[0].secret.name
+          value: grid-site-identity
+      - equal:
+          path: spec.template.spec.volumes[?(@.name == "tls")].projected.sources[1].secret.name
+          value: grid-site-identity
 
   - it: accepts one Secret named for both identity and CA
     template: templates/deployment.yaml

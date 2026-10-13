@@ -425,9 +425,6 @@ Validate enabled mounts have a non-empty resource name.
 {{- if and .Values.gridIdentity.caSecretName (not .Values.gridIdentity.tlsSecretName) }}
 {{- fail "gridIdentity.tlsSecretName is required when gridIdentity.caSecretName is set" }}
 {{- end }}
-{{- if and .Values.gridIdentity.tlsSecretName (not .Values.gridIdentity.caSecretName) }}
-{{- fail "gridIdentity.caSecretName is required when gridIdentity.tlsSecretName is set: name the Secret that holds the Grid CA (ca.crt). The Grid operator writes it as grid-ca. If one Secret holds tls.crt, tls.key and ca.crt, set both to its name" }}
-{{- end }}
 {{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled (not .Values.grid.networkName) }}
 {{- fail "grid.networkName is required when the overlay sidecar is on: set it, or set overlay.sidecar.enabled false." }}
 {{- end }}

@@ -491,14 +491,12 @@ overlay:
         memory: 32Mi
 
 # -- Grid identity Secret used for mTLS to backends and peer gateways. It must contain
-# tls.crt and tls.key. Empty turns the identity off. Setting it also requires caSecretName,
-# the Secret that holds the Grid CA (ca.crt). The Grid operator keeps them in separate
-# Secrets.
+# tls.crt and tls.key. Empty turns the identity off. When caSecretName is empty, the chart
+# reads ca.crt from tlsSecretName. Set caSecretName only when the CA is in a separate Secret.
 gridIdentity:
   # -- Secret holding the client certificate and key.
   tlsSecretName: ""
-  # -- Secret holding ca.crt. Required when tlsSecretName is set. The Grid operator writes
-  # the CA as grid-ca. Use the same name for both if one Secret holds all three files.
+  # -- Secret holding ca.crt. Empty uses tlsSecretName. Set it when the CA is separate.
   caSecretName: ""
   # -- Mount path for TLS files.
   mountPath: "/etc/praxis/tls"

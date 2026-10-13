@@ -65,7 +65,7 @@ Before running the installer, prepare the following in each cluster's
 |----------|-----------|---------|
 | `consumer-praxis-config` ConfigMap | installer-managed | Created by `install.sh` from config template |
 | `provider-praxis-config` ConfigMap | installer-managed | Created by `install.sh` from config template with overlay stable IDs |
-| `consumer-tls` Secret | user-managed | TLS certificate and key for consumer identity |
+| `consumer-tls` Secret | user-managed | TLS certificate, key, and `ca.crt` for consumer identity |
 | `provider-tls` Secret | user-managed | TLS certificate and key for provider identity |
 | Per-provider credential Secrets | user-managed | One Secret per inference provider backend |
 
@@ -783,9 +783,10 @@ Never add credential mounts to consumer gateway values.
 
 ### Private CA Bundles
 
-For Grid mTLS, set `gridIdentity.tlsSecretName` and
-`gridIdentity.caSecretName`. If one Secret contains `tls.crt`, `tls.key`, and
-`ca.crt`, set both fields to that Secret's name. With BYO `praxis.yaml`, point
+For Grid mTLS, set `gridIdentity.tlsSecretName`. Set
+`gridIdentity.caSecretName` only when the CA is in a separate Secret. If one
+Secret contains `tls.crt`, `tls.key`, and `ca.crt`, leave the CA name empty.
+With BYO `praxis.yaml`, point
 its TLS paths to `gridIdentity.mountPath`; the mount alone does not enable TLS.
 
 For server-only backend TLS, use `upstreamCA.secretName` or a backend's
