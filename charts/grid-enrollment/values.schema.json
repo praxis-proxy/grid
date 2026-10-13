@@ -381,6 +381,16 @@
               "pattern": "^[A-Za-z0-9.-]+/[A-Za-z0-9._-]+$"
             }
           }
+        },
+        "inviteSecrets": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "namespace": {
+              "type": "string",
+              "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+            }
+          }
         }
       },
       "additionalProperties": false

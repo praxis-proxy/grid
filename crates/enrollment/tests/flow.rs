@@ -24,9 +24,14 @@ const TOKEN: &str = "t0ken";
 
 /// A service with a fresh CA, an empty store, and one grid-admin that may also delete.
 fn service() -> axum::Router {
+    service_with_store(Store::memory())
+}
+
+/// A service over the supplied store.
+fn service_with_store(store: Store) -> axum::Router {
     let ca = certs::generate_ca("test-grid-ca").expect("ca");
     router(Arc::new(AppState {
-        store: Store::memory(),
+        store,
         ca: SharedCa::new(ca),
         authorizer: Authorizer::Local(
             GridAdmins::from_table("tester: t0ken\n")
@@ -73,6 +78,13 @@ fn csr_asking_for(requested: &[SanType]) -> String {
 
 fn plain_csr() -> String {
     csr_asking_for(&[])
+}
+
+/// A valid CSR and its public key digest.
+fn csr_and_key_hash() -> (String, String) {
+    let csr = plain_csr();
+    let key = certs::verify_csr(&csr).expect("valid CSR");
+    (csr, key)
 }
 
 async fn call(app: &axum::Router, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -179,6 +191,49 @@ async fn a_site_enrolls_and_gets_a_certificate() {
     assert!(
         issued["publicKeySha256"].as_str().is_some_and(|hex| hex.len() == 64),
         "the key fingerprint comes back"
+    );
+}
+
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "exercises the invite key-binding retry flow")]
+async fn a_bound_invite_refuses_another_key_without_spending_the_token() {
+    let (expected_csr, expected_key) = csr_and_key_hash();
+    let (other_csr, other_key) = csr_and_key_hash();
+    assert_ne!(expected_key, other_key, "the test requests use distinct keys");
+    let token = "bound-invite-token";
+    let token_sha256 = certs::sha256(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let store = Store::memory();
+    store
+        .mint_site_token(NewSiteToken {
+            token_id: Some(uuid::Uuid::new_v4()),
+            token_sha256,
+            public_key_sha256: Some(expected_key),
+            site_name: "site-bound".to_owned(),
+            grid_network_ref: "demo-grid".to_owned(),
+            issued_by: "siteinvite/test".to_owned(),
+            expires_at: time::OffsetDateTime::now_utc().saturating_add(time::Duration::hours(1)),
+            allow_deleted_name: false,
+        })
+        .await
+        .expect("mint bound invite");
+    let app = service_with_store(store);
+
+    let (mismatch_status, body) = enroll(&app, token, &other_csr).await;
+    assert_eq!(
+        mismatch_status,
+        StatusCode::CONFLICT,
+        "another key cannot use the invite"
+    );
+    assert_eq!(body["error"], "key_mismatch");
+
+    let (enrollment_status, _) = enroll(&app, token, &expected_csr).await;
+    assert_eq!(
+        enrollment_status,
+        StatusCode::CREATED,
+        "a mismatched request leaves the invite available"
     );
 }
 
@@ -559,10 +614,12 @@ async fn a_token_minted_before_the_reservation_cannot_claim_it() {
 /// A store-level token pinning `site`, presented as `token`.
 fn new_token(site: &str, token: &str) -> NewSiteToken {
     NewSiteToken {
+        token_id: None,
         token_sha256: certs::sha256(token.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect(),
+        public_key_sha256: None,
         site_name: site.to_owned(),
         grid_network_ref: "demo-grid".to_owned(),
         issued_by: "tester".to_owned(),

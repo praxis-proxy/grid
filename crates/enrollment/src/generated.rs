@@ -255,6 +255,8 @@ pub enum ErrorError {
     Timeout,
     #[serde(rename = "name_taken")]
     NameTaken,
+    #[serde(rename = "key_mismatch")]
+    KeyMismatch,
     #[serde(rename = "reserved_site")]
     ReservedSite,
     #[serde(rename = "token_outstanding")]
@@ -283,6 +285,7 @@ impl ::std::fmt::Display for ErrorError {
             Self::NotFound => f.write_str("not_found"),
             Self::Timeout => f.write_str("timeout"),
             Self::NameTaken => f.write_str("name_taken"),
+            Self::KeyMismatch => f.write_str("key_mismatch"),
             Self::ReservedSite => f.write_str("reserved_site"),
             Self::TokenOutstanding => f.write_str("token_outstanding"),
             Self::NameDeleted => f.write_str("name_deleted"),
@@ -310,6 +313,7 @@ impl ::std::str::FromStr for ErrorError {
             "not_found" => Ok(Self::NotFound),
             "timeout" => Ok(Self::Timeout),
             "name_taken" => Ok(Self::NameTaken),
+            "key_mismatch" => Ok(Self::KeyMismatch),
             "reserved_site" => Ok(Self::ReservedSite),
             "token_outstanding" => Ok(Self::TokenOutstanding),
             "name_deleted" => Ok(Self::NameDeleted),

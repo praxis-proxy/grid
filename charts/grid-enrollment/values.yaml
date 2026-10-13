@@ -147,6 +147,10 @@ enrollment:
       # while the record is on. Needs admissionregistration.k8s.io/v1 (Kubernetes
       # 1.30); on an older cluster turn the record off instead.
       enabled: true
+  # Namespace that holds only SiteInvite token Secrets. Create it before install
+  # when setting a value different from the release namespace.
+  inviteSecrets:
+    namespace: ""
   # Audience a grid-admin token must be bound to under authz=kube, e.g.
   # kubectl create token <sa> --audience grid-enrollment --duration 10m.
   # Never an API-server audience (kubernetes, https://kubernetes.default.svc,

@@ -11,7 +11,7 @@ name = "enrollment"
 path = "src/main.rs"
 
 [features]
-default = ["tls-rustls", "sar", "bootstrap", "csr-record"]
+default = ["tls-rustls", "sar", "bootstrap", "csr-record", "site-invite-controller"]
 tls-rustls = [
   "certs/rcgen",
   "certs/verifier",
@@ -42,12 +42,14 @@ sar = ["dep:kube", "dep:k8s-openapi"]
 # sar in code; the chart turns it on only under kube authz, since both need the API server.
 csr-record = ["dep:kube", "dep:k8s-openapi", "dep:pem"]
 bootstrap = ["dep:clap", "dep:kube", "dep:k8s-openapi", "dep:reqwest", "dep:grid-client", "dep:zeroize"]
+site-invite-controller = ["dep:kube", "dep:k8s-openapi", "dep:pem"]
 
 [dependencies]
 version.workspace = true
 axum = { workspace = true }
 certs = { path = "../certs", default-features = false }
 grid-client = { path = "../client", default-features = false, features = ["reqwest-client"], optional = true }
+futures = { workspace = true }
 clap = { workspace = true, optional = true, features = ["env"] }
 kube = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, optional = true }
@@ -69,6 +71,7 @@ axum-server = { version = "0.8.0", default-features = false }
 rustls = { workspace = true, optional = true }
 openssl = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+schemars = { workspace = true }
 zeroize = { workspace = true, optional = true }
 
 [lints]

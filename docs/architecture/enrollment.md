@@ -179,8 +179,9 @@ above with a persistent backend.
 ## Direction
 
 The flow above ships, driven by chart values and a Job that mints invites. The
-`SiteInvite` schema now describes the signer-side invitation object, including
-the site's jurisdictions and optional public-key binding. Its enrollment
-service reconciliation and the joining site's Grid resource are not yet
-implemented. See [SiteInvite usage](crds.md#siteinvite) for the schema and
-current limitation.
+In Kubernetes, the enrollment service reconciles SiteInvite objects into
+token Secrets and revokes unused tokens when an admin deletes an invite.
+Standalone enrollment keeps its existing flow. The service enforces an optional
+key binding, but jurisdiction assignment and the approval gate remain pending.
+Redemption still issues immediately. See
+[SiteInvite usage](crds.md#siteinvite).

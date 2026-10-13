@@ -22,6 +22,8 @@ static SCHEMA_RENEWAL: &str = include_str!("../../db/schema/0003_site_enrollment
 static SCHEMA_HISTORY: &str = include_str!("../../db/schema/0004_enrollment_history.up.sql");
 /// The grid CA the records belong to.
 static SCHEMA_CA_ANCHOR: &str = include_str!("../../db/schema/0005_grid_ca_anchor.up.sql");
+/// Policy fields on invitation tokens.
+static SCHEMA_TOKEN_POLICY: &str = include_str!("../../db/schema/0006_site_token_policy.up.sql");
 /// Advisory-lock key that serializes schema application across instances.
 const SCHEMA_LOCK_KEY: i64 = 0x671D_E401;
 /// Advisory-lock class for mints, keyed with a hash of the site name.
@@ -64,6 +66,10 @@ impl PgStore {
             .execute(&mut *tx)
             .await
             .map_err(backend)?;
+        sqlx::raw_sql(SCHEMA_TOKEN_POLICY)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
         tx.commit().await.map_err(backend)?;
         Ok(Self { pool })
     }
@@ -76,6 +82,7 @@ impl PgStore {
         reason = "the lock, check, and insert read as one transaction"
     )]
     pub(super) async fn mint_site_token(&self, token: NewSiteToken) -> Result<Uuid, StoreError> {
+        let token_id = token.token_id.unwrap_or_else(Uuid::new_v4);
         let mut tx = Box::pin(self.pool.begin()).await.map_err(backend)?;
         sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
             .bind(MINT_LOCK_CLASS)
@@ -83,6 +90,33 @@ impl PgStore {
             .execute(&mut *tx)
             .await
             .map_err(backend)?;
+        if let Some(held) = sqlx::query(
+            "SELECT token_sha256, site_name, grid_network_ref, issued_by, expires_at,
+                    allow_deleted_name, public_key_sha256
+               FROM site_tokens WHERE id = $1",
+        )
+        .bind(token_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?
+        {
+            let matches = held.try_get::<String, _>("token_sha256").map_err(backend)? == token.token_sha256
+                && held.try_get::<String, _>("site_name").map_err(backend)? == token.site_name
+                && held.try_get::<String, _>("grid_network_ref").map_err(backend)? == token.grid_network_ref
+                && held.try_get::<String, _>("issued_by").map_err(backend)? == token.issued_by
+                && held.try_get::<time::OffsetDateTime, _>("expires_at").map_err(backend)? == token.expires_at
+                && held.try_get::<bool, _>("allow_deleted_name").map_err(backend)? == token.allow_deleted_name
+                && held
+                    .try_get::<Option<String>, _>("public_key_sha256")
+                    .map_err(backend)?
+                    == token.public_key_sha256;
+            if matches {
+                tx.commit().await.map_err(backend)?;
+                return Ok(token_id);
+            }
+            return Err(StoreError::Backend("site token id is already in use".to_owned()));
+        }
+
         let (enrolled, deleted, outstanding): (bool, bool, bool) = sqlx::query_as(
             "SELECT EXISTS (SELECT 1 FROM site_enrollments WHERE site_name = $1),
                     EXISTS (SELECT 1 FROM deleted_site_names WHERE site_name = $1),
@@ -102,11 +136,10 @@ impl PgStore {
         if outstanding {
             return Err(StoreError::TokenOutstanding);
         }
-        let token_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO site_tokens
-                 (id, token_sha256, site_name, grid_network_ref, issued_by, expires_at, allow_deleted_name)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                 (id, token_sha256, site_name, grid_network_ref, issued_by, expires_at, allow_deleted_name, public_key_sha256)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(token_id)
         .bind(&token.token_sha256)
@@ -115,6 +148,7 @@ impl PgStore {
         .bind(&token.issued_by)
         .bind(token.expires_at)
         .bind(token.allow_deleted_name)
+        .bind(&token.public_key_sha256)
         .execute(&mut *tx)
         .await
         .map_err(backend)?;
@@ -152,6 +186,17 @@ impl PgStore {
         Ok(row.is_some())
     }
 
+    /// Return the enrollment that spent this token, if the token row remains.
+    pub(super) async fn redeemed_enrollment(&self, token_id: Uuid) -> Result<Option<Uuid>, StoreError> {
+        let row = sqlx::query("SELECT redeemed_by FROM site_tokens WHERE id = $1")
+            .bind(token_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(backend)?
+            .ok_or(StoreError::NotFound)?;
+        row.try_get("redeemed_by").map_err(backend)
+    }
+
     /// Redeem a token by digest, sign under its pin, and record the enrollment.
     ///
     /// One transaction covers the guarded consume, the sign, and the audit
@@ -173,7 +218,7 @@ impl PgStore {
             "UPDATE site_tokens
                 SET redeemed_at = NOW(), redeemed_by = $2
               WHERE token_sha256 = $1 AND redeemed_at IS NULL AND expires_at > NOW()
-              RETURNING id, site_name, allow_deleted_name",
+              RETURNING id, site_name, allow_deleted_name, public_key_sha256",
         )
         .bind(token_sha256)
         .bind(enrollment_id)
@@ -185,6 +230,7 @@ impl PgStore {
         let allow_deleted_name: bool = consumed.try_get("allow_deleted_name").map_err(backend)?;
         let pin = Pin {
             site_name: consumed.try_get("site_name").map_err(backend)?,
+            public_key_sha256: consumed.try_get("public_key_sha256").map_err(backend)?,
         };
 
         // Sign inside the transaction. A failure returns here, and the dropped
@@ -500,6 +546,7 @@ fn held_from(row: &sqlx::postgres::PgRow) -> Result<Held, sqlx::Error> {
 }
 
 /// Wrap any backend failure.
+/// Convert a database error without dropping its diagnostic.
 fn backend<E: std::fmt::Display>(err: E) -> StoreError {
     StoreError::Backend(err.to_string())
 }

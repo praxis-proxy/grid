@@ -166,6 +166,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         recorder,
     });
 
+    #[cfg(feature = "site-invite-controller")]
+    Box::pin(start_site_invite_controller(Arc::clone(&state))).await?;
+
     // Reload the server certificate on an interval so a rotated TLS secret is
     // served without a restart. A failed reload keeps the current certificate.
     tokio::spawn(reload_tls(tls.clone(), tls_cert, tls_key, Arc::clone(&state)));
@@ -200,6 +203,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The acceptor hands each connection's verified client leaf to the renewal handler.
     let server = axum_server::bind(addr).acceptor(PeerAcceptor(TlsAcceptor::new(tls)));
     Box::pin(server.handle(handle).serve(router(state).into_make_service())).await?;
+    Ok(())
+}
+
+/// Start the `SiteInvite` controller only when the service runs in Kubernetes.
+#[cfg(feature = "site-invite-controller")]
+async fn start_site_invite_controller(state: Arc<AppState>) -> Result<(), String> {
+    if std::env::var_os("KUBERNETES_SERVICE_HOST").is_none() {
+        return Ok(());
+    }
+    let client = Box::pin(kube::Client::try_default())
+        .await
+        .map_err(|error| format!("SiteInvite controller needs a Kubernetes client: {error}"))?;
+    let namespace = std::env::var("ENROLLMENT_INVITE_SECRET_NAMESPACE")
+        .or_else(|_| std::env::var("POD_NAMESPACE"))
+        .map_err(|error| format!("SiteInvite controller needs an invite Secret namespace: {error}"))?;
+    tracing::info!(%namespace, "SiteInvite controller started");
+    tokio::spawn(enrollment::site_invite::run(client, state, namespace));
     Ok(())
 }
 

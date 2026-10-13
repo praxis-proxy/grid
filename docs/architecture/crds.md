@@ -35,10 +35,14 @@ referenced Secret as a credential and deliver it and the grid CA bundle to the
 joining site's operator namespace out of band. The token itself is never
 published in status.
 
-This release installs the API schema only. The enrollment service does not yet
-watch `SiteInvite` objects, create tokens from them, or populate their status.
-Use the [existing enrollment invite flow](../installation/enrollment.md#2-invite-a-site)
-to enroll sites until that reconciliation is implemented.
+In Kubernetes, the controller reads SiteInvite objects, stores each token in a
+Secret, and revokes unused tokens when an admin deletes an invite.
+Standalone enrollment does not start the controller. Enrollment enforces an
+optional key binding. Jurisdiction assignment and the human approval gate remain
+pending, so a redeemed token currently issues a certificate inline.
+
+The chart stores token Secrets in its release namespace by default. Configure a
+dedicated namespace in the chart values to separate access to those credentials.
 
 ## GridNetwork
 

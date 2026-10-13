@@ -501,6 +501,7 @@ components:
             - not_found
             - timeout
             - name_taken
+            - key_mismatch
             - reserved_site
             - token_outstanding
             - name_deleted

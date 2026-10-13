@@ -43,6 +43,10 @@ pub enum StoreError {
     #[error("key was enrolled before")]
     KeyReused,
 
+    /// The invite is bound to a different public key.
+    #[error("the public key does not match the invite")]
+    KeyMismatch,
+
     /// The presented token is not usable.
     ///
     /// One error for missing, already redeemed, and expired, so a caller cannot
@@ -65,8 +69,16 @@ pub enum StoreError {
 /// hand to the site, and passes its digest here.
 #[derive(Debug, Clone)]
 pub struct NewSiteToken {
+    /// Identifier selected by a Kubernetes reconciler so it can persist the
+    /// token Secret before recording the digest. Ordinary API mints leave this
+    /// unset and receive a fresh identifier.
+    pub token_id: Option<Uuid>,
+
     /// Lowercase hex SHA-256 of the one-time token.
     pub token_sha256: String,
+
+    /// Optional lowercase SHA-256 of the public key allowed to redeem this token.
+    pub public_key_sha256: Option<String>,
 
     /// The name the site will enroll under. The operator chooses it here, so the
     /// site never names itself.
@@ -90,6 +102,8 @@ pub struct NewSiteToken {
 pub struct Pin {
     /// The name the certificate is signed under.
     pub site_name: String,
+    /// Optional public key constraint carried by the token.
+    pub public_key_sha256: Option<String>,
 }
 
 /// A signed identity, returned inline from enroll and recorded as an audit row.
@@ -205,6 +219,18 @@ impl Store {
         match self {
             Self::Memory(store) => store.token_valid(token_sha256),
             Self::Postgres(store) => store.token_valid(token_sha256).await,
+        }
+    }
+
+    /// Read the enrollment ID that redeemed `token_id`, if it is still outstanding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] when the token is absent.
+    pub async fn redeemed_enrollment(&self, token_id: Uuid) -> Result<Option<Uuid>, StoreError> {
+        match self {
+            Self::Memory(store) => store.redeemed_enrollment(token_id),
+            Self::Postgres(store) => store.redeemed_enrollment(token_id).await,
         }
     }
 
@@ -379,6 +405,8 @@ impl Inner {
 struct TokenRow {
     /// Lowercase hex SHA-256 of the token.
     token_sha256: String,
+    /// Optional public key constraint carried by the token.
+    public_key_sha256: Option<String>,
     /// The pinned name.
     site_name: String,
     /// When the token stops being usable.
@@ -425,6 +453,16 @@ impl MemoryStore {
     /// Record a token, unless the name is held, deleted without opt-in, or pinned by a live token.
     fn mint_site_token(&self, token: NewSiteToken) -> Result<Uuid, StoreError> {
         let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
+        let token_id = token.token_id.unwrap_or_else(Uuid::new_v4);
+        if let Some(existing) = inner.tokens.get(&token_id) {
+            return (existing.token_sha256 == token.token_sha256
+                && existing.site_name == token.site_name
+                && existing.public_key_sha256 == token.public_key_sha256
+                && existing.expires_at == token.expires_at
+                && existing.allow_deleted_name == token.allow_deleted_name)
+                .then_some(token_id)
+                .ok_or_else(|| StoreError::Backend("site token id is already in use".to_owned()));
+        }
         if inner.issued_names.contains_key(&token.site_name) {
             return Err(StoreError::NameTaken);
         }
@@ -439,13 +477,16 @@ impl MemoryStore {
         {
             return Err(StoreError::TokenOutstanding);
         }
-        let token_id = Uuid::new_v4();
+        if inner.by_digest.contains_key(&token.token_sha256) {
+            return Err(StoreError::Backend("site token digest is already in use".to_owned()));
+        }
         inner.by_digest.insert(token.token_sha256.clone(), token_id);
         inner.tokens.insert(
             token_id,
             TokenRow {
                 token_sha256: token.token_sha256,
                 site_name: token.site_name,
+                public_key_sha256: token.public_key_sha256,
                 expires_at: token.expires_at,
                 allow_deleted_name: token.allow_deleted_name,
                 redeemed_by: None,
@@ -480,6 +521,16 @@ impl MemoryStore {
             .is_some_and(|row| row.redeemed_by.is_none() && row.expires_at > now))
     }
 
+    /// Return the enrollment that spent this token, if any.
+    fn redeemed_enrollment(&self, token_id: Uuid) -> Result<Option<Uuid>, StoreError> {
+        let inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
+        inner
+            .tokens
+            .get(&token_id)
+            .map(|row| row.redeemed_by)
+            .ok_or(StoreError::NotFound)
+    }
+
     /// Redeem a token by digest, sign under its pin, and record the enrollment.
     ///
     /// One lock covers the guard, the sign, and the record, so the token is spent
@@ -507,6 +558,7 @@ impl MemoryStore {
             .map(|row| {
                 let pin = Pin {
                     site_name: row.site_name.clone(),
+                    public_key_sha256: row.public_key_sha256.clone(),
                 };
                 (pin, row.allow_deleted_name)
             })
@@ -662,7 +714,65 @@ impl MemoryStore {
     }
 }
 
-/// A poisoned lock means another thread panicked holding it.
+/// A poisoned lock means another thread panicked while holding it.
 fn poisoned() -> StoreError {
     StoreError::Backend("in-memory store lock was poisoned".to_owned())
+}
+
+#[cfg(test)]
+mod token_id_tests {
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    use super::{MemoryStore, NewSiteToken, StoreError};
+
+    #[test]
+    fn token_id_mint_is_retryable_only_for_the_same_token() -> Result<(), StoreError> {
+        let store = MemoryStore::default();
+        let token_id = Uuid::new_v4();
+        let token = NewSiteToken {
+            token_id: Some(token_id),
+            token_sha256: "digest".to_owned(),
+            public_key_sha256: None,
+            site_name: "west".to_owned(),
+            grid_network_ref: "site-invite".to_owned(),
+            issued_by: "siteinvite/test".to_owned(),
+            expires_at: OffsetDateTime::now_utc().saturating_add(time::Duration::hours(1)),
+            allow_deleted_name: false,
+        };
+        assert_eq!(store.mint_site_token(token.clone())?, token_id);
+        assert_eq!(store.mint_site_token(token.clone())?, token_id);
+        assert!(matches!(
+            store.mint_site_token(NewSiteToken {
+                site_name: "east".to_owned(),
+                ..token
+            }),
+            Err(StoreError::Backend(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_bound_key_mismatch_keeps_the_token_available() -> Result<(), StoreError> {
+        let store = MemoryStore::default();
+        store.mint_site_token(NewSiteToken {
+            token_id: Some(Uuid::new_v4()),
+            token_sha256: "bound-token".to_owned(),
+            public_key_sha256: Some("expected-key".to_owned()),
+            site_name: "west".to_owned(),
+            grid_network_ref: "site-invite".to_owned(),
+            issued_by: "siteinvite/test".to_owned(),
+            expires_at: OffsetDateTime::now_utc().saturating_add(time::Duration::hours(1)),
+            allow_deleted_name: false,
+        })?;
+        let result = store.redeem_and_issue("bound-token", |pin| {
+            if pin.public_key_sha256.as_deref() != Some("presented-key") {
+                return Err(StoreError::KeyMismatch);
+            }
+            Err(StoreError::Backend("unexpected signing path".to_owned()))
+        });
+        assert!(matches!(result, Err(StoreError::KeyMismatch)));
+        assert!(store.token_valid("bound-token")?);
+        Ok(())
+    }
 }

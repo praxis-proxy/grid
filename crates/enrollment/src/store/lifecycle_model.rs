@@ -154,7 +154,9 @@ impl World {
         let now = self.now();
         self.store
             .mint_site_token(NewSiteToken {
+                token_id: None,
                 token_sha256: digest.clone(),
+                public_key_sha256: None,
                 site_name: name.to_owned(),
                 grid_network_ref: "grid".to_owned(),
                 issued_by: "model".to_owned(),

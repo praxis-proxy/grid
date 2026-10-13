@@ -608,7 +608,9 @@ mod live {
         state
             .store
             .mint_site_token(enrollment::NewSiteToken {
+                token_id: None,
                 token_sha256: digest(token),
+                public_key_sha256: None,
                 site_name: site.to_owned(),
                 grid_network_ref: "demo-grid".to_owned(),
                 issued_by: "admin".to_owned(),

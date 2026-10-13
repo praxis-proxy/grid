@@ -86,11 +86,13 @@ spec:
               value: {{ .Values.enrollment.listenAddr | quote }}
             - name: ENROLLMENT_AUTHZ
               value: {{ .Values.enrollment.authz | quote }}
-            {{- if eq .Values.enrollment.authz "kube" }}
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: ENROLLMENT_INVITE_SECRET_NAMESPACE
+              value: {{ .Values.enrollment.inviteSecrets.namespace | default .Release.Namespace | quote }}
+            {{- if eq .Values.enrollment.authz "kube" }}
             - name: ENROLLMENT_TOKEN_AUDIENCE
               value: {{ .Values.enrollment.tokenAudience | quote }}
             {{- if .Values.enrollment.csrRecord.enabled }}

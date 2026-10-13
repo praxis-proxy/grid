@@ -107,6 +107,10 @@ pub enum ApiError {
     #[error("the key was enrolled before")]
     KeyReused,
 
+    /// The request key differs from the invite's bound key.
+    #[error("the request key does not match the invite")]
+    KeyMismatch,
+
     /// The caller presented no grid-admin credential, or one that is not known.
     #[error("a grid-admin credential is required")]
     Unauthorized,
@@ -172,6 +176,7 @@ impl From<StoreError> for ApiError {
             StoreError::TokenOutstanding => Self::TokenOutstanding,
             StoreError::NameDeleted => Self::NameDeleted,
             StoreError::KeyReused => Self::KeyReused,
+            StoreError::KeyMismatch => Self::KeyMismatch,
             StoreError::TokenInvalid => Self::InvalidToken,
             StoreError::Refused(_) => Self::IdentityRefused,
             StoreError::Backend(detail) => Self::Internal(detail),
@@ -266,6 +271,11 @@ impl ApiError {
                 StatusCode::CONFLICT,
                 ErrorCode::KeyReused,
                 "this key was enrolled before; enroll with a new key".to_owned(),
+            ),
+            Self::KeyMismatch => (
+                StatusCode::CONFLICT,
+                ErrorCode::KeyMismatch,
+                "the certificate request key does not match this invite".to_owned(),
             ),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
@@ -467,7 +477,9 @@ async fn mint_site_token(
     let token_id = state
         .store
         .mint_site_token(NewSiteToken {
+            token_id: None,
             token_sha256: digest(&token),
+            public_key_sha256: None,
             site_name: input.site_name.clone(),
             grid_network_ref: input.grid_network_ref,
             issued_by: admin.clone(),
@@ -523,7 +535,7 @@ async fn enroll(
 
     // Prove possession of the key before consuming the token. verify_csr confirms
     // the CSR self-signature and fails closed. No name is involved here.
-    verify_csr(&input.csr).map_err(signing_error)?;
+    let request_key_sha256 = verify_csr(&input.csr).map_err(signing_error)?;
 
     let csr = input.csr;
     let validity = Validity::starting_now(state.cert_lifetime);
@@ -533,6 +545,13 @@ async fn enroll(
         // A token minted before the name was reserved still cannot claim it.
         if state.reserved_sites.contains(&pin.site_name) {
             return Err(StoreError::NameTaken);
+        }
+        if pin
+            .public_key_sha256
+            .as_ref()
+            .is_some_and(|expected| expected != &request_key_sha256)
+        {
+            return Err(StoreError::KeyMismatch);
         }
         // Signed under the pinned name, with every SAN rebuilt from it.
         sign_csr(&ca, &pin.site_name, &csr, validity)

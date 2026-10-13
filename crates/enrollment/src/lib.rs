@@ -19,9 +19,11 @@ pub mod auth;
 pub mod authz;
 pub mod ca;
 pub mod generated;
-#[cfg(feature = "csr-record")]
+#[cfg(any(feature = "csr-record", feature = "site-invite-controller"))]
 pub mod record;
 pub mod seed;
+#[cfg(feature = "site-invite-controller")]
+pub mod site_invite;
 pub mod store;
 pub mod tls;
 

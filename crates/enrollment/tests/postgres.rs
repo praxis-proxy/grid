@@ -55,7 +55,9 @@ fn unique(prefix: &str) -> String {
 /// here.
 fn new_token(site: &str, digest: &str) -> NewSiteToken {
     NewSiteToken {
+        token_id: None,
         token_sha256: digest.to_owned(),
+        public_key_sha256: None,
         site_name: site.to_owned(),
         grid_network_ref: "demo-grid".to_owned(),
         issued_by: "sam".to_owned(),
@@ -521,6 +523,7 @@ fn renewal(site: &str, presented: &str, requested: &str) -> enrollment::Renewal 
 fn resign(site: &str) -> Result<Issued, StoreError> {
     sign_for(&Pin {
         site_name: site.to_owned(),
+        public_key_sha256: None,
     })
 }
 
