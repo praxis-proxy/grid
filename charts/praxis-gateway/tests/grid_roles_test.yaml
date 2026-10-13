@@ -128,6 +128,15 @@ tests:
       - failedTemplate:
           errorPattern: "image.flavor grid-gateway"
 
+  - it: a provider requires the Grid identity
+    template: templates/deployment.yaml
+    set:
+      gridIdentity.tlsSecretName: ""
+      gridIdentity.caSecretName: ""
+    asserts:
+      - failedTemplate:
+          errorPattern: "praxisConfig.render.role provider needs gridIdentity.tlsSecretName"
+
   - it: a provider rejects api-key caller authentication
     template: templates/deployment.yaml
     set:
