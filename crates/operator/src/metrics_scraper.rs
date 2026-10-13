@@ -1,0 +1,1405 @@
+// Copyright 2026 Praxis Proxy Authors
+//! Async HTTP scraper for Prometheus `/metrics` endpoints.
+//!
+//! Fetches the raw Prometheus exposition text from a backend's `/metrics`
+//! path.  The returned text is passed directly to
+//! [`crate::metrics_parser::parse_prometheus_text`] to extract signal values
+//! for the scoring engine.
+//!
+//! ## Usage
+//!
+//! ```text
+//! let text = scrape_metrics("http://backend:9090/metrics", Duration::from_secs(5), None, None).await?;
+//! let signals = parse_prometheus_text(&text, &names);
+//! let metrics = signals.into_backend_metrics();
+//! state.set_metrics(provider_name.to_owned(), metrics);
+//! ```
+//!
+//! ## TLS and mTLS
+//!
+//! When a [`rustls::ClientConfig`] is provided via the `tls_config` parameter,
+//! the scraper uses it for server verification and (when configured) client
+//! certificate presentation.  When `tls_config` is `None`, native root
+//! certificates are used (backward-compatible).  There is no
+//! `insecureSkipVerify` option.
+//!
+//! [`rustls::ClientConfig`]: rustls::ClientConfig
+
+use std::time::{Duration, SystemTime};
+
+use bytes::Bytes;
+use http_body_util::{BodyExt as _, Empty, Limited};
+use hyper_util::{client::legacy::Client as HyperClient, rt::TokioExecutor};
+use zeroize::Zeroizing;
+
+pub(crate) use crate::resources::tls_backend::{
+    build_custom_tls_connector, build_native_connector, build_pinned_client_config, build_spiffe_client_config,
+    build_tls_client_config,
+};
+use crate::{
+    crd::inference_provider::{MetricsAuth, MetricsAuthType},
+    resources::tls_backend::ClientTlsConfig,
+};
+
+// ---------------------------------------------------------------------------
+// Bounded input limits
+// ---------------------------------------------------------------------------
+
+/// Maximum size for a metrics response body: 1 MiB.
+///
+/// This is a deliberate memory bound for one scrape. Reaching it means the
+/// endpoint answered; it is counted as `body_cap` and leaves readiness unknown
+/// rather than treating the provider as down.
+const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+/// Error returned by `scrape_metrics`.
+#[derive(Debug, thiserror::Error)]
+pub enum MetricsScrapeError {
+    /// The URL could not be parsed.
+    #[error("invalid metrics URL: {0}")]
+    InvalidUrl(String),
+
+    /// TLS is configured but the URL does not use HTTPS.
+    #[error("metrics TLS configured but URL scheme is not https: {0}")]
+    HttpWithTls(String),
+
+    /// The scrape request timed out.
+    #[error("metrics scrape timed out after {0:?}")]
+    Timeout(Duration),
+
+    /// The server returned a non-2xx status code.
+    #[error("metrics endpoint returned HTTP {status}: {url}")]
+    NonOkStatus {
+        /// HTTP status code.
+        status: u16,
+        /// URL that was scraped.
+        url: String,
+    },
+
+    /// A transport or TLS error occurred.
+    #[error("metrics scrape transport error: {0}")]
+    Transport(Box<dyn std::error::Error + Send + Sync>),
+
+    /// The response body could not be decoded as UTF-8.
+    #[error("metrics response body is not valid UTF-8: {0}")]
+    Encoding(std::string::FromUtf8Error),
+
+    /// TLS material could not be parsed or assembled into a valid configuration.
+    #[error("metrics TLS material error: {0}")]
+    TlsMaterial(String),
+    /// The scrape credential could not be read. Never carries the credential.
+    #[error("metrics credential unavailable: {0}")]
+    Credential(String),
+    /// A credential would have gone over plain HTTP without `allowPlaintext`.
+    #[error("refusing to send a metrics credential over plain http: {0}")]
+    PlaintextCredential(String),
+    /// The body passed the 1 MiB response limit.
+    #[error("metrics response body exceeds {0} byte limit")]
+    BodyTooLarge(usize),
+}
+
+impl MetricsScrapeError {
+    /// The bounded class of this failure, for the provider's condition and scrape counters.
+    #[must_use]
+    pub(crate) fn class(&self) -> crate::readiness::ScrapeClass {
+        use crate::readiness::ScrapeClass;
+        match self {
+            Self::Timeout(_) => ScrapeClass::Timeout,
+            Self::NonOkStatus { status: 401 | 403, .. } => ScrapeClass::Unauthorized,
+            Self::NonOkStatus { .. } => ScrapeClass::Http,
+            Self::Transport(source) => transport_class(source.as_ref()),
+            Self::Encoding(_) => ScrapeClass::Parse,
+            Self::TlsMaterial(_) => ScrapeClass::Tls,
+            Self::BodyTooLarge(_) => ScrapeClass::BodyCap,
+            Self::InvalidUrl(_) | Self::HttpWithTls(_) | Self::Credential(_) | Self::PlaintextCredential(_) => {
+                ScrapeClass::Config
+            },
+        }
+    }
+}
+
+/// TLS when the chain holds a TLS error, DNS when resolution failed, timeout when the socket
+/// timed out, else a connect failure.
+fn transport_class(source: &(dyn std::error::Error + 'static)) -> crate::readiness::ScrapeClass {
+    use crate::readiness::ScrapeClass;
+    let mut cause = Some(source);
+    while let Some(error) = cause {
+        if tls_within(error) {
+            return ScrapeClass::Tls;
+        }
+        let text = error.to_string();
+        if text.contains("dns error") || text.contains("failed to lookup address") {
+            return ScrapeClass::Dns;
+        }
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        {
+            return ScrapeClass::Timeout;
+        }
+        cause = error.source();
+    }
+    ScrapeClass::Connect
+}
+
+/// Whether `error` is a TLS failure or wraps one through any depth of `io::Error`.
+///
+/// `io::Error::source` skips the error it wraps, which is where a TLS failure sits, and
+/// hyper-rustls wraps the connector's `io::Error` in another, so the chain is walked by
+/// `get_ref`, not `source`.
+fn tls_within(error: &(dyn std::error::Error + 'static)) -> bool {
+    crate::resources::tls_backend::is_tls_error(error)
+        || error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .is_some_and(|inner| tls_within(inner))
+}
+
+// ---------------------------------------------------------------------------
+// Scrape
+// ---------------------------------------------------------------------------
+
+/// Scrape the Prometheus text exposition from `url`.
+///
+/// Makes an HTTP GET request to `url` and returns the response body as a
+/// `String` if the status is 2xx.  The caller is responsible for parsing
+/// the returned text with [`crate::metrics_parser::parse_prometheus_text`].
+///
+/// When `tls_config` is `Some`, the connector uses the provided
+/// [`rustls::ClientConfig`] for server verification and optional client
+/// certificate presentation.  When `None`, native root certificates are
+/// used (backward-compatible).
+///
+/// # Errors
+///
+/// Returns [`MetricsScrapeError::Timeout`] if the request exceeds `timeout`.
+/// Returns [`MetricsScrapeError::NonOkStatus`] for non-2xx responses.
+/// Returns [`MetricsScrapeError::Transport`] for connection failures.
+pub(crate) async fn scrape_metrics(
+    url: &str,
+    timeout: Duration,
+    tls_config: Option<ClientTlsConfig>,
+    credential: Option<(&MetricsAuth, &kube::Client)>,
+) -> Result<String, MetricsScrapeError> {
+    let bearer = match credential {
+        Some((auth, client)) => {
+            // Refuse before minting, so a bad URL or an unsafe target costs no TokenRequest.
+            let uri = url
+                .parse::<http::Uri>()
+                .map_err(|_invalid| MetricsScrapeError::InvalidUrl(url.to_owned()))?;
+            credential_allowed(&uri, tls_config.is_some(), auth.allow_plaintext, url)?;
+            Some(Bearer::for_auth(auth, client).await?)
+        },
+        None => None,
+    };
+    scrape(url, timeout, tls_config, bearer.as_ref())
+        .await
+        .map(|(body, _)| body)
+}
+
+/// Like [`scrape_metrics`], but also returns the response `Date` header parsed
+/// to a [`SystemTime`], or `None` when it is absent or unparseable.
+///
+/// The peer poller uses the date to re-express a relayed sample's age on one
+/// clock.
+pub(crate) async fn scrape_metrics_with_date(
+    url: &str,
+    timeout: Duration,
+    tls_config: Option<ClientTlsConfig>,
+) -> Result<(String, Option<SystemTime>), MetricsScrapeError> {
+    scrape(url, timeout, tls_config, None).await
+}
+
+/// GET `url`, presenting `bearer` when given.
+async fn scrape(
+    url: &str,
+    timeout: Duration,
+    tls_config: Option<ClientTlsConfig>,
+    bearer: Option<&Bearer>,
+) -> Result<(String, Option<SystemTime>), MetricsScrapeError> {
+    let uri = url
+        .parse::<http::Uri>()
+        .map_err(|e| MetricsScrapeError::Transport(e.into()))
+        .and_then(|u| {
+            if u.scheme_str().is_some_and(|s| s == "http" || s == "https") {
+                Ok(u)
+            } else {
+                Err(MetricsScrapeError::InvalidUrl(url.to_owned()))
+            }
+        })?;
+
+    if tls_config.is_some() && uri.scheme_str() != Some("https") {
+        return Err(MetricsScrapeError::HttpWithTls(url.to_owned()));
+    }
+    if let Some(bearer) = bearer {
+        credential_allowed(&uri, tls_config.is_some(), bearer.allow_plaintext, url)?;
+    }
+
+    let connector = if let Some(config) = &tls_config {
+        build_custom_tls_connector(config)?
+    } else {
+        build_native_connector()?
+    };
+    let client: HyperClient<_, Empty<Bytes>> = HyperClient::builder(TokioExecutor::new()).build(connector);
+
+    let req = build_request(uri, bearer)?;
+
+    // One deadline covers the body too, so a stalled peer cannot hold the caller.
+    tokio::time::timeout(timeout, read_response(client.request(req), url))
+        .await
+        .map_err(|_elapsed| MetricsScrapeError::Timeout(timeout))?
+}
+
+/// A GET for `uri`, carrying `bearer` as a sensitive `Authorization` header when given.
+fn build_request(uri: http::Uri, bearer: Option<&Bearer>) -> Result<http::Request<Empty<Bytes>>, MetricsScrapeError> {
+    let mut req = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(uri)
+        .body(Empty::<Bytes>::new())
+        .map_err(|e| MetricsScrapeError::Transport(e.into()))?;
+    if let Some(bearer) = bearer {
+        req.headers_mut().insert(http::header::AUTHORIZATION, bearer.header()?);
+    }
+    Ok(req)
+}
+
+/// Refuse to send `bearer` to `url` unless a CA the provider names proves the host, or plain HTTP is allowed.
+fn credential_allowed(
+    uri: &http::Uri,
+    named_ca: bool,
+    allow_plaintext: bool,
+    url: &str,
+) -> Result<(), MetricsScrapeError> {
+    match uri.scheme_str() {
+        // Never system roots: any host with a public certificate would receive the token.
+        Some("https") if !named_ca => Err(MetricsScrapeError::Credential(format!(
+            "a credential needs metricsConfig.tls to name the CA for {url}"
+        ))),
+        Some("https") => Ok(()),
+        _ if allow_plaintext => Ok(()),
+        _ => Err(MetricsScrapeError::PlaintextCredential(url.to_owned())),
+    }
+}
+
+/// Longest token accepted; a minted token is a few KiB.
+const MAX_TOKEN_BYTES: usize = 16 * 1024;
+
+/// A bearer credential for one scrape. Never printed.
+pub(crate) struct Bearer {
+    /// The token, wiped on drop.
+    token: Zeroizing<String>,
+    /// Whether it may travel over plain HTTP.
+    allow_plaintext: bool,
+}
+
+impl std::fmt::Debug for Bearer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Bearer(redacted)")
+    }
+}
+
+impl Bearer {
+    /// The credential `auth` names: a short-lived token for the metrics scraper `ServiceAccount`.
+    async fn for_auth(auth: &MetricsAuth, client: &kube::Client) -> Result<Self, MetricsScrapeError> {
+        match auth.kind {
+            MetricsAuthType::ServiceAccountToken => {
+                Self::new(crate::metrics_token::scraper_token(client).await?, auth.allow_plaintext)
+            },
+        }
+    }
+
+    /// Wrap `token`, which must be one bounded, printable word so it is a safe header value.
+    fn new(token: Zeroizing<String>, allow_plaintext: bool) -> Result<Self, MetricsScrapeError> {
+        if token.len() > MAX_TOKEN_BYTES {
+            return Err(MetricsScrapeError::Credential(format!(
+                "token exceeds {MAX_TOKEN_BYTES} bytes"
+            )));
+        }
+        if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err(MetricsScrapeError::Credential(
+                "token is empty or not a single printable word".to_owned(),
+            ));
+        }
+        Ok(Self { token, allow_plaintext })
+    }
+
+    /// `Authorization: Bearer <token>`, marked sensitive so it is never logged or indexed.
+    fn header(&self) -> Result<http::HeaderValue, MetricsScrapeError> {
+        let value = Zeroizing::new(format!("Bearer {}", self.token.as_str()));
+        let mut header = http::HeaderValue::from_str(&value)
+            .map_err(|_invalid| MetricsScrapeError::Credential("token is not a valid header value".to_owned()))?;
+        header.set_sensitive(true);
+        Ok(header)
+    }
+}
+
+/// Await `request`, then read a 2xx body from `url` and its `Date` header.
+async fn read_response(
+    request: hyper_util::client::legacy::ResponseFuture,
+    url: &str,
+) -> Result<(String, Option<SystemTime>), MetricsScrapeError> {
+    let response = request.await.map_err(|e| MetricsScrapeError::Transport(e.into()))?;
+
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(MetricsScrapeError::NonOkStatus {
+            status,
+            url: url.to_owned(),
+        });
+    }
+
+    let date = response
+        .headers()
+        .get(http::header::DATE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| httpdate::parse_http_date(text).ok());
+
+    let body_bytes = Limited::new(response.into_body(), MAX_RESPONSE_BODY_BYTES)
+        .collect()
+        .await
+        .map_err(|e| {
+            if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+                MetricsScrapeError::BodyTooLarge(MAX_RESPONSE_BODY_BYTES)
+            } else {
+                MetricsScrapeError::Transport(e)
+            }
+        })?
+        .to_bytes();
+
+    let body = String::from_utf8(Vec::from(body_bytes)).map_err(MetricsScrapeError::Encoding)?;
+    Ok((body, date))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+mod tests {
+    use std::sync::Arc;
+
+    #[cfg(not(feature = "fips"))]
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::*;
+
+    #[test]
+    #[cfg(not(feature = "fips"))]
+    fn a_tls_failure_wrapped_in_an_io_error_classes_as_tls() {
+        let tls: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::General("bad certificate".to_owned()),
+        ));
+        assert_eq!(
+            MetricsScrapeError::Transport(tls).class(),
+            crate::readiness::ScrapeClass::Tls
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "fips"))]
+    fn a_tls_failure_wrapped_twice_classes_as_tls() {
+        // hyper-rustls wraps the connector's io::Error in another io::Error::other.
+        let tls: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::other(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::General("bad certificate".to_owned()),
+        )));
+        assert_eq!(
+            MetricsScrapeError::Transport(tls).class(),
+            crate::readiness::ScrapeClass::Tls
+        );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one table of failures and their classes")]
+    fn a_scrape_failure_has_a_bounded_class() {
+        use crate::readiness::ScrapeClass;
+        let status = |status| MetricsScrapeError::NonOkStatus {
+            status,
+            url: "https://epp:9090/metrics".to_owned(),
+        };
+        let transport = |error: Box<dyn std::error::Error + Send + Sync>| MetricsScrapeError::Transport(error);
+        let cases = [
+            (
+                "timeout",
+                MetricsScrapeError::Timeout(Duration::from_secs(2)),
+                ScrapeClass::Timeout,
+            ),
+            ("401", status(401), ScrapeClass::Unauthorized),
+            ("403", status(403), ScrapeClass::Unauthorized),
+            ("500", status(500), ScrapeClass::Http),
+            ("404", status(404), ScrapeClass::Http),
+            (
+                "dns",
+                transport("dns error: failed to lookup address information".into()),
+                ScrapeClass::Dns,
+            ),
+            (
+                "refused",
+                transport(Box::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))),
+                ScrapeClass::Connect,
+            ),
+            (
+                "socket timeout",
+                transport(Box::new(std::io::Error::from(std::io::ErrorKind::TimedOut))),
+                ScrapeClass::Timeout,
+            ),
+            (
+                "body cap",
+                MetricsScrapeError::BodyTooLarge(MAX_RESPONSE_BODY_BYTES),
+                ScrapeClass::BodyCap,
+            ),
+            (
+                "tls material",
+                MetricsScrapeError::TlsMaterial("no key".to_owned()),
+                ScrapeClass::Tls,
+            ),
+            (
+                "plaintext",
+                MetricsScrapeError::PlaintextCredential("http://epp".to_owned()),
+                ScrapeClass::Config,
+            ),
+        ];
+        for (label, error, class) in cases {
+            assert_eq!(error.class(), class, "{label}");
+        }
+    }
+    use crate::resources::tls_backend::{MAX_CA_PEM_BYTES, MAX_CLIENT_CERT_PEM_BYTES, MAX_CLIENT_KEY_PEM_BYTES};
+
+    /// Start a local HTTP server on a random port and return the URL.
+    async fn start_test_server(response: &'static [u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|_| std::process::abort());
+        let port = listener.local_addr().unwrap_or_else(|_| std::process::abort()).port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0_u8; 4096];
+                drop(stream.read(&mut buf).await);
+                drop(stream.write_all(response).await);
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn scrape_returns_body_for_200() {
+        let body = b"# HELP test_metric Test\ntest_metric 1.0\n";
+        let response = b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 39\r\n\r\n# HELP test_metric Test\ntest_metric 1.0\n";
+        let url = start_test_server(response).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), None, None).await;
+        assert!(result.is_ok(), "HTTP 200 must succeed: {result:?}");
+        let text = result.unwrap_or_else(|_| std::process::abort());
+        assert!(text.contains("test_metric"), "body must be in scrape result");
+        let _ = body; // referenced for documentation
+    }
+
+    #[tokio::test]
+    async fn scrape_returns_error_for_non_2xx() {
+        let response = b"HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+        let url = start_test_server(response).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), None, None).await;
+        assert!(result.is_err(), "HTTP 503 must return an error");
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::NonOkStatus { status: 503, .. }),
+            "error must be NonOkStatus(503)"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrape_returns_timeout_for_silent_server() {
+        // Server accepts but never responds, so the scrape must time out.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|_| std::process::abort());
+        let port = listener.local_addr().unwrap_or_else(|_| std::process::abort()).port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0_u8; 4096];
+                drop(stream.read(&mut buf).await);
+                // Intentionally never respond; hold open for 60s then drop.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                drop(stream);
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/metrics");
+        let result = scrape_metrics(&url, Duration::from_millis(100), None, None).await;
+        assert!(result.is_err(), "silent server must time out");
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::Timeout(_)),
+            "error must be Timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrape_returns_error_for_connection_refused() {
+        // Port 1 is never open on any standard OS.
+        let result = scrape_metrics("http://127.0.0.1:1/metrics", Duration::from_secs(5), None, None).await;
+        assert!(result.is_err(), "connection refused must return an error");
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::Transport(_)),
+            "error must be Transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrape_returns_invalid_url_for_unsupported_scheme() {
+        let result = scrape_metrics("ftp://example.com/metrics", Duration::from_secs(5), None, None).await;
+        assert!(result.is_err(), "ftp:// must return an error");
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::InvalidUrl(_)),
+            "error must be InvalidUrl"
+        );
+    }
+
+    #[test]
+    fn error_variants_format_correctly() {
+        let timeout_err = MetricsScrapeError::Timeout(Duration::from_secs(5));
+        assert!(timeout_err.to_string().contains("timed out"), "timeout format");
+
+        let non_ok_err = MetricsScrapeError::NonOkStatus {
+            status: 404,
+            url: "http://x".to_owned(),
+        };
+        assert!(non_ok_err.to_string().contains("404"), "non-ok format");
+
+        let url_err = MetricsScrapeError::InvalidUrl("ftp://bad".to_owned());
+        assert!(url_err.to_string().contains("ftp://bad"), "url format");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_tls_client_config: PEM material validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_tls_config_valid_ca_only() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let result = build_tls_client_config(ca.cert_pem.as_bytes(), None, None);
+        assert!(result.is_ok(), "valid CA PEM must produce a ClientConfig: {result:?}");
+    }
+
+    #[test]
+    fn build_tls_config_valid_mtls() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let client = certs::generate_dns_cert(&ca, "client", "localhost").unwrap();
+        let result = build_tls_client_config(
+            ca.cert_pem.as_bytes(),
+            Some(client.cert_pem.as_bytes()),
+            Some(client.key_pem.as_bytes()),
+        );
+        assert!(result.is_ok(), "valid CA + client cert + key must succeed: {result:?}");
+    }
+
+    #[test]
+    fn build_tls_config_empty_ca_pem_fails() {
+        let result = build_tls_client_config(b"", None, None);
+        assert!(result.is_err(), "empty CA PEM must fail");
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::TlsMaterial(_)),
+            "error must be TlsMaterial"
+        );
+    }
+
+    #[test]
+    fn build_tls_config_garbage_ca_pem_fails() {
+        let result = build_tls_client_config(b"not valid pem data", None, None);
+        assert!(result.is_err(), "garbage CA PEM must fail");
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::TlsMaterial(_)),
+            "error must be TlsMaterial"
+        );
+    }
+
+    #[test]
+    fn build_tls_config_client_cert_without_key_fails() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let client = certs::generate_dns_cert(&ca, "client", "localhost").unwrap();
+        let result = build_tls_client_config(ca.cert_pem.as_bytes(), Some(client.cert_pem.as_bytes()), None);
+        assert!(result.is_err(), "client cert without key must fail");
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::TlsMaterial(_)),
+            "error must be TlsMaterial"
+        );
+    }
+
+    #[test]
+    fn build_tls_config_client_key_without_cert_fails() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let client = certs::generate_dns_cert(&ca, "client", "localhost").unwrap();
+        let result = build_tls_client_config(ca.cert_pem.as_bytes(), None, Some(client.key_pem.as_bytes()));
+        assert!(result.is_err(), "client key without cert must fail");
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::TlsMaterial(_)),
+            "error must be TlsMaterial"
+        );
+    }
+
+    #[test]
+    fn build_tls_config_mismatched_client_cert_and_key_fails() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let cert_a = certs::generate_dns_cert(&ca, "client-a", "a.localhost").unwrap();
+        let cert_b = certs::generate_dns_cert(&ca, "client-b", "b.localhost").unwrap();
+        let result = build_tls_client_config(
+            ca.cert_pem.as_bytes(),
+            Some(cert_a.cert_pem.as_bytes()),
+            Some(cert_b.key_pem.as_bytes()),
+        );
+        assert!(result.is_err(), "mismatched client cert and key must fail");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("identity construction failed"),
+            "error must indicate identity mismatch: {err_msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounded input limits
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_tls_config_rejects_oversized_ca_pem() {
+        let oversized = vec![b'A'; MAX_CA_PEM_BYTES + 1];
+        let result = build_tls_client_config(&oversized, None, None);
+        assert!(result.is_err(), "oversized CA PEM must fail");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exceeds maximum size"),
+            "error must mention size limit: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_tls_config_rejects_oversized_client_cert_pem() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let oversized = vec![b'A'; MAX_CLIENT_CERT_PEM_BYTES + 1];
+        let client_cert = certs::generate_dns_cert(&ca, "client", "localhost").unwrap();
+        let result = build_tls_client_config(
+            ca.cert_pem.as_bytes(),
+            Some(&oversized),
+            Some(client_cert.key_pem.as_bytes()),
+        );
+        assert!(result.is_err(), "oversized client cert PEM must fail");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exceeds maximum size"),
+            "error must mention size limit: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_tls_config_rejects_oversized_client_key_pem() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let client_cert = certs::generate_dns_cert(&ca, "client", "localhost").unwrap();
+        let oversized = vec![b'A'; MAX_CLIENT_KEY_PEM_BYTES + 1];
+        let result = build_tls_client_config(
+            ca.cert_pem.as_bytes(),
+            Some(client_cert.cert_pem.as_bytes()),
+            Some(&oversized),
+        );
+        assert!(result.is_err(), "oversized client key PEM must fail");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exceeds maximum size"),
+            "error must mention size limit: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TLS server helper
+    // -----------------------------------------------------------------------
+
+    /// Start a one-shot TLS server on localhost and return the URL.
+    ///
+    /// `client_ca_pem`: when `Some`, the server requires client certificate
+    /// authentication (mTLS).  When `None`, one-way TLS only.
+    #[cfg(not(feature = "fips"))]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "TLS server setup: certs + verifier + acceptor + one-shot handler"
+    )]
+    async fn start_tls_test_server(
+        server_cert_pem: &str,
+        server_key_pem: &str,
+        client_ca_pem: Option<&str>,
+        response: Vec<u8>,
+    ) -> String {
+        let server_certs = CertificateDer::pem_slice_iter(server_cert_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let server_key = PrivateKeyDer::from_pem_slice(server_key_pem.as_bytes()).unwrap();
+
+        let server_config = if let Some(ca) = client_ca_pem {
+            let mut root_store = rustls::RootCertStore::empty();
+            let ca_certs = CertificateDer::pem_slice_iter(ca.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            for cert in &ca_certs {
+                root_store.add(cert.clone()).unwrap();
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+                .build()
+                .unwrap();
+            rustls::ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(server_certs, server_key)
+                .unwrap()
+        } else {
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(server_certs, server_key)
+                .unwrap()
+        };
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await
+                && let Ok(tls_stream) = acceptor.accept(stream).await
+            {
+                let (mut reader, mut writer) = tokio::io::split(tls_stream);
+                let mut buf = [0_u8; 4096];
+                drop(reader.read(&mut buf).await);
+                drop(writer.write_all(&response).await);
+            }
+        });
+
+        format!("https://localhost:{port}")
+    }
+
+    /// OpenSSL twin of the rustls one-shot TLS server, so the scrape and mTLS
+    /// integration tests exercise the real `hyper-openssl` connector path
+    /// under `fips`.
+    #[cfg(feature = "fips")]
+    #[expect(clippy::too_many_lines, reason = "OpenSSL test server setup")]
+    async fn start_tls_test_server(
+        server_cert_pem: &str,
+        server_key_pem: &str,
+        client_ca_pem: Option<&str>,
+        response: Vec<u8>,
+    ) -> String {
+        use openssl::{
+            pkey::PKey,
+            ssl::{Ssl, SslAcceptor, SslMethod, SslVerifyMode},
+            x509::{X509, store::X509StoreBuilder},
+        };
+
+        let cert = X509::from_pem(server_cert_pem.as_bytes()).unwrap();
+        let key = PKey::private_key_from_pem(server_key_pem.as_bytes()).unwrap();
+        let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        builder.set_certificate(&cert).unwrap();
+        builder.set_private_key(&key).unwrap();
+        builder.check_private_key().unwrap();
+        if let Some(ca) = client_ca_pem {
+            let mut store = X509StoreBuilder::new().unwrap();
+            for client_ca in X509::stack_from_pem(ca.as_bytes()).unwrap() {
+                store.add_cert(client_ca).unwrap();
+            }
+            builder.set_verify_cert_store(store.build()).unwrap();
+            builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+        }
+        let acceptor = builder.build();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(ssl) = Ssl::new(acceptor.context()) else {
+                return;
+            };
+            let Ok(mut tls) = tokio_openssl::SslStream::new(ssl, stream) else {
+                return;
+            };
+            if std::pin::Pin::new(&mut tls).accept().await.is_ok() {
+                let (mut reader, mut writer) = tokio::io::split(tls);
+                let mut buf = [0_u8; 4096];
+                drop(reader.read(&mut buf).await);
+                drop(writer.write_all(&response).await);
+            }
+        });
+
+        format!("https://localhost:{port}")
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end TLS scrape tests (real certificates, real handshakes)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn scrape_tls_with_matching_ca_succeeds() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let server_cert = certs::generate_dns_cert(&ca, "test-server", "localhost").unwrap();
+
+        let url = start_tls_test_server(
+            &server_cert.cert_pem,
+            &server_cert.key_pem,
+            None,
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 16\r\n\r\ntest_metric 1.0\n".to_vec(),
+        )
+        .await;
+
+        let tls_config = build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap();
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config)), None).await;
+        assert!(result.is_ok(), "TLS scrape with matching CA must succeed: {result:?}");
+        assert!(
+            result.unwrap().contains("test_metric"),
+            "response body must contain the scraped metric"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrape_tls_with_wrong_ca_fails() {
+        let ca_server = certs::generate_ca("server-ca").unwrap();
+        let ca_client = certs::generate_ca("wrong-ca").unwrap();
+        let server_cert = certs::generate_dns_cert(&ca_server, "test-server", "localhost").unwrap();
+
+        let url = start_tls_test_server(
+            &server_cert.cert_pem,
+            &server_cert.key_pem,
+            None,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        )
+        .await;
+
+        let tls_config = build_tls_client_config(ca_client.cert_pem.as_bytes(), None, None).unwrap();
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config)), None).await;
+        assert!(result.is_err(), "TLS scrape with wrong CA must fail");
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::Transport(_)),
+            "error must be Transport (TLS verification failure)"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrape_mtls_with_valid_client_cert_succeeds() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let server_cert = certs::generate_dns_cert(&ca, "test-server", "localhost").unwrap();
+        let client_cert = certs::generate_dns_cert(&ca, "test-client", "client.local").unwrap();
+
+        let url = start_tls_test_server(
+            &server_cert.cert_pem,
+            &server_cert.key_pem,
+            Some(&ca.cert_pem),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 16\r\n\r\ntest_metric 2.0\n".to_vec(),
+        )
+        .await;
+
+        let tls_config = build_tls_client_config(
+            ca.cert_pem.as_bytes(),
+            Some(client_cert.cert_pem.as_bytes()),
+            Some(client_cert.key_pem.as_bytes()),
+        )
+        .unwrap();
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config)), None).await;
+        assert!(
+            result.is_ok(),
+            "mTLS scrape with valid client cert must succeed: {result:?}"
+        );
+        assert!(
+            result.unwrap().contains("test_metric"),
+            "response body must contain the scraped metric"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrape_mtls_without_client_cert_fails() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let server_cert = certs::generate_dns_cert(&ca, "test-server", "localhost").unwrap();
+
+        let url = start_tls_test_server(
+            &server_cert.cert_pem,
+            &server_cert.key_pem,
+            Some(&ca.cert_pem),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        )
+        .await;
+
+        let tls_config = build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap();
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config)), None).await;
+        assert!(result.is_err(), "mTLS scrape without client cert must fail");
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::Transport(_)),
+            "error must be Transport (server rejected missing client cert)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pinned peer polling
+    // -----------------------------------------------------------------------
+
+    /// The SHA-256 fingerprint of a certificate's leaf, as a pin string.
+    fn leaf_pin(cert_pem: &str) -> String {
+        let der = crate::resources::tls_backend::first_cert_der_from_pem(cert_pem).unwrap();
+        crate::signals::leaf_fingerprint(&der)
+    }
+
+    #[tokio::test]
+    async fn pinned_scrape_accepts_the_declared_leaf_despite_a_name_mismatch() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        // SAN is peer.local, but a peer is dialled by IP, so the name never
+        // matches. The pin is what accepts it.
+        let server_cert = certs::generate_dns_cert(&ca, "peer", "peer.local").unwrap();
+        let url = start_tls_test_server(
+            &server_cert.cert_pem,
+            &server_cert.key_pem,
+            None,
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 16\r\n\r\ntest_metric 3.0\n".to_vec(),
+        )
+        .await;
+
+        let pin = leaf_pin(&server_cert.cert_pem);
+        let config = build_pinned_client_config(ca.cert_pem.as_bytes(), None, None, &[pin]).unwrap();
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(config), None).await;
+        assert!(result.is_ok(), "a matching pin must accept the peer: {result:?}");
+        assert!(result.unwrap().contains("test_metric"), "body must be returned");
+    }
+
+    #[tokio::test]
+    async fn pinned_scrape_rejects_an_undeclared_leaf() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let server_cert = certs::generate_dns_cert(&ca, "peer", "localhost").unwrap();
+        let url = start_tls_test_server(
+            &server_cert.cert_pem,
+            &server_cert.key_pem,
+            None,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        )
+        .await;
+
+        // A cert signed by the same CA but never declared: trust alone is not
+        // enough, the leaf must be the one this site wrote down.
+        let other = certs::generate_dns_cert(&ca, "other", "localhost").unwrap();
+        let config =
+            build_pinned_client_config(ca.cert_pem.as_bytes(), None, None, &[leaf_pin(&other.cert_pem)]).unwrap();
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(config), None).await;
+        assert!(result.is_err(), "an undeclared leaf must be rejected");
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::Transport(_)),
+            "error must be Transport (pin mismatch at handshake)"
+        );
+    }
+
+    #[tokio::test]
+    async fn spiffe_scrape_authorizes_by_site_id_not_pin() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let server_cert = certs::generate_site_cert(&ca, "east").unwrap();
+        let body = b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\ntest_metric 3.0\n".to_vec();
+        for (label, site, accepted) in [("the dialed site", "east", true), ("another site", "west", false)] {
+            let url = start_tls_test_server(&server_cert.cert_pem, &server_cert.key_pem, None, body.clone()).await;
+            let config =
+                build_spiffe_client_config(ca.cert_pem.as_bytes(), None, None, &certs::spiffe_id(site)).unwrap();
+            let result = scrape_metrics(&url, Duration::from_secs(5), Some(config), None).await;
+            assert_eq!(result.is_ok(), accepted, "{label}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn pinned_config_without_declared_pins_is_refused() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let result = build_pinned_client_config(ca.cert_pem.as_bytes(), None, None, &[]);
+        assert!(
+            matches!(result, Err(MetricsScrapeError::TlsMaterial(_))),
+            "dialling a peer with no declared pin must be refused"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Server-side seam (signals listener)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn server_accept_refuses_an_anonymous_client() {
+        use crate::resources::tls_backend::{accept, build_server_config, connect, parse_server_name};
+
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let server_cert = certs::generate_dns_cert(&ca, "server", "localhost").unwrap();
+        let server_tls = build_server_config(
+            ca.cert_pem.as_bytes(),
+            server_cert.cert_pem.as_bytes(),
+            server_cert.key_pem.as_bytes(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            accept(tcp, &server_tls).await.is_ok()
+        });
+        let anonymous = Arc::new(build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap());
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = parse_server_name("localhost").unwrap();
+        drop(connect(tcp, &anonymous, &name).await);
+        assert!(
+            !server.await.unwrap(),
+            "a client without a certificate must fail the handshake"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "server + client handshake round-trip setup")]
+    async fn server_accept_verifies_the_client_and_exposes_its_leaf() {
+        use crate::resources::tls_backend::{
+            accept, build_server_config, connect, parse_server_name, server_peer_leaf_der,
+        };
+
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let server_cert = certs::generate_dns_cert(&ca, "server", "localhost").unwrap();
+        let client_cert = certs::generate_dns_cert(&ca, "client", "client.local").unwrap();
+
+        let server_tls = build_server_config(
+            ca.cert_pem.as_bytes(),
+            server_cert.cert_pem.as_bytes(),
+            server_cert.key_pem.as_bytes(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_leaf = crate::resources::tls_backend::first_cert_der_from_pem(&client_cert.cert_pem).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let stream = accept(tcp, &server_tls).await.unwrap();
+            server_peer_leaf_der(&stream)
+        });
+
+        let client_tls = Arc::new(
+            build_tls_client_config(
+                ca.cert_pem.as_bytes(),
+                Some(client_cert.cert_pem.as_bytes()),
+                Some(client_cert.key_pem.as_bytes()),
+            )
+            .unwrap(),
+        );
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let name = parse_server_name("localhost").unwrap();
+        let _client = connect(tcp, &client_tls, &name).await.unwrap();
+
+        let presented = server.await.unwrap();
+        assert_eq!(
+            presented.as_deref(),
+            Some(client_leaf.as_slice()),
+            "the listener must expose the client's leaf certificate for scope"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TLS negative test coverage (Item 6)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn scrape_tls_hostname_mismatch_fails() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let server_cert = certs::generate_dns_cert(&ca, "test-server", "wrong.example.com").unwrap();
+
+        let url = start_tls_test_server(
+            &server_cert.cert_pem,
+            &server_cert.key_pem,
+            None,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        )
+        .await;
+
+        let tls_config = build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap();
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config)), None).await;
+        assert!(
+            result.is_err(),
+            "TLS scrape with hostname mismatch must fail (SAN has wrong.example.com, connecting to localhost)"
+        );
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::Transport(_)),
+            "error must be Transport (hostname verification failure)"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrape_tls_expired_server_cert_fails() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let expired_cert = certs::generate_expired_dns_cert(&ca, "test-server", "localhost").unwrap();
+
+        let url = start_tls_test_server(
+            &expired_cert.cert_pem,
+            &expired_cert.key_pem,
+            None,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        )
+        .await;
+
+        let tls_config = build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap();
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config)), None).await;
+        assert!(result.is_err(), "TLS scrape with expired server cert must fail");
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::Transport(_)),
+            "error must be Transport (expired certificate)"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrape_tls_not_yet_valid_server_cert_fails() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let future_cert = certs::generate_not_yet_valid_dns_cert(&ca, "test-server", "localhost").unwrap();
+
+        let url = start_tls_test_server(
+            &future_cert.cert_pem,
+            &future_cert.key_pem,
+            None,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        )
+        .await;
+
+        let tls_config = build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap();
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(Arc::new(tls_config)), None).await;
+        assert!(result.is_err(), "TLS scrape with not-yet-valid server cert must fail");
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::Transport(_)),
+            "error must be Transport (certificate not yet valid)"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrape_401_returns_non_ok_status() {
+        let response = b"HTTP/1.0 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
+        let url = start_test_server(response).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), None, None).await;
+        assert!(result.is_err(), "HTTP 401 must return an error");
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::NonOkStatus { status: 401, .. }),
+            "error must be NonOkStatus(401)"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrape_403_returns_non_ok_status() {
+        let response = b"HTTP/1.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+        let url = start_test_server(response).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), None, None).await;
+        assert!(result.is_err(), "HTTP 403 must return an error");
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::NonOkStatus { status: 403, .. }),
+            "error must be NonOkStatus(403)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounded response body (streaming rejection)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn scrape_rejects_oversized_response_body_during_streaming() {
+        let body_size = MAX_RESPONSE_BODY_BYTES + 1;
+        let header = format!("HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {body_size}\r\n\r\n");
+        let mut response_bytes = header.into_bytes();
+        response_bytes.resize(response_bytes.len() + body_size, b'x');
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|_| std::process::abort());
+        let port = listener.local_addr().unwrap_or_else(|_| std::process::abort()).port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0_u8; 4096];
+                drop(stream.read(&mut buf).await);
+                drop(stream.write_all(&response_bytes).await);
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/metrics");
+        let result = scrape_metrics(&url, Duration::from_secs(10), None, None).await;
+        assert!(result.is_err(), "oversized response body must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("limit"), "error must mention size limit: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Error message safety: no secret bytes in diagnostics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exhaustive PEM-leak check across multiple error paths"
+    )]
+    fn error_messages_never_contain_pem_material() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let client = certs::generate_dns_cert(&ca, "client", "localhost").unwrap();
+
+        let cases = vec![
+            ("empty CA", build_tls_client_config(b"", None, None)),
+            ("garbage CA", build_tls_client_config(b"not valid", None, None)),
+            ("mismatched cert/key", {
+                let other = certs::generate_dns_cert(&ca, "other", "other.local").unwrap();
+                build_tls_client_config(
+                    ca.cert_pem.as_bytes(),
+                    Some(client.cert_pem.as_bytes()),
+                    Some(other.key_pem.as_bytes()),
+                )
+            }),
+        ];
+
+        for (label, result) in cases {
+            if let Err(e) = result {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("BEGIN CERTIFICATE"),
+                    "{label}: error message must not contain PEM certificate data"
+                );
+                assert!(
+                    !msg.contains("BEGIN PRIVATE KEY"),
+                    "{label}: error message must not contain PEM private key data"
+                );
+                assert!(
+                    !msg.contains("BEGIN RSA"),
+                    "{label}: error message must not contain RSA key data"
+                );
+                assert!(
+                    !msg.contains("BEGIN EC"),
+                    "{label}: error message must not contain EC key data"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTPS enforcement when TLS is configured
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn scrape_rejects_http_url_with_tls_config() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let config = Arc::new(build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap());
+        let result = scrape_metrics(
+            "http://127.0.0.1:9090/metrics",
+            Duration::from_secs(5),
+            Some(config),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "HTTP URL with TLS config must fail");
+        assert!(
+            matches!(result.unwrap_err(), MetricsScrapeError::HttpWithTls(_)),
+            "error must be HttpWithTls"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrape_allows_https_url_with_tls_config() {
+        let ca = certs::generate_ca("test-ca").unwrap();
+        let server = certs::generate_dns_cert(&ca, "server", "localhost").unwrap();
+        let response = b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let url = start_tls_test_server(&server.cert_pem, &server.key_pem, None, response.to_vec()).await;
+        let config = Arc::new(build_tls_client_config(ca.cert_pem.as_bytes(), None, None).unwrap());
+        let result = scrape_metrics(&url, Duration::from_secs(5), Some(config), None).await;
+        assert!(result.is_ok(), "HTTPS URL with TLS config must succeed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn scrape_allows_http_url_without_tls_config() {
+        let response = b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let url = start_test_server(response).await;
+        let result = scrape_metrics(&url, Duration::from_secs(5), None, None).await;
+        assert!(result.is_ok(), "HTTP URL without TLS config must succeed: {result:?}");
+    }
+
+    /// A plain HTTP server answering one request with `200 ok`, handing back what it received.
+    async fn capturing_server() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/metrics", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0_u8; 8192];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                drop(tx.send(String::from_utf8_lossy(buf.get(..read).unwrap_or_default()).into_owned()));
+                drop(
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                        .await,
+                );
+            }
+        });
+        (url, rx)
+    }
+
+    fn bearer(token: &str, allow_plaintext: bool) -> Bearer {
+        Bearer::new(Zeroizing::new(token.to_owned()), allow_plaintext).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_bearer_is_sent_as_the_authorization_header() {
+        let bearer = bearer("eyJhbGciOi.tok-en_1", true);
+        let (url, request) = capturing_server().await;
+        let body = scrape(&url, Duration::from_secs(5), None, Some(&bearer))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(body, "ok");
+        let request = request.await.unwrap().to_ascii_lowercase();
+        assert!(
+            request.contains("authorization: bearer eyjhbgcioi.tok-en_1\r\n"),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_auth_sends_no_authorization_header() {
+        let (url, request) = capturing_server().await;
+        scrape_metrics(&url, Duration::from_secs(5), None, None).await.unwrap();
+        assert!(!request.await.unwrap().to_ascii_lowercase().contains("authorization:"));
+    }
+
+    #[tokio::test]
+    async fn a_bearer_is_never_sent_over_plain_http_unless_allowed() {
+        let bearer = bearer("secret-token", false);
+        let (url, request) = capturing_server().await;
+        let refused = scrape(&url, Duration::from_secs(5), None, Some(&bearer)).await;
+        assert!(matches!(refused, Err(MetricsScrapeError::PlaintextCredential(_))));
+        let not_contacted = tokio::time::timeout(Duration::from_millis(200), request).await;
+        assert!(not_contacted.is_err(), "the server is never contacted");
+    }
+
+    #[test]
+    fn an_unusable_token_is_refused_without_echoing_it() {
+        let oversized = "a".repeat(MAX_TOKEN_BYTES + 1);
+        for (label, token) in [
+            ("empty", ""),
+            ("two words", "not one-word"),
+            ("newline", "tok\nen"),
+            ("oversized", oversized.as_str()),
+        ] {
+            let error = Bearer::new(Zeroizing::new(token.to_owned()), false).unwrap_err();
+            assert!(matches!(error, MetricsScrapeError::Credential(_)), "{label}");
+            assert!(
+                !error.to_string().contains("one-word"),
+                "{label}: the token never reaches an error"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bearer_is_never_sent_under_system_roots() {
+        let refused = scrape(
+            "https://example.com/metrics",
+            Duration::from_secs(5),
+            None,
+            Some(&bearer("t", false)),
+        )
+        .await;
+        assert!(matches!(refused, Err(MetricsScrapeError::Credential(_))), "{refused:?}");
+    }
+
+    #[test]
+    fn a_bearer_never_prints_its_token() {
+        let secret = bearer("super-secret", false);
+        assert_eq!(format!("{secret:?}"), "Bearer(redacted)");
+        assert!(secret.header().unwrap().is_sensitive());
+    }
+}

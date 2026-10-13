@@ -198,7 +198,7 @@ Praxis AI image; these values may advance independently.
 | `replicaCount` | int | `1` | Gateway replicas. |
 | `image.repository` | string | `ghcr.io/praxis-proxy/ai` | Image repository. |
 | `image.tag` | string | `0.4.0` | Image tag (ignored when `image.digest` is set). |
-| `image.digest` | string | `""` | Immutable digest (sha256:…). When set, tag is ignored. |
+| `image.digest` | string | `""` | Immutable digest (sha256:...). When set, tag is ignored. |
 | `image.flavor` | string | `ai` | `ai` or `grid-gateway`, the grid build that `gatewayConfig.role: provider`, `gridServing`, and telemetry need. A repository ending in `/grid-gateway` sets it. |
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy. |
 | `imagePullSecrets` | list | `[]` | Pull secrets for private registries. |
@@ -250,6 +250,9 @@ Praxis AI image; these values may advance independently.
 | `mountReconciliation.gatewayRef` | string | release fullname | `GatewayRef.name` to bind the Deployment opt-in to. |
 | `mountReconciliation.releaseHelmMounts` | bool | `false` | Second handoff phase. After Grid reports `Ready`, set this true to release selected Helm credential mounts and, without Grid serving, the chart TLS mount. |
 | `mountReconciliation.managedCredentialNames` | list | `[]` | Credential Secret names to release from Helm in the second handoff phase. Other entries in `credentials` remain Helm-managed. |
+| `mountReconciliation.rbac.create` | bool | `true` | Render a Role and RoleBinding in the release namespace that let the operator ServiceAccount `get` and `patch` this chart's Deployment and no other. `false` leaves the Role to you; see below. |
+| `mountReconciliation.operator.serviceAccount` | string | `grid-operator` | Operator ServiceAccount the Role binds. Blank fails the render while `rbac.create` is true. |
+| `mountReconciliation.operator.namespace` | string | `grid-system` | Namespace of that ServiceAccount. Blank fails the render while `rbac.create` is true. |
 | `networkPolicy.enabled` | bool | `false` | Render a NetworkPolicy that limits which pods can reach the listener port, where the CNI enforces NetworkPolicy. It is not authentication. Node and host-network traffic handling is CNI-specific (OVN-Kubernetes: the `policy-group.network.openshift.io/host-network` label), and a LoadBalancer with `externalTrafficPolicy: Cluster` can SNAT clients to node IPs. |
 | `networkPolicy.from` | list | `[]` | NetworkPolicyPeer entries allowed in. Required when enabled. With `auth.mode: none`, list only the authenticating front. `{podSelector: {}}` admits every pod in this namespace. An empty `namespaceSelector` and an `ipBlock` of `0.0.0.0/0` or `::/0` admit everyone and fail the render. An all-address `ipBlock` with `except` entries is allowed. The check reads selector emptiness and the cidr only, so `matchExpressions` that happen to select every pod pass. A provider gateway behind a LoadBalancer that SNATs clients to node IPs needs `ipBlock` peers for those node addresses. |
 | `metricsListener.enabled` | bool | `false` | Serve `GET /metrics` over TLS on its own port and ClusterIP Service, for an in-cluster Prometheus. The admin listener refuses a non-loopback Host, so Prometheus cannot scrape it. Needs the grid-gateway image, `existingSecret`, `fromNamespaces`, and `networkPolicy.enabled`. The port answers only `/metrics` but has no authentication, so the NetworkPolicy is its access control, and that holds only where the CNI enforces NetworkPolicy. |
@@ -286,7 +289,7 @@ Praxis AI image; these values may advance independently.
 | `gridServing.gatewayRef` | string | release fullname | This gateway's gatewayRef name in the GridNetwork. |
 | `gridServing.configMap` | string | `""` | Overrides the derived `grid-serving-<network>-<gatewayRef>`. Needed when that name passes 63 characters. |
 | `gridServing.mountPath` | string | `/etc/praxis/grid-serving` | Mount directory for the ConfigMap. |
-| `gridServing.siteRoute.availability` | object | `{}` | Site availability, rendered into the `grid_site_route` filter block with keys snake_case as the filter reads them (`shedding`, `smoothing`, `ceiling_half_life_ms`, `ceiling_floor`, `explore_floor`, `full_after_ms`, `room_after_ms`, `queue_full`). Every field defaults and `shedding` is the one switch. See `examples/gateway/grid-site-route.yaml`. |
+| `gridServing.siteRoute.availability` | object | `{}` | Site availability, rendered into the `grid_site_route` filter block with keys snake_case as the filter reads them (`shedding`, `smoothing`, `ceiling_floor`, `explore_floor`, `full_after_ms`, `room_after_ms`, `queue_full`). Every field defaults and `shedding` is the one switch. See `examples/gateway/grid-site-route.yaml`. |
 | `gridServing.siteRoute.prefixAffinity` | object | `{}` | Prefix affinity tuning rendered as the filter's `prefix_affinity` (`enabled`, `threshold`, `exploration`, `prefill_tokens_per_second`, `queued_request_seconds`, `tag_key_path`). |
 | `tls.enabled` | bool | `false` | Mount a TLS Secret. |
 | `tls.existingSecret` | string | `grid-site-identity` | Name of the TLS Secret, the site identity the grid operator writes. |
@@ -457,6 +460,38 @@ Consumer config and Secret mount reconciliation is opt-in on both the
 patches its reserved volumes, the delegated Praxis config volume source, the
 named container's mounts, and rollout annotations. It preserves other
 Deployment fields and Helm resources.
+
+The operator's own charts grant no unrestricted Deployment access; certificate
+rotation retains a grant on the named gateway Deployment. With
+`mountReconciliation.enabled`, this chart renders a Role and RoleBinding in
+the release namespace that let `mountReconciliation.operator.serviceAccount`
+in `mountReconciliation.operator.namespace` (`grid-operator` in `grid-system`
+by default) `get` and `patch` this chart's Deployment and no other. The Role
+names the Deployment with the same helper as the Deployment itself, so
+`fullnameOverride` moves both. Set `mountReconciliation.rbac.create: false`
+to bring your own Role, for example from an installer that may not create
+RBAC; the Role to create, and what the grant still allows (`patch` is
+whole-object, not mounts-only), are in
+[Deployment access](../../docs/architecture/operations.md#deployment-access).
+The installer needs permission to create or update Roles and RoleBindings in
+this namespace and must pass Kubernetes' role-escalation and binding checks:
+it must already hold the granted `get` and `patch` permissions on the named
+Deployment, or have `escalate` on the Role, and hold its permissions or have
+`bind` on it to create the RoleBinding. Namespace `edit` access alone does
+not permit creating these RBAC objects. An authorized administrator can
+create the grant separately with `mountReconciliation.rbac.create: false`.
+The grant stays as long as `mountReconciliation.enabled` is set here, even
+after the `GridNetwork` stops delegating.
+
+Upgrading from v0.2.0 with delegation enabled: the v0.2.0 operator charts
+granted every Deployment in their resource namespaces, and that rule is
+gone. Upgrade this chart first, so the Role exists, then the operator. Out
+of order, the operator reports
+`mountReconciliationStatus[].reason: DeploymentForbidden`, patches nothing,
+retains the previous populated routing overlay, and cannot publish new
+populated routes to this gateway until the Role exists. If the last provider
+disappears, the operator still publishes an empty authoritative overlay before
+mount reconciliation, so watched routes stop selecting providers.
 
 Configure the gateway chart to mount the operator-generated Praxis config.
 Keep the old Helm mounts during the first phase, then release them only after

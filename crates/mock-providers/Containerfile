@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1
+
+# Multi-stage build for mock AI provider servers.
+# Produces a single binary that serves any provider via --provider flag.
+#
+# Usage:
+#   docker build -t grid-mock-providers:latest -f crates/mock-providers/Containerfile .
+#   docker run --rm -p 10001:8080 grid-mock-providers:latest --provider openai
+
+# ------------------------------------------------------------------------------
+# Stage 1: Build
+# ------------------------------------------------------------------------------
+
+FROM rust:1.96-alpine AS builder
+
+RUN apk add --no-cache musl-dev
+
+# Build provenance. .dockerignore excludes .git, so the build cannot resolve these
+# itself: the Makefile passes them, and a build that does not ships "unknown".
+ARG GRID_GIT_COMMIT=unknown
+ARG GRID_GIT_VERSION=unknown
+ARG GRID_GIT_TREE_STATE=unknown
+ARG GRID_BUILD_DATE=unknown
+ENV GRID_GIT_COMMIT=$GRID_GIT_COMMIT \
+    GRID_GIT_VERSION=$GRID_GIT_VERSION \
+    GRID_GIT_TREE_STATE=$GRID_GIT_TREE_STATE \
+    GRID_BUILD_DATE=$GRID_BUILD_DATE
+
+WORKDIR /src
+
+COPY . .
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --package mock-providers \
+    && cp target/release/mock-providers /usr/local/bin/mock-providers
+
+# ------------------------------------------------------------------------------
+# Stage 2: Runtime
+# ------------------------------------------------------------------------------
+
+FROM alpine:3.23
+
+ARG GRID_GIT_COMMIT=unknown
+ARG GRID_GIT_VERSION=unknown
+LABEL org.opencontainers.image.revision="$GRID_GIT_COMMIT" \
+    org.opencontainers.image.version="$GRID_GIT_VERSION" \
+    org.opencontainers.image.source="https://github.com/praxis-proxy/grid" \
+    org.opencontainers.image.description="Mock inference providers for Grid executable demos" \
+    org.opencontainers.image.licenses="Apache-2.0"
+
+RUN adduser -D -u 1000 app
+
+COPY --from=builder --chown=root:root --chmod=0555 \
+    /usr/local/bin/mock-providers /usr/local/bin/mock-providers
+
+USER 1000:1000
+
+EXPOSE 8080
+
+ENTRYPOINT ["mock-providers"]

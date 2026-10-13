@@ -1,5 +1,13 @@
 [files]
-extend-exclude = ["Cargo.lock", "target/"]
+extend-exclude = ["Cargo.lock", "**/target/**"]
 
 [default.extend-words]
-# Add project-specific identifiers that typos flags incorrectly.
+# Accepted spelling used in parser errors and documentation.
+unparseable = "unparseable"
+
+[default.extend-identifiers]
+# B merged with A in CRDT laws, and a backend node in a topology diagram.
+ba = "ba"
+ba_provider = "ba_provider"
+# Local abbreviation for a configured pool name.
+pn = "pn"

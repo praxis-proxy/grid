@@ -1,0 +1,66 @@
+//! Kubernetes resource builders for the Grid Operator.
+
+/// Site-level geography and load-aware admission for routing overlays.
+pub(crate) mod geography;
+
+/// Operator-owned consumer Praxis config renderer.
+///
+/// Generates the `praxis.yaml` content for consumer gateway `ConfigMap`s from
+/// routing overlays.  Used when `GatewayRef.consumerConfig.enabled` is true.
+pub(crate) mod consumer_config;
+
+/// Deterministic projected volume layout and revision helpers for delegated mounts.
+pub(crate) mod gateway_mounts;
+
+/// Endpoint topology derived from provider and `GridSite` declarations.
+pub(crate) mod derived_topology;
+
+/// Controller-owned credential resolution for API-provider authentication.
+///
+/// Provides [`CredentialPlan`], [`CredentialResolver`], and the v1
+/// [`KubernetesSecretResolver`] backend.  Call [`credential_plan_from_auth`]
+/// to parse `spec.auth` without I/O, then use a resolver or
+/// [`verify_credential_accessible`] to interact with Kubernetes.
+///
+/// [`CredentialPlan`]: credentials::CredentialPlan
+/// [`CredentialResolver`]: credentials::CredentialResolver
+/// [`KubernetesSecretResolver`]: credentials::KubernetesSecretResolver
+/// [`credential_plan_from_auth`]: credentials::credential_plan_from_auth
+/// [`verify_credential_accessible`]: credentials::verify_credential_accessible
+pub mod credentials;
+
+/// Bridge from operator routing overlays to Praxis `intelligent_route` filter config.
+pub mod overlay_bridge;
+/// Versioned overlay envelope for content-addressed revision tracking.
+pub mod overlay_envelope;
+/// Stateful provider admission and pressure-recovery evaluator.
+pub(crate) mod provider_admission;
+/// Provider metrics collection for the [`GridNetwork`] overlay renderer.
+///
+/// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
+pub(crate) mod provider_metrics;
+/// Pure overlay renderer for Praxis `intelligent_route` routing candidates.
+pub mod routing_overlay;
+/// Secret builders for grid TLS certificates.
+pub mod secret;
+/// Grid serving config the gateway's cross-site pollers read.
+pub(crate) mod serving_config;
+/// Shared Kubernetes Secret test doubles, reused by `secret`/`endpoint_tls`
+/// unit tests instead of each keeping its own copy of the same mock.
+#[cfg(test)]
+pub(crate) mod test_doubles;
+/// Trust bundle management for grid mTLS.
+pub mod trust_bundle;
+
+/// Shared TLS material resolution and validation for endpoint probes.
+pub(crate) mod endpoint_tls;
+/// Typed gateway probe outcome and phase-transition contracts.
+pub(crate) mod gateway_probe;
+/// Live MCP `tools/list` probe for [`AgentToolProvider`](crate::crd::agent_tool_provider::AgentToolProvider).
+pub(crate) mod mcp_probe;
+/// Served-model discovery sources for [`InferenceProvider`](crate::crd::inference_provider::InferenceProvider).
+pub(crate) mod model_discovery;
+/// TLS backend abstraction: client config, connectors, handshake, PEM gates.
+pub mod tls_backend;
+/// TLS gateway probe: bounded handshake and peer certificate extraction.
+pub(crate) mod tls_probe;

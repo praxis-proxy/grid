@@ -10,6 +10,16 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]
+  - package-ecosystem: cargo
+    directory: /crates/gateway
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
   - package-ecosystem: github-actions
     directory: /
     schedule:

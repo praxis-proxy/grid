@@ -84,6 +84,9 @@ spec:
               repository: "{{ cluster.properties.operatorImageRepo }}"
               tag: "{{ cluster.properties.operatorImageTag }}"
               pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            signals:
+              enabled: true
+              peerIntervalSeconds: "2"
             swim:
               siteName: "pool-a"
               seeds: ""
@@ -119,6 +122,9 @@ spec:
               repository: "{{ cluster.properties.operatorImageRepo }}"
               tag: "{{ cluster.properties.operatorImageTag }}"
               pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+            signals:
+              enabled: true
+              peerIntervalSeconds: "2"
             swim:
               siteName: "pool-b"
               seeds: ""
@@ -290,9 +296,9 @@ spec:
                   poolName: "{{ cluster.properties.poolName }}"
                   queueCapacity: 4
                   signalNames:
-                    kvCacheUtilization: inference_pool_average_kv_cache_utilization
-                    queueDepth: inference_pool_average_queue_size
-                    healthy: inference_pool_ready_pods
+                    kvCacheUtilization: llm_d_epp_average_kv_cache_utilization
+                    queueDepth: llm_d_epp_average_queue_size
+                    healthy: llm_d_epp_ready_endpoints
 
     pool-b-site:
       description: Pool-B combined site with Grid CRs
@@ -367,9 +373,9 @@ spec:
                   poolName: "{{ cluster.properties.poolName }}"
                   queueCapacity: 4
                   signalNames:
-                    kvCacheUtilization: inference_pool_average_kv_cache_utilization
-                    queueDepth: inference_pool_average_queue_size
-                    healthy: inference_pool_ready_pods
+                    kvCacheUtilization: llm_d_epp_average_kv_cache_utilization
+                    queueDepth: llm_d_epp_average_queue_size
+                    healthy: llm_d_epp_ready_endpoints
 
     provider-gateway:
       description: Praxis provider gateway with mTLS and credential mounts

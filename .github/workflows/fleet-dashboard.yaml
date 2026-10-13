@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths:
       - "crates/fleet-dashboard/**"
-      - "version/**"
+      - "crates/version/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".cargo/**"
@@ -15,7 +15,7 @@ on:
   pull_request:
     paths:
       - "crates/fleet-dashboard/**"
-      - "version/**"
+      - "crates/version/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".cargo/**"

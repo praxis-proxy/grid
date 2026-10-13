@@ -40,6 +40,15 @@ signal TTL when unset), or when it is `Unavailable`. The EPP counts endpoints
 with fresh metrics, so a saturated engine can read zero while serving, which is
 why two scrapes and the engine answer both gate the verdict.
 
+Provider scrapes run concurrently with a bound of 16. A network's readiness
+floor is one scrape interval plus the longer of one interval or the latest
+measured pass, and it overrides `staleMetricsSeconds` when longer. This keeps a
+successful sample valid until the next non-overlapping pass can refresh it. The
+trade-off is that a slow pass widens the window for every provider on the
+network, so a real failure is reported later. The 15s local-exclusion claim
+below therefore holds only when a pass finishes within one interval; scrape
+cadence follows the slowest provider's timeout, which has no upper bound.
+
 A scrape answering without the pool's ready-endpoint series leaves readiness
 unknown, not false, and does not exclude: a provider pointed at vLLM's own
 `/metrics` carries no such series.

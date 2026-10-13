@@ -147,7 +147,7 @@ different client identity; see [TLS and mTLS](architecture/crds.md#tls-and-mtls)
 
 Add a route, credential injection entry, and load balancer cluster for
 the new provider. Use the InferenceProvider CR name as the
-`candidate_id` placeholder — `install.sh`'s `render_provider_config`
+`candidate_id` placeholder; `install.sh`'s `render_provider_config`
 replaces it with the overlay's `stable_id` after reconciliation.
 
 ```yaml
@@ -210,7 +210,7 @@ filter_chains:
             tls: { ... }
             endpoints:
               - "provider-gateway.grid-system.svc.cluster.local:8443"
-          - name: my-new-provider        # new — same provider gateway endpoint
+          - name: my-new-provider        # new, same provider gateway endpoint
             tls:
               ca:
                 ca_path: /etc/praxis/tls/ca.crt
@@ -414,7 +414,7 @@ kubectl create secret generic provider-tls \
 ## Credential Isolation
 
 Each provider uses a distinct credential Secret and mount path.
-Credentials are mounted only on the provider gateway — never on the
+Credentials are mounted only on the provider gateway, never on the
 consumer gateway or operator.
 
 ```
@@ -488,9 +488,9 @@ The `grid-mock-providers` chart creates a NetworkPolicy that permits
 ingress from two sources:
 
 1. **Provider gateway** pods (`app.kubernetes.io/instance: provider-gateway`)
-   — for request forwarding
+   for request forwarding
 2. **AGN Operator** pods (`app.kubernetes.io/name: grid-operator`)
-   — for health check probes
+   for health check probes
 
 If the operator cannot reach a backend's endpoint, the InferenceProvider
 stays `Unavailable` and the overlay excludes it.

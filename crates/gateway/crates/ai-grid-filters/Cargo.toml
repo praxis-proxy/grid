@@ -1,0 +1,61 @@
+[package]
+name = "ai-grid-filters"
+description = "Grid data-plane routing filters (grid_site_route) for the Praxis gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+praxis-filter = { version = "0.7.1", package = "praxis-proxy-filter" }
+praxis-core = { version = "0.7.1", package = "praxis-proxy-core" }
+praxis-tls = { version = "0.7.1", package = "praxis-proxy-tls" }
+grid-signals = { path = "../../../signals" }
+# The gateway wiring spawns the pollers and builds their mTLS scrapers, so the
+# poller and cert issuance are real dependencies, not just test ones.
+grid-signals-client = { path = "../../../signals-client", default-features = false, features = [
+  "fips",
+] }
+certs = { path = "../../../certs", default-features = false, features = ["verifier", "fips"] }
+serde.workspace = true
+# praxis-proxy-filter 0.7 renamed its YAML crate to the yaml_serde fork and
+# aliases it as serde_yaml; match it so filter config types line up.
+serde_yaml.workspace = true
+arc-swap = "1.0.0"
+async-trait = "0.1.0"
+tracing = "0.1.0"
+http = "1.0.0"
+rustls = { version = "0.23.0", default-features = false, features = ["logging", "std", "tls12"] }
+metrics = "0.24.6"
+zeroize = "1.9.0"
+serde_json = { version = "1.0.0", features = ["raw_value"] }
+xxhash-rust = { version = "0.8.0", features = ["xxh64"] }
+lru = "0.18.0"
+foldhash = "0.2.0"
+bytes = "1.0.0"
+tokio = { version = "1.53.1", features = ["net", "rt", "time"] }
+
+[dev-dependencies]
+dhat = "0.3.0"
+divan = "0.1.21"
+# The flow tests bind a mock TLS peer to drive the real scrape path.
+tokio = { version = "1.53.1", features = [
+  "macros",
+  "net",
+  "rt",
+  "rt-multi-thread",
+  "io-util",
+  "time",
+] }
+tokio-rustls = "0.26.0"
+rustls = { version = "0.23.0", features = ["ring"] }
+praxis-tls = { version = "0.7.1", package = "praxis-proxy-tls" }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
+
+[[bench]]
+name = "choose"
+harness = false
+
+[lints]
+workspace = true
