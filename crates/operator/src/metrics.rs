@@ -796,8 +796,8 @@ mod tests {
         let families = GATEWAY_FEEDBACK_EVENTS.collect();
         let labels: Vec<_> = families
             .iter()
-            .flat_map(|family| family.get_metric())
-            .flat_map(|metric| metric.get_label())
+            .flat_map(MetricFamily::get_metric)
+            .flat_map(prometheus::proto::Metric::get_label)
             .map(|label| (label.name(), label.value()))
             .collect();
         assert_eq!(labels.len(), 5, "only five bounded series are possible");
