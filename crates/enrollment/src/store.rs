@@ -451,6 +451,10 @@ impl MemoryStore {
     }
 
     /// Record a token, unless the name is held, deleted without opt-in, or pinned by a live token.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "idempotent retries and name guards must stay under one lock"
+    )]
     fn mint_site_token(&self, token: NewSiteToken) -> Result<Uuid, StoreError> {
         let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
         let token_id = token.token_id.unwrap_or_else(Uuid::new_v4);
