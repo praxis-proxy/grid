@@ -5669,6 +5669,20 @@ fn env_validate_all(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std
 /// Each entry is `(crd_partial_name, json_pointer)` where the pointer is
 /// evaluated against the CRD JSON and must point to a non-null value.
 const REQUIRED_CRD_FIELDS: &[(&str, &str)] = &[
+    // AgentToAgentProvider spec and status
+    (
+        "agenttoagentproviders",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/binding",
+    ),
+    (
+        "agenttoagentproviders",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/agentCard",
+    ),
+    (
+        "agenttoagentproviders",
+        "/spec/versions/0/schema/openAPIV3Schema/properties/status/properties/discoveredCard",
+    ),
+    ("agenttoagentproviders", "/spec/versions/0/subresources/status"),
     // GridNetwork status fields
     (
         "gridnetworks",
@@ -5803,6 +5817,8 @@ fn rbac_can_i_checks(context: &str) -> Result<(), Box<dyn std::error::Error>> {
         ("patch", "gridsites.grid.praxis.fast/status", None),
         ("list", "inferenceproviders.grid.praxis.fast", None),
         ("patch", "inferenceproviders.grid.praxis.fast/status", None),
+        ("list", "agenttoagentproviders.grid.praxis.fast", None),
+        ("patch", "agenttoagentproviders.grid.praxis.fast/status", None),
         ("get", "secrets", Some("default")),
         ("create", "secrets", Some("default")),
         ("patch", "secrets", Some("default")),

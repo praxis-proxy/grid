@@ -2,6 +2,24 @@ suite: ClusterRole CRD template
 templates:
   - templates/clusterrole-crd.yaml
 tests:
+  - it: grants agenttoagentproviders the same verbs as the other provider CRDs
+    asserts:
+      - contains:
+          path: rules[0].resources
+          content: agenttoagentproviders
+      - equal:
+          path: rules[0].verbs
+          value: ["get", "list", "watch", "patch"]
+
+  - it: grants agenttoagentproviders/status get and patch
+    asserts:
+      - contains:
+          path: rules[2].resources
+          content: agenttoagentproviders/status
+      - equal:
+          path: rules[2].verbs
+          value: ["get", "patch"]
+
   - it: grants agenttoolproviders the same verbs as gridnetworks and inferenceproviders
     asserts:
       - contains:

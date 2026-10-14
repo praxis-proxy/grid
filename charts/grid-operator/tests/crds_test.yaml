@@ -1,5 +1,6 @@
 suite: CRDs
 templates:
+  - templates/crds/agenttoagentprovider.yaml
   - templates/crds/agenttoolprovider.yaml
   - templates/crds/gridnetwork.yaml
   - templates/crds/gridsite.yaml

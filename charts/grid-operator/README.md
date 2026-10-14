@@ -64,7 +64,7 @@ default), keeps the CRDs and every custom resource. To remove CRDs and all
 custom resources:
 
 ```bash
-kubectl delete crd agenttoolproviders.grid.praxis.fast \
+kubectl delete crd agenttoagentproviders.grid.praxis.fast agenttoolproviders.grid.praxis.fast \
   gridnetworks.grid.praxis.fast gridsites.grid.praxis.fast \
   inferenceproviders.grid.praxis.fast
 ```
@@ -132,7 +132,7 @@ does not own them yet. First check that no other release owns them. The
 release annotation must be empty or this release:
 
 ```bash
-kubectl get crd agenttoolproviders.grid.praxis.fast gridnetworks.grid.praxis.fast \
+kubectl get crd agenttoagentproviders.grid.praxis.fast agenttoolproviders.grid.praxis.fast gridnetworks.grid.praxis.fast \
   gridsites.grid.praxis.fast inferenceproviders.grid.praxis.fast \
   -o custom-columns='NAME:.metadata.name,RELEASE:.metadata.annotations.meta\.helm\.sh/release-name'
 ```
@@ -147,7 +147,7 @@ helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
 With an older Helm, mark them as owned by the release, then upgrade as usual:
 
 ```bash
-RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders gridnetworks gridsites inferenceproviders; do kubectl label crd "${crd}.grid.praxis.fast" app.kubernetes.io/managed-by=Helm --overwrite; kubectl annotate crd "${crd}.grid.praxis.fast" meta.helm.sh/release-name="${RELEASE}" meta.helm.sh/release-namespace="${NAMESPACE}" --overwrite; done
+RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoagentproviders agenttoolproviders gridnetworks gridsites inferenceproviders; do kubectl label crd "${crd}.grid.praxis.fast" app.kubernetes.io/managed-by=Helm --overwrite; kubectl annotate crd "${crd}.grid.praxis.fast" meta.helm.sh/release-name="${RELEASE}" meta.helm.sh/release-namespace="${NAMESPACE}" --overwrite; done
 ```
 
 ## Values

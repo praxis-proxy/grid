@@ -9,6 +9,7 @@ metadata:
 rules:
   - apiGroups: ["grid.praxis.fast"]
     resources:
+      - agenttoagentproviders
       - agenttoolproviders
       - gridnetworks
       - inferenceproviders
@@ -19,6 +20,7 @@ rules:
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
   - apiGroups: ["grid.praxis.fast"]
     resources:
+      - agenttoagentproviders/status
       - agenttoolproviders/status
       - gridnetworks/status
       - gridsites/status

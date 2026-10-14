@@ -104,11 +104,13 @@ CRS_BEFORE="$(for k in gridnetworks gridsites inferenceproviders; do uids "${k}.
 # Documented one-time CRD adoption for Helm < 3.17 (keep in sync with the
 # grid-operator README).
 adopt_crds() { # <release> <namespace>
-  for crd in agenttoolproviders gridnetworks gridsites inferenceproviders; do
-    kubectl --context "${CTX}" label crd "${crd}.${GROUP}" \
-      app.kubernetes.io/managed-by=Helm --overwrite
-    kubectl --context "${CTX}" annotate crd "${crd}.${GROUP}" \
-      meta.helm.sh/release-name="$1" meta.helm.sh/release-namespace="$2" --overwrite
+  for crd in agenttoagentproviders agenttoolproviders gridnetworks gridsites inferenceproviders; do
+    if ${K} get crd "${crd}.${GROUP}" >/dev/null 2>&1; then
+      kubectl --context "${CTX}" label crd "${crd}.${GROUP}" \
+        app.kubernetes.io/managed-by=Helm --overwrite
+      kubectl --context "${CTX}" annotate crd "${crd}.${GROUP}" \
+        meta.helm.sh/release-name="$1" meta.helm.sh/release-namespace="$2" --overwrite
+    fi
   done
 }
 branch_crds="$(${UPGRADE_HELM} template grid-operator "${ROOT}/charts/grid-operator" -n "${NS}" "${OPERATOR_ARGS[@]}" \
@@ -133,9 +135,16 @@ if [ "${BASE_GROUP}" = "${GROUP}" ]; then
   echo "== CRDs and CRs survive =="
   CRDS_AFTER="$(uids crd)"
   CRDS_AFTER="$(grep -F ".${GROUP} " <<<"${CRDS_AFTER}" || true)"
-  [ "${CRDS_AFTER}" = "${CRDS_BEFORE}" ] || fail "CRD set or UIDs changed across upgrade:
-$(diff <(echo "${CRDS_BEFORE}") <(echo "${CRDS_AFTER}"))"
-  pass "every grid CRD kept its UID ($(wc -l <<<"${CRDS_AFTER}"))"
+  missing_crds="$(comm -23 \
+    <(sed '/^$/d' <<<"${CRDS_BEFORE}" | sort) \
+    <(sed '/^$/d' <<<"${CRDS_AFTER}" | sort))"
+  [ -z "${missing_crds}" ] || fail "a base CRD was removed or changed across upgrade:
+${missing_crds}"
+  if grep -Fq "/agenttoagentproviders.${GROUP} " <<<"${CRDS_AFTER}"; then
+    pass "every base CRD kept its UID and the A2A CRD was added ($(wc -l <<<"${CRDS_AFTER}"))"
+  else
+    fail "branch did not establish agenttoagentproviders.${GROUP}"
+  fi
   CRS_AFTER="$(for k in gridnetworks gridsites inferenceproviders; do uids "${k}.${GROUP}" -A; done)"
   [ "${CRS_AFTER}" = "${CRS_BEFORE}" ] || fail "CR set or UIDs changed across upgrade:
 $(diff <(echo "${CRS_BEFORE}") <(echo "${CRS_AFTER}"))"

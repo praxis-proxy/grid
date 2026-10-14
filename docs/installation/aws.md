@@ -66,7 +66,7 @@ The grid CRDs go in before the release, because the chart renders them and the r
 that use them together and Helm validates the whole set first:
 
 ```bash
-for k in gridnetwork gridsite inferenceprovider agenttoolprovider; do
+for k in gridnetwork gridsite inferenceprovider agenttoolprovider agenttoagentprovider; do
   helm template grid-operator charts/grid-operator -n grid \
     --show-only templates/crds/$k.yaml | oc apply -f -
 done

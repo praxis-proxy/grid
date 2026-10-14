@@ -1,0 +1,36 @@
+apiVersion: grid.praxis.fast/v1alpha1
+kind: AgentToAgentProvider
+metadata:
+  name: claims-agent
+spec:
+  gridNetworkRef: example
+  endpoint: https://claims-agent.example.test
+  binding: JSONRPC
+
+  # The default is /.well-known/agent-card.json. Set at most one of url/path
+  # when the agent publishes its card elsewhere.
+  agentCard:
+    path: /.well-known/agent-card.json
+    skillAllowlist:
+      - claims-processing
+      - document-review
+
+  # The provider endpoint remains the routing authority. Card URLs are
+  # discovery input only and never redirect the final agent hop.
+  auth:
+    strategy: mtls_only
+  tls:
+    caSecretRef:
+      name: claims-agent-ca
+      namespace: grid-system
+    clientCertificateSecretRef:
+      name: claims-agent-client-cert
+      namespace: grid-system
+      certificateKey: tls.crt
+      privateKeyKey: tls.key
+
+  siteSelector:
+    matchLabels: {}
+  accessPolicy:
+    siteSelector:
+      matchLabels: {}

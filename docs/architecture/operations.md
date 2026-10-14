@@ -106,9 +106,10 @@ The standalone install creates:
 | `NetworkPolicy` | `grid-operator` | `grid-system` (platform base only) |
 | `Deployment` | `grid-operator` | `grid-system` |
 
-The operator runs as a single binary with multiple
-controllers (one per CRD type) in the same process.  No
-SWIM runtime starts until a `GridNetwork` resource exists.
+The operator runs as a single binary with controllers for reconciled CRD types
+in the same process. `AgentToAgentProvider` is currently an API-only contract;
+its controller is introduced by a follow-up task. No SWIM runtime starts until
+a `GridNetwork` resource exists.
 
 **Important**: AGN deploys only the operator and CRDs. Cluster lifecycle,
 Praxis AI gateways, inference runtimes, load-balancer integrations, and DNS
