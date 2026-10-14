@@ -4164,9 +4164,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_relayed_row_reads_its_own_age_against_the_response_date() {
+        let client = stalled_peer_ages_client(false, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
         let published = Published {
             site: operator::signals::SignalStore::new(),
             peers: operator::signals::SignalStore::new(),
+            feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
         };
         published.peers.refresh(
             BTreeMap::from([("east".to_owned(), vec![row_aged(std::time::Duration::from_secs(30))])]),
