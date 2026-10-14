@@ -1636,6 +1636,67 @@ mod tests {
         );
     }
 
+    /// Sustained pressure must affect routing without proving why capacity changed.
+    ///
+    /// Keep provider identity, ready units, held work and KV use unchanged. Only one
+    /// site's queue changes. Its historic peak must not hide that pressure from dispatch.
+    #[test]
+    #[ignore = "known gap: the room set ignores backlog below the historic ceiling"]
+    fn routing_counterexample_fresh_backlog_reduces_dispatch() {
+        let mut observed = Vec::new();
+        for count in [2, 3] {
+            let sites = &EQUAL_CAPACITY[..count];
+            let clean = sustained_pressure(sites, 0.0);
+            let queued = sustained_pressure(sites, 2.0);
+            assert_configured_sites(&clean, sites);
+            assert_configured_sites(&queued, sites);
+            let subject = sites.last().expect("a pressure subject").site;
+            for candidate in &queued.candidates {
+                assert_eq!(candidate.admission_state, AdmissionState::NewAndExisting);
+                assert_eq!(candidate.backlog, Some(candidate.site.as_ref() == subject));
+            }
+            assert!(
+                clean
+                    .candidates
+                    .iter()
+                    .all(|candidate| candidate.backlog == Some(false))
+            );
+            observed.push((count, routed_to(&clean, subject), routed_to(&queued, subject)));
+        }
+        assert!(
+            observed.iter().all(|(_, clean, queued)| queued < clean),
+            "fresh sustained backlog must reduce dispatch without a topology change; \
+             (sites, queue-free draws, backlogged draws): {observed:?}"
+        );
+    }
+
+    /// Fresh queue and readiness data keep a usable pool participating when capacity is unknown.
+    #[test]
+    #[ignore = "known gap: one measured pool with room excludes healthy unknown-capacity pools"]
+    fn routing_counterexample_unknown_capacity_keeps_participating() {
+        let mut observed = Vec::new();
+        for count in [2, 3] {
+            let sites = &EQUAL_CAPACITY[..count];
+            let snapshot = partially_measured(sites);
+            assert_configured_sites(&snapshot, sites);
+            for candidate in &snapshot.candidates {
+                assert_eq!(candidate.admission_state, AdmissionState::NewAndExisting);
+                assert_eq!(candidate.backlog, Some(false), "every pool has fresh zero queue");
+                if candidate.site.as_ref() == sites[0].site {
+                    assert!(candidate.rho.is_some_and(|rho| rho < 1.0), "the measured pool has room");
+                } else {
+                    assert_eq!(candidate.capacity, None, "no running sample can teach capacity");
+                    assert_eq!(candidate.rho, None, "unknown capacity is not measured room");
+                    observed.push((count, candidate.site.to_string(), routed_to(&snapshot, &candidate.site)));
+                }
+            }
+        }
+        assert!(
+            observed.iter().all(|(_, _, draws)| *draws > 0),
+            "healthy pools with unknown capacity must receive traffic; (sites, pool, draws): {observed:?}"
+        );
+    }
+
     /// A site out of sequence slots reads full, even with its cache barely touched.
     ///
     /// The slot cap is the one request-denominated limit the engine really has, and short
@@ -2212,6 +2273,96 @@ mod tests {
     // ---------------------------------------------------------------------------
     // Test Utilities
     // ---------------------------------------------------------------------------
+
+    /// Prevent missing pools or reordered hash slots from satisfying a routing assertion.
+    fn assert_configured_sites(snapshot: &RouteSnapshot, sites: &[SiteSpec]) {
+        let actual: Vec<&str> = snapshot
+            .candidates
+            .iter()
+            .map(|candidate| candidate.site.as_ref())
+            .collect();
+        let expected: Vec<&str> = sites.iter().map(|spec| spec.site).collect();
+        assert_eq!(
+            actual, expected,
+            "every configured pool must survive in the same candidate order"
+        );
+    }
+
+    /// Keep every pool freshly ready and queue-free, but measure capacity only for the first.
+    fn partially_measured(sites: &[SiteSpec]) -> RouteSnapshot {
+        let mut grid = Harness::new(WINDOW_MS);
+        publish_cool(&grid, &sites[..1], NOW_MS, sites[0].capacity, 0.0);
+        let mut snapshot = grid.order(sites, NOW_MS);
+        for nth in 1..=(WINDOW_MS / REFRESH_MS + SETTLE) {
+            let at_ms = NOW_MS + nth * REFRESH_MS;
+            publish_cool(&grid, &sites[..1], at_ms, 20.0, 0.0);
+            for spec in &sites[1..] {
+                let labels = format!(r#"grid_site="{}",grid_provider="pool-{}""#, spec.site, spec.site);
+                for (metric, value) in [
+                    ("llm_d_epp_average_queue_size", 0.0),
+                    ("llm_d_epp_ready_endpoints", 1.0),
+                ] {
+                    let line = format!("{metric}{{{labels}}} {value} {at_ms}");
+                    grid.store.ingest_at(&line, at_ms, at_ms, spec.site);
+                }
+            }
+            snapshot = grid.order(sites, at_ms);
+        }
+        snapshot
+    }
+
+    /// Attribute real selector decisions to a pool rather than inspecting its weight alone.
+    fn routed_to(snapshot: &RouteSnapshot, site: &str) -> usize {
+        (0..DRAWS)
+            .filter(|turn| {
+                select_spread(
+                    snapshot,
+                    CapabilityKind::InferenceModel,
+                    MODEL,
+                    *turn,
+                    |_| true,
+                    &KeepAll,
+                )
+                .expect("an admitted pool takes the request")
+                .candidate
+                .site
+                .as_ref()
+                    == site
+            })
+            .count()
+    }
+
+    /// Publish raw observations with low KV use, independently of topology refresh.
+    fn publish_cool(grid: &Harness, sites: &[SiteSpec], at_ms: i64, held: f64, queued: f64) {
+        grid.publish(sites, at_ms, |_| held, queued);
+        for spec in sites {
+            let labels = format!(r#"grid_site="{}",grid_provider="pool-{}""#, spec.site, spec.site);
+            let line = format!("llm_d_epp_average_kv_cache_utilization{{{labels}}} 0.3 {at_ms}");
+            grid.store.ingest_at(&line, at_ms, at_ms, spec.site);
+        }
+    }
+
+    /// Vary the last pool's queue without changing topology, held work or candidate order.
+    fn sustained_pressure(sites: &[SiteSpec], queued: f64) -> RouteSnapshot {
+        let mut grid = Harness::new(WINDOW_MS);
+        publish_cool(&grid, sites, NOW_MS, sites[0].capacity, 0.0);
+        let mut snapshot = grid.order(sites, NOW_MS);
+        assert!(
+            snapshot
+                .candidates
+                .iter()
+                .all(|candidate| candidate.capacity == Some(80.0)),
+            "the fixture must teach the same historic peak to every pool"
+        );
+        for nth in 1..=(WINDOW_MS / REFRESH_MS + SETTLE) {
+            let at_ms = NOW_MS + nth * REFRESH_MS;
+            let last = sites.len() - 1;
+            publish_cool(&grid, &sites[..last], at_ms, 20.0, 0.0);
+            publish_cool(&grid, &sites[last..], at_ms, 20.0, queued);
+            snapshot = grid.order(sites, at_ms);
+        }
+        snapshot
+    }
 
     /// Teach one bound before testing whether withdrawal or a telemetry gap preserves it.
     fn taught_grid(sites: &[SiteSpec], queued: f64, spell: i64) -> Harness {
