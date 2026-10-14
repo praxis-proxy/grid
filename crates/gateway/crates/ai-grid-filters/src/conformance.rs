@@ -32,10 +32,10 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use grid_signals::LoadStore;
 
 use crate::{
-    descriptor::{AdmissionState, CandidateConfig, CapabilityKind, validate_candidates},
+    descriptor::{AdmissionState, CandidateConfig, CapabilityKind, validate_candidates, validate_serving_candidates},
     route::{KeepAll, select_spread},
     serving::AvailabilitySettings,
-    snapshot::{Inputs, Learned, MIN_BACKLOG_SPELL_MS, RouteSnapshot},
+    snapshot::{Gauged, Inputs, Learned, MIN_BACKLOG_SPELL_MS, RouteSnapshot},
 };
 
 /// The model every scenario routes.
@@ -241,7 +241,7 @@ fn config(spec: &SiteSpec) -> CandidateConfig {
 /// the ones that need their own sequence over time: an idle spell, a burst, a recovery.
 pub(crate) struct Harness {
     store: LoadStore,
-    learned: Learned,
+    gauged: Gauged,
     availability: AvailabilitySettings,
     window_ms: i64,
     /// Serving units each site publishes. The request series are per unit, so a site's total
@@ -259,14 +259,14 @@ impl Harness {
 
     /// Clear every site's soft bound, as a periodic reset would.
     pub(crate) fn reset_soft(&mut self) {
-        self.learned.clear_soft();
+        self.gauged.learned.clear_soft();
     }
 
     /// An empty grid reading load over `window_ms`.
     pub(crate) fn new(window_ms: i64) -> Self {
         Self {
             store: LoadStore::new(Duration::from_secs(600)),
-            learned: Learned::default(),
+            gauged: Gauged::new(),
             availability: AvailabilitySettings::default(),
             window_ms,
             units: 1.0,
@@ -310,17 +310,12 @@ impl Harness {
                 self.store.ingest_at(&line, at_ms, at_ms, spec.site);
             }
         }
-        self.publish_and_order(sites, at_ms, holding, queued)
+        self.publish(sites, at_ms, holding, queued);
+        self.order(sites, at_ms)
     }
 
-    /// Publish the request-shaped series and order.
-    fn publish_and_order(
-        &mut self,
-        sites: &[SiteSpec],
-        at_ms: i64,
-        holding: impl Fn(&SiteSpec) -> f64,
-        queued: f64,
-    ) -> RouteSnapshot {
+    /// Deliver telemetry independently of topology acceptance and snapshot refresh.
+    fn publish(&self, sites: &[SiteSpec], at_ms: i64, holding: impl Fn(&SiteSpec) -> f64, queued: f64) {
         for spec in sites {
             let labels = format!(r#"grid_site="{}",grid_provider="pool-{}""#, spec.site, spec.site);
             let running = (holding(spec) - queued).max(0.0);
@@ -334,19 +329,24 @@ impl Harness {
                 self.store.ingest_at(&line, at_ms, at_ms, spec.site);
             }
         }
-        let validated = validate_candidates(sites.iter().map(config).collect()).expect("candidates");
+    }
+
+    /// Accept a topology without fabricating a fresh observation for its candidates.
+    fn order(&mut self, sites: &[SiteSpec], at_ms: i64) -> RouteSnapshot {
+        let validated = validate_serving_candidates(sites.iter().map(config).collect()).expect("serving candidates");
         RouteSnapshot::from_store(
             validated,
-            Arc::from(sites[0].site),
+            Arc::from(sites.first().map_or("", |site| site.site)),
             &mut Inputs {
                 signals: &self.store,
                 now_ms: at_ms,
                 window_ms: self.window_ms,
                 horizon_ms: self.window_ms,
                 availability: &self.availability,
-                learned: &mut self.learned,
+                learned: &mut self.gauged.learned,
             },
         )
+        .published(&mut self.gauged)
     }
 }
 
@@ -650,6 +650,130 @@ mod tests {
 
     /// A share at or above this is a pin rather than a spread.
     const CEILING: f64 = 0.9;
+
+    /// Accepting topology before telemetry keeps capacity unknown until a sample arrives.
+    #[test]
+    fn topology_can_arrive_before_telemetry() {
+        let sites = &EQUAL_CAPACITY[..1];
+        let mut grid = Harness::new(WINDOW_MS);
+        let empty = grid.order(sites, NOW_MS);
+        let unmeasured = empty.candidates.first().expect("configured candidate");
+        assert_eq!(
+            unmeasured.capacity, None,
+            "accepting topology cannot manufacture a sample"
+        );
+
+        grid.publish(sites, NOW_MS + 1, |site| site.capacity, 0.0);
+        let measured = grid.order(sites, NOW_MS + 1);
+        let candidate = measured.candidates.first().expect("configured candidate");
+        assert_eq!(
+            candidate.capacity,
+            Some(80.0),
+            "later telemetry teaches the configured pool"
+        );
+    }
+
+    /// Telemetry delivery cannot introduce a candidate without accepted topology.
+    #[test]
+    fn telemetry_delivery_does_not_publish_topology() {
+        let sites = &EQUAL_CAPACITY[..1];
+        let mut grid = Harness::new(WINDOW_MS);
+        grid.publish(sites, NOW_MS, |site| site.capacity, 0.0);
+        assert!(
+            grid.gauged.published.is_empty(),
+            "delivery alone must not publish a candidate"
+        );
+        assert!(
+            grid.order(&[], NOW_MS).candidates.is_empty(),
+            "samples cannot invent topology"
+        );
+
+        let accepted = grid.order(sites, NOW_MS + 1);
+        let candidate = accepted.candidates.first().expect("configured candidate");
+        assert_eq!(
+            candidate.capacity,
+            Some(80.0),
+            "legacy samples are usable after topology acceptance"
+        );
+    }
+
+    /// A telemetry gap expires pressure without discarding the configured pool's history.
+    #[test]
+    fn expired_telemetry_preserves_learning_without_withdrawal() {
+        let sites = &EQUAL_CAPACITY[..1];
+        let mut grid = Harness::new(WINDOW_MS);
+        grid.refresh(sites, NOW_MS, |site| site.capacity, 0.0);
+        let expired_at = NOW_MS + WINDOW_MS + 1;
+        let expired = grid.order(sites, expired_at);
+        let unmeasured = expired.candidates.first().expect("configured candidate");
+        assert_eq!(
+            unmeasured.capacity, None,
+            "expired pressure is not a current measurement"
+        );
+
+        let recovered = grid.refresh(sites, expired_at + 1, |site| site.capacity / 4.0, 0.0);
+        let candidate = recovered.candidates.first().expect("configured candidate");
+        assert_eq!(
+            candidate.capacity,
+            Some(80.0),
+            "a telemetry gap is not a pool replacement"
+        );
+    }
+
+    /// Queue-free and sustained-backlog histories exercise soft and hard bounds separately.
+    #[test]
+    fn accepted_withdrawal_discards_either_learned_bound() {
+        let sites = &EQUAL_CAPACITY[..1];
+        let spell = AvailabilitySettings::default().full_after_ms.max(MIN_BACKLOG_SPELL_MS);
+        for queued in [0.0, 2.0] {
+            let mut withdrawn = taught_grid(sites, queued, spell);
+            let mut retained = taught_grid(sites, queued, spell);
+
+            let expired_at = NOW_MS + spell + WINDOW_MS + 1;
+            assert!(
+                withdrawn.order(&[], expired_at).candidates.is_empty(),
+                "withdrawal must be accepted"
+            );
+            retained.order(sites, expired_at);
+
+            let after_removal = withdrawn.refresh(sites, expired_at + 1, |_| 20.0, 2.0);
+            let after_gap = retained.refresh(sites, expired_at + 1, |_| 20.0, 2.0);
+            let removed = after_removal.candidates.first().expect("returning candidate");
+            let kept = after_gap.candidates.first().expect("retained candidate");
+            assert_eq!(
+                removed.capacity,
+                Some(AvailabilitySettings::default().ceiling_floor),
+                "withdrawal must discard the queued={queued} history before a new backlog settles"
+            );
+            assert_eq!(
+                kept.capacity,
+                Some(80.0),
+                "without withdrawal the queued={queued} history must survive"
+            );
+        }
+    }
+
+    /// Delayed samples cannot undo an accepted withdrawal.
+    #[test]
+    fn late_telemetry_cannot_restore_withdrawn_topology() {
+        let sites = &EQUAL_CAPACITY[..1];
+        let mut grid = Harness::new(WINDOW_MS);
+        grid.refresh(sites, NOW_MS, |site| site.capacity, 0.0);
+        assert!(
+            grid.order(&[], NOW_MS + 1).candidates.is_empty(),
+            "withdrawal must be accepted"
+        );
+
+        grid.publish(sites, NOW_MS + 2, |site| site.capacity, 0.0);
+        assert!(
+            grid.order(&[], NOW_MS + 2).candidates.is_empty(),
+            "late telemetry cannot revive an excluded candidate"
+        );
+        assert!(
+            grid.gauged.published.is_empty(),
+            "late telemetry cannot publish a withdrawn pair"
+        );
+    }
 
     /// Scenario: heterogeneous capacity, equal speed. Exercises the learned ceiling, which is
     /// what weights a site.
@@ -2083,5 +2207,23 @@ mod tests {
              an hour, and reads {worst:.2} saturated rather than 0.25: ceilings {ceilings:?} \
              against a capacity of 80, saturation {rhos:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test Utilities
+    // ---------------------------------------------------------------------------
+
+    /// Teach one bound before testing whether withdrawal or a telemetry gap preserves it.
+    fn taught_grid(sites: &[SiteSpec], queued: f64, spell: i64) -> Harness {
+        let mut grid = Harness::new(WINDOW_MS);
+        grid.refresh(sites, NOW_MS, |site| site.capacity, queued);
+        let taught = grid.refresh(sites, NOW_MS + spell, |site| site.capacity, queued);
+        let candidate = taught.candidates.first().expect("taught candidate");
+        assert_eq!(
+            candidate.capacity,
+            Some(80.0),
+            "the queued={queued} control must learn first"
+        );
+        grid
     }
 }
