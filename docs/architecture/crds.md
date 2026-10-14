@@ -117,8 +117,9 @@ means no polled peer has a rejected timestamp; `False` means at least one does.
 A relayed age survives a clock step on every hop, so a step alone never makes
 this condition false: it points at a peer whose clock or stamping is wrong.
 Rejected rows are dropped and counted in
-`grid_peer_signals_refused_total{peer,reason="skew"}`, so routing reads that
-peer's providers as unmeasured. A peer that does not answer keeps its standing,
+`grid_peer_signals_refused_total{peer,reason="skew"}`. Only rejected rows become
+unavailable for provider measurement; valid rows from the same peer remain
+available. A peer that does not answer keeps its standing,
 a peer that leaves membership is dropped, and one clean answer restores its
 validity. The operator conservatively preserves an existing `False` condition
 after restarting until every currently polled peer has answered or left
