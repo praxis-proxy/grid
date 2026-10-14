@@ -2577,7 +2577,7 @@ fn observe_peer_ages(
     true
 }
 
-/// Write the `PeerAgesRejected` condition on the sole `GridNetwork` when it changed.
+/// Write the `PeerTimeValid` condition on the sole `GridNetwork` when it changed.
 ///
 /// Compared against the live status every round, so a restart, a recreated
 /// `GridNetwork` or an edited status is set right on the next round, and nothing
@@ -2740,7 +2740,7 @@ mod tests {
         assert_eq!(
             ages.condition(std::slice::from_ref(&live), "t1", Some(1))
                 .map(|condition| condition.status),
-            Some("False".to_owned()),
+            Some("True".to_owned()),
             "a genuinely empty snapshot after convergence clears rejection"
         );
     }

@@ -1294,10 +1294,7 @@ pub struct SecretRef {
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GridNetworkStatus {
-    /// Observed conditions. `PeerAgesRejected` says whether this site's peer poller is
-    /// rejecting some peer's relayed signal ages, which points at that peer's clock.
-    ///
-    /// Written by the operator's peer poller, never by `GridNetwork` reconciliation.
+    /// Observed conditions of the `GridNetwork`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["type"]))]
     pub conditions: Vec<Condition>,

@@ -104,27 +104,28 @@ not part of this CRD.
 `observedGeneration`, `phase`, `conditions[]`, `consumerConfigStatus[]`,
 `mountReconciliationStatus[]`, `budgetStatus[]`
 
-**Conditions**: `status.conditions` carries a `PeerAgesRejected` condition,
+**Conditions**: `status.conditions` carries a `PeerTimeValid` condition,
 written by the operator's peer poller under its own field manager
 (`grid-operator-peer-signals`), never by `GridNetwork` reconciliation. `True`
-means a problem is present, as with `MemoryPressure` on a node.
+means no polled peer has a rejected timestamp; `False` means at least one does.
 
 | Status | Reason | When |
 |---|---|---|
-| `True` | `ImplausiblePeerAge` | A polled peer's latest answer carried a row stamped more than a second past its `Date`, or more than a day before it. The message names those peers (the first ten, then a count): check their clocks. |
-| `False` | `PeerAgesAccepted` | No polled peer's latest answer was rejected for its age. |
+| `False` | `TimestampOutOfRange` | A polled peer's latest answer carried a row stamped more than a second past its `Date`, or more than a day before it. The message names those peers (the first ten, then a count): check their clocks. |
+| `True` | `PeerTimestampsValid` | No polled peer's latest answer was rejected for its age. |
 
-A relayed age survives a clock step on every hop, so a step alone never raises
-this condition: it points at a peer whose clock or stamping is wrong. Rejected
-rows are dropped and counted in
+A relayed age survives a clock step on every hop, so a step alone never makes
+this condition false: it points at a peer whose clock or stamping is wrong.
+Rejected rows are dropped and counted in
 `grid_peer_signals_refused_total{peer,reason="skew"}`, so routing reads that
 peer's providers as unmeasured. A peer that does not answer keeps its standing,
-a peer that leaves membership is dropped, and one clean answer clears it. The
-operator conservatively preserves an existing `True` condition after restarting
-until every currently polled peer has answered or left membership. Unavailable secure polling is not a clean
-round and does not clear the condition. The
-condition is written only when its status, its message or the generation
-changes, since each write starts a `GridNetwork` reconcile.
+a peer that leaves membership is dropped, and one clean answer restores its
+validity. The operator conservatively preserves an existing `False` condition
+after restarting until every currently polled peer has answered or left
+membership. Unavailable secure polling is not a clean round and does not
+establish recovery. The condition is written only when its status, its
+message or the generation changes, since each write starts a `GridNetwork`
+reconcile.
 
 Peer-age observation and status publication wait for the operator's existing
 membership-convergence gate, so an initial empty snapshot cannot erase a live

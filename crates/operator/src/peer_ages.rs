@@ -1,5 +1,5 @@
-//! The `PeerAgesRejected` condition on the `GridNetwork`: which peers' relayed
-//! signal ages this site's peer poller is rejecting.
+//! The `PeerTimeValid` condition on the `GridNetwork`: whether this site's peer
+//! poller accepts its peers' relayed signal ages.
 //!
 //! A relayed age survives a clock step on every hop, so a rejected one means a
 //! peer's stamps ran more than a second past its own `Date`, or more than a day
@@ -17,13 +17,13 @@ use crate::crd::{grid_network::GridNetwork, inference_provider::Condition};
 // ---------------------------------------------------------------------------
 
 /// The condition's type.
-pub const PEER_AGES_REJECTED: &str = "PeerAgesRejected";
+pub const PEER_TIME_VALID: &str = "PeerTimeValid";
 
 /// Reason while some polled peer's relayed ages are being rejected.
-pub const IMPLAUSIBLE_PEER_AGE: &str = "ImplausiblePeerAge";
+pub const TIMESTAMP_OUT_OF_RANGE: &str = "TimestampOutOfRange";
 
 /// Reason while no polled peer's are.
-pub const PEER_AGES_ACCEPTED: &str = "PeerAgesAccepted";
+pub const PEER_TIMESTAMPS_VALID: &str = "PeerTimestampsValid";
 
 /// Server-side apply manager for the condition, apart from `GridNetwork`
 /// reconciliation, so neither removes what the other wrote.
@@ -89,14 +89,14 @@ impl PeerAges {
     /// where the peers are named. `lastTransitionTime` moves only with the status.
     #[must_use]
     pub fn condition(&self, current: &[Condition], now_rfc3339: &str, generation: Option<i64>) -> Option<Condition> {
-        let held = current.iter().find(|held| held.type_ == PEER_AGES_REJECTED);
-        if self.rejecting.is_empty() && self.unobserved && held.is_some_and(|held| held.status == "True") {
+        let held = current.iter().find(|held| held.type_ == PEER_TIME_VALID);
+        if self.rejecting.is_empty() && self.unobserved && held.is_some_and(|held| held.status == "False") {
             return None;
         }
         let (status, reason) = if self.rejecting.is_empty() {
-            ("False", PEER_AGES_ACCEPTED)
+            ("True", PEER_TIMESTAMPS_VALID)
         } else {
-            ("True", IMPLAUSIBLE_PEER_AGE)
+            ("False", TIMESTAMP_OUT_OF_RANGE)
         };
         let message = self.message();
         if held.is_some_and(|held| {
@@ -111,7 +111,7 @@ impl PeerAges {
             .filter(|held| held.status == status)
             .map_or_else(|| now_rfc3339.to_owned(), |held| held.last_transition_time.clone());
         Some(Condition {
-            type_: PEER_AGES_REJECTED.to_owned(),
+            type_: PEER_TIME_VALID.to_owned(),
             status: status.to_owned(),
             reason: reason.to_owned(),
             message,
@@ -144,7 +144,7 @@ impl PeerAges {
     }
 }
 
-/// The status patch carrying `network`'s `PeerAgesRejected` condition from
+/// The status patch carrying `network`'s `PeerTimeValid` condition from
 /// `ages`, with the name to apply it to, or `None` when the live status already
 /// says this.
 #[must_use]
@@ -180,17 +180,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_peer_serving_implausible_ages_is_named_in_a_true_condition() {
+    fn a_peer_serving_implausible_ages_is_named_in_a_false_condition() {
         let ages = after(&PeerAges::default(), &["east", "west"], &[("east", 2), ("west", 0)]);
         let raised = ages.condition(&[], "t0", Some(3)).expect("absent is written");
         assert_eq!(
             (
+                raised.type_.as_str(),
                 raised.status.as_str(),
                 raised.reason.as_str(),
                 raised.last_transition_time.as_str(),
                 raised.observed_generation
             ),
-            ("True", IMPLAUSIBLE_PEER_AGE, "t0", Some(3))
+            (PEER_TIME_VALID, "False", TIMESTAMP_OUT_OF_RANGE, "t0", Some(3))
         );
         assert!(
             raised.message.contains("east") && !raised.message.contains("west"),
@@ -200,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn a_clean_answer_clears_it_back_to_false() {
+    fn a_clean_answer_restores_it_to_true() {
         let rejecting = after(&PeerAges::default(), &["east"], &[("east", 1)]);
         let raised = rejecting.condition(&[], "t0", Some(3)).expect("raised");
         let cleared = after(&rejecting, &["east"], &[("east", 0)])
@@ -212,7 +213,7 @@ mod tests {
                 cleared.reason.as_str(),
                 cleared.last_transition_time.as_str()
             ),
-            ("False", PEER_AGES_ACCEPTED, "t1")
+            ("True", PEER_TIMESTAMPS_VALID, "t1")
         );
     }
 
@@ -242,7 +243,7 @@ mod tests {
             alone
                 .condition(std::slice::from_ref(&raised), "t1", Some(3))
                 .map(|cleared| cleared.status),
-            Some("False".to_owned()),
+            Some("True".to_owned()),
             "a round with no peer to poll clears it"
         );
     }
@@ -265,7 +266,7 @@ mod tests {
     fn nothing_is_written_when_nothing_changed() {
         let quiet = PeerAges::default();
         let accepted = quiet.condition(&[], "t0", Some(3)).expect("absent is written");
-        assert_eq!(accepted.status, "False", "a poller with nothing rejected says so");
+        assert_eq!(accepted.status, "True", "a poller with nothing rejected says so");
         assert_eq!(quiet.condition(std::slice::from_ref(&accepted), "t1", Some(3)), None);
         assert!(
             quiet
@@ -284,14 +285,14 @@ mod tests {
             restarted
                 .condition(std::slice::from_ref(&live), "t1", Some(3))
                 .map(|cleared| cleared.status),
-            Some("False".to_owned()),
+            Some("True".to_owned()),
             "the first round after a restart corrects what the last process wrote"
         );
         let still = after(&PeerAges::default(), &["east"], &[("east", 1)]);
         assert_eq!(
             still.condition(std::slice::from_ref(&live), "t1", Some(3)),
             None,
-            "and leaves what is still true alone"
+            "and leaves the still-invalid condition alone"
         );
     }
 
@@ -316,7 +317,7 @@ mod tests {
             clean
                 .condition(std::slice::from_ref(&live), "t3", Some(3))
                 .map(|condition| condition.status),
-            Some("False".to_owned()),
+            Some("True".to_owned()),
             "clean answers across rounds establish every current peer's standing"
         );
     }
@@ -331,14 +332,14 @@ mod tests {
             departed
                 .condition(std::slice::from_ref(&live), "t1", Some(3))
                 .map(|condition| condition.status),
-            Some("False".to_owned()),
+            Some("True".to_owned()),
             "a departed peer is not required to answer before recovery"
         );
         assert_eq!(
             after(&partial, &[], &[])
                 .condition(std::slice::from_ref(&live), "t1", Some(3))
                 .map(|condition| condition.status),
-            Some("False".to_owned()),
+            Some("True".to_owned()),
             "genuinely empty membership can clear live rejection"
         );
     }
@@ -351,7 +352,7 @@ mod tests {
         let condition = restarted
             .condition(std::slice::from_ref(&live), "t1", Some(3))
             .expect("new evidence is written despite an unobserved peer");
-        assert_eq!(condition.status, "True", "fresh rejection evidence remains reportable");
+        assert_eq!(condition.status, "False", "fresh rejection evidence remains reportable");
         assert!(condition.message.contains("east"), "the newly rejecting peer is named");
         assert_eq!(condition.last_transition_time, "t0", "rejection status has not changed");
     }

@@ -923,11 +923,7 @@ spec:
                     type: object
                   type: array
                 conditions:
-                  description: |-
-                    Observed conditions. `PeerAgesRejected` says whether this site's peer poller is
-                    rejecting some peer's relayed signal ages, which points at that peer's clock.
-
-                    Written by the operator's peer poller, never by `GridNetwork` reconciliation.
+                  description: Observed conditions of the `GridNetwork`.
                   items:
                     description: One observed condition, shaped like `metav1.Condition`.
                     properties:

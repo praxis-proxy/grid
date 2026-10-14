@@ -7901,7 +7901,7 @@ mod tests {
         };
         let with_condition = GridNetworkStatus {
             conditions: vec![crate::crd::inference_provider::Condition {
-                type_: crate::peer_ages::PEER_AGES_REJECTED.to_owned(),
+                type_: crate::peer_ages::PEER_TIME_VALID.to_owned(),
                 status: "True".to_owned(),
                 ..crate::crd::inference_provider::Condition::default()
             }],
