@@ -4401,7 +4401,7 @@ mod tests {
                 .patch_status(NETWORK, &PatchParams::default(), &Patch::Merge(&invalid))
                 .await;
             assert!(
-                matches!(result, Err(kube::Error::Api(ref error)) if error.code == 422),
+                matches!(&result, Err(kube::Error::Api(error)) if error.code == 422),
                 "the API server enforces sequence minimum one: {result:?}"
             );
         }
