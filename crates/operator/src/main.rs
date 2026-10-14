@@ -4044,6 +4044,10 @@ mod tests {
         stopping.await.expect("writer group").expect("stopped");
     }
 
+    /// `Date` uses the render's wall reading to approximate message origination
+    /// time, as specified by [RFC 9110 Section 6.6.1].
+    ///
+    /// [RFC 9110 Section 6.6.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-6.6.1
     #[test]
     fn a_signals_response_is_dated_from_the_reading_it_was_rendered_at() {
         let stepped_back = UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
@@ -4065,6 +4069,11 @@ mod tests {
 
     /// hyper writes its cached `Date` only when a response carries none, so the
     /// render's own `Date` is the only one a reader gets.
+    /// `Date` carries the origination time per [RFC 9110 Section 6.6.1]; duplicate
+    /// field lines are forbidden for this non-list field per [RFC 9110 Section 5.2].
+    ///
+    /// [RFC 9110 Section 6.6.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-6.6.1
+    /// [RFC 9110 Section 5.2]: https://datatracker.ietf.org/doc/html/rfc9110#section-5.2
     #[tokio::test]
     async fn the_explicit_date_is_the_only_date_on_the_wire() {
         let stepped_back = UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
