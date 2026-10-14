@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "ai-grid-filters"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1507,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "ai-grid-filters",
  "certs",
