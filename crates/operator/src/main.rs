@@ -4378,7 +4378,7 @@ mod tests {
                 "the contract test must not touch existing networks"
             );
             let network = serde_json::from_value(serde_json::json!({"apiVersion":"grid.praxis.fast/v1alpha1","kind":"GridNetwork","metadata":{"name":NETWORK},"spec":{"seeds":[],"gridId":"feedback-test"}})).expect("network fixture");
-            api.create(&kube::api::PostParams::default(), &network)
+            api.create(&PostParams::default(), &network)
                 .await
                 .expect("create network through real CRD");
             let peer = serde_json::json!({
@@ -4387,8 +4387,8 @@ mod tests {
             });
             api.patch_status(
                 NETWORK,
-                &kube::api::PatchParams::apply(operator::peer_ages::FIELD_MANAGER),
-                &kube::api::Patch::Apply(&peer),
+                &PatchParams::apply(operator::peer_ages::FIELD_MANAGER),
+                &Patch::Apply(&peer),
             )
             .await
             .expect("peer field manager");
@@ -4398,11 +4398,7 @@ mod tests {
         async fn reject_invalid_schema(api: &Api<GridNetwork>) {
             let invalid = serde_json::json!({"status":{"gatewayAgeReports":[{"epoch":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","replica":"gateway","sequence":0,"skew":0,"rejected":false,"reportedRejected":false,"receivedAt":"2026-10-14T00:00:00Z"}]}});
             let result = api
-                .patch_status(
-                    NETWORK,
-                    &kube::api::PatchParams::default(),
-                    &kube::api::Patch::Merge(&invalid),
-                )
+                .patch_status(NETWORK, &PatchParams::default(), &Patch::Merge(&invalid))
                 .await;
             assert!(
                 matches!(result, Err(kube::Error::Api(ref error)) if error.code == 422),
@@ -4421,12 +4417,8 @@ mod tests {
                     {
                         let api: Api<GridNetwork> = Api::all(client.clone());
                         let competing = serde_json::json!({"metadata":{"annotations":{"feedback-contract-race":"1"}}});
-                        api.patch_metadata(
-                            NETWORK,
-                            &kube::api::PatchParams::default(),
-                            &kube::api::Patch::Merge(&competing),
-                        )
-                        .await?;
+                        api.patch_metadata(NETWORK, &PatchParams::default(), &Patch::Merge(&competing))
+                            .await?;
                     }
                     let response = client.send(request).await?;
                     if response.status() == http::StatusCode::CONFLICT {
