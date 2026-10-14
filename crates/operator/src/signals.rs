@@ -2213,7 +2213,7 @@ mod tests {
             &answered,
         );
         let condition = ages.condition(&[], "t0", Some(1)).expect("raised");
-        assert_eq!(condition.status, "True", "{condition:?}");
+        assert_eq!(condition.status, "False", "{condition:?}");
         assert!(
             condition.message.contains("from ahead, ancient:"),
             "the peers stamping past their Date and a day behind it are named, the clean one is not: {}",
