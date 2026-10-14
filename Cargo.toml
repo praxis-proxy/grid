@@ -64,7 +64,7 @@ rmcp = { version = "3.1.4", default-features = false, features = [
   "client",
   "transport-streamable-http-client-reqwest",
 ] }
-rustls = { version = "0.23.0", default-features = false, features = ["logging", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["logging", "std", "tls12"] }
 schemars = "1.2.2"
 sha2 = "0.11.0"
 hmac = "0.13.0"

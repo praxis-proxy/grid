@@ -339,7 +339,7 @@ serde_yaml.workspace = true
 # The reload test runs a real mTLS signals peer against the binary.
 certs = { path = "../certs", default-features = false, features = ["verifier"] }
 httpdate = { workspace = true }
-rustls = { version = "0.23.45", features = ["ring"] }
+rustls = { version = "0.23.46", features = ["ring"] }
 tokio = { version = "1.53.1", features = ["macros"] }
 # The help-text test emits one sample per documented metric.
 metrics = { workspace = true }
