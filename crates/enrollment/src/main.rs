@@ -218,8 +218,7 @@ async fn start_site_invite_controller(state: Arc<AppState>) -> Result<(), String
     let namespace = std::env::var("ENROLLMENT_INVITE_SECRET_NAMESPACE")
         .or_else(|_| std::env::var("POD_NAMESPACE"))
         .map_err(|error| format!("SiteInvite controller needs an invite Secret namespace: {error}"))?;
-    tracing::info!(%namespace, "SiteInvite controller started");
-    tokio::spawn(enrollment::site_invite::run(client, state, namespace));
+    tokio::spawn(enrollment::site_invite::run_when_available(client, state, namespace));
     Ok(())
 }
 

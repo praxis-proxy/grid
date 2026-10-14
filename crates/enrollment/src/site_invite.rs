@@ -189,6 +189,22 @@ pub async fn run(client: Client, state: Arc<AppState>, namespace: String) {
         .await;
 }
 
+/// Wait for the operator-installed CRD before starting its watcher.
+pub async fn run_when_available(client: Client, state: Arc<AppState>, namespace: String) {
+    let gvk = kube::api::GroupVersionKind::gvk("grid.praxis.fast", "v1alpha1", "SiteInvite");
+    loop {
+        match kube::discovery::pinned_kind(&client, &gvk).await {
+            Ok(_) => {
+                tracing::info!("SiteInvite API is available; starting controller");
+                run(client, state, namespace).await;
+                return;
+            },
+            Err(error) => tracing::info!(%error, "SiteInvite API is not available; controller is waiting"),
+        }
+        tokio::time::sleep(REQUEUE).await;
+    }
+}
+
 /// Reconcile one object through its finalizer.
 async fn reconcile(invite: Arc<SiteInvite>, ctx: Arc<Context>) -> Result<Action, ReconcileError> {
     let api = Api::<SiteInvite>::all(ctx.client.clone());
