@@ -630,6 +630,7 @@ jobs:
       - name: Run hub and site e2e (${{ matrix.leg }})
         env:
           MODES: ${{ matrix.peer-trust-mode }}
+          GRID_FEEDBACK_CONTRACT_TEST: ${{ matrix.peer-trust-mode == 'pin' && '1' || '0' }}
           # The spiffe leg rotates 8 minute identities; pin trust does not rotate.
           ROTATION_LIFETIME: "480"
           SKIP_BUILD: "1"
