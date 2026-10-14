@@ -1624,6 +1624,20 @@ fi
 echo ""
 echo "=== Provider workflow ==="
 
+# Explicit identity must not disappear when a reference is invalid or empty.
+for pool_ref in '{}' '{"name":"pool"}' '{"name":"../pool","namespace":"serving"}' \
+  '{"name":"pool","namespace":" "}' '{"name":"pool","namespace":"serving","uid":"claimed"}'; do
+  try_reject_msg "$SITE_DIR" "keyed pool reference $pool_ref" 'inferencePoolRef' \
+    --set gridSite.name=test-site --set inferenceProviders.model.endpoint=http://backend:8000 \
+    --set-json "inferenceProviders.model.inferencePoolRef=$pool_ref"
+  try_reject_msg "$SITE_DIR" "list pool reference $pool_ref" 'inferencePoolRef' \
+    --set gridSite.name=test-site \
+    --set-json "inferenceProviders=[{\"name\":\"model\",\"gridNetworkRef\":\"grid\",\"providerKind\":\"vllm\",\"backendKind\":\"local_model\",\"endpoint\":\"http://backend:8000\",\"inferencePoolRef\":$pool_ref}]"
+  try_reject_msg "$CHART_DIR" "operator pool reference $pool_ref" 'inferencePoolRef' \
+    --set site.name=test-site --set grid.id=example --set grid.providers.model.endpoint=http://backend:8000 \
+    --set-json "grid.providers.model.inferencePoolRef=$pool_ref"
+done
+
 # Three-provider template rendering
 try_template "$SITE_DIR" "three providers" --namespace grid-system \
   --set gridNetwork.name=test-grid --set gridNetwork.gridId=test-id \

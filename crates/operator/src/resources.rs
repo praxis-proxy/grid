@@ -33,6 +33,12 @@ pub mod credentials;
 pub mod overlay_bridge;
 /// Versioned overlay envelope for content-addressed revision tracking.
 pub mod overlay_envelope;
+/// Metadata-only source `InferencePool` identity resolution.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "source-scoped refresh integration is the next draft increment")
+)]
+pub(crate) mod pool_identity;
 /// Stateful provider admission and pressure-recovery evaluator.
 pub(crate) mod provider_admission;
 /// Provider metrics collection for the [`GridNetwork`] overlay renderer.

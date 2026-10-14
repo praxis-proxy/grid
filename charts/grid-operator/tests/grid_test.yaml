@@ -158,6 +158,32 @@ tests:
               - name: Qwen3-Coder-30B-A3B
                 capabilities: [text_generation]
 
+  - it: preserves the explicit source pool reference
+    template: templates/inferenceprovider.yaml
+    set:
+      site.name: east
+      grid.id: example
+      grid.providers.model.endpoint: http://backend:8000
+      grid.providers.model.inferencePoolRef: {namespace: serving, name: source-pool}
+      grid.providers.model.metricsConfig.poolName: metric-label
+    asserts:
+      - equal:
+          path: spec.inferencePoolRef
+          value: {namespace: serving, name: source-pool}
+      - equal:
+          path: spec.metricsConfig.poolName
+          value: metric-label
+
+  - it: leaves legacy providers without a source pool reference
+    template: templates/inferenceprovider.yaml
+    set:
+      site.name: east
+      grid.id: example
+      grid.providers.model.endpoint: http://backend:8000
+    asserts:
+      - notExists:
+          path: spec.inferencePoolRef
+
   - it: keeps YAML-ambiguous names strings
     templates:
       - templates/gridnetwork.yaml

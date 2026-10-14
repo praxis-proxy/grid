@@ -12,6 +12,10 @@ spec:
   providerKind: {{ required "inferenceProviders[].providerKind is required" .providerKind }}
   backendKind: {{ required "inferenceProviders[].backendKind is required" .backendKind }}
   endpoint: {{ required "inferenceProviders[].endpoint is required" .endpoint | quote }}
+  {{- if hasKey . "inferencePoolRef" }}
+  inferencePoolRef:
+    {{- toYaml .inferencePoolRef | nindent 4 }}
+  {{- end }}
   {{- with .capacityWeight }}
   capacityWeight: {{ . }}
   {{- end }}

@@ -16,6 +16,7 @@
 //! |-----------|-------|
 //! | `spec.endpoint` is blank or whitespace | `Unavailable` |
 //! | Any `spec.models[].name` is blank | `Unavailable` |
+//! | `spec.inferencePoolRef` has an invalid name or namespace | `Unavailable` |
 //! | `spec.auth` specifies an unsupported strategy | `Unavailable` |
 //! | `auth.strategy = bearer_token` but `secretRef` is absent or invalid | `Unavailable` |
 //! | `auth.secretRef` Secret does not exist in the cluster | `Unavailable` |
@@ -173,12 +174,21 @@ pub fn error_policy(_provider: Arc<InferenceProvider>, error: &OperatorError, _c
 /// Checked invariants:
 /// - `spec.endpoint` is non-blank and non-whitespace.
 /// - All `spec.models[].name` values are non-blank.
+/// - A configured `spec.inferencePoolRef` has valid DNS names.
 ///
 /// The `gridNetworkRef` existence check is not included here because it
 /// requires a Kubernetes API call.
 pub(crate) fn validate_provider_config(provider: &InferenceProvider) -> Option<&'static str> {
     if provider.spec.endpoint.trim().is_empty() {
         return Some("blank endpoint");
+    }
+    if provider
+        .spec
+        .inference_pool_ref
+        .as_ref()
+        .is_some_and(|pool| !pool.is_valid())
+    {
+        return Some("invalid inference pool reference");
     }
     for model in &provider.spec.models {
         if model.name.trim().is_empty() {
@@ -1616,6 +1626,24 @@ mod tests {
             validate_provider_config(&provider).is_none(),
             "valid provider config must pass static validation"
         );
+    }
+
+    /// Invalid source references fail static validation before any Kubernetes lookup.
+    #[test]
+    fn invalid_inference_pool_ref_fails_static_validation() {
+        let mut provider = test_provider("prov", "net", &["model-a"]);
+        provider.spec.inference_pool_ref = Some(crate::crd::inference_provider::InferencePoolRef {
+            name: "pool".to_owned(),
+            namespace: " ".to_owned(),
+        });
+        assert_eq!(
+            validate_provider_config(&provider),
+            Some("invalid inference pool reference")
+        );
+        if let Some(reference) = &mut provider.spec.inference_pool_ref {
+            reference.namespace = "serving".to_owned();
+        }
+        assert!(validate_provider_config(&provider).is_none());
     }
 
     // Item 5: missing GridNetwork → Unavailable
@@ -3266,6 +3294,7 @@ mod tests {
             auth: None,
             backend_kind: "local".to_owned(),
             gateway_ref: None,
+            inference_pool_ref: None,
             cost: None,
             endpoint: endpoint.to_owned(),
             tls: None,

@@ -47,3 +47,37 @@ tests:
       - equal:
           path: metadata.name
           value: old
+
+  - it: preserves the source pool reference separately from metric label selection
+    set:
+      inferenceProviders.model.endpoint: http://backend:8000
+      inferenceProviders.model.inferencePoolRef: {namespace: serving, name: source-pool}
+      inferenceProviders.model.metricsConfig.poolName: metric-label
+    asserts:
+      - equal:
+          path: spec.inferencePoolRef
+          value: {namespace: serving, name: source-pool}
+      - equal:
+          path: spec.metricsConfig.poolName
+          value: metric-label
+
+  - it: leaves legacy providers without a source pool reference
+    set:
+      inferenceProviders.model.endpoint: http://backend:8000
+    asserts:
+      - notExists:
+          path: spec.inferencePoolRef
+
+  - it: preserves a source pool reference in the older list form
+    set:
+      inferenceProviders:
+        - name: model
+          gridNetworkRef: grid
+          providerKind: vllm
+          backendKind: local_model
+          endpoint: http://backend:8000
+          inferencePoolRef: {namespace: serving, name: source-pool}
+    asserts:
+      - equal:
+          path: spec.inferencePoolRef
+          value: {namespace: serving, name: source-pool}

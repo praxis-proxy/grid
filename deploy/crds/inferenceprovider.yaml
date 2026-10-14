@@ -292,6 +292,31 @@ spec:
                         - message: set exactly one of caSecretRef and caConfigMapRef
                           rule: has(self.caSecretRef) != has(self.caConfigMapRef)
                   type: object
+                inferencePoolRef:
+                  description: |-
+                    Source `InferencePool` in the hosting site's Kubernetes cluster.
+
+                    Separate from the metrics `poolName` label selector. The source object's
+                    UID identifies its incarnation but does not bind telemetry to that UID.
+                    Contract plumbing only: pool resolution is not yet connected to routing.
+                  nullable: true
+                  properties:
+                    name:
+                      description: Source pool name.
+                      maxLength: 253
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                      type: string
+                    namespace:
+                      description: Namespace in the hosting site's cluster, never the operator's default namespace.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                  required:
+                    - name
+                    - namespace
+                  type: object
                 metricsConfig:
                   description: |-
                     Prometheus metrics scraping configuration.

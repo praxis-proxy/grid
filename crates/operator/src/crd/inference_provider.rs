@@ -65,6 +65,14 @@ pub struct InferenceProviderSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_ref: Option<String>,
 
+    /// Source `InferencePool` in the hosting site's Kubernetes cluster.
+    ///
+    /// Separate from the metrics `poolName` label selector. The source object's
+    /// UID identifies its incarnation but does not bind telemetry to that UID.
+    /// Contract plumbing only: pool resolution is not yet connected to routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_pool_ref: Option<InferencePoolRef>,
+
     /// Relative capacity used by an opt-in placement policy.
     #[schemars(range(min = 1, max = 1000))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,6 +155,43 @@ impl InferenceProviderSpec {
             || self.metrics_config.as_ref().is_some_and(|mc| mc.tls.is_some())
             || self.health_check.as_ref().is_some_and(|hc| hc.tls.is_some())
     }
+}
+
+/// Explicit reference to an `inference.networking.k8s.io/v1` `InferencePool`.
+///
+/// Both fields are required because `InferenceProvider` is cluster-scoped.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InferencePoolRef {
+    /// Source pool name.
+    #[schemars(
+        length(min = 1, max = 253),
+        regex(pattern = r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$")
+    )]
+    pub name: String,
+
+    /// Namespace in the hosting site's cluster, never the operator's default namespace.
+    #[schemars(length(min = 1, max = 63), regex(pattern = "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"))]
+    pub namespace: String,
+}
+
+impl InferencePoolRef {
+    /// Whether both fields satisfy Kubernetes DNS name constraints.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.name.len() <= 253
+            && self.name.split('.').all(dns_name_part)
+            && self.namespace.len() <= 63
+            && dns_name_part(&self.namespace)
+    }
+}
+
+/// A nonempty lowercase DNS name segment with alphanumeric ends.
+fn dns_name_part(value: &str) -> bool {
+    let valid_end = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    value.as_bytes().first().copied().is_some_and(valid_end)
+        && value.as_bytes().last().copied().is_some_and(valid_end)
+        && value.bytes().all(|byte| valid_end(byte) || byte == b'-')
 }
 
 /// Administrative policy for provider traffic.
@@ -749,6 +794,109 @@ mod tests {
 
     fn crd_json() -> serde_json::Value {
         serde_json::to_value(InferenceProvider::crd()).unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// The source namespace is explicit and arbitrary resource kinds are not accepted.
+    #[test]
+    fn inference_pool_ref_requires_exact_namespaced_shape() {
+        let value = serde_json::json!({"name": "model.pool", "namespace": "serving"});
+        let reference: InferencePoolRef =
+            serde_json::from_value(value.clone()).unwrap_or_else(|_| std::process::abort());
+        assert!(reference.is_valid(), "a namespaced DNS reference is valid");
+        assert_eq!(serde_json::to_value(reference).ok(), Some(value));
+        for invalid in [
+            serde_json::json!({"name": "pool"}),
+            serde_json::json!({"namespace": "serving"}),
+            serde_json::json!({"name": "pool", "namespace": "serving", "kind": "Service"}),
+            serde_json::json!({"name": "pool", "namespace": "serving", "uid": "claimed"}),
+        ] {
+            let parsed = serde_json::from_value::<InferencePoolRef>(invalid);
+            assert!(matches!(&parsed, Err(error) if error.is_data()), "{parsed:?}");
+        }
+    }
+
+    /// The schema requires both fields and constrains their lengths and DNS syntax.
+    #[test]
+    fn inference_pool_ref_schema_bounds_both_names() {
+        let crd = crd_json();
+        let reference = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/inferencePoolRef")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            reference.get("required"),
+            Some(&serde_json::json!(["name", "namespace"]))
+        );
+        for (field, maximum) in [("name", 253), ("namespace", 63)] {
+            let schema = reference
+                .get("properties")
+                .and_then(|fields| fields.get(field))
+                .unwrap_or_else(|| std::process::abort());
+            assert_eq!(schema.get("minLength"), Some(&serde_json::json!(1)));
+            assert_eq!(schema.get("maxLength"), Some(&serde_json::json!(maximum)));
+            assert!(schema.get("pattern").is_some(), "{field} requires DNS syntax");
+        }
+    }
+
+    /// Invalid references are rejected without trimming or choosing a default namespace.
+    #[test]
+    fn inference_pool_ref_rejects_invalid_dns_names() {
+        for invalid in [
+            "", " ", " pool", "pool ", "Pool", "a/b", "a%2fb", ".", "a..b", "-pool", "pool-",
+        ] {
+            let bad_name = InferencePoolRef {
+                name: invalid.to_owned(),
+                namespace: "serving".to_owned(),
+            };
+            let bad_namespace = InferencePoolRef {
+                name: "pool".to_owned(),
+                namespace: invalid.to_owned(),
+            };
+            assert!(!bad_name.is_valid(), "invalid pool name: {invalid:?}");
+            assert!(!bad_namespace.is_valid(), "invalid namespace: {invalid:?}");
+        }
+        let mut reference = InferencePoolRef {
+            name: "a".repeat(253),
+            namespace: "b".repeat(63),
+        };
+        assert!(reference.is_valid(), "maximum API lengths are accepted");
+        reference.name.push('a');
+        assert!(!reference.is_valid(), "overlong name");
+        reference.name = "pool".to_owned();
+        reference.namespace.push('b');
+        assert!(!reference.is_valid(), "overlong namespace");
+        reference.namespace = "a.b".to_owned();
+        assert!(!reference.is_valid(), "namespaces are DNS labels, not subdomains");
+    }
+
+    /// Existing metric label selection does not silently opt into pool identity.
+    #[test]
+    fn inference_pool_ref_is_independent_of_metrics_pool_name() {
+        let mut value = serde_json::json!({
+            "gridNetworkRef": "net", "providerKind": "self_hosted", "backendKind": "local",
+            "endpoint": "http://backend:8080", "metricsConfig": {"poolName": "label-only"}
+        });
+        let legacy: InferenceProviderSpec =
+            serde_json::from_value(value.clone()).unwrap_or_else(|_| std::process::abort());
+        assert!(legacy.inference_pool_ref.is_none());
+        assert!(
+            serde_json::to_value(legacy)
+                .ok()
+                .and_then(|spec| spec.get("inferencePoolRef").cloned())
+                .is_none()
+        );
+        value.as_object_mut().unwrap_or_else(|| std::process::abort()).insert(
+            "inferencePoolRef".to_owned(),
+            serde_json::json!({"name": "source-pool", "namespace": "serving"}),
+        );
+        let bound: InferenceProviderSpec = serde_json::from_value(value).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            bound.inference_pool_ref.map(|reference| reference.name).as_deref(),
+            Some("source-pool")
+        );
+        assert_eq!(
+            bound.metrics_config.and_then(|metrics| metrics.pool_name).as_deref(),
+            Some("label-only")
+        );
     }
 
     #[test]

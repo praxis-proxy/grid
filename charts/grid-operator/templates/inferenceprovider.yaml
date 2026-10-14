@@ -20,6 +20,10 @@ spec:
   providerKind: {{ required "grid.providers.providerKind is required" .providerKind | quote }}
   backendKind: {{ required "grid.providers.backendKind is required" .backendKind | quote }}
   endpoint: {{ required "grid.providers.endpoint is required" .endpoint | quote }}
+  {{- if hasKey . "inferencePoolRef" }}
+  inferencePoolRef:
+    {{- toYaml .inferencePoolRef | nindent 4 }}
+  {{- end }}
   {{- with .capacityWeight }}
   capacityWeight: {{ . }}
   {{- end }}
