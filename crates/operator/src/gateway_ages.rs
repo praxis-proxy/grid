@@ -22,6 +22,7 @@ use crate::{
         grid_network::{GatewayAgeReport, GridNetwork},
         inference_provider::Condition,
     },
+    metrics::{GatewayFeedbackEvent, record_gateway_feedback},
     shutdown::Shutdown,
 };
 
@@ -64,6 +65,7 @@ impl GatewayFeedback {
     /// Accept only the connection's cryptographically proven local scope.
     pub async fn respond(&self, local: bool, request: http::Request<Body>) -> Response {
         if !local {
+            record_gateway_feedback(GatewayFeedbackEvent::Unauthorized);
             return StatusCode::FORBIDDEN.into_response();
         }
         tokio::select! {
@@ -101,6 +103,7 @@ impl GatewayFeedback {
                 Err(status) => return status.into_response(),
             }
         }
+        record_gateway_feedback(GatewayFeedbackEvent::ConflictExhausted);
         StatusCode::SERVICE_UNAVAILABLE.into_response()
     }
 }
@@ -130,6 +133,7 @@ async fn attempt(
     .await
     .map_err(|error| write_error(&error))?;
     if !durable(&applied, &update) {
+        record_gateway_feedback(GatewayFeedbackEvent::WriteFailure);
         tracing::warn!("gateway feedback response did not contain the intended evidence");
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -139,6 +143,7 @@ async fn attempt(
 /// Echo exact report identity only after storage and capacity acceptance.
 fn acknowledgment(report: &IngestReport, overflow: bool) -> Response {
     if overflow {
+        record_gateway_feedback(GatewayFeedbackEvent::Overflow);
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     (
@@ -176,8 +181,10 @@ async fn read_network(api: &Api<GridNetwork>) -> Result<Box<GridNetwork>, Status
 /// Retry only resourceVersion races; other API failures retain client evidence.
 fn write_error(error: &kube::Error) -> StatusCode {
     if matches!(error, kube::Error::Api(error) if error.code == 409) {
+        record_gateway_feedback(GatewayFeedbackEvent::Conflict);
         StatusCode::CONFLICT
     } else {
+        record_gateway_feedback(GatewayFeedbackEvent::WriteFailure);
         tracing::warn!(%error, "gateway age feedback was not persisted");
         StatusCode::SERVICE_UNAVAILABLE
     }
@@ -621,6 +628,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_conflicts_count_every_race_and_stop_after_three_attempts() {
+        let (client, _stored, patches) = mock_api(StorageMode::Contention);
+        let feedback = GatewayFeedback::new(client, Shutdown::never());
+        let conflicts = metric_count("conflict");
+        let exhausted = metric_count("conflict_exhausted");
+        let response = feedback.respond(true, request(&report("a", 1, 0, false), "")).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "contention is not acknowledged"
+        );
+        assert_eq!(
+            patches.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "retry budget is unchanged"
+        );
+        assert!(
+            metric_count("conflict") >= conflicts.saturating_add(3),
+            "all three races are counted"
+        );
+        assert!(
+            metric_count("conflict_exhausted") > exhausted,
+            "exhaustion is separately visible"
+        );
+    }
+
+    #[tokio::test]
     async fn conflict_retries_against_live_version_and_exact_duplicate_keeps_receipt() {
         let (client, stored, patches) = mock_api(StorageMode::Conflict);
         let (_trigger, shutdown) = crate::shutdown::Trigger::new();
@@ -796,6 +830,8 @@ mod tests {
         Conflict,
         /// Returned evidence differs from the intended write.
         Changed,
+        /// Every mocked write returns a resource-version conflict.
+        Contention,
         /// Every write fails.
         Failure,
     }
@@ -823,7 +859,10 @@ mod tests {
                         return Ok::<_, std::convert::Infallible>(http::Response::new(Body::from(serde_json::json!({"apiVersion":"grid.praxis.fast/v1alpha1","kind":"GridNetworkList","items":[network]}).to_string())));
                     }
                     let count = patches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if mode == StorageMode::Failure || (mode == StorageMode::Conflict && count == 0) {
+                    if mode == StorageMode::Failure
+                        || mode == StorageMode::Contention
+                        || (mode == StorageMode::Conflict && count == 0)
+                    {
                         if mode == StorageMode::Conflict {
                             let mut concurrent = stored.lock().expect("stored");
                             concurrent["metadata"]["resourceVersion"] = serde_json::json!("2");
@@ -867,6 +906,15 @@ mod tests {
     // ---------------------------------------------------------------------------
     // Test Utilities
     // ---------------------------------------------------------------------------
+
+    /// Current exported count for one bounded feedback event.
+    fn metric_count(event: &str) -> u64 {
+        let text = String::from_utf8(crate::metrics::encode_metrics()).expect("metrics text");
+        let prefix = format!("grid_gateway_feedback_events_total{{event=\"{event}\"}} ");
+        text.lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .map_or(0, |value| value.parse().expect("integer counter"))
+    }
 
     /// Named network with a CAS version.
     fn network() -> GridNetwork {

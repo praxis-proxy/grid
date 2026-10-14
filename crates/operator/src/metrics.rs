@@ -41,6 +41,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PEER_SIGNALS_REFUSED.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(GATEWAY_FEEDBACK_EVENTS.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PROVIDER_SCRAPES.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PROVIDER_LAST_SCRAPE_SUCCESS.clone()))
@@ -81,6 +83,48 @@ static SIGNALS_SHED: LazyLock<IntCounterVec> = LazyLock::new(|| {
     )
     .unwrap_or_else(|_| std::process::abort())
 });
+
+/// Gateway status feedback events, without reporter-controlled labels.
+static GATEWAY_FEEDBACK_EVENTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new("grid_gateway_feedback_events_total", "Gateway status feedback events"),
+        &["event"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// Bounded failure and contention classes for gateway status feedback.
+#[derive(Clone, Copy)]
+pub(crate) enum GatewayFeedbackEvent {
+    /// A resource version race that can be retried.
+    Conflict,
+    /// All resource version retries were consumed.
+    ConflictExhausted,
+    /// Durable reporter capacity refused an additional identity.
+    Overflow,
+    /// A caller's certificate does not identify the local gateway.
+    Unauthorized,
+    /// A Kubernetes write failed without a retriable resource version race.
+    WriteFailure,
+}
+
+impl GatewayFeedbackEvent {
+    /// Stable metric label, independent of request headers or error messages.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Conflict => "conflict",
+            Self::ConflictExhausted => "conflict_exhausted",
+            Self::Overflow => "overflow",
+            Self::Unauthorized => "unauthorized",
+            Self::WriteFailure => "write_failure",
+        }
+    }
+}
+
+/// Count a bounded gateway status feedback event.
+pub(crate) fn record_gateway_feedback(event: GatewayFeedbackEvent) {
+    GATEWAY_FEEDBACK_EVENTS.with_label_values(&[event.as_str()]).inc();
+}
 
 /// What a bounded relay render left out, by store and by what was cut.
 static SIGNALS_RELAY_TRUNCATED: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -705,6 +749,15 @@ pub fn encode_metrics() -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// Every bounded event used by the feedback counter.
+    const FEEDBACK_EVENTS: [GatewayFeedbackEvent; 5] = [
+        GatewayFeedbackEvent::Conflict,
+        GatewayFeedbackEvent::ConflictExhausted,
+        GatewayFeedbackEvent::Overflow,
+        GatewayFeedbackEvent::Unauthorized,
+        GatewayFeedbackEvent::WriteFailure,
+    ];
+
     #[test]
     fn site_phases_expire_three_requeues_after_the_last_refresh() {
         let now = std::time::Instant::now();
@@ -716,6 +769,41 @@ mod tests {
         assert!(
             site_phases_expired(Some(now), now + SITE_PHASE_MAX_AGE + Duration::from_secs(1)),
             "past it"
+        );
+    }
+
+    #[test]
+    fn gateway_feedback_events_are_counted_and_exported() {
+        for event in FEEDBACK_EVENTS {
+            let counter = GATEWAY_FEEDBACK_EVENTS.with_label_values(&[event.as_str()]);
+            let before = counter.get();
+            record_gateway_feedback(event);
+            assert!(counter.get() > before, "every feedback event is counted");
+        }
+        let text = String::from_utf8(encode_metrics()).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            text.contains("grid_gateway_feedback_events_total"),
+            "the operator exports the feedback events"
+        );
+    }
+
+    #[test]
+    fn gateway_feedback_labels_have_no_reporter_dimension() {
+        use prometheus::core::Collector as _;
+        for event in FEEDBACK_EVENTS {
+            record_gateway_feedback(event);
+        }
+        let families = GATEWAY_FEEDBACK_EVENTS.collect();
+        let labels: Vec<_> = families
+            .iter()
+            .flat_map(|family| family.get_metric())
+            .flat_map(|metric| metric.get_label())
+            .map(|label| (label.name(), label.value()))
+            .collect();
+        assert_eq!(labels.len(), 5, "only five bounded series are possible");
+        assert!(
+            labels.iter().all(|(name, _)| *name == "event"),
+            "no reporter identity label"
         );
     }
 

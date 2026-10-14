@@ -64,6 +64,18 @@ it cannot carry a clean report. Malformed, repeated, unsupported, or oversized
 metadata and nonempty bodies are refused. The entire server operation has a
 five-second budget, including body reading, admission, and Kubernetes writes.
 
+Local callers share the listener's 256-connection limit. Peers can hold at most
+248 slots, leaving eight for local traffic. The site's own certificate remains
+the trust boundary; feedback has no separate local quota, and its single writer
+serializes publication within the same request budget.
+
+`grid_gateway_feedback_events_total{event}` counts `conflict` for each Kubernetes
+`409` resource-version race, `conflict_exhausted` after all three attempts,
+`overflow` when persisted reporter capacity refuses a new identity,
+`unauthorized` when a non-local caller submits feedback, and `write_failure`
+for other Kubernetes write errors or unverified storage responses. Labels never
+include reporter identities, request metadata, or error strings.
+
 A `204` response echoes `x-grid-ingest-epoch` and `x-grid-ingest-sequence` only
 after the report and resulting condition have been persisted together. A
 counter increase establishes rejection even when the flag claims clean. A
