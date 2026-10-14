@@ -35,7 +35,7 @@ use crate::{
     descriptor::{AdmissionState, CandidateConfig, CapabilityKind, validate_candidates},
     route::{KeepAll, select_spread},
     serving::AvailabilitySettings,
-    snapshot::{Inputs, Learned, RouteSnapshot},
+    snapshot::{Inputs, Learned, MIN_BACKLOG_SPELL_MS, RouteSnapshot},
 };
 
 /// The model every scenario routes.
@@ -112,7 +112,8 @@ pub(crate) struct SiteSpec {
 pub(crate) enum Withheld {
     /// Every signal published.
     Nothing,
-    /// No queue-free sample, so nothing teaches a ceiling and the site falls to the floor.
+    /// No queue-free sample, so nothing teaches the soft bound. A backlog at the site's limit
+    /// still teaches the hard one, which is why this no longer leaves capacity unknown.
     Capacity,
     /// No sample at all after the teaching one, so the site reports no room.
     Saturation,
@@ -243,9 +244,24 @@ pub(crate) struct Harness {
     learned: Learned,
     availability: AvailabilitySettings,
     window_ms: i64,
+    /// Serving units each site publishes. The request series are per unit, so a site's total
+    /// is the published count times this, which is how the gateway reads them.
+    units: f64,
 }
 
 impl Harness {
+    /// An empty grid with `share` as the explore floor.
+    pub(crate) fn with_explore_floor(window_ms: i64, share: f64) -> Self {
+        let mut harness = Self::new(window_ms);
+        harness.availability.explore_floor = share;
+        harness
+    }
+
+    /// Clear every site's soft bound, as a periodic reset would.
+    pub(crate) fn reset_soft(&mut self) {
+        self.learned.clear_soft();
+    }
+
     /// An empty grid reading load over `window_ms`.
     pub(crate) fn new(window_ms: i64) -> Self {
         Self {
@@ -253,7 +269,13 @@ impl Harness {
             learned: Learned::default(),
             availability: AvailabilitySettings::default(),
             window_ms,
+            units: 1.0,
         }
+    }
+
+    /// Set how many serving units each site publishes from here on.
+    pub(crate) fn set_units(&mut self, units: f64) {
+        self.units = units;
     }
 
     /// Publish each site holding `holding` with `queued` waiting at `at_ms`, then order.
@@ -267,13 +289,45 @@ impl Harness {
         holding: impl Fn(&SiteSpec) -> f64,
         queued: f64,
     ) -> RouteSnapshot {
+        self.refresh_with_saturation(sites, at_ms, holding, queued, |_| None)
+    }
+
+    /// As `refresh`, with each site's own fullness reading where it publishes one. An llm-d
+    /// site publishes it as KV cache utilization.
+    #[expect(clippy::too_many_arguments, reason = "a harness publisher, one argument per series")]
+    pub(crate) fn refresh_with_saturation(
+        &mut self,
+        sites: &[SiteSpec],
+        at_ms: i64,
+        holding: impl Fn(&SiteSpec) -> f64,
+        queued: f64,
+        reported: impl Fn(&SiteSpec) -> Option<f64>,
+    ) -> RouteSnapshot {
+        for spec in sites {
+            if let Some(share) = reported(spec) {
+                let labels = format!(r#"grid_site="{}",grid_provider="pool-{}""#, spec.site, spec.site);
+                let line = format!("llm_d_epp_average_kv_cache_utilization{{{labels}}} {share} {at_ms}");
+                self.store.ingest_at(&line, at_ms, at_ms, spec.site);
+            }
+        }
+        self.publish_and_order(sites, at_ms, holding, queued)
+    }
+
+    /// Publish the request-shaped series and order.
+    fn publish_and_order(
+        &mut self,
+        sites: &[SiteSpec],
+        at_ms: i64,
+        holding: impl Fn(&SiteSpec) -> f64,
+        queued: f64,
+    ) -> RouteSnapshot {
         for spec in sites {
             let labels = format!(r#"grid_site="{}",grid_provider="pool-{}""#, spec.site, spec.site);
             let running = (holding(spec) - queued).max(0.0);
             for (metric, value) in [
                 ("llm_d_epp_average_running_requests", running),
                 ("llm_d_epp_average_queue_size", queued),
-                ("llm_d_epp_ready_endpoints", 1.0),
+                ("llm_d_epp_ready_endpoints", self.units),
                 ("llm_d_epp_flow_control_queue_size", 0.0),
             ] {
                 let line = format!("{metric}{{{labels}}} {value} {at_ms}");
@@ -868,6 +922,25 @@ mod tests {
         spreads(&blind, CEILING).expect("with no saturation published the overflow band spreads");
     }
 
+    /// A site never seen queue-free still learns what it can carry.
+    ///
+    /// The soft bound needs a sample with nothing waiting. A site busy from the moment the
+    /// gateway starts watching it never gives one, which is what a restart under load leaves
+    /// behind: nothing learned, and no quiet moment coming. The hard bound covers it, because a
+    /// backlog at the site's own limit says it cannot carry much more than that, and that is a
+    /// usable denominator.
+    #[test]
+    fn a_site_never_seen_queue_free_still_learns_what_it_carries() {
+        let observed = dispatch(
+            &HETEROGENEOUS_CAPACITY,
+            &Run {
+                withheld: Withheld::Capacity,
+                ..Run::fresh(0..DRAWS)
+            },
+        );
+        capacity_tracking(&observed, UNIT_TOLERANCE).expect("a backlog teaches what a site carries");
+    }
+
     /// Scenario: every signal absent, which splits in two because selection does. With
     /// saturation gone no site reports room and the overflow band still weights by capacity, so
     /// dispatch must keep tracking it. With capacity gone too the only claim left is that it
@@ -938,16 +1011,19 @@ mod tests {
                 "{blind:?} passed a scenario it cannot satisfy"
             );
         }
+        // Withholding the queue-free sample alone no longer withholds capacity, because a
+        // backlog at the site's limit teaches the hard bound and that bound is capacity. Both
+        // have to go.
         let unpublished = dispatch(
             &HETEROGENEOUS_CAPACITY,
             &Run {
-                withheld: Withheld::Capacity,
+                withheld: Withheld::Everything,
                 ..Run::fresh(0..DRAWS)
             },
         );
         assert!(
             capacity_tracking(&unpublished, UNIT_TOLERANCE).is_err(),
-            "the draw passed with its weight off the wire, so the scenario does not read capacity"
+            "selection passed with nothing on the wire, so the scenario does not read load"
         );
     }
 
@@ -1037,6 +1113,869 @@ mod tests {
             spread < 0.05,
             "the verdict moves with the harness's settling, by {spread:.3}: {}",
             report.join(", ")
+        );
+    }
+
+    /// A site spent on long contexts, which its request count cannot see.
+    ///
+    /// Measured on dagobah: one GPU, `max_num_seqs` 128, a 49,424 token KV cache, and vLLM's
+    /// own report of a maximum concurrency of 1.51x at a 32,768 token context. At a full
+    /// context the engine holds one or two requests and its cache is spent, so a request count
+    /// against a ceiling learned from short prompts reads near empty while the site is about
+    /// to preempt. Prompt length decides which limit binds, and nothing in the routing path
+    /// sees a prompt, so the only reading that is right in both regimes is the larger of the
+    /// two.
+    #[expect(clippy::too_many_lines, reason = "one sequence: short prompts, then long ones")]
+    #[test]
+    fn a_site_spent_on_long_contexts_reads_full_at_a_low_request_count() {
+        let sites = EQUAL_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        // Short prompts first: the site carries its capacity queue-free and learns the ceiling.
+        for nth in 0..=3_i64 {
+            grid.refresh_with_saturation(
+                &sites,
+                NOW_MS + nth * REFRESH_MS,
+                |spec| spec.capacity,
+                0.0,
+                |_| Some(0.3),
+            );
+        }
+        // Then long prompts. Two requests in flight against a ceiling of 80, and a cache that
+        // is nearly spent. The queue is still empty: the engine has not started refusing.
+        let long = |spec: &SiteSpec| {
+            if spec.site == "campus" {
+                2.0
+            } else {
+                spec.capacity / 2.0
+            }
+        };
+        let kv = |spec: &SiteSpec| Some(if spec.site == "campus" { 0.97 } else { 0.4 });
+        let mut snapshot = grid.refresh_with_saturation(&sites, NOW_MS + 10 * REFRESH_MS, long, 0.0, kv);
+        for nth in 11..=40_i64 {
+            snapshot = grid.refresh_with_saturation(&sites, NOW_MS + nth * REFRESH_MS, long, 0.0, kv);
+        }
+        let of = |name: &str| {
+            snapshot
+                .candidates
+                .iter()
+                .find(|candidate| &*candidate.site == name)
+                .and_then(|candidate| candidate.rho)
+                .unwrap()
+        };
+        assert!(
+            of("campus") > 0.9,
+            "two requests in flight against a ceiling of 80 is a request ratio of 0.025, and \
+             the site reads {:.3}; its cache is at 0.97",
+            of("campus")
+        );
+        assert!(
+            of("hub") < 0.6,
+            "a site at the same request count on short prompts is not read as full: {:.3}",
+            of("hub")
+        );
+        // It is ordered behind every peer, which is what selection acts on.
+        let worst = snapshot
+            .candidates
+            .iter()
+            .filter(|candidate| &*candidate.site != "campus")
+            .filter_map(|candidate| candidate.rho)
+            .fold(0.0_f64, f64::max);
+        assert!(of("campus") > worst, "the spent site is the most saturated: {worst:.3}");
+    }
+
+    /// A spent cache is not a backlog, so nothing sheds for it.
+    ///
+    /// Fullness is read from the in-flight count against the learned ceiling, so a site holding
+    /// two requests on full contexts is never full however little cache it has left. Saturation
+    /// now reads the cache, and fullness does not, which is the second place the reading has to
+    /// reach. Until it does, the latch that refuses a model when every site is out of room
+    /// cannot fire on the one limit that binds at long contexts.
+    #[test]
+    #[ignore = "reproduces the fullness gap: `full` is in-flight against the ceiling, so a spent \
+                 KV cache at a low request count never counts as full"]
+    fn a_spent_cache_counts_as_full() {
+        let sites = EQUAL_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        for nth in 0..=3_i64 {
+            grid.refresh_with_saturation(
+                &sites,
+                NOW_MS + nth * REFRESH_MS,
+                |spec| spec.capacity,
+                0.0,
+                |_| Some(0.3),
+            );
+        }
+        // Every site spent, every queue shallow, every request count low.
+        let mut snapshot = grid.refresh_with_saturation(&sites, NOW_MS + 10 * REFRESH_MS, |_| 2.0, 0.5, |_| Some(0.99));
+        for nth in 11..=40_i64 {
+            snapshot = grid.refresh_with_saturation(&sites, NOW_MS + nth * REFRESH_MS, |_| 2.0, 0.5, |_| Some(0.99));
+        }
+        let full = snapshot
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.full == Some(true))
+            .count();
+        assert_eq!(
+            full,
+            snapshot.candidates.len(),
+            "every site has a spent cache and none counts as full"
+        );
+    }
+
+    /// One proven site and one that knows nothing, both healthy and both queue-free.
+    const PROVEN_AND_FRESH: [SiteSpec; 2] = [
+        SiteSpec {
+            site: "proven",
+            capacity: 200.0,
+            enforced: 200.0,
+            in_flight: 200.0,
+        },
+        SiteSpec {
+            site: "fresh",
+            capacity: 200.0,
+            enforced: 200.0,
+            in_flight: 0.0,
+        },
+    ];
+
+    /// What an unproven site converges to when it is only ever offered its weight's share.
+    ///
+    /// Open loop, the shape the draw produces: each round the fresh site holds its share of a
+    /// fixed offered total, queue-free, and that becomes the load it publishes next round.
+    fn converged_share(explore_floor: f64, rounds: i64) -> (f64, f64, f64) {
+        let sites = PROVEN_AND_FRESH;
+        let mut grid = Harness::with_explore_floor(WINDOW_MS, explore_floor);
+        let offered = 200.0;
+        let mut held = 0.0_f64;
+        let mut share = 0.0_f64;
+        let mut rho = 0.0_f64;
+        for nth in 0..=rounds {
+            let snapshot = grid.refresh(
+                &sites,
+                NOW_MS + nth * REFRESH_MS,
+                |spec| if spec.site == "proven" { offered } else { held },
+                0.0,
+            );
+            let of = |name: &str| {
+                snapshot
+                    .candidates
+                    .iter()
+                    .find(|candidate| &*candidate.site == name)
+                    .map_or((0.0, f64::NAN), |candidate| {
+                        (candidate.capacity.unwrap_or(0.0), candidate.rho.unwrap_or(f64::NAN))
+                    })
+            };
+            let (weight_proven, _) = of("proven");
+            let (weight_fresh, rho_fresh) = of("fresh");
+            share = weight_fresh / (weight_proven + weight_fresh);
+            rho = rho_fresh;
+            held = offered * share;
+        }
+        (share, held, rho)
+    }
+
+    /// A full cache tells a limit from a burst at once, where a clock has to wait.
+    ///
+    /// A backlog is either the site's limit showing or a burst of arrivals, and only one of
+    /// those should teach a bound. Time can tell them apart, which is why the spell has to
+    /// last, but the site's own reading tells them apart immediately: a backlog at a cache
+    /// that is nearly spent is a limit on the first sample. This is the whole benefit of
+    /// reading the cache into that decision, so it is asserted inside the spell rather than
+    /// after it.
+    #[test]
+    fn a_backlog_at_a_spent_cache_is_a_limit_before_the_spell_elapses() {
+        let sites = EQUAL_CAPACITY;
+        let spell = AvailabilitySettings::default().full_after_ms.max(MIN_BACKLOG_SPELL_MS);
+        let within = spell / 4;
+        let learned = |cache: f64| {
+            let mut grid = Harness::new(WINDOW_MS);
+            // Taught at capacity, queue-free, cache cool.
+            grid.refresh_with_saturation(&sites, NOW_MS, |spec| spec.capacity, 0.0, |_| Some(0.2));
+            // Then a quarter of the capacity with a queue, well inside the spell.
+            let snapshot = grid.refresh_with_saturation(
+                &sites,
+                NOW_MS + within,
+                |spec| spec.capacity / 4.0,
+                4.0,
+                |_| Some(cache),
+            );
+            snapshot.candidates[0].capacity.unwrap()
+        };
+        let taught = sites[0].capacity;
+        assert!(
+            (learned(0.2) - taught).abs() < f64::EPSILON,
+            "a cool cache inside the spell teaches no bound, so the ceiling is what the \
+             queue-free sample left: {} against {taught}",
+            learned(0.2)
+        );
+        assert!(
+            learned(0.95) < taught,
+            "a spent cache inside the spell teaches the bound at once: {} against {taught}",
+            learned(0.95)
+        );
+    }
+
+    /// A site that grew is no longer held by what the smaller one queued at.
+    ///
+    /// The hard bound is an upper bound on capacity and it was learned about a site of a given
+    /// size. A pool that gains units while its queue never empties has no queue-free sample
+    /// large enough to retire that bound, and every later queued sample can only tighten it, so
+    /// the larger pool keeps being ranked against what the smaller one could carry. The soft
+    /// bound survives the same growth, because the most a smaller site carried is still a floor
+    /// under what a larger one can.
+    #[expect(clippy::too_many_lines, reason = "one sequence: taught, bounded, grown")]
+    #[test]
+    fn a_site_that_gained_units_is_not_held_by_the_bound_the_smaller_one_taught() {
+        let sites = EQUAL_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        grid.set_units(2.0);
+
+        // Two units carrying the site's capacity with nothing waiting teaches the soft bound.
+        grid.refresh_with_saturation(&sites, NOW_MS, |spec| spec.capacity / 2.0, 0.0, |_| Some(0.3));
+
+        // Then the cache fills and it queues at half that, which is a hard bound below the soft.
+        let mut bounded = grid.refresh_with_saturation(&sites, NOW_MS, |spec| spec.capacity / 4.0, 2.0, |_| Some(0.95));
+        for nth in 1..=6 {
+            bounded = grid.refresh_with_saturation(
+                &sites,
+                NOW_MS + nth * REFRESH_MS,
+                |spec| spec.capacity / 4.0,
+                2.0,
+                |_| Some(0.95),
+            );
+        }
+        let small: Vec<f64> = bounded.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert!(
+            small.iter().all(|against| *against < 60.0),
+            "the smaller site queued at half what it carried, so a hard bound holds it: {small:?}"
+        );
+
+        // It doubles, stays busy, and its new pods make the cache cool, so no queue-free or
+        // newly full sample arrives to retire or replace that bound. The old smaller-pool
+        // instants remain in the horizon but must not immediately reteach it.
+        grid.set_units(4.0);
+        let mut grown = bounded;
+        for nth in 7..=(7 + (WINDOW_MS / REFRESH_MS) + 4) {
+            grown = grid.refresh_with_saturation(
+                &sites,
+                NOW_MS + nth * REFRESH_MS,
+                |spec| spec.capacity / 4.0,
+                2.0,
+                |_| Some(0.2),
+            );
+        }
+        let large: Vec<f64> = grown.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert!(
+            large.iter().zip(&small).all(|(after, before)| after > before),
+            "a site with twice the units is read against more than the bound the smaller one \
+             taught: {large:?} against {small:?}"
+        );
+    }
+
+    /// A gateway restart loses both learned bounds. A slot-bound site can remain queued with
+    /// a cool cache from the first sample onward, so it must relearn a hard bound from the
+    /// sustained backlog without first seeing a queue-free sample.
+    #[test]
+    fn a_restarted_gateway_relearns_a_slot_bound_site_under_load() {
+        let sites = EQUAL_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        grid.availability.smoothing = 1.0;
+        let first = grid.refresh_with_saturation(&sites, NOW_MS, |spec| spec.capacity, 2.0, |_| Some(0.2));
+        assert!(
+            first.candidates.iter().all(|site| site.rho == Some(0.2)),
+            "before the backlog settles, the cache is the only admissible reading"
+        );
+
+        let spell = AvailabilitySettings::default().full_after_ms.max(MIN_BACKLOG_SPELL_MS);
+        let settled = grid.refresh_with_saturation(&sites, NOW_MS + spell, |spec| spec.capacity, 2.0, |_| Some(0.2));
+        assert!(
+            settled.candidates.iter().all(|site| site.rho == Some(1.0)),
+            "the second backlogged sample teaches a hard bound and makes the request count bind"
+        );
+        assert!(
+            settled.candidates.iter().all(|site| site
+                .capacity
+                .is_some_and(|capacity| capacity > AvailabilitySettings::default().ceiling_floor)),
+            "the busy spell relearns above the cold-start floor"
+        );
+    }
+
+    /// Two congested samples are two observations, not one made of the worst of each.
+    ///
+    /// Both have a backlog, so filtering on that is not enough: the highest count among them
+    /// pairs with the highest fullness among them, and a site that queued at sixty with a cool
+    /// cache and at twenty with a spent one has sixty recorded as the limit a spent cache showed.
+    /// That is the wrong direction, raising the denominator of a site already at a limit.
+    #[test]
+    fn the_count_a_limit_is_learned_from_comes_from_the_sample_that_showed_it() {
+        let sites = EQUAL_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        let taught = grid.refresh_with_saturation(&sites, NOW_MS, |spec| spec.capacity, 0.0, |_| Some(0.3));
+        let soft: Vec<f64> = taught.candidates.iter().filter_map(|site| site.capacity).collect();
+
+        // Queueing at three quarters with a cool cache: a backlog, but nothing says it is a limit.
+        grid.refresh_with_saturation(
+            &sites,
+            NOW_MS + REFRESH_MS,
+            |spec| spec.capacity * 0.75,
+            2.0,
+            |_| Some(0.3),
+        );
+        // Then queueing at a quarter with the cache spent, which is a limit, at that count.
+        let mut seen = taught;
+        for nth in 2..=4 {
+            seen = grid.refresh_with_saturation(
+                &sites,
+                NOW_MS + nth * REFRESH_MS,
+                |spec| spec.capacity / 4.0,
+                2.0,
+                |_| Some(0.95),
+            );
+        }
+        let against: Vec<f64> = seen.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert!(
+            against.iter().all(|held| *held <= 25.0),
+            "the spent sample held a quarter, so that is the bound it shows, not the three \
+             quarters a cool one held: {against:?} against {soft:?}"
+        );
+    }
+
+    /// A spent cache in one sample and a backlog in another are not one observation.
+    ///
+    /// Every series here is the worst in its window, and the two are maximised apart: the cache
+    /// reading is the highest in the window, the congested count the highest at an instant that
+    /// had a backlog. Nothing makes those the same instant. A site that was full and quiet, then
+    /// quiet and queueing at a lower count, would otherwise have the lower count recorded as a
+    /// hard bound for a state it was never in, and the cool-cache guard that exists to stop
+    /// exactly that is bypassed by the older reading.
+    #[test]
+    fn a_spent_cache_and_a_later_backlog_are_not_one_congested_sample() {
+        let sites = EQUAL_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        // Full cache, nothing waiting, carrying its capacity. This teaches the soft bound.
+        let taught = grid.refresh_with_saturation(&sites, NOW_MS, |spec| spec.capacity, 0.0, |_| Some(0.95));
+        let soft: Vec<f64> = taught.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert!(
+            soft.iter().all(|weight| *weight >= 80.0),
+            "a queue-free sample at capacity teaches the soft bound: {soft:?}"
+        );
+
+        // The cache drains and a burst queues at a much lower count, inside the same window.
+        let mut later = taught;
+        for nth in 1..=3 {
+            later = grid.refresh_with_saturation(
+                &sites,
+                NOW_MS + nth * REFRESH_MS,
+                |spec| spec.capacity / 4.0,
+                2.0,
+                |_| Some(0.2),
+            );
+        }
+        let against: Vec<f64> = later.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert_eq!(
+            against, soft,
+            "the site was never both spent and queueing at a quarter of its load, so nothing \
+             there is a capacity bound: {against:?} against {soft:?}"
+        );
+    }
+
+    /// A standing queue at low load does not ratchet the ceiling down.
+    ///
+    /// A queue that never goes away is not a limit. A site taking arrivals in bursts queues at
+    /// a quarter of what it has carried, with its cache cool, and a rule that reads any
+    /// sustained backlog as a limit latches the bound at whatever the site held when the queue
+    /// first appeared. Measured with such a rule: a site carrying eighty read a ceiling of
+    /// twenty six, permanently, because clearing the bound needs a queue-free sample and a
+    /// persistently busy site never gives one.
+    ///
+    /// The site's own reading separates the two. Below `REPORTED_FULL` it says it has room, so
+    /// the only backlog still worth reading as a limit is one carried at or above the most it
+    /// has ever carried queue-free.
+    #[test]
+    fn a_standing_queue_at_low_load_does_not_lower_the_ceiling() {
+        let sites = EQUAL_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        let cool = |_: &SiteSpec| Some(0.3);
+        grid.refresh_with_saturation(&sites, NOW_MS, |spec| spec.capacity, 0.0, cool);
+        let taught = sites[0].capacity;
+        let mut snapshot =
+            grid.refresh_with_saturation(&sites, NOW_MS + REFRESH_MS, |spec| spec.capacity / 4.0, 4.0, cool);
+        for nth in 2..=40_i64 {
+            snapshot =
+                grid.refresh_with_saturation(&sites, NOW_MS + nth * REFRESH_MS, |spec| spec.capacity / 4.0, 4.0, cool);
+        }
+        let ceiling = snapshot.candidates[0].capacity.unwrap();
+        assert!(
+            (ceiling - taught).abs() < f64::EPSILON,
+            "a standing queue at a quarter of the load left the ceiling at {ceiling} against the \
+             {taught} the site carried queue-free"
+        );
+    }
+
+    /// A site out of sequence slots reads full, even with its cache barely touched.
+    ///
+    /// The slot cap is the one request-denominated limit the engine really has, and short
+    /// prompts reach it while the cache stays low: a pool at `max_num_seqs` on 512-token
+    /// prompts holds its slots full at a third of its blocks. The site's own reading cannot
+    /// see that, because the reading is about blocks. Its count can, which is the whole reason
+    /// the count is a limit at all, so the backlog has to be read as evidence of a limit
+    /// whether or not the cache agrees.
+    #[test]
+    fn a_site_out_of_slots_reads_full_with_a_cold_cache() {
+        let sites = EQUAL_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        // Taught at capacity, queue-free, cache cool throughout.
+        let cool = |_: &SiteSpec| Some(0.3);
+        grid.refresh_with_saturation(&sites, NOW_MS, |spec| spec.capacity, 0.0, cool);
+        // Then the slots fill and a queue builds, and stays, while the cache stays at 0.3.
+        let mut snapshot = grid.refresh_with_saturation(&sites, NOW_MS + REFRESH_MS, |spec| spec.capacity, 4.0, cool);
+        for nth in 2..=20_i64 {
+            snapshot = grid.refresh_with_saturation(&sites, NOW_MS + nth * REFRESH_MS, |spec| spec.capacity, 4.0, cool);
+        }
+        let worst = snapshot
+            .candidates
+            .iter()
+            .filter_map(|candidate| candidate.rho)
+            .fold(0.0_f64, f64::max);
+        assert!(
+            worst > 0.9,
+            "every slot is full and work is queued, and the site reads {worst:.3} because its \
+             cache sits at 0.30"
+        );
+    }
+    /// One row of the timeline bench: its name, how its cache and load move with the tick, and
+    /// how much it queues throughout.
+    type Regime = (&'static str, fn(i64) -> f64, fn(i64) -> f64, f64);
+
+    /// A timeline bench over the real store, snapshot and draw: which limit binds, and when.
+    ///
+    /// Ignored because it measures rather than asserts. Run it with
+    /// `cargo test -p ai-grid-filters --lib timeline_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a bench, not an invariant: prints which limit bound in each regime"]
+    #[expect(clippy::too_many_lines, reason = "one table, one row per regime")]
+    #[expect(clippy::print_stdout, reason = "a bench reports its table on stdout")]
+    fn timeline_bench() {
+        let regimes: [Regime; 4] = [
+            (
+                "cache ramps, load flat",
+                |t| 0.2 + 0.78 * (t as f64 / 60.0).min(1.0),
+                |_| 0.25,
+                0.0,
+            ),
+            (
+                "load ramps, cache flat",
+                |_| 0.3,
+                |t| 0.25 + 0.75 * (t as f64 / 60.0).min(1.0),
+                0.0,
+            ),
+            (
+                "both ramp",
+                |t| 0.2 + 0.78 * (t as f64 / 60.0).min(1.0),
+                |t| 0.25 + 0.75 * (t as f64 / 60.0).min(1.0),
+                0.0,
+            ),
+            (
+                "load ramps with a queue",
+                |_| 0.3,
+                |t| 0.25 + 0.75 * (t as f64 / 60.0).min(1.0),
+                4.0,
+            ),
+        ];
+        println!("\n  regime                      | rho   | reported | counted | ceiling | hard  | binding");
+        println!("  ----------------------------|-------|----------|---------|---------|-------|--------");
+        for (name, cache, load, queued) in regimes {
+            let sites = EQUAL_CAPACITY;
+            let mut grid = Harness::new(WINDOW_MS);
+            // Teach a ceiling first, queue-free at capacity with a cool cache.
+            grid.refresh_with_saturation(&sites, NOW_MS, |spec| spec.capacity, 0.0, |_| Some(0.2));
+            let mut snapshot =
+                grid.refresh_with_saturation(&sites, NOW_MS + REFRESH_MS, |spec| spec.capacity, 0.0, |_| Some(0.2));
+            for tick in 1..=90_i64 {
+                let at = NOW_MS + (tick + 1) * REFRESH_MS;
+                snapshot = grid.refresh_with_saturation(
+                    &sites,
+                    at,
+                    |spec| spec.capacity * load(tick),
+                    queued,
+                    |_| Some(cache(tick)),
+                );
+            }
+            let c = &snapshot.candidates[0];
+            let rho = c.rho.unwrap_or(f64::NAN);
+            let reported = cache(90).min(1.0);
+            let ceiling = c.capacity.unwrap_or(f64::NAN);
+            let counted = (sites[0].capacity * load(90) / ceiling).min(1.0);
+            let binding = if reported >= counted { "reported" } else { "counted" };
+            println!(
+                "  {name:27} | {rho:<5.3} | {reported:<8.3} | {counted:<7.3} | {ceiling:<7.1} | {:<5} | {binding}",
+                c.capacity.map_or_else(|| "-".to_owned(), |_| format!("{ceiling:.0}"))
+            );
+        }
+        println!();
+    }
+
+    /// A site that has never been pushed is not read as full.
+    ///
+    /// Its ceiling is a lower bound on capacity, being the most it has been seen to carry, so
+    /// its count over that ceiling is an upper bound on saturation rather than a reading of it.
+    /// A site only ever handed twenty requests reads a count of 1.0 whatever it could serve,
+    /// and taking the larger of a reading and an upper bound gives the upper bound. The count
+    /// is therefore admitted beside the site's own reading only once a backlog has shown where
+    /// the limit is.
+    ///
+    /// Measured before the rule: a site carrying twenty queue-free, reporting its cache at
+    /// 0.10, read 1.000 saturated.
+    #[test]
+    fn a_site_that_has_never_been_pushed_is_not_read_as_full() {
+        let sites = EQUAL_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        let reported = 0.1;
+        let mut snapshot = grid.refresh_with_saturation(&sites, NOW_MS, |_| 20.0, 0.0, |_| Some(reported));
+        for nth in 1..=30_i64 {
+            snapshot =
+                grid.refresh_with_saturation(&sites, NOW_MS + nth * REFRESH_MS, |_| 20.0, 0.0, |_| Some(reported));
+        }
+        let worst = snapshot
+            .candidates
+            .iter()
+            .filter_map(|candidate| candidate.rho)
+            .fold(0.0_f64, f64::max);
+        assert!(
+            (worst - reported).abs() < 0.05,
+            "every site carries twenty queue-free and reports {reported:.2}, and reads \
+             {worst:.3}: its own reading is the only limit anything has shown"
+        );
+    }
+
+    #[expect(clippy::too_many_lines, reason = "one sequence: taught, shrunk, recovered")]
+    #[test]
+    fn a_shrunken_site_is_measured_against_what_it_queues_at_now() {
+        let sites = EQUAL_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        let taught = grid.refresh(&sites, NOW_MS, |spec| spec.capacity, 0.0);
+        let soft: Vec<f64> = taught.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert!(
+            soft.iter().all(|weight| *weight >= 80.0),
+            "taught its capacity: {soft:?}"
+        );
+        // It shrinks: it queues at a quarter of what it used to carry, and keeps doing so,
+        // which is what a quartered pool under the same load looks like.
+        let quarter = |spec: &SiteSpec| spec.capacity / 4.0;
+        let mut shrunk = taught;
+        for nth in 1..=12 {
+            shrunk = grid.refresh(&sites, NOW_MS + nth * REFRESH_MS, quarter, 2.0);
+        }
+        let under_backlog: Vec<f64> = shrunk.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert!(
+            under_backlog.iter().all(|weight| *weight <= 25.0),
+            "a site queueing at a quarter of what it carried is measured against the quarter: \
+             {under_backlog:?} against {soft:?}"
+        );
+        let worst = shrunk
+            .candidates
+            .iter()
+            .filter_map(|site| site.rho)
+            .fold(0.0_f64, f64::max);
+        assert!(
+            worst > 0.5,
+            "and reads saturated rather than quarter loaded: {worst:.2}"
+        );
+        // It grows back. The backlog has to leave the reading window first, because every
+        // series here is the worst in its window, so recovery costs one window.
+        let mut grown = shrunk;
+        for nth in 12..=(12 + (WINDOW_MS / REFRESH_MS) + 2) {
+            grown = grid.refresh(&sites, NOW_MS + nth * REFRESH_MS, |spec| spec.capacity, 0.0);
+        }
+        let recovered: Vec<f64> = grown.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert_eq!(
+            recovered, soft,
+            "one queue-free sample at the old level hands the denominator back: {recovered:?} \
+             against {soft:?}"
+        );
+    }
+
+    /// A site that loses serving units has its learned bounds retired.
+    ///
+    /// The bounds describe a site of a given size, and a site that lost three quarters of its
+    /// units is not that site. Nothing it publishes says how much smaller it got, but the unit
+    /// count says that it did, and that is enough: drop what was learned about the old shape
+    /// and learn the new one from the next queue-free sample.
+    ///
+    /// Sustained, because the ready-unit count is a count of fresh scrapes rather than of ready
+    /// pods, so it dips whenever a scrape is late. A dip that clears inside the window the load
+    /// is read over is a late collector, not a smaller site.
+    #[test]
+    fn a_site_that_loses_units_retires_what_it_learned_about_the_old_one() {
+        let sites = EQUAL_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        grid.set_units(4.0);
+        let cool = |_: &SiteSpec| Some(0.3);
+        // Four units each carrying a quarter of the site's capacity, with nothing waiting.
+        let per_unit = |spec: &SiteSpec| spec.capacity / 4.0;
+        let taught = grid.refresh_with_saturation(&sites, NOW_MS, per_unit, 0.0, cool);
+        let soft: Vec<f64> = taught.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert!(
+            soft.iter().all(|weight| *weight >= 80.0),
+            "four units taught the site total: {soft:?}"
+        );
+
+        // Three units go. The one left carries what one unit carried, and says nothing about
+        // being smaller: its cache is as cool as it ever was.
+        grid.set_units(1.0);
+        let mut shrunk = taught;
+        for nth in 1..=((WINDOW_MS / REFRESH_MS) + 6) {
+            shrunk = grid.refresh_with_saturation(&sites, NOW_MS + nth * REFRESH_MS, per_unit, 0.0, cool);
+        }
+        let against: Vec<f64> = shrunk.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert!(
+            against.iter().all(|weight| *weight <= 30.0),
+            "a site down to a quarter of its units is measured against what a quarter carries, \
+             not against what four did: {against:?} against {soft:?}"
+        );
+    }
+
+    /// A unit count that dips and comes back is a late scrape, not a smaller site.
+    ///
+    /// Measured on a busy site, because that is where retiring early costs something. With a
+    /// backlog there is no queue-free sample to relearn from, so bounds dropped on a dip leave
+    /// the site read against the floor until its load lets up.
+    #[test]
+    fn a_unit_count_that_recovers_inside_the_window_keeps_what_was_learned() {
+        let sites = EQUAL_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        grid.set_units(4.0);
+        let cool = |_: &SiteSpec| Some(0.3);
+        let per_unit = |spec: &SiteSpec| spec.capacity / 4.0;
+        let taught = grid.refresh_with_saturation(&sites, NOW_MS, per_unit, 0.0, cool);
+        let soft: Vec<f64> = taught.candidates.iter().filter_map(|site| site.capacity).collect();
+
+        // The site stays busy throughout, so nothing re-teaches a bound that is dropped.
+        grid.set_units(1.0);
+        let dip = (WINDOW_MS / REFRESH_MS) - 4;
+        let mut snapshot = taught;
+        for nth in 1..=dip {
+            snapshot = grid.refresh_with_saturation(&sites, NOW_MS + nth * REFRESH_MS, per_unit, 2.0, cool);
+        }
+        grid.set_units(4.0);
+        for nth in dip + 1..=dip + 6 {
+            snapshot = grid.refresh_with_saturation(&sites, NOW_MS + nth * REFRESH_MS, per_unit, 2.0, cool);
+        }
+        let kept: Vec<f64> = snapshot.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert_eq!(
+            kept, soft,
+            "a dip shorter than the window the load is read over is a late collector: \
+             {kept:?} against {soft:?}"
+        );
+    }
+
+    /// The same shrink, reported by the site rather than counted by the gateway.
+    ///
+    /// Pods go and their blocks go with them, so the work that fit before now fills what is
+    /// left. The site says so itself, and the ceiling comes down on that reading alone. The
+    /// sibling above reaches the same place from a count against a learned ceiling, with no
+    /// reading from the site at all, so the two signals are tested to agree rather than one
+    /// being assumed to stand in for the other.
+    #[test]
+    fn a_shrunken_site_that_reports_a_spent_cache_is_measured_against_what_is_left() {
+        let sites = EQUAL_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        let cool = |_: &SiteSpec| Some(0.3);
+        let taught = grid.refresh_with_saturation(&sites, NOW_MS, |spec| spec.capacity, 0.0, cool);
+        let soft: Vec<f64> = taught.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert!(
+            soft.iter().all(|weight| *weight >= 80.0),
+            "taught its capacity: {soft:?}"
+        );
+
+        // A quarter of the pods left, holding a quarter of the work, and the blocks that went
+        // with them mean that quarter fills what remains.
+        let quarter = |spec: &SiteSpec| spec.capacity / 4.0;
+        let spent = |_: &SiteSpec| Some(1.0);
+        let mut shrunk = taught;
+        for nth in 1..=12 {
+            shrunk = grid.refresh_with_saturation(&sites, NOW_MS + nth * REFRESH_MS, quarter, 2.0, spent);
+        }
+        let against: Vec<f64> = shrunk.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert!(
+            against.iter().all(|weight| *weight <= 25.0),
+            "a site reporting a spent cache at a quarter of what it carried is measured against \
+             the quarter: {against:?} against {soft:?}"
+        );
+        let worst = shrunk
+            .candidates
+            .iter()
+            .filter_map(|site| site.rho)
+            .fold(0.0_f64, f64::max);
+        assert!(
+            worst > 0.5,
+            "and reads saturated rather than quarter loaded: {worst:.2}"
+        );
+    }
+
+    /// A site whose slots shrink without its blocks is read against a stale ceiling.
+    ///
+    /// Known gap, and not fixable from these signals. Lowering `max_num_seqs` on a rollout
+    /// leaves the cache cool, so nothing the site publishes says it got smaller, and a count
+    /// against the old ceiling reads it as emptier than it is. Losing pods is not this case:
+    /// blocks go with them, the cache fills, and the reported arm catches it at once.
+    ///
+    /// The backlog cannot carry the evidence either, because
+    /// `a_standing_queue_at_low_load_does_not_lower_the_ceiling` is the same sequence of
+    /// readings with the opposite answer, and it holds for longer. Duration cannot separate a
+    /// bursty site from a throttled one, and of the two mistakes only one is recoverable: a
+    /// ceiling left too high is cleared by the next queue-free sample, while one latched too
+    /// low needs a queue-free sample a busy site never gives.
+    ///
+    /// What would close it is the engine publishing its slot capacity. Running requests over
+    /// `max_num_seqs` is the same shape as cache utilization, and a site that is out of slots
+    /// would report it the way a site out of blocks already does, with nothing learned.
+    #[ignore = "needs a published slot capacity; see the doc comment"]
+    #[test]
+    fn a_shrunken_site_that_reports_a_cool_cache_is_measured_against_what_it_queues_at_now() {
+        let sites = EQUAL_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        // A quarter of its slots, against a cache with room to spare: the regime where the
+        // cache reading is not the limit and the count is all there is.
+        let cool = |_: &SiteSpec| Some(0.3);
+        let taught = grid.refresh_with_saturation(&sites, NOW_MS, |spec| spec.capacity, 0.0, cool);
+        let soft: Vec<f64> = taught.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert!(
+            soft.iter().all(|weight| *weight >= 80.0),
+            "taught its capacity: {soft:?}"
+        );
+
+        let quarter = |spec: &SiteSpec| spec.capacity / 4.0;
+        let settles = (WINDOW_MS / REFRESH_MS) + 8;
+        let mut shrunk = taught;
+        for nth in 1..=settles {
+            shrunk = grid.refresh_with_saturation(&sites, NOW_MS + nth * REFRESH_MS, quarter, 2.0, cool);
+        }
+        let under_backlog: Vec<f64> = shrunk.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert!(
+            under_backlog.iter().all(|weight| *weight <= 25.0),
+            "a site queueing at a quarter of what it carried is measured against the quarter, \
+             whether or not it also reports a cool cache: {under_backlog:?} against {soft:?}"
+        );
+    }
+
+    #[expect(clippy::too_many_lines, reason = "one sequence: taught, reset, recovered")]
+    #[test]
+    fn a_reset_under_load_recovers_within_the_debounce() {
+        let sites = HETEROGENEOUS_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        // Before the reset: each site has carried its capacity queue-free, so each knows it.
+        let taught = grid.refresh(&sites, NOW_MS, |spec| spec.capacity, 0.0);
+        let before: Vec<f64> = taught.candidates.iter().filter_map(|site| site.capacity).collect();
+        let declared: Vec<f64> = sites.iter().map(|spec| spec.capacity).collect();
+        assert_eq!(before.len(), declared.len());
+        // The reset: a fresh gateway, nothing learned, and a grid that is busy. Every sample
+        // from here on carries a queue, so nothing can teach a soft bound.
+        let mut reset = Harness::new(WINDOW_MS);
+        let busy = |spec: &SiteSpec| spec.capacity;
+        let first = reset.refresh(&sites, NOW_MS, busy, 2.0);
+        let floor = AvailabilitySettings::default().ceiling_floor;
+        for site in &first.candidates {
+            assert_eq!(
+                site.capacity,
+                Some(floor),
+                "the first busy refresh after a reset knows nothing: {}",
+                site.site
+            );
+        }
+        // The debounce passes, and the backlog is still there.
+        let spell = AvailabilitySettings::default().full_after_ms.max(MIN_BACKLOG_SPELL_MS);
+        let mut recovered = first;
+        for nth in 1..=((spell / REFRESH_MS) + 2) {
+            recovered = reset.refresh(&sites, NOW_MS + nth * REFRESH_MS, busy, 2.0);
+        }
+        let after: Vec<f64> = recovered.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert_eq!(
+            after, before,
+            "a settled backlog recovered what the queue-free samples had taught: {after:?} \
+             against {before:?}"
+        );
+        // And the recovery is not a flat value: the sites are ordered by what they carry
+        // again. The spread itself cannot prove much, because `explore_floor` lifts every
+        // measured weight to a quarter of the largest and so bounds any spread at four to one
+        // whatever the capacities are.
+        let ordered = after.windows(2).all(|pair| pair[0] < pair[1]);
+        assert!(ordered, "the weights follow the capacities: {after:?} for {declared:?}");
+    }
+
+    /// Resetting the soft bound on a clock is the removed descent in another shape.
+    ///
+    /// A reset under load is cheap, because a settled backlog teaches the hard bound within
+    /// the debounce. A reset at steady partial load is not, and that is the case a periodic
+    /// reset would mostly land in: the site is queue-free, so there is no backlog to teach a
+    /// hard bound, and the soft bound relearns from the only sample available, which is
+    /// whatever the site happens to be carrying. The gateway then reads its own offered load
+    /// back as the site's capacity.
+    ///
+    /// Measured at a steady quarter load over two hours: never resetting holds the ceiling at
+    /// 80 and saturation at 0.25, while resetting every 5, 15 or 60 minutes collapses it to 20
+    /// and saturation to 1.0. The period does not matter, because the relearn is immediate and
+    /// wrong rather than slow and wrong.
+    ///
+    /// The soft bound is taught by offered load, and selection controls offered load. Clearing
+    /// it on a clock closes that loop. A published identity change is a different thing: it is
+    /// evidence the old number is invalid rather than a guess that it might be stale.
+    #[test]
+    fn resetting_the_soft_bound_on_a_clock_reads_offered_load_as_capacity() {
+        let sites = EQUAL_CAPACITY;
+        let quarter = |spec: &SiteSpec| spec.capacity / 4.0;
+        let worst_rho = |period_min: i64| {
+            let mut grid = Harness::new(WINDOW_MS);
+            grid.refresh(&sites, NOW_MS, |spec| spec.capacity, 0.0);
+            let mut snap = grid.refresh(&sites, NOW_MS + 1_000, quarter, 0.0);
+            for minute in 1..=120_i64 {
+                if period_min > 0 && minute % period_min == 0 {
+                    grid.reset_soft();
+                }
+                snap = grid.refresh(&sites, NOW_MS + minute * 60_000, quarter, 0.0);
+            }
+            snap.candidates
+                .iter()
+                .filter_map(|candidate| candidate.rho)
+                .fold(0.0_f64, f64::max)
+        };
+        let never = worst_rho(0);
+        assert!(
+            never < 0.3,
+            "a quarter load reads a quarter saturated when nothing resets: {never:.3}"
+        );
+        for period_min in [5_i64, 15, 60] {
+            let reset = worst_rho(period_min);
+            assert!(
+                reset > 0.9,
+                "a reset every {period_min} minutes should read the offered load back as \
+                 capacity, and read {reset:.3}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "reproduces the unproven-site fixed point: weight is what a site has carried and \
+                 load is proportional to weight, so a fresh site converges on explore_floor's share"]
+    fn an_unproven_site_discovers_what_it_can_carry() {
+        let (share, held, rho) = converged_share(AvailabilitySettings::default().explore_floor, 40);
+        assert!(
+            held > 150.0,
+            "a site that can serve 200 converged holding {held:.1} at a {share:.3} share, \
+             reading {rho:.3} saturated with nothing queued"
+        );
+    }
+
+    /// Raising the explore floor moves the fixed point rather than removing it.
+    #[test]
+    #[ignore = "reproduces the same fixed point at every explore_floor setting"]
+    fn a_higher_explore_floor_lets_an_unproven_site_finish_proving_itself() {
+        let (_, low, _) = converged_share(0.25, 40);
+        let (_, high, _) = converged_share(0.75, 40);
+        assert!(
+            high > 150.0 && low > 150.0,
+            "tripling the explore floor took the converged load from {low:.1} to {high:.1}, \
+             against a true 200, so the floor sets the fixed point rather than escaping it"
         );
     }
 
