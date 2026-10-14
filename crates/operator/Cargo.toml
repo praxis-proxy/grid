@@ -11,7 +11,7 @@ publish = false
 default = ["tls-rustls"]
 tls-rustls = [
   "certs/rcgen",
-  "reqwest/rustls-no-provider",
+  "grid-client/rcgen",
   "rmcp/reqwest-tls-no-provider",
   "kube/rustls-tls",
   "kube/ring",
@@ -21,7 +21,7 @@ tls-rustls = [
 ]
 fips = [
   "certs/fips",
-  "reqwest/native-tls",
+  "grid-client/fips",
   "rmcp/reqwest-native-tls",
   "kube/openssl-tls",
   "dep:openssl",
@@ -36,6 +36,7 @@ axum = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 certs = { path = "../certs", default-features = false }
+grid-client = { path = "../client", default-features = false, features = ["reqwest-client"] }
 crdt = { path = "../crdt" }
 swim = { path = "../swim" }
 futures = { workspace = true }

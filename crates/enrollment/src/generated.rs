@@ -39,7 +39,8 @@ else. The token pins the name, so a submission cannot assert one.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug, Eq, PartialEq)]
 pub struct EnrollmentRequest {
     /**PKCS#10 certificate signing request, PEM encoded. The private key
-stays with the requester and is never sent.
+stays with the requester and is never sent. The key must be an EC
+key on P-256 or P-384.
 */
     pub csr: ::std::string::String,
 }
@@ -158,6 +159,13 @@ pub struct EnrollmentToken {
 ///What a grid-admin submits to mint a token.
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug, Eq, PartialEq)]
 pub struct EnrollmentTokenRequest {
+    /**Lets the token enroll a name whose enrollment a grid-admin deleted.
+Without it, a deleted name is refused at mint and at enroll. Keys
+the deleted enrollment held stay refused either way. Setting it also
+needs the right to delete enrollments.
+*/
+    #[serde(rename = "allowDeletedName", default)]
+    pub allow_deleted_name: bool,
     /**How long the token stays usable, in seconds. A default applies when
 unset. An explicit value must be greater than zero and at most
 604800 (seven days).
@@ -183,7 +191,7 @@ Retry-After when present, and stop on 401 and 403.
 
 | Code | Status | Meaning |
 |---|---|---|
-| invalid_csr | 400 | The signing request does not parse or verify. |
+| invalid_csr | 400 | The signing request does not parse or verify, or its key is not EC P-256 or P-384. |
 | invalid_site_name | 400 | The site name is not a DNS label. |
 | invalid_token_ttl | 400 | The token lifetime is out of range. |
 | missing_grid_network | 400 | The token request names no grid. |
@@ -196,6 +204,9 @@ Retry-After when present, and stop on 401 and 403.
 | timeout | 408 | The request ran past the server's limit. |
 | name_taken | 409 | Another enrollment holds the site name. |
 | reserved_site | 409 | The name is the enrollment bootstrap's. |
+| token_outstanding | 409 | A live token already pins the site name. |
+| name_deleted | 409 | The name's enrollment was deleted; mint with allowDeletedName. |
+| key_reused | 409 | The signing request's key was enrolled before. |
 | internal | 500 | The service could not complete the request. |
 | rotation_disabled | 503 | Rotation is turned off for the grid. Issued certificates stay valid. |
 */
@@ -246,6 +257,12 @@ pub enum ErrorError {
     NameTaken,
     #[serde(rename = "reserved_site")]
     ReservedSite,
+    #[serde(rename = "token_outstanding")]
+    TokenOutstanding,
+    #[serde(rename = "name_deleted")]
+    NameDeleted,
+    #[serde(rename = "key_reused")]
+    KeyReused,
     #[serde(rename = "internal")]
     Internal,
     #[serde(rename = "rotation_disabled")]
@@ -267,6 +284,9 @@ impl ::std::fmt::Display for ErrorError {
             Self::Timeout => f.write_str("timeout"),
             Self::NameTaken => f.write_str("name_taken"),
             Self::ReservedSite => f.write_str("reserved_site"),
+            Self::TokenOutstanding => f.write_str("token_outstanding"),
+            Self::NameDeleted => f.write_str("name_deleted"),
+            Self::KeyReused => f.write_str("key_reused"),
             Self::Internal => f.write_str("internal"),
             Self::RotationDisabled => f.write_str("rotation_disabled"),
         }
@@ -291,6 +311,9 @@ impl ::std::str::FromStr for ErrorError {
             "timeout" => Ok(Self::Timeout),
             "name_taken" => Ok(Self::NameTaken),
             "reserved_site" => Ok(Self::ReservedSite),
+            "token_outstanding" => Ok(Self::TokenOutstanding),
+            "name_deleted" => Ok(Self::NameDeleted),
+            "key_reused" => Ok(Self::KeyReused),
             "internal" => Ok(Self::Internal),
             "rotation_disabled" => Ok(Self::RotationDisabled),
             _ => Err("invalid value".into()),

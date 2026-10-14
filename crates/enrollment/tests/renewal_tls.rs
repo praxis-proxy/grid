@@ -45,7 +45,7 @@ fn serve() -> Served {
     let state = Arc::new(AppState {
         store: Store::memory(),
         ca: SharedCa::new(ca),
-        authorizer: Authorizer::Local(GridAdmins::from_table("tester: t0ken\n")),
+        authorizer: Authorizer::Local(GridAdmins::from_table("tester: t0ken\n").expect("token table")),
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         reserved_sites: vec!["hub".to_owned()],
         renewals_enabled: true,

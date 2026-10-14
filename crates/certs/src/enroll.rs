@@ -97,6 +97,10 @@ pub enum EnrollError {
     #[error("certificate request signature is invalid")]
     BadSignature,
 
+    /// The request's key is not an EC key on P-256 or P-384.
+    #[error("certificate request key must be an EC key on P-256 or P-384")]
+    UnsupportedKey,
+
     /// The assigned site name is not a valid name.
     ///
     /// The name is interpolated into a SPIFFE URI and a DNS name, so anything
@@ -138,8 +142,9 @@ pub fn validate_site_name(site_name: &str) -> Result<(), EnrollError> {
 ///
 /// # Errors
 ///
-/// Returns [`EnrollError`] if the request is oversized, unparseable, signed by a
-/// key it does not carry, or if `site_name` is not a DNS label.
+/// Returns [`EnrollError`] if the request is oversized, unparseable, carries a key
+/// other than EC P-256 or P-384, is signed by a key it does not carry, or if
+/// `site_name` is not a DNS label.
 pub fn sign_csr(ca: &CaCert, site_name: &str, csr_pem: &str, validity: Validity) -> Result<EnrolledCert, EnrollError> {
     validate_site_name(site_name)?;
 
@@ -178,7 +183,8 @@ pub fn sign_csr(ca: &CaCert, site_name: &str, csr_pem: &str, validity: Validity)
 ///
 /// # Errors
 ///
-/// [`EnrollError::TooLarge`] past [`MAX_CSR_PEM_BYTES`], and
+/// [`EnrollError::TooLarge`] past [`MAX_CSR_PEM_BYTES`],
+/// [`EnrollError::UnsupportedKey`] for a key other than EC P-256 or P-384, and
 /// [`EnrollError::BadSignature`] or [`EnrollError::Malformed`] when the request
 /// does not verify or parse.
 pub fn verify_csr(csr_pem: &str) -> Result<String, EnrollError> {
@@ -215,6 +221,7 @@ fn map_backend_error(err: BackendError) -> EnrollError {
     match err {
         BackendError::CsrBadSignature => EnrollError::BadSignature,
         BackendError::ParseCsr => EnrollError::Malformed,
+        BackendError::UnsupportedKey => EnrollError::UnsupportedKey,
         BackendError::KeyGen(msg) | BackendError::Sign(msg) | BackendError::InvalidCaKey(msg) => {
             EnrollError::Signing(msg)
         },

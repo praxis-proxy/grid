@@ -910,7 +910,7 @@ assert_renewal() {
     fail "frozen site renewal with its current leaf: HTTP $code"
   fi
 
-  # A grid-admin deletes the enrollment, mints an invite, and the site enrolls again.
+  # An enrollment admin deletes the enrollment, re-admits the name, and the site enrolls again.
   token=$(admin_token) || { fail "mint a grid-admin token"; return; }
   code=$(enroll_api "$out" DELETE "/enrollments/$SITE" -H @<(printf 'Authorization: Bearer %s\n' "$token"))
   if [[ $code == 204 ]]; then
@@ -919,7 +919,7 @@ assert_renewal() {
     fail "delete the $SITE enrollment: HTTP $code $(head -c 200 "$out.body" 2>/dev/null)"
     return
   fi
-  code=$(jq -cn --arg s "$SITE" '{siteName: $s, gridNetworkRef: "grid"}' \
+  code=$(jq -cn --arg s "$SITE" '{siteName: $s, gridNetworkRef: "grid", allowDeletedName: true}' \
     | enroll_api "$out" POST /enrollmenttokens -d @- -H @<(printf 'Authorization: Bearer %s\n' "$token"))
   if [[ $code != 201 ]] || ! jq -er .token "$out.body" >"$WORK/invite" 2>/dev/null; then
     fail "mint a new $SITE invite: HTTP $code $(head -c 200 "$out.body" 2>/dev/null)"

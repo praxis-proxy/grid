@@ -99,7 +99,7 @@ impl World {
             ca_key: Some(1),
             bundle: Some(1),
         };
-        world.enroll(SPOKE);
+        world.enroll(SPOKE, false);
         world.reissue_hub();
         world.apply_seed();
         world
@@ -148,7 +148,7 @@ impl World {
     }
 
     /// A token enrollment, the spoke's first and its documented recovery.
-    fn enroll(&mut self, name: &'static str) {
+    fn enroll(&mut self, name: &'static str, allow_deleted_name: bool) {
         let key = self.fresh_key();
         let digest = self.fresh_key();
         let now = self.now();
@@ -159,6 +159,7 @@ impl World {
                 grid_network_ref: "grid".to_owned(),
                 issued_by: "model".to_owned(),
                 expires_at: now.saturating_add(Duration::hours(1)),
+                allow_deleted_name,
             })
             .expect("mint");
         let issued = key.clone();
@@ -357,7 +358,7 @@ impl World {
             Ok(()) | Err(StoreError::NotFound) => {},
             Err(other) => self.fail(&format!("delete failed: {other}")),
         }
-        self.enroll(SPOKE);
+        self.enroll(SPOKE, true);
         let now = self.now();
         self.recovered(SPOKE, now);
         let key = self.sites[SPOKE].leaf.as_ref().map(|leaf| leaf.key.clone());

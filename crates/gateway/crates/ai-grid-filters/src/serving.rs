@@ -16,7 +16,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use certs::spiffe_id;
-use grid_signals_client::{PeerScraper, Reporter, spawn_on_thread_held};
+use grid_client::{PeerScraper, Reporter, spawn_on_thread_held};
 use praxis_filter::FilterError;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
 use serde::{Deserialize, Serialize};
@@ -190,7 +190,7 @@ pub struct PeerServingConfig {
     /// `Duration::ZERO` to the poller's interval timer and panic its thread.
     #[serde(
         default = "default_interval_ms",
-        deserialize_with = "grid_signals_client::deserialize_interval_ms"
+        deserialize_with = "grid_client::deserialize_interval_ms"
     )]
     pub interval_ms: u64,
 

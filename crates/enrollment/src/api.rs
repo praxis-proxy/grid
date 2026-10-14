@@ -95,6 +95,18 @@ pub enum ApiError {
     #[error("site name is already taken")]
     NameTaken,
 
+    /// A live site token already pins the name.
+    #[error("a live site token already pins this site name")]
+    TokenOutstanding,
+
+    /// The name's enrollment was deleted, and the token does not opt in to it.
+    #[error("the site name was deleted")]
+    NameDeleted,
+
+    /// The signing request's key was enrolled before.
+    #[error("the key was enrolled before")]
+    KeyReused,
+
     /// The caller presented no grid-admin credential, or one that is not known.
     #[error("a grid-admin credential is required")]
     Unauthorized,
@@ -147,11 +159,19 @@ impl From<AuthzError> for ApiError {
     }
 }
 
+/// The refusal while the held CA is not the one the database records.
+fn ca_withheld() -> ApiError {
+    ApiError::Internal("the signing CA is not the grid CA the database records".to_owned())
+}
+
 impl From<StoreError> for ApiError {
     fn from(err: StoreError) -> Self {
         match err {
             StoreError::NotFound => Self::NotFound,
             StoreError::NameTaken => Self::NameTaken,
+            StoreError::TokenOutstanding => Self::TokenOutstanding,
+            StoreError::NameDeleted => Self::NameDeleted,
+            StoreError::KeyReused => Self::KeyReused,
             StoreError::TokenInvalid => Self::InvalidToken,
             StoreError::Refused(_) => Self::IdentityRefused,
             StoreError::Backend(detail) => Self::Internal(detail),
@@ -232,6 +252,21 @@ impl ApiError {
                 ErrorCode::NameTaken,
                 "another member already holds this site name".to_owned(),
             ),
+            Self::TokenOutstanding => (
+                StatusCode::CONFLICT,
+                ErrorCode::TokenOutstanding,
+                "a live site token already pins this site name; revoke it or let it expire first".to_owned(),
+            ),
+            Self::NameDeleted => (
+                StatusCode::CONFLICT,
+                ErrorCode::NameDeleted,
+                "this site name's enrollment was deleted; mint with allowDeletedName to enroll it again".to_owned(),
+            ),
+            Self::KeyReused => (
+                StatusCode::CONFLICT,
+                ErrorCode::KeyReused,
+                "this key was enrolled before; enroll with a new key".to_owned(),
+            ),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 ErrorCode::Unauthorized,
@@ -304,11 +339,13 @@ impl IntoResponse for ApiError {
 fn signing_error(err: EnrollError) -> ApiError {
     match err {
         EnrollError::Signing(detail) => ApiError::Internal(detail),
-        EnrollError::TooLarge | EnrollError::Malformed | EnrollError::BadSignature | EnrollError::InvalidSiteName => {
-            ApiError::BadRequest {
-                code: ErrorCode::InvalidCsr,
-                message: err.to_string(),
-            }
+        EnrollError::TooLarge
+        | EnrollError::Malformed
+        | EnrollError::BadSignature
+        | EnrollError::UnsupportedKey
+        | EnrollError::InvalidSiteName => ApiError::BadRequest {
+            code: ErrorCode::InvalidCsr,
+            message: err.to_string(),
         },
     }
 }
@@ -372,7 +409,8 @@ async fn enforce_timeout(request: Request, next: Next) -> Response {
 /// Mint a site token so a site can enroll under a name the grid-admin pins.
 ///
 /// The pin is validated here, so a bad name fails at mint rather than at the
-/// site's enroll. The token is returned once, and only its digest is stored.
+/// site's enroll. The token is returned once, and only its digest is stored. A
+/// name an enrollment holds, or a live token already pins, is refused.
 #[expect(
     clippy::too_many_lines,
     reason = "validate, mint, store, and build the response read as one flow"
@@ -380,12 +418,23 @@ async fn enforce_timeout(request: Request, next: Next) -> Response {
 async fn mint_site_token(
     State(state): State<Arc<AppState>>,
     GridAdmin(admin): GridAdmin,
+    headers: HeaderMap,
     Json(input): Json<EnrollmentTokenRequest>,
 ) -> Result<(StatusCode, Json<EnrollmentToken>), ApiError> {
     validate_site_name(&input.site_name).map_err(|err| ApiError::BadRequest {
         code: ErrorCode::InvalidSiteName,
         message: err.to_string(),
     })?;
+    // Re-admitting a deleted name undoes a delete, so it needs the right to delete.
+    if input.allow_deleted_name {
+        let presented = bearer(&headers).ok_or(ApiError::Unauthorized)?;
+        let undelete = Operation {
+            resource: "enrollments",
+            verb: "delete",
+            subresource: None,
+        };
+        state.authorizer.decide(presented, undelete).await?;
+    }
     if state.reserved_sites.contains(&input.site_name) {
         return Err(ApiError::NameTaken);
     }
@@ -423,6 +472,7 @@ async fn mint_site_token(
             grid_network_ref: input.grid_network_ref,
             issued_by: admin.clone(),
             expires_at,
+            allow_deleted_name: input.allow_deleted_name,
         })
         .await?;
 
@@ -478,7 +528,7 @@ async fn enroll(
     let csr = input.csr;
     let validity = Validity::starting_now(state.cert_lifetime);
     // One snapshot, so the certificate and the CA returned with it always match.
-    let ca = state.ca.current();
+    let ca = state.ca.signer().ok_or_else(ca_withheld)?;
     let (enrollment_id, issued) = Box::pin(state.store.redeem_and_issue(&token_sha256, |pin: &Pin| {
         // A token minted before the name was reserved still cannot claim it.
         if state.reserved_sites.contains(&pin.site_name) {
@@ -600,7 +650,7 @@ async fn renew(
         presented_not_before: leaf.not_before,
     };
     let validity = Validity::starting_now(state.cert_lifetime);
-    let ca = state.ca.current();
+    let ca = state.ca.signer().ok_or_else(ca_withheld)?;
     let csr = input.csr;
     let signed = Box::pin(state.store.renew_and_issue(&renewal, || {
         sign_csr(&ca, &renewal.site_name, &csr, validity)
@@ -704,7 +754,7 @@ async fn get_enrollment(
     }))
 }
 
-/// Delete a site's enrollment: its renewals end and the name is released to re-enroll.
+/// Delete a site's enrollment: its renewals end, and its name and keys are not reused by default.
 async fn delete_enrollment(
     State(state): State<Arc<AppState>>,
     GridAdmin(admin): GridAdmin,
@@ -721,7 +771,7 @@ async fn delete_enrollment(
             err.into()
         }
     })?;
-    tracing::info!(site = %site_name, %admin, "site enrollment deleted; the name may re-enroll");
+    tracing::info!(site = %site_name, %admin, "site enrollment deleted; the name re-enrolls only with allowDeletedName");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -825,6 +875,9 @@ mod error_codes {
             ApiError::NoEnrollment,
             ApiError::NameTaken,
             ApiError::ReservedSite,
+            ApiError::TokenOutstanding,
+            ApiError::NameDeleted,
+            ApiError::KeyReused,
             ApiError::Internal(String::new()),
             ApiError::RotationDisabled,
         ]
@@ -846,6 +899,9 @@ mod error_codes {
             (404, "not_found"),
             (409, "name_taken"),
             (409, "reserved_site"),
+            (409, "token_outstanding"),
+            (409, "name_deleted"),
+            (409, "key_reused"),
             (500, "internal"),
             (503, "rotation_disabled"),
         ]

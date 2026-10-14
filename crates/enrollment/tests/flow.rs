@@ -13,7 +13,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use enrollment::{AppState, GridAdmins, NewSiteToken, SharedCa, Store, authz::Authorizer, router};
+use enrollment::{AppState, GridAdmins, NewSiteToken, SeedRecord, SharedCa, Store, authz::Authorizer, router};
 use http_body_util::BodyExt as _;
 use rcgen::{CertificateParams, DnType, KeyPair, SanType};
 use serde_json::{Value, json};
@@ -22,13 +22,18 @@ use tower::ServiceExt as _;
 /// The grid-admin credential the tests mint with.
 const TOKEN: &str = "t0ken";
 
-/// A service with a fresh CA, an empty store, and one grid-admin.
+/// A service with a fresh CA, an empty store, and one grid-admin that may also delete.
 fn service() -> axum::Router {
     let ca = certs::generate_ca("test-grid-ca").expect("ca");
     router(Arc::new(AppState {
         store: Store::memory(),
         ca: SharedCa::new(ca),
-        authorizer: Authorizer::Local(GridAdmins::from_table("tester: t0ken\n")),
+        authorizer: Authorizer::Local(
+            GridAdmins::from_table("tester: t0ken\n")
+                .expect("token table")
+                .with_roles("tester: grid-admin,enrollment-admin\n")
+                .expect("roles"),
+        ),
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         reserved_sites: Vec::new(),
         renewals_enabled: true,
@@ -43,7 +48,12 @@ fn service_reserving(store: Store, reserved: &str) -> axum::Router {
     router(Arc::new(AppState {
         store,
         ca: SharedCa::new(ca),
-        authorizer: Authorizer::Local(GridAdmins::from_table("tester: t0ken\n")),
+        authorizer: Authorizer::Local(
+            GridAdmins::from_table("tester: t0ken\n")
+                .expect("token table")
+                .with_roles("tester: grid-admin,enrollment-admin\n")
+                .expect("roles"),
+        ),
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         reserved_sites: vec![reserved.to_owned()],
         renewals_enabled: true,
@@ -103,15 +113,20 @@ async fn send(
     (status, value)
 }
 
-/// Mint a token pinning `site`, returning the token and its id.
-async fn mint(app: &axum::Router, site: &str) -> (String, String) {
-    let (status, body) = call_as_admin(
+/// Ask to mint a token pinning `site`, returning the response as is.
+async fn mint_status(app: &axum::Router, site: &str) -> (StatusCode, Value) {
+    call_as_admin(
         app,
         "POST",
         "/v1alpha1/enrollmenttokens",
         Some(json!({ "siteName": site, "gridNetworkRef": "demo-grid" })),
     )
-    .await;
+    .await
+}
+
+/// Mint a token pinning `site`, returning the token and its id.
+async fn mint(app: &axum::Router, site: &str) -> (String, String) {
+    let (status, body) = mint_status(app, site).await;
     assert_eq!(status, StatusCode::CREATED, "a grid-admin can mint a token");
     assert_eq!(body["siteName"], site, "the token pins the name");
     (
@@ -325,16 +340,119 @@ async fn the_certificate_carries_the_pinned_name_not_one_the_csr_asked_for() {
 }
 
 #[tokio::test]
-async fn two_sites_cannot_hold_one_name() {
+async fn a_held_name_cannot_be_minted() {
     let app = service();
     let (first_token, _) = mint(&app, "site-d").await;
     let (first_status, _first) = enroll(&app, &first_token, &plain_csr()).await;
     assert_eq!(first_status, StatusCode::CREATED);
 
-    let (second_token, _) = mint(&app, "site-d").await;
-    let (second_status, second_body) = enroll(&app, &second_token, &plain_csr()).await;
-    assert_eq!(second_status, StatusCode::CONFLICT, "the name is already held");
-    assert_eq!(second_body["error"], "name_taken");
+    let (status, body) = mint_status(&app, "site-d").await;
+    assert_eq!(status, StatusCode::CONFLICT, "an enrollment holds the name");
+    assert_eq!(body["error"], "name_taken");
+}
+
+#[tokio::test]
+async fn a_name_holds_one_live_token() {
+    let app = service();
+    let (_token, token_id) = mint(&app, "site-d").await;
+
+    let (status, body) = mint_status(&app, "site-d").await;
+    assert_eq!(status, StatusCode::CONFLICT, "a live token already pins the name");
+    assert_eq!(body["error"], "token_outstanding");
+
+    let (revoked, _) = call_as_admin(&app, "DELETE", &format!("/v1alpha1/enrollmenttokens/{token_id}"), None).await;
+    assert_eq!(revoked, StatusCode::NO_CONTENT);
+    let (reminted, _body) = mint_status(&app, "site-d").await;
+    assert_eq!(
+        reminted,
+        StatusCode::CREATED,
+        "revoking the live token frees the name to mint"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_mints_for_one_name_leave_one_live_token() {
+    let app = service();
+    let racers: Vec<_> = std::iter::repeat_with(|| {
+        let app = app.clone();
+        tokio::spawn(async move { mint_status(&app, "site-race").await })
+    })
+    .take(16)
+    .collect();
+    let mut created = 0_usize;
+    for racer in racers {
+        let (status, body) = racer.await.expect("join");
+        if status == StatusCode::CREATED {
+            created = created.saturating_add(1);
+        } else {
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["error"], "token_outstanding");
+        }
+    }
+    assert_eq!(created, 1, "exactly one racing mint wins the name");
+}
+
+#[tokio::test]
+async fn an_expired_token_frees_the_name_but_a_live_one_holds_it() {
+    let store = Store::memory();
+    let mut expired = new_token("site-x", "expired-token");
+    expired.expires_at = time::OffsetDateTime::now_utc().saturating_sub(time::Duration::seconds(1));
+    store.mint_site_token(expired).await.expect("mint expired");
+    let app = service_reserving(store, "hub");
+
+    let (first, body) = mint_status(&app, "site-x").await;
+    assert_eq!(first, StatusCode::CREATED, "an expired token holds nothing: {body}");
+    let (second, refused) = mint_status(&app, "site-x").await;
+    assert_eq!(second, StatusCode::CONFLICT, "the fresh token does");
+    assert_eq!(refused["error"], "token_outstanding");
+}
+
+#[tokio::test]
+async fn a_spelling_variant_does_not_mint_a_second_token_for_a_name() {
+    let app = service();
+    let _live = mint(&app, "site-d").await;
+    for variant in ["Site-D", "SITE-D", " site-d", "site-d ", "site-d\n", "site\u{2010}d"] {
+        let (status, body) = mint_status(&app, variant).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{variant:?} is not a second name: {body}"
+        );
+        assert_eq!(body["error"], "invalid_site_name", "{variant:?}");
+    }
+}
+
+/// A token whose name another record took cannot claim it once that record is deleted.
+#[tokio::test]
+async fn a_token_that_loses_its_name_cannot_claim_it_after_a_delete() {
+    let store = Store::memory();
+    let token = "loser-token";
+    store.mint_site_token(new_token("east", token)).await.expect("mint");
+    // A record with no token takes the name, the only way after mint refuses a held one.
+    store
+        .seed_reserved(&SeedRecord {
+            site_name: "east".to_owned(),
+            key_sha256: "e".repeat(64),
+            generation: 1,
+            issued_at: time::OffsetDateTime::now_utc(),
+        })
+        .await
+        .expect("seed");
+    let app = service_reserving(store, "hub");
+
+    let (status, body) = enroll(&app, token, &plain_csr()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "the name is held");
+    assert_eq!(body["error"], "name_taken");
+
+    let (deleted, _) = call_as_admin(&app, "DELETE", "/v1alpha1/enrollments/east", None).await;
+    assert_eq!(deleted, StatusCode::NO_CONTENT, "the holder is deleted");
+    let (replayed, replay) = enroll(&app, token, &plain_csr()).await;
+    assert_eq!(
+        replayed,
+        StatusCode::CONFLICT,
+        "the deleted name refuses the losing token"
+    );
+    assert_eq!(replay["error"], "name_deleted");
 }
 
 #[tokio::test]
@@ -349,6 +467,22 @@ async fn a_malformed_csr_is_refused_on_enroll() {
     // The CSR is verified before the token is touched, so a bad one cannot spend it.
     let (retry, _) = enroll(&app, &token, &plain_csr()).await;
     assert_eq!(retry, StatusCode::CREATED, "a malformed CSR does not spend the token");
+}
+
+#[tokio::test]
+async fn an_rsa_key_is_refused_on_enroll_without_spending_the_token() {
+    let app = service();
+    let (token, _id) = mint(&app, "site-d").await;
+    for rsa in [
+        include_str!("../../certs/tests/fixtures/requests/rsa-1024.csr"),
+        include_str!("../../certs/tests/fixtures/requests/rsa-2048.csr"),
+    ] {
+        let (status, body) = enroll(&app, &token, rsa).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "invalid_csr");
+    }
+    let (retry, _) = enroll(&app, &token, &plain_csr()).await;
+    assert_eq!(retry, StatusCode::CREATED, "the token is still unspent");
 }
 
 /// An issued site certificate must not be a CA, or a compromised site could mint
@@ -411,23 +545,341 @@ async fn a_reserved_name_cannot_be_minted() {
 async fn a_token_minted_before_the_reservation_cannot_claim_it() {
     let store = Store::memory();
     let token = "pre-reservation-token";
-    let token_sha256: String = certs::sha256(token.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    store
-        .mint_site_token(NewSiteToken {
-            token_sha256,
-            site_name: "hub".to_owned(),
-            grid_network_ref: "demo-grid".to_owned(),
-            issued_by: "tester".to_owned(),
-            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
-        })
-        .await
-        .expect("mint");
+    store.mint_site_token(new_token("hub", token)).await.expect("mint");
     let app = service_reserving(store, "hub");
 
     let (status, body) = enroll(&app, token, &plain_csr()).await;
     assert_eq!(status, StatusCode::CONFLICT, "no second identity for the hub");
     assert_eq!(body["error"], "name_taken");
+    let (replayed, replay) = enroll(&app, token, &plain_csr()).await;
+    assert_eq!(replayed, StatusCode::CONFLICT, "the token stays unspent and refused");
+    assert_eq!(replay["error"], "name_taken");
+}
+
+/// A store-level token pinning `site`, presented as `token`.
+fn new_token(site: &str, token: &str) -> NewSiteToken {
+    NewSiteToken {
+        token_sha256: certs::sha256(token.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        site_name: site.to_owned(),
+        grid_network_ref: "demo-grid".to_owned(),
+        issued_by: "tester".to_owned(),
+        expires_at: time::OffsetDateTime::now_utc().saturating_add(time::Duration::hours(1)),
+        allow_deleted_name: false,
+    }
+}
+
+/// A CSR for `key`, so a test can present one key more than once.
+fn csr_for(key: &KeyPair) -> String {
+    CertificateParams::default()
+        .serialize_request(key)
+        .expect("csr")
+        .pem()
+        .expect("pem")
+}
+
+/// Mint a token for `site` that opts in to a deleted name, returning the token.
+async fn mint_deleted(app: &axum::Router, site: &str) -> String {
+    let (status, body) = call_as_admin(
+        app,
+        "POST",
+        "/v1alpha1/enrollmenttokens",
+        Some(json!({ "siteName": site, "gridNetworkRef": "demo-grid", "allowDeletedName": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body["token"].as_str().expect("token").to_owned()
+}
+
+/// Delete `site`'s enrollment as a grid-admin.
+async fn delete(app: &axum::Router, site: &str) {
+    let (status, body) = call_as_admin(app, "DELETE", &format!("/v1alpha1/enrollments/{site}"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+#[tokio::test]
+async fn a_deleted_sites_key_cannot_enroll_again_under_any_name() {
+    let app = service();
+    let key = KeyPair::generate().expect("key");
+    let (token, _) = mint(&app, "site-a").await;
+    let (enrolled, _) = enroll(&app, &token, &csr_for(&key)).await;
+    assert_eq!(enrolled, StatusCode::CREATED);
+    delete(&app, "site-a").await;
+
+    let (other, _) = mint(&app, "site-b").await;
+    let (reused, body) = enroll(&app, &other, &csr_for(&key)).await;
+    assert_eq!(reused, StatusCode::CONFLICT, "the key under another name: {body}");
+    assert_eq!(body["error"], "key_reused");
+
+    let same = mint_deleted(&app, "site-a").await;
+    let (again, renamed) = enroll(&app, &same, &csr_for(&key)).await;
+    assert_eq!(again, StatusCode::CONFLICT, "the key under its old name: {renamed}");
+    assert_eq!(renamed["error"], "key_reused");
+
+    let (fresh, _) = enroll(&app, &other, &plain_csr()).await;
+    assert_eq!(
+        fresh,
+        StatusCode::CREATED,
+        "a key_reused refusal leaves the token unspent"
+    );
+}
+
+#[tokio::test]
+async fn a_live_sites_key_cannot_enroll_a_second_name() {
+    let app = service();
+    let key = KeyPair::generate().expect("key");
+    let (first, _) = mint(&app, "site-a").await;
+    let (second, _) = mint(&app, "site-b").await;
+    let (enrolled, _) = enroll(&app, &first, &csr_for(&key)).await;
+    assert_eq!(enrolled, StatusCode::CREATED);
+    let (reused, body) = enroll(&app, &second, &csr_for(&key)).await;
+    assert_eq!(reused, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "key_reused");
+}
+
+#[tokio::test]
+async fn a_deleted_name_enrolls_again_only_with_the_opt_in() {
+    let app = service();
+    let (token, _) = mint(&app, "site-a").await;
+    let (enrolled, _) = enroll(&app, &token, &plain_csr()).await;
+    assert_eq!(enrolled, StatusCode::CREATED);
+    delete(&app, "site-a").await;
+
+    let (refused, body) = call_as_admin(
+        &app,
+        "POST",
+        "/v1alpha1/enrollmenttokens",
+        Some(json!({ "siteName": "site-a", "gridNetworkRef": "demo-grid" })),
+    )
+    .await;
+    assert_eq!(refused, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "name_deleted");
+    let (explicit_false, declined) = call_as_admin(
+        &app,
+        "POST",
+        "/v1alpha1/enrollmenttokens",
+        Some(json!({ "siteName": "site-a", "gridNetworkRef": "demo-grid", "allowDeletedName": false })),
+    )
+    .await;
+    assert_eq!(explicit_false, StatusCode::CONFLICT, "{declined}");
+
+    let opted_in = mint_deleted(&app, "site-a").await;
+    let (reenrolled, issued) = enroll(&app, &opted_in, &plain_csr()).await;
+    assert_eq!(reenrolled, StatusCode::CREATED, "{issued}");
+    assert_eq!(issued["spiffeId"], "spiffe://grid.internal/site/site-a");
+}
+
+#[tokio::test]
+async fn a_token_minted_before_the_delete_cannot_claim_the_deleted_name() {
+    let store = Store::memory();
+    let waiting = "waiting-token";
+    store.mint_site_token(new_token("site-a", waiting)).await.expect("mint");
+    // A record with no token holds the name, the only way after mint refuses a held one.
+    store
+        .seed_reserved(&SeedRecord {
+            site_name: "site-a".to_owned(),
+            key_sha256: "a".repeat(64),
+            generation: 1,
+            issued_at: time::OffsetDateTime::now_utc(),
+        })
+        .await
+        .expect("seed");
+    let app = service_reserving(store, "hub");
+    delete(&app, "site-a").await;
+
+    let (claimed, body) = enroll(&app, waiting, &plain_csr()).await;
+    assert_eq!(claimed, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "name_deleted");
+    let (replayed, _body) = enroll(&app, waiting, &plain_csr()).await;
+    assert_eq!(replayed, StatusCode::UNAUTHORIZED, "the refusal spent the token");
+    let opted_in = mint_deleted(&app, "site-a").await;
+    let (reenrolled, issued) = enroll(&app, &opted_in, &plain_csr()).await;
+    assert_eq!(reenrolled, StatusCode::CREATED, "{issued}");
+}
+
+#[tokio::test]
+async fn a_spelling_variant_of_a_deleted_name_is_not_a_new_name() {
+    let app = service();
+    let (token, _) = mint(&app, "site-a").await;
+    let (enrolled, _) = enroll(&app, &token, &plain_csr()).await;
+    assert_eq!(enrolled, StatusCode::CREATED);
+    delete(&app, "site-a").await;
+    for variant in ["Site-A", "SITE-A", " site-a", "site-a ", "site-a\n"] {
+        let (status, body) = call_as_admin(
+            &app,
+            "POST",
+            "/v1alpha1/enrollmenttokens",
+            Some(json!({ "siteName": variant, "gridNetworkRef": "demo-grid" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{variant:?}: {body}");
+        assert_eq!(body["error"], "invalid_site_name", "{variant:?}");
+    }
+}
+
+/// A table with a default grid-admin, a full admin, and a deleter-only entry.
+const ROLE_TABLE: &str = "\
+ops:t0ken
+root:full-token
+security:delete-token
+";
+
+const ROLES: &str = "\
+root:grid-admin,enrollment-admin
+security:enrollment-admin
+";
+
+fn service_with_roles() -> axum::Router {
+    let ca = certs::generate_ca("test-grid-ca").expect("ca");
+    router(Arc::new(AppState {
+        store: Store::memory(),
+        ca: SharedCa::new(ca),
+        authorizer: Authorizer::Local(
+            GridAdmins::from_table(ROLE_TABLE)
+                .expect("token table")
+                .with_roles(ROLES)
+                .expect("roles"),
+        ),
+        cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
+        reserved_sites: Vec::new(),
+        renewals_enabled: true,
+        #[cfg(feature = "csr-record")]
+        recorder: None,
+    }))
+}
+
+async fn call_with(app: &axum::Router, bearer: &str, method: &str, path: &str, body: Option<Value>) -> StatusCode {
+    send(
+        app,
+        method,
+        path,
+        body,
+        &[("authorization", format!("Bearer {bearer}"))],
+    )
+    .await
+    .0
+}
+
+/// Mint and enroll `site` as the default grid-admin.
+async fn enrolled(app: &axum::Router, site: &str) {
+    let (token, _token_id) = mint(app, site).await;
+    let (status, _issued) = enroll(app, &token, &plain_csr()).await;
+    assert_eq!(status, StatusCode::CREATED, "{site} enrolls");
+}
+
+#[tokio::test]
+async fn a_grid_admin_without_enrollment_admin_cannot_delete_an_enrollment() {
+    let app = service_with_roles();
+    enrolled(&app, "site-kept").await;
+
+    let (refused, body) = call_as_admin(&app, "DELETE", "/v1alpha1/enrollments/site-kept", None).await;
+    assert_eq!(refused, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "forbidden");
+    for (method, path) in [
+        ("DELETE", "/v1alpha1/enrollments/site-kept/"),
+        ("DELETE", "/v1alpha1//enrollments/site-kept"),
+        ("DELETE", "/v1alpha1/enrollments/%73ite-kept"),
+        ("DELETE", "/V1ALPHA1/enrollments/site-kept"),
+        ("DELETE", "/v1alpha1/enrollments/site-kept?force=true"),
+        ("PUT", "/v1alpha1/enrollments/site-kept"),
+        ("PATCH", "/v1alpha1/enrollments/site-kept"),
+        ("POST", "/v1alpha1/enrollments/site-kept"),
+    ] {
+        let status = call_with(&app, TOKEN, method, path, None).await;
+        assert!(
+            status.is_client_error() && status != StatusCode::NO_CONTENT,
+            "{method} {path}: {status}"
+        );
+    }
+    let (read, record) = call_as_admin(&app, "GET", "/v1alpha1/enrollments/site-kept", None).await;
+    assert_eq!(
+        read,
+        StatusCode::OK,
+        "a grid-admin still reads, and the record survived: {record}"
+    );
+}
+
+#[tokio::test]
+async fn a_default_entry_keeps_mint_revoke_and_read() {
+    let app = service_with_roles();
+    let (_token, token_id) = mint(&app, "site-ops").await;
+    let status = call_with(
+        &app,
+        TOKEN,
+        "DELETE",
+        &format!("/v1alpha1/enrollmenttokens/{token_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "a default entry revokes");
+    enrolled(&app, "site-read").await;
+    let read = call_with(&app, TOKEN, "GET", "/v1alpha1/enrollments/site-read", None).await;
+    assert_eq!(read, StatusCode::OK, "a default entry reads enrollments");
+}
+
+#[tokio::test]
+async fn an_enrollment_admin_can_delete_an_enrollment() {
+    let app = service_with_roles();
+    enrolled(&app, "site-a").await;
+    enrolled(&app, "site-b").await;
+    assert_eq!(
+        call_with(&app, "full-token", "DELETE", "/v1alpha1/enrollments/site-a", None).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call_with(&app, "delete-token", "DELETE", "/v1alpha1/enrollments/site-b", None).await,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn an_enrollment_admin_alone_cannot_mint_or_revoke() {
+    let app = service_with_roles();
+    let (_token, token_id) = mint(&app, "site-z").await;
+    let mint_body = json!({ "siteName": "site-y", "gridNetworkRef": "demo-grid" });
+    assert_eq!(
+        call_with(
+            &app,
+            "delete-token",
+            "POST",
+            "/v1alpha1/enrollmenttokens",
+            Some(mint_body)
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call_with(
+            &app,
+            "delete-token",
+            "DELETE",
+            &format!("/v1alpha1/enrollmenttokens/{token_id}"),
+            None
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn re_admitting_a_deleted_name_needs_the_right_to_delete() {
+    let app = service_with_roles();
+    enrolled(&app, "site-gone").await;
+    assert_eq!(
+        call_with(&app, "full-token", "DELETE", "/v1alpha1/enrollments/site-gone", None).await,
+        StatusCode::NO_CONTENT
+    );
+    let readmit = json!({ "siteName": "site-gone", "gridNetworkRef": "demo-grid", "allowDeletedName": true });
+    assert_eq!(
+        call_with(&app, TOKEN, "POST", "/v1alpha1/enrollmenttokens", Some(readmit.clone())).await,
+        StatusCode::FORBIDDEN,
+        "a grid-admin alone cannot undo a delete"
+    );
+    assert_eq!(
+        call_with(&app, "full-token", "POST", "/v1alpha1/enrollmenttokens", Some(readmit)).await,
+        StatusCode::CREATED,
+        "grid-admin with enrollment-admin re-admits the name"
+    );
 }

@@ -26,6 +26,7 @@ use super::{BackendError, CertSpec, GeneratedCa, GeneratedCert, GeneratedCsr, Si
 fn request_spki_der(csr_pem: &str) -> Result<Vec<u8>, BackendError> {
     let der = pem::parse(csr_pem).map_err(|_bad| BackendError::ParseCsr)?;
     let (_rest, csr) = X509CertificationRequest::from_der(der.contents()).map_err(|_bad| BackendError::ParseCsr)?;
+    super::check_request_key(csr.certification_request_info.subject_pki.raw)?;
     // The self-signature proves the requester holds the private half.
     csr.verify_signature().map_err(|_bad| BackendError::CsrBadSignature)?;
     Ok(csr.certification_request_info.subject_pki.raw.to_vec())

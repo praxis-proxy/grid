@@ -312,6 +312,36 @@ Never silently drop futures or `#[must_use]` values.
 it. The `let_underscore_future` and
 `let_underscore_must_use` lints catch this.
 
+#### Outbound HTTP
+
+Build reqwest clients reaching grid endpoints through grid roots with
+`grid-client`. It owns the TLS backend choice, trust material, and both timeout
+phases, so callers forward `fips` rather than naming a backend themselves.
+Platform-root provider and MCP probes, and the operator's pooled peer transport,
+use their dedicated builders outside this API.
+
+```rust
+// Bad - a ninth client with its own bounds:
+let client = reqwest::Client::builder()
+    .timeout(Duration::from_secs(30))
+    .build()?;
+
+// Good - the grid's bounds and trust posture:
+let roots = grid_client::roots_from_pem(pem, "GRID_ENROLL_CA_FILE")?;
+let client = grid_client::trusted_client(
+    roots,
+    Some(identity),
+    grid_client::Timeouts::ENROLLMENT,
+)?;
+```
+
+Retry verdicts come from `RequestOutcome`. It is a
+closed enum, so a new failure mode gets an explicit
+verdict instead of defaulting to retryable, and its
+`as_str` is the bounded label for outcome metrics.
+Classify a status with `from_status` rather than
+comparing numbers at the call site.
+
 #### String Safety
 
 Raw string indexing (`&s[n..m]`) panics on non-char

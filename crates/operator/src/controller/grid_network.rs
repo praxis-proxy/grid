@@ -60,6 +60,10 @@ use crate::{
     swim_runtime::SwimHandle,
 };
 
+/// How long a leave waits for peers to hear it before the pod restarts.
+const SWIM_LEAVE_WAIT: Duration = Duration::from_secs(5);
+
+
 // ---------------------------------------------------------------------------
 // Operator context
 // ---------------------------------------------------------------------------
@@ -1358,6 +1362,11 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
             running.signal,
             running.trust
         );
+        // Leave first, so peers stop dialing an endpoint that is going away
+        // rather than waiting for suspicion to catch up.
+        if let Some(swim) = ctx.swim() {
+            swim.leave(SWIM_LEAVE_WAIT).await;
+        }
         #[expect(clippy::exit, reason = "modes apply only at startup; Kubernetes restarts the pod")]
         std::process::exit(0);
     }

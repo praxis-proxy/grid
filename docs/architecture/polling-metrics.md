@@ -73,8 +73,7 @@ gateway answers 503 with `Retry-After`, not 404: the model exists but cannot be
 served now. At the default 5s scrape and 5s poll, exclusion of a local site takes
 about 15s and rejoin about 10s. A remote site's reading reaches the gateway through
 its operator's peer poll, so its exclusion and rejoin also wait on that poll and its
-budget: about 15s more at a 5s peer poll, and up to the 30s default poll plus its 10s
-budget otherwise.
+budget: about 15s more at the default 5s peer poll plus its 10s budget.
 
 ## Provider In-flight
 

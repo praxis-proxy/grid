@@ -10,7 +10,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     net::{IpAddr, Ipv6Addr},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, PoisonError, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,7 +19,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 pub use crate::crd::grid_network::PeerTrustMode;
 use crate::{
-    metrics_scraper::{MetricsScrapeError, scrape_metrics_with_date},
+    metrics_scraper::{MetricsScrapeError, PeerTransport, scrape_peer},
     resources::tls_backend::{self, ClientTlsConfig},
     swim::MemberRecord,
 };
@@ -774,7 +774,7 @@ pub fn dialable_signals_endpoint(member: &MemberRecord, fallback_port: u16) -> O
 }
 
 /// Refused `(site, endpoint)` pairs already warned, bounded.
-static REFUSED_WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(String, String)>>> =
+static REFUSED_WARNED: std::sync::LazyLock<Mutex<std::collections::HashSet<(String, String)>>> =
     std::sync::LazyLock::new(Default::default);
 
 /// Refused pairs remembered before the set starts over.
@@ -783,7 +783,7 @@ const REFUSED_WARNED_MAX: usize = 1_024;
 /// Warn about a refused endpoint the first time a peer gossips it, `true` when warned.
 fn warn_refused_once(site: &str, endpoint: &str) -> bool {
     let endpoint: String = endpoint.chars().take(128).collect();
-    let mut warned = REFUSED_WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut warned = REFUSED_WARNED.lock().unwrap_or_else(PoisonError::into_inner);
     if warned.len() >= REFUSED_WARNED_MAX {
         warned.clear();
     }
@@ -818,85 +818,27 @@ pub(crate) fn is_dialable_ip(ip: IpAddr) -> bool {
 /// Everything outside the RFC 3986 unreserved set is escaped in a query value.
 const QUERY_VALUE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
 
-/// Why a poll ended, at the granularity a response differs by.
-///
-/// Finer than success or failure, so "why is this peer not scored" is
-/// answerable: a refusal, a trust failure, and a 403 each call for a different
-/// response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PollOutcome {
-    /// The peer answered.
-    Ok,
-    /// No answer within the timeout.
-    Timeout,
-    /// The connection was refused or the host was unreachable.
-    Refused,
-    /// The TLS handshake or certificate verification failed.
-    Tls,
-    /// Any other transport failure.
-    Transport,
-    /// The peer answered with a 4xx.
-    ClientError,
-    /// The peer answered with a 5xx.
-    ServerError,
-    /// The body was not decodable.
-    Encoding,
-    /// This site is misconfigured for that peer.
-    Config,
-    /// The process is shutting down and the poll stood down.
-    Cancelled,
-}
-
-impl PollOutcome {
-    /// Label value, stable because dashboards and alerts are written against it.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Timeout => "timeout",
-            Self::Refused => "refused",
-            Self::Tls => "tls",
-            Self::Transport => "transport",
-            Self::ClientError => "client_error",
-            Self::ServerError => "server_error",
-            Self::Encoding => "encoding",
-            Self::Config => "config",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
-    /// Whether trying again within this round could plausibly help.
-    ///
-    /// Retrying a trust failure or a refusal to answer wastes the budget that a
-    /// genuinely transient failure needs, and turns one misconfiguration into a
-    /// burst against a peer that already said no.
-    #[must_use]
-    pub const fn is_retryable(self) -> bool {
-        matches!(
-            self,
-            Self::Timeout | Self::Refused | Self::Transport | Self::ServerError
-        )
-    }
-}
+use grid_client::RequestOutcome;
 
 /// Classify a scrape failure.
-fn classify(error: &MetricsScrapeError) -> PollOutcome {
+fn classify(error: &MetricsScrapeError) -> RequestOutcome {
     match error {
-        MetricsScrapeError::Timeout(_) => PollOutcome::Timeout,
+        MetricsScrapeError::Timeout(_) => RequestOutcome::Timeout,
         MetricsScrapeError::NonOkStatus { status, .. } => {
-            if (500..600).contains(status) {
-                PollOutcome::ServerError
-            } else {
-                PollOutcome::ClientError
+            match http::StatusCode::from_u16(*status).map(grid_client::from_status) {
+                // A 2xx carried in an error means the scrape failed while the
+                // status said it worked, so nothing was answered.
+                Ok(RequestOutcome::Ok) | Err(_) => RequestOutcome::Transport,
+                Ok(outcome) => outcome,
             }
         },
-        MetricsScrapeError::Encoding(_) => PollOutcome::Encoding,
-        MetricsScrapeError::BodyTooLarge(_) => PollOutcome::Transport,
+        MetricsScrapeError::Encoding(_) => RequestOutcome::Encoding,
+        MetricsScrapeError::BodyTooLarge(_) => RequestOutcome::Transport,
         MetricsScrapeError::InvalidUrl(_)
         | MetricsScrapeError::HttpWithTls(_)
         | MetricsScrapeError::TlsMaterial(_)
         | MetricsScrapeError::Credential(_)
-        | MetricsScrapeError::PlaintextCredential(_) => PollOutcome::Config,
+        | MetricsScrapeError::PlaintextCredential(_) => RequestOutcome::Config,
         MetricsScrapeError::Transport(inner) => classify_transport(&**inner),
     }
 }
@@ -908,25 +850,25 @@ fn classify(error: &MetricsScrapeError) -> PollOutcome {
 /// replaced. The chain is walked rather than the message matched, because an
 /// error string is not an interface.
 #[expect(clippy::wildcard_enum_match_arm, reason = "std::io::ErrorKind is non_exhaustive")]
-fn classify_transport(error: &(dyn std::error::Error + 'static)) -> PollOutcome {
+fn classify_transport(error: &(dyn std::error::Error + 'static)) -> RequestOutcome {
     let mut current = Some(error);
     while let Some(err) = current {
         if tls_backend::is_tls_error(err) {
-            return PollOutcome::Tls;
+            return RequestOutcome::Tls;
         }
         if let Some(io) = err.downcast_ref::<std::io::Error>() {
             return match io.kind() {
                 std::io::ErrorKind::ConnectionRefused
                 | std::io::ErrorKind::HostUnreachable
                 | std::io::ErrorKind::NetworkUnreachable
-                | std::io::ErrorKind::ConnectionReset => PollOutcome::Refused,
-                std::io::ErrorKind::TimedOut => PollOutcome::Timeout,
-                _ => PollOutcome::Transport,
+                | std::io::ErrorKind::ConnectionReset => RequestOutcome::Refused,
+                std::io::ErrorKind::TimedOut => RequestOutcome::Timeout,
+                _ => RequestOutcome::Transport,
             };
         }
         current = err.source();
     }
-    PollOutcome::Transport
+    RequestOutcome::Transport
 }
 
 /// Delay before attempt `attempt`, counting the first retry as zero.
@@ -997,6 +939,45 @@ impl std::fmt::Debug for PeerTlsMaterial {
     }
 }
 
+/// How long an unused peer connection is kept.
+///
+/// Above the default poll interval, but below the signals listener's 10s idle
+/// timeout and the idle window a stateful firewall is likely to enforce.
+const PEER_POOL_IDLE: Duration = Duration::from_secs(8);
+
+/// How long a peer transport may live before it is rebuilt.
+///
+/// A pooled connection is verified once, when it is made. Rebuilding forces a
+/// fresh handshake, and so a fresh leaf check, bounding how long a revoked or
+/// expired certificate stays reachable.
+const PEER_TRANSPORT_MAX_AGE: Duration = Duration::from_mins(1);
+
+/// Per-peer transports, with the pins each was built for.
+///
+/// Held across rounds because building one parses a private key and opens a
+/// connection. Keyed by peer with the pins in the value, because keying on the
+/// pins would leak an entry per rotation. Each entry owns a connection pool,
+/// so an entry is dropped once its peer leaves the grid or its transport
+/// reaches its age.
+#[derive(Default)]
+pub struct PeerTransports(Mutex<HashMap<String, HeldTransport>>);
+
+/// A peer's transport, the pins it was built for, and when it was built.
+struct HeldTransport {
+    /// The pins the transport verifies against.
+    pins: Vec<String>,
+    /// The client, whose pool outlives a round.
+    transport: Arc<PeerTransport>,
+    /// When it was built, which bounds how long a connection may live.
+    built: Instant,
+}
+
+impl std::fmt::Debug for PeerTransports {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerTransports").finish_non_exhaustive()
+    }
+}
+
 /// Reads each peer's signals endpoint over HTTP.
 pub struct PollPeers {
     /// Per-attempt request timeout.
@@ -1026,6 +1007,8 @@ pub struct PollPeers {
     pub budget: Duration,
     /// Duration past which a poll is counted as slow.
     pub slow_after: Duration,
+    /// Per-peer transports, held across rounds.
+    pub transports: PeerTransports,
     /// Signal that the process is stopping.
     ///
     /// Lets an in-flight round stand down cleanly; dropping the future instead
@@ -1048,6 +1031,7 @@ impl Default for PollPeers {
             slow_after: Duration::from_secs(1),
             shutdown: crate::shutdown::Shutdown::never(),
             trust: PeerTrustMode::Pin,
+            transports: PeerTransports::default(),
         }
     }
 }
@@ -1063,22 +1047,71 @@ impl PollPeers {
         // used to leave the in-flight gauge counting a poll that had ended.
         let mut guard = PollGuard::enter(peer, self.slow_after);
 
-        // Once per peer, not per attempt: this parses a private key.
-        let tls = match self.tls.as_ref().map(|m| peer_client_config(m, self.trust, peer, pins)) {
-            Some(Ok(config)) => Some(config),
-            Some(Err(error)) => {
+        let transport = match self.peer_transport(peer, pins) {
+            Ok(transport) => transport,
+            Err(error) => {
                 tracing::warn!(peer, %error, "peer client config unusable; not polling");
-                guard.finish(PollOutcome::Config, 0);
+                guard.finish(RequestOutcome::Config, 0);
                 return None;
             },
-            None => None,
         };
         let (outcome, result) =
-            tokio::time::timeout(self.budget, self.attempt_until(peer, url, tls.as_ref(), guard.started))
+            tokio::time::timeout(self.budget, self.attempt_until(peer, url, &transport, guard.started))
                 .await
-                .unwrap_or((PollOutcome::Timeout, None));
+                .unwrap_or((RequestOutcome::Timeout, None));
         guard.finish(outcome, result.as_ref().map_or(0, |(body, _)| body.len()));
         result
+    }
+
+    /// The transport for `peer`, built on first use and rebuilt when its pins
+    /// change or it reaches [`PEER_TRANSPORT_MAX_AGE`].
+    ///
+    /// The build runs outside the lock; concurrent callers may keep different
+    /// usable transports for their rounds, and the last insert stays cached.
+    fn peer_transport(&self, peer: &str, pins: &[String]) -> Result<Arc<PeerTransport>, MetricsScrapeError> {
+        let held = self
+            .transports
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(peer)
+            .filter(|held| held.pins == pins && held.built.elapsed() < PEER_TRANSPORT_MAX_AGE)
+            .map(|held| Arc::clone(&held.transport));
+        if let Some(transport) = held {
+            return Ok(transport);
+        }
+        let config = match self.tls.as_ref() {
+            Some(material) => Some(peer_client_config(material, self.trust, peer, pins)?),
+            None => None,
+        };
+        let transport = Arc::new(PeerTransport::new(config.as_ref(), Some(PEER_POOL_IDLE))?);
+        self.transports.0.lock().unwrap_or_else(PoisonError::into_inner).insert(
+            peer.to_owned(),
+            HeldTransport {
+                pins: pins.to_vec(),
+                transport: Arc::clone(&transport),
+                built: Instant::now(),
+            },
+        );
+        Ok(transport)
+    }
+
+    /// Drop the transports of peers no longer in the grid.
+    ///
+    /// Without this a departed peer keeps its material for the life of the
+    /// process.
+    fn retain_transports(&self, current: &[(String, String, Vec<String>)]) {
+        self.transports
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|peer, _| current.iter().any(|(name, ..)| name == peer));
+    }
+
+    /// How many peer transports are held.
+    #[cfg(all(test, not(feature = "fips")))]
+    fn held_transports(&self) -> usize {
+        self.transports.0.lock().unwrap_or_else(PoisonError::into_inner).len()
     }
 
     /// One request, abandoned if the process is stopping.
@@ -1089,12 +1122,12 @@ impl PollPeers {
     async fn scrape_or_stand_down(
         &self,
         url: &str,
-        tls: Option<&ClientTlsConfig>,
+        transport: &PeerTransport,
     ) -> Option<Result<(String, Option<SystemTime>), MetricsScrapeError>> {
         tokio::select! {
             biased;
             () = self.shutdown.triggered() => None,
-            result = scrape_metrics_with_date(url, self.timeout, tls.cloned()) => Some(result),
+            result = scrape_peer(url, self.timeout, transport) => Some(result),
         }
     }
 
@@ -1117,25 +1150,25 @@ impl PollPeers {
         &self,
         peer: &str,
         url: &str,
-        tls: Option<&ClientTlsConfig>,
+        transport: &PeerTransport,
         started: Instant,
-    ) -> (PollOutcome, Option<(String, Option<SystemTime>)>) {
+    ) -> (RequestOutcome, Option<(String, Option<SystemTime>)>) {
         let attempts = self.attempts.max(1);
-        let mut outcome = PollOutcome::Transport;
+        let mut outcome = RequestOutcome::Transport;
         for attempt in 0..attempts {
             if self.shutdown.is_triggered() {
-                return (PollOutcome::Cancelled, None);
+                return (RequestOutcome::Cancelled, None);
             }
             if started.elapsed() >= self.budget {
                 break;
             }
 
-            let Some(scrape) = self.scrape_or_stand_down(url, tls).await else {
-                return (PollOutcome::Cancelled, None);
+            let Some(scrape) = self.scrape_or_stand_down(url, transport).await else {
+                return (RequestOutcome::Cancelled, None);
             };
 
             match scrape {
-                Ok(pair) => return (PollOutcome::Ok, Some(pair)),
+                Ok(pair) => return (RequestOutcome::Ok, Some(pair)),
                 Err(error) => {
                     outcome = classify(&error);
                     if attempt + 1 >= attempts || !outcome.is_retryable() {
@@ -1144,7 +1177,7 @@ impl PollPeers {
                     }
                     crate::metrics::record_peer_retry(peer, outcome.as_str());
                     if !self.wait_before_retry(peer, attempt, started).await {
-                        return (PollOutcome::Cancelled, None);
+                        return (RequestOutcome::Cancelled, None);
                     }
                 },
             }
@@ -1177,15 +1210,15 @@ impl PollPeers {
             .collect::<Vec<_>>()
             .join("&");
 
-        let fetches = peer_urls(sites, &collect_query)
-            .into_iter()
-            .map(|(peer, url, pins)| async move {
-                let (body, date) = self.poll_one(&peer, &url, &pins).await?;
-                let now_ms = wall_millis(SystemTime::now(), Duration::ZERO);
-                let mut observations = bound_peer(stamp_origin(parse(&body), &peer), &peer);
-                reexpress_peer_ages(&mut observations, date, now_ms);
-                Some((peer, observations))
-            });
+        let targets = peer_urls(sites, &collect_query);
+        self.retain_transports(&targets);
+        let fetches = targets.into_iter().map(|(peer, url, pins)| async move {
+            let (body, date) = self.poll_one(&peer, &url, &pins).await?;
+            let now_ms = wall_millis(SystemTime::now(), Duration::ZERO);
+            let mut observations = bound_peer(stamp_origin(parse(&body), &peer), &peer);
+            reexpress_peer_ages(&mut observations, date, now_ms);
+            Some((peer, observations))
+        });
 
         // A failed peer is absent, not empty, so silence stays distinct from nothing to report.
         let mut done = futures::stream::iter(fetches).buffer_unordered(self.concurrency.max(1));
@@ -1225,12 +1258,12 @@ impl<'poll> PollGuard<'poll> {
     }
 
     /// Record a poll that ran to a conclusion.
-    fn finish(&mut self, outcome: PollOutcome, bytes: usize) {
+    fn finish(&mut self, outcome: RequestOutcome, bytes: usize) {
         self.record(outcome, bytes);
     }
 
     /// Record an outcome once and only once.
-    fn record(&mut self, outcome: PollOutcome, bytes: usize) {
+    fn record(&mut self, outcome: RequestOutcome, bytes: usize) {
         if self.recorded {
             return;
         }
@@ -1244,8 +1277,8 @@ impl<'poll> PollGuard<'poll> {
         );
         // Reachability is claimed only when the poll concluded: a cancelled
         // poll learned nothing, and marking it down would fake an outage.
-        if outcome != PollOutcome::Cancelled {
-            crate::metrics::set_peer_collection_up(self.peer, outcome == PollOutcome::Ok, SystemTime::now());
+        if outcome != RequestOutcome::Cancelled {
+            crate::metrics::set_peer_collection_up(self.peer, outcome == RequestOutcome::Ok, SystemTime::now());
         }
     }
 }
@@ -1253,7 +1286,7 @@ impl<'poll> PollGuard<'poll> {
 impl Drop for PollGuard<'_> {
     fn drop(&mut self) {
         crate::metrics::peer_polls_in_flight(-1);
-        self.record(PollOutcome::Cancelled, 0);
+        self.record(RequestOutcome::Cancelled, 0);
     }
 }
 
@@ -2134,45 +2167,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_trust_failure_is_not_retried() {
-        // Retrying a certificate problem burns the budget a transient failure
-        // needs, and it will fail identically until somebody replaces a cert.
-        assert!(!PollOutcome::Tls.is_retryable());
-        assert!(!PollOutcome::Config.is_retryable());
-    }
-
-    #[test]
-    fn a_peer_declining_to_answer_is_not_retried() {
-        // A 403 is the scope rule working. Retrying it turns one misconfigured
-        // reader into a burst against a peer that already said no.
-        assert!(!PollOutcome::ClientError.is_retryable());
-    }
-
-    #[test]
-    fn transient_failures_are_retried() {
-        for outcome in [
-            PollOutcome::Timeout,
-            PollOutcome::Refused,
-            PollOutcome::Transport,
-            PollOutcome::ServerError,
-        ] {
-            assert!(outcome.is_retryable(), "{} is worth another attempt", outcome.as_str());
+    /// `status` as a scrape failure, for a table that reads in numbers.
+    fn non_ok(status: u16) -> MetricsScrapeError {
+        MetricsScrapeError::NonOkStatus {
+            status,
+            url: "https://peer/metrics".to_owned(),
         }
     }
 
     #[test]
+    fn a_throttled_peer_is_named_without_being_hit_again_this_round() {
+        // Three attempts at a 50ms base is not the schedule a 429 asked for.
+        assert_eq!(classify(&non_ok(429)), RequestOutcome::Throttled);
+        assert!(!classify(&non_ok(429)).is_retryable());
+        assert!(!classify(&non_ok(403)).is_retryable());
+    }
+
+    #[test]
+    fn a_success_status_carried_in_an_error_is_not_read_as_an_answer() {
+        // Marking the peer up here would publish a round that scraped nothing.
+        assert_eq!(classify(&non_ok(204)), RequestOutcome::Transport);
+    }
+
+    #[test]
     fn a_status_is_split_at_five_hundred() {
-        let client = classify(&MetricsScrapeError::NonOkStatus {
-            status: 403,
-            url: "https://peer/metrics".to_owned(),
-        });
-        let server = classify(&MetricsScrapeError::NonOkStatus {
-            status: 503,
-            url: "https://peer/metrics".to_owned(),
-        });
-        assert_eq!(client, PollOutcome::ClientError, "the peer answered and refused");
-        assert_eq!(server, PollOutcome::ServerError, "the peer is having a bad time");
+        let client = classify(&non_ok(403));
+        let server = classify(&non_ok(503));
+        assert_eq!(client, RequestOutcome::ClientError, "the peer answered and refused");
+        assert_eq!(server, RequestOutcome::ServerError, "the peer is having a bad time");
         assert!(!client.is_retryable() && server.is_retryable());
     }
 
@@ -2181,25 +2203,113 @@ mod tests {
         // Both arrive as transport errors and call for opposite responses, so
         // the chain is walked rather than the message matched.
         let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
-        assert_eq!(classify_transport(&refused), PollOutcome::Refused);
+        assert_eq!(classify_transport(&refused), RequestOutcome::Refused);
 
         #[cfg(not(feature = "fips"))]
         let tls_err = rustls::Error::DecryptError;
         #[cfg(feature = "fips")]
         let tls_err = openssl::error::ErrorStack::get();
-        assert_eq!(classify_transport(&tls_err), PollOutcome::Tls);
+        assert_eq!(classify_transport(&tls_err), RequestOutcome::Tls);
+    }
+
+    /// Peer TLS material from a throwaway CA, for the config cache tests.
+    #[cfg(not(feature = "fips"))]
+    fn test_material() -> Arc<PeerTlsMaterial> {
+        let ca = certs::generate_ca("cache-ca").expect("a CA");
+        let leaf = certs::generate_site_cert(&ca, "local").expect("a leaf");
+        Arc::new(PeerTlsMaterial {
+            ca: ca.cert_pem.into_bytes(),
+            identity: Some(PeerClientIdentity {
+                cert: leaf.cert_pem.into_bytes(),
+                key: zeroize::Zeroizing::new(leaf.key_pem.into_bytes()),
+            }),
+        })
+    }
+
+    #[test]
+    #[cfg(not(feature = "fips"))]
+    fn a_peer_transport_is_held_across_rounds_and_rebuilt_when_its_pins_change() {
+        let poll = PollPeers {
+            tls: Some(test_material()),
+            trust: PeerTrustMode::Pin,
+            ..PollPeers::default()
+        };
+        let pins = vec!["a".repeat(64)];
+        let first = poll.peer_transport("east", &pins).expect("built");
+        let again = poll.peer_transport("east", &pins).expect("built");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "building twice parses the private key and reopens the connection"
+        );
+        assert_eq!(poll.held_transports(), 1);
+
+        // A rotation replaces the entry rather than adding one, and takes the
+        // old pool with it.
+        let rotated = vec!["b".repeat(64)];
+        let after = poll.peer_transport("east", &rotated).expect("built");
+        assert!(!Arc::ptr_eq(&first, &after), "rotated pins must not reuse the socket");
+        assert_eq!(poll.held_transports(), 1, "keyed by peer, not by pin set");
+    }
+
+    #[test]
+    #[cfg(not(feature = "fips"))]
+    fn a_transport_past_its_age_is_rebuilt_so_the_leaf_is_checked_again() {
+        let poll = PollPeers {
+            tls: Some(test_material()),
+            trust: PeerTrustMode::Pin,
+            ..PollPeers::default()
+        };
+        let pins = vec!["a".repeat(64)];
+        let first = poll.peer_transport("east", &pins).expect("built");
+
+        // Age the entry past the bound without waiting for it.
+        let aged = Instant::now()
+            .checked_sub(PEER_TRANSPORT_MAX_AGE + Duration::from_secs(1))
+            .expect("a time before the bound");
+        let mut held = poll.transports.0.lock().unwrap_or_else(PoisonError::into_inner);
+        held.get_mut("east").expect("an entry").built = aged;
+        drop(held);
+
+        let after = poll.peer_transport("east", &pins).expect("built");
+        assert!(
+            !Arc::ptr_eq(&first, &after),
+            "an aged transport must be rebuilt, or a pooled connection is never verified again"
+        );
+        assert_eq!(
+            poll.held_transports(),
+            1,
+            "the rebuild replaces rather than accumulates"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "fips"))]
+    fn a_departed_peer_does_not_keep_its_config() {
+        let poll = PollPeers {
+            tls: Some(test_material()),
+            trust: PeerTrustMode::Pin,
+            ..PollPeers::default()
+        };
+        let pins = vec!["a".repeat(64)];
+        drop(poll.peer_transport("east", &pins).expect("built"));
+        drop(poll.peer_transport("west", &pins).expect("built"));
+        assert_eq!(poll.held_transports(), 2);
+
+        poll.retain_transports(&[("east".to_owned(), String::new(), pins)]);
+        assert_eq!(poll.held_transports(), 1, "west left the grid and took its material");
     }
 
     #[test]
     fn outcome_labels_are_stable() {
         // Dashboards and alert rules are written against these strings, so a
         // rename is a break for anyone already watching.
-        assert_eq!(PollOutcome::Ok.as_str(), "ok");
-        assert_eq!(PollOutcome::Timeout.as_str(), "timeout");
-        assert_eq!(PollOutcome::Refused.as_str(), "refused");
-        assert_eq!(PollOutcome::Tls.as_str(), "tls");
-        assert_eq!(PollOutcome::ClientError.as_str(), "client_error");
-        assert_eq!(PollOutcome::ServerError.as_str(), "server_error");
+        assert_eq!(RequestOutcome::Ok.as_str(), "ok");
+        assert_eq!(RequestOutcome::Timeout.as_str(), "timeout");
+        assert_eq!(RequestOutcome::Refused.as_str(), "refused");
+        assert_eq!(RequestOutcome::Tls.as_str(), "tls");
+        assert_eq!(RequestOutcome::ClientError.as_str(), "client_error");
+        assert_eq!(RequestOutcome::ServerError.as_str(), "server_error");
+        assert_eq!(RequestOutcome::Throttled.as_str(), "throttled");
     }
 
     #[test]

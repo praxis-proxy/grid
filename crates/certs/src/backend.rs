@@ -25,6 +25,26 @@ pub(crate) use openssl_backend::{
     sign_csr, sign_message, verify_leaf_signature, verify_message,
 };
 
+/// Refuse anything but the canonical DER encoding of an uncompressed P-256 or
+/// P-384 key, so one key cannot acquire another fingerprint through its encoding.
+pub(crate) fn check_request_key(spki_der: &[u8]) -> Result<(), BackendError> {
+    /// P-256 `AlgorithmIdentifier` and BIT STRING header, including the uncompressed marker.
+    const P256: &[u8] =
+        b"\x30\x59\x30\x13\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07\x03\x42\x00\x04";
+    /// P-384 `AlgorithmIdentifier` and BIT STRING header, including the uncompressed marker.
+    const P384: &[u8] =
+        b"\x30\x76\x30\x10\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x05\x2b\x81\x04\x00\x22\x03\x62\x00\x04";
+    for (prefix, coordinates) in [(P256, 64), (P384, 96)] {
+        if spki_der
+            .strip_prefix(prefix)
+            .is_some_and(|point| point.len() == coordinates)
+        {
+            return Ok(());
+        }
+    }
+    Err(BackendError::UnsupportedKey)
+}
+
 /// What a certificate should say, independent of the backend that mints it.
 ///
 /// `is_ca` selects the extension set: a CA gets basic-constraints and cert-sign
@@ -92,6 +112,8 @@ pub(crate) enum BackendError {
     ParseCsr,
     /// A certificate request's self-signature does not verify.
     CsrBadSignature,
+    /// A certificate request's key is not an EC key on P-256 or P-384.
+    UnsupportedKey,
     /// A CA certificate could not be parsed.
     InvalidCaCert,
     /// A CA private key could not be parsed.

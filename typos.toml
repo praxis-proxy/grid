@@ -1,5 +1,5 @@
 [files]
-extend-exclude = ["Cargo.lock", "**/target/**"]
+extend-exclude = ["Cargo.lock", "**/target/**", "*.csr"]
 
 [default.extend-words]
 # Accepted spelling used in parser errors and documentation.

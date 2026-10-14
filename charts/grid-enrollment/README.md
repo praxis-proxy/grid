@@ -79,6 +79,9 @@ The bootstrap writes three Secrets:
 
 Generation is idempotent and runs only when the CA is absent. `ca.forceRegenerate`
 replaces the CA in place, which invalidates every certificate it has issued.
+The service records the fingerprint of the CA's public key in the database and
+refuses a CA with another key unless `ca.confirmRotation` is set to the old
+fingerprint. A CA certificate renewed on the same key is accepted.
 
 ## Bring your own (overrides)
 
@@ -94,13 +97,17 @@ Each override takes a Secret reference, so no key material is inlined in values.
 | `enrollment.csrRecord.enabled` | `true` under `authz=kube`: each enrollment is recorded as a `CertificateSigningRequest`, approved and completed by the service, off the request path. The API server deletes an issued request about an hour after approval; the API server's audit log keeps the history when its policy covers these writes at `Request` level or above with a persistent backend. The service's own enrollment record is separate and always kept | `false` keeps no Kubernetes record; also the setting for Kubernetes 1.26 to 1.29, which lack the policy API |
 | `enrollment.csrRecord.signerName` | `grid.praxis.fast/site` | one per enrollment service on a cluster, since the policy admits only this release's service for it |
 | `enrollment.csrRecord.policy.enabled` | `true`: two `ValidatingAdmissionPolicies`, one letting only the service file under the signer name, one confining the service to that name (Kubernetes 1.30). Required while the record is on | `false` is refused; turn the record off on clusters without the v1 policy API |
-| `enrollment.gridAdminTokens.existingSecretRef` | generated (local authz) | pre-created token Secret (name:token lines) |
+| `enrollment.gridAdminTokens.existingSecretRef` | generated (local authz) | pre-created token Secret (`name:token` lines, optional `roles` key, see below) |
 
 The installing principal must itself hold `approve` and `sign` on the signer name, or RBAC escalation prevention refuses the record roles.
 
+## Local grid-admin roles
+
+Under `enrollment.authz=local` the Secret's `tokens` key holds one `name:token` line per admin, where the token is everything after the first colon and may contain any character, including `:`. Roles live in an optional `roles` key of `name:role[,role]` lines, with roles from `grid-admin` and `enrollment-admin`, matching the Roles kube mode binds. A name with no roles line is `grid-admin`: mint and revoke tokens, and read enrollments. Deleting an enrollment, or minting with `allowDeletedName`, needs `enrollment-admin`. Role names are exact and lowercase. An unknown, repeated, or empty role list fails startup, as does a roles line naming an admin the token table does not. Keeping roles out of the token line means a token's meaning never depends on the token's own characters. The generated table holds one `admin:<token>` line, a grid-admin without `enrollment-admin`, as kube mode binds `enrollment-admin` to nobody by default. To delete enrollments, add a `security:<token>` line to `tokens` and a `security:enrollment-admin` line to `roles`, then restart the service.
+
 ## Site invites
 
-Each `invites` entry (`siteName`, `gridNetworkRef`, optional `expiresInSecs` up to 604800) has a post-install and post-upgrade Job mint a one-time site token into Secret `grid-invite-<siteName>` (key `token`). The Job skips sites whose Secret already exists, so an upgrade mints only for new sites. Invites need `enrollment.authz=kube`. Before Helm 3.19, a failed invite run leaves its hook RBAC in place until the next run. [Site Enrollment](../../docs/installation/enrollment.md#invite-a-site-on-the-hub) covers delivery and revocation.
+Each `invites` entry (`siteName`, `gridNetworkRef`, optional `expiresInSecs` up to 604800, optional `allowDeletedName` to invite a site whose enrollment was deleted) has a post-install and post-upgrade Job mint a one-time site token into Secret `grid-invite-<siteName>` (key `token`). The Job skips sites whose Secret already exists, so an upgrade mints only for new sites. It also skips, without failing, a site that is enrolled, one whose live token it cannot store because its Secret was deleted (rerun after that token expires), and one whose enrollment was deleted. An entry with `allowDeletedName` also needs the invite ServiceAccount bound to the enrollment-admin Role. Invites need `enrollment.authz=kube`. Before Helm 3.19, a failed invite run leaves its hook RBAC in place until the next run. [Site Enrollment](../../docs/installation/enrollment.md#invite-a-site-on-the-hub) covers delivery and revocation.
 
 ## Hub site identity
 
@@ -116,7 +123,7 @@ The builtin Postgres serves TLS with a cert the bootstrap Job issues from the
 generated CA, and the service refuses a plaintext DB. A provided CA
 (`ca.method=provided`) does not run the bootstrap Job, so it issues no DB cert.
 Provided-CA installs must therefore use an external DB (`db.type=external`) whose
-URL sets `sslmode` (verify-full for FIPS).
+URL sets `sslmode=verify-full`.
 
 Postgres reads its serving cert at pod start. Each bootstrap run compares the
 builtin DB Deployment's `grid.praxis.fast/db-serving-cert-sha256` pod

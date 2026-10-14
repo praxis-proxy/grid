@@ -959,6 +959,7 @@ dependencies = [
  "axum-server",
  "certs",
  "clap",
+ "grid-client",
  "http-body-util",
  "k8s-openapi",
  "kube",
@@ -1370,6 +1371,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "grid-client"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "certs",
+ "grid-signals",
+ "http",
+ "http-body-util",
+ "httpdate",
+ "hyper",
+ "hyper-util",
+ "metrics",
+ "openssl",
+ "percent-encoding",
+ "reqwest",
+ "rustls",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "yaml_serde",
+ "zeroize",
+]
+
+[[package]]
 name = "grid-overlay-sync"
 version = "0.2.0"
 dependencies = [
@@ -1397,29 +1424,6 @@ name = "grid-signals"
 version = "0.2.0"
 dependencies = [
  "dashmap",
-]
-
-[[package]]
-name = "grid-signals-client"
-version = "0.2.0"
-dependencies = [
- "bytes",
- "certs",
- "grid-signals",
- "http",
- "http-body-util",
- "httpdate",
- "hyper",
- "hyper-util",
- "metrics",
- "percent-encoding",
- "rustls",
- "serde",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls",
- "tracing",
- "yaml_serde",
 ]
 
 [[package]]
@@ -2505,6 +2509,7 @@ dependencies = [
  "clap",
  "crdt",
  "futures",
+ "grid-client",
  "grid-signals",
  "http",
  "http-body-util",

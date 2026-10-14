@@ -248,6 +248,7 @@ Job reads, keys in sorted order.
 {{- $i := get $v.invites $site | default dict }}
 {{- $entry := dict "siteName" $site "gridNetworkRef" ($i.network | default "grid") }}
 {{- with $i.expiresInSecs }}{{- $_ := set $entry "expiresInSecs" (int .) }}{{- end }}
+{{- with $i.allowDeletedName }}{{- $_ := set $entry "allowDeletedName" true }}{{- end }}
 {{- with $i.cluster }}{{- $_ := set $entry "cluster" . }}{{- end }}
 {{- $list = append $list $entry }}
 {{- end }}

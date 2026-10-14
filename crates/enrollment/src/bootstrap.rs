@@ -273,7 +273,7 @@ fn db_credentials(args: &BootstrapArgs, password: &str) -> std::collections::BTr
     ])
 }
 
-/// A one-line grid-admin token table.
+/// A one-line grid-admin token table: grid-admin only, as kube mode binds enrollment-admin to nobody.
 fn admin_tokens(token: &str) -> std::collections::BTreeMap<String, String> {
     std::collections::BTreeMap::from([("tokens".to_owned(), format!("admin:{token}\n"))])
 }
@@ -1472,6 +1472,14 @@ mod tests {
     fn admin_tokens_is_one_name_token_line() {
         let data = admin_tokens("abc");
         assert_eq!(data.get("tokens").map(String::as_str), Some("admin:abc\n"));
+    }
+
+    #[test]
+    fn the_generated_admin_is_a_grid_admin_without_enrollment_admin() {
+        let data = admin_tokens("abc");
+        let admins = enrollment::GridAdmins::from_table(data.get("tokens").expect("tokens")).expect("token table");
+        let admin = admins.resolve("abc").expect("the generated token resolves");
+        assert_eq!(admin.roles, [enrollment::auth::Role::GridAdmin]);
     }
 
     #[test]

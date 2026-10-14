@@ -23,7 +23,7 @@ tls-rustls = [
   # kube's client needs a TLS backend to reach the API server; rustls off ring
   # on the non-fips path. Only bites when kube is enabled (sar or bootstrap).
   "kube?/rustls-tls",
-  "reqwest?/rustls-no-provider",
+  "grid-client?/rcgen",
 ]
 # sqlx still links sha2/md-5 for Postgres password auth, unused under the client-cert auth fips uses.
 fips = [
@@ -34,19 +34,20 @@ fips = [
   "sqlx/tls-native-tls",
   # kube's TLS backend must be openssl under fips, not rustls/ring.
   "kube?/openssl-tls",
-  "reqwest?/native-tls",
+  "grid-client?/fips",
 ]
 # Reuse Kubernetes RBAC for operator authorization (TokenReview + SubjectAccessReview).
 sar = ["dep:kube", "dep:k8s-openapi"]
 # Record each enrollment as a CertificateSigningRequest on the hub. Independent of
 # sar in code; the chart turns it on only under kube authz, since both need the API server.
 csr-record = ["dep:kube", "dep:k8s-openapi", "dep:pem"]
-bootstrap = ["dep:clap", "dep:kube", "dep:k8s-openapi", "dep:reqwest", "dep:zeroize"]
+bootstrap = ["dep:clap", "dep:kube", "dep:k8s-openapi", "dep:reqwest", "dep:grid-client", "dep:zeroize"]
 
 [dependencies]
 version.workspace = true
 axum = { workspace = true }
 certs = { path = "../certs", default-features = false }
+grid-client = { path = "../client", default-features = false, features = ["reqwest-client"], optional = true }
 clap = { workspace = true, optional = true, features = ["env"] }
 kube = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, optional = true }

@@ -12,8 +12,8 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
+use grid_client::{PollHandle, PollerConfig};
 use grid_signals::{LoadStore, now_ms};
-use grid_signals_client::{PollHandle, PollerConfig};
 use praxis_filter::FilterError;
 
 use crate::{
@@ -760,7 +760,7 @@ mod tests {
         time::Instant,
     };
 
-    use grid_signals_client::{FetchError, Scrape, SignalSource, spawn_on_thread_held};
+    use grid_client::{FetchError, Scrape, SignalSource, spawn_on_thread_held};
 
     use super::*;
     use crate::{

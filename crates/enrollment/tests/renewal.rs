@@ -55,7 +55,12 @@ fn grid_with(reserved: &[&str], renewals_enabled: bool) -> Grid {
     let state = Arc::new(AppState {
         store: Store::memory(),
         ca: SharedCa::new(ca),
-        authorizer: Authorizer::Local(GridAdmins::from_table("tester: t0ken\n")),
+        authorizer: Authorizer::Local(
+            GridAdmins::from_table("tester: t0ken\n")
+                .expect("token table")
+                .with_roles("tester: grid-admin,enrollment-admin\n")
+                .expect("roles"),
+        ),
         cert_lifetime: certs::DEFAULT_SITE_CERT_LIFETIME,
         reserved_sites: reserved.iter().map(|site| (*site).to_owned()).collect(),
         renewals_enabled,
@@ -120,7 +125,18 @@ fn admin() -> [(&'static str, String); 1] {
 
 /// Enroll `site` under a fresh token, returning its identity.
 async fn enroll(grid: &Grid, site: &str) -> Identity {
-    let mint = json!({ "siteName": site, "gridNetworkRef": "demo-grid" }).to_string();
+    enroll_minted(grid, site, false).await
+}
+
+/// Enroll `site` again after its enrollment was deleted.
+async fn reenroll(grid: &Grid, site: &str) -> Identity {
+    enroll_minted(grid, site, true).await
+}
+
+/// Enroll `site` under a token minted with `allow_deleted_name`.
+async fn enroll_minted(grid: &Grid, site: &str, allow_deleted_name: bool) -> Identity {
+    let mint =
+        json!({ "siteName": site, "gridNetworkRef": "demo-grid", "allowDeletedName": allow_deleted_name }).to_string();
     let (minted, token) = send(&grid.app, ("POST", "/v1alpha1/enrollmenttokens"), &mint, &admin(), None).await;
     assert_eq!(minted, StatusCode::CREATED, "mint");
     let csr = certs::generate_csr(site).expect("csr");
@@ -317,7 +333,7 @@ async fn a_fork_freezes_the_site_until_a_grid_admin_deletes_its_enrollment() {
 
     let gone = renew(&grid, "site-a", Some(&current)).await;
     assert_eq!(gone.status, StatusCode::FORBIDDEN, "no record, no renewal");
-    let reenrolled = enroll(&grid, "site-a").await;
+    let reenrolled = reenroll(&grid, "site-a").await;
     assert_eq!(
         renew(&grid, "site-a", Some(&reenrolled)).await.status,
         StatusCode::OK,
@@ -507,7 +523,7 @@ async fn a_stolen_leaf_from_before_a_recovery_cannot_freeze_the_recovered_site()
     )
     .await;
     assert_eq!(deleted, StatusCode::NO_CONTENT);
-    let recovered = enroll(&grid, "site-a").await;
+    let recovered = reenroll(&grid, "site-a").await;
 
     let stolen = issued_days_ago(&grid, "site-a", 1);
     let refused = renew(&grid, "site-a", Some(&stolen)).await;
@@ -641,5 +657,163 @@ async fn a_rolled_back_seed_is_warned_once_and_changes_nothing() {
         renew(&grid, "hub", Some(&second)).await.status,
         StatusCode::OK,
         "the applied seed still holds"
+    );
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "exercise both routes across signer withholding and recovery"
+)]
+async fn a_withheld_signer_refuses_enrollment_and_rotation_then_recovers() {
+    use enrollment::ca::{RecordedCa, anchor};
+
+    let grid = grid(&[]);
+    let first = enroll(&grid, "site-a").await;
+    let fingerprint = certs::cert_public_key_sha256(&grid.ca.cert_pem).expect("held key");
+    let other = certs::generate_ca("another-grid").expect("other CA");
+    let changed = certs::cert_public_key_sha256(&other.cert_pem).expect("other key");
+    let record = RecordedCa {
+        store: &grid.state.store,
+        confirm: None,
+    };
+    anchor(record.store, &fingerprint, None).await.expect("initial record");
+    anchor(record.store, &changed, Some(&fingerprint))
+        .await
+        .expect("another replica rotates");
+    grid.state
+        .ca
+        .reload(record, "test-grid-ca", &grid.ca.cert_pem, &grid.ca.key_pem)
+        .await
+        .expect_err("record names another CA");
+
+    let mint = json!({ "siteName": "site-b", "gridNetworkRef": "demo-grid" }).to_string();
+    let (minted, token) = send(&grid.app, ("POST", "/v1alpha1/enrollmenttokens"), &mint, &admin(), None).await;
+    assert_eq!(minted, StatusCode::CREATED);
+    let bearer = [(
+        "authorization",
+        format!("Bearer {}", token["token"].as_str().expect("token")),
+    )];
+    let csr = certs::generate_csr("site-b").expect("csr");
+    let body = json!({ "csr": csr.csr_pem }).to_string();
+    let (refused, _) = send(&grid.app, ("POST", "/v1alpha1/enrollments"), &body, &bearer, None).await;
+    assert_eq!(
+        refused,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a withheld CA cannot enroll"
+    );
+    assert_eq!(
+        renew(&grid, "site-a", Some(&first)).await.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a withheld CA cannot rotate"
+    );
+
+    anchor(record.store, &fingerprint, Some(&changed))
+        .await
+        .expect("restore the record");
+    grid.state
+        .ca
+        .reload(record, "test-grid-ca", &grid.ca.cert_pem, &grid.ca.key_pem)
+        .await
+        .expect("recover");
+    let (enrolled, issued) = send(&grid.app, ("POST", "/v1alpha1/enrollments"), &body, &bearer, None).await;
+    assert_eq!(
+        enrolled,
+        StatusCode::CREATED,
+        "the refused attempt kept its token: {issued}"
+    );
+    assert_eq!(
+        renew(&grid, "site-a", Some(&first)).await.status,
+        StatusCode::OK,
+        "rotation recovers with the held identity"
+    );
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "cover enrollment and rotation reuse through one key history"
+)]
+async fn rotation_to_any_key_ever_enrolled_is_refused() {
+    let grid = grid(&["hub"]);
+    let east = enroll(&grid, "east").await;
+    let west = enroll(&grid, "west").await;
+    let hub = issue(&grid.ca, "hub", certs::Validity::default());
+    seed(&grid, "hub", &hub, 1).await;
+
+    let (status, body) = renew_with(&grid, Some(&west), &csr_for(&east.key_pem)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "another site's live key: {body}");
+    assert_eq!(body["error"], "identity_refused");
+    let (seeded, _) = renew_with(&grid, Some(&west), &csr_for(&hub.key_pem)).await;
+    assert_eq!(seeded, StatusCode::FORBIDDEN, "the hub's seeded key");
+
+    let (deleted, _) = send(&grid.app, ("DELETE", "/v1alpha1/enrollments/east"), "", &admin(), None).await;
+    assert_eq!(deleted, StatusCode::NO_CONTENT);
+    let (gone, _) = renew_with(&grid, Some(&west), &csr_for(&east.key_pem)).await;
+    assert_eq!(gone, StatusCode::FORBIDDEN, "a deleted site's key");
+
+    let second = renew(&grid, "west", Some(&west)).await.identity();
+    let third = renew(&grid, "west", Some(&second)).await.identity();
+    let (rolled_back, _) = renew_with(&grid, Some(&third), &csr_for(&west.key_pem)).await;
+    assert_eq!(
+        rolled_back,
+        StatusCode::FORBIDDEN,
+        "its own key from two rotations back"
+    );
+    let mint = json!({ "siteName": "fresh", "gridNetworkRef": "demo-grid" }).to_string();
+    let (minted, token) = send(&grid.app, ("POST", "/v1alpha1/enrollmenttokens"), &mint, &admin(), None).await;
+    assert_eq!(minted, StatusCode::CREATED);
+    let bearer = [(
+        "authorization",
+        format!("Bearer {}", token["token"].as_str().expect("token")),
+    )];
+    let enrollment = json!({ "csr": csr_for(&second.key_pem) }).to_string();
+    let (code, refused) = send(&grid.app, ("POST", "/v1alpha1/enrollments"), &enrollment, &bearer, None).await;
+    assert_eq!(
+        code,
+        StatusCode::CONFLICT,
+        "a key recorded only during rotation: {refused}"
+    );
+    assert_eq!(refused["error"], "key_reused");
+    assert_eq!(
+        renew(&grid, "west", Some(&third)).await.status,
+        StatusCode::OK,
+        "a refused reuse does not freeze the site"
+    );
+}
+
+#[tokio::test]
+async fn a_reserved_names_seeded_key_cannot_enroll_a_spoke() {
+    let grid = grid(&["hub"]);
+    let hub = issue(&grid.ca, "hub", certs::Validity::default());
+    seed(&grid, "hub", &hub, 1).await;
+    let mint = json!({ "siteName": "east", "gridNetworkRef": "demo-grid" }).to_string();
+    let (_, token) = send(&grid.app, ("POST", "/v1alpha1/enrollmenttokens"), &mint, &admin(), None).await;
+    let bearer = [(
+        "authorization",
+        format!("Bearer {}", token["token"].as_str().expect("token")),
+    )];
+    let body = json!({ "csr": csr_for(&hub.key_pem) }).to_string();
+    let (status, refused) = send(&grid.app, ("POST", "/v1alpha1/enrollments"), &body, &bearer, None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"], "key_reused");
+}
+
+#[tokio::test]
+async fn an_rsa_key_is_refused_on_rotation_and_the_record_is_kept() {
+    let grid = grid(&[]);
+    let first = enroll(&grid, "site-a").await;
+    for rsa in [
+        include_str!("../../certs/tests/fixtures/requests/rsa-1024.csr"),
+        include_str!("../../certs/tests/fixtures/requests/rsa-2048.csr"),
+    ] {
+        let (status, body) = renew_with(&grid, Some(&first), rsa).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "invalid_csr");
+    }
+    assert_eq!(
+        renew(&grid, "site-a", Some(&first)).await.status,
+        StatusCode::OK,
+        "the current key still rotates"
     );
 }

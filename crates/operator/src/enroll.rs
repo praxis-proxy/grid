@@ -26,13 +26,9 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Retry schedule per startup step.
 const STEP_BACKOFF: Backoff = Backoff {
-    attempts: 10,
     initial: Duration::from_secs(2),
     max: Duration::from_secs(60),
 };
-
-/// Deadline for the whole run.
-const ENROLL_DEADLINE: Duration = Duration::from_secs(15 * 60);
 
 /// `app.kubernetes.io/managed-by` on the Secrets enrollment writes.
 const MANAGED_BY: &str = "grid-operator";
@@ -41,7 +37,8 @@ const MANAGED_BY: &str = "grid-operator";
 const SITE_LABEL: &str = "grid.praxis.fast/site";
 
 /// Recovery hint for a spent token.
-const SPENT: &str = "Delete the site's enrollment on the hub, then mint a new invite.";
+const SPENT: &str = "Delete the site's enrollment on the hub with enrollment-admin, then mint a new invite with \
+     allowDeletedName as a grid-admin that also holds enrollment-admin.";
 
 /// Auto-enroll configuration.
 #[derive(Args, Debug, Clone)]
@@ -112,6 +109,13 @@ pub enum EnrollError {
     #[error("site name already enrolled ({0}). {SPENT}")]
     NameTaken(String),
 
+    /// The site name's enrollment was deleted and the token does not re-admit it.
+    #[error(
+        "site name was deleted ({0}). The token is spent. Mint a new invite with allowDeletedName as a grid-admin \
+         that also holds enrollment-admin."
+    )]
+    NameDeleted(String),
+
     /// The service rejected the request.
     #[error("enrollment refused: {0}")]
     Refused(String),
@@ -119,17 +123,6 @@ pub enum EnrollError {
     /// The request was sent but no usable answer came back.
     #[error("enrollment failed after the request was sent ({0}). The token may be spent. {SPENT}")]
     MaybeSpent(String),
-
-    /// A pre-send step exhausted its retries.
-    #[error("{what} failed after {attempts} attempts: {last}")]
-    Exhausted {
-        /// The step that failed.
-        what: &'static str,
-        /// Attempts made.
-        attempts: u32,
-        /// The last failure.
-        last: String,
-    },
 
     /// The service answered with an unusable certificate.
     #[error("enrollment response invalid ({0}). The token is spent. {SPENT}")]
@@ -142,17 +135,11 @@ pub enum EnrollError {
     /// A Kubernetes call failed in a way retrying cannot fix.
     #[error("kubernetes: {0}")]
     Kube(String),
-
-    /// The whole run passed its deadline, in seconds.
-    #[error("enrollment did not finish within {0}s. A token already sent may be spent. {SPENT}")]
-    TimedOut(u64),
 }
 
-/// Capped exponential retry schedule.
+/// Capped exponential retry schedule, without an attempt limit.
 #[derive(Clone, Copy, Debug)]
 struct Backoff {
-    /// Total attempts, including the first.
-    attempts: u32,
     /// Delay after the first failure.
     initial: Duration,
     /// Delay cap.
@@ -160,12 +147,31 @@ struct Backoff {
 }
 
 impl Backoff {
-    /// Delay after failed attempt `attempt` (1-based).
+    /// Delay after failed attempt `attempt` (1-based), spread by [`jittered`].
     fn delay(self, attempt: u32) -> Duration {
-        self.initial
-            .saturating_mul(2_u32.saturating_pow(attempt.saturating_sub(1)))
-            .min(self.max)
+        jittered(
+            self.initial
+                .saturating_mul(2_u32.saturating_pow(attempt.saturating_sub(1)))
+                .min(self.max),
+        )
     }
+}
+
+/// `wait` plus up to a tenth of itself, so independent sites that failed
+/// together do not come back in step and herd on the enrollment service.
+pub(crate) fn jittered(wait: Duration) -> Duration {
+    let spread = u64::from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos(),
+    );
+    let tenth = wait
+        .as_millis()
+        .checked_div(10)
+        .and_then(|ms| u64::try_from(ms).ok())
+        .unwrap_or(0);
+    wait.saturating_add(Duration::from_millis(spread.checked_rem(tenth).unwrap_or(0)))
 }
 
 /// One attempt's result.
@@ -183,23 +189,18 @@ where
     Fut: Future<Output = Result<Attempt<T>, EnrollError>> + Send,
     T: Send,
 {
-    let mut last = String::new();
-    for n in 1..=backoff.attempts {
+    let mut failures = 0_u32;
+    loop {
         match attempt().await? {
             Attempt::Done(value) => return Ok(value),
-            Attempt::Retry(reason) => last = reason,
-        }
-        if n < backoff.attempts {
-            let delay = backoff.delay(n);
-            tracing::warn!(what, attempt = n, retry_in_ms = delay.as_millis(), error = %last, "retrying");
-            tokio::time::sleep(delay).await;
+            Attempt::Retry(reason) => {
+                failures = failures.saturating_add(1);
+                let delay = backoff.delay(failures);
+                tracing::warn!(what, attempt = failures, retry_in_ms = delay.as_millis(), error = %reason, "retrying");
+                tokio::time::sleep(delay).await;
+            },
         }
     }
-    Err(EnrollError::Exhausted {
-        what,
-        attempts: backoff.attempts,
-        last,
-    })
 }
 
 /// Validated settings.
@@ -275,13 +276,8 @@ fn read_anchors(path: &Path) -> Result<String, EnrollError> {
 }
 
 /// The certificates in `pem`, refusing a bundle with none.
-fn pem_roots(pem: &str, name: &str) -> Result<Vec<reqwest::Certificate>, EnrollError> {
-    let roots = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
-        .map_err(|e| EnrollError::Config(format!("{name}: {e}")))?;
-    if roots.is_empty() {
-        return Err(EnrollError::Config(format!("{name} holds no certificate")));
-    }
-    Ok(roots)
+fn pem_roots(pem: &str, name: &'static str) -> Result<Vec<reqwest::Certificate>, EnrollError> {
+    grid_client::roots_from_pem(pem.as_bytes(), name).map_err(|e| EnrollError::Config(error_chain(&e)))
 }
 
 /// A non-blank setting, or a config error naming it.
@@ -668,7 +664,11 @@ fn classify(status: StatusCode, body: &[u8]) -> Result<Enrollment, EnrollError> 
     );
     Err(match status {
         StatusCode::UNAUTHORIZED => EnrollError::TokenRejected(detail),
-        StatusCode::CONFLICT if error.is_some_and(|err| err.error == "name_taken") => EnrollError::NameTaken(detail),
+        StatusCode::CONFLICT => match error.as_ref().map(|err| err.error.as_str()) {
+            Some("name_taken") => EnrollError::NameTaken(detail),
+            Some("name_deleted") => EnrollError::NameDeleted(detail),
+            _ => EnrollError::Refused(detail),
+        },
         _ if status.is_server_error() => EnrollError::MaybeSpent(detail),
         _ => EnrollError::Refused(detail),
     })
@@ -847,14 +847,8 @@ async fn keep_existing_ca<S: Store + Sync>(
 
 /// A client that trusts only `roots`.
 fn http_client(roots: Vec<reqwest::Certificate>) -> Result<reqwest::Client, EnrollError> {
-    reqwest::Client::builder()
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .tls_certs_only(roots)
-        .build()
-        .map_err(|e| EnrollError::Config(format!("building the enrollment client: {e}")))
+    grid_client::trusted_client(roots, None, grid_client::Timeouts::ENROLLMENT)
+        .map_err(|e| EnrollError::Config(error_chain(&e)))
 }
 
 /// Resolve the target, then enroll into it.
@@ -878,9 +872,7 @@ async fn run(client: &Client, settings: &Settings) -> Result<(), EnrollError> {
 /// Returns [`EnrollError`] when enrollment does not complete.
 pub async fn ensure_enrolled(client: &Client, config: &Config) -> Result<(), EnrollError> {
     let settings = Settings::from_config(config)?;
-    tokio::time::timeout(ENROLL_DEADLINE, Box::pin(run(client, &settings)))
-        .await
-        .map_err(|_elapsed| EnrollError::TimedOut(ENROLL_DEADLINE.as_secs()))?
+    Box::pin(run(client, &settings)).await
 }
 
 pub mod renew;

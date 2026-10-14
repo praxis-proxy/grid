@@ -16,7 +16,6 @@ const SITE: &str = "site-d";
 const TOKEN_SECRET: &str = "grid-invite-site-d";
 
 const FAST: Backoff = Backoff {
-    attempts: 3,
     initial: Duration::from_millis(1),
     max: Duration::from_millis(5),
 };
@@ -203,9 +202,23 @@ struct FakeStore {
     conflict_on: Option<&'static str>,
     /// Status every dry-run create answers.
     dry_run_status: Option<u16>,
+    /// Attempts at a write, so a retry is countable.
+    create_calls: Mutex<u32>,
+    /// Attempts at a dry-run write, so a retry is countable.
+    check_calls: Mutex<u32>,
 }
 
 impl FakeStore {
+    /// Attempts at a write.
+    fn create_calls(&self) -> u32 {
+        *self.create_calls.lock().expect("lock")
+    }
+
+    /// Attempts at a dry-run write.
+    fn check_calls(&self) -> u32 {
+        *self.check_calls.lock().expect("lock")
+    }
+
     /// A store holding the site token.
     fn invited() -> Self {
         let store = Self::default();
@@ -249,6 +262,7 @@ impl Store for FakeStore {
 
     async fn create(&self, secret: &Secret) -> Result<Created, EnrollError> {
         let name = secret.metadata.name.clone().unwrap_or_default();
+        *self.create_calls.lock().expect("lock") += 1;
         if self.creates_fail {
             return Ok(Created::Retry("apiserver unavailable".to_owned()));
         }
@@ -267,6 +281,7 @@ impl Store for FakeStore {
 
     async fn check_create(&self, secret: &Secret) -> Result<Attempt<()>, EnrollError> {
         let name = secret.metadata.name.as_deref().unwrap_or_default();
+        *self.check_calls.lock().expect("lock") += 1;
         dry_run_result(
             "grid-system",
             name,
@@ -382,7 +397,6 @@ async fn a_refused_connection_is_retried_until_the_service_is_up() {
     let addr = closed_addr().await;
     let mut settings = mock.settings(addr.port());
     settings.backoff = Backoff {
-        attempts: 400,
         initial: Duration::from_millis(5),
         max: Duration::from_millis(25),
     };
@@ -400,13 +414,19 @@ async fn a_refused_connection_is_retried_until_the_service_is_up() {
 }
 
 #[tokio::test]
-async fn an_unreachable_service_exhausts_the_retry_budget() {
+async fn an_unreachable_service_is_retried_without_a_limit() {
     let mock = Mock::new(Reply::Sign);
     let settings = mock.settings(closed_addr().await.port());
-    let outcome = run_flow(&FakeStore::invited(), &settings).await;
+    // Giving up would leave the site unenrolled until something restarted the
+    // pod, so a retryable failure must never resolve to an error.
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(60),
+        Box::pin(run_flow(&FakeStore::invited(), &settings)),
+    )
+    .await;
     assert!(
-        matches!(outcome, Err(EnrollError::Exhausted { attempts: 3, .. })),
-        "a dead endpoint is retried to the budget, then fails: {outcome:?}"
+        outcome.is_err(),
+        "enrollment stopped retrying a reachable-again service: {outcome:?}"
     );
 }
 
@@ -463,16 +483,24 @@ async fn an_unusable_certificate_is_refused_and_not_stored() {
 }
 
 #[tokio::test]
-async fn persistent_write_failures_end_in_not_stored() {
+async fn transient_write_failures_keep_retrying_rather_than_lose_the_identity() {
     let (_mock, settings) = serve(Reply::Sign).await;
     let store = FakeStore {
         creates_fail: true,
         ..FakeStore::invited()
     };
-    let outcome = run_flow(&store, &settings).await;
+    // The token is spent and the certificate is only in memory, so giving up
+    // would cost a new invite. A refused write still fails fast, which
+    // kube_write_errors_retry_unless_refused covers.
+    let outcome = tokio::time::timeout(Duration::from_millis(60), Box::pin(run_flow(&store, &settings))).await;
     assert!(
-        matches!(&outcome, Err(e @ EnrollError::NotStored(_)) if e.to_string().contains("mint a new invite")),
-        "writes retry to the budget, then say the token is spent: {outcome:?}"
+        outcome.is_err(),
+        "a transient write failure must keep retrying: {outcome:?}"
+    );
+    assert!(
+        store.create_calls() > 1,
+        "pending alone would hold for a stall too: {} attempts",
+        store.create_calls()
     );
 }
 
@@ -546,16 +574,21 @@ async fn a_refused_dry_run_stops_before_the_token_is_spent() {
 }
 
 #[tokio::test]
-async fn a_dry_run_that_keeps_failing_transiently_exhausts_before_the_token_is_spent() {
+async fn a_dry_run_that_keeps_failing_transiently_never_spends_the_token() {
     let (mock, settings) = serve(Reply::Sign).await;
     let store = FakeStore {
         dry_run_status: Some(503),
         ..FakeStore::invited()
     };
-    let outcome = run_flow(&store, &settings).await;
+    let outcome = tokio::time::timeout(Duration::from_millis(60), Box::pin(run_flow(&store, &settings))).await;
     assert!(
-        matches!(outcome, Err(EnrollError::Exhausted { attempts: 3, .. })),
-        "a transient dry-run failure retries to the budget: {outcome:?}"
+        outcome.is_err(),
+        "a transient dry-run failure must keep retrying rather than fail: {outcome:?}"
+    );
+    assert!(
+        store.check_calls() > 1,
+        "pending alone would hold for a stall too: {} attempts",
+        store.check_calls()
     );
     assert_eq!(mock.calls(), 0, "the token is not sent");
 }
@@ -604,12 +637,28 @@ async fn an_identity_stored_concurrently_wins_and_ours_is_discarded() {
 }
 
 #[test]
+fn recovery_messages_name_both_roles_for_a_new_invite() {
+    for error in [
+        EnrollError::TokenRejected("spent".into()),
+        EnrollError::NameDeleted("deleted".into()),
+    ] {
+        let message = error.to_string();
+        assert!(
+            message.contains("allowDeletedName as a grid-admin that also holds enrollment-admin"),
+            "recovery must describe both required roles: {message}"
+        );
+    }
+}
+
+#[test]
 fn responses_classify_as_done_or_hard_failures() {
     let spent = br#"{"error":"invalid_token","message":"spent"}"#;
     let taken = br#"{"error":"name_taken","message":"held"}"#;
-    let cases: [(u16, &[u8], &str); 7] = [
+    let deleted = br#"{"error":"name_deleted","message":"deleted"}"#;
+    let cases: [(u16, &[u8], &str); 8] = [
         (401, spent, "rejected"),
         (409, taken, "already enrolled"),
+        (409, deleted, "allowDeletedName"),
         (500, b"", "may be spent"),
         (503, b"", "may be spent"),
         (400, b"{}", "refused"),
@@ -791,8 +840,24 @@ fn a_grid_network_names_the_target_secrets() {
 }
 
 #[test]
-fn backoff_doubles_to_the_cap() {
-    let delays: Vec<u64> = (1..=5).map(|n| STEP_BACKOFF.delay(n).as_secs()).collect();
-    assert_eq!(delays, [2, 4, 8, 16, 32], "doubling from the initial delay");
-    assert_eq!(STEP_BACKOFF.delay(9), Duration::from_secs(60), "capped");
+fn backoff_doubles_to_the_cap_and_never_shortens_a_delay() {
+    // Jitter is added, never subtracted, so each delay sits in [base, base + a tenth].
+    for (attempt, base) in (1..=5_u32).zip([2_u64, 4, 8, 16, 32]) {
+        let delay = STEP_BACKOFF.delay(attempt).as_millis();
+        let floor = u128::from(base) * 1_000;
+        assert!(
+            (floor..=floor + floor / 10).contains(&delay),
+            "attempt {attempt} waited {delay}ms, outside [{floor}, {}]",
+            floor + floor / 10
+        );
+    }
+    let capped = STEP_BACKOFF.delay(9).as_millis();
+    assert!((60_000..=66_000).contains(&capped), "capped, with jitter: {capped}ms");
+}
+
+#[test]
+fn the_schedule_has_no_attempt_limit() {
+    // A retryable failure must never run out of attempts: the delay keeps
+    // coming back capped rather than the caller giving up.
+    assert!((60..=66).contains(&STEP_BACKOFF.delay(u32::MAX).as_secs()));
 }

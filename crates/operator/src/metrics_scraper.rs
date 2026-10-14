@@ -201,17 +201,58 @@ pub(crate) async fn scrape_metrics(
         .map(|(body, _)| body)
 }
 
-/// Like [`scrape_metrics`], but also returns the response `Date` header parsed
-/// to a [`SystemTime`], or `None` when it is absent or unparseable.
+/// A hyper client for one peer's trust material.
+pub(crate) type PeerClient = HyperClient<crate::resources::tls_backend::HttpsConnector, Empty<Bytes>>;
+
+/// A client and whether it presents TLS, which the plaintext checks need.
+pub(crate) struct PeerTransport {
+    /// The client, whose pool outlives a single request.
+    client: PeerClient,
+    /// Whether the client was built with peer TLS material.
+    tls: bool,
+}
+
+impl PeerTransport {
+    /// A transport for `tls_config`, or over native roots when absent.
+    ///
+    /// `pool_idle` bounds how long an unused connection is kept. A transport
+    /// built per request passes `None`, which keeps no connection at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetricsScrapeError::Transport`] when the connector cannot be built.
+    pub(crate) fn new(
+        tls_config: Option<&ClientTlsConfig>,
+        pool_idle: Option<Duration>,
+    ) -> Result<Self, MetricsScrapeError> {
+        let connector = match tls_config {
+            Some(config) => build_custom_tls_connector(config)?,
+            None => build_native_connector()?,
+        };
+        let mut builder = HyperClient::builder(TokioExecutor::new());
+        match pool_idle {
+            // One connection per peer: a round polls a peer once.
+            Some(idle) => builder.pool_idle_timeout(idle).pool_max_idle_per_host(1),
+            None => builder.pool_max_idle_per_host(0),
+        };
+        Ok(Self {
+            client: builder.build(connector),
+            tls: tls_config.is_some(),
+        })
+    }
+}
+
+/// GET `url` over `transport`, presenting `bearer` when given.
 ///
-/// The peer poller uses the date to re-express a relayed sample's age on one
-/// clock.
-pub(crate) async fn scrape_metrics_with_date(
+/// # Errors
+///
+/// Returns [`MetricsScrapeError::Timeout`] if the request exceeds `timeout`.
+pub(crate) async fn scrape_peer(
     url: &str,
     timeout: Duration,
-    tls_config: Option<ClientTlsConfig>,
+    transport: &PeerTransport,
 ) -> Result<(String, Option<SystemTime>), MetricsScrapeError> {
-    scrape(url, timeout, tls_config, None).await
+    scrape_over(url, timeout, transport, None).await
 }
 
 /// GET `url`, presenting `bearer` when given.
@@ -219,6 +260,17 @@ async fn scrape(
     url: &str,
     timeout: Duration,
     tls_config: Option<ClientTlsConfig>,
+    bearer: Option<&Bearer>,
+) -> Result<(String, Option<SystemTime>), MetricsScrapeError> {
+    let transport = PeerTransport::new(tls_config.as_ref(), None)?;
+    scrape_over(url, timeout, &transport, bearer).await
+}
+
+/// GET `url` over an already-built `transport`.
+async fn scrape_over(
+    url: &str,
+    timeout: Duration,
+    transport: &PeerTransport,
     bearer: Option<&Bearer>,
 ) -> Result<(String, Option<SystemTime>), MetricsScrapeError> {
     let uri = url
@@ -232,24 +284,17 @@ async fn scrape(
             }
         })?;
 
-    if tls_config.is_some() && uri.scheme_str() != Some("https") {
+    if transport.tls && uri.scheme_str() != Some("https") {
         return Err(MetricsScrapeError::HttpWithTls(url.to_owned()));
     }
     if let Some(bearer) = bearer {
-        credential_allowed(&uri, tls_config.is_some(), bearer.allow_plaintext, url)?;
+        credential_allowed(&uri, transport.tls, bearer.allow_plaintext, url)?;
     }
-
-    let connector = if let Some(config) = &tls_config {
-        build_custom_tls_connector(config)?
-    } else {
-        build_native_connector()?
-    };
-    let client: HyperClient<_, Empty<Bytes>> = HyperClient::builder(TokioExecutor::new()).build(connector);
 
     let req = build_request(uri, bearer)?;
 
     // One deadline covers the body too, so a stalled peer cannot hold the caller.
-    tokio::time::timeout(timeout, read_response(client.request(req), url))
+    tokio::time::timeout(timeout, read_response(transport.client.request(req), url))
         .await
         .map_err(|_elapsed| MetricsScrapeError::Timeout(timeout))?
 }

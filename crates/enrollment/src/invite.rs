@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, error::Error, path::PathBuf, time::Duration};
 
 use clap::Parser;
-use enrollment::generated::{EnrollmentToken, EnrollmentTokenRequest, Error as ErrorBody};
+use enrollment::generated::{EnrollmentToken, EnrollmentTokenRequest, Error as ErrorBody, ErrorError as ErrorCode};
 use k8s_openapi::api::core::v1::Secret;
 use kube::api::{Api, ObjectMeta, PostParams};
 use reqwest::{StatusCode, Url};
@@ -125,17 +125,12 @@ fn parse_invites(json: &str) -> Result<Vec<EnrollmentTokenRequest>, BoxError> {
 
 /// A client that trusts only the pinned bundle.
 fn http_client(ca_pem: &[u8]) -> Result<reqwest::Client, BoxError> {
-    let roots = reqwest::Certificate::from_pem_bundle(ca_pem)?;
-    if roots.is_empty() {
-        return Err("enrollment CA bundle holds no certificate".into());
-    }
-    Ok(reqwest::Client::builder()
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .tls_certs_only(roots)
-        .build()?)
+    let roots = grid_client::roots_from_pem(ca_pem, "the enrollment CA bundle")?;
+    Ok(grid_client::trusted_client(
+        roots,
+        None,
+        grid_client::Timeouts::ENROLLMENT,
+    )?)
 }
 
 /// Capped exponential retry schedule.
@@ -210,6 +205,20 @@ enum Invited {
     Skipped,
     /// Another writer stored the Secret first, so the new token was revoked.
     Raced,
+    /// The site is enrolled, so it needs no invite.
+    Enrolled,
+    /// The service holds a live token this run cannot store, so none was minted.
+    Outstanding,
+    /// The site's enrollment was deleted, so it is not invited again.
+    Deleted,
+}
+
+/// What a mint returned.
+enum Minted {
+    /// A new token.
+    Token(MintedToken),
+    /// A 409 that says the site needs no new token, or cannot get one from this run.
+    Settled(ErrorCode),
 }
 
 /// A minted token.
@@ -239,12 +248,36 @@ async fn invite_one<S: InviteSecrets + Sync>(
         tracing::info!(secret = %name, %site, "invite Secret exists, skipped");
         return Ok(Invited::Skipped);
     }
-    let token = minter.mint(invite).await?;
+    let token = match minter.mint(invite).await? {
+        Minted::Token(token) => token,
+        Minted::Settled(code) => return Ok(settled(&name, site, code)),
+    };
     let Err(create_err) = secrets.create(&name, invite, &token).await else {
         tracing::info!(secret = %name, %site, expires_at = %token.expires_at, "site invited");
         return Ok(Invited::Minted);
     };
     settle_failed_create(secrets, minter, &name, token.token_id, &*create_err).await
+}
+
+/// Report a site the service refused a new token for without failing the run.
+fn settled(name: &str, site: &str, code: ErrorCode) -> Invited {
+    if code == ErrorCode::TokenOutstanding {
+        tracing::warn!(
+            secret = %name, %site,
+            "a live token pins this site but Secret {name} is gone; revoke it by the token_id on the service's \
+             `site token minted` log line, or rerun after it expires"
+        );
+        Invited::Outstanding
+    } else if code == ErrorCode::NameDeleted {
+        tracing::warn!(
+            %site,
+            "the site's enrollment was deleted; remove it from invites, or re-admit it with allowDeletedName"
+        );
+        Invited::Deleted
+    } else {
+        tracing::info!(%site, "the site is enrolled, skipped");
+        Invited::Enrolled
+    }
 }
 
 /// Keep `id` if Secret `name` holds it after a failed create, else revoke it.
@@ -302,7 +335,7 @@ impl Minter {
     }
 
     /// Mint a token for `invite`.
-    async fn mint(&mut self, invite: &EnrollmentTokenRequest) -> Result<MintedToken, BoxError> {
+    async fn mint(&mut self, invite: &EnrollmentTokenRequest) -> Result<Minted, BoxError> {
         let url = format!("{}{TOKENS_PATH}", self.base);
         let response = self
             .send(|http, admin| http.post(&url).bearer_auth(admin).json(invite))
@@ -342,7 +375,7 @@ impl Minter {
                     return Ok(response);
                 },
                 // Only an unsent request is safe to resend.
-                Err(error) if error.is_connect() && !is_tls_failure(&error) => {
+                Err(error) if grid_client::classify(&error) == grid_client::RequestOutcome::Refused => {
                     tracing::warn!(left = self.retry.left, error = %error_chain(&error), "enrollment service unreachable");
                     if !self.retry.failed().await {
                         return Err(error_chain(&error).into());
@@ -355,29 +388,44 @@ impl Minter {
 }
 
 /// Decode a mint response.
-async fn decode_minted(response: reqwest::Response) -> Result<MintedToken, BoxError> {
+async fn decode_minted(response: reqwest::Response) -> Result<Minted, BoxError> {
     let status = response.status();
     let body = read_capped(response).await?;
     if status.is_success() {
         let mut token: EnrollmentToken = serde_json::from_slice(body.as_slice())?;
-        return Ok(MintedToken {
+        return Ok(Minted::Token(MintedToken {
             token_id: token.token_id,
             token: Zeroizing::new(std::mem::take(&mut token.token)),
             expires_at: token.expires_at,
-        });
+        }));
     }
-    let detail = serde_json::from_slice::<ErrorBody>(body.as_slice()).map_or_else(
+    let refusal = serde_json::from_slice::<ErrorBody>(body.as_slice());
+    if let Some(code) = settling(status, refusal.as_ref().ok()) {
+        return Ok(Minted::Settled(code));
+    }
+    let detail = refusal.map_or_else(
         |_e| status.to_string(),
         |err| format!("{status} {}: {}", err.error, err.message),
     );
     let hint = match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-            ": the invite ServiceAccount needs the grid-admin Role and an audience-bound token"
+            ": the invite ServiceAccount needs the grid-admin Role, enrollment-admin too for allowDeletedName, \
+             and an audience-bound token"
         },
         _ if status.is_server_error() => ": a token may have been minted, revoke unheld ones by id",
         _ => "",
     };
     Err(format!("minting a site token refused: {detail}{hint}").into())
+}
+
+/// The 409 code that settles an invite without a new token, if `refusal` is one.
+fn settling(status: StatusCode, refusal: Option<&ErrorBody>) -> Option<ErrorCode> {
+    let code = refusal?.error;
+    let settles = matches!(
+        code,
+        ErrorCode::NameTaken | ErrorCode::TokenOutstanding | ErrorCode::NameDeleted
+    );
+    (status == StatusCode::CONFLICT && settles).then_some(code)
 }
 
 /// Read at most [`MAX_RESPONSE_BYTES`] into wiped memory.
@@ -402,30 +450,6 @@ fn error_chain(error: &dyn Error) -> String {
         source = cause.source();
     }
     out
-}
-
-/// Whether `error`'s chain holds a TLS failure.
-fn is_tls_failure(error: &(dyn Error + 'static)) -> bool {
-    std::iter::successors(Some(error), |&err| {
-        // io::Error::source skips its wrapped error.
-        err.downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::get_ref)
-            .map(|inner| -> &(dyn Error + 'static) { inner })
-            .or_else(move || err.source())
-    })
-    .any(is_tls_error)
-}
-
-/// Whether `error` is a rustls error.
-#[cfg(not(feature = "fips"))]
-fn is_tls_error(error: &(dyn Error + 'static)) -> bool {
-    error.is::<rustls::Error>()
-}
-
-/// Whether `error` is an openssl error.
-#[cfg(feature = "fips")]
-fn is_tls_error(error: &(dyn Error + 'static)) -> bool {
-    error.is::<openssl::ssl::Error>() || error.is::<openssl::error::ErrorStack>()
 }
 
 /// Kubernetes-backed [`InviteSecrets`].

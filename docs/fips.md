@@ -26,7 +26,7 @@ rustls.
 
 One dependency-level exception remains at the database hop. sqlx-postgres links
 the sha2 and md-5 crates for Postgres password authentication (SCRAM-SHA-256 and
-legacy MD5), which no sqlx feature removes. A fips build fails closed unless the
+legacy MD5), which no sqlx feature removes. Every build fails closed unless the
 database URL sets sslmode=verify-full, so the server is always fully verified. A
 fips deployment must authenticate to Postgres with a client certificate rather
 than a password. A password connection runs SCRAM-SHA-256 or legacy MD5 hashing

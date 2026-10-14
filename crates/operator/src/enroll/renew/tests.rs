@@ -1,5 +1,3 @@
-use std::sync::Mutex;
-
 use time::Duration as Span;
 
 use super::*;
@@ -512,4 +510,44 @@ fn renewal_refuses_an_enrollment_url_a_site_certificate_could_answer() {
     ] {
         assert!(Settings::from_config(&config(url)).is_err(), "{url}");
     }
+}
+
+/// A unique path under the temp dir, cleaned up by the caller.
+fn scratch_pem(name: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!("grid-renew-{name}-{}.pem", std::process::id()));
+    path
+}
+
+#[test]
+fn the_pin_is_cached_until_a_reload_rather_than_read_every_renewal() {
+    let path = scratch_pem("rotate");
+    std::fs::write(&path, "first").expect("write the pin");
+    let renewer = HttpsRenewer::new("https://enroll.example", Some(path.clone()));
+
+    assert_eq!(renewer.pin().expect("read").as_deref(), Some("first"));
+
+    // The enrollment CA rotates under a running pod.
+    std::fs::write(&path, "second").expect("rotate the pin");
+    assert_eq!(
+        renewer.pin().expect("read").as_deref(),
+        Some("first"),
+        "a renewal does no file work once the pin is held"
+    );
+
+    renewer.forget_pin();
+    assert_eq!(
+        renewer.pin().expect("read").as_deref(),
+        Some("second"),
+        "a reload picks up the rotated CA without a restart"
+    );
+    let _removed = std::fs::remove_file(&path);
+}
+
+#[test]
+fn without_a_configured_pin_the_held_grid_ca_is_used() {
+    let renewer = HttpsRenewer::new("https://enroll.example", None);
+    assert!(renewer.pin().expect("read").is_none());
+    renewer.forget_pin();
+    assert!(renewer.pin().expect("read").is_none());
 }

@@ -214,7 +214,7 @@ signals:
   advertiseAddress: ""
 
   # -- Seconds between peer signal polls. Every site polls every other alive site, so
-  # a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator's 30s.
+  # a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator's 5s.
   peerIntervalSeconds: ""
 # -- Advertised site gateway address configuration.
 gateway:
@@ -252,8 +252,8 @@ health:
   startup:
     # -- Period between startup probes.
     periodSeconds: 10
-    # -- Failures allowed before restart. Keep the window past the operator's
-    # 15 minute enrollment deadline, so a restart never lands mid-enrollment.
+    # -- Failures allowed before restart. Enrollment has no retry deadline; this
+    # probe restarts a siteIdentity pod still enrolling after about 16 minutes.
     failureThreshold: 96
   # -- Readiness probe settings.
   readiness:

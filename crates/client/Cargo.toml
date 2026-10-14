@@ -1,0 +1,82 @@
+[package]
+name = "grid-client"
+description = "Outbound HTTP transport for the grid: client construction, bounds, and retry classification"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# The reqwest TLS backend follows this crate's backend feature, so a caller
+# forwards fips here instead of naming a backend itself.
+[features]
+default = ["rcgen", "peer-scraper"]
+rcgen = ["certs?/rcgen", "dep:rustls", "reqwest?/rustls-no-provider"]
+fips = ["certs?/fips", "dep:openssl", "reqwest?/native-tls"]
+# The pinned-peer transport and the signals poller. On by default, and off for
+# a caller that only needs a client, so a ten-line builder does not pull hyper
+# and the signals store.
+peer-scraper = [
+    "dep:bytes",
+    "dep:certs",
+    "dep:grid-signals",
+    "dep:http-body-util",
+    "dep:httpdate",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:metrics",
+    "dep:percent-encoding",
+    "dep:rustls",
+    "dep:serde",
+    "dep:tokio",
+    "dep:tokio-rustls",
+    "dep:tracing",
+]
+# Root-trust reqwest clients, for callers that dial enrollment rather than a
+# pinned peer. Off by default so the data plane does not build reqwest.
+reqwest-client = ["dep:reqwest", "dep:zeroize"]
+
+[dependencies]
+grid-signals = { optional = true, path = "../signals" }
+certs = { path = "../certs", default-features = false, features = ["verifier"], optional = true }
+bytes = { optional = true, workspace = true }
+http = { workspace = true }
+http-body-util = { optional = true, workspace = true }
+httpdate = { optional = true, workspace = true }
+hyper = { optional = true, workspace = true }
+hyper-util = { optional = true, workspace = true, features = ["client", "client-legacy", "http1", "tokio"] }
+metrics = { optional = true, workspace = true }
+openssl = { optional = true, workspace = true }
+percent-encoding = { optional = true, workspace = true }
+reqwest = { workspace = true, optional = true }
+rustls = { optional = true, workspace = true }
+serde = { optional = true, workspace = true }
+thiserror = { workspace = true }
+tokio = { optional = true, workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { optional = true, workspace = true }
+tracing = { optional = true, workspace = true }
+zeroize = { workspace = true, optional = true }
+
+[dev-dependencies]
+certs = { path = "../certs", default-features = false, features = ["verifier", "rcgen"] }
+rustls = { workspace = true, features = ["ring"] }
+serde_yaml = { workspace = true }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+  "rt-multi-thread",
+  "sync",
+  "time",
+  "test-util",
+] }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "tls_posture"
+# peer-scraper carries tokio-rustls, which the loopback server needs. Taking it
+# from there rather than a dev-dependency keeps rustls out of a fips resolve.
+required-features = ["reqwest-client", "rcgen", "peer-scraper"]

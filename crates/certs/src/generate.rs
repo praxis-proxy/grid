@@ -74,9 +74,10 @@ fn map_backend(err: BackendError) -> GenerateError {
             GenerateError::Backend(msg)
         },
         // No generate or load path produces a request-side failure.
-        BackendError::ParseCsr | BackendError::CsrBadSignature | BackendError::BadSignature => {
-            GenerateError::Backend("unexpected backend error".to_owned())
-        },
+        BackendError::ParseCsr
+        | BackendError::CsrBadSignature
+        | BackendError::UnsupportedKey
+        | BackendError::BadSignature => GenerateError::Backend("unexpected backend error".to_owned()),
     }
 }
 

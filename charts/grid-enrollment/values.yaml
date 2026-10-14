@@ -43,8 +43,13 @@ ca:
   # Replace an existing CA in place. Off by default: regenerating the CA
   # invalidates every certificate it has issued. If the CA key Secret is lost while
   # the CA bundle still exists, bootstrap refuses to mint a new CA, since that would
-  # split the grid: restore the key from backup, or set this to start a new grid.
+  # split the grid: restore the key from backup, or set this and confirmRotation to
+  # start a new grid.
   forceRegenerate: false
+  # -- The service records the SHA-256 of the CA's public key in the database and
+  # refuses to start with a CA on any other key. To start a new grid on purpose, set this to the OLD
+  # fingerprint the refusal names, exactly as printed. Clear it once the new CA serves.
+  confirmRotation: ""
   provided:
     # Reference to a pre-created {tls.crt,tls.key} Secret. Never inline the key
     # in values: Helm persists release values (helm get values, GitOps, CI logs).
@@ -116,8 +121,14 @@ enrollment:
     enabled: true
   # kube (default): SAR via TokenReview + SubjectAccessReview, the in-cluster path
   # (needs the sar-feature image and the auth-delegator RBAC this chart binds).
-  # local: the standalone grid-admin-token table, for non-kube deploys. The table has no
-  # roles, so every token in it may mint and revoke tokens and read and delete enrollments.
+  # local: the standalone grid-admin-token table, for non-kube deploys. Lines in the
+  # "tokens" key are name:token, where the token is everything after the first colon
+  # and may contain any character. Roles come from an optional "roles" key of
+  # name:role[,role] lines, from grid-admin and enrollment-admin, comma separated. A
+  # name with no roles line is grid-admin: mint and revoke tokens, and read
+  # enrollments. Deleting an enrollment, or minting with allowDeletedName, needs
+  # enrollment-admin. An unknown role, or a roles line naming nobody in the token
+  # table, fails startup.
   authz: kube                        # kube | local
   # Record each enrollment as a CertificateSigningRequest on this cluster, under
   # signer grid.praxis.fast/site: created, approved on the invite's authority and
@@ -158,7 +169,7 @@ enrollment:
     subjects: []
   gridAdminTokens:
     generate: true                   # the bootstrap Job creates a grid-admin-token Secret once
-    existingSecretRef: ""            # BYO Secret with key "tokens" (name:token lines)
+    existingSecretRef: ""            # BYO Secret with key "tokens" (name:token), optional "roles"
   serviceAccount:
     create: true
     name: ""
@@ -213,10 +224,10 @@ db:
       servingSecretName: grid-db-serving-tls
   external:
     # Secret carrying the full connection URL under connectionUrlSecretKey.
-    # Point this at MaaS's maas-db-config to share its database. The URL must
-    # require TLS (sslmode=require min, verify-full for fips); the binary refuses
-    # a plaintext DB. For verify-full, set caConfigMapName so the client trusts
-    # the DB's issuer and reference it as sslrootcert in the URL.
+    # The URL must set sslmode=verify-full with sslrootcert=/etc/grid-db-ca/<caConfigMapKey>;
+    # the binary refuses any lesser mode. Set caConfigMapName so that file is the DB's issuer.
+    # On a shared Postgres server, use a database and role dedicated to enrollment, with
+    # its URL in a separate Secret: whoever can write these tables can mint site identities.
     connectionUrlSecretRef: ""
     connectionUrlSecretKey: DB_CONNECTION_URL
     # Optional CA bundle for the external DB, mounted at /etc/grid-db-ca (mirrors
@@ -225,7 +236,8 @@ db:
     caConfigMapName: ""
     caConfigMapKey: ca.crt
 
-# -- Sites to invite, keyed by site name: network (default grid), expiresInSecs, and
+# -- Sites to invite, keyed by site name: network (default grid), expiresInSecs,
+# allowDeletedName to invite a site whose enrollment was deleted, and
 # cluster when the ManagedCluster is named something other than the site. Each run skips
 # sites whose invite Secret exists. The older list of {siteName, gridNetworkRef,
 # expiresInSecs} still renders.

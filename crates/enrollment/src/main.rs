@@ -6,6 +6,7 @@ use axum_server::Handle;
 use enrollment::{
     AppState, GridAdmins, SharedCa, Store,
     authz::Authorizer,
+    ca::{Anchored, CONFIRM_ROTATION_VAR, RecordedCa},
     router,
     tls::{PeerAcceptor, TlsAcceptor, TlsConfig},
 };
@@ -39,6 +40,9 @@ const LISTEN_ADDR: &str = "ENROLLMENT_LISTEN_ADDR";
 const CA_COMMON_NAME: &str = "ENROLLMENT_CA_COMMON_NAME";
 /// Table of grid-admins allowed to mint and revoke site tokens.
 const GRID_ADMIN_TOKENS: &str = "ENROLLMENT_GRID_ADMIN_TOKENS";
+/// Path to the optional role table. Roles live apart from the tokens so a
+/// token's meaning never depends on the token's own characters.
+const GRID_ADMIN_ROLES: &str = "ENROLLMENT_GRID_ADMIN_ROLES";
 /// How many seconds an issued certificate lasts.
 const CERT_LIFETIME_SECS: &str = "ENROLLMENT_CERT_LIFETIME_SECS";
 /// Set to `false` to refuse every renewal.
@@ -141,13 +145,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_unset| format!("{TLS_KEY_PATH} is required: the CA-signing service must not serve in the clear"))?;
     let tls = load_tls(&tls_cert, &tls_key, &ca.cert_pem)?;
 
+    let store = open_store().await?;
+    let confirm = std::env::var(CONFIRM_ROTATION_VAR).ok();
+    // Boxed: kept off the startup stack frame.
+    Box::pin(anchor_ca(&store, &ca.cert_pem, confirm.as_deref())).await?;
+
     // Boxed: the Kubernetes-RBAC authorizer builds a large future under the sar
     // feature, kept off the startup stack frame.
     let authorizer = Box::pin(build_authorizer()).await?;
     #[cfg(feature = "csr-record")]
     let recorder = load_recorder(&authorizer).await?;
     let state = Arc::new(AppState {
-        store: open_store().await?,
+        store,
         ca: SharedCa::new(ca),
         authorizer,
         cert_lifetime: load_cert_lifetime(),
@@ -162,7 +171,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(reload_tls(tls.clone(), tls_cert, tls_key, Arc::clone(&state)));
     // Reload the signing CA the same way, so a regenerated or restored CA signs
     // new site certificates without a restart.
-    tokio::spawn(reload_ca(Arc::clone(&state), common_name, ca_cert_path, ca_key_path));
+    tokio::spawn(reload_ca(
+        Arc::clone(&state),
+        confirm,
+        common_name,
+        ca_cert_path,
+        ca_key_path,
+    ));
     // Apply reserved-name seeds now and as bootstrap rewrites them.
     if let Ok(dir) = std::env::var(RESERVED_SEEDS_DIR) {
         let mut reported = std::collections::HashMap::new();
@@ -251,32 +266,50 @@ async fn reload_tls(config: TlsConfig, cert_path: String, key_path: String, stat
     }
 }
 
+/// Refuse a CA other than the one the database records, since bootstrap's guard reads deletable Secrets.
+async fn anchor_ca(store: &Store, cert_pem: &str, confirm: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let fingerprint = certs::cert_public_key_sha256(cert_pem)?;
+    let anchored = enrollment::ca::anchor(store, &fingerprint, confirm).await?;
+    if let Anchored::Replaced { previous } = &anchored {
+        tracing::warn!(
+            old_fingerprint = %previous,
+            new_fingerprint = %fingerprint,
+            "grid CA replaced as {CONFIRM_ROTATION_VAR} confirmed; every site must re-enroll"
+        );
+    } else {
+        tracing::info!(%fingerprint, ?anchored, "grid CA checked against the database record");
+    }
+    Ok(())
+}
+
 /// Reload the signing CA from disk on an interval, swapping it in when its
 /// certificate changes. A reload that fails keeps the current CA.
 #[expect(
     clippy::infinite_loop,
     reason = "a background reloader runs for the life of the process"
 )]
-async fn reload_ca(state: Arc<AppState>, common_name: String, cert_path: String, key_path: String) {
+async fn reload_ca(
+    state: Arc<AppState>,
+    confirm: Option<String>,
+    common_name: String,
+    cert_path: String,
+    key_path: String,
+) {
+    let record = RecordedCa {
+        store: &state.store,
+        confirm: confirm.as_deref(),
+    };
     let mut ticker = tokio::time::interval(TLS_RELOAD_INTERVAL);
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        // A cert read mid-rotation that does not match its key fails the load and
-        // is retried on the next tick.
-        let material = async {
-            let cert = tokio::fs::read_to_string(&cert_path).await?;
-            let key = tokio::fs::read_to_string(&key_path).await?;
-            Ok::<_, std::io::Error>((cert, key))
-        }
+        let reloaded = Box::pin(state.ca.reload_from_files(
+            record,
+            &common_name,
+            std::path::Path::new(&cert_path),
+            std::path::Path::new(&key_path),
+        ))
         .await;
-        let reloaded = match material {
-            Ok((cert, key)) => state
-                .ca
-                .reload(&common_name, &cert, &key)
-                .map_err(|err| err.to_string()),
-            Err(err) => Err(err.to_string()),
-        };
         match reloaded {
             Ok(Some((old, new))) => tracing::warn!(
                 old_fingerprint = %old,
@@ -284,7 +317,7 @@ async fn reload_ca(state: Arc<AppState>, common_name: String, cert_path: String,
                 "signing CA changed on disk; new site certificates are signed by the new CA"
             ),
             Ok(None) => {},
-            Err(err) => tracing::warn!(%err, "signing CA reload failed, keeping the current CA"),
+            Err(err) => tracing::error!(%err, "signing CA reload refused, keeping the current CA"),
         }
     }
 }
@@ -385,32 +418,16 @@ async fn open_store() -> Result<Store, Box<dyn std::error::Error>> {
     }
 }
 
-/// Refuse a Postgres URL that could cross the network in plaintext.
+/// Refuse a Postgres URL whose server certificate is not fully verified.
 ///
-/// The store holds token digests, pinned names, and grid-admin identities, so the
-/// database hop must be encrypted. sslmode disable, allow, and prefer permit a
-/// plaintext fallback and are rejected before any connection. A fips build then
-/// requires verify-full and fails closed on anything less, since the FIPS posture
-/// rests on a fully verified server. A default build accepts require and verify-ca
-/// with a warning that verify-full is the intended posture.
+/// Parsed by the connection's own parser, so every spelling is judged as it will connect.
 fn require_db_tls(url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mode = PgConnectOptions::from_str(url)?.get_ssl_mode();
-    if matches!(mode, PgSslMode::Disable | PgSslMode::Allow | PgSslMode::Prefer) {
+    if !matches!(PgConnectOptions::from_str(url)?.get_ssl_mode(), PgSslMode::VerifyFull) {
         return Err(format!(
-            "{DB_CONNECTION_URL} must require TLS: set sslmode=verify-full, or at least require. disable, allow, and prefer permit a plaintext fallback"
+            "{DB_CONNECTION_URL} must set sslmode=verify-full with a CA bundle (sslrootcert): \
+             a lesser mode leaves the server certificate unverified"
         )
         .into());
-    }
-    if !matches!(mode, PgSslMode::VerifyFull) {
-        #[cfg(feature = "fips")]
-        return Err(format!(
-            "{DB_CONNECTION_URL} must set sslmode=verify-full in a fips build: a lesser mode leaves the server certificate unverified"
-        )
-        .into());
-        #[cfg(not(feature = "fips"))]
-        tracing::warn!(
-            "Postgres TLS is on but the server certificate is not fully verified. Set sslmode=verify-full with a CA bundle to close a man-in-the-middle path"
-        );
     }
     Ok(())
 }
@@ -531,12 +548,32 @@ fn load_cert_lifetime() -> time::Duration {
     lifetime
 }
 
+/// A file's contents, `None` when it is not there.
+fn read_optional(path: &str) -> Result<Option<String>, std::io::Error> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Read the grid-admin token table.
 ///
 /// No table means nobody can mint, rather than anybody.
-fn load_grid_admins() -> Result<GridAdmins, std::io::Error> {
+fn load_grid_admins() -> Result<GridAdmins, Box<dyn std::error::Error>> {
     let admins = match std::env::var(GRID_ADMIN_TOKENS) {
-        Ok(path) => GridAdmins::from_table(&std::fs::read_to_string(&path)?),
+        Ok(path) => {
+            let admins = GridAdmins::from_table(&std::fs::read_to_string(&path)?)?;
+            match std::env::var(GRID_ADMIN_ROLES)
+                .ok()
+                .map(|roles| read_optional(&roles))
+                .transpose()?
+            {
+                // A Secret without the key mounts no file, so absent means no roles.
+                Some(Some(roles)) => admins.with_roles(&roles).map_err(|error| error.to_string())?,
+                Some(None) | None => admins,
+            }
+        },
         Err(_unset) => GridAdmins::default(),
     };
 
@@ -596,7 +633,7 @@ async fn build_authorizer() -> Result<Authorizer, Box<dyn std::error::Error>> {
 mod tests {
     #[cfg(not(feature = "bootstrap"))]
     use super::reject_bootstrap_without_feature;
-    use super::{parse_bool_env, require_db_tls};
+    use super::{anchor_ca, parse_bool_env, require_db_tls};
 
     #[cfg(feature = "csr-record")]
     #[test]
@@ -640,54 +677,56 @@ mod tests {
         reject_bootstrap_without_feature(args)
     }
 
+    #[tokio::test]
+    async fn a_freshly_minted_ca_does_not_start_against_a_recorded_one() -> Result<(), Box<dyn std::error::Error>> {
+        let store = enrollment::Store::memory();
+        let original = certs::generate_ca("grid-ca")?;
+        anchor_ca(&store, &original.cert_pem, None).await?;
+        let minted = certs::generate_ca("grid-ca")?;
+        let refused = anchor_ca(&store, &minted.cert_pem, None).await;
+        assert!(refused.is_err(), "a different CA must not start");
+        let old = certs::cert_public_key_sha256(&original.cert_pem)?;
+        anchor_ca(&store, &minted.cert_pem, Some(&old)).await
+    }
+
     #[test]
-    fn a_url_that_permits_plaintext_is_refused() {
+    fn a_url_short_of_verify_full_is_refused_in_every_build() {
+        // These fall back to PGSSLMODE, as the connection does, so judge them only without it.
+        if std::env::var_os("PGSSLMODE").is_none() {
+            for url in [
+                "postgres://u:p@h/db",
+                "postgres://u:p@h/db?SSLMODE=verify-full",
+                "postgres://u:p@h/db?sslmode=",
+            ] {
+                assert!(require_db_tls(url).is_err(), "{url} must be refused");
+            }
+        }
         for url in [
-            "postgres://u:p@h/db",
             "postgres://u:p@h/db?sslmode=disable",
             "postgres://u:p@h/db?sslmode=allow",
             "postgres://u:p@h/db?sslmode=prefer",
+            "postgres://u:p@h/db?sslmode=require",
+            "postgres://u:p@h/db?sslmode=verify-ca",
+            "postgres://u:p@h/db?sslmode=Require",
+            "postgres://u:p@h/db?sslmode=VERIFY-CA",
+            "postgres://u:p@h/db?sslmode=verify-full&sslmode=require",
+            "postgres://u:p@h/db?sslmode=verify-full&ssl-mode=verify-ca",
+            "postgres://u:p@h/db?ssl-mode=require",
+            "postgres://u:p@h/db?sslmode=%72equire",
+            "postgres://u:p@h/db?sslmode=verify-full%20",
         ] {
-            assert!(
-                require_db_tls(url).is_err(),
-                "{url} permits a plaintext fallback and must be refused"
-            );
+            assert!(require_db_tls(url).is_err(), "{url} must be refused");
         }
     }
 
     #[test]
     fn verify_full_is_accepted() {
-        assert!(
-            require_db_tls("postgres://u:p@h/db?sslmode=verify-full").is_ok(),
-            "verify-full fully verifies the server and must be accepted in every build"
-        );
-    }
-
-    #[cfg(not(feature = "fips"))]
-    #[test]
-    fn a_partially_verified_url_is_accepted_outside_fips() {
         for url in [
-            "postgres://u:p@h/db?sslmode=require",
-            "postgres://u:p@h/db?sslmode=verify-ca",
+            "postgres://u:p@h/db?sslmode=verify-full",
+            "postgres://u:p@h/db?ssl-mode=verify-full",
+            "postgres://u:p@h/db?sslmode=require&sslmode=verify-full",
         ] {
-            assert!(
-                require_db_tls(url).is_ok(),
-                "{url} encrypts the hop and must be accepted in a default build"
-            );
-        }
-    }
-
-    #[cfg(feature = "fips")]
-    #[test]
-    fn a_partially_verified_url_is_refused_under_fips() {
-        for url in [
-            "postgres://u:p@h/db?sslmode=require",
-            "postgres://u:p@h/db?sslmode=verify-ca",
-        ] {
-            assert!(
-                require_db_tls(url).is_err(),
-                "{url} leaves the server unverified and a fips build must fail closed"
-            );
+            assert!(require_db_tls(url).is_ok(), "{url} fully verifies the server");
         }
     }
 }

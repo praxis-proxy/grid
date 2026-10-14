@@ -15,7 +15,11 @@
 
 use std::sync::{Arc, LazyLock};
 
-use enrollment::{Issued, NewSiteToken, Pin, Store, StoreError};
+use enrollment::{
+    CaAction, Issued, NewSiteToken, Pin, Store, StoreError,
+    ca::{AnchorError, Anchored, anchor},
+    ca_action,
+};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::{Mutex, MutexGuard};
 
@@ -27,7 +31,14 @@ static DB_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 /// A store against the test database and the exclusive lock over it, or `None`
 /// when no database is configured.
 async fn store() -> Option<(Store, MutexGuard<'static, ()>)> {
-    let url = std::env::var("ENROLLMENT_TEST_DATABASE_URL").ok()?;
+    let Ok(url) = std::env::var("ENROLLMENT_TEST_DATABASE_URL") else {
+        // CI sets this, so a dropped database fails the run instead of skipping every test.
+        assert!(
+            std::env::var_os("ENROLLMENT_REQUIRE_TEST_DATABASE").is_none(),
+            "ENROLLMENT_REQUIRE_TEST_DATABASE is set but ENROLLMENT_TEST_DATABASE_URL is not"
+        );
+        return None;
+    };
     let guard = DB_LOCK.lock().await;
     let store = Store::postgres(&url).await.expect("connect to the test database");
     Some((store, guard))
@@ -49,22 +60,40 @@ fn new_token(site: &str, digest: &str) -> NewSiteToken {
         grid_network_ref: "demo-grid".to_owned(),
         issued_by: "sam".to_owned(),
         expires_at: OffsetDateTime::now_utc().saturating_add(Duration::hours(1)),
+        allow_deleted_name: false,
     }
 }
 
-/// A signer that issues a stub certificate for the pinned name, standing in for
-/// the certs primitive the handler uses.
+/// A signer that issues a stub certificate for the pinned name under a fresh
+/// key, standing in for the certs primitive the handler uses.
 #[expect(clippy::unnecessary_wraps, reason = "matches the redeem_and_issue signer signature")]
 fn sign_for(pin: &Pin) -> Result<Issued, StoreError> {
-    Ok(Issued {
+    Ok(issued(pin, &keys()('0')))
+}
+
+/// A stub certificate for the pinned name carrying `key`.
+fn issued(pin: &Pin, key: &str) -> Issued {
+    Issued {
         site_name: String::new(),
         certificate: format!(
             "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----",
             pin.site_name
         ),
         spiffe_id: format!("spiffe://grid.internal/site/{}", pin.site_name),
-        public_key_sha256: "a".repeat(64),
-    })
+        public_key_sha256: key.to_owned(),
+    }
+}
+
+/// Key digests unique to one test, by character, since the database keeps every key it enrolled.
+fn keys() -> impl Fn(char) -> String {
+    let prefix = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    move |letter| {
+        format!(
+            "{}{}",
+            prefix.get(..56).unwrap_or_default(),
+            letter.to_string().repeat(8)
+        )
+    }
 }
 
 /// The full lifecycle: a grid-admin mints a token, a site redeems it under the
@@ -186,9 +215,9 @@ async fn a_redeemed_token_cannot_be_revoked() {
     );
 }
 
-/// The partial unique index, not the process, is what guarantees this.
+/// A name an enrollment holds, or a live token pins, is refused at mint.
 #[tokio::test]
-async fn two_sites_cannot_hold_one_name() {
+async fn a_name_mints_one_live_token_and_none_once_held() {
     let Some((store, _guard)) = store().await else {
         return;
     };
@@ -199,22 +228,184 @@ async fn two_sites_cannot_hold_one_name() {
         .mint_site_token(new_token(&site, &first))
         .await
         .expect("mint first");
-    store.redeem_and_issue(&first, sign_for).await.expect("first enroll");
+    let second = store.mint_site_token(new_token(&site, &unique("digest"))).await;
+    assert!(
+        matches!(second, Err(StoreError::TokenOutstanding)),
+        "a live token already pins the name, got {second:?}"
+    );
 
-    let second = unique("digest");
+    store.redeem_and_issue(&first, sign_for).await.expect("first enroll");
+    let held = store.mint_site_token(new_token(&site, &unique("digest"))).await;
+    assert!(
+        matches!(held, Err(StoreError::NameTaken)),
+        "an enrolled name is refused, got {held:?}"
+    );
+}
+
+/// Concurrent mints of one name: the per-name lock, not the process, lets one through.
+#[tokio::test]
+async fn concurrent_mints_of_one_name_leave_one_live_token() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let site = unique("mint-race");
+    let store = Arc::new(store);
+    let racers: Vec<_> = std::iter::repeat_with(|| {
+        let (store, token) = (Arc::clone(&store), new_token(&site, &unique("digest")));
+        tokio::spawn(async move { store.mint_site_token(token).await })
+    })
+    .take(8)
+    .collect();
+    let mut minted = 0_usize;
+    for racer in racers {
+        let result = racer.await.expect("join");
+        assert!(
+            matches!(result, Ok(_) | Err(StoreError::TokenOutstanding)),
+            "a racing mint either wins or finds the live token, got {result:?}"
+        );
+        minted = minted.saturating_add(usize::from(result.is_ok()));
+    }
+    assert_eq!(minted, 1, "exactly one mint wins the name");
+}
+
+/// An expired, unredeemed token holds nothing; a live one holds the name.
+#[tokio::test]
+async fn an_expired_token_frees_the_name_but_a_live_one_holds_it() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let site = unique("expired");
+    let mut expired = new_token(&site, &unique("digest"));
+    expired.expires_at = OffsetDateTime::now_utc().saturating_sub(Duration::seconds(1));
+    store.mint_site_token(expired).await.expect("mint expired");
     store
-        .mint_site_token(new_token(&site, &second))
+        .mint_site_token(new_token(&site, &unique("digest")))
         .await
-        .expect("mint second");
-    let again = store.redeem_and_issue(&second, sign_for).await;
+        .expect("an expired token does not hold the name");
+    let again = store.mint_site_token(new_token(&site, &unique("digest"))).await;
+    assert!(matches!(again, Err(StoreError::TokenOutstanding)), "got {again:?}");
+}
+
+/// Mints racing a redeem never leave a live token beside the enrollment.
+#[tokio::test]
+async fn a_mint_racing_a_redeem_leaves_no_live_token_beside_the_enrollment() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let site = unique("mint-redeem");
+    let digest = unique("digest");
+    store.mint_site_token(new_token(&site, &digest)).await.expect("mint");
+    let store = Arc::new(store);
+    let redeem = spawn_redeem(&store, digest);
+    let minters: Vec<_> = std::iter::repeat_with(|| {
+        let (store, token) = (Arc::clone(&store), new_token(&site, &unique("digest")));
+        tokio::spawn(async move { store.mint_site_token(token).await })
+    })
+    .take(8)
+    .collect();
+    redeem.await.expect("join").expect("the live token redeems");
+    for minter in minters {
+        let result = minter.await.expect("join");
+        assert!(
+            matches!(result, Err(StoreError::TokenOutstanding | StoreError::NameTaken)),
+            "no mint lands while the name is pinned or held, got {result:?}"
+        );
+    }
+}
+
+/// A row written before mint refused a second live token for a name.
+async fn insert_legacy_token(site: &str, digest: &str) {
+    let url = std::env::var("ENROLLMENT_TEST_DATABASE_URL").expect("url");
+    let pool = Box::pin(sqlx::PgPool::connect(&url)).await.expect("pool");
+    sqlx::query(
+        "INSERT INTO site_tokens (id, token_sha256, site_name, grid_network_ref, issued_by, expires_at)
+         VALUES ($1, $2, $3, 'demo-grid', 'sam', NOW() + INTERVAL '1 hour')",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(digest)
+    .bind(site)
+    .execute(&pool)
+    .await
+    .expect("insert legacy token");
+}
+
+/// A token that loses its name at redeem is spent, even after the holder is deleted.
+#[tokio::test]
+async fn a_token_that_loses_its_name_cannot_claim_it_after_a_delete() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let site = unique("loser");
+    let (winner, loser) = (unique("digest"), unique("digest"));
+    store.mint_site_token(new_token(&site, &winner)).await.expect("mint");
+    Box::pin(insert_legacy_token(&site, &loser)).await;
+    store.redeem_and_issue(&winner, sign_for).await.expect("first enroll");
+
+    let lost = store.redeem_and_issue(&loser, sign_for).await;
+    assert!(matches!(lost, Err(StoreError::NameTaken)), "got {lost:?}");
     assert!(
-        matches!(again, Err(StoreError::NameTaken)),
-        "a name an issued member holds must be refused, got {again:?}"
+        store.token_valid(&loser).await.expect("peek"),
+        "a taken name leaves the losing token unspent"
+    );
+
+    store.delete_enrollment(&site).await.expect("delete");
+    let later = store.redeem_and_issue(&loser, sign_for).await;
+    assert!(
+        matches!(later, Err(StoreError::NameDeleted)),
+        "the losing token cannot claim the deleted name, got {later:?}"
     );
     assert!(
-        store.token_valid(&second).await.expect("peek"),
-        "the refused redeem rolls back, so the second token is not spent"
+        !store.token_valid(&loser).await.expect("peek"),
+        "the deleted-name refusal spends it"
     );
+}
+
+/// A name deleted before the history existed is still a deleted name after the upgrade.
+#[tokio::test]
+async fn a_name_deleted_before_the_upgrade_is_backfilled_as_deleted() {
+    let Some((store, guard)) = store().await else {
+        return;
+    };
+    let site = unique("predeleted");
+    let digest = unique("digest");
+    store.mint_site_token(new_token(&site, &digest)).await.expect("mint");
+    store.redeem_and_issue(&digest, sign_for).await.expect("enroll");
+    // The pre-upgrade delete: the enrollment goes, the redeemed token and no tombstone stay.
+    let url = std::env::var("ENROLLMENT_TEST_DATABASE_URL").expect("url");
+    let pool = Box::pin(sqlx::PgPool::connect(&url)).await.expect("pool");
+    sqlx::query("DELETE FROM site_enrollments WHERE site_name = $1")
+        .bind(&site)
+        .execute(&pool)
+        .await
+        .expect("legacy delete");
+    sqlx::query("DELETE FROM deleted_site_names WHERE site_name = $1")
+        .bind(&site)
+        .execute(&pool)
+        .await
+        .expect("no tombstone");
+    drop(store);
+
+    // Starting again applies the schema, as an upgrade does.
+    let upgraded = Store::postgres(&url).await.expect("reconnect");
+    let refused = upgraded.mint_site_token(new_token(&site, &unique("digest"))).await;
+    assert!(matches!(refused, Err(StoreError::NameDeleted)), "got {refused:?}");
+    drop(guard);
+}
+
+/// A token the signer refuses for a taken name stays unspent.
+#[tokio::test]
+async fn a_token_refused_by_the_signer_is_not_spent() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let digest = unique("digest");
+    store
+        .mint_site_token(new_token(&unique("reserved"), &digest))
+        .await
+        .expect("mint");
+    let refused = store.redeem_and_issue(&digest, |_pin| Err(StoreError::NameTaken)).await;
+    assert!(matches!(refused, Err(StoreError::NameTaken)), "got {refused:?}");
+    assert!(store.token_valid(&digest).await.expect("peek"), "the token is unspent");
 }
 
 /// Redeem `digest` on its own task, so two can race the same store.
@@ -256,7 +447,7 @@ async fn concurrent_redeems_spend_a_token_once() {
 }
 
 /// Two racers redeeming different tokens that pin the same name: the unique index,
-/// not the process, holds the name, so exactly one wins and the other is refused.
+/// not the process, holds the name, so exactly one wins and the loser stays unspent.
 #[tokio::test]
 async fn concurrent_redeems_of_one_name_leave_one_holder() {
     let Some((store, _guard)) = store().await else {
@@ -269,14 +460,11 @@ async fn concurrent_redeems_of_one_name_leave_one_holder() {
         .mint_site_token(new_token(&site, &first_digest))
         .await
         .expect("mint first");
-    store
-        .mint_site_token(new_token(&site, &second_digest))
-        .await
-        .expect("mint second");
+    Box::pin(insert_legacy_token(&site, &second_digest)).await;
 
     let store = Arc::new(store);
-    let first = spawn_redeem(&store, first_digest);
-    let second = spawn_redeem(&store, second_digest);
+    let first = spawn_redeem(&store, first_digest.clone());
+    let second = spawn_redeem(&store, second_digest.clone());
     let first = first.await.expect("join first");
     let second = second.await.expect("join second");
 
@@ -288,6 +476,10 @@ async fn concurrent_redeems_of_one_name_leave_one_holder() {
         name_taken, 1,
         "the loser is refused as name taken, got {first:?} and {second:?}"
     );
+    for (digest, won) in [(first_digest, first.is_ok()), (second_digest, second.is_ok())] {
+        let live = store.token_valid(&digest).await.expect("peek");
+        assert_eq!(live, !won, "only the winner's token is spent");
+    }
 }
 
 /// The invariant: the token is spent only when the certificate is issued.
@@ -332,11 +524,6 @@ fn resign(site: &str) -> Result<Issued, StoreError> {
     })
 }
 
-/// A key digest from one character.
-fn key(letter: char) -> String {
-    letter.to_string().repeat(64)
-}
-
 /// Rotate, re-sign a lost response, fork, stay frozen, and release on delete.
 #[tokio::test]
 #[expect(clippy::too_many_lines, reason = "one record's whole lifecycle")]
@@ -344,9 +531,13 @@ async fn a_renewal_rotates_the_recorded_key_and_a_fork_freezes_it() {
     let Some((store, _guard)) = store().await else {
         return;
     };
+    let key = keys();
     let (site, digest) = (unique("site"), unique("digest"));
     store.mint_site_token(new_token(&site, &digest)).await.expect("mint");
-    store.redeem_and_issue(&digest, sign_for).await.expect("redeem");
+    store
+        .redeem_and_issue(&digest, |pin| Ok(issued(pin, &key('a'))))
+        .await
+        .expect("redeem");
 
     let renewed = store
         .renew_and_issue(&renewal(&site, &key('a'), &key('b')), || resign(&site))
@@ -410,6 +601,7 @@ async fn a_seed_registers_a_reserved_name_and_only_it_records_without_a_token() 
         return;
     };
     let hub = unique("hub");
+    let key = keys();
     let seed = |letter, generation| enrollment::SeedRecord {
         site_name: hub.clone(),
         key_sha256: key(letter),
@@ -472,4 +664,270 @@ async fn a_seed_registers_a_reserved_name_and_only_it_records_without_a_token() 
     .execute(&pool)
     .await;
     assert!(forged.is_err(), "the schema refuses a token-less spoke record");
+}
+
+/// Mint a token for `site` and redeem it under `key`.
+async fn enroll_with(store: &Store, site: &str, key: &str, allow_deleted_name: bool) -> Result<(), StoreError> {
+    let digest = unique("digest");
+    store
+        .mint_site_token(NewSiteToken {
+            allow_deleted_name,
+            ..new_token(site, &digest)
+        })
+        .await?;
+    store
+        .redeem_and_issue(&digest, |pin| Ok(issued(pin, key)))
+        .await
+        .map(drop)
+}
+
+/// A key enrolled once is refused under any name, before and after its enrollment is deleted.
+#[tokio::test]
+async fn a_key_enrolled_once_is_refused_under_any_name() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let key = keys();
+    let (east, west) = (unique("east"), unique("west"));
+    enroll_with(&store, &east, &key('a'), false).await.expect("enroll");
+
+    let digest = unique("digest");
+    store
+        .mint_site_token(new_token(&west, &digest))
+        .await
+        .expect("mint west");
+    let live = store.redeem_and_issue(&digest, |pin| Ok(issued(pin, &key('a')))).await;
+    assert!(matches!(live, Err(StoreError::KeyReused)), "a live key, got {live:?}");
+    store.delete_enrollment(&east).await.expect("delete");
+    let other = store.redeem_and_issue(&digest, |pin| Ok(issued(pin, &key('a')))).await;
+    assert!(
+        matches!(other, Err(StoreError::KeyReused)),
+        "another name, got {other:?}"
+    );
+    let same = enroll_with(&store, &east, &key('a'), true).await;
+    assert!(matches!(same, Err(StoreError::KeyReused)), "its old name, got {same:?}");
+    assert!(
+        store.enrollment(&west).await.expect("read").is_none(),
+        "a refused key records nothing"
+    );
+}
+
+/// Racing enrollments of one key under many names: the primary key lets one through.
+#[tokio::test]
+async fn concurrent_enrollments_of_one_key_leave_one_holder() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let shared = keys()('a');
+    let store = Arc::new(store);
+    let racers: Vec<_> = std::iter::repeat_with(|| {
+        let (store, shared) = (Arc::clone(&store), shared.clone());
+        tokio::spawn(async move { Box::pin(enroll_with(&store, &unique("racer"), &shared, false)).await })
+    })
+    .take(8)
+    .collect();
+    let mut enrolled = 0_usize;
+    for racer in racers {
+        let result = racer.await.expect("join");
+        assert!(
+            matches!(result, Ok(()) | Err(StoreError::KeyReused)),
+            "a racer wins or finds the key enrolled, got {result:?}"
+        );
+        enrolled = enrolled.saturating_add(usize::from(result.is_ok()));
+    }
+    assert_eq!(enrolled, 1, "exactly one name holds the key");
+}
+
+/// A deleted name is refused without the opt-in, at mint and at redeem, and enrolls with it.
+#[tokio::test]
+async fn a_deleted_name_enrolls_again_only_with_the_opt_in() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let key = keys();
+    let site = unique("site");
+    enroll_with(&store, &site, &key('a'), false).await.expect("enroll");
+    let waiting = unique("digest");
+    Box::pin(insert_legacy_token(&site, &waiting)).await;
+    store.delete_enrollment(&site).await.expect("delete");
+
+    let minted = store.mint_site_token(new_token(&site, &unique("digest"))).await;
+    assert!(matches!(minted, Err(StoreError::NameDeleted)), "got {minted:?}");
+    let claimed = store.redeem_and_issue(&waiting, |pin| Ok(issued(pin, &key('b')))).await;
+    assert!(
+        matches!(claimed, Err(StoreError::NameDeleted)),
+        "a token minted before the delete, got {claimed:?}"
+    );
+    assert!(
+        !store.token_valid(&waiting).await.expect("peek"),
+        "the refusal spends the token"
+    );
+    enroll_with(&store, &site, &key('c'), true)
+        .await
+        .expect("the opt-in enrolls the deleted name");
+    let record = store.enrollment(&site).await.expect("read").expect("held");
+    assert_eq!(record.held.current_key, key('c'));
+}
+
+/// A redeem racing the delete of its name never claims the name without the opt-in.
+#[tokio::test]
+async fn a_redeem_racing_a_delete_never_claims_the_name() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let key = keys();
+    let site = unique("site");
+    enroll_with(&store, &site, &key('a'), false).await.expect("enroll");
+    let waiting = unique("digest");
+    Box::pin(insert_legacy_token(&site, &waiting)).await;
+
+    let store = Arc::new(store);
+    let deleter = {
+        let (store, site) = (Arc::clone(&store), site.clone());
+        tokio::spawn(async move { store.delete_enrollment(&site).await })
+    };
+    let redeemer = {
+        let (store, fresh) = (Arc::clone(&store), key('b'));
+        tokio::spawn(async move { store.redeem_and_issue(&waiting, |pin| Ok(issued(pin, &fresh))).await })
+    };
+    deleter.await.expect("join").expect("delete");
+    let claimed = redeemer.await.expect("join");
+    assert!(
+        matches!(claimed, Err(StoreError::NameTaken | StoreError::NameDeleted)),
+        "got {claimed:?}"
+    );
+    assert!(
+        store.enrollment(&site).await.expect("read").is_none(),
+        "nothing holds the name"
+    );
+}
+
+/// Rotation to any key ever enrolled is refused without freezing the record.
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "the reused keys, then the record")]
+async fn rotation_to_a_key_ever_enrolled_is_refused() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    let key = keys();
+    let (east, west) = (unique("east"), unique("west"));
+    enroll_with(&store, &east, &key('e'), false).await.expect("enroll east");
+    enroll_with(&store, &west, &key('a'), false).await.expect("enroll west");
+    store.delete_enrollment(&east).await.expect("delete east");
+
+    let stolen = store
+        .renew_and_issue(&renewal(&west, &key('a'), &key('e')), || resign(&west))
+        .await;
+    assert!(
+        matches!(stolen, Err(StoreError::Refused(enrollment::Refusal::KeyReused))),
+        "a deleted site's key, got {stolen:?}"
+    );
+    for (presented, requested) in [('a', 'b'), ('b', 'c')] {
+        store
+            .renew_and_issue(&renewal(&west, &key(presented), &key(requested)), || resign(&west))
+            .await
+            .expect("rotate");
+    }
+    let back = store
+        .renew_and_issue(&renewal(&west, &key('c'), &key('a')), || resign(&west))
+        .await;
+    assert!(
+        matches!(back, Err(StoreError::Refused(enrollment::Refusal::KeyReused))),
+        "its own key from two rotations back, got {back:?}"
+    );
+    let record = store.enrollment(&west).await.expect("read").expect("held");
+    assert!(!record.held.frozen, "a refused reuse does not freeze");
+    assert_eq!(record.held.current_key, key('c'));
+    let reused = enroll_with(&store, &unique("fresh"), &key('b'), false).await;
+    assert!(
+        matches!(reused, Err(StoreError::KeyReused)),
+        "a key recorded only during rotation cannot enroll a fresh name: {reused:?}"
+    );
+}
+/// Clear the recorded grid CA, standing in for a new database.
+async fn forget_ca() {
+    let url = std::env::var("ENROLLMENT_TEST_DATABASE_URL").expect("database url");
+    let pool = Box::pin(sqlx::PgPool::connect(&url)).await.expect("pool");
+    sqlx::query("DELETE FROM grid_ca_anchor")
+        .execute(&pool)
+        .await
+        .expect("clear the anchor");
+}
+
+/// A freshly minted CA's fingerprint.
+fn minted_ca() -> String {
+    let ca = certs::generate_ca("grid-ca").expect("ca");
+    certs::canonical_fingerprint(&ca.cert_pem).expect("fingerprint")
+}
+
+/// A first start records a CA, then an attacker deletes the CA key Secret and every
+/// distributed copy, so bootstrap mints a new one and the service restarts.
+/// Returns the restarted store, the recorded fingerprint, and the minted one.
+async fn restarted_with_a_minted_ca() -> Option<(Store, MutexGuard<'static, ()>, String, String)> {
+    let (store, guard) = store().await?;
+    forget_ca().await;
+    let original = minted_ca();
+    assert_eq!(
+        anchor(&store, &original, None).await.expect("first start"),
+        Anchored::Recorded,
+        "the first start records the CA"
+    );
+    drop(store);
+    assert_eq!(
+        ca_action(None, false, &[]),
+        CaAction::Mint,
+        "with every Secret gone bootstrap mints"
+    );
+    let url = std::env::var("ENROLLMENT_TEST_DATABASE_URL").expect("database url");
+    let restarted = Store::postgres(&url).await.expect("restart");
+    Some((restarted, guard, original, minted_ca()))
+}
+
+#[tokio::test]
+async fn a_ca_minted_after_its_secrets_were_deleted_is_refused() {
+    let Some((store, _guard, original, minted)) = restarted_with_a_minted_ca().await else {
+        return;
+    };
+    let refused = anchor(&store, &minted, None).await;
+    assert!(
+        matches!(&refused, Err(AnchorError::Mismatch { recorded, loaded }) if *recorded == original && *loaded == minted),
+        "{refused:?}"
+    );
+    let truncated = original.get(..63).expect("fingerprint");
+    let upper = original.to_ascii_uppercase();
+    let padded = format!(" {original}");
+    for wrong in ["", truncated, &upper, &padded, &minted, "not-a-fingerprint"] {
+        assert!(
+            anchor(&store, &minted, Some(wrong)).await.is_err(),
+            "the override {wrong:?} does not name the recorded CA"
+        );
+    }
+    assert_eq!(store.recorded_ca().await.expect("read"), Some(original));
+}
+
+#[tokio::test]
+async fn starting_over_needs_the_old_fingerprint_confirmed() {
+    let Some((store, _guard, original, minted)) = restarted_with_a_minted_ca().await else {
+        return;
+    };
+    assert_eq!(
+        anchor(&store, &minted, Some(&original)).await.expect("start over"),
+        Anchored::Replaced { previous: original },
+    );
+    assert_eq!(store.recorded_ca().await.expect("read"), Some(minted));
+}
+
+/// Two replicas racing a first start with different CAs: only one is recorded.
+#[tokio::test]
+async fn racing_first_starts_record_one_ca() {
+    let Some((store, _guard)) = store().await else {
+        return;
+    };
+    forget_ca().await;
+    let (left, right) = (minted_ca(), minted_ca());
+    let (first, second) = tokio::join!(anchor(&store, &left, None), anchor(&store, &right, None));
+    assert!(
+        first.is_ok() != second.is_ok(),
+        "exactly one CA wins: {first:?} {second:?}"
+    );
 }

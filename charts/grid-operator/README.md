@@ -212,7 +212,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `health.liveness.initialDelaySeconds` | int | `5` | Liveness probe initial delay. |
 | `health.liveness.periodSeconds` | int | `10` | Liveness probe period. |
 | `health.startup.periodSeconds` | int | `10` | Startup probe period, for `metrics.tls.source` `siteIdentity`. |
-| `health.startup.failureThreshold` | int | `96` | Startup probe failures before a restart. The window outlasts the 15-minute enrollment deadline, so a restart never interrupts enrollment. |
+| `health.startup.failureThreshold` | int | `96` | Startup probe failures before a restart. Enrollment has no retry deadline; a `siteIdentity` pod still enrolling restarts after about 16 minutes by default. |
 | `health.readiness.initialDelaySeconds` | int | `5` | Readiness probe initial delay. |
 | `health.readiness.periodSeconds` | int | `10` | Readiness probe period. |
 | `serviceMonitor.enabled` | bool | `false` | Create a Prometheus ServiceMonitor. |

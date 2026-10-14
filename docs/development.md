@@ -39,7 +39,7 @@ directory.
 | `certs` | [`crates/certs/`](../crates/certs/) | Site certificates and certificate-provider interfaces. |
 | `enrollment` | [`crates/enrollment/`](../crates/enrollment/) | Site enrollment service and API types. |
 | `grid-signals` | [`crates/signals/`](../crates/signals/) | Shared load-signal store, Prometheus exposition parser, and labels. |
-| `grid-signals-client` | [`crates/signals-client/`](../crates/signals-client/) | mTLS poller for the operator's site-signal endpoint. |
+| `grid-client` | [`crates/client/`](../crates/client/) | Grid-root HTTP clients and the mTLS site-signal poller. |
 | `mock-providers` | [`crates/mock-providers/`](../crates/mock-providers/) | Mock inference-provider APIs. |
 | `fleet-dashboard` | [`crates/fleet-dashboard/`](../crates/fleet-dashboard/) | Optional fleet UI and Prometheus-backed views. |
 | `xtask` | [`crates/xtask/`](../crates/xtask/) | Repository generation, environments, and qualification commands. |

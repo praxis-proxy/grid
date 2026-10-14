@@ -46,11 +46,12 @@ reloaded from disk periodically, so a rotated secret is picked up without a
 restart.
 
 Store. `DB_CONNECTION_URL` is a Postgres connection string, named to match MaaS
-so a deployment beside it points at the database already there. It must require
-TLS: set `sslmode=verify-full` with a CA bundle, or at least `sslmode=require`.
-`disable`, `allow`, and `prefer` permit a plaintext fallback and are refused at
-startup. When the variable is unset the records are kept in memory and lost on
-restart, which suits a local trial and nothing else.
+so a deployment beside it points at the database already there. It must set
+`sslmode=verify-full` with a CA bundle (`sslrootcert`). Every other mode is
+refused at startup, since `require` and `verify-ca` leave the server's name
+unverified and the rest permit a plaintext fallback. When the variable is unset
+the records are kept in memory and lost on restart, which suits a local trial
+and nothing else.
 
 Listen address. `ENROLLMENT_LISTEN_ADDR` defaults to `0.0.0.0:8443`, HTTPS. On a
 stop signal, SIGINT or SIGTERM, the service drains in-flight requests before it
@@ -58,8 +59,14 @@ exits, so a rolling deploy does not cut off an enrollment mid-issue.
 
 Grid-admin authorization. `ENROLLMENT_AUTHZ` selects who may mint and revoke
 tokens. `local`, the default, reads a grid-admin token table from
-`ENROLLMENT_GRID_ADMIN_TOKENS`, one `name:token` line per grid-admin, where an
-empty table admits nobody and is the safe direction. `kube` defers to Kubernetes
+`ENROLLMENT_GRID_ADMIN_TOKENS`, one `name:token` line per grid-admin, where the
+token is everything after the first `:`. An empty table admits nobody. Roles
+come from the optional file at `ENROLLMENT_GRID_ADMIN_ROLES`, one
+`name:role[,role]` line per admin, from `grid-admin` and `enrollment-admin`.
+A name it does not list is `grid-admin`, which mints and revokes tokens and
+reads enrollments. Deleting an enrollment, or minting with `allowDeletedName`,
+needs `enrollment-admin`. A malformed line, an unknown, repeated, or empty role
+list, or a roles line for a name with no token, fails startup. `kube` defers to Kubernetes
 RBAC through TokenReview and SubjectAccessReview on the `enrollmenttokens`
 resource, through the `sar` feature. Under `kube`, a bearer must be bound to
 `ENROLLMENT_TOKEN_AUDIENCE` (default `grid-enrollment`), and reviews are scoped

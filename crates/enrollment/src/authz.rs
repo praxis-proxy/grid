@@ -6,7 +6,7 @@
 //! origin and who decides.
 //!
 //!   - [`Authorizer::Local`] is the grid-admin token table, the standalone, cluster-free default. A valid token
-//!     authorizes the action.
+//!     authorizes the actions its entry's roles grant.
 //!   - `Authorizer::Kube` (feature `sar`) reuses Kubernetes RBAC. The bearer is authenticated with a `TokenReview`, and
 //!     the action authorized with a `SubjectAccessReview` against the virtual `grid.praxis.fast/enrollmenttokens`
 //!     resource. Permissions are ordinary `Roles` or `ClusterRoles`, no CRD required.
@@ -97,18 +97,18 @@ impl Authorizer {
     /// [`AuthzError::Backend`] when the backend cannot render a decision.
     #[cfg_attr(
         not(feature = "sar"),
-        expect(
-            unused_variables,
-            clippy::unused_async,
-            reason = "operation and async are consulted only by the Kubernetes-RBAC backend"
-        )
+        expect(clippy::unused_async, reason = "async only for the Kubernetes-RBAC backend")
     )]
     pub async fn decide(&self, bearer: &str, operation: Operation) -> Result<String, AuthzError> {
         match self {
-            Self::Local(admins) => admins
-                .resolve(bearer)
-                .map(str::to_owned)
-                .ok_or(AuthzError::Unauthenticated),
+            Self::Local(admins) => {
+                let admin = admins.resolve(bearer).ok_or(AuthzError::Unauthenticated)?;
+                if admin.permits(operation) {
+                    Ok(admin.name.clone())
+                } else {
+                    Err(AuthzError::Forbidden(operation.verb.to_owned()))
+                }
+            },
             #[cfg(feature = "sar")]
             Self::Kube(kube) => kube.decide(bearer, operation).await,
         }

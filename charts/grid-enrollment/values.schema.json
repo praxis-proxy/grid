@@ -108,6 +108,10 @@
         "forceRegenerate": {
           "type": "boolean"
         },
+        "confirmRotation": {
+          "type": "string",
+          "pattern": "^([0-9a-f]{64})?$"
+        },
         "provided": {
           "type": "object",
           "properties": {
@@ -515,6 +519,10 @@
                 "minimum": 1,
                 "maximum": 604800
               },
+              "allowDeletedName": {
+                "type": "boolean",
+                "description": "Mint a token that may enroll a name whose enrollment was deleted."
+              },
               "cluster": {
                 "type": "string",
                 "description": "ManagedCluster name to target when it differs from the site name.",
@@ -546,6 +554,10 @@
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 604800
+              },
+              "allowDeletedName": {
+                "type": "boolean",
+                "description": "Mint a token that may enroll a name whose enrollment was deleted."
               },
               "cluster": {
                 "type": "string",

@@ -34,7 +34,9 @@ paths:
       summary: Mint a single-use enrollment token
       description: |
         Mints a one-time token that pins a site name. The token is returned
-        once; only its digest is stored. Minting is not self-service.
+        once; only its digest is stored. Minting is not self-service. A name
+        holds at most one live token, and a name an enrollment holds cannot be
+        minted, so revoke the outstanding token or delete the enrollment first.
       security:
         - gridAdminAuth: []
       requestBody:
@@ -56,6 +58,15 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '409':
+          description: |
+            An enrollment holds the name (name_taken), its enrollment was
+            deleted and allowDeletedName is not set (name_deleted), or an
+            unredeemed, unexpired token already pins it (token_outstanding).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   /enrollmenttokens/{tokenId}:
     delete:
@@ -114,7 +125,11 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
-          description: The pinned name is already held by an issued member.
+          description: |
+            The pinned name is already held by an issued member (name_taken), or
+            the signing request's key was enrolled before (key_reused); the
+            token stays unspent. The name's enrollment was deleted and the token
+            does not opt in (name_deleted); that spends the token.
           content:
             application/json:
               schema:
@@ -160,10 +175,12 @@ paths:
       summary: Delete a site's enrollment
       description: |
         Deletes the enrollment record that holds a site name. The site can no
-        longer rotate, its current certificate stays valid until it expires, and
-        the name is released so the site can enroll again with a new token. This
-        is also how a site frozen after a rotation fork recovers. A reserved
-        name's record comes from the enrollment bootstrap and is refused here.
+        longer rotate, and its current certificate stays valid until it expires.
+        The name is recorded as deleted: enrolling it again takes a token minted
+        with allowDeletedName. Every key the name enrolled stays refused under
+        any name. This is also how a site frozen after a rotation fork recovers,
+        with a new key. A reserved name's record comes from the enrollment
+        bootstrap and is refused here.
       security:
         - gridAdminAuth: []
       parameters:
@@ -203,7 +220,7 @@ paths:
         certificate and submits a signing request for a new key. Returns a new
         certificate for the name the presented certificate carries. No token is
         involved. A name with no enrollment record, a key that is not the site's
-        current one, or a request that reuses a held key is refused. A grid
+        current one, or a request for any key ever enrolled is refused. A grid
         with rotations turned off refuses every rotation with 503.
       security:
         - siteCertificateAuth: []
@@ -321,6 +338,14 @@ components:
             604800 (seven days).
           minimum: 1
           maximum: 604800
+        allowDeletedName:
+          type: boolean
+          default: false
+          description: |
+            Lets the token enroll a name whose enrollment a grid-admin deleted.
+            Without it, a deleted name is refused at mint and at enroll. Keys
+            the deleted enrollment held stay refused either way. Setting it also
+            needs the right to delete enrollments.
 
     EnrollmentToken:
       type: object
@@ -355,7 +380,8 @@ components:
           type: string
           description: |
             PKCS#10 certificate signing request, PEM encoded. The private key
-            stays with the requester and is never sent.
+            stays with the requester and is never sent. The key must be an EC
+            key on P-256 or P-384.
           maxLength: 16384
 
     Enrollment:
@@ -439,7 +465,7 @@ components:
 
         | Code | Status | Meaning |
         |---|---|---|
-        | invalid_csr | 400 | The signing request does not parse or verify. |
+        | invalid_csr | 400 | The signing request does not parse or verify, or its key is not EC P-256 or P-384. |
         | invalid_site_name | 400 | The site name is not a DNS label. |
         | invalid_token_ttl | 400 | The token lifetime is out of range. |
         | missing_grid_network | 400 | The token request names no grid. |
@@ -452,6 +478,9 @@ components:
         | timeout | 408 | The request ran past the server's limit. |
         | name_taken | 409 | Another enrollment holds the site name. |
         | reserved_site | 409 | The name is the enrollment bootstrap's. |
+        | token_outstanding | 409 | A live token already pins the site name. |
+        | name_deleted | 409 | The name's enrollment was deleted; mint with allowDeletedName. |
+        | key_reused | 409 | The signing request's key was enrolled before. |
         | internal | 500 | The service could not complete the request. |
         | rotation_disabled | 503 | Rotation is turned off for the grid. Issued certificates stay valid. |
       required: [error, message]
@@ -473,6 +502,9 @@ components:
             - timeout
             - name_taken
             - reserved_site
+            - token_outstanding
+            - name_deleted
+            - key_reused
             - internal
             - rotation_disabled
         message:

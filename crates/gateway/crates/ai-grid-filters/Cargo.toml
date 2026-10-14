@@ -14,8 +14,9 @@ praxis-tls = { version = "0.7.1", package = "praxis-proxy-tls" }
 grid-signals = { path = "../../../signals" }
 # The gateway wiring spawns the pollers and builds their mTLS scrapers, so the
 # poller and cert issuance are real dependencies, not just test ones.
-grid-signals-client = { path = "../../../signals-client", default-features = false, features = [
+grid-client = { path = "../../../client", default-features = false, features = [
   "fips",
+  "peer-scraper",
 ] }
 certs = { path = "../../../certs", default-features = false, features = ["verifier", "fips"] }
 serde.workspace = true

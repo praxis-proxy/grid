@@ -9,7 +9,7 @@ use openssl::{
     error::ErrorStack,
     hash::MessageDigest,
     nid::Nid,
-    pkey::{HasPublic, Id, PKey, PKeyRef, Private},
+    pkey::{HasPublic, Id, PKey, PKeyRef, Private, Public},
     pkey_ctx::PkeyCtx,
     x509::{
         X509, X509Builder, X509NameBuilder, X509Ref, X509Req,
@@ -273,17 +273,12 @@ pub(crate) fn issue_leaf(ca: &CaMaterial, spec: &CertSpec<'_>) -> Result<Generat
 
 /// Sign a request's public key under the spec, returning the cert and the key DER.
 pub(crate) fn sign_csr(ca: &CaMaterial, spec: &CertSpec<'_>, csr_pem: &str) -> Result<SignedCsr, BackendError> {
-    let req = X509Req::from_pem(csr_pem.as_bytes()).map_err(|_bad| BackendError::ParseCsr)?;
-    let request_key = req.public_key().map_err(|_bad| BackendError::ParseCsr)?;
-    // A verify error means an unusable key, so treat it as a bad request.
-    if !req.verify(&request_key).map_err(|_bad| BackendError::CsrBadSignature)? {
-        return Err(BackendError::CsrBadSignature);
-    }
+    let (request_key, public_key_der) = verified_request(csr_pem)?;
     // Only the request's public key is carried forward. Names come from `spec`.
     let cert = build_signed_cert(spec, &request_key, Some(&ca.cert), &ca.key)?;
     Ok(SignedCsr {
         cert_pem: to_pem(&cert)?,
-        public_key_der: request_key.public_key_to_der().map_err(|err| sign_err(&err))?,
+        public_key_der,
     })
 }
 
@@ -296,13 +291,25 @@ pub(crate) fn key_spki_der(key_pem: &str) -> Option<Vec<u8>> {
 
 /// Verify a request's self-signature and return its `SubjectPublicKeyInfo` DER.
 pub(crate) fn csr_spki_der(csr_pem: &str) -> Result<Vec<u8>, BackendError> {
-    let req = X509Req::from_pem(csr_pem.as_bytes()).map_err(|_bad| BackendError::ParseCsr)?;
+    verified_request(csr_pem).map(|(_key, der)| der)
+}
+
+/// A request's key, once allowed and its self-signature verified, and its
+/// `SubjectPublicKeyInfo` DER.
+fn verified_request(csr_pem: &str) -> Result<(PKey<Public>, Vec<u8>), BackendError> {
+    use x509_parser::{certification_request::X509CertificationRequest, prelude::FromDer as _};
+
+    let pem = pem::parse(csr_pem).map_err(|_bad| BackendError::ParseCsr)?;
+    let (_, csr) = X509CertificationRequest::from_der(pem.contents()).map_err(|_bad| BackendError::ParseCsr)?;
+    super::check_request_key(csr.certification_request_info.subject_pki.raw)?;
+    let req = X509Req::from_der(pem.contents()).map_err(|_bad| BackendError::ParseCsr)?;
     let request_key = req.public_key().map_err(|_bad| BackendError::ParseCsr)?;
+    let der = request_key.public_key_to_der().map_err(|err| sign_err(&err))?;
     // A verify error means an unusable key, so treat it as a bad request.
     if !req.verify(&request_key).map_err(|_bad| BackendError::CsrBadSignature)? {
         return Err(BackendError::CsrBadSignature);
     }
-    request_key.public_key_to_der().map_err(|err| sign_err(&err))
+    Ok((request_key, der))
 }
 
 /// Load CA material from a PEM key and cert, checking they correspond.
