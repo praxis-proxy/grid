@@ -1,5 +1,5 @@
 #!/bin/bash
-# Generate the Grid CRD manifests from the Rust types in operator/src/crd.
+# Generate the Grid CRD manifests from the Rust types in crates/operator/src/crd.
 #
 # Writes one YAML file per CRD to deploy/crds, its kustomization.yaml, and a
 # copy gated by crds.enabled to charts/grid-operator/templates/crds.

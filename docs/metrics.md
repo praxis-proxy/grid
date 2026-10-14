@@ -107,9 +107,16 @@ state, so two replicas agree only in steady state.
 |---|---|---|---|
 | `grid_route_decisions_total` | counter | `site`, `cluster`, `reason` | Requests the gateway decided, by outcome. A refusal records an empty site and cluster. |
 | `grid_route_selections_total` | counter | `path` | Decisions by the path that produced them. |
-| `grid_route_site_rho` | gauge | `site`, `cluster` | Saturation the gateway last read for the site, in-flight over its ceiling. |
+| `grid_route_site_rho` | gauge | `site`, `cluster` | Smoothed saturation used by the draw: the nearer of the reported and counted limits. |
+| `grid_route_site_rho_reported` | gauge | `site`, `cluster` | KV-cache mean plus spread, joined per scrape; `NaN` when absent. |
+| `grid_route_site_rho_counted` | gauge | `site`, `cluster` | In-flight over the learned ceiling; `NaN` until a hard bound makes it a reading. |
 | `grid_route_site_weight` | gauge | `site`, `cluster` | Capacity the draw weights the site by. |
-| `grid_route_site_ceiling` | gauge | `site`, `cluster` | Ceiling the gateway has learned for the site. |
+| `grid_route_site_ceiling` | gauge | `site`, `cluster` | Lesser of the learned soft and hard bounds, never below the floor. |
+| `grid_route_site_ceiling_soft` | gauge | `site`, `cluster` | Most requests the current site size carried with nothing waiting; `NaN` until observed. |
+| `grid_route_site_ceiling_hard` | gauge | `site`, `cluster` | Fewest requests held at a demonstrated limit; `NaN` until observed. |
+| `grid_route_site_in_flight` | gauge | `site`, `cluster` | Requests held in the reading used by the decision. |
+| `grid_route_site_full` | gauge | `site`, `cluster` | 1 after a backlog at the ceiling spans `full_after_ms`, 0 otherwise, `NaN` without a queue signal. |
+| `grid_route_site_reading_age_seconds` | gauge | `site`, `cluster` | Age of the newest sample used by the decision. |
 | `grid_route_site_score` | gauge | `site`, `cluster` | Score the site ranks by in the current snapshot. |
 | `grid_route_shedding` | gauge | `model` | 1 while the gateway sheds this model, 0 otherwise. |
 | `grid_route_prefix_affinity_total` | counter | `outcome` | Prefix-affinity decisions by outcome. |

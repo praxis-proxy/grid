@@ -16,8 +16,10 @@ for AI inference routing and agentic networking
 across clusters, cloud providers, and third-party
 APIs. The AGN Operator (`grid-operator`) orchestrates mesh formation,
 trust, capability discovery, and routing - while
-Praxis AI (from `../ai/`) handles all data-plane
-traffic as the gateway.
+Praxis gateways handle the data plane. The
+`praxis-gateway` chart uses the separately released
+Praxis AI image; `crates/gateway/` contains the project-owned
+`grid-gateway` operand in a separate Cargo workspace.
 
 ## Architecture
 
@@ -60,7 +62,7 @@ make build          # workspace build
 make check          # type-check only (fast)
 make test           # workspace tests (ignored tests excluded)
 make test V=1       # tests with --nocapture
-make fmt            # format with nightly rustfmt
+make fmt            # format root + Gateway workspaces
 make lint           # root + Gateway clippy, fmt, machete
                     #   + Gateway no-ring dependency check
 make lint-extra     # typos + taplo + shellcheck
@@ -68,9 +70,10 @@ make lint-extra     # typos + taplo + shellcheck
 make doc            # rustdoc -D warnings, private
 make audit          # cargo audit + cargo deny check
 make generate-crds  # regenerate CRD manifests from
-                    #   operator/src/crd
+                    #   crates/operator/src/crd
 make crds-check     # fail if CRD manifests are stale
-make all            # build + fmt + lint + test + audit
+make all            # build + fmt + lint + doc
+                    #   + test + audit
 ```
 
 Single-test and single-crate commands:
@@ -95,14 +98,25 @@ cargo xtask env status   # health of all components
 | Crate | Purpose |
 |-------|---------|
 | `operator` | K8s controllers, CRDs, operator binary |
-| `overlay-sync` | K8s API-watch sidecar for overlay delivery |
+| `grid-overlay-sync` | K8s API-watch sidecar for overlay delivery |
 | `swim` | foca wrapper, SWIM runtime, encryption |
 | `crdt` | Delta CRDT types (LWW, OR-Set, G-Counter) |
 | `scoring` | Scoring engine, backend types, grid state |
 | `certs` | Certificate generation and provider trait |
+| `enrollment` | Site enrollment service and API types |
+| `grid-signals` | Shared load-signal store, Prometheus parser, and labels |
+| `grid-signals-client` | mTLS poller for operator site signals |
 | `mock-providers` | Mock OpenAI, Anthropic, Bedrock, Vertex APIs |
 | `xtask` | Dev task runner for test environments |
+| `version` | Shared build identity for binaries and container provenance |
 | `fleet-dashboard` | Opt-in hub web UI: fleet map and per-site health from each site's Prometheus (Axum + React) |
+
+The separate `crates/gateway/` workspace contains `gateway`
+(the `grid-gateway` binary) and `ai-grid-filters`. Root
+Cargo workspace commands do not include it. See
+[the verification matrix](docs/development.md#verification)
+for local and CI scopes; coverage currently gates root
+line coverage at 80% with documented exclusions.
 
 ### scoring
 

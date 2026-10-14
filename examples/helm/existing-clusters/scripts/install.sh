@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-# ── Argument parsing ─────────────────────────────────────────────────
+# Argument parsing
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <inventory.yaml> [--site-values SITE:ROLE:PATH ...]" >&2
@@ -60,7 +60,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ── Inventory and topology ───────────────────────────────────────────
+# Inventory and topology
 
 TOPOLOGY=$(yq eval '.topology' "$INVENTORY")
 CHART_DIR="$(cd "$(dirname "$0")/../../../.." && pwd)/charts"
@@ -80,7 +80,7 @@ fi
 
 SITE_NAMES=$(yq eval '.sites | keys | .[]' "$INVENTORY")
 
-# ── Validate overrides before any cluster changes ────────────────────
+# Validate overrides before any cluster changes
 
 VALID_ROLES="operator site mock consumer provider provider-config consumer-config"
 
@@ -126,7 +126,7 @@ for OV_KEY in "${!SITE_OVERRIDES[@]+"${!SITE_OVERRIDES[@]}"}"; do
   fi
 done
 
-# ── Image overrides from inventory ───────────────────────────────────
+# Image overrides from inventory
 
 IMAGE_SETS=()
 OP_REPO=$(yq eval '.images.operator.repository // ""' "$INVENTORY")
@@ -140,7 +140,7 @@ GW_SETS=()
 [[ -n "$GW_REPO" ]] && GW_SETS+=(--set "image.repository=$GW_REPO")
 [[ -n "$GW_TAG" ]]  && GW_SETS+=(--set "image.tag=$GW_TAG")
 
-# ── Helper: resolve override for a site:role ─────────────────────────
+# Helper: resolve override for a site:role
 
 get_override_args() {
   local site="$1" role="$2"
@@ -154,7 +154,7 @@ get_override_args() {
   fi
 }
 
-# ── Helper: wait for overlay ConfigMap ───────────────────────────────
+# Helper: wait for overlay ConfigMap
 
 wait_for_overlay() {
   local context="$1" timeout="${2:-120}"
@@ -170,11 +170,11 @@ wait_for_overlay() {
     sleep 5
     elapsed=$((elapsed + 5))
   done
-  echo "  WARN: overlay ConfigMap not found after ${timeout}s — consumer gateway may fail to start" >&2
+  echo "  WARN: overlay ConfigMap not found after ${timeout}s; consumer gateway may fail to start" >&2
   return 0
 }
 
-# ── Helper: render provider config using overlay stable IDs ─────────
+# Helper: render provider config using overlay stable IDs
 
 render_provider_config() {
   local context="$1" template="$2"
@@ -215,7 +215,7 @@ for c in data.get('candidates', []):
   echo "$rendered"
 }
 
-# ── Run preflight ────────────────────────────────────────────────────
+# Run preflight
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PREFLIGHT="${SCRIPT_DIR}/preflight.sh"
@@ -227,7 +227,7 @@ echo "Running preflight checks..."
 bash "$PREFLIGHT" "$INVENTORY"
 echo ""
 
-# ── Install ──────────────────────────────────────────────────────────
+# Install
 
 echo "Installing Grid components"
 echo "  Topology: $TOPOLOGY"
@@ -259,7 +259,7 @@ for SITE in $SITE_NAMES; do
     fi
   done
 
-  # ── Operator ────────────────────────────────────────────────────
+  # Operator
 
   OPERATOR_VALUES="${VALUES_DIR}/${SITE}-operator.yaml"
   if [[ -f "$OPERATOR_VALUES" ]]; then
@@ -285,8 +285,8 @@ for SITE in $SITE_NAMES; do
     echo "  WARN: no operator values at $OPERATOR_VALUES, skipping" >&2
   fi
 
-  # ── Mock inference providers (before grid-site so backends are ──
-  # ── healthy when InferenceProvider CRs trigger health checks)  ──
+  # Mock inference providers (before grid-site so backends are
+  # healthy when InferenceProvider CRs trigger health checks)
 
   MOCK_VALUES="${VALUES_DIR}/${SITE}-grid-mock-providers.yaml"
   if [[ -f "$MOCK_VALUES" ]]; then
@@ -305,7 +305,7 @@ for SITE in $SITE_NAMES; do
       --wait --timeout 120s
   fi
 
-  # ── Site topology CRs ────────────────────────────────────────────
+  # Site topology CRs
 
   SITE_VALUES="${VALUES_DIR}/${SITE}-grid-site.yaml"
   if [[ -f "$SITE_VALUES" ]]; then
@@ -324,7 +324,7 @@ for SITE in $SITE_NAMES; do
       --wait --timeout 120s
   fi
 
-  # ── Gateways ────────────────────────────────────────────────────
+  # Gateways
 
   if [[ "$TOPOLOGY" == "dedicated-edge" ]]; then
     GATEWAY_VALUES="${VALUES_DIR}/${SITE}-gateway.yaml"
@@ -365,7 +365,7 @@ for SITE in $SITE_NAMES; do
 
     wait_for_overlay "$CONTEXT" 120
 
-    # ── Render provider Praxis config from overlay ──────────────
+    # Render provider Praxis config from overlay
     PROVIDER_CONFIG=""
     if [[ -v "SITE_OVERRIDES[${SITE}:provider-config]" ]]; then
       PROVIDER_CONFIG="${SITE_OVERRIDES[${SITE}:provider-config]}"
@@ -384,7 +384,7 @@ for SITE in $SITE_NAMES; do
         --dry-run=client -o yaml | kubectl --context "$CONTEXT" apply -f -
     fi
 
-    # ── Create consumer Praxis config ConfigMap ─────────────────
+    # Create consumer Praxis config ConfigMap
     CONSUMER_CONFIG=""
     if [[ -v "SITE_OVERRIDES[${SITE}:consumer-config]" ]]; then
       CONSUMER_CONFIG="${SITE_OVERRIDES[${SITE}:consumer-config]}"
@@ -399,7 +399,7 @@ for SITE in $SITE_NAMES; do
         --dry-run=client -o yaml | kubectl --context "$CONTEXT" apply -f -
     fi
 
-    # ── Provider gateway ────────────────────────────────────────
+    # Provider gateway
     PROVIDER_VALUES="${VALUES_DIR}/${SITE}-provider-gateway.yaml"
     if [[ -f "$PROVIDER_VALUES" ]]; then
       PROVIDER_OV=()
@@ -418,7 +418,7 @@ for SITE in $SITE_NAMES; do
         --wait --timeout 120s
     fi
 
-    # ── Consumer gateway ────────────────────────────────────────
+    # Consumer gateway
     CONSUMER_VALUES="${VALUES_DIR}/${SITE}-consumer-gateway.yaml"
     if [[ -f "$CONSUMER_VALUES" ]]; then
       CONSUMER_OV=()

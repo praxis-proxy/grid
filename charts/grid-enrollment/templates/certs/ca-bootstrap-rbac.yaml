@@ -6,6 +6,13 @@ RBAC for the bootstrap Job: it reads and writes the CA, bundle, serving, DB
 serving, and generated credentials Secrets in this namespace only. get+create
 cover generate-if-absent; update covers ca.forceRegenerate (replace-in-place, no
 absent window).
+
+Both the Job and these objects use `before-hook-creation` only. Helm 3.19 and
+later delete earlier successful hooks marked `hook-succeeded` when a later hook
+fails, so retaining them requires that policy. The Job's TTL removes it only
+when `ca.bootstrap.ttlSecondsAfterFinished` is configured; setting that value to
+null omits the TTL. These RBAC objects have no TTL and remain until the next
+hook run or manual cleanup.
 */}}
 apiVersion: v1
 kind: ServiceAccount
@@ -17,7 +24,8 @@ metadata:
   annotations:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-10"
-    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed
+    helm.sh/hook-delete-policy: before-hook-creation
+automountServiceAccountToken: false
 {{- with .Values.imagePullSecrets }}
 imagePullSecrets:
   {{- toYaml . | nindent 2 }}
@@ -33,7 +41,7 @@ metadata:
   annotations:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-10"
-    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed
+    helm.sh/hook-delete-policy: before-hook-creation
 rules:
   # create cannot be resourceName-scoped (the object does not exist yet).
   - apiGroups: [""]
@@ -109,7 +117,7 @@ metadata:
   annotations:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-10"
-    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed
+    helm.sh/hook-delete-policy: before-hook-creation
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -121,8 +129,9 @@ subjects:
 {{- with .Values.hubSite.name }}
 {{- $name := printf "%s-hub-site" (include "grid-enrollment.bootstrapServiceAccountName" $) }}
 ---
-{{- /* The hub identity lands in the operator namespace. create cannot be name-scoped, so for the hook's
-lifetime this SA can create any Secret there; it already holds the CA key, so that adds little. */}}
+{{- /* The hub identity is stored in the operator namespace. Kubernetes cannot limit Secret creation to one name,
+so this ServiceAccount can create any Secret there until the next hook run or manual cleanup. It already has the CA
+key, so this extra permission adds little additional risk. */}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -133,7 +142,7 @@ metadata:
   annotations:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-10"
-    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed
+    helm.sh/hook-delete-policy: before-hook-creation
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
@@ -169,7 +178,7 @@ metadata:
   annotations:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-10"
-    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded,hook-failed
+    helm.sh/hook-delete-policy: before-hook-creation
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role

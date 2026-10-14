@@ -4,6 +4,56 @@ templates:
   - templates/certs/ca-bootstrap-rbac.yaml
   - templates/enrollment/auth-rbac.yaml
 tests:
+  - it: keeps bootstrap RBAC until the next hook run
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    documentSelector:
+      path: kind
+      value: ServiceAccount
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook-delete-policy"]
+          value: before-hook-creation
+      - equal:
+          path: automountServiceAccountToken
+          value: false
+  - it: keeps the bootstrap Role until the next hook run
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    documentSelector:
+      path: kind
+      value: Role
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook-delete-policy"]
+          value: before-hook-creation
+  - it: keeps the bootstrap RoleBinding until the next hook run
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    documentSelector:
+      path: kind
+      value: RoleBinding
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook-delete-policy"]
+          value: before-hook-creation
+
+  - it: keeps the hub-site Role until the next hook run
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    set:
+      hubSite.name: hub
+    documentIndex: 3
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook-delete-policy"]
+          value: before-hook-creation
+  - it: keeps the hub-site RoleBinding until the next hook run
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    set:
+      hubSite.name: hub
+    documentIndex: 4
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook-delete-policy"]
+          value: before-hook-creation
+
   - it: names one Job across upgrades, so runs do not pile up
     template: templates/certs/ca-bootstrap-job.yaml
     release:
@@ -40,6 +90,9 @@ tests:
       - equal:
           path: spec.template.spec.containers[0].command
           value: ["enrollment", "bootstrap"]
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: true
 
   - it: passes the CA, serving, and DB cert secrets but no gossip flag
     template: templates/certs/ca-bootstrap-job.yaml
