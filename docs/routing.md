@@ -621,14 +621,18 @@ measured request distribution
 
 # 7b. Measured site availability
 
-The gateway learns each site's ceiling, the most in-flight it has held with nothing waiting,
-reads saturation as in-flight over that ceiling, and picks among the sites with room by it: two
-choices by ceiling taking the lower saturation at three or more, a weighted pick between two.
+The gateway learns a soft capacity bound from the most in-flight a site has held with nothing
+waiting and a hard bound from the least it held at a demonstrated limit. A request count is read
+against the lesser bound, never below the floor. Saturation is the nearer of that counted limit
+and the site's reported KV-cache fullness (mean plus spread across pods), smoothed per new sample.
+Among sites with room, three or more use two choices by capacity taking the lower saturation;
+two use a weighted pick.
 With shedding on, a model whose every site has been at its ceiling with work waiting for
 `full_after_ms` answers 429 with Retry-After until one site has room. Every input is a raw series the
-site's operator relays from its EPP: running and waiting per endpoint, ready endpoints, and what
-flow control holds. The gateway concludes in-flight from those itself and counts nothing of its
-own. The operator's `grid_provider_*` conclusions are its Prometheus metrics, not gateway inputs.
+site's operator relays from its EPP: running and waiting per endpoint, ready endpoints, KV-cache
+mean and spread, and what flow control holds. The gateway concludes in-flight from those itself
+and counts nothing of its own. The operator's `grid_provider_*` conclusions are its Prometheus
+metrics, not gateway inputs.
 
 Nothing needs setting. Every field below has a default, and the one switch is `shedding`.
 The fields live in the `availability` block of the `grid_site_route` filter in the gateway's
@@ -638,15 +642,17 @@ praxis config, rendered from the chart's `gridServing.siteRoute.availability`, a
 | key | default | what it does |
 |---|---|---|
 | `smoothing` | 0.3 | How far one new sample moves saturation toward the new reading. |
-| `ceiling_floor` | 8 | The least a ceiling can be, so a quiet site does not read as full. A ceiling only rises; nothing brings it down. |
+| `ceiling_floor` | 8 | The least denominator a request count is read against, so a quiet or newly restarted site does not read as full from its count alone. |
 | `explore_floor` | 0.25 | The least share of the largest ceiling a measured site weighs, so an unproven site can prove more. |
-| `full_after_ms` | 5000 | How long a site stays at its ceiling with work waiting before it counts as full, the same for a site polled every 500 ms and one polled every 5 s. |
+| `full_after_ms` | 5000 | How long backlogged samples must span before a site counts as full. Together with a small safety floor, it also gates learning a hard bound from a cool-cache, slot-limited backlog. |
 | `room_after_ms` | 2000 | How long no sample may show a site at its ceiling with work waiting before a shedding model routes again. |
-| `queue_full` | 1.0 | Queued work per serving unit at which a site counts as full. Teaching stops on any whole request waiting, whatever this is set to. |
+| `queue_full` | 1.0 | Queued work per serving unit that makes a sample backlogged for fullness and hard-bound learning. Any whole request waiting stops that sample from raising the soft bound, whatever this is set to. |
 | `shedding` | false | Whether a full model answers 429. On only where every client retries on 429 and every provider publishes a queue. Keep it off where the EPP's flow control is on: two layers refusing on their own signals shed twice for one overload, and the grid's 429 would arrive while the EPP is still holding the request. |
 
-Tune one metric against one truth: `grid_route_site_ceiling` should settle near the engine's
-running plateau (far below means the site was queued whenever it ran high, raise
+Tune one metric against one truth: `grid_route_site_ceiling_soft` should track the largest
+queue-free load and `grid_route_site_ceiling_hard` the smallest demonstrated limit; their
+lesser, `grid_route_site_ceiling`, should settle near the engine's running plateau (far below
+means the site was queued whenever it ran high, raise
 `explore_floor`); `grid_route_site_rho` should reach 1.0 as the engine queue forms and fall as
 it drains (swinging, lower `smoothing`; lagging, raise it); `grid_route_selections_total{path}`
 should be mostly `two_choices` (much `by_capacity` means the grid is full or `ceiling_floor` is

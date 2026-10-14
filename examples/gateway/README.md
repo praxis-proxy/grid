@@ -12,18 +12,19 @@ the health checks selection demotes on. A user sets it through the chart's
 the block may be empty. The example sets the one switch, `shedding`. A change is a chart value
 and a rollout.
 
-`availability` governs how a site's availability is measured from its in-flight count and
-what the gateway does with it. The fields other than `shedding` are for a symptom in
+`availability` governs how a site's availability is measured from its in-flight count, learned
+soft and hard capacity bounds, and provider-reported KV-cache fullness. The fields other than
+`shedding` are for a symptom in
 `docs/site-selection.md`, not for a first deployment.
 
 | Field | Default | Meaning |
 |---|---|---|
 | `smoothing` | 0.3 | How far one new sample moves a site's saturation toward the new reading. |
-| `ceiling_floor` | 8 | The least a ceiling can be, so a quiet site does not read as full. A ceiling only rises; nothing brings it down. |
+| `ceiling_floor` | 8 | The least denominator a request count is read against, so a quiet or newly restarted site does not read as full from its count alone. |
 | `explore_floor` | 0.25 | A measured site's weight is at least this share of the largest ceiling. |
-| `full_after_ms` | 5000 | How long a site must stay at its ceiling with work waiting before it counts as full. |
+| `full_after_ms` | 5000 | How long backlogged samples must span before a site counts as full; it also gates a cool-cache backlog teaching the hard bound. |
 | `room_after_ms` | 2000 | How long no sample may show a site at its ceiling with work waiting before a shedding model routes again. |
-| `queue_full` | 1.0 | Queued work per serving unit at which a site counts as full. Teaching stops on any whole request waiting. |
+| `queue_full` | 1.0 | Queued work per serving unit that makes a sample backlogged for fullness and hard-bound learning. Any whole request waiting stops soft-bound teaching. |
 | `shedding` | false | Whether a model whose every site is full answers 429 with Retry-After. Keep it off where the EPP's flow control is on: two layers refusing on their own signals shed twice for one overload, and the grid's 429 would arrive while the EPP is still holding the request. |
 
 `prefix_affinity` governs how strongly a conversation keeps to the site holding its prompt.
@@ -37,8 +38,9 @@ what the gateway does with it. The fields other than `shedding` are for a sympto
 | `queued_request_seconds` | 2.0 | Seconds one queued request adds to a wait, turning that price into queue depth. |
 | `tag_key_path` | none | A file holding the key that authenticates stored-state tags. |
 
-Tuning order, one metric against one truth per step: `grid_route_site_ceiling` against the
-engine's running plateau, `grid_route_site_rho` against the engine queue,
+Tuning order, one metric against one truth per step: the soft and hard ceiling gauges against
+queue-free load and demonstrated limits, `grid_route_site_rho` against the engine queue and KV
+cache,
 `grid_route_selections_total{path}` mostly `two_choices`, and with shedding on
 `grid_route_shedding{model}` against the 429 rate. `docs/routing.md` section 7b has the
 procedure and what to move at each step.
