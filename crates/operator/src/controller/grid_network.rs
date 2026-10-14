@@ -5130,8 +5130,6 @@ async fn update_status(
 ) -> Result<(), OperatorError> {
     let name = grid_network_name(network)?;
 
-    let connected_sites = membership.map_or(0, MembershipSnapshot::connected_count);
-
     let api: Api<GridNetwork> = Api::all(client.clone());
     let status = GridNetworkStatus {
         // Signal publishers own this evidence under separate field managers. Left
@@ -5139,7 +5137,7 @@ async fn update_status(
         conditions: Vec::new(),
         gateway_age_reports: Vec::new(),
         gateway_age_report_overflow: false,
-        connected_sites,
+        connected_sites: membership.map_or(0, MembershipSnapshot::connected_count),
         distributed_provider_count,
         grid_id: grid_id.to_owned(),
         observed_generation: network.metadata.generation.unwrap_or(0),
