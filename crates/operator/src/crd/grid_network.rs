@@ -10,7 +10,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::inference_provider::Condition;
+use crate::crd::inference_provider::Condition;
 
 // ---------------------------------------------------------------------------
 // Routing policy
@@ -1294,7 +1294,7 @@ pub struct SecretRef {
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GridNetworkStatus {
-    /// Independently published signal-age diagnostic conditions.
+    /// Observed conditions of the `GridNetwork`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["type"]))]
     pub conditions: Vec<Condition>,

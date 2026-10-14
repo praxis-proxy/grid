@@ -265,6 +265,7 @@ fn sample(metric: &str, value: f64) -> Observation {
         labels: BTreeMap::new(),
         value,
         timestamp_ms: None,
+        age: Duration::ZERO,
     }
 }
 
@@ -295,6 +296,7 @@ mod tests {
             labels: labels.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
             value,
             timestamp_ms: None,
+            age: Duration::ZERO,
         }
     }
 

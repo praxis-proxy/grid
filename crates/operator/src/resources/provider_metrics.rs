@@ -239,6 +239,7 @@ fn in_flight_observation(
         labels: std::collections::BTreeMap::new(),
         value,
         timestamp_ms: None,
+        age: Duration::ZERO,
     })
 }
 

@@ -644,6 +644,7 @@ fn readiness_entry<'provider>(
         labels: BTreeMap::new(),
         value: count,
         timestamp_ms: None,
+        age: Duration::ZERO,
     });
     // A fresh scrape republishes with the verdict. Without one, the last published
     // entry ages on its own, unless the verdict turned not ready.
@@ -681,6 +682,7 @@ fn ready_sample(verdict: &readiness::Verdict) -> signals::Observation {
         labels: BTreeMap::new(),
         value: if verdict.reason.excludes() { 0.0 } else { 1.0 },
         timestamp_ms: None,
+        age: Duration::ZERO,
     }
 }
 
@@ -5128,12 +5130,16 @@ async fn update_status(
 ) -> Result<(), OperatorError> {
     let name = grid_network_name(network)?;
 
+    let connected_sites = membership.map_or(0, MembershipSnapshot::connected_count);
+
     let api: Api<GridNetwork> = Api::all(client.clone());
     let status = GridNetworkStatus {
+        // Signal publishers own this evidence under separate field managers. Left
+        // empty, it is not serialized, so this apply never claims or clears it.
         conditions: Vec::new(),
         gateway_age_reports: Vec::new(),
         gateway_age_report_overflow: false,
-        connected_sites: membership.map_or(0, MembershipSnapshot::connected_count),
+        connected_sites,
         distributed_provider_count,
         grid_id: grid_id.to_owned(),
         observed_generation: network.metadata.generation.unwrap_or(0),
@@ -5239,7 +5245,8 @@ fn identity_status(cert_pem: &str, now: time::OffsetDateTime, renews: bool) -> O
     })
 }
 
-/// Return whether the status subresource differs from the desired status.
+/// Return whether reconciliation-owned status differs from the desired status.
+/// Ignore conditions and gateway evidence managed by the signal publishers.
 fn grid_network_status_needs_update(current: Option<&GridNetworkStatus>, desired: &GridNetworkStatus) -> bool {
     current.is_none_or(|current| {
         *desired
@@ -6283,6 +6290,7 @@ mod tests {
             labels: BTreeMap::new(),
             value,
             timestamp_ms: None,
+            age: Duration::ZERO,
         };
         assert!(
             matches!(
@@ -7895,8 +7903,9 @@ mod tests {
         let baseline = GridNetworkStatus::default();
         let mut independently_owned = baseline.clone();
         independently_owned.conditions = vec![crate::crd::inference_provider::Condition {
-            type_: "PeerAgesRejected".to_owned(),
-            status: "True".to_owned(),
+            type_: crate::peer_ages::PEER_TIME_VALID.to_owned(),
+            status: "False".to_owned(),
+            reason: "TimestampOutOfRange".to_owned(),
             ..Default::default()
         }];
         independently_owned.gateway_age_report_overflow = true;
@@ -7921,6 +7930,31 @@ mod tests {
             "normal reconciliation never claims separately managed status"
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_condition_alone_never_calls_for_a_status_write() {
+        let baseline = GridNetworkStatus {
+            grid_id: "grid-id".to_owned(),
+            phase: GridNetworkPhase::Active,
+            ..GridNetworkStatus::default()
+        };
+        let with_condition = GridNetworkStatus {
+            conditions: vec![crate::crd::inference_provider::Condition {
+                type_: crate::peer_ages::PEER_TIME_VALID.to_owned(),
+                status: "True".to_owned(),
+                ..crate::crd::inference_provider::Condition::default()
+            }],
+            ..baseline.clone()
+        };
+        assert!(
+            !grid_network_status_needs_update(Some(&with_condition), &baseline),
+            "a condition the peer poller wrote is no reason to write status, or reconcile would fight it"
+        );
+        assert!(
+            serde_json::to_value(&baseline).is_ok_and(|value| value.get("conditions").is_none()),
+            "empty conditions are left out of the reconcile's apply, so it never claims the field"
+        );
     }
 
     #[test]

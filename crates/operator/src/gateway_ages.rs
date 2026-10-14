@@ -597,8 +597,16 @@ mod tests {
             "same-epoch clean evidence clears the rejection"
         );
         assert_eq!(
-            network["status"]["conditions"][0]["type"], "PeerAgesRejected",
+            network["status"]["conditions"][0]["type"], "PeerTimeValid",
             "gateway feedback preserves independent peer diagnostics"
+        );
+        assert_eq!(
+            network["status"]["conditions"][0]["status"], "False",
+            "gateway recovery preserves the peer timestamp rejection"
+        );
+        assert_eq!(
+            network["status"]["conditions"][0]["reason"], "TimestampOutOfRange",
+            "gateway recovery preserves the independent peer reason"
         );
         assert_eq!(
             network["status"]["phase"], "Active",
@@ -801,7 +809,7 @@ mod tests {
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
         let mut fixture = serde_json::to_value(network()).expect("network");
-        fixture["status"] = serde_json::json!({"phase":"Active","conditions":[{"type":"PeerAgesRejected","status":"True","reason":"Peer","message":"peer","lastTransitionTime":"2026-10-12T00:00:00Z"}]});
+        fixture["status"] = serde_json::json!({"phase":"Active","conditions":[{"type":"PeerTimeValid","status":"False","reason":"TimestampOutOfRange","message":"peer","lastTransitionTime":"2026-10-12T00:00:00Z"}]});
         let stored = Arc::new(Mutex::new(fixture));
         let patches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let service = tower::service_fn({

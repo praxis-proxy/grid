@@ -931,7 +931,7 @@ spec:
                     type: object
                   type: array
                 conditions:
-                  description: Independently published signal-age diagnostic conditions.
+                  description: Observed conditions of the `GridNetwork`.
                   items:
                     description: One observed condition, shaped like `metav1.Condition`.
                     properties:

@@ -60,7 +60,7 @@ use futures::StreamExt as _;
 use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use kube::{
     Api, Client,
-    api::{ObjectMeta, PostParams},
+    api::{ObjectMeta, Patch, PatchParams, PostParams},
     runtime::{controller::Controller, watcher},
 };
 use operator::{
@@ -2168,19 +2168,21 @@ async fn signals_handler(
 
     // Local, the site's own data plane, gets the whole grid view unscoped.
     // Access policy bounds peer reads, not the site reading itself.
+    let now = operator::signals::ClockReading::now();
     let (body, oldest) = match &caller {
         Caller::Local => {
             // One body under the gateway's read ceiling: the site first, so a
             // flood of relayed rows can only cost the last peers, never this site.
             let site = published
                 .site
-                .render_bounded(target, &collect, operator::signals::MAX_RELAY_BYTES);
+                .render_bounded(target, &collect, operator::signals::MAX_RELAY_BYTES, now);
             // Peers relay only to Local, and the peers store carries no access map.
             // A Peer(Some) relay would need per-target scoping added here.
             let peers = published.peers.render_bounded(
                 target,
                 &collect,
                 operator::signals::MAX_RELAY_BYTES.saturating_sub(site.body.len()),
+                now,
             );
             operator::metrics::record_relay_truncated("site", &site);
             operator::metrics::record_relay_truncated("peers", &peers);
@@ -2188,10 +2190,10 @@ async fn signals_handler(
             body.push_str(&peers.body);
             (body, site.oldest.max(peers.oldest))
         },
-        Caller::Peer(Some(labels)) => published.site.render(target, &collect, Some(labels)),
+        Caller::Peer(Some(labels)) => published.site.render(target, &collect, Some(labels), now),
         Caller::Peer(None) => return refused(),
     };
-    served(body, oldest)
+    served(body, oldest, now.wall)
 }
 
 /// Refuse a caller this site will not serve.
@@ -2208,12 +2210,19 @@ fn refused() -> axum::response::Response {
         .into_response()
 }
 
-/// One exposition response, with `Age` bounding the whole body.
-fn served(body: String, oldest: std::time::Duration) -> axum::response::Response {
+/// One exposition response, with `Age` bounding the whole body and `Date` the
+/// wall reading its stamps were written from.
+///
+/// A reader takes each row's age as `Date` minus its stamp. hyper's own `Date` is
+/// cached and, after a backward clock step, stays frozen for about the size of
+/// the step, which would age every row by that much; an explicit `Date` wins over
+/// it.
+fn served(body: String, oldest: std::time::Duration, wall: SystemTime) -> axum::response::Response {
     (
         [
             (http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"),
             (http::header::AGE, &*oldest.as_secs().to_string()),
+            (http::header::DATE, &*httpdate::fmt_http_date(wall)),
         ],
         body,
     )
@@ -2445,6 +2454,7 @@ async fn run_peer_poller(
         client,
         settings,
         shutdown,
+        ages: operator::peer_ages::PeerAges::default(),
     }
     .run()
     .await;
@@ -2463,17 +2473,19 @@ struct PeerPoller {
     settings: operator::cli::SignalsArgs,
     /// Lets an in-flight round stand down when the process is stopping.
     shutdown: operator::shutdown::Shutdown,
+    /// Peers whose relayed ages the last rounds rejected, for the `GridNetwork` condition.
+    ages: operator::peer_ages::PeerAges,
 }
 
 impl PeerPoller {
     /// Rebuild and poll until shutdown.
-    async fn run(&self) {
+    async fn run(mut self) {
         while !self.shutdown.is_triggered() && self.cycle().await {}
         tracing::info!("peer signals poller stopped");
     }
 
     /// One build-and-poll cycle; `false` means shutdown arrived while idle.
-    async fn cycle(&self) -> bool {
+    async fn cycle(&mut self) -> bool {
         let own = Box::pin(sole_own_leaf(&self.client)).await;
         let Some(source) = Box::pin(peer_source(
             &self.client,
@@ -2507,7 +2519,7 @@ impl PeerPoller {
 
     /// Poll every interval until this site's material changes, or shutdown.
     async fn poll_until_changed(
-        &self,
+        &mut self,
         source: &operator::signals::PollPeers,
         changed: impl Future<Output = ()> + Send,
     ) {
@@ -2528,27 +2540,103 @@ impl PeerPoller {
         }
     }
 
-    /// Collect from every alive peer and replace what is published for them.
-    async fn poll_once(&self, source: &operator::signals::PollPeers) {
-        let targets = poll_targets(
+    /// Collect from every alive peer, replace what is published for them, and say
+    /// on the `GridNetwork` whose relayed ages are being rejected.
+    async fn poll_once(&mut self, source: &operator::signals::PollPeers) {
+        let membership_ready = self.ctx.membership_hold().is_none();
+        let Some(sites) = poll_targets(
             &self.swim.snapshot(),
             &self.ctx.peer_identities(),
             source.trust,
             self.swim.is_encrypted(),
             self.swim.site_name(),
             self.settings.peer_port,
-        );
-        let Some(sites) = targets.filter(|sites| !sites.is_empty()) else {
+        ) else {
             return;
         };
         // Each peer lands as it answers, so one slow peer cannot age out the rest.
         let peers = self.ctx.peers();
         let ttl = self.settings.peer_ttl();
+        let mut answered = BTreeMap::new();
         source
-            .collect_each(&sites, |peer, observations| {
+            .collect_each(&sites, |peer, observations, rejected| {
+                answered.insert(peer.clone(), rejected);
                 peers.refresh(BTreeMap::from([(peer, observations)]), ttl);
             })
             .await;
+        // A round stood down by shutdown learned nothing, and writing would hold termination open.
+        if self.shutdown.is_triggered() {
+            return;
+        }
+        let polled: Vec<String> = sites.into_iter().map(|site| site.name).collect();
+        if observe_peer_ages(membership_ready, &mut self.ages, &polled, &answered) {
+            Box::pin(write_peer_ages(&self.client, &self.ages, &self.shutdown)).await;
+        }
+    }
+}
+
+/// Observe a round only if membership converged before its target snapshot, so
+/// convergence during collection cannot make an old startup snapshot erase evidence.
+fn observe_peer_ages(
+    membership_ready: bool,
+    ages: &mut operator::peer_ages::PeerAges,
+    polled: &[String],
+    answered: &BTreeMap<String, usize>,
+) -> bool {
+    if !membership_ready {
+        return false;
+    }
+    ages.observe(polled, answered);
+    true
+}
+
+/// Write the `PeerTimeValid` condition on the sole `GridNetwork` when it changed.
+///
+/// Compared against the live status every round, so a restart, a recreated
+/// `GridNetwork` or an edited status is set right on the next round, and nothing
+/// is written while the condition already says this.
+async fn write_peer_ages(
+    client: &Client,
+    ages: &operator::peer_ages::PeerAges,
+    shutdown: &operator::shutdown::Shutdown,
+) {
+    tokio::select! {
+        biased;
+        () = shutdown.triggered() => {},
+        result = tokio::time::timeout(PEER_AGES_WRITE_TIMEOUT, Box::pin(apply_peer_ages(client, ages))) => {
+            if result.is_err() {
+                tracing::warn!("peer ages condition write timed out; retrying next round");
+            }
+        },
+    }
+}
+
+/// Total lookup-and-patch budget, so diagnostic publication cannot hold peer
+/// freshness behind a slow Kubernetes API.
+const PEER_AGES_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Look up the live network and apply its peer-age condition when changed.
+async fn apply_peer_ages(client: &Client, ages: &operator::peer_ages::PeerAges) {
+    let Some(network) = Box::pin(sole_network(client)).await else {
+        return;
+    };
+    let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
+        return;
+    };
+    let Some((name, patch)) = operator::peer_ages::patch(&network, ages, &now) else {
+        return;
+    };
+    let api: Api<GridNetwork> = Api::all(client.clone());
+    let params = PatchParams::apply(operator::peer_ages::FIELD_MANAGER).force();
+    match Box::pin(api.patch_status(name, &params, &Patch::Apply(patch))).await {
+        Ok(_) if ages.rejecting().is_empty() => {
+            tracing::info!("relayed signal ages accepted from every polled peer");
+        },
+        Ok(_) => tracing::warn!(
+            peers = ?ages.rejecting(),
+            "relayed signal ages rejected from peers; check their clocks"
+        ),
+        Err(error) => tracing::warn!(%error, "peer ages condition not written; retrying next round"),
     }
 }
 
@@ -2666,6 +2754,102 @@ mod tests {
                 "neither authorized peers nor absent identities can publish gateway status"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn peer_age_observation_waits_for_membership_release() {
+        let client = stalled_peer_ages_client(false, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let ctx = OperatorCtx::new(client, None, SignalMode::Poll).hold_membership();
+        let mut ages = operator::peer_ages::PeerAges::default();
+        ages.observe(&["east".to_owned()], &BTreeMap::from([("east".to_owned(), 1)]));
+        let previous = ages.clone();
+        let live = ages
+            .condition(&[], "t0", Some(1))
+            .expect("rejection recorded before convergence");
+        let held_round = ctx.membership_hold().is_none();
+        ctx.release_membership();
+        assert!(
+            !observe_peer_ages(held_round, &mut ages, &[], &BTreeMap::new()),
+            "release during collection must not make a held startup snapshot publishable"
+        );
+        assert_eq!(ages, previous, "the membership hold must prevent evidence pruning");
+        let ready_round = ctx.membership_hold().is_none();
+        assert!(
+            observe_peer_ages(ready_round, &mut ages, &[], &BTreeMap::new()),
+            "the following converged round enables observation and publication"
+        );
+        assert_eq!(
+            ages.condition(std::slice::from_ref(&live), "t1", Some(1))
+                .map(|condition| condition.status),
+            Some("True".to_owned()),
+            "a genuinely empty snapshot after convergence clears rejection"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_age_publication_bounds_stalled_lookups_and_patches() {
+        for stall_patch in [false, true] {
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let client = stalled_peer_ages_client(stall_patch, Arc::clone(&requests));
+            let ages = operator::peer_ages::PeerAges::default();
+            let shutdown = operator::shutdown::Shutdown::never();
+            let start = tokio::time::Instant::now();
+            let completed = tokio::time::timeout(
+                PEER_AGES_WRITE_TIMEOUT.saturating_add(std::time::Duration::from_secs(1)),
+                write_peer_ages(&client, &ages, &shutdown),
+            )
+            .await;
+            assert!(completed.is_ok(), "a stalled API must release the peer polling round");
+            assert_eq!(
+                start.elapsed(),
+                PEER_AGES_WRITE_TIMEOUT,
+                "one budget covers lookup and patch"
+            );
+            assert_eq!(
+                requests.load(std::sync::atomic::Ordering::SeqCst),
+                if stall_patch { 2 } else { 1 },
+                "the test must reach the intended stalled request"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_peer_age_publication_during_lookup_or_patch() {
+        for stall_patch in [false, true] {
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let client = stalled_peer_ages_client(stall_patch, Arc::clone(&requests));
+            let ages = operator::peer_ages::PeerAges::default();
+            let (trigger, shutdown) = operator::shutdown::Trigger::new();
+            let writing = tokio::spawn(async move { write_peer_ages(&client, &ages, &shutdown).await });
+            let expected_requests = if stall_patch { 2 } else { 1 };
+            wait_for_peer_age_requests(&requests, expected_requests).await;
+            let start = tokio::time::Instant::now();
+            trigger.trigger();
+            assert!(
+                writing.await.is_ok(),
+                "a stalled diagnostic must not hold termination open"
+            );
+            assert_eq!(
+                start.elapsed(),
+                std::time::Duration::ZERO,
+                "shutdown must beat the deadline"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_already_triggered_shutdown_skips_peer_age_publication() {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client = stalled_peer_ages_client(false, Arc::clone(&requests));
+        let ages = operator::peer_ages::PeerAges::default();
+        let (trigger, shutdown) = operator::shutdown::Trigger::new();
+        trigger.trigger();
+        write_peer_ages(&client, &ages, &shutdown).await;
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "shutdown must not start a diagnostic request"
+        );
     }
 
     #[test]
@@ -3899,5 +4083,179 @@ mod tests {
             "the writer future drops before the completion latch fires"
         );
         stopping.await.expect("writer group").expect("stopped");
+    }
+
+    /// `Date` uses the render's wall reading to approximate message origination
+    /// time, as specified by [RFC 9110 Section 6.6.1].
+    ///
+    /// [RFC 9110 Section 6.6.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-6.6.1
+    #[test]
+    fn a_signals_response_is_dated_from_the_reading_it_was_rendered_at() {
+        let stepped_back = UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        let response = served(String::new(), std::time::Duration::from_secs(7), stepped_back);
+        let header = |name: http::header::HeaderName| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            header(http::header::DATE),
+            Some(httpdate::fmt_http_date(stepped_back)),
+            "the Date is the render's wall reading, not the server's cached clock"
+        );
+        assert_eq!(header(http::header::AGE).as_deref(), Some("7"));
+    }
+
+    /// hyper writes its cached `Date` only when a response carries none, so the
+    /// render's own `Date` is the only one a reader gets.
+    /// `Date` carries the origination time per [RFC 9110 Section 6.6.1]; duplicate
+    /// field lines are forbidden for this non-list field per [RFC 9110 Section 5.2].
+    ///
+    /// [RFC 9110 Section 6.6.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-6.6.1
+    /// [RFC 9110 Section 5.2]: https://datatracker.ietf.org/doc/html/rfc9110#section-5.2
+    #[tokio::test]
+    async fn the_explicit_date_is_the_only_date_on_the_wire() {
+        let stepped_back = UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        let answer = served_on_the_wire(stepped_back).await;
+        let dates: Vec<&str> = answer
+            .lines()
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("date"))
+            .map(|(_, value)| value.trim())
+            .collect();
+        assert_eq!(
+            dates,
+            [httpdate::fmt_http_date(stepped_back)],
+            "the render's Date replaces hyper's cached one rather than joining it"
+        );
+    }
+
+    /// The raw HTTP/1.1 answer hyper writes for an empty exposition rendered at `wall`.
+    async fn served_on_the_wire(wall: SystemTime) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut client, server_io) = tokio::io::duplex(4096);
+        let service = hyper::service::service_fn(move |_request: http::Request<hyper::body::Incoming>| {
+            std::future::ready(Ok::<_, std::convert::Infallible>(served(
+                String::new(),
+                std::time::Duration::ZERO,
+                wall,
+            )))
+        });
+        let connection = hyper::server::conn::http1::Builder::new()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .keep_alive(false)
+            .serve_connection(hyper_util::rt::TokioIo::new(server_io), service);
+        let server = tokio::spawn(connection);
+        client
+            .write_all(b"GET /v1/site/signals HTTP/1.1\r\nHost: east\r\n\r\n")
+            .await
+            .expect("request");
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).await.expect("response");
+        assert!(
+            server.await.expect("server task").is_ok(),
+            "one answer, then a clean close"
+        );
+        String::from_utf8_lossy(&answer).into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_relayed_row_reads_its_own_age_against_the_response_date() {
+        let published = Published {
+            site: operator::signals::SignalStore::new(),
+            peers: operator::signals::SignalStore::new(),
+        };
+        published.peers.refresh(
+            BTreeMap::from([("east".to_owned(), vec![row_aged(std::time::Duration::from_secs(30))])]),
+            std::time::Duration::from_secs(60),
+        );
+        let response = signals_handler(
+            axum::extract::State(published),
+            axum::Extension(Caller::Local),
+            axum::extract::Query(Vec::new()),
+        )
+        .await;
+        let date = date_ms_of(&response);
+        let stamp = last_stamp_of(response).await;
+        assert!(
+            (29_000..=31_000).contains(&(date - stamp)),
+            "Date minus the stamp is the row's 30 s age: {}",
+            date - stamp
+        );
+    }
+
+    /// One relayed contract row, already `age` old when collected.
+    fn row_aged(age: std::time::Duration) -> operator::signals::Observation {
+        operator::signals::Observation {
+            metric: "inference_pool_average_queue_size".to_owned(),
+            labels: BTreeMap::from([("grid_provider".to_owned(), "pool-a".to_owned())]),
+            value: 1.0,
+            timestamp_ms: None,
+            age,
+        }
+    }
+
+    /// The `Date` a response carries, epoch milliseconds.
+    fn date_ms_of(response: &axum::response::Response) -> i64 {
+        response
+            .headers()
+            .get(http::header::DATE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|text| httpdate::parse_http_date(text).ok())
+            .and_then(|when| when.duration_since(UNIX_EPOCH).ok())
+            .map(|since| i64::try_from(since.as_millis()).expect("fits i64"))
+            .expect("the response carries its own Date")
+    }
+
+    /// The trailing stamp of the last row a response carries.
+    async fn last_stamp_of(response: axum::response::Response) -> i64 {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        String::from_utf8_lossy(&body)
+            .trim_end()
+            .rsplit_once(' ')
+            .and_then(|(_, stamp)| stamp.parse().ok())
+            .expect("a stamped row")
+    }
+
+    /// Wait until the mock receives a request, failing instead of spinning if
+    /// the expected lookup or patch was never made.
+    async fn wait_for_peer_age_requests(requests: &std::sync::atomic::AtomicUsize, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while requests.load(std::sync::atomic::Ordering::SeqCst) < expected {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the intended diagnostic request is reached");
+    }
+
+    /// A Kubernetes client whose list or status patch never produces a response.
+    fn stalled_peer_ages_client(stall_patch: bool, requests: Arc<std::sync::atomic::AtomicUsize>) -> Client {
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if !stall_patch || request.method() == http::Method::PATCH {
+                    std::future::pending::<()>().await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let body = serde_json::json!({
+                    "apiVersion": "grid.praxis.fast/v1alpha1",
+                    "kind": "GridNetworkList",
+                    "items": [{
+                        "apiVersion": "grid.praxis.fast/v1alpha1",
+                        "kind": "GridNetwork",
+                        "metadata": { "name": "grid", "generation": 1 },
+                        "spec": { "seeds": [], "gridId": "test-id" }
+                    }]
+                });
+                Ok::<_, std::convert::Infallible>(http::Response::new(axum::body::Body::from(body.to_string())))
+            }
+        });
+        Client::new(service, "default")
     }
 }

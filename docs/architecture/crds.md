@@ -101,9 +101,39 @@ not part of this CRD.
 **Phases**: Pending → Initializing → Active → Degraded
 
 **Status fields**: `gridId`, `connectedSites`, `distributedProviderCount`,
-`observedGeneration`, `phase`, `consumerConfigStatus[]`,
-`mountReconciliationStatus[]`, `budgetStatus[]`, `conditions[]`,
-`gatewayAgeReports[]`, `gatewayAgeReportOverflow`
+`observedGeneration`, `phase`, `conditions[]`, `consumerConfigStatus[]`,
+`mountReconciliationStatus[]`, `budgetStatus[]`, `gatewayAgeReports[]`,
+`gatewayAgeReportOverflow`
+
+**Conditions**: `status.conditions` carries a `PeerTimeValid` condition,
+written by the operator's peer poller under its own field manager
+(`grid-operator-peer-signals`), never by `GridNetwork` reconciliation. `True`
+means no polled peer has a rejected timestamp; `False` means at least one does.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `TimestampOutOfRange` | A polled peer's latest answer carried a row stamped more than a second past its `Date`, or more than a day before it. The message names those peers (the first ten, then a count): check their clocks. |
+| `True` | `PeerTimestampsValid` | No polled peer's latest answer was rejected for its age. |
+
+A relayed age survives a clock step on every hop, so a step alone never makes
+this condition false: it points at a peer whose clock or stamping is wrong.
+Rejected rows are dropped and counted in
+`grid_peer_signals_refused_total{peer,reason="skew"}`. Only rejected rows become
+unavailable for provider measurement; valid rows from the same peer remain
+available. A peer that does not answer keeps its standing,
+a peer that leaves membership is dropped, and one clean answer restores its
+validity. The operator conservatively preserves an existing `False` condition
+after restarting until every currently polled peer has answered or left
+membership. Unavailable secure polling is not a clean round and does not
+establish recovery. The condition is written only when its status, its
+message or the generation changes, since each write starts a `GridNetwork`
+reconcile.
+
+Peer-age observation and status publication wait for the operator's existing
+membership-convergence gate, so an initial empty snapshot cannot erase a live
+rejection during restart. Signal collection continues while this gate is held.
+A round begun while held cannot publish even if convergence finishes during
+collection; the next round uses the converged membership.
 
 `distributedProviderCount` reflects the number of remote `InferenceProvider`
 records received from peer sites via CRDT broadcast.  Local providers and records
