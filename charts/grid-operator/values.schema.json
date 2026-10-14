@@ -1,17 +1,5 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
-  "definitions": {
-    "inferencePoolRef": {
-      "description": "Source InferencePool reference. Contract plumbing only; runtime identity fencing is not enabled yet.",
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["name", "namespace"],
-      "properties": {
-        "name": {"type": "string", "minLength": 1, "maxLength": 253, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"},
-        "namespace": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}
-      }
-    }
-  },
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -97,10 +85,7 @@
             "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
           },
           "additionalProperties": {
-            "type": "object",
-            "properties": {
-              "inferencePoolRef": {"$ref": "#/definitions/inferencePoolRef"}
-            }
+            "type": "object"
           }
         }
       }
