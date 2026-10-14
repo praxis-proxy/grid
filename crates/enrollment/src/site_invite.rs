@@ -6,11 +6,10 @@ use futures::StreamExt as _;
 use k8s_openapi::api::core::v1::Secret;
 use kube::{
     Api, Client, Resource as _, ResourceExt as _,
-    api::{DeleteParams, ObjectMeta, Patch, PatchParams, PostParams},
+    api::{DeleteParams, ObjectMeta, Patch, PatchParams, PostParams, Preconditions},
     runtime::{Controller, controller::Action, finalizer, watcher},
 };
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use site_invite_api::SiteInvite;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
@@ -26,87 +25,6 @@ const TOKEN_ID: &str = "grid.praxis.fast/token-id";
 const EXPIRES_AT: &str = "grid.praxis.fast/expires-at";
 /// Retry interval for transient reconciliation errors and expiry checks.
 const REQUEUE: Duration = Duration::from_secs(60);
-
-/// Cluster-scoped invitation managed by the enrollment service.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, kube::CustomResource)]
-#[kube(
-    group = "grid.praxis.fast",
-    version = "v1alpha1",
-    kind = "SiteInvite",
-    plural = "siteinvites",
-    status = "SiteInviteStatus",
-    namespaced = false
-)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SiteInviteSpec {
-    /// Site name pinned by this invite.
-    pub site_name: String,
-    /// Jurisdictions assigned to the site.
-    pub jurisdictions: Vec<String>,
-    /// Optional SHA-256 digest of the site's public key.
-    #[serde(rename = "publicKeySHA256", default, skip_serializing_if = "Option::is_none")]
-    pub public_key_sha256: Option<String>,
-    /// Token lifetime, such as `24h`.
-    pub lifetime: String,
-    /// Whether a previously deleted site name may enroll again.
-    #[serde(default)]
-    pub allow_deleted_name: bool,
-}
-
-/// Public lifecycle information for an invite.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SiteInviteStatus {
-    /// Last generation reconciled.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub observed_generation: Option<i64>,
-    /// Public token identifier; never the token secret.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_id: Option<String>,
-    /// Secret holding the one-time token.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub secret_ref: Option<InviteSecretReference>,
-    /// Expiry of the token.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<String>,
-    /// CSR name that redeemed this invite.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub redeemed_by: Option<String>,
-    /// Current readiness condition.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub conditions: Vec<SiteInviteCondition>,
-}
-
-/// A `SiteInvite` lifecycle condition.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SiteInviteCondition {
-    /// Condition type.
-    #[serde(rename = "type")]
-    pub type_: String,
-    /// Whether the invite is ready.
-    pub status: String,
-    /// Stable reason code.
-    pub reason: String,
-    /// Short human-readable state.
-    pub message: String,
-    /// Observed generation.
-    pub observed_generation: i64,
-    /// Last transition time.
-    pub last_transition_time: String,
-}
-
-/// Namespace and name of the invite Secret.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct InviteSecretReference {
-    /// Secret namespace.
-    pub namespace: String,
-    /// Secret name.
-    pub name: String,
-    /// Key containing the token.
-    pub key: String,
-}
 
 /// State shared by invite reconciliations.
 #[derive(Clone)]
@@ -222,7 +140,7 @@ async fn reconcile(invite: Arc<SiteInvite>, ctx: Arc<Context>) -> Result<Action,
 /// Create or recover an invite token and publish its public status.
 async fn apply_invite(invite: &SiteInvite, ctx: &Context) -> Result<Action, ReconcileError> {
     let namespace = &ctx.namespace;
-    let secret_name = format!("grid-invite-{}", invite.spec.site_name);
+    let secret_name = format!("grid-invite-{}", invite.name_any());
     let secrets = Api::<Secret>::namespaced(ctx.client.clone(), namespace);
     if invite.status.as_ref().is_some_and(|status| {
         status.conditions.iter().any(|condition| {
@@ -321,11 +239,7 @@ async fn expire_invite(
     secret_name: &str,
     checkpoint: TokenCheckpoint,
 ) -> Result<Action, ReconcileError> {
-    match Box::pin(secrets.delete(secret_name, &DeleteParams::default())).await {
-        Ok(_) => {},
-        Err(kube::Error::Api(response)) if response.code == 404 => {},
-        Err(error) => return Err(error.into()),
-    }
+    Box::pin(delete_secret(secrets, secret_name)).await?;
     match Box::pin(ctx.state.store.revoke_site_token(checkpoint.token_id)).await {
         Ok(()) | Err(crate::StoreError::NotFound) => {},
         Err(error) => return Err(error.into()),
@@ -369,7 +283,6 @@ async fn revoke_invite(
 async fn delete_secret(secrets: &Api<Secret>, secret_name: &str) -> Result<(), ReconcileError> {
     match Box::pin(secrets.delete(secret_name, &DeleteParams::default())).await {
         Ok(_) => Ok(()),
-        Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
         Err(error) => Err(error.into()),
     }
 }
@@ -415,10 +328,14 @@ fn invite_status(
     let mut status = serde_json::Map::from_iter([
         (
             "observedGeneration".to_owned(),
-            serde_json::json!(invite.metadata.generation),
+            serde_json::json!(invite.metadata.generation.unwrap_or_default()),
         ),
         ("tokenId".to_owned(), serde_json::json!(checkpoint.token_id)),
         ("expiresAt".to_owned(), serde_json::json!(checkpoint.expires_at_raw)),
+        (
+            "publicKeySHA256".to_owned(),
+            serde_json::json!(invite.spec.public_key_sha256),
+        ),
         ("conditions".to_owned(), serde_json::json!([condition])),
     ]);
     if let Some((namespace, name)) = secret {
@@ -549,29 +466,81 @@ fn new_secret(invite: &SiteInvite, namespace: &str, secret_name: &str) -> Result
 /// Revoke an unused token and remove its Secret before deleting the invite.
 async fn cleanup_invite(invite: &SiteInvite, ctx: &Context) -> Result<Action, ReconcileError> {
     let secrets = Api::<Secret>::namespaced(ctx.client.clone(), &ctx.namespace);
-    if let Some(id) = invite
-        .status
+    let secret_name = format!("grid-invite-{}", invite.name_any());
+    let secret = Box::pin(owned_secret(invite, &secrets, &ctx.namespace, &secret_name)).await?;
+    let id = secret
         .as_ref()
-        .and_then(|status| status.token_id.as_deref())
-        .and_then(|id| Uuid::parse_str(id).ok())
-    {
+        .and_then(|secret| secret.metadata.annotations.as_ref())
+        .and_then(|annotations| annotations.get(TOKEN_ID))
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .or_else(|| {
+            invite
+                .status
+                .as_ref()
+                .and_then(|status| status.token_id.as_deref())
+                .and_then(|value| Uuid::parse_str(value).ok())
+        });
+    if let Some(id) = id {
         match ctx.state.store.revoke_site_token(id).await {
             Ok(()) | Err(crate::StoreError::NotFound) => {},
             Err(error) => return Err(error.into()),
         }
     }
-    match secrets
-        .delete(
-            &format!("grid-invite-{}", invite.spec.site_name),
-            &DeleteParams::default(),
-        )
-        .await
-    {
-        Ok(_) => {},
-        Err(kube::Error::Api(response)) if response.code == 404 => {},
-        Err(error) => return Err(error.into()),
-    }
+    Box::pin(delete_owned_secret(secret, &secrets, &ctx.namespace, &secret_name)).await?;
     Ok(Action::await_change())
+}
+
+/// Delete only the Secret previously verified as owned by this invite.
+async fn delete_owned_secret(
+    secret: Option<Secret>,
+    secrets: &Api<Secret>,
+    namespace: &str,
+    secret_name: &str,
+) -> Result<(), ReconcileError> {
+    let Some(secret) = secret else { return Ok(()) };
+    let uid = secret
+        .metadata
+        .uid
+        .ok_or_else(|| ReconcileError::Invalid(format!("Secret {namespace}/{secret_name} has no UID")))?;
+    let params = DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: Some(uid),
+            ..Preconditions::default()
+        }),
+        ..DeleteParams::default()
+    };
+    match secrets.delete(secret_name, &params).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Return the invite's Secret only after checking its owner reference.
+async fn owned_secret(
+    invite: &SiteInvite,
+    secrets: &Api<Secret>,
+    namespace: &str,
+    secret_name: &str,
+) -> Result<Option<Secret>, ReconcileError> {
+    let secret = match secrets.get(secret_name).await {
+        Ok(secret) => secret,
+        Err(kube::Error::Api(response)) if response.code == 404 => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let uid = invite
+        .uid()
+        .ok_or_else(|| ReconcileError::Invalid("SiteInvite UID is missing".to_owned()))?;
+    if !secret.metadata.owner_references.as_ref().is_some_and(|owners| {
+        owners
+            .iter()
+            .any(|owner| owner.kind == "SiteInvite" && owner.uid == uid)
+    }) {
+        return Err(ReconcileError::Invalid(format!(
+            "Secret {namespace}/{secret_name} is not owned by this SiteInvite"
+        )));
+    }
+    Ok(Some(secret))
 }
 
 /// Apply the controller-owned status fields.
@@ -580,10 +549,19 @@ async fn api_patch_status(client: &Client, invite: &SiteInvite, value: serde_jso
         .patch_status(
             &invite.name_any(),
             &PatchParams::apply("grid-enrollment"),
-            &Patch::Apply(value),
+            &Patch::Apply(status_apply_patch(&value)),
         )
         .await
         .map(|_updated| ())
+}
+
+/// Add the resource metadata required by Kubernetes server-side apply.
+fn status_apply_patch(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "SiteInvite",
+        "status": value.get("status").cloned().unwrap_or_default(),
+    })
 }
 
 /// Retry failed reconciliations and log their cause.
@@ -654,5 +632,24 @@ mod tests {
         assert!(matches!(duration("4m59s"), Err(ReconcileError::Invalid(_))));
         assert!(matches!(duration("169h"), Err(ReconcileError::Invalid(_))));
         assert!(matches!(duration("24hours"), Err(ReconcileError::Invalid(_))));
+    }
+
+    #[test]
+    fn status_apply_patch_includes_the_resource_type() {
+        let status_value = serde_json::json!({"status": {"tokenId": "id"}});
+        let patch = super::status_apply_patch(&status_value);
+
+        assert!(
+            patch
+                .get("apiVersion")
+                .is_some_and(|field| field == "grid.praxis.fast/v1alpha1")
+        );
+        assert!(patch.get("kind").is_some_and(|field| field == "SiteInvite"));
+        assert!(
+            patch
+                .get("status")
+                .and_then(|status| status.get("tokenId"))
+                .is_some_and(|field| field == "id")
+        );
     }
 }

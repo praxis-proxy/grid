@@ -212,12 +212,20 @@ async fn start_site_invite_controller(state: Arc<AppState>) -> Result<(), String
     if std::env::var_os("KUBERNETES_SERVICE_HOST").is_none() {
         return Ok(());
     }
-    let client = Box::pin(kube::Client::try_default())
-        .await
-        .map_err(|error| format!("SiteInvite controller needs a Kubernetes client: {error}"))?;
+    let client = Box::pin(kube::Client::try_default()).await.map_err(|error| {
+        tracing::warn!(%error, "SiteInvite controller unavailable; enrollment will continue without it");
+    });
+    let Ok(client) = client else {
+        return Ok(());
+    };
     let namespace = std::env::var("ENROLLMENT_INVITE_SECRET_NAMESPACE")
         .or_else(|_| std::env::var("POD_NAMESPACE"))
-        .map_err(|error| format!("SiteInvite controller needs an invite Secret namespace: {error}"))?;
+        .map_err(|error| {
+            tracing::warn!(%error, "SiteInvite controller unavailable; enrollment will continue without it");
+        });
+    let Ok(namespace) = namespace else {
+        return Ok(());
+    };
     tokio::spawn(enrollment::site_invite::run_when_available(client, state, namespace));
     Ok(())
 }

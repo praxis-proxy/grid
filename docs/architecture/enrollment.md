@@ -178,7 +178,7 @@ above with a persistent backend.
 
 ## Direction
 
-The flow above ships, driven by chart values and a Job that mints invites. The
+The flow above ships, driven by chart values and a Job that mints invites.
 In Kubernetes, the enrollment service reconciles SiteInvite objects into
 token Secrets and revokes unused tokens when an admin deletes an invite.
 Standalone enrollment keeps its existing flow. The service enforces an optional

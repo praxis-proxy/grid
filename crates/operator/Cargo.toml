@@ -49,6 +49,7 @@ hyper-openssl = { workspace = true, optional = true }
 hyper-util = { workspace = true }
 scoring = { path = "../scoring" }
 grid-signals = { path = "../signals" }
+site-invite-api = { path = "../site-invite-api" }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
 percent-encoding = { workspace = true }

@@ -42,7 +42,7 @@ sar = ["dep:kube", "dep:k8s-openapi"]
 # sar in code; the chart turns it on only under kube authz, since both need the API server.
 csr-record = ["dep:kube", "dep:k8s-openapi", "dep:pem"]
 bootstrap = ["dep:clap", "dep:kube", "dep:k8s-openapi", "dep:reqwest", "dep:grid-client", "dep:zeroize"]
-site-invite-controller = ["dep:kube", "dep:k8s-openapi", "dep:pem"]
+site-invite-controller = ["dep:kube", "dep:k8s-openapi", "dep:pem", "dep:site-invite-api"]
 
 [dependencies]
 version.workspace = true
@@ -72,6 +72,7 @@ rustls = { workspace = true, optional = true }
 openssl = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 schemars = { workspace = true }
+site-invite-api = { path = "../site-invite-api", optional = true }
 zeroize = { workspace = true, optional = true }
 
 [lints]

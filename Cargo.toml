@@ -11,6 +11,7 @@ members = [
   "crates/overlay-sync",
   "crates/scoring",
   "crates/signals",
+  "crates/site-invite-api",
   "crates/swim",
   "crates/version",
   "crates/xtask",
