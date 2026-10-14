@@ -132,17 +132,25 @@ impl RouteSnapshot {
         }
         // The site as a whole had work waiting at some instant of the settling time: its
         // average queue at queue_full, or any work held before scheduling, which is a count
-        // and blocks admission at one. One busy unit is not a full site; it only stops a
-        // sample teaching, in measured. Unknown without a queue reading.
-        candidate.backlog = recent.queued.map(|_| recent.congested_in_flight.is_some());
-        // A site's own in-flight count against the ceiling it has shown. A site that publishes
-        // none has no room and is chosen only when no site has any.
+        // and signals pressure at one. This evidence does not require a running count.
+        candidate.backlog = if recent
+            .queued
+            .is_some_and(|queued| queued >= inputs.availability.queue_full)
+            || recent.held.is_some_and(|held| held >= 1.0)
+        {
+            Some(true)
+        } else {
+            recent.queued.map(|_| false)
+        };
         let measured = Self::measured(&candidate, &reading, &recent, inputs);
         if let Some(measured) = &measured {
             candidate.capacity = Some(measured.ceiling);
             candidate.rho = Some(measured.rho);
             candidate.full = measured.full;
             candidate.relieved = measured.relieved;
+        } else {
+            // Direct pressure remains useful without a count or a learned ceiling.
+            candidate.rho = reported_limit(&reading);
         }
         // Ordered by queue depth; a site publishing none sorts after every site that does.
         let load = if candidate.admission_state == AdmissionState::NewAndExisting {
@@ -345,6 +353,7 @@ impl RouteSnapshot {
                 // showing the last ones it had, or a seed taken during an outage reads them.
                 if candidate.capacity.is_none() {
                     clear_measured(&key);
+                    site_gauge("grid_route_site_rho_reported", &key, candidate.rho.unwrap_or(f64::NAN));
                 }
             }
         }
@@ -1635,6 +1644,67 @@ mod tests {
             ..SiteReading::default()
         };
         assert_eq!(reported_limit(&reading), Some(0.85));
+    }
+
+    #[test]
+    fn direct_pressure_is_published_without_capacity_and_cleared_on_expiry_or_withdrawal() {
+        use std::sync::atomic::Ordering;
+
+        let recorder = ReportedPressure(Arc::default());
+        metrics::with_local_recorder(&recorder, || {
+            let store = LoadStore::new(Duration::from_secs(60));
+            let mut gauged = Gauged::new();
+            let availability = AvailabilitySettings::default();
+            with_series(&store, "a", "llm_d_epp_average_kv_cache_utilization", 0.85, 1_000);
+            for now_ms in [1_000, 2_000] {
+                let snapshot = RouteSnapshot::from_store(
+                    one("a"),
+                    Arc::from("hub"),
+                    &mut at(&store, &availability, &mut gauged.learned, now_ms, 500),
+                )
+                .published(&mut gauged);
+                let candidate = &snapshot.candidates[0];
+                let reported = f64::from_bits(recorder.0.load(Ordering::Relaxed));
+                assert_eq!(candidate.capacity, None);
+                if now_ms == 1_000 {
+                    assert_eq!(candidate.rho, Some(0.85));
+                    assert_eq!(reported.to_bits(), 0.85_f64.to_bits());
+                    drop(RouteSnapshot::from_static(Vec::new(), Arc::from("hub")).published(&mut gauged));
+                    assert!(f64::from_bits(recorder.0.load(Ordering::Relaxed)).is_nan());
+                    drop(snapshot.published(&mut gauged));
+                } else {
+                    assert_eq!(candidate.rho, None);
+                    assert!(reported.is_nan(), "expired direct pressure must not remain visible");
+                }
+            }
+        });
+    }
+
+    /// Thread-local capture of the pressure input used without measured capacity.
+    struct ReportedPressure(Arc<metrics::atomics::AtomicU64>);
+
+    impl metrics::Recorder for ReportedPressure {
+        fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn register_counter(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+
+        fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            if key.name() == "grid_route_site_rho_reported" {
+                metrics::Gauge::from_arc(Arc::clone(&self.0))
+            } else {
+                metrics::Gauge::noop()
+            }
+        }
+
+        fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
     }
 
     #[test]

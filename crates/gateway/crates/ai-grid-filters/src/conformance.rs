@@ -1641,7 +1641,6 @@ mod tests {
     /// Keep provider identity, ready units, held work and KV use unchanged. Only one
     /// site's queue changes. Its historic peak must not hide that pressure from dispatch.
     #[test]
-    #[ignore = "known gap: the room set ignores backlog below the historic ceiling"]
     fn routing_counterexample_fresh_backlog_reduces_dispatch() {
         let mut observed = Vec::new();
         for count in [2, 3] {
@@ -1672,7 +1671,6 @@ mod tests {
 
     /// Fresh queue and readiness data keep a usable pool participating when capacity is unknown.
     #[test]
-    #[ignore = "known gap: one measured pool with room excludes healthy unknown-capacity pools"]
     fn routing_counterexample_unknown_capacity_keeps_participating() {
         let mut observed = Vec::new();
         for count in [2, 3] {
@@ -1694,6 +1692,156 @@ mod tests {
         assert!(
             observed.iter().all(|(_, _, draws)| *draws > 0),
             "healthy pools with unknown capacity must receive traffic; (sites, pool, draws): {observed:?}"
+        );
+    }
+
+    /// Missing concurrency cannot erase direct queue, held-work, or KV pressure.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one matrix asserts signal state and dispatch together"
+    )]
+    fn partial_signals_preserve_pressure_without_inventing_capacity() {
+        for count in [2, 3] {
+            let sites = &EQUAL_CAPACITY[..count];
+            for queue in [None, Some(0.0), Some(0.5), Some(1.0)] {
+                for held in [None, Some(0.0), Some(1.0)] {
+                    for kv in [None, Some(0.3), Some(1.0)] {
+                        for ready in [None, Some(1.0)] {
+                            let mut grid = Harness::new(WINDOW_MS);
+                            publish_cool(&grid, &sites[..1], NOW_MS, 20.0, 0.0);
+                            for spec in &sites[1..] {
+                                publish_partial(&grid, spec, NOW_MS, queue, held, kv, ready);
+                            }
+                            let snapshot = grid.order(sites, NOW_MS);
+                            let waiting =
+                                queue.is_some_and(|value| value >= 1.0) || held.is_some_and(|value| value >= 1.0);
+                            let backlog = if waiting { Some(true) } else { queue.map(|_| false) };
+                            for candidate in snapshot.candidates.iter().filter(|c| c.site.as_ref() != sites[0].site) {
+                                assert_eq!(candidate.capacity, None, "no concurrency sample teaches capacity");
+                                assert_eq!(candidate.rho, kv, "direct KV survives missing concurrency");
+                                assert_eq!(candidate.backlog, backlog, "queue={queue:?}, held={held:?}");
+                                assert_eq!(candidate.full, None, "partial signals cannot authorize shedding");
+                                assert_eq!(candidate.relieved, None);
+                                let draws = routed_to(&snapshot, &candidate.site);
+                                if waiting || kv == Some(1.0) || (queue.is_none() && kv.is_none()) {
+                                    assert_eq!(draws, 0, "known pressure is avoided beside a clear pool");
+                                } else {
+                                    assert!(draws > 0, "unknown capacity must not prevent participation");
+                                }
+                            }
+                            let availability = AvailabilitySettings {
+                                shedding: true,
+                                ..grid.availability
+                            };
+                            assert!(
+                                snapshot
+                                    .shed(&[Arc::from(MODEL)].into(), &availability)
+                                    .shedding
+                                    .is_empty()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Neither a telemetry gap nor a fresh recovery is interpreted as a learned limit.
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one trace covers pressure, expiry, and recovery")]
+    fn partial_pressure_expires_and_recovers_without_teaching_a_ceiling() {
+        let sites = &EQUAL_CAPACITY[..2];
+        for (queue, kv) in [(2.0, 0.3), (0.0, 1.0)] {
+            let mut grid = Harness::new(WINDOW_MS);
+            publish_cool(&grid, &sites[..1], NOW_MS, 20.0, 0.0);
+            publish_partial(&grid, &sites[1], NOW_MS, Some(queue), None, Some(kv), Some(1.0));
+            let pressured = grid.order(sites, NOW_MS);
+            assert_eq!(routed_to(&pressured, sites[1].site), 0);
+            let expired_at = NOW_MS + WINDOW_MS + 1;
+            publish_cool(&grid, &sites[..1], expired_at, 20.0, 0.0);
+            let expired = grid.order(sites, expired_at);
+            let subject = expired
+                .candidates
+                .iter()
+                .find(|c| c.site.as_ref() == sites[1].site)
+                .unwrap();
+            assert_eq!((subject.capacity, subject.rho, subject.backlog), (None, None, None));
+            assert_eq!(
+                routed_to(&expired, sites[1].site),
+                0,
+                "entirely stale pressure remains a fallback"
+            );
+            publish_partial(&grid, &sites[1], expired_at, Some(0.0), Some(0.0), Some(0.3), Some(1.0));
+            let recovered = grid.order(sites, expired_at);
+            assert!(
+                routed_to(&recovered, sites[1].site) > 0,
+                "fresh clear signals restore participation"
+            );
+            let restored = recovered
+                .candidates
+                .iter()
+                .find(|c| c.site.as_ref() == sites[1].site)
+                .unwrap();
+            assert_eq!(
+                (restored.capacity, restored.rho, restored.backlog),
+                (None, Some(0.3), Some(false))
+            );
+        }
+    }
+
+    /// Queue thresholds are configurable. One held request is independently pressure.
+    #[test]
+    fn partial_pressure_respects_the_configured_queue_threshold() {
+        let sites = &EQUAL_CAPACITY[..2];
+        for threshold in [0.5, 2.0, 10.0] {
+            for (queue, held, blocked) in [(threshold / 2.0, 0.5, false), (threshold, 0.0, true), (0.0, 1.0, true)] {
+                let mut grid = Harness::new(WINDOW_MS);
+                grid.availability.queue_full = threshold;
+                publish_cool(&grid, &sites[..1], NOW_MS, 20.0, 0.0);
+                publish_partial(&grid, &sites[1], NOW_MS, Some(queue), Some(held), Some(0.3), Some(1.0));
+                let snapshot = grid.order(sites, NOW_MS);
+                let subject = snapshot
+                    .candidates
+                    .iter()
+                    .find(|c| c.site.as_ref() == sites[1].site)
+                    .unwrap();
+                assert_eq!(
+                    subject.backlog,
+                    Some(blocked),
+                    "threshold={threshold}, queue={queue}, held={held}"
+                );
+                assert_eq!(routed_to(&snapshot, sites[1].site) == 0, blocked);
+            }
+        }
+    }
+
+    /// Clearing recent pressure restores participation before the long queue window expires.
+    #[test]
+    fn a_partial_pool_rejoins_after_its_recent_queue_clears() {
+        let sites = &EQUAL_CAPACITY[..2];
+        let mut grid = Harness::new(WINDOW_MS);
+        publish_cool(&grid, &sites[..1], NOW_MS, 20.0, 0.0);
+        publish_partial(&grid, &sites[1], NOW_MS, Some(2.0), None, Some(0.3), Some(1.0));
+        assert_eq!(routed_to(&grid.order(sites, NOW_MS), sites[1].site), 0);
+        let settled_at = NOW_MS + grid.availability.room_after_ms + 1;
+        publish_cool(&grid, &sites[..1], settled_at, 20.0, 0.0);
+        publish_partial(&grid, &sites[1], settled_at, Some(0.0), None, Some(0.3), Some(1.0));
+        let settled = grid.order(sites, settled_at);
+        let (subject, score) = settled
+            .candidates
+            .iter()
+            .zip(&settled.scores)
+            .find(|(c, _)| c.site.as_ref() == sites[1].site)
+            .unwrap();
+        assert_eq!(subject.backlog, Some(false));
+        assert!(
+            (*score - 2.0).abs() < f64::EPSILON,
+            "the long window still contains the old queue"
+        );
+        assert!(
+            routed_to(&settled, sites[1].site) > 0,
+            "recent pressure, not historic queue, gates mixed-capacity participation"
         );
     }
 
@@ -2339,6 +2487,35 @@ mod tests {
             let labels = format!(r#"grid_site="{}",grid_provider="pool-{}""#, spec.site, spec.site);
             let line = format!("llm_d_epp_average_kv_cache_utilization{{{labels}}} 0.3 {at_ms}");
             grid.store.ingest_at(&line, at_ms, at_ms, spec.site);
+        }
+    }
+
+    /// Publish independent pressure signals, deliberately omitting running concurrency.
+    #[expect(clippy::too_many_arguments, reason = "each raw signal can be independently absent")]
+    fn publish_partial(
+        grid: &Harness,
+        spec: &SiteSpec,
+        at_ms: i64,
+        queue: Option<f64>,
+        held: Option<f64>,
+        kv: Option<f64>,
+        ready: Option<f64>,
+    ) {
+        let labels = format!(r#"grid_site="{}",grid_provider="pool-{}""#, spec.site, spec.site);
+        for (metric, value) in [
+            ("llm_d_epp_average_queue_size", queue),
+            ("llm_d_epp_flow_control_queue_size", held),
+            ("llm_d_epp_average_kv_cache_utilization", kv),
+            ("llm_d_epp_ready_endpoints", ready),
+        ] {
+            if let Some(value) = value {
+                grid.store.ingest_at(
+                    &format!("{metric}{{{labels}}} {value} {at_ms}"),
+                    at_ms,
+                    at_ms,
+                    spec.site,
+                );
+            }
         }
     }
 
