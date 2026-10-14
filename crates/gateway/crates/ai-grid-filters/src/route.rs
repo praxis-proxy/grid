@@ -265,7 +265,7 @@ impl GridSiteRouteFilter {
         tuning.set(cfg.availability, cfg.prefix_affinity);
         let declared = cfg.clusters;
         tracing::info!(
-            "grid_site_route: choosing sites by measured in-flight against a learned ceiling: two choices among 3 or \
+            "grid_site_route: choosing sites by the nearer measured capacity or provider-reported limit: two choices among 3 or \
              more sites with room, a weighted pick between 2, and a capacity-weighted pick when none has room"
         );
         Ok(Box::new(Self {

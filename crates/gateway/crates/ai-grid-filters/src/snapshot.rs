@@ -20,6 +20,16 @@ use crate::{
     signals::{Over, SiteReading, SiteSignals},
 };
 
+/// The reading at which a site is treated as having little room left, matching the threshold
+/// the EPP's own utilization detector uses over KV.
+///
+/// A routing threshold, not an engine limit: vLLM runs its cache to about 1.0 and preempts
+/// rather than refusing, so this says prefer elsewhere rather than out of room.
+const REPORTED_FULL: f64 = 0.8;
+
+/// Minimum duration required before concluding any backlog-based limit, even when the site
+/// reports saturation. A sample marked full through `full_in_flight` bypasses this spell.
+pub(crate) const MIN_BACKLOG_SPELL_MS: i64 = 5_000;
 
 /// Score of a candidate whose cluster has no healthy endpoint: after every healthy one,
 /// unmeasured included, since `total_cmp` orders a positive NaN above infinity.
@@ -153,6 +163,7 @@ impl RouteSnapshot {
             window_ms: inputs.window_ms,
             horizon_ms,
             queue_full: inputs.availability.queue_full,
+            reported_full: REPORTED_FULL,
         };
         let reading = inputs
             .signals
@@ -167,8 +178,8 @@ impl RouteSnapshot {
 
     /// Lift every measured site's weight to at least `share` of the largest ceiling.
     ///
-    /// A ceiling only grows when a site carries load, and a site weighted by a small ceiling
-    /// carries little. Without a floor an unproven site would never get the chance to prove more.
+    /// A soft bound only grows when a site carries queue-free load, and a site weighted by a
+    /// small ceiling carries little. Without a floor an unproven site would never prove more.
     /// The floor as a device follows Brent Salisbury's pressure-weighted placement, where it keeps
     /// a saturated site eligible; here it keeps an unproven one exploring.
     fn explore_floor(ranked: Vec<(f64, RouteCandidate, bool)>, share: f64) -> Vec<(f64, RouteCandidate)> {
@@ -189,13 +200,14 @@ impl RouteSnapshot {
             .collect()
     }
 
-    /// The site's learned ceiling, smoothed saturation, and fullness from its own in-flight
-    /// count, or `None` when it publishes no in-flight sample in the window.
+    /// The site's learned bounds, smoothed saturation, and fullness, or `None` when it
+    /// publishes no in-flight sample in the window.
     ///
-    /// The ceiling is the most the site has held with nothing waiting, floored and only ever
-    /// rising. Saturation is in-flight over it, smoothed so one new sample moves it by
-    /// `smoothing`; a refresh with no new sample leaves it alone. Full is at the ceiling with a
-    /// backlog for `full_after_ms`; room is no sample in `recent` showing that.
+    /// The soft bound is the most held queue-free; the hard bound is the least held at a
+    /// demonstrated limit. A count is read against the lesser, floored. Saturation is the
+    /// nearer of that counted limit and the provider's own fullness, smoothed so one new sample
+    /// moves it by `smoothing`; a refresh with no new sample leaves it alone. Full is at the
+    /// resulting ceiling with a backlog for `full_after_ms`; room is no such sample in `recent`.
     ///
     /// The smoothing, and reading an absent sample as absent rather than as zero load, follow
     /// Brent Salisbury's pressure-weighted placement. The learned ceiling in place of a
@@ -212,29 +224,21 @@ impl RouteSnapshot {
         // The newest sample at or before now is the epoch a smoothing step belongs to.
         let sample_at = reading.sampled_at.map(|at| at.min(inputs.now_ms));
         let previous = inputs.learned.0.get(&key).copied();
-        let ceiling = ceiling(previous, reading, availability);
-        let raw = (in_flight / ceiling).clamp(0.0, 1.0);
+        let ceiling = ceiling(previous, reading, inputs.now_ms, inputs.window_ms, availability);
+        let by_count = (in_flight / ceiling.read_against).clamp(0.0, 1.0);
+        let raw = nearest_limit(reading, by_count, ceiling.hard.is_some());
         let rho = smoothed(previous, sample_at, raw, availability.smoothing);
-        // Congested: at the ceiling at an instant within the settling time that also had a
-        // backlog, read together so a full moment and a queued moment are not crossed.
-        let congested = recent.congested_in_flight.is_some_and(|held| held >= ceiling);
-        let full_since = congested_since(previous, congested, inputs.now_ms, inputs.window_ms);
-        let full = candidate
-            .backlog
-            .map(|_| full_since.is_some_and(|since| inputs.now_ms.saturating_sub(since) >= availability.full_after_ms));
-        site_gauge("grid_route_site_ceiling", &key, ceiling);
+        let (congested, full_since) = congestion(previous, recent, ceiling.read_against, inputs);
+        let full = full_for(candidate, full_since, inputs.now_ms, availability.full_after_ms);
+        let age_ms = sample_at.map(|at| inputs.now_ms.saturating_sub(at));
+        let limits = Limits::read(in_flight, &ceiling, by_count, full, age_ms);
+        publish_limits(&key, &ceiling, reading, &limits);
         inputs.learned.0.insert(
             key,
-            SiteLearned {
-                ceiling,
-                rho,
-                at_ms: inputs.now_ms,
-                sample_at,
-                full_since,
-            },
+            SiteLearned::at(&ceiling, rho, inputs.now_ms, sample_at, full_since),
         );
         Some(Measured {
-            ceiling,
+            ceiling: ceiling.read_against,
             rho,
             full,
             relieved: candidate.backlog.map(|_| !congested),
@@ -337,10 +341,10 @@ impl RouteSnapshot {
                 site_score(&key, *score);
                 site_gauge("grid_route_site_rho", &key, candidate.rho.unwrap_or(f64::NAN));
                 site_gauge("grid_route_site_weight", &key, candidate.capacity.unwrap_or(f64::NAN));
-                // The ceiling is set where it is learned; an unmeasured site must not keep
-                // showing the last one it had, or a seed taken during an outage reads it.
+                // The limits are set where they are learned; an unmeasured site must not keep
+                // showing the last ones it had, or a seed taken during an outage reads them.
                 if candidate.capacity.is_none() {
-                    site_gauge("grid_route_site_ceiling", &key, f64::NAN);
+                    clear_measured(&key);
                 }
             }
         }
@@ -348,9 +352,9 @@ impl RouteSnapshot {
             site_score(gone, f64::NAN);
             site_gauge("grid_route_site_rho", gone, f64::NAN);
             site_gauge("grid_route_site_weight", gone, f64::NAN);
-            site_gauge("grid_route_site_ceiling", gone, f64::NAN);
-            // A ceiling only rises, so a pair that leaves must not keep one: a site rebuilt
-            // under the same name would resume it untaught.
+            clear_measured(gone);
+            // Learned bounds outlive their samples, so a pair that leaves must not keep them:
+            // a site rebuilt under the same name would resume them untaught.
             learned.0.remove(gone);
         }
         *published = current;
@@ -386,8 +390,12 @@ type SitePair = (Arc<str>, Arc<str>);
 /// What one site's own load has taught the gateway: its running ceiling and smoothed saturation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SiteLearned {
-    /// The most requests the site has been seen to hold with nothing waiting.
-    ceiling: f64,
+    /// The most it has held with nothing waiting: capacity is at least this. Absent until a
+    /// queue-free sample teaches one.
+    soft: Option<f64>,
+    /// The least it has held while work waited, since the last queue-free sample to reach that
+    /// level: capacity is at most this. Absent until a backlog is seen.
+    hard: Option<f64>,
     /// Saturation against that ceiling, smoothed by [`AvailabilitySettings::smoothing`].
     rho: f64,
     /// When the site was last measured, so a spell does not resume across a gap.
@@ -398,13 +406,156 @@ struct SiteLearned {
     /// When the site last reached its ceiling with work waiting and has stayed so since, for
     /// `full_after_ms`.
     full_since: Option<i64>,
+    /// When the site's current spell of having work waiting began, whatever its ceiling, so one
+    /// burst of arrivals does not read as a site that shrank.
+    backlog_since: Option<i64>,
+    /// Units the site reported when these bounds were learned.
+    units: Option<f64>,
+    /// When it first reported fewer than that, so a late scrape is not read as a smaller site.
+    shrunk_since: Option<i64>,
+}
+
+/// A site's two bounds at one refresh, and the denominator they give.
+struct Ceiling {
+    /// Capacity is at least this: the most held with nothing waiting.
+    soft: Option<f64>,
+    /// Capacity is at most this: the least held while work waited.
+    hard: Option<f64>,
+    /// When the current backlog spell began, carried into the next refresh.
+    backlog_since: Option<i64>,
+    /// What a count is read against, never below `ceiling_floor`.
+    read_against: f64,
+    /// Units the site reported when these bounds were taught, not this refresh's count. Pinned,
+    /// because a count carried forward from the newest reading can never differ from it.
+    units: Option<f64>,
+    /// When the site first reported fewer units than its bounds were learned at.
+    shrunk_since: Option<i64>,
+}
+
+/// When the site started reporting fewer serving units than its bounds were taught at, and
+/// whether that has held long enough to retire them.
+///
+/// Bounds describe a site of a given size, and a site reporting fewer units is not that site.
+/// Nothing it publishes says how much smaller it got, so what was learned about the old one is
+/// dropped rather than scaled, and relearned from the next queue-free sample. Sustained past
+/// the window, because the ready-unit count counts fresh scrapes rather than ready pods and
+/// dips whenever one is late.
+fn shrinking(prior: Option<SiteLearned>, reading: &SiteReading, now_ms: i64, window_ms: i64) -> (Option<i64>, bool) {
+    let since = spell_since(
+        prior.map(|prior| (prior.at_ms, prior.shrunk_since)),
+        lost_units(reading.units, prior.and_then(|prior| prior.units)),
+        now_ms,
+        window_ms,
+    );
+    (
+        since,
+        since.is_some_and(|since| now_ms.saturating_sub(since) >= window_ms),
+    )
+}
+
+/// Whether anything is waiting at the site, and what it holds if nothing is.
+///
+/// A sample taken while work waits measures the backlog rather than the capacity, so only a
+/// queue-free one can teach what the site carries.
+fn queue_state(reading: &SiteReading) -> (bool, Option<f64>) {
+    let waiting = waiting(reading);
+    (waiting, (!waiting).then(|| reading.in_flight.unwrap_or(0.0)))
+}
+
+/// The hard bound still worth keeping.
+///
+/// A queue-free sample at or above it retires it: the site now carries what it used to queue
+/// at, so that bound describes a site that no longer exists.
+fn kept_hard(prior: Option<SiteLearned>, queue_free: Option<f64>) -> Option<f64> {
+    prior
+        .and_then(|prior| prior.hard)
+        .filter(|hard| queue_free.is_none_or(|free| free < *hard))
+}
+
+/// The unit count the bounds now describe: this refresh's where they were just taught or
+/// retired, else the one carried forward. Carrying it is the point, since a count taken from
+/// the newest reading every refresh can never differ from it.
+fn taught_at(now: Option<f64>, prior: Option<SiteLearned>, soft: Option<f64>, retired: bool) -> Option<f64> {
+    if retired || soft != prior.and_then(|prior| prior.soft) {
+        now
+    } else {
+        prior.and_then(|prior| prior.units).or(now)
+    }
+}
+
+/// What a change in the site's unit count means for the bounds learned about the old one.
+struct Resized {
+    /// When it first reported fewer units than its bounds were taught at.
+    shrunk_since: Option<i64>,
+    /// Whether that has held long enough to drop both bounds.
+    retired: bool,
+    /// Whether it reports more units, which drops the hard bound alone.
+    grown: bool,
+}
+
+/// Read the unit count against the one the bounds were taught at.
+///
+/// A site that gained units is no longer held by what the smaller one queued at, and only the
+/// hard bound goes: the most a smaller site carried is still a floor under what a larger one
+/// can, and dropping that floor would read the offered load as the capacity.
+fn resized(prior: Option<SiteLearned>, reading: &SiteReading, now_ms: i64, window_ms: i64) -> Resized {
+    let (shrunk_since, retired) = shrinking(prior, reading, now_ms, window_ms);
+    Resized {
+        shrunk_since,
+        retired,
+        grown: gained_units(reading.units, prior.and_then(|prior| prior.units)),
+    }
+}
+
+/// Whether the site reports more serving units than its bounds were learned at.
+///
+/// Immediate, with no spell behind it, because releasing an upper bound only ever raises the
+/// ceiling and the next congested sample teaches a new one. A spell guards the other direction,
+/// where a stale count would lower it.
+fn gained_units(now: Option<f64>, learned: Option<f64>) -> bool {
+    now.zip(learned).is_some_and(|(now, learned)| now > learned)
+}
+
+/// Whether the site reports fewer serving units than its bounds were learned at.
+///
+/// Only a fall counts here. Growth is handled by `gained_units`, which drops the hard bound
+/// alone: the soft bound is still a true lower bound on what the larger site can carry.
+fn lost_units(now: Option<f64>, learned: Option<f64>) -> bool {
+    now.zip(learned).is_some_and(|(now, learned)| now < learned)
+}
+
+impl Ceiling {
+    /// Set the ceiling gauges, so an operator can tell a bound that moved because the site
+    /// carried more from one that moved because it queued.
+    fn publish(&self, key: &SitePair) {
+        site_gauge("grid_route_site_ceiling", key, self.read_against);
+        site_gauge("grid_route_site_ceiling_soft", key, self.soft.unwrap_or(f64::NAN));
+        site_gauge("grid_route_site_ceiling_hard", key, self.hard.unwrap_or(f64::NAN));
+    }
+}
+
+impl SiteLearned {
+    /// What this refresh leaves for the next one.
+    fn at(ceiling: &Ceiling, rho: f64, now_ms: i64, sample_at: Option<i64>, full_since: Option<i64>) -> Self {
+        Self {
+            soft: ceiling.soft,
+            hard: ceiling.hard,
+            rho,
+            at_ms: now_ms,
+            sample_at,
+            full_since,
+            backlog_since: ceiling.backlog_since,
+            units: ceiling.units,
+            shrunk_since: ceiling.shrunk_since,
+        }
+    }
 }
 
 /// What one refresh measured about a site.
 struct Measured {
-    /// The learned ceiling.
+    /// The denominator produced by the learned soft and hard bounds.
     ceiling: f64,
-    /// Smoothed saturation against it.
+    /// Smoothed saturation at the nearer provider-reported or counted limit.
     rho: f64,
     /// At the ceiling with a backlog for `full_after_ms`; `None` without a queue reading.
     full: Option<bool>,
@@ -426,6 +577,17 @@ pub(crate) struct Gauged {
     pub(crate) learned: Learned,
 }
 
+impl Learned {
+    /// Clear every site's soft bound, as a periodic reset would. Test-only, for the scenario
+    /// that measures what such a reset would cost.
+    #[cfg(test)]
+    pub(crate) fn clear_soft(&mut self) {
+        for learned in self.0.values_mut() {
+            learned.soft = None;
+        }
+    }
+}
+
 impl Gauged {
     /// Empty state: nothing published, nothing learned.
     pub(crate) fn new() -> Self {
@@ -443,33 +605,307 @@ fn smoothed(prior: Option<SiteLearned>, sample_at: Option<i64>, raw: f64, alpha:
     }
 }
 
-/// The ceiling `reading` teaches over what `prior` held, floored. It only rises: the event a
-/// clock would approximate, a site that lost serving units, is published.
+/// The soft and hard bounds `reading` teaches over what `prior` held, and the floored ceiling
+/// they produce. The soft bound rises while the site keeps its shape; a demonstrated limit can
+/// tighten the hard bound, and a serving-unit change retires the bounds that no longer apply.
 ///
 /// In-flight counts waiting as well as running, so a sample with one whole request waiting
-/// anywhere measures the backlog rather than the capacity and teaches nothing. It still reads
-/// against the ceiling learned while nothing waited, where it saturates.
-fn ceiling(prior: Option<SiteLearned>, reading: &SiteReading, availability: &AvailabilitySettings) -> f64 {
-    let waiting = [reading.queued, reading.deepest_queue, reading.held]
-        .into_iter()
-        .any(|queue| queue.is_some_and(|queue| queue >= 1.0));
-    let taught = if waiting { 0.0 } else { reading.in_flight.unwrap_or(0.0) };
-    prior
-        .map_or(0.0, |prior| prior.ceiling)
-        .max(taught)
-        .max(availability.ceiling_floor)
+/// anywhere measures the backlog rather than the capacity and cannot raise the soft bound. It
+/// can tighten the hard bound after demonstrating a limit, and reads against the resulting
+/// ceiling.
+fn ceiling(
+    prior: Option<SiteLearned>,
+    reading: &SiteReading,
+    now_ms: i64,
+    window_ms: i64,
+    availability: &AvailabilitySettings,
+) -> Ceiling {
+    let (_, queue_free) = queue_state(reading);
+    let sized = resized(prior, reading, now_ms, window_ms);
+    let prior = prior.filter(|_| !sized.retired);
+    let soft = soft_bound(prior.and_then(|prior| prior.soft), queue_free);
+    let kept = kept_hard(prior.filter(|_| !sized.grown), queue_free);
+    let backlog_since = sample_spell_since(prior, reading.backlogged_at, window_ms);
+    let hard = hard_bound(
+        kept,
+        reading,
+        Backlog {
+            held: 0.0,
+            soft,
+            since: backlog_since,
+            now_ms: reading.backlogged_at.unwrap_or(now_ms),
+        },
+        availability,
+    );
+    Ceiling {
+        soft,
+        hard,
+        backlog_since,
+        read_against: read_against(soft, hard).max(availability.ceiling_floor),
+        units: taught_at(reading.units, prior, soft, sized.retired || sized.grown),
+        // Retiring resets the spell: the bounds now describe the size the site reports.
+        shrunk_since: sized.shrunk_since.filter(|_| !sized.retired),
+    }
 }
 
-/// When the site's current spell of congestion began, if it is congested at `now_ms`: carried
-/// from `prior` while the site was measured within the window, else starting now, so a site
-/// unmeasured for longer than the window does not resume a spell from before the gap.
-fn congested_since(prior: Option<SiteLearned>, congested: bool, now_ms: i64, window_ms: i64) -> Option<i64> {
-    congested.then(|| {
+/// Whether the site has a whole request waiting anywhere: at the site, at its busiest unit, or
+/// held before scheduling. A sample taken then measures the backlog rather than the capacity.
+fn waiting(reading: &SiteReading) -> bool {
+    [reading.queued, reading.deepest_queue, reading.held]
+        .into_iter()
+        .any(|queue| queue.is_some_and(|queue| queue >= 1.0))
+}
+
+/// The soft bound after this refresh: the most the site has been seen to carry with nothing
+/// waiting, which only ever rises.
+fn soft_bound(kept: Option<f64>, queue_free: Option<f64>) -> Option<f64> {
+    match (kept, queue_free) {
+        (Some(held), Some(free)) => Some(held.max(free)),
+        (held, free) => held.or(free),
+    }
+}
+
+/// The hard bound after this refresh: what `kept` held, tightened by a congested observation
+/// that counts as the site's limit.
+fn hard_bound(
+    kept: Option<f64>,
+    reading: &SiteReading,
+    backlog: Backlog,
+    availability: &AvailabilitySettings,
+) -> Option<f64> {
+    // Two ways a sample shows a limit, each carrying the count it was holding then: one the
+    // site reported full, one the gateway concluded from a settled backlog at its ceiling.
+    let concluded = reading
+        .congested_in_flight
+        .filter(|held| at_limit(reading, Backlog { held: *held, ..backlog }, availability));
+    let seen = [reading.full_in_flight, concluded]
+        .into_iter()
+        .flatten()
+        .reduce(f64::min);
+    match (kept, seen) {
+        (Some(held), Some(seen)) => Some(held.min(seen)),
+        (held, seen) => held.or(seen),
+    }
+}
+
+/// What one backlog observation carries: how much the site held at a congested instant, the
+/// most it has carried queue-free, when the spell began, and now.
+#[derive(Clone, Copy, Debug)]
+struct Backlog {
+    /// What the site held at a congested instant in the window.
+    held: f64,
+    /// The most it has carried with nothing waiting.
+    soft: Option<f64>,
+    /// When the current backlog spell began.
+    since: Option<i64>,
+    /// Now, milliseconds.
+    now_ms: i64,
+}
+
+/// Whether a backlog is the site's limit rather than a burst of arrivals.
+///
+/// Three shapes look alike from a count of in-flight requests, and the site's own reading is
+/// what separates them. Queueing below the most it has carried, with the cache nearly spent, is
+/// a site that shrank. Queueing at or above that, with a cool cache, is a site out of sequence
+/// slots, which is the one request-denominated limit the engine really has. Queueing below that
+/// with a cool cache is neither: the site is taking arrivals in bursts and nothing about its
+/// capacity has been shown.
+///
+/// Time alone cannot tell the third from the second, because a standing queue at a quarter of
+/// the load lasts as long as anyone cares to wait. A clock on its own reads burstiness as a
+/// limit and ratchets the bound down to whatever the site held when the queue first appeared.
+///
+/// A preempted request returns to the front of the waiting queue rather than leaving the
+/// engine, so a cache-limited backlog is visible as a queue at the moment it happens and the
+/// in-flight count is unchanged by the preemption. Block pressure shows near a full cache
+/// rather than at `REPORTED_FULL`, so a bound is learned where pressure begins rather than
+/// where the engine gave up.
+///
+/// The floor on the spell matters because `full_after_ms` can be set to zero, and at zero even
+/// a slot-bound site would latch on its first congested instant.
+fn at_limit(reading: &SiteReading, backlog: Backlog, availability: &AvailabilitySettings) -> bool {
+    let Backlog {
+        held,
+        soft,
+        since,
+        now_ms,
+    } = backlog;
+    let settled =
+        since.is_some_and(|since| now_ms.saturating_sub(since) >= availability.full_after_ms.max(MIN_BACKLOG_SPELL_MS));
+    match reading.saturation {
+        Some(_) => settled && soft.is_none_or(|soft| held >= soft),
+        None => settled,
+    }
+}
+
+/// The denominator saturation is read against, before the floor.
+///
+/// The soft bound says capacity is at least `low`; a backlog at `high` says it is at most
+/// `high`. With both, the smaller is the honest read: a `high` below `low` means the site
+/// contradicted itself, which is what a site whose units got smaller does, and the newer
+/// observation wins; a `high` above `low` says nothing `low` did not. With only one, that one,
+/// which is what lets a site relearn a usable denominator from a busy spell alone.
+fn read_against(low: Option<f64>, high: Option<f64>) -> f64 {
+    match (low, high) {
+        (Some(low), Some(high)) => low.min(high),
+        (bound, None) | (None, bound) => bound.unwrap_or(0.0),
+    }
+}
+
+/// Whether the site is at `ceiling` with a backlog, and when that spell began.
+///
+/// Both read from `recent`, the settling time rather than the horizon, and from one instant, so
+/// a full moment and a queued moment are not crossed into congestion.
+fn congestion<S: SiteSignals>(
+    prior: Option<SiteLearned>,
+    recent: &SiteReading,
+    ceiling: f64,
+    inputs: &Inputs<'_, S>,
+) -> (bool, Option<i64>) {
+    let congested = recent.congested_in_flight.is_some_and(|held| held >= ceiling);
+    let since = spell_since(
+        prior.map(|prior| (prior.at_ms, prior.full_since)),
+        congested,
+        inputs.now_ms,
+        inputs.window_ms,
+    );
+    (congested, since)
+}
+
+/// Whether the site counts as full: a backlog at its ceiling, held for `full_after_ms`.
+///
+/// Absent where the site publishes no backlog, which is not the same as having none.
+fn full_for(candidate: &RouteCandidate, full_since: Option<i64>, now_ms: i64, full_after_ms: i64) -> Option<bool> {
+    candidate
+        .backlog
+        .map(|_| full_since.is_some_and(|since| now_ms.saturating_sub(since) >= full_after_ms))
+}
+
+/// What one measured refresh publishes beside `rho`.
+struct Limits {
+    /// Requests the site held, as read.
+    in_flight: f64,
+    /// In-flight over the ceiling, where a hard bound makes that a reading.
+    by_count: Option<f64>,
+    /// Whether the site is full, absent where it publishes no backlog.
+    full: Option<bool>,
+    /// Age of the sample the decision read.
+    age_ms: Option<i64>,
+}
+
+impl Limits {
+    /// What one refresh read, as the gauges take it.
+    fn read(in_flight: f64, ceiling: &Ceiling, by_count: f64, full: Option<bool>, age_ms: Option<i64>) -> Self {
+        Self {
+            in_flight,
+            // The count is a reading only where a hard bound holds it; elsewhere it is an upper
+            // bound on saturation, and must not be published as an input.
+            by_count: ceiling.hard.is_some().then_some(by_count),
+            full,
+            age_ms,
+        }
+    }
+}
+
+/// Set every gauge a measured refresh produces, so an operator reads the inputs the decision
+/// used rather than numbers published beside them.
+fn publish_limits(key: &SitePair, ceiling: &Ceiling, reading: &SiteReading, limits: &Limits) {
+    ceiling.publish(key);
+    site_gauge("grid_route_site_in_flight", key, limits.in_flight);
+    site_gauge("grid_route_site_rho_counted", key, limits.by_count.unwrap_or(f64::NAN));
+    site_gauge(
+        "grid_route_site_rho_reported",
+        key,
+        reported_limit(reading).unwrap_or(f64::NAN),
+    );
+    site_gauge(
+        "grid_route_site_full",
+        key,
+        limits.full.map_or(f64::NAN, |full| f64::from(u8::from(full))),
+    );
+    site_gauge(
+        "grid_route_site_reading_age_seconds",
+        key,
+        limits.age_ms.map_or(f64::NAN, |age| {
+            f64::from(u32::try_from(age).unwrap_or(u32::MAX)) / 1000.0
+        }),
+    );
+}
+
+/// How close the site is to the nearest limit it is up against.
+///
+/// Two limits, grouped by who worked them out. What the provider reports about itself is one:
+/// its own fullness, and the backlog behind it, both already relative to its own capacity. What
+/// the gateway has to work out is the other: a count of requests over a ceiling learned from
+/// the site's own load. The first needs nothing learned and arrives wherever the provider
+/// publishes it; the second needs the ceiling and arrives only where a per-request count does.
+///
+/// The nearest, not a blend. Each limit is a necessary condition for having room, so the larger
+/// reading is the binding one. These are limits rather than scores, which is why no weight sits
+/// between them: a weighted sum of necessary conditions is not one, and a site at 0.95 of its
+/// own reading and 0.05 of its counted ceiling would read half full while it is about to
+/// preempt. The EPP weighs its KV and queue scorers against each other because it only ranks
+/// endpoints; this reading also answers whether a site has room at all.
+///
+/// They bind in different regimes and neither knows which regime it is in, because request size
+/// decides that and nothing here sees a request: at a full context a site holds one or two
+/// requests while its cache is spent, and at small ones the slots fill while the cache is
+/// barely touched.
+fn nearest_limit(reading: &SiteReading, by_count: f64, at_a_known_limit: bool) -> f64 {
+    match reported_limit(reading) {
+        // The site says something about itself. Its count is admissible beside that only once
+        // a backlog has shown where its limit is, because until then the ceiling is a lower
+        // bound on capacity and the count over it is an upper bound on saturation, not a
+        // reading. Taking the larger of a reading and an upper bound gives the upper bound,
+        // which is how a site that has never been pushed reads as full while idle.
+        Some(reported) if at_a_known_limit => reported.max(by_count),
+        Some(reported) => reported,
+        // The site says nothing, so its count is all there is, upper bound and all.
+        None => by_count,
+    }
+}
+
+/// What the site reports about its own fullness, already joined across its units by the signal
+/// mapping.
+///
+/// The backlog is deliberately not folded in here. A queue is evidence that the site has
+/// reached a limit, which is what `at_limit` reads it for, and not a measure of how full the
+/// site is: a site at its ceiling with a queue is exactly where its own count should bind, and
+/// treating the queue as a reading would suppress that count instead.
+///
+/// Absent when the site reports nothing, which is when its count is all there is.
+fn reported_limit(reading: &SiteReading) -> Option<f64> {
+    reading.saturation
+}
+
+/// When the site's current spell of `on` began, if it is `on` at `now_ms`: carried from
+/// `prior`, that refresh's clock and the spell it held, while the site was measured within the
+/// window, else starting now, so a site unmeasured for longer than the window does not resume a
+/// spell from before the gap.
+fn spell_since(prior: Option<(i64, Option<i64>)>, on: bool, now_ms: i64, window_ms: i64) -> Option<i64> {
+    on.then(|| {
         prior
-            .filter(|prior| now_ms.saturating_sub(prior.at_ms) <= window_ms)
-            .and_then(|prior| prior.full_since)
+            .filter(|(at_ms, _)| now_ms.saturating_sub(*at_ms) <= window_ms)
+            .and_then(|(_, since)| since)
             .unwrap_or(now_ms)
     })
+}
+
+/// When a spell of backlogged samples began. Refreshing the same sample does not advance its
+/// clock, and a non-backlogged sample clears the spell before a later backlog starts another.
+fn sample_spell_since(prior: Option<SiteLearned>, backlogged_at: Option<i64>, window_ms: i64) -> Option<i64> {
+    let at = backlogged_at?;
+    Some(
+        prior
+            .filter(|prior| {
+                prior.backlog_since.is_some()
+                    && prior
+                        .sample_at
+                        .is_some_and(|previous| at.saturating_sub(previous) <= window_ms)
+            })
+            .and_then(|prior| prior.backlog_since)
+            .unwrap_or(at),
+    )
 }
 
 /// Set `grid_route_site_score` for one site/cluster pair.
@@ -477,7 +913,28 @@ fn site_score(key: &SitePair, score: f64) {
     site_gauge("grid_route_site_score", key, score);
 }
 
-/// Set a per-site gauge: the learned ceiling, the smoothed saturation, or the weight.
+/// The gauges only a measured refresh sets. A pair that is still a candidate but published no
+/// in-flight sample never reaches that refresh, so each has to be cleared by name: the exporter
+/// keeps a series until restart, and a frozen ceiling beside a NaN one reads as a healthy site.
+const MEASURED_GAUGES: [&str; 8] = [
+    "grid_route_site_ceiling",
+    "grid_route_site_ceiling_soft",
+    "grid_route_site_ceiling_hard",
+    "grid_route_site_rho_reported",
+    "grid_route_site_rho_counted",
+    "grid_route_site_in_flight",
+    "grid_route_site_full",
+    "grid_route_site_reading_age_seconds",
+];
+
+/// Set every gauge a measured refresh owns to NaN.
+fn clear_measured(key: &SitePair) {
+    for name in MEASURED_GAUGES {
+        site_gauge(name, key, f64::NAN);
+    }
+}
+
+/// Set a per-site gauge: a limit, the ceiling it is read against, or the weight.
 fn site_gauge(name: &'static str, (site, cluster): &SitePair, value: f64) {
     metrics::gauge!(name, "site" => Arc::clone(site), "cluster" => Arc::clone(cluster)).set(value);
 }
@@ -1141,6 +1598,43 @@ mod tests {
             "one unqueued sample restores the ceiling"
         );
         assert!(taught.shed(&BTreeSet::new(), &availability).shedding.is_empty());
+    }
+
+    #[test]
+    fn refreshing_one_backlogged_sample_does_not_settle_its_spell() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        let availability = AvailabilitySettings {
+            smoothing: 1.0,
+            full_after_ms: 0,
+            ..AvailabilitySettings::default()
+        };
+        with_in_flight(&store, "a", 60.0, 1_000);
+        with_queue(&store, "a", 5.0, 1_000);
+        let mut learned = Learned::default();
+        let first = RouteSnapshot::from_store(
+            one("a"),
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut learned, 1_000, 30_000),
+        );
+        let reread = RouteSnapshot::from_store(
+            one("a"),
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut learned, 10_000, 30_000),
+        );
+        assert_eq!(
+            reread.candidates[0].capacity, first.candidates[0].capacity,
+            "the refresh clock cannot turn one queued scrape into a hard bound"
+        );
+        assert_eq!(reread.candidates[0].rho, first.candidates[0].rho);
+    }
+
+    #[test]
+    fn reported_fullness_uses_the_joined_cache_reading() {
+        let reading = SiteReading {
+            saturation: Some(0.85),
+            ..SiteReading::default()
+        };
+        assert_eq!(reported_limit(&reading), Some(0.85));
     }
 
     #[test]

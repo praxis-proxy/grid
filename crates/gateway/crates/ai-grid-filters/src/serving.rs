@@ -88,7 +88,7 @@ pub struct GridServingConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AvailabilitySettings {
-    /// Weight of the newest in-flight sample against the running saturation estimate, in (0, 1].
+    /// Weight of the newest saturation reading against the running estimate, in (0, 1].
     pub smoothing: f64,
     /// The least a learned ceiling can be, so a quiet site does not read as full, at least 1.
     pub ceiling_floor: f64,
@@ -101,8 +101,9 @@ pub struct AvailabilitySettings {
     /// How long a site must stay below its ceiling before a shedding model routes again,
     /// milliseconds, at least 0. An emptied queue is room at once.
     pub room_after_ms: i64,
-    /// Queued work per serving unit at which a site counts as full, at least 0. Fullness only:
-    /// a sample stops teaching the ceiling as soon as one whole request waits anywhere.
+    /// Queued work per serving unit that makes a sample backlogged, at least 0. A sustained
+    /// backlog can teach the hard capacity bound; any whole request waiting stops that sample
+    /// from teaching the soft bound.
     pub queue_full: f64,
     /// Whether a model whose every site is full answers 429 rather than queueing deeper. Off
     /// unless every client of the grid retries on 429 with Retry-After, and off where the EPP's

@@ -1287,7 +1287,7 @@ fn with_query(url: &str, query: &str) -> Option<String> {
 /// Names a hub keeps from a peer: the cross-site contract, plus the EPP pool averages and
 /// ready counts the gateway routes on until it routes on saturation. A peer's custom
 /// `signalNames` are dropped here.
-const PEER_SIGNAL_NAMES: [&str; 18] = [
+const PEER_SIGNAL_NAMES: [&str; 19] = [
     crate::readiness::READY_SIGNAL,
     crate::readiness::READY_ENDPOINTS_SIGNAL,
     crate::readiness::IN_FLIGHT_SIGNAL,
@@ -1301,6 +1301,9 @@ const PEER_SIGNAL_NAMES: [&str; 18] = [
     "llm_d_epp_average_running_requests",
     "inference_pool_average_kv_cache_utilization",
     "llm_d_epp_average_kv_cache_utilization",
+    // The deviation across a pool's units, which a gateway reads beside the mean. Without it
+    // a remote site is routed from the mean alone and one hot unit stays hidden behind it.
+    "llm_d_epp_stddev_kv_cache_utilization",
     "llm_d_epp_ready_endpoints",
     "inference_pool_ready_pods",
     // What a gateway reads as a backlog beside the averages, and the per-unit series whose
@@ -1315,10 +1318,18 @@ const PEER_SIGNAL_NAMES: [&str; 18] = [
 pub const MAX_PEER_PROVIDERS: usize = 64;
 
 /// Signals that are shares, which a peer may not report above one.
-const UNIT_SIGNALS: [&str; 2] = [crate::readiness::READY_SIGNAL, crate::latency::ERROR_RATIO_SIGNAL];
+const UNIT_SIGNALS: [&str; 5] = [
+    crate::readiness::READY_SIGNAL,
+    crate::latency::ERROR_RATIO_SIGNAL,
+    // KV utilization is a fraction, and a provider publishing a percentage would otherwise
+    // read as a hundred times saturated.
+    "llm_d_epp_average_kv_cache_utilization",
+    "inference_pool_average_kv_cache_utilization",
+    "llm_d_epp_stddev_kv_cache_utilization",
+];
 
-/// A value a hub accepts: finite and non-negative, and at most one for a share.
-fn plausible(observation: &Observation) -> bool {
+/// Whether a hub accepts the value: finite, non-negative, and at most one for a share.
+fn in_range(observation: &Observation) -> bool {
     observation.value.is_finite()
         && observation.value >= 0.0
         && (observation.value <= 1.0 || !UNIT_SIGNALS.contains(&observation.metric.as_str()))
@@ -1346,7 +1357,7 @@ fn refusal(observation: &Observation) -> Option<&'static str> {
         .is_none_or(|provider| !valid_provider(provider))
     {
         Some("provider")
-    } else if !plausible(observation) {
+    } else if !in_range(observation) {
         Some("value")
     } else {
         None
@@ -1354,7 +1365,7 @@ fn refusal(observation: &Observation) -> Option<&'static str> {
 }
 
 /// Keep what a hub accepts from `peer`: an allowed name, a `grid_provider` that names a
-/// routing cluster, a plausible value, and at most [`MAX_PEER_PROVIDERS`] providers. Each
+/// routing cluster, a value in range, and at most [`MAX_PEER_PROVIDERS`] providers. Each
 /// refusal is counted by reason.
 fn bound_peer(observations: Vec<Observation>, peer: &str) -> Vec<Observation> {
     let mut kept = Vec::with_capacity(observations.len());
@@ -1460,7 +1471,7 @@ fn render_contract_block(
     (block, oldest, cut)
 }
 
-/// The largest relayed-sample age treated as plausible, one day.
+/// The largest relayed-sample age accepted, one day.
 ///
 /// A larger apparent age means the peer's clock is skewed or the timestamp is
 /// garbage. Such a sample is stamped fresh rather than trusted to be that old.
@@ -1470,7 +1481,7 @@ const MAX_RELAY_AGE_MS: i64 = 24 * 60 * 60 * 1000;
 ///
 /// Age is the peer's `Date` minus the sample's own timestamp, both on the peer
 /// clock so no skew enters, then stamped as this site's `now` minus that age. A
-/// missing or implausible input falls back to `now`, never the peer's absolute
+/// missing or out-of-range input falls back to `now`, never the peer's absolute
 /// clock, so a reader compares timestamps within one clock.
 fn reexpress_peer_ages(observations: &mut [Observation], date: Option<SystemTime>, now_ms: i64) {
     let date_ms = date
@@ -1538,7 +1549,7 @@ mod tests {
     fn a_row_naming_another_site_is_refused_not_re_attributed() {
         // A peer serving data on another site's behalf is the chaining the grid
         // does not allow. Re-attributing it to the dialed peer would turn a
-        // misconfigured peer into plausible numbers of its own, so it is
+        // misconfigured peer into numbers of its own that are in range, so it is
         // refused and counted instead.
         let mut claims_elsewhere = peer_sample(crate::readiness::READY_SIGNAL, "pool", 1.0);
         claims_elsewhere
@@ -1957,7 +1968,7 @@ mod tests {
     }
 
     #[test]
-    fn reexpress_peer_ages_preserves_age_and_rejects_implausible() {
+    fn reexpress_peer_ages_preserves_age_and_rejects_out_of_range() {
         let obs = |ts: Option<i64>| Observation {
             metric: "m".to_owned(),
             labels: BTreeMap::new(),
@@ -1980,7 +1991,7 @@ mod tests {
             now_ms,
         );
         let got: Vec<Option<i64>> = samples.iter().map(|o| o.timestamp_ms).collect();
-        // Age preserved on this clock. Future, implausible, and missing all fall back.
+        // Age preserved on this clock. Future, out of range, and missing all fall back.
         assert_eq!(got, vec![Some(now_ms - 30_000), None, None, None]);
     }
 
@@ -2724,5 +2735,34 @@ q{pool=\"d\"} 0.35
             kept.iter().all(|o| o.value.is_finite()),
             "a non-finite score outranks every finite one at the consumer"
         );
+    }
+
+    /// Every cache reading the gateway can read crosses the relay, and is bounded as a share.
+    ///
+    /// The two lists are easy to update apart: a name added to one and not the other either
+    /// never reaches a peer, or reaches it as a percentage that the gateway then refuses. Both
+    /// drop the reading silently, so the gateway routes a remote site from whatever is left.
+    #[test]
+    fn every_cache_reading_the_gateway_takes_is_relayed_and_bounded() {
+        const GATEWAY: &str = include_str!("../../gateway/crates/ai-grid-filters/src/signals/llm_d.rs");
+
+        let names: Vec<&str> = GATEWAY
+            .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+            .filter(|part| part.contains("kv_cache_utilization"))
+            .collect();
+        assert!(
+            names.len() >= 3,
+            "found only {names:?}, the scan is not reading the gateway's series"
+        );
+        for name in names {
+            assert!(
+                PEER_SIGNAL_NAMES.contains(&name),
+                "{name} is read by the gateway but never relayed to a peer"
+            );
+            assert!(
+                UNIT_SIGNALS.contains(&name),
+                "{name} is a share the gateway refuses above one, but a hub accepts any value"
+            );
+        }
     }
 }

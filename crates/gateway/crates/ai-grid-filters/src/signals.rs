@@ -26,10 +26,28 @@ pub struct SiteReading {
     /// `queue_full` per unit, or anything held before scheduling), worst within the window.
     /// Absent when no instant in the window had one.
     pub congested_in_flight: Option<f64>,
+    /// The site's own reading of how full it is, 0 to 1, worst within the window. The
+    /// provider divides by its own capacity, so this needs no ceiling and does not depend on
+    /// how much the gateway has sent. An llm-d site derives it from its KV-cache mean widened
+    /// by the spread across units; a provider that knows its own limit by other means reports
+    /// the same joined reading.
+    pub saturation: Option<f64>,
+    /// The most it held at an instant that had a backlog and reported itself full. One sample
+    /// decides both, because every series here is the worst in its window: maximised apart, the
+    /// count from one congested sample pairs with the fullness of another, and a limit is
+    /// recorded for a state the site was never in.
+    pub full_in_flight: Option<f64>,
+    /// When the newest sample itself had a backlog. Unlike the windowed backlog fields, this
+    /// advances only when another backlogged sample arrives, so refreshes cannot age one burst
+    /// into a sustained backlog.
+    pub backlogged_at: Option<i64>,
     /// Whether the site's last word on readiness was no, with nothing newer since.
     pub unready: bool,
     /// When the site's newest sample arrived, the epoch of a smoothing step.
     pub sampled_at: Option<i64>,
+    /// Serving units the site last reported. Not a capacity: it says nothing about how much
+    /// one unit carries, only that the site is a different size than it was.
+    pub units: Option<f64>,
 }
 
 /// What a reading covers: the clock, how old a site's newest sample may be, how far behind
@@ -44,6 +62,8 @@ pub struct Over {
     pub horizon_ms: i64,
     /// Waiting work per serving unit at which an instant has a backlog.
     pub queue_full: f64,
+    /// The fullness a site reports at which that reading alone marks a limit.
+    pub reported_full: f64,
 }
 
 /// A source of site readings. Dispatch is static: the snapshot is generic over it.

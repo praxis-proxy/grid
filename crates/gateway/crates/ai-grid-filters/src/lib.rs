@@ -67,18 +67,46 @@ const COUNTER_HELP: [(&str, &str); 7] = [
 ];
 
 /// Grid gauges the gateway emits.
-const GAUGE_HELP: [(&str, &str); 7] = [
+const GAUGE_HELP: [(&str, &str); 14] = [
     (
         "grid_route_site_rho",
-        "Saturation the gateway last read for the site, in-flight over its ceiling. NaN when unmeasured.",
+        "Saturation the draw weights the site by: the nearest limit it is up against, smoothed across samples. NaN when unmeasured.",
+    ),
+    (
+        "grid_route_site_rho_reported",
+        "Saturation the site reports about itself, as its KV cache utilization plus the spread across its pods. NaN where it reports none.",
+    ),
+    (
+        "grid_route_site_rho_counted",
+        "Requests in flight over the ceiling they are read against. NaN until a hard bound makes the count a reading rather than an upper bound.",
     ),
     (
         "grid_route_site_weight",
-        "Capacity the draw weights the site by. NaN when unmeasured.",
+        "Capacity the draw weights the site by, after the explore floor. NaN when unmeasured.",
     ),
     (
         "grid_route_site_ceiling",
-        "Ceiling the gateway has learned for the site. NaN when unmeasured.",
+        "Requests a count is read against: the lesser of the two bounds, never below the floor. NaN when unmeasured.",
+    ),
+    (
+        "grid_route_site_ceiling_soft",
+        "Most requests the current site size has carried with nothing waiting. NaN until it is seen queue-free; retired after a sustained loss of serving units.",
+    ),
+    (
+        "grid_route_site_ceiling_hard",
+        "Fewest requests the site held while at a limit. NaN until it has been pushed to one.",
+    ),
+    (
+        "grid_route_site_in_flight",
+        "Requests the site held, as read. The numerator of the counted saturation. NaN when unmeasured.",
+    ),
+    (
+        "grid_route_site_full",
+        "1 while the site has had a backlog at its ceiling for long enough to shed, 0 otherwise. NaN where it publishes no backlog.",
+    ),
+    (
+        "grid_route_site_reading_age_seconds",
+        "Age of the sample the decision read. A frozen value and a steady one are the same picture without it.",
     ),
     (
         "grid_route_site_score",
