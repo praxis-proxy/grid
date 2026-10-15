@@ -447,7 +447,8 @@ mod tests {
         assert_eq!(
             counts.keys().collect::<Vec<_>>(),
             vec![&"site-a"],
-            "only the drained site has room: {counts:?}"
+            "only the drained site has room: {counts:?}; selection state:\n{}",
+            grid_lines()
         );
         let after = gateway.metrics();
         assert!(

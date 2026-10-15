@@ -297,10 +297,10 @@ pub(super) struct Guard {
 }
 
 impl Guard {
-    /// Whether the held identity is within the requested age bound.
+    /// Whether the held identity is within the age bound, including commits newer than a reader's clock.
     fn fresh(&self, now_ms: i64, max_age_ms: i64) -> bool {
         self.accepted_at
-            .is_some_and(|at_ms| (0..=max_age_ms).contains(&now_ms.saturating_sub(at_ms)))
+            .is_some_and(|at_ms| now_ms.saturating_sub(at_ms).max(0) <= max_age_ms)
     }
 }
 
@@ -701,6 +701,23 @@ mod tests {
         let second = state(&store, 2_000);
         assert_eq!(first.epoch, second.epoch);
         assert!(second.serial > first.serial);
+    }
+
+    #[test]
+    fn refresh_started_before_a_new_publication_cannot_expire_it() {
+        let store = store();
+        ingest(&store, &batch("u1", 1, 1, 1, 1_000), 1_000);
+        let first = state(&store, 1_000);
+        ingest(&store, &batch("u1", 1, 1, 2, 2_000), 2_000);
+        let current = state(&store, 2_000);
+        assert_eq!(current.epoch, first.epoch);
+        assert_eq!(
+            state(&store, 1_999),
+            current,
+            "a refresh clock captured before commit must not disqualify a newer publication"
+        );
+        assert_eq!(state(&store, 12_000), current, "age is bounded from acceptance");
+        assert_eq!(state(&store, 12_001).epoch, None, "real expiry still retires learning");
     }
 
     #[test]
