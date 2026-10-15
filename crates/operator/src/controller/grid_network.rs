@@ -6222,13 +6222,15 @@ async fn reconcile_discovered_sites(
         let existing = api.get_opt(&site.name).await?;
         let noteworthy = stub_changed(existing.as_ref(), site);
 
-        let clear_legacy_endpoint = serde_json::json!({"spec": {"egress": null}});
-        api.patch(
-            &site.name,
-            &PatchParams::default(),
-            &Patch::Merge(&clear_legacy_endpoint),
-        )
-        .await?;
+        if existing.is_some() && !site.egress_address.is_empty() {
+            let clear_legacy_endpoint = serde_json::json!({"spec": {"egress": null}});
+            api.patch(
+                &site.name,
+                &PatchParams::default(),
+                &Patch::Merge(&clear_legacy_endpoint),
+            )
+            .await?;
+        }
 
         api.patch(
             &site.name,
