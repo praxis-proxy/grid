@@ -26,7 +26,7 @@ Run the chart's connectivity test:
 {{- if eq $configSource "operator" }}
 
 The Grid operator writes ConfigMap {{ include "praxis-gateway.configMapName" . }} (GridNetwork
-gatewayRefs consumerConfig.enabled: true). The pod waits in ContainerCreating until
+gatewayRefs[].consumerConfig.enabled: true). The pod waits in ContainerCreating until
 that ConfigMap exists. If the GridNetwork sets another consumerConfig.configMapName, set the
 same name in praxisConfig.operator.configMapName.
 

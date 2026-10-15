@@ -3558,17 +3558,20 @@ fn install_embedded_gateway(root: &Path, image: &str) -> Result<(), Box<dyn std:
         format!("image.tag={tag}"),
         "image.flavor=grid-gateway".to_owned(),
         "image.pullPolicy=Never".to_owned(),
-        "config.existingConfigMap=grid-serving-gateway-config".to_owned(),
+        "praxisConfig.source=render".to_owned(),
+        format!("grid.siteName={CONSUMER_SITE}"),
+        "praxisConfig.render.role=consumer".to_owned(),
+        "praxisConfig.render.auth.mode=none".to_owned(),
         "service.type=ClusterIP".to_owned(),
-        format!("gridServing.network={GRID_NETWORK_NAME}"),
-        format!("gridServing.gatewayRef={GRID_SERVING_GATEWAY}"),
-        format!("gridServing.configMap={GRID_SERVING_CONFIGMAP}"),
-        format!("tls.existingSecret={CONSUMER_TLS_SECRET}"),
-        format!("tls.caSecret={CONSUMER_TLS_SECRET}"),
+        format!("praxisConfig.render.gridServing.networkName={GRID_NETWORK_NAME}"),
+        format!("praxisConfig.render.gridServing.gatewayRefName={GRID_SERVING_GATEWAY}"),
+        format!("praxisConfig.render.gridServing.configMapName={GRID_SERVING_CONFIGMAP}"),
+        format!("gridIdentity.tlsSecretName={CONSUMER_TLS_SECRET}"),
+        format!("gridIdentity.caSecretName={CONSUMER_TLS_SECRET}"),
     ] {
         command.args(["--set-string", &value]);
     }
-    command.args(["--set", "gridServing.enabled=true", "--set", "tls.enabled=true"]);
+    command.args(["--set", "praxisConfig.render.gridServing.enabled=true"]);
     let output = command.output()?;
     if !output.status.success() {
         return Err(format!(

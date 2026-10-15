@@ -25,6 +25,7 @@ grid:
 
 gridIdentity:
   tlsSecretName: provider-tls
+  caSecretName: provider-tls
 
 providerCredentials:
   - secretName: mock-inference-credential

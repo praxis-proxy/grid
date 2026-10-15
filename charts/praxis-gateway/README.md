@@ -92,7 +92,7 @@ These values do not add TLS settings to `praxis.yaml`.
 
 The chart rejects selected render settings when `source` is not `render`:
 non-empty `model`, `backends`, or `auth.mode`; `role: provider`;
-`gridServing.enabled: true`; and `telemetry.enabled: true`. Other
+`praxisConfig.render.gridServing.enabled: true`; and `telemetry.enabled: true`. Other
 `praxisConfig.render` values may be accepted and ignored. For example,
 `peerTrust.certDigests` is used only with `source: render` and
 `role: provider`; `auth.validateUrl` and `auth.validateCA` are used only with
@@ -537,21 +537,21 @@ Keep the old Helm mounts during the first phase, then release them only after
 Grid reports `mountReconciliationStatus: Ready`:
 
 ```yaml
-config:
-  existingConfigMap: praxis-consumer-config
-  key: praxis.yaml
-gatewayConfig:
-  render: false
+praxisConfig:
+  source: byo
+  byo:
+    configMapName: praxis-consumer-config
+    key: praxis.yaml
 mountReconciliation:
   enabled: true
   network: production
   gatewayRef: consumer-gateway
   managedCredentialNames: [backend-api-token]
   releaseHelmMounts: false
-credentials:
-  - name: backend-api-token
+providerCredentials:
+  - secretName: backend-api-token
     mountPath: /run/secrets/backend-api-token # retained during preparation
-  - name: monitoring-token
+  - secretName: monitoring-token
     mountPath: /run/secrets/monitoring-token # stays Helm-managed
 ```
 
