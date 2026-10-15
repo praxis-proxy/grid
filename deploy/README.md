@@ -73,9 +73,13 @@ Services.
 # Regenerate after a chart change (writes the base and overlays with values.yaml)
 make generate-deploy
 
-# Check that the committed manifests match the chart (runs in CI)
+# Check generated manifests and rendered overlays (runs in CI)
 make deploy-check
 ```
+
+`deploy-check` requires Helm, yq v4, jq, and Kustomize. It verifies that the
+AWS overlay requests NLBs for the separate UDP SWIM and TCP signals Services
+and changes only those two annotations relative to the OpenShift base.
 
 ### Install Steps
 

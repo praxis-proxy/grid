@@ -108,9 +108,10 @@ crds-check:
 generate-deploy:
 	./scripts/generate-deployment-operator.sh
 
-# Fail if the checked-in install manifests no longer match the chart.
+# Check generated install manifests and cloud overlay behavior.
 deploy-check:
 	./scripts/generate-deployment-operator.sh --check
+	./scripts/verify-deployment-overlays.sh
 
 audit:
 	cargo audit

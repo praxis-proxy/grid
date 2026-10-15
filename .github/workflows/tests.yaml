@@ -116,7 +116,18 @@ jobs:
           echo "${YQ_SHA256}  /tmp/yq" | sha256sum -c
           sudo install -m 0755 /tmp/yq /usr/local/bin/yq
 
-      - name: Check install manifests match the chart
+      - name: Install Kustomize
+        env:
+          KUSTOMIZE_VERSION: v5.8.1
+          KUSTOMIZE_SHA256: 029a7f0f4e1932c52a0476cf02a0fd855c0bb85694b82c338fc648dcb53a819d
+        run: |
+          curl -fsSL -o /tmp/kustomize.tar.gz \
+            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          echo "${KUSTOMIZE_SHA256}  /tmp/kustomize.tar.gz" | sha256sum -c
+          tar -xzf /tmp/kustomize.tar.gz -C /tmp kustomize
+          sudo install -m 0755 /tmp/kustomize /usr/local/bin/kustomize
+
+      - name: Check generated manifests and cloud overlays
         run: make deploy-check
 
   # ----------------------------------------------------------------------------
