@@ -53,6 +53,12 @@ Each directory keeps the `values.yaml` that renders it.
   `values.yaml` as a delta, rendered against the API versions in its `api-versions` file.
   `overlays/openshift/` takes metrics TLS from the service CA and adds a NetworkPolicy that
   admits the platform's monitoring namespaces. Add a flavor by adding a directory.
+- `overlays/openshift-aws/` adds the chart's `platform: aws` setting to the
+  OpenShift configuration. It requests an AWS Network Load Balancer for each
+  of the SWIM and signals Services. The default AWS Classic Load Balancer
+  rejects UDP, leaving SWIM without an address and the operator unready.
+  Platform operators deploying on AWS must select this flavor when vendoring
+  the manifests; generated manifests do not detect the cluster's cloud provider.
 - The SWIM and signals Services are `LoadBalancer`, because the operator refuses any other
   type for the Service it advertises and peer sites reach both through it. A cluster with
   no LoadBalancer provider leaves the operator waiting for an address and never ready. The
@@ -92,6 +98,9 @@ kubectl apply -k deploy/operator/ -n grid-system
 
 # or OpenShift
 kubectl apply -k deploy/overlays/openshift/ -n grid-system
+
+# or OpenShift on AWS
+kubectl apply -k deploy/overlays/openshift-aws/ -n grid-system
 
 # or kind, which brings its own namespace
 kubectl apply -k deploy/overlays/kind/

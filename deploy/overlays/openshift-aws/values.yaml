@@ -1,0 +1,7 @@
+# OpenShift on AWS needs an NLB for UDP SWIM traffic.
+platform: aws
+metrics:
+  tls:
+    source: serviceCA
+networkPolicy:
+  enabled: true

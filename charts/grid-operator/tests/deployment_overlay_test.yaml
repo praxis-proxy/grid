@@ -1,0 +1,76 @@
+suite: OpenShift AWS deployment overlay
+templates:
+  - templates/service-swim.yaml
+  - templates/service-signals.yaml
+  - templates/service-metrics.yaml
+  - templates/deployment.yaml
+  - templates/networkpolicy.yaml
+values:
+  - ../../../deploy/operator/values.yaml
+  - ../../../deploy/overlays/openshift-aws/values.yaml
+capabilities:
+  apiVersions: [security.openshift.io/v1]
+release:
+  name: grid-operator
+  namespace: grid-system
+tests:
+  - it: requests an NLB for the UDP SWIM Service
+    template: templates/service-swim.yaml
+    asserts:
+      - equal:
+          path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-type"]
+          value: nlb
+      - equal:
+          path: spec.type
+          value: LoadBalancer
+      - equal:
+          path: spec.ports
+          value:
+            - name: swim-udp
+              port: 7946
+              targetPort: swim-udp
+              protocol: UDP
+
+  - it: requests a separate NLB for TCP signals
+    template: templates/service-signals.yaml
+    asserts:
+      - equal:
+          path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-type"]
+          value: nlb
+      - equal:
+          path: spec.type
+          value: LoadBalancer
+      - equal:
+          path: spec.ports
+          value:
+            - name: signals
+              port: 9091
+              targetPort: signals
+              protocol: TCP
+
+  - it: retains the OpenShift service CA and HTTPS readiness probe
+    asserts:
+      - template: templates/service-metrics.yaml
+        equal:
+          path: metadata.annotations["service.beta.openshift.io/serving-cert-secret-name"]
+          value: grid-operator-metrics-tls
+      - template: templates/deployment.yaml
+        equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.scheme
+          value: HTTPS
+
+  - it: admits OpenShift monitoring namespaces to the metrics port
+    template: templates/networkpolicy.yaml
+    asserts:
+      - contains:
+          path: spec.ingress[1].from
+          content:
+            namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: openshift-monitoring
+      - contains:
+          path: spec.ingress[1].from
+          content:
+            namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: openshift-user-workload-monitoring
