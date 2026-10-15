@@ -318,7 +318,10 @@ mod tests {
             refresh_signals(&ctx, &client, network).await?;
             tokio::time::timeout(Duration::from_secs(1), listed.notified()).await?;
         }
-        assert!(ctx.signals.current().iter().all(|row| row.metric != revision::METRIC));
+        assert!(
+            ctx.signals.current().iter().all(|row| row.metric != revision::METRIC),
+            "a pass without a publisher must not emit revision metadata"
+        );
         Ok(())
     }
 

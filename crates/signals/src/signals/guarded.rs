@@ -596,12 +596,31 @@ mod tests {
         ingest(&store, &payload("queue", 8, 1_000), 1_000);
         let first = state(&store, 1_000);
         ingest(&store, &payload("running", 3, 2_000), 2_000);
-        assert_eq!(store.window_worst("b/m", "queue", 2_000, 3_000, true), Some(8.0));
+        assert_eq!(
+            store.window_worst("b/m", "queue", 2_000, 3_000, true),
+            Some(8.0),
+            "a partial pressure update must preserve the queue window"
+        );
         ingest(&store, &payload("queue", 0, 3_000), 3_000);
-        assert_eq!(store.window_worst("b/m", "queue", 3_000, 3_000, true), Some(8.0));
-        assert_eq!(store.window_worst("b/m", "queue", 4_001, 3_000, true), Some(0.0));
-        assert_eq!(state(&store, 4_001).epoch, None);
-        assert!(state(&store, 4_001).serial > first.serial);
+        assert_eq!(
+            store.window_worst("b/m", "queue", 3_000, 3_000, true),
+            Some(8.0),
+            "a drained queue must retain the recent pressure peak"
+        );
+        assert_eq!(
+            store.window_worst("b/m", "queue", 4_001, 3_000, true),
+            Some(0.0),
+            "the pressure peak must expire at the window boundary"
+        );
+        assert_eq!(
+            state(&store, 4_001).epoch,
+            None,
+            "metadata-free updates must not enable learning"
+        );
+        assert!(
+            state(&store, 4_001).serial > first.serial,
+            "pressure updates must advance the read guard"
+        );
     }
 
     #[test]
@@ -611,12 +630,31 @@ mod tests {
         let first = state(&store, 1_000);
         ingest(&store, &payload("queue", 8, 2_000), 2_000);
         ingest(&store, &payload("queue", 0, 3_000), 3_000);
-        assert_eq!(store.window_worst("b/m", "queue", 3_000, 3_000, true), Some(8.0));
-        assert_eq!(state(&store, 3_000).epoch, None);
+        assert_eq!(
+            store.window_worst("b/m", "queue", 3_000, 3_000, true),
+            Some(8.0),
+            "unqualified updates must retain fresh pressure history"
+        );
+        assert_eq!(
+            state(&store, 3_000).epoch,
+            None,
+            "losing metadata must disable learning"
+        );
         ingest(&store, &batch("u1", 1, 1, 2, 4_000), 4_000);
-        assert!(state(&store, 4_000).epoch.is_some());
-        assert_ne!(state(&store, 4_000).epoch, first.epoch);
-        assert_eq!(store.window_worst("b/m", "queue", 4_000, 4_000, true), Some(2.0));
+        assert!(
+            state(&store, 4_000).epoch.is_some(),
+            "a newer complete batch must re-enable learning"
+        );
+        assert_ne!(
+            state(&store, 4_000).epoch,
+            first.epoch,
+            "recovery must start a new learning lifetime"
+        );
+        assert_eq!(
+            store.window_worst("b/m", "queue", 4_000, 4_000, true),
+            Some(2.0),
+            "recovered learning must exclude unknown-era pressure history"
+        );
     }
 
     #[test]
