@@ -52,6 +52,8 @@ struct TokenCheckpoint {
 /// Invite lifecycle condition state.
 #[derive(Clone, Copy)]
 enum InviteState {
+    /// Token checkpoint is durable before the token is minted.
+    Pending,
     /// Token remains usable.
     Ready,
     /// Token lifetime ended.
@@ -158,7 +160,18 @@ async fn apply_invite(invite: &SiteInvite, ctx: &Context) -> Result<Action, Reco
     }
     let checkpoint = Box::pin(read_invite_checkpoint(invite, &secrets, namespace, &secret_name)).await?;
     match Box::pin(token_phase(invite, ctx, checkpoint.token_id)).await? {
-        TokenPhase::Outstanding => {},
+        TokenPhase::Outstanding => {
+            if checkpoint.expires_at <= OffsetDateTime::now_utc() {
+                return Box::pin(expire_invite(invite, ctx, &secrets, &secret_name, checkpoint)).await;
+            }
+            if checkpoint.token_sha256.is_none() {
+                match Box::pin(ctx.state.store.revoke_site_token(checkpoint.token_id)).await {
+                    Ok(()) | Err(crate::StoreError::NotFound) => {},
+                    Err(error) => return Err(error.into()),
+                }
+                return Box::pin(revoke_invite(invite, ctx, &secret_name, checkpoint)).await;
+            }
+        },
         TokenPhase::Redeemed(enrollment_id) => {
             return Box::pin(redeem_invite(invite, ctx, &secret_name, checkpoint, enrollment_id)).await;
         },
@@ -231,7 +244,12 @@ async fn token_phase(invite: &SiteInvite, ctx: &Context, token_id: Uuid) -> Resu
                 .status
                 .as_ref()
                 .and_then(|status| status.token_id.as_ref())
-                .is_none() =>
+                .is_none()
+                || invite.status.as_ref().is_some_and(|status| {
+                    status.conditions.iter().any(|condition| {
+                        condition.type_ == "Ready" && condition.status == "False" && condition.reason == "Pending"
+                    })
+                }) =>
         {
             Ok(TokenPhase::Outstanding)
         },
@@ -241,6 +259,10 @@ async fn token_phase(invite: &SiteInvite, ctx: &Context, token_id: Uuid) -> Resu
 }
 
 /// Record an unexpired token and expose only its Secret reference.
+#[expect(
+    clippy::too_many_lines,
+    reason = "pending status, token mint, and Ready status must remain ordered"
+)]
 async fn activate_invite(
     invite: &SiteInvite,
     ctx: &Context,
@@ -258,6 +280,14 @@ async fn activate_invite(
         InviteState::Ready,
         None,
     )?;
+    let pending = invite_status(
+        invite,
+        &checkpoint,
+        Some((namespace, secret_name)),
+        InviteState::Pending,
+        None,
+    )?;
+    Box::pin(api_patch_status(&ctx.client, invite, pending)).await?;
     Box::pin(ctx.state.store.mint_site_token(NewSiteToken {
         token_id: Some(checkpoint.token_id),
         token_sha256: checkpoint.token_sha256.ok_or_else(|| {
@@ -347,6 +377,7 @@ fn invite_status(
     redeemed_by: Option<&str>,
 ) -> Result<serde_json::Value, ReconcileError> {
     let (condition_status, reason, message) = match state {
+        InviteState::Pending => ("False", "Pending", "Invite token mint is pending"),
         InviteState::Ready => ("True", "Ready", "Invite token is ready"),
         InviteState::Expired => ("False", "Expired", "Invite token expired"),
         InviteState::Redeemed => ("True", "Redeemed", "Invite token was redeemed"),

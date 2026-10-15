@@ -203,6 +203,7 @@ Retry-After when present, and stop on 401 and 403.
 | not_found | 404 | No such token or enrollment. |
 | timeout | 408 | The request ran past the server's limit. |
 | name_taken | 409 | Another enrollment holds the site name. |
+| key_mismatch | 409 | The request key differs from the token's bound key; the token stays unspent. |
 | reserved_site | 409 | The name is the enrollment bootstrap's. |
 | token_outstanding | 409 | A live token already pins the site name. |
 | name_deleted | 409 | The name's enrollment was deleted; mint with allowDeletedName. |

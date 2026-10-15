@@ -409,6 +409,10 @@ struct TokenRow {
     public_key_sha256: Option<String>,
     /// The pinned name.
     site_name: String,
+    /// The grid the token admits the site to.
+    grid_network_ref: String,
+    /// The operator that issued the token.
+    issued_by: String,
     /// When the token stops being usable.
     expires_at: OffsetDateTime,
     /// Whether it may enroll a deleted name.
@@ -461,6 +465,8 @@ impl MemoryStore {
         if let Some(existing) = inner.tokens.get(&token_id) {
             return (existing.token_sha256 == token.token_sha256
                 && existing.site_name == token.site_name
+                && existing.grid_network_ref == token.grid_network_ref
+                && existing.issued_by == token.issued_by
                 && existing.public_key_sha256 == token.public_key_sha256
                 && existing.expires_at == token.expires_at
                 && existing.allow_deleted_name == token.allow_deleted_name)
@@ -490,6 +496,8 @@ impl MemoryStore {
             TokenRow {
                 token_sha256: token.token_sha256,
                 site_name: token.site_name,
+                grid_network_ref: token.grid_network_ref,
+                issued_by: token.issued_by,
                 public_key_sha256: token.public_key_sha256,
                 expires_at: token.expires_at,
                 allow_deleted_name: token.allow_deleted_name,
@@ -731,6 +739,10 @@ mod token_id_tests {
     use super::{MemoryStore, NewSiteToken, StoreError};
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the retry test checks all fields that define token identity"
+    )]
     fn token_id_mint_is_retryable_only_for_the_same_token() -> Result<(), StoreError> {
         let store = MemoryStore::default();
         let token_id = Uuid::new_v4();
@@ -746,13 +758,22 @@ mod token_id_tests {
         };
         assert_eq!(store.mint_site_token(token.clone())?, token_id);
         assert_eq!(store.mint_site_token(token.clone())?, token_id);
-        assert!(matches!(
-            store.mint_site_token(NewSiteToken {
+        for changed in [
+            NewSiteToken {
                 site_name: "east".to_owned(),
+                ..token.clone()
+            },
+            NewSiteToken {
+                grid_network_ref: "other-grid".to_owned(),
+                ..token.clone()
+            },
+            NewSiteToken {
+                issued_by: "other-operator".to_owned(),
                 ..token
-            }),
-            Err(StoreError::Backend(_))
-        ));
+            },
+        ] {
+            assert!(matches!(store.mint_site_token(changed), Err(StoreError::Backend(_))));
+        }
         Ok(())
     }
 
