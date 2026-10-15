@@ -109,9 +109,10 @@ Under `enrollment.authz=local` the Secret's `tokens` key holds one `name:token` 
 
 For GitOps-managed invites, install the Grid operator chart and this chart,
 then sync SiteInvite resources after both are ready. The enrollment controller
-creates and revokes each token Secret. A secret-delivery controller must copy
-the token and Grid CA bundle to the joining site's operator namespace and remove
-the delivered token when the invite is pruned. Keep credentials out of Git. See
+creates and revokes each token Secret. A secret-sync mechanism must copy the
+token and Grid CA bundle to the joining site's operator namespace and remove
+the delivered token when the invite is pruned. Vault can store the token, but
+an external sync process must export and deliver it. Keep credentials out of Git. See
 [Site Enrollment](../../docs/installation/enrollment.md#2-invite-a-site-with-gitops)
 for the manifest and delivery flow.
 

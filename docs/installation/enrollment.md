@@ -108,12 +108,12 @@ enrollment service are ready.
 
 The controller creates Secret `grid-invite-east2` with key `token` and reports
 the reference in `.status.secretRef`. The token never appears in Git or status.
-Use a secret-delivery controller to copy that Secret and `grid-ca-bundle` to the
-site's operator namespace. Configure that controller to remove the delivered
-token when the invite is pruned. By default, the source Secret is in the
-enrollment release namespace; set `enrollment.inviteSecrets.namespace` to use a
-dedicated namespace. Restrict read access to this namespace to the enrollment
-service and the delivery controller.
+The chart does not sync these resources. Vault can store the token, but an
+external sync process must copy it and `grid-ca-bundle` to the site's operator
+namespace and delete the delivered token when the invite is pruned. By default,
+the source Secret is in the enrollment release namespace; set
+`enrollment.inviteSecrets.namespace` to use a dedicated namespace. Restrict read
+access to this namespace to the enrollment service and the sync process.
 
 The required jurisdiction labels are recorded but not enforced yet.
 
