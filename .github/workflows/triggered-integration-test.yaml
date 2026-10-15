@@ -32,6 +32,7 @@ on:
           - glb
           - static-weighted
           - combined-site
+          - llmd-pool-metrics
       mode:
         description: Demo execution mode
         required: true
@@ -69,6 +70,10 @@ env:
   STATIC_WEIGHTED_SIM_IMAGE_TAG: ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
   COMBINED_SITE_SIM_IMAGE_REF: ghcr.io/neuralmagic/vllm-vcr@sha256:cf98f91f12210893f63b3afd3b1ea5bd3c35640379ce2bbf702a4cefddf9e5a4
   COMBINED_SITE_SIM_IMAGE_TAG: ghcr.io/neuralmagic/vllm-vcr:vllm0.23
+  LLMD_SIM_IMAGE_REF: ghcr.io/llm-d/llm-d-inference-sim@sha256:7f3a1f72875c5dd5d00299ad358dc1f6e17041a5124609a43aa17ad318bbed32
+  LLMD_SIM_IMAGE_TAG: ghcr.io/llm-d/llm-d-inference-sim:v0.10.2
+  LLMD_EPP_IMAGE_REF: ghcr.io/llm-d/llm-d-router-endpoint-picker@sha256:39257d24552d16d8f215d3de25cc734fd44af3b282b67032db01aff900c610cf
+  LLMD_EPP_IMAGE_TAG: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.11.0
   # Pin the linux/amd64 child manifest. Kind imports every platform from a
   # multi-platform index, while this workflow runs amd64 nodes and only pulls
   # the runner's platform into Docker.
@@ -135,8 +140,10 @@ jobs:
                 exit 1
               fi
               ;;
+            llmd-pool-metrics)
+              ;;
             *)
-              echo "::error::Unknown qualification '${QUALIFICATION}'; expected glb, static-weighted, or combined-site"
+              echo "::error::Unknown qualification '${QUALIFICATION}'; expected glb, static-weighted, combined-site, or llmd-pool-metrics"
               exit 1
               ;;
           esac
@@ -512,7 +519,7 @@ jobs:
                 "${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-glb-demo/configs/west-provider/praxis.yaml"
               )
               ;;
-            static-weighted|combined-site)
+            static-weighted|combined-site|llmd-pool-metrics)
               CONFIGS=(
                 "${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-${QUALIFICATION}/configs/consumer/praxis.yaml"
                 "${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-${QUALIFICATION}/configs/provider/praxis.yaml"
@@ -668,8 +675,21 @@ jobs:
           cache-from: type=gha,scope=triggered-e2e-operator
           cache-to: type=gha,mode=max,scope=triggered-e2e-operator
 
+      - name: Build source-matched Grid Gateway image
+        if: env.QUALIFICATION == 'llmd-pool-metrics' && env.MODE == 'full'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: grid
+          file: grid/deploy/gateway/Containerfile
+          push: false
+          load: true
+          tags: grid-gateway:${{ steps.tags.outputs.tag }}
+          labels: org.opencontainers.image.revision=${{ env.TESTED_SHA }}
+          cache-from: type=gha,scope=triggered-e2e-grid-gateway
+          cache-to: type=gha,mode=max,scope=triggered-e2e-grid-gateway
+
       - name: Build Grid overlay-sync image
-        if: env.QUALIFICATION == 'static-weighted' || env.QUALIFICATION == 'combined-site'
+        if: env.QUALIFICATION == 'static-weighted' || env.QUALIFICATION == 'combined-site' || env.QUALIFICATION == 'llmd-pool-metrics'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: grid
@@ -769,6 +789,46 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
           echo "Combined-site simulator verified: ${COMBINED_SITE_SIM_IMAGE_REF} (image ID ${IMAGE_ID}; tagged locally as ${COMBINED_SITE_SIM_IMAGE_TAG})"
 
+      - name: Pull pinned llm-d simulator image
+        if: env.QUALIFICATION == 'llmd-pool-metrics'
+        id: llmd-simulator
+        run: |
+          set -euo pipefail
+          docker pull "${LLMD_SIM_IMAGE_REF}"
+          EXPECTED_DIGEST="${LLMD_SIM_IMAGE_REF##*@}"
+          REPO_DIGESTS=$(docker image inspect --format='{{json .RepoDigests}}' "${LLMD_SIM_IMAGE_REF}")
+          if ! jq -e --arg digest "${EXPECTED_DIGEST}" 'any(.[]; endswith($digest))' <<< "${REPO_DIGESTS}" > /dev/null; then
+            echo "::error::Pulled llm-d simulator does not report pinned digest ${EXPECTED_DIGEST}: ${REPO_DIGESTS}"
+            exit 1
+          fi
+          docker tag "${LLMD_SIM_IMAGE_REF}" "${LLMD_SIM_IMAGE_TAG}"
+          IMAGE_ID=$(docker image inspect --format='{{.Id}}' "${LLMD_SIM_IMAGE_TAG}")
+          {
+            echo "image_id=${IMAGE_ID}"
+            echo "repo_digests=${REPO_DIGESTS}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "llm-d simulator verified: ${LLMD_SIM_IMAGE_REF} (image ID ${IMAGE_ID}; tagged locally as ${LLMD_SIM_IMAGE_TAG})"
+
+      - name: Pull pinned llm-d EPP image
+        if: env.QUALIFICATION == 'llmd-pool-metrics'
+        id: llmd-epp
+        run: |
+          set -euo pipefail
+          docker pull "${LLMD_EPP_IMAGE_REF}"
+          EXPECTED_DIGEST="${LLMD_EPP_IMAGE_REF##*@}"
+          REPO_DIGESTS=$(docker image inspect --format='{{json .RepoDigests}}' "${LLMD_EPP_IMAGE_REF}")
+          if ! jq -e --arg digest "${EXPECTED_DIGEST}" 'any(.[]; endswith($digest))' <<< "${REPO_DIGESTS}" > /dev/null; then
+            echo "::error::Pulled llm-d EPP does not report pinned digest ${EXPECTED_DIGEST}: ${REPO_DIGESTS}"
+            exit 1
+          fi
+          docker tag "${LLMD_EPP_IMAGE_REF}" "${LLMD_EPP_IMAGE_TAG}"
+          IMAGE_ID=$(docker image inspect --format='{{.Id}}' "${LLMD_EPP_IMAGE_TAG}")
+          {
+            echo "image_id=${IMAGE_ID}"
+            echo "repo_digests=${REPO_DIGESTS}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "llm-d EPP verified: ${LLMD_EPP_IMAGE_REF} (image ID ${IMAGE_ID}; tagged locally as ${LLMD_EPP_IMAGE_TAG})"
+
       - name: Pull pinned probe image
         run: |
           set -euo pipefail
@@ -806,7 +866,7 @@ jobs:
             fi
           fi
 
-          if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" ]]; then
+          if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" || "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
             img="grid-overlay-sync:${TAG}"
             if ! docker image inspect "${img}" > /dev/null 2>&1; then
               echo "::error::Required locally-built image missing: ${img}"
@@ -825,9 +885,33 @@ jobs:
             fi
           fi
 
+          if [[ "${QUALIFICATION}" == "llmd-pool-metrics" && "${MODE}" == "full" ]]; then
+            img="grid-gateway:${TAG}"
+            if ! docker image inspect "${img}" > /dev/null 2>&1; then
+              echo "::error::Required source-built Grid Gateway image missing: ${img}"
+              FAILED=1
+            else
+              IMAGE_REVISION=$(docker image inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' "${img}")
+              echo "${img}: revision label ${IMAGE_REVISION}"
+              if [[ "${IMAGE_REVISION}" != "${TESTED_SHA}" ]]; then
+                echo "::error::${img} was not built from verified source ${TESTED_SHA}"
+                FAILED=1
+              fi
+            fi
+          fi
+
           if ! docker image inspect "${GATEWAY_IMAGE_REF}" > /dev/null 2>&1; then
             echo "::error::Pinned gateway image missing: ${GATEWAY_IMAGE_REF}"
             FAILED=1
+          fi
+
+          if [[ "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
+            for img in "${LLMD_SIM_IMAGE_TAG}" "${LLMD_EPP_IMAGE_TAG}"; do
+              if ! docker image inspect "${img}" > /dev/null 2>&1; then
+                echo "::error::Pinned llm-d image missing: ${img}"
+                FAILED=1
+              fi
+            done
           fi
 
           if [[ "${operator_img}" =~ ^ghcr\.io/ ]] || [[ "${operator_img}" =~ :v[0-9] ]] || [[ "${operator_img}" =~ :latest$ ]]; then
@@ -846,6 +930,8 @@ jobs:
           RESOLVED_DIGEST: ${{ steps.gateway.outputs.digest }}
           STATIC_SIMULATOR_DIGESTS: ${{ steps.static-simulator.outputs.repo_digests || 'unknown' }}
           COMBINED_SIMULATOR_DIGESTS: ${{ steps.combined-simulator.outputs.repo_digests || 'unknown' }}
+          LLMD_SIMULATOR_DIGESTS: ${{ steps.llmd-simulator.outputs.repo_digests || 'unknown' }}
+          LLMD_EPP_DIGESTS: ${{ steps.llmd-epp.outputs.repo_digests || 'unknown' }}
         run: |
           set -euo pipefail
           case "${QUALIFICATION}" in
@@ -867,6 +953,12 @@ jobs:
               SIMULATOR_DESCRIPTION="combined-site default tag materialized from its pinned digest"
               SIMULATOR_DIGESTS="${COMBINED_SIMULATOR_DIGESTS}"
               ;;
+            llmd-pool-metrics)
+              SIMULATOR_REF="${LLMD_SIM_IMAGE_TAG}"
+              SIMULATOR_SOURCE_REF="${LLMD_SIM_IMAGE_REF}"
+              SIMULATOR_DESCRIPTION="llm-d simulator materialized from its pinned digest"
+              SIMULATOR_DIGESTS="${LLMD_SIMULATOR_DIGESTS}"
+              ;;
             *)
               echo "::error::Unknown qualification '${QUALIFICATION}' while writing image manifest"
               exit 1
@@ -879,10 +971,16 @@ jobs:
             docker inspect --format='  ID: {{.Id}}' "grid-operator:${TAG}"
             docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "grid-operator:${TAG}"
             echo ""
-            if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" ]]; then
+            if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" || "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
               echo "grid-overlay-sync:${TAG}"
               docker inspect --format='  ID: {{.Id}}' "grid-overlay-sync:${TAG}"
               docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "grid-overlay-sync:${TAG}"
+              echo ""
+            fi
+            if [[ "${QUALIFICATION}" == "llmd-pool-metrics" && "${MODE}" == "full" ]]; then
+              echo "grid-gateway:${TAG}  (built from tested Grid source)"
+              docker inspect --format='  ID: {{.Id}}' "grid-gateway:${TAG}"
+              docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "grid-gateway:${TAG}"
               echo ""
             fi
             echo "${GATEWAY_IMAGE_REF}  (pinned gateway; not built by Grid)"
@@ -894,17 +992,34 @@ jobs:
             echo "  Pinned source: ${SIMULATOR_SOURCE_REF}"
             echo "  Repository digests: ${SIMULATOR_DIGESTS}"
             echo ""
+            if [[ "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
+              echo "${LLMD_EPP_IMAGE_TAG}  (llm-d endpoint picker materialized from its pinned digest)"
+              docker inspect --format='  ID: {{.Id}}' "${LLMD_EPP_IMAGE_TAG}"
+              echo "  Pinned source: ${LLMD_EPP_IMAGE_REF}"
+              echo "  Repository digests: ${LLMD_EPP_DIGESTS}"
+              echo ""
+            fi
             echo "${PROBE_IMAGE_REF}  (pinned GLB probe image; local tag ${PROBE_IMAGE_TAG})"
             docker inspect --format='  ID: {{.Id}}' "${PROBE_IMAGE_TAG}"
             echo ""
             echo "=== Override Environment ==="
             echo "GRID_XTASK_OPERATOR_IMAGE=grid-operator:${TAG}"
-            if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" ]]; then
+            if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" || "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
               echo "GRID_XTASK_OVERLAY_SYNC_IMAGE=grid-overlay-sync:${TAG}"
             else
               echo "GRID_XTASK_OVERLAY_SYNC_IMAGE=<unset>"
             fi
             echo "GRID_XTASK_GATEWAY_IMAGE=${GATEWAY_IMAGE_REF}"
+            if [[ "${QUALIFICATION}" == "llmd-pool-metrics" && "${MODE}" == "full" ]]; then
+              echo "GRID_XTASK_GRID_GATEWAY_IMAGE=grid-gateway:${TAG}"
+            else
+              echo "GRID_XTASK_GRID_GATEWAY_IMAGE=<unset>"
+            fi
+            if [[ "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
+              echo "GRID_XTASK_EPP_IMAGE=${LLMD_EPP_IMAGE_TAG}"
+            else
+              echo "GRID_XTASK_EPP_IMAGE=<unset>"
+            fi
             if [[ "${QUALIFICATION}" == "combined-site" ]]; then
               echo "GRID_XTASK_SIM_IMAGE=<unset> (xtask default ${COMBINED_SITE_SIM_IMAGE_TAG}, materialized from ${COMBINED_SITE_SIM_IMAGE_REF})"
             else
@@ -927,6 +1042,40 @@ jobs:
         run: |
           mkdir -p "${EVIDENCE_DIR}" "${DIAGNOSTICS_DIR}"
 
+      - name: Record llm-d cleanup baseline
+        if: env.QUALIFICATION == 'llmd-pool-metrics'
+        run: |
+          set -euo pipefail
+          mkdir -p "${DIAGNOSTICS_DIR}"
+          kind get clusters 2>/dev/null | sort > "${DIAGNOSTICS_DIR}/llmd-kind-before.txt"
+          docker network ls --format '{{.Name}} {{.ID}}' | sort > "${DIAGNOSTICS_DIR}/llmd-networks-before.txt"
+          docker ps -a --format '{{.ID}} {{.Names}}' | sort > "${DIAGNOSTICS_DIR}/llmd-containers-before.txt"
+
+      - name: Configure isolated llm-d partition network subnet
+        if: env.QUALIFICATION == 'llmd-pool-metrics' && env.MODE == 'full'
+        run: |
+          set -euo pipefail
+          real_docker=$(command -v docker)
+          wrapper_dir="${RUNNER_TEMP}/grid-llmd-docker-bin"
+          mkdir -p "${wrapper_dir}"
+          cat > "${wrapper_dir}/docker" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ "${1:-}" == "network" && "${2:-}" == "create" ]]; then
+            network_name="${@: -1}"
+            if [[ "${network_name}" == grid-llmd-pm-*-net ]]; then
+              printf 'Applied subnet 10.253.0.0/16 to run-owned network %s\n' "${network_name}" >> "${DIAGNOSTICS_DIR}/docker-network-subnet-override.txt"
+              "${GRID_VALIDATION_REAL_DOCKER:?}" network create --subnet 10.253.0.0/16 "${@:3}"
+              "${GRID_VALIDATION_REAL_DOCKER}" network inspect "${network_name}" --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' >> "${DIAGNOSTICS_DIR}/docker-network-subnet-override.txt"
+              exit 0
+            fi
+          fi
+          exec "${GRID_VALIDATION_REAL_DOCKER:?}" "$@"
+          EOF
+          chmod +x "${wrapper_dir}/docker"
+          echo "GRID_VALIDATION_REAL_DOCKER=${real_docker}" >> "${GITHUB_ENV}"
+          echo "${wrapper_dir}" >> "${GITHUB_PATH}"
+
       # ----------------------------------------------------------------------
       # Run selected qualification
       # ----------------------------------------------------------------------
@@ -937,6 +1086,9 @@ jobs:
           GRID_REPO: ${{ github.workspace }}/grid
           GRID_XTASK_OPERATOR_IMAGE: grid-operator:${{ steps.tags.outputs.tag }}
           GRID_XTASK_GATEWAY_IMAGE: ${{ env.GATEWAY_IMAGE_REF }}
+          GRID_GATEWAY_IMAGE: grid-gateway:${{ steps.tags.outputs.tag }}
+          LLMD_EPP_IMAGE: ${{ env.LLMD_EPP_IMAGE_TAG }}
+          LLMD_SIM_IMAGE: ${{ env.LLMD_SIM_IMAGE_TAG }}
           OVERLAY_SYNC_IMAGE: grid-overlay-sync:${{ steps.tags.outputs.tag }}
         run: |
           set -euo pipefail
@@ -986,6 +1138,32 @@ jobs:
                 --full --teardown --keep-on-failure --evidence-dir "${EVIDENCE_DIR}" \
                 2>&1 | tee "${GITHUB_WORKSPACE}/run-${QUALIFICATION}.log"
               ;;
+            llmd-pool-metrics)
+              set +e
+              GRID_XTASK_SIM_IMAGE="${LLMD_SIM_IMAGE}" \
+              GRID_XTASK_EPP_IMAGE="${LLMD_EPP_IMAGE}" \
+              GRID_XTASK_GRID_GATEWAY_IMAGE="${GRID_GATEWAY_IMAGE}" \
+              GRID_XTASK_OVERLAY_SYNC_IMAGE="${OVERLAY_SYNC_IMAGE}" \
+              GRID_XTASK_IMAGE_PULL_POLICY=Never \
+              timeout --signal=TERM --kill-after=30s 75m cargo xtask env run-grid-llmd-pool-metrics-demo \
+                --forge-config tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml \
+                "--${MODE}" --teardown --keep-on-failure --evidence-dir "${EVIDENCE_DIR}" \
+                2>&1 | tee "${GITHUB_WORKSPACE}/run-${QUALIFICATION}.log"
+              pipeline_status=("${PIPESTATUS[@]}")
+              set -e
+              qualification_status=${pipeline_status[0]}
+              tee_status=${pipeline_status[1]}
+              printf '%s\n' "${qualification_status}" > "${EVIDENCE_DIR}/xtask-exit-status.txt"
+              printf '%s\n' "${tee_status}" > "${EVIDENCE_DIR}/tee-exit-status.txt"
+              if [[ "${qualification_status}" -ne 0 ]]; then
+                echo "::error::llm-d pool-metrics xtask exited with status ${qualification_status}"
+                exit "${qualification_status}"
+              fi
+              if [[ "${tee_status}" -ne 0 ]]; then
+                echo "::error::llm-d pool-metrics tee exited with status ${tee_status}"
+                exit "${tee_status}"
+              fi
+              ;;
             *)
               echo "::error::Unknown qualification '${QUALIFICATION}'"
               exit 1
@@ -1027,6 +1205,7 @@ jobs:
             glb) DEMO_DIR="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-glb-demo" ;;
             static-weighted) DEMO_DIR="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-static-weighted" ;;
             combined-site) DEMO_DIR="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-combined-site" ;;
+            llmd-pool-metrics) DEMO_DIR="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-llmd-pool-metrics" ;;
             *)
               echo "::warning::Unknown qualification '${QUALIFICATION}'; skipping Forge diagnostics"
               DEMO_DIR=""
@@ -1332,6 +1511,7 @@ jobs:
           OWNED_CLUSTERS=()
           OWNED_NETWORKS=()
           NETWORK_OWNER=""
+          RUN_PREFIX=""
 
           resolve_run_forge_state() {
             local topology_dir="$1"
@@ -1426,6 +1606,47 @@ jobs:
               NETWORK_OWNER="grid-combined-site"
               resolve_run_forge_state "grid-combined-site"
               ;;
+            llmd-pool-metrics)
+              BASE_KIND="${DIAGNOSTICS_DIR}/llmd-kind-before.txt"
+              BASE_NETWORKS="${DIAGNOSTICS_DIR}/llmd-networks-before.txt"
+              if [[ ! -f "${BASE_KIND}" || ! -f "${BASE_NETWORKS}" ]]; then
+                echo "::warning::llm-d pre-run inventory is absent; refusing broad cleanup"
+                CLEANUP_RESULT="partial"
+              fi
+
+              mapfile -t LLMD_STATE_FILES < <(find "${EVIDENCE_DIR}" -type f -path '*/forge-state/state.json' -print 2>/dev/null | sort)
+              if [[ "${#LLMD_STATE_FILES[@]}" -ne 1 ]]; then
+                echo "::warning::Expected one run-scoped llm-d Forge state file, found ${#LLMD_STATE_FILES[@]}"
+                CLEANUP_RESULT="partial"
+              else
+                STATE_FILE="${LLMD_STATE_FILES[0]}"
+                if ! POOL_A_CLUSTER=$(jq -er '.clusters[] | select(.name == "pool-a") | .kindName' "${STATE_FILE}"); then
+                  echo "::warning::Unable to parse pool-a cluster from llm-d Forge state; refusing cleanup"
+                  CLEANUP_RESULT="partial"
+                  STATE_FILE=""
+                else
+                  RUN_PREFIX="${POOL_A_CLUSTER%-pool-a}"
+                  if ! [[ "${RUN_PREFIX}" =~ ^grid-llmd-pm-[0-9]{8}t[0-9]{6}z-[0-9]+$ ]] \
+                    || ! jq -e --arg prefix "${RUN_PREFIX}" '
+                      .network.name == ($prefix + "-net")
+                      and ([.clusters[].kindName] | sort == [($prefix + "-pool-a"), ($prefix + "-pool-b")])
+                    ' "${STATE_FILE}" > /dev/null; then
+                    echo "::warning::llm-d Forge state does not match a unique two-pool run prefix; refusing cleanup"
+                    CLEANUP_RESULT="partial"
+                    STATE_FILE=""
+                  else
+                    OWNED_CLUSTERS=("${RUN_PREFIX}-pool-a" "${RUN_PREFIX}-pool-b")
+                    OWNED_NETWORKS=("${RUN_PREFIX}-net")
+                    NETWORK_OWNER="${RUN_PREFIX}"
+                    if ! jq -e '.networkCreatedByForge == true or .network.phase == "gone"' "${STATE_FILE}" > /dev/null; then
+                      echo "::warning::llm-d Forge state does not show a run-created or already-removed network"
+                      CLEANUP_RESULT="partial"
+                      OWNED_NETWORKS=()
+                    fi
+                  fi
+                fi
+              fi
+              ;;
             *)
               echo "::warning::Unknown qualification '${QUALIFICATION}'; refusing cleanup"
               CLEANUP_RESULT="partial"
@@ -1434,6 +1655,13 @@ jobs:
 
           for cluster in "${OWNED_CLUSTERS[@]}"; do
             if ! kind get clusters 2>/dev/null | grep -Fxq "${cluster}"; then
+              continue
+            fi
+            if [[ "${QUALIFICATION}" == "llmd-pool-metrics" ]] \
+              && [[ -f "${DIAGNOSTICS_DIR}/llmd-kind-before.txt" ]] \
+              && grep -Fxq "${cluster}" "${DIAGNOSTICS_DIR}/llmd-kind-before.txt"; then
+              echo "::warning::Preserving pre-existing Kind cluster '${cluster}'"
+              CLEANUP_RESULT="partial"
               continue
             fi
             echo "Deleting run-owned cluster: ${cluster}"
@@ -1445,6 +1673,13 @@ jobs:
 
           for net in "${OWNED_NETWORKS[@]}"; do
             if ! docker network inspect "${net}" >/dev/null 2>&1; then
+              continue
+            fi
+            if [[ "${QUALIFICATION}" == "llmd-pool-metrics" ]] \
+              && [[ -f "${DIAGNOSTICS_DIR}/llmd-networks-before.txt" ]] \
+              && awk -v name="${net}" '$1 == name { found=1 } END { exit !found }' "${DIAGNOSTICS_DIR}/llmd-networks-before.txt"; then
+              echo "::warning::Preserving pre-existing Docker network '${net}'"
+              CLEANUP_RESULT="partial"
               continue
             fi
             LABELS=$(docker network inspect --format '{{.Labels}}' "${net}" 2>/dev/null || true)
@@ -1463,6 +1698,31 @@ jobs:
               CLEANUP_RESULT="partial"
             fi
           done
+
+          if [[ "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
+            kind get clusters | sort > "${DIAGNOSTICS_DIR}/llmd-kind-after-cleanup.txt" 2>&1 || true
+            docker network ls --format '{{.Name}} {{.ID}}' | sort > "${DIAGNOSTICS_DIR}/llmd-networks-after-cleanup.txt"
+            docker ps -a --format '{{.ID}} {{.Names}}' | sort > "${DIAGNOSTICS_DIR}/llmd-containers-after-cleanup.txt"
+            for cluster in "${OWNED_CLUSTERS[@]}"; do
+              if grep -Fxq "${cluster}" "${DIAGNOSTICS_DIR}/llmd-kind-after-cleanup.txt"; then
+                echo "::warning::Run-owned llm-d Kind cluster remains after cleanup: ${cluster}"
+                CLEANUP_RESULT="partial"
+              fi
+            done
+            for net in "${OWNED_NETWORKS[@]}"; do
+              if awk -v name="${net}" '$1 == name { found=1 } END { exit !found }' "${DIAGNOSTICS_DIR}/llmd-networks-after-cleanup.txt"; then
+                echo "::warning::Run-owned llm-d Docker network remains after cleanup: ${net}"
+                CLEANUP_RESULT="partial"
+              fi
+            done
+            if [[ -n "${RUN_PREFIX}" && -f "${DIAGNOSTICS_DIR}/llmd-containers-before.txt" ]]; then
+              while read -r container_id container_name; do
+                [[ "${container_name}" == "${RUN_PREFIX}-"* ]] || continue
+                echo "::warning::Run-owned llm-d Docker container remains after cleanup: ${container_name} (${container_id})"
+                CLEANUP_RESULT="partial"
+              done < <(comm -13 "${DIAGNOSTICS_DIR}/llmd-containers-before.txt" "${DIAGNOSTICS_DIR}/llmd-containers-after-cleanup.txt")
+            fi
+          fi
 
           for cluster in "${OWNED_CLUSTERS[@]}"; do
             rm -rf "/tmp/kind-${cluster}" 2>/dev/null || true
@@ -1531,6 +1791,11 @@ jobs:
               TOPOLOGY="tests/e2e/topologies/grid-combined-site"
               SIMULATOR="${COMBINED_SITE_SIM_IMAGE_TAG} (default tag pinned to ${COMBINED_SITE_SIM_IMAGE_REF})"
               ;;
+            llmd-pool-metrics)
+              QUALIFICATION_DISPLAY="llm-d pool-metrics and signal lifecycle"
+              TOPOLOGY="tests/e2e/topologies/grid-llmd-pool-metrics"
+              SIMULATOR="${LLMD_SIM_IMAGE_TAG} (pinned from ${LLMD_SIM_IMAGE_REF})"
+              ;;
             *)
               QUALIFICATION_DISPLAY="Unknown (${QUALIFICATION})"
               TOPOLOGY="unknown"
@@ -1572,6 +1837,13 @@ jobs:
             echo "| **Mode** | \`${MODE}\` |"
             echo "| **Qualification result** | ${QUALIFICATION_DISPLAY_RESULT} |"
             echo "| **Cleanup** | ${CLEANUP_RESULT} |"
+            if [[ "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
+              XTASK_EXIT="unknown"
+              if [[ -f "${EVIDENCE_DIR}/xtask-exit-status.txt" ]]; then
+                XTASK_EXIT=$(cat "${EVIDENCE_DIR}/xtask-exit-status.txt")
+              fi
+              echo "| **xtask exit status** | ${XTASK_EXIT} |"
+            fi
             echo ""
             echo "### Images"
             echo ""
@@ -1580,6 +1852,12 @@ jobs:
             echo "| Grid Operator | \`grid-operator:${TAG}\` |"
             echo "| Gateway (pinned) | \`${GATEWAY_IMAGE_REF}\` (\`${RESOLVED_DIGEST}\`) |"
             echo "| Simulator | \`${SIMULATOR}\` |"
+            if [[ "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
+              echo "| llm-d EPP | \`${LLMD_EPP_IMAGE_TAG}\` (pinned from \`${LLMD_EPP_IMAGE_REF}\`) |"
+              if [[ "${MODE}" == "full" ]]; then
+                echo "| Grid Gateway | \`grid-gateway:${TAG}\` (built from tested Grid SHA) |"
+              fi
+            fi
             echo ""
             echo "### Artifact"
             echo ""

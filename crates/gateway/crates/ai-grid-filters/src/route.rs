@@ -989,13 +989,9 @@ impl<'snap> Sites<'snap> {
 
 /// Choose a site for `name` among the admitted, `routable` matches.
 ///
-/// Among healthy matches with room (rho below 1) that `narrow` keeps: two choices at
-/// three or more, picked by capacity, taking the lower rho; a weighted pick between two,
-/// by capacity over 1 + rho with each share clamped to 0.1..0.9; or the only one. With
-/// none, a capacity-weighted pick over the healthy matches not full, or all of them when
-/// every one is, tied on the best polled queue score (a prefix, since scores ascend), which
-/// covers sites that publish no rho without herding. With no healthy match, the front
-/// demoted one, as a fallback.
+/// Choose a pressure tier before affinity, keeping entirely missing telemetry as fallback.
+/// Spread observed room by pressure. Unknown capacity uses mean-known weights.
+/// Queue-only and saturated tiers retain least-queue routing.
 #[expect(
     clippy::too_many_arguments,
     reason = "the request path passes its inputs directly rather than build a struct per request"
@@ -1016,19 +1012,36 @@ pub(crate) fn select_spread<'snap>(
         // Demotion scores a candidate NaN: every healthy site is gone, so try the front one.
         return Some(Pick::new((front, front_decisions, front_score), true));
     }
-    // Affinity narrows the eligible set first; its gate weighs a match against load. The
-    // pick then spreads over what it kept: the sites with room, or failing that the lightest.
-    let kept = narrowed(&healthy, narrow);
-    let room = Sites::gather(kept.iter().filter(|(candidate, ..)| has_room(candidate)));
-    let band = || {
-        // A site full for `full_after_ms` is the last resort: a site that has just drained
-        // still carries its backlog in the window's worst queue reading, and would tie.
-        let open = Sites::gather(kept.iter().filter(|(candidate, ..)| candidate.full != Some(true)));
-        let pool = if open.len > 0 { open } else { kept };
-        let best = pool.iter().map(|(.., score)| score).fold(f64::INFINITY, f64::min);
-        Sites::gather(pool.iter().filter(|(.., score)| score.total_cmp(&best).is_eq()))
+    let room = Sites::gather(
+        healthy
+            .iter()
+            .filter(|(candidate, ..)| has_room(candidate) && candidate.backlog != Some(true)),
+    );
+    let eligible = if room.len > 0 { room } else { overflow(&healthy) };
+    let spread = eligible.iter().all(|(candidate, ..)| has_room(candidate));
+    let kept = narrowed(&eligible, narrow);
+    let pressure_known = kept.iter().all(|(candidate, ..)| candidate.rho.is_some());
+    let pool = if !spread || kept.iter().all(|(candidate, ..)| candidate.rho.is_none()) {
+        let best = kept.iter().map(|(.., score)| score).fold(f64::INFINITY, f64::min);
+        Sites::gather(kept.iter().filter(|(.., score)| score.total_cmp(&best).is_eq()))
+    } else {
+        kept
     };
-    select(&room, band, turn).map(|chosen| Pick::new(chosen, false))
+    select(&pool, spread && pressure_known, turn).map(|chosen| Pick::new(chosen, false))
+}
+
+/// Keep queued but unsaturated sites ahead of saturated sites, then retain the not-full fallback.
+fn overflow<'snap>(healthy: &Sites<'snap>) -> Sites<'snap> {
+    let available = Sites::gather(healthy.iter().filter(|(candidate, ..)| has_room(candidate)));
+    if available.len > 0 {
+        return available;
+    }
+    let open = Sites::gather(healthy.iter().filter(|(candidate, ..)| candidate.full != Some(true)));
+    if open.len > 0 {
+        open
+    } else {
+        Sites::gather(healthy.iter())
+    }
 }
 
 /// Seconds a client should wait before retrying a model with no admitted candidate:
@@ -1062,29 +1075,33 @@ where
         })
 }
 
-/// The tier for `room` sites: two choices at three or more, a weighted pick at two, the
-/// only one at one, and with none a capacity-weighted pick over `band`.
-fn select<'snap>(room: &Sites<'snap>, band: impl FnOnce() -> Sites<'snap>, turn: usize) -> Option<Site<'snap>> {
+/// Spread observed room by pressure. Otherwise draw by capacity, with mean weights for unknowns.
+fn select<'snap>(sites: &Sites<'snap>, spread: bool, turn: usize) -> Option<Site<'snap>> {
     // Registered once; counting an arm is one atomic add on the request path.
     static SELECTIONS: LazyLock<[metrics::Counter; 4]> = LazyLock::new(|| {
         ["by_capacity", "lone", "between_two", "two_choices"]
             .map(|path| metrics::counter!("grid_route_selections_total", "path" => path))
     });
-    let arm = room.len.min(3);
+    let arm = if spread { sites.len.min(3) } else { 0 };
     if let Some(counter) = SELECTIONS.get(arm) {
         counter.increment(1);
     }
+    let unpublished = mean_capacity(sites);
     match arm {
-        0 => by_capacity(&band(), turn),
-        1 => room.get(0),
-        2 => Some(between_two(room.get(0)?, room.get(1)?, turn)),
-        _ => two_choices(room, turn),
+        0 => weighted(sites, unit(turn, SALTS.0), None, |candidate| {
+            candidate.capacity.unwrap_or(unpublished)
+        }),
+        1 => sites.get(0),
+        2 => Some(between_two(sites.get(0)?, sites.get(1)?, turn, unpublished)),
+        _ => two_choices(sites, turn, unpublished),
     }
 }
 
-/// Whether `candidate` publishes load and has room for one more request.
+/// Whether observed pressure permits room. An entirely missing reading is only a fallback.
 fn has_room(candidate: &RouteCandidate) -> bool {
-    candidate.rho.is_some_and(|rho| rho < 1.0)
+    candidate.full != Some(true)
+        && candidate.rho.is_none_or(|rho| rho < 1.0)
+        && (candidate.rho.is_some() || candidate.backlog.is_some())
 }
 
 /// The sites `narrow` keeps of `room`, or all of them when it keeps none.
@@ -1108,31 +1125,28 @@ fn narrowed<'snap>(room: &Sites<'snap>, narrow: &impl Narrow) -> Sites<'snap> {
     Sites::gather(room.iter().zip(keep).filter(|(_, kept)| *kept).map(|(site, _)| site))
 }
 
-/// A capacity-weighted pick over `sites`. Unpublished capacity weighs the mean of the published, or 1.
-fn by_capacity<'snap>(sites: &Sites<'snap>, turn: usize) -> Option<Site<'snap>> {
-    // The mean of what is published stands in for a site that publishes nothing, without a Vec.
+/// Weight for unknown capacity: the mean of known capacities, or one when all are unknown.
+fn mean_capacity(sites: &Sites<'_>) -> f64 {
     let (sum, count) = sites
         .iter()
         .filter_map(|(candidate, ..)| candidate.capacity)
         .fold((0.0_f64, 0.0_f64), |(sum, count), capacity| {
             (sum + capacity, count + 1.0)
         });
-    let unpublished = if count > 0.0 { sum / count } else { 1.0 };
-    weighted(sites, unit(turn, SALTS.0), None, |candidate| {
-        candidate.capacity.unwrap_or(unpublished)
-    })
+    if count > 0.0 { sum / count } else { 1.0 }
 }
 
 /// A pick between two sites by capacity over 1 + rho, each share clamped to 0.1..0.9.
-fn between_two<'snap>(first: Site<'snap>, second: Site<'snap>, turn: usize) -> Site<'snap> {
-    let rate = |candidate: &RouteCandidate| candidate.capacity.unwrap_or(1.0) / (1.0 + candidate.rho.unwrap_or(0.0));
+fn between_two<'snap>(first: Site<'snap>, second: Site<'snap>, turn: usize, unpublished: f64) -> Site<'snap> {
+    let rate =
+        |candidate: &RouteCandidate| candidate.capacity.unwrap_or(unpublished) / (1.0 + candidate.rho.unwrap_or(0.0));
     let share = (rate(first.0) / (rate(first.0) + rate(second.0))).clamp(TWO_SITE_SHARE.0, TWO_SITE_SHARE.1);
     if unit(turn, SALTS.0) < share { first } else { second }
 }
 
 /// Two distinct picks from `sites` by capacity, taking the lower rho; exact ties go to the first.
-fn two_choices<'snap>(sites: &Sites<'snap>, turn: usize) -> Option<Site<'snap>> {
-    let capacity = |candidate: &RouteCandidate| candidate.capacity.unwrap_or(1.0);
+fn two_choices<'snap>(sites: &Sites<'snap>, turn: usize, unpublished: f64) -> Option<Site<'snap>> {
+    let capacity = |candidate: &RouteCandidate| candidate.capacity.unwrap_or(unpublished);
     let first = weighted(sites, unit(turn, SALTS.0), None, capacity)?;
     let second = weighted(sites, unit(turn, SALTS.1), Some(first.0), capacity).unwrap_or(first);
     Some(if second.0.rho < first.0.rho { second } else { first })
@@ -1880,6 +1894,263 @@ mod tests {
         let taken = shares(&snapshot, 300, &Only { all: true });
         assert_eq!(taken.get("c"), None, "a full site is never added back");
         assert!(taken.contains_key("a") && taken.contains_key("b"), "{taken:?}");
+    }
+
+    #[test]
+    fn pressure_tiers_precede_even_a_strong_warm_affinity() {
+        for (rho, backlog, full) in [
+            (Some(0.3), Some(true), Some(false)),
+            (Some(1.0), Some(false), None),
+            (None, Some(true), None),
+            (Some(0.3), Some(false), Some(true)),
+        ] {
+            let mut snapshot = loaded(&[("a", Some(3.0), Some(10.0)), ("b", Some(3.0), Some(10.0))]);
+            snapshot.scores = vec![0.0; 2];
+            let subject = &mut snapshot.candidates[0];
+            subject.rho = rho;
+            subject.backlog = backlog;
+            subject.full = full;
+            let filter = filter(snapshot, steady());
+            for _ in 0..100 {
+                assert_eq!(
+                    pick_for_a_prompt(&filter).as_deref(),
+                    Some("b"),
+                    "pressure beats a warm prompt"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_backlogged_pool_precedes_a_queue_free_but_kv_saturated_pool() {
+        let mut snapshot = loaded(&[("a", None, None), ("b", Some(3.0), Some(10.0))]);
+        for candidate in &mut snapshot.candidates {
+            let saturated = candidate.site.as_ref() == "a";
+            candidate.rho = Some(if saturated { 1.0 } else { 0.3 });
+            candidate.backlog = Some(!saturated);
+        }
+        snapshot.scores = vec![0.0, 2.0];
+        assert_eq!(shares(&snapshot, 300, &KeepAll).get("b"), Some(&300));
+        let filter = filter(snapshot, steady());
+        assert_eq!(
+            pick_for_a_prompt(&filter).as_deref(),
+            Some("b"),
+            "affinity cannot restore the KV-full pool"
+        );
+    }
+
+    #[test]
+    fn queued_pools_with_room_spread_by_rho_despite_different_queues() {
+        let mut snapshot = loaded(&[
+            ("a", Some(7.0), Some(10.0)),
+            ("b", Some(3.0), Some(10.0)),
+            ("c", Some(10.0), Some(10.0)),
+        ]);
+        for candidate in &mut snapshot.candidates {
+            candidate.backlog = Some(true);
+        }
+        snapshot.scores = vec![2.0, 4.0, 1.0];
+        let taken = shares(&snapshot, 10_000, &KeepAll);
+        assert_eq!(taken.len(), 2, "saturated pool cannot win on its smaller queue");
+        assert!(taken["a"] > 0, "a non-minimal rho still receives a share");
+        assert!(taken["b"] > taken["a"], "lower rho wins more despite its larger queue");
+    }
+
+    #[test]
+    fn unknown_capacity_gets_a_mean_weight_not_zero_load_or_a_unit_weight() {
+        for count in [2, 3, MAX_SITES] {
+            let sites: Vec<_> = (0..count).map(|index| format!("s{index}")).collect();
+            let specs: Vec<_> = sites
+                .iter()
+                .enumerate()
+                .map(|(index, site)| {
+                    (
+                        site.as_str(),
+                        (index == 0).then_some(20.0),
+                        (index == 0).then_some(1_000_000.0),
+                    )
+                })
+                .collect();
+            let mut snapshot = loaded(&specs);
+            for candidate in &mut snapshot.candidates {
+                candidate.backlog = Some(false);
+            }
+            let taken = shares(&snapshot, count * 1_000, &KeepAll);
+            assert_eq!(taken.len(), count, "every eligible pool participates");
+            for site in &sites {
+                assert!(
+                    (750..=1_250).contains(&taken[site]),
+                    "mean-known weight gives each pool its share: {taken:?}"
+                );
+            }
+            assert_eq!(
+                snapshot.candidates[1].rho, None,
+                "selection does not invent a load reading"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_capacity_does_not_bypass_admission_health_or_route_eligibility() {
+        let mut snapshot = loaded(&[
+            ("open", None, None),
+            ("excluded", None, None),
+            ("existing", None, None),
+            ("down", None, None),
+            ("unroutable", None, None),
+            ("other-model", None, None),
+        ]);
+        for candidate in &mut snapshot.candidates {
+            candidate.backlog = Some(false);
+            match candidate.site.as_ref() {
+                "excluded" => candidate.admission_state = AdmissionState::Excluded,
+                "existing" => candidate.admission_state = AdmissionState::ExistingOnly,
+                "other-model" => candidate.name = Arc::from("other"),
+                _ => {},
+            }
+        }
+        let snapshot = snapshot.demote(&BTreeSet::from([Arc::from("pool-down")]));
+        for turn in 0..1_000 {
+            let pick = select_spread(
+                &snapshot,
+                CapabilityKind::InferenceModel,
+                "llama",
+                turn,
+                |candidate| candidate.site.as_ref() != "unroutable",
+                &KeepAll,
+            )
+            .unwrap();
+            assert_eq!(pick.candidate.site.as_ref(), "open");
+        }
+    }
+
+    #[test]
+    fn mixed_weights_preserve_known_capacity_ratios_in_every_candidate_order() {
+        let mut snapshot = loaded(&[
+            ("small", Some(3.0), Some(30.0)),
+            ("large", Some(9.0), Some(90.0)),
+            ("unknown-a", None, None),
+            ("unknown-b", None, None),
+        ]);
+        for candidate in &mut snapshot.candidates {
+            candidate.backlog = Some(false);
+        }
+        for _ in 0..4 {
+            let taken = shares(&snapshot, 20_000, &KeepAll);
+            for (site, expected) in [
+                ("small", 2_500),
+                ("large", 7_500),
+                ("unknown-a", 5_000),
+                ("unknown-b", 5_000),
+            ] {
+                assert!(
+                    (expected - 400..=expected + 400).contains(&taken[site]),
+                    "site={site}, draws={taken:?}"
+                );
+            }
+            snapshot.candidates.rotate_left(1);
+            snapshot.scores.rotate_left(1);
+            snapshot.decisions.rotate_left(1);
+        }
+    }
+
+    #[test]
+    fn complete_pressure_uses_mean_capacity_for_unknown_sites() {
+        for count in [2, 3, MAX_SITES] {
+            let names: Vec<_> = (0..count).map(|index| format!("s{index}")).collect();
+            let specs: Vec<_> = names
+                .iter()
+                .enumerate()
+                .map(|(index, site)| {
+                    (
+                        site.as_str(),
+                        (index == 0).then_some(20.0),
+                        (index == 0).then_some(1_000_000.0),
+                    )
+                })
+                .collect();
+            let mut snapshot = loaded(&specs);
+            for candidate in &mut snapshot.candidates {
+                candidate.backlog = Some(false);
+                candidate.rho = Some(0.2);
+            }
+            let taken = shares(&snapshot, count * 1_000, &KeepAll);
+            assert_eq!(taken.len(), count, "every unknown-capacity site remains eligible");
+            for site in &names {
+                assert!(
+                    (750..=1_250).contains(&taken[site]),
+                    "equal pressure and mean-known capacity must give comparable shares: {taken:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_affinity_exploration_reaches_unknown_capacity() {
+        let mut snapshot = loaded(&[("a", Some(3.0), Some(10.0)), ("b", None, None), ("c", None, None)]);
+        for candidate in &mut snapshot.candidates {
+            candidate.backlog = Some(false);
+        }
+        let filter = filter(snapshot, AffinitySettings::default());
+        let mut taken = BTreeSet::new();
+        for _ in 0..10_000 {
+            taken.insert(pick_for_a_prompt(&filter).unwrap());
+        }
+        assert_eq!(taken, BTreeSet::from(["a".to_owned(), "b".to_owned(), "c".to_owned()]));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "enumerate state pairs and compare actual draws with the tier oracle"
+    )]
+    fn pressure_tiers_match_an_exhaustive_pairwise_oracle() {
+        let states: Vec<_> = [None, Some(0.3), Some(1.0)]
+            .into_iter()
+            .flat_map(|rho| {
+                [None, Some(false), Some(true)].into_iter().flat_map(move |backlog| {
+                    [None, Some(false), Some(true)]
+                        .into_iter()
+                        .map(move |full| (rho, backlog, full))
+                })
+            })
+            .collect();
+        for left in &states {
+            for right in &states {
+                let mut snapshot = loaded(&[("a", None, None), ("b", None, None)]);
+                for (candidate, &(rho, backlog, full)) in snapshot.candidates.iter_mut().zip([left, right]) {
+                    candidate.rho = rho;
+                    candidate.backlog = backlog;
+                    candidate.full = full;
+                }
+                snapshot.scores = vec![0.0; 2];
+                let priority =
+                    |&(rho, backlog, full): &(Option<f64>, Option<bool>, Option<bool>)| match (full, rho, backlog) {
+                        (Some(true), ..) => 3,
+                        (_, Some(1.0), _) | (_, None, None) => 2,
+                        (_, _, Some(true)) => 1,
+                        _ => 0,
+                    };
+                let best = priority(left).min(priority(right));
+                for turn in 0..32 {
+                    let chosen = select_spread(
+                        &snapshot,
+                        CapabilityKind::InferenceModel,
+                        "llama",
+                        turn,
+                        |_| true,
+                        &KeepAll,
+                    )
+                    .unwrap();
+                    let state = if chosen.candidate.site.as_ref() == "a" {
+                        left
+                    } else {
+                        right
+                    };
+                    assert_eq!(priority(state), best, "left={left:?}, right={right:?}, turn={turn}");
+                }
+            }
+        }
     }
 
     #[test]

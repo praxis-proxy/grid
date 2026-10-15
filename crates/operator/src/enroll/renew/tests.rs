@@ -514,9 +514,7 @@ fn renewal_refuses_an_enrollment_url_a_site_certificate_could_answer() {
 
 /// A unique path under the temp dir, cleaned up by the caller.
 fn scratch_pem(name: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!("grid-renew-{name}-{}.pem", std::process::id()));
-    path
+    std::env::temp_dir().join(format!("grid-renew-{name}-{}.pem", std::process::id()))
 }
 
 #[test]

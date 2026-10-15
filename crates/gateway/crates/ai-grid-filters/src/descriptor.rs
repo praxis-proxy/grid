@@ -144,13 +144,13 @@ pub struct RouteCandidate {
     /// it; `None` when unpublished, which leaves its load unknown.
     pub capacity: Option<f64>,
 
-    /// Requests held over capacity, as its operator publishes it; `None` when unpublished or
-    /// stale. Resolved when the snapshot is built, never per request.
+    /// Saturation from learned capacity or the site's own pressure reading. `None` when
+    /// unmeasured or stale. Resolved when the snapshot is built, never per request.
     pub rho: Option<f64>,
 
     /// Whether the site as a whole has work waiting: its average queue at `availability.queue_full`
-    /// or any work held before scheduling. `None` when it publishes no queue, and such a
-    /// site never counts as full.
+    /// or any work held before scheduling. `None` without a queue reading or positive
+    /// held-work evidence. Unknown backlog cannot establish fullness.
     pub backlog: Option<bool>,
 
     /// Whether the site has been at its ceiling with work waiting for `full_after_ms`.

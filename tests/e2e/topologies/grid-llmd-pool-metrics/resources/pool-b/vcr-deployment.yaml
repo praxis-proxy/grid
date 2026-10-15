@@ -11,6 +11,23 @@ data:
     mode: "echo"
     fake-metrics:
       waiting-requests: 0
+      running-requests: 0
+      kv-cache-usage: 0.0
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vcr-2-config
+  namespace: grid-system
+data:
+  config.yaml: |
+    port: 8000
+    model: "Qwen/Qwen3-0.6B"
+    served-model-name: ["Qwen/Qwen3-0.6B"]
+    mode: "echo"
+    fake-metrics:
+      waiting-requests: 0
+      running-requests: 0
       kv-cache-usage: 0.0
 ---
 apiVersion: apps/v1
@@ -138,7 +155,7 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: vcr-1-config
+            name: vcr-2-config
       containers:
         - name: vcr
           image: "llm-d-inference-sim:deterministic"

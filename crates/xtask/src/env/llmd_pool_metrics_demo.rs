@@ -16,7 +16,7 @@
 )]
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -25,8 +25,10 @@ use std::{
 };
 
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 
 mod cross_site;
+mod learned_ceiling;
 
 use super::{
     DemoMode, GlbDemoOptions, certs, glb, kubectl, operator,
@@ -81,6 +83,9 @@ const SIGNALS_LB_INGRESS_TIMEOUT: Duration = Duration::from_secs(90);
 /// Retry interval for convergence probes.
 const DATA_PLANE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Tolerance for comparing Prometheus-serialized EPP KV-cache means.
+const KV_CACHE_METRIC_TOLERANCE: f64 = 1e-6;
+
 /// Configured queue capacity (matches MOCK_MAX_NUM_SEQS on VCR pods).
 const QUEUE_CAPACITY: f64 = 4.0;
 
@@ -110,10 +115,12 @@ const RECOVERY_QUEUE_THRESHOLD: f64 = 3.0;
 
 /// Deterministic simulator Deployments representing the pool endpoints.
 const SIMULATOR_DEPLOYMENTS: &[&str] = &["vcr-1", "vcr-2"];
-/// Persistent simulator ConfigMap containing startup fake metrics.
-const SIMULATOR_CONFIGMAP: &str = "vcr-1-config";
+/// Persistent simulator ConfigMaps keyed by their Deployment.
+const SIMULATOR_CONFIGMAPS: &[(&str, &str)] = &[("vcr-1", "vcr-1-config"), ("vcr-2", "vcr-2-config")];
 /// Pod template annotation for the simulator's queue metric.
 const SIMULATOR_WAITING_REQUESTS_ANNOTATION: &str = "grid.praxis.fast/fake-waiting-requests";
+/// Pod template annotation for the simulator's running-request metric.
+const SIMULATOR_RUNNING_REQUESTS_ANNOTATION: &str = "grid.praxis.fast/fake-running-requests";
 /// Pod template annotation for the simulator's KV-cache metric.
 const SIMULATOR_KV_CACHE_ANNOTATION: &str = "grid.praxis.fast/fake-kv-cache-usage";
 
@@ -264,6 +271,8 @@ impl ScoringFlavor {
 
 /// Demo execution context holding resolved paths.
 struct DemoContext {
+    /// Directory where this run's structured evidence is written.
+    evidence_dir: PathBuf,
     /// Path to the resolved Forge config.
     resolved_config: PathBuf,
     /// Per-run Forge state directory, kept beside the run's evidence.
@@ -407,6 +416,20 @@ struct InferenceResponse {
     demo_attribution: String,
 }
 
+/// Captured response and transport diagnostics from one curl probe.
+struct CurlProbeOutput {
+    /// HTTP status returned by curl, with zero representing no HTTP response.
+    status: u16,
+    /// Provider gateway attribution header.
+    provider_gateway: String,
+    /// Demo provider attribution header.
+    demo_attribution: String,
+    /// Exit code returned by curl inside the probe pod.
+    curl_exit_code: i32,
+    /// Standard error emitted by curl inside the probe pod.
+    curl_stderr: String,
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -452,6 +475,7 @@ pub(crate) fn run(
 
     let context = prepare_setup(
         forge_config,
+        &evidence_dir,
         &evidence_dir.join("forge-state"),
         &run_id,
         metrics_transport,
@@ -636,6 +660,7 @@ fn write_transition_timeline(
 )]
 fn prepare_setup(
     forge_config: &Path,
+    evidence_dir: &Path,
     forge_state_dir: &Path,
     run_id: &str,
     metrics_transport: MetricsTransport,
@@ -661,6 +686,7 @@ fn prepare_setup(
         .into();
 
     Ok(DemoContext {
+        evidence_dir: evidence_dir.to_path_buf(),
         resolved_config,
         forge_state_dir: forge_state_dir.to_path_buf(),
         forge_bin,
@@ -958,6 +984,7 @@ fn run_proof_scenarios(context: &DemoContext, mode: DemoMode) -> BTreeMap<String
         // Proof 5: EPP metrics cross the operator poll relay and drive the
         // embedded Grid Gateway's live site route without a gateway restart.
         results.insert("cross_site_signal_poll".to_owned(), cross_site::proof(context));
+        results.insert("learned_ceiling_lifecycle".to_owned(), learned_ceiling::proof(context));
     }
 
     // TLS proof stages, only in mTLS mode
@@ -1054,7 +1081,7 @@ fn proof_baseline(context: &DemoContext) -> ProofResult {
                 epp_a.queue_size
             );
             let probe_ctx = kind_context("pool-a");
-            match send_inference_request(&probe_ctx, VCR_MODEL) {
+            match send_inference_request(&probe_ctx, VCR_MODEL, "baseline") {
                 Ok(resp) => {
                     if resp.provider_gateway.contains("pool-a") && resp.demo_attribution.contains("pool-a") {
                         let epp_b =
@@ -1208,7 +1235,7 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
             );
             eprintln!("  [FAILOVER] Pool B is now preferred; sending verification request");
             let probe_ctx = kind_context("pool-a");
-            match send_inference_request(&probe_ctx, VCR_MODEL) {
+            match send_inference_request(&probe_ctx, VCR_MODEL, "failover") {
                 Ok(resp) => {
                     last_route = if resp.provider_gateway.contains("pool-b") {
                         "pool-b".to_owned()
@@ -1256,9 +1283,7 @@ fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> Proof
                 },
                 Err(error) => {
                     let result = format!("verification request failed: {error}");
-                    if last_probe_result.as_deref() != Some(result.as_str()) {
-                        eprintln!("  [FAILOVER] {result}");
-                    }
+                    eprintln!("  [FAILOVER] {result}");
                     last_probe_result = Some(result);
                 },
             }
@@ -1335,7 +1360,7 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
                 epp_a.queue_size, epp_a.kv_cache
             );
             let probe_ctx = kind_context("pool-a");
-            match send_inference_request(&probe_ctx, VCR_MODEL) {
+            match send_inference_request(&probe_ctx, VCR_MODEL, "recovery") {
                 Ok(resp) => {
                     last_route = if resp.provider_gateway.contains("pool-a") {
                         "pool-a".to_owned()
@@ -1378,9 +1403,7 @@ fn proof_recovery(context: &DemoContext, table_start: Instant) -> ProofResult {
                 },
                 Err(error) => {
                     let result = format!("verification request failed: {error}");
-                    if last_probe_result.as_deref() != Some(result.as_str()) {
-                        eprintln!("  [RECOVERY] {result}");
-                    }
+                    eprintln!("  [RECOVERY] {result}");
                     last_probe_result = Some(result);
                 },
             }
@@ -1413,19 +1436,67 @@ fn set_simulator_waiting_requests(
     scoring_flavor: ScoringFlavor,
     mtls: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = kind_context(cluster);
     let (waiting_requests, kv_cache_usage) = simulator_metrics(waiting_requests, scoring_flavor);
-    let config = simulator_config(waiting_requests, kv_cache_usage);
-    kubectl::apply_manifest(&ctx, &config)
-        .map_err(|e| format!("apply persistent simulator config on {cluster}: {e}"))?;
+    set_simulator_fake_metrics(cluster, waiting_requests, 0, kv_cache_usage, mtls)
+}
 
-    for deployment in SIMULATOR_DEPLOYMENTS {
+/// Persist all fake simulator metrics and roll its run-owned pods.
+fn set_simulator_fake_metrics(
+    cluster: &str,
+    waiting_requests: u32,
+    running_requests: u32,
+    kv_cache_usage: f64,
+    mtls: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    set_simulator_fake_metrics_with_endpoint_kv(
+        cluster,
+        waiting_requests,
+        running_requests,
+        kv_cache_usage,
+        kv_cache_usage,
+        mtls,
+    )
+}
+
+/// Persist pool metrics with a distinct KV-cache value on each run-owned endpoint.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the queue, running load, and each endpoint's cache value describe the stimulus directly"
+)]
+fn set_simulator_fake_metrics_with_endpoint_kv(
+    cluster: &str,
+    waiting_requests: u32,
+    running_requests: u32,
+    vcr1_kv_cache_usage: f64,
+    vcr2_kv_cache_usage: f64,
+    mtls: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = kind_context(cluster);
+    for (deployment, configmap) in SIMULATOR_CONFIGMAPS {
+        let kv_cache_usage = match *deployment {
+            "vcr-1" => vcr1_kv_cache_usage,
+            "vcr-2" => vcr2_kv_cache_usage,
+            _ => return Err(format!("no KV-cache stimulus was specified for {deployment}").into()),
+        };
+        kubectl::apply_manifest(
+            &ctx,
+            &simulator_config(configmap, waiting_requests, running_requests, kv_cache_usage),
+        )
+        .map_err(|e| format!("apply persistent simulator configmap/{configmap} on {cluster}: {e}"))?;
+    }
+
+    for (deployment, configmap) in SIMULATOR_CONFIGMAPS {
+        let kv_cache_usage = match *deployment {
+            "vcr-1" => vcr1_kv_cache_usage,
+            "vcr-2" => vcr2_kv_cache_usage,
+            _ => return Err(format!("no KV-cache stimulus was specified for {deployment}").into()),
+        };
         let before = deployment_generation(&ctx, deployment)?;
         let patch = serde_json::json!({
             "spec": {
                 "template": {
                     "metadata": {
-                        "annotations": simulator_rollout_annotations(waiting_requests, kv_cache_usage)
+                        "annotations": simulator_rollout_annotations(waiting_requests, running_requests, kv_cache_usage)
                     }
                 }
             }
@@ -1459,34 +1530,83 @@ fn set_simulator_waiting_requests(
         }
         kubectl::wait_for_rollout_ns(&ctx, deployment, GRID_SYSTEM_NS, cluster)
             .map_err(|e| format!("wait for simulator deployment/{deployment} rollout: {e}"))?;
+
+        let expected_config = simulator_config_data(waiting_requests, running_requests, kv_cache_usage);
+        let config_text = get_configmap_data_key(&ctx, GRID_SYSTEM_NS, configmap, "config.yaml").map_err(|error| {
+            format!("could not read configmap/{configmap} on {cluster} after applying the simulator metrics: {error}")
+        })?;
+        if config_text != expected_config {
+            let expected_digest = hex::encode(Sha256::digest(expected_config.as_bytes()));
+            let actual_digest = hex::encode(Sha256::digest(config_text.as_bytes()));
+            return Err(format!(
+                "configmap/{configmap} on {cluster} does not contain its requested simulator metrics (expected {} bytes sha256={expected_digest}; found {} bytes sha256={actual_digest})",
+                expected_config.len(),
+                config_text.len(),
+            )
+            .into());
+        }
     }
 
+    let ready_replicas = wait_for_simulator_service_endpoints(&ctx)?;
+    let expected_endpoints = ready_replicas.total().map_err(std::io::Error::other)?;
+    let expected_kv_cache = simulator_kv_cache_mean(vcr1_kv_cache_usage, vcr2_kv_cache_usage, ready_replicas)
+        .map_err(std::io::Error::other)?;
+    let expected_endpoint_metric = u32::try_from(expected_endpoints).map(f64::from).map_err(|error| {
+        std::io::Error::other(format!(
+            "simulator endpoint count exceeds EPP metric precision: {error}"
+        ))
+    })?;
     let deadline = Instant::now() + DATA_PLANE_WAIT;
+    let mut last_observed = String::from("no valid EPP metric sample");
     while Instant::now() < deadline {
-        let config_text = get_configmap_data_key(&ctx, GRID_SYSTEM_NS, SIMULATOR_CONFIGMAP, "config.yaml");
-        if config_text
-            .as_deref()
-            .is_ok_and(|text| text.contains(&format!("waiting-requests: {waiting_requests}")))
-            && kubectl_exec_epp_metrics(cluster, mtls)
-                .ok()
-                .and_then(|text| parse_required_epp_metrics(&text).ok())
-                .is_some_and(|metrics| {
-                    (metrics.queue_size - f64::from(waiting_requests)).abs() < f64::EPSILON
-                        && (metrics.kv_cache - kv_cache_usage).abs() < f64::EPSILON
-                })
-        {
-            eprintln!("  [OK] {cluster}: simulator waiting-requests={waiting_requests} is live in EPP metrics");
-            return Ok(());
+        match kubectl_exec_epp_metrics(cluster, mtls) {
+            Ok(text) => match parse_required_epp_metrics(&text) {
+                Ok(metrics) => {
+                    let observed_endpoints = first_prom_value(&text, EPP_READY_METRICS);
+                    last_observed = format!(
+                        "queue-size={}, KV-cache mean={}, ready endpoints={observed_endpoints:?}, per-deployment ready replicas={ready_replicas:?}",
+                        metrics.queue_size, metrics.kv_cache,
+                    );
+                    if (metrics.queue_size - f64::from(waiting_requests)).abs() < f64::EPSILON
+                        && (metrics.kv_cache - expected_kv_cache).abs() < KV_CACHE_METRIC_TOLERANCE
+                        && observed_endpoints
+                            .is_some_and(|ready| (ready - expected_endpoint_metric).abs() < f64::EPSILON)
+                    {
+                        eprintln!(
+                            "  [OK] {cluster}: simulator waiting-requests={waiting_requests}, endpoint-weighted KV-cache mean={expected_kv_cache:.3}, ready endpoints={expected_endpoints} (vcr-1={}, vcr-2={}) are live in EPP metrics",
+                            ready_replicas.vcr_1, ready_replicas.vcr_2,
+                        );
+                        return Ok(());
+                    }
+                },
+                Err(error) => last_observed = format!("EPP metrics parse failed: {error}"),
+            },
+            Err(error) => last_observed = format!("EPP metrics scrape failed: {error}"),
         }
         std::thread::sleep(DATA_PLANE_INTERVAL);
     }
-    Err(format!("{cluster}: simulator did not expose waiting-requests={waiting_requests} within timeout").into())
+    Err(format!(
+        "{cluster}: simulator did not expose waiting-requests={waiting_requests}, endpoint-weighted KV-cache mean={expected_kv_cache:.6}, and ready-endpoints={expected_endpoints} within timeout; last observation: {last_observed}"
+    )
+    .into())
 }
 
-/// Render the complete simulator startup configuration for a queue value.
-fn simulator_config(waiting_requests: u32, kv_cache_usage: f64) -> String {
+/// Render the complete simulator ConfigMap for the requested fake metrics.
+fn simulator_config(configmap: &str, waiting_requests: u32, running_requests: u32, kv_cache_usage: f64) -> String {
+    let config_data = simulator_config_data(waiting_requests, running_requests, kv_cache_usage);
+    let config_data_block = config_data
+        .lines()
+        .map(|line| format!("    {line}\n"))
+        .collect::<String>();
     format!(
-        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {SIMULATOR_CONFIGMAP}\n  namespace: {GRID_SYSTEM_NS}\ndata:\n  config.yaml: |\n    port: 8000\n    model: {VCR_MODEL}\n    served-model-name: [{VCR_MODEL}]\n    mode: echo\n    fake-metrics:\n      waiting-requests: {waiting_requests}\n      kv-cache-usage: {kv_cache_usage}\n"
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {configmap}\n  namespace: {GRID_SYSTEM_NS}\ndata:\n  config.yaml: |\n{config_data_block}"
+    )
+}
+
+/// Render the simulator's `config.yaml` ConfigMap value for fake metrics.
+fn simulator_config_data(waiting_requests: u32, running_requests: u32, kv_cache_usage: f64) -> String {
+    format!(
+        "port: 8000\nmodel: {VCR_MODEL}\nserved-model-name: [{VCR_MODEL}]\nmode: echo\nfake-metrics:\n  waiting-requests: {waiting_requests}\n  running-requests: {running_requests}\n  kv-cache-usage: {kv_cache_usage}\n"
     )
 }
 
@@ -1502,11 +1622,19 @@ fn simulator_metrics(pressure: u32, scoring_flavor: ScoringFlavor) -> (u32, f64)
 }
 
 /// Return the pod-template annotations that identify the complete fake-metric state.
-fn simulator_rollout_annotations(waiting_requests: u32, kv_cache_usage: f64) -> BTreeMap<String, String> {
+fn simulator_rollout_annotations(
+    waiting_requests: u32,
+    running_requests: u32,
+    kv_cache_usage: f64,
+) -> BTreeMap<String, String> {
     BTreeMap::from([
         (
             SIMULATOR_WAITING_REQUESTS_ANNOTATION.to_owned(),
             waiting_requests.to_string(),
+        ),
+        (
+            SIMULATOR_RUNNING_REQUESTS_ANNOTATION.to_owned(),
+            running_requests.to_string(),
         ),
         (SIMULATOR_KV_CACHE_ANNOTATION.to_owned(), kv_cache_usage.to_string()),
     ])
@@ -1518,6 +1646,245 @@ fn simulator_rollout_needed(before: i64, after: i64) -> Result<bool, String> {
         return Err(format!("generation moved backwards ({before} -> {after})"));
     }
     Ok(after > before)
+}
+
+/// Sum the desired replicas of the run-owned simulator Deployments.
+fn simulator_desired_replicas(context: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut replicas = 0_usize;
+    for deployment in SIMULATOR_DEPLOYMENTS {
+        let output = Command::new("kubectl")
+            .args([
+                "--context",
+                context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "get",
+                &format!("deployment/{deployment}"),
+                "-o",
+                "jsonpath={.spec.replicas}",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "read deployment/{deployment} replica count: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        let value = String::from_utf8_lossy(&output.stdout);
+        let count = if value.trim().is_empty() {
+            1
+        } else {
+            value.trim().parse::<usize>().map_err(|error| {
+                std::io::Error::other(format!("invalid deployment/{deployment} replica count: {error}"))
+            })?
+        };
+        replicas = replicas
+            .checked_add(count)
+            .ok_or_else(|| std::io::Error::other("simulator replica count overflowed"))?;
+    }
+    Ok(replicas)
+}
+
+/// Ready endpoint counts for the two simulator Deployments behind `vcr-service`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SimulatorReadyReplicas {
+    /// Ready endpoints owned by `vcr-1`.
+    vcr_1: usize,
+    /// Ready endpoints owned by `vcr-2`.
+    vcr_2: usize,
+}
+
+impl SimulatorReadyReplicas {
+    /// Return the total ready endpoints, rejecting arithmetic overflow.
+    fn total(self) -> Result<usize, String> {
+        self.vcr_1
+            .checked_add(self.vcr_2)
+            .ok_or_else(|| "simulator ready endpoint count overflowed".to_owned())
+    }
+}
+
+/// Read each simulator Deployment's ready replica count.
+fn simulator_ready_replicas(context: &str) -> Result<SimulatorReadyReplicas, Box<dyn std::error::Error>> {
+    let mut counts = SimulatorReadyReplicas::default();
+    for deployment in SIMULATOR_DEPLOYMENTS {
+        let output = Command::new("kubectl")
+            .args([
+                "--context",
+                context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "get",
+                &format!("deployment/{deployment}"),
+                "-o",
+                "json",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "read deployment/{deployment} ready replicas: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let ready = match document.pointer("/status/readyReplicas") {
+            None => 0,
+            Some(value) => usize::try_from(value.as_u64().ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "deployment/{deployment} has an invalid status.readyReplicas value: {value}"
+                ))
+            })?)
+            .map_err(|error| std::io::Error::other(format!("deployment/{deployment} ready replicas: {error}")))?,
+        };
+        match *deployment {
+            "vcr-1" => counts.vcr_1 = ready,
+            "vcr-2" => counts.vcr_2 = ready,
+            _ => return Err(format!("unknown simulator Deployment {deployment}").into()),
+        }
+    }
+    Ok(counts)
+}
+
+/// Calculate the EPP's endpoint-weighted mean for the two simulator Deployments.
+fn simulator_kv_cache_mean(
+    vcr_1_kv_cache: f64,
+    vcr_2_kv_cache: f64,
+    ready_replicas: SimulatorReadyReplicas,
+) -> Result<f64, String> {
+    if !vcr_1_kv_cache.is_finite()
+        || !(0.0..=1.0).contains(&vcr_1_kv_cache)
+        || !vcr_2_kv_cache.is_finite()
+        || !(0.0..=1.0).contains(&vcr_2_kv_cache)
+    {
+        return Err(format!(
+            "simulator KV-cache values must be finite and in [0, 1]: vcr-1={vcr_1_kv_cache}, vcr-2={vcr_2_kv_cache}"
+        ));
+    }
+    let total = ready_replicas.total()?;
+    if total == 0 {
+        return Err("cannot calculate simulator KV-cache mean without ready endpoints".to_owned());
+    }
+    let vcr_1_count = u32::try_from(ready_replicas.vcr_1)
+        .map_err(|error| format!("vcr-1 ready endpoints exceed EPP metric precision: {error}"))?;
+    let vcr_2_count = u32::try_from(ready_replicas.vcr_2)
+        .map_err(|error| format!("vcr-2 ready endpoints exceed EPP metric precision: {error}"))?;
+    let total_count = u32::try_from(total)
+        .map_err(|error| format!("simulator ready endpoints exceed EPP metric precision: {error}"))?;
+    Ok((vcr_1_kv_cache * f64::from(vcr_1_count) + vcr_2_kv_cache * f64::from(vcr_2_count)) / f64::from(total_count))
+}
+
+/// Ready and not-ready pod identities currently published by the VCR Service.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct SimulatorServiceEndpoints {
+    /// Identities of endpoints ready to receive traffic.
+    ready: BTreeSet<String>,
+    /// Identities of endpoints Kubernetes has marked not ready.
+    not_ready: BTreeSet<String>,
+}
+
+/// Parse the Endpoints view that kube-proxy uses for the VCR Service.
+fn parse_simulator_service_endpoints(
+    document: &serde_json::Value,
+) -> Result<SimulatorServiceEndpoints, Box<dyn std::error::Error>> {
+    let mut endpoints = SimulatorServiceEndpoints::default();
+    let subsets = document
+        .get("subsets")
+        .and_then(serde_json::Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    for subset in subsets {
+        for (field, destination) in [
+            ("addresses", &mut endpoints.ready),
+            ("notReadyAddresses", &mut endpoints.not_ready),
+        ] {
+            let addresses = subset
+                .get(field)
+                .and_then(serde_json::Value::as_array)
+                .map_or(&[][..], Vec::as_slice);
+            for address in addresses {
+                let identity = address
+                    .pointer("/targetRef/uid")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| address.pointer("/targetRef/name").and_then(serde_json::Value::as_str))
+                    .or_else(|| address.get("ip").and_then(serde_json::Value::as_str))
+                    .ok_or_else(|| {
+                        std::io::Error::other(format!("{field} entry has no pod identity or IP: {address}"))
+                    })?;
+                destination.insert(identity.to_owned());
+            }
+        }
+    }
+    Ok(endpoints)
+}
+
+/// Read the Service endpoints that provider Gateways connect to.
+fn simulator_service_endpoints(context: &str) -> Result<SimulatorServiceEndpoints, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "endpoints/vcr-service",
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "read vcr-service Endpoints: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    parse_simulator_service_endpoints(&document)
+}
+
+/// Wait until the VCR Service publishes the desired ready pods without a stale or
+/// not-ready endpoint before routing proof traffic through its provider Gateway.
+fn wait_for_simulator_service_endpoints(context: &str) -> Result<SimulatorReadyReplicas, Box<dyn std::error::Error>> {
+    const STABLE_SAMPLES: u32 = 3;
+
+    let expected = simulator_desired_replicas(context)?;
+    let deadline = Instant::now() + DATA_PLANE_WAIT;
+    let mut previous: Option<(BTreeSet<String>, SimulatorReadyReplicas)> = None;
+    let mut stable_samples = 0_u32;
+    let mut last = String::from("no Endpoints observation");
+    while Instant::now() < deadline {
+        let endpoints = simulator_service_endpoints(context)?;
+        let ready_replicas = simulator_ready_replicas(context)?;
+        let deployment_endpoint_total = ready_replicas.total().map_err(std::io::Error::other)?;
+        last = format!(
+            "service-ready={:?}, service-not-ready={:?}, per-deployment-ready={ready_replicas:?}, expected-service-ready={expected}",
+            endpoints.ready, endpoints.not_ready,
+        );
+        if endpoints.ready.len() == expected
+            && endpoints.not_ready.is_empty()
+            && deployment_endpoint_total == endpoints.ready.len()
+        {
+            let observation = (endpoints.ready.clone(), ready_replicas);
+            if previous.as_ref() == Some(&observation) {
+                stable_samples = stable_samples.saturating_add(1);
+            } else {
+                stable_samples = 1;
+                previous = Some(observation);
+            }
+            if stable_samples >= STABLE_SAMPLES {
+                eprintln!(
+                    "  [OK] {context}: vcr-service has {expected} stable ready endpoint(s), vcr-1={}, vcr-2={}",
+                    ready_replicas.vcr_1, ready_replicas.vcr_2
+                );
+                return Ok(ready_replicas);
+            }
+        } else {
+            previous = None;
+            stable_samples = 0;
+        }
+        std::thread::sleep(DATA_PLANE_INTERVAL);
+    }
+    Err(format!("{context}: vcr-service endpoints did not converge: {last}").into())
 }
 
 /// Read a Deployment generation before and after a deterministic simulator
@@ -1883,40 +2250,173 @@ fn print_live_table_row(row: &LiveTableRow<'_>) {
 // ---------------------------------------------------------------------------
 
 /// Send an inference request and capture gateway attribution headers.
-fn send_inference_request(kube_context: &str, model: &str) -> Result<InferenceResponse, Box<dyn std::error::Error>> {
+fn send_inference_request(
+    kube_context: &str,
+    model: &str,
+    phase: &str,
+) -> Result<InferenceResponse, Box<dyn std::error::Error>> {
     let body = format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"test"}}]}}"#,);
     let session_id = format!("probe-{}", format_utc_timestamp());
     let curl_cmd = format!(
-        "curl -s -o /dev/null \
+        "curl -sS -o /dev/null \
          -w 'STATUS:%{{http_code}}\\nPROVIDER_GW:%header{{X-Grid-LlmD-Provider-Gateway}}\\nDEMO_ATTRIB:%header{{x-ai-demo-provider-gateway}}\\n' \
          -X POST http://consumer-gateway.grid-system.svc.cluster.local:8080/v1/chat/completions \
          -H 'Content-Type: application/json' \
          -H 'X-Session-Id: {session_id}' \
-         -d '{body}'",
+         -d '{body}' 2>/tmp/curl.stderr > /tmp/curl.stdout
+         curl_exit=$?
+         curl_stdout=$(cat /tmp/curl.stdout)
+         curl_stderr=$(cat /tmp/curl.stderr)
+         printf '%s\\n' \"$curl_stdout\"
+         printf 'CURL_EXIT:%s\\n' \"$curl_exit\"
+         printf 'CURL_STDERR_BEGIN\\n'
+         printf '%s' \"$curl_stderr\"
+         printf '\\nCURL_STDERR_END\\n'
+         exit 0",
     );
-    let raw = kubectl_exec_curl_raw(kube_context, &curl_cmd)?;
-    let mut status = 0_u16;
-    let mut provider_gw = String::new();
-    let mut demo_attr = String::new();
-    for line in raw.lines() {
-        if let Some(code) = line.strip_prefix("STATUS:") {
-            status = code.trim().parse().unwrap_or(0);
-        } else if let Some(val) = line.strip_prefix("PROVIDER_GW:") {
-            val.trim().clone_into(&mut provider_gw);
-        } else if let Some(val) = line.strip_prefix("DEMO_ATTRIB:") {
-            val.trim().clone_into(&mut demo_attr);
-        }
+    let raw = kubectl_exec_curl_raw(kube_context, &curl_cmd).map_err(|error| {
+        format!(
+            "inference probe command failed: phase={phase}; observed_at={}; request_id={session_id}; {error}",
+            format_utc_iso()
+        )
+    })?;
+    let probe = parse_curl_probe_output(&raw.stdout).map_err(|error| {
+        format!(
+            "inference probe output could not be parsed: {}",
+            curl_probe_diagnostics(&CurlProbeDiagnostic {
+                phase,
+                observed_at: &format_utc_iso(),
+                request_id: &session_id,
+                http_status: None,
+                curl_exit_code: None,
+                curl_stderr: &format!("kubectl stderr: {}; raw stdout: {:?}", raw.stderr, raw.stdout),
+                reason: &error.to_string(),
+            })
+        )
+    })?;
+    if probe.status != 200 {
+        let reason = if probe.status == 0 {
+            "no HTTP response (HTTP status 000)"
+        } else {
+            "unexpected HTTP response"
+        };
+        return Err(format!(
+            "inference probe failed: {}",
+            curl_probe_diagnostics(&CurlProbeDiagnostic {
+                phase,
+                observed_at: &format_utc_iso(),
+                request_id: &session_id,
+                http_status: Some(probe.status),
+                curl_exit_code: Some(probe.curl_exit_code),
+                curl_stderr: &probe.curl_stderr,
+                reason,
+            })
+        )
+        .into());
     }
-    if status != 200 {
-        return Err(format!("inference request returned HTTP {status}").into());
-    }
-    if provider_gw.is_empty() || demo_attr.is_empty() {
-        return Err("missing attribution headers in response".into());
+    if probe.provider_gateway.is_empty() || probe.demo_attribution.is_empty() {
+        return Err(format!(
+            "inference probe failed: {}",
+            curl_probe_diagnostics(&CurlProbeDiagnostic {
+                phase,
+                observed_at: &format_utc_iso(),
+                request_id: &session_id,
+                http_status: Some(probe.status),
+                curl_exit_code: Some(probe.curl_exit_code),
+                curl_stderr: &probe.curl_stderr,
+                reason: "missing attribution headers in HTTP 200 response",
+            })
+        )
+        .into());
     }
     Ok(InferenceResponse {
-        provider_gateway: provider_gw,
-        demo_attribution: demo_attr,
+        provider_gateway: probe.provider_gateway,
+        demo_attribution: probe.demo_attribution,
     })
+}
+
+/// Context recorded when one inference probe is rejected.
+struct CurlProbeDiagnostic<'diagnostic> {
+    /// Name of the proof phase that issued this request.
+    phase: &'diagnostic str,
+    /// UTC time at which the probe result was observed.
+    observed_at: &'diagnostic str,
+    /// Unique request identifier.
+    request_id: &'diagnostic str,
+    /// HTTP status, with zero representing no response.
+    http_status: Option<u16>,
+    /// Exit code returned by curl.
+    curl_exit_code: Option<i32>,
+    /// Captured curl or kubectl error output.
+    curl_stderr: &'diagnostic str,
+    /// Reason the probe result was rejected.
+    reason: &'diagnostic str,
+}
+
+/// Format rejected inference-probe context without affecting acceptance.
+fn curl_probe_diagnostics(probe: &CurlProbeDiagnostic<'_>) -> serde_json::Value {
+    serde_json::json!({
+        "phase": probe.phase,
+        "observed_at": probe.observed_at,
+        "request_id": probe.request_id,
+        "http_status": probe.http_status.map(|status| format!("{status:03}")),
+        "curl_exit_code": probe.curl_exit_code,
+        "curl_stderr": probe.curl_stderr,
+        "reason": probe.reason,
+    })
+}
+
+/// Parse curl's HTTP result, exit code, attribution headers, and captured stderr.
+fn parse_curl_probe_output(raw: &str) -> Result<CurlProbeOutput, Box<dyn std::error::Error>> {
+    let (response_lines, stderr_block) = raw
+        .split_once("CURL_STDERR_BEGIN\n")
+        .ok_or_else(|| std::io::Error::other("curl probe output omitted the stderr marker"))?;
+    let (curl_stderr, trailing_output) = stderr_block
+        .split_once("\nCURL_STDERR_END")
+        .ok_or_else(|| std::io::Error::other("curl probe output omitted the stderr terminator"))?;
+    let trailing_output = trailing_output.trim();
+    if !trailing_output.is_empty() && !is_kubectl_curl_probe_cleanup_notice(trailing_output) {
+        return Err(std::io::Error::other("curl probe output had unexpected trailing data").into());
+    }
+
+    let mut status = None;
+    let mut provider_gateway = String::new();
+    let mut demo_attribution = String::new();
+    let mut curl_exit_code = None;
+    for line in response_lines.lines() {
+        if let Some(code) = line.strip_prefix("STATUS:") {
+            status = Some(code.trim().parse::<u16>().map_err(|error| {
+                std::io::Error::other(format!("curl probe output had an invalid HTTP status: {error}"))
+            })?);
+        } else if let Some(value) = line.strip_prefix("PROVIDER_GW:") {
+            value.trim().clone_into(&mut provider_gateway);
+        } else if let Some(value) = line.strip_prefix("DEMO_ATTRIB:") {
+            value.trim().clone_into(&mut demo_attribution);
+        } else if let Some(code) = line.strip_prefix("CURL_EXIT:") {
+            curl_exit_code = Some(code.trim().parse::<i32>().map_err(|error| {
+                std::io::Error::other(format!("curl probe output had an invalid exit code: {error}"))
+            })?);
+        }
+    }
+
+    Ok(CurlProbeOutput {
+        status: status.ok_or_else(|| std::io::Error::other("curl probe output omitted the HTTP status"))?,
+        provider_gateway,
+        demo_attribution,
+        curl_exit_code: curl_exit_code
+            .ok_or_else(|| std::io::Error::other("curl probe output omitted the curl exit code"))?,
+        curl_stderr: curl_stderr.to_owned(),
+    })
+}
+
+/// Recognize the line kubectl prints after deleting a successful `run --rm` pod.
+fn is_kubectl_curl_probe_cleanup_notice(line: &str) -> bool {
+    const PREFIX: &str = "pod \"curl-probe-";
+    const SUFFIXES: [&str; 2] = ["\" deleted", "\" deleted from grid-system namespace"];
+
+    line.strip_prefix(PREFIX)
+        .and_then(|name| SUFFIXES.iter().find_map(|suffix| name.strip_suffix(suffix)))
+        .is_some_and(|name| !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Fetch EPP metrics.
@@ -1973,8 +2473,16 @@ fn kubectl_exec_epp_metrics(cluster: &str, mtls: bool) -> Result<String, Box<dyn
     }
 }
 
-/// Run an arbitrary command via `kubectl run` in a temporary pod.
-fn kubectl_exec_curl_raw(kube_context: &str, cmd: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// Captured output from a curl probe run in a temporary pod.
+struct KubectlCurlOutput {
+    /// Standard output from the pod and kubectl.
+    stdout: String,
+    /// Standard error from kubectl.
+    stderr: String,
+}
+
+/// Run curl via kubectl in a temporary pod and retain its raw output.
+fn kubectl_exec_curl_raw(kube_context: &str, cmd: &str) -> Result<KubectlCurlOutput, Box<dyn std::error::Error>> {
     let pod_name = format!("curl-probe-{}", &format_utc_timestamp()[9..15]);
     let output = Command::new("kubectl")
         .args([
@@ -1995,9 +2503,18 @@ fn kubectl_exec_curl_raw(kube_context: &str, cmd: &str) -> Result<String, Box<dy
         ])
         .output()?;
     if !output.status.success() {
-        return Err(format!("kubectl run failed: {}", String::from_utf8_lossy(&output.stderr).trim()).into());
+        return Err(format!(
+            "kubectl run {pod_name} failed (kubectl exit code {:?}); stdout={:?}; stderr={:?}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        )
+        .into());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(KubectlCurlOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
 }
 
 /// Extract a specific data key from a ConfigMap as raw text.
@@ -4184,7 +4701,7 @@ fn proof_tls_routing() -> ProofResult {
 
     // Send an inference request and verify attribution
     let probe_ctx = kind_context("pool-a");
-    match send_inference_request(&probe_ctx, VCR_MODEL) {
+    match send_inference_request(&probe_ctx, VCR_MODEL, "tls-routing") {
         Ok(resp) => {
             observations.push(format!(
                 "routing attribution: gateway={} provider={}",
@@ -4215,11 +4732,92 @@ fn proof_tls_routing() -> ProofResult {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use std::collections::BTreeSet;
-
     use serde::Deserialize as _;
 
     use super::*;
+
+    #[test]
+    fn curl_probe_output_preserves_no_response_transport_diagnostics() -> Result<(), Box<dyn std::error::Error>> {
+        let output = parse_curl_probe_output(
+            "STATUS:000\nPROVIDER_GW:\nDEMO_ATTRIB:\nCURL_EXIT:28\nCURL_STDERR_BEGIN\ncurl: (28) timed out\nCURL_STDERR_END\npod \"curl-probe-050906\" deleted\n",
+        )?;
+
+        assert_eq!(output.status, 0);
+        assert_eq!(output.curl_exit_code, 28);
+        assert_eq!(output.curl_stderr, "curl: (28) timed out");
+        assert!(output.provider_gateway.is_empty());
+        assert!(output.demo_attribution.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn curl_probe_output_accepts_kubectl_cleanup_notice_with_namespace_detail() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let output = parse_curl_probe_output(
+            "STATUS:200\nPROVIDER_GW:pool-a\nDEMO_ATTRIB:pool-a\nCURL_EXIT:0\nCURL_STDERR_BEGIN\n\nCURL_STDERR_END\npod \"curl-probe-050906\" deleted from grid-system namespace\n",
+        )?;
+
+        assert_eq!(output.status, 200);
+        assert_eq!(output.provider_gateway, "pool-a");
+        assert_eq!(output.demo_attribution, "pool-a");
+        assert_eq!(output.curl_exit_code, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn curl_probe_output_rejects_unrecognized_trailing_data() {
+        assert!(
+            parse_curl_probe_output(
+                "STATUS:000\nPROVIDER_GW:\nDEMO_ATTRIB:\nCURL_EXIT:28\nCURL_STDERR_BEGIN\ncurl: (28) timed out\nCURL_STDERR_END\nunexpected output\n",
+            )
+            .err()
+            .is_some_and(|error| error.to_string().contains("unexpected trailing data")),
+            "unrecognized kubectl output must not be accepted as curl data"
+        );
+    }
+
+    #[test]
+    fn curl_probe_failure_report_keeps_phase_timestamp_exit_code_and_stderr() {
+        let report = curl_probe_diagnostics(&CurlProbeDiagnostic {
+            phase: "network-partition-traffic",
+            observed_at: "2026-10-15T04:28:27Z",
+            request_id: "grid-poll-0-1",
+            http_status: Some(0),
+            curl_exit_code: Some(28),
+            curl_stderr: "curl: (28) Operation timed out\n",
+            reason: "curl returned a transport failure or HTTP status 000",
+        });
+
+        assert_eq!(
+            report.get("phase"),
+            Some(&serde_json::json!("network-partition-traffic"))
+        );
+        assert_eq!(
+            report.get("observed_at"),
+            Some(&serde_json::json!("2026-10-15T04:28:27Z"))
+        );
+        assert_eq!(report.get("request_id"), Some(&serde_json::json!("grid-poll-0-1")));
+        assert_eq!(report.get("http_status"), Some(&serde_json::json!("000")));
+        assert_eq!(report.get("curl_exit_code"), Some(&serde_json::json!(28)));
+        assert_eq!(
+            report.get("curl_stderr"),
+            Some(&serde_json::json!("curl: (28) Operation timed out\n"))
+        );
+    }
+
+    #[test]
+    fn curl_probe_output_parses_successful_status_and_attribution() -> Result<(), Box<dyn std::error::Error>> {
+        let output = parse_curl_probe_output(
+            "STATUS:200\nPROVIDER_GW:pool-a\nDEMO_ATTRIB:pool-a-provider\nCURL_EXIT:0\nCURL_STDERR_BEGIN\n\nCURL_STDERR_END\n",
+        )?;
+
+        assert_eq!(output.status, 200);
+        assert_eq!(output.curl_exit_code, 0);
+        assert!(output.curl_stderr.is_empty());
+        assert_eq!(output.provider_gateway, "pool-a");
+        assert_eq!(output.demo_attribution, "pool-a-provider");
+        Ok(())
+    }
 
     #[test]
     fn pool_metrics_topology_uses_deterministic_selection_for_pressure_recovery()
@@ -4437,31 +5035,67 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
 
     #[test]
     fn simulator_config_persists_zero_queue_value() {
-        let config = simulator_config(0, 0.0);
+        let config = simulator_config("vcr-1-config", 0, 0, 0.0);
         assert!(config.contains("fake-metrics:"));
+        assert!(config.contains("name: vcr-1-config"));
         assert!(config.contains("waiting-requests: 0"));
+        assert!(config.contains("running-requests: 0"));
         assert!(config.contains("kv-cache-usage: 0"));
     }
 
     #[test]
     fn simulator_config_persists_pressure_queue_value() {
-        let config = simulator_config(9, 0.0);
+        let config = simulator_config("vcr-2-config", 9, 0, 0.0);
+        assert!(config.contains("name: vcr-2-config"));
         assert!(config.contains("waiting-requests: 9"));
         assert!(!config.contains("pressure-generator"));
     }
 
     #[test]
+    fn simulator_config_supports_distinct_endpoint_kv_cache_values() {
+        let high_endpoint = simulator_config("vcr-1-config", 1, 8, 1.0);
+        let low_endpoint = simulator_config("vcr-2-config", 1, 8, 0.0);
+
+        assert!(high_endpoint.contains("name: vcr-1-config"));
+        assert!(high_endpoint.contains("waiting-requests: 1"));
+        assert!(high_endpoint.contains("running-requests: 8"));
+        assert!(high_endpoint.contains("kv-cache-usage: 1"));
+        assert!(low_endpoint.contains("name: vcr-2-config"));
+        assert!(low_endpoint.contains("waiting-requests: 1"));
+        assert!(low_endpoint.contains("running-requests: 8"));
+        assert!(low_endpoint.contains("kv-cache-usage: 0"));
+    }
+
+    #[test]
+    fn simulator_config_data_matches_the_manifest_block_value() {
+        let waiting_requests = 1;
+        let running_requests = 8;
+        let kv_cache_usage = 1.0;
+        let config = simulator_config("vcr-1-config", waiting_requests, running_requests, kv_cache_usage);
+        let config_data = simulator_config_data(waiting_requests, running_requests, kv_cache_usage);
+        let indented_config_data = config_data
+            .lines()
+            .map(|line| format!("    {line}\n"))
+            .collect::<String>();
+
+        assert!(
+            config.ends_with(&format!("data:\n  config.yaml: |\n{indented_config_data}")),
+            "the readback value should be rendered from the same simulator configuration data"
+        );
+    }
+
+    #[test]
     fn kv_cache_pressure_sets_only_the_selected_signal() {
         let (queue, kv_cache) = simulator_metrics(9, ScoringFlavor::KvCachePressure);
-        let config = simulator_config(queue, kv_cache);
+        let config = simulator_config("vcr-1-config", queue, 0, kv_cache);
         assert!(config.contains("waiting-requests: 0"));
         assert!(config.contains("kv-cache-usage: 0.95"));
     }
 
     #[test]
     fn simulator_rollout_annotations_change_for_kv_cache_pressure() {
-        let idle = simulator_rollout_annotations(0, 0.0);
-        let pressured = simulator_rollout_annotations(0, 0.95);
+        let idle = simulator_rollout_annotations(0, 0, 0.0);
+        let pressured = simulator_rollout_annotations(0, 0, 0.95);
 
         assert_eq!(
             idle.get(SIMULATOR_WAITING_REQUESTS_ANNOTATION).map(String::as_str),
@@ -4477,6 +5111,11 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
             idle.get(SIMULATOR_KV_CACHE_ANNOTATION).map(String::as_str),
             Some("0"),
             "idle configuration should annotate zero KV-cache use"
+        );
+        assert_eq!(
+            idle.get(SIMULATOR_RUNNING_REQUESTS_ANNOTATION).map(String::as_str),
+            Some("0"),
+            "idle configuration should annotate the zero running-request value"
         );
         assert_eq!(
             pressured.get(SIMULATOR_KV_CACHE_ANNOTATION).map(String::as_str),
@@ -4681,6 +5320,44 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
                      llm_d_epp_ready_endpoints{name=\"pool-a\"} 2\n";
         assert!(any_metric_present(text, EPP_READY_METRICS));
         assert!(!any_metric_present("no epp metrics here", EPP_READY_METRICS));
+    }
+
+    #[test]
+    fn simulator_endpoints_parser_separates_ready_pods_from_replacements() -> Result<(), Box<dyn std::error::Error>> {
+        let endpoints = parse_simulator_service_endpoints(&serde_json::json!({
+            "subsets": [{
+                "addresses": [{
+                    "ip": "10.244.0.12",
+                    "targetRef": {"name": "vcr-1-new", "uid": "ready-uid"}
+                }],
+                "notReadyAddresses": [{
+                    "ip": "10.244.0.11",
+                    "targetRef": {"name": "vcr-1-old", "uid": "terminating-uid"}
+                }]
+            }]
+        }))?;
+
+        assert_eq!(endpoints.ready, BTreeSet::from(["ready-uid".to_owned()]));
+        assert_eq!(endpoints.not_ready, BTreeSet::from(["terminating-uid".to_owned()]));
+        Ok(())
+    }
+
+    #[test]
+    fn simulator_kv_cache_mean_weights_each_ready_endpoint() {
+        let mean = simulator_kv_cache_mean(0.2, 0.8, SimulatorReadyReplicas { vcr_1: 2, vcr_2: 1 });
+
+        assert!(mean.is_ok(), "ready endpoint counts should produce a mean");
+        assert!(
+            mean.is_ok_and(|value| (value - 0.4).abs() < f64::EPSILON),
+            "the mean must weight the two vcr-1 endpoints separately from the one vcr-2 endpoint"
+        );
+    }
+
+    #[test]
+    fn simulator_kv_cache_mean_rejects_missing_ready_endpoints() {
+        let mean = simulator_kv_cache_mean(0.2, 0.8, SimulatorReadyReplicas::default());
+
+        assert!(mean.is_err(), "the mean requires at least one ready endpoint");
     }
 
     #[test]

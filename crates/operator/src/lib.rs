@@ -45,6 +45,7 @@ pub mod metrics_tls;
 pub(crate) mod metrics_token;
 /// The `GridNetwork` condition naming peers whose relayed signal ages are rejected.
 pub mod peer_ages;
+mod provider_revision;
 pub mod readiness;
 /// Kubernetes resource builders.
 pub mod resources;

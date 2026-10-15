@@ -1,4 +1,4 @@
-//! Per-request site selection: `on_request` over a snapshot of N measured sites, prefix affinity off.
+//! Per-request selection time and allocations, with prefix affinity off.
 
 use std::{
     collections::HashMap,
@@ -24,16 +24,35 @@ use praxis_filter::{
 /// The request id source every call shares.
 static IDS: LazyLock<IdGenerator> = LazyLock::new(|| IdGenerator::with_seed(0));
 
-/// `sites` measured sites serving `llama`, each with room and a distinct rho.
-fn snapshot(sites: u32) -> RouteSnapshot {
+/// Count allocations only inside the benchmark's measured iterations.
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
+
+/// The normal, queued fallback, and unknown-capacity selection paths.
+#[derive(Clone, Copy)]
+enum Shape {
+    /// Every site has measured room.
+    Measured,
+    /// Every site has a backlog despite low measured saturation.
+    Backlogged,
+    /// Only the first site has measured capacity and saturation.
+    Mixed,
+    /// Every site has fresh pressure but no known capacity.
+    PressureOnly,
+}
+
+/// `sites` candidates serving `llama` with the selected pressure pattern.
+fn snapshot(sites: u32, shape: Shape) -> RouteSnapshot {
     let candidates = (1..=sites)
         .map(|index| {
             let site: Arc<str> = Arc::from(format!("site-{index}"));
             RouteCandidate {
                 admission_state: AdmissionState::NewAndExisting,
-                capacity: Some(8.0),
-                rho: Some(f64::from(index) / f64::from(sites.saturating_add(1))),
-                backlog: None,
+                capacity: (!matches!(shape, Shape::PressureOnly) && (!matches!(shape, Shape::Mixed) || index == 1))
+                    .then_some(8.0),
+                rho: (!matches!(shape, Shape::Mixed) || index == 1)
+                    .then_some(f64::from(index) / f64::from(sites.saturating_add(1))),
+                backlog: Some(matches!(shape, Shape::Backlogged)),
                 full: None,
                 relieved: None,
                 cluster: Arc::from(format!("pool-{index}")),
@@ -50,11 +69,9 @@ fn snapshot(sites: u32) -> RouteSnapshot {
         })
         .collect();
     let mut snapshot = RouteSnapshot::from_static(candidates, Arc::from("site-1"));
-    snapshot.scores = snapshot
-        .candidates
-        .iter()
-        .map(|candidate| candidate.rho.unwrap_or(0.0))
-        .collect();
+    snapshot
+        .scores
+        .fill(if matches!(shape, Shape::Backlogged) { 2.0 } else { 0.0 });
     snapshot
 }
 
@@ -138,22 +155,48 @@ fn context(request: &Request) -> HttpFilterContext<'_> {
     }
 }
 
-/// One `on_request`, polled to completion, and the cluster it selected.
-fn route(filter: &dyn HttpFilter, ctx: &mut HttpFilterContext<'_>) -> Option<Arc<str>> {
+/// One `on_request`, polled to completion, with request-local mutation buffers reset.
+fn route(filter: &dyn HttpFilter, ctx: &mut HttpFilterContext<'_>) -> bool {
     // The call has no await point on this path, so one poll completes it.
     let routed = {
         let mut call = pin!(filter.on_request(ctx));
         let polled = call.as_mut().poll(&mut Context::from_waker(Waker::noop()));
         matches!(polled, Poll::Ready(Ok(FilterAction::Continue)))
     };
-    routed.then(|| ctx.cluster.take()).flatten()
+    let chosen = ctx.cluster.take().is_some();
+    ctx.request_headers_to_remove.clear();
+    ctx.request_headers_to_set.clear();
+    routed && chosen
 }
 
 /// One request through the filter over `sites` measured sites.
 #[divan::bench(args = [2, 4, 16, 64])]
-#[expect(clippy::expect_used, reason = "bench setup")]
 fn choose(bencher: Bencher<'_, '_>, sites: u32) {
-    let filter = filter(snapshot(sites)).expect("the filter builds");
+    measure(bencher, sites, Shape::Measured);
+}
+
+/// The queue fallback when no site is queue-free.
+#[divan::bench(args = [2, 4, 16, 64])]
+fn backlogged(bencher: Bencher<'_, '_>, sites: u32) {
+    measure(bencher, sites, Shape::Backlogged);
+}
+
+/// Unknown-capacity participation beside one measured site.
+#[divan::bench(args = [2, 4, 16, 64])]
+fn mixed(bencher: Bencher<'_, '_>, sites: u32) {
+    measure(bencher, sites, Shape::Mixed);
+}
+
+/// Fresh pressure guides the draw before any site has learned capacity.
+#[divan::bench(args = [2, 4, 16, 64])]
+fn pressure_only(bencher: Bencher<'_, '_>, sites: u32) {
+    measure(bencher, sites, Shape::PressureOnly);
+}
+
+/// Warm up the filter before measuring requests and allocator calls.
+#[expect(clippy::expect_used, reason = "bench setup")]
+fn measure(bencher: Bencher<'_, '_>, sites: u32, shape: Shape) {
+    let filter = filter(snapshot(sites, shape)).expect("the filter builds");
     let request = Request {
         headers: [(HeaderName::from_static("x-model"), HeaderValue::from_static("llama"))]
             .into_iter()
@@ -162,7 +205,7 @@ fn choose(bencher: Bencher<'_, '_>, sites: u32) {
         uri: Uri::from_static("/v1/chat/completions"),
     };
     let mut ctx = context(&request);
-    assert!(route(filter.as_ref(), &mut ctx).is_some(), "the first request routes");
+    assert!(route(filter.as_ref(), &mut ctx), "the first request routes");
     bencher.bench_local(|| route(filter.as_ref(), &mut ctx));
 }
 

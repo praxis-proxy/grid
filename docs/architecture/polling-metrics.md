@@ -7,6 +7,8 @@ orders cross-site candidates from it. Wire format and store:
 [Signals](signals.md). Selection: [Routing](routing.md), [Scoring](scoring.md).
 Peer identity: [Authentication](auth.md).
 
+Backend-specific load metrics in this document describe the llm-d EPP integration.
+
 ## The Poll Path
 
 The operator polls each peer directly and attributes readings to one verified
@@ -19,7 +21,7 @@ identity. The gateway reads the operator's relay over the same mutual TLS.
 | Read | Under a byte ceiling and a time bound, so a slow or oversized peer cannot hold the poll open or exhaust memory. |
 | Store | Keyed on the verified identity, never on anything the body carries, so no peer can inject readings as another. A body label disagreeing with the verified owner is dropped. The gateway keys on the body's site label only for rows its own operator served, since that operator stamped each from the leaf it verified. |
 | Age | A row's age is the response `Date` minus the row's stamp, both from one reading of the sender's clock, so the offset between two sites' clocks never enters. The operator keeps each relayed row's age and stamps it again when it serves its gateway, with a `Date` from that same reading, so a step of its wall clock moves the stamps and the `Date` together. A row stamped more than a second past its `Date` (the `Date`'s own resolution) or more than a day before it is dropped rather than read as current: the operator counts it in `grid_peer_signals_refused_total{peer,reason="skew"}` and the gateway in `grid_signals_ingest_dropped_total{reason="skew"}`, where `skew` means a stamp out of line with its own `Date`, not an offset between sites. The gateway holds each row on its own timeline, its wall clock at start advanced by the monotonic clock only, so a step of the gateway's clock neither drops new rows as older than the held ones nor ages the held ones at once. |
-| Bound | The operator serves its own gateway the contract series only, cuts each target at 4096 lines and holds the body under 768 KiB, dropping whole targets past it and counting them in `grid_signals_relay_truncated_total{store,cut}`, so a flood from one provider costs the last targets rather than every site. The gateway then keeps only the contract names and EPP pool averages it routes on, a DNS-1123 `grid_provider`, a finite non-negative value (at most one for `grid_provider_ready` and `grid_provider_error_ratio`), and the peer's first 64 providers by name. Custom `signalNames` are dropped. Refusals count in `grid_peer_signals_refused_total{peer,reason}`. |
+| Bound | The operator relays whole provider batches within a 4096-line target limit and a 768 KiB response limit. Each peer contributes up to 64 providers, with payload-bearing batches first. The gateway retains up to 256 provider identities per site and 4096 total, including metadata-only entries. Truncations count in grid_signals_relay_truncated_total and refused samples in grid_peer_signals_refused_total. |
 
 A gateway polls only while serving, since one that is not serving has no routing
 decision to inform. Each gateway holds one connection, to its operator, so live
@@ -30,6 +32,34 @@ path, reading each candidate's recent worst load into a least-loaded-first list.
 The request path reads one ordered snapshot and picks among its healthy sites with
 room, or failing that the best-scored sites not full. It does not read raw signals or
 compute load. It reads resolved order.
+
+## Provider revisions
+
+The operator publishes grid_provider_config_generation once per qualified
+provider batch.
+Its value is the InferenceProvider generation. The provider_uid label identifies
+the object, including same-name recreations. Spec changes advance the generation.
+Status-only updates preserve it.
+
+For a batch with three load samples:
+
+```text
+grid_provider_config_generation{grid_site="b",grid_provider="m",provider_uid="u1",publisher_epoch="1",batch_sequence="11",batch_samples="3"} 7 2000
+```
+
+A changed UID, generation, or publisher epoch resets learned ceilings and their
+load and congestion history. Missing or stale metadata disables learning while
+fresh pressure signals remain usable. A zero-sample revision invalidates
+learning. A newer complete batch starts fresh learning.
+
+Receivers order batches by publisher epoch and sequence to reject delayed data.
+Repeating a complete publication leaves its age and learning lifetime unchanged
+and is not counted as a parse drop. At admission, hubs and gateways reject epochs
+more than ten minutes ahead of their own wall clock, matching SWIM's lease bound,
+before retaining any publication fence.
+Relays preserve sample age and whole batches. Valid ordering metadata survives
+rejected payloads. Ordering depends on preserving the site's SWIM high-water-mark
+ConfigMap across restarts.
 
 ## Provider Readiness
 

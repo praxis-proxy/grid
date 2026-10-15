@@ -98,6 +98,7 @@ mod tests {
             let stop = Arc::new(AtomicBool::new(false));
             let (serving, stopping) = (Arc::clone(&mode), Arc::clone(&stop));
             thread::spawn(move || {
+                let mut sequence = 0_u64;
                 for stream in listener.incoming() {
                     if stopping.load(Ordering::SeqCst) {
                         return;
@@ -124,7 +125,8 @@ mod tests {
                     // and each poll a new observation rather than one republished.
                     let now = SystemTime::now();
                     let stamp = now.duration_since(UNIX_EPOCH).map_or(0, |since| since.as_millis());
-                    let body = signals(site, publishing, stamp);
+                    sequence = sequence.checked_add(1).expect("publication sequence");
+                    let body = signals(site, publishing, stamp, sequence);
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nDate: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         httpdate::fmt_http_date(now),
@@ -145,7 +147,7 @@ mod tests {
     }
 
     /// What `site`'s operator publishes in `mode`: its in-flight count and its queue.
-    fn signals(site: &str, mode: u8, stamp: u128) -> String {
+    fn signals(site: &str, mode: u8, stamp: u128, sequence: u64) -> String {
         let labels = format!(r#"grid_site="{site}",grid_provider="pool-{site}""#);
         let (in_flight, queued) = match mode {
             FULL => (CEILING, 5),
@@ -153,7 +155,7 @@ mod tests {
             _ => (CEILING, 0),
         };
         format!(
-            "llm_d_epp_average_queue_size{{{labels}}} {queued} {stamp}\nllm_d_epp_average_running_requests{{{labels}}} {in_flight} {stamp}\nllm_d_epp_ready_endpoints{{{labels}}} 1 {stamp}\n"
+            "grid_provider_config_generation{{{labels},provider_uid=\"provider-{site}\",publisher_epoch=\"1\",batch_sequence=\"{sequence}\",batch_samples=\"3\"}} 1 {stamp}\nllm_d_epp_average_queue_size{{{labels}}} {queued} {stamp}\nllm_d_epp_average_running_requests{{{labels}}} {in_flight} {stamp}\nllm_d_epp_ready_endpoints{{{labels}}} 1 {stamp}\n"
         )
     }
 
@@ -445,7 +447,8 @@ mod tests {
         assert_eq!(
             counts.keys().collect::<Vec<_>>(),
             vec![&"site-a"],
-            "only the drained site has room: {counts:?}"
+            "only the drained site has room: {counts:?}; selection state:\n{}",
+            grid_lines()
         );
         let after = gateway.metrics();
         assert!(

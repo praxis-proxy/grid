@@ -35,6 +35,7 @@ spec:
             - --metrics-port=9090
             - --metrics-endpoint-auth=false
             - --zap-log-level=info
+            - --feature-gates=flowControl
           ports:
             - name: grpc
               containerPort: 9002

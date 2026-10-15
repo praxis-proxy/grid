@@ -85,14 +85,90 @@ pub(crate) fn in_pool(o: &Observation, pool: Option<&str>) -> bool {
 
 /// Parse an exposition response into observations.
 ///
-/// An unparseable response yields nothing rather than an error: it is a copy of
-/// somebody else's scrape and the caller cannot repair it.
+/// Malformed revision metadata rejects payload while preserving independently
+/// valid ordering fences.
 #[must_use]
 pub fn parse(text: &str) -> Vec<Observation> {
-    parse_scrape(text)
+    let now = SystemTime::now();
+    if text.lines().any(|line| {
+        split_metric_name(line.trim()).is_some_and(|(name, _)| name == grid_signals::revision::METRIC)
+            && grid_signals::exposition::parse(line)
+                .and_then(|metric| grid_signals::revision::parse(&metric))
+                .filter(|revision| grid_signals::revision::valid_epoch(revision.publisher_epoch, now))
+                .is_none()
+    }) {
+        return revision_fences(text, now);
+    }
+    let observations: Vec<_> = parse_scrape(text)
         .into_iter()
         .filter_map(|(o, republishable)| republishable.then_some(o))
+        .collect();
+    retain_complete_batches(observations)
+}
+
+/// Retain unique, strictly valid metadata as invalidations after a framing failure.
+fn revision_fences(text: &str, now: SystemTime) -> Vec<Observation> {
+    let mut groups = BTreeMap::new();
+    for line in text
+        .lines()
+        .filter(|line| split_metric_name(line.trim()).is_some_and(|(name, _)| name == grid_signals::revision::METRIC))
+    {
+        let Some(observation) = parse_sample(line) else {
+            continue;
+        };
+        let key = (
+            observation.labels.get(SITE_LABEL).cloned(),
+            observation.labels.get(PROVIDER_LABEL).cloned(),
+        );
+        let fence = grid_signals::exposition::parse(line)
+            .and_then(|metric| grid_signals::revision::parse(&metric))
+            .filter(|revision| grid_signals::revision::valid_epoch(revision.publisher_epoch, now))
+            .map(|_| invalidation(&observation));
+        groups.entry(key).and_modify(|entry| *entry = None).or_insert(fence);
+    }
+    groups.into_values().flatten().collect()
+}
+
+/// Refuse incomplete revision groups before timestamp-to-age conversion loses information.
+fn retain_complete_batches(observations: Vec<Observation>) -> Vec<Observation> {
+    if !observations
+        .iter()
+        .any(|sample| sample.metric == grid_signals::revision::METRIC)
+    {
+        return observations;
+    }
+    let mut groups = BTreeMap::<_, Vec<Observation>>::new();
+    for observation in observations {
+        let key = (
+            observation.labels.get(SITE_LABEL).cloned(),
+            observation.labels.get(PROVIDER_LABEL).cloned(),
+        );
+        groups.entry(key).or_default().push(observation);
+    }
+    groups
+        .into_values()
+        .flat_map(|group| {
+            let metadata: Vec<_> = group
+                .iter()
+                .filter(|sample| sample.metric == grid_signals::revision::METRIC)
+                .collect();
+            match metadata.as_slice() {
+                [] => group,
+                [metadata] if complete_batch(&group.iter().collect::<Vec<_>>(), metadata) => group,
+                [metadata] => vec![invalidation(metadata)],
+                _ => Vec::new(),
+            }
+        })
         .collect()
+}
+
+/// Preserve a trustworthy revision fence without qualifying unusable payload.
+fn invalidation(metadata: &Observation) -> Observation {
+    let mut metadata = metadata.clone();
+    metadata
+        .labels
+        .insert(grid_signals::revision::SAMPLES_LABEL.to_owned(), "0".to_owned());
+    metadata
 }
 
 /// Parse a scrape this site made itself: every finite sample, each paired with whether
@@ -565,15 +641,9 @@ impl SignalStore {
             // TTL uses a monotonic instant; exposition wants epoch millis, so
             // derive from the age rather than store a wall clock that can jump.
             let held_for = now.instant.saturating_duration_since(held.collected_at);
-            for sample in held.samples.iter() {
-                if collect.is_empty() || collect.iter().any(|c| c == &sample.metric) {
-                    let age = held_for.saturating_add(sample.age);
-                    render_sample(&mut out, sample, wall_millis(now.wall, age));
-                    out.push('\n');
-                    // Age bounds the whole response by the oldest sample emitted.
-                    oldest = oldest.max(age);
-                }
-            }
+            let (block, age, _) = render_batches(&held.samples, collect, held_for, now.wall, false);
+            out.push_str(&block);
+            oldest = oldest.max(age);
         }
         (out, oldest)
     }
@@ -1359,7 +1429,8 @@ fn with_query(url: &str, query: &str) -> Option<String> {
 /// Names a hub keeps from a peer: the cross-site contract, plus the EPP pool averages and
 /// ready counts the gateway routes on until it routes on saturation. A peer's custom
 /// `signalNames` are dropped here.
-const PEER_SIGNAL_NAMES: [&str; 19] = [
+const PEER_SIGNAL_NAMES: [&str; 20] = [
+    grid_signals::revision::METRIC,
     crate::readiness::READY_SIGNAL,
     crate::readiness::READY_ENDPOINTS_SIGNAL,
     crate::readiness::IN_FLIGHT_SIGNAL,
@@ -1375,7 +1446,7 @@ const PEER_SIGNAL_NAMES: [&str; 19] = [
     "llm_d_epp_average_kv_cache_utilization",
     // The deviation across a pool's units, which a gateway reads beside the mean. Without it
     // a remote site is routed from the mean alone and one hot unit stays hidden behind it.
-    "llm_d_epp_stddev_kv_cache_utilization",
+    "llm_d_epp_std_dev_kv_cache_utilization",
     "llm_d_epp_ready_endpoints",
     "inference_pool_ready_pods",
     // What a gateway reads as a backlog beside the averages, and the per-unit series whose
@@ -1397,7 +1468,7 @@ const UNIT_SIGNALS: [&str; 5] = [
     // read as a hundred times saturated.
     "llm_d_epp_average_kv_cache_utilization",
     "inference_pool_average_kv_cache_utilization",
-    "llm_d_epp_stddev_kv_cache_utilization",
+    "llm_d_epp_std_dev_kv_cache_utilization",
 ];
 
 /// Whether a hub accepts the value: finite, non-negative, and at most one for a share.
@@ -1440,27 +1511,76 @@ fn refusal(observation: &Observation) -> Option<&'static str> {
 /// routing cluster, a value in range, and at most [`MAX_PEER_PROVIDERS`] providers. Each
 /// refusal is counted by reason.
 fn bound_peer(observations: Vec<Observation>, peer: &str) -> Vec<Observation> {
+    let mut kept = project_peer(observations, peer);
+    let payload: std::collections::BTreeSet<&str> = kept
+        .iter()
+        .filter(|observation| observation.metric != grid_signals::revision::METRIC)
+        .filter_map(|observation| observation.labels.get(PROVIDER_LABEL).map(String::as_str))
+        .collect();
+    let providers: std::collections::BTreeSet<&str> = kept
+        .iter()
+        .filter_map(|observation| observation.labels.get(PROVIDER_LABEL).map(String::as_str))
+        .collect();
+    let accepted: std::collections::BTreeSet<_> = payload
+        .iter()
+        .copied()
+        .chain(providers.difference(&payload).copied())
+        .take(MAX_PEER_PROVIDERS)
+        .map(str::to_owned)
+        .collect();
+    let before = kept.len();
+    kept.retain(|observation| {
+        observation
+            .labels
+            .get(PROVIDER_LABEL)
+            .is_some_and(|provider| accepted.contains(provider))
+    });
+    for _ in kept.len()..before {
+        crate::metrics::record_peer_signal_refused(peer, "provider_cap");
+    }
+    retain_complete_batches(kept)
+}
+
+/// Apply the deliberate metric projection without hiding rejected payload rows.
+fn project_peer(observations: Vec<Observation>, peer: &str) -> Vec<Observation> {
     let mut kept = Vec::with_capacity(observations.len());
+    let mut projected = BTreeMap::<String, usize>::new();
     for observation in observations {
         match refusal(&observation) {
+            Some("name") => {
+                if let Some(provider) = observation.labels.get(PROVIDER_LABEL) {
+                    let removed = projected.entry(provider.clone()).or_default();
+                    *removed = removed.saturating_add(1);
+                }
+                crate::metrics::record_peer_signal_refused(peer, "name");
+            },
             Some(reason) => crate::metrics::record_peer_signal_refused(peer, reason),
             None => kept.push(observation),
         }
     }
-    let providers: std::collections::BTreeSet<&str> = kept
-        .iter()
-        .filter_map(|o| o.labels.get(PROVIDER_LABEL).map(String::as_str))
-        .collect();
-    let Some(&last) = providers.iter().nth(MAX_PEER_PROVIDERS.saturating_sub(1)) else {
-        return kept;
-    };
-    let last = last.to_owned();
-    let before = kept.len();
-    kept.retain(|o| o.labels.get(PROVIDER_LABEL).is_some_and(|p| *p <= last));
-    for _ in kept.len()..before {
-        crate::metrics::record_peer_signal_refused(peer, "provider_cap");
-    }
+    recount_projection(&mut kept, &projected);
     kept
+}
+
+/// Adjust metadata only for deliberate name filtering, never for corrupt payload.
+fn recount_projection(kept: &mut [Observation], projected: &BTreeMap<String, usize>) {
+    for observation in kept {
+        if observation.metric == grid_signals::revision::METRIC
+            && let Some(removed) = observation
+                .labels
+                .get(PROVIDER_LABEL)
+                .and_then(|provider| projected.get(provider))
+            && let Some(count) = observation
+                .labels
+                .get(grid_signals::revision::SAMPLES_LABEL)
+                .and_then(|count| count.parse::<usize>().ok())
+                .and_then(|count| count.checked_sub(*removed))
+        {
+            observation
+                .labels
+                .insert(grid_signals::revision::SAMPLES_LABEL.to_owned(), count.to_string());
+        }
+    }
 }
 
 /// Attribute every observation to the peer this site dialed, refusing one that
@@ -1522,25 +1642,95 @@ fn render_contract_block(
     held_for: Duration,
     wall: SystemTime,
 ) -> (String, Duration, usize) {
+    render_batches(samples, collect, held_for, wall, true)
+}
+
+/// Render whole provider batches, retaining metadata through metric selection.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one atomic provider render keeps filtering, row counts, and the line budget together"
+)]
+fn render_batches(
+    samples: &[Observation],
+    collect: &[String],
+    held_for: Duration,
+    wall: SystemTime,
+    bounded: bool,
+) -> (String, Duration, usize) {
+    let mut groups = BTreeMap::<_, Vec<&Observation>>::new();
+    for sample in samples {
+        let key = (sample.labels.get(SITE_LABEL), sample.labels.get(PROVIDER_LABEL));
+        groups.entry(key).or_default().push(sample);
+    }
     let mut block = String::new();
     let mut oldest = Duration::ZERO;
     let mut lines = 0_usize;
     let mut cut = 0_usize;
-    for sample in samples.iter().filter(|sample| is_peer_signal(&sample.metric)) {
-        if !collect.is_empty() && !collect.iter().any(|c| c == &sample.metric) {
+    for group in groups.values() {
+        let metadata = group
+            .iter()
+            .find(|sample| sample.metric == grid_signals::revision::METRIC)
+            .copied();
+        if let Some(metadata) = metadata
+            && !complete_batch(group, metadata)
+        {
+            cut = cut.saturating_add(group.len());
             continue;
         }
-        if lines >= MAX_RENDER_LINES_PER_TARGET {
-            cut = cut.saturating_add(1);
+        let selected: Vec<_> = group
+            .iter()
+            .copied()
+            .filter(|sample| {
+                sample.metric != grid_signals::revision::METRIC
+                    && (!bounded || is_peer_signal(&sample.metric))
+                    && (collect.is_empty() || collect.iter().any(|name| name == &sample.metric))
+            })
+            .collect();
+        let count = selected.len().saturating_add(usize::from(metadata.is_some()));
+        if bounded && lines.saturating_add(count) > MAX_RENDER_LINES_PER_TARGET {
+            cut = cut.saturating_add(count);
             continue;
         }
-        let age = held_for.saturating_add(sample.age);
-        render_sample(&mut block, sample, wall_millis(wall, age));
-        block.push('\n');
-        lines = lines.saturating_add(1);
-        oldest = oldest.max(age);
+        if let Some(metadata) = metadata {
+            let mut metadata = metadata.clone();
+            metadata.labels.insert(
+                grid_signals::revision::SAMPLES_LABEL.to_owned(),
+                selected.len().to_string(),
+            );
+            let age = held_for.saturating_add(metadata.age);
+            render_sample(&mut block, &metadata, wall_millis(wall, age));
+            block.push('\n');
+            oldest = oldest.max(age);
+        }
+        for sample in selected {
+            let age = held_for.saturating_add(sample.age);
+            render_sample(&mut block, sample, wall_millis(wall, age));
+            block.push('\n');
+            oldest = oldest.max(age);
+        }
+        lines = lines.saturating_add(count);
     }
     (block, oldest, cut)
+}
+
+/// Whether metadata binds every row in its provider group at the same age.
+fn complete_batch(group: &[&Observation], metadata: &Observation) -> bool {
+    let mut line = String::new();
+    render_sample(&mut line, metadata, metadata.timestamp_ms.unwrap_or(1));
+    let Some(revision) =
+        grid_signals::exposition::parse(&line).and_then(|metric| grid_signals::revision::parse(&metric))
+    else {
+        return false;
+    };
+    group
+        .iter()
+        .filter(|sample| sample.metric == grid_signals::revision::METRIC)
+        .count()
+        == 1
+        && group.len() == revision.batch_samples.saturating_add(1)
+        && group
+            .iter()
+            .all(|sample| sample.timestamp_ms == metadata.timestamp_ms && sample.age == metadata.age)
 }
 
 /// How far a relayed sample may be stamped past its peer's `Date` and still count
@@ -1567,6 +1757,10 @@ const MAX_RELAY_AGE_MS: i64 = 86_400_000; // one day
 /// the sample from its own clock reading and this age, so no wall time of this
 /// site's is stored. A missing `Date` or stamp leaves the row aged from its
 /// collection here, never from the peer's absolute clock.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one age conversion keeps invalidations and payload freshness together"
+)]
 fn reexpress_peer_ages(
     observations: Vec<Observation>,
     date: Option<SystemTime>,
@@ -1575,9 +1769,29 @@ fn reexpress_peer_ages(
     let date_ms = date
         .and_then(|when| when.duration_since(UNIX_EPOCH).ok())
         .and_then(|since| i64::try_from(since.as_millis()).ok());
+    let undated: std::collections::BTreeSet<_> = observations
+        .iter()
+        .filter(|observation| date_ms.is_none() && observation.metric == grid_signals::revision::METRIC)
+        .filter_map(|observation| observation.labels.get(PROVIDER_LABEL).cloned())
+        .collect();
     let mut kept = Vec::with_capacity(observations.len());
     let mut rejected = 0_usize;
     for mut observation in observations {
+        if observation
+            .labels
+            .get(PROVIDER_LABEL)
+            .is_some_and(|provider| undated.contains(provider))
+        {
+            if observation.metric == grid_signals::revision::METRIC {
+                let mut metadata = invalidation(&observation);
+                metadata.timestamp_ms = None;
+                metadata.age = Duration::from_millis(86_400_001);
+                kept.push(metadata);
+            }
+            rejected = rejected.saturating_add(1);
+            crate::metrics::record_peer_signal_refused(peer, "skew");
+            continue;
+        }
         let age = match (date_ms, observation.timestamp_ms.take()) {
             (Some(date_ms), Some(stamp_ms)) => relay_age(date_ms, stamp_ms),
             _ => Some(Duration::ZERO),
@@ -1586,11 +1800,16 @@ fn reexpress_peer_ages(
             observation.age = age;
             kept.push(observation);
         } else {
+            if observation.metric == grid_signals::revision::METRIC {
+                let mut metadata = invalidation(&observation);
+                metadata.age = Duration::from_millis(86_400_001);
+                kept.push(metadata);
+            }
             crate::metrics::record_peer_signal_refused(peer, "skew");
             rejected = rejected.saturating_add(1);
         }
     }
-    (kept, rejected)
+    (retain_complete_batches(kept), rejected)
 }
 
 /// The age `stamp_ms` carries against its peer's `date_ms`, `None` when it is
@@ -2366,6 +2585,301 @@ mod tests {
     }
 
     #[test]
+    fn revision_metadata_survives_metric_selection_with_exact_count() {
+        let store = SignalStore::new();
+        store.refresh(
+            BTreeMap::from([("model".to_owned(), parse(&revision_text()))]),
+            Duration::from_secs(60),
+        );
+        let selected = vec!["llm_d_epp_average_queue_size".to_owned()];
+        for bounded in [false, true] {
+            let body = if bounded {
+                store
+                    .render_bounded(None, &selected, MAX_RELAY_BYTES, ClockReading::now())
+                    .body
+            } else {
+                store.render_unrestricted(None, &selected, ClockReading::now()).0
+            };
+            let rows = parse(&body);
+            assert_eq!(rows.len(), 2, "one selected gauge and its metadata survive: {body}");
+            let metadata = rows
+                .iter()
+                .find(|row| row.metric == grid_signals::revision::METRIC)
+                .expect("metadata");
+            assert_eq!(
+                metadata
+                    .labels
+                    .get(grid_signals::revision::SAMPLES_LABEL)
+                    .map(String::as_str),
+                Some("1")
+            );
+            assert!(rows.iter().all(|row| row.timestamp_ms == metadata.timestamp_ms));
+        }
+    }
+
+    #[test]
+    fn incomplete_conflicting_and_malformed_revision_batches_are_refused() {
+        let valid = revision_text();
+        assert_eq!(parse(&valid).len(), 3);
+        for invalid in [
+            valid.replace("provider_uid=\"u1\"", "provider_uid=\"u1\",provider_uid=\"u2\""),
+            valid.replace("publisher_epoch=\"1\"", "publisher_epoch=\"0\""),
+            format!("{valid}{}\n", valid.lines().next().expect("metadata")),
+            format!("{valid}{}", valid.replace(" 7 2000", " 0 2000")),
+            format!("{}{valid}", valid.replace(" 7 2000", " 0 2000")),
+        ] {
+            assert!(
+                parse(&invalid).is_empty(),
+                "an invalid batch must never be relayed: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn future_publisher_epochs_are_never_relayed_as_payload_or_fences() {
+        assert_eq!(
+            grid_signals::revision::MAX_PUBLISHER_EPOCH_SKEW,
+            swim::identity::MAX_LEASE_SKEW,
+            "signals and SWIM enforce the same reservation bound"
+        );
+        let future = revision_text().replace("publisher_epoch=\"1\"", &format!("publisher_epoch=\"{}\"", u64::MAX));
+        for invalid in [
+            future.clone(),
+            future.replace("batch_samples=\"2\"", "batch_samples=\"3\""),
+            format!("{future}\nmalformed"),
+            future.replace(" 2 2000", " 2 99999999"),
+        ] {
+            for date in [None, Some(UNIX_EPOCH + Duration::from_secs(20_000_000_000))] {
+                let (rows, _) = reexpress_peer_ages(parse(&invalid), date, "east");
+                assert!(
+                    rows.is_empty(),
+                    "future epochs cannot survive as invalidations, even with a missing or forged Date"
+                );
+            }
+        }
+        assert_eq!(parse(&revision_text()).len(), 3, "ordinary revisions still relay");
+    }
+
+    #[test]
+    fn incomplete_payload_retains_only_its_revision_fence() {
+        let valid = revision_text();
+        for incomplete in [
+            valid.replace("batch_samples=\"2\"", "batch_samples=\"3\""),
+            valid.replace(" 2 2000", " 2 1999"),
+            valid.replace(" 2 2000", " 2"),
+        ] {
+            let rows = parse(&incomplete);
+            assert_eq!(
+                rows.len(),
+                1,
+                "valid metadata survives unusable payload as an invalidation"
+            );
+            assert_eq!(
+                rows.first()
+                    .and_then(|row| row.labels.get(grid_signals::revision::SAMPLES_LABEL))
+                    .map(String::as_str),
+                Some("0")
+            );
+        }
+    }
+
+    #[test]
+    fn peer_row_rejection_cannot_leave_a_partially_qualified_batch() {
+        let parsed = parse(&revision_text().replace(" 2 2000", " -2 2000"));
+        assert_eq!(parsed.len(), 3, "wire completeness precedes value policy");
+        let bounded = bound_peer(parsed, "east");
+        let (body, ..) = render_contract_block(&bounded, &[], Duration::ZERO, SystemTime::now());
+        let rows = parse(&body);
+        assert_eq!(rows.len(), 1, "rejected raw rows preserve only an ordered invalidation");
+        assert_eq!(
+            rows.first()
+                .and_then(|row| row.labels.get(grid_signals::revision::SAMPLES_LABEL))
+                .map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn peer_relay_keeps_revision_batch_timestamps_together() {
+        let (aged, rejected) = reexpress_peer_ages(
+            parse(&revision_text()),
+            Some(UNIX_EPOCH + Duration::from_millis(3000)),
+            "east",
+        );
+        assert_eq!(rejected, 0);
+        let (body, _, cut) = render_contract_block(
+            &bound_peer(aged, "east"),
+            &[],
+            Duration::from_secs(1),
+            UNIX_EPOCH + Duration::from_secs(10),
+        );
+        let reparsed = parse(&body);
+        assert_eq!(reparsed.len(), 3, "all rows survive a relay: {body}");
+        assert_eq!(cut, 0);
+        assert!(
+            reparsed.iter().all(|row| row.timestamp_ms == Some(8000)),
+            "the batch retains one relative age"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exercise HTTP projection, relay and guarded consumption together"
+    )]
+    async fn a_default_peer_poll_projects_custom_metrics_without_losing_revision() {
+        crate::init_process_crypto();
+        let body = format!(
+            "{}vendor_custom_gauge{{grid_site=\"east\",grid_provider=\"model\"}} 4 2000\n",
+            revision_text().replace("batch_samples=\"2\"", "batch_samples=\"3\"")
+        );
+        let (headers, _) = dated(UNIX_EPOCH + Duration::from_secs(3));
+        let peer = PeerSite {
+            name: "east".to_owned(),
+            url: serve_once_with(body, headers).await,
+            pins: Vec::new(),
+        };
+        let collected = one_attempt().collect(&[peer]).await;
+        let hub = SignalStore::new();
+        hub.refresh(collected, Duration::from_secs(60));
+        let clock = ClockReading::now();
+        let rendered = hub.render_bounded(None, &[], MAX_RELAY_BYTES, clock);
+        let rows = parse(&rendered.body);
+        assert_eq!(
+            rows.len(),
+            3,
+            "custom gauges cannot erase legitimate telemetry: {}",
+            rendered.body
+        );
+        assert!(!rendered.body.contains("vendor_custom_gauge"));
+        assert!(rendered.body.contains("batch_samples=\"2\""));
+        let receiver = grid_signals::LoadStore::new(Duration::from_secs(60)).with_revision_guard(30_000);
+        receiver.ingest_at(&rendered.body, wall_millis(clock.wall, Duration::ZERO), 10_000, "east");
+        assert!(receiver.learning_state("east/model", 10_000, 30_000).epoch.is_some());
+        assert_eq!(
+            receiver
+                .latest("east/model", "llm_d_epp_average_queue_size")
+                .map(|sample| sample.value),
+            Some(2.0)
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "invalidation, replay rejection and recovery share one receiver"
+    )]
+    fn relay_invalidation_fences_old_data_and_allows_later_learning() {
+        let old = revision_text();
+        let new = old
+            .replace("publisher_epoch=\"1\"", "publisher_epoch=\"2\"")
+            .replace("provider_uid=\"u1\"", "provider_uid=\"u2\"");
+        for invalid in [
+            new.replace("batch_samples=\"2\"", "batch_samples=\"3\""),
+            new.replace(" 2 2000", " -2 2000"),
+            new.replace(" 2 2000", " 2 1999"),
+            format!(
+                "{new}{}",
+                old.replace("grid_provider=\"model\"", "grid_provider=\"unrelated\"")
+                    .replace(" 7 2000", " 0 2000")
+            ),
+        ] {
+            let receiver = grid_signals::LoadStore::new(Duration::from_secs(60)).with_revision_guard(30_000);
+            ingest_revision_relay(&receiver, &old);
+            assert!(receiver.learning_state("east/model", 10_000, 30_000).epoch.is_some());
+            ingest_revision_relay(&receiver, &invalid);
+            assert_eq!(receiver.learning_state("east/model", 10_000, 30_000).epoch, None);
+            assert!(receiver.latest("east/model", "llm_d_epp_average_queue_size").is_none());
+            ingest_revision_relay(
+                &receiver,
+                &old.replace("batch_sequence=\"2\"", "batch_sequence=\"999\""),
+            );
+            ingest_revision_relay(&receiver, &new);
+            assert_eq!(
+                receiver.learning_state("east/model", 10_000, 30_000).epoch,
+                None,
+                "neither old authority nor an equal-order repair can re-enable learning"
+            );
+            ingest_revision_relay(&receiver, &new.replace("batch_sequence=\"2\"", "batch_sequence=\"3\""));
+            assert!(
+                receiver.learning_state("east/model", 10_000, 30_000).epoch.is_some(),
+                "a later complete publication restores learning"
+            );
+        }
+    }
+
+    /// Exercise peer parsing, age conversion, allowlist projection, relay and guarded ingest.
+    fn ingest_revision_relay(receiver: &grid_signals::LoadStore, body: &str) {
+        let (aged, _) = reexpress_peer_ages(parse(body), Some(UNIX_EPOCH + Duration::from_secs(3)), "east");
+        let (rendered, ..) = render_contract_block(
+            &bound_peer(aged, "east"),
+            &[],
+            Duration::ZERO,
+            UNIX_EPOCH + Duration::from_secs(10),
+        );
+        receiver.ingest_at(&rendered, 10_000, 10_000, "east");
+    }
+
+    #[tokio::test]
+    async fn a_revision_without_date_relays_only_a_stale_invalidation() {
+        crate::init_process_crypto();
+        let peer = peer_serving("east", revision_text()).await;
+        let collected = one_attempt().collect(&[peer]).await;
+        let rows = collected.get("east").expect("peer answered");
+        assert_eq!(rows.len(), 1, "undated payload cannot be rejuvenated");
+        let metadata = rows.first().expect("ordered invalidation");
+        assert_eq!(
+            metadata
+                .labels
+                .get(grid_signals::revision::SAMPLES_LABEL)
+                .map(String::as_str),
+            Some("0")
+        );
+        assert!(
+            metadata.age > Duration::from_secs(86_400),
+            "uncertain freshness never becomes current"
+        );
+    }
+
+    #[test]
+    fn metadata_only_providers_do_not_displace_a_live_pressure_batch() {
+        let metadata = parse(&revision_text())
+            .into_iter()
+            .find(|row| row.metric == grid_signals::revision::METRIC)
+            .expect("metadata");
+        let mut rows: Vec<_> = (0..MAX_PEER_PROVIDERS)
+            .map(|index| {
+                let mut row = invalidation(&metadata);
+                row.labels.insert(PROVIDER_LABEL.to_owned(), format!("a{index:02}"));
+                row
+            })
+            .collect();
+        rows.extend(parse(
+            &revision_text().replace("grid_provider=\"model\"", "grid_provider=\"z-live\""),
+        ));
+        let kept = bound_peer(rows, "east");
+        assert_eq!(
+            kept.iter()
+                .filter(|row| row
+                    .labels
+                    .get(PROVIDER_LABEL)
+                    .is_some_and(|provider| provider == "z-live"))
+                .count(),
+            3,
+            "a pressure-bearing provider survives metadata cardinality"
+        );
+    }
+
+    /// A complete provider batch before filtering or timestamp rebasing.
+    fn revision_text() -> String {
+        concat!(
+            "grid_provider_config_generation{grid_site=\"east\",grid_provider=\"model\",provider_uid=\"u1\",publisher_epoch=\"1\",batch_sequence=\"2\",batch_samples=\"2\"} 7 2000\n",
+            "llm_d_epp_average_queue_size{grid_site=\"east\",grid_provider=\"model\"} 2 2000\n",
+            "llm_d_epp_ready_endpoints{grid_site=\"east\",grid_provider=\"model\"} 1 2000\n"
+        ).to_owned()
+    }
+
+    #[test]
     fn a_target_past_the_line_cap_is_cut_and_the_others_still_render() {
         let store = SignalStore::new();
         let big = stocked("pool-big", MAX_RENDER_LINES_PER_TARGET + 10);
@@ -2373,8 +2887,8 @@ mod tests {
         store.refresh(BTreeMap::from([big, small]), Duration::from_secs(60));
         let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES, ClockReading::now());
         let big_lines = rendered.body.lines().filter(|line| line.contains("pool-big")).count();
-        assert_eq!(big_lines, MAX_RENDER_LINES_PER_TARGET, "cut at the cap");
-        assert_eq!(rendered.lines_cut, 10);
+        assert_eq!(big_lines, 0, "a provider group is never rendered as a prefix");
+        assert_eq!(rendered.lines_cut, MAX_RENDER_LINES_PER_TARGET + 10);
         assert!(rendered.body.contains("pool-small"), "the small target still renders");
         assert_eq!(rendered.targets_dropped, 0);
     }
@@ -3220,5 +3734,22 @@ q{pool=\"d\"} 0.35
                 "{name} is a share the gateway refuses above one, but a hub accepts any value"
             );
         }
+    }
+
+    #[test]
+    fn llm_d_kv_cache_spread_is_relayed_as_a_bounded_share() {
+        let spread = peer_sample("llm_d_epp_std_dev_kv_cache_utilization", "pool-b", 0.71);
+        assert_eq!(
+            refusal(&spread),
+            None,
+            "the pinned EPP spread series must be accepted and relayed to remote gateways"
+        );
+
+        let invalid_spread = peer_sample("llm_d_epp_std_dev_kv_cache_utilization", "pool-b", 1.01);
+        assert_eq!(
+            refusal(&invalid_spread),
+            Some("value"),
+            "the KV-cache spread is a normalized share and must stay within one"
+        );
     }
 }
