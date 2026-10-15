@@ -1796,8 +1796,9 @@ async fn apply_configured_swim_key(
             ))
         })?;
 
-    swim.set_swim_key(key)
-        .map_err(|e| OperatorError::SwimKeyConfig(format!("failed to apply swimKeySecretRef for {network_name}: {e}")))?;
+    swim.set_swim_key(key).map_err(|e| {
+        OperatorError::SwimKeyConfig(format!("failed to apply swimKeySecretRef for {network_name}: {e}"))
+    })?;
     Ok(())
 }
 
@@ -1822,7 +1823,9 @@ async fn release_plain_if_undeclared(client: &Client, swim: &SwimHandle, network
 /// Whether any of `networks` declares a SWIM key.
 #[must_use]
 pub fn declares_swim_key(networks: &[GridNetwork]) -> bool {
-    networks.iter().any(|network| network.spec.tls.swim_key_secret_ref.is_some())
+    networks
+        .iter()
+        .any(|network| network.spec.tls.swim_key_secret_ref.is_some())
 }
 
 /// Return a monotonic-ish revision for public-cert metadata broadcasts.
@@ -2780,10 +2783,9 @@ async fn apply_serving_config(
 #[cfg(test)]
 fn already_empty(network: &GridNetwork, gw_ref: &GatewayRef) -> bool {
     network.status.as_ref().is_some_and(|status| {
-        status
-            .routing_map_status
-            .iter()
-            .any(|entry| entry.gateway_name == gw_ref.name && entry.namespace == gw_ref.namespace && entry.reason == EMPTY_CANDIDATES)
+        status.routing_map_status.iter().any(|entry| {
+            entry.gateway_name == gw_ref.name && entry.namespace == gw_ref.namespace && entry.reason == EMPTY_CANDIDATES
+        })
     })
 }
 
@@ -9637,6 +9639,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "checks retention across an empty prior overlay")]
     fn retained_overlay_status_does_not_retain_an_error_without_revision() {
         let gw = make_gw_ref("gw", "grid-system");
         let mut network = base_network();
@@ -9660,7 +9663,14 @@ mod tests {
             ..GridNetworkStatus::default()
         });
 
-        let status = retained_overlay_status(&network, &gw, 2, None, "RoutingMapRenderFailed", "overlay render failed");
+        let status = retained_overlay_status(
+            &network,
+            &gw,
+            2,
+            None,
+            "RoutingMapRenderFailed",
+            "overlay render failed",
+        );
 
         assert_eq!(status.phase, OverlayPhase::Error);
         assert!(status.rendered_revision.is_empty());
@@ -9675,7 +9685,10 @@ mod tests {
     const FRESH: &str = "2026-10-01T12:00:00Z";
 
     fn only_overlay(status: &GridNetworkStatus) -> &OverlayRevisionStatus {
-        status.routing_map_status.first().unwrap_or_else(|| std::process::abort())
+        status
+            .routing_map_status
+            .first()
+            .unwrap_or_else(|| std::process::abort())
     }
 
     fn network_with_overlay(prior: OverlayRevisionStatus) -> GridNetwork {

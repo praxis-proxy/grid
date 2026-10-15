@@ -1922,8 +1922,7 @@ pub(crate) fn assert_swim_peer_stays_isolated(
             .into());
         }
 
-        let distributed_str =
-            kubectl_jsonpath(context, &resource, "{.status.remoteProviderCount}").unwrap_or_default();
+        let distributed_str = kubectl_jsonpath(context, &resource, "{.status.remoteProviderCount}").unwrap_or_default();
         let distributed_provider_count: u32 = distributed_str.parse().unwrap_or(0);
         if distributed_provider_count != 0 {
             return Err(format!(
@@ -2000,8 +1999,7 @@ pub(crate) fn assert_reconcile_blocked_no_side_effects(
             .into());
         }
 
-        let distributed_str =
-            kubectl_jsonpath(context, &resource, "{.status.remoteProviderCount}").unwrap_or_default();
+        let distributed_str = kubectl_jsonpath(context, &resource, "{.status.remoteProviderCount}").unwrap_or_default();
         let distributed_count: u32 = distributed_str.parse().unwrap_or(0);
         if distributed_count != 0 {
             return Err(format!(
@@ -2258,7 +2256,10 @@ pub(crate) fn verify_distributed_state_received(
     distributed_provider_count: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match distributed_provider_count {
-        0 => Err("distributed state validation failed: remoteProviderCount must be 1 (received 0 - state not propagated)".into()),
+        0 => Err(
+            "distributed state validation failed: remoteProviderCount must be 1 (received 0 - state not propagated)"
+                .into(),
+        ),
         1 => {
             eprintln!("  [OK] distributed state received via SWIM broadcast: remoteProviderCount=1");
             Ok(())
@@ -2267,7 +2268,8 @@ pub(crate) fn verify_distributed_state_received(
             "distributed state validation failed: remoteProviderCount={n} but expected exactly 1; \
              cross-network state leakage suspected - ensure op-e2e-net resources are cleaned up before \
              running verify-swim-state"
-        ).into()),
+        )
+        .into()),
     }
 }
 
@@ -9291,7 +9293,7 @@ mod tests {
         let refs = &value["spec"]["consumerGateways"];
         let first = &refs[0];
         assert_eq!(
-            first["praxisConfig"]["enabled"].as_bool(),
+            first["praxisConfig"]["generate"].as_bool(),
             Some(true),
             "praxisConfig.generate must be true"
         );

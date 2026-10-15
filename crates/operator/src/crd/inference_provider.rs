@@ -827,6 +827,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks duplicate rejection for every renamed provider field"
+    )]
     fn legacy_and_current_provider_field_names_are_rejected_together() {
         let gateway_json = serde_json::json!({
             "gridNetworkRef": "production",
@@ -836,7 +840,9 @@ mod tests {
             "gatewayRef": "legacy-gateway",
             "providerGateway": "current-gateway"
         });
-        assert!(serde_json::from_value::<InferenceProviderSpec>(gateway_json).is_err());
+        let Err(_gateway_error) = serde_json::from_value::<InferenceProviderSpec>(gateway_json) else {
+            std::process::abort();
+        };
 
         let cluster_json = serde_json::json!({
             "gridNetworkRef": "production",
@@ -846,7 +852,9 @@ mod tests {
             "routingClusterRef": "legacy-cluster",
             "clusterName": "current-cluster"
         });
-        assert!(serde_json::from_value::<InferenceProviderSpec>(cluster_json).is_err());
+        let Err(_cluster_error) = serde_json::from_value::<InferenceProviderSpec>(cluster_json) else {
+            std::process::abort();
+        };
 
         let metrics_json = serde_json::json!({
             "gridNetworkRef": "production",
@@ -855,7 +863,9 @@ mod tests {
             "endpoint": "http://backend:8080",
             "metricsConfig": {"metricsEndpoint": "http://legacy:9090", "endpoint": "http://current:9090"}
         });
-        assert!(serde_json::from_value::<InferenceProviderSpec>(metrics_json).is_err());
+        let Err(_metrics_error) = serde_json::from_value::<InferenceProviderSpec>(metrics_json) else {
+            std::process::abort();
+        };
 
         let auth_json = serde_json::json!({
             "gridNetworkRef": "production",
@@ -868,7 +878,9 @@ mod tests {
                 "strategy": "bearer_token"
             }
         });
-        assert!(serde_json::from_value::<InferenceProviderSpec>(auth_json).is_err());
+        let Err(_auth_error) = serde_json::from_value::<InferenceProviderSpec>(auth_json) else {
+            std::process::abort();
+        };
     }
 
     #[test]

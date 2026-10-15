@@ -807,7 +807,7 @@ pub struct GatewayRef {
 
 /// Opt-in configuration for operator-generated consumer Praxis config.
 ///
-    /// When `generate` is `true` on a [`GatewayRef`], the `GridNetwork` controller
+/// When `generate` is `true` on a [`GatewayRef`], the `GridNetwork` controller
 /// renders a `praxis.yaml`-keyed `ConfigMap` in the gateway namespace in addition
 /// to the normal routing overlay `ConfigMap`.  The generated config includes the
 /// inference-model `intelligent_route` candidates, `credential_inject` (when
@@ -1875,10 +1875,7 @@ mod tests {
     fn gateway_ref_local_site_name_defaults_to_none() {
         let json = serde_json::json!({"name": "gw", "namespace": "ns"});
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
-        assert!(
-            gw.site_name.is_none(),
-            "absent siteName must default to None"
-        );
+        assert!(gw.site_name.is_none(), "absent siteName must default to None");
     }
 
     #[test]
@@ -1989,7 +1986,9 @@ mod tests {
     fn grid_network_crd_has_gateway_ref_local_site_name() {
         let crd = crd_json();
         let gateway_ref_properties = crd
-            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/consumerGateways/items/properties")
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/consumerGateways/items/properties",
+            )
             .and_then(serde_json::Value::as_object)
             .unwrap_or_else(|| std::process::abort());
         assert!(
@@ -2343,7 +2342,9 @@ mod tests {
     fn grid_network_crd_has_consumer_config_field_on_gateway_ref() {
         let crd = crd_json();
         let gateway_ref_properties = crd
-            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/consumerGateways/items/properties")
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/consumerGateways/items/properties",
+            )
             .and_then(serde_json::Value::as_object)
             .unwrap_or_else(|| std::process::abort());
         assert!(

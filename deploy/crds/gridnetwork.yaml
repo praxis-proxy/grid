@@ -259,11 +259,6 @@ spec:
                                   required:
                                     - mode
                                   type: object
-                                  x-kubernetes-validations:
-                                    - message: caSecretRef is only valid for tls transport
-                                      rule: self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null
-                                    - message: an explicitly empty sni is only valid for plaintext transport
-                                      rule: self.mode == 'plaintext' || !has(self.sni) || self.sni.size() > 0
                               required:
                                 - address
                                 - cluster
@@ -359,15 +354,7 @@ spec:
                                 required:
                                   - mode
                                 type: object
-                                x-kubernetes-validations:
-                                  - message: caSecretRef is only valid for tls transport
-                                    rule: self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null
-                                  - message: an explicitly empty sni is only valid for plaintext transport
-                                    rule: self.mode == 'plaintext' || !has(self.sni) || self.sni.size() > 0
                             type: object
-                            x-kubernetes-validations:
-                              - message: deriveTopology.transport mode must be tls
-                                rule: '!has(self.transport) || self.transport.mode == ''tls'''
                           enableProjectedCredentials:
                             default: false
                             description: |-
@@ -428,9 +415,6 @@ spec:
                                 description: Enable delegated mount reconciliation. Defaults to `false`.
                                 type: boolean
                             type: object
-                            x-kubernetes-validations:
-                              - message: deploymentName is required when mount reconciliation is enabled
-                                rule: '!has(self.enabled) || !self.enabled || has(self.deploymentName)'
                           supportsProjectedCredentials:
                             default: false
                             description: |-
@@ -512,11 +496,6 @@ spec:
                               Default: `/etc/praxis/tls`.
                             type: string
                         type: object
-                        x-kubernetes-validations:
-                          - message: set only `enabled` or `generate`, not both
-                            rule: '!(has(self.enabled) && has(self.generate))'
-                          - message: set only `credentialMountBase` or `credentialMountPath`, not both
-                            rule: '!(has(self.credentialMountBase) && has(self.credentialMountPath))'
                       localSiteName:
                         description: |-
                           Deprecated in favor of `siteName`; this legacy field will be removed in a future release. Local site name for the `intelligent_route` overlay generated for this gateway.
@@ -1104,11 +1083,6 @@ spec:
                                   required:
                                     - mode
                                   type: object
-                                  x-kubernetes-validations:
-                                    - message: caSecretRef is only valid for tls transport
-                                      rule: self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null
-                                    - message: an explicitly empty sni is only valid for plaintext transport
-                                      rule: self.mode == 'plaintext' || !has(self.sni) || self.sni.size() > 0
                               required:
                                 - address
                                 - cluster
@@ -1204,15 +1178,7 @@ spec:
                                 required:
                                   - mode
                                 type: object
-                                x-kubernetes-validations:
-                                  - message: caSecretRef is only valid for tls transport
-                                    rule: self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null
-                                  - message: an explicitly empty sni is only valid for plaintext transport
-                                    rule: self.mode == 'plaintext' || !has(self.sni) || self.sni.size() > 0
                             type: object
-                            x-kubernetes-validations:
-                              - message: deriveTopology.transport mode must be tls
-                                rule: '!has(self.transport) || self.transport.mode == ''tls'''
                           enableProjectedCredentials:
                             default: false
                             description: |-
@@ -1273,9 +1239,6 @@ spec:
                                 description: Enable delegated mount reconciliation. Defaults to `false`.
                                 type: boolean
                             type: object
-                            x-kubernetes-validations:
-                              - message: deploymentName is required when mount reconciliation is enabled
-                                rule: '!has(self.enabled) || !self.enabled || has(self.deploymentName)'
                           supportsProjectedCredentials:
                             default: false
                             description: |-
@@ -1357,11 +1320,6 @@ spec:
                               Default: `/etc/praxis/tls`.
                             type: string
                         type: object
-                        x-kubernetes-validations:
-                          - message: set only `enabled` or `generate`, not both
-                            rule: '!(has(self.enabled) && has(self.generate))'
-                          - message: set only `credentialMountBase` or `credentialMountPath`, not both
-                            rule: '!(has(self.credentialMountBase) && has(self.credentialMountPath))'
                       localSiteName:
                         description: |-
                           Deprecated in favor of `siteName`; this legacy field will be removed in a future release. Local site name for the `intelligent_route` overlay generated for this gateway.
@@ -1488,11 +1446,6 @@ spec:
                                   required:
                                     - mode
                                   type: object
-                                  x-kubernetes-validations:
-                                    - message: caSecretRef is only valid for tls transport
-                                      rule: self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null
-                                    - message: an explicitly empty sni is only valid for plaintext transport
-                                      rule: self.mode == 'plaintext' || !has(self.sni) || self.sni.size() > 0
                               required:
                                 - address
                                 - cluster
@@ -1588,15 +1541,7 @@ spec:
                                 required:
                                   - mode
                                 type: object
-                                x-kubernetes-validations:
-                                  - message: caSecretRef is only valid for tls transport
-                                    rule: self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null
-                                  - message: an explicitly empty sni is only valid for plaintext transport
-                                    rule: self.mode == 'plaintext' || !has(self.sni) || self.sni.size() > 0
                             type: object
-                            x-kubernetes-validations:
-                              - message: deriveTopology.transport mode must be tls
-                                rule: '!has(self.transport) || self.transport.mode == ''tls'''
                           enableProjectedCredentials:
                             default: false
                             description: |-
@@ -1657,9 +1602,6 @@ spec:
                                 description: Enable delegated mount reconciliation. Defaults to `false`.
                                 type: boolean
                             type: object
-                            x-kubernetes-validations:
-                              - message: deploymentName is required when mount reconciliation is enabled
-                                rule: '!has(self.enabled) || !self.enabled || has(self.deploymentName)'
                           supportsProjectedCredentials:
                             default: false
                             description: |-
@@ -1741,11 +1683,6 @@ spec:
                               Default: `/etc/praxis/tls`.
                             type: string
                         type: object
-                        x-kubernetes-validations:
-                          - message: set only `enabled` or `generate`, not both
-                            rule: '!(has(self.enabled) && has(self.generate))'
-                          - message: set only `credentialMountBase` or `credentialMountPath`, not both
-                            rule: '!(has(self.credentialMountBase) && has(self.credentialMountPath))'
                       providerHopEndpoints:
                         description: |-
                           Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
@@ -1804,11 +1741,6 @@ spec:
                               required:
                                 - mode
                               type: object
-                              x-kubernetes-validations:
-                                - message: caSecretRef is only valid for tls transport
-                                  rule: self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null
-                                - message: an explicitly empty sni is only valid for plaintext transport
-                                  rule: self.mode == 'plaintext' || !has(self.sni) || self.sni.size() > 0
                           required:
                             - cluster
                             - transport
@@ -1835,11 +1767,6 @@ spec:
                       - name
                       - namespace
                     type: object
-                    x-kubernetes-validations:
-                      - message: set only `localSiteName` or `siteName`, not both
-                        rule: '!(has(self.localSiteName) && has(self.siteName))'
-                      - message: set only `consumerConfig` or `praxisConfig`, not both
-                        rule: '!(has(self.consumerConfig) && has(self.praxisConfig))'
                   type: array
                 gridId:
                   default: ""

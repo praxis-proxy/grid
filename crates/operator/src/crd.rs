@@ -35,6 +35,7 @@ fn add_legacy_field(
         }
         field_schema.clone()
     })?;
+    strip_validation_rules(&mut alias_schema);
     if let Some(alias_object) = alias_schema.as_object_mut() {
         let current_description = alias_object
             .get("description")
@@ -52,6 +53,31 @@ fn add_legacy_field(
         "rule": format!("!(has(self.{legacy}) && has(self.{current}))"),
         "message": format!("set only `{legacy}` or `{current}`, not both")
     }))
+}
+
+/// Remove nested CEL rules from a legacy alias schema.
+///
+/// The canonical field retains the validation rules. Copying every nested rule
+/// into every legacy alias can exceed Kubernetes' CRD validation-cost budget,
+/// especially when one aliased object contains other aliased objects.
+fn strip_validation_rules(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for entry in values {
+                strip_validation_rules(entry);
+            }
+        },
+        serde_json::Value::Object(object) => {
+            object.remove("x-kubernetes-validations");
+            for entry in object.values_mut() {
+                strip_validation_rules(entry);
+            }
+        },
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {},
+    }
 }
 
 /// Append alias validation rules without duplicating existing expressions.

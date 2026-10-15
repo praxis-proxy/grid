@@ -457,7 +457,10 @@ mod tests {
         });
         let json = serde_json::json!({
             "gridNetworkRef": "production",
-            "egress": endpoint.clone(),
+            "egress": {
+                "address": "egress.cluster-b:8443",
+                "tls": {"mode": "Mutual"}
+            },
             "gatewayEndpoint": endpoint
         });
         let result: Result<GridSiteSpec, _> = serde_json::from_value(json);
@@ -491,6 +494,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "checks the complete generated GridSite schema")]
     fn grid_site_crd_bounds_identity_fields() {
         let crd = crd_json();
         let pins = crd

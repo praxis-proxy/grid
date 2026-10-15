@@ -2792,7 +2792,7 @@ fn enable_generated_consumer_config() -> Result<(), Box<dyn std::error::Error>> 
     }
 
     let consumer_config = serde_json::json!({
-        "enabled": true,
+        "generate": true,
         "enableProjectedCredentials": true,
         "supportsProjectedCredentials": false,
         "configMapName": "praxis-consumer-config",
@@ -6586,7 +6586,7 @@ mod tests {
         let gateway = embedded_serving_gateway_ref(&endpoints);
         assert_eq!(
             gateway
-                .pointer("/praxisConfig/enabled")
+                .pointer("/praxisConfig/generate")
                 .and_then(serde_json::Value::as_bool),
             Some(false)
         );
