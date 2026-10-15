@@ -28,6 +28,7 @@ grid:
 
 gridIdentity:
   tlsSecretName: consumer-tls
+  caSecretName: consumer-tls
 
 service:
   enabled: true
