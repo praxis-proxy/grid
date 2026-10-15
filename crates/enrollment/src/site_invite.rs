@@ -9,7 +9,7 @@ use kube::{
     api::{DeleteParams, ObjectMeta, Patch, PatchParams, PostParams, Preconditions},
     runtime::{Controller, controller::Action, finalizer, watcher},
 };
-use site_invite_api::SiteInvite;
+use site_invite_api::{SiteInvite, SiteInviteStatus};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
@@ -42,7 +42,7 @@ struct TokenCheckpoint {
     /// Public token ID.
     token_id: Uuid,
     /// Token digest written to the enrollment store.
-    token_sha256: String,
+    token_sha256: Option<String>,
     /// Expiry parsed for the store and status.
     expires_at: OffsetDateTime,
     /// Original expiry text from the Secret annotation.
@@ -138,6 +138,10 @@ async fn reconcile(invite: Arc<SiteInvite>, ctx: Arc<Context>) -> Result<Action,
 }
 
 /// Create or recover an invite token and publish its public status.
+#[expect(
+    clippy::too_many_lines,
+    reason = "checkpoint recovery and terminal transitions must be ordered together"
+)]
 async fn apply_invite(invite: &SiteInvite, ctx: &Context) -> Result<Action, ReconcileError> {
     let namespace = &ctx.namespace;
     let secret_name = format!("grid-invite-{}", invite.name_any());
@@ -159,6 +163,9 @@ async fn apply_invite(invite: &SiteInvite, ctx: &Context) -> Result<Action, Reco
             return Box::pin(redeem_invite(invite, ctx, &secret_name, checkpoint, enrollment_id)).await;
         },
         TokenPhase::Revoked => {
+            if checkpoint.expires_at <= OffsetDateTime::now_utc() {
+                return Box::pin(expire_invite(invite, ctx, &secrets, &secret_name, checkpoint)).await;
+            }
             return Box::pin(revoke_invite(invite, ctx, &secret_name, checkpoint)).await;
         },
     }
@@ -175,8 +182,43 @@ async fn read_invite_checkpoint(
     namespace: &str,
     secret_name: &str,
 ) -> Result<TokenCheckpoint, ReconcileError> {
-    let secret = Box::pin(get_or_create_secret(invite, secrets, namespace, secret_name)).await?;
-    read_checkpoint(invite, &secret, namespace, secret_name)
+    match Box::pin(secrets.get(secret_name)).await {
+        Ok(secret) => read_checkpoint(invite, &secret, namespace, secret_name),
+        Err(kube::Error::Api(response)) if response.code == 404 => {
+            let Some(status) = invite.status.as_ref() else {
+                let secret = Box::pin(get_or_create_secret(invite, secrets, namespace, secret_name)).await?;
+                return read_checkpoint(invite, &secret, namespace, secret_name);
+            };
+            if status.token_id.is_none() || status.expires_at.is_none() {
+                let secret = Box::pin(get_or_create_secret(invite, secrets, namespace, secret_name)).await?;
+                return read_checkpoint(invite, &secret, namespace, secret_name);
+            }
+            checkpoint_from_status(status)
+        },
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Rebuild terminal-transition data from status after the checkpoint Secret was deleted.
+fn checkpoint_from_status(status: &SiteInviteStatus) -> Result<TokenCheckpoint, ReconcileError> {
+    let token_id = status
+        .token_id
+        .as_deref()
+        .ok_or_else(|| ReconcileError::Invalid("status token id is missing".to_owned()))?;
+    let expires_at_raw = status
+        .expires_at
+        .as_deref()
+        .ok_or_else(|| ReconcileError::Invalid("status expiry is missing".to_owned()))?;
+    let token_id = Uuid::parse_str(token_id)
+        .map_err(|error| ReconcileError::Invalid(format!("status token id is invalid: {error}")))?;
+    let expires_at = OffsetDateTime::parse(expires_at_raw, &Rfc3339)
+        .map_err(|error| ReconcileError::Invalid(format!("status expiry is invalid: {error}")))?;
+    Ok(TokenCheckpoint {
+        token_id,
+        token_sha256: None,
+        expires_at,
+        expires_at_raw: expires_at_raw.to_owned(),
+    })
 }
 
 /// Distinguish usable, spent, and externally revoked tokens.
@@ -218,7 +260,11 @@ async fn activate_invite(
     )?;
     Box::pin(ctx.state.store.mint_site_token(NewSiteToken {
         token_id: Some(checkpoint.token_id),
-        token_sha256: checkpoint.token_sha256,
+        token_sha256: checkpoint.token_sha256.ok_or_else(|| {
+            ReconcileError::Invalid(
+                "invite Secret is missing for an outstanding token; delete and recreate this invite".to_owned(),
+            )
+        })?,
         public_key_sha256: invite.spec.public_key_sha256.clone(),
         site_name: invite.spec.site_name.clone(),
         grid_network_ref: "site-invite".to_owned(),
@@ -283,6 +329,7 @@ async fn revoke_invite(
 async fn delete_secret(secrets: &Api<Secret>, secret_name: &str) -> Result<(), ReconcileError> {
     match Box::pin(secrets.delete(secret_name, &DeleteParams::default())).await {
         Ok(_) => Ok(()),
+        Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
         Err(error) => Err(error.into()),
     }
 }
@@ -393,7 +440,7 @@ fn read_checkpoint(
         .map_err(|error| ReconcileError::Invalid(format!("Secret expiry is invalid: {error}")))?;
     Ok(TokenCheckpoint {
         token_id,
-        token_sha256,
+        token_sha256: Some(token_sha256),
         expires_at,
         expires_at_raw,
     })
@@ -622,7 +669,7 @@ fn duration(raw: &str) -> Result<time::Duration, ReconcileError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReconcileError, duration};
+    use super::{ReconcileError, checkpoint_from_status, duration};
 
     #[test]
     fn parses_kubernetes_durations_within_the_invite_bounds() {
@@ -651,5 +698,21 @@ mod tests {
                 .and_then(|status| status.get("tokenId"))
                 .is_some_and(|field| field == "id")
         );
+    }
+
+    #[test]
+    fn rebuilds_terminal_checkpoint_from_status_without_secret_digest() {
+        let status = site_invite_api::SiteInviteStatus {
+            token_id: Some("e550fae6-e6f8-4e3a-9d13-1b42f2cce67d".to_owned()),
+            expires_at: Some("2026-10-14T12:00:00Z".to_owned()),
+            ..site_invite_api::SiteInviteStatus::default()
+        };
+
+        let checkpoint = checkpoint_from_status(&status);
+
+        assert!(matches!(checkpoint, Ok(value)
+            if value.token_id.to_string() == "e550fae6-e6f8-4e3a-9d13-1b42f2cce67d"
+                && value.expires_at_raw == "2026-10-14T12:00:00Z"
+                && value.token_sha256.is_none()));
     }
 }

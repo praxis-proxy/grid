@@ -970,7 +970,6 @@ dependencies = [
  "reqwest",
  "ring",
  "rustls",
- "schemars 1.2.2",
  "serde",
  "serde_json",
  "site-invite-api",

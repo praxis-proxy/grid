@@ -71,7 +71,6 @@ axum-server = { version = "0.8.0", default-features = false }
 rustls = { workspace = true, optional = true }
 openssl = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
-schemars = { workspace = true }
 site-invite-api = { path = "../site-invite-api", optional = true }
 zeroize = { workspace = true, optional = true }
 
