@@ -71,7 +71,7 @@
             "swimKeySecretRef": { "type": "object", "additionalProperties": true },
             "swimKeyRef": {
               "type": "object",
-              "description": "Deprecated alias for swimKeySecretRef; accepted through 0.1.5.",
+              "description": "Deprecated alias for swimKeySecretRef; accepted through 0.3.x.",
               "additionalProperties": true
             }
           }
@@ -189,15 +189,15 @@
               "name": { "type": "string", "minLength": 1 },
               "namespace": { "type": "string", "minLength": 1 },
               "siteName": { "type": "string" },
-              "localSiteName": { "type": "string", "description": "Deprecated alias for siteName; accepted through 0.1.5." },
-              "praxisConfig": { "type": "object", "additionalProperties": true, "properties": { "generate": { "type": "boolean" }, "enabled": { "type": "boolean", "description": "Deprecated alias for generate; accepted through 0.1.5." }, "credentialMountPath": { "type": "string" }, "credentialMountBase": { "type": "string", "description": "Deprecated alias for credentialMountPath; accepted through 0.1.5." } } },
-              "consumerConfig": { "type": "object", "description": "Deprecated alias for praxisConfig; accepted through 0.1.5.", "additionalProperties": true, "properties": { "generate": { "type": "boolean" }, "enabled": { "type": "boolean", "description": "Deprecated alias for generate; accepted through 0.1.5." }, "credentialMountPath": { "type": "string" }, "credentialMountBase": { "type": "string", "description": "Deprecated alias for credentialMountPath; accepted through 0.1.5." } } }
+              "localSiteName": { "type": "string", "description": "Deprecated alias for siteName; accepted through 0.3.x." },
+              "praxisConfig": { "type": "object", "additionalProperties": true, "properties": { "generate": { "type": "boolean" }, "enabled": { "type": "boolean", "description": "Deprecated alias for generate; accepted through 0.3.x." }, "credentialMountPath": { "type": "string" }, "credentialMountBase": { "type": "string", "description": "Deprecated alias for credentialMountPath; accepted through 0.3.x." } } },
+              "consumerConfig": { "type": "object", "description": "Deprecated alias for praxisConfig; accepted through 0.3.x.", "additionalProperties": true, "properties": { "generate": { "type": "boolean" }, "enabled": { "type": "boolean", "description": "Deprecated alias for generate; accepted through 0.3.x." }, "credentialMountPath": { "type": "string" }, "credentialMountBase": { "type": "string", "description": "Deprecated alias for credentialMountPath; accepted through 0.3.x." } } }
             }
           }
         },
         "gatewayRefs": {
           "type": "array",
-          "description": "Deprecated alias for consumerGateways; accepted through 0.1.5.",
+          "description": "Deprecated alias for consumerGateways; accepted through 0.3.x.",
           "items": {
             "type": "object",
             "additionalProperties": true,
@@ -207,8 +207,8 @@
               "namespace": { "type": "string", "minLength": 1 },
               "siteName": { "type": "string" },
               "localSiteName": { "type": "string" },
-              "praxisConfig": { "type": "object", "additionalProperties": true, "properties": { "generate": { "type": "boolean" }, "enabled": { "type": "boolean", "description": "Deprecated alias for generate; accepted through 0.1.5." }, "credentialMountPath": { "type": "string" }, "credentialMountBase": { "type": "string", "description": "Deprecated alias for credentialMountPath; accepted through 0.1.5." } } },
-              "consumerConfig": { "type": "object", "additionalProperties": true, "properties": { "generate": { "type": "boolean" }, "enabled": { "type": "boolean", "description": "Deprecated alias for generate; accepted through 0.1.5." }, "credentialMountPath": { "type": "string" }, "credentialMountBase": { "type": "string", "description": "Deprecated alias for credentialMountPath; accepted through 0.1.5." } } }
+              "praxisConfig": { "type": "object", "additionalProperties": true, "properties": { "generate": { "type": "boolean" }, "enabled": { "type": "boolean", "description": "Deprecated alias for generate; accepted through 0.3.x." }, "credentialMountPath": { "type": "string" }, "credentialMountBase": { "type": "string", "description": "Deprecated alias for credentialMountPath; accepted through 0.3.x." } } },
+              "consumerConfig": { "type": "object", "additionalProperties": true, "properties": { "generate": { "type": "boolean" }, "enabled": { "type": "boolean", "description": "Deprecated alias for generate; accepted through 0.3.x." }, "credentialMountPath": { "type": "string" }, "credentialMountBase": { "type": "string", "description": "Deprecated alias for credentialMountPath; accepted through 0.3.x." } } }
             }
           }
         }
@@ -242,7 +242,7 @@
         },
         "egress": {
           "type": "object",
-          "description": "Deprecated alias for gatewayEndpoint; accepted through 0.1.5.",
+          "description": "Deprecated alias for gatewayEndpoint; accepted through 0.3.x.",
           "additionalProperties": true,
           "properties": {
             "address": { "type": "string", "minLength": 1 },
@@ -285,11 +285,11 @@
               "backendKind": { "type": "string", "minLength": 1 },
               "endpoint": { "type": "string", "minLength": 1 },
               "clusterName": { "type": "string" },
-              "routingClusterRef": { "type": "string", "description": "Deprecated alias for clusterName; accepted through 0.1.5." },
+              "routingClusterRef": { "type": "string", "description": "Deprecated alias for clusterName; accepted through 0.3.x." },
               "providerGateway": { "type": "string", "minLength": 1 },
-              "gatewayRef": { "type": "string", "description": "Deprecated alias for providerGateway; accepted through 0.1.5." },
-              "metricsConfig": { "type": "object", "additionalProperties": true, "properties": { "endpoint": { "type": "string" }, "metricsEndpoint": { "type": "string", "description": "Deprecated alias for endpoint; accepted through 0.1.5." } } },
-              "auth": { "type": "object", "additionalProperties": true, "properties": { "credentialsManagedExternally": { "type": "boolean" }, "manual": { "type": "boolean", "description": "Deprecated alias for credentialsManagedExternally; accepted through 0.1.5." } } },
+              "gatewayRef": { "type": "string", "description": "Deprecated alias for providerGateway; accepted through 0.3.x." },
+              "metricsConfig": { "type": "object", "additionalProperties": true, "properties": { "endpoint": { "type": "string" }, "metricsEndpoint": { "type": "string", "description": "Deprecated alias for endpoint; accepted through 0.3.x." } } },
+              "auth": { "type": "object", "additionalProperties": true, "properties": { "credentialsManagedExternally": { "type": "boolean" }, "manual": { "type": "boolean", "description": "Deprecated alias for credentialsManagedExternally; accepted through 0.3.x." } } },
               "trafficPolicy": { "type": "object", "additionalProperties": false, "properties": { "drain": { "type": "boolean", "default": false } } },
               "capacityWeight": { "type": "integer", "minimum": 1, "maximum": 1000 },
               "model": { "type": "string", "minLength": 1, "description": "Model name. Defaults to the key." }
@@ -310,11 +310,11 @@
           "backendKind": { "type": "string", "minLength": 1 },
           "endpoint": { "type": "string", "minLength": 1 },
           "clusterName": { "type": "string" },
-          "routingClusterRef": { "type": "string", "description": "Deprecated alias for clusterName; accepted through 0.1.5." },
+          "routingClusterRef": { "type": "string", "description": "Deprecated alias for clusterName; accepted through 0.3.x." },
           "providerGateway": { "type": "string", "minLength": 1 },
-          "gatewayRef": { "type": "string", "description": "Deprecated alias for providerGateway; accepted through 0.1.5." },
-          "metricsConfig": { "type": "object", "additionalProperties": true, "properties": { "endpoint": { "type": "string" }, "metricsEndpoint": { "type": "string", "description": "Deprecated alias for endpoint; accepted through 0.1.5." } } },
-          "auth": { "type": "object", "additionalProperties": true, "properties": { "credentialsManagedExternally": { "type": "boolean" }, "manual": { "type": "boolean", "description": "Deprecated alias for credentialsManagedExternally; accepted through 0.1.5." } } },
+          "gatewayRef": { "type": "string", "description": "Deprecated alias for providerGateway; accepted through 0.3.x." },
+          "metricsConfig": { "type": "object", "additionalProperties": true, "properties": { "endpoint": { "type": "string" }, "metricsEndpoint": { "type": "string", "description": "Deprecated alias for endpoint; accepted through 0.3.x." } } },
+          "auth": { "type": "object", "additionalProperties": true, "properties": { "credentialsManagedExternally": { "type": "boolean" }, "manual": { "type": "boolean", "description": "Deprecated alias for credentialsManagedExternally; accepted through 0.3.x." } } },
           "trafficPolicy": {
             "type": "object",
             "additionalProperties": false,

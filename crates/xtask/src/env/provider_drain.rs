@@ -40,6 +40,7 @@ struct Metadata {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Spec {
+    #[serde(alias = "gatewayRef")]
     provider_gateway: Option<String>,
 }
 
@@ -441,6 +442,16 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["a", "b"]);
+    }
+
+    #[test]
+    fn provider_selection_accepts_legacy_gateway_ref() {
+        let provider: Provider = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "legacy"},
+            "spec": {"gatewayRef": "gw"}
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(provider.spec.provider_gateway.as_deref(), Some("gw"));
     }
 
     #[test]

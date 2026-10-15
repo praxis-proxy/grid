@@ -435,6 +435,36 @@ mod tests {
     }
 
     #[test]
+    fn legacy_egress_deserializes_into_gateway_endpoint() {
+        let json = serde_json::json!({
+            "gridNetworkRef": "production",
+            "egress": {
+                "address": "egress.cluster-b:8443",
+                "tls": {"mode": "Mutual"}
+            }
+        });
+        let spec: GridSiteSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        let endpoint = spec.gateway_endpoint.unwrap_or_else(|| std::process::abort());
+        assert_eq!(endpoint.address, "egress.cluster-b:8443");
+        assert_eq!(endpoint.tls.mode, EgressTlsMode::Mutual);
+    }
+
+    #[test]
+    fn legacy_and_current_gateway_endpoint_names_are_rejected_together() {
+        let endpoint = serde_json::json!({
+            "address": "egress.cluster-b:8443",
+            "tls": {"mode": "Mutual"}
+        });
+        let json = serde_json::json!({
+            "gridNetworkRef": "production",
+            "egress": endpoint.clone(),
+            "gatewayEndpoint": endpoint
+        });
+        let result: Result<GridSiteSpec, _> = serde_json::from_value(json);
+        assert!(result.is_err(), "both endpoint names must be rejected");
+    }
+
+    #[test]
     fn backward_compatible_spec_without_new_fields() {
         let json = serde_json::json!({
             "gridNetworkRef": "production",
@@ -487,6 +517,25 @@ mod tests {
         assert_eq!(
             server_name.get("maxLength").and_then(serde_json::Value::as_u64),
             Some(253)
+        );
+
+        let spec = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec")
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            spec.pointer("/properties/egress").is_some(),
+            "CRD must preserve legacy egress"
+        );
+        let validations = spec
+            .get("x-kubernetes-validations")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            validations.iter().any(|validation| {
+                validation.get("rule").and_then(serde_json::Value::as_str)
+                    == Some("!(has(self.egress) && has(self.gatewayEndpoint))")
+            }),
+            "CRD must reject both endpoint names"
         );
     }
 }

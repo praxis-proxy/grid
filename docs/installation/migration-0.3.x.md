@@ -1,10 +1,10 @@
-# 0.1.4 to 0.2.0 CRD Field Migration
+# 0.3.x CRD Field Migration
 
-The 0.2.0 release accepts both the previous and current names for CRD spec
+The 0.3.x release accepts both the previous and current names for CRD spec
 fields. The `grid-site` and `grid-operator` charts also translate previous
 value names when they render resources. The previous names are deprecated and
 will be removed in a later release. Migrate custom resources and Helm values before
-upgrading to 0.2.0.
+upgrading to 0.3.x.
 
 Do not set both names for one field. The API schema and chart reject conflicting
 old and new names.
@@ -43,16 +43,28 @@ old and new names.
 | `grid-operator` chart `grid.providers[].metricsConfig` | `metricsEndpoint` | `endpoint` |
 | `grid-operator` chart `grid.providers[].auth` | `manual` | `credentialsManagedExternally` |
 
-## Upgrade to 0.2.0
+## Upgrade to 0.3.x
 
-Existing CRD spec field names and chart values remain accepted in 0.2.0.
+Existing CRD spec field names and chart values remain accepted in 0.3.x.
 Update manifests and Helm values to the current names when convenient.
 
-Status fields and reasons change in 0.2.0 without legacy aliases. Update scripts
-and dashboards that read them during the 0.2.0 upgrade, including
+Status fields and reasons change in 0.3.x without legacy aliases. Update scripts
+and dashboards that read them during the 0.3.x upgrade, including
 `overlayStatus` to `routingMapStatus` and `consumerConfigStatus` to
 `praxisConfigStatus`. Status is operator-owned; do not migrate it by hand.
 The compatibility window covers spec fields and chart values only.
+
+Upgrade in this order:
+
+1. Apply the 0.3.x CRDs first. When the platform owns the CRDs, apply the
+   chart's CRD templates before installing the charts with `crds.enabled=false`.
+2. Upgrade `grid-operator`.
+3. Upgrade `grid-site`.
+4. Apply custom resources and Helm values using the current field names.
+
+For a rollback, roll back `grid-site` before `grid-operator` so the older
+operator does not receive current field names. Restore custom resources and
+values only after the older CRDs and charts are ready.
 
 | Previous status field or reason | Current status field or reason |
 |---|---|

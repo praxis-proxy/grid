@@ -799,6 +799,79 @@ mod tests {
     }
 
     #[test]
+    fn legacy_field_aliases_deserialize() {
+        let json = serde_json::json!({
+            "gridNetworkRef": "production",
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://backend:8080",
+            "gatewayRef": "legacy-gateway",
+            "routingClusterRef": "legacy-cluster",
+            "metricsConfig": {"metricsEndpoint": "http://metrics:9090"},
+            "auth": {"manual": true, "strategy": "bearer_token"}
+        });
+        let spec: InferenceProviderSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(spec.provider_gateway.as_deref(), Some("legacy-gateway"));
+        assert_eq!(spec.cluster_name.as_deref(), Some("legacy-cluster"));
+        assert_eq!(
+            spec.metrics_config
+                .as_ref()
+                .and_then(|metrics| metrics.endpoint.as_deref()),
+            Some("http://metrics:9090")
+        );
+        assert!(
+            spec.auth
+                .as_ref()
+                .is_some_and(|auth| auth.credentials_managed_externally)
+        );
+    }
+
+    #[test]
+    fn legacy_and_current_provider_field_names_are_rejected_together() {
+        let gateway_json = serde_json::json!({
+            "gridNetworkRef": "production",
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://backend:8080",
+            "gatewayRef": "legacy-gateway",
+            "providerGateway": "current-gateway"
+        });
+        assert!(serde_json::from_value::<InferenceProviderSpec>(gateway_json).is_err());
+
+        let cluster_json = serde_json::json!({
+            "gridNetworkRef": "production",
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://backend:8080",
+            "routingClusterRef": "legacy-cluster",
+            "clusterName": "current-cluster"
+        });
+        assert!(serde_json::from_value::<InferenceProviderSpec>(cluster_json).is_err());
+
+        let metrics_json = serde_json::json!({
+            "gridNetworkRef": "production",
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://backend:8080",
+            "metricsConfig": {"metricsEndpoint": "http://legacy:9090", "endpoint": "http://current:9090"}
+        });
+        assert!(serde_json::from_value::<InferenceProviderSpec>(metrics_json).is_err());
+
+        let auth_json = serde_json::json!({
+            "gridNetworkRef": "production",
+            "providerKind": "self_hosted",
+            "backendKind": "local",
+            "endpoint": "http://backend:8080",
+            "auth": {
+                "manual": true,
+                "credentialsManagedExternally": false,
+                "strategy": "bearer_token"
+            }
+        });
+        assert!(serde_json::from_value::<InferenceProviderSpec>(auth_json).is_err());
+    }
+
+    #[test]
     fn administrative_policy_round_trips_and_is_omitted_by_default() {
         let base = serde_json::json!({
             "gridNetworkRef": "production", "providerKind": "self_hosted",

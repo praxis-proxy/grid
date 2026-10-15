@@ -191,6 +191,24 @@ tests:
       - notExists:
           path: spec.gatewayRef
 
+  - it: drops an empty legacy provider value beside its current field
+    template: templates/inferenceprovider.yaml
+    set:
+      site.name: east
+      grid.id: lab
+      grid.providers:
+        qwen3:
+          endpoint: http://qwen3.llm-d.svc:80
+          auth:
+            manual: false
+            credentialsManagedExternally: true
+    asserts:
+      - equal:
+          path: spec.auth.credentialsManagedExternally
+          value: true
+      - notExists:
+          path: spec.auth.manual
+
   - it: keeps YAML-ambiguous names strings
     templates:
       - templates/gridnetwork.yaml

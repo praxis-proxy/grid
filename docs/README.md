@@ -86,8 +86,8 @@ image preparation, execution, evidence, and cleanup.
 
 - [Existing-Cluster Helm Installation](installation/existing-clusters.md):
   install AGN and Praxis on running Kubernetes clusters with Helm.
-- [0.1.4 to 0.2.0 CRD Field Migration](installation/migration-0.1.4-to-0.2.0.md) —
-  migrate deprecated field names before the 0.2.0 upgrade.
+- [0.3.x CRD Field Migration](installation/migration-0.3.x.md) — migrate
+  deprecated field names before the 0.3.x upgrade.
 
 ## Development
 

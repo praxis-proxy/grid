@@ -44,11 +44,11 @@ pending, so a redeemed token currently issues a certificate inline.
 The chart stores token Secrets in its release namespace by default. Configure a
 dedicated namespace in the chart values to separate access to those credentials.
 
-The 0.2.0 operator accepts both previous and current CRD spec field names. The
+The 0.3.x operator accepts both previous and current CRD spec field names. The
 previous names are deprecated. Set only one name per field; setting both is
 rejected by the API schema. The `grid-site` chart translates previous value
 names into current CRD fields and also rejects both names together. See the
-[0.1.4 to 0.2.0 CRD field migration guide](../installation/migration-0.1.4-to-0.2.0.md)
+[0.3.x CRD field migration guide](../installation/migration-0.3.x.md)
 for the planned removal and upgrade steps.
 
 ## GridNetwork
@@ -72,7 +72,7 @@ spec:
       namespace: praxis-system
       siteName: cluster-east   # optional; defaults to network name
       praxisConfig:               # optional; opt-in consumer Praxis config generation
-        enabled: true
+        generate: true
         enableProjectedCredentials: true  # generate filter, then roll out consumer
         supportsProjectedCredentials: true # set only after that rollout
         credentialMountPath: /run/secrets/grid-credentials

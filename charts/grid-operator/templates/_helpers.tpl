@@ -108,10 +108,15 @@ the CustomResource. Setting both names is ambiguous, so fail before rendering.
 {{- $new := .new -}}
 {{- if hasKey $object $old -}}
   {{- if hasKey $object $new -}}
-    {{- fail (printf "grid-operator: remove deprecated value %q; set only %q" $old $new) -}}
+    {{- if empty (get $object $old) -}}
+      {{- $_ := unset $object $old -}}
+    {{- else -}}
+      {{- fail (printf "grid-operator: remove deprecated value %q; set only %q" $old $new) -}}
+    {{- end -}}
+  {{- else -}}
+    {{- $_ := set $object $new (get $object $old) -}}
+    {{- $_ := unset $object $old -}}
   {{- end -}}
-  {{- $_ := set $object $new (get $object $old) -}}
-  {{- $_ := unset $object $old -}}
 {{- end -}}
 {{- end }}
 
