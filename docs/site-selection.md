@@ -47,8 +47,9 @@ These load metrics describe the llm-d EPP integration.
 
 The gateway concludes in-flight as running plus waiting per endpoint, times
 ready endpoints, plus what flow control holds. The operator adds one
-grid_provider_config_generation row per batch to scope learning to a
+grid_provider_config_generation row per qualified batch to scope learning to a
 [provider revision](architecture/polling-metrics.md#provider-revisions).
+Fresh pressure remains usable without this row, but learning stays disabled.
 
 The EPP exposes load samples at /metrics. Point metricsConfig.metricsEndpoint at
 the EPP Service. A pod address can reach a standby replica that reports nothing.

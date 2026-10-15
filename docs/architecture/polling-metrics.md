@@ -35,7 +35,8 @@ compute load. It reads resolved order.
 
 ## Provider revisions
 
-The operator publishes grid_provider_config_generation once per provider batch.
+The operator publishes grid_provider_config_generation once per qualified
+provider batch.
 Its value is the InferenceProvider generation. The provider_uid label identifies
 the object, including same-name recreations. Spec changes advance the generation.
 Status-only updates preserve it.
