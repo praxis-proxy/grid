@@ -294,10 +294,10 @@ Praxis AI image; these values may advance independently.
 | `praxisConfig.render.auth.validateUrl` | string | **required** for `api-key` | https validate endpoint. |
 | `praxisConfig.render.auth.allowPrivateEndpoint` | bool | `false` | Sets `allow_private_idp`, which is engine-wide: every policy callout in this gateway, not only `validateUrl`, may then reach private, loopback, link-local, and cloud metadata addresses. Turn it on only when every policy in the gateway is yours. |
 | `praxisConfig.render.auth.validateCA` | object | empty | CA for the validate call (`configMapName` or `secretName`, `key`). Set as `SSL_CERT_FILE`, which replaces the platform trust store for the validate call and https backends without a per-backend CA or `upstreamCA`. mutual_tls backends and `upstreamCA` are unaffected. See the recipe below. |
-| `mountReconciliation.enabled` | bool | `false` | Explicitly delegate generated consumer Secret mounts and rollouts to the AGN Operator. Requires `mountReconciliation.network` and `praxisConfig.byo.configMapName` matching `consumerConfig.configMapName`; supported for the consumer role. |
+| `mountReconciliation.enabled` | bool | `false` | Explicitly delegate generated consumer Secret mounts and rollouts to the AGN Operator. Requires `mountReconciliation.network`; with `praxisConfig.source: byo`, `praxisConfig.byo.configMapName` must match `consumerConfig.configMapName`. Supported for the consumer role; `source: render` is rejected. |
 | `mountReconciliation.network` | string | `""` | GridNetwork name. Required when delegation is enabled. |
 | `mountReconciliation.gatewayRef` | string | release fullname | `GatewayRef.name` to bind the Deployment opt-in to. |
-| `mountReconciliation.releaseHelmMounts` | bool | `false` | Second handoff phase. After Grid reports `Ready`, set this true to release selected Helm credential mounts and, without Grid serving, the chart TLS mount. |
+| `mountReconciliation.releaseHelmMounts` | bool | `false` | Second handoff phase. After Grid reports `Ready`, set this true to release selected Helm credential mounts and the chart TLS mount. |
 | `mountReconciliation.managedCredentialNames` | list | `[]` | Credential Secret names to release from Helm in the second handoff phase. Other entries in `credentials` remain Helm-managed. |
 | `mountReconciliation.rbac.create` | bool | `true` | Render a Role and RoleBinding in the release namespace that let the operator ServiceAccount `get` and `patch` this chart's Deployment and no other. `false` leaves the Role to you; see below. |
 | `mountReconciliation.operator.serviceAccount` | string | `grid-operator` | Operator ServiceAccount the Role binds. Blank fails the render while `rbac.create` is true. |
@@ -538,10 +538,9 @@ Grid reports `mountReconciliationStatus: Ready`:
 
 ```yaml
 praxisConfig:
-  source: byo
-  byo:
+  source: operator
+  operator:
     configMapName: praxis-consumer-config
-    key: praxis.yaml
 mountReconciliation:
   enabled: true
   network: production
@@ -554,6 +553,11 @@ providerCredentials:
   - secretName: monitoring-token
     mountPath: /run/secrets/monitoring-token # stays Helm-managed
 ```
+
+Chart-rendered Grid serving cannot be combined with operator-managed delegated
+mount reconciliation. Use `praxisConfig.source: render` without operator-managed
+delegated mount reconciliation when the gateway must
+read the operator's serving ConfigMap and route with `grid_site_route`.
 
 Before enabling delegation on an existing release, set
 `consumerConfig.credentialMountBase` and (when consumer mTLS is used without
@@ -593,13 +597,13 @@ mounts. Secret rotation triggers a rollout based on resource versions.
 applied; check `mountReconciliationStatus: Ready` before treating the gateway
 as ready.
 
-When `praxisConfig.render.gridServing.enabled` is set, Helm keeps its read-only TLS projection at
-`/etc/praxis/tls` through both handoff phases because the signals poller reads
-those files. The GridNetwork's `tls.caSecretRef` and `tls.siteSecretRef` must
-match the chart's effective CA Secret (`gridIdentity.caSecretName`, or
-`gridIdentity.tlsSecretName` when the CA name is empty) and identity Secret; Grid validates the
-mounted Secret keys and rolls the gateway when their resource versions change.
-The chart rejects a different `gridIdentity.mountPath` for Grid serving.
+When chart-rendered Grid serving is enabled without operator-managed delegated
+mount reconciliation, Helm keeps its read-only TLS projection at `/etc/praxis/tls`
+because the signals poller reads those files. The GridNetwork's
+`tls.caSecretRef` and `tls.siteSecretRef` must match the chart's effective CA
+Secret (`gridIdentity.caSecretName`, or `gridIdentity.tlsSecretName` when the
+CA name is empty) and identity Secret. The chart rejects a different
+`gridIdentity.mountPath` for Grid serving.
 
 ### Cross-site routing in AGN
 

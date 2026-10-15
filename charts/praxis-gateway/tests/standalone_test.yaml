@@ -137,6 +137,19 @@ tests:
       - notExists:
           path: spec.template.spec.containers[?(@.name == "praxis")].volumeMounts[?(@.name == "credential-0")]
 
+  - it: accepts operator source for delegated mounts
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.source: operator
+      praxisConfig.operator.configMapName: praxis-consumer-config
+      mountReconciliation.enabled: true
+      mountReconciliation.network: production
+      mountReconciliation.gatewayRef: inference-gw
+    asserts:
+      - equal:
+          path: spec.template.spec.volumes[?(@.name == "config")].configMap.name
+          value: praxis-consumer-config
+
   - it: keeps user pod annotations next to the config checksum
     template: templates/deployment.yaml
     set:
