@@ -409,13 +409,14 @@ Validate enabled mounts have a non-empty resource name.
 {{- if ne (.Values.praxisConfig.render.role | default "consumer") "consumer" }}
 {{- fail "mount reconciliation is supported for consumer gateways only" }}
 {{- end }}
-{{- if eq .Values.praxisConfig.source "render" }}
+{{- $source := .Values.praxisConfig.source }}
+{{- if eq $source "render" }}
 {{- fail "mount reconciliation requires the operator-generated consumer ConfigMap, not praxisConfig.source render" }}
 {{- end }}
-{{- if not .Values.praxisConfig.byo.configMapName }}
+{{- if and (eq $source "byo") (not .Values.praxisConfig.byo.configMapName) }}
 {{- fail "praxisConfig.byo.configMapName must name consumerConfig.configMapName when mount reconciliation is enabled" }}
 {{- end }}
-{{- if ne .Values.praxisConfig.byo.key "praxis.yaml" }}
+{{- if and (eq $source "byo") (ne .Values.praxisConfig.byo.key "praxis.yaml") }}
 {{- fail "praxisConfig.byo.key must be praxis.yaml when mount reconciliation is enabled" }}
 {{- end }}
 {{- end }}

@@ -40,8 +40,8 @@ mountReconciliation:
   network: ""
   # -- GridNetwork gatewayRefs name. Defaults to this chart's Deployment name.
   gatewayRef: ""
-  # -- Release selected Helm-managed credential mounts, and TLS mounts when
-  # gridServing is disabled, after Grid reports the generated config Ready.
+  # -- Release selected Helm-managed credential mounts and TLS mounts after
+  # Grid reports the generated config Ready.
   # Keep false during the preparation rollout.
   releaseHelmMounts: false
   # -- Credential Secret names whose mounts Grid now owns. Other entries in

@@ -286,10 +286,9 @@ ConfigMap at `/etc/praxis` before it patches volumes or mounts.
 `mountReconciliation.gatewayRef` must match the GridNetwork and `GatewayRef`.
 
 Point the chart at the operator-generated ConfigMap with
-`praxisConfig.source: byo` and
-`praxisConfig.byo.configMapName: praxis-consumer-config`. Set
-`praxisConfig.byo.key: praxis.yaml` and change the ConfigMap name only when the
-GridNetwork uses a non-default `consumerConfig.configMapName`. List the credential Secret names in
+`praxisConfig.source: operator`. Set
+`praxisConfig.operator.configMapName` only when the GridNetwork uses a
+non-default `consumerConfig.configMapName`. List the credential Secret names in
 `mountReconciliation.managedCredentialNames`, and keep
 `mountReconciliation.releaseHelmMounts: false` for the preparation phase. The
 chart retains all credential and TLS mounts during this phase. For an existing
@@ -298,17 +297,17 @@ used without Grid serving) `praxisConfig.tlsCertMountPath` to paths that do
 not overlap Helm mounts. Grid installs its mounts and rolls the generated
 config while the prior Helm files remain available. After
 `mountReconciliationStatus: Ready`, set `releaseHelmMounts: true` and upgrade
-the chart to remove only the selected old credential mounts and, without Grid
-serving, the old TLS projection. Listener TLS and other chart-managed Secret
-mounts remain Helm-owned.
+the chart to remove only the selected old credential mounts and the old TLS
+projection. Listener TLS and other chart-managed Secret mounts remain
+Helm-owned.
 
-With `praxisConfig.render.gridServing.enabled`, the chart retains its TLS projection at
-`/etc/praxis/tls` permanently because the serving pollers read those files.
-The chart adds a marker that lets Grid validate those Secret keys and include
-their resource versions in rollout decisions without taking ownership of the
-mount. The chart's `gridIdentity.tlsSecretName` and `gridIdentity.caSecretName` must match the
-GridNetwork's site identity and CA references; the chart enforces the fixed
-mount path.
+Chart-rendered Grid serving cannot be combined with operator-managed delegated
+mount reconciliation. When `praxisConfig.render.gridServing.enabled` is used
+without operator-managed delegated mount reconciliation, the
+chart retains its TLS projection at `/etc/praxis/tls` because the serving
+pollers read those files. The chart's `gridIdentity.tlsSecretName` and
+`gridIdentity.caSecretName` must match the GridNetwork's site identity and CA
+references; the chart enforces the fixed mount path.
 
 Create the referenced ConfigMap with a valid bootstrap `praxis.yaml` before
 installing the gateway. Once the bootstrap Deployment is ready, Grid writes the
