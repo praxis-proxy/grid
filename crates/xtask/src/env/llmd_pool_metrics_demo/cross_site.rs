@@ -1301,10 +1301,10 @@ fn patch_network_for_poll(cluster: &str, endpoints: &[serde_json::Value]) -> Res
     let ctx = kind_context(cluster);
     let network = kubectl_json(&ctx, "get", &format!("gridnetwork/{GRID_NETWORK_NAME}"))?;
     let mut gateway_refs = network
-        .pointer("/spec/gatewayRefs")
+        .pointer("/spec/consumerGateways")
         .and_then(serde_json::Value::as_array)
         .cloned()
-        .ok_or_else(|| format!("{cluster}: GridNetwork has no gatewayRefs array"))?;
+        .ok_or_else(|| format!("{cluster}: GridNetwork has no consumerGateways array"))?;
     if cluster == GRID_SERVING_SITE {
         let provider_hop_endpoints: Vec<_> = endpoints
             .iter()
@@ -1325,7 +1325,7 @@ fn patch_network_for_poll(cluster: &str, endpoints: &[serde_json::Value]) -> Res
     let patch = serde_json::json!({
         "spec": {
             "signalTransport": { "mode": "poll" },
-            "gatewayRefs": gateway_refs
+            "consumerGateways": gateway_refs
         }
     });
     kubectl_patch_json(&ctx, &format!("gridnetwork/{GRID_NETWORK_NAME}"), &patch)

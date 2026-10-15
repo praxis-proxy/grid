@@ -45,13 +45,13 @@ tests:
               caSecretRef: {name: grid-ca, namespace: grid}
               swimKeySecretRef: {name: grid-swim-key, namespace: grid}
 
-  - it: passes gateway.consumerConfig through to the site gateway reference
+  - it: passes gateway.praxisConfig through to the site gateway reference
     template: templates/gridnetwork.yaml
     set:
       site.name: east
       grid.id: lab
-      gateway.consumerConfig:
-        enabled: true
+      gateway.praxisConfig:
+        generate: true
         deriveTopology:
           fromProviders: [qwen3]
     release:
@@ -64,7 +64,7 @@ tests:
               namespace: grid
               siteName: east
               praxisConfig:
-                enabled: true
+                generate: true
                 deriveTopology:
                   fromProviders: [qwen3]
 

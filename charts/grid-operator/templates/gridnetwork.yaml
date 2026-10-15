@@ -30,7 +30,7 @@ spec:
     - name: {{ . | quote }}
       namespace: {{ $.Values.gateway.namespace | default $.Release.Namespace | quote }}
       siteName: {{ $.Values.swim.siteName | quote }}
-      {{- with $.Values.gateway.consumerConfig }}
+      {{- with $.Values.gateway.praxisConfig }}
       praxisConfig:
         {{- toYaml . | nindent 8 }}
       {{- end }}

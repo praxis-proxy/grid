@@ -535,9 +535,9 @@
           "type": "boolean",
           "description": "Discover and advertise a LoadBalancer address for the site gateway."
         },
-        "consumerConfig": {
+        "praxisConfig": {
           "type": "object",
-          "description": "GridNetwork gatewayRefs[].consumerConfig for the site gateway, validated by the CRD."
+          "description": "GridNetwork consumerGateways[].praxisConfig for the site gateway, validated by the CRD."
         }
       }
     },

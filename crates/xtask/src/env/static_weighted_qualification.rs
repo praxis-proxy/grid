@@ -123,9 +123,9 @@ fn overlay_configmap(cluster: &str) -> Result<String, Box<dyn std::error::Error>
 /// Select the `ConfigMap` for the consumer gateway from the `GridNetwork` status entries.
 fn overlay_configmap_from_status(grid_network: &serde_json::Value) -> Result<String, Box<dyn std::error::Error>> {
     let overlays = grid_network
-        .pointer("/status/overlayStatus")
+        .pointer("/status/routingMapStatus")
         .and_then(serde_json::Value::as_array)
-        .ok_or("GridNetwork status has no overlayStatus entries")?;
+        .ok_or("GridNetwork status has no routingMapStatus entries")?;
     overlays
         .iter()
         .find(|overlay| {
@@ -4894,7 +4894,7 @@ mod tests {
     fn overlay_configmap_uses_operator_reported_hashed_name() {
         let grid_network = serde_json::json!({
             "status": {
-                "overlayStatus": [
+                "routingMapStatus": [
                     {
                         "gatewayName": "other-gateway",
                         "namespace": GRID_SYSTEM_NS,
@@ -4917,7 +4917,7 @@ mod tests {
 
     #[test]
     fn overlay_configmap_requires_distributed_consumer_status() {
-        let grid_network = serde_json::json!({ "status": { "overlayStatus": [] } });
+        let grid_network = serde_json::json!({ "status": { "routingMapStatus": [] } });
         assert_eq!(
             overlay_configmap_from_status(&grid_network)
                 .err()

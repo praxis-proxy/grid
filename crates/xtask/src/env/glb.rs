@@ -3367,9 +3367,9 @@ pub(crate) fn reset_edge_overlay_observation_markers() -> Result<BTreeMap<String
                 .into());
             }
             let overlay_statuses = network
-                .pointer("/status/overlayStatus")
+                .pointer("/status/routingMapStatus")
                 .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| format!("{edge} GridNetwork status has no overlayStatus array"))?;
+                .ok_or_else(|| format!("{edge} GridNetwork status has no routingMapStatus array"))?;
             let overlay_index = overlay_statuses
                 .iter()
                 .position(|entry| {
@@ -3382,12 +3382,12 @@ pub(crate) fn reset_edge_overlay_observation_markers() -> Result<BTreeMap<String
             let patch = serde_json::json!([
                 {
                     "op": "test",
-                    "path": format!("/status/overlayStatus/{overlay_index}/gatewayName"),
+                    "path": format!("/status/routingMapStatus/{overlay_index}/gatewayName"),
                     "value": "edge-gateway"
                 },
                 {
                     "op": "test",
-                    "path": format!("/status/overlayStatus/{overlay_index}/namespace"),
+                    "path": format!("/status/routingMapStatus/{overlay_index}/namespace"),
                     "value": GRID_SYSTEM_NS
                 },
                 {
@@ -3402,7 +3402,7 @@ pub(crate) fn reset_edge_overlay_observation_markers() -> Result<BTreeMap<String
                 },
                 {
                     "op": "replace",
-                    "path": format!("/status/overlayStatus/{overlay_index}/observedGeneration"),
+                    "path": format!("/status/routingMapStatus/{overlay_index}/observedGeneration"),
                     "value": generation - 1
                 }
             ]);
@@ -3829,7 +3829,7 @@ fn edge_overlay_status<'network>(
         .into());
     }
     let overlay_status = status
-        .get("overlayStatus")
+        .get("routingMapStatus")
         .and_then(serde_json::Value::as_array)
         .and_then(|entries| {
             entries.iter().find(|entry| {
