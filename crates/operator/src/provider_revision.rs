@@ -275,6 +275,53 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn signals_network_mismatch_preserves_current_publisher() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::controller::grid_network::{OperatorCtx, refresh_signals};
+        let release = Arc::new(tokio::sync::Notify::new());
+        let client = collection_client(provider()?, Arc::default(), Arc::clone(&release), 10);
+        let ctx = OperatorCtx::new(
+            client.clone(),
+            Some(publisher().await?),
+            crate::crd::grid_network::SignalMode::Poll,
+        );
+        release.notify_one();
+        refresh_signals(&ctx, &client, "net").await?;
+        let before = ctx.signals.current();
+        refresh_signals(&ctx, &client, "unrelated").await?;
+        assert_eq!(
+            ctx.signals.current(),
+            before,
+            "a mismatch leaves the current publication intact"
+        );
+        release.notify_one();
+        refresh_signals(&ctx, &client, "net").await?;
+        assert!(
+            ctx.signals.current().iter().any(|row| {
+                row.metric == revision::METRIC
+                    && row.labels.get(revision::SEQUENCE_LABEL).map(String::as_str) == Some("2")
+            }),
+            "the bound network must keep publishing after a mismatch"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signals_network_binding_requires_a_publisher() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::controller::grid_network::{OperatorCtx, refresh_signals};
+        let listed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let client = collection_client(provider()?, Arc::clone(&listed), Arc::clone(&release), 10);
+        let ctx = OperatorCtx::new(client.clone(), None, crate::crd::grid_network::SignalMode::Poll);
+        for network in ["net", "unrelated", "net"] {
+            release.notify_one();
+            refresh_signals(&ctx, &client, network).await?;
+            tokio::time::timeout(Duration::from_secs(1), listed.notified()).await?;
+        }
+        assert!(ctx.signals.current().iter().all(|row| row.metric != revision::METRIC));
+        Ok(())
+    }
+
     // ---------------------------------------------------------------------------
     // Test Utilities
     // ---------------------------------------------------------------------------

@@ -499,11 +499,11 @@ fn site_signals_ttl() -> Duration {
 ///
 /// Returns [`OperatorError`] when providers or sites cannot be listed.
 pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &str) -> Result<(), OperatorError> {
-    let Some(_pass) = signal_pass(ctx, network_name) else {
+    let publisher = ctx.swim().map(Arc::as_ref);
+    let Some(_pass) = signal_pass(ctx, network_name, publisher) else {
         return Ok(());
     };
     let collected_at = Instant::now();
-    let publisher = ctx.swim();
     let providers = list_all_inference_providers(client).await?;
     ctx.signals.set_access(signal_access(&providers));
     Box::pin(register_peers(ctx, client)).await?;
@@ -527,13 +527,18 @@ pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &
     Ok(())
 }
 
-/// Serialize collection and publication within the single supported network.
-fn signal_pass<'context>(ctx: &'context OperatorCtx, network: &str) -> Option<tokio::sync::SemaphorePermit<'context>> {
+/// Serialize collection and bind ordered publication to one network.
+fn signal_pass<'context>(
+    ctx: &'context OperatorCtx,
+    network: &str,
+    publisher: Option<&SwimHandle>,
+) -> Option<tokio::sync::SemaphorePermit<'context>> {
     let pass = ctx.signal_pass.try_acquire().ok()?;
-    if ctx.signal_fenced.load(std::sync::atomic::Ordering::Relaxed)
-        || ctx.signal_network.get_or_init(|| network.to_owned()) != network
-    {
-        ctx.signal_fenced.store(true, std::sync::atomic::Ordering::Relaxed);
+    if ctx.signal_fenced.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    if publisher.is_some() && ctx.signal_network.get_or_init(|| network.to_owned()) != network {
+        tracing::warn!(network, "skipping signals for a different GridNetwork");
         return None;
     }
     Some(pass)

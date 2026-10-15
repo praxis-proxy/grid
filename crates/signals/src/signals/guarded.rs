@@ -385,7 +385,10 @@ impl Provider {
             }
             self.qualify(revision, scrape, max_age_ms)
         } else {
-            self.invalidate();
+            if self.guard.epoch.is_some() || self.guard.accepted_at.is_some() {
+                self.metrics.clear();
+            }
+            self.disqualify();
             true
         }
     }
@@ -585,6 +588,35 @@ mod tests {
         ingest(&store, &payload("queue", 2, 1_000), 1_000);
         assert_eq!(state(&store, 1_000).epoch, None);
         assert_eq!(store.latest("b/m", "queue").map(|sample| sample.at_ms), Some(1_000));
+    }
+
+    #[test]
+    fn unqualified_pressure_windows_survive_until_they_age_out() {
+        let store = store();
+        ingest(&store, &payload("queue", 8, 1_000), 1_000);
+        let first = state(&store, 1_000);
+        ingest(&store, &payload("running", 3, 2_000), 2_000);
+        assert_eq!(store.window_worst("b/m", "queue", 2_000, 3_000, true), Some(8.0));
+        ingest(&store, &payload("queue", 0, 3_000), 3_000);
+        assert_eq!(store.window_worst("b/m", "queue", 3_000, 3_000, true), Some(8.0));
+        assert_eq!(store.window_worst("b/m", "queue", 4_001, 3_000, true), Some(0.0));
+        assert_eq!(state(&store, 4_001).epoch, None);
+        assert!(state(&store, 4_001).serial > first.serial);
+    }
+
+    #[test]
+    fn unqualified_pressure_history_cannot_enter_recovered_learning() {
+        let store = store();
+        ingest(&store, &batch("u1", 1, 1, 1, 1_000), 1_000);
+        let first = state(&store, 1_000);
+        ingest(&store, &payload("queue", 8, 2_000), 2_000);
+        ingest(&store, &payload("queue", 0, 3_000), 3_000);
+        assert_eq!(store.window_worst("b/m", "queue", 3_000, 3_000, true), Some(8.0));
+        assert_eq!(state(&store, 3_000).epoch, None);
+        ingest(&store, &batch("u1", 1, 1, 2, 4_000), 4_000);
+        assert!(state(&store, 4_000).epoch.is_some());
+        assert_ne!(state(&store, 4_000).epoch, first.epoch);
+        assert_eq!(store.window_worst("b/m", "queue", 4_000, 4_000, true), Some(2.0));
     }
 
     #[test]
