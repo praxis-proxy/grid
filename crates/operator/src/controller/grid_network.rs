@@ -80,6 +80,14 @@ const SWIM_LEAVE_WAIT: Duration = Duration::from_secs(5);
     reason = "client is public API; the SWIM handle and caches are reached through methods"
 )]
 pub struct OperatorCtx {
+    /// One provider collection/publication pass at a time, across networks.
+    signal_pass: tokio::sync::Semaphore,
+    /// Monotonic batch sequence within this process's immutable publisher epoch.
+    signal_sequence: std::sync::atomic::AtomicU64,
+    /// A superseded publisher never reacquires authority in the same process.
+    signal_fenced: std::sync::atomic::AtomicBool,
+    /// Publication ordering is scoped to the single supported network.
+    signal_network: std::sync::OnceLock<String>,
     /// Kubernetes API client.
     pub client: Client,
 
@@ -308,6 +316,10 @@ impl OperatorCtx {
     pub fn new(client: Client, swim: Option<Arc<SwimHandle>>, signal_mode: SignalMode) -> Self {
         Self {
             client,
+            signal_pass: tokio::sync::Semaphore::new(1),
+            signal_sequence: std::sync::atomic::AtomicU64::new(0),
+            signal_fenced: std::sync::atomic::AtomicBool::new(false),
+            signal_network: std::sync::OnceLock::new(),
             swim: swim.map(std::sync::OnceLock::from).unwrap_or_default(),
             metrics_cache: Mutex::new(provider_metrics::MetricsCache::new()),
             admission_memory: Mutex::new(provider_admission::AdmissionMemory::default()),
@@ -487,6 +499,11 @@ fn site_signals_ttl() -> Duration {
 ///
 /// Returns [`OperatorError`] when providers or sites cannot be listed.
 pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &str) -> Result<(), OperatorError> {
+    let Some(_pass) = signal_pass(ctx, network_name) else {
+        return Ok(());
+    };
+    let collected_at = Instant::now();
+    let publisher = ctx.swim();
     let providers = list_all_inference_providers(client).await?;
     ctx.signals.set_access(signal_access(&providers));
     Box::pin(register_peers(ctx, client)).await?;
@@ -499,9 +516,49 @@ pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &
     ))
     .await;
     ctx.record_scrape_pass(network_name, scrape_started.elapsed());
-    let collected = resolve_readiness(ctx, client, &providers, network_name);
-    publish_signals(ctx, collected);
+    let mut collected = resolve_readiness(ctx, client, &providers, network_name);
+    if let Some(swim) = publisher {
+        let Some((epoch, sequence)) = publication_order(ctx, client, swim).await? else {
+            return Ok(());
+        };
+        crate::provider_revision::qualify(&mut collected, &providers, network_name, epoch, sequence);
+    }
+    publish_signals(ctx, collected, collected_at);
     Ok(())
+}
+
+/// Serialize collection and publication within the single supported network.
+fn signal_pass<'context>(ctx: &'context OperatorCtx, network: &str) -> Option<tokio::sync::SemaphorePermit<'context>> {
+    let pass = ctx.signal_pass.try_acquire().ok()?;
+    if ctx.signal_fenced.load(std::sync::atomic::Ordering::Relaxed)
+        || ctx.signal_network.get_or_init(|| network.to_owned()) != network
+    {
+        ctx.signal_fenced.store(true, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    Some(pass)
+}
+
+/// Allocate a publication order only while the pre-collection publisher still owns its fence.
+async fn publication_order(
+    ctx: &OperatorCtx,
+    client: &Client,
+    swim: &SwimHandle,
+) -> Result<Option<(u64, u64)>, OperatorError> {
+    let (epoch, high) = swim.publisher_reservation();
+    if !swim.is_running() || !crate::provider_revision::holds_fence(client, swim.site_name(), high).await? {
+        ctx.signal_fenced.store(true, std::sync::atomic::Ordering::Relaxed);
+        return Ok(None);
+    }
+    Ok(ctx
+        .signal_sequence
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |value| value.checked_add(1),
+        )
+        .ok()
+        .map(|previous| (epoch, previous.saturating_add(1))))
 }
 
 /// Resolve each provider's readiness, write its `Ready` condition, and return what to publish.
@@ -888,11 +945,15 @@ fn signal_access(providers: &[InferenceProvider]) -> signals::AccessMap {
 /// The site label is applied here because this is where the membership identity
 /// is known. A provider that set it itself keeps its value under an exported
 /// name, so what a reader sees as the origin is what this site says it is.
-fn publish_signals(ctx: &OperatorCtx, collected: HashMap<String, Vec<signals::Observation>>) {
+fn publish_signals(ctx: &OperatorCtx, collected: HashMap<String, Vec<signals::Observation>>, collected_at: Instant) {
     let site = ctx.swim().map(|s| s.site_name().to_owned()).unwrap_or_default();
+    let age = collected_at.elapsed();
     let attributed = collected
         .into_iter()
-        .map(|(provider, observations)| {
+        .map(|(provider, mut observations)| {
+            for observation in &mut observations {
+                observation.age = observation.age.max(age);
+            }
             let attributed = signals::attribute(observations, &site, &provider);
             (provider, attributed)
         })
@@ -6783,6 +6844,28 @@ mod tests {
         assert!(
             ctx.last_scrape_pass("net") >= Duration::from_millis(25),
             "the scrape pass records its measured duration"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_publication_retains_the_collection_pass_age() {
+        let client = crate::resources::test_doubles::mock_kube_client_with_providers(Vec::new());
+        let ctx = OperatorCtx::new(client, None, SignalMode::default());
+        let observations = signals::parse("queue 2\nready 1\n");
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(40))
+            .unwrap_or_else(|| std::process::abort());
+        publish_signals(&ctx, HashMap::from([("model".to_owned(), observations)]), started);
+        let published = ctx.signals.current();
+        assert_eq!(published.len(), 2);
+        assert!(
+            published.iter().all(|row| row.age >= Duration::from_secs(40)),
+            "collection and API delays cannot rejuvenate observations"
+        );
+        assert_eq!(
+            published.first().map(|row| row.age),
+            published.last().map(|row| row.age),
+            "one batch keeps one age"
         );
     }
 

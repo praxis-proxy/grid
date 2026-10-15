@@ -70,4 +70,7 @@ pub struct Over {
 pub trait SiteSignals {
     /// The site's reading `over` the horizon behind its newest fresh sample.
     fn read(&self, site: &str, cluster: &str, over: Over) -> SiteReading;
+
+    /// Publication serial and qualified learning epoch for a snapshot read.
+    fn learning_state(&self, site: &str, cluster: &str, now_ms: i64, max_age_ms: i64) -> grid_signals::LearningState;
 }

@@ -859,6 +859,8 @@ pub enum SeedAnnounceError {
 /// and [`SwimHandle::state_snapshot`] by cloning the most recent watch value
 /// without blocking.
 pub struct SwimHandle {
+    /// Immutable node-generation reservation, also fencing signal publication.
+    publisher_reservation: (u64, u64),
     /// Stable local site identity advertised by this SWIM runtime.
     site_name: String,
 
@@ -907,6 +909,11 @@ pub struct SwimHandle {
 }
 
 impl SwimHandle {
+    /// Immutable publisher epoch and the persisted generation high-water mark.
+    pub(crate) fn publisher_reservation(&self) -> (u64, u64) {
+        self.publisher_reservation
+    }
+
     /// Return the signals endpoint gossiped to peers, if any.
     #[must_use]
     pub fn signals_address(&self) -> Option<&str> {
@@ -1279,6 +1286,10 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
     );
 
     let signals_address = config.signals_address.clone();
+    let publisher_reservation = (
+        config.revision_lease.first_node_generation,
+        config.revision_lease.last_node_generation,
+    );
     let run_loop_handle = tokio::spawn(run_loop(
         Arc::new(socket),
         config,
@@ -1299,6 +1310,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
     });
 
     Ok(Arc::new(SwimHandle {
+        publisher_reservation,
         site_name,
         advertise_addr,
         signals_address,
@@ -2556,6 +2568,7 @@ mod tests {
         let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, _gateway_rx) = watch::channel(None);
         let handle = SwimHandle {
+            publisher_reservation: (1, 2),
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
             signals_address: None,
@@ -2725,6 +2738,7 @@ mod tests {
         let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, _gateway_rx) = watch::channel(Some("127.0.0.1:19080".to_owned()));
         let handle = SwimHandle {
+            publisher_reservation: (1, 2),
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
             signals_address: None,
@@ -2756,6 +2770,7 @@ mod tests {
         let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, _gateway_rx) = watch::channel(None);
         let handle = SwimHandle {
+            publisher_reservation: (1, 2),
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
             signals_address: None,
@@ -3143,6 +3158,7 @@ mod tests {
         let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, _gateway_rx) = watch::channel(None);
         let handle = SwimHandle {
+            publisher_reservation: (1, 2),
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
             signals_address: None,
@@ -3175,6 +3191,7 @@ mod tests {
         let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, _gateway_rx) = watch::channel(None);
         let handle = SwimHandle {
+            publisher_reservation: (1, 2),
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
             signals_address: None,

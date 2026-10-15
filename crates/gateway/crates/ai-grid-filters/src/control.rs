@@ -274,7 +274,8 @@ impl Control {
         Ok(Self {
             store: Arc::new(
                 LoadStore::with_combine(Duration::from_secs(config.window_secs), crate::signals::llm_d::combine)
-                    .with_local_site(&config.local_site),
+                    .with_local_site(&config.local_site)
+                    .with_revision_guard(i64::try_from(config.window_secs.saturating_mul(1_000)).unwrap_or(i64::MAX)),
             ),
             snapshot: Arc::new(ArcSwap::from_pointee(cold_start)),
             topology: Arc::new(ArcSwap::from_pointee(topology)),

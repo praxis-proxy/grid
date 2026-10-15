@@ -136,13 +136,14 @@ pub(crate) async fn collect_provider_signals(
             .filter(|provider| provider.spec.grid_network_ref == network_name),
     )
     .for_each_concurrent(PROVIDER_SCRAPE_CONCURRENCY, |provider| async move {
-        let Some(plan) = signal_scrape_plan(provider) else {
-            return;
-        };
         let Some(name) = provider.metadata.name.as_deref() else {
             return;
         };
         let key = crate::readiness::key(network_name, name);
+        readiness.bind_revision(&key, provider.metadata.uid.as_deref(), provider.metadata.generation);
+        let Some(plan) = signal_scrape_plan(provider) else {
+            return;
+        };
         match scrape_provider_signals(provider, &plan, client).await {
             Ok(text) => record_scrape(readiness, &key, provider, &plan, &text),
             Err(class) => {
@@ -183,6 +184,8 @@ fn record_scrape(
         .zip(republishable)
         .filter_map(|(o, republishable)| republishable.then_some(o))
         .filter(|o| relayed(&o.metric))
+        .filter(|o| o.metric != grid_signals::revision::METRIC)
+        .filter(|o| pool.is_none_or(|pool| o.labels.get("name").or_else(|| o.labels.get(crate::signals::POOL_LABEL)).is_some_and(|name| name == pool)))
         // A local sample's freshness is its collection time, so drop any trailing
         // timestamp. Only relayed peer samples carry a per-sample stamp.
         .map(|mut o| {
@@ -930,7 +933,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "InferenceProvider",
-            "metadata": {"name": name},
+            "metadata": {"name": name, "uid": format!("uid-{name}"), "generation": 1},
             "spec": spec
         }))
         .unwrap_or_else(|_| std::process::abort())
@@ -1031,6 +1034,29 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
             verdict.message.contains("answered"),
             "progress seen through the parser: {verdict:?}"
         );
+    }
+
+    #[test]
+    fn raw_pool_samples_cannot_cross_attribution_or_spoof_revision() {
+        let readiness = crate::readiness::ReadinessStore::default();
+        let mut metrics = mc_with_queue("llm_d_epp_average_queue_size");
+        metrics.pool_name = Some("a".to_owned());
+        let provider = provider_fixture("p", "http://epp:9090", Some(metrics));
+        let plan = signal_scrape_plan(&provider).unwrap_or_else(|| std::process::abort());
+        record_scrape(
+            &readiness,
+            "net/p",
+            &provider,
+            &plan,
+            "llm_d_epp_average_queue_size{name=\"a\"} 2\nllm_d_epp_average_queue_size{name=\"b\"} 99\nllm_d_epp_average_queue_size 88\ngrid_provider_config_generation{name=\"a\"} 42\n",
+        );
+        let observations = readiness.take_fresh("net/p").unwrap_or_default();
+        assert_eq!(
+            observations.len(),
+            1,
+            "only the selected pool's genuine raw gauge survives"
+        );
+        assert_eq!(observations.first().map(|sample| sample.value), Some(2.0));
     }
 
     fn mc_with_queue(metric_name: &str) -> MetricsConfig {

@@ -110,9 +110,10 @@ impl RouteSnapshot {
     ) -> Self {
         // Score each candidate once, then sort the pairs: load_of allocates a
         // store key and scans a window, too costly to repeat inside sort_by.
+        let mut reset_pairs = BTreeSet::new();
         let ranked = candidates
             .into_iter()
-            .map(|candidate| Self::resolve(candidate, inputs))
+            .map(|candidate| Self::resolve(candidate, inputs, &mut reset_pairs))
             .collect();
         Self::ranked(
             Self::explore_floor(ranked, inputs.availability.explore_floor),
@@ -125,8 +126,11 @@ impl RouteSnapshot {
     fn resolve<S: SiteSignals>(
         mut candidate: RouteCandidate,
         inputs: &mut Inputs<'_, S>,
+        reset_pairs: &mut BTreeSet<SitePair>,
     ) -> (f64, RouteCandidate, bool) {
-        let (reading, recent) = Self::readings(&candidate, inputs);
+        let readings = Self::readings(&candidate, inputs);
+        let reading = &readings.horizon;
+        let recent = &readings.recent;
         if reading.unready {
             candidate.admission_state = AdmissionState::Excluded;
         }
@@ -142,7 +146,7 @@ impl RouteSnapshot {
         } else {
             recent.queued.map(|_| false)
         };
-        let measured = Self::measured(&candidate, &reading, &recent, inputs);
+        let measured = Self::measured(&candidate, &readings, inputs, reset_pairs);
         if let Some(measured) = &measured {
             candidate.capacity = Some(measured.ceiling);
             candidate.rho = Some(measured.rho);
@@ -150,7 +154,7 @@ impl RouteSnapshot {
             candidate.relieved = measured.relieved;
         } else {
             // Direct pressure remains useful without a count or a learned ceiling.
-            candidate.rho = reported_limit(&reading);
+            candidate.rho = reported_limit(reading);
         }
         // Ordered by queue depth; a site publishing none sorts after every site that does.
         let load = if candidate.admission_state == AdmissionState::NewAndExisting {
@@ -165,7 +169,13 @@ impl RouteSnapshot {
     /// anchored at the site's newest fresh sample, so a site polled less often than either is
     /// still judged on what it last said. Fullness is judged from the second, so one spike a
     /// horizon ago does not hold a site full.
-    fn readings<S: SiteSignals>(candidate: &RouteCandidate, inputs: &Inputs<'_, S>) -> (SiteReading, SiteReading) {
+    fn readings<S: SiteSignals>(candidate: &RouteCandidate, inputs: &Inputs<'_, S>) -> Readings {
+        let state = || {
+            inputs
+                .signals
+                .learning_state(&candidate.site, &candidate.cluster, inputs.now_ms, inputs.window_ms)
+        };
+        let before = state();
         let over = |horizon_ms| Over {
             now_ms: inputs.now_ms,
             window_ms: inputs.window_ms,
@@ -181,7 +191,14 @@ impl RouteSnapshot {
             &candidate.cluster,
             over(inputs.availability.room_after_ms),
         );
-        (reading, recent)
+        if before != state() {
+            return Readings::default();
+        }
+        Readings {
+            horizon: reading,
+            recent,
+            epoch: before.epoch,
+        }
     }
 
     /// Lift every measured site's weight to at least `share` of the largest ceiling.
@@ -222,13 +239,16 @@ impl RouteSnapshot {
     /// declared capacity is new.
     fn measured<S: SiteSignals>(
         candidate: &RouteCandidate,
-        reading: &SiteReading,
-        recent: &SiteReading,
+        readings: &Readings,
         inputs: &mut Inputs<'_, S>,
+        reset_pairs: &mut BTreeSet<SitePair>,
     ) -> Option<Measured> {
+        let key = (Arc::clone(&candidate.site), Arc::clone(&candidate.cluster));
+        inputs.learned.retire_changed(&key, readings.epoch, reset_pairs);
+        let epoch = readings.epoch?;
+        let reading = &readings.horizon;
         let in_flight = reading.in_flight?;
         let availability = inputs.availability;
-        let key = (Arc::clone(&candidate.site), Arc::clone(&candidate.cluster));
         // The newest sample at or before now is the epoch a smoothing step belongs to.
         let sample_at = reading.sampled_at.map(|at| at.min(inputs.now_ms));
         let previous = inputs.learned.0.get(&key).copied();
@@ -236,20 +256,23 @@ impl RouteSnapshot {
         let by_count = (in_flight / ceiling.read_against).clamp(0.0, 1.0);
         let raw = nearest_limit(reading, by_count, ceiling.hard.is_some());
         let rho = smoothed(previous, sample_at, raw, availability.smoothing);
-        let (congested, full_since) = congestion(previous, recent, ceiling.read_against, inputs);
-        let full = full_for(candidate, full_since, inputs.now_ms, availability.full_after_ms);
+        let (congested, full_since) = congestion(previous, &readings.recent, ceiling.read_against, inputs);
+        let reset = reset_pairs.contains(&key);
+        let full = (!reset)
+            .then(|| full_for(candidate, full_since, inputs.now_ms, availability.full_after_ms))
+            .flatten();
         let age_ms = sample_at.map(|at| inputs.now_ms.saturating_sub(at));
         let limits = Limits::read(in_flight, &ceiling, by_count, full, age_ms);
         publish_limits(&key, &ceiling, reading, &limits);
         inputs.learned.0.insert(
             key,
-            SiteLearned::at(&ceiling, rho, inputs.now_ms, sample_at, full_since),
+            SiteLearned::at(&ceiling, rho, inputs.now_ms, sample_at, full_since, epoch),
         );
         Some(Measured {
             ceiling: ceiling.read_against,
             rho,
             full,
-            relieved: candidate.backlog.map(|_| !congested),
+            relieved: candidate.backlog.filter(|_| !reset).map(|_| !congested),
         })
     }
 
@@ -399,6 +422,8 @@ type SitePair = (Arc<str>, Arc<str>);
 /// What one site's own load has taught the gateway: its running ceiling and smoothed saturation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SiteLearned {
+    /// Qualified source revision that taught this state.
+    epoch: u64,
     /// The most it has held with nothing waiting: capacity is at least this. Absent until a
     /// queue-free sample teaches one.
     soft: Option<f64>,
@@ -545,8 +570,20 @@ impl Ceiling {
 
 impl SiteLearned {
     /// What this refresh leaves for the next one.
-    fn at(ceiling: &Ceiling, rho: f64, now_ms: i64, sample_at: Option<i64>, full_since: Option<i64>) -> Self {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "retained learning binds its bounds and timing to one revision"
+    )]
+    fn at(
+        ceiling: &Ceiling,
+        rho: f64,
+        now_ms: i64,
+        sample_at: Option<i64>,
+        full_since: Option<i64>,
+        epoch: u64,
+    ) -> Self {
         Self {
+            epoch,
             soft: ceiling.soft,
             hard: ceiling.hard,
             rho,
@@ -558,6 +595,17 @@ impl SiteLearned {
             shrunk_since: ceiling.shrunk_since,
         }
     }
+}
+
+/// Both observation horizons from a consistent publication state.
+#[derive(Default)]
+struct Readings {
+    /// Qualified learning history shared by both horizons.
+    epoch: Option<u64>,
+    /// Full measurement horizon.
+    horizon: SiteReading,
+    /// Recent pressure and congestion horizon.
+    recent: SiteReading,
 }
 
 /// What one refresh measured about a site.
@@ -587,6 +635,14 @@ pub(crate) struct Gauged {
 }
 
 impl Learned {
+    /// Retire changed history once while marking every model sharing the provider.
+    fn retire_changed(&mut self, key: &SitePair, epoch: Option<u64>, reset_pairs: &mut BTreeSet<SitePair>) {
+        if self.0.get(key).is_some_and(|held| Some(held.epoch) != epoch) {
+            self.0.remove(key);
+            reset_pairs.insert(key.clone());
+        }
+    }
+
     /// Clear every site's soft bound, as a periodic reset would. Test-only, for the scenario
     /// that measures what such a reset would cost.
     #[cfg(test)]

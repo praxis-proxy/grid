@@ -224,6 +224,8 @@ impl ScrapeClass {
 /// What the signals loop last saw from one provider.
 #[derive(Clone, Debug, Default)]
 struct Probe {
+    /// Source object and spec revision whose observations this probe holds.
+    revision: Option<(String, i64)>,
     /// When the first scrape was attempted, which starts the grace before any success.
     first_attempt: Option<Instant>,
     /// When the last scrape succeeded.
@@ -303,6 +305,25 @@ pub(crate) fn provider_of(key: &str) -> &str {
 }
 
 impl ReadinessStore {
+    /// Forget observations when a provider is replaced or its spec changes.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the guard covers one atomic source binding"
+    )]
+    pub(crate) fn bind_revision(&self, key: &str, uid: Option<&str>, generation: Option<i64>) {
+        let revision = uid
+            .zip(generation)
+            .map(|(uid, generation)| (uid.to_owned(), generation));
+        let mut probes = self.probes();
+        let probe = probes.entry(key.to_owned()).or_default();
+        if revision.is_none() || probe.revision != revision {
+            *probe = Probe {
+                revision,
+                ..Probe::default()
+            };
+        }
+    }
+
     /// The probes, recovered if a panicking holder poisoned the lock: each write is whole.
     fn probes(&self) -> std::sync::MutexGuard<'_, HashMap<String, Probe>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
@@ -1015,6 +1036,40 @@ mod tests {
         };
         assert_eq!(reason_in("east"), Some(Reason::NoEndpointsReady));
         assert_eq!(reason_in("west"), Some(Reason::Ready));
+    }
+
+    #[test]
+    fn revision_changes_clear_probe_history_but_equal_revisions_keep_it() {
+        let store = ReadinessStore::default();
+        let now = Instant::now();
+        store.bind_revision("p", Some("u1"), Some(1));
+        store.record_success("p", Some(3.0), None, Vec::new(), now);
+        store.bind_revision("p", Some("u1"), Some(1));
+        assert_eq!(
+            store.ready_endpoints("p"),
+            Some(3.0),
+            "status-only changes preserve observations"
+        );
+        store.bind_revision("p", Some("u1"), Some(2));
+        assert_eq!(store.ready_endpoints("p"), None, "spec updates clear old observations");
+        assert!(
+            store.take_fresh("p").is_none(),
+            "no unpublished old scrape may inherit the new revision"
+        );
+        store.record_success("p", Some(5.0), None, Vec::new(), now);
+        store.bind_revision("p", Some("u2"), Some(2));
+        assert_eq!(
+            store.ready_endpoints("p"),
+            None,
+            "replacement objects do not inherit readiness"
+        );
+        store.record_success("p", Some(7.0), None, Vec::new(), now);
+        store.bind_revision("p", None, None);
+        assert_eq!(
+            store.ready_endpoints("p"),
+            None,
+            "unknown identity cannot retain attributed history"
+        );
     }
 
     #[test]

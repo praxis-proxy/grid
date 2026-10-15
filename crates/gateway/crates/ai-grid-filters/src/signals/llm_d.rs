@@ -135,6 +135,11 @@ pub(crate) struct Mapped<'store> {
 }
 
 impl SiteSignals for Mapped<'_> {
+    fn learning_state(&self, site: &str, cluster: &str, now_ms: i64, max_age_ms: i64) -> grid_signals::LearningState {
+        self.store
+            .learning_state(&LoadStore::key(site, cluster), now_ms, max_age_ms)
+    }
+
     fn read(&self, site: &str, cluster: &str, over: Over) -> SiteReading {
         let key = LoadStore::key(site, cluster);
         let sampled_at = self.store.newest_at(&key);
@@ -351,6 +356,10 @@ impl Mapped<'_> {
 
 /// The store read under the llm-d mapping.
 impl SiteSignals for LoadStore {
+    fn learning_state(&self, site: &str, cluster: &str, now_ms: i64, max_age_ms: i64) -> grid_signals::LearningState {
+        self.learning_state(&LoadStore::key(site, cluster), now_ms, max_age_ms)
+    }
+
     fn read(&self, site: &str, cluster: &str, over: Over) -> SiteReading {
         Mapped {
             store: self,

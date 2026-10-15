@@ -31,6 +31,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use grid_signals::LoadStore;
 
+mod revisions;
+
 use crate::{
     descriptor::{AdmissionState, CandidateConfig, CapabilityKind, validate_candidates, validate_serving_candidates},
     route::{KeepAll, select_spread},
