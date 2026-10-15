@@ -144,6 +144,7 @@ fn concurrent_revision_between_metric_reads_cannot_mix_epochs() {
         store: &grid.store,
         replaced: std::cell::Cell::new(false),
         at,
+        generation: 2,
     };
     let validated = super::validate_serving_candidates(vec![super::config(&SITES[0])]).expect("valid candidate");
     let snapshot = RouteSnapshot::from_store(
@@ -173,6 +174,97 @@ fn concurrent_revision_between_metric_reads_cannot_mix_epochs() {
         Some(20.0),
         "the next consistent read uses only the new revision"
     );
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the race setup and recovered learning belong to one scenario"
+)]
+fn concurrent_publication_of_the_same_revision_preserves_learning() {
+    let mut grid = learned();
+    let at = NOW_MS + WINDOW_MS + 1;
+    publish(
+        &grid,
+        "a",
+        at - REFRESH_MS,
+        Some(Revision { sequence: 2, ..INITIAL }),
+        Some((20.0, 0.0)),
+    );
+    let signals = ReplacingSignals {
+        store: &grid.store,
+        replaced: std::cell::Cell::new(false),
+        at,
+        generation: 1,
+    };
+    let validated = super::validate_serving_candidates(vec![super::config(&SITES[0])]).expect("valid candidate");
+    let torn = RouteSnapshot::from_store(
+        validated,
+        std::sync::Arc::from("a"),
+        &mut super::Inputs {
+            signals: &signals,
+            now_ms: at,
+            window_ms: WINDOW_MS,
+            horizon_ms: WINDOW_MS,
+            availability: &grid.availability,
+            learned: &mut grid.gauged.learned,
+        },
+    );
+    assert_eq!(capacity(&torn, "a"), None, "a torn read publishes no measurement");
+    assert_eq!(
+        capacity(&grid.order(&SITES[..1], at), "a"),
+        Some(80.0),
+        "the old peak has left the raw window, but a same-revision race cannot discard its learned ceiling"
+    );
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "both bound histories must stay qualified through withdrawal and recovery"
+)]
+fn guarded_withdrawal_discards_learning_while_fresh_topology_retains_it() {
+    for queued in [0.0, 4.0] {
+        let mut grid = learned();
+        let mut sequence = 1;
+        for turn in 1..=10 {
+            sequence += 1;
+            let at = NOW_MS + turn * REFRESH_MS;
+            let text = batch(
+                "a",
+                at,
+                Some(Revision { sequence, ..INITIAL }),
+                Some((80.0 - queued, queued)),
+            )
+            .replace("} 0.1 ", "} 1 ");
+            grid.store.ingest_at(&text, at, at, "a");
+            grid.order(&SITES[..1], at);
+        }
+        let low_at = NOW_MS + 10 * REFRESH_MS;
+        for turn in 1..=(WINDOW_MS / REFRESH_MS + 2) {
+            sequence += 1;
+            publish(
+                &grid,
+                "a",
+                low_at + turn * REFRESH_MS,
+                Some(Revision { sequence, ..INITIAL }),
+                Some((20.0, 0.0)),
+            );
+            grid.order(&SITES[..1], low_at + turn * REFRESH_MS);
+        }
+        let at = low_at + (WINDOW_MS / REFRESH_MS + 2) * REFRESH_MS;
+        assert_eq!(
+            capacity(&grid.order(&SITES[..1], at), "a"),
+            Some(80.0),
+            "fresh qualification retains the queued={queued} bound"
+        );
+        assert!(grid.order(&[], at).candidates.is_empty(), "withdrawal removes topology");
+        assert_eq!(
+            capacity(&grid.order(&SITES[..1], at), "a"),
+            Some(20.0),
+            "re-admission relearns from current samples for queued={queued}"
+        );
+    }
 }
 
 #[test]
@@ -517,6 +609,8 @@ struct ReplacingSignals<'store> {
     replaced: std::cell::Cell<bool>,
     /// Publication time of the replacement batch.
     at: i64,
+    /// Whether the concurrent publication changes the provider revision.
+    generation: u64,
 }
 
 impl crate::signals::SiteSignals for ReplacingSignals<'_> {
@@ -527,8 +621,8 @@ impl crate::signals::SiteSignals for ReplacingSignals<'_> {
                 site,
                 self.at,
                 Some(Revision {
-                    generation: 2,
-                    sequence: 2,
+                    generation: self.generation,
+                    sequence: 3,
                     ..INITIAL
                 }),
                 Some((20.0, 0.0)),

@@ -1,12 +1,18 @@
 //! Provider revision and fenced publication wire contract.
 
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use crate::exposition::{Metric, PROVIDER_LABEL, SITE_LABEL};
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+
+/// Maximum future publisher reservation, matching SWIM's node-generation lease skew.
+pub const MAX_PUBLISHER_EPOCH_SKEW: Duration = Duration::from_mins(10);
 
 /// Provider spec generation, bound to one complete observation batch.
 pub const METRIC: &str = "grid_provider_config_generation";
@@ -48,6 +54,15 @@ impl Revision {
     pub const fn order(&self) -> (u64, u64) {
         (self.publisher_epoch, self.batch_sequence)
     }
+}
+
+/// Whether a nanosecond publisher reservation is within the receiver's wall-clock bound.
+#[must_use]
+pub fn valid_epoch(epoch: u64, now: SystemTime) -> bool {
+    now.duration_since(UNIX_EPOCH).is_ok_and(|since| {
+        let limit = u64::try_from(since.saturating_add(MAX_PUBLISHER_EPOCH_SKEW).as_nanos()).unwrap_or(u64::MAX);
+        epoch <= limit
+    })
 }
 
 /// Validate exact integer values and the complete metadata label vocabulary.
@@ -146,6 +161,25 @@ fn decimal_integer(value: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::exposition;
+
+    #[test]
+    fn publisher_epoch_uses_the_inclusive_local_wall_clock_bound() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let limit = 1_600_000_000_000;
+        assert!(
+            valid_epoch(1, now),
+            "old reservations remain valid for long-lived publishers"
+        );
+        assert!(valid_epoch(limit, now), "the SWIM skew boundary is inclusive");
+        assert!(
+            !valid_epoch(limit + 1, now),
+            "future reservations cannot poison the fence"
+        );
+        assert!(
+            !valid_epoch(u64::MAX, now),
+            "a maximal epoch is not a valid current reservation"
+        );
+    }
 
     #[test]
     fn parses_exact_revision_and_order() {

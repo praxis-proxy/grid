@@ -517,13 +517,15 @@ pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &
     .await;
     ctx.record_scrape_pass(network_name, scrape_started.elapsed());
     let mut collected = resolve_readiness(ctx, client, &providers, network_name);
-    if let Some(swim) = publisher {
-        let Some((epoch, sequence)) = publication_order(ctx, client, swim).await? else {
-            return Ok(());
-        };
-        crate::provider_revision::qualify(&mut collected, &providers, network_name, epoch, sequence);
+    if !ctx.signal_fenced.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Some(swim) = publisher {
+            let Some((epoch, sequence)) = publication_order(ctx, client, swim).await? else {
+                return Ok(());
+            };
+            crate::provider_revision::qualify(&mut collected, &providers, network_name, epoch, sequence);
+        }
+        publish_signals(ctx, collected, collected_at);
     }
-    publish_signals(ctx, collected, collected_at);
     Ok(())
 }
 
@@ -534,9 +536,6 @@ fn signal_pass<'context>(
     publisher: Option<&SwimHandle>,
 ) -> Option<tokio::sync::SemaphorePermit<'context>> {
     let pass = ctx.signal_pass.try_acquire().ok()?;
-    if ctx.signal_fenced.load(std::sync::atomic::Ordering::Relaxed) {
-        return None;
-    }
     if publisher.is_some() && ctx.signal_network.get_or_init(|| network.to_owned()) != network {
         tracing::warn!(network, "skipping signals for a different GridNetwork");
         return None;
@@ -552,7 +551,13 @@ async fn publication_order(
 ) -> Result<Option<(u64, u64)>, OperatorError> {
     let (epoch, high) = swim.publisher_reservation();
     if !swim.is_running() || !crate::provider_revision::holds_fence(client, swim.site_name(), high).await? {
-        ctx.signal_fenced.store(true, std::sync::atomic::Ordering::Relaxed);
+        if !ctx.signal_fenced.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::error!(
+                site = swim.site_name(),
+                epoch,
+                "signals publisher lost its reservation; publication is fenced until restart"
+            );
+        }
         return Ok(None);
     }
     Ok(ctx
@@ -6850,6 +6855,58 @@ mod tests {
             ctx.last_scrape_pass("net") >= Duration::from_millis(25),
             "the scrape pass records its measured duration"
         );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one fenced pass must refresh collection, readiness and peer inventory"
+    )]
+    async fn fenced_publication_keeps_scraping_readiness_and_refreshing_peers() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let response = "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n"
+            .as_bytes()
+            .to_vec();
+        let mut provider = make_inference_provider("provider-a", "net");
+        provider.spec.endpoint =
+            crate::resources::test_doubles::start_delayed_http_server(response, Duration::from_millis(25)).await;
+        provider.spec.metrics_config = Some(crate::crd::inference_provider::MetricsConfig {
+            timeout: "1s".to_owned(),
+            ..Default::default()
+        });
+        let client = crate::resources::test_doubles::mock_kube_client_with_providers(vec![provider.clone()]);
+        let ctx = OperatorCtx::new(client.clone(), None, SignalMode::Poll);
+        ctx.signal_fenced.store(true, std::sync::atomic::Ordering::Relaxed);
+        ctx.peer_identities.set(BTreeMap::from([(
+            "removed".to_owned(),
+            signals::PeerRecord {
+                labels: BTreeMap::new(),
+                pins: vec!["previous-pin".to_owned()],
+            },
+        )]));
+        assert!(
+            !ctx.peer_identities.refuses("removed"),
+            "the old peer is present before refresh"
+        );
+        refresh_signals(&ctx, &client, "net").await?;
+        assert!(
+            ctx.last_scrape_pass("net") >= Duration::from_millis(25),
+            "fencing publication cannot skip collection"
+        );
+        let verdict = provider_readiness(&ctx, &provider, Instant::now()).ok_or("readiness was not refreshed")?;
+        assert!(
+            ready_condition_patch(&provider, &verdict).is_some(),
+            "new readiness remains eligible for a Ready condition write"
+        );
+        assert!(
+            ctx.signals.current().is_empty(),
+            "the fenced process still cannot publish"
+        );
+        assert!(
+            ctx.peer_identities.refuses("removed"),
+            "fencing publication cannot freeze the peer inventory"
+        );
+        Ok(())
     }
 
     #[tokio::test]

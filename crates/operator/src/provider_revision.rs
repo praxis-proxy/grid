@@ -276,24 +276,22 @@ mod tests {
         let listed = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         release.notify_one();
-        let client = collection_client(provider()?, listed, release, 20);
+        let client = collection_client(provider()?, Arc::clone(&listed), Arc::clone(&release), 20);
         let ctx = OperatorCtx::new(
             client.clone(),
             Some(publisher().await?),
             crate::crd::grid_network::SignalMode::Poll,
         );
         refresh_signals(&ctx, &client, "net").await?;
+        tokio::time::timeout(Duration::from_secs(1), listed.notified()).await?;
         assert!(
             ctx.signals.current().is_empty(),
             "superseded epoch cannot publish its collected source"
         );
-        let stalled = Client::new(
-            tower::service_fn(|_: http::Request<kube::client::Body>| async {
-                std::future::pending::<Result<http::Response<kube::client::Body>, std::convert::Infallible>>().await
-            }),
-            "default",
-        );
-        tokio::time::timeout(Duration::from_secs(1), refresh_signals(&ctx, &stalled, "net")).await??;
+        let recovered = collection_client(provider()?, Arc::clone(&listed), Arc::clone(&release), 10);
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), refresh_signals(&ctx, &recovered, "net")).await??;
+        tokio::time::timeout(Duration::from_secs(1), listed.notified()).await?;
         assert!(
             ctx.signals.current().is_empty(),
             "lost authority is permanent for this process"

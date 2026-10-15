@@ -53,6 +53,10 @@ fresh pressure signals remain usable. A zero-sample revision invalidates
 learning. A newer complete batch starts fresh learning.
 
 Receivers order batches by publisher epoch and sequence to reject delayed data.
+Repeating a complete publication leaves its age and learning lifetime unchanged
+and is not counted as a parse drop. At admission, hubs and gateways reject epochs
+more than ten minutes ahead of their own wall clock, matching SWIM's lease bound,
+before retaining any publication fence.
 Relays preserve sample age and whole batches. Valid ordering metadata survives
 rejected payloads. Ordering depends on preserving the site's SWIM high-water-mark
 ConfigMap across restarts.

@@ -195,6 +195,7 @@ impl RouteSnapshot {
             return Readings::default();
         }
         Readings {
+            coherent: true,
             horizon: reading,
             recent,
             epoch: before.epoch,
@@ -243,23 +244,23 @@ impl RouteSnapshot {
         inputs: &mut Inputs<'_, S>,
         reset_pairs: &mut BTreeSet<SitePair>,
     ) -> Option<Measured> {
+        readings.coherent.then_some(())?;
         let key = (Arc::clone(&candidate.site), Arc::clone(&candidate.cluster));
         inputs.learned.retire_changed(&key, readings.epoch, reset_pairs);
         let epoch = readings.epoch?;
         let reading = &readings.horizon;
         let in_flight = reading.in_flight?;
-        let availability = inputs.availability;
         // The newest sample at or before now is the epoch a smoothing step belongs to.
         let sample_at = reading.sampled_at.map(|at| at.min(inputs.now_ms));
         let previous = inputs.learned.0.get(&key).copied();
-        let ceiling = ceiling(previous, reading, inputs.now_ms, inputs.window_ms, availability);
+        let ceiling = ceiling(previous, reading, inputs.now_ms, inputs.window_ms, inputs.availability);
         let by_count = (in_flight / ceiling.read_against).clamp(0.0, 1.0);
         let raw = nearest_limit(reading, by_count, ceiling.hard.is_some());
-        let rho = smoothed(previous, sample_at, raw, availability.smoothing);
+        let rho = smoothed(previous, sample_at, raw, inputs.availability.smoothing);
         let (congested, full_since) = congestion(previous, &readings.recent, ceiling.read_against, inputs);
         let reset = reset_pairs.contains(&key);
         let full = (!reset)
-            .then(|| full_for(candidate, full_since, inputs.now_ms, availability.full_after_ms))
+            .then(|| full_for(candidate, full_since, inputs.now_ms, inputs.availability.full_after_ms))
             .flatten();
         let age_ms = sample_at.map(|at| inputs.now_ms.saturating_sub(at));
         let limits = Limits::read(in_flight, &ceiling, by_count, full, age_ms);
@@ -600,6 +601,8 @@ impl SiteLearned {
 /// Both observation horizons from a consistent publication state.
 #[derive(Default)]
 struct Readings {
+    /// Both horizons were read without an intervening publication.
+    coherent: bool,
     /// Qualified learning history shared by both horizons.
     epoch: Option<u64>,
     /// Full measurement horizon.

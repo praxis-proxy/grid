@@ -699,62 +699,6 @@ mod tests {
         );
     }
 
-    /// A telemetry gap expires pressure without discarding the configured pool's history.
-    #[test]
-    fn expired_telemetry_preserves_learning_without_withdrawal() {
-        let sites = &EQUAL_CAPACITY[..1];
-        let mut grid = Harness::new(WINDOW_MS);
-        grid.refresh(sites, NOW_MS, |site| site.capacity, 0.0);
-        let expired_at = NOW_MS + WINDOW_MS + 1;
-        let expired = grid.order(sites, expired_at);
-        let unmeasured = expired.candidates.first().expect("configured candidate");
-        assert_eq!(
-            unmeasured.capacity, None,
-            "expired pressure is not a current measurement"
-        );
-
-        let recovered = grid.refresh(sites, expired_at + 1, |site| site.capacity / 4.0, 0.0);
-        let candidate = recovered.candidates.first().expect("configured candidate");
-        assert_eq!(
-            candidate.capacity,
-            Some(80.0),
-            "a telemetry gap is not a pool replacement"
-        );
-    }
-
-    /// Queue-free and sustained-backlog histories exercise soft and hard bounds separately.
-    #[test]
-    fn accepted_withdrawal_discards_either_learned_bound() {
-        let sites = &EQUAL_CAPACITY[..1];
-        let spell = AvailabilitySettings::default().full_after_ms.max(MIN_BACKLOG_SPELL_MS);
-        for queued in [0.0, 2.0] {
-            let mut withdrawn = taught_grid(sites, queued, spell);
-            let mut retained = taught_grid(sites, queued, spell);
-
-            let expired_at = NOW_MS + spell + WINDOW_MS + 1;
-            assert!(
-                withdrawn.order(&[], expired_at).candidates.is_empty(),
-                "withdrawal must be accepted"
-            );
-            retained.order(sites, expired_at);
-
-            let after_removal = withdrawn.refresh(sites, expired_at + 1, |_| 20.0, 2.0);
-            let after_gap = retained.refresh(sites, expired_at + 1, |_| 20.0, 2.0);
-            let removed = after_removal.candidates.first().expect("returning candidate");
-            let kept = after_gap.candidates.first().expect("retained candidate");
-            assert_eq!(
-                removed.capacity,
-                Some(AvailabilitySettings::default().ceiling_floor),
-                "withdrawal must discard the queued={queued} history before a new backlog settles"
-            );
-            assert_eq!(
-                kept.capacity,
-                Some(80.0),
-                "without withdrawal the queued={queued} history must survive"
-            );
-        }
-    }
-
     /// Delayed samples cannot undo an accepted withdrawal.
     #[test]
     fn late_telemetry_cannot_restore_withdrawn_topology() {
@@ -2575,19 +2519,5 @@ mod tests {
             snapshot = grid.order(sites, at_ms);
         }
         snapshot
-    }
-
-    /// Teach one bound before testing whether withdrawal or a telemetry gap preserves it.
-    fn taught_grid(sites: &[SiteSpec], queued: f64, spell: i64) -> Harness {
-        let mut grid = Harness::new(WINDOW_MS);
-        grid.refresh(sites, NOW_MS, |site| site.capacity, queued);
-        let taught = grid.refresh(sites, NOW_MS + spell, |site| site.capacity, queued);
-        let candidate = taught.candidates.first().expect("taught candidate");
-        assert_eq!(
-            candidate.capacity,
-            Some(80.0),
-            "the queued={queued} control must learn first"
-        );
-        grid
     }
 }

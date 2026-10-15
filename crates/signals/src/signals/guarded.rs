@@ -172,6 +172,7 @@ impl LoadStore {
             }
             let slot = match result {
                 Commit::Accepted => &mut tally.kept,
+                Commit::Duplicate => continue,
                 Commit::Capped => &mut tally.capped,
                 Commit::Rejected => &mut tally.unparsed,
             };
@@ -191,6 +192,9 @@ impl LoadStore {
                 entry.insert(Provider::default())
             },
         };
+        if provider.duplicate(&batch) {
+            return Commit::Duplicate;
+        }
         if !provider.accept(&batch, scrape, max_age_ms) {
             return Commit::Rejected;
         }
@@ -269,6 +273,8 @@ fn advance_orders(
 enum Commit {
     /// All rows were accepted.
     Accepted,
+    /// A complete batch matching retained publication metadata; neither stored nor dropped.
+    Duplicate,
     /// The bounded store refused a new provider.
     Capped,
     /// The batch failed validation or publication ordering.
@@ -299,6 +305,23 @@ impl Guard {
 }
 
 impl Provider {
+    /// Repeated polls of a complete publication cannot refresh its age or qualification.
+    fn duplicate(&self, batch: &Batch<'_>) -> bool {
+        batch
+            .revision
+            .as_ref()
+            .zip(self.guard.newest.as_ref())
+            .is_some_and(|(next, held)| {
+                next.order() == held.order()
+                    && next.uid == held.uid
+                    && next.generation == held.generation
+                    && next.batch_samples == held.batch_samples
+            })
+            && batch.refusal.is_none()
+            && !batch.invalid_identity
+            && batch.complete()
+    }
+
     /// Consume observed authority even when this publication has no usable data.
     fn reject(&mut self) {
         if let Some(fence) = &self.guard.fence {
@@ -436,9 +459,11 @@ struct Batch<'text> {
 
 impl<'text> Batch<'text> {
     /// Keep one metadata record and a bounded borrowed payload.
-    fn push(&mut self, observation: Observation<'text>, line: &str) {
+    fn push(&mut self, observation: Observation<'text>, line: &str, now: std::time::SystemTime) {
         if observation.metric == revision::METRIC {
-            let parsed = exposition::parse(line).and_then(|metric| revision::parse(&metric));
+            let parsed = exposition::parse(line)
+                .and_then(|metric| revision::parse(&metric))
+                .filter(|revision| revision::valid_epoch(revision.publisher_epoch, now));
             self.invalid_identity |= parsed.is_none() || self.revision.is_some();
             if self.invalid_identity {
                 self.refusal.get_or_insert(Dropped::Unparsed);
@@ -489,7 +514,7 @@ impl<'text> Staged<'text> {
     }
 
     /// Attribute a row and retain its metadata before checking timestamp age.
-    fn push(&mut self, line: &'text str, scrape: &ScrapeClock<'_>) -> Result<(), Dropped> {
+    fn push(&mut self, line: &'text str, scrape: &ScrapeClock<'_>, now: std::time::SystemTime) -> Result<(), Dropped> {
         let observation = attributed_row(line, scrape)?;
         let site = observation.site.as_deref().ok_or(Dropped::Unparsed)?;
         let key = LoadStore::key(site, &observation.cluster);
@@ -501,7 +526,7 @@ impl<'text> Staged<'text> {
             site: site.to_owned(),
             ..Batch::default()
         });
-        batch.push(observation, line);
+        batch.push(observation, line, now);
         if skewed {
             batch.refusal = Some(Dropped::Skewed);
             self.reject(Dropped::Skewed);
@@ -513,6 +538,7 @@ impl<'text> Staged<'text> {
 /// Attribute and bound every row before any payload can be mutated.
 fn stage<'text>(text: &'text str, scrape: &ScrapeClock<'_>) -> Staged<'text> {
     let mut staged = Staged::default();
+    let now = std::time::SystemTime::now();
     if text.len() > MAX_RESPONSE_BYTES {
         staged.invalid = true;
         staged.reject(Dropped::Capped);
@@ -527,7 +553,7 @@ fn stage<'text>(text: &'text str, scrape: &ScrapeClock<'_>) -> Staged<'text> {
         if line.trim().is_empty() || line.trim_start().starts_with('#') {
             continue;
         }
-        if let Err(cause) = staged.push(line, scrape) {
+        if let Err(cause) = staged.push(line, scrape, now) {
             staged.invalid = true;
             staged.reject(cause);
         }
@@ -705,6 +731,114 @@ mod tests {
             ingest(&store, &replay, 2_000);
             assert_eq!(state(&store, 2_000), first);
             assert_eq!(store.newest_at("b/m"), Some(1_000));
+        }
+    }
+
+    #[test]
+    fn equal_order_republication_is_neither_stored_nor_counted_as_a_drop() {
+        let store = store();
+        ingest(&store, &batch("u1", 1, 1, 1, 1_000), 1_000);
+        let first = state(&store, 1_000);
+        let restamped = batch("u1", 1, 1, 1, 2_000);
+        let tally = store.ingest_at(&restamped, 2_000, 2_000, "b");
+        assert_eq!(tally.kept, 0, "repeat polls do not insert observations");
+        assert!(
+            tally.dropped().iter().all(|(_, count)| *count == 0),
+            "healthy republishing is not a parse failure"
+        );
+        assert_eq!(
+            state(&store, 2_000),
+            first,
+            "repeat polls do not change the read serial"
+        );
+        assert_eq!(
+            store.newest_at("b/m"),
+            Some(1_000),
+            "relay restamping cannot refresh sample age"
+        );
+        assert_eq!(
+            state(&store, 31_001).epoch,
+            None,
+            "repeat polls cannot prolong qualification"
+        );
+    }
+
+    #[test]
+    fn equal_order_republication_cannot_restore_expired_learning() {
+        let store = store();
+        ingest(&store, &batch("u1", 1, 1, 1, 1_000), 1_000);
+        assert_eq!(
+            state(&store, 31_001).epoch,
+            None,
+            "qualification expires before republishing"
+        );
+        let restamped = batch("u1", 1, 1, 1, 32_000);
+        let tally = store.ingest_at(&restamped, 32_000, 32_000, "b");
+        assert_eq!(
+            tally.unparsed, 0,
+            "expiry does not turn a valid duplicate into malformed data"
+        );
+        assert_eq!(
+            state(&store, 32_000).epoch,
+            None,
+            "duplicates cannot restore expired learning"
+        );
+    }
+
+    #[test]
+    fn conflicting_or_incomplete_equal_order_batches_remain_rejected() {
+        let store = store();
+        ingest(&store, &batch("u1", 1, 1, 2, 1_000), 1_000);
+        for invalid in [
+            batch("u2", 1, 1, 2, 2_000),
+            batch("u1", 2, 1, 2, 2_000),
+            metadata("u1", 1, 1, 2, 0, 2_000),
+            metadata("u1", 1, 1, 2, 1, 2_000),
+            batch("u1", 1, 1, 1, 2_000),
+        ] {
+            assert!(
+                store.ingest_at(&invalid, 2_000, 2_000, "b").unparsed > 0,
+                "conflicting, partial and older publications are not duplicates"
+            );
+            assert_eq!(
+                store.newest_at("b/m"),
+                Some(1_000),
+                "rejection preserves the accepted observation"
+            );
+        }
+    }
+
+    #[test]
+    fn future_epochs_never_poison_site_or_provider_fences() {
+        let future = batch("u2", 1, u64::MAX, 1, 2_000);
+        for invalid in [
+            future.clone(),
+            metadata("u2", 1, u64::MAX, 1, 1, 2_000),
+            format!("{future}\nmalformed"),
+            future.replace(" 2000", " 99999999"),
+        ] {
+            let store = store();
+            ingest(&store, &batch("u1", 1, 1, 1, 1_000), 1_000);
+            store.ingest_at(&invalid, i64::MAX, i64::MAX, "b");
+            assert_eq!(
+                store
+                    .revision_orders
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get("b"),
+                Some(&(1, 1)),
+                "neither a forged Date nor a distant local timeline authorizes a future epoch"
+            );
+            ingest(&store, &batch("u1", 1, 1, 2, 3_000), 3_000);
+            assert!(
+                state(&store, 3_000).epoch.is_some(),
+                "legitimate publication recovers without restarting the receiver"
+            );
+            assert_eq!(
+                store.newest_at("b/m"),
+                Some(3_000),
+                "the valid sequence is not fenced out"
+            );
         }
     }
 

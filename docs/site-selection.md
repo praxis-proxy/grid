@@ -18,13 +18,13 @@ room, then queued sites with room, then sites not marked full. If none remain,
 all healthy sites are eligible. Entirely missing telemetry stays a fallback.
 Affinity narrows only within the selected tier.
 
-Within the queue-free tier with room, selection uses pressure when every
+Within either tier with room, selection uses pressure when every
 remaining site has fresh rho, even if capacity is unknown. With three or more
 sites, it draws two by capacity and takes the lower
 rho. With two, weights are capacity over 1 + rho, with each share bounded to
 10–90 percent. Unknown capacity receives the mean known capacity, or equal weights
 when all capacities are unknown. Missing rho uses capacity-weighted selection.
-Queue-only and overflow selection retain sites tied on the least queue depth.
+Queue-only and saturated selection retain sites tied on the least queue depth.
 Selection excludes unready sites. A site demoted by gateway health checks is a last
 resort if it remains admitted.
 

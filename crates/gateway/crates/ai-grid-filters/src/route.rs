@@ -991,7 +991,7 @@ impl<'snap> Sites<'snap> {
 ///
 /// Choose a pressure tier before affinity, keeping entirely missing telemetry as fallback.
 /// Spread observed room by pressure. Unknown capacity uses mean-known weights.
-/// Queue-only and overflow tiers retain least-queue routing.
+/// Queue-only and saturated tiers retain least-queue routing.
 #[expect(
     clippy::too_many_arguments,
     reason = "the request path passes its inputs directly rather than build a struct per request"
@@ -1017,8 +1017,8 @@ pub(crate) fn select_spread<'snap>(
             .iter()
             .filter(|(candidate, ..)| has_room(candidate) && candidate.backlog != Some(true)),
     );
-    let spread = room.len > 0;
-    let eligible = if spread { room } else { overflow(&healthy) };
+    let eligible = if room.len > 0 { room } else { overflow(&healthy) };
+    let spread = eligible.iter().all(|(candidate, ..)| has_room(candidate));
     let kept = narrowed(&eligible, narrow);
     let pressure_known = kept.iter().all(|(candidate, ..)| candidate.rho.is_some());
     let pool = if !spread || kept.iter().all(|(candidate, ..)| candidate.rho.is_none()) {
@@ -1937,6 +1937,23 @@ mod tests {
             Some("b"),
             "affinity cannot restore the KV-full pool"
         );
+    }
+
+    #[test]
+    fn queued_pools_with_room_spread_by_rho_despite_different_queues() {
+        let mut snapshot = loaded(&[
+            ("a", Some(7.0), Some(10.0)),
+            ("b", Some(3.0), Some(10.0)),
+            ("c", Some(10.0), Some(10.0)),
+        ]);
+        for candidate in &mut snapshot.candidates {
+            candidate.backlog = Some(true);
+        }
+        snapshot.scores = vec![2.0, 4.0, 1.0];
+        let taken = shares(&snapshot, 10_000, &KeepAll);
+        assert_eq!(taken.len(), 2, "saturated pool cannot win on its smaller queue");
+        assert!(taken["a"] > 0, "a non-minimal rho still receives a share");
+        assert!(taken["b"] > taken["a"], "lower rho wins more despite its larger queue");
     }
 
     #[test]

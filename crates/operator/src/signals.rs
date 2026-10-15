@@ -89,13 +89,15 @@ pub(crate) fn in_pool(o: &Observation, pool: Option<&str>) -> bool {
 /// valid ordering fences.
 #[must_use]
 pub fn parse(text: &str) -> Vec<Observation> {
+    let now = SystemTime::now();
     if text.lines().any(|line| {
         split_metric_name(line.trim()).is_some_and(|(name, _)| name == grid_signals::revision::METRIC)
             && grid_signals::exposition::parse(line)
                 .and_then(|metric| grid_signals::revision::parse(&metric))
+                .filter(|revision| grid_signals::revision::valid_epoch(revision.publisher_epoch, now))
                 .is_none()
     }) {
-        return revision_fences(text);
+        return revision_fences(text, now);
     }
     let observations: Vec<_> = parse_scrape(text)
         .into_iter()
@@ -105,7 +107,7 @@ pub fn parse(text: &str) -> Vec<Observation> {
 }
 
 /// Retain unique, strictly valid metadata as invalidations after a framing failure.
-fn revision_fences(text: &str) -> Vec<Observation> {
+fn revision_fences(text: &str, now: SystemTime) -> Vec<Observation> {
     let mut groups = BTreeMap::new();
     for line in text
         .lines()
@@ -120,6 +122,7 @@ fn revision_fences(text: &str) -> Vec<Observation> {
         );
         let fence = grid_signals::exposition::parse(line)
             .and_then(|metric| grid_signals::revision::parse(&metric))
+            .filter(|revision| grid_signals::revision::valid_epoch(revision.publisher_epoch, now))
             .map(|_| invalidation(&observation));
         groups.entry(key).and_modify(|entry| *entry = None).or_insert(fence);
     }
@@ -2630,6 +2633,31 @@ mod tests {
                 "an invalid batch must never be relayed: {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn future_publisher_epochs_are_never_relayed_as_payload_or_fences() {
+        assert_eq!(
+            grid_signals::revision::MAX_PUBLISHER_EPOCH_SKEW,
+            swim::identity::MAX_LEASE_SKEW,
+            "signals and SWIM enforce the same reservation bound"
+        );
+        let future = revision_text().replace("publisher_epoch=\"1\"", &format!("publisher_epoch=\"{}\"", u64::MAX));
+        for invalid in [
+            future.clone(),
+            future.replace("batch_samples=\"2\"", "batch_samples=\"3\""),
+            format!("{future}\nmalformed"),
+            future.replace(" 2 2000", " 2 99999999"),
+        ] {
+            for date in [None, Some(UNIX_EPOCH + Duration::from_secs(20_000_000_000))] {
+                let (rows, _) = reexpress_peer_ages(parse(&invalid), date, "east");
+                assert!(
+                    rows.is_empty(),
+                    "future epochs cannot survive as invalidations, even with a missing or forged Date"
+                );
+            }
+        }
+        assert_eq!(parse(&revision_text()).len(), 3, "ordinary revisions still relay");
     }
 
     #[test]
