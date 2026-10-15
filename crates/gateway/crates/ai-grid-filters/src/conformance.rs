@@ -1749,6 +1749,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fresh_kv_pressure_guides_selection_without_known_capacity() {
+        for count in [2, 3] {
+            let sites = &EQUAL_CAPACITY[..count];
+            let mut grid = Harness::new(WINDOW_MS);
+            for (site, kv) in sites.iter().zip([0.95, 0.2, 0.5]) {
+                publish_partial(&grid, site, NOW_MS, Some(0.0), None, Some(kv), Some(1.0));
+            }
+            let mut snapshot = grid.order(sites, NOW_MS);
+            let unknown_capacity = snapshot.candidates.iter().all(|candidate| candidate.capacity.is_none());
+            assert!(unknown_capacity, "KV-only observations must not invent capacity");
+            for _ in 0..2 {
+                let low = routed_to(&snapshot, sites[1].site);
+                if count == 2 {
+                    assert!(
+                        (59..=65).contains(&(low * 100 / DRAWS)),
+                        "the lower-pressure site should receive about 62 percent, got {low}/{DRAWS}"
+                    );
+                } else {
+                    let middle = routed_to(&snapshot, sites[2].site);
+                    assert!(low > middle && middle > 0, "two choices must favor lower pressure");
+                    assert_eq!(
+                        routed_to(&snapshot, sites[0].site),
+                        0,
+                        "two choices avoid the highest pressure"
+                    );
+                }
+                snapshot.candidates.reverse();
+                snapshot.scores.reverse();
+                snapshot.decisions.reverse();
+            }
+        }
+    }
+
     /// Neither a telemetry gap nor a fresh recovery is interpreted as a learned limit.
     #[test]
     #[expect(clippy::too_many_lines, reason = "one trace covers pressure, expiry, and recovery")]

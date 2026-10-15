@@ -47,17 +47,17 @@ pub(crate) fn qualify(
     epoch: u64,
     sequence: u64,
 ) {
+    let providers = providers
+        .iter()
+        .filter(|provider| provider.spec.grid_network_ref == network);
     let mut identities = BTreeMap::<&str, usize>::new();
-    for provider in providers {
+    for provider in providers.clone() {
         if let Some(identity) = routing_overlay::routing_identity(provider) {
             let count = identities.entry(identity).or_default();
             *count = count.saturating_add(1);
         }
     }
-    for provider in providers
-        .iter()
-        .filter(|provider| provider.spec.grid_network_ref == network)
-    {
+    for provider in providers {
         let Some(identity) = routing_overlay::routing_identity(provider) else {
             continue;
         };
@@ -181,6 +181,32 @@ mod tests {
             collected.get("model").is_some_and(Vec::is_empty),
             "clear old qualification on collision"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_network_alias_does_not_suppress_local_revision() -> Result<(), Box<dyn std::error::Error>> {
+        let local = provider()?;
+        let mut foreign = local.clone();
+        foreign.metadata.name = Some("foreign".to_owned());
+        foreign.metadata.uid = Some("foreign-uid".to_owned());
+        foreign.spec.grid_network_ref = "other".to_owned();
+        foreign.spec.routing_cluster_ref = Some("model".to_owned());
+        let mut providers = [local, foreign];
+        for _ in 0..2 {
+            let mut collected = HashMap::new();
+            qualify(&mut collected, &providers, "net", 1, 1);
+            let rows = collected.get("model").ok_or("missing local publication")?;
+            assert_eq!(rows.len(), 1, "only the local provider emits revision metadata");
+            assert_eq!(
+                rows.first()
+                    .and_then(|row| row.labels.get(revision::UID_LABEL))
+                    .map(String::as_str),
+                Some("u1"),
+                "an unrelated network alias must not suppress or replace the local revision"
+            );
+            providers.reverse();
+        }
         Ok(())
     }
 

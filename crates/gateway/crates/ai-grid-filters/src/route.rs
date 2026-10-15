@@ -990,7 +990,7 @@ impl<'snap> Sites<'snap> {
 /// Choose a site for `name` among the admitted, `routable` matches.
 ///
 /// Choose a pressure tier before affinity, keeping entirely missing telemetry as fallback.
-/// Spread measured room by load. Mixed known/unknown capacity uses mean-known weights.
+/// Spread observed room by pressure. Unknown capacity uses mean-known weights.
 /// Queue-only and overflow tiers retain least-queue routing.
 #[expect(
     clippy::too_many_arguments,
@@ -1020,16 +1020,14 @@ pub(crate) fn select_spread<'snap>(
     let spread = room.len > 0;
     let eligible = if spread { room } else { overflow(&healthy) };
     let kept = narrowed(&eligible, narrow);
-    let measured = kept
-        .iter()
-        .all(|(candidate, ..)| candidate.capacity.is_some() && candidate.rho.is_some());
-    let pool = if !spread || (!measured && kept.iter().all(|(candidate, ..)| candidate.rho.is_none())) {
+    let pressure_known = kept.iter().all(|(candidate, ..)| candidate.rho.is_some());
+    let pool = if !spread || kept.iter().all(|(candidate, ..)| candidate.rho.is_none()) {
         let best = kept.iter().map(|(.., score)| score).fold(f64::INFINITY, f64::min);
         Sites::gather(kept.iter().filter(|(.., score)| score.total_cmp(&best).is_eq()))
     } else {
         kept
     };
-    select(&pool, spread && measured, turn).map(|chosen| Pick::new(chosen, false))
+    select(&pool, spread && pressure_known, turn).map(|chosen| Pick::new(chosen, false))
 }
 
 /// Keep queued but unsaturated sites ahead of saturated sites, then retain the not-full fallback.
@@ -1077,7 +1075,7 @@ where
         })
 }
 
-/// Spread measured room by load. Otherwise draw by capacity, with mean weights for unknowns.
+/// Spread observed room by pressure. Otherwise draw by capacity, with mean weights for unknowns.
 fn select<'snap>(sites: &Sites<'snap>, spread: bool, turn: usize) -> Option<Site<'snap>> {
     // Registered once; counting an arm is one atomic add on the request path.
     static SELECTIONS: LazyLock<[metrics::Counter; 4]> = LazyLock::new(|| {
@@ -1088,11 +1086,14 @@ fn select<'snap>(sites: &Sites<'snap>, spread: bool, turn: usize) -> Option<Site
     if let Some(counter) = SELECTIONS.get(arm) {
         counter.increment(1);
     }
+    let unpublished = mean_capacity(sites);
     match arm {
-        0 => by_capacity(sites, turn),
+        0 => weighted(sites, unit(turn, SALTS.0), None, |candidate| {
+            candidate.capacity.unwrap_or(unpublished)
+        }),
         1 => sites.get(0),
-        2 => Some(between_two(sites.get(0)?, sites.get(1)?, turn)),
-        _ => two_choices(sites, turn),
+        2 => Some(between_two(sites.get(0)?, sites.get(1)?, turn, unpublished)),
+        _ => two_choices(sites, turn, unpublished),
     }
 }
 
@@ -1124,31 +1125,28 @@ fn narrowed<'snap>(room: &Sites<'snap>, narrow: &impl Narrow) -> Sites<'snap> {
     Sites::gather(room.iter().zip(keep).filter(|(_, kept)| *kept).map(|(site, _)| site))
 }
 
-/// A capacity-weighted pick over `sites`. Unpublished capacity weighs the mean of the published, or 1.
-fn by_capacity<'snap>(sites: &Sites<'snap>, turn: usize) -> Option<Site<'snap>> {
-    // The mean of what is published stands in for a site that publishes nothing, without a Vec.
+/// Weight for unknown capacity: the mean of known capacities, or one when all are unknown.
+fn mean_capacity(sites: &Sites<'_>) -> f64 {
     let (sum, count) = sites
         .iter()
         .filter_map(|(candidate, ..)| candidate.capacity)
         .fold((0.0_f64, 0.0_f64), |(sum, count), capacity| {
             (sum + capacity, count + 1.0)
         });
-    let unpublished = if count > 0.0 { sum / count } else { 1.0 };
-    weighted(sites, unit(turn, SALTS.0), None, |candidate| {
-        candidate.capacity.unwrap_or(unpublished)
-    })
+    if count > 0.0 { sum / count } else { 1.0 }
 }
 
 /// A pick between two sites by capacity over 1 + rho, each share clamped to 0.1..0.9.
-fn between_two<'snap>(first: Site<'snap>, second: Site<'snap>, turn: usize) -> Site<'snap> {
-    let rate = |candidate: &RouteCandidate| candidate.capacity.unwrap_or(1.0) / (1.0 + candidate.rho.unwrap_or(0.0));
+fn between_two<'snap>(first: Site<'snap>, second: Site<'snap>, turn: usize, unpublished: f64) -> Site<'snap> {
+    let rate =
+        |candidate: &RouteCandidate| candidate.capacity.unwrap_or(unpublished) / (1.0 + candidate.rho.unwrap_or(0.0));
     let share = (rate(first.0) / (rate(first.0) + rate(second.0))).clamp(TWO_SITE_SHARE.0, TWO_SITE_SHARE.1);
     if unit(turn, SALTS.0) < share { first } else { second }
 }
 
 /// Two distinct picks from `sites` by capacity, taking the lower rho; exact ties go to the first.
-fn two_choices<'snap>(sites: &Sites<'snap>, turn: usize) -> Option<Site<'snap>> {
-    let capacity = |candidate: &RouteCandidate| candidate.capacity.unwrap_or(1.0);
+fn two_choices<'snap>(sites: &Sites<'snap>, turn: usize, unpublished: f64) -> Option<Site<'snap>> {
+    let capacity = |candidate: &RouteCandidate| candidate.capacity.unwrap_or(unpublished);
     let first = weighted(sites, unit(turn, SALTS.0), None, capacity)?;
     let second = weighted(sites, unit(turn, SALTS.1), Some(first.0), capacity).unwrap_or(first);
     Some(if second.0.rho < first.0.rho { second } else { first })
@@ -2036,6 +2034,37 @@ mod tests {
             snapshot.candidates.rotate_left(1);
             snapshot.scores.rotate_left(1);
             snapshot.decisions.rotate_left(1);
+        }
+    }
+
+    #[test]
+    fn complete_pressure_uses_mean_capacity_for_unknown_sites() {
+        for count in [2, 3, MAX_SITES] {
+            let names: Vec<_> = (0..count).map(|index| format!("s{index}")).collect();
+            let specs: Vec<_> = names
+                .iter()
+                .enumerate()
+                .map(|(index, site)| {
+                    (
+                        site.as_str(),
+                        (index == 0).then_some(20.0),
+                        (index == 0).then_some(1_000_000.0),
+                    )
+                })
+                .collect();
+            let mut snapshot = loaded(&specs);
+            for candidate in &mut snapshot.candidates {
+                candidate.backlog = Some(false);
+                candidate.rho = Some(0.2);
+            }
+            let taken = shares(&snapshot, count * 1_000, &KeepAll);
+            assert_eq!(taken.len(), count, "every unknown-capacity site remains eligible");
+            for site in &names {
+                assert!(
+                    (750..=1_250).contains(&taken[site]),
+                    "equal pressure and mean-known capacity must give comparable shares: {taken:?}"
+                );
+            }
         }
     }
 

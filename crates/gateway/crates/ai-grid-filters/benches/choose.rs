@@ -37,6 +37,8 @@ enum Shape {
     Backlogged,
     /// Only the first site has measured capacity and saturation.
     Mixed,
+    /// Every site has fresh pressure but no known capacity.
+    PressureOnly,
 }
 
 /// `sites` candidates serving `llama` with the selected pressure pattern.
@@ -46,7 +48,8 @@ fn snapshot(sites: u32, shape: Shape) -> RouteSnapshot {
             let site: Arc<str> = Arc::from(format!("site-{index}"));
             RouteCandidate {
                 admission_state: AdmissionState::NewAndExisting,
-                capacity: (!matches!(shape, Shape::Mixed) || index == 1).then_some(8.0),
+                capacity: (!matches!(shape, Shape::PressureOnly) && (!matches!(shape, Shape::Mixed) || index == 1))
+                    .then_some(8.0),
                 rho: (!matches!(shape, Shape::Mixed) || index == 1)
                     .then_some(f64::from(index) / f64::from(sites.saturating_add(1))),
                 backlog: Some(matches!(shape, Shape::Backlogged)),
@@ -182,6 +185,12 @@ fn backlogged(bencher: Bencher<'_, '_>, sites: u32) {
 #[divan::bench(args = [2, 4, 16, 64])]
 fn mixed(bencher: Bencher<'_, '_>, sites: u32) {
     measure(bencher, sites, Shape::Mixed);
+}
+
+/// Fresh pressure guides the draw before any site has learned capacity.
+#[divan::bench(args = [2, 4, 16, 64])]
+fn pressure_only(bencher: Bencher<'_, '_>, sites: u32) {
+    measure(bencher, sites, Shape::PressureOnly);
 }
 
 /// Warm up the filter before measuring requests and allocator calls.
