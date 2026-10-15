@@ -496,6 +496,11 @@ spec:
                               Default: `/etc/praxis/tls`.
                             type: string
                         type: object
+                        x-kubernetes-validations:
+                          - message: set only `enabled` or `generate`, not both
+                            rule: '!(has(self.enabled) && has(self.generate))'
+                          - message: set only `credentialMountBase` or `credentialMountPath`, not both
+                            rule: '!(has(self.credentialMountBase) && has(self.credentialMountPath))'
                       localSiteName:
                         description: |-
                           Deprecated in favor of `siteName`; this legacy field will be removed in a future release. Local site name for the `intelligent_route` overlay generated for this gateway.
@@ -1320,6 +1325,11 @@ spec:
                               Default: `/etc/praxis/tls`.
                             type: string
                         type: object
+                        x-kubernetes-validations:
+                          - message: set only `enabled` or `generate`, not both
+                            rule: '!(has(self.enabled) && has(self.generate))'
+                          - message: set only `credentialMountBase` or `credentialMountPath`, not both
+                            rule: '!(has(self.credentialMountBase) && has(self.credentialMountPath))'
                       localSiteName:
                         description: |-
                           Deprecated in favor of `siteName`; this legacy field will be removed in a future release. Local site name for the `intelligent_route` overlay generated for this gateway.
@@ -1683,6 +1693,11 @@ spec:
                               Default: `/etc/praxis/tls`.
                             type: string
                         type: object
+                        x-kubernetes-validations:
+                          - message: set only `enabled` or `generate`, not both
+                            rule: '!(has(self.enabled) && has(self.generate))'
+                          - message: set only `credentialMountBase` or `credentialMountPath`, not both
+                            rule: '!(has(self.credentialMountBase) && has(self.credentialMountPath))'
                       providerHopEndpoints:
                         description: |-
                           Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
@@ -1767,6 +1782,11 @@ spec:
                       - name
                       - namespace
                     type: object
+                    x-kubernetes-validations:
+                      - message: set only `localSiteName` or `siteName`, not both
+                        rule: '!(has(self.localSiteName) && has(self.siteName))'
+                      - message: set only `consumerConfig` or `praxisConfig`, not both
+                        rule: '!(has(self.consumerConfig) && has(self.praxisConfig))'
                   type: array
                 gridId:
                   default: ""

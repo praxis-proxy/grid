@@ -1997,6 +1997,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_gateway_schemas_keep_nested_mutual_exclusion_rules() {
+        let crd = crd_json();
+        for (path, rule) in [
+            (
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/gatewayRefs/items/x-kubernetes-validations",
+                "!(has(self.localSiteName) && has(self.siteName))",
+            ),
+            (
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/gatewayRefs/items/properties/consumerConfig/x-kubernetes-validations",
+                "!(has(self.enabled) && has(self.generate))",
+            ),
+        ] {
+            let validations = crd
+                .pointer(path)
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| std::process::abort());
+            assert!(
+                validations
+                    .iter()
+                    .any(|validation| validation.get("rule").and_then(serde_json::Value::as_str) == Some(rule)),
+                "legacy schema must keep nested validation {rule:?}: {validations:?}"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // ConsumerConfig tests
     // -----------------------------------------------------------------------
