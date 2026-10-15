@@ -178,10 +178,11 @@ above with a persistent backend.
 
 ## Direction
 
-The flow above ships, driven by chart values and a Job that mints invites.
-In Kubernetes, the enrollment service reconciles SiteInvite objects into
-token Secrets and revokes unused tokens when an admin deletes an invite.
-Standalone enrollment keeps its existing flow. The service enforces an optional
-key binding, but jurisdiction assignment and the approval gate remain pending.
-Redemption still issues immediately. See
-[SiteInvite usage](crds.md#siteinvite).
+In Kubernetes, the enrollment service reconciles SiteInvite objects into token
+Secrets and revokes unused tokens when an invite is deleted. This is the GitOps
+path. The chart's values-based invite Job remains for existing ACM delivery
+workflows. The standalone Helm chart accepts database connection and CA
+references as values. The per-site Grid operator consumes the invite.
+Standalone enrollment does not start the controller. The service enforces
+optional key binding, but jurisdiction assignment and the approval gate remain
+pending. See [SiteInvite usage](crds.md#siteinvite).

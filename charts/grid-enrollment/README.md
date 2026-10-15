@@ -1,8 +1,8 @@
 # Grid Enrollment Helm Chart
 
-Helm chart for the grid enrollment service: the enrollment authority for a grid,
-its self-provisioned Grid CA, and a Postgres store. A zero-config install stands
-up a site ready to enroll.
+Standalone Helm chart for the grid enrollment service, its Grid CA, and a
+Postgres store. Configure an external database with chart values. The service
+reconciles SiteInvite objects.
 
 ## Prerequisites
 
@@ -27,8 +27,8 @@ grid-admin token. The hook creates each Secret once and never rotates it, so
 
 `host` names the enrollment endpoint sites connect to. It joins the serving cert names,
 is the default `route.host`, and makes the enrollment Service a LoadBalancer when no
-Route renders. `invites` takes sites keyed by name, for example
-`--set invites.east2.network=grid`.
+Route renders. For GitOps-managed invites, create SiteInvite resources. The
+chart's `invites` values remain for existing ACM workflows below.
 
 ## Route
 
@@ -91,7 +91,7 @@ Each override takes a Secret reference, so no key material is inlined in values.
 |-------|---------|----------|
 | `ca.provided.keySecretRef` | generate | pre-created CA Secret (tls.crt, tls.key) |
 | `serving.existingSecretRef` | issued from the CA | pre-created serving Secret |
-| `db.type` | `builtin` Postgres | `external` + `db.external.connectionUrlSecretRef` |
+| `db.type` | `builtin` Postgres | `external`, a Secret containing `DB_CONNECTION_URL`, and a ConfigMap with the PostgreSQL CA; see [external PostgreSQL setup](../../docs/installation/enrollment.md#1-install-a-standalone-enrollment-service-on-the-hub) |
 | `db.builtin.pvcAnnotations` | none | annotations on the builtin DB PVC, which holds every site record; under Argo CD set `argocd.argoproj.io/sync-options: Prune=false,Delete=false` |
 | `enrollment.authz` | `kube` (SAR, needs the sar-feature image) | `local` (standalone grid-admin token table) |
 | `enrollment.csrRecord.enabled` | `true` under `authz=kube`: each enrollment is recorded as a `CertificateSigningRequest`, approved and completed by the service, off the request path. The API server deletes an issued request about an hour after approval; the API server's audit log keeps the history when its policy covers these writes at `Request` level or above with a persistent backend. The service's own enrollment record is separate and always kept | `false` keeps no Kubernetes record; also the setting for Kubernetes 1.26 to 1.29, which lack the policy API |
@@ -107,7 +107,20 @@ Under `enrollment.authz=local` the Secret's `tokens` key holds one `name:token` 
 
 ## Site invites
 
-Each `invites` entry (`siteName`, `gridNetworkRef`, optional `expiresInSecs` up to 604800, optional `allowDeletedName` to invite a site whose enrollment was deleted) has a post-install and post-upgrade Job mint a one-time site token into Secret `grid-invite-<siteName>` (key `token`). The Job skips sites whose Secret already exists, so an upgrade mints only for new sites. It also skips, without failing, a site that is enrolled, one whose live token it cannot store because its Secret was deleted (rerun after that token expires), and one whose enrollment was deleted. An entry with `allowDeletedName` also needs the invite ServiceAccount bound to the enrollment-admin Role. Invites need `enrollment.authz=kube`. Before Helm 3.19, a failed invite run leaves its hook RBAC in place until the next run. [Site Enrollment](../../docs/installation/enrollment.md#invite-a-site-on-the-hub) covers delivery and revocation.
+For GitOps-managed invites, install the Grid operator chart and this chart,
+then sync SiteInvite resources after both are ready. The enrollment controller
+creates and revokes each token Secret. A secret-delivery controller must copy
+the token and Grid CA bundle to the joining site's operator namespace and remove
+the delivered token when the invite is pruned. Keep credentials out of Git. See
+[Site Enrollment](../../docs/installation/enrollment.md#2-invite-a-site-with-gitops)
+for the manifest and delivery flow.
+
+### Existing ACM delivery workflow
+
+The chart's `invites` values remain for existing ACM installations. A Helm hook
+creates each token Secret, and the optional ACM Policy delivers it with the CA
+bundle and SWIM key. Removing an entry does not revoke its token. This workflow
+requires `enrollment.authz=kube`. Use SiteInvite for new GitOps-managed invites.
 
 ## Hub site identity
 

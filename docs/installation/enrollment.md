@@ -15,25 +15,51 @@ seeds](../architecture/crds.md#crd-driven-swim-seeds) describes.
 - An enrollment image with the default `sar` and `bootstrap` features (not a
   `--no-default-features` build)
 
-## 1. Install the enrollment service on the hub
+## 1. Install a standalone enrollment service on the hub
 
-1. Install the chart:
+Provision a dedicated database and role for enrollment. The service applies its
+schema at startup, so the role must own the database or have equivalent schema
+privileges. Create the Secret and CA ConfigMap in the release namespace from
+files supplied by your secret manager:
 
-   ```bash
-   helm install grid-enrollment ./charts/grid-enrollment \
-     --namespace grid-enrollment --create-namespace \
-     --set route.host=enrollment.apps.example.com \
-     --set db.type=external \
-     --set db.external.connectionUrlSecretRef=grid-enrollment-db
-   ```
+```bash
+kubectl create namespace grid-enrollment
+kubectl create secret generic grid-enrollment-db -n grid-enrollment \
+  --from-file=DB_CONNECTION_URL=/secure/path/db-connection-url
+kubectl create configmap maas-postgres-ca -n grid-enrollment \
+  --from-file=ca.crt=/secure/path/postgres-ca.crt
+```
 
-2. On OpenShift, the chart renders a passthrough Route for `route.host`.
-   Elsewhere, omit `route.host` and front the Service with your own ingress.
-3. For GitOps renders with `helm template` on OpenShift, pass `--api-versions
-   route.openshift.io/v1`. Without it, `route.enabled=auto` renders no Route.
+`db-connection-url` must contain the full URL, for example:
 
-A pre-install Job creates the grid CA and the serving certificates for
-enrollment and its database. On upgrade it keeps the CA.
+```text
+postgres://<user>:<password>@<host>:5432/<database>?sslmode=verify-full&sslrootcert=/etc/grid-db-ca/ca.crt
+```
+
+Keep the URL in a secret manager, not Helm values or Git. The URL must use
+`sslmode=verify-full` and the mounted CA path. This CA is separate from the Grid
+CA. The chart does not create or manage the external database.
+
+Install the chart with the minimum external-Postgres settings. On OpenShift,
+include `route.host`; elsewhere omit it and front the Service with your own
+ingress:
+
+```bash
+helm install grid-enrollment ./charts/grid-enrollment \
+  --namespace grid-enrollment \
+  --set db.type=external \
+  --set db.external.connectionUrlSecretRef=grid-enrollment-db \
+  --set db.external.caConfigMapName=maas-postgres-ca \
+  --set route.host=enrollment.apps.example.com
+```
+
+For GitOps renders with `helm template` on OpenShift, pass
+`--api-versions route.openshift.io/v1`. Without it, `route.enabled=auto` renders
+no Route.
+
+A pre-install Job creates the grid CA and enrollment serving certificate. With
+builtin PostgreSQL, it also creates the database serving certificate. With an
+external database, provide its CA as above. On upgrade the Job keeps the grid CA.
 
 | Value | Decide |
 | --- | --- |
@@ -52,38 +78,53 @@ If a `reencrypt` or publicly trusted Route must front enrollment, set
 `enrollment.rotation.enabled=false`, pin that Route's CA in the site's
 `enrollment.caBundle`, and set `enrollment.gridCaBundle` to the grid CA.
 
-## 2. Invite a site
+## 2. Invite a site with GitOps
 
-1. Add the site to the chart's `invites` value, keyed by site name, and upgrade.
-   Invites need `enrollment.authz=kube`.
+Install the Grid operator chart to register the SiteInvite CRD, then install the
+enrollment chart and wait for the service to become ready. Apply invites from a
+GitOps app that syncs after both charts:
 
-   ```bash
-   helm upgrade --install grid-enrollment ./charts/grid-enrollment --namespace grid-enrollment \
-     --set invites.east2.network=my-grid --set invites.east2.expiresInSecs=86400
-   ```
+```yaml
+apiVersion: grid.praxis.fast/v1alpha1
+kind: SiteInvite
+metadata:
+  name: east2
+spec:
+  siteName: east2
+  jurisdictions: [eu-west]
+  lifetime: 24h
+```
 
-   `network` defaults to `grid`. `expiresInSecs` allows at most 604800 (seven
-   days).
+For a CLI test, save this as `siteinvite-east2.yaml`, then apply and check it:
 
-2. A Job mints a token for each new entry into Secret `grid-invite-<siteName>`
-   (key `token`) in the release namespace. Existing Secrets are skipped.
-3. Copy `grid-invite-<siteName>` and the grid CA bundle (`ca.crt` from Secret
-   `grid-ca-bundle`) to the site's operator namespace, by hand or with a policy
-   engine such as ACM.
+```bash
+kubectl apply -f siteinvite-east2.yaml
+kubectl wait --for=condition=Ready siteinvite/east2 --timeout=2m
+kubectl get siteinvite east2 -o jsonpath='{.status.secretRef.namespace}/{.status.secretRef.name}{"\n"}'
+```
 
-If the service starts slowly, pass `--timeout 10m`. The Job retries for about
-four minutes per run, then fails naming every site it did not invite. A serving
-certificate you bring must chain to the `ca.bundleSecretName` bundle and carry
-`<fullname>.<namespace>.svc`.
+For GitOps, commit the same manifest and sync its application after the CRD and
+enrollment service are ready.
 
-Treat invite Secrets as credentials:
+The controller creates Secret `grid-invite-east2` with key `token` and reports
+the reference in `.status.secretRef`. The token never appears in Git or status.
+Use a secret-delivery controller to copy that Secret and `grid-ca-bundle` to the
+site's operator namespace. Configure that controller to remove the delivered
+token when the invite is pruned. By default, the source Secret is in the
+enrollment release namespace; set `enrollment.inviteSecrets.namespace` to use a
+dedicated namespace. Restrict read access to this namespace to the enrollment
+service and the delivery controller.
 
-- Anyone who can get Secrets in the release namespace can read them.
-- Removing an entry or deleting its Secret does not revoke the token. Revoke it
-  with `DELETE /v1alpha1/enrollmenttokens/<id>`, using the id in the Secret's
-  `grid.praxis.fast/token-id` annotation. The
-  `<release>-grid-enrollment-grid-admin` Role grants that.
-- `helm uninstall` leaves invite Secrets behind. Delete them by hand.
+The required jurisdiction labels are recorded but not enforced yet.
+
+The spec is immutable. Deleting the resource revokes an unused token and its
+source Secret. GitOps pruning is an intentional revocation. To change an invite,
+delete it and recreate it. Set `allowDeletedName: true` when inviting a site
+name whose prior enrollment was deleted.
+
+Existing ACM installations can continue using the chart's `invites` values and
+delivery policy. That hook-based flow remains documented in the chart README.
+Use SiteInvite resources for new GitOps-managed invitations.
 
 ## 3. Enroll the site
 
@@ -152,16 +193,26 @@ signer name, or RBAC escalation prevention refuses the record roles.
 
 ## 4. Recover a failed enrollment
 
-- **Expired or revoked token** (`site token rejected`): delete
-  `grid-invite-<siteName>` on the hub, run `helm upgrade` with the site still in
-  `invites`, and copy the new token to the site.
+- **Expired or revoked token** (`site token rejected`): remove the `SiteInvite`
+  from Git and sync, then add it back to mint a new token and deliver its Secret
+  again. For the existing chart-hook flow, follow the recovery steps in the
+  chart README.
 - **Site name held** (`site name already enrolled`): a redeemed token holds its
   name. An enrollment admin runs `DELETE /v1alpha1/enrollments/<siteName>`, then
-  you invite the site again with `invites.<siteName>.allowDeletedName=true`, and
-  the site enrolls with a new key. That needs `delete` on `enrollments` in group
-  `grid.praxis.fast`, which the `enrollment-admin` Role grants to
-  `enrollment.enrollmentAdmins.subjects` and to no one by default. Without that
-  access, enroll under a new site name.
+  a new `SiteInvite` with `allowDeletedName: true` can admit the site with a new
+  key. That needs `delete` on `enrollments` in group `grid.praxis.fast`, which
+  the `enrollment-admin` Role grants to `enrollment.enrollmentAdmins.subjects`
+  and to no one by default. Without that access, enroll under a new site name.
+
+## Availability
+
+The chart defaults to one replica. `enrollment.replicaCount` starts the API and
+SiteInvite controller in every pod. Postgres serializes concurrent token writes,
+and invite Secrets checkpoint reconciliation, but there is no leader election or
+multi-replica qualification. For HA, use shared HA Postgres and the same CA key
+Secret for every replica. Qualify concurrent reconciliation before scaling
+beyond one. The target shape is active-active API pods with a single controller,
+using leader election or a separate deployment.
 
 ## 5. Rotation
 
@@ -285,8 +336,8 @@ Operator metrics: `grid_site_identity_expiry_timestamp_seconds` and
 
 | Symptom | Check | Fix |
 | --- | --- | --- |
-| `site token rejected (...)` | The token expired or was revoked. | Delete `grid-invite-<siteName>` on the hub, run `helm upgrade` with the site still in `invites`, and copy the new token. |
-| `site name already enrolled (...)` | An earlier attempt spent a token for this name. | An admin with `enrollment-admin` runs `DELETE /v1alpha1/enrollments/<siteName>`, then an admin with both `grid-admin` and `enrollment-admin` invites the site again with `allowDeletedName`. Without that access, enroll under a new site name. |
+| `site token rejected (...)` | The token expired or was revoked. | Delete and recreate the `SiteInvite`, then deliver its new token Secret. For the ACM chart-hook flow, follow the chart README. |
+| `site name already enrolled (...)` | An earlier attempt spent a token for this name. | An admin with `enrollment-admin` runs `DELETE /v1alpha1/enrollments/<siteName>`, then recreate the `SiteInvite` with `allowDeletedName: true`. Without that access, enroll under a new site name. |
 | `reaching the enrollment service failed after 10 attempts` | `enrollment.url` from the site. | Make it reachable. |
 | `TLS to the enrollment service failed, check GRID_ENROLL_CA_FILE` | The CA that issued the enrollment serving certificate. | Set `enrollment.caBundle` to it. |
 | `returned CA is not the pinned grid CA` | The attempt spent the token. | Set `enrollment.gridCaBundle` to the grid CA and enroll under a new site name. |
