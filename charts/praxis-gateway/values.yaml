@@ -45,7 +45,7 @@ mountReconciliation:
   # Keep false during the preparation rollout.
   releaseHelmMounts: false
   # -- Credential Secret names whose mounts Grid now owns. Other entries in
-  # credentials remain Helm-managed and are rendered as before. These mounts
+  # providerCredentials remain Helm-managed and are rendered as before. These mounts
   # are omitted only when releaseHelmMounts is true.
   managedCredentialNames: []
   # -- Create a Role and RoleBinding in the release namespace that let the AGN
