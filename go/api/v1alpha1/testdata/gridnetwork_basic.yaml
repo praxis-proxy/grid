@@ -1,0 +1,25 @@
+apiVersion: grid.praxis.fast/v1alpha1
+kind: GridNetwork
+metadata:
+  name: production
+spec:
+  seeds:
+    - site-a.example.com:7946
+    - site-b.example.com:7946
+  selectionPolicy:
+    mode: roundRobin
+  scoringPolicy:
+    strategy: queueDepth
+  peerTrust:
+    mode: pin
+  swim:
+    gossipNodes: 5
+    probeInterval: "5s"
+    suspicionTimeout: "10s"
+  tls:
+    caSecretRef:
+      name: grid-ca
+      namespace: grid-system
+    siteSecretRef:
+      name: grid-site-cert
+      namespace: grid-system

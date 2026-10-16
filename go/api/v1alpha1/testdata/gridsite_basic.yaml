@@ -1,0 +1,10 @@
+apiVersion: grid.praxis.fast/v1alpha1
+kind: GridSite
+metadata:
+  name: site-a
+spec:
+  gridNetworkRef: production
+  region: us-east-1
+  zone: us-east-1a
+  egress:
+    address: site-a.example.com:443
