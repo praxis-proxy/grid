@@ -90,7 +90,7 @@ not run concurrent Forge qualifications that share the same state or resource
 names.
 
 The triggered GitHub qualification uses the published
-`ghcr.io/praxis-proxy/ai:0.6.0` image, pinned by its OCI index digest in the
+`ghcr.io/praxis-proxy/ai:0.7.0` image, pinned by its OCI index digest in the
 workflow. The local source-validation instructions below deliberately build a
 Praxis AI image from the companion checkout and pass it as an explicit image
 override.
@@ -112,7 +112,7 @@ docker build -f crates/overlay-sync/Containerfile -t "grid-overlay-sync:${IMAGE_
 docker build -f Containerfile -t "praxis-ai:${IMAGE_TAG}" .
 ```
 
-The standard `ghcr.io/praxis-proxy/ai:0.4.0` image is incompatible with Grid's
+The standard `ghcr.io/praxis-proxy/ai:0.7.0` image is compatible with Grid's
 authoritative empty versioned no-route snapshots. Use AI 0.6.0 or a Praxis build
 that supports them; the qualification must remain failed while the configured
 image lacks that support.

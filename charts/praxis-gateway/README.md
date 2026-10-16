@@ -167,13 +167,13 @@ listener where the CNI enforces NetworkPolicy.
 ## Image
 
 The default image is the official Praxis AI release, `ghcr.io/praxis-proxy/ai`
-at the chart's `appVersion` (0.4.0). Praxis AI is a Praxis build with the AI
-filters included, and it runs any Praxis configuration. Praxis AI 0.4.0 is
-built on Praxis 0.7.0; these are separate release versions.
+at the chart's `appVersion` (0.7.0). Praxis AI is a Praxis build with the AI
+filters included, and it runs any Praxis configuration. The 0.7.0 image is
+expected to be built on Praxis 0.7.4; these are separate release versions.
 
 `image.digest` defaults to empty so an `image.tag` override stays effective.
-For immutable deployments, set `image.digest` explicitly to
-`sha256:0f619d4a0b533093f94a76921cfbba0ecdec51557dffee1615a29721ee1fc878`.
+For immutable deployments, set `image.digest` to the digest published for the
+0.7.0 image.
 
 Other Praxis builds work as long as they accept `--config <path>`, which the
 chart passes through `args`. The core Praxis image's entrypoint already names
@@ -197,7 +197,7 @@ Praxis AI image; these values may advance independently.
 |-----|------|---------|-------------|
 | `replicaCount` | int | `1` | Gateway replicas. |
 | `image.repository` | string | `ghcr.io/praxis-proxy/ai` | Image repository. |
-| `image.tag` | string | `0.4.0` | Image tag (ignored when `image.digest` is set). |
+| `image.tag` | string | `0.7.0` | Image tag (ignored when `image.digest` is set). |
 | `image.digest` | string | `""` | Immutable digest (sha256:...). When set, tag is ignored. |
 | `image.flavor` | string | `ai` | `ai` or `grid-gateway`, the grid build that `gatewayConfig.role: provider`, `gridServing`, and telemetry need. A repository ending in `/grid-gateway` sets it. |
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy. |
@@ -239,7 +239,7 @@ Praxis AI image; these values may advance independently.
 | `gatewayConfig.peerTrust.allowAnyGridSite` | bool | `false` | SPIFFE mode with no IDs: accept any enrolled site. It names no site, so the chain gets no peer check, and it is refused beside `spiffeIds`. |
 | `gatewayConfig.provider.allowedPaths` | list | chat, completions, models, embeddings | Exact paths a provider forwards, GET and POST only. Other paths get a 404, other methods a 405. |
 | `gatewayConfig.localSite` | string | **required** when rendered | This gateway's site name. A consumer scores locality with it, and a provider returns it in `X-Grid-Provider-Site`. |
-| `gatewayConfig.auth.mode` | string | **required** when rendered | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); the render refuses it on the default `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
+| `gatewayConfig.auth.mode` | string | **required** when rendered | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later). `none` renders no policy filter, for use only behind an authenticating front. |
 | `gatewayConfig.auth.allowUnauthenticatedExposure` | bool | `false` | With `none`, allow a LoadBalancer or NodePort Service. Without it the render fails. The guard sees only this chart's Service, not `oc expose`, another Service selecting the pod labels, an HTTPRoute, or a hand-made Service with `service.enabled=false`. Use `networkPolicy` for those. |
 | `gatewayConfig.auth.stripAuthorization` | bool | `true` | Remove the caller's `Authorization` before routing, in either mode. Forwarded grid hops authenticate by mTLS identity. `false` forwards the caller's key or bearer to every backend and cross-site peer, so use it only when the backend validates that same credential. |
 | `gatewayConfig.auth.validateUrl` | string | **required** for `api-key` | https validate endpoint. |
