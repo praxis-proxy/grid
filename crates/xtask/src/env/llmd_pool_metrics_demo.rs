@@ -142,7 +142,7 @@ static RUN_CLUSTER_PREFIX: OnceLock<String> = OnceLock::new();
 /// combined-site demo. Both require the `peer_identity_trust`,
 /// `provider_route`, `credential_inject`, and `intelligent_route` filters
 /// which are built into the published Grid AI rollup.
-const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.6.0";
+const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.7.0";
 
 /// Default local Grid Gateway image used by the full cross-site signal proof.
 const DEFAULT_GRID_GATEWAY_IMAGE: &str = "grid-gateway:llmd-pool-metrics-demo";

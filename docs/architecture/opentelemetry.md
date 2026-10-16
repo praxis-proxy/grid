@@ -95,7 +95,7 @@ The `grid-gateway` binary built by `deploy/gateway/Containerfile` enables the
 Praxis `otel` feature and the Praxis AI v0.4.1 `opentelemetry` feature. The
 tracked gateway lockfile currently resolves Praxis 0.7.3. Use an image built
 from this Grid target, published as `ghcr.io/praxis-proxy/grid-gateway`, for
-this configuration. The chart's default `ghcr.io/praxis-proxy/ai:0.4.0` image
+this configuration. The chart's default `ghcr.io/praxis-proxy/ai:0.7.0` image
 does not include the Grid build features.
 
 With the AI feature enabled, these short semantic spans are supported when the

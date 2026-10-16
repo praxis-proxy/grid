@@ -170,7 +170,7 @@ token-rate-limit-filter
 ```
 
 > **Published-image limitation:** The standard
-> `ghcr.io/praxis-proxy/ai:0.4.0` image includes Basic Auth but does not contain
+> `ghcr.io/praxis-proxy/ai:0.7.0` image includes Basic Auth but does not contain
 > the optional `token-rate-limit-filter`, so it cannot run this qualification.
 > The standard image depends on Praxis core 0.7.0; that is distinct from the
 > Praxis AI image version 0.4.0. AGN publishes no alternate AI rollup.

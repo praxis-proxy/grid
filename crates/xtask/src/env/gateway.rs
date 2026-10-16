@@ -386,7 +386,7 @@ fn provider_gateway_config() -> String {
          \x20       status_on_required_failure: 503\n\
          \x20       strip_header: true\n\
          admin:\n\
-         \x20 address: \"127.0.0.1:9901\"\n\
+         \x20 metrics_address: \"127.0.0.1:9901\"\n\
          shutdown_timeout_secs: 5\n"
     )
 }

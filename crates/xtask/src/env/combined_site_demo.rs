@@ -39,7 +39,7 @@ use super::{
 const CERTS_DIR: &str = "tests/env/certs";
 
 /// Default published Praxis AI gateway image used by this qualification.
-const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.6.0";
+const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.7.0";
 
 /// Ordered cluster names in the combined-site scenario environment.
 const CLUSTERS: &[&str] = &["west", "central", "east"];
@@ -7730,7 +7730,7 @@ mod tests {
     #[test]
     fn default_gateway_image_is_the_published_qualification_image() {
         assert_eq!(
-            DEFAULT_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.6.0",
+            DEFAULT_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.7.0",
             "combined-site qualification must use the published gateway release"
         );
     }
@@ -8546,7 +8546,7 @@ filter_chains:
             tls:
               sni: west.grid.internal
 admin:
-  address: 127.0.0.1:9901
+  metrics_address: 127.0.0.1:9901
 "#;
         let rendered = append_secondary_consumer_config(config).unwrap();
         let value: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();

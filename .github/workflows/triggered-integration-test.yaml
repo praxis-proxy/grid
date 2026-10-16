@@ -60,8 +60,8 @@ env:
   # To obtain the digest for a new tag:
   #   docker pull ghcr.io/praxis-proxy/ai:<tag>
   #   docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/praxis-proxy/ai:<tag>
-  GATEWAY_IMAGE_REF: ghcr.io/praxis-proxy/ai:0.6.0
-  GATEWAY_IMAGE_DIGEST: sha256:45e7f510ad40ffc41b7dadfa0feabd0d201ce43e75f8bd1ebee6c2f020f7f3e3
+  GATEWAY_IMAGE_REF: ghcr.io/praxis-proxy/ai:0.7.0
+  GATEWAY_IMAGE_DIGEST: sha256:550661eea7e392a9f4415b836e0b2393299f26856bc02cbbc8d3301d49b759f3
   # Forge topologies run with imagePullPolicy=Never, so pull immutable simulator
   # references and materialize the expected local tags before loading Kind.
   SIM_IMAGE_REF: ghcr.io/neuralmagic/vllm-vcr@sha256:cf98f91f12210893f63b3afd3b1ea5bd3c35640379ce2bbf702a4cefddf9e5a4

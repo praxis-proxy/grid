@@ -54,7 +54,7 @@ tests:
       config:
         inline: |
           admin:
-            address: "127.0.0.1:9911"
+            metrics_address: "127.0.0.1:9911"
           listeners:
             - name: default
               address: "0.0.0.0:8080"
@@ -62,6 +62,20 @@ tests:
       - equal:
           path: spec.template.spec.containers[?(@.name == "praxis")].readinessProbe.exec.command[4]
           value: http://127.0.0.1:9911/ready
+
+  - it: follows the legacy admin address for older Praxis images
+    set:
+      config:
+        inline: |
+          admin:
+            address: "127.0.0.1:9912"
+          listeners:
+            - name: default
+              address: "0.0.0.0:8080"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[?(@.name == "praxis")].readinessProbe.exec.command[4]
+          value: http://127.0.0.1:9912/ready
 
   - it: keeps the TCP probe on the listener when config.inline has no admin listener
     set:
@@ -84,7 +98,7 @@ tests:
       config:
         inline: |
           admin:
-            address: "10.0.0.5:9901"
+            metrics_address: "10.0.0.5:9901"
           listeners:
             - name: default
               address: "0.0.0.0:8080"
@@ -194,7 +208,7 @@ tests:
       config:
         inline: |
           admin:
-            address: "127.0.0.1:9901"
+            metrics_address: "127.0.0.1:9901"
           listeners:
             - name: default
               address: "0.0.0.0:8080"
@@ -234,7 +248,7 @@ tests:
       config:
         inline: |
           admin:
-            address: "127.0.0.1:9901"
+            metrics_address: "127.0.0.1:9901"
           listeners:
             - name: default
               address: "0.0.0.0:8080"

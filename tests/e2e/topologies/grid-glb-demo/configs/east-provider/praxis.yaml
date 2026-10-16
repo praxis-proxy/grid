@@ -79,5 +79,5 @@ filter_chains:
               - "vcr-inference-secondary.grid-system.svc.cluster.local:8000"
 
 admin:
-  address: "127.0.0.1:9901"
+  metrics_address: "127.0.0.1:9901"
 shutdown_timeout_secs: 5

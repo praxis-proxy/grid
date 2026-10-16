@@ -25,7 +25,7 @@ mod tests {
         let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("generated-consumer-config.yaml");
         let yaml = format!(
             r#"admin:
-  address: "127.0.0.1:0"
+  metrics_address: "127.0.0.1:0"
 listeners:
   - name: public
     address: "127.0.0.1:{port}"

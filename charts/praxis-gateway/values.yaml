@@ -6,7 +6,7 @@ image:
   # -- Image repository.
   repository: ghcr.io/praxis-proxy/ai
   # -- Image tag. Used when digest is empty.
-  tag: "0.4.0"
+  tag: "0.7.0"
   # -- Immutable image digest (sha256:<64 hex>). When set, tag is ignored.
   digest: ""
   # -- Image pull policy.
@@ -131,7 +131,7 @@ config:
   # --set-file config.inline=praxis.yaml.
   inline: |
     admin:
-      address: "127.0.0.1:9901"
+      metrics_address: "127.0.0.1:9901"
     listeners:
       - name: default
         address: "0.0.0.0:8080"
@@ -222,7 +222,7 @@ gatewayConfig:
     # -- Caller authentication, required when render is true. api-key validates the
     # caller's key against validateUrl and needs an image whose policy engine registers
     # identity/api-key (praxis-policy 0.4 or later); the render refuses it on the default
-    # ai:0.4.0 image. none
+    # ai:0.7.0 image. none
     # renders no policy filter and belongs only behind an authenticating front.
     # TODO: default to api-key once the default image carries praxis-policy 0.4.
     mode: ""
