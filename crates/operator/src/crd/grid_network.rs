@@ -1083,7 +1083,7 @@ impl Default for ConsumerConfig {
 pub struct DeriveTopology {
     /// Routing identities whose declarations this gateway derives from.
     ///
-    /// Each entry is a provider's `routingClusterRef`, or its `metadata.name`
+    /// Each entry is a provider's `clusterName`, or its `metadata.name`
     /// when that is unset. At most 64 entries, each named once.
     #[schemars(
         length(max = 64),

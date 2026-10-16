@@ -325,7 +325,7 @@ pub fn credential_failure_reason_for_auth(auth: Option<&AuthConfig>) -> Credenti
         return CredentialFailureReason::CredentialSecretRefInvalid;
     };
     if auth.credentials_managed_externally {
-        // credential_plan_from_auth(manual=true) always returns Ok(Manual).
+        // credential_plan_from_auth(credentialsManagedExternally=true) always returns Ok(Manual).
         return CredentialFailureReason::CredentialSecretRefInvalid;
     }
     match auth.strategy {
@@ -477,7 +477,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn manual_when_manual_flag_is_true() {
+    fn externally_managed_credentials_suppress_injection() {
         let auth = AuthConfig {
             credentials_managed_externally: true,
             strategy: AuthStrategy::BearerToken,
@@ -487,7 +487,7 @@ mod tests {
         assert_eq!(
             plan,
             CredentialPlan::Manual,
-            "manual=true must suppress injection regardless of strategy"
+            "credentialsManagedExternally=true must suppress injection regardless of strategy"
         );
     }
 

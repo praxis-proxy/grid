@@ -174,7 +174,7 @@ mod tests {
         let mut second = first.clone();
         second.metadata.name = Some("other".to_owned());
         second.metadata.uid = Some("u2".to_owned());
-        second.spec.routing_cluster_ref = Some("model".to_owned());
+        second.spec.cluster_name = Some("model".to_owned());
         let mut collected = HashMap::new();
         qualify(&mut collected, &[first, second], "net", 1, 1);
         assert!(
@@ -191,7 +191,7 @@ mod tests {
         foreign.metadata.name = Some("foreign".to_owned());
         foreign.metadata.uid = Some("foreign-uid".to_owned());
         foreign.spec.grid_network_ref = "other".to_owned();
-        foreign.spec.routing_cluster_ref = Some("model".to_owned());
+        foreign.spec.cluster_name = Some("model".to_owned());
         let mut providers = [local, foreign];
         for _ in 0..2 {
             let mut collected = HashMap::new();

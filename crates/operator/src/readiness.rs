@@ -1344,7 +1344,7 @@ mod tests {
     #[test]
     fn a_scrape_label_is_forgotten_under_the_name_it_was_recorded_under() {
         // The defect this pins: scrapes were counted under the routing identity and
-        // forgotten under the provider name, so a provider declaring routingClusterRef
+        // forgotten under the provider name, so a provider declaring clusterName
         // leaked its series and could collide with another provider's.
         for (network, provider) in [("net", "qwen3-east"), ("net", "qwen3-west")] {
             let key = key(network, provider);

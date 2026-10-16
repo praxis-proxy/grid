@@ -350,7 +350,7 @@ pub(crate) fn remote_crdt_provider_to_candidates(provider: &crdt::ProviderState)
 /// - `auth.strategy` is [`AuthStrategy::BearerToken`]
 /// - `auth.secretRef` is present with non-blank `name`, `namespace`, and `key`
 ///
-/// Returns `None` for absent auth, `manual = true`, unsupported strategies, or
+/// Returns `None` for absent auth, `auth.credentialsManagedExternally = true`, unsupported strategies, or
 /// an incomplete `secretRef`.  Incomplete refs are silently ignored here because
 /// [`crate::resources::credentials::credential_plan_from_auth`] drives the
 /// `Unavailable` phase for validation failures; this function only emits a
@@ -918,7 +918,7 @@ pub struct RoutingCandidate {
     /// The xtask harness resolves the token from the Secret at config-generation
     /// time.  Praxis will eventually consume this reference natively.
     ///
-    /// `None` for providers with `manual`, absent, or unsupported-strategy auth.
+    /// `None` for providers with `auth.credentialsManagedExternally = true`, absent, or unsupported-strategy auth.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential: Option<ProjectedCredential>,
 

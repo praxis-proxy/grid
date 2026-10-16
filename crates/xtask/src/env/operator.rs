@@ -8923,13 +8923,13 @@ mod tests {
     }
 
     #[test]
-    fn credential_plan_manual_when_manual_is_true() {
+    fn credential_plan_externally_managed_when_flag_is_true() {
         let auth = serde_json::json!({ "credentialsManagedExternally": true, "strategy": "bearer_token" });
         let plan = parse_api_credential_plan(&auth).unwrap();
         assert_eq!(
             plan,
             ApiCredentialPlan::Manual,
-            "manual=true must suppress injection regardless of strategy"
+            "credentialsManagedExternally=true must suppress injection regardless of strategy"
         );
     }
 
