@@ -1524,6 +1524,36 @@ mod tests {
         assert_eq!(tuning.generation(), 1, "a refused block sets nothing");
     }
 
+    /// Invalid cache limits are rejected atomically without changing previously applied plugin tuning.
+    #[test]
+    fn cache_settings_are_validated_before_plugin_tuning_changes() {
+        let tuning = Tuning::default();
+        let build = |yaml: &str| build_tuned_filter(yaml, &tuning);
+        let _filter = build("prefix_affinity: {capacity: 2048, ttl_secs: 120}").expect("valid cache settings build");
+        let applied = tuning.affinity();
+        assert_eq!(applied.capacity.get(), 2048, "plugin capacity adopted");
+        assert_eq!(applied.ttl_secs.get(), 120, "plugin ttl_secs adopted");
+        for field in ["capacity", "ttl_secs"] {
+            for value in ["0", "-1", "1.5", "null", "18446744073709551616"] {
+                assert!(
+                    build(&format!("prefix_affinity: {{{field}: {value}}}")).is_err(),
+                    "{field}={value}"
+                );
+                assert_eq!(tuning.generation(), 1, "invalid settings cannot change the live tuning");
+            }
+        }
+        let error = build("prefix_affinity: {ttl_secs: 18446744073709551615}")
+            .err()
+            .expect("unrepresentable lifetime");
+        assert!(error.to_string().contains("ttl_secs"), "{error}");
+        assert_eq!(tuning.generation(), 1, "invalid ttl_secs keeps tuning");
+        assert_eq!(
+            *tuning.affinity(),
+            *applied,
+            "rejections preserve every previously applied setting"
+        );
+    }
+
     #[test]
     fn a_declared_cluster_is_a_name_or_a_name_with_its_transport() {
         let cfg: GridSiteRouteConfig = serde_yaml::from_str(
@@ -2269,5 +2299,20 @@ mod tests {
         assert!(set_route_attribution_headers(&mut headers, "pool-a", "provider\n-a").is_err());
         assert!(!headers.contains_key(ROUTE_SITE_HEADER));
         assert!(!headers.contains_key(ROUTE_BACKEND_HEADER));
+    }
+
+    /// Build a plugin against the supplied tuning to exercise configuration rejection and adoption.
+    fn build_tuned_filter(yaml: &str, tuning: &Tuning) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let config = serde_yaml::from_str(yaml).map_err(|error| error.to_string())?;
+        GridSiteRouteFilter::from_config(
+            &config,
+            Arc::new(ArcSwap::from_pointee(RouteSnapshot::from_static(
+                Vec::new(),
+                Arc::from("hub"),
+            ))),
+            Arc::default(),
+            Arc::default(),
+            tuning,
+        )
     }
 }

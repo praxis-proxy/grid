@@ -963,6 +963,12 @@ else
   fail "gridServing: unexpected render: $(grep -E 'route|GRID_SERVING|grid-serving|Error' <<<"$SERV_RENDER" | head -3 | tr '\n' ' ')"
 fi
 try_reject_msg "$GW_DIR" "gridServing without network or configMap (gw)" "gridServing.network" "${SERVING[@]}" --set gridServing.configMap=""
+for setting in capacity ttl_secs; do
+  for value in 0 -1 1.5; do
+    try_reject_msg "$GW_DIR" "prefixAffinity $setting=$value (gw)" "$setting" \
+      "${SERVING[@]}" --set "gridServing.siteRoute.prefixAffinity.$setting=$value"
+  done
+done
 if helm template v-serv "$GW_DIR" "${SERVING[@]}" --set gridServing.configMap="" --set gridServing.network=grid \
   --set fullnameOverride=gw 2>&1 | matches 'name: "grid-serving-grid-gw"'; then
   pass "gridServing: derives the operator's ConfigMap name from network and gatewayRef"

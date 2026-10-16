@@ -50,6 +50,16 @@ tests:
           path: data["praxis.yaml"]
           pattern: 'prefix_affinity:'
 
+  - it: passes cache limits into the grid_site_route plugin
+    template: templates/gateway-config.yaml
+    set:
+      gridServing.siteRoute.prefixAffinity.capacity: 2048
+      gridServing.siteRoute.prefixAffinity.ttl_secs: 120
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'prefix_affinity:\n\s+capacity: 2048\n\s+ttl_secs: 120'
+
   - it: syncs after the grid CRs under Argo CD, since the operator writes the serving ConfigMap from them
     template: templates/deployment.yaml
     asserts:

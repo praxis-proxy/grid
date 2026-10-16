@@ -469,7 +469,8 @@ gridServing:
   siteRoute:
     # -- Site availability. Every field defaults; `shedding` is the one switch.
     availability: {}
-    # -- Prefix affinity.
+    # -- Prefix affinity. Cache limits: capacity (16384 entries per backend cluster),
+    # ttl_secs (600 seconds); positive integers.
     prefixAffinity: {}
 
 # -- Optional TLS Secret mounted at tls.mountPath: the grid site identity, or a client
