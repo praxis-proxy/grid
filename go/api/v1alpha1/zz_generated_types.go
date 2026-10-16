@@ -127,10 +127,10 @@ const (
 	AuthStrategyAPIKey         AuthStrategy = "api_key"
 	AuthStrategyBearerToken    AuthStrategy = "bearer_token"
 	AuthStrategyCustom         AuthStrategy = "custom"
-	AuthStrategyMtlsOnly       AuthStrategy = "mtls_only"
-	AuthStrategyOauth2         AuthStrategy = "oauth2"
+	AuthStrategyMTLSOnly       AuthStrategy = "mtls_only"
+	AuthStrategyOAuth2         AuthStrategy = "oauth2"
 	AuthStrategyServiceAccount AuthStrategy = "service_account"
-	AuthStrategySigv4          AuthStrategy = "sigv4"
+	AuthStrategySigV4          AuthStrategy = "sigv4"
 )
 
 // ProviderPhase is a string enumeration.
@@ -197,7 +197,7 @@ type ScoringStrategy string
 const (
 	ScoringStrategyNoMetrics       ScoringStrategy = "noMetrics"
 	ScoringStrategyQueueDepth      ScoringStrategy = "queueDepth"
-	ScoringStrategyKvCachePressure ScoringStrategy = "kvCachePressure"
+	ScoringStrategyKVCachePressure ScoringStrategy = "kvCachePressure"
 )
 
 // SelectionMode is a string enumeration.
@@ -421,7 +421,7 @@ type GridNetworkAdmissionPolicy struct {
 // GridNetworkBudgetPolicyTenantsItem Per-tenant budget cap declaration.
 type GridNetworkBudgetPolicyTenantsItem struct {
 	// Maximum cumulative spend in USD before this tenant is considered over budget.
-	CapUsd float64 `json:"capUsd"`
+	CapUSD float64 `json:"capUsd"`
 	// Tenant identifier.
 	TenantID string `json:"tenantId"`
 }
@@ -623,7 +623,7 @@ type GridNetworkSpec struct {
 	// Grid-wide signal transport.
 	SignalTransport *GridNetworkSignalTransport `json:"signalTransport,omitempty"`
 	// Maximum age in seconds before a stale (fresh=false) remote routing candidate is removed from the overlay.
-	StaleCandidateTtlSeconds *int64 `json:"staleCandidateTtlSeconds,omitempty"`
+	StaleCandidateTTLSeconds *int64 `json:"staleCandidateTtlSeconds,omitempty"`
 	// SWIM protocol configuration.
 	SWIM *GridNetworkSWIM `json:"swim,omitempty"`
 	// TLS secret references for grid certificate management.
@@ -635,11 +635,11 @@ type GridNetworkSpec struct {
 // GridNetworkBudgetItem Per-tenant budget status derived from policy + merged CRDT spend state.
 type GridNetworkBudgetItem struct {
 	// Budget cap for this tenant, in USD, copied from spec.budgetPolicy.
-	CapUsd float64 `json:"capUsd"`
+	CapUSD float64 `json:"capUsd"`
 	// spend_usd / cap_usd, clamped to 0.0..=1.0. See [spend_ratio].
 	SpendRatio float64 `json:"spendRatio"`
 	// Cumulative spend observed for this tenant, in USD.
-	SpendUsd float64 `json:"spendUsd"`
+	SpendUSD float64 `json:"spendUsd"`
 	// Tenant identifier, matching spec.budgetPolicy.tenants[].tenantId.
 	TenantID string `json:"tenantId"`
 }
@@ -847,7 +847,7 @@ type GridSiteStatus struct {
 	// Current lifecycle phase.
 	Phase GridSitePhase `json:"phase,omitempty"`
 	// Remote site's public certificate PEM (received via SWIM state broadcast from the remote operator).
-	PublicCertPem *string `json:"publicCertPem,omitempty"`
+	PublicCertPEM *string `json:"publicCertPem,omitempty"`
 	// Machine-readable reason for the current phase.
 	Reason string `json:"reason,omitempty"`
 }
@@ -889,7 +889,7 @@ type MetricSignalNames struct {
 	// Metric name for a health gauge (any positive value = healthy).
 	Healthy *string `json:"healthy,omitempty"`
 	// Metric name for KV-cache utilisation (0.0 to 1.0).
-	KvCacheUtilization *string `json:"kvCacheUtilization,omitempty"`
+	KVCacheUtilization *string `json:"kvCacheUtilization,omitempty"`
 	// Metric name for P99 request latency in milliseconds (pre-computed gauge).
 	LatencyP99Ms *string `json:"latencyP99Ms,omitempty"`
 	// Metric name for prefix-cache hit ratio (0.0 to 1.0).

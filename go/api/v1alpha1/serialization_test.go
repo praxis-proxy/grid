@@ -335,7 +335,7 @@ func TestInferenceProviderFullRoundTrip(t *testing.T) {
 	if ip.Spec.ProviderKind != "self_hosted" {
 		t.Errorf("ProviderKind = %q", ip.Spec.ProviderKind)
 	}
-	if ip.Spec.Auth == nil || ip.Spec.Auth.Strategy != v1alpha1.AuthStrategyMtlsOnly {
+	if ip.Spec.Auth == nil || ip.Spec.Auth.Strategy != v1alpha1.AuthStrategyMTLSOnly {
 		t.Errorf("Auth.Strategy not mtls_only")
 	}
 	if ip.Spec.TLS == nil || ip.Spec.TLS.CASecretRef == nil || ip.Spec.TLS.CASecretRef.Name != "grid-ca" {
@@ -534,8 +534,11 @@ func TestAgentToolProviderRoundTrip(t *testing.T) {
 	if atp.Spec.Protocol != "mcp" {
 		t.Errorf("Protocol = %q, want mcp", atp.Spec.Protocol)
 	}
-	if len(atp.Spec.Tools) != 2 || atp.Spec.Tools[0].Name != "web_search" {
-		t.Errorf("Tools not preserved: %v", atp.Spec.Tools)
+	if len(atp.Spec.Tools) != 2 {
+		t.Fatalf("Tools len = %d, want 2", len(atp.Spec.Tools))
+	}
+	if atp.Spec.Tools[0].Name != "web_search" {
+		t.Errorf("Tools[0].Name = %q, want web_search", atp.Spec.Tools[0].Name)
 	}
 	if atp.Spec.Tools[0].Description == nil || *atp.Spec.Tools[0].Description != "Search the web for current information" {
 		t.Errorf("Tools[0].Description not preserved")
@@ -624,9 +627,8 @@ func TestDeepCopyIsolation(t *testing.T) {
 	if cp.Spec.Models[0].Name != modelName {
 		t.Error("Models[0].Name: copy sees mutation in original")
 	}
-	newSig := "mutated"
-	ip.Spec.MetricsConfig.SignalNames.QueueDepth = &newSig
-	if *cp.Spec.MetricsConfig.SignalNames.QueueDepth != sig {
+	*ip.Spec.MetricsConfig.SignalNames.QueueDepth = "mutated"
+	if *cp.Spec.MetricsConfig.SignalNames.QueueDepth == "mutated" {
 		t.Error("MetricsConfig.SignalNames.QueueDepth: copy sees mutation in original")
 	}
 }

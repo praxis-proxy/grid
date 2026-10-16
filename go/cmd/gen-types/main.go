@@ -369,17 +369,24 @@ func sortedKeys(m map[string]schemaNode) []string {
 
 // acronyms maps lowercase word segments to their canonical Go form.
 var acronyms = map[string]string{
-	"ai":   "AI",
-	"api":  "API",
-	"ca":   "CA",
-	"crdt": "CRDT",
-	"id":   "ID",
-	"mcp":  "MCP",
-	"otlp": "OTLP",
-	"sni":  "SNI",
-	"swim": "SWIM",
-	"tls":  "TLS",
-	"url":  "URL",
+	"ai":     "AI",
+	"api":    "API",
+	"ca":     "CA",
+	"crdt":   "CRDT",
+	"id":     "ID",
+	"kv":     "KV",
+	"mcp":    "MCP",
+	"mtls":   "MTLS",
+	"oauth2": "OAuth2",
+	"otlp":   "OTLP",
+	"pem":    "PEM",
+	"sigv4":  "SigV4",
+	"sni":    "SNI",
+	"swim":   "SWIM",
+	"tls":    "TLS",
+	"ttl":    "TTL",
+	"url":    "URL",
+	"usd":    "USD",
 }
 
 // splitCamelCaseWords breaks a camelCase identifier into component words.
@@ -848,13 +855,15 @@ func enumConstSuffix(v string) string {
 		if len(p) == 0 {
 			continue
 		}
-		if upper, ok := acronyms[strings.ToLower(p)]; ok {
-			sb.WriteString(upper)
-			continue
+		for _, w := range splitCamelCaseWords(p) {
+			if upper, ok := acronyms[strings.ToLower(w)]; ok {
+				sb.WriteString(upper)
+			} else {
+				r := []rune(w)
+				r[0] = unicode.ToUpper(r[0])
+				sb.WriteString(string(r))
+			}
 		}
-		r := []rune(p)
-		r[0] = unicode.ToUpper(r[0])
-		sb.WriteString(string(r))
 	}
 	return sb.String()
 }

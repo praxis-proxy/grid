@@ -169,7 +169,7 @@ make build          # build the root workspace
 make fmt            # format root and Gateway workspaces
 make lint           # Clippy, formatting, dependencies, Gateway no-ring check
 make test           # run root workspace tests
-make all            # build, format, lint, docs, tests, audit
+make all            # build, format, lint, docs, tests, audit, Go types check
 ```
 
 Install the pinned upstream Forge with `./scripts/forge.sh install` before

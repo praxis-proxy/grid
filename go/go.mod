@@ -1,6 +1,6 @@
 module github.com/praxis-proxy/grid/go
 
-go 1.23.0
+go 1.24.0
 
 require (
 	k8s.io/apimachinery v0.32.1

@@ -293,7 +293,7 @@ help:
 	@echo "  PROJECT_IMAGE      container image tag"
 	@echo ""
 	@echo "Top-level:"
-	@echo "  all              build + fmt + lint + doc + test + audit"
+	@echo "  all              build + fmt + lint + doc + test + audit + go-types-check (requires Go)"
 	@echo ""
 	@echo "Build:"
 	@echo "  build            cargo build --workspace"

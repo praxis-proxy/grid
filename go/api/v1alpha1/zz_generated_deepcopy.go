@@ -892,9 +892,9 @@ func (in *GridNetworkSpec) DeepCopyInto(out *GridNetworkSpec) {
 		out.SignalTransport = new(GridNetworkSignalTransport)
 		in.SignalTransport.DeepCopyInto(out.SignalTransport)
 	}
-	if in.StaleCandidateTtlSeconds != nil {
-		x := *in.StaleCandidateTtlSeconds
-		out.StaleCandidateTtlSeconds = &x
+	if in.StaleCandidateTTLSeconds != nil {
+		x := *in.StaleCandidateTTLSeconds
+		out.StaleCandidateTTLSeconds = &x
 	}
 	if in.SWIM != nil {
 		out.SWIM = new(GridNetworkSWIM)
@@ -1173,9 +1173,9 @@ func (in *GridSiteStatus) DeepCopyInto(out *GridSiteStatus) {
 		x := *in.LastTransitionTime
 		out.LastTransitionTime = &x
 	}
-	if in.PublicCertPem != nil {
-		x := *in.PublicCertPem
-		out.PublicCertPem = &x
+	if in.PublicCertPEM != nil {
+		x := *in.PublicCertPEM
+		out.PublicCertPEM = &x
 	}
 }
 
@@ -1257,9 +1257,9 @@ func (in *MetricSignalNames) DeepCopyInto(out *MetricSignalNames) {
 		x := *in.Healthy
 		out.Healthy = &x
 	}
-	if in.KvCacheUtilization != nil {
-		x := *in.KvCacheUtilization
-		out.KvCacheUtilization = &x
+	if in.KVCacheUtilization != nil {
+		x := *in.KVCacheUtilization
+		out.KVCacheUtilization = &x
 	}
 	if in.LatencyP99Ms != nil {
 		x := *in.LatencyP99Ms

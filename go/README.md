@@ -103,13 +103,7 @@ Tags follow the submodule convention: `go/v0.x.y` (not `v0.x.y`), so
 go get github.com/praxis-proxy/grid/go@v0.1.0
 ```
 
-Each `go/v0.x.y` tag is cut at the same commit as Grid operator release
-`v0.x.y`. The Go types in that tag are generated from the CRD schemas
-shipped in that operator release. To find which module version is
-compatible with a given operator version, match the version numbers:
-
-| Operator release | Go module tag |
-|------------------|---------------|
-| `v0.x.y`         | `go/v0.x.y`   |
-
-See `make release-go-types` for the tagging workflow.
+Tags follow the `go/vX.Y.Z` convention required by Go's module proxy for
+subdirectory modules. Tags are intended to align with operator releases
+so the Go types match the CRD schemas shipped in that release. See
+`make release-go-types` for the tagging workflow.
