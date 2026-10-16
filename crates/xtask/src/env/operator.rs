@@ -9193,7 +9193,7 @@ mod tests {
              \x20           endpoints:\n\
              \x20             - \"mock-api-provider.default.svc:8080\"\n\
              admin:\n\
-             \x20 address: \"127.0.0.1:9901\"\n\
+             \x20 metrics_address: \"127.0.0.1:9901\"\n\
              shutdown_timeout_secs: 5\n"
         )
     }

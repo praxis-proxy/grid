@@ -3507,7 +3507,7 @@ fn apply_embedded_gateway_config(
                 { "filter": "load_balancer", "clusters": clusters }
             ]
         }],
-        "admin": { "address": "127.0.0.1:9901" },
+        "admin": { "metrics_address": "127.0.0.1:9901" },
         "shutdown_timeout_secs": 5
     });
     let config_yaml = serde_yaml::to_string(&config)?;

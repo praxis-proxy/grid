@@ -8546,7 +8546,7 @@ filter_chains:
             tls:
               sni: west.grid.internal
 admin:
-  address: 127.0.0.1:9901
+  metrics_address: 127.0.0.1:9901
 "#;
         let rendered = append_secondary_consumer_config(config).unwrap();
         let value: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();

@@ -673,7 +673,7 @@ if echo "$SECURE_RENDER" | matches 'insecure_options'; then
 else
   pass "secure config: no insecure_options"
 fi
-if echo "$SECURE_RENDER" | matches 'address: "127.0.0.1:9901"'; then
+if echo "$SECURE_RENDER" | matches 'metrics_address: "127.0.0.1:9901"'; then
   pass "secure config: admin bound to 127.0.0.1"
 else
   fail "secure config: admin not bound to 127.0.0.1"
@@ -1392,7 +1392,7 @@ CR_EOF
   fi
 
   kubectl --context "$KCTX" -n grid-system create configmap test-gateway-config \
-    --from-literal=praxis.yaml='admin: {address: "0.0.0.0:9901"}' 2>/dev/null || true
+    --from-literal=praxis.yaml='admin: {metrics_address: "0.0.0.0:9901"}' 2>/dev/null || true
 
   GW_IMAGE="${GRID_GATEWAY_CI_IMAGE:-registry.k8s.io/pause}"
   GW_TAG="${GRID_GATEWAY_CI_TAG:-3.9}"

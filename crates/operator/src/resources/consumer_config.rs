@@ -407,7 +407,7 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
     }
 
     // Admin interface and graceful shutdown use standard constants for consumer gateways.
-    config.push_str("\nadmin:\n  address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n");
+    config.push_str("\nadmin:\n  metrics_address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n");
 
     Ok(config)
 }
@@ -580,7 +580,7 @@ fn generate_consumer_praxis_config_for_gateway_with_telemetry(
     if let Some(telemetry) = telemetry {
         config.push_str(&render_telemetry(telemetry)?);
     }
-    config.push_str("\nadmin:\n  address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n");
+    config.push_str("\nadmin:\n  metrics_address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n");
     Ok(config)
 }
 

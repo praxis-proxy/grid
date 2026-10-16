@@ -28,6 +28,25 @@ tests:
           path: data["praxis.yaml"]
           pattern: '"server": "praxis"'
 
+  - it: binds Praxis 0.7.4 health endpoints to metrics_address
+    template: templates/gateway-config.yaml
+    set:
+      gatewayConfig.render: true
+      gatewayConfig.localSite: hub
+      gatewayConfig.model: model
+      gatewayConfig.auth.mode: none
+      gatewayConfig.backends:
+        - cluster: local
+          endpoints: ["10.0.0.1:8000"]
+          transport: { mode: plaintext }
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'admin:\s+metrics_address: "127\.0\.0\.1:9901"'
+      - notMatchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'admin:\s+address:'
+
   - it: leaves mount delegation disabled by default
     template: templates/deployment.yaml
     asserts:

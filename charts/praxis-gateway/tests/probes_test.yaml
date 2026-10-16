@@ -54,7 +54,7 @@ tests:
       config:
         inline: |
           admin:
-            address: "127.0.0.1:9911"
+            metrics_address: "127.0.0.1:9911"
           listeners:
             - name: default
               address: "0.0.0.0:8080"
@@ -84,7 +84,7 @@ tests:
       config:
         inline: |
           admin:
-            address: "10.0.0.5:9901"
+            metrics_address: "10.0.0.5:9901"
           listeners:
             - name: default
               address: "0.0.0.0:8080"
@@ -194,7 +194,7 @@ tests:
       config:
         inline: |
           admin:
-            address: "127.0.0.1:9901"
+            metrics_address: "127.0.0.1:9901"
           listeners:
             - name: default
               address: "0.0.0.0:8080"
@@ -234,7 +234,7 @@ tests:
       config:
         inline: |
           admin:
-            address: "127.0.0.1:9901"
+            metrics_address: "127.0.0.1:9901"
           listeners:
             - name: default
               address: "0.0.0.0:8080"

@@ -445,7 +445,7 @@ complete, runnable Praxis config containing:
     cluster must have a matching `clusterEndpoints[]` entry with endpoint address
     and explicit `transport` configuration.  `transport.mode` is the security
     switch, not `sni` presence.  Missing transport fails closed
-- `admin:` with an admin listener at `127.0.0.1:9901`
+- `admin:` with a health and metrics listener at `127.0.0.1:9901` under `metrics_address`
 - `shutdown_timeout_secs: 5`
 
 The generated credential-injection config is for credentials intentionally

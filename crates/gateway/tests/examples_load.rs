@@ -17,7 +17,7 @@ mod tests {
             .map(|line| format!("      {line}\n"))
             .collect();
         let yaml = format!(
-            "admin:\n  address: \"127.0.0.1:9901\"\nlisteners:\n  - name: default\n    address: \"0.0.0.0:8080\"\n    \
+            "admin:\n  metrics_address: \"127.0.0.1:9901\"\nlisteners:\n  - name: default\n    address: \"0.0.0.0:8080\"\n    \
              filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n{filters}"
         );
         let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("example-{}.yaml", std::process::id()));

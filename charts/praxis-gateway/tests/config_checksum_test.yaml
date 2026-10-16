@@ -27,7 +27,7 @@ tests:
       # Pinned so the changed-endpoint test below compares against a real hash.
       - equal:
           path: spec.template.metadata.annotations["checksum/config"]
-          value: 0a7543d2d56503b318ce2fda109d1bd1875cab9267d9ae77406d68eac7d528e2
+          value: 26a66c5db40d88dc67b7fa2e6aa73ff0cf2138a982f6458dd44b816edfeaaf4e
 
   - it: hashes the config when render turns on by itself
     set:

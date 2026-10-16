@@ -694,7 +694,7 @@ fn consumer_gateway_config(
          \x20       clusters:\n\
          {clusters}\n\
          admin:\n\
-         \x20 address: \"127.0.0.1:9901\"\n\
+         \x20 metrics_address: \"127.0.0.1:9901\"\n\
          shutdown_timeout_secs: 5\n"
     )
 }
@@ -744,7 +744,7 @@ fn responses_consumer_gateway_config(
          \x20       clusters:\n\
          {clusters}\n\
          admin:\n\
-         \x20 address: \"127.0.0.1:9901\"\n\
+         \x20 metrics_address: \"127.0.0.1:9901\"\n\
          shutdown_timeout_secs: 5\n"
     )
 }
@@ -1023,7 +1023,7 @@ filter_chains:
 {mtls_clusters}
 {api_cluster_yaml}
 admin:
-  address: "127.0.0.1:9901"
+  metrics_address: "127.0.0.1:9901"
 shutdown_timeout_secs: 5
 "#
     )
@@ -1101,7 +1101,7 @@ filter_chains:
 {mtls_clusters}
 {api_cluster_yaml}
 admin:
-  address: "127.0.0.1:9901"
+  metrics_address: "127.0.0.1:9901"
 shutdown_timeout_secs: 5
 "#
     )
@@ -1372,7 +1372,7 @@ filter_chains:
 {cloud_cluster_yaml}
 {api_cluster_yaml}
 admin:
-  address: "127.0.0.1:9901"
+  metrics_address: "127.0.0.1:9901"
 shutdown_timeout_secs: 5
 "#
     )

@@ -119,7 +119,7 @@ The generated config contains:
     endpoint address and explicit `transport` configuration (`mutual_tls`,
     `tls`, or `plaintext`). Missing transport fails closed: the operator will
     not silently render a plain-HTTP cluster when transport intent is absent.
-- `admin:` with an admin listener at `127.0.0.1:9901`
+- `admin:` with a health and metrics listener at `127.0.0.1:9901` under `metrics_address`
 - `shutdown_timeout_secs: 5`
 
 Set `consumerConfig.telemetry` to add process-level OTLP settings and the

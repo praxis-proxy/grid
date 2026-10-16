@@ -7609,7 +7609,7 @@ filter_chains:
               - \"vcr-inference:8000\"
 
 admin:
-  address: \"127.0.0.1:9901\""
+  metrics_address: \"127.0.0.1:9901\""
     }
 
     fn minimal_edge_config() -> &'static str {
@@ -7630,7 +7630,7 @@ filter_chains:
               - \"172.18.0.6:8443\"
 
 admin:
-  address: \"127.0.0.1:9901\""
+  metrics_address: \"127.0.0.1:9901\""
     }
 
     #[test]
