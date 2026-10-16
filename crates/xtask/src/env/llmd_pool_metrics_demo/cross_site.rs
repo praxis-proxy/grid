@@ -972,7 +972,7 @@ fn prepare_poll_gateway(image: &str) -> Result<(), Box<dyn std::error::Error>> {
         restart_operator(cluster)?;
     }
     apply_grid_gateway_config(&endpoints)?;
-    install_grid_gateway(image)?;
+    install_grid_gateway(image, &endpoints)?;
     wait_for_grid_serving_snapshot(Duration::from_secs(120))?;
     Ok(())
 }
@@ -1290,6 +1290,7 @@ fn provider_gateway_endpoint(site: &str) -> Result<serde_json::Value, Box<dyn st
     let sni = format!("{site}.grid.internal");
     Ok(serde_json::json!({
         "cluster": cluster,
+        "site": site,
         "address": format!("{host}:{PROVIDER_GATEWAY_PORT}"),
         "sni": sni,
         "transport": { "mode": "mutual_tls", "sni": sni }
@@ -1387,7 +1388,7 @@ fn apply_grid_gateway_config(endpoints: &[serde_json::Value]) -> Result<(), Box<
 }
 
 /// Install the embedded Grid Gateway with a TLS metrics listener for proof evidence.
-fn install_grid_gateway(image: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn install_grid_gateway(image: &str, endpoints: &[serde_json::Value]) -> Result<(), Box<dyn std::error::Error>> {
     let (repository, tag) = split_image_reference(image)?;
     let chart = crate::workspace_root().join("charts/praxis-gateway");
     let chart = chart.to_str().ok_or("Praxis Gateway chart path is not UTF-8")?;
@@ -1427,6 +1428,32 @@ fn install_grid_gateway(image: &str) -> Result<(), Box<dyn std::error::Error>> {
         "metricsListener.fromNamespaces[0]=grid-system".to_owned(),
     ] {
         command.args(["--set-string", &value]);
+    }
+    for endpoint in endpoints {
+        let cluster = endpoint
+            .get("cluster")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("provider gateway endpoint has no cluster")?;
+        let site = endpoint
+            .get("site")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("provider gateway endpoint {cluster} has no site"))?;
+        let address = endpoint
+            .get("address")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("provider gateway endpoint {cluster} has no address"))?;
+        let sni = endpoint
+            .get("sni")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("provider gateway endpoint {cluster} has no SNI"))?;
+        for value in [
+            format!("praxisConfig.render.backends.{cluster}.endpoint={address}"),
+            format!("praxisConfig.render.backends.{cluster}.site={site}"),
+            format!("praxisConfig.render.backends.{cluster}.transport.mode=mutual_tls"),
+            format!("praxisConfig.render.backends.{cluster}.transport.sni={sni}"),
+        ] {
+            command.args(["--set-string", &value]);
+        }
     }
     command.args([
         "--set",
