@@ -20,6 +20,9 @@ use super::{AffinitySettings, PrefixKeys};
 /// Keys written under one hold of a candidate's lock.
 const WRITE_CHUNK: usize = 64;
 
+/// How long a key recorded for a request with no answer yet stays pending.
+const PENDING_TTL: Duration = Duration::from_secs(30);
+
 /// One recorded key.
 #[derive(Clone, Copy)]
 struct Entry {
@@ -50,8 +53,6 @@ struct IndexState {
     capacity: NonZeroUsize,
     /// Lifetime of a newly confirmed key.
     confirmed_ttl: Duration,
-    /// Lifetime of a newly recorded, unconfirmed key.
-    pending_ttl: Duration,
 }
 
 impl Default for IndexState {
@@ -59,9 +60,8 @@ impl Default for IndexState {
         let settings = AffinitySettings::default();
         Self {
             candidates: HashMap::new(),
-            capacity: settings.max_entries_per_cluster,
-            confirmed_ttl: Duration::from_secs(settings.confirmed_ttl_secs.get()),
-            pending_ttl: Duration::from_secs(settings.pending_ttl_secs.get()),
+            capacity: settings.capacity,
+            confirmed_ttl: Duration::from_secs(settings.ttl_secs.get()),
         }
     }
 }
@@ -113,9 +113,9 @@ impl PrefixIndex {
 
     /// Record `keys` as sent to `candidate`, waiting on [`Self::confirm`] or [`Self::forget`].
     pub(crate) fn record(&self, keys: &PrefixKeys, candidate: &Arc<str>) {
-        let (held, pending_ttl, _) = self.candidate(candidate);
+        let (held, _) = self.candidate(candidate);
         let now = Instant::now();
-        let until = now.checked_add(pending_ttl).unwrap_or(now);
+        let until = now.checked_add(PENDING_TTL).unwrap_or(now);
         Self::update(keys, &held, |held| match held {
             Some(entry) if now < entry.until => Entry {
                 pending: entry.pending.saturating_add(1),
@@ -131,7 +131,7 @@ impl PrefixIndex {
 
     /// The request sent to `candidate` got a success: its keys hold there.
     pub(crate) fn confirm(&self, keys: &PrefixKeys, candidate: &Arc<str>) {
-        let (held, _, confirmed_ttl) = self.candidate(candidate);
+        let (held, confirmed_ttl) = self.candidate(candidate);
         let now = Instant::now();
         let until = now.checked_add(confirmed_ttl).unwrap_or(now);
         Self::update(keys, &held, |held| Entry {
@@ -172,15 +172,14 @@ impl PrefixIndex {
     /// Adopt cache limits and retain routed candidates. Existing keys keep their expiry times.
     pub(crate) fn apply(&self, settings: &AffinitySettings, candidates: &[Arc<str>]) {
         let mut index = self.inner.write().unwrap_or_else(PoisonError::into_inner);
-        index.capacity = settings.max_entries_per_cluster;
-        index.pending_ttl = Duration::from_secs(settings.pending_ttl_secs.get());
-        index.confirmed_ttl = Duration::from_secs(settings.confirmed_ttl_secs.get());
+        index.capacity = settings.capacity;
+        index.confirmed_ttl = Duration::from_secs(settings.ttl_secs.get());
         index.candidates.retain(|candidate, _| candidates.contains(candidate));
         for candidate in candidates {
             if let Some(held) = index.candidates.get(candidate) {
                 held.write()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .resize(settings.max_entries_per_cluster);
+                    .resize(settings.capacity);
             }
         }
     }
@@ -211,12 +210,12 @@ impl PrefixIndex {
             .map(Arc::clone)
     }
 
-    /// The candidate's keys and pending/confirmed lifetimes, creating its LRU on first use.
-    fn candidate(&self, candidate: &Arc<str>) -> (Keys, Duration, Duration) {
+    /// The candidate's keys and confirmed lifetime, creating its LRU on first use.
+    fn candidate(&self, candidate: &Arc<str>) -> (Keys, Duration) {
         {
             let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
             if let Some(held) = index.candidates.get(candidate) {
-                return (Arc::clone(held), index.pending_ttl, index.confirmed_ttl);
+                return (Arc::clone(held), index.confirmed_ttl);
             }
         }
         let mut index = self.inner.write().unwrap_or_else(PoisonError::into_inner);
@@ -227,7 +226,7 @@ impl PrefixIndex {
                 foldhash::fast::RandomState::default(),
             )))
         }));
-        (held, index.pending_ttl, index.confirmed_ttl)
+        (held, index.confirmed_ttl)
     }
 
     /// Keys held for `candidate`.
@@ -326,7 +325,7 @@ mod tests {
     fn eviction_takes_the_tail_first() {
         let index = PrefixIndex::default();
         let east = name("east");
-        let capacity = AffinitySettings::default().max_entries_per_cluster.get();
+        let capacity = AffinitySettings::default().capacity.get();
         let cap = u64::try_from(capacity).unwrap();
         index.confirm(&keys(0..cap), &east);
         index.confirm(&keys(1_000_000..1_000_010), &east);
@@ -349,7 +348,7 @@ mod tests {
     fn configured_capacity_is_independent_for_each_cluster_and_resizes_live_caches() {
         let index = PrefixIndex::default();
         let clusters = [name("east"), name("west")];
-        let mut settings: AffinitySettings = serde_yaml::from_str("max_entries_per_cluster: 4").expect("settings");
+        let mut settings: AffinitySettings = serde_yaml::from_str("capacity: 4").expect("settings");
         index.apply(&settings, &clusters);
         for cluster in &clusters {
             index.confirm(&keys(0..8), cluster);
@@ -358,7 +357,7 @@ mod tests {
         index.confirm(&keys(100..108), &clusters[0]);
         assert_eq!(index.depths(&keys(0..8), ["west"]), [4], "east cannot evict west");
 
-        settings.max_entries_per_cluster = NonZeroUsize::new(2).expect("nonzero");
+        settings.capacity = NonZeroUsize::new(2).expect("nonzero");
         index.apply(&settings, &clusters);
         assert_eq!(
             index.depths(&keys(100..108), ["east"]),
@@ -369,7 +368,7 @@ mod tests {
         index.confirm(&keys(0..8), &name("north"));
         assert_eq!(index.len("north"), 2, "new clusters use the current capacity");
 
-        settings.max_entries_per_cluster = NonZeroUsize::new(8).expect("nonzero");
+        settings.capacity = NonZeroUsize::new(8).expect("nonzero");
         index.apply(&settings, &clusters);
         index.confirm(&keys(0..8), &clusters[1]);
         assert_eq!(index.depths(&keys(0..8), ["west"]), [8], "growth allows more entries");
@@ -377,17 +376,16 @@ mod tests {
     }
 
     #[test]
-    fn configured_lifetimes_apply_to_new_records_and_confirmations() {
+    fn pending_lifetime_is_fixed_and_confirmation_lifetime_is_configurable() {
         let index = PrefixIndex::default();
         let east = name("east");
-        let settings: AffinitySettings =
-            serde_yaml::from_str("pending_ttl_secs: 7\nconfirmed_ttl_secs: 11").expect("settings");
+        let settings: AffinitySettings = serde_yaml::from_str("ttl_secs: 11").expect("settings");
         index.apply(&settings, &[Arc::clone(&east)]);
         let before = Instant::now();
         index.record(&keys(0..4), &east);
         let after = Instant::now();
         let pending = deadline(&index, "east", 0);
-        assert!(pending >= before + Duration::from_secs(7) && pending <= after + Duration::from_secs(7));
+        assert!(pending >= before + Duration::from_secs(30) && pending <= after + Duration::from_secs(30));
         assert_eq!(index.depths(&keys(0..4), ["east"]), [0], "pending entries do not match");
 
         let before = Instant::now();
@@ -409,7 +407,7 @@ mod tests {
         let east = name("east");
         index.confirm(&keys(0..8), &east);
         let original = deadline(&index, "east", 0);
-        let settings: AffinitySettings = serde_yaml::from_str("confirmed_ttl_secs: 1").expect("settings");
+        let settings: AffinitySettings = serde_yaml::from_str("ttl_secs: 1").expect("settings");
         index.apply(&settings, &[Arc::clone(&east)]);
         assert_eq!(
             deadline(&index, "east", 0),

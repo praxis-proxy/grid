@@ -17,13 +17,10 @@ use xxhash_rust::xxh64::xxh64;
 use super::{BLOCK, PrefixIndex, PrefixKeys};
 
 /// Default number of prefix entries retained per backend cluster.
-const DEFAULT_MAX_ENTRIES: NonZeroUsize = NonZeroUsize::new(16_384).expect("nonzero");
-
-/// Default lifetime of an unconfirmed prefix, in seconds.
-const DEFAULT_PENDING_TTL: NonZeroU64 = NonZeroU64::new(30).expect("nonzero");
+const DEFAULT_CAPACITY: NonZeroUsize = NonZeroUsize::new(16_384).expect("nonzero");
 
 /// Default lifetime of a confirmed prefix, in seconds.
-const DEFAULT_CONFIRMED_TTL: NonZeroU64 = NonZeroU64::new(600).expect("nonzero");
+const DEFAULT_TTL: NonZeroU64 = NonZeroU64::new(600).expect("nonzero");
 
 /// One admitted site selection would consider.
 #[derive(Clone, Copy, Debug)]
@@ -79,38 +76,35 @@ impl LoadGate for QueueGate {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AffinitySettings {
-    /// Lifetime in seconds after a successful response confirms a prefix.
-    pub confirmed_ttl_secs: NonZeroU64,
+    /// Maximum prefix entries retained per backend cluster in this gateway replica.
+    pub capacity: NonZeroUsize,
     /// Whether selection prefers the site holding a request's prompt. Off routes on load alone.
     pub enabled: bool,
     /// Share of the request's keys a site must hold to be sticky.
     pub threshold: f64,
     /// Share of requests that skip affinity, so a second site learns a shared prefix.
     pub exploration: f64,
-    /// Maximum prefix entries retained per backend cluster in this gateway replica.
-    pub max_entries_per_cluster: NonZeroUsize,
-    /// Lifetime in seconds of a prefix awaiting its first successful response.
-    pub pending_ttl_secs: NonZeroU64,
     /// Prompt tokens a site prefills per second, to price the cache a match saves.
     pub prefill_tokens_per_second: f64,
     /// Seconds one queued request adds to a new request's wait, to turn that price into queue depth.
     pub queued_request_seconds: f64,
     /// A file holding the key that authenticates stored-state tags. Without one, tags carry no mac.
     pub tag_key_path: Option<String>,
+    /// Lifetime in seconds after a successful response confirms a prefix.
+    pub ttl_secs: NonZeroU64,
 }
 
 impl Default for AffinitySettings {
     fn default() -> Self {
         Self {
-            confirmed_ttl_secs: DEFAULT_CONFIRMED_TTL,
+            capacity: DEFAULT_CAPACITY,
             enabled: true,
             threshold: 0.8,
             exploration: 0.02,
-            max_entries_per_cluster: DEFAULT_MAX_ENTRIES,
-            pending_ttl_secs: DEFAULT_PENDING_TTL,
             prefill_tokens_per_second: 10_000.0,
             queued_request_seconds: 2.0,
             tag_key_path: None,
+            ttl_secs: DEFAULT_TTL,
         }
     }
 }
@@ -122,13 +116,11 @@ impl AffinitySettings {
     ///
     /// Returns a message naming the first field out of range.
     pub(crate) fn validate(&self) -> Result<(), String> {
-        for (name, seconds) in [
-            ("pending_ttl_secs", self.pending_ttl_secs),
-            ("confirmed_ttl_secs", self.confirmed_ttl_secs),
-        ] {
-            if Instant::now().checked_add(Duration::from_secs(seconds.get())).is_none() {
-                return Err(format!("prefix_affinity.{name} exceeds the supported lifetime"));
-            }
+        if Instant::now()
+            .checked_add(Duration::from_secs(self.ttl_secs.get()))
+            .is_none()
+        {
+            return Err("prefix_affinity.ttl_secs exceeds the supported lifetime".to_owned());
         }
         if !(self.threshold > 0.0 && self.threshold <= 1.0) {
             return Err(format!(

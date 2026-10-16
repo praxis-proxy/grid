@@ -1528,14 +1528,11 @@ mod tests {
     fn cache_settings_are_validated_before_plugin_tuning_changes() {
         let tuning = Tuning::default();
         let build = |yaml: &str| build_tuned_filter(yaml, &tuning);
-        let _filter =
-            build("prefix_affinity: {max_entries_per_cluster: 2048, pending_ttl_secs: 5, confirmed_ttl_secs: 120}")
-                .expect("valid cache settings build");
+        let _filter = build("prefix_affinity: {capacity: 2048, ttl_secs: 120}").expect("valid cache settings build");
         let applied = tuning.affinity();
-        assert_eq!(applied.max_entries_per_cluster.get(), 2048);
-        assert_eq!(applied.pending_ttl_secs.get(), 5);
-        assert_eq!(applied.confirmed_ttl_secs.get(), 120);
-        for field in ["max_entries_per_cluster", "pending_ttl_secs", "confirmed_ttl_secs"] {
+        assert_eq!(applied.capacity.get(), 2048);
+        assert_eq!(applied.ttl_secs.get(), 120);
+        for field in ["capacity", "ttl_secs"] {
             for value in ["0", "-1", "1.5", "null", "18446744073709551616"] {
                 assert!(
                     build(&format!("prefix_affinity: {{{field}: {value}}}")).is_err(),
@@ -1544,13 +1541,11 @@ mod tests {
                 assert_eq!(tuning.generation(), 1, "invalid settings cannot change the live tuning");
             }
         }
-        for field in ["pending_ttl_secs", "confirmed_ttl_secs"] {
-            let error = build(&format!("prefix_affinity: {{{field}: 18446744073709551615}}"))
-                .err()
-                .expect("unrepresentable lifetime");
-            assert!(error.to_string().contains(field), "{error}");
-            assert_eq!(tuning.generation(), 1);
-        }
+        let error = build("prefix_affinity: {ttl_secs: 18446744073709551615}")
+            .err()
+            .expect("unrepresentable lifetime");
+        assert!(error.to_string().contains("ttl_secs"), "{error}");
+        assert_eq!(tuning.generation(), 1);
         assert_eq!(
             *tuning.affinity(),
             *applied,

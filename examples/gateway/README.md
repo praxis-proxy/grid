@@ -34,9 +34,8 @@ soft and hard capacity bounds, and provider-reported KV-cache fullness. The fiel
 | `enabled` | true | Prefer the site holding a request's prompt. Off routes on load alone. |
 | `threshold` | 0.8 | Share of the request's keys a site must hold to be sticky. |
 | `exploration` | 0.02 | Share of requests that skip affinity, so a second site learns a shared prefix. |
-| `max_entries_per_cluster` | 16384 | Positive entry limit for each backend cluster's LRU in each gateway replica. |
-| `pending_ttl_secs` | 30 | Positive lifetime in seconds for an unconfirmed prefix entry. |
-| `confirmed_ttl_secs` | 600 | Positive lifetime in seconds after a successful response confirms a prefix entry. |
+| `capacity` | 16384 | Positive entry limit for each backend cluster's LRU in each gateway replica. |
+| `ttl_secs` | 600 | Positive lifetime in seconds after a successful response confirms a prefix entry. |
 | `prefill_tokens_per_second` | 10000 | Prompt tokens a site prefills per second, pricing the cache a match saves. |
 | `queued_request_seconds` | 2.0 | Seconds one queued request adds to a wait, turning that price into queue depth. |
 | `tag_key_path` | none | A file holding the key that authenticates stored-state tags. |
@@ -44,7 +43,7 @@ soft and hard capacity bounds, and provider-reported KV-cache fullness. The fiel
 Cache limits reserve space separately for each backend cluster; total entry
 capacity grows with the cluster count. Plugin reconfiguration resizes existing
 LRUs while preserving their most recent entries. TTL changes affect subsequent
-records and confirmations; previously recorded deadlines stay unchanged. See
+confirmations; previously recorded deadlines stay unchanged. See
 [prefix affinity](../../docs/architecture/prefix-affinity.md) for the lifecycle.
 
 Tuning order, one metric against one truth per step: the soft and hard ceiling gauges against

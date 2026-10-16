@@ -1112,10 +1112,7 @@ mod tests {
         for cluster in ["pool-east", "pool-west"] {
             affinity.index.confirm(&keys, &Arc::from(cluster));
         }
-        let config = serde_yaml::from_str(
-            "prefix_affinity: {max_entries_per_cluster: 4, pending_ttl_secs: 5, confirmed_ttl_secs: 120}",
-        )
-        .expect("plugin settings");
+        let config = serde_yaml::from_str("prefix_affinity: {capacity: 4, ttl_secs: 120}").expect("plugin settings");
         let _filter = crate::route::GridSiteRouteFilter::from_config(
             &config,
             grid.snapshot(),
@@ -1125,8 +1122,7 @@ mod tests {
         )
         .expect("plugin builds against the running control");
         assert_eq!(affinity.index.depths(&keys, ["pool-east", "pool-west"]), [4, 4]);
-        assert_eq!(affinity.settings.load().pending_ttl_secs.get(), 5);
-        assert_eq!(affinity.settings.load().confirmed_ttl_secs.get(), 120);
+        assert_eq!(affinity.settings.load().ttl_secs.get(), 120);
         assert_eq!(
             grid.reload(&initial).expect("reload"),
             None,

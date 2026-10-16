@@ -963,7 +963,7 @@ else
   fail "gridServing: unexpected render: $(grep -E 'route|GRID_SERVING|grid-serving|Error' <<<"$SERV_RENDER" | head -3 | tr '\n' ' ')"
 fi
 try_reject_msg "$GW_DIR" "gridServing without network or configMap (gw)" "gridServing.network" "${SERVING[@]}" --set gridServing.configMap=""
-for setting in max_entries_per_cluster pending_ttl_secs confirmed_ttl_secs; do
+for setting in capacity ttl_secs; do
   for value in 0 -1 1.5; do
     try_reject_msg "$GW_DIR" "prefixAffinity $setting=$value (gw)" "$setting" \
       "${SERVING[@]}" --set "gridServing.siteRoute.prefixAffinity.$setting=$value"

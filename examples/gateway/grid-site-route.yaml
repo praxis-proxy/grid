@@ -8,9 +8,8 @@
   availability:
     shedding: true
   prefix_affinity:
-    max_entries_per_cluster: 16384
-    pending_ttl_secs: 30
-    confirmed_ttl_secs: 600
+    capacity: 16384
+    ttl_secs: 600
 - filter: load_balancer
   clusters:
     # One cluster per candidate, named as the serving config names it.
