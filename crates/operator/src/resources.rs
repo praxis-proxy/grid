@@ -52,6 +52,8 @@ pub(crate) mod test_doubles;
 /// Trust bundle management for grid mTLS.
 pub mod trust_bundle;
 
+/// SSRF-safe endpoint validation, DNS resolution, and address pinning.
+pub(crate) mod endpoint_resolution;
 /// Shared TLS material resolution and validation for endpoint probes.
 pub(crate) mod endpoint_tls;
 /// Typed gateway probe outcome and phase-transition contracts.
