@@ -31,11 +31,11 @@ tests:
   - it: binds Praxis 0.7.4 health endpoints to metrics_address
     template: templates/gateway-config.yaml
     set:
-      gatewayConfig.render: true
-      gatewayConfig.localSite: hub
-      gatewayConfig.model: model
-      gatewayConfig.auth.mode: none
-      gatewayConfig.backends:
+      praxisConfig.source: render
+      grid.siteName: hub
+      praxisConfig.render.model: model
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.backends:
         - cluster: local
           endpoints: ["10.0.0.1:8000"]
           transport: { mode: plaintext }
