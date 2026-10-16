@@ -21,7 +21,7 @@ that ConfigMap and delivers a file that the Praxis AI gateway can reload
 without restarting.
 
 For the project-owned `grid-gateway`, cross-site routing uses a separate
-serving ConfigMap. With `gridServing.enabled`, the chart mounts this file and
+serving ConfigMap. With `praxisConfig.render.gridServing.enabled`, the chart mounts this file and
 sets `GRID_SERVING_CONFIG`. The gateway combines that configuration with
 peer signals to build its routing snapshot. See the [cross-site setup]
 for the required image, TLS, and operator settings.

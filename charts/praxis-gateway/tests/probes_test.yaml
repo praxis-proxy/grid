@@ -32,7 +32,9 @@ tests:
 
   - it: probes the admin listener when the chart renders the config
     set:
-      gatewayConfig:
+      praxisConfig.source: render
+      grid.siteName: hub
+      praxisConfig.render:
         model: m
         auth: {mode: none}
         backends:
@@ -49,9 +51,9 @@ tests:
           path: spec.template.spec.containers[?(@.name == "praxis")].livenessProbe.exec.command[4]
           value: http://127.0.0.1:9901/healthy
 
-  - it: follows the admin port that config.inline sets
+  - it: follows the admin port that praxisConfig.byo.inline sets
     set:
-      config:
+      praxisConfig.byo:
         inline: |
           admin:
             metrics_address: "127.0.0.1:9911"
@@ -65,7 +67,7 @@ tests:
 
   - it: follows the legacy admin address for older Praxis images
     set:
-      config:
+      praxisConfig.byo:
         inline: |
           admin:
             address: "127.0.0.1:9912"
@@ -77,9 +79,9 @@ tests:
           path: spec.template.spec.containers[?(@.name == "praxis")].readinessProbe.exec.command[4]
           value: http://127.0.0.1:9912/ready
 
-  - it: keeps the TCP probe on the listener when config.inline has no admin listener
+  - it: keeps the TCP probe on the listener when praxisConfig.byo.inline has no admin listener
     set:
-      config:
+      praxisConfig.byo:
         inline: |
           listeners:
             - name: default
@@ -95,7 +97,7 @@ tests:
 
   - it: keeps the TCP probe when the admin listener is not on loopback or the wildcard
     set:
-      config:
+      praxisConfig.byo:
         inline: |
           admin:
             metrics_address: "10.0.0.5:9901"
@@ -109,8 +111,8 @@ tests:
 
   - it: keeps the TCP probe with an existingConfigMap, whose admin listener the chart cannot see
     set:
-      config:
-        existingConfigMap: mine
+      praxisConfig.byo:
+        configMapName: mine
     asserts:
       - equal:
           path: spec.template.spec.containers[?(@.name == "praxis")].readinessProbe.tcpSocket.port
@@ -119,9 +121,9 @@ tests:
           path: spec.template.spec.containers[?(@.name == "praxis")].livenessProbe.tcpSocket.port
           value: http
 
-  - it: refuses a TCP probe on a TLS listener when config.inline has no admin listener
+  - it: refuses a TCP probe on a TLS listener when praxisConfig.byo.inline has no admin listener
     set:
-      config:
+      praxisConfig.byo:
         inline: |
           listeners:
             - name: default
@@ -136,7 +138,7 @@ tests:
 
   - it: probes the admin listener, never the TLS port, when the TLS Secret is mounted
     set:
-      tls: {enabled: true}
+      listenerTls.secretName: listener-tls
     asserts:
       - notExists:
           path: spec.template.spec.containers[?(@.name == "praxis")].readinessProbe.tcpSocket
@@ -203,9 +205,9 @@ tests:
           path: spec.template.spec.containers[?(@.name == "praxis")].livenessProbe.exec.command
           value: ["/usr/local/bin/healthcheck", "--timeout", "2", "http://127.0.0.1:9901/healthy"]
 
-  - it: probes /healthy for readiness when config.inline defines clusters
+  - it: probes /healthy for readiness when praxisConfig.byo.inline defines clusters
     set:
-      config:
+      praxisConfig.byo:
         inline: |
           admin:
             metrics_address: "127.0.0.1:9901"
@@ -223,15 +225,14 @@ tests:
   - it: probes /healthy for readiness when gridServing is on
     set:
       image.flavor: grid-gateway
-      gatewayConfig.render: true
-      gatewayConfig.localSite: hub
-      gatewayConfig.auth.mode: none
-      tls.enabled: true
-      tls.existingSecret: grid-site-identity
-      tls.caSecret: grid-ca
-      gridServing.enabled: true
-      gridServing.network: grid
-      gatewayConfig.backends:
+      praxisConfig.source: render
+      grid.siteName: hub
+      praxisConfig.render.auth.mode: none
+      gridIdentity.tlsSecretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
+      praxisConfig.render.gridServing.enabled: true
+      praxisConfig.render.gridServing.networkName: grid
+      praxisConfig.render.backends:
         - cluster: pool-b
           endpoints: ["203.0.113.7:8443"]
           transport: { mode: mutual_tls, sni: site-b.grid.internal }
@@ -243,9 +244,9 @@ tests:
           path: spec.template.spec.containers[?(@.name == "praxis")].readinessProbe.exec.command[4]
           value: http://127.0.0.1:9901/healthy
 
-  - it: refuses a /ready probe when config.inline defines clusters
+  - it: refuses a /ready probe when praxisConfig.byo.inline defines clusters
     set:
-      config:
+      praxisConfig.byo:
         inline: |
           admin:
             metrics_address: "127.0.0.1:9901"
@@ -265,15 +266,14 @@ tests:
   - it: refuses a /ready probe when gridServing is on
     set:
       image.flavor: grid-gateway
-      gatewayConfig.render: true
-      gatewayConfig.localSite: hub
-      gatewayConfig.auth.mode: none
-      tls.enabled: true
-      tls.existingSecret: grid-site-identity
-      tls.caSecret: grid-ca
-      gridServing.enabled: true
-      gridServing.network: grid
-      gatewayConfig.backends:
+      praxisConfig.source: render
+      grid.siteName: hub
+      praxisConfig.render.auth.mode: none
+      gridIdentity.tlsSecretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
+      praxisConfig.render.gridServing.enabled: true
+      praxisConfig.render.gridServing.networkName: grid
+      praxisConfig.render.backends:
         - cluster: pool-b
           endpoints: ["203.0.113.7:8443"]
           transport: { mode: mutual_tls, sni: site-b.grid.internal }

@@ -1,0 +1,9 @@
+# Gateway with your own praxis.yaml. The chart mounts your ConfigMap and does not manage it.
+#
+#   kubectl create configmap my-praxis-config --from-file=praxis.yaml
+#   helm install gw charts/praxis-gateway -f examples/helm/praxis-gateway/byo.yaml
+praxisConfig:
+  source: byo
+  byo:
+    configMapName: my-praxis-config
+    key: praxis.yaml

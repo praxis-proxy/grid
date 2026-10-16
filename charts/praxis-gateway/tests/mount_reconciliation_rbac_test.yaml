@@ -6,7 +6,7 @@ release:
   name: gw
   namespace: grid
 set:
-  config.existingConfigMap: praxis-consumer-config
+  praxisConfig.byo.configMapName: praxis-consumer-config
 tests:
   - it: grants the operator nothing without delegation
     template: templates/role-mount-reconciliation.yaml

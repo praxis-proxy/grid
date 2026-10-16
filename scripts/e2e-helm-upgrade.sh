@@ -43,17 +43,24 @@ trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
-# Values both sides install with; the operator and gateway never start.
+# Each chart version gets values it understands; the operator and gateway never start.
 OPERATOR_ARGS=(--set image.repository=registry.k8s.io/pause --set image.tag=3.9)
 SITE_ARGS=(--set gridNetwork.name=upgrade --set gridSite.name=upgrade-site)
-GATEWAY_ARGS=(--set config.existingConfigMap=upgrade-gateway --set image.tag=v0.1.0-ci)
+GATEWAY_BASE_ARGS=(--set config.existingConfigMap=upgrade-gateway --set image.tag=v0.1.0-ci)
+GATEWAY_ARGS=(--set praxisConfig.byo.configMapName=upgrade-gateway --set image.tag=v0.1.0-ci)
 RELEASES=(grid-operator grid-site praxis-gateway grid-mock-providers)
 
-release_args() { # <release>: prints the extra args, one per line
-  case "$1" in
+release_args() { # <base|branch> <release>: prints the values for that chart version
+  case "$2" in
     grid-operator) printf '%s\n' "${OPERATOR_ARGS[@]}" ;;
     grid-site) printf '%s\n' "${SITE_ARGS[@]}" ;;
-    praxis-gateway) printf '%s\n' "${GATEWAY_ARGS[@]}" ;;
+    praxis-gateway)
+      if [ "$1" = base ]; then
+        printf '%s\n' "${GATEWAY_BASE_ARGS[@]}"
+      else
+        printf '%s\n' "${GATEWAY_ARGS[@]}"
+      fi
+      ;;
   esac
 }
 
@@ -63,6 +70,11 @@ uids() { # <kind> [-n ns | -A]: "name uid" lines, sorted
 
 echo "== base ${BASE_REF}, install with $(${INSTALL_HELM} version --short), upgrade with $(${UPGRADE_HELM} version --short) =="
 git -C "${ROOT}" worktree add --detach "${BASE}" "${BASE_REF}" >/dev/null
+
+# A later base branch may already contain the source-mode value rename. Use the base chart's values schema instead of assuming it still accepts the legacy key.
+if grep -q '^praxisConfig:' "${BASE}/charts/praxis-gateway/values.yaml"; then
+  GATEWAY_BASE_ARGS=("${GATEWAY_ARGS[@]}")
+fi
 
 crd_group() { # <chart dir>: the grid API group its GridNetwork CRD serves
   awk '/^  group: /{print $2; exit}' "$1"/templates/crds/gridnetwork.yaml "$1"/crds/gridnetwork.yaml 2>/dev/null
@@ -85,7 +97,7 @@ ${K} -n "${NS}" create configmap upgrade-gateway --from-literal=config.yaml='{}'
 
 echo "== install from base =="
 for r in "${RELEASES[@]}"; do
-  mapfile -t extra < <(release_args "${r}")
+  mapfile -t extra < <(release_args base "${r}")
   ${INSTALL_HELM} --kube-context "${CTX}" install "${r}" "${BASE}/charts/${r}" -n "${NS}" "${extra[@]}" >/dev/null \
     || fail "base install of ${r}"
   pass "base install: ${r}"
@@ -121,7 +133,7 @@ fi
 
 echo "== upgrade to branch ${UPGRADE_FLAGS[*]} =="
 for r in "${RELEASES[@]}"; do
-  mapfile -t extra < <(release_args "${r}")
+  mapfile -t extra < <(release_args branch "${r}")
   ${UPGRADE_HELM} --kube-context "${CTX}" upgrade "${r}" "${ROOT}/charts/${r}" -n "${NS}" \
     "${UPGRADE_FLAGS[@]}" "${extra[@]}" >/dev/null || fail "upgrade of ${r}"
   status="$(${UPGRADE_HELM} --kube-context "${CTX}" status "${r}" -n "${NS}" -o json | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["info"]["status"],d["version"])')"
