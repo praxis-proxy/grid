@@ -6,7 +6,10 @@ The AI Grid Network (AGN) Operator defines these resources to describe sites,
 provider capacity, and routing policy. The established API identities remain
 unchanged by the project-name update.
 
-All CRDs are cluster-scoped and served at `v1alpha1`.
+All installed CRDs are cluster-scoped and served at `v1alpha1`.
+See the [ownership index](crds/README.md) for producers, consumers, and a concise
+lifecycle page for each object. AgentToAgentProvider is schema-only and is not
+included in the generated CRD installation.
 
 ## SiteInvite
 
