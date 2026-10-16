@@ -36,6 +36,12 @@ spec:
     backends:
       description: Two plain HTTP backends and a client pod under restricted pod security
       steps:
+        # Kind can start workloads before cluster DNS is ready to resolve Services.
+        - type: wait
+          resource: deployment/coredns
+          namespace: kube-system
+          condition: available
+          timeout: "180s"
         - type: manifest
           path: resources/namespaces.yaml
         - type: manifest

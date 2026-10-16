@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/ai-grid-filters"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
@@ -309,7 +309,9 @@ private_doc_tests = "allow"
 [package]
 name = "gateway"
 description = "Praxis-based grid data-plane gateway"
-version.workspace = true
+# Hermeto 0.62.0 cannot resolve an inherited version for the workspace root package.
+# Keep this in sync with workspace.package.version above until that is supported.
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
