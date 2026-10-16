@@ -23,6 +23,7 @@ on:
       - 'rustfmt.toml'
       - 'clippy.toml'
       - 'deploy/gateway/Containerfile'
+      - 'scripts/test-gateway-dependencies.py'
       - '.github/workflows/gateway.yaml'
   pull_request:
     branches: [main]
@@ -38,6 +39,7 @@ on:
       - 'rustfmt.toml'
       - 'clippy.toml'
       - 'deploy/gateway/Containerfile'
+      - 'scripts/test-gateway-dependencies.py'
       - '.github/workflows/gateway.yaml'
   merge_group:
     branches: [main]
@@ -93,6 +95,9 @@ jobs:
 
       - name: Machete (unused dependencies)
         run: cargo machete crates/gateway
+
+      - name: Machete regression tests
+        run: python3 scripts/test-gateway-dependencies.py
 
       # The binary's TLS must come from the OpenSSL provider Praxis installs, so ring stays test-only.
       # openssl-sys is the positive control: an empty or failed tree must not pass.
