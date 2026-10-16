@@ -1074,6 +1074,22 @@ loop owns this field separately from the provider's routing phase and clears
 it when discovery is disabled. The field reports the latest poll error; the
 held model set still follows its TTL independently.
 
+`status.servedModels` is the discovered set itself: the deduplicated model
+names the loop last observed for this provider (the field is a set; order
+carries no meaning). A successful poll writes the set and its expiry boundary,
+including when the names are unchanged. An empty set is present and means the
+backend serves no models.
+
+`status.servedModelsExpiresAt` is the RFC 3339 UTC deadline for that exact set,
+computed from the last successful poll and the discovery TTL. Readers must
+require this timestamp to be in the future before using `servedModels`. The
+discovery loop may not clear the status until its next round after the TTL, so
+the presence of `servedModels` alone does not prove freshness. Failed polls do
+not extend the deadline. When the set is unknown, expired and cleared, or
+discovery is disabled, both fields are absent; readers must fail closed.
+Writing either field advances `metadata.resourceVersion`, so the CRDT revision
+of the gossiped provider record advances with discovery status changes.
+
 The bearer token comes from `spec.auth`. A model-discovery URL must use HTTPS
 when a bearer token is configured. With `auth.manual`, requests carry no
 credentials, so plain HTTP remains available.
@@ -1084,8 +1100,9 @@ Discovered sets are held in memory per provider:
 - A successful poll replaces the set and renews its deadline; an empty list is
   a valid result.
 - A failed poll keeps the set; its deadline is not renewed.
-- A set not renewed within the TTL expires. Absence is the staleness signal,
-  so a stale set fails closed and no clocks are compared.
+- A set not renewed within the TTL expires in the monotonic in-memory store.
+  Readers use `servedModelsExpiresAt` to reject stale status even if the next
+  discovery round has not cleared it yet.
 - A provider that is deleted or drops `modelDiscovery` loses its set on the
   next round.
 - The response is rejected as a whole, never partially applied, when it:

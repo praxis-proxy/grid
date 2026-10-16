@@ -833,6 +833,8 @@ async fn update_status(
         observed_generation,
         phase,
         reason,
+        served_models: None,
+        served_models_expires_at: None,
     };
 
     if provider
@@ -875,6 +877,8 @@ mod tests {
             observed_generation: 2,
             phase: ProviderPhase::Available,
             reason: None,
+            served_models: None,
+            served_models_expires_at: None,
         };
         assert!(baseline.matches_reconciler_status(&baseline));
 
@@ -884,17 +888,41 @@ mod tests {
         };
         assert!(!baseline.matches_reconciler_status(&changed_phase));
 
+        let changed_discovery_url = InferenceProviderStatus {
+            model_discovery_url: Some("https://example.com/v1/models".to_owned()),
+            ..baseline.clone()
+        };
+        assert!(!baseline.matches_reconciler_status(&changed_discovery_url));
+    }
+
+    #[test]
+    fn discovery_fields_are_not_the_reconcilers_to_write() {
+        let baseline = InferenceProviderStatus {
+            conditions: Vec::new(),
+            matching_sites: vec!["site-a".to_owned()],
+            model_discovery_error: None,
+            model_discovery_url: None,
+            observed_generation: 2,
+            phase: ProviderPhase::Available,
+            reason: None,
+            served_models: None,
+            served_models_expires_at: None,
+        };
+
         let changed_discovery_error = InferenceProviderStatus {
             model_discovery_error: Some("poll failed".to_owned()),
             ..baseline.clone()
         };
         assert!(baseline.matches_reconciler_status(&changed_discovery_error));
 
-        let changed_discovery_url = InferenceProviderStatus {
-            model_discovery_url: Some("https://example.com/v1/models".to_owned()),
+        let changed_served_models = InferenceProviderStatus {
+            served_models: Some(vec!["model-a".to_owned()]),
             ..baseline.clone()
         };
-        assert!(!baseline.matches_reconciler_status(&changed_discovery_url));
+        assert!(
+            baseline.matches_reconciler_status(&changed_served_models),
+            "the discovery poller owns servedModels"
+        );
     }
 
     #[test]
