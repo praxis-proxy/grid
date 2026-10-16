@@ -433,6 +433,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
+    /// An absent identity delays binding; usable material then exposes an occupied port's bind error.
     #[tokio::test]
     async fn a_site_loads_its_identity_before_binding_the_listener() {
         tls_backend::init_process_crypto();
@@ -457,10 +458,12 @@ mod tests {
             .expect_err("the reserved port cannot be bound");
         assert_eq!(
             error.downcast_ref::<std::io::Error>().expect("bind error").kind(),
-            std::io::ErrorKind::AddrInUse
+            std::io::ErrorKind::AddrInUse,
+            "binding begins only after the site identity becomes usable"
         );
     }
 
+    /// Site enrollment and renewal replace the served certificate without restarting the listener.
     #[tokio::test]
     async fn a_site_serves_and_rotates_its_identity() {
         tls_backend::init_process_crypto();

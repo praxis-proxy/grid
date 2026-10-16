@@ -221,10 +221,10 @@ impl PrefixIndex {
         let mut index = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         let capacity = index.capacity;
         let held = Arc::clone(index.candidates.entry(Arc::clone(candidate)).or_insert_with(|| {
-            Arc::new(RwLock::new(LruCache::with_hasher(
-                capacity,
-                foldhash::fast::RandomState::default(),
-            )))
+            let mut cache = LruCache::unbounded_with_hasher(foldhash::fast::RandomState::default());
+            // Set the entry limit without reserving its full capacity.
+            cache.resize(capacity);
+            Arc::new(RwLock::new(cache))
         }));
         (held, index.confirmed_ttl)
     }
@@ -344,6 +344,7 @@ mod tests {
         assert_eq!(index.depths(&keys(0..4), ["east", "west"]), [4, 0]);
     }
 
+    /// Per-cluster limits isolate backends and resize existing caches without losing recent prefixes.
     #[test]
     fn configured_capacity_is_independent_for_each_cluster_and_resizes_live_caches() {
         let index = PrefixIndex::default();
@@ -353,7 +354,11 @@ mod tests {
         for cluster in &clusters {
             index.confirm(&keys(0..8), cluster);
         }
-        assert_eq!(index.depths(&keys(0..8), ["east", "west"]), [4, 4]);
+        assert_eq!(
+            index.depths(&keys(0..8), ["east", "west"]),
+            [4, 4],
+            "each cluster gets capacity 4"
+        );
         index.confirm(&keys(100..108), &clusters[0]);
         assert_eq!(index.depths(&keys(0..8), ["west"]), [4], "east cannot evict west");
 
@@ -364,7 +369,11 @@ mod tests {
             [2],
             "shrink retains recent keys"
         );
-        assert_eq!(index.depths(&keys(0..8), ["west"]), [2]);
+        assert_eq!(
+            index.depths(&keys(0..8), ["west"]),
+            [2],
+            "west also shrinks to capacity 2"
+        );
         index.confirm(&keys(0..8), &name("north"));
         assert_eq!(index.len("north"), 2, "new clusters use the current capacity");
 
@@ -375,6 +384,37 @@ mod tests {
         assert_eq!(index.len("north"), 0, "removed clusters release their cache");
     }
 
+    /// A sparse cache must not reserve storage for every entry its configured limit permits.
+    #[test]
+    fn a_large_capacity_does_not_reserve_space_for_absent_entries() {
+        let index = PrefixIndex::default();
+        let east = name("east");
+        let settings = AffinitySettings {
+            capacity: NonZeroUsize::MAX,
+            ..AffinitySettings::default()
+        };
+        index.apply(&settings, &[Arc::clone(&east)]);
+        index.record(&keys(0..1), &east);
+        index.confirm(&keys(0..1), &east);
+        assert_eq!(
+            index.len("east"),
+            1,
+            "east stores only the single observed prefix entry"
+        );
+        assert_eq!(
+            index.depths(&keys(0..1), ["east"]),
+            [1],
+            "the sparse entry remains usable"
+        );
+        let held = index.existing("east").expect("east cache");
+        assert_eq!(
+            held.read().unwrap().cap(),
+            settings.capacity,
+            "the configured limit is retained"
+        );
+    }
+
+    /// Public TTL tuning affects confirmed mappings while pending bookkeeping keeps its fixed lifetime.
     #[test]
     fn pending_lifetime_is_fixed_and_confirmation_lifetime_is_configurable() {
         let index = PrefixIndex::default();
@@ -385,15 +425,25 @@ mod tests {
         index.record(&keys(0..4), &east);
         let after = Instant::now();
         let pending = deadline(&index, "east", 0);
-        assert!(pending >= before + Duration::from_secs(30) && pending <= after + Duration::from_secs(30));
+        assert!(
+            pending >= before + Duration::from_secs(30) && pending <= after + Duration::from_secs(30),
+            "pending TTL stays at 30 seconds"
+        );
         assert_eq!(index.depths(&keys(0..4), ["east"]), [0], "pending entries do not match");
 
         let before = Instant::now();
         index.confirm(&keys(0..4), &east);
         let after = Instant::now();
         let confirmed = deadline(&index, "east", 0);
-        assert!(confirmed >= before + Duration::from_secs(11) && confirmed <= after + Duration::from_secs(11));
-        assert_eq!(index.depths_at(&keys(0..4), ["east"], before), [4]);
+        assert!(
+            confirmed >= before + Duration::from_secs(11) && confirmed <= after + Duration::from_secs(11),
+            "confirmation uses ttl_secs = 11"
+        );
+        assert_eq!(
+            index.depths_at(&keys(0..4), ["east"], before),
+            [4],
+            "east matches all confirmed keys before expiry"
+        );
         assert_eq!(
             index.depths_at(&keys(0..4), ["east"], confirmed),
             [0],
@@ -401,6 +451,7 @@ mod tests {
         );
     }
 
+    /// Shorter TTLs can expire a refreshed head first, so matching must stop before its live tail.
     #[test]
     fn ttl_reload_preserves_deadlines_and_an_expired_head_cannot_match_a_live_tail() {
         let index = PrefixIndex::default();

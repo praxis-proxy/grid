@@ -1524,14 +1524,15 @@ mod tests {
         assert_eq!(tuning.generation(), 1, "a refused block sets nothing");
     }
 
+    /// Invalid cache limits are rejected atomically without changing previously applied plugin tuning.
     #[test]
     fn cache_settings_are_validated_before_plugin_tuning_changes() {
         let tuning = Tuning::default();
         let build = |yaml: &str| build_tuned_filter(yaml, &tuning);
         let _filter = build("prefix_affinity: {capacity: 2048, ttl_secs: 120}").expect("valid cache settings build");
         let applied = tuning.affinity();
-        assert_eq!(applied.capacity.get(), 2048);
-        assert_eq!(applied.ttl_secs.get(), 120);
+        assert_eq!(applied.capacity.get(), 2048, "plugin capacity adopted");
+        assert_eq!(applied.ttl_secs.get(), 120, "plugin ttl_secs adopted");
         for field in ["capacity", "ttl_secs"] {
             for value in ["0", "-1", "1.5", "null", "18446744073709551616"] {
                 assert!(
@@ -1545,7 +1546,7 @@ mod tests {
             .err()
             .expect("unrepresentable lifetime");
         assert!(error.to_string().contains("ttl_secs"), "{error}");
-        assert_eq!(tuning.generation(), 1);
+        assert_eq!(tuning.generation(), 1, "invalid ttl_secs keeps tuning");
         assert_eq!(
             *tuning.affinity(),
             *applied,

@@ -1102,6 +1102,7 @@ mod tests {
         );
     }
 
+    /// Applying plugin cache policy resizes live backend caches without restarting their pollers.
     #[test]
     fn plugin_cache_limits_resize_the_running_index_without_restarting_peers() {
         let peers = Peers::default();
@@ -1121,15 +1122,23 @@ mod tests {
             &grid.tuning(),
         )
         .expect("plugin builds against the running control");
-        assert_eq!(affinity.index.depths(&keys, ["pool-east", "pool-west"]), [4, 4]);
-        assert_eq!(affinity.settings.load().ttl_secs.get(), 120);
+        assert_eq!(
+            affinity.index.depths(&keys, ["pool-east", "pool-west"]),
+            [4, 4],
+            "both backend caches adopt capacity 4"
+        );
+        assert_eq!(
+            affinity.settings.load().ttl_secs.get(),
+            120,
+            "the live plugin adopts ttl_secs = 120"
+        );
         assert_eq!(
             grid.reload(&initial).expect("reload"),
             None,
             "tuning was adopted immediately"
         );
         assert_eq!(peers.starts("east"), 1, "changing cache policy keeps existing pollers");
-        assert_eq!(peers.starts("west"), 1);
+        assert_eq!(peers.starts("west"), 1, "west also keeps its existing poller");
     }
 
     #[test]
