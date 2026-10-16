@@ -61,22 +61,42 @@ not DNS-1123 labels.
 
 ## Settings
 
-These live under `prefix_affinity` in the grid serving config. The block is optional, and
-every field has a default.
+These live under `prefix_affinity` in the `grid_site_route` plugin configuration.
+Helm exposes them through `gridServing.siteRoute.prefixAffinity`. The block is
+optional, and every field has a default.
+
+Default cache settings:
+
+```yaml
+prefix_affinity:
+  max_entries_per_cluster: 16384
+  pending_ttl_secs: 30
+  confirmed_ttl_secs: 600
+```
 
 | Setting | Default | Effect |
 |---|---|---|
 | `enabled` | true | The off switch. Off routes on queue depth alone and reads no prompt. |
 | `threshold` | 0.8 | Share of the prompt a site's run must cover to be sticky when it is under 32 blocks. Lower keeps more short conversations sticky. |
 | `exploration` | 0.02 | Share of requests that skip affinity. Higher spreads a shared prompt sooner and costs more cache misses. |
+| `max_entries_per_cluster` | 16384 | Maximum entries in each backend cluster's LRU, per gateway replica. Must be a positive integer. |
+| `pending_ttl_secs` | 30 | Lifetime of an unconfirmed entry, in seconds. Must be a positive integer. |
+| `confirmed_ttl_secs` | 600 | Lifetime after a successful response confirms an entry, in seconds. Must be a positive integer. |
 | `prefill_tokens_per_second` | 10000 | Prices the prefill a match saves. Lower makes a match worth more queue. |
 | `queued_request_seconds` | 2 | Seconds one queued request adds to a new request's wait. Lower lets a sticky site queue deeper. |
 | `tag_key_path` | none | A file holding at least 32 bytes that authenticate stored-state tags. Set it in production. A changed file re-applies the config. |
 
-The operator writes no `prefix_affinity` block, so these defaults apply. These values do not
-change: 256-byte blocks and at most 512 keys per request. A 32-block run is always sticky,
-and a run under 4 blocks never is. Each cluster remembers 16,384 blocks. A block with no
-answer yet lasts 30s, and a confirmed one 10 minutes.
+Each backend cluster has its own LRU, so traffic to one cluster cannot evict
+another cluster's entries. The replica's total entry capacity grows with the
+number of backend clusters. The limit counts prefix entries, not bytes or
+tokens. A plugin reconfiguration resizes existing LRUs, evicting the least
+recent entries when shrinking. New clusters use the current limit. TTL changes
+apply to subsequent records and confirmations; existing deadlines remain in
+place. TTLs must fit the platform's monotonic clock.
+
+The operator writes no `prefix_affinity` block, so the plugin defaults apply
+unless configured separately. Blocks remain 256 bytes, with at most 512 keys
+per request. A 32-block run is always sticky, and a run under 4 blocks never is.
 
 ## What to watch
 

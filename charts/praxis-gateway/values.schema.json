@@ -1335,6 +1335,21 @@
               "additionalProperties": false,
               "description": "Rendered as the filter's prefix_affinity.",
               "properties": {
+                "max_entries_per_cluster": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Maximum prefix entries per backend cluster in each gateway replica; defaults to 16384."
+                },
+                "pending_ttl_secs": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Unconfirmed prefix lifetime in seconds; defaults to 30."
+                },
+                "confirmed_ttl_secs": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Prefix lifetime after a successful response, in seconds; defaults to 600."
+                },
                 "enabled": {
                   "type": "boolean"
                 },

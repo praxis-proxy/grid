@@ -1103,6 +1103,40 @@ mod tests {
     }
 
     #[test]
+    fn plugin_cache_limits_resize_the_running_index_without_restarting_peers() {
+        let peers = Peers::default();
+        let initial = config(&["east", "west"]);
+        let grid = runtime(&peers, &initial);
+        let affinity = grid.affinity();
+        let keys = crate::prefix::PrefixKeys::from_keys((0..8).collect());
+        for cluster in ["pool-east", "pool-west"] {
+            affinity.index.confirm(&keys, &Arc::from(cluster));
+        }
+        let config = serde_yaml::from_str(
+            "prefix_affinity: {max_entries_per_cluster: 4, pending_ttl_secs: 5, confirmed_ttl_secs: 120}",
+        )
+        .expect("plugin settings");
+        let _filter = crate::route::GridSiteRouteFilter::from_config(
+            &config,
+            grid.snapshot(),
+            Arc::clone(&affinity),
+            Arc::default(),
+            &grid.tuning(),
+        )
+        .expect("plugin builds against the running control");
+        assert_eq!(affinity.index.depths(&keys, ["pool-east", "pool-west"]), [4, 4]);
+        assert_eq!(affinity.settings.load().pending_ttl_secs.get(), 5);
+        assert_eq!(affinity.settings.load().confirmed_ttl_secs.get(), 120);
+        assert_eq!(
+            grid.reload(&initial).expect("reload"),
+            None,
+            "tuning was adopted immediately"
+        );
+        assert_eq!(peers.starts("east"), 1, "changing cache policy keeps existing pollers");
+        assert_eq!(peers.starts("west"), 1);
+    }
+
+    #[test]
     fn a_tuning_set_before_the_control_runs_is_adopted_on_the_next_apply() {
         let peers = Peers::default();
         let initial = config(&["east"]);

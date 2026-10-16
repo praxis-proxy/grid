@@ -480,7 +480,8 @@ gridServing:
   siteRoute:
     # -- Site availability. Every field defaults; `shedding` is the one switch.
     availability: {}
-    # -- Prefix affinity.
+    # -- Prefix affinity. Cache limits: max_entries_per_cluster (16384),
+    # pending_ttl_secs (30), confirmed_ttl_secs (600); positive integers.
     prefixAffinity: {}
 
 # -- Optional TLS Secret mounted at tls.mountPath: the grid site identity, or a client

@@ -58,9 +58,9 @@ impl Default for PrefixAffinity {
 impl PrefixAffinity {
     /// Take a serving config's settings and tag key, and forget clusters it no longer routes to.
     pub(crate) fn apply(&self, settings: AffinitySettings, tag_key: Option<TagKey>, clusters: &[Arc<str>]) {
+        self.index.apply(&settings, clusters);
         self.settings.store(Arc::new(settings));
         self.tag_key.store(tag_key.map(Arc::new));
-        self.index.retain(clusters);
     }
 }
 
