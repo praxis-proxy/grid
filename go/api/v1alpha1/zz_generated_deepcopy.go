@@ -329,23 +329,6 @@ func (in *AuthConfig) DeepCopy() *AuthConfig {
 	return out
 }
 
-func (in *SecretRefX) DeepCopyInto(out *SecretRefX) {
-	*out = *in
-	if in.Key != nil {
-		x := *in.Key
-		out.Key = &x
-	}
-}
-
-func (in *SecretRefX) DeepCopy() *SecretRefX {
-	if in == nil {
-		return nil
-	}
-	out := new(SecretRefX)
-	in.DeepCopyInto(out)
-	return out
-}
-
 func (in *ClientCertificateSecretRef) DeepCopyInto(out *ClientCertificateSecretRef) {
 	*out = *in
 }
@@ -362,7 +345,7 @@ func (in *ClientCertificateSecretRef) DeepCopy() *ClientCertificateSecretRef {
 func (in *EndpointTLSConfig) DeepCopyInto(out *EndpointTLSConfig) {
 	*out = *in
 	if in.CAConfigMapRef != nil {
-		out.CAConfigMapRef = new(SecretRefX)
+		out.CAConfigMapRef = new(SecretRef)
 		in.CAConfigMapRef.DeepCopyInto(out.CAConfigMapRef)
 	}
 	if in.CASecretRef != nil {
@@ -1524,15 +1507,15 @@ func (in *SiteInviteSpec) DeepCopy() *SiteInviteSpec {
 	return out
 }
 
-func (in *SecretRefXX) DeepCopyInto(out *SecretRefXX) {
+func (in *SecretKeyRef) DeepCopyInto(out *SecretKeyRef) {
 	*out = *in
 }
 
-func (in *SecretRefXX) DeepCopy() *SecretRefXX {
+func (in *SecretKeyRef) DeepCopy() *SecretKeyRef {
 	if in == nil {
 		return nil
 	}
-	out := new(SecretRefXX)
+	out := new(SecretKeyRef)
 	in.DeepCopyInto(out)
 	return out
 }
@@ -1558,7 +1541,7 @@ func (in *SiteInviteStatus) DeepCopyInto(out *SiteInviteStatus) {
 		out.RedeemedBy = &x
 	}
 	if in.SecretRef != nil {
-		out.SecretRef = new(SecretRefXX)
+		out.SecretRef = new(SecretKeyRef)
 		in.SecretRef.DeepCopyInto(out.SecretRef)
 	}
 	if in.TokenID != nil {

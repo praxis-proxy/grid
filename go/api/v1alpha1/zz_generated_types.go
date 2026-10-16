@@ -318,16 +318,6 @@ type AuthConfig struct {
 	Strategy AuthStrategy `json:"strategy"`
 }
 
-// SecretRefX Reference to a ConfigMap holding the CA certificate PEM, such as the platform service CA (openshift-service-ca.crt, key ...
-type SecretRefX struct {
-	// Key within the ConfigMap's data.
-	Key *string `json:"key,omitempty"`
-	// ConfigMap name.
-	Name string `json:"name"`
-	// ConfigMap namespace.
-	Namespace string `json:"namespace"`
-}
-
 // ClientCertificateSecretRef Reference to a Secret containing the client certificate and private key for mutual TLS.
 type ClientCertificateSecretRef struct {
 	// Key within Secret.data holding the PEM-encoded client certificate.
@@ -343,7 +333,7 @@ type ClientCertificateSecretRef struct {
 // EndpointTLSConfig TLS configuration for the operator's own MCP tools/list probe.
 type EndpointTLSConfig struct {
 	// Reference to a ConfigMap holding the CA certificate PEM, such as the platform service CA (openshift-service-ca.crt, key ...
-	CAConfigMapRef *SecretRefX `json:"caConfigMapRef,omitempty"`
+	CAConfigMapRef *SecretRef `json:"caConfigMapRef,omitempty"`
 	// Reference to a Secret containing the CA certificate PEM for server verification.
 	CASecretRef *SecretRef `json:"caSecretRef,omitempty"`
 	// Reference to a Secret containing the client certificate and private key for mutual TLS.
@@ -1024,8 +1014,8 @@ type SiteInviteSpec struct {
 	SiteName string `json:"siteName"`
 }
 
-// SecretRefXX Secret containing the one-time token.
-type SecretRefXX struct {
+// SecretKeyRef Secret containing the one-time token.
+type SecretKeyRef struct {
 	// Data key holding the token.
 	Key string `json:"key"`
 	// Secret name.
@@ -1047,7 +1037,7 @@ type SiteInviteStatus struct {
 	// CSR name that redeemed this invitation.
 	RedeemedBy *string `json:"redeemedBy,omitempty"`
 	// Secret containing the one-time token.
-	SecretRef *SecretRefXX `json:"secretRef,omitempty"`
+	SecretRef *SecretKeyRef `json:"secretRef,omitempty"`
 	// Public token identifier; the token secret is never stored here.
 	TokenID *string `json:"tokenId,omitempty"`
 }

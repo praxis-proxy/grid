@@ -126,14 +126,34 @@ func newRegistry() *registry {
 // schemaHash returns a content hash of the schema's structural shape, ignoring
 // fields that don't affect the Go type definition: description, default, and
 // nullable (which determines pointer vs value at the call site, not the type
-// itself).
+// itself). Stripping is applied recursively so that two schemas that are
+// structurally identical but differ only in field descriptions hash the same.
 func schemaHash(n schemaNode) string {
+	b, _ := json.Marshal(stripHashFields(n))
+	h := sha256.Sum256(b)
+	return fmt.Sprintf("%x", h[:12])
+}
+
+func stripHashFields(n schemaNode) schemaNode {
 	n.Description = ""
 	n.Default = nil
 	n.Nullable = false
-	b, _ := json.Marshal(n)
-	h := sha256.Sum256(b)
-	return fmt.Sprintf("%x", h[:12])
+	if len(n.Properties) > 0 {
+		clean := make(map[string]schemaNode, len(n.Properties))
+		for k, v := range n.Properties {
+			clean[k] = stripHashFields(v)
+		}
+		n.Properties = clean
+	}
+	if n.Items != nil {
+		items := stripHashFields(*n.Items)
+		n.Items = &items
+	}
+	if n.AdditionalProperties != nil {
+		ap := stripHashFields(*n.AdditionalProperties)
+		n.AdditionalProperties = &ap
+	}
+	return n
 }
 
 // preRegister records the name for a schema hash without building the goDef.
@@ -143,16 +163,27 @@ func (r *registry) preRegister(schema schemaNode, name string) bool {
 	if len(schema.Properties) == 0 && len(schema.Enum) == 0 {
 		return false
 	}
+	isWellKnown := false
 	if wk, ok := wellKnownTypeName(schema); ok {
 		name = wk
+		isWellKnown = true
 	} else if schema.Type == "string" && len(schema.Enum) > 0 {
 		name = wellKnownEnumName(schema, name)
+		isWellKnown = true
 	}
 	hash := schemaHash(schema)
 	if _, exists := r.byHash[hash]; exists {
 		return false
 	}
-	name = r.uniqueName(name)
+	if r.byName[name] {
+		if isWellKnown {
+			// Two structurally distinct schemas resolved to the same well-known
+			// name. Extend wellKnownTypeName (or wellKnownEnumName) to give the
+			// second schema its own stable name before re-running the generator.
+			panic(fmt.Sprintf("preRegister: well-known name collision %q — extend wellKnownTypeName to distinguish the two schemas", name))
+		}
+		name = r.uniqueName(name)
+	}
 	r.byHash[hash] = name
 	r.byName[name] = true
 	return true
@@ -516,6 +547,10 @@ func wellKnownTypeName(n schemaNode) (string, bool) {
 	keys := sortedKeys(props)
 
 	switch {
+	// SecretKeyRef: {key, name, namespace} - all three required (e.g. SiteInvite token secret).
+	case eqKeys(keys, "key", "name", "namespace") && hasRequired(n, "key", "name", "namespace"):
+		return "SecretKeyRef", true
+
 	// SecretRef: {key?, name, namespace} - name+namespace required, key optional.
 	case eqKeys(keys, "key", "name", "namespace") && hasRequired(n, "name", "namespace"):
 		return "SecretRef", true
