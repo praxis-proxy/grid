@@ -15,6 +15,7 @@ endif
 .PHONY: all build release check clean \
 	test test-unit lint gateway-lint lint-extra fmt doc audit \
 	generate-api-types codegen-check generate-crds crds-check generate-deploy deploy-check \
+	generate-go-types go-types-check release-go-types \
 	coverage coverage-check \
 	mutants semver publish-dry-run \
 	require-container-engine \
@@ -30,7 +31,7 @@ endif
 # All
 # -------------------------------------------------------------------
 
-all: build fmt lint doc test audit
+all: build fmt lint doc test audit go-types-check
 
 # -------------------------------------------------------------------
 # Build
@@ -102,6 +103,34 @@ generate-crds:
 # Fail if the checked-in CRD manifests no longer match the Rust types.
 crds-check:
 	./scripts/generate-deployment-crds.sh --check
+
+# Generate Go API types and deep-copy methods from the deployed CRD schemas.
+# Run this after every `make generate-crds` to keep the Go types in sync.
+generate-go-types:
+	cd go && go run ./cmd/gen-types --crds ../deploy/crds --out ./api/v1alpha1
+	cd go && go build ./... && go vet ./...
+	cd go && go build -o /dev/null ./_example
+
+# Fail if the committed generated Go types are out of date with the CRD schemas.
+# Regenerates the types, checks git diff --exit-code on the generated files,
+# then runs the serialization and structural-drift tests.
+# Run this after every `make generate-crds`.
+go-types-check:
+	cd go && go run ./cmd/gen-types --crds ../deploy/crds --out ./api/v1alpha1
+	git diff --exit-code go/api/v1alpha1/zz_generated_types.go go/api/v1alpha1/zz_generated_deepcopy.go
+	cd go && go test ./...
+	cd go && go build -o /dev/null ./_example
+
+# Tag and release the Go API types submodule.
+# The module lives in go/ so tags must use the go/vX.Y.Z convention.
+# Usage: git tag go/v0.1.0 && git push upstream go/v0.1.0
+release-go-types:
+	@echo "To release the Go API types module, tag the commit with the go/ prefix:"
+	@echo "  git tag go/v<X>.<Y>.<Z>"
+	@echo "  git push upstream go/v<X>.<Y>.<Z>"
+	@echo ""
+	@echo "The go/ prefix is required for Go's module proxy to resolve the submodule."
+	@echo "See: https://go.dev/ref/mod#vcs-version"
 
 # Regenerate the operator install manifests in deploy/operator (platform base) and
 # deploy/overlays/kind from charts/grid-operator and the values.yaml in each directory.
@@ -264,7 +293,7 @@ help:
 	@echo "  PROJECT_IMAGE      container image tag"
 	@echo ""
 	@echo "Top-level:"
-	@echo "  all              build + fmt + lint + doc + test + audit"
+	@echo "  all              build + fmt + lint + doc + test + audit + go-types-check (requires Go)"
 	@echo ""
 	@echo "Build:"
 	@echo "  build            cargo build --workspace"

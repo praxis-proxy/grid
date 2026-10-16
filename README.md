@@ -124,7 +124,13 @@ tenant-facing catalog. See the
 configuration examples. The [site-selection guide](docs/site-selection.md)
 explains measured site availability and shedding at consumer gateways.
 
+Go API types for the public CRDs (`grid.praxis.fast/v1alpha1`) live in
+[`go/`](go/) as the module `github.com/praxis-proxy/grid/go`. They are
+generated from the deployed CRD schemas; see [`go/README.md`](go/README.md)
+for install and usage.
+
 ## Compatibility and trust
+
 
 The API version is `grid.praxis.fast/v1alpha1`. Resources from the former
 `grid.praxis-proxy.io` group require a fresh installation. Removing old CRDs
@@ -163,7 +169,7 @@ make build          # build the root workspace
 make fmt            # format root and Gateway workspaces
 make lint           # Clippy, formatting, dependencies, Gateway no-ring check
 make test           # run root workspace tests
-make all            # build, format, lint, docs, tests, audit
+make all            # build, format, lint, docs, tests, audit, Go types check
 ```
 
 Install the pinned upstream Forge with `./scripts/forge.sh install` before

@@ -1,0 +1,9 @@
+apiVersion: grid.praxis.fast/v1alpha1
+kind: SiteInvite
+metadata:
+  name: invite-site-b
+spec:
+  siteName: site-b
+  jurisdictions:
+    - us-east
+  lifetime: 24h
