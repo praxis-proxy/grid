@@ -392,6 +392,15 @@ service:
   # -- Static IP for LoadBalancer type.
   loadBalancerIP: ""
 
+# -- Cloud the cluster runs on. `aws` asks for an NLB on a LoadBalancer Service.
+platform: ""
+
+# -- Reach of the provider load balancer on a cloud platform. `internal` keeps it on the
+# cluster's private network, so sites need private connectivity between them. `external`
+# makes it internet-facing. AWS sets the scope only when a load balancer is created:
+# changing it means recreating the Service.
+loadBalancerScope: internal
+
 # -- OpenShift Route to the Service, for a stable HTTPS name. The gateway terminates TLS.
 route:
   # -- Render the Route. Needs the route.openshift.io/v1 API.

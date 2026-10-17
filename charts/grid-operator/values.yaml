@@ -184,10 +184,18 @@ swim:
 # -- Cloud the grid runs on. `aws` asks for an NLB, since the default carries no UDP.
 platform: ""
 
+# -- Reach of the SWIM and signals load balancers on a cloud platform. `internal` keeps them
+# on the cluster's private network, so sites need private connectivity between them.
+# `external` makes them internet-facing. AWS sets the scope only when a load balancer is
+# created: changing it means recreating the Service.
+loadBalancerScope: internal
+
 # -- The grid's other sites, separated by spaces or commas. Each becomes a SWIM seed and,
 # if a bare IPv4 address, a host route in both Services. That fits a peer that listens on
-# the address it egresses from. Where they differ, as on AWS (NAT address out, SWIM Service
-# hostname in), list the NAT addresses here and the SWIM hostnames in grid.seeds. Either
+# the address it egresses from. Where they differ, as on AWS with internet-facing load
+# balancers (NAT address out, SWIM Service hostname in), list the NAT addresses here and the
+# SWIM hostnames in grid.seeds. Internal load balancers see peers' private addresses: leave
+# this empty and set swim.service.loadBalancerSourceRanges to their machine networks. Either
 # seed key overrides the seeds, and either Service's loadBalancerSourceRanges the routes.
 peers: ""
 

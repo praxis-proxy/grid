@@ -799,6 +799,14 @@
         "aws"
       ]
     },
+    "loadBalancerScope": {
+      "description": "Reach of the SWIM and signals load balancers on a cloud platform: internal (private network) or external (internet-facing).",
+      "type": "string",
+      "enum": [
+        "internal",
+        "external"
+      ]
+    },
     "peers": {
       "description": "The grid's other sites, separated by spaces or commas: SWIM seeds unless a seed key is set, and host routes for the bare IPv4 addresses.",
       "type": "string"

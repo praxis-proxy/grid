@@ -1,0 +1,79 @@
+suite: platform aws
+templates:
+  - templates/enrollment/service.yaml
+# A host with no Route, where the enrollment Service defaults to LoadBalancer.
+set:
+  platform: aws
+  host: enroll.grid.example.com
+  route.enabled: false
+tests:
+  - it: exposes enrollment on an internal network load balancer that carries TCP
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: spec.type
+          value: LoadBalancer
+      - equal:
+          path: spec.ports[0].protocol
+          value: TCP
+      - equal:
+          path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-type"]
+          value: nlb
+      - equal:
+          path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-internal"]
+          value: "true"
+
+  - it: makes the load balancer internet-facing when the scope is external
+    documentIndex: 0
+    set:
+      loadBalancerScope: external
+    asserts:
+      - equal:
+          path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-internal"]
+          value: "false"
+      - equal:
+          path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-type"]
+          value: nlb
+
+  - it: lets the Service's own annotation override the platform's
+    documentIndex: 0
+    set:
+      enrollment.service.annotations:
+        service.beta.kubernetes.io/aws-load-balancer-internal: "false"
+    asserts:
+      - equal:
+          path: metadata.annotations["service.beta.kubernetes.io/aws-load-balancer-internal"]
+          value: "false"
+
+  - it: adds no AWS annotations when a Route fronts enrollment
+    documentIndex: 0
+    set:
+      route.enabled: true
+    asserts:
+      - equal:
+          path: spec.type
+          value: ClusterIP
+      - notExists:
+          path: metadata.annotations
+
+  - it: adds no AWS annotations without a host
+    documentIndex: 0
+    set:
+      host: ""
+    asserts:
+      - equal:
+          path: spec.type
+          value: ClusterIP
+      - notExists:
+          path: metadata.annotations
+
+  - it: adds no AWS annotations without the aws platform
+    documentIndex: 0
+    set:
+      platform: ""
+    asserts:
+      - equal:
+          path: spec.type
+          value: LoadBalancer
+      - notExists:
+          path: metadata.annotations

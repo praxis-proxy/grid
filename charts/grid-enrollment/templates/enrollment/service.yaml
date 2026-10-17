@@ -7,6 +7,11 @@ metadata:
   labels:
     {{- include "grid-enrollment.labels" . | nindent 4 }}
     app.kubernetes.io/component: enrollment
+  {{- $ann := include "grid-enrollment.serviceAnnotations" . }}
+  {{- if $ann }}
+  annotations:
+    {{- $ann | nindent 4 }}
+  {{- end }}
 spec:
   type: {{ .Values.enrollment.service.type }}
   {{- if and (eq .Values.enrollment.service.type "LoadBalancer") .Values.enrollment.service.loadBalancerIP }}

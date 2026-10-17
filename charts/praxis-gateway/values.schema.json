@@ -1122,6 +1122,22 @@
         }
       }
     },
+    "platform": {
+      "description": "Cloud the cluster runs on. aws asks for an NLB on a LoadBalancer Service.",
+      "type": "string",
+      "enum": [
+        "",
+        "aws"
+      ]
+    },
+    "loadBalancerScope": {
+      "description": "Reach of the provider load balancer on a cloud platform: internal (private network) or external (internet-facing).",
+      "type": "string",
+      "enum": [
+        "internal",
+        "external"
+      ]
+    },
     "route": {
       "type": "object",
       "additionalProperties": false,

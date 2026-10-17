@@ -8,6 +8,15 @@
 # default route.host.
 host: ""
 
+# -- Cloud the cluster runs on. `aws` asks for an NLB on a LoadBalancer Service.
+platform: ""
+
+# -- Reach of the enrollment load balancer on a cloud platform. `internal` keeps it on the
+# cluster's private network, so sites need private connectivity between them. `external`
+# makes it internet-facing. AWS sets the scope only when a load balancer is created:
+# changing it means recreating the Service.
+loadBalancerScope: internal
+
 nameOverride: ""
 fullnameOverride: ""
 commonLabels: {}
@@ -183,6 +192,8 @@ enrollment:
     type: ""
     # Static LoadBalancer address, so the enrollment URL is known before install.
     loadBalancerIP: ""
+    # Service annotations, merged over the platform's.
+    annotations: {}
   resources: {}
   podSecurityContext:
     runAsNonRoot: true

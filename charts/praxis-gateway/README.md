@@ -270,6 +270,8 @@ Praxis AI image; these values may advance independently.
 | `service.port` | int | `8080` | Service port. |
 | `service.annotations` | object | `{}` | Service annotations. |
 | `service.loadBalancerIP` | string | `""` | Static IP for LoadBalancer. |
+| `platform` | string | `""` | Cloud the cluster runs on. `aws` asks for an NLB on a LoadBalancer Service. `service.annotations` override the platform's. |
+| `loadBalancerScope` | string | `internal` | Reach of the provider load balancer on a cloud platform. `internal` keeps it on the private network, so sites need private connectivity between them. `external` makes it internet-facing. AWS fixes the scope when it creates the load balancer, so changing it means recreating the Service. |
 | `route.enabled` | bool | `false` | Render an OpenShift Route to the Service. Needs TLS at the gateway and `route.host`. |
 | `route.tls.termination` | string | `passthrough` | `passthrough`, or `reencrypt` with `route.tls.destinationCACertificate`. That CA can be omitted when `service.annotations` has `service.beta.openshift.io/serving-cert-secret-name` naming `gatewayConfig.listenerTls.existingSecret`, since the router trusts the service CA. A provider allows only `passthrough`. |
 | `overlay.enabled` | bool | `false` | Mount an AGN routing overlay ConfigMap. |

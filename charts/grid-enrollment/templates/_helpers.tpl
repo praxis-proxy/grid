@@ -133,6 +133,22 @@ DB_CONNECTION_URL
 {{- end }}
 {{- end }}
 
+{{/* Service annotations, the platform's merged under the Service's own. Only a LoadBalancer gets the platform's. */}}
+{{- define "grid-enrollment.serviceAnnotations" -}}
+{{- $svc := .Values.enrollment.service -}}
+{{- $own := $svc.annotations | default dict -}}
+{{- $platform := dict -}}
+{{- if and (eq $svc.type "LoadBalancer") (eq (.Values.platform | default "") "aws") -}}
+{{- $platform = dict "service.beta.kubernetes.io/aws-load-balancer-type" "nlb" -}}
+{{- /* Explicit false: the AWS Load Balancer Controller treats an absent annotation as internal. */ -}}
+{{- $_ := set $platform "service.beta.kubernetes.io/aws-load-balancer-internal" (toString (eq (.Values.loadBalancerScope | default "internal") "internal")) -}}
+{{- end -}}
+{{- $merged := merge (deepCopy $own) $platform -}}
+{{- if $merged }}
+{{- toYaml $merged }}
+{{- end }}
+{{- end -}}
+
 {{/*
 Whether a Route renders: route.enabled true or false, or auto when the cluster serves
 route.openshift.io/v1. Emits "true" or nothing.
