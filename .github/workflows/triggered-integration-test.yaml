@@ -2,8 +2,8 @@ name: Triggered Integration Test
 
 # ------------------------------------------------------------------------------
 # Maintainer-triggered integration test of Grid main, a pull request, or a branch,
-# plus a nightly quick GLB run against main. Manual runs can select one of the
-# release qualifications below; scheduled runs intentionally remain GLB.
+# plus the legacy nightly quick GLB run against main. Manual and scheduled
+# release qualifications share this workflow through workflow_call.
 #
 # Runs the selected qualification against the tested revision. GLB verifies
 # multi-cluster routing, SWIM discovery, mTLS, overlay hot-reload, and provider
@@ -23,30 +23,40 @@ on:
         required: false
         default: ""
         type: string
-      qualification:
-        description: Release qualification to run
+      release_qualification:
+        description: Release qualification and supported mode to run
         required: true
-        default: glb
+        default: glb-quick
         type: choice
         options:
-          - glb
+          - glb-quick
+          - glb-full
           - static-weighted
           - combined-site
-          - llmd-pool-metrics
-      mode:
-        description: Demo execution mode
+          - llmd-pool-metrics-quick
+          - llmd-pool-metrics-full
+  workflow_call:
+    inputs:
+      release_qualification:
+        description: Release qualification and supported mode to run
         required: true
-        default: quick
-        type: choice
-        options:
-          - quick
-          - full
+        type: string
+      pr_number:
+        description: Grid pull-request number; mutually exclusive with branch
+        required: false
+        type: string
+        default: ""
+      branch:
+        description: Branch in this repository to test; leave blank for a PR or main
+        required: false
+        type: string
+        default: ""
   schedule:
     - cron: "0 18 * * *"
       timezone: America/New_York
 
 concurrency:
-  group: grid-triggered-integration-${{ inputs.qualification || 'glb' }}-${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.branch != '' && format('branch-{0}', inputs.branch) || 'main' }}-${{ inputs.mode || 'quick' }}-${{ github.event_name }}
+  group: grid-triggered-integration-${{ inputs.release_qualification || 'glb-quick' }}-${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.branch != '' && format('branch-{0}', inputs.branch) || 'main' }}-${{ github.event_name }}
   cancel-in-progress: true
 
 permissions: {}
@@ -117,41 +127,46 @@ jobs:
       head_branch: ${{ steps.pr.outputs.head_branch }}
       head_sha: ${{ steps.pr.outputs.head_sha }}
       base_sha: ${{ steps.source.outputs.base_sha }}
+      release_qualification: ${{ steps.selection.outputs.release_qualification }}
+      qualification: ${{ steps.selection.outputs.qualification }}
+      mode: ${{ steps.selection.outputs.mode }}
     steps:
-      - name: Validate qualification and mode
+      - name: Resolve release qualification
+        id: selection
         env:
-          QUALIFICATION: ${{ inputs.qualification || 'glb' }}
-          MODE: ${{ inputs.mode || 'quick' }}
-          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_QUALIFICATION: ${{ inputs.release_qualification || 'glb-quick' }}
         run: |
           set -euo pipefail
-          case "${QUALIFICATION}" in
-            glb)
+          case "${RELEASE_QUALIFICATION}" in
+            glb-quick)
+              QUALIFICATION=glb MODE=quick
+              ;;
+            glb-full)
+              QUALIFICATION=glb MODE=full
               ;;
             static-weighted)
-              if [[ "${MODE}" != "quick" ]]; then
-                echo "::error::static-weighted is a fixed quick release qualification; select mode=quick"
-                exit 1
-              fi
+              QUALIFICATION=static-weighted MODE=quick
               ;;
             combined-site)
-              if [[ "${MODE}" != "full" ]]; then
-                echo "::error::combined-site is a fixed full release qualification; select mode=full"
-                exit 1
-              fi
+              QUALIFICATION=combined-site MODE=full
               ;;
-            llmd-pool-metrics)
+            llmd-pool-metrics-quick)
+              QUALIFICATION=llmd-pool-metrics MODE=quick
+              ;;
+            llmd-pool-metrics-full)
+              QUALIFICATION=llmd-pool-metrics MODE=full
               ;;
             *)
-              echo "::error::Unknown qualification '${QUALIFICATION}'; expected glb, static-weighted, combined-site, or llmd-pool-metrics"
+              echo "::error::Unknown release qualification '${RELEASE_QUALIFICATION}'"
               exit 1
               ;;
           esac
-          if [[ "${EVENT_NAME}" == "schedule" && "${QUALIFICATION}" != "glb" ]]; then
-            echo "::error::Scheduled runs must use the GLB qualification"
-            exit 1
-          fi
-          echo "Qualification: ${QUALIFICATION} (${MODE})"
+          {
+            echo "release_qualification=${RELEASE_QUALIFICATION}"
+            echo "qualification=${QUALIFICATION}"
+            echo "mode=${MODE}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Release qualification: ${RELEASE_QUALIFICATION} -> ${QUALIFICATION} (${MODE})"
 
       - name: Validate source selector
         env:
@@ -369,7 +384,7 @@ jobs:
   # ============================================================================
 
   qualification-e2e:
-    name: ${{ needs.resolve-source.outputs.source_label }} ${{ inputs.qualification || 'glb' }} E2E
+    name: ${{ needs.resolve-source.outputs.source_label }} ${{ needs.resolve-source.outputs.release_qualification }} E2E
     needs: resolve-source
     runs-on: ubuntu-24.04
     permissions:
@@ -384,10 +399,10 @@ jobs:
       HEAD_SHA: ${{ needs.resolve-source.outputs.head_sha }}
       BASE_SHA: ${{ needs.resolve-source.outputs.base_sha }}
       BRANCH_NAME: ${{ needs.resolve-source.outputs.branch_name }}
-      QUALIFICATION: ${{ inputs.qualification || 'glb' }}
-      MODE: ${{ inputs.mode || 'quick' }}
-      EVIDENCE_DIR: ${{ github.workspace }}/evidence/${{ inputs.qualification || 'glb' }}
-      DIAGNOSTICS_DIR: ${{ github.workspace }}/diagnostics/${{ inputs.qualification || 'glb' }}
+      QUALIFICATION: ${{ needs.resolve-source.outputs.qualification }}
+      MODE: ${{ needs.resolve-source.outputs.mode }}
+      EVIDENCE_DIR: ${{ github.workspace }}/evidence/${{ needs.resolve-source.outputs.release_qualification }}
+      DIAGNOSTICS_DIR: ${{ github.workspace }}/diagnostics/${{ needs.resolve-source.outputs.release_qualification }}
     steps:
       # ----------------------------------------------------------------------
       # Checkout
@@ -1749,8 +1764,8 @@ jobs:
         with:
           name: ${{ steps.tags.outputs.artifact_prefix || format('grid-{0}-{1}', needs.resolve-source.outputs.source_kind, needs.resolve-source.outputs.tested_sha) }}-${{ env.QUALIFICATION }}-${{ env.MODE }}
           path: |
-            ${{ github.workspace }}/evidence/${{ env.QUALIFICATION }}/
-            ${{ github.workspace }}/diagnostics/${{ env.QUALIFICATION }}/
+            ${{ env.EVIDENCE_DIR }}/
+            ${{ env.DIAGNOSTICS_DIR }}/
             ${{ github.workspace }}/run-${{ env.QUALIFICATION }}.log
             ${{ github.workspace }}/image-manifest.txt
             ${{ github.workspace }}/source-metadata.json

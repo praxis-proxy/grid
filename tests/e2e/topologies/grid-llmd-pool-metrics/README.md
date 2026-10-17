@@ -117,9 +117,11 @@ the proof can require an explicit zero held-capacity observation; a missing
 held-work metric fails closed.
 
 The permanent **Triggered Integration Test** workflow offers this topology as
-`llmd-pool-metrics` in both quick and full modes. Full mode builds the Grid
-Gateway from the tested source revision; the Praxis AI gateway, simulator, and
-EPP images are pinned and recorded in the run artifact.
+`llmd-pool-metrics-quick` and `llmd-pool-metrics-full`. Full mode builds the
+Grid Gateway from the tested source revision; the Praxis AI gateway, simulator,
+and EPP images are pinned and recorded in the run artifact. The workflow's
+scheduled quick run calls the same reusable runner as manual dispatch; full
+mode remains manual-only.
 
 AGN still performs real EPP metric scraping, score/rank computation, overlay
 publication, overlay-sync projection, Praxis configuration loading, and
