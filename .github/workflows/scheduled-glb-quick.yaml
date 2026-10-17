@@ -1,0 +1,16 @@
+name: Scheduled GLB Quick Qualification
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+
+permissions:
+  contents: read
+  packages: read
+  pull-requests: read
+
+jobs:
+  qualify:
+    uses: ./.github/workflows/triggered-integration-test.yaml
+    with:
+      release_qualification: glb-quick

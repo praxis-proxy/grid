@@ -94,6 +94,43 @@ The first-class integration qualifications are documented in
 isolated Kind environments, exercise runtime behavior, record evidence, and
 clean up their resources.
 
+### Triggered Integration Test dispatch and schedules
+
+The **Triggered Integration Test** manual dispatch uses one **Release
+qualification** dropdown. Its supported choices are:
+
+| Dropdown choice | Runner command | Mode |
+|---|---|---|
+| `glb-quick` | `run-grid-glb-demo` | `--quick` |
+| `glb-full` | `run-grid-glb-demo` | `--full` |
+| `static-weighted` | `run-grid-static-weighted-qualification` | Fixed `--quick` |
+| `combined-site` | `run-grid-combined-site-demo` | Fixed `--full` |
+| `llmd-pool-metrics-quick` | `run-grid-llmd-pool-metrics-demo` | `--quick` |
+| `llmd-pool-metrics-full` | `run-grid-llmd-pool-metrics-demo` | `--full` |
+
+Static-weighted full mode and combined-site quick mode are not selectable in
+this workflow: its validation and runner intentionally support only the fixed
+modes above. The GLB `--no-ingress` variant is also omitted because the
+Triggered Integration Test does not expose that topology selector.
+
+Only quick-mode qualifications have daily scheduled workflows. Full runs
+remain available for manual dispatch only; `combined-site` is also manual-only
+because its only supported mode is `--full`. Scheduled start times are UTC and
+are spaced one hour apart to avoid overlapping the approximately 30-minute
+runs. The original daily quick-GLB schedule remains enabled at 18:00
+`America/New_York` (22:00 UTC during daylight time, 23:00 UTC during standard
+time); consequently, `glb-quick` also has that legacy run.
+
+| Scheduled workflow | Release qualification | Daily UTC start |
+|---|---|---:|
+| `Scheduled GLB Quick Qualification` | `glb-quick` | 00:00 |
+| `Scheduled Static-Weighted Qualification` | `static-weighted` | 01:00 |
+| `Scheduled llm-d Pool-Metrics Quick Qualification` | `llmd-pool-metrics-quick` | 02:00 |
+
+The scheduled workflows call the same reusable Triggered Integration Test
+workflow as manual runs, so source resolution, image selection, evidence
+upload, cleanup, and failure diagnostics stay shared.
+
 ## Integration qualification checklist
 
 Run the individual qualification commands below against fresh source builds
@@ -112,7 +149,7 @@ directory can lose its clusters even when it uses a different config file.
 | Combined-site lifecycle | `cargo xtask env run-grid-combined-site-demo --forge-config tests/e2e/topologies/grid-combined-site/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-combined-site/forge.yaml` | Release qualification | Combined-site routing, provider add/remove/re-add, session fallback, rollout, trust, or lifecycle changes | [README](../tests/e2e/topologies/grid-combined-site/README.md) |
 | GLB | `cargo xtask env run-grid-glb-demo --forge-config tests/e2e/topologies/grid-glb-demo/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-glb-demo/forge.yaml` | Release qualification | GLB, ingress, edge/provider boundary, mTLS, or network-boundary changes | [README](../tests/e2e/topologies/grid-glb-demo/README.md) |
 | Workload inference / no ingress | `cargo xtask env run-grid-glb-demo --forge-config tests/e2e/topologies/grid-glb-demo/forge.yaml --no-ingress --full --teardown --evidence-dir "$EVIDENCE_DIR"` | Reuses `tests/e2e/topologies/grid-glb-demo/forge.yaml`; documented by `tests/e2e/topologies/grid-workload-inference/README.md` | Release qualification | Workload inference, no-ingress routing, or cluster-local workload entry changes | [README](../tests/e2e/topologies/grid-workload-inference/README.md) |
-| llm-d pool metrics, cross-site signals, learned ceilings, partition, and recovery | `cargo xtask env run-grid-llmd-pool-metrics-demo --forge-config tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml` | Experimental qualification; selectable in the generic triggered workflow as `llmd-pool-metrics` in quick or full mode | EPP metrics, operator peer polling, Grid Gateway site selection and stale-signal gauge clearing, KV-cache saturation or learned-ceiling lifecycle, provider topology withdrawal/re-addition, pressure transitions, recovery, partition, or metrics mTLS changes | [README](../tests/e2e/topologies/grid-llmd-pool-metrics/README.md) |
+| llm-d pool metrics, cross-site signals, learned ceilings, partition, and recovery | `cargo xtask env run-grid-llmd-pool-metrics-demo --forge-config tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml` | Experimental qualification; selectable in Triggered Integration Test as `llmd-pool-metrics-quick` or `llmd-pool-metrics-full` | EPP metrics, operator peer polling, Grid Gateway site selection and stale-signal gauge clearing, KV-cache saturation or learned-ceiling lifecycle, provider topology withdrawal/re-addition, pressure transitions, recovery, partition, or metrics mTLS changes | [README](../tests/e2e/topologies/grid-llmd-pool-metrics/README.md) |
 
 Use the following one-line command stack after setting `IMAGE_TAG` and
 `EVIDENCE_DIR` for each run. The quota qualification additionally requires a
