@@ -1123,11 +1123,14 @@
       }
     },
     "platform": {
-      "description": "Cloud the cluster runs on. aws asks for an NLB on a LoadBalancer Service.",
+      "description": "Cloud whose load balancer settings LoadBalancer Services get: aws, azure, gcp, or any for all three, since each cloud reads only its own keys.",
       "type": "string",
       "enum": [
         "",
-        "aws"
+        "aws",
+        "azure",
+        "gcp",
+        "any"
       ]
     },
     "loadBalancerScope": {

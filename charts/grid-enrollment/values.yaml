@@ -8,7 +8,9 @@
 # default route.host.
 host: ""
 
-# -- Cloud the cluster runs on. `aws` asks for an NLB on a LoadBalancer Service.
+# -- Cloud whose load balancer settings LoadBalancer Services get: `aws` (an NLB, since the
+# default carries no UDP), `azure`, `gcp`, or `any` for all three. Each cloud reads only its
+# own keys, so `any` suits a render that runs on every cloud.
 platform: ""
 
 # -- Reach of the enrollment load balancer on a cloud platform. `internal` keeps it on the

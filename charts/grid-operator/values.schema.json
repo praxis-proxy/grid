@@ -796,8 +796,12 @@
       "type": "string",
       "enum": [
         "",
-        "aws"
-      ]
+        "aws",
+        "azure",
+        "gcp",
+        "any"
+      ],
+      "description": "Cloud whose load balancer settings LoadBalancer Services get: aws, azure, gcp, or any for all three, since each cloud reads only its own keys."
     },
     "loadBalancerScope": {
       "description": "Reach of the SWIM and signals load balancers on a cloud platform: internal (private network) or external (internet-facing).",

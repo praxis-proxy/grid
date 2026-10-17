@@ -6,6 +6,6 @@ metrics:
     source: serviceCA
 networkPolicy:
   enabled: true
-# AWS load balancer annotations on every OpenShift install: the default AWS load balancer
-# carries no UDP, and other clouds ignore the aws- annotations, so no cloud detection is needed.
-platform: aws
+# Every cloud's load balancer settings on every OpenShift install: each cloud reads only its
+# own keys, so no cloud detection is needed.
+platform: any
