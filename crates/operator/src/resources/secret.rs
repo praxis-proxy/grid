@@ -153,7 +153,7 @@ pub(crate) async fn read_config_map_bytes(
 /// Returns `None` for missing, empty, invalid UTF-8, or private-key-looking
 /// content.  This is deliberately conservative because the returned value may
 /// be broadcast to peers and written to `GridSite.status.publicCertPem`.
-fn public_cert_pem_from_secret(secret: &Secret) -> Option<String> {
+pub(crate) fn public_cert_pem_from_secret(secret: &Secret) -> Option<String> {
     secret
         .data
         .as_ref()

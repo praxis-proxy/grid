@@ -1701,6 +1701,8 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     )
     .await?;
 
+    Box::pin(apply_local_site_condition(client, &network, ctx.site_name())).await;
+
     // Auto-create or update GridSite records for remote Alive SWIM members.
     // Only runs when the GridNetwork explicitly opts in via LABEL_AUTO_DISCOVER_SITES.
     // This gate prevents auto-discovery from changing overlay generation semantics
@@ -1720,6 +1722,36 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     Ok(Action::requeue(
         serving_retry.map_or(requeue_interval, |wait| requeue_interval.min(wait)),
     ))
+}
+
+/// Report whether this site's own [`GridSite`] is declared and labelled.
+async fn apply_local_site_condition(client: &Client, network: &GridNetwork, local_site: Option<&str>) {
+    let Some(network_name) = network.metadata.name.as_deref() else {
+        return;
+    };
+    let site = match local_site {
+        Some(local) => match Api::<GridSite>::all(client.clone()).get_opt(local).await {
+            Ok(site) => site,
+            Err(error) => {
+                tracing::debug!(%error, site = local, "local GridSite not readable; retrying next reconcile");
+                return;
+            },
+        },
+        None => None,
+    };
+    let declared = crate::local_site::Declared::of(network_name, local_site, site.as_ref());
+    let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
+        return;
+    };
+    let Some((name, patch)) = crate::local_site::patch(network, local_site, declared, &now) else {
+        return;
+    };
+    let params = PatchParams::apply(crate::local_site::FIELD_MANAGER).force();
+    let api: Api<GridNetwork> = Api::all(client.clone());
+    match Box::pin(api.patch_status(name, &params, &Patch::Apply(patch))).await {
+        Ok(_) => tracing::info!(?declared, network = name, "local site condition written"),
+        Err(error) => tracing::warn!(%error, "local site condition not written; retrying next reconcile"),
+    }
 }
 
 /// Advance the explicitly configured local [`GridSite`] into discovery.

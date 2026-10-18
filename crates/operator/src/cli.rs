@@ -49,6 +49,32 @@ pub struct GridArgs {
     /// Peer trust to start in with no `GridNetwork`, the chart's grid.peerTrust.
     #[arg(long = "grid-peer-trust", env = "GRID_PEER_TRUST", value_enum)]
     pub peer_trust: Option<PeerTrustMode>,
+
+    /// `GridNetwork` the operator creates for its site when none exists.
+    #[arg(long = "grid-network", env = "GRID_NETWORK", default_value = "grid")]
+    pub network: String,
+
+    /// Namespace holding the site identity before a `GridNetwork` names it. Defaults to the operator's.
+    #[arg(long = "grid-identity-namespace", env = "GRID_IDENTITY_NAMESPACE")]
+    pub identity_namespace: Option<String>,
+
+    /// SWIM key Secret beside the identity, referenced when it exists.
+    #[arg(
+        long = "grid-swim-key-secret",
+        env = "GRID_SWIM_KEY_SECRET",
+        default_value = "grid-swim-key"
+    )]
+    pub swim_key_secret: String,
+
+    /// Create this site's `GridNetwork` and `GridSite` once its identity exists.
+    #[arg(
+        long = "grid-create-local-records",
+        env = "GRID_CREATE_LOCAL_RECORDS",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub create_local_records: bool,
 }
 
 /// Metrics and health listener options.
