@@ -137,6 +137,12 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
           {{- if ($.Values.gridServing).enabled }}
           - filter: grid_site_route
             model_header: X-Gateway-Model-Name
+            {{- with $cfg.backends }}
+            clusters:
+              {{- range . }}
+              - {{ .cluster | quote }}
+              {{- end }}
+            {{- end }}
             {{- with ($.Values.gridServing).siteRoute }}
             {{- with .availability }}
             availability:

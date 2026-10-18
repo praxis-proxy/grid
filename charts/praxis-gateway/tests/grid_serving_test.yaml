@@ -38,7 +38,7 @@ tests:
     asserts:
       - matchRegex:
           path: data["praxis.yaml"]
-          pattern: 'filter: grid_site_route\n\s+model_header: X-Gateway-Model-Name\n\s+availability:\n\s+shedding: true\n\s+prefix_affinity:\n\s+threshold: 0.5'
+          pattern: 'filter: grid_site_route\n\s+model_header: X-Gateway-Model-Name\n\s+clusters:\n(\s+- .+\n)+\s+availability:\n\s+shedding: true\n\s+prefix_affinity:\n\s+threshold: 0.5'
 
   - it: renders no tuning block when siteRoute is empty
     template: templates/gateway-config.yaml
