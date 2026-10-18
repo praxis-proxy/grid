@@ -79,6 +79,13 @@ spec:
               value: {{ printf "%s-swim" (include "grid-operator.fullname" .) | quote }}
             {{- end }}
             {{- end }}
+            - name: GRID_NETWORK
+              value: {{ .Values.grid.network | quote }}
+            {{- /* The chart renders the records with grid.id, and an enrolling release may set it later. */}}
+            {{- if or .Values.grid.id .Values.enrollment.enabled }}
+            - name: GRID_CREATE_LOCAL_RECORDS
+              value: "false"
+            {{- end }}
             {{- with .Values.swim.siteName | default (and .Values.enrollment.enabled .Values.enrollment.siteName) }}
             - name: GRID_SWIM_SITE_NAME
               value: {{ . | quote }}

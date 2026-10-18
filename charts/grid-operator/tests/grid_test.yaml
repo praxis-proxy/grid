@@ -78,6 +78,9 @@ tests:
           path: metadata.name
           value: east
       - equal:
+          path: metadata.labels["grid.praxis.fast/provider-site"]
+          value: east
+      - equal:
           path: spec
           value: {gridNetworkRef: grid, region: us-east, zone: us-east-1a}
 
@@ -276,3 +279,45 @@ tests:
         contains:
           path: spec.template.spec.containers[0].env
           content: {name: GRID_SWIM_SEEDS, value: "[2001:db8::1]:7947,[2001:db8::2]:7948"}
+
+  - it: leaves the records to the chart when grid.id renders them
+    template: templates/deployment.yaml
+    set:
+      site.name: east
+      grid.id: lab
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_CREATE_LOCAL_RECORDS, value: "false"}
+
+  - it: leaves the records to an enrolling release from its first install, before grid.id
+    template: templates/deployment.yaml
+    set:
+      site.name: east
+      enrollment.enabled: true
+      enrollment.url: https://enroll.example.com
+      enrollment.caBundle.configMap: grid-ca
+      enrollment.tokenSecretRef.name: grid-invite
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_CREATE_LOCAL_RECORDS, value: "false"}
+
+  - it: lets the operator create the records when the chart renders none
+    template: templates/deployment.yaml
+    set:
+      site.name: east
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_CREATE_LOCAL_RECORDS, value: "false"}
+
+  - it: names the GridNetwork the operator creates after grid.network
+    template: templates/deployment.yaml
+    set:
+      site.name: east
+      grid.network: lab-net
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_NETWORK, value: lab-net}

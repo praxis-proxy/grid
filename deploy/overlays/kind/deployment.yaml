@@ -57,6 +57,8 @@ spec:
               value: "$(POD_IP):7946"
             - name: GRID_SWIM_ADVERTISE_FALLBACK
               value: "$(POD_IP):7946"
+            - name: GRID_NETWORK
+              value: "grid"
             - name: GRID_GATEWAY_NAMESPACE
               value: "$(POD_NAMESPACE)"
             - name: GRID_GATEWAY_DISCOVERY_ENABLED

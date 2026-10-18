@@ -6,6 +6,7 @@ metadata:
   name: {{ .Values.swim.siteName | quote }}
   labels:
     {{- include "grid-operator.labels" . | nindent 4 }}
+    grid.praxis.fast/provider-site: {{ .Values.swim.siteName | quote }}
   annotations:
     {{- include "grid-operator.afterCrds" . | nindent 4 }}
 spec:
