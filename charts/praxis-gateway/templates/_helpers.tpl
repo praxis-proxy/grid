@@ -36,6 +36,7 @@ otherwise config.inline serves.
 {{- if and (not ($v.config).existingConfigMap) $gridRouting }}{{- $_ := set $cfg "render" true }}{{- end }}
 {{- if not $v.service.type }}{{- $_ := set $v.service "type" (ternary "LoadBalancer" "ClusterIP" $provider) }}{{- end }}
 {{- if hasSuffix "/grid-gateway" $v.image.repository }}{{- $_ := set $v.image "flavor" "grid-gateway" }}{{- end }}
+{{- include "praxis-gateway.resolveMetricsListener" . }}
 {{- $t := $cfg.peerTrust | default dict }}
 {{- $digests := concat ($t.certDigests | default list) (compact (list $t.digest $t.nextDigest)) | uniq }}
 {{- $ids := concat ($t.spiffeIds | default list) (compact (list $t.spiffeId)) | uniq }}
@@ -660,6 +661,50 @@ RUST_LOG for the gateway and overlay-sync: log.filter when set, else log.level, 
 {{- define "praxis-gateway.rustLog" -}}
 {{- $log := .Values.log | default dict -}}
 {{- $log.filter | default $log.level -}}
+{{- end }}
+
+{{/*
+Resolve metricsListener.enabled and serviceMonitor.enabled to booleans. auto turns the
+listener on for the grid-gateway image on OpenShift with the NetworkPolicy on, and fills
+each unset value from the platform: a service serving cert, user workload monitoring, and
+the service CA. Off OpenShift no cert source exists by default, so auto stays off.
+*/}}
+{{- define "praxis-gateway.resolveMetricsListener" -}}
+{{- $v := .Values }}
+{{- $m := $v.metricsListener }}
+{{- if eq (toString $m.enabled) "auto" }}
+{{- $openshift := include "praxis-gateway.openshift" . }}
+{{- $grid := eq $v.image.flavor "grid-gateway" }}
+{{- $on := and $grid $openshift $v.networkPolicy.enabled }}
+{{- $_ := set $m "enabled" (not (empty $on)) }}
+{{- if and $grid $openshift (not $v.networkPolicy.enabled) }}
+{{- $_ := set $m "skipped" "networkPolicy.enabled is false" }}
+{{- end }}
+{{- if $m.enabled }}
+{{- if not $m.existingSecret }}
+{{- $_ := set $m "existingSecret" (printf "%s-metrics-tls" (include "praxis-gateway.fullname" .)) }}
+{{- $annotations := $m.service.annotations | default dict }}
+{{- if not (hasKey $annotations "service.beta.openshift.io/serving-cert-secret-name") }}
+{{- $_ := set $annotations "service.beta.openshift.io/serving-cert-secret-name" $m.existingSecret }}
+{{- end }}
+{{- $_ := set $m.service "annotations" $annotations }}
+{{- end }}
+{{- if not $m.fromNamespaces }}
+{{- $_ := set $m "fromNamespaces" (list "openshift-user-workload-monitoring") }}
+{{- end }}
+{{- if not $m.serviceMonitor.caConfigMap.name }}
+{{- $_ := set $m.serviceMonitor "caConfigMap" (dict "name" "openshift-service-ca.crt" "key" "service-ca.crt") }}
+{{- end }}
+{{- end }}
+{{- else }}
+{{- $_ := set $m "enabled" (eq (toString $m.enabled) "true") }}
+{{- end }}
+{{- $sm := $m.serviceMonitor }}
+{{- if eq (toString $sm.enabled) "auto" }}
+{{- $_ := set $sm "enabled" (and $m.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") (not (empty $sm.caConfigMap.name))) }}
+{{- else }}
+{{- $_ := set $sm "enabled" (eq (toString $sm.enabled) "true") }}
+{{- end }}
 {{- end }}
 
 {{/*

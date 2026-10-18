@@ -745,7 +745,8 @@
       "description": "TLS listener serving only GET /metrics.",
       "properties": {
         "enabled": {
-          "type": "boolean"
+          "enum": [true, false, "true", "false", "auto"],
+          "description": "auto serves the listener for the grid-gateway image on OpenShift with networkPolicy.enabled and fills unset values from the platform. true needs each value set."
         },
         "port": {
           "type": "integer",
@@ -779,7 +780,8 @@
           "additionalProperties": false,
           "properties": {
             "enabled": {
-              "type": "boolean"
+              "enum": [true, false, "true", "false", "auto"],
+              "description": "auto renders the ServiceMonitor when the listener is on, monitoring.coreos.com/v1 is served, and a CA is set."
             },
             "interval": {
               "type": "string"

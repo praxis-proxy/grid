@@ -351,8 +351,11 @@ networkPolicy:
 # listener cannot be scraped from outside the pod. Needs the grid-gateway image and
 # networkPolicy.enabled, since the port is reachable only from fromNamespaces.
 metricsListener:
-  # -- Serve the listener.
-  enabled: false
+  # -- Serve the listener. auto serves it for the grid-gateway image on OpenShift with
+  # networkPolicy.enabled, and fills each unset value below from the platform: the service
+  # serving cert in <fullname>-metrics-tls, openshift-user-workload-monitoring, and the
+  # openshift-service-ca.crt CA. true needs each value set.
+  enabled: auto
   # -- Container and Service port.
   port: 9443
   # -- Secret holding tls.crt and tls.key, for example the serving cert that
@@ -366,8 +369,9 @@ metricsListener:
     # -- Annotations on the ClusterIP metrics Service.
     annotations: {}
   serviceMonitor:
-    # -- Render a monitoring.coreos.com/v1 ServiceMonitor for the metrics Service.
-    enabled: false
+    # -- Render a monitoring.coreos.com/v1 ServiceMonitor for the metrics Service. auto
+    # renders it when the listener is on, monitoring.coreos.com/v1 is served, and a CA is set.
+    enabled: auto
     # -- Scrape interval.
     interval: 30s
     # -- Scrape timeout. Unset leaves Prometheus's default of 10s, which Prometheus
