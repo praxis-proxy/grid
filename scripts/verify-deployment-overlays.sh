@@ -43,7 +43,9 @@ done
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 cp -r deploy/overlays/openshift "$WORK/moved"
-sed -i 's/^namespace=.*/namespace=moved-ns/' "$WORK/moved/params.env"
+# Written from the pristine source into the copy: BSD sed -i needs a suffix argument.
+sed 's/^namespace=.*/namespace=moved-ns/' deploy/overlays/openshift/params.env \
+  > "$WORK/moved/params.env"
 if ! kustomize build "$WORK/moved" | yq eval-all -o=json '[.]' | jq -e '
   all(.[]; .metadata.namespace == null or .metadata.namespace == "moved-ns") and
   all(.[] | (.subjects // [])[] | select(.kind == "ServiceAccount"); .namespace == "moved-ns") and
