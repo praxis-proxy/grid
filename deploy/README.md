@@ -53,8 +53,10 @@ Services.
   namespace.
 - Generated `overlays/<flavor>/` directories use the base values plus the flavor's
   `values.yaml` as a delta, rendered against the API versions in its `api-versions` file.
-  `overlays/openshift/` takes metrics TLS from the service CA and adds a NetworkPolicy that
-  admits the platform's monitoring namespaces.
+  `overlays/openshift/` takes metrics TLS from the service CA, adds a NetworkPolicy that
+  admits the platform's monitoring namespaces, and adds a ServiceMonitor for user workload
+  monitoring. The ServiceMonitor names its namespace in its selector and TLS server name,
+  so a consumer that moves the overlay sets `namespace` in `params.env` as well.
 - `overlays/openshift/` also sets `platform: any`: internal load balancers for the SWIM and
   signals Services on AWS (NLBs with cross-zone load balancing, since the default Classic
   Load Balancer rejects UDP), Azure and GCP (with global access, so other regions reach

@@ -1,6 +1,6 @@
 # The OpenShift flavor of deploy/operator: a delta on deploy/operator/values.yaml.
-# Metrics TLS from the service CA, and a NetworkPolicy that admits the platform's
-# monitoring namespaces to the metrics port.
+# Metrics TLS from the service CA, a NetworkPolicy that admits the platform's monitoring
+# namespaces to the metrics port, and a ServiceMonitor so user workload monitoring scrapes it.
 metrics:
   tls:
     source: serviceCA
@@ -9,3 +9,5 @@ networkPolicy:
 # Every cloud's load balancer settings on every OpenShift install: each cloud reads only its
 # own keys, so no cloud detection is needed.
 platform: any
+serviceMonitor:
+  enabled: true

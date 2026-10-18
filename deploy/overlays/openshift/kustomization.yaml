@@ -21,6 +21,7 @@ resources:
   - service-swim.yaml
   - serviceaccount-metrics-scraper.yaml
   - serviceaccount.yaml
+  - servicemonitor.yaml
 
 labels:
   - pairs:
@@ -46,3 +47,23 @@ replacements:
           name: grid-operator
         fieldPaths:
           - spec.template.spec.containers.[name=operator].image
+  # A consumer's namespace override does not reach the ServiceMonitor's selector or its TLS
+  # server name, so the namespace comes through params.env.
+  - source:
+      kind: ConfigMap
+      name: grid-operator-parameters
+      fieldPath: data.namespace
+    targets:
+      - select:
+          kind: ServiceMonitor
+          name: grid-operator
+        fieldPaths:
+          - spec.namespaceSelector.matchNames.0
+      - select:
+          kind: ServiceMonitor
+          name: grid-operator
+        fieldPaths:
+          - spec.endpoints.0.tlsConfig.serverName
+        options:
+          delimiter: "."
+          index: 1

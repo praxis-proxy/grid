@@ -135,6 +135,7 @@ render_base() {
   cat > "$out/params.env" <<EOF
 grid-operator-image=$image_default
 EOF
+  [ -e "$out/servicemonitor.yaml" ] && echo "namespace=$NAMESPACE_PLACEHOLDER" >> "$out/params.env"
   local resources
   resources="$(resource_list "$out")"
   {
@@ -174,6 +175,30 @@ replacements:
         fieldPaths:
           - spec.template.spec.containers.[name=operator].image
 EOF
+    if [ -e "$out/servicemonitor.yaml" ]; then
+      cat <<'EOF'
+  # A consumer's namespace override does not reach the ServiceMonitor's selector or its TLS
+  # server name, so the namespace comes through params.env.
+  - source:
+      kind: ConfigMap
+      name: grid-operator-parameters
+      fieldPath: data.namespace
+    targets:
+      - select:
+          kind: ServiceMonitor
+          name: grid-operator
+        fieldPaths:
+          - spec.namespaceSelector.matchNames.0
+      - select:
+          kind: ServiceMonitor
+          name: grid-operator
+        fieldPaths:
+          - spec.endpoints.0.tlsConfig.serverName
+        options:
+          delimiter: "."
+          index: 1
+EOF
+    fi
   } > "$out/kustomization.yaml"
 }
 
