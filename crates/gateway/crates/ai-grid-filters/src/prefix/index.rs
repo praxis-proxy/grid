@@ -49,6 +49,8 @@ pub(crate) struct PrefixIndex {
 struct IndexState {
     /// Each candidate's keys, by cluster name.
     candidates: HashMap<Arc<str>, Keys>,
+    /// Clusters the last apply adopted, absent before the first one.
+    adopted: Option<Vec<Arc<str>>>,
     /// Maximum keys retained in each candidate's LRU.
     capacity: NonZeroUsize,
     /// Lifetime of a newly confirmed key.
@@ -60,6 +62,7 @@ impl Default for IndexState {
         let settings = AffinitySettings::default();
         Self {
             candidates: HashMap::new(),
+            adopted: None,
             capacity: settings.capacity,
             confirmed_ttl: Duration::from_secs(settings.ttl_secs.get()),
         }
@@ -113,7 +116,9 @@ impl PrefixIndex {
 
     /// Record `keys` as sent to `candidate`, waiting on [`Self::confirm`] or [`Self::forget`].
     pub(crate) fn record(&self, keys: &PrefixKeys, candidate: &Arc<str>) {
-        let (held, _) = self.candidate(candidate);
+        let Some((held, _)) = self.candidate(candidate) else {
+            return;
+        };
         let now = Instant::now();
         let until = now.checked_add(PENDING_TTL).unwrap_or(now);
         Self::update(keys, &held, |held| match held {
@@ -131,7 +136,9 @@ impl PrefixIndex {
 
     /// The request sent to `candidate` got a success: its keys hold there.
     pub(crate) fn confirm(&self, keys: &PrefixKeys, candidate: &Arc<str>) {
-        let (held, confirmed_ttl) = self.candidate(candidate);
+        let Some((held, confirmed_ttl)) = self.candidate(candidate) else {
+            return;
+        };
         let now = Instant::now();
         let until = now.checked_add(confirmed_ttl).unwrap_or(now);
         Self::update(keys, &held, |held| Entry {
@@ -175,6 +182,7 @@ impl PrefixIndex {
         index.capacity = settings.capacity;
         index.confirmed_ttl = Duration::from_secs(settings.ttl_secs.get());
         index.candidates.retain(|candidate, _| candidates.contains(candidate));
+        index.adopted = Some(candidates.to_vec());
         for candidate in candidates {
             if let Some(held) = index.candidates.get(candidate) {
                 held.write()
@@ -211,14 +219,23 @@ impl PrefixIndex {
     }
 
     /// The candidate's keys and confirmed lifetime, creating its LRU on first use.
-    fn candidate(&self, candidate: &Arc<str>) -> (Keys, Duration) {
+    ///
+    /// Absent once an apply has dropped the cluster, so an in-flight request cannot recreate it.
+    fn candidate(&self, candidate: &Arc<str>) -> Option<(Keys, Duration)> {
         {
             let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
             if let Some(held) = index.candidates.get(candidate) {
-                return (Arc::clone(held), index.confirmed_ttl);
+                return Some((Arc::clone(held), index.confirmed_ttl));
             }
         }
         let mut index = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+        if index
+            .adopted
+            .as_ref()
+            .is_some_and(|adopted| !adopted.contains(candidate))
+        {
+            return None;
+        }
         let capacity = index.capacity;
         let held = Arc::clone(index.candidates.entry(Arc::clone(candidate)).or_insert_with(|| {
             let mut cache = LruCache::unbounded_with_hasher(foldhash::fast::RandomState::default());
@@ -226,7 +243,7 @@ impl PrefixIndex {
             cache.resize(capacity);
             Arc::new(RwLock::new(cache))
         }));
-        (held, index.confirmed_ttl)
+        Some((held, index.confirmed_ttl))
     }
 
     /// Keys held for `candidate`.
@@ -374,7 +391,9 @@ mod tests {
             [2],
             "west also shrinks to capacity 2"
         );
-        index.confirm(&keys(0..8), &name("north"));
+        let north = name("north");
+        index.apply(&settings, &[name("east"), name("west"), Arc::clone(&north)]);
+        index.confirm(&keys(0..8), &north);
         assert_eq!(index.len("north"), 2, "new clusters use the current capacity");
 
         settings.capacity = NonZeroUsize::new(8).expect("nonzero");
@@ -382,6 +401,28 @@ mod tests {
         index.confirm(&keys(0..8), &clusters[1]);
         assert_eq!(index.depths(&keys(0..8), ["west"]), [8], "growth allows more entries");
         assert_eq!(index.len("north"), 0, "removed clusters release their cache");
+    }
+
+    /// A reload can drop a cluster while one of its requests is still in flight. The late
+    /// outcome must not bring the cache back, or its keys linger until the next apply.
+    #[test]
+    fn an_in_flight_request_does_not_resurrect_a_dropped_cluster() {
+        let index = PrefixIndex::default();
+        let settings = AffinitySettings::default();
+        let (east, west) = (name("east"), name("west"));
+        index.apply(&settings, &[Arc::clone(&east), Arc::clone(&west)]);
+
+        // East is sent a request, then the reload drops it.
+        index.record(&keys(0..8), &east);
+        index.apply(&settings, &[Arc::clone(&west)]);
+        assert_eq!(index.len("east"), 0, "the reload released east's cache");
+
+        // The in-flight request now finishes, either way round.
+        index.confirm(&keys(0..8), &east);
+        assert_eq!(index.len("east"), 0, "a late success does not recreate the cluster");
+        index.record(&keys(0..8), &east);
+        assert_eq!(index.len("east"), 0, "nor does a late send");
+        assert_eq!(index.depths(&keys(0..8), ["west"]), [0], "west is untouched");
     }
 
     /// A sparse cache must not reserve storage for every entry its configured limit permits.
