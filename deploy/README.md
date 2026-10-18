@@ -47,16 +47,15 @@ hand-edit them. Each generated directory keeps the `values.yaml` that renders
 it. Cloud-specific Kustomize overlays reuse a generated base and patch its
 Services.
 
-- `operator/` is the platform base: the image set through `params.env`, the namespace left
-  to the consumer, metrics TLS from the enrolled site identity, and no platform assumptions.
-  A platform operator vendors this directory, or a flavor of it, and places it in its own
-  namespace.
+- `operator/` is the platform base: the image and the namespace set through `params.env`,
+  metrics TLS from the enrolled site identity, and no platform assumptions. A platform
+  operator vendors this directory, or a flavor of it, and sets `namespace` in `params.env`
+  to place it in its own namespace.
 - Generated `overlays/<flavor>/` directories use the base values plus the flavor's
   `values.yaml` as a delta, rendered against the API versions in its `api-versions` file.
   `overlays/openshift/` takes metrics TLS from the service CA, adds a NetworkPolicy that
   admits the platform's monitoring namespaces, and adds a ServiceMonitor for user workload
-  monitoring. The ServiceMonitor names its namespace in its selector and TLS server name,
-  so a consumer that moves the overlay sets `namespace` in `params.env` as well.
+  monitoring, whose selector and TLS server name follow `namespace` in `params.env`.
 - `overlays/openshift/` also sets `platform: any`: internal load balancers for the SWIM and
   signals Services on AWS (NLBs with cross-zone load balancing, since the default Classic
   Load Balancer rejects UDP), Azure and GCP (with global access, so other regions reach

@@ -134,8 +134,8 @@ render_base() {
   image_default="$(yq '.spec.template.spec.containers[0].image' "$out/deployment.yaml")"
   cat > "$out/params.env" <<EOF
 grid-operator-image=$image_default
+namespace=$NAMESPACE_PLACEHOLDER
 EOF
-  [ -e "$out/servicemonitor.yaml" ] && echo "namespace=$NAMESPACE_PLACEHOLDER" >> "$out/params.env"
   local resources
   resources="$(resource_list "$out")"
   {
@@ -143,7 +143,8 @@ EOF
     echo "kind: Kustomization"
     echo ""
     echo "# Generated from charts/grid-operator by scripts/generate-deployment-operator.sh."
-    echo "# The namespace is a default; a platform operator or kubectl -n overrides it."
+    echo "# Set the namespace in params.env: the replacements below carry it to every object,"
+    echo "# its ServiceAccount subjects, and the ServiceMonitor. This line is only the default."
     echo "namespace: $NAMESPACE_PLACEHOLDER"
     echo ""
     echo "resources:"
@@ -174,16 +175,18 @@ replacements:
           name: grid-operator
         fieldPaths:
           - spec.template.spec.containers.[name=operator].image
-EOF
-    if [ -e "$out/servicemonitor.yaml" ]; then
-      cat <<'EOF'
-  # A consumer's namespace override does not reach the ServiceMonitor's selector or its TLS
-  # server name, so the namespace comes through params.env.
   - source:
       kind: ConfigMap
       name: grid-operator-parameters
       fieldPath: data.namespace
     targets:
+      - select:
+          namespace: grid-system
+        fieldPaths:
+          - metadata.namespace
+EOF
+    if [ -e "$out/servicemonitor.yaml" ]; then
+      cat <<'EOF'
       - select:
           kind: ServiceMonitor
           name: grid-operator
