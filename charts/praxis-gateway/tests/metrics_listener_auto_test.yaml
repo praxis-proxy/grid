@@ -170,3 +170,25 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: "metricsListener.serviceMonitor.caConfigMap.name is required to verify the metrics cert"
+
+  - it: a serving-cert annotation alone names the Secret the pod mounts
+    set:
+      image.flavor: grid-gateway
+      networkPolicy.enabled: true
+      metricsListener.service.annotations:
+        service.beta.openshift.io/serving-cert-secret-name: team-owned-metrics-tls
+    capabilities:
+      apiVersions:
+        - security.openshift.io/v1
+        - monitoring.coreos.com/v1
+    asserts:
+      # The platform creates the Secret the annotation names, so the mount must follow it
+      # rather than the generated default, or the pod cannot start.
+      - matchRegex:
+          path: spec.template.spec.volumes[?(@.name=='metrics-tls')].secret.secretName
+          pattern: '^team-owned-metrics-tls$'
+        template: templates/deployment.yaml
+      - equal:
+          path: metadata.annotations["service.beta.openshift.io/serving-cert-secret-name"]
+          value: team-owned-metrics-tls
+        template: templates/service-metrics.yaml

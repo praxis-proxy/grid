@@ -682,11 +682,12 @@ the service CA. Off OpenShift no cert source exists by default, so auto stays of
 {{- end }}
 {{- if $m.enabled }}
 {{- if not $m.existingSecret }}
-{{- $_ := set $m "existingSecret" (printf "%s-metrics-tls" (include "praxis-gateway.fullname" .)) }}
 {{- $annotations := $m.service.annotations | default dict }}
-{{- if not (hasKey $annotations "service.beta.openshift.io/serving-cert-secret-name") }}
-{{- $_ := set $annotations "service.beta.openshift.io/serving-cert-secret-name" $m.existingSecret }}
-{{- end }}
+{{- /* The annotation names the Secret the platform creates, so the mount follows it. */}}
+{{- $named := index $annotations "service.beta.openshift.io/serving-cert-secret-name" }}
+{{- $secret := $named | default (printf "%s-metrics-tls" (include "praxis-gateway.fullname" .)) }}
+{{- $_ := set $m "existingSecret" $secret }}
+{{- $_ := set $annotations "service.beta.openshift.io/serving-cert-secret-name" $secret }}
 {{- $_ := set $m.service "annotations" $annotations }}
 {{- end }}
 {{- if not $m.fromNamespaces }}
