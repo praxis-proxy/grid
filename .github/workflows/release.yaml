@@ -79,6 +79,23 @@ jobs:
             echo "::error::Tag version (${TAG_VERSION}) does not match Cargo.toml (${CARGO_VERSION})"
             exit 1
           fi
+          # The gateway workspace declares its version twice because Hermeto cannot
+          # inherit one for a workspace root package, so check both against the tag.
+          GATEWAY_MANIFEST=crates/gateway/Cargo.toml
+          GATEWAY_VERSIONS="$(
+            perl -ne 'print "$1\n" if /^version\s*=\s*"(.+)"/' \
+              "${GATEWAY_MANIFEST}"
+          )"
+          if [ "$(printf '%s' "${GATEWAY_VERSIONS}" | grep -c '')" -ne 2 ]; then
+            echo "::error::Expected two version declarations in ${GATEWAY_MANIFEST}"
+            exit 1
+          fi
+          while read -r GATEWAY_VERSION; do
+            if [ "${TAG_VERSION}" != "${GATEWAY_VERSION}" ]; then
+              echo "::error::Tag version (${TAG_VERSION}) does not match ${GATEWAY_MANIFEST} (${GATEWAY_VERSION})"
+              exit 1
+            fi
+          done <<< "${GATEWAY_VERSIONS}"
           SOURCE_SHA="$(git rev-parse HEAD)"
           {
             echo "tag=${TAG}"
