@@ -815,6 +815,10 @@ pub(crate) fn provider_readiness(
 }
 
 /// Write the provider's `Ready` condition when its status or reason changed.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the Kubernetes status patch future carries a full InferenceProvider response"
+)]
 async fn apply_ready_condition(
     client: &Client,
     provider: &InferenceProvider,
@@ -4954,8 +4958,8 @@ fn provider_state_from_kube(
     let provider_id = provider.metadata.name.as_deref()?;
     let routing_cluster = routing_overlay::routing_identity(provider)?.to_owned();
     let models = match served_model_store.select_for(provider) {
-        Some(inventory) if inventory.is_static() =>
-            inventory.models.to_vec(),
+        // FIXME: we are currently only wiring static config, even if we support discovery.
+        Some(inventory) if inventory.is_static() => inventory.models.to_vec(),
         _ => Vec::new(),
     };
     let phase = crdt_phase_from_provider(
@@ -7770,6 +7774,31 @@ mod tests {
         assert_eq!(state.backend_kind, "local", "backend_kind from spec");
         assert_eq!(state.models, vec!["model-a", "model-b"], "models from spec");
         assert_eq!(state.revision, 3, "revision from generation");
+    }
+
+    #[test]
+    fn provider_state_from_kube_does_not_gossip_dynamic_spec_models() {
+        let p: InferenceProvider = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": "dynamic-provider", "uid": "provider-uid", "generation": 1 },
+            "spec": {
+                "gridNetworkRef": "net",
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8080",
+                "models": [{ "name": "configured-model" }],
+                "modelDiscovery": { "openAiModels": {} }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let state = provider_state_from_kube(&p, "net", "site-a", None, &served_models::ServedModelStore::new())
+            .unwrap_or_else(|| std::process::abort());
+
+        assert!(
+            state.models.is_empty(),
+            "dynamic providers without a fresh inventory must not gossip spec.models"
+        );
     }
 
     #[test]

@@ -126,15 +126,14 @@ pub(crate) struct ModelInventory {
 }
 
 impl ModelInventory {
-    fn for_provider(provider: &InferenceProvider) -> Option<ModelInventory> {
-        Some(ModelInventory {
+    /// Build the static inventory declared in a provider's spec.
+    fn for_provider(provider: &InferenceProvider) -> ModelInventory {
+        ModelInventory {
             models: provider.spec.models.iter().map(|model| model.name.clone()).collect(),
             source: ModelInventorySource::Static,
-        })
+        }
     }
-}
 
-impl ModelInventory {
     /// Whether the names came from the provider's static configuration.
     #[must_use]
     pub(crate) fn is_static(&self) -> bool {
@@ -335,7 +334,7 @@ impl ServedModelStore {
         if provider.spec.model_discovery.is_some() {
             self.fresh_inventory(provider)
         } else {
-            ModelInventory::for_provider(provider)
+            Some(ModelInventory::for_provider(provider))
         }
     }
 
@@ -1204,6 +1203,53 @@ mod tests {
         let mut provider = discovery_provider("p", &status_with_models(&store, &["a"]));
         provider.spec.endpoint = "http://replacement".to_owned();
         assert_failed_poll_clears_old_inventory(&store, &provider);
+    }
+
+    #[test]
+    fn provider_generation_change_invalidates_held_inventory() {
+        let store = ServedModelStore::new();
+        refresh(&store, round(&[("p", Some(&["a"]))]), TTL);
+        let mut provider = discovery_provider("p", &status_with_models(&store, &["a"]));
+        provider.metadata.generation = Some(2);
+
+        assert!(
+            store.select_for(&provider).is_none(),
+            "an inventory from an earlier provider generation must not be selected"
+        );
+        assert_eq!(
+            patch_for_provider(&provider, &store, None),
+            Some(DiscoveryStatusPatch {
+                name: "p".to_owned(),
+                failure_reason: None,
+                inventory: None,
+            }),
+            "the old inventory must be cleared from status"
+        );
+    }
+
+    #[test]
+    fn a_generation_mismatch_is_a_status_change() {
+        let store = ServedModelStore::new();
+        refresh(&store, round(&[("p", Some(&["a"]))]), TTL);
+        let expiry = stored_expiry(&store, "p").unwrap_or_else(|| std::process::abort());
+        let provider = discovery_provider(
+            "p",
+            &serde_json::json!({
+                "servedModels": ["a"],
+                "servedModelsExpiresAt": expiry,
+                "servedModelsObservedGeneration": 0
+            }),
+        );
+
+        assert_eq!(
+            patch_for_provider(&provider, &store, None),
+            Some(DiscoveryStatusPatch {
+                name: "p".to_owned(),
+                failure_reason: None,
+                inventory: store.fresh_inventory(&provider),
+            }),
+            "matching names and expiry still require the current provider generation"
+        );
     }
 
     #[test]

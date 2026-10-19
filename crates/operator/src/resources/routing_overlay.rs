@@ -1602,6 +1602,10 @@ fn should_include_provider_for_consumer(
 /// evaluated against the `consumer_site_labels`. Providers with non-empty access
 /// policies will only generate candidates if the consumer site matches the required
 /// labels. Empty access policies allow all consumers (preserving existing behavior).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "network, site, access, placement, and inventory inputs are independent for this pass"
+)]
 fn collect_candidates(
     network_name: &str,
     sites: &[GridSite],
@@ -1766,8 +1770,9 @@ fn candidates_from_provider(
     // silently lost rather than served.
     let mut seen = BTreeSet::new();
     let Some(model_inventory) = served_model_store.select_for(provider) else {
-        return Ok(Vec::new())
+        return Ok(Vec::new());
     };
+    // FIXME: we are currently only wiring static config, even if we support discovery.
     if !model_inventory.is_static() {
         return Ok(Vec::new());
     }
@@ -4032,6 +4037,31 @@ mod tests {
         assert!(
             overlay.candidates.iter().all(|c| !c.fresh),
             "all candidates from a Degraded provider must have fresh=false"
+        );
+    }
+
+    #[test]
+    fn local_candidates_do_not_fall_back_to_dynamic_spec_models() {
+        let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": "dynamic-provider", "uid": "provider-uid", "generation": 1 },
+            "spec": {
+                "gridNetworkRef": "net",
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8000",
+                "models": [{ "name": "configured-model" }],
+                "modelDiscovery": { "openAiModels": {} }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let candidates = candidates_from_provider(&provider, &SiteResolution::Unavailable, &ServedModelStore::new())
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert!(
+            candidates.is_empty(),
+            "dynamic providers without a fresh inventory must not route spec.models"
         );
     }
 
