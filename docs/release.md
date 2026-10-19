@@ -72,6 +72,9 @@ Before opening a release preparation pull request:
       `praxis-gateway` `overlay.sidecar.image.tag`. An empty tag there resolves
       to the chart `appVersion`, which is the Praxis AI version, so these are
       pinned by hand and the release workflow does not check them.
+- [ ] Run `make generate-deploy` and commit the result. The manifests under
+      `deploy/operator` and `deploy/overlays` render from `charts/grid-operator`,
+      so they carry the operator image tag and the kind version label.
 - [ ] Confirm the release workflow builds
       `ghcr.io/praxis-proxy/grid-gateway:v<version>` from the same tagged AGN
       source, publishes the version tag, and records the resulting immutable
@@ -82,7 +85,7 @@ Before opening a release preparation pull request:
 - [ ] Run `make test` and `make doc` for the root workspace.
 - [ ] Run `cargo test --locked --manifest-path crates/gateway/Cargo.toml --workspace`
       for the separate Gateway workspace.
-- [ ] Run `make codegen-check` and `make crds-check`.
+- [ ] Run `make codegen-check`, `make crds-check`, and `make deploy-check`.
 - [ ] Run `git diff --check` and validate the release workflow with
       `actionlint`.
 - [ ] Lint and render the five release charts with their required values.
