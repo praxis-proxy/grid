@@ -1100,8 +1100,13 @@ require this timestamp to be in the future before using `servedModels`. The
 discovery loop may not clear the status until its next round after the TTL, so
 the presence of `servedModels` alone does not prove freshness. Failed polls do
 not extend the deadline. When the set is unknown, expired and cleared, or
-discovery is disabled, both fields are absent; readers must fail closed.
-Writing either field advances `metadata.resourceVersion`, so the CRDT revision
+discovery is disabled, these discovery inventory fields are absent; readers
+must fail closed.
+`status.servedModelsObservedGeneration` records the provider `metadata.generation`
+that produced the set. Readers must require it to equal the current generation;
+a spec change makes the prior inventory unusable until a successful poll writes
+a new set, expiry, and generation together.
+Updating these fields advances `metadata.resourceVersion`, so the CRDT revision
 of the gossiped provider record advances with discovery status changes.
 
 The bearer token comes from `spec.auth`. A model-discovery URL must use HTTPS

@@ -1052,6 +1052,15 @@ spec:
                   format: date-time
                   nullable: true
                   type: string
+                servedModelsObservedGeneration:
+                  description: |-
+                    Provider generation that produced the corresponding `servedModels` set.
+
+                    Readers must require this value to equal `metadata.generation`; a spec
+                    change invalidates the inventory until discovery succeeds again.
+                  format: int64
+                  nullable: true
+                  type: integer
               type: object
           required:
             - spec
