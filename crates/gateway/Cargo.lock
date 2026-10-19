@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "ai-grid-filters"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "certs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "openssl",
  "pem 4.0.0",
@@ -1507,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ai-grid-filters",
  "certs",
@@ -1610,7 +1610,7 @@ dependencies = [
 
 [[package]]
 name = "grid-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "certs",
@@ -1634,7 +1634,7 @@ dependencies = [
 
 [[package]]
 name = "grid-signals"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "dashmap",
 ]
@@ -5223,7 +5223,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "tracing",
