@@ -15,7 +15,10 @@ use serde::Deserialize;
 use super::{DiscoveryError, ModelSource, ServedModels};
 use crate::resources::{
     credentials::BearerToken,
-    tls_backend::{ClientTlsConfig, HttpsConnector, build_custom_tls_connector, build_native_connector},
+    endpoint_resolution::{self, PinnedResolver},
+    tls_backend::{
+        ClientTlsConfig, HttpsConnector, build_custom_tls_connector_with_resolver, build_native_connector_with_resolver,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -61,8 +64,8 @@ pub(crate) struct OpenAiModels {
     /// Pre-built `Authorization` header, marked sensitive.
     authorization: Option<HeaderValue>,
 
-    /// Client reused across requests to this source.
-    client: Client<HttpsConnector, Empty<Bytes>>,
+    /// Client built from the endpoint's validated DNS answers.
+    client: ModelClient,
 
     /// Bound on the whole poll, including reading the body.
     timeout: Duration,
@@ -73,21 +76,17 @@ impl OpenAiModels {
     ///
     /// # Errors
     ///
-    /// Returns [`DiscoveryError::Config`] when `url` is not `http`/`https`,
+    /// Returns [`DiscoveryError::Config`] when the URI is not `http`/`https`,
     /// when a bearer token or TLS configuration is used with plain HTTP, or
-    /// when `token` is not a valid header value. Returns
-    /// [`DiscoveryError::Transport`] if the connector cannot be built.
+    /// when `token` is not a valid header value.
     pub(crate) fn new(
-        url: &str,
+        uri: Uri,
         token: Option<&BearerToken>,
         tls: Option<&ClientTlsConfig>,
+        client: ModelClient,
         timeout: Duration,
     ) -> Result<Self, DiscoveryError> {
-        let url: Uri = url
-            .parse()
-            .map_err(|e| DiscoveryError::Config(format!("invalid URL: {e}")))?;
-
-        match url.scheme_str() {
+        match uri.scheme_str() {
             Some("https") => {},
             Some("http") if token.is_some() => {
                 return Err(DiscoveryError::Config("bearer token requires HTTPS".to_owned()));
@@ -98,15 +97,8 @@ impl OpenAiModels {
         }
 
         let authorization = token.map(bearer_header).transpose()?;
-        let connector = match tls {
-            Some(config) => build_custom_tls_connector(config),
-            None => build_native_connector(),
-        }
-        .map_err(|e| DiscoveryError::Transport(e.into()))?;
-        let client = Client::builder(TokioExecutor::new()).build(connector);
-
         Ok(Self {
-            url,
+            url: uri,
             authorization,
             client,
             timeout,
@@ -142,6 +134,74 @@ impl OpenAiModels {
             .body(Empty::new())
             .map_err(|e| DiscoveryError::Config(e.to_string()))
     }
+}
+
+/// Hyper client pinned to one validated endpoint resolution.
+pub(crate) type ModelClient = Client<HttpsConnector<PinnedResolver>, Empty<Bytes>>;
+
+/// Validate and parse a model-discovery endpoint before building its client.
+pub(crate) fn validated_uri(url: &str) -> Result<Uri, DiscoveryError> {
+    if endpoint_resolution::validate_endpoint_url(url) != endpoint_resolution::EndpointUrlValidation::Ok {
+        return Err(DiscoveryError::Config("URL endpoint is blocked or invalid".to_owned()));
+    }
+    parse_url(url)
+}
+
+/// Build a client pinned to the endpoint's validated DNS answers.
+pub(crate) async fn build_client(
+    uri: &Uri,
+    tls: Option<&ClientTlsConfig>,
+    timeout: Duration,
+) -> Result<ModelClient, DiscoveryError> {
+    let endpoint = endpoint_resolution::resolve_endpoint(uri, timeout)
+        .await
+        .map_err(|error| match error {
+            endpoint_resolution::EndpointResolutionError::DnsTimeout => DiscoveryError::Timeout(timeout),
+            error @ (endpoint_resolution::EndpointResolutionError::Dns
+            | endpoint_resolution::EndpointResolutionError::BlockedAddress) => {
+                DiscoveryError::Transport(Box::new(error))
+            },
+        })?;
+    build_client_from_endpoint(endpoint, tls)
+}
+
+/// Build a client from an already resolved endpoint.
+fn build_client_from_endpoint(
+    endpoint: endpoint_resolution::ResolvedEndpoint,
+    tls: Option<&ClientTlsConfig>,
+) -> Result<ModelClient, DiscoveryError> {
+    let resolver = endpoint.into_pinned_resolver();
+    let connector = match tls {
+        Some(config) => build_custom_tls_connector_with_resolver(config, resolver),
+        None => build_native_connector_with_resolver(resolver),
+    }
+    .map_err(|error| DiscoveryError::Transport(Box::new(error)))?;
+    Ok(Client::builder(TokioExecutor::new()).build(connector))
+}
+
+/// Build a source for a local fixture server using test-only endpoint setup.
+#[cfg(test)]
+pub(crate) async fn new_for_test(
+    url: &str,
+    token: Option<&BearerToken>,
+    tls: Option<&ClientTlsConfig>,
+    timeout: Duration,
+) -> Result<OpenAiModels, DiscoveryError> {
+    #[cfg(not(feature = "fips"))]
+    drop(rustls::crypto::ring::default_provider().install_default());
+
+    let uri = parse_url(url)?;
+    let endpoint = endpoint_resolution::resolve_endpoint_for_test(&uri, timeout)
+        .await
+        .map_err(|error| DiscoveryError::Transport(Box::new(error)))?;
+    let client = build_client_from_endpoint(endpoint, tls)?;
+    OpenAiModels::new(uri, token, tls, client, timeout)
+}
+
+/// Parse a model-discovery endpoint that already passed validation.
+fn parse_url(url: &str) -> Result<Uri, DiscoveryError> {
+    url.parse()
+        .map_err(|e| DiscoveryError::Config(format!("invalid URL: {e}")))
 }
 
 impl ModelSource for OpenAiModels {
@@ -187,7 +247,7 @@ mod tests {
     async fn lists_served_models() {
         let url = serve(|| async { r#"{"object":"list","data":[{"id":"b","object":"model"},{"id":"a"}]}"# }).await;
 
-        let models = source(&url, None).served_models().await.map(|models| {
+        let models = source(&url, None).await.served_models().await.map(|models| {
             let mut names = models.into_names();
             names.sort_unstable();
             names
@@ -204,18 +264,20 @@ mod tests {
     async fn empty_list_is_success() {
         let url = serve(|| async { r#"{"data":[]}"# }).await;
 
-        let models = source(&url, None).served_models().await;
+        let models = source(&url, None).await.served_models().await;
 
         assert_eq!(models.ok(), Some(ServedModels::default()), "empty list should succeed");
     }
 
-    #[test]
-    fn bearer_token_over_http_is_rejected() {
+    #[tokio::test]
+    async fn bearer_token_over_http_is_rejected() {
         let token = BearerToken::new("s3cret".to_owned());
+        let client = test_client().await;
         let result = OpenAiModels::new(
-            "http://example.com/v1/models",
+            parse_url("http://example.com/v1/models").unwrap_or_else(|_| std::process::abort()),
             Some(&token),
             None,
+            client,
             Duration::from_secs(5),
         );
 
@@ -229,7 +291,7 @@ mod tests {
     async fn non_success_status_is_rejected() {
         let url = serve(|| async { StatusCode::SERVICE_UNAVAILABLE.into_response() }).await;
 
-        let models = source(&url, None).served_models().await;
+        let models = source(&url, None).await.served_models().await;
 
         assert!(
             matches!(models, Err(DiscoveryError::Status(StatusCode::SERVICE_UNAVAILABLE))),
@@ -241,7 +303,7 @@ mod tests {
     async fn malformed_json_is_rejected() {
         let url = serve(|| async { r#"{"data":[{"name":"a"}]}"# }).await;
 
-        let models = source(&url, None).served_models().await;
+        let models = source(&url, None).await.served_models().await;
 
         assert!(
             matches!(models, Err(DiscoveryError::Malformed(_))),
@@ -253,7 +315,7 @@ mod tests {
     async fn duplicate_id_is_rejected() {
         let url = serve(|| async { r#"{"data":[{"id":"a"},{"id":"a"}]}"# }).await;
 
-        let models = source(&url, None).served_models().await;
+        let models = source(&url, None).await.served_models().await;
 
         assert!(
             matches!(
@@ -268,7 +330,7 @@ mod tests {
     async fn oversized_body_is_rejected() {
         let url = serve(|| async { " ".repeat(MAX_BODY_BYTES + 1) }).await;
 
-        let models = source(&url, None).served_models().await;
+        let models = source(&url, None).await.served_models().await;
 
         assert!(
             matches!(models, Err(DiscoveryError::BodyTooLarge(MAX_BODY_BYTES))),
@@ -285,7 +347,8 @@ mod tests {
         .await;
         let timeout = Duration::from_millis(50);
 
-        let models = OpenAiModels::new(&url, None, None, timeout)
+        let models = new_for_test(&url, None, None, timeout)
+            .await
             .unwrap_or_else(|_| std::process::abort())
             .served_models()
             .await;
@@ -298,7 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_backend_is_transport_error() {
-        let models = source("http://127.0.0.1:1/v1/models", None).served_models().await;
+        let models = source("http://127.0.0.1:1/v1/models", None).await.served_models().await;
 
         assert!(
             matches!(models, Err(DiscoveryError::Transport(_))),
@@ -308,7 +371,7 @@ mod tests {
 
     #[test]
     fn unsupported_scheme_is_rejected() {
-        let result = OpenAiModels::new("ftp://example.com/v1/models", None, None, Duration::from_secs(1));
+        let result = validated_uri("ftp://example.com/v1/models");
 
         assert!(
             matches!(result, Err(DiscoveryError::Config(_))),
@@ -316,12 +379,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ssrf_sensitive_endpoint_is_rejected_before_model_discovery() {
+        let result = validated_uri("http://127.0.0.1:8080/v1/models");
+
+        assert!(
+            matches!(result, Err(DiscoveryError::Config(_))),
+            "model discovery must apply the shared endpoint SSRF policy"
+        );
+    }
+
+    #[test]
+    fn ordinary_cluster_endpoint_is_accepted() {
+        let result = validated_uri("http://10.96.0.42:8080/v1/models");
+
+        assert!(
+            result.is_ok(),
+            "ordinary cluster addresses must remain eligible for model discovery"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Test Utilities
     // -----------------------------------------------------------------------
 
-    fn source(url: &str, token: Option<&BearerToken>) -> OpenAiModels {
-        OpenAiModels::new(url, token, None, Duration::from_secs(5)).unwrap_or_else(|_| std::process::abort())
+    async fn source(url: &str, token: Option<&BearerToken>) -> OpenAiModels {
+        new_for_test(url, token, None, Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|_| std::process::abort())
+    }
+
+    async fn test_client() -> ModelClient {
+        #[cfg(not(feature = "fips"))]
+        drop(rustls::crypto::ring::default_provider().install_default());
+
+        let uri = parse_url("http://127.0.0.1:1/v1/models").unwrap_or_else(|_| std::process::abort());
+        let endpoint = endpoint_resolution::resolve_endpoint_for_test(&uri, Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|_| std::process::abort());
+        build_client_from_endpoint(endpoint, None).unwrap_or_else(|_| std::process::abort())
     }
 
     /// Serve `handler` at `/v1/models` on an ephemeral port; returns the URL.

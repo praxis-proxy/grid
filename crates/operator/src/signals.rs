@@ -9,7 +9,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    net::{IpAddr, Ipv6Addr},
+    net::IpAddr,
     sync::{Arc, Mutex, PoisonError, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -20,7 +20,10 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 pub use crate::crd::grid_network::PeerTrustMode;
 use crate::{
     metrics_scraper::{MetricsScrapeError, PeerTransport, scrape_peer},
-    resources::tls_backend::{self, ClientTlsConfig},
+    resources::{
+        endpoint_resolution,
+        tls_backend::{self, ClientTlsConfig},
+    },
     swim::MemberRecord,
 };
 
@@ -905,9 +908,6 @@ fn warn_refused_once(site: &str, endpoint: &str) -> bool {
     first
 }
 
-/// AWS instance metadata over IPv6, inside the unique-local range peers may use.
-const AWS_METADATA_V6: Ipv6Addr = Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0254);
-
 /// Whether a peer IP may be dialed: anything but local and metadata addresses.
 pub(crate) fn is_dialable_ip(ip: IpAddr) -> bool {
     match ip.to_canonical() {
@@ -915,10 +915,16 @@ pub(crate) fn is_dialable_ip(ip: IpAddr) -> bool {
             !(v4.is_loopback()
                 || v4.is_link_local()
                 || v4.is_unspecified()
-                || v4 == crate::resources::mcp_probe::ALIBABA_CLOUD_METADATA_V4)
+                || v4 == endpoint_resolution::ALIBABA_CLOUD_METADATA_V4)
         },
         IpAddr::V6(v6) => {
-            !(v6.is_loopback() || v6.is_unspecified() || v6.is_unicast_link_local() || v6 == AWS_METADATA_V6)
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unicast_link_local()
+                || v6 == endpoint_resolution::AWS_METADATA_V6
+                || v6 == endpoint_resolution::GCP_METADATA_V6
+                || v6 == endpoint_resolution::EKS_POD_IDENTITY_V6
+                || v6 == endpoint_resolution::AKAMAI_METADATA_V6)
         },
     }
 }

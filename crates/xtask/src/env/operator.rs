@@ -58,6 +58,8 @@ pub(crate) const AGENT_TOOL_TEST_PROVIDER_UNREACHABLE: &str = "op-e2e-agent-tool
 pub(crate) const AGENT_TOOL_TEST_GATEWAY: &str = "op-e2e-agent-tool-gw";
 /// Name of the `InferenceProvider` with a blank endpoint (expected: reconciles to `Unavailable`).
 pub(crate) const TEST_PROVIDER_INVALID: &str = "op-e2e-invalid";
+/// Name of the model-discovery fixture with a loopback endpoint (expected: discovery error `config`).
+pub(crate) const TEST_PROVIDER_SSRF_BLOCKED: &str = "op-e2e-ssrf-blocked";
 /// Name of the `InferenceProvider` whose health probe returns non-2xx (expected: `Degraded`).
 pub(crate) const TEST_PROVIDER_DEGRADED: &str = "op-e2e-degraded";
 /// Name of the `InferenceProvider` with `api_provider` backend kind.
@@ -665,6 +667,7 @@ pub(crate) fn cleanup_validation_resources(context: &str) -> Result<(), Box<dyn 
     force_delete_pod(context, TEST_GATEWAY_NS, TEST_METRICS_BUSY_PROVIDER)?;
     delete_cluster_resource(context, "inferenceprovider", TEST_PROVIDER_HEALTHY)?;
     delete_cluster_resource(context, "inferenceprovider", TEST_PROVIDER_INVALID)?;
+    delete_cluster_resource(context, "inferenceprovider", TEST_PROVIDER_SSRF_BLOCKED)?;
     delete_cluster_resource(context, "inferenceprovider", TEST_PROVIDER_DEGRADED)?;
     delete_cluster_resource(context, "inferenceprovider", TEST_PROVIDER_API)?;
     delete_cluster_resource(context, "inferenceprovider", TEST_METRICS_IDLE_PROVIDER)?;
@@ -976,6 +979,34 @@ pub(crate) fn apply_test_fixtures_for_cluster(
     Ok(())
 }
 
+/// Apply an `InferenceProvider` whose production model-discovery path must reject loopback.
+pub(crate) fn apply_ssrf_blocked_model_discovery_fixture(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "InferenceProvider",
+        "metadata": { "name": TEST_PROVIDER_SSRF_BLOCKED },
+        "spec": {
+            "gridNetworkRef": TEST_NETWORK,
+            "providerKind": "open_ai",
+            "backendKind": "local",
+            "endpoint": "http://127.0.0.1:1",
+            "models": [{ "name": "model-ssrf" }],
+            "modelDiscovery": {
+                "openAiModels": {
+                    "path": "/v1/models"
+                }
+            }
+        }
+    }))
+    .unwrap_or_else(|e| {
+        eprintln!("SSRF model-discovery fixture serialization failed: {e}");
+        std::process::exit(1);
+    });
+    kubectl::apply_manifest(context, &manifest)?;
+    eprintln!("  [OK] SSRF model-discovery fixture applied");
+    Ok(())
+}
+
 /// Build a `GridNetwork` JSON fixture.
 ///
 /// `local_site_name` becomes `consumerGateways[0].siteName`, the site the
@@ -1253,6 +1284,9 @@ pub(crate) fn spawn_operator(context: &str) -> Result<Child, Box<dyn std::error:
     let child = Command::new("cargo")
         .args(["run", "--quiet", "-p", "operator", "--bin", "operator"])
         .env("GRID_METRICS_ADDR", &metrics_addr)
+        .env("GRID_MODEL_DISCOVERY_INTERVAL_SECS", "1")
+        .env("GRID_MODEL_DISCOVERY_TIMEOUT_SECS", "2")
+        .env("GRID_MODEL_DISCOVERY_TTL_SECS", "5")
         .stdin(Stdio::null())
         .spawn()?;
     // Brief pause so the operator establishes its watches before fixtures are polled.
@@ -2352,6 +2386,41 @@ pub(crate) fn wait_for_provider_phase_and_reason(
             "  waiting for {name} phase={expected_phase:?} reason={expected_reason:?} \
              (observed: phase={phase:?} reason={reason:?})..."
         );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous poll loop in xtask; no async runtime available"
+)]
+/// Poll until an `InferenceProvider` reports the expected model-discovery error.
+pub(crate) fn wait_for_model_discovery_error(
+    context: &str,
+    name: &str,
+    expected_error: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        let observed = kubectl_jsonpath(
+            context,
+            &format!("inferenceproviders/{name}"),
+            "{.status.modelDiscoveryError}",
+        )
+        .unwrap_or_default();
+
+        if observed == expected_error {
+            eprintln!("  [OK] {name} modelDiscoveryError={observed:?}");
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timeout waiting for {name} modelDiscoveryError={expected_error:?}; last observed: {observed:?}"
+            )
+            .into());
+        }
+        eprintln!("  waiting for {name} modelDiscoveryError={expected_error:?} (observed={observed:?})...");
         std::thread::sleep(POLL_INTERVAL);
     }
 }
