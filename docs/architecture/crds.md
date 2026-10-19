@@ -1084,6 +1084,12 @@ The bearer token comes from `spec.auth`. A model-discovery URL must use HTTPS
 when a bearer token is configured. With `auth.credentialsManagedExternally`, requests carry no
 credentials, so plain HTTP remains available.
 
+Discovery refuses loopback, `localhost`, link-local, unspecified, and cloud
+metadata addresses, including the AWS, GCP, and EKS Pod Identity IPv6
+endpoints. Other unique-local IPv6 addresses remain allowed. A literal blocked
+IP or a `localhost` URL is reported as `config`; a hostname that resolves to a
+blocked address is reported as `unreachable`.
+
 Discovery runs in its own loop, like the signals scraper, not in reconcile.
 Discovered sets are held in memory per provider:
 

@@ -11,7 +11,9 @@ mod openai;
 use std::time::Duration;
 
 pub(crate) use models::{ServedModels, ServedModelsError};
-pub(crate) use openai::OpenAiModels;
+#[cfg(test)]
+pub(crate) use openai::new_for_test;
+pub(crate) use openai::{OpenAiModels, build_client, validated_uri};
 
 // ---------------------------------------------------------------------------
 // ModelSource

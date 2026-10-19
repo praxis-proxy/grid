@@ -19,11 +19,7 @@
 //!   tier against a real local HTTP listener (`mod integration_tests`), not unit-tested, since it exercises third-party
 //!   wire behavior rather than this crate's own branching.
 
-use std::{
-    collections::HashMap,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    time::Duration,
-};
+use std::{collections::HashMap, time::Duration};
 
 use http::{HeaderName, HeaderValue};
 use rmcp::{
@@ -38,22 +34,11 @@ use crate::{
     crd::inference_provider::EndpointTlsConfig,
     resources::{
         credentials::BearerToken,
+        endpoint_resolution::{self, ResolvedEndpoint},
         endpoint_tls::{read_secret_bytes_for_tls, secret_ref_from_client_cert},
         tls_backend::{validate_pem_certificates, validate_pem_private_key},
     },
 };
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Alibaba Cloud instance metadata service IPv4 endpoint.
-///
-/// Not covered by [`Ipv4Addr::is_link_local`] (unlike AWS/GCP/Azure's shared
-/// `169.254.169.254`, which the 169.254.0.0/16 link-local check already
-/// blocks) since Alibaba's metadata service sits in RFC 6598 shared address
-/// space, not the link-local range.
-pub(crate) const ALIBABA_CLOUD_METADATA_V4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
 
 /// Stable `status.reason` for any of `attach_tls_client_identity`'s three
 /// client-identity failure modes (unparseable cert, unparseable key, or a
@@ -299,30 +284,8 @@ pub(crate) fn auth_header_map(
 // SSRF validation (synchronous, DNS-resolution-free portion)
 // ---------------------------------------------------------------------------
 
-/// Result of validating an `AgentToolProvider`'s `spec.endpoint` before
-/// attempting to probe it.
-///
-/// Covers everything that can be decided without a DNS lookup. Hostname
-/// resolution and per-address SSRF pinning (mirroring
-/// `praxis-ai`'s `resolve_hostname_ssrf`) happen in the async probe itself,
-/// since they require I/O and are covered by the integration tier instead.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum McpUrlValidation {
-    /// The URL passed all synchronous checks.
-    Ok,
-    /// The URL could not be parsed.
-    InvalidUrl,
-    /// The scheme is neither `http` nor `https`.
-    UnsupportedScheme,
-    /// The URL's authority embeds `user:pass@` credentials.
-    EmbeddedCredentials,
-    /// The URL has no host component.
-    MissingHost,
-    /// The host is a blocked hostname or resolves (as a literal IP) to a
-    /// loopback, link-local, unique-local, unspecified, or known cloud
-    /// metadata address.
-    BlockedHost,
-}
+/// Result of validating an MCP endpoint before attempting to probe it.
+pub(crate) use crate::resources::endpoint_resolution::EndpointUrlValidation as McpUrlValidation;
 
 /// Validate an `AgentToolProvider`'s `spec.endpoint` before probing it.
 ///
@@ -331,81 +294,12 @@ pub(crate) enum McpUrlValidation {
 /// live probe. Hostnames that are not literal IPs are deferred to the
 /// async probe's DNS resolution step; this function cannot resolve them.
 pub(crate) fn validate_probe_url(url: &str) -> McpUrlValidation {
-    // `http::Uri`'s parser treats an empty authority (`http:///path` or
-    // bare `http://`) as a hard parse error rather than a URI with a blank
-    // host, so that case is detected here before attempting to parse;
-    // otherwise it would be misreported as InvalidUrl instead of MissingHost.
-    if let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))
-        && (rest.is_empty() || rest.starts_with('/'))
-    {
-        return McpUrlValidation::MissingHost;
-    }
-    let Ok(uri) = url.parse::<http::Uri>() else {
-        return McpUrlValidation::InvalidUrl;
-    };
-    match uri.scheme_str() {
-        Some("http" | "https") => {},
-        _ => return McpUrlValidation::UnsupportedScheme,
-    }
-    if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
-        return McpUrlValidation::EmbeddedCredentials;
-    }
-    let Some(host) = uri.host() else {
-        return McpUrlValidation::MissingHost;
-    };
-    let host = host.trim_matches(|c| c == '[' || c == ']');
-    if is_blocked_hostname(host) {
-        return McpUrlValidation::BlockedHost;
-    }
-    if let Ok(ip) = host.parse::<IpAddr>()
-        && is_ssrf_sensitive(&normalize_mapped_ipv4(ip))
-    {
-        return McpUrlValidation::BlockedHost;
-    }
-    McpUrlValidation::Ok
+    endpoint_resolution::validate_endpoint_url(url)
 }
 
 /// Hostnames that resolve to loopback without a DNS lookup.
 pub(crate) fn is_blocked_hostname(host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
-    lower == "localhost" || lower.ends_with(".localhost")
-}
-
-/// Loopback, link-local, unspecified, unique-local, and known cloud
-/// metadata addresses are SSRF-sensitive.
-fn is_ssrf_sensitive(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || *v4 == ALIBABA_CLOUD_METADATA_V4
-        },
-        IpAddr::V6(v6) => {
-            let [a, b, ..] = v6.octets();
-            v6.is_loopback() || v6.is_unspecified() || (a == 0xFE && (b & 0xC0) == 0x80) || (a & 0xFE) == 0xFC
-        },
-    }
-}
-
-/// Normalize an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its IPv4
-/// form before SSRF checks, closing the bypass where a mapped address
-/// would otherwise skip the IPv4 loopback/link-local checks entirely.
-fn normalize_mapped_ipv4(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-        v4 @ IpAddr::V4(_) => v4,
-    }
-}
-
-/// Check DNS-resolved addresses against the SSRF block list.
-///
-/// Used by the async probe after resolving a hostname, mirroring
-/// `praxis-ai`'s `check_resolved_addrs`, kept here (rather than inline in
-/// the probe function) so both the literal-IP path
-/// ([`validate_probe_url`]) and the resolved-hostname path share the same
-/// [`is_ssrf_sensitive`] rule.
-pub(crate) fn check_resolved_addrs(addrs: &[SocketAddr]) -> bool {
-    addrs
-        .iter()
-        .all(|addr| !is_ssrf_sensitive(&normalize_mapped_ipv4(addr.ip())))
+    endpoint_resolution::is_blocked_hostname(host)
 }
 
 // ---------------------------------------------------------------------------
@@ -438,17 +332,6 @@ pub(crate) fn observed_status_from_service_error(error: &rmcp::ServiceError) -> 
 // Live probe orchestration (I/O; covered by the integration/E2E tiers)
 // ---------------------------------------------------------------------------
 
-/// Hostname and DNS-resolved addresses pinned for connect-time use,
-/// eliminating the DNS-rebinding TOCTOU window between SSRF validation and
-/// the actual connection.
-struct ResolvedEndpoint {
-    /// Present for DNS-resolved hostnames; absent for literal IPs (nothing
-    /// to pin; the literal address itself already passed [`validate_probe_url`]).
-    hostname: Option<String>,
-    /// Validated socket addresses from DNS resolution.
-    addrs: Vec<SocketAddr>,
-}
-
 /// Resolve `endpoint`'s host, applying the DNS-resolved-address half of the
 /// SSRF check (the literal-IP half already ran in [`validate_probe_url`]).
 ///
@@ -456,34 +339,9 @@ struct ResolvedEndpoint {
 /// being SSRF-sensitive returns [`McpProbeOutcome::Unreachable`].
 async fn resolve_endpoint_for_probe(endpoint: &str, timeout: Duration) -> Result<ResolvedEndpoint, McpProbeOutcome> {
     let uri: http::Uri = endpoint.parse().map_err(|_parse_err| McpProbeOutcome::Unreachable)?;
-    let host = uri.host().ok_or(McpProbeOutcome::Unreachable)?;
-    let host = host.trim_matches(|c| c == '[' || c == ']');
-
-    if host.parse::<IpAddr>().is_ok() {
-        // Literal IP: already validated by validate_probe_url, nothing to resolve/pin.
-        return Ok(ResolvedEndpoint {
-            hostname: None,
-            addrs: Vec::new(),
-        });
-    }
-
-    let port = uri
-        .port_u16()
-        .unwrap_or_else(|| if uri.scheme_str() == Some("https") { 443 } else { 80 });
-    let addrs: Vec<SocketAddr> = tokio::time::timeout(timeout, tokio::net::lookup_host((host, port)))
+    endpoint_resolution::resolve_endpoint(&uri, timeout)
         .await
-        .map_err(|_elapsed| McpProbeOutcome::Unreachable)?
-        .map_err(|_dns_err| McpProbeOutcome::Unreachable)?
-        .collect();
-
-    if !check_resolved_addrs(&addrs) {
-        return Err(McpProbeOutcome::Unreachable);
-    }
-
-    Ok(ResolvedEndpoint {
-        hostname: Some(host.to_owned()),
-        addrs,
-    })
+        .map_err(|_resolution_error| McpProbeOutcome::Unreachable)
 }
 
 /// Build the `reqwest::Client` used for the probe: address-pinned per
@@ -507,8 +365,8 @@ async fn build_probe_client(
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none());
 
-    if let Some(hostname) = &resolved.hostname {
-        builder = builder.resolve_to_addrs(hostname, &resolved.addrs);
+    if let Some(hostname) = resolved.hostname() {
+        builder = builder.resolve_to_addrs(hostname, resolved.addrs());
     }
 
     if should_use_custom_tls(tls_config) {
@@ -805,6 +663,8 @@ async fn run_probe_session(
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
+    use std::net::SocketAddr;
+
     use super::*;
     use crate::crd::inference_provider::ProviderPhase;
 
@@ -1289,11 +1149,20 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_unique_local_literal_is_blocked() {
+    fn ipv6_unique_local_literal_is_accepted_for_dual_stack_clusters() {
         assert_eq!(
             validate_probe_url("http://[fd00::1]:8080/mcp"),
+            McpUrlValidation::Ok,
+            "unique-local addresses carry dual-stack cluster services and must stay dialable"
+        );
+    }
+
+    #[test]
+    fn aws_metadata_ipv6_literal_is_blocked() {
+        assert_eq!(
+            validate_probe_url("http://[fd00:ec2::254]:80/mcp"),
             McpUrlValidation::BlockedHost,
-            "IPv6 unique-local (ULA) addresses must be blocked"
+            "the AWS IPv6 metadata endpoint must stay blocked inside the unique-local range"
         );
     }
 
@@ -1344,14 +1213,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // check_resolved_addrs
+    // endpoint_resolution::check_resolved_addrs
     // -----------------------------------------------------------------------
 
     #[test]
     fn all_safe_resolved_addrs_pass() {
         let addrs: Vec<SocketAddr> = vec!["10.96.0.42:8080".parse().unwrap(), "10.96.0.43:8080".parse().unwrap()];
         assert!(
-            check_resolved_addrs(&addrs),
+            endpoint_resolution::check_resolved_addrs(&addrs),
             "ordinary cluster addresses must pass DNS-resolved SSRF checks"
         );
     }
@@ -1360,7 +1229,7 @@ mod tests {
     fn any_unsafe_resolved_addr_fails_the_whole_set() {
         let addrs: Vec<SocketAddr> = vec!["10.96.0.42:8080".parse().unwrap(), "127.0.0.1:8080".parse().unwrap()];
         assert!(
-            !check_resolved_addrs(&addrs),
+            !endpoint_resolution::check_resolved_addrs(&addrs),
             "a hostname resolving to even one SSRF-sensitive address must fail closed for the whole set"
         );
     }
@@ -1368,7 +1237,7 @@ mod tests {
     #[test]
     fn empty_resolved_addrs_passes_vacuously() {
         assert!(
-            check_resolved_addrs(&[]),
+            endpoint_resolution::check_resolved_addrs(&[]),
             "an empty address list has nothing unsafe to find"
         );
     }

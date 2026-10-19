@@ -35,7 +35,7 @@ use crate::{
     resources::{
         credentials::{self, CredentialPlan, CredentialResolver as _, KubernetesSecretResolver},
         endpoint_tls,
-        model_discovery::{DiscoveryError, ModelSource as _, OpenAiModels, ServedModels},
+        model_discovery::{self, DiscoveryError, ModelSource as _, OpenAiModels, ServedModels},
     },
 };
 
@@ -378,8 +378,12 @@ async fn query_openai(
     client: &Client,
     timeout: Duration,
 ) -> Result<ServedModels, PollError> {
-    let source = openai_source(provider, openai, client, timeout).await?;
-    Ok(source.served_models().await?)
+    tokio::time::timeout(timeout, async {
+        let source = openai_source(provider, openai, client, timeout).await?;
+        Ok(source.served_models().await?)
+    })
+    .await
+    .map_err(|_elapsed| PollError::Source(DiscoveryError::Timeout(timeout)))?
 }
 
 /// Build an [`OpenAiModels`] source, resolving credentials and TLS.
@@ -394,8 +398,7 @@ async fn openai_source(
 
     let token = match credentials::credential_plan_from_auth(provider.spec.auth.as_ref()) {
         Ok(CredentialPlan::Bearer(secret_ref)) => Some(
-            KubernetesSecretResolver::new(client.clone())
-                .resolve(&secret_ref)
+            Box::pin(KubernetesSecretResolver::new(client.clone()).resolve(&secret_ref))
                 .await
                 .map_err(|e| PollError::Credential(e.to_string()))?,
         ),
@@ -404,11 +407,59 @@ async fn openai_source(
     };
 
     let ep_tls = openai.tls.as_ref().or(provider.spec.tls.as_ref());
-    let client_tls = endpoint_tls::resolve_tls_config(ep_tls, Some(client), name)
+    let client_tls = Box::pin(endpoint_tls::resolve_tls_config(ep_tls, Some(client), name))
         .await
         .map_err(|(_, message)| PollError::Tls(message))?;
 
-    Ok(OpenAiModels::new(&url, token.as_ref(), client_tls.as_ref(), timeout)?)
+    let uri = model_discovery::validated_uri(&url)?;
+    let model_client = model_discovery::build_client(&uri, client_tls.as_ref(), timeout).await?;
+    Ok(OpenAiModels::new(
+        uri,
+        token.as_ref(),
+        client_tls.as_ref(),
+        model_client,
+        timeout,
+    )?)
+}
+
+/// Build and query a model-discovery source backed by a local test server.
+#[cfg(test)]
+async fn query_openai_for_test(
+    provider: &InferenceProvider,
+    openai: &OpenAiModelsSource,
+    client: &Client,
+    timeout: Duration,
+) -> Result<ServedModels, PollError> {
+    let source = openai_source_for_test(provider, openai, client, timeout).await?;
+    Ok(source.served_models().await?)
+}
+
+/// Build a test model-discovery source without shipping a loopback bypass.
+#[cfg(test)]
+async fn openai_source_for_test(
+    provider: &InferenceProvider,
+    openai: &OpenAiModelsSource,
+    client: &Client,
+    timeout: Duration,
+) -> Result<OpenAiModels, PollError> {
+    let name = provider.metadata.name.as_deref().unwrap_or("?");
+    let url = openai.effective_url(&provider.spec.endpoint);
+
+    let token = match credentials::credential_plan_from_auth(provider.spec.auth.as_ref()) {
+        Ok(CredentialPlan::Bearer(secret_ref)) => Some(
+            Box::pin(KubernetesSecretResolver::new(client.clone()).resolve(&secret_ref))
+                .await
+                .map_err(|e| PollError::Credential(e.to_string()))?,
+        ),
+        Ok(CredentialPlan::Absent | CredentialPlan::Manual) => None,
+        Err(e) => return Err(PollError::Credential(e.to_string())),
+    };
+
+    let ep_tls = openai.tls.as_ref().or(provider.spec.tls.as_ref());
+    let client_tls = Box::pin(endpoint_tls::resolve_tls_config(ep_tls, Some(client), name))
+        .await
+        .map_err(|(_, message)| PollError::Tls(message))?;
+    Ok(model_discovery::new_for_test(&url, token.as_ref(), client_tls.as_ref(), timeout).await?)
 }
 
 // ---------------------------------------------------------------------------
@@ -606,7 +657,7 @@ mod tests {
         provider.spec.endpoint = endpoint;
         provider.spec.tls = Some(crate::resources::test_doubles::endpoint_tls_for_ca("shared-ca"));
 
-        let models = query_openai(&provider, &openai_source(None, None), &client, Duration::from_secs(5))
+        let models = query_openai_for_test(&provider, &openai_source(None, None), &client, Duration::from_secs(5))
             .await
             .unwrap_or_else(|_| std::process::abort())
             .into_names();
@@ -627,7 +678,7 @@ mod tests {
         provider.spec.endpoint = "https://unused.invalid".to_owned();
         provider.spec.tls = Some(crate::resources::test_doubles::endpoint_tls_for_ca("missing-shared-ca"));
 
-        let models = query_openai(
+        let models = query_openai_for_test(
             &provider,
             &openai_source(
                 Some(&endpoint),
@@ -654,7 +705,8 @@ mod tests {
         provider.spec.endpoint = "https://localhost:8443".to_owned();
         provider.spec.tls = Some(crate::resources::test_doubles::endpoint_tls_for_ca("missing-shared-ca"));
 
-        let result = query_openai(&provider, &openai_source(None, None), &client, Duration::from_secs(5)).await;
+        let result =
+            query_openai_for_test(&provider, &openai_source(None, None), &client, Duration::from_secs(5)).await;
 
         assert!(
             matches!(result, Err(PollError::Tls(_))),

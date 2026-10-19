@@ -2149,7 +2149,8 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
         POD_READY_TIMEOUT, STATUS_POLL_TIMEOUT, TEST_DEGRADED_ROUTING_CLUSTER, TEST_GATEWAY_NAME, TEST_GATEWAY_NS,
         TEST_HEALTHY_ROUTING_CLUSTER, TEST_METRICS_BUSY_PROVIDER, TEST_METRICS_BUSY_ROUTING_CLUSTER,
         TEST_METRICS_IDLE_PROVIDER, TEST_METRICS_IDLE_ROUTING_CLUSTER, TEST_NETWORK, TEST_PROVIDER_API,
-        TEST_PROVIDER_DEGRADED, TEST_PROVIDER_HEALTHY, TEST_PROVIDER_INVALID, TEST_PROVIDER_TLS_KEY_MISSING,
+        TEST_PROVIDER_DEGRADED, TEST_PROVIDER_HEALTHY, TEST_PROVIDER_INVALID, TEST_PROVIDER_SSRF_BLOCKED,
+        TEST_PROVIDER_TLS_KEY_MISSING,
     };
 
     // Step 1: install Grid CRDs and remove stale owned resources.
@@ -2203,6 +2204,7 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
     let healthy_endpoint = "http://mock-openai-provider.default.svc:8080";
     let api_endpoint = "https://api.anthropic.com";
     operator::apply_test_fixtures(context, healthy_endpoint)?;
+    operator::apply_ssrf_blocked_model_discovery_fixture(context)?;
     operator::apply_degraded_provider_fixture(context, &degraded_endpoint)?;
     operator::delete_api_credential_secret(context, API_PROVIDER_SECRET_NS)
         .unwrap_or_else(|e| eprintln!("  note: credential Secret cleanup: {e}"));
@@ -2220,6 +2222,7 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
     // Step 7: wait for reconciliation and verify overlay.
     let result = (|| -> Result<PathBuf, Box<dyn std::error::Error>> {
         operator::wait_for_provider_phase(context, TEST_PROVIDER_INVALID, "Unavailable", STATUS_POLL_TIMEOUT)?;
+        operator::wait_for_model_discovery_error(context, TEST_PROVIDER_SSRF_BLOCKED, "config", STATUS_POLL_TIMEOUT)?;
         operator::wait_for_provider_phase(context, TEST_PROVIDER_HEALTHY, "Pending", STATUS_POLL_TIMEOUT)?;
         operator::wait_for_provider_phase(context, TEST_PROVIDER_DEGRADED, "Degraded", STATUS_POLL_TIMEOUT)?;
         operator::wait_for_provider_phase(context, TEST_PROVIDER_API, "Pending", STATUS_POLL_TIMEOUT)?;

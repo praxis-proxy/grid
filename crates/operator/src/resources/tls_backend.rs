@@ -14,7 +14,7 @@
 use std::sync::OnceLock;
 use std::{borrow::Cow, sync::Arc, time::Duration};
 
-use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::connect::{HttpConnector, dns::GaiResolver};
 #[cfg(feature = "fips")]
 use openssl::{
     pkey::{PKey, Private},
@@ -94,24 +94,30 @@ pub(crate) type ServerName = String;
 
 /// HTTPS connector used by the hyper-based metrics scrape and health probe.
 #[cfg(not(feature = "fips"))]
-pub(crate) type HttpsConnector = hyper_rustls::HttpsConnector<HttpConnector>;
+pub(crate) type HttpsConnector<R = GaiResolver> = hyper_rustls::HttpsConnector<HttpConnector<R>>;
 /// HTTPS connector used by the hyper-based metrics scrape and health probe.
 #[cfg(feature = "fips")]
 #[derive(Clone)]
-pub(crate) enum HttpsConnector {
+pub(crate) enum HttpsConnector<R = GaiResolver> {
     /// Native trust for ordinary HTTP or HTTPS requests.
-    Native(hyper_openssl::client::legacy::HttpsConnector<HttpConnector>),
+    Native(hyper_openssl::client::legacy::HttpsConnector<HttpConnector<R>>),
     /// Grid trust: each new connection authenticates the peer without resuming a session.
     Custom {
         /// TCP dialer, including the pooled connection keepalive settings.
-        http: HttpConnector,
+        http: HttpConnector<R>,
         /// Shared roots, client identity, and peer rule.
         config: ClientTlsConfig,
     },
 }
 
 #[cfg(feature = "fips")]
-impl tower::Service<http::Uri> for HttpsConnector {
+impl<R> tower::Service<http::Uri> for HttpsConnector<R>
+where
+    HttpConnector<R>: tower::Service<http::Uri, Response = hyper_util::rt::TokioIo<tokio::net::TcpStream>>,
+    <HttpConnector<R> as tower::Service<http::Uri>>::Future: Send + 'static,
+    <HttpConnector<R> as tower::Service<http::Uri>>::Error:
+        std::error::Error + Send + Sync + 'static + Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     type Error = Box<dyn std::error::Error + Send + Sync>;
     type Future = std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
     type Response = hyper_openssl::client::legacy::MaybeHttpsStream<hyper_util::rt::TokioIo<tokio::net::TcpStream>>;
@@ -766,9 +772,9 @@ const TCP_KEEPALIVE: Duration = Duration::from_secs(15);
 /// Probes after [`TCP_KEEPALIVE`] before the connection is declared dead.
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
 
-/// A TCP connector that probes an idle connection rather than trusting it.
-fn probing_connector() -> HttpConnector {
-    let mut http = HttpConnector::new();
+/// Build a TCP connector with the selected resolver and idle-connection probes.
+fn probing_connector_with_resolver<R>(resolver: R) -> HttpConnector<R> {
+    let mut http = HttpConnector::new_with_resolver(resolver);
     // https is layered on top, so the scheme check belongs to the TLS connector.
     http.enforce_http(false);
     http.set_keepalive(Some(TCP_KEEPALIVE));
@@ -784,9 +790,20 @@ fn probing_connector() -> HttpConnector {
 /// Returns [`MetricsScrapeError::Transport`] if native roots cannot be loaded.
 #[cfg(not(feature = "fips"))]
 pub(crate) fn build_native_connector() -> Result<HttpsConnector, MetricsScrapeError> {
+    build_native_connector_with_resolver(GaiResolver::new())
+}
+
+/// Build an HTTP(S) connector using native roots and an explicit DNS resolver.
+///
+/// # Errors
+///
+/// Returns [`MetricsScrapeError::Transport`] if native roots cannot be loaded.
+#[cfg(not(feature = "fips"))]
+pub(crate) fn build_native_connector_with_resolver<R>(resolver: R) -> Result<HttpsConnector<R>, MetricsScrapeError> {
+    let http = probing_connector_with_resolver(resolver);
     hyper_rustls::HttpsConnectorBuilder::new()
         .with_native_roots()
-        .map(|b| b.https_or_http().enable_http1().wrap_connector(probing_connector()))
+        .map(|b| b.https_or_http().enable_http1().wrap_connector(http))
         .map_err(|e| MetricsScrapeError::Transport(e.into()))
 }
 
@@ -797,9 +814,19 @@ pub(crate) fn build_native_connector() -> Result<HttpsConnector, MetricsScrapeEr
 /// Returns [`MetricsScrapeError::Transport`] if the connector cannot be built.
 #[cfg(feature = "fips")]
 pub(crate) fn build_native_connector() -> Result<HttpsConnector, MetricsScrapeError> {
-    let builder =
-        SslConnector::builder(SslMethod::tls_client()).map_err(|e| MetricsScrapeError::Transport(e.into()))?;
-    hyper_openssl::client::legacy::HttpsConnector::with_connector(probing_connector(), builder)
+    build_native_connector_with_resolver(GaiResolver::new())
+}
+
+/// Build an HTTP(S) connector using native roots and an explicit DNS resolver.
+///
+/// # Errors
+///
+/// Returns [`MetricsScrapeError::Transport`] if the connector cannot be built.
+#[cfg(feature = "fips")]
+pub(crate) fn build_native_connector_with_resolver<R>(resolver: R) -> Result<HttpsConnector<R>, MetricsScrapeError> {
+    let http = probing_connector_with_resolver(resolver);
+    let ssl = SslConnector::builder(SslMethod::tls_client()).map_err(|e| MetricsScrapeError::Transport(e.into()))?;
+    hyper_openssl::client::legacy::HttpsConnector::with_connector(http, ssl)
         .map(HttpsConnector::Native)
         .map_err(|e| MetricsScrapeError::Transport(e.into()))
 }
@@ -810,16 +837,30 @@ pub(crate) fn build_native_connector() -> Result<HttpsConnector, MetricsScrapeEr
 ///
 /// Returns [`MetricsScrapeError::Transport`] if the connector cannot be built.
 #[cfg(not(feature = "fips"))]
+pub(crate) fn build_custom_tls_connector(config: &ClientTlsConfig) -> Result<HttpsConnector, MetricsScrapeError> {
+    build_custom_tls_connector_with_resolver(config, GaiResolver::new())
+}
+
+/// Build an HTTPS-only connector using custom TLS material and an explicit DNS resolver.
+///
+/// # Errors
+///
+/// Returns [`MetricsScrapeError::Transport`] if the connector cannot be built.
+#[cfg(not(feature = "fips"))]
 #[expect(
     clippy::unnecessary_wraps,
     reason = "the fips (openssl) backend's connector build is fallible"
 )]
-pub(crate) fn build_custom_tls_connector(config: &ClientTlsConfig) -> Result<HttpsConnector, MetricsScrapeError> {
+pub(crate) fn build_custom_tls_connector_with_resolver<R>(
+    config: &ClientTlsConfig,
+    resolver: R,
+) -> Result<HttpsConnector<R>, MetricsScrapeError> {
+    let http = probing_connector_with_resolver(resolver);
     Ok(hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config((**config).clone())
         .https_only()
         .enable_http1()
-        .wrap_connector(probing_connector()))
+        .wrap_connector(http))
 }
 
 /// Build an HTTPS-only connector using a custom client TLS configuration.
@@ -833,7 +874,26 @@ pub(crate) fn build_custom_tls_connector(config: &ClientTlsConfig) -> Result<Htt
         .connector()
         .map_err(|e| MetricsScrapeError::Transport(e.into()))?;
     Ok(HttpsConnector::Custom {
-        http: probing_connector(),
+        http: probing_connector_with_resolver(GaiResolver::new()),
+        config: Arc::clone(config),
+    })
+}
+
+/// Build an HTTPS-only connector using custom TLS material and an explicit DNS resolver.
+///
+/// # Errors
+///
+/// Returns [`MetricsScrapeError::Transport`] if the connector cannot be built.
+#[cfg(feature = "fips")]
+pub(crate) fn build_custom_tls_connector_with_resolver<R>(
+    config: &ClientTlsConfig,
+    resolver: R,
+) -> Result<HttpsConnector<R>, MetricsScrapeError> {
+    config
+        .connector()
+        .map_err(|e| MetricsScrapeError::Transport(e.into()))?;
+    Ok(HttpsConnector::Custom {
+        http: probing_connector_with_resolver(resolver),
         config: Arc::clone(config),
     })
 }
