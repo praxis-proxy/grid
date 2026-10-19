@@ -162,10 +162,17 @@ async fn main() {
         },
     };
     config.swim.site_name = site_name;
-    let idle = config.swim.site_name.is_none();
-    if idle {
-        tracing::info!("no site identity or site name: idle until an admin creates or joins a grid");
-    } else if has_identity && config.grid.create_local_records {
+    let startup = SiteStartup::resolve(config.swim.site_name.is_some(), has_identity);
+    match startup {
+        SiteStartup::Idle => {
+            tracing::info!("no site identity or site name: idle until an admin creates or joins a grid");
+        },
+        SiteStartup::AwaitingIdentity => {
+            tracing::info!("site named but not yet identified: waiting for its identity");
+        },
+        SiteStartup::Identified => {},
+    }
+    if startup.creates_records() && config.grid.create_local_records {
         Box::pin(create_local_records(&client, &config, identity)).await;
     }
     let GridModes {
@@ -285,14 +292,13 @@ async fn main() {
         .map(|_joined| ())
     };
 
-    // A site without an identity exits once it has one, so the restart names the
-    // site from it and creates its records. A configured name is not enough: the
-    // records need the identity, so a named site waits for it too.
+    // Waiting exits once the identity appears, so the restart names the site from
+    // it and creates its records.
     let identified = async {
-        if has_identity {
-            std::future::pending::<()>().await;
-        } else {
+        if startup.waits_for_identity() {
             identity_appears(&client, &config).await;
+        } else {
+            std::future::pending::<()>().await;
         }
     };
     // Standing down wins, and dropping the work closes every connection pool
@@ -1129,6 +1135,42 @@ fn parse_swim_key(hex: &str) -> Result<swim::crypto::SwimKey, &'static str> {
         }
     }
     Ok(key)
+}
+
+/// What startup does about the site's name and its records.
+///
+/// The identity names the site and the records need it, so a configured name
+/// alone is not enough to proceed: a named site still waits for its identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SiteStartup {
+    /// Neither a name nor an identity: nothing to do until an admin acts.
+    Idle,
+    /// Named, but the identity has not appeared yet.
+    AwaitingIdentity,
+    /// Identified, so the records this release owns can be created.
+    Identified,
+}
+
+impl SiteStartup {
+    /// Decide from whether the site has a name and whether its identity is present.
+    const fn resolve(named: bool, has_identity: bool) -> Self {
+        match (named, has_identity) {
+            // The identity names the site, so being identified settles it either way.
+            (_, true) => Self::Identified,
+            (true, false) => Self::AwaitingIdentity,
+            (false, false) => Self::Idle,
+        }
+    }
+
+    /// Whether to poll for an identity and exit once one appears.
+    const fn waits_for_identity(self) -> bool {
+        !matches!(self, Self::Identified)
+    }
+
+    /// Whether the local records can be created now.
+    const fn creates_records(self) -> bool {
+        matches!(self, Self::Identified)
+    }
 }
 
 /// How often a site without an identity checks for one.
@@ -4338,6 +4380,73 @@ mod tests {
             }
         });
         Client::new(service, "default")
+    }
+
+    /// Startup's name and identity decision, over every combination.
+    mod site_startup {
+        use super::super::SiteStartup;
+
+        /// No name and no identity: idle, and still watching for an identity.
+        #[test]
+        fn unnamed_and_unidentified_idles_and_waits() {
+            let startup = SiteStartup::resolve(false, false);
+            assert_eq!(startup, SiteStartup::Idle);
+            assert!(
+                startup.waits_for_identity(),
+                "an idle site must notice an identity arriving"
+            );
+            assert!(!startup.creates_records(), "records need the identity");
+        }
+
+        /// Named but not yet identified: the gap that skipped both paths. The
+        /// records need the identity, so this site waits for it rather than
+        /// proceeding on the name alone.
+        #[test]
+        fn named_but_unidentified_waits_without_creating_records() {
+            let startup = SiteStartup::resolve(true, false);
+            assert_eq!(startup, SiteStartup::AwaitingIdentity);
+            assert!(
+                startup.waits_for_identity(),
+                "a named site must still wait for its identity"
+            );
+            assert!(!startup.creates_records(), "records need the identity");
+        }
+
+        /// Named and identified: create the records and stop watching.
+        #[test]
+        fn named_and_identified_creates_records_and_stops_waiting() {
+            let startup = SiteStartup::resolve(true, true);
+            assert_eq!(startup, SiteStartup::Identified);
+            assert!(
+                !startup.waits_for_identity(),
+                "an identified site has nothing to wait for"
+            );
+            assert!(startup.creates_records());
+        }
+
+        /// The identity names the site, so an identity without a configured name
+        /// is identified too.
+        #[test]
+        fn unnamed_but_identified_is_identified() {
+            let startup = SiteStartup::resolve(false, true);
+            assert_eq!(startup, SiteStartup::Identified);
+            assert!(!startup.waits_for_identity());
+            assert!(startup.creates_records());
+        }
+
+        /// Exactly one disposition creates records, and it is the only one that
+        /// stops waiting.
+        #[test]
+        fn creating_records_and_waiting_are_exclusive() {
+            for (named, has_identity) in [(false, false), (true, false), (true, true), (false, true)] {
+                let startup = SiteStartup::resolve(named, has_identity);
+                assert_ne!(
+                    startup.creates_records(),
+                    startup.waits_for_identity(),
+                    "named={named} has_identity={has_identity} must either create records or wait"
+                );
+            }
+        }
     }
 
     /// Real Kubernetes and mutual-TLS feedback proof for the isolated CI cluster.
