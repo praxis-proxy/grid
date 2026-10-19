@@ -152,7 +152,7 @@ jobs:
 
       - name: Upload rendered manifests
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rendered-manifests-${{ matrix.helm }}
           path: ${{ runner.temp }}/helm-rendered/
@@ -201,7 +201,7 @@ jobs:
           cache-to: ${{ github.event_name == 'push' && format('type=gha,mode=max,scope=img-{0}', matrix.name) || '' }}
 
       - name: Upload ${{ matrix.name }} image
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-${{ matrix.name }}
           path: /tmp/grid-${{ matrix.name }}.tar
@@ -291,7 +291,7 @@ jobs:
 
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: kind-test-logs
           path: /tmp/helm-kind-logs/
@@ -369,7 +369,7 @@ jobs:
 
       - name: Upload Kind logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: helm-upgrade-logs-${{ matrix.helm }}
           path: /tmp/helm-upgrade-logs/
@@ -425,7 +425,7 @@ jobs:
         run: ./scripts/check-forge-lifecycle.sh
       - name: Upload Forge compatibility evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: forge-compatibility
           path: target/forge-compatibility/
@@ -487,7 +487,7 @@ jobs:
 
       - name: Upload e2e logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gateway-standalone-e2e
           path: |
@@ -549,7 +549,7 @@ jobs:
 
       - name: Upload e2e logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: enrollment-e2e-logs-${{ matrix.authz }}
           path: /tmp/helm-kind-logs/
@@ -641,7 +641,7 @@ jobs:
 
       - name: Upload e2e logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: hub-site-e2e-logs-${{ matrix.peer-trust-mode }}
           path: /tmp/grid-hub-site-e2e/
