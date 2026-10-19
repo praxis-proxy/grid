@@ -74,6 +74,8 @@ make generate-crds  # regenerate CRD manifests from
 make crds-check     # fail if CRD manifests are stale
 make all            # build + fmt + lint + doc
                     #   + test + audit
+                    #   + go-types-check (only when go is in PATH;
+                    #     rewrites zz_generated_*.go in place)
 ```
 
 Single-test and single-crate commands:

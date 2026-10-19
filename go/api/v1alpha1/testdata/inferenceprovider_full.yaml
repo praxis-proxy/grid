@@ -1,0 +1,94 @@
+apiVersion: grid.praxis.fast/v1alpha1
+kind: InferenceProvider
+metadata:
+  name: llmd-pool-east
+spec:
+  gridNetworkRef: production
+  providerKind: self_hosted
+  backendKind: llm_d
+  endpoint: https://llmd-pool.east.svc:8443
+  gatewayRef: provider-gateway-east
+  routingClusterRef: llmd-east
+  capacityWeight: 500
+  accessPolicy:
+    siteSelector:
+      matchLabels:
+        region: us-east-1
+  auth:
+    strategy: mtls_only
+    manual: false
+  tls:
+    caSecretRef:
+      name: grid-ca
+      namespace: grid-system
+    clientCertificateSecretRef:
+      name: llmd-client-cert
+      namespace: grid-system
+      certificateKey: tls.crt
+      privateKeyKey: tls.key
+  healthCheck:
+    endpoint: https://llmd-epp.east.svc:9443
+    path: /healthz
+    interval: 15s
+    timeout: 5s
+    tls:
+      caConfigMapRef:
+        name: openshift-service-ca
+        namespace: openshift-service-ca-operator
+        key: service-ca.crt
+  metricsConfig:
+    metricsEndpoint: https://llmd-epp.east.svc:9443
+    path: /metrics
+    timeout: 2s
+    poolName: llmd-pool-east
+    queueCapacity: 200
+    staleMetricsSeconds: 30
+    signalNames:
+      queueDepth: llm_d_epp_average_queue_size
+      kvCacheUtilization: llm_d_epp_kv_cache_utilization
+      latencyP99Ms: llm_d_epp_request_latency_p99
+      prefixCacheHitRatio: llm_d_epp_prefix_cache_hit_ratio
+      errorRate: llm_d_epp_error_rate
+      healthy: llm_d_epp_health_status
+      readyEndpoints: llm_d_epp_ready_endpoints
+    tls:
+      caConfigMapRef:
+        name: openshift-service-ca
+        namespace: openshift-service-ca-operator
+        key: service-ca.crt
+    auth:
+      type: serviceAccountToken
+      allowPlaintext: false
+  modelDiscovery:
+    openAiModels:
+      endpoint: https://llmd-pool.east.svc:8443
+      path: /v1/models
+      tls:
+        caSecretRef:
+          name: grid-ca
+          namespace: grid-system
+  models:
+    - name: meta-llama/Llama-3.1-8B-Instruct
+      capabilities:
+        - chat
+        - completion
+      contextWindow: 131072
+  cost:
+    perMillionInputTokens: 0.15
+    perMillionOutputTokens: 0.60
+  trafficPolicy:
+    drain: true
+status:
+  phase: Degraded
+  observedGeneration: 7
+  matchingSites:
+    - cluster-east
+  modelDiscoveryUrl: https://llmd-pool.east.svc:8443/v1/models
+  reason: MetricsTlsIdentityMismatch
+  conditions:
+    - type: Ready
+      status: "False"
+      reason: MetricsTlsIdentityMismatch
+      message: TLS certificate identity does not match expected SNI
+      lastTransitionTime: "2024-06-01T12:00:00Z"
+      observedGeneration: 7

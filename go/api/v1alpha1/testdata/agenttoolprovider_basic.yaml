@@ -1,0 +1,17 @@
+apiVersion: grid.praxis.fast/v1alpha1
+kind: AgentToolProvider
+metadata:
+  name: my-tools
+spec:
+  gridNetworkRef: production
+  endpoint: https://tools.example.com
+  protocol: mcp
+  auth:
+    strategy: bearer_token
+    secretRef:
+      name: tools-token
+      namespace: grid-system
+  tools:
+    - name: web_search
+      description: Search the web for current information
+    - name: code_interpreter

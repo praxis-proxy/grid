@@ -3,6 +3,7 @@
 # -------------------------------------------------------------------
 
 CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+GO               ?= $(shell command -v go 2>/dev/null)
 V                ?=
 NIGHTLY_RUSTFMT   ?= nightly-2026-03-28
 KIND_CLUSTER_NAME ?= praxis-grid
@@ -15,6 +16,7 @@ endif
 .PHONY: all build release check clean \
 	test test-unit lint gateway-lint lint-extra fmt doc audit \
 	generate-api-types codegen-check generate-crds crds-check generate-deploy deploy-check \
+	generate-go-types go-types-check \
 	coverage coverage-check \
 	mutants semver publish-dry-run \
 	require-container-engine \
@@ -30,7 +32,7 @@ endif
 # All
 # -------------------------------------------------------------------
 
-all: build fmt lint doc test audit
+all: build fmt lint doc test audit $(if $(GO),go-types-check,)
 
 # -------------------------------------------------------------------
 # Build
@@ -102,6 +104,23 @@ generate-crds:
 # Fail if the checked-in CRD manifests no longer match the Rust types.
 crds-check:
 	./scripts/generate-deployment-crds.sh --check
+
+# Generate Go API types and deep-copy methods from the deployed CRD schemas.
+# Run this after every `make generate-crds` to keep the Go types in sync.
+generate-go-types:
+	cd go && $(GO) run ./cmd/gen-types --crds ../deploy/crds --out ./api/v1alpha1
+	cd go && $(GO) build ./... && $(GO) vet ./...
+	cd go && $(GO) build -o /dev/null ./_example
+
+# Fail if the committed generated Go types are out of date with the CRD schemas.
+# Regenerates the types, checks git diff --exit-code on the generated files,
+# then runs the serialization and structural-drift tests.
+# Run this after every `make generate-crds`.
+go-types-check:
+	cd go && $(GO) run ./cmd/gen-types --crds ../deploy/crds --out ./api/v1alpha1
+	git diff --exit-code go/api/v1alpha1/zz_generated_types.go go/api/v1alpha1/zz_generated_deepcopy.go
+	cd go && $(GO) test ./...
+	cd go && $(GO) build -o /dev/null ./_example
 
 # Regenerate the operator install manifests in deploy/operator (platform base) and
 # deploy/overlays/kind from charts/grid-operator and the values.yaml in each directory.
@@ -264,7 +283,7 @@ help:
 	@echo "  PROJECT_IMAGE      container image tag"
 	@echo ""
 	@echo "Top-level:"
-	@echo "  all              build + fmt + lint + doc + test + audit"
+	@echo "  all              build + fmt + lint + doc + test + audit (+ go-types-check when go is in PATH)"
 	@echo ""
 	@echo "Build:"
 	@echo "  build            cargo build --workspace"

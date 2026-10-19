@@ -9,6 +9,7 @@ Development and validation guidance for AI Grid Network (AGN).
 - Clippy, `cargo-machete`, `cargo-audit`, and `cargo-deny` for the Rust gates.
 - `typos`, `taplo`, `shellcheck`, and `actionlint` for `make lint-extra`.
 - `jq` and Mike Farah's `yq` v4 for CRD generation.
+- Go 1.24+ for `make generate-go-types` and `make go-types-check`.
 - `cargo-llvm-cov` and `llvm-tools-preview` for optional coverage runs.
 - Docker or Podman, kind, kubectl, Helm, and the topology-specific prerequisites
   for live integration checks. Individual harnesses may require Docker.
@@ -78,14 +79,20 @@ those targets.
 | `make test` | Root workspace tests; ignored tests stay excluded. | Tests / test; separate FIPS and Gateway jobs cover their configurations. |
 | `make audit` | Root lockfile audit and dependency/license policy. | Supply Chain; Gateway policy is checked in its own workflow. |
 | `make codegen-check`, `make crds-check` | Compare generated enrollment types and CRDs with their source definitions. | Tests / lint. |
+| `make go-types-check` | Regenerate Go API types from `deploy/crds/` and fail if the committed files differ. Rewrites `go/api/v1alpha1/zz_generated_*.go` in place — run before staging. | Check Go API types match the CRD schemas. |
 | `make coverage-check` | 80% root line-coverage floor with documented exclusions. | Coverage / coverage. |
 | `make mutants`, `make semver`, `make publish-dry-run` | Opt-in specialist checks. | No corresponding scheduled Grid workflows. |
 
 `make all` runs build, formatting, lint, rustdoc, root tests, and root audit.
+When `go` is found in `PATH` it also runs `go-types-check`, which regenerates
+the Go API types from the deployed CRD schemas and fails if the committed files
+differ. The check rewrites `go/api/v1alpha1/zz_generated_*.go` in place, so
+run it before staging. Without Go in `PATH` the check is skipped silently; CI
+always runs it via the `go-types-check` step regardless.
 Run `make lint-extra` separately for spelling, TOML, shell, and workflow checks.
-The `make all` aggregate does not run coverage, Gateway tests, generated-file
-checks, FIPS checks, container builds, dashboard web checks, or live cluster
-qualifications. Run those when the changed contract requires them. The
+The `make all` aggregate does not run coverage, Gateway tests, FIPS checks,
+container builds, dashboard web checks, or live cluster qualifications. Run
+those when the changed contract requires them. The
 [release guide](release.md) records the integration qualification matrix.
 
 Tests and Coverage workflows skip their Rust jobs for documentation-only PRs;
@@ -123,11 +130,19 @@ and report whether automated Markdown/link checks were run.
 generated output directly. CRD doc-comment changes also affect field
 descriptions and require regeneration.
 
+`make generate-go-types` derives `go/api/v1alpha1/zz_generated_*.go` from
+`deploy/crds/`. Run it after any `make generate-crds` pass and commit the
+result. `make go-types-check` re-runs the generator and fails if the committed
+files differ; CI runs this step regardless of whether Go is in your local
+`PATH`.
+
 ```console
 make generate-crds
 make crds-check
 make generate-api-types
 make codegen-check
+make generate-go-types
+make go-types-check
 ```
 
 ### Coverage and supply chain
