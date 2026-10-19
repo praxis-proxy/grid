@@ -76,7 +76,7 @@ floor is one scrape interval plus the longer of one interval or the latest
 measured pass, and it overrides `staleMetricsSeconds` when longer. This keeps a
 successful sample valid until the next non-overlapping pass can refresh it. The
 trade-off is that a slow pass widens the window for every provider on the
-network, so a real failure is reported later. The 15s local-exclusion claim
+network, so a real failure is reported later. The 3s local-exclusion claim
 below therefore holds only when a pass finishes within one interval; scrape
 cadence follows the slowest provider's timeout, which has no upper bound.
 
