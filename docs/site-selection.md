@@ -61,7 +61,7 @@ Nothing needs setting. `availability.shedding` is the one switch, off by default
 fields of the filter's `availability` block, set from the chart's
 `gridServing.siteRoute.availability`, have defaults, and their table and tuning order are in
 [routing.md](routing.md#7b-measured-site-availability). On the operator,
-`GRID_SIGNALS_SCRAPE_INTERVAL_SECS` (default 5) sets how often it scrapes its EPP, and
+`GRID_SIGNALS_SCRAPE_INTERVAL_SECS` (default 1) sets how often it scrapes its EPP, and
 `metricsConfig.staleMetricsSeconds` how long a failing scrape keeps the last readiness.
 
 ## What to watch

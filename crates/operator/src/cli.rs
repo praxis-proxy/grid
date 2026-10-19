@@ -131,7 +131,7 @@ pub struct SignalsArgs {
     #[arg(
         long = "signals-scrape-interval-secs",
         env = "GRID_SIGNALS_SCRAPE_INTERVAL_SECS",
-        default_value_t = 5
+        default_value_t = 1
     )]
     pub scrape_interval_secs: u64,
 

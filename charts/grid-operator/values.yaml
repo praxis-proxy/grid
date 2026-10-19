@@ -226,6 +226,10 @@ signals:
   # -- Seconds between peer signal polls. Every site polls every other alive site, so
   # a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator's 5s.
   peerIntervalSeconds: ""
+
+  # -- Seconds between scrapes of this site's own EPPs. Local and unicast, so it costs
+  # one request per provider per interval. Empty keeps the operator's 1s.
+  scrapeIntervalSeconds: ""
 # -- Advertised site gateway address configuration.
 gateway:
   # -- Discover and advertise a LoadBalancer address for the site gateway.

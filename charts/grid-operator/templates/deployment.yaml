@@ -135,6 +135,10 @@ spec:
             - name: GRID_SIGNALS_PEER_INTERVAL_SECS
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.signals.scrapeIntervalSeconds }}
+            - name: GRID_SIGNALS_SCRAPE_INTERVAL_SECS
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             - name: GRID_METRICS_ADDR
               value: {{ .Values.metrics.bindAddress | quote }}

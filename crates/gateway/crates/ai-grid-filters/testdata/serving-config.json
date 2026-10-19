@@ -1,7 +1,7 @@
 {
   "local_site": "site-a",
   "window_secs": 60,
-  "load_window_ms": 82000,
+  "load_window_ms": 78000,
   "horizon_ms": 17000,
   "candidates": [
     {
@@ -26,7 +26,7 @@
       "server_name": "site-a.grid.internal",
       "authority": "site-a.grid.internal",
       "path": "/v1/site/signals",
-      "interval_ms": 5000,
+      "interval_ms": 1000,
       "connect_timeout_ms": 2000,
       "request_timeout_ms": 2000,
       "grid_ca_path": "/etc/praxis/tls/ca.crt",

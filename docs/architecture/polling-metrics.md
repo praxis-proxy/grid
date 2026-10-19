@@ -101,10 +101,10 @@ while that count kept stamping, leaves selection within one poll and rejoins wit
 poll of recovery. The serving config carries the same verdict for local
 providers as `admission: none`. When every candidate for a model is excluded the
 gateway answers 503 with `Retry-After`, not 404: the model exists but cannot be
-served now. At the default 5s scrape and 5s poll, exclusion of a local site takes
-about 15s and rejoin about 10s. A remote site's reading reaches the gateway through
-its operator's peer poll, so its exclusion and rejoin also wait on that poll and its
-budget: about 15s more at the default 5s peer poll plus its 10s budget.
+served now. At the default 1s scrape and 1s poll, exclusion of a local site takes
+about 3s and rejoin about 2s. A remote site's reading reaches the gateway through
+its operator's peer poll, which is unchanged at 5s, so its exclusion and rejoin still
+wait on that poll and its budget: about 15s more.
 
 ## Provider In-flight
 

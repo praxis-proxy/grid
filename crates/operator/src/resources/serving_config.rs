@@ -35,7 +35,10 @@ pub(crate) const MIN_WRITE_INTERVAL: Duration = Duration::from_secs(30);
 const WINDOW_SECS: u64 = 60;
 
 /// How often the gateway polls its local operator, milliseconds.
-const GATEWAY_POLL_MS: u64 = 5_000;
+///
+/// In-cluster and unicast, so it is paced by how current the router needs its load to be
+/// rather than by what it costs.
+const GATEWAY_POLL_MS: u64 = 1_000;
 
 /// Gateway connect and request timeout to its local operator, milliseconds.
 const GATEWAY_TIMEOUT_MS: u64 = 2_000;
@@ -52,7 +55,7 @@ const HORIZON_SCRAPES: u32 = 3;
 /// The oldest a relayed sample can be when it arrives: a provider scrape, the
 /// operator's peer poll and the budget that poll may take, the gateway's own poll
 /// of the operator, and two hops of `Date` truncation. Plus one peer poll of
-/// slack, so one late poll does not turn a healthy site unknown. About 32s at the
+/// slack, so one late poll does not turn a healthy site unknown. About 24s at the
 /// defaults. Sized shorter than one relay cycle, every remote site would be
 /// unmeasured for most of every cycle and every gateway would route to its local
 /// site in a square wave.
@@ -70,7 +73,7 @@ fn load_window_ms(scrape: Duration, peer_interval: Duration, peer_budget: Durati
 /// How far behind a site's newest sample the gateway reads worst load, milliseconds.
 ///
 /// A few scrapes, so one spike is forgotten within seconds whatever the relay cadence.
-/// Anchored at the newest sample on the gateway, so it needs no relay term. About 17s at
+/// Anchored at the newest sample on the gateway, so it needs no relay term. About 5s at
 /// the defaults, the freshness window before the gateway read its local operator.
 fn horizon_ms(scrape: Duration) -> i64 {
     let horizon = u64::try_from(scrape.as_millis())
@@ -506,12 +509,12 @@ mod tests {
     fn the_load_window_covers_the_oldest_a_sample_can_arrive_plus_a_poll() {
         assert_eq!(
             load_window_ms(Duration::from_secs(5), Duration::from_secs(30), Duration::from_secs(10)),
-            82_000,
-            "5s scrape + 30s peer poll + 10s budget + 5s gateway poll + 2s Date + 30s slack"
+            78_000,
+            "5s scrape + 30s peer poll + 10s budget + 1s gateway poll + 2s Date + 30s slack"
         );
         assert_eq!(
             load_window_ms(Duration::from_secs(1), Duration::from_secs(30), Duration::from_secs(10)),
-            78_000
+            74_000
         );
         let oldest_arrival = 5_000 + 30_000 + 10_000 + GATEWAY_POLL_MS + MARGIN_MS;
         assert!(
