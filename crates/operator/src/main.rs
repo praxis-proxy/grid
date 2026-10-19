@@ -285,12 +285,14 @@ async fn main() {
         .map(|_joined| ())
     };
 
-    // An idle site exits once identified, so the restart takes the new name.
+    // A site without an identity exits once it has one, so the restart names the
+    // site from it and creates its records. A configured name is not enough: the
+    // records need the identity, so a named site waits for it too.
     let identified = async {
-        if idle {
-            identity_appears(&client, &config).await;
-        } else {
+        if has_identity {
             std::future::pending::<()>().await;
+        } else {
+            identity_appears(&client, &config).await;
         }
     };
     // Standing down wins, and dropping the work closes every connection pool
@@ -1129,7 +1131,7 @@ fn parse_swim_key(hex: &str) -> Result<swim::crypto::SwimKey, &'static str> {
     Ok(key)
 }
 
-/// How often an idle site checks for its identity.
+/// How often a site without an identity checks for one.
 const IDENTITY_POLL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Resolve once the site identity appears, warning once per distinct error.
