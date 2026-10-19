@@ -1054,8 +1054,10 @@ as a normalized `0.0` to `1.0` gauge before the operator scrapes it.
 ### Model discovery
 
 `spec.modelDiscovery` makes the operator poll the backend for the models it
-serves. Discovery does not yet affect routing or gossip; `spec.models`
-remains the routing source.
+serves. For now, discovered model names are withheld from routes and provider
+records because those formats cannot enforce inventory expiry. A provider with
+discovery configured does not fall back to `spec.models`; providers without
+discovery continue to use `spec.models`.
 
 ```yaml
 spec:
