@@ -41,14 +41,23 @@ sar = ["dep:kube", "dep:k8s-openapi"]
 # Record each enrollment as a CertificateSigningRequest on the hub. Independent of
 # sar in code; the chart turns it on only under kube authz, since both need the API server.
 csr-record = ["dep:kube", "dep:k8s-openapi", "dep:pem"]
-bootstrap = ["dep:clap", "dep:kube", "dep:k8s-openapi", "dep:reqwest", "dep:grid-client", "dep:zeroize"]
+bootstrap = [
+  "dep:clap",
+  "dep:kube",
+  "dep:k8s-openapi",
+  "dep:reqwest",
+  "dep:grid-client",
+  "dep:zeroize",
+]
 site-invite-controller = ["dep:kube", "dep:k8s-openapi", "dep:pem", "dep:site-invite-api"]
 
 [dependencies]
 version.workspace = true
 axum = { workspace = true }
 certs = { path = "../certs", default-features = false }
-grid-client = { path = "../client", default-features = false, features = ["reqwest-client"], optional = true }
+grid-client = { path = "../client", default-features = false, features = [
+  "reqwest-client",
+], optional = true }
 futures = { workspace = true }
 clap = { workspace = true, optional = true, features = ["env"] }
 kube = { workspace = true, optional = true }
