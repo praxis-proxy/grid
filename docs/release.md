@@ -297,15 +297,22 @@ does not count as a passed external-provider qualification.
 Tags use `v<MAJOR>.<MINOR>.<PATCH>`, with an optional pre-release segment for a
 release candidate, as in `v0.3.0-rc.3`. Build metadata is refused, because an OCI
 tag cannot carry a plus. Create the tag only from the reviewed commit after its
-pull request and CI checks pass. Sign the tag using the project's normal Git
-signing configuration:
+pull request and CI checks pass, which for a squash-merged preparation branch is
+the resulting commit on `main`, not the branch tip. Sign the tag using the
+project's normal Git signing configuration:
 
 ```console
 VERSION="${VERSION:?set VERSION to the workspace release version}"
 TAG="v${VERSION}"
+REMOTE="${REMOTE:-origin}"
 git tag -s "$TAG" -m "AGN $TAG"
-git push origin "$TAG"
+git push "$REMOTE" "$TAG"
 ```
+
+Only a tag on this repository starts the Release workflow. A clone that keeps
+this repository under a name other than `origin`, such as a fork checkout whose
+`origin` is the fork, needs `REMOTE` set to the name that points here;
+`git remote -v` shows which. A tag pushed to a fork publishes nothing.
 
 Do not move or recreate a published release tag. Prepare a new patch release
 for corrections.
