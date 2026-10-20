@@ -6550,7 +6550,8 @@ mod tests {
                 "cluster": "provider-a",
                 "address": "203.0.113.10:8443",
                 "transport": { "mode": "mutual_tls", "sni": "provider-a.example" }
-            })]
+            })],
+            "GridNetwork endpoints must omit xtask-only site metadata"
         );
     }
 
@@ -6562,7 +6563,10 @@ mod tests {
             "transport": { "mode": "mutual_tls", "sni": "provider-a.example" }
         });
         let site = provider_gateway_endpoint_site(&endpoint, "provider-a").unwrap_or_else(|_| std::process::abort());
-        assert_eq!(site, "provider-a");
+        assert_eq!(
+            site, "provider-a",
+            "embedded gateway backends must use the explicit provider site"
+        );
     }
 
     #[test]
