@@ -754,7 +754,14 @@ pub struct PeerSite {
     /// URL: a pin asserts a known key, not merely that some authority signed a
     /// name (which need not match the advertised address anyway).
     pub pins: Vec<String>,
+
+    /// Whether the site answered when last polled, or has not been polled. One that did not
+    /// gets [`UNANSWERED_PEER_BUDGET`], so a peer that cannot answer frees its slot quickly.
+    pub answering: bool,
 }
+
+/// The most one poll of a peer that did not answer last time may take, attempts included.
+pub const UNANSWERED_PEER_BUDGET: Duration = Duration::from_secs(2);
 
 /// Members other than this site, addressed at their dialable signals endpoint.
 pub fn peer_sites<'member, Members>(
@@ -773,6 +780,7 @@ where
                 name: member.site_id.clone(),
                 url: dialable_signals_endpoint(member, fallback_port)?.url(scheme)?,
                 pins: Vec::new(),
+                answering: true,
             })
         })
         .collect()
@@ -1125,6 +1133,9 @@ pub struct PollPeers {
     /// next one, and rounds would overlap until the pool was full of work
     /// nobody is waiting for any more.
     pub budget: Duration,
+    /// The most one round may take. A poll still running at its end times out and is tried again
+    /// next round, so peers that cannot answer never delay the rest.
+    pub round: Duration,
     /// Duration past which a poll is counted as slow.
     pub slow_after: Duration,
     /// Per-peer transports, held across rounds.
@@ -1148,6 +1159,7 @@ impl Default for PollPeers {
             attempts: 3,
             backoff: Duration::from_millis(50),
             budget: Duration::from_secs(5),
+            round: Duration::from_secs(5),
             slow_after: Duration::from_secs(1),
             shutdown: crate::shutdown::Shutdown::never(),
             trust: PeerTrustMode::Pin,
@@ -1162,10 +1174,21 @@ impl PollPeers {
     /// Returns the body, or nothing if every attempt failed. The outcome is
     /// recorded either way, because a peer that is never reachable has to be
     /// distinguishable from one that has nothing to say.
-    async fn poll_one(&self, peer: &str, url: &str, pins: &[String]) -> Option<(String, Option<SystemTime>)> {
+    async fn poll_one(
+        &self,
+        peer: &str,
+        url: &str,
+        pins: &[String],
+        (budget, cut): (Duration, bool),
+    ) -> Option<(String, Option<SystemTime>)> {
         // The guard owns the accounting, including the drop-mid-await path that
         // used to leave the in-flight gauge counting a poll that had ended.
         let mut guard = PollGuard::enter(peer, self.slow_after);
+        // A peer the round has no time left for is not dialled at all.
+        if budget.is_zero() {
+            guard.finish(RequestOutcome::Deadline, 0);
+            return None;
+        }
 
         let transport = match self.peer_transport(peer, pins) {
             Ok(transport) => transport,
@@ -1175,10 +1198,17 @@ impl PollPeers {
                 return None;
             },
         };
-        let (outcome, result) =
-            tokio::time::timeout(self.budget, self.attempt_until(peer, url, &transport, guard.started))
-                .await
-                .unwrap_or((RequestOutcome::Timeout, None));
+        let ran_out = if cut {
+            RequestOutcome::Deadline
+        } else {
+            RequestOutcome::Timeout
+        };
+        let (outcome, result) = tokio::time::timeout(
+            budget,
+            self.attempt_until(peer, url, &transport, (guard.started, budget)),
+        )
+        .await
+        .unwrap_or((ran_out, None));
         guard.finish(outcome, result.as_ref().map_or(0, |(body, _)| body.len()));
         result
     }
@@ -1220,7 +1250,7 @@ impl PollPeers {
     ///
     /// Without this a departed peer keeps its material for the life of the
     /// process.
-    fn retain_transports(&self, current: &[(String, String, Vec<String>)]) {
+    fn retain_transports(&self, current: &[(String, String, Vec<String>, bool)]) {
         self.transports
             .0
             .lock()
@@ -1243,11 +1273,12 @@ impl PollPeers {
         &self,
         url: &str,
         transport: &PeerTransport,
+        timeout: Duration,
     ) -> Option<Result<(String, Option<SystemTime>), MetricsScrapeError>> {
         tokio::select! {
             biased;
             () = self.shutdown.triggered() => None,
-            result = scrape_peer(url, self.timeout, transport) => Some(result),
+            result = scrape_peer(url, timeout, transport) => Some(result),
         }
     }
 
@@ -1255,9 +1286,9 @@ impl PollPeers {
     ///
     /// Waiting out a backoff is the easiest place to be stuck during shutdown,
     /// and the least excusable. Returns whether the wait completed.
-    async fn wait_before_retry(&self, peer: &str, attempt: u32, started: Instant) -> bool {
+    async fn wait_before_retry(&self, peer: &str, attempt: u32, started: Instant, budget: Duration) -> bool {
         let wait = backoff(self.backoff, attempt, peer);
-        let remaining = self.budget.saturating_sub(started.elapsed());
+        let remaining = budget.saturating_sub(started.elapsed());
         tokio::select! {
             biased;
             () = self.shutdown.triggered() => false,
@@ -1265,13 +1296,17 @@ impl PollPeers {
         }
     }
 
-    /// Attempt until one succeeds, the budget runs out, or retrying is pointless.
+    /// Attempt until one succeeds, the budget from `started` runs out, or retrying is pointless.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one retry loop with its budget, backoff and stand-down"
+    )]
     async fn attempt_until(
         &self,
         peer: &str,
         url: &str,
         transport: &PeerTransport,
-        started: Instant,
+        (started, budget): (Instant, Duration),
     ) -> (RequestOutcome, Option<(String, Option<SystemTime>)>) {
         let attempts = self.attempts.max(1);
         let mut outcome = RequestOutcome::Transport;
@@ -1279,11 +1314,14 @@ impl PollPeers {
             if self.shutdown.is_triggered() {
                 return (RequestOutcome::Cancelled, None);
             }
-            if started.elapsed() >= self.budget {
+            if started.elapsed() >= budget {
                 break;
             }
 
-            let Some(scrape) = self.scrape_or_stand_down(url, transport).await else {
+            // Each attempt may use what the budget has left, up to the configured timeout, so a slow
+            // peer on a short budget is not timed out sooner than it would answer.
+            let timeout = self.timeout.min(budget.saturating_sub(started.elapsed()));
+            let Some(scrape) = self.scrape_or_stand_down(url, transport, timeout).await else {
                 return (RequestOutcome::Cancelled, None);
             };
 
@@ -1296,7 +1334,7 @@ impl PollPeers {
                         break;
                     }
                     crate::metrics::record_peer_retry(peer, outcome.as_str());
-                    if !self.wait_before_retry(peer, attempt, started).await {
+                    if !self.wait_before_retry(peer, attempt, started, budget).await {
                         return (RequestOutcome::Cancelled, None);
                     }
                 },
@@ -1320,6 +1358,10 @@ impl PollPeers {
 
     /// Hand each site's observations to `publish` as its poll completes, with how
     /// many of its rows were dropped for an implausible age.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one round: targets, budgets, then each answer as it lands"
+    )]
     pub async fn collect_each<Publish>(&self, sites: &[PeerSite], mut publish: Publish)
     where
         Publish: FnMut(String, Vec<Observation>, usize),
@@ -1333,8 +1375,23 @@ impl PollPeers {
 
         let targets = peer_urls(sites, &collect_query);
         self.retain_transports(&targets);
-        let fetches = targets.into_iter().map(|(peer, url, pins)| async move {
-            let (body, date) = self.poll_one(&peer, &url, &pins).await?;
+        let deadline = Instant::now() + self.round;
+        let fetches = targets.into_iter().map(|(peer, url, pins, answering)| async move {
+            let budget = if answering {
+                self.budget
+            } else {
+                self.budget.min(UNANSWERED_PEER_BUDGET)
+            };
+            // Too little left for one attempt to finish is not dialled: it waits for the next round.
+            let left = deadline.saturating_duration_since(Instant::now());
+            let left = if left < self.timeout.min(UNANSWERED_PEER_BUDGET).min(self.round) / 2 {
+                Duration::ZERO
+            } else {
+                left
+            };
+            let (body, date) = self
+                .poll_one(&peer, &url, &pins, (budget.min(left), left < budget))
+                .await?;
             // Ages first, so a row dropped for its age never takes a provider slot.
             let (aged, rejected) = reexpress_peer_ages(stamp_origin(parse(&body), &peer), date, &peer);
             let observations = bound_peer(aged, &peer);
@@ -1416,7 +1473,7 @@ impl Drop for PollGuard<'_> {
 /// No `target`: it names a provider, not a site, so passing a site name matches
 /// nothing and the peer answers empty. Scoping a peer's answer is the
 /// publisher's job; the reader re-checks the site label on receipt.
-fn peer_urls(sites: &[PeerSite], collect_query: &str) -> Vec<(String, String, Vec<String>)> {
+fn peer_urls(sites: &[PeerSite], collect_query: &str) -> Vec<(String, String, Vec<String>, bool)> {
     sites
         .iter()
         .filter_map(|site| {
@@ -1425,7 +1482,7 @@ fn peer_urls(sites: &[PeerSite], collect_query: &str) -> Vec<(String, String, Ve
             } else {
                 with_query(&site.url, collect_query)?
             };
-            Some((site.name.clone(), url, site.pins.clone()))
+            Some((site.name.clone(), url, site.pins.clone(), site.answering))
         })
         .collect()
 }
@@ -2083,6 +2140,7 @@ mod tests {
             name: site.to_owned(),
             url: format!("http://{addr}{SIGNALS_PATH}"),
             pins: Vec::new(),
+            answering: true,
         }
     }
 
@@ -2092,6 +2150,7 @@ mod tests {
             name: site.to_owned(),
             url: serve_once(body).await,
             pins: Vec::new(),
+            answering: true,
         }
     }
 
@@ -2193,6 +2252,7 @@ mod tests {
             name: site.to_owned(),
             url: format!("http://{addr}{SIGNALS_PATH}"),
             pins: Vec::new(),
+            answering: true,
         }
     }
 
@@ -2217,6 +2277,101 @@ mod tests {
                 .expect(label);
             assert_eq!(round.keys().collect::<Vec<_>>(), ["live"], "{label}");
         }
+    }
+
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "a peer that answers late, served inline")]
+    async fn a_slow_peer_that_missed_a_round_still_answers_inside_its_short_budget() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        crate::init_process_crypto();
+        let (date, date_ms) = dated(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let body = format!("inference_pool_average_queue_size{{grid_provider=\"pool-a\"}} 1 {date_ms}\n");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 1024];
+            drop(stream.read(&mut request).await);
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            let response = format!("HTTP/1.1 200 OK\r\n{date}Content-Length: {}\r\n\r\n{body}", body.len());
+            drop(stream.write_all(response.as_bytes()).await);
+        });
+        let slow = PeerSite {
+            name: "east".to_owned(),
+            url: format!("http://{addr}{SIGNALS_PATH}"),
+            pins: Vec::new(),
+            answering: false,
+        };
+        let poll = PollPeers {
+            timeout: Duration::from_secs(5),
+            budget: Duration::from_secs(10),
+            round: Duration::from_secs(5),
+            ..PollPeers::default()
+        };
+        let round = poll.collect(&[slow]).await;
+        assert!(
+            round.contains_key("east"),
+            "1.5 s fits the 2 s budget of one that missed a round"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_did_not_answer_gets_the_short_budget() {
+        crate::init_process_crypto();
+        let poll = PollPeers {
+            attempts: 1,
+            timeout: Duration::from_secs(20),
+            budget: Duration::from_secs(20),
+            round: Duration::from_secs(20),
+            ..PollPeers::default()
+        };
+        let unanswered = PeerSite {
+            answering: false,
+            ..stalled_peer("stalled").await
+        };
+        let started = Instant::now();
+        let round = tokio::time::timeout(Duration::from_secs(10), poll.collect(&[unanswered]))
+            .await
+            .expect("the short budget ends the poll");
+        assert!(round.is_empty());
+        assert!(started.elapsed() < UNANSWERED_PEER_BUDGET + Duration::from_secs(1));
+
+        let answering = stalled_peer("stalled").await;
+        assert!(
+            tokio::time::timeout(UNANSWERED_PEER_BUDGET * 2, poll.collect(&[answering]))
+                .await
+                .is_err(),
+            "a peer that answered keeps the full budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_round_ends_on_time_however_many_peers_cannot_answer() {
+        crate::init_process_crypto();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        release.send(()).unwrap_or(());
+        let mut sites = vec![held_peer("live", gate).await];
+        for index in 0..32 {
+            sites.push(PeerSite {
+                answering: false,
+                ..stalled_peer(&format!("dead-{index}")).await
+            });
+        }
+        let poll = PollPeers {
+            attempts: 1,
+            timeout: Duration::from_secs(20),
+            budget: Duration::from_secs(20),
+            round: Duration::from_secs(1),
+            ..PollPeers::default()
+        };
+        let started = Instant::now();
+        let round = poll.collect(&sites).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the round took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(round.keys().collect::<Vec<_>>(), ["live"]);
     }
 
     #[test]
@@ -2544,6 +2699,7 @@ mod tests {
             name: site.to_owned(),
             url: serve_once_with(body, headers).await,
             pins: Vec::new(),
+            answering: true,
         }
     }
 
@@ -2750,6 +2906,7 @@ mod tests {
             name: "east".to_owned(),
             url: serve_once_with(body, headers).await,
             pins: Vec::new(),
+            answering: true,
         };
         let collected = one_attempt().collect(&[peer]).await;
         let hub = SignalStore::new();
@@ -2992,10 +3149,11 @@ mod tests {
             name: "pool-b".to_owned(),
             url: "http://10.0.0.2:9091/v1/site/signals".to_owned(),
             pins: Vec::new(),
+            answering: true,
         }];
         let urls = peer_urls(&sites, "");
         assert_eq!(
-            urls.first().map(|(_, u, _)| u.as_str()),
+            urls.first().map(|(_, u, ..)| u.as_str()),
             Some("http://10.0.0.2:9091/v1/site/signals"),
             "the whole site is asked for, with no target"
         );
@@ -3007,10 +3165,11 @@ mod tests {
             name: "pool-b".to_owned(),
             url: "http://10.0.0.2:9091/v1/site/signals".to_owned(),
             pins: Vec::new(),
+            answering: true,
         }];
         let urls = peer_urls(&sites, "collect[]=queue");
         assert_eq!(
-            urls.first().map(|(_, u, _)| u.as_str()),
+            urls.first().map(|(_, u, ..)| u.as_str()),
             Some("http://10.0.0.2:9091/v1/site/signals?collect[]=queue")
         );
     }
@@ -3143,7 +3302,7 @@ mod tests {
         drop(poll.peer_transport("west", &pins).expect("built"));
         assert_eq!(poll.held_transports(), 2);
 
-        poll.retain_transports(&[("east".to_owned(), String::new(), pins)]);
+        poll.retain_transports(&[("east".to_owned(), String::new(), pins, true)]);
         assert_eq!(poll.held_transports(), 1, "west left the grid and took its material");
     }
 

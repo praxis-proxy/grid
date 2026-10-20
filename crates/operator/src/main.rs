@@ -48,7 +48,7 @@
 )]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -610,7 +610,11 @@ async fn maybe_start_swim(
         key,
         revision_lease,
         revision_renewer: Some(revision_renewer(client.clone(), site_name.clone())),
-        retain_departed_providers: signal_mode == SignalMode::Poll,
+        departed: if signal_mode == SignalMode::Poll {
+            swim_runtime::Departed::RetainProviders
+        } else {
+            swim_runtime::Departed::Evict
+        },
     };
     match swim_runtime::start(cfg).await {
         Ok(handle) => {
@@ -2614,6 +2618,9 @@ async fn run_peer_poller(
         settings,
         shutdown,
         ages: operator::peer_ages::PeerAges::default(),
+        remembered: BTreeMap::new(),
+        unanswered: BTreeSet::new(),
+        turn: 0,
     }
     .run()
     .await;
@@ -2634,6 +2641,12 @@ struct PeerPoller {
     shutdown: operator::shutdown::Shutdown,
     /// Peers whose relayed ages the last rounds rejected, for the `GridNetwork` condition.
     ages: operator::peer_ages::PeerAges,
+    /// Each peer where it was last polled, so one SWIM no longer lists is still polled there.
+    remembered: BTreeMap<String, operator::signals::PeerSite>,
+    /// Peers polled last round that did not answer, polled last and briefly.
+    unanswered: BTreeSet<String>,
+    /// Rounds run, which rotates the order the unanswered peers are polled in.
+    turn: usize,
 }
 
 impl PeerPoller {
@@ -2699,20 +2712,26 @@ impl PeerPoller {
         }
     }
 
-    /// Collect from every alive peer, replace what is published for them, and say
+    /// Collect from every known peer, replace what is published for them, and say
     /// on the `GridNetwork` whose relayed ages are being rejected.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one round: targets, order, collection, then what it taught"
+    )]
     async fn poll_once(&mut self, source: &operator::signals::PollPeers) {
         let membership_ready = self.ctx.membership_hold().is_none();
-        let Some(sites) = poll_targets(
+        let Some(mut sites) = poll_targets(
             &self.swim.snapshot(),
             &self.ctx.peer_identities(),
             source.trust,
             self.swim.is_encrypted(),
             self.swim.site_name(),
-            self.settings.peer_port,
+            &mut self.remembered,
         ) else {
             return;
         };
+        self.turn = self.turn.wrapping_add(1);
+        order_targets(&mut sites, &self.unanswered, self.turn);
         // Each peer lands as it answers, so one slow peer cannot age out the rest.
         let peers = self.ctx.peers();
         let ttl = self.settings.peer_ttl();
@@ -2728,9 +2747,41 @@ impl PeerPoller {
             return;
         }
         let polled: Vec<String> = sites.into_iter().map(|site| site.name).collect();
+        self.unanswered = polled
+            .iter()
+            .filter(|site| !answered.contains_key(*site))
+            .cloned()
+            .collect();
         if observe_peer_ages(membership_ready, &mut self.ages, &polled, &answered) {
             Box::pin(write_peer_ages(&self.client, &self.ages, &self.shutdown)).await;
         }
+    }
+}
+
+/// The order a round polls `sites` in.
+///
+/// One peer that did not answer last round goes first, so a peer cut from a saturated round
+/// always has a way back; then the peers that answered; then the other unanswered peers. Both
+/// groups rotate by `turn`, so a round that runs out cuts different peers each time.
+fn order_targets(sites: &mut [operator::signals::PeerSite], unanswered: &BTreeSet<String>, turn: usize) {
+    for site in sites.iter_mut() {
+        site.answering = !unanswered.contains(&site.name);
+    }
+    sites.sort_by_key(|site| !site.answering);
+    let split = sites.partition_point(|site| site.answering);
+    let (answering, rest) = sites.split_at_mut(split);
+    for group in [&mut *answering, &mut *rest] {
+        if !group.is_empty() {
+            let len = group.len();
+            group.rotate_left(turn % len);
+        }
+    }
+    // The reserved slot: the head of the unanswered group moves ahead of every answering peer.
+    if !rest.is_empty() {
+        sites
+            .get_mut(..=split)
+            .into_iter()
+            .for_each(|front| front.rotate_right(1));
     }
 }
 
@@ -2799,7 +2850,11 @@ async fn apply_peer_ages(client: &Client, ages: &operator::peer_ages::PeerAges) 
     }
 }
 
-/// Alive peers this site would name under `trust`, `None` in SPIFFE mode over plaintext gossip.
+/// Peers this site would name under `trust`, `None` in SPIFFE mode over plaintext gossip.
+///
+/// Every member whatever its SWIM state at the signals address it gossiped, then each peer SWIM no
+/// longer lists at the address it was last polled at while its `GridSite` still names it, so
+/// polling never waits on gossip. A peer that never gossiped an address is not polled.
 #[expect(
     clippy::too_many_arguments,
     reason = "membership, trust, and addressing inputs of one round"
@@ -2810,25 +2865,31 @@ fn poll_targets(
     trust: operator::signals::PeerTrustMode,
     encrypted: bool,
     local_site: &str,
-    fallback_port: u16,
+    remembered: &mut BTreeMap<String, operator::signals::PeerSite>,
 ) -> Option<Vec<operator::signals::PeerSite>> {
     let pinned = trust == operator::signals::PeerTrustMode::Pin;
     if !pinned && !encrypted {
         tracing::debug!("SPIFFE peer polling waits for encrypted gossip");
         return None;
     }
-    let alive = snapshot
+    let named = |site: &str| {
+        if pinned {
+            !identities.refuses(site)
+        } else {
+            identities.labels_for(site).is_some()
+        }
+    };
+    let members = snapshot
         .members
         .iter()
-        .filter(|m| m.status == operator::swim::MemberStatus::Alive)
-        .filter(|m| {
-            if pinned {
-                !identities.refuses(&m.site_id)
-            } else {
-                identities.labels_for(&m.site_id).is_some()
-            }
-        });
-    let mut sites = operator::signals::peer_sites(alive, local_site, "https", fallback_port);
+        .filter(|m| m.signals_address.is_some() && named(&m.site_id));
+    let mut sites = operator::signals::peer_sites(members, local_site, "https", 0);
+    remembered.retain(|site, _| named(site));
+    for site in &sites {
+        remembered.insert(site.name.clone(), site.clone());
+    }
+    let listed: BTreeSet<String> = sites.iter().map(|site| site.name.clone()).collect();
+    sites.extend(remembered.values().filter(|site| !listed.contains(&site.name)).cloned());
     if pinned {
         for site in &mut sites {
             site.pins = identities.pins_for(&site.name);
@@ -2853,6 +2914,7 @@ async fn peer_source(
         attempts: settings.peer_attempts,
         backoff: std::time::Duration::from_millis(settings.peer_backoff_ms),
         budget: std::time::Duration::from_secs(settings.peer_budget_secs),
+        round: std::time::Duration::from_secs(settings.peer_interval_secs),
         slow_after: std::time::Duration::from_millis(settings.peer_slow_ms),
         shutdown,
         trust,
@@ -4007,7 +4069,7 @@ mod tests {
             age_secs: 0,
             gateway_address: None,
             site_cert_pem: None,
-            signals_address: None,
+            signals_address: Some(endpoint.replace(":7946", ":9443")),
         };
         let snapshot = operator::swim::MembershipSnapshot {
             members: vec![
@@ -4015,10 +4077,21 @@ mod tests {
                 member("east", "10.0.0.2:7946"),
                 member("west", "10.0.0.3:7946"),
                 member("stranger", "10.0.0.4:7946"),
+                operator::swim::MemberRecord {
+                    signals_address: None,
+                    ..member("mute", "10.0.0.5:7946")
+                },
             ],
         };
         let identities = operator::signals::PeerIdentities::new();
         identities.set(BTreeMap::from([
+            (
+                "mute".to_owned(),
+                operator::signals::PeerRecord {
+                    labels: gpu(),
+                    pins: vec!["bb".to_owned()],
+                },
+            ),
             (
                 "east".to_owned(),
                 operator::signals::PeerRecord {
@@ -4035,7 +4108,7 @@ mod tests {
             ),
         ]));
         let names = |trust, encrypted| {
-            poll_targets(&snapshot, &identities, trust, encrypted, "hub", 9091)
+            poll_targets(&snapshot, &identities, trust, encrypted, "hub", &mut BTreeMap::new())
                 .map(|sites| sites.into_iter().map(|site| site.name).collect::<Vec<_>>())
         };
         let (pin, spiffe) = (
@@ -4053,6 +4126,110 @@ mod tests {
             Some(vec!["east".to_owned(), "west".to_owned()]),
             "named sites only"
         );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "three rounds over one remembered set")]
+    fn a_peer_swim_lost_is_still_polled_while_its_grid_site_names_it() {
+        let member = |site: &str, endpoint: &str, status| operator::swim::MemberRecord {
+            site_id: site.to_owned(),
+            endpoint: endpoint.to_owned(),
+            incarnation: 0,
+            status,
+            age_secs: 0,
+            gateway_address: None,
+            site_cert_pem: None,
+            signals_address: Some(endpoint.replace(":7946", ":9443")),
+        };
+        let alive = || member("east", "10.0.0.2:7946", operator::swim::MemberStatus::Alive);
+        let dead = || member("west", "10.0.0.3:7946", operator::swim::MemberStatus::Dead);
+        let record = || operator::signals::PeerRecord {
+            labels: BTreeMap::new(),
+            pins: vec!["aa".to_owned()],
+        };
+        let identities = operator::signals::PeerIdentities::new();
+        identities.set(BTreeMap::from([
+            ("east".to_owned(), record()),
+            ("west".to_owned(), record()),
+        ]));
+        let mut remembered = BTreeMap::new();
+        let mut round = |members| {
+            let snapshot = operator::swim::MembershipSnapshot { members };
+            poll_targets(
+                &snapshot,
+                &identities,
+                operator::signals::PeerTrustMode::Pin,
+                false,
+                "hub",
+                &mut remembered,
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .map(|site| (site.name, site.url))
+            .collect::<Vec<_>>()
+        };
+        let east = ("east".to_owned(), "https://10.0.0.2:9443/v1/site/signals".to_owned());
+        let west = ("west".to_owned(), "https://10.0.0.3:9443/v1/site/signals".to_owned());
+
+        assert_eq!(
+            round(vec![dead(), alive()]),
+            [west.clone(), east.clone()],
+            "a dead member is polled"
+        );
+        assert_eq!(
+            round(vec![alive()]),
+            [east.clone(), west],
+            "a member SWIM dropped is polled where it last was"
+        );
+        identities.set(BTreeMap::from([("east".to_owned(), record())]));
+        assert_eq!(
+            round(vec![alive()]),
+            [east],
+            "a site whose GridSite is gone is forgotten"
+        );
+    }
+
+    #[test]
+    fn one_peer_that_did_not_answer_leads_each_round_in_turn() {
+        let site = |name: &str| operator::signals::PeerSite {
+            name: name.to_owned(),
+            url: format!("https://{name}:9443/v1/site/signals"),
+            pins: Vec::new(),
+            answering: true,
+        };
+        let unanswered: BTreeSet<String> = ["a", "b", "c"].iter().map(|name| (*name).to_owned()).collect();
+        let order = |turn| {
+            let mut sites: Vec<_> = ["a", "b", "c", "x", "y"].iter().map(|name| site(name)).collect();
+            order_targets(&mut sites, &unanswered, turn);
+            sites.into_iter().map(|target| target.name).collect::<Vec<_>>()
+        };
+        assert_eq!(order(0), ["a", "x", "y", "b", "c"]);
+        assert_eq!(order(1), ["b", "y", "x", "c", "a"]);
+        assert_eq!(order(2), ["c", "x", "y", "a", "b"]);
+    }
+
+    #[test]
+    fn a_round_too_small_for_every_peer_still_reaches_each_in_turn() {
+        // Four peers that each fill a slot, a round with room for two: whoever is dialled answers.
+        let names = ["a", "b", "c", "d"];
+        let mut unanswered = BTreeSet::new();
+        let mut reached = BTreeSet::new();
+        for turn in 1..=6 {
+            let mut sites: Vec<_> = names
+                .iter()
+                .map(|name| operator::signals::PeerSite {
+                    name: (*name).to_owned(),
+                    url: format!("https://{name}:9443/v1/site/signals"),
+                    pins: Vec::new(),
+                    answering: true,
+                })
+                .collect();
+            order_targets(&mut sites, &unanswered, turn);
+            let (dialled, cut) = sites.split_at(2);
+            reached.extend(dialled.iter().map(|target| target.name.clone()));
+            unanswered = cut.iter().map(|target| target.name.clone()).collect();
+        }
+        assert_eq!(reached.len(), names.len(), "every peer was dialled: {reached:?}");
     }
 
     #[test]
