@@ -2740,6 +2740,7 @@ fn generated_consumer_endpoints() -> Result<Vec<serde_json::Value>, Box<dyn std:
         .map(|(site, resource)| {
             Ok(serde_json::json!({
                 "cluster": resource,
+                "site": site,
                 "address": read_provider_gateway_address(site)?,
                 "transport": {
                     "mode": "mutual_tls",
@@ -2748,6 +2749,46 @@ fn generated_consumer_endpoints() -> Result<Vec<serde_json::Value>, Box<dyn std:
             }))
         })
         .collect()
+}
+
+/// Keep xtask-only site metadata out of the `GridNetwork` endpoint contract.
+fn grid_network_cluster_endpoints(
+    endpoints: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    endpoints
+        .iter()
+        .map(|endpoint| {
+            let cluster = endpoint
+                .get("cluster")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("provider gateway endpoint has no cluster")?;
+            let address = endpoint
+                .get("address")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("provider gateway endpoint {cluster} has no address"))?;
+            let transport = endpoint
+                .get("transport")
+                .cloned()
+                .ok_or_else(|| format!("provider gateway endpoint {cluster} has no transport"))?;
+            Ok(serde_json::json!({
+                "cluster": cluster,
+                "address": address,
+                "transport": transport
+            }))
+        })
+        .collect()
+}
+
+/// Read the provider site from the endpoint's explicit routing identity.
+fn provider_gateway_endpoint_site<'endpoint>(
+    endpoint: &'endpoint serde_json::Value,
+    cluster: &str,
+) -> Result<&'endpoint str, Box<dyn std::error::Error>> {
+    endpoint
+        .get("site")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("provider gateway endpoint {cluster} has no site"))
+        .map_err(Into::into)
 }
 
 /// Opt the run-owned provider-a `GatewayRef` into the operator-generated config.
@@ -2790,12 +2831,13 @@ fn enable_generated_consumer_config() -> Result<(), Box<dyn std::error::Error>> 
         return Err("consumer-gateway already has praxisConfig; refusing to replace unexpected fixture state".into());
     }
 
+    let endpoints = generated_consumer_endpoints()?;
     let consumer_config = serde_json::json!({
         "generate": true,
         "enableProjectedCredentials": true,
         "supportsProjectedCredentials": false,
         "configMapName": "praxis-consumer-config",
-        "clusterEndpoints": generated_consumer_endpoints()?,
+        "clusterEndpoints": grid_network_cluster_endpoints(&endpoints)?,
         "tlsCertMountPath": "/etc/praxis/tls"
     });
     let patch = serde_json::json!([{
@@ -3508,9 +3550,7 @@ fn install_embedded_gateway(
             .pointer("/transport/sni")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| format!("provider gateway endpoint {cluster} has no SNI"))?;
-        let site = sni
-            .strip_suffix(".grid.internal")
-            .ok_or_else(|| format!("provider gateway endpoint {cluster} SNI {sni} has no site suffix"))?;
+        let site = provider_gateway_endpoint_site(endpoint, cluster)?;
         for value in [
             format!("praxisConfig.render.backends.{cluster}.endpoint={address}"),
             format!("praxisConfig.render.backends.{cluster}.site={site}"),
@@ -6492,6 +6532,37 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn grid_network_cluster_endpoints_drop_xtask_site_metadata() {
+        let endpoints = serde_json::json!([{
+            "cluster": "provider-a",
+            "site": "provider-a",
+            "address": "203.0.113.10:8443",
+            "transport": { "mode": "mutual_tls", "sni": "provider-a.example" }
+        }]);
+        let actual = grid_network_cluster_endpoints(endpoints.as_array().unwrap_or_else(|| std::process::abort()))
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            actual,
+            vec![serde_json::json!({
+                "cluster": "provider-a",
+                "address": "203.0.113.10:8443",
+                "transport": { "mode": "mutual_tls", "sni": "provider-a.example" }
+            })]
+        );
+    }
+
+    #[test]
+    fn embedded_gateway_uses_explicit_site_not_sni_suffix() {
+        let endpoint = serde_json::json!({
+            "cluster": "provider-a",
+            "site": "provider-a",
+            "transport": { "mode": "mutual_tls", "sni": "provider-a.example" }
+        });
+        let site = provider_gateway_endpoint_site(&endpoint, "provider-a").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(site, "provider-a");
     }
 
     #[test]
