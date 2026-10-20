@@ -28,7 +28,7 @@ tests:
           path: spec.template.metadata.annotations["checksum/config"]
           value: 835f4ba5853398c65e91d760398bbbdc4aab0f6e04204da12d1b92a3edcacc65
 
-  - it: hashes the config when render turns on by itself
+  - it: hashes the config when render is selected explicitly
     set:
       praxisConfig.source: render
       grid.siteName: east

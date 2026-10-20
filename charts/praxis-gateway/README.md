@@ -289,7 +289,7 @@ Praxis AI image; these values may advance independently.
 | `praxisConfig.render.provider.allowedPaths` | list | chat, completions, models, embeddings | Exact paths a provider forwards, GET and POST only. Other paths get a 404, other methods a 405. |
 | `grid.networkName` | string | `""` | GridNetwork name for overlay-sidecar scope validation. Required when the sidecar is on. |
 | `grid.siteName` | string | `""` | This gateway's site name. Required for render and when the overlay sidecar is on. A consumer scores locality with it; a provider returns it in `X-Grid-Provider-Site`. |
-| `praxisConfig.render.auth.mode` | string | **required** for a render consumer | `api-key` validates a consumer caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); provider role rejects it because providers authenticate peers by Grid identity. The render refuses it on the default `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
+| `praxisConfig.render.auth.mode` | string | **required** for a render consumer | `api-key` validates a consumer caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); provider role rejects it because providers authenticate peers by Grid identity. The render refuses it on the legacy `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
 | `praxisConfig.render.auth.allowUnauthenticatedExposure` | bool | `false` | With `none`, allow a LoadBalancer or NodePort Service. Without it the render fails. The guard sees only this chart's Service, not `oc expose`, another Service selecting the pod labels, an HTTPRoute, or a hand-made Service with `service.enabled=false`. Use `networkPolicy` for those. |
 | `praxisConfig.render.auth.stripAuthorization` | bool | `true` | Remove the caller's `Authorization` before routing, in either mode. Forwarded grid hops authenticate by mTLS identity. `false` forwards the caller's key or bearer to every backend and cross-site peer, so use it only when the backend validates that same credential. |
 | `praxisConfig.render.auth.validateUrl` | string | **required** for `api-key` | https validate endpoint. |
@@ -439,17 +439,16 @@ settings exist for that integration:
   for BYO `praxis.yaml`; the overlay-sync sidecar validates and delivers it.
 - `gridIdentity.tlsSecretName` mounts the site identity used for mTLS between sites.
 
-The standard Praxis AI 0.4.0 image supports AGN provider selection and load
-balancing and includes Basic Auth. It does not include the optional
+The standard Praxis AI 0.7.0 image supports AGN provider selection, load
+balancing, and API-key caller authentication. It does not include the optional
 `token-rate-limit-filter` required by the distributed token quota
 qualification. That qualification is not supported by this default image; AGN
 does not publish a replacement AI rollup.
 
-The default image predates empty versioned routing snapshots and is not
-compatible with Grid's authoritative no-route publication. The paired Praxis AI
-change must be released, and this chart's default image must be updated to that
-compatible release, before the next Grid release. Upgrade and roll every
-consumer of a Grid-managed overlay before deploying that Grid version.
+The default Praxis AI 0.7.0 image supports Grid's authoritative empty no-route
+publication. Older AI images that predate versioned routing snapshots retain
+candidates from an earlier overlay, so upgrade and roll every consumer of a
+Grid-managed overlay before publishing an empty candidate set.
 
 Generated consumer credentials use a separate two-step opt-in: set
 `praxisConfig.enableProjectedCredentials: true`, let Grid render the filter,

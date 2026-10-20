@@ -816,7 +816,7 @@ try_reject_msg "$GW_DIR" "blank grid.siteName (gw)" "grid.siteName" "${R0[@]}" "
 try_reject_msg "$GW_DIR" "blank model (gw)" "praxisConfig.render.model is required" "${R0[@]}" "${BK1[@]}" --set-string "praxisConfig.render.model= "
 try_reject_msg "$GW_DIR" "unknown healthCheck key (gw)" "healthCheck" "${R0[@]}" "${BK1[@]}" \
   --set "praxisConfig.render.backends[0].healthCheck.bogus=1"
-try_reject_msg "$GW_DIR" "api-key on the legacy 0.4.0 image (gw)" "unsupported on the default image" "${R0[@]}" "${BK1[@]}" \
+try_reject_msg "$GW_DIR" "api-key on the legacy 0.4.0 image (gw)" "unsupported on the legacy image" "${R0[@]}" "${BK1[@]}" \
   --set image.tag=0.4.0 --set praxisConfig.render.auth.mode=api-key --set praxisConfig.render.auth.validateUrl=https://maas/validate
 try_template "$GW_DIR" "api-key on the 0.7.0 image (gw)" "${R0[@]}" "${BK1[@]}" \
   --set praxisConfig.render.auth.mode=api-key --set praxisConfig.render.auth.validateUrl=https://maas/validate

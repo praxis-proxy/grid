@@ -240,7 +240,7 @@ class S(http.server.HTTPServer):
             print("handshake failed:", e, flush=True)
             raise
 S(("0.0.0.0", 9443), H).serve_forever()' >/dev/null
-  # A non-default tag: the chart refuses api-key on its default image.
+  # A non-legacy tag: the chart allows api-key when the image provides it.
   APIKEY=(--set image.tag=api-key-image --set praxisConfig.render.auth.mode=api-key --set praxisConfig.render.auth.allowPrivateEndpoint=true
     --set praxisConfig.render.auth.validateUrl=https://validate:9443/v)
 

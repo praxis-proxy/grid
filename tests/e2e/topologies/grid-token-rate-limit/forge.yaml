@@ -597,7 +597,7 @@ spec:
         - type: helm
           release: provider-gateway
           chart: charts/praxis-gateway
-          version: "0.1.5"
+          version: "0.2.1"
           namespace: grid-system
           values:
             fullnameOverride: "provider-gateway"
@@ -687,7 +687,7 @@ spec:
         - type: helm
           release: consumer-gateway-a
           chart: charts/praxis-gateway
-          version: "0.1.5"
+          version: "0.2.1"
           namespace: grid-system
           values:
             fullnameOverride: "consumer-gateway-a"
@@ -753,7 +753,7 @@ spec:
         - type: helm
           release: consumer-gateway-b
           chart: charts/praxis-gateway
-          version: "0.1.5"
+          version: "0.2.1"
           namespace: grid-system
           values:
             fullnameOverride: "consumer-gateway-b"

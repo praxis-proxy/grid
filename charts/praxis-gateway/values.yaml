@@ -231,9 +231,8 @@ praxisConfig:
       # consumer caller's key against validateUrl and needs an image whose policy engine
       # registers identity/api-key (praxis-policy 0.4 or later); provider role rejects it
       # because providers authenticate peers by Grid identity. The render refuses it on
-      # the default ai:0.4.0 image. none
+      # the legacy ai:0.4.0 image. none
       # renders no policy filter and belongs only behind an authenticating front.
-      # TODO: default to api-key once the default image carries praxis-policy 0.4.
       mode: ""
       # -- With mode none, allow a LoadBalancer or NodePort Service. Without it the render
       # fails, since that exposes unauthenticated inference. The guard only sees this chart's

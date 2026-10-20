@@ -1,6 +1,7 @@
 suite: grid_site_route declared clusters
 templates:
   - templates/gateway-config.yaml
+  - templates/deployment.yaml
 release:
   name: grid
   namespace: grid
@@ -10,6 +11,7 @@ release:
 # fails with a 500 instead of a no-route.
 tests:
   - it: declares every backend's cluster to the grid filter
+    template: templates/gateway-config.yaml
     set:
       image.flavor: grid-gateway
       grid.siteName: dagobah
@@ -22,9 +24,11 @@ tests:
       praxisConfig.render.backends:
         - cluster: grid-local-a
           endpoints: ["10.0.0.1:8000"]
+          transport: { mode: plaintext }
         - cluster: grid-local-b
           site: dagobah
           endpoints: ["10.0.0.2:8000"]
+          transport: { mode: plaintext }
         - cluster: grid-remote-e
           endpoints: ["192.168.1.218:443"]
           site: site-e
@@ -37,6 +41,7 @@ tests:
           pattern: 'filter: grid_site_route\n\s+model_header: X-Gateway-Model-Name\n\s+clusters:\n\s+- "grid-local-a"\n\s+- "grid-local-b"\n\s+- "grid-remote-e"'
 
   - it: declares the remote cluster the draw can select, so it is never a 500
+    template: templates/gateway-config.yaml
     set:
       image.flavor: grid-gateway
       grid.siteName: dagobah
@@ -49,6 +54,7 @@ tests:
       praxisConfig.render.backends:
         - cluster: grid-local-a
           endpoints: ["10.0.0.1:8000"]
+          transport: { mode: plaintext }
         - cluster: grid-remote-e
           endpoints: ["192.168.1.218:443"]
           site: site-e
@@ -60,7 +66,8 @@ tests:
           path: data["praxis.yaml"]
           pattern: 'clusters:\n\s+- "grid-local-a"\n\s+- "grid-remote-e"'
 
-  - it: declares nothing to the grid filter when there are no backends
+  - it: fails render mode without backends
+    template: templates/deployment.yaml
     set:
       image.flavor: grid-gateway
       grid.siteName: dagobah
@@ -72,6 +79,5 @@ tests:
       praxisConfig.render.gridServing.networkName: grid
       praxisConfig.render.backends: []
     asserts:
-      - notMatchRegex:
-          path: data["praxis.yaml"]
-          pattern: 'filter: grid_site_route\n\s+model_header: X-Gateway-Model-Name\n\s+clusters:'
+      - failedTemplate:
+          errorPattern: praxisConfig.render.backends needs at least one backend

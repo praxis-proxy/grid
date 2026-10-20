@@ -320,7 +320,7 @@ spec:
         - type: helm
           release: provider-gateway
           chart: charts/praxis-gateway
-          version: "0.1.5"
+          version: "0.2.1"
           namespace: grid-system
           values:
             nameOverride: "provider-gateway"
@@ -409,7 +409,7 @@ spec:
         - type: helm
           release: edge-gateway
           chart: charts/praxis-gateway
-          version: "0.1.5"
+          version: "0.2.1"
           namespace: grid-system
           values:
             nameOverride: "edge-gateway"
@@ -478,7 +478,7 @@ spec:
         - type: helm
           release: gtm-emulator
           chart: charts/praxis-gateway
-          version: "0.1.5"
+          version: "0.2.1"
           namespace: grid-system
           values:
             nameOverride: "gtm-emulator"

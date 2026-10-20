@@ -166,6 +166,20 @@ tests:
           path: data["praxis.yaml"]
           pattern: 'connection_timeout_ms: 1000\s+total_connection_timeout_ms: 4000'
 
+  - it: defaults a list-form provider local backend to plaintext
+    template: templates/gateway-config.yaml
+    set:
+      praxisConfig.render.backends:
+        - cluster: local
+          endpoints: ["10.96.0.20:8000"]
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: '- name: "local"\s+endpoints:\s+- "10\.96\.0\.20:8000"'
+      - notMatchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'name: "local"\s+tls:'
+
   - it: trusts only the hostname endpoints of a trustPrivate backend
     template: templates/gateway-config.yaml
     set:

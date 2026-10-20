@@ -24,6 +24,17 @@ become the list the templates read, keys in sorted order.
 {{- $list = append $list $b }}
 {{- end }}
 {{- $_ := set $cfg "backends" $list }}
+{{- else if kindIs "slice" $cfg.backends }}
+{{- $list := list }}
+{{- range $cfg.backends }}
+{{- $backend := deepCopy . }}
+{{- $mode := ($backend.transport).mode | default "" }}
+{{- if and $provider (eq ($backend.cluster | default "") "local") (not $mode) }}
+{{- $_ := set $backend "transport" (merge (dict "mode" "plaintext") ($backend.transport | default dict)) }}
+{{- end }}
+{{- $list = append $list $backend }}
+{{- end }}
+{{- $_ := set $cfg "backends" $list }}
 {{- end }}
 {{- if not $v.service.type }}{{- $_ := set $v.service "type" (ternary "LoadBalancer" "ClusterIP" $provider) }}{{- end }}
 {{- if hasSuffix "/grid-gateway" $v.image.repository }}{{- $_ := set $v.image "flavor" "grid-gateway" }}{{- end }}
@@ -244,9 +255,9 @@ Validate praxisConfig: the source, and that each source gets only the settings i
 {{- if regexMatch "^https://(\\[|[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+([:/]|$))" $auth.validateUrl }}
 {{- fail "praxisConfig.render.auth.validateUrl must name a host, not an IP address: https to an IP literal has no SNI to verify" }}
 {{- end }}
-{{- /* The chart-default image predates praxis-policy 0.4, which adds identity/api-key. */}}
+{{- /* The legacy 0.4.0 image predates praxis-policy 0.4, which adds identity/api-key. */}}
 {{- if eq (include "praxis-gateway.image" .) "ghcr.io/praxis-proxy/ai:0.4.0" }}
-{{- fail "praxisConfig.render.auth.mode api-key is unsupported on the default image ghcr.io/praxis-proxy/ai:0.4.0: its policy engine lacks identity/api-key (praxis-policy 0.4 or later). Set image to a build that registers it, or use auth.mode none behind an authenticating front." }}
+{{- fail "praxisConfig.render.auth.mode api-key is unsupported on the legacy image ghcr.io/praxis-proxy/ai:0.4.0: its policy engine lacks identity/api-key (praxis-policy 0.4 or later). Set image to a build that registers it, or use auth.mode none behind an authenticating front." }}
 {{- end }}
 {{- end }}
 {{- include "praxis-gateway.validateBackends" . }}
