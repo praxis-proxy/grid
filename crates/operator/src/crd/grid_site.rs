@@ -9,6 +9,8 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::crd::grid_network::SignalMode;
+
 // ---------------------------------------------------------------------------
 // Spec
 // ---------------------------------------------------------------------------
@@ -262,6 +264,19 @@ pub enum GridSitePhase {
     Left,
 }
 
+impl GridSitePhase {
+    /// Whether this site's providers stay candidates. Under poll the gateway drops a silent
+    /// site on signal staleness, so a verified site that loses its connection stays.
+    #[must_use]
+    pub fn routes(&self, signal: SignalMode) -> bool {
+        match self {
+            Self::Active => true,
+            Self::Unreachable => signal == SignalMode::Poll,
+            Self::Pending | Self::Discovered | Self::Connecting | Self::Left => false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -271,6 +286,21 @@ mod tests {
     use kube::CustomResourceExt as _;
 
     use super::*;
+
+    #[test]
+    fn only_poll_keeps_an_unreachable_site_routable() {
+        for (phase, gossip, poll) in [
+            (GridSitePhase::Active, true, true),
+            (GridSitePhase::Unreachable, false, true),
+            (GridSitePhase::Pending, false, false),
+            (GridSitePhase::Discovered, false, false),
+            (GridSitePhase::Connecting, false, false),
+            (GridSitePhase::Left, false, false),
+        ] {
+            assert_eq!(phase.routes(SignalMode::Gossip), gossip, "{phase:?} under gossip");
+            assert_eq!(phase.routes(SignalMode::Poll), poll, "{phase:?} under poll");
+        }
+    }
 
     fn crd_json() -> serde_json::Value {
         serde_json::to_value(GridSite::crd()).unwrap_or_else(|_| std::process::abort())

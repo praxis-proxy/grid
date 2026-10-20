@@ -109,6 +109,9 @@ pub struct SwimConfig {
 
     /// Persists the next revision range as the lease runs low, `None` to stop at its end.
     pub revision_renewer: Option<RevisionRenewer>,
+
+    /// Keep a departed site's provider state once its member record expires, within the origin bound.
+    pub retain_departed_providers: bool,
 }
 
 /// Persists a revision range past the given last revision before any of it is used, returning its bounds.
@@ -243,6 +246,7 @@ impl std::fmt::Debug for SwimConfig {
             .field("key", &self.key)
             .field("revision_lease", &self.revision_lease)
             .field("revision_renewer", &self.revision_renewer.is_some())
+            .field("retain_departed_providers", &self.retain_departed_providers)
             .finish()
     }
 }
@@ -443,13 +447,24 @@ fn publish_state(state_tx: &watch::Sender<GridStateSnapshot>, node: &SwimNode) {
     });
 }
 
-/// Evict departed origins and immediately expose their provider withdrawal to readers.
-fn evict_origins(origins: &[String], node: &SwimNode, state_tx: &watch::Sender<GridStateSnapshot>) {
+/// Evict departed origins and immediately expose the change to readers.
+///
+/// A retained origin keeps its provider state and loses its metadata lanes, so it rejoins on fresh values.
+fn evict_origins(
+    origins: &[String],
+    retain_providers: bool,
+    node: &SwimNode,
+    state_tx: &watch::Sender<GridStateSnapshot>,
+) {
     if origins.is_empty() {
         return;
     }
     for origin in origins {
-        node.evict_origin(origin);
+        if retain_providers {
+            node.evict_origin_metadata(origin);
+        } else {
+            node.evict_origin(origin);
+        }
     }
     publish_state(state_tx, node);
 }
@@ -1689,7 +1704,7 @@ async fn run_loop(
                 let live: Vec<&NodeId> = node.live_identities().collect();
                 let gone = restore_from_foca(evicted, &mut tracked, &live, now);
                 let adopted = adopt_live_identities(&mut tracked, &live, now);
-                evict_origins(&gone, &node, &state_tx);
+                evict_origins(&gone, config.retain_departed_providers, &node, &state_tx);
                 // Republish while age changes or after eviction so readers see
                 // a coherent bounded membership view.
                 if has_aging_members(&tracked) || changed || adopted {
@@ -2195,6 +2210,7 @@ mod tests {
             key: KeyState::Plain,
             revision_lease: test_revision_lease(seed),
             revision_renewer: None,
+            retain_departed_providers: false,
         }
     }
 
@@ -3045,7 +3061,7 @@ mod tests {
             "the initial publication must contain provider-a"
         );
 
-        evict_origins(&["site-a".to_owned()], &node, &state_tx);
+        evict_origins(&["site-a".to_owned()], false, &node, &state_tx);
 
         assert!(
             state_rx.has_changed()?,
@@ -3231,6 +3247,7 @@ mod tests {
             key: KeyState::Plain,
             revision_lease: test_revision_lease(1),
             revision_renewer: None,
+            retain_departed_providers: false,
         };
         let handle = start(cfg).await;
         assert!(handle.is_ok(), "start must succeed with an available port");
@@ -3256,6 +3273,7 @@ mod tests {
             key: KeyState::Plain,
             revision_lease: test_revision_lease(20_000),
             revision_renewer: None,
+            retain_departed_providers: false,
         };
         let result = start(cfg).await;
         assert!(result.is_err(), "start on an already-bound port must fail");
@@ -3278,6 +3296,7 @@ mod tests {
             key: KeyState::Plain,
             revision_lease: test_revision_lease(40_000),
             revision_renewer: None,
+            retain_departed_providers: false,
         };
         let handle1 = start(cfg1).await.unwrap_or_else(|_| std::process::abort());
 
@@ -3291,6 +3310,7 @@ mod tests {
             key: KeyState::Plain,
             revision_lease: test_revision_lease(60_000),
             revision_renewer: None,
+            retain_departed_providers: false,
         };
         let handle2 = start(cfg2).await.unwrap_or_else(|_| std::process::abort());
 
@@ -3442,6 +3462,7 @@ mod tests {
             key: KeyState::Plain,
             revision_lease: test_revision_lease(80_000),
             revision_renewer: None,
+            retain_departed_providers: false,
         })
         .await
         .unwrap_or_else(|_| std::process::abort());
@@ -3456,6 +3477,7 @@ mod tests {
             key: KeyState::Plain,
             revision_lease: test_revision_lease(90_000),
             revision_renewer: None,
+            retain_departed_providers: false,
         })
         .await
         .unwrap_or_else(|_| std::process::abort());
@@ -3493,6 +3515,7 @@ mod tests {
             key: KeyState::Plain,
             revision_lease: test_revision_lease(100_000),
             revision_renewer: None,
+            retain_departed_providers: false,
         })
         .await
         .unwrap_or_else(|_| std::process::abort());
@@ -3541,6 +3564,29 @@ mod tests {
     // -----------------------------------------------------------------------
     // Dead-member eviction
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn retained_departed_origins_keep_their_providers() -> Result<(), Box<dyn std::error::Error>> {
+        let identity = NodeId::with_generation("site-local".to_owned(), "127.0.0.1:7946".parse()?, 1);
+        let mut node = SwimNode::new(identity);
+        node.publish_state_broadcast(&provider_broadcast(0.1))?;
+        let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new("site-local".to_owned()));
+        publish_state(&state_tx, &node);
+        let gone = ["site-a".to_owned()];
+
+        evict_origins(&gone, true, &node, &state_tx);
+        assert!(
+            state_rx.borrow().provider("net", "site-a", "provider-a").is_some(),
+            "a retained origin keeps its providers"
+        );
+
+        evict_origins(&gone, false, &node, &state_tx);
+        assert!(
+            state_rx.borrow().providers.is_empty(),
+            "an origin that is not retained loses its providers"
+        );
+        Ok(())
+    }
 
     #[test]
     fn dead_member_evicted_after_ttl() {

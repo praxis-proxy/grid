@@ -715,7 +715,9 @@ regardless of how the final-hop Secret is provisioned.
 
 The AGN Operator enforces a routing eligibility gate on remote provider state
 received over SWIM CRDT broadcasts.  A remote provider record is included in the
-routing overlay only when the corresponding `GridSite.status.phase` is `Active`.
+routing overlay only when the corresponding `GridSite.status.phase` is `Active`, or
+`Unreachable` under poll signal transport, where the gateway judges reachability from
+signals.
 
 | Site state | Remote CRDT providers eligible |
 |---|---|
@@ -724,13 +726,13 @@ routing overlay only when the corresponding `GridSite.status.phase` is `Active`.
 | `Discovered` | No |
 | `Connecting` | No |
 | `Active` | Yes (control-plane eligible) |
-| `Unreachable` | No |
+| `Unreachable` | Under poll signal transport only |
 | `Left` | No |
 
 The matching rule: for a remote CRDT provider with `site_id = S` in network `N`,
 the operator looks for a `GridSite` resource whose Kubernetes name equals
 `discovered_site_k8s_name(N, S)` (the auto-discovered name derivation) and whose
-`spec.gridNetworkRef == N` and `status.phase == Active`.
+`spec.gridNetworkRef == N` and `status.phase == Active` (or `Unreachable` under poll).
 
 `Active` indicates control-plane eligibility: the operator has verified the remote
 site's certificate fingerprint against the configured trust policy and confirmed TCP

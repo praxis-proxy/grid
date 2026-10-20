@@ -68,6 +68,7 @@ fn decl<'decl>(
         // Every fixture identity is allowlisted; the refusals have their own tests.
         from_providers: &ALLOWED,
         transport: None,
+        signal: SignalMode::Gossip,
     }
 }
 
@@ -326,6 +327,48 @@ fn an_active_site_from_an_older_generation_is_refused() {
 }
 
 #[test]
+fn under_poll_an_unreachable_site_from_an_older_generation_is_refused() {
+    // A spec edit while unreachable must not route until a probe verifies it.
+    let mut changed = site_in_phase(
+        "site-b",
+        Some(mutual_egress("moved.grid.example.invalid:8443", "site-b.grid.internal")),
+        "Unreachable",
+    );
+    changed.metadata.generation = Some(2);
+    if let Some(status) = changed.status.as_mut() {
+        status.observed_generation = 1;
+    }
+    let sites = vec![site("site-a", None), changed];
+    let candidates = vec![candidate("prov-b", "site-b")];
+    let poll = Declarations {
+        signal: SignalMode::Poll,
+        ..decl(&[], &sites, "site-a")
+    };
+    let resolution = resolve(&candidates, &[], &poll);
+    assert!(resolution.get("prov-b").is_none(), "an unprobed address is not derived");
+    assert_eq!(
+        resolution.refused.first().map(|refused| refused.reason),
+        Some(Refusal::SiteNotProbed)
+    );
+}
+
+#[test]
+fn under_poll_an_unreachable_site_without_an_address_derives_nothing() {
+    let sites = vec![site("site-a", None), site_in_phase("site-b", None, "Unreachable")];
+    let candidates = vec![candidate("prov-b", "site-b")];
+    let poll = Declarations {
+        signal: SignalMode::Poll,
+        ..decl(&[], &sites, "site-a")
+    };
+    let resolution = resolve(&candidates, &[], &poll);
+    assert!(resolution.get("prov-b").is_none(), "no address, no hop");
+    assert_eq!(
+        resolution.refused.first().map(|refused| refused.reason),
+        Some(Refusal::NoEgress)
+    );
+}
+
+#[test]
 fn a_blank_server_name_is_treated_as_undeclared() {
     let sites = vec![
         site("site-a", None),
@@ -421,6 +464,7 @@ fn decl_allowing<'decl>(
         network_name: "net",
         from_providers: allowed,
         transport: None,
+        signal: SignalMode::Gossip,
     }
 }
 
@@ -670,6 +714,37 @@ fn a_site_that_is_not_active_is_not_a_source() {
             resolved.is_empty(),
             "{phase} is not probed and pinned, so its egress must not become an upstream"
         );
+    }
+}
+
+#[test]
+fn under_poll_an_unreachable_site_keeps_its_hop_and_nothing_earlier_does() {
+    for (phase, kept) in [
+        ("Unreachable", true),
+        ("Active", true),
+        ("Pending", false),
+        ("Discovered", false),
+        ("Connecting", false),
+        ("Left", false),
+    ] {
+        let sites = vec![
+            site("site-a", None),
+            site_in_phase(
+                "site-b",
+                Some(mutual_egress(
+                    "site-b.grid.example.invalid:8443",
+                    "site-b.grid.internal",
+                )),
+                phase,
+            ),
+        ];
+        let candidates = vec![candidate("prov-b", "site-b")];
+        let poll = Declarations {
+            signal: SignalMode::Poll,
+            ..decl(&[], &sites, "site-a")
+        };
+        let resolved = resolve(&candidates, &[], &poll);
+        assert_eq!(resolved.contains_key("prov-b"), kept, "{phase} under poll");
     }
 }
 

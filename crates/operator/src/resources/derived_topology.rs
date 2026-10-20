@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     crd::{
-        grid_network::{ClusterEndpointConfig, EndpointTransport, TransportMode},
+        grid_network::{ClusterEndpointConfig, EndpointTransport, SignalMode, TransportMode},
         grid_site::{EgressTls, EgressTlsMode, GridSite},
         inference_provider::InferenceProvider,
     },
@@ -137,6 +137,8 @@ pub(crate) struct Declarations<'decl> {
     pub(crate) from_providers: &'decl [String],
     /// TLS for derived local `https` backends.
     pub(crate) transport: Option<&'decl EndpointTransport>,
+    /// The grid's signal transport, which decides whether an unreachable site keeps its hop.
+    pub(crate) signal: SignalMode,
 }
 
 /// Explicit entries win whole.
@@ -239,7 +241,7 @@ fn resolve_one(
             None => Err(local_refusal(cluster, declarations)),
         };
     }
-    derive_remote(cluster, site, declarations.sites, declarations.network_name)
+    derive_remote(cluster, site, declarations)
 }
 
 /// Why no admitted provider carries `cluster` at this site: nobody does, every
@@ -298,8 +300,8 @@ fn derive_local(
 }
 
 /// Derive a remote provider-hop entry from the provider site's `GridSite`.
-fn derive_remote(cluster: &str, site: &str, sites: &[GridSite], network_name: &str) -> Result<Resolved, Refusal> {
-    let site = probed_site(site, sites, network_name)?;
+fn derive_remote(cluster: &str, site: &str, declarations: &Declarations<'_>) -> Result<Resolved, Refusal> {
+    let site = probed_site(site, declarations)?;
     let egress = site.spec.gateway_endpoint.as_ref().ok_or(Refusal::NoEgress)?;
     let address = egress.address.trim();
     if address.is_empty() {
@@ -320,17 +322,19 @@ fn derive_remote(cluster: &str, site: &str, sites: &[GridSite], network_name: &s
 }
 
 /// The site named `site` in this network, if a probe verified its current spec.
-fn probed_site<'site>(site: &str, sites: &'site [GridSite], network_name: &str) -> Result<&'site GridSite, Refusal> {
-    let site = sites
+fn probed_site<'site>(site: &str, declarations: &Declarations<'site>) -> Result<&'site GridSite, Refusal> {
+    let network_name = declarations.network_name;
+    let site = declarations
+        .sites
         .iter()
         .find(|known| {
             crate::controller::grid_network::peer_site_key(known).is_some_and(|(key, _)| key == site)
                 && known.spec.grid_network_ref == network_name
         })
         .ok_or(Refusal::SiteUnknown)?;
-    // Only an Active site's address has been probed; earlier phases carry gossip.
+    // Only an Active or Unreachable site's address has been probed; earlier phases carry gossip.
     let status = site.status.as_ref().ok_or(Refusal::SiteNotActive)?;
-    if status.phase != crate::crd::grid_site::GridSitePhase::Active {
+    if !status.phase.routes(declarations.signal) {
         return Err(Refusal::SiteNotActive);
     }
     // Active for an older spec says nothing about the address now declared.

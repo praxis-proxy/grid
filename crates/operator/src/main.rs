@@ -405,7 +405,7 @@ async fn start_swim(
     ready: Arc<std::sync::atomic::AtomicBool>,
     started: tokio::sync::watch::Sender<SwimStage>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let swim = Box::pin(maybe_start_swim(&client, &cli))
+    let swim = Box::pin(maybe_start_swim(&client, &cli, ctx.signal_mode()))
         .await
         .map_err(|error| format!("SWIM startup failed: {error}"))?;
     if let Some(handle) = &swim {
@@ -415,12 +415,7 @@ async fn start_swim(
             Arc::clone(handle),
             cli.gateway.clone(),
         ));
-        let (handle, ctx) = (Arc::clone(handle), Arc::clone(&ctx));
-        tokio::spawn(async move {
-            let members = || !handle.snapshot().members.is_empty();
-            converged(members, handle.reconciliation_events(), MEMBERSHIP_GRACE).await;
-            ctx.release_membership();
-        });
+        tokio::spawn(release_membership_once_settled(Arc::clone(handle), Arc::clone(&ctx)));
     } else {
         ctx.release_membership();
     }
@@ -429,8 +424,38 @@ async fn start_swim(
     Ok(())
 }
 
-/// Longest wait for a first peer before membership-derived writes run without one.
-const MEMBERSHIP_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+/// Release membership-derived writes once every live named peer has delivered, or after the grace.
+async fn release_membership_once_settled(handle: Arc<swim_runtime::SwimHandle>, ctx: Arc<OperatorCtx>) {
+    let settled = || {
+        peers_delivered(
+            &handle.snapshot(),
+            &handle.state_snapshot(),
+            &ctx.peer_identities(),
+            handle.site_name(),
+        )
+    };
+    converged(settled, handle.reconciliation_events(), MEMBERSHIP_GRACE).await;
+    ctx.release_membership();
+}
+
+/// Longest wait for peers' state before membership-derived writes run without it: one state
+/// republish, every 30 s, and the membership convergence before it.
+const MEMBERSHIP_GRACE: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Whether a peer is a member and every live member a `GridSite` names has delivered providers,
+/// so the first serving write after a restart is not missing peers this process has yet to hear.
+fn peers_delivered(
+    members: &operator::swim::MembershipSnapshot,
+    state: &crdt::GridStateSnapshot,
+    identities: &operator::signals::PeerIdentities,
+    local_site: &str,
+) -> bool {
+    let mut peers = members.members.iter().filter(|m| m.site_id != local_site).peekable();
+    peers.peek().is_some()
+        && peers
+            .filter(|m| m.status == operator::swim::MemberStatus::Alive && identities.knows(&m.site_id))
+            .all(|m| state.providers.values().any(|p| p.site_id == m.site_id))
+}
 
 /// Wait until `has_members` holds, rechecked on each `changes` item, or `grace` passes.
 async fn converged(
@@ -510,7 +535,11 @@ async fn resolve_grid_modes(client: &Client, enrolled: bool, without_network: Gr
     clippy::large_stack_frames,
     reason = "sequential env-var parsing + runtime startup; splitting would obscure the startup sequence"
 )]
-async fn maybe_start_swim(client: &Client, cli: &Cli) -> Result<Option<Arc<swim_runtime::SwimHandle>>, String> {
+async fn maybe_start_swim(
+    client: &Client,
+    cli: &Cli,
+    signal_mode: SignalMode,
+) -> Result<Option<Arc<swim_runtime::SwimHandle>>, String> {
     let Some(addr_str) = std::env::var("GRID_SWIM_BIND_ADDR").ok() else {
         return Ok(None);
     };
@@ -581,6 +610,7 @@ async fn maybe_start_swim(client: &Client, cli: &Cli) -> Result<Option<Arc<swim_
         key,
         revision_lease,
         revision_renewer: Some(revision_renewer(client.clone(), site_name.clone())),
+        retain_departed_providers: signal_mode == SignalMode::Poll,
     };
     match swim_runtime::start(cfg).await {
         Ok(handle) => {
@@ -3752,6 +3782,61 @@ mod tests {
         started.send_replace(SwimStage::Settled(None));
         assert!(settled.await.is_none(), "settled without SWIM");
         assert!(readiness(&std::sync::atomic::AtomicBool::new(false)).0 == http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one fixture walked through each kind of peer")]
+    fn the_first_write_waits_for_every_live_named_peer_to_deliver() {
+        let member = |site: &str, status| operator::swim::MemberRecord {
+            site_id: site.to_owned(),
+            endpoint: "10.0.0.2:7946".to_owned(),
+            incarnation: 0,
+            status,
+            age_secs: 0,
+            gateway_address: None,
+            site_cert_pem: None,
+            signals_address: None,
+        };
+        let (alive, dead) = (operator::swim::MemberStatus::Alive, operator::swim::MemberStatus::Dead);
+        let identities = operator::signals::PeerIdentities::new();
+        let record = operator::signals::PeerRecord {
+            labels: BTreeMap::new(),
+            pins: vec!["aa".to_owned()],
+        };
+        identities.set(BTreeMap::from([
+            ("east".to_owned(), record.clone()),
+            ("west".to_owned(), record),
+        ]));
+        let mut state = crdt::GridStateSnapshot::new("hub".to_owned());
+        let members = |list| operator::swim::MembershipSnapshot { members: list };
+        let delivered = |snapshot: &operator::swim::MembershipSnapshot, held: &crdt::GridStateSnapshot| {
+            peers_delivered(snapshot, held, &identities, "hub")
+        };
+
+        assert!(
+            !delivered(&members(vec![member("hub", alive.clone())]), &state),
+            "no peer yet"
+        );
+        let east_and_west = members(vec![member("east", alive.clone()), member("west", dead)]);
+        assert!(!delivered(&east_and_west, &state), "east is live and has said nothing");
+        state.upsert_provider(crdt::ProviderState {
+            network_id: "net".to_owned(),
+            site_id: "east".to_owned(),
+            provider_id: "p".to_owned(),
+            routing_cluster: "east".to_owned(),
+            models: Vec::new(),
+            tools: Vec::new(),
+            backend_kind: "local".to_owned(),
+            capacity_weight: 1,
+            phase: crdt::ProviderPhase::Available,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(),
+            revision: 1,
+            writer_id: "east".to_owned(),
+        });
+        assert!(delivered(&east_and_west, &state), "a dead peer is not waited on");
+        let stranger = members(vec![member("east", alive.clone()), member("stranger", alive)]);
+        assert!(delivered(&stranger, &state), "nor one no GridSite names");
     }
 
     #[tokio::test(start_paused = true)]

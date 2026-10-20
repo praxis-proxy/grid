@@ -214,6 +214,19 @@ pub(crate) fn site_phase_next(
         GridSitePhase::Connecting | GridSitePhase::Active | GridSitePhase::Unreachable => {
             let outcome = outcome.unwrap_or(&GatewayProbeOutcome::AddressMissing);
             let t = probe_transition(current, outcome);
+            // Unreachable keeps a verified spec routable under poll, so an edit no probe has
+            // verified cannot hold it.
+            let edited = site
+                .status
+                .as_ref()
+                .is_some_and(|status| status.observed_generation != site.metadata.generation.unwrap_or(0));
+            if edited && t.phase == GridSitePhase::Unreachable {
+                return (
+                    GridSitePhase::Connecting,
+                    "SpecUnverified".to_owned(),
+                    "gateway endpoint changed and no probe has verified it".to_owned(),
+                );
+            }
             (t.phase, t.reason.to_owned(), t.message)
         },
     }
@@ -780,6 +793,7 @@ mod tests {
             },
             status: phase.map(|p| GridSiteStatus {
                 phase: p,
+                observed_generation: 1,
                 ..Default::default()
             }),
         }
@@ -810,6 +824,7 @@ mod tests {
             },
             status: phase.map(|p| GridSiteStatus {
                 phase: p,
+                observed_generation: 1,
                 ..Default::default()
             }),
         }
@@ -926,6 +941,24 @@ mod tests {
             site_phase_next(&GridSitePhase::Connecting, &site, Some(&GatewayProbeOutcome::Verified));
         assert_eq!(next, GridSitePhase::Active, "Verified must promote to Active");
         assert_eq!(reason, "TlsVerified");
+    }
+
+    #[test]
+    fn an_edit_no_probe_verified_never_holds_unreachable() {
+        for current in [GridSitePhase::Active, GridSitePhase::Unreachable] {
+            let mut site = site_with_egress(Some(current.clone()), "10.0.0.2:8443");
+            site.metadata.generation = Some(2);
+            for failure in [
+                GatewayProbeOutcome::ConnectionFailed,
+                GatewayProbeOutcome::ConnectTimeout,
+            ] {
+                let (next, reason, _msg) = site_phase_next(&current, &site, Some(&failure));
+                assert_eq!(next, GridSitePhase::Connecting, "{current:?} edited, then {failure:?}");
+                assert_eq!(reason, "SpecUnverified");
+            }
+            let (next, ..) = site_phase_next(&current, &site, Some(&GatewayProbeOutcome::Verified));
+            assert_eq!(next, GridSitePhase::Active, "a verified edit promotes");
+        }
     }
 
     #[test]
@@ -1211,6 +1244,7 @@ mod tests {
             },
             status: phase.map(|p| GridSiteStatus {
                 phase: p,
+                observed_generation: 1,
                 ..Default::default()
             }),
         }
@@ -1423,6 +1457,7 @@ mod tests {
             },
             status: phase.map(|p| GridSiteStatus {
                 phase: p,
+                observed_generation: 1,
                 ..Default::default()
             }),
         }

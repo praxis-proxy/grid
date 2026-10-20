@@ -418,6 +418,12 @@ impl PeerIdentities {
         }
     }
 
+    /// Whether a record is held for `site`.
+    #[must_use]
+    pub fn knows(&self, site: &str) -> bool {
+        self.inner.read().is_ok_and(|guard| guard.contains_key(site))
+    }
+
     /// Fingerprints declared for `site`, empty when none are.
     #[must_use]
     pub fn pins_for(&self, site: &str) -> Vec<String> {

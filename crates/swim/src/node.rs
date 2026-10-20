@@ -210,6 +210,11 @@ impl SwimNode {
         self.origin_state.remove_origin(origin);
     }
 
+    /// Remove one origin's gateway, certificate and signals state, keeping its providers.
+    pub fn evict_origin_metadata(&self, origin: &str) {
+        self.origin_state.remove_origin_metadata(origin);
+    }
+
     /// Identities foca currently holds as active, suspect ones included.
     pub fn live_identities(&self) -> impl Iterator<Item = &NodeId> {
         self.foca.iter_members().map(foca::Member::id)

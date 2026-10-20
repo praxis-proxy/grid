@@ -362,7 +362,8 @@ variable (64-character hex) provides an alternative key injection path without
 requiring a Kubernetes Secret.  Because environment variables are visible to
 same-host process inspectors, this is not the production Secret delivery path.
 
-Routing eligibility remains gated separately by `GridSite.status.phase == Active`
+Routing eligibility remains gated separately by `GridSite.status.phase == Active`,
+or `Unreachable` under poll signal transport,
 regardless of SWIM encryption configuration. Active status indicates control-plane
 eligibility only: sufficient trust information exists to include the site in routing
 overlays. Data-plane security readiness (mTLS handshake completion, client certificate
@@ -381,6 +382,12 @@ candidates are evicted from the rendered overlay.
 
 Local and healthy remote candidates are never evicted.  CRDT storage records
 are not deleted by this mechanism.
+
+Under poll signal transport the operator removes no candidate for liveness. A failed
+probe, a Dead or Suspect SWIM member, this TTL and the SWIM dead-member TTL leave a
+remote site's candidates in place, and the gateway routes around a silent site. A
+candidate leaves when trust fails, its endpoint changed and awaits a probe, its
+providers are withdrawn, or its GridSite is deleted.
 
 With site auto discovery on, the same TTL bounds auto-discovered GridSites. When
 gossip stops vouching for a stub's site (any SWIM state but `Dead`), the operator
@@ -633,8 +640,9 @@ verified the remote site's identity through TLS, which is sufficient to include
 the site's providers in routing overlays for consideration.
 
 Provider records from a peer whose `GridSite` is in `Discovered`, `Connecting`, `Pending`,
-`Unreachable`, or `Left` are excluded from the routing overlay. Records from a peer with
-no matching `GridSite` are also excluded (fail-closed).
+or `Left` are excluded from the routing overlay, and so are those from an `Unreachable`
+peer except under poll signal transport, where the gateway judges reachability from
+signals. Records from a peer with no matching `GridSite` are also excluded (fail-closed).
 
 GridSite Active is a control-plane eligibility signal. It means AGN has enough
 site/trust information to consider the site for overlay generation. It does not

@@ -1006,6 +1006,11 @@ impl RetainedOrigins {
         self.latest_by_scope.retain(|scope, _| scope.origin_site != origin);
         self.provider_networks_by_scope
             .retain(|scope, _| scope.origin_site != origin);
+        self.remove_metadata(origin);
+    }
+
+    /// Remove one origin's metadata lanes and their revision guards, keeping its provider state.
+    fn remove_metadata(&mut self, origin: &str) {
         self.gateway_addrs.remove(origin);
         self.latest_gateway_revision_by_origin.remove(origin);
         self.cert_pems.remove(origin);
@@ -1065,6 +1070,17 @@ impl OriginStateHandle {
         self.state_tx.send_modify(|snapshot| {
             snapshot.remove_origin_providers(origin);
         });
+        self.publish_metadata_removed(origin);
+    }
+
+    /// Remove a departed origin's gateway, certificate and signals lanes, keeping its provider state.
+    pub(crate) fn remove_origin_metadata(&self, origin: &str) {
+        self.lock().remove_metadata(origin);
+        self.publish_metadata_removed(origin);
+    }
+
+    /// Publish the removal of one origin's metadata lanes.
+    fn publish_metadata_removed(&self, origin: &str) {
         self.gateway_addrs_tx.send_modify(|addresses| {
             addresses.remove(origin);
         });
@@ -3847,6 +3863,40 @@ mod tests {
             handler.gateway_address_for_site("site-a").as_deref(),
             Some("10.0.0.9:8443")
         );
+    }
+
+    #[test]
+    fn metadata_eviction_keeps_providers_and_their_guard() {
+        let (mut handler, origin_state) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 4);
+        let broadcast = |revision: u64, address: &str, cert: &str| {
+            StateBroadcast::new(
+                "site-a".to_owned(),
+                revision,
+                snapshot("site-a", revision, 0.4),
+                Some(address.to_owned()),
+            )
+            .with_cert(Some(cert.to_owned()))
+        };
+        assert!(receive(&mut handler, &broadcast(10, "10.0.0.1:8443", "old-cert")).is_some());
+        origin_state.remove_origin_metadata("site-a");
+
+        assert!(
+            handler.snapshot().provider("net", "site-a", "provider").is_some(),
+            "provider state survives"
+        );
+        assert!(handler.gateway_address_for_site("site-a").is_none());
+        assert!(handler.cert_pem_for_site("site-a").is_none());
+        assert!(
+            receive(&mut handler, &broadcast(9, "10.0.0.8:8443", "replayed-cert")).is_none(),
+            "the provider guard still refuses an older broadcast"
+        );
+
+        assert!(receive(&mut handler, &broadcast(11, "10.0.0.9:8443", "new-cert")).is_some());
+        assert_eq!(
+            handler.gateway_address_for_site("site-a").as_deref(),
+            Some("10.0.0.9:8443")
+        );
+        assert_eq!(handler.cert_pem_for_site("site-a").as_deref(), Some("new-cert"));
     }
 
     #[test]
