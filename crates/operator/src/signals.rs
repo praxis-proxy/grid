@@ -340,6 +340,110 @@ struct Cached {
     expires_at: Instant,
 }
 
+/// The providers each peer has sent load rows for since this process started, its most recently
+/// heard [`MAX_PEER_PROVIDERS`], so a candidate that publishes load can be told from one that
+/// never will.
+#[derive(Clone, Debug, Default)]
+pub struct LoadHeard(Arc<RwLock<BTreeMap<String, std::collections::VecDeque<String>>>>);
+
+impl LoadHeard {
+    /// Note each provider `peer` sent a load row for in `observations`, keeping each peer's
+    /// [`MAX_PEER_PROVIDERS`] most recently heard, so a renamed provider is learned, not refused.
+    pub fn record(&self, peer: &str, observations: &[Observation]) {
+        let Ok(mut heard) = self.0.write() else {
+            return;
+        };
+        let held = heard.entry(peer.to_owned()).or_default();
+        for observation in observations {
+            if observation.metric == grid_signals::revision::METRIC {
+                continue;
+            }
+            let Some(provider) = observation.labels.get(PROVIDER_LABEL) else {
+                continue;
+            };
+            if let Some(at) = held.iter().position(|seen| seen == provider) {
+                held.remove(at);
+            } else if held.len() >= MAX_PEER_PROVIDERS {
+                held.pop_front();
+            }
+            held.push_back(provider.clone());
+        }
+    }
+
+    /// Forget every site `keep` no longer names.
+    pub fn retain_sites<Keep: Fn(&str) -> bool>(&self, keep: Keep) {
+        if let Ok(mut heard) = self.0.write() {
+            heard.retain(|site, _| keep(site));
+        }
+    }
+
+    /// Whether `site` has sent load for `provider`.
+    #[must_use]
+    pub fn heard(&self, site: &str, provider: &str) -> bool {
+        self.0.read().is_ok_and(|heard| {
+            heard
+                .get(site)
+                .is_some_and(|held| held.iter().any(|seen| seen == provider))
+        })
+    }
+
+    /// Whether `site` has sent load for any provider.
+    #[must_use]
+    pub fn any_from(&self, site: &str) -> bool {
+        self.0
+            .read()
+            .is_ok_and(|heard| heard.get(site).is_some_and(|held| !held.is_empty()))
+    }
+}
+
+/// When the last poll round that included each peer ended, for this site's own gateway.
+#[derive(Clone, Debug, Default)]
+pub struct PeerRounds(Arc<RwLock<BTreeMap<String, SystemTime>>>);
+
+impl PeerRounds {
+    /// Record that a round polling `peers` ended `at`; a peer not in it is no longer polled.
+    pub fn record(&self, peers: &[String], at: SystemTime) {
+        if let Ok(mut rounds) = self.0.write() {
+            *rounds = peers.iter().map(|peer| (peer.clone(), at)).collect();
+        }
+    }
+
+    /// One row per peer, stamped at its last round, ahead of anything a byte budget can drop.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let Ok(rounds) = self.0.read() else {
+            return String::new();
+        };
+        let mut out = String::new();
+        // Names come from `GridSite` identities, so none needs escaping; one that would is skipped.
+        for (peer, at) in rounds
+            .iter()
+            .filter(|(peer, _)| certs::validate_site_name(peer).is_ok())
+        {
+            let stamp = at
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX));
+            for part in [
+                grid_signals::poller::METRIC,
+                "{",
+                SITE_LABEL,
+                "=\"",
+                peer,
+                "\",",
+                PROVIDER_LABEL,
+                "=\"",
+                grid_signals::poller::PROVIDER,
+                "\"} 1 ",
+                &stamp.to_string(),
+                "\n",
+            ] {
+                out.push_str(part);
+            }
+        }
+        out
+    }
+}
+
 /// Signals held per target, where a target is a provider routing identity.
 #[derive(Clone, Debug, Default)]
 pub struct SignalStore {
@@ -402,6 +506,8 @@ pub struct PeerRecord {
 pub struct PeerIdentities {
     /// Site name to what is held for it.
     inner: Arc<RwLock<BTreeMap<String, PeerRecord>>>,
+    /// Whether the peers have been read from the `GridSite` objects at least once.
+    loaded: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PeerIdentities {
@@ -416,6 +522,13 @@ impl PeerIdentities {
         if let Ok(mut guard) = self.inner.write() {
             *guard = identities;
         }
+        self.loaded.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the peers have been read at least once, so an empty registry means none.
+    #[must_use]
+    pub fn loaded(&self) -> bool {
+        self.loaded.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Whether a record is held for `site`.
@@ -1555,6 +1668,7 @@ const MAX_PROVIDER_LABEL_LEN: usize = 253;
 /// valid, so this is wider than a site name.
 fn valid_provider(provider: &str) -> bool {
     !provider.trim().is_empty()
+        && provider != grid_signals::poller::PROVIDER
         && provider.len() <= MAX_PROVIDER_LABEL_LEN
         && !provider.chars().any(|ch| ch.is_control() || ch == '/')
 }
@@ -2686,6 +2800,61 @@ mod tests {
         let peers = SignalStore::new();
         peers.refresh(poll_one_peer("east", row, date).await, Duration::from_secs(60));
         peers
+    }
+
+    #[tokio::test]
+    async fn a_peer_cannot_relay_poller_rounds() {
+        crate::init_process_crypto();
+        let (date, date_ms) = dated(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let body = format!(
+            "inference_pool_average_queue_size{{grid_provider=\"pool-a\"}} 1 {date_ms}\n\
+             inference_pool_average_queue_size{{grid_provider=\"{provider}\"}} 1 {date_ms}\n\
+             {}{{grid_site=\"west\",grid_provider=\"{provider}\"}} 1 {date_ms}\n",
+            grid_signals::poller::METRIC,
+            provider = grid_signals::poller::PROVIDER,
+        );
+        let round = poll_one_peer("east", body, date).await;
+        let metrics: Vec<&str> = round
+            .get("east")
+            .expect("east answered")
+            .iter()
+            .map(|row| row.metric.as_str())
+            .collect();
+        assert_eq!(metrics, ["inference_pool_average_queue_size"]);
+    }
+
+    #[test]
+    fn heard_load_keeps_each_peers_most_recent_providers() {
+        let row = |provider: String| Observation {
+            metric: "inference_pool_average_queue_size".to_owned(),
+            labels: BTreeMap::from([(PROVIDER_LABEL.to_owned(), provider)]),
+            value: 0.0,
+            timestamp_ms: None,
+            age: Duration::ZERO,
+        };
+        let heard = LoadHeard::default();
+        let first: Vec<_> = (0..MAX_PEER_PROVIDERS).map(|i| row(format!("old-{i}"))).collect();
+        heard.record("east", &first);
+        heard.record("east", &[row("old-0".to_owned())]);
+        heard.record("east", &[row("renamed".to_owned())]);
+        assert!(heard.heard("east", "renamed"), "a new name past the cap is learned");
+        assert!(heard.heard("east", "old-0"), "one heard again is kept");
+        assert!(!heard.heard("east", "old-1"), "the least recently heard is dropped");
+        assert!(!heard.heard("west", "renamed"), "kept per peer");
+    }
+
+    #[test]
+    fn poller_rounds_render_one_stamped_row_per_peer() {
+        let rounds = PeerRounds::default();
+        let at = UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
+        rounds.record(&["east".to_owned(), "west".to_owned()], at);
+        assert_eq!(
+            rounds.render(),
+            "grid_peer_poll_round{grid_site=\"east\",grid_provider=\"_poller\"} 1 1700000000123\n\
+             grid_peer_poll_round{grid_site=\"west\",grid_provider=\"_poller\"} 1 1700000000123\n"
+        );
+        rounds.record(&["west".to_owned()], at);
+        assert!(!rounds.render().contains("east"), "a peer no longer polled has no row");
     }
 
     /// One round polling `site`, which answers `body` under the extra header lines `headers`.

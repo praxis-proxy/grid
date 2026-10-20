@@ -135,6 +135,16 @@ pub(crate) struct ServingCandidate {
     /// still loads on a gateway that predates the field.
     #[serde(skip_serializing_if = "admits_new")]
     pub(crate) admission: AdmissionState,
+    /// Whether its site publishes load for it: a local provider with metrics, or a peer's this
+    /// operator has heard load for. Omitted when it does, as the gateway assumes when absent.
+    #[serde(skip_serializing_if = "publishes")]
+    pub(crate) publishes_load: bool,
+}
+
+/// Whether `publishes_load` is the default, which the gateway assumes when absent.
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde skip_serializing_if signature")]
+const fn publishes(publishes_load: &bool) -> bool {
+    *publishes_load
 }
 
 /// Whether `admission` is the default, which the gateway assumes when absent.
@@ -171,7 +181,7 @@ pub(crate) struct ServingPeer {
 }
 
 /// Per-gateway inputs that are not in the overlay.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct ServingInputs<'input> {
     /// Verified gateway clusters allowed to carry provider-hop context.
     pub(crate) provider_hop_clusters: &'input BTreeSet<String>,
@@ -187,6 +197,10 @@ pub(crate) struct ServingInputs<'input> {
     pub(crate) peer_interval: Duration,
     /// The most one peer poll may take.
     pub(crate) peer_budget: Duration,
+    /// Whether a peer has sent load for a `(site, cluster)`.
+    pub(crate) heard: &'input (dyn Fn(&str, &str) -> bool + Sync),
+    /// This site's provider clusters with no metrics to scrape.
+    pub(crate) quiet_local: &'input BTreeSet<String>,
 }
 
 /// Render for one gateway. Its only peer is the local operator, which relays
@@ -195,7 +209,7 @@ pub(crate) struct ServingInputs<'input> {
 /// An empty candidate list is an authoritative no-route state. It must still
 /// be written so a gateway cannot retain candidates from an older config.
 pub(crate) fn render(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> ServingConfig {
-    let candidates = candidates(overlay);
+    let candidates = candidates(overlay, inputs);
     let peers = inputs
         .local_signals_addr
         .filter(|_| certs::validate_site_name(&overlay.local_site).is_ok())
@@ -251,7 +265,7 @@ fn dedup<'overlay>(
 /// Inference candidates within gateway limits, deduplicated and ordered.
 ///
 /// Past the cap, candidates taking new requests are kept before the rest.
-fn candidates(overlay: &RoutingOverlay) -> Vec<ServingCandidate> {
+fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<ServingCandidate> {
     if overlay.candidates.is_empty() {
         return Vec::new();
     }
@@ -269,7 +283,7 @@ fn candidates(overlay: &RoutingOverlay) -> Vec<ServingCandidate> {
     }
     kept.into_iter()
         .map(
-            |((_, site, name, cluster), (fresh, admission, stable_id))| ServingCandidate {
+            |((remote, site, name, cluster), (fresh, admission, stable_id))| ServingCandidate {
                 stable_id,
                 kind: INFERENCE_MODEL,
                 name: name.to_owned(),
@@ -277,9 +291,19 @@ fn candidates(overlay: &RoutingOverlay) -> Vec<ServingCandidate> {
                 cluster: cluster.to_owned(),
                 fresh,
                 admission,
+                publishes_load: publishes_load(inputs, remote, site, cluster),
             },
         )
         .collect()
+}
+
+/// Whether `site` publishes load for `cluster`: a peer's once heard, this site's when it has metrics.
+fn publishes_load(inputs: &ServingInputs<'_>, remote: bool, site: &str, cluster: &str) -> bool {
+    if remote {
+        (inputs.heard)(site, cluster)
+    } else {
+        !inputs.quiet_local.contains(cluster)
+    }
 }
 
 /// An inference candidate the gateway will accept, whatever its admission.
@@ -467,6 +491,8 @@ mod tests {
         scrape_interval: Duration::from_secs(5),
         peer_interval: Duration::from_secs(30),
         peer_budget: Duration::from_secs(10),
+        heard: &|_, _| true,
+        quiet_local: &NO_PROVIDER_HOPS,
     };
 
     fn cand(name: &str, site: &str, cluster: &str, admission: Option<&str>) -> RoutingCandidate {
@@ -503,6 +529,42 @@ mod tests {
             .iter()
             .map(|peer| (peer.site.as_str(), peer.addr.as_str()))
             .collect()
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one render over each kind of candidate")]
+    fn publishes_load_is_written_only_for_a_candidate_whose_site_publishes_none() {
+        let quiet = BTreeSet::from(["pool-a".to_owned()]);
+        let heard = |site: &str, _: &str| site == "site-c";
+        let inputs = ServingInputs {
+            heard: &heard,
+            quiet_local: &quiet,
+            ..INPUTS
+        };
+        let source = overlay(vec![
+            cand("llama", "site-a", "pool-a", None),
+            cand("llama", "site-a", "pool-a2", None),
+            cand("llama", "site-b", "pool-b", None),
+            cand("llama", "site-c", "pool-c", None),
+        ]);
+        let config = render(&source, &inputs);
+        let unpublished: Vec<&str> = config
+            .candidates
+            .iter()
+            .filter(|candidate| !candidate.publishes_load)
+            .map(|candidate| candidate.cluster.as_str())
+            .collect();
+        assert_eq!(
+            unpublished,
+            ["pool-a", "pool-b"],
+            "a local one without metrics, a peer's never heard"
+        );
+        let text = to_text(&config).expect("json");
+        assert_eq!(text.matches("\"publishes_load\": false").count(), 2);
+        assert!(
+            !text.contains("\"publishes_load\": true"),
+            "the default is never written"
+        );
     }
 
     #[test]

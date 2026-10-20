@@ -272,6 +272,7 @@ async fn main() {
                     published: Published {
                         site: ctx.signals(),
                         peers: ctx.peers(),
+                        rounds: ctx.peer_rounds(),
                         feedback: operator::gateway_ages::GatewayFeedback::new(client.clone(), shutdown.clone()),
                     },
                     peer_identities: ctx.peer_identities(),
@@ -426,15 +427,29 @@ async fn start_swim(
 
 /// Release membership-derived writes once every live named peer has delivered, or after the grace.
 async fn release_membership_once_settled(handle: Arc<swim_runtime::SwimHandle>, ctx: Arc<OperatorCtx>) {
+    // Only the poll path hears load and gates on peers' state; push releases on a first member.
+    let poll = ctx.signal_mode() == SignalMode::Poll;
     let settled = || {
-        peers_delivered(
-            &handle.snapshot(),
-            &handle.state_snapshot(),
-            &ctx.peer_identities(),
-            handle.site_name(),
-        )
+        let members = handle.snapshot();
+        if poll {
+            peers_delivered(
+                &members,
+                &handle.state_snapshot(),
+                &ctx.peer_identities(),
+                &ctx.load_heard(),
+                handle.site_name(),
+            )
+        } else {
+            !members.members.is_empty()
+        }
     };
-    converged(settled, handle.reconciliation_events(), MEMBERSHIP_GRACE).await;
+    // Load arrives on poll rounds, which raise no SWIM event, so recheck each second too.
+    let ticks = futures::stream::unfold((), |()| async {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        Some(((), ()))
+    });
+    let changes = futures::stream::select(handle.reconciliation_events(), ticks);
+    converged(settled, changes, MEMBERSHIP_GRACE).await;
     ctx.release_membership();
 }
 
@@ -442,19 +457,22 @@ async fn release_membership_once_settled(handle: Arc<swim_runtime::SwimHandle>, 
 /// republish, every 30 s, and the membership convergence before it.
 const MEMBERSHIP_GRACE: std::time::Duration = std::time::Duration::from_secs(45);
 
-/// Whether a peer is a member and every live member a `GridSite` names has delivered providers,
-/// so the first serving write after a restart is not missing peers this process has yet to hear.
+/// Whether a peer is a member and every live member a `GridSite` names has delivered providers
+/// and load, so the first serving write after a restart is not missing peers or their load. A
+/// live peer that publishes no load holds the write for the whole grace.
 fn peers_delivered(
     members: &operator::swim::MembershipSnapshot,
     state: &crdt::GridStateSnapshot,
     identities: &operator::signals::PeerIdentities,
+    heard: &operator::signals::LoadHeard,
     local_site: &str,
 ) -> bool {
     let mut peers = members.members.iter().filter(|m| m.site_id != local_site).peekable();
-    peers.peek().is_some()
+    identities.loaded()
+        && peers.peek().is_some()
         && peers
             .filter(|m| m.status == operator::swim::MemberStatus::Alive && identities.knows(&m.site_id))
-            .all(|m| state.providers.values().any(|p| p.site_id == m.site_id))
+            .all(|m| state.providers.values().any(|p| p.site_id == m.site_id) && heard.any_from(&m.site_id))
 }
 
 /// Wait until `has_members` holds, rechecked on each `changes` item, or `grace` passes.
@@ -1582,6 +1600,8 @@ struct Published {
     site: operator::signals::SignalStore,
     /// What peers reported about themselves.
     peers: operator::signals::SignalStore,
+    /// When the poller last tried each peer, for this site's own gateway only.
+    rounds: operator::signals::PeerRounds,
 }
 
 /// What the signals listener needs from startup.
@@ -2338,30 +2358,43 @@ async fn signals_handler(
     // Access policy bounds peer reads, not the site reading itself.
     let now = operator::signals::ClockReading::now();
     let (body, oldest) = match &caller {
-        Caller::Local => {
-            // One body under the gateway's read ceiling: the site first, so a
-            // flood of relayed rows can only cost the last peers, never this site.
-            let site = published
-                .site
-                .render_bounded(target, &collect, operator::signals::MAX_RELAY_BYTES, now);
-            // Peers relay only to Local, and the peers store carries no access map.
-            // A Peer(Some) relay would need per-target scoping added here.
-            let peers = published.peers.render_bounded(
-                target,
-                &collect,
-                operator::signals::MAX_RELAY_BYTES.saturating_sub(site.body.len()),
-                now,
-            );
-            operator::metrics::record_relay_truncated("site", &site);
-            operator::metrics::record_relay_truncated("peers", &peers);
-            let mut body = site.body;
-            body.push_str(&peers.body);
-            (body, site.oldest.max(peers.oldest))
-        },
+        Caller::Local => local_relay(&published, target, &collect, now),
         Caller::Peer(Some(labels)) => published.site.render(target, &collect, Some(labels), now),
         Caller::Peer(None) => return refused(),
     };
     served(body, oldest, now.wall)
+}
+
+/// This site's own gateway's read: the poller's rounds, then the site, then its peers, in one
+/// body under the gateway's read ceiling, so a flood of relayed rows can only cost the last peers,
+/// never this site.
+fn local_relay(
+    published: &Published,
+    target: Option<&str>,
+    collect: &[String],
+    now: operator::signals::ClockReading,
+) -> (String, std::time::Duration) {
+    let rounds = published.rounds.render();
+    let site = published.site.render_bounded(
+        target,
+        collect,
+        operator::signals::MAX_RELAY_BYTES.saturating_sub(rounds.len()),
+        now,
+    );
+    // Peers relay only to Local, and the peers store carries no access map.
+    // A Peer(Some) relay would need per-target scoping added here.
+    let peers = published.peers.render_bounded(
+        target,
+        collect,
+        operator::signals::MAX_RELAY_BYTES.saturating_sub(rounds.len().saturating_add(site.body.len())),
+        now,
+    );
+    operator::metrics::record_relay_truncated("site", &site);
+    operator::metrics::record_relay_truncated("peers", &peers);
+    let mut body = rounds;
+    body.push_str(&site.body);
+    body.push_str(&peers.body);
+    (body, site.oldest.max(peers.oldest))
 }
 
 /// Refuse a caller this site will not serve.
@@ -2734,11 +2767,15 @@ impl PeerPoller {
         order_targets(&mut sites, &self.unanswered, self.turn);
         // Each peer lands as it answers, so one slow peer cannot age out the rest.
         let peers = self.ctx.peers();
+        let heard = self.ctx.load_heard();
+        let identities = self.ctx.peer_identities();
+        heard.retain_sites(|site| identities.knows(site));
         let ttl = self.settings.peer_ttl();
         let mut answered = BTreeMap::new();
         source
             .collect_each(&sites, |peer, observations, rejected| {
                 answered.insert(peer.clone(), rejected);
+                heard.record(&peer, &observations);
                 peers.refresh(BTreeMap::from([(peer, observations)]), ttl);
             })
             .await;
@@ -2747,6 +2784,7 @@ impl PeerPoller {
             return;
         }
         let polled: Vec<String> = sites.into_iter().map(|site| site.name).collect();
+        self.ctx.peer_rounds().record(&polled, SystemTime::now());
         self.unanswered = polled
             .iter()
             .filter(|site| !answered.contains_key(*site))
@@ -2960,6 +2998,7 @@ mod tests {
         let published = Published {
             site: operator::signals::SignalStore::new(),
             peers: operator::signals::SignalStore::new(),
+            rounds: operator::signals::PeerRounds::default(),
             feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
         };
         for caller in [Caller::Peer(None), Caller::Peer(Some(BTreeMap::new()))] {
@@ -3865,6 +3904,15 @@ mod tests {
             labels: BTreeMap::new(),
             pins: vec!["aa".to_owned()],
         };
+        let heard = operator::signals::LoadHeard::default();
+        let nothing = crdt::GridStateSnapshot::new("hub".to_owned());
+        let east_alone = operator::swim::MembershipSnapshot {
+            members: vec![member("east", alive.clone())],
+        };
+        assert!(
+            !peers_delivered(&east_alone, &nothing, &identities, &heard, "hub"),
+            "no GridSite read yet, so no peer is known not to need waiting on"
+        );
         identities.set(BTreeMap::from([
             ("east".to_owned(), record.clone()),
             ("west".to_owned(), record),
@@ -3872,7 +3920,7 @@ mod tests {
         let mut state = crdt::GridStateSnapshot::new("hub".to_owned());
         let members = |list| operator::swim::MembershipSnapshot { members: list };
         let delivered = |snapshot: &operator::swim::MembershipSnapshot, held: &crdt::GridStateSnapshot| {
-            peers_delivered(snapshot, held, &identities, "hub")
+            peers_delivered(snapshot, held, &identities, &heard, "hub")
         };
 
         assert!(
@@ -3896,6 +3944,15 @@ mod tests {
             revision: 1,
             writer_id: "east".to_owned(),
         });
+        assert!(!delivered(&east_and_west, &state), "east has sent no load yet");
+        let row = operator::signals::Observation {
+            metric: "inference_pool_average_queue_size".to_owned(),
+            labels: BTreeMap::from([("grid_provider".to_owned(), "p".to_owned())]),
+            value: 0.0,
+            timestamp_ms: None,
+            age: std::time::Duration::ZERO,
+        };
+        heard.record("east", &[row]);
         assert!(delivered(&east_and_west, &state), "a dead peer is not waited on");
         let stranger = members(vec![member("east", alive.clone()), member("stranger", alive)]);
         assert!(delivered(&stranger, &state), "nor one no GridSite names");
@@ -4551,6 +4608,7 @@ mod tests {
         let published = Published {
             site: operator::signals::SignalStore::new(),
             peers: operator::signals::SignalStore::new(),
+            rounds: operator::signals::PeerRounds::default(),
             feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
         };
         published.peers.refresh(
@@ -4902,6 +4960,7 @@ mod tests {
             signals_app(Published {
                 site: operator::signals::SignalStore::new(),
                 peers: operator::signals::SignalStore::new(),
+                rounds: operator::signals::PeerRounds::default(),
                 feedback,
             })
         }

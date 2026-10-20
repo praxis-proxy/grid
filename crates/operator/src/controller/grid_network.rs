@@ -132,6 +132,10 @@ pub struct OperatorCtx {
     /// Signals polled from peers, keyed by site name. Kept apart from local so a
     /// scoped read returns only what this site observed, never a second-hand copy.
     pub(crate) peers: signals::SignalStore,
+    /// When the poller's last round that included each peer ended.
+    pub(crate) peer_rounds: signals::PeerRounds,
+    /// Each peer provider the poller has received load rows for.
+    pub(crate) load_heard: signals::LoadHeard,
 
     /// This site's scraped signals, served to gateways and peers.
     pub(crate) signals: signals::SignalStore,
@@ -326,6 +330,8 @@ impl OperatorCtx {
             refused_sites: std::sync::Mutex::new(HashMap::new()),
             peer_identities: signals::PeerIdentities::new(),
             peers: signals::SignalStore::new(),
+            peer_rounds: signals::PeerRounds::default(),
+            load_heard: signals::LoadHeard::default(),
             signals: signals::SignalStore::new(),
             served_models: served_models::ServedModelStore::new(),
             readiness: readiness::ReadinessStore::default(),
@@ -468,6 +474,18 @@ impl OperatorCtx {
     #[must_use]
     pub fn peers(&self) -> signals::SignalStore {
         self.peers.clone()
+    }
+
+    /// A handle to the poller's rounds, for the poller and this site's own gateway.
+    #[must_use]
+    pub fn peer_rounds(&self) -> signals::PeerRounds {
+        self.peer_rounds.clone()
+    }
+
+    /// A handle to the peer providers the poller has heard load for.
+    #[must_use]
+    pub fn load_heard(&self) -> signals::LoadHeard {
+        self.load_heard.clone()
     }
 
     /// A handle to who may read, for the signals listener and poller.
@@ -833,7 +851,8 @@ async fn apply_ready_condition(
     Ok(())
 }
 
-/// The status patch carrying the provider's new `Ready` condition, `None` when unchanged.
+/// The status patch carrying the provider's `Ready` and `MetricsAvailable` conditions, `None`
+/// when neither changed. Both are always sent, since an apply that leaves one out removes it.
 fn ready_condition_patch<'provider>(
     provider: &'provider InferenceProvider,
     verdict: &readiness::Verdict,
@@ -844,14 +863,27 @@ fn ready_condition_patch<'provider>(
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .ok()?;
-    let condition = readiness::ready_condition(current, verdict, &now, provider.metadata.generation)?;
+    let generation = provider.metadata.generation;
+    let ready = readiness::ready_condition(current, verdict, &now, generation);
+    let metrics = readiness::metrics_condition(current, verdict, &now, generation);
+    if ready.is_none() && metrics.is_none() {
+        return None;
+    }
+    let held = |type_: &str| current.iter().find(|c| c.type_ == type_).cloned();
+    let conditions: Vec<_> = [
+        ready.or_else(|| held(readiness::READY_CONDITION)),
+        metrics.or_else(|| held(readiness::METRICS_CONDITION)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     Some((
         name,
         serde_json::json!({
             "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
-            "status": { "conditions": [condition] }
+            "status": { "conditions": conditions }
         }),
     ))
 }
@@ -1621,7 +1653,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let remote_crdt_providers = membership_staleness(&network, remote_crdt_providers, membership.as_ref());
 
     let scoring_weights = crate::crd::grid_network::resolve_scoring_weights(network.spec.scoring_policy.as_ref());
-    let serving = serving_source(&ctx);
+    let serving = serving_source(&ctx, &providers);
 
     // List tool providers once; shared between overlay rendering and CRDT publishing.
     let tool_providers = list_all_agent_tool_providers(client).await?;
@@ -2662,18 +2694,31 @@ struct ServingSource<'src> {
     scrape_interval: Duration,
     /// Sites each network's serving config last refused.
     refused: &'src serving_config::RefusedSites,
+    /// Peer providers the poller has heard load for.
+    load_heard: &'src signals::LoadHeard,
+    /// This site's provider clusters with no metrics to scrape.
+    quiet_local: BTreeSet<String>,
 }
 
 /// Build the serving source, `None` outside poll mode.
-fn serving_source(ctx: &OperatorCtx) -> Option<ServingSource<'_>> {
+fn serving_source<'ctx>(ctx: &'ctx OperatorCtx, providers: &[InferenceProvider]) -> Option<ServingSource<'ctx>> {
     if ctx.signal_mode != SignalMode::Poll {
         return None;
     }
+    let quiet_local = providers
+        .iter()
+        // The same plan signal publication scrapes by, so a provider it cannot scrape publishes none.
+        .filter(|provider| provider_metrics::signal_scrape_plan(provider).is_none())
+        .filter_map(|provider| routing_overlay::routing_identity(provider))
+        .map(str::to_owned)
+        .collect();
     Some(ServingSource {
         gate: &ctx.serving_writes,
         settings: &ctx.peer_settings,
         scrape_interval: ctx.scrape_interval,
         refused: &ctx.refused_sites,
+        load_heard: &ctx.load_heard,
+        quiet_local,
     })
 }
 
@@ -2691,6 +2736,7 @@ fn render_serving_text(
         });
     let provider_hop_sni = serving_provider_hop_sni_for_overlay(overlay, gw_ref)?;
     let provider_hop_clusters: BTreeSet<String> = provider_hop_sni.keys().cloned().collect();
+    let heard = |site: &str, cluster: &str| source.load_heard.heard(site, cluster);
     let inputs = ServingInputs {
         provider_hop_clusters: &provider_hop_clusters,
         provider_hop_sni: &provider_hop_sni,
@@ -2699,6 +2745,8 @@ fn render_serving_text(
         scrape_interval: source.scrape_interval,
         peer_interval: source.settings.peer_interval,
         peer_budget: source.settings.peer_budget,
+        heard: &heard,
+        quiet_local: &source.quiet_local,
     };
     serving_config::to_text(&serving_config::render(overlay, &inputs)).map_err(OperatorError::Json)
 }
@@ -6479,6 +6527,7 @@ mod tests {
     #[expect(
         clippy::expect_used,
         clippy::indexing_slicing,
+        clippy::too_many_lines,
         reason = "test assertions on a JSON patch"
     )]
     fn the_ready_condition_is_patched_only_on_a_change() {
@@ -6486,12 +6535,16 @@ mod tests {
             reason: readiness::Reason::NoEndpointsReady,
             message: "0 ready endpoints".to_owned(),
         };
+        let metrics = serde_json::json!({
+            "type": "MetricsAvailable", "status": "True", "reason": "ScrapeSucceeded", "message": "metrics scraped",
+            "lastTransitionTime": "2026-10-03T00:00:00Z", "observedGeneration": 1
+        });
         let current = provider_with_status(&serde_json::json!({
-            "conditions": [ready_condition_json("False", "NoEndpointsReady")]
+            "conditions": [ready_condition_json("False", "NoEndpointsReady"), metrics]
         }));
         assert!(
             ready_condition_patch(&current, &down).is_none(),
-            "the condition already says so, so there is nothing to write"
+            "the conditions already say so, so there is nothing to write"
         );
         let up = readiness::Verdict {
             reason: readiness::Reason::Ready,
@@ -6499,6 +6552,20 @@ mod tests {
         };
         let (_, patch) = ready_condition_patch(&current, &up).expect("a transition is written");
         assert_eq!(patch["status"]["conditions"][0]["status"], "True");
+        assert_eq!(
+            patch["status"]["conditions"][1]["type"], "MetricsAvailable",
+            "the unchanged condition is sent too, or the apply would remove it"
+        );
+
+        let failing = readiness::Verdict {
+            reason: readiness::Reason::ScrapeTimedOut,
+            message: "no successful metrics scrape in the last 30s; the latest failed: timeout".to_owned(),
+        };
+        let (_, failed) = ready_condition_patch(&current, &failing).expect("a scrape failure is written");
+        let written = &failed["status"]["conditions"][1];
+        assert_eq!(written["status"], "False");
+        assert_eq!(written["reason"], "ScrapeTimedOut");
+        assert_eq!(written["message"], failing.message.as_str());
         assert!(
             patch["status"].get("state").is_none(),
             "the column reads the condition, so status carries no copy of it"

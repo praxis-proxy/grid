@@ -557,6 +557,9 @@ fn ready_message(count: f64, busy: bool) -> String {
 /// The condition type this module owns.
 pub const READY_CONDITION: &str = "Ready";
 
+/// Whether the provider's metrics are being scraped, apart from whether its endpoints are ready.
+pub const METRICS_CONDITION: &str = "MetricsAvailable";
+
 /// The `Ready` condition to write, or `None` when `current` already says the same.
 ///
 /// A changed message alone is not written, so a moving endpoint count does not
@@ -568,20 +571,62 @@ pub(crate) fn ready_condition(
     generation: Option<i64>,
 ) -> Option<Condition> {
     let held = current.iter().find(|c| c.type_ == READY_CONDITION);
-    let status = verdict.reason.status();
-    if held.is_some_and(|c| {
-        c.status == status && c.reason == verdict.reason.as_str() && c.observed_generation == generation
-    }) {
+    let state = (
+        verdict.reason.status(),
+        verdict.reason.as_str(),
+        verdict.message.as_str(),
+    );
+    changed(READY_CONDITION, held, state, now_rfc3339, generation)
+}
+
+/// The `MetricsAvailable` condition to write, or `None` when `current` already says the same.
+///
+/// True once a scrape succeeds, whatever the endpoints say; False with the scrape's failure, or
+/// when the provider declares no metrics; Unknown while it awaits its first scrape.
+pub(crate) fn metrics_condition(
+    current: &[Condition],
+    verdict: &Verdict,
+    now_rfc3339: &str,
+    generation: Option<i64>,
+) -> Option<Condition> {
+    let held = current.iter().find(|c| c.type_ == METRICS_CONDITION);
+    let state = match verdict.reason {
+        Reason::Ready | Reason::NoEndpointsReady | Reason::NoLivenessCheck => {
+            ("True", "ScrapeSucceeded", "metrics scraped")
+        },
+        Reason::AwaitingFirstScrape | Reason::ProviderUnavailable => {
+            ("Unknown", verdict.reason.as_str(), verdict.message.as_str())
+        },
+        Reason::MetricsStale
+        | Reason::ScrapeTimedOut
+        | Reason::ScrapeUnauthorized
+        | Reason::TlsHandshakeFailed
+        | Reason::MetricsBodyTooLarge
+        | Reason::ScrapeFailed
+        | Reason::MetricsNotConfigured => ("False", verdict.reason.as_str(), verdict.message.as_str()),
+    };
+    changed(METRICS_CONDITION, held, state, now_rfc3339, generation)
+}
+
+/// The condition `type_` in `(status, reason, message)`, or `None` when `held` already says so.
+fn changed(
+    type_: &str,
+    held: Option<&Condition>,
+    (status, reason, message): (&str, &str, &str),
+    now_rfc3339: &str,
+    generation: Option<i64>,
+) -> Option<Condition> {
+    if held.is_some_and(|c| c.status == status && c.reason == reason && c.observed_generation == generation) {
         return None;
     }
     let last_transition_time = held
         .filter(|c| c.status == status)
         .map_or_else(|| now_rfc3339.to_owned(), |c| c.last_transition_time.clone());
     Some(Condition {
-        type_: READY_CONDITION.to_owned(),
+        type_: type_.to_owned(),
         status: status.to_owned(),
-        reason: verdict.reason.as_str().to_owned(),
-        message: verdict.message.clone(),
+        reason: reason.to_owned(),
+        message: message.to_owned(),
         last_transition_time,
         observed_generation: generation,
     })

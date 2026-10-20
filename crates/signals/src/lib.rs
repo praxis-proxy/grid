@@ -11,6 +11,9 @@ pub mod exposition;
 /// Gateway ingest feedback wire vocabulary.
 pub mod feedback;
 
+/// The operator's peer poller rounds, relayed to its own gateway.
+pub mod poller;
+
 pub mod revision;
 
 mod signals;
