@@ -52,8 +52,8 @@ tests:
   - it: passes cache limits into the grid_site_route plugin
     template: templates/gateway-config.yaml
     set:
-      gridServing.siteRoute.prefixAffinity.capacity: 2048
-      gridServing.siteRoute.prefixAffinity.ttl_secs: 120
+      praxisConfig.render.gridServing.siteRoute.prefixAffinity.capacity: 2048
+      praxisConfig.render.gridServing.siteRoute.prefixAffinity.ttl_secs: 120
     asserts:
       - matchRegex:
           path: data["praxis.yaml"]

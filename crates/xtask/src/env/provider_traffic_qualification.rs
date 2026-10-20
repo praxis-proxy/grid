@@ -2,7 +2,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Write as _,
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -3201,8 +3200,7 @@ fn activate_embedded_serving_gateway() -> AssertionResult {
         crate::env::image_overrides::load_docker_image_into_kind(&image, &kind_name)?;
     }
 
-    apply_embedded_gateway_config(&cluster_context("provider-a"), &endpoints)?;
-    install_embedded_gateway(repository_root, &image)?;
+    install_embedded_gateway(repository_root, &image, &endpoints)?;
     wait_for_deployment(GRID_SERVING_GATEWAY, GRID_SYSTEM_NS, &cluster_context("provider-a"))?;
     let serving_log = wait_for_embedded_serving_log(&initial_serving, &cluster_context("provider-a"), 0, TIMEOUT)?;
     let baseline = send_embedded_lifecycle_request(None)?;
@@ -3450,90 +3448,16 @@ fn restart_grid_operator(cluster: &str) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-/// Apply the embedded gateway's static listener/backend plumbing; Grid owns the changing candidates.
-#[expect(
-    clippy::too_many_lines,
-    reason = "this renders listener plumbing and static endpoint inventory in one run-owned ConfigMap"
-)]
-fn apply_embedded_gateway_config(
-    context: &str,
-    endpoints: &[serde_json::Value],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let clusters: Vec<_> = endpoints
-        .iter()
-        .map(|endpoint| {
-            let cluster = endpoint
-                .get("cluster")
-                .and_then(serde_json::Value::as_str)
-                .ok_or("generated endpoint has no cluster name")?;
-            let address = endpoint
-                .get("address")
-                .and_then(serde_json::Value::as_str)
-                .ok_or("generated endpoint has no address")?;
-            let sni = endpoint
-                .pointer("/transport/sni")
-                .and_then(serde_json::Value::as_str)
-                .ok_or("generated endpoint has no TLS server name")?;
-            Ok(serde_json::json!({
-                "name": cluster,
-                "tls": {
-                    "ca": { "ca_path": "/etc/praxis/tls/ca.crt" },
-                    "client_cert": {
-                        "cert_path": "/etc/praxis/tls/tls.crt",
-                        "key_path": "/etc/praxis/tls/tls.key"
-                    },
-                    "sni": sni,
-                    "verify": true
-                },
-                "endpoints": [address]
-            }))
-        })
-        .collect::<Result<_, &str>>()?;
-    let config = serde_json::json!({
-        "insecure_options": {
-            "allow_private_endpoints": true,
-            "allow_private_upstreams": true
-        },
-        "listeners": [{
-            "name": "proxy",
-            "address": "0.0.0.0:8080",
-            "filter_chains": ["main"]
-        }],
-        "filter_chains": [{
-            "name": "main",
-            "filters": [
-                { "filter": "model_to_header", "header": "X-Gateway-Model-Name" },
-                { "filter": "grid_site_route", "model_header": "X-Gateway-Model-Name" },
-                { "filter": "load_balancer", "clusters": clusters }
-            ]
-        }],
-        "admin": { "metrics_address": "127.0.0.1:9901" },
-        "shutdown_timeout_secs": 5
-    });
-    let config_yaml = serde_yaml::to_string(&config)?;
-    let run_id = RUN_CLUSTER_PREFIX
-        .get()
-        .ok_or("run-owned cluster prefix was not initialized")?;
-    let config_map = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": {
-            "name": "grid-serving-gateway-config",
-            "namespace": GRID_SYSTEM_NS,
-            "labels": { "grid.praxis-proxy.io/run-id": run_id }
-        },
-        "data": { "praxis.yaml": config_yaml }
-    });
-    kubectl_apply_json(context, &config_map)?;
-    Ok(())
-}
-
-/// Install the chart-managed embedded consumer against the Grid serving `ConfigMap`.
+/// Install the chart-managed embedded consumer with its provider-hop endpoints.
 #[expect(
     clippy::too_many_lines,
     reason = "Helm inputs and run-owned rollout verification form one bounded install operation"
 )]
-fn install_embedded_gateway(root: &Path, image: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn install_embedded_gateway(
+    root: &Path,
+    image: &str,
+    endpoints: &[serde_json::Value],
+) -> Result<(), Box<dyn std::error::Error>> {
     let (repository, tag) = parse_image_ref(image);
     let chart = root.join("charts/praxis-gateway");
     let chart = chart.to_str().ok_or("Praxis Gateway chart path is not UTF-8")?;
@@ -3570,6 +3494,31 @@ fn install_embedded_gateway(root: &Path, image: &str) -> Result<(), Box<dyn std:
         format!("gridIdentity.caSecretName={CONSUMER_TLS_SECRET}"),
     ] {
         command.args(["--set-string", &value]);
+    }
+    for endpoint in endpoints {
+        let cluster = endpoint
+            .get("cluster")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("provider gateway endpoint has no cluster")?;
+        let address = endpoint
+            .get("address")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("provider gateway endpoint {cluster} has no address"))?;
+        let sni = endpoint
+            .pointer("/transport/sni")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("provider gateway endpoint {cluster} has no SNI"))?;
+        let site = sni
+            .strip_suffix(".grid.internal")
+            .ok_or_else(|| format!("provider gateway endpoint {cluster} SNI {sni} has no site suffix"))?;
+        for value in [
+            format!("praxisConfig.render.backends.{cluster}.endpoint={address}"),
+            format!("praxisConfig.render.backends.{cluster}.site={site}"),
+            format!("praxisConfig.render.backends.{cluster}.transport.mode=mutual_tls"),
+            format!("praxisConfig.render.backends.{cluster}.transport.sni={sni}"),
+        ] {
+            command.args(["--set-string", &value]);
+        }
     }
     command.args(["--set", "praxisConfig.render.gridServing.enabled=true"]);
     let output = command.output()?;
@@ -3840,31 +3789,6 @@ fn kubectl_patch_merge(
     if !output.status.success() {
         return Err(format!(
             "could not patch run-owned {resource}: {}",
-            safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 800)
-        )
-        .into());
-    }
-    Ok(())
-}
-
-/// Apply JSON through stdin, so generated `ConfigMap` data is not shell-interpreted.
-fn kubectl_apply_json(context: &str, resource: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
-    let mut child = Command::new("kubectl")
-        .args(["--context", context, "-n", GRID_SYSTEM_NS, "apply", "-f", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let bytes = serde_json::to_vec(resource)?;
-    child
-        .stdin
-        .take()
-        .ok_or("kubectl stdin was not piped")?
-        .write_all(&bytes)?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "could not apply run-owned ConfigMap: {}",
             safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 800)
         )
         .into());

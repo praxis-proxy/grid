@@ -5,10 +5,16 @@ templates:
 set:
   platform: aws
   image.repository: ghcr.io/praxis-proxy/grid-gateway
-  gatewayConfig.role: provider
-  gatewayConfig.localSite: site-a
-  gatewayConfig.peerTrust.digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  gatewayConfig.backends.local.endpoint: 10.96.0.20:8000
+  praxisConfig.source: render
+  grid.siteName: site-a
+  gridIdentity.tlsSecretName: grid-site-identity
+  gridIdentity.caSecretName: grid-ca
+  praxisConfig.render.role: provider
+  praxisConfig.render.peerTrust.certDigests: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+  praxisConfig.render.backends:
+    - cluster: local
+      endpoints: ["10.96.0.20:8000"]
+      transport: { mode: plaintext }
 tests:
   - it: exposes a provider on an internal network load balancer that carries TCP
     asserts:
@@ -57,7 +63,10 @@ tests:
 
   - it: adds no AWS annotations to a consumer, whose Service defaults to ClusterIP
     set:
-      gatewayConfig.role: consumer
+      praxisConfig.render.role: consumer
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.model: qwen
+      praxisConfig.render.peerTrust.certDigests: []
     asserts:
       - equal:
           path: spec.type

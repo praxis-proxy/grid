@@ -11,23 +11,26 @@ release:
 tests:
   - it: declares every backend's cluster to the grid filter
     set:
-      gridServing.enabled: true
-      gridServing.network: grid
-      gatewayConfig:
-        model: qwen
-        localSite: dagobah
-        backends:
-          - cluster: grid-local-a
-            endpoints: ["10.0.0.1:8000"]
-          - cluster: grid-local-b
-            site: dagobah
-            endpoints: ["10.0.0.2:8000"]
-          - cluster: grid-remote-e
-            endpoints: ["192.168.1.218:443"]
-            site: site-e
-            transport:
-              mode: mutual_tls
-              sni: site-e.grid.internal
+      image.flavor: grid-gateway
+      grid.siteName: dagobah
+      gridIdentity.tlsSecretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
+      praxisConfig.source: render
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.gridServing.enabled: true
+      praxisConfig.render.gridServing.networkName: grid
+      praxisConfig.render.backends:
+        - cluster: grid-local-a
+          endpoints: ["10.0.0.1:8000"]
+        - cluster: grid-local-b
+          site: dagobah
+          endpoints: ["10.0.0.2:8000"]
+        - cluster: grid-remote-e
+          endpoints: ["192.168.1.218:443"]
+          site: site-e
+          transport:
+            mode: mutual_tls
+            sni: site-e.grid.internal
     asserts:
       - matchRegex:
           path: data["praxis.yaml"]
@@ -35,20 +38,23 @@ tests:
 
   - it: declares the remote cluster the draw can select, so it is never a 500
     set:
-      gridServing.enabled: true
-      gridServing.network: grid
-      gatewayConfig:
-        model: qwen
-        localSite: dagobah
-        backends:
-          - cluster: grid-local-a
-            endpoints: ["10.0.0.1:8000"]
-          - cluster: grid-remote-e
-            endpoints: ["192.168.1.218:443"]
-            site: site-e
-            transport:
-              mode: mutual_tls
-              sni: site-e.grid.internal
+      image.flavor: grid-gateway
+      grid.siteName: dagobah
+      gridIdentity.tlsSecretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
+      praxisConfig.source: render
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.gridServing.enabled: true
+      praxisConfig.render.gridServing.networkName: grid
+      praxisConfig.render.backends:
+        - cluster: grid-local-a
+          endpoints: ["10.0.0.1:8000"]
+        - cluster: grid-remote-e
+          endpoints: ["192.168.1.218:443"]
+          site: site-e
+          transport:
+            mode: mutual_tls
+            sni: site-e.grid.internal
     asserts:
       - matchRegex:
           path: data["praxis.yaml"]
@@ -56,12 +62,15 @@ tests:
 
   - it: declares nothing to the grid filter when there are no backends
     set:
-      gridServing.enabled: true
-      gridServing.network: grid
-      gatewayConfig:
-        model: qwen
-        localSite: dagobah
-        backends: []
+      image.flavor: grid-gateway
+      grid.siteName: dagobah
+      gridIdentity.tlsSecretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
+      praxisConfig.source: render
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.gridServing.enabled: true
+      praxisConfig.render.gridServing.networkName: grid
+      praxisConfig.render.backends: []
     asserts:
       - notMatchRegex:
           path: data["praxis.yaml"]

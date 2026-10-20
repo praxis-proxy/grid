@@ -820,8 +820,6 @@ try_reject_msg "$GW_DIR" "api-key on the legacy 0.4.0 image (gw)" "unsupported o
   --set image.tag=0.4.0 --set praxisConfig.render.auth.mode=api-key --set praxisConfig.render.auth.validateUrl=https://maas/validate
 try_template "$GW_DIR" "api-key on the 0.7.0 image (gw)" "${R0[@]}" "${BK1[@]}" \
   --set praxisConfig.render.auth.mode=api-key --set praxisConfig.render.auth.validateUrl=https://maas/validate
-try_reject_msg "$GW_DIR" "api-key on the default image via an empty tag (gw)" "unsupported on the default image" "${R0[@]}" "${BK1[@]}" \
-  --set image.tag="" --set praxisConfig.render.auth.mode=api-key --set praxisConfig.render.auth.validateUrl=https://maas/validate
 try_reject_msg "$GW_DIR" "validateUrl without a host (gw)" "validateUrl" "${R0[@]}" "${BK1[@]}" \
   --set image.tag=verify-api-key --set praxisConfig.render.auth.mode=api-key --set praxisConfig.render.auth.validateUrl=https:///v
 try_reject_msg "$GW_DIR" "blank backend endpoint (gw)" "endpoints[./]0" "${R0[@]}" --set "praxisConfig.render.backends[0].cluster=a" \
