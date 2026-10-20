@@ -73,4 +73,10 @@ pub trait SiteSignals {
 
     /// Publication serial and qualified learning epoch for a snapshot read.
     fn learning_state(&self, site: &str, cluster: &str, now_ms: i64, max_age_ms: i64) -> grid_signals::LearningState;
+
+    /// When this site's own operator last answered, `None` if it never has.
+    fn relay_heard_ms(&self) -> Option<i64>;
+
+    /// When the operator's last poll round that tried `site` ended, `None` if it reports none.
+    fn round_ms(&self, site: &str) -> Option<i64>;
 }

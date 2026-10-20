@@ -113,6 +113,11 @@ pub struct CandidateConfig {
     /// Capability name (model name, tool name, or agent name).
     pub name: String,
 
+    /// Whether its site publishes load for it, so a candidate never heard from is silent rather
+    /// than unmeasured. Absent means it does.
+    #[serde(default = "default_fresh")]
+    pub publishes_load: bool,
+
     /// Site that owns this capability.
     pub site: String,
 
@@ -136,6 +141,10 @@ fn default_fresh() -> bool {
 /// `Clone` is cheap: every owned field is reference counted. The refresh step clones
 /// the base set each poll cycle to re-order it by live load.
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent fact the operator or the snapshot resolves"
+)]
 pub struct RouteCandidate {
     /// Grid-operator admission state.
     pub admission_state: AdmissionState,
@@ -161,6 +170,10 @@ pub struct RouteCandidate {
     /// for `room_after_ms`. `None` when unmeasured. Resolved with `rho`.
     pub relieved: Option<bool>,
 
+    /// Whether the site published and then said nothing within the freshness window.
+    /// Resolved with `rho`.
+    pub silent: bool,
+
     /// Cluster name to select.
     pub cluster: Arc<str>,
 
@@ -176,6 +189,9 @@ pub struct RouteCandidate {
 
     /// Capability name.
     pub name: Arc<str>,
+
+    /// Whether its site publishes load for it.
+    pub publishes_load: bool,
 
     /// Grid-operator rank within the snapshot (lower is better).
     pub rank: Option<u32>,
@@ -269,11 +285,13 @@ fn validate_candidates_with_empty(
             backlog: None,
             full: None,
             relieved: None,
+            silent: false,
             cluster: Arc::from(cand.cluster.as_str()),
             credential: cand.credential,
             fresh: cand.fresh,
             kind: cand.kind,
             name: Arc::from(cand.name.as_str()),
+            publishes_load: cand.publishes_load,
             rank: None,
             selection_tier: None,
             site: Arc::from(cand.site.as_str()),
@@ -421,6 +439,7 @@ mod tests {
             fresh: true,
             kind,
             name: name.to_owned(),
+            publishes_load: true,
             site: site.to_owned(),
             stable_id: None,
         }
@@ -569,5 +588,13 @@ mod tests {
             AdmissionState::ExistingOnly
         );
         parse(&format!(r#"{{{base},"admission":"maybe"}}"#)).expect_err("an unknown admission is refused");
+    }
+
+    #[test]
+    fn publishes_load_parses_as_the_operator_writes_it_and_defaults_to_true() {
+        let parse = |json: &str| serde_yaml::from_str::<CandidateConfig>(json).map(|c| c.publishes_load);
+        let base = r#""kind":"inference_model","name":"m","site":"s","cluster":"c""#;
+        assert!(parse(&format!("{{{base}}}")).unwrap());
+        assert!(!parse(&format!(r#"{{{base},"publishes_load":false}}"#)).unwrap());
     }
 }

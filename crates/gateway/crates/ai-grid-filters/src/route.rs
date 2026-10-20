@@ -829,7 +829,9 @@ fn unserved(snapshot: &RouteSnapshot, model: &str, routable: impl Fn(&RouteCandi
 pub(crate) struct Pick<'snap> {
     /// The chosen candidate.
     pub(crate) candidate: &'snap RouteCandidate,
-    /// Whether it was demoted, chosen only because no healthy site was left.
+    /// Whether it was a fallback: a demoted site, chosen because no healthy one was left; a
+    /// silent one, because every healthy site was silent; or a peer that publishes no load,
+    /// because every site that does was silent.
     pub(crate) fallback: bool,
     /// The chosen site's decision counters.
     pub(crate) decisions: &'snap SiteDecisions,
@@ -1012,6 +1014,16 @@ pub(crate) fn select_spread<'snap>(
         // Demotion scores a candidate NaN: every healthy site is gone, so try the front one.
         return Some(Pick::new((front, front_decisions, front_score), true));
     }
+    // A silent site takes nothing while a live one can; when all are silent they take it, and the
+    // pick counts as a fallback. So does a pick of a peer that publishes no load while every site
+    // that does is silent: from here it cannot be told from one that cannot be scraped.
+    let live = Sites::gather(healthy.iter().filter(|(candidate, ..)| !candidate.silent));
+    let all_silent = live.len == 0
+        || (live.len < healthy.len
+            && live
+                .iter()
+                .all(|(candidate, ..)| !candidate.publishes_load && *candidate.site != *snapshot.local_site));
+    let healthy = if live.len > 0 { live } else { healthy };
     let room = Sites::gather(
         healthy
             .iter()
@@ -1027,7 +1039,7 @@ pub(crate) fn select_spread<'snap>(
     } else {
         kept
     };
-    select(&pool, spread && pressure_known, turn).map(|chosen| Pick::new(chosen, false))
+    select(&pool, spread && pressure_known, turn).map(|chosen| Pick::new(chosen, all_silent))
 }
 
 /// Keep queued but unsaturated sites ahead of saturated sites, then retain the not-full fallback.
@@ -1036,9 +1048,20 @@ fn overflow<'snap>(healthy: &Sites<'snap>) -> Sites<'snap> {
     if available.len > 0 {
         return available;
     }
-    let open = Sites::gather(healthy.iter().filter(|(candidate, ..)| candidate.full != Some(true)));
+    // A candidate whose site publishes no load is never the overflow an unmeasured site takes.
+    let open = Sites::gather(
+        healthy
+            .iter()
+            .filter(|(candidate, ..)| candidate.full != Some(true) && candidate.publishes_load),
+    );
     if open.len > 0 {
-        open
+        return open;
+    }
+    // A full site may publish held work but no queue, tying a no-load site's unmeasured score, so
+    // the last resort keeps to the sites that publish load while any remain.
+    let publishing = Sites::gather(healthy.iter().filter(|(candidate, ..)| candidate.publishes_load));
+    if publishing.len > 0 {
+        publishing
     } else {
         Sites::gather(healthy.iter())
     }
@@ -1252,6 +1275,7 @@ mod tests {
             fresh: true,
             kind: CapabilityKind::InferenceModel,
             name: model.to_owned(),
+            publishes_load: true,
             site: site.to_owned(),
             stable_id: None,
         }])
@@ -1289,6 +1313,7 @@ mod tests {
                     fresh: true,
                     kind: CapabilityKind::InferenceModel,
                     name: "llama".to_owned(),
+                    publishes_load: true,
                     site: (*site).to_owned(),
                 })
                 .collect(),
@@ -1418,6 +1443,7 @@ mod tests {
                     fresh: true,
                     kind: CapabilityKind::InferenceModel,
                     name: name.to_owned(),
+                    publishes_load: true,
                     site: "a".to_owned(),
                 })
                 .collect(),
@@ -1633,6 +1659,34 @@ mod tests {
         // One cluster left healthy is a routed pick, not a fallback.
         let one = BTreeSet::from([Arc::from("pool-a")]);
         assert_eq!(fallback(&two_sites(Some(1.0), Some(5.0)).demote(&one), 0), Some(false));
+    }
+
+    #[test]
+    fn a_full_site_keeps_the_last_resort_from_a_site_that_publishes_no_load() {
+        // East is full with work held but publishes no queue, so its score ties west's unmeasured one.
+        let mut candidates = one("llama", "east", "pool-a", AdmissionState::NewAndExisting);
+        candidates.extend(one("llama", "west", "pool-b", AdmissionState::NewAndExisting));
+        for candidate in &mut candidates {
+            if &*candidate.site == "east" {
+                candidate.full = Some(true);
+                candidate.backlog = Some(true);
+            } else {
+                candidate.publishes_load = false;
+            }
+        }
+        let snapshot = RouteSnapshot::from_static(candidates, Arc::from("hub"));
+        for turn in 0..20 {
+            let pick = select_spread(
+                &snapshot,
+                CapabilityKind::InferenceModel,
+                "llama",
+                turn,
+                |_| true,
+                &KeepAll,
+            )
+            .expect("a pick");
+            assert_eq!(&*pick.candidate.site, "east", "turn {turn}");
+        }
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::{
     collections::HashMap,
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -294,6 +294,8 @@ pub struct LoadStore {
     local_site: Option<Box<str>>,
     /// The clock every sample is held on and every read is made at.
     timeline: Timeline,
+    /// When this site's own operator last answered a poll, on the timeline; `i64::MIN` until it has.
+    relay_heard_ms: AtomicI64,
 }
 
 #[expect(
@@ -322,6 +324,7 @@ impl LoadStore {
             combine,
             local_site: None,
             timeline: Timeline::process(),
+            relay_heard_ms: AtomicI64::new(i64::MIN),
         }
     }
 
@@ -523,6 +526,9 @@ impl LoadStore {
             owner,
             local: self.local_site.as_deref() == Some(owner),
         };
+        if scrape.local {
+            self.relay_heard_ms.fetch_max(local_now_ms, Ordering::AcqRel);
+        }
         if let Some(max_age_ms) = self.revision_max_age_ms {
             return self.ingest_guarded(text, &scrape, max_age_ms);
         }
@@ -584,6 +590,12 @@ impl LoadStore {
     #[must_use]
     pub fn local_site(&self) -> Option<&str> {
         self.local_site.as_deref()
+    }
+
+    /// When this site's own operator last answered a poll, on the store's timeline.
+    #[must_use]
+    pub fn relay_heard_ms(&self) -> Option<i64> {
+        Some(self.relay_heard_ms.load(Ordering::Acquire)).filter(|at| *at != i64::MIN)
     }
 
     /// Now on this store's timeline: the `local_now_ms` to ingest at and the
@@ -824,6 +836,22 @@ mod tests {
                 value: 3.0
             },
             "value and time as reported"
+        );
+    }
+
+    #[test]
+    fn only_the_local_operator_answering_counts_as_the_relay() {
+        let store = LoadStore::new(Duration::from_secs(60)).with_local_site("here");
+        assert_eq!(store.relay_heard_ms(), None, "nothing heard yet");
+        let _ = store.ingest_at("", 1_000, 5_000, "elsewhere");
+        assert_eq!(store.relay_heard_ms(), None, "another site is not the relay");
+        let _ = store.ingest_at("", 1_000, 6_000, "here");
+        assert_eq!(store.relay_heard_ms(), Some(6_000), "an empty answer still counts");
+        let _ = store.ingest_at("", 1_000, 4_000, "here");
+        assert_eq!(
+            store.relay_heard_ms(),
+            Some(6_000),
+            "an older clock never moves it back"
         );
     }
 

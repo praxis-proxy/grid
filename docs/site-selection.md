@@ -28,6 +28,32 @@ Queue-only and saturated selection retain sites tied on the least queue depth.
 Selection excludes unready sites. A site demoted by gateway health checks is a last
 resort if it remains admitted.
 
+A site that has published and then sends nothing for the freshness window is silent.
+A peer is judged at the end of the operator's last poll round that tried it, and this
+site at the last read of its operator, so a stalled poller or relay pauses the judgement
+rather than silencing every peer. A peer whose operator reports no poll rounds is not
+judged. While any live site serves the model, a silent site takes no request, and
+shedding does not wait on it. It routes again after two new samples with no full window
+between them, about two peer polls, so one poll through a lossy link does not bring it
+back. When every site is silent they take the request, and the pick counts as a
+fallback.
+
+A peer candidate that publishes load and has sent nothing through a full window of
+rounds is silent too, so a gateway that starts during a partition does not send overflow
+to the partitioned site. A candidate publishes load unless it is this site's provider
+with no metrics to scrape, or a peer's provider that this operator has not received load
+rows for since it started.
+One that does not publish load is unmeasured, takes no overflow and never holds off
+shedding. After an operator restart during a partition, the partitioned site's
+candidates are unmeasured until it returns. A provider with `metricsConfig` whose
+scrape fails still publishes load: it goes silent and is routed around, and its
+`MetricsAvailable` condition is `False` with the scrape error.
+
+Known issue: from outside its site, the operator cannot tell a peer's provider that has
+no metrics from one it cannot scrape. When every candidate that publishes load is
+silent, a peer candidate with no load rows takes every pick. Those picks count as
+`reason="fallback"`.
+
 With `availability.shedding` on, a model sheds once every healthy site serving it has been at
 its ceiling with work waiting for `full_after_ms`, and routes again once no sample from a site
 has shown that for `room_after_ms`. A shed request gets 429 with `Retry-After`. A model with
@@ -89,6 +115,7 @@ failing and once when it recovers.
 | Symptom | Likely cause | Action |
 |---|---|---|
 | A site is never chosen | Zero ready endpoints, or its cluster has no healthy endpoint | Check `llm_d_epp_ready_endpoints` and the gateway's cluster health log line |
+| A site takes nothing though its engine is up | Its signals stopped reaching the gateway, so it is silent | `grid_route_site_silent` and `grid_route_site_last_sample_age_seconds`; a steady `grid_route_site_silent_transitions_total` rate is a lossy link |
 | Every remote site is unmeasured | The gateway's poll of its local operator is failing, or the operator is not collecting from peers | `grid_signals_poll_total` by result at the gateway; `grid_collection_up` and `grid_peer_signals_refused_total` at the operator |
 | A site's soft bound sits far below what its engine runs | It was queued whenever it ran high, so no queue-free sample taught it | Raise `explore_floor` |
 | A small or slow site takes little | Expected: picks follow measured ceilings, and two choices never pick the busiest of three | Nothing |

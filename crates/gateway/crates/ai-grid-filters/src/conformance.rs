@@ -232,6 +232,7 @@ fn config(spec: &SiteSpec) -> CandidateConfig {
         fresh: true,
         kind: CapabilityKind::InferenceModel,
         name: MODEL.to_owned(),
+        publishes_load: true,
         site: spec.site.to_owned(),
         stable_id: None,
     }
@@ -367,9 +368,8 @@ fn snapshot(sites: &[SiteSpec], run: &Run) -> RouteSnapshot {
             publish(&store, spec, run, phase);
         }
         let validated = validate_candidates(sites.iter().map(config).collect()).expect("candidates");
-        // Mirrors control.rs::order: from_store, then shed. `demote` is skipped because
-        // the harness registers no cluster health, and production skips it too until
-        // health is observed.
+        // Mirrors control.rs::order: from_store, then shed. `demote` is skipped because the
+        // harness registers no cluster health; its ordering is covered by the snapshot tests.
         RouteSnapshot::from_store(
             validated,
             Arc::from(sites[0].site),
@@ -817,6 +817,38 @@ mod tests {
                 "{stale_ms}ms past the window differs from signals absent"
             );
         }
+    }
+
+    /// One site silent while the rest stay live: it takes nothing, and the rest still spread.
+    #[test]
+    fn a_silent_site_takes_nothing_while_the_rest_are_live() {
+        let (silent, live) = UNEQUAL_LOAD.split_first().expect("sites");
+        let mut grid = Harness::new(WINDOW_MS);
+        publish_cool(&grid, &UNEQUAL_LOAD, NOW_MS, 8.0, 0.0);
+        let later = NOW_MS + WINDOW_MS + 1;
+        publish_cool(&grid, live, later, 8.0, 0.0);
+        let snapshot = grid.order(&UNEQUAL_LOAD, later);
+        assert_eq!(routed_to(&snapshot, silent.site), 0, "{} is silent", silent.site);
+        for site in live {
+            assert!(
+                routed_to(&snapshot, site.site) > 0,
+                "{} is live and keeps its share",
+                site.site
+            );
+        }
+    }
+
+    /// The negation: the same grid with that site still publishing routes to it, so the zero
+    /// above comes from its silence and not from the scenario.
+    #[test]
+    fn the_silent_scenario_routes_to_the_site_when_it_keeps_publishing() {
+        let silent = &UNEQUAL_LOAD[0];
+        let mut grid = Harness::new(WINDOW_MS);
+        publish_cool(&grid, &UNEQUAL_LOAD, NOW_MS, 8.0, 0.0);
+        let later = NOW_MS + WINDOW_MS + 1;
+        publish_cool(&grid, &UNEQUAL_LOAD, later, 8.0, 0.0);
+        let snapshot = grid.order(&UNEQUAL_LOAD, later);
+        assert!(routed_to(&snapshot, silent.site) > 0);
     }
 
     /// The negation. With saturation off the wire there is no load to read at any age,
@@ -1753,10 +1785,19 @@ mod tests {
                 "entirely stale pressure remains a fallback"
             );
             publish_partial(&grid, &sites[1], expired_at, Some(0.0), Some(0.0), Some(0.3), Some(1.0));
-            let recovered = grid.order(sites, expired_at);
+            let returning = grid.order(sites, expired_at);
+            assert_eq!(
+                routed_to(&returning, sites[1].site),
+                0,
+                "one sample after silence is not a return"
+            );
+            let again_at = expired_at + 1_000;
+            publish_cool(&grid, &sites[..1], again_at, 20.0, 0.0);
+            publish_partial(&grid, &sites[1], again_at, Some(0.0), Some(0.0), Some(0.3), Some(1.0));
+            let recovered = grid.order(sites, again_at);
             assert!(
                 routed_to(&recovered, sites[1].site) > 0,
-                "fresh clear signals restore participation"
+                "a second fresh clear sample restores participation"
             );
             let restored = recovered
                 .candidates

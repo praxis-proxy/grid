@@ -883,6 +883,7 @@ mod tests {
             fresh: true,
             kind: CapabilityKind::InferenceModel,
             name: "llama".to_owned(),
+            publishes_load: true,
             site: site.to_owned(),
             stable_id: None,
         }

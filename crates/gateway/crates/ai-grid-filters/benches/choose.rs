@@ -42,6 +42,7 @@ enum Shape {
 }
 
 /// `sites` candidates serving `llama` with the selected pressure pattern.
+#[expect(clippy::too_many_lines, reason = "one candidate literal spelled field by field")]
 fn snapshot(sites: u32, shape: Shape) -> RouteSnapshot {
     let candidates = (1..=sites)
         .map(|index| {
@@ -55,11 +56,13 @@ fn snapshot(sites: u32, shape: Shape) -> RouteSnapshot {
                 backlog: Some(matches!(shape, Shape::Backlogged)),
                 full: None,
                 relieved: None,
+                silent: false,
                 cluster: Arc::from(format!("pool-{index}")),
                 credential: None,
                 fresh: true,
                 kind: CapabilityKind::InferenceModel,
                 name: Arc::from("llama"),
+                publishes_load: true,
                 rank: None,
                 selection_tier: None,
                 site: Arc::clone(&site),

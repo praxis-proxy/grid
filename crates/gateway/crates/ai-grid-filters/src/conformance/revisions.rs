@@ -636,6 +636,14 @@ impl crate::signals::SiteSignals for ReplacingSignals<'_> {
         self.store
             .learning_state(&LoadStore::key(site, cluster), now_ms, max_age_ms)
     }
+
+    fn relay_heard_ms(&self) -> Option<i64> {
+        self.store.relay_heard_ms()
+    }
+
+    fn round_ms(&self, site: &str) -> Option<i64> {
+        crate::signals::SiteSignals::round_ms(self.store, site)
+    }
 }
 
 /// Wire identity independent of sample values and sample time.

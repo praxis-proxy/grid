@@ -130,6 +130,10 @@ state, so two replicas agree only in steady state.
 | `grid_route_site_in_flight` | gauge | `site`, `cluster` | Requests held in the reading used by the decision. |
 | `grid_route_site_full` | gauge | `site`, `cluster` | 1 after a backlog at the ceiling spans `full_after_ms`, 0 otherwise, `NaN` without a queue signal. |
 | `grid_route_site_reading_age_seconds` | gauge | `site`, `cluster` | Age of the newest sample used by the decision. |
+| `grid_route_site_silent` | gauge | `site`, `cluster` | 1 while a site that has published has sent nothing within the freshness window, until it sends two new samples; it takes no request while a live site can. 0 otherwise. |
+| `grid_route_site_silent_transitions_total` | counter | `site`, `cluster`, `to` | Sites entering (`silent`) or leaving (`live`) silence. A steady rate is a flapping link. |
+| `grid_route_site_last_sample_age_seconds` | gauge | `site`, `cluster` | Seconds since the site's newest sample. Unlike `grid_route_site_reading_age_seconds`, which goes `NaN` once the sample leaves the freshness window, this keeps counting. |
+| `grid_route_site_round_age_seconds` | gauge | `site`, `cluster` | Seconds since the operator's last poll round that tried this peer; a peer's silence is judged at that round. `NaN` for this site or when the operator reports no rounds. A growing value with the poller running is a stalled poller, under which no peer goes silent. |
 | `grid_route_site_score` | gauge | `site`, `cluster` | Score the site ranks by in the current snapshot. |
 | `grid_route_shedding` | gauge | `model` | 1 while the gateway sheds this model, 0 otherwise. |
 | `grid_route_prefix_affinity_total` | counter | `outcome` | Prefix-affinity decisions by outcome. |

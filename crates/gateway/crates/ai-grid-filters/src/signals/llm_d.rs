@@ -135,6 +135,15 @@ pub(crate) struct Mapped<'store> {
 }
 
 impl SiteSignals for Mapped<'_> {
+    fn relay_heard_ms(&self) -> Option<i64> {
+        self.store.relay_heard_ms()
+    }
+
+    fn round_ms(&self, site: &str) -> Option<i64> {
+        self.store
+            .newest_at(&LoadStore::key(site, grid_signals::poller::PROVIDER))
+    }
+
     fn learning_state(&self, site: &str, cluster: &str, now_ms: i64, max_age_ms: i64) -> grid_signals::LearningState {
         self.store
             .learning_state(&LoadStore::key(site, cluster), now_ms, max_age_ms)
@@ -356,6 +365,14 @@ impl Mapped<'_> {
 
 /// The store read under the llm-d mapping.
 impl SiteSignals for LoadStore {
+    fn relay_heard_ms(&self) -> Option<i64> {
+        Self::relay_heard_ms(self)
+    }
+
+    fn round_ms(&self, site: &str) -> Option<i64> {
+        self.newest_at(&Self::key(site, grid_signals::poller::PROVIDER))
+    }
+
     fn learning_state(&self, site: &str, cluster: &str, now_ms: i64, max_age_ms: i64) -> grid_signals::LearningState {
         self.learning_state(&LoadStore::key(site, cluster), now_ms, max_age_ms)
     }
