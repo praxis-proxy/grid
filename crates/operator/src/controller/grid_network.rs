@@ -4948,7 +4948,7 @@ fn log_capacity_changes(logged: &ChangeLog, network: &str, providers: &[Inferenc
 /// advances on spec and status writes, and falls back to `metadata.generation`
 /// when no parseable resource version is present.  Equal revisions break ties
 /// via `writer_id`, which is the advertising SWIM site identity.
-fn provider_state_from_kube(
+pub(crate) fn provider_state_from_kube(
     provider: &InferenceProvider,
     network_id: &str,
     site_id: &str,

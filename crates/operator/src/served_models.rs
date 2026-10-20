@@ -890,6 +890,50 @@ mod tests {
     }
 
     #[test]
+    fn fresh_discovered_inventory_is_not_routed_or_gossiped() {
+        let provider = discovery_provider("p", &serde_json::json!({}));
+        let store = ServedModelStore::new();
+        refresh(&store, round(&[("p", Some(&["discovered"]))]), TTL);
+        let inventory = store.select_for(&provider).unwrap_or_else(|| std::process::abort());
+        assert!(!inventory.is_static(), "the fixture must hold discovered inventory");
+        assert_eq!(
+            inventory.models.as_ref(),
+            &["discovered".to_owned()],
+            "the fixture must expose the discovered model"
+        );
+        let network: crate::crd::grid_network::GridNetwork = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": "net" },
+            "spec": { "seeds": [], "gridId": "test-id" }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let overlay = crate::resources::routing_overlay::render_routing_overlay_with_admission(
+            &network,
+            &[],
+            std::slice::from_ref(&provider),
+            &[],
+            &[],
+            "site-a",
+            None,
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+            None,
+            &store,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let state = crate::controller::grid_network::provider_state_from_kube(&provider, "net", "site-a", None, &store)
+            .unwrap_or_else(|| std::process::abort());
+
+        assert!(
+            overlay.candidates.is_empty(),
+            "fresh discovered models must not produce routing candidates"
+        );
+        assert!(state.models.is_empty(), "fresh discovered models must not be gossiped");
+    }
+
+    #[test]
     fn failures_map_to_reasons() {
         assert_eq!(
             PollError::Credential(String::new()).as_reason(),
