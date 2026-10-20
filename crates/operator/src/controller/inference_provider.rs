@@ -54,7 +54,7 @@
 //! [`GridNetwork`]: crate::crd::grid_network::GridNetwork
 //! [`GridSite`]: crate::crd::grid_site::GridSite
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use credentials::CredentialPlan;
@@ -67,7 +67,7 @@ use hyper_util::{client::legacy::Client as HyperClient, rt::TokioExecutor};
 use kube::{
     Client,
     api::{Api, ListParams, Patch, PatchParams},
-    runtime::controller::Action,
+    runtime::{controller::Action, watcher},
 };
 use tracing::info;
 
@@ -792,6 +792,66 @@ fn hosting_sites(provider: &InferenceProvider, sites: &[GridSite], local_site: O
 // Status Update
 // ---------------------------------------------------------------------------
 
+/// What a provider matches a [`GridSite`] on: its generation, labels, and gossiped site id.
+type MatchedOn = (Option<i64>, Option<BTreeMap<String, String>>, Option<String>);
+
+/// What each [`GridSite`] last looked like to a provider.
+#[derive(Debug, Default)]
+pub struct SiteMatchInputs(BTreeMap<String, MatchedOn>);
+
+impl SiteMatchInputs {
+    /// Whether a [`GridSite`] watch event changes which sites providers can match.
+    ///
+    /// A provider resolves `status.matchingSites` from the spec, labels and site-id annotation of
+    /// the `GridSite`s in its network, so a site appearing, going away, or changing any of them
+    /// leaves every provider's list stale until something else touches it. A status write changes
+    /// none, and with a probe, phase and verification time per site it is most of the traffic.
+    ///
+    /// A list starts afresh, so a site deleted inside a watch gap is not held, and the completed
+    /// list re-resolves once, since a relist after a gap looks the same as the first list.
+    pub fn affects_providers(&mut self, event: &watcher::Event<GridSite>) -> bool {
+        match event {
+            watcher::Event::Apply(site) => self.observe(site),
+            watcher::Event::InitApply(site) => {
+                self.observe(site);
+                false
+            },
+            watcher::Event::Delete(site) => {
+                self.0.remove(&site_key(site));
+                true
+            },
+            watcher::Event::Init => {
+                self.0.clear();
+                false
+            },
+            // A relist after a watch gap ends the same way, and a site that changed inside the
+            // gap raises no event of its own, so each completed list re-resolves once.
+            watcher::Event::InitDone => true,
+        }
+    }
+
+    /// Record `site`, returning whether what providers match it on differs from what was held.
+    fn observe(&mut self, site: &GridSite) -> bool {
+        let site_id = site
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(crate::controller::grid_network::ANNOTATION_SITE_ID))
+            .cloned();
+        let inputs = (site.metadata.generation, site.metadata.labels.clone(), site_id);
+        self.0.insert(site_key(site), inputs.clone()) != Some(inputs)
+    }
+}
+
+/// A site's identity across its watch events.
+fn site_key(site: &GridSite) -> String {
+    site.metadata
+        .uid
+        .clone()
+        .or_else(|| site.metadata.name.clone())
+        .unwrap_or_default()
+}
+
 /// Patch the [`InferenceProvider`] status subresource.
 ///
 /// # Errors
@@ -912,6 +972,72 @@ mod tests {
             baseline.matches_reconciler_status(&changed_conditions),
             "the signals loop owns conditions"
         );
+    }
+
+    #[test]
+    fn a_site_appearing_or_going_away_re_resolves_providers() {
+        let mut inputs = SiteMatchInputs::default();
+        let site = test_site("site-e", "grid");
+        assert!(inputs.affects_providers(&watcher::Event::Apply(site.clone())));
+        assert!(inputs.affects_providers(&watcher::Event::Delete(site)));
+    }
+
+    #[test]
+    fn a_site_list_re_resolves_once_when_it_completes() {
+        let mut inputs = SiteMatchInputs::default();
+        let site = test_site("site-e", "grid");
+        assert!(!inputs.affects_providers(&watcher::Event::Init));
+        assert!(!inputs.affects_providers(&watcher::Event::InitApply(site.clone())));
+        assert!(
+            inputs.affects_providers(&watcher::Event::InitDone),
+            "a relist after a gap may hold changes no event announced"
+        );
+        assert!(
+            !inputs.affects_providers(&watcher::Event::Apply(site)),
+            "the listed site, unchanged"
+        );
+    }
+
+    #[test]
+    fn only_a_spec_or_label_change_re_resolves_providers() {
+        let mut inputs = SiteMatchInputs::default();
+        let mut site = test_site("site-e", "grid");
+        site.metadata.generation = Some(1);
+        assert!(!inputs.affects_providers(&watcher::Event::InitApply(site.clone())));
+
+        let mut status_only = site.clone();
+        status_only.metadata.resource_version = Some("2".to_owned());
+        assert!(
+            !inputs.affects_providers(&watcher::Event::Apply(status_only)),
+            "a status write re-resolves nothing"
+        );
+
+        let mut spec = site;
+        spec.metadata.generation = Some(2);
+        assert!(inputs.affects_providers(&watcher::Event::Apply(spec.clone())));
+
+        let mut relabelled = spec;
+        relabelled.metadata.labels = Some(BTreeMap::from([("tier".to_owned(), "gpu".to_owned())]));
+        assert!(inputs.affects_providers(&watcher::Event::Apply(relabelled.clone())));
+
+        let mut renamed = relabelled;
+        renamed.metadata.annotations = Some(BTreeMap::from([(
+            crate::controller::grid_network::ANNOTATION_SITE_ID.to_owned(),
+            "site-f".to_owned(),
+        )]));
+        assert!(
+            inputs.affects_providers(&watcher::Event::Apply(renamed)),
+            "a discovered stub's gossiped site id is what providers key it on"
+        );
+    }
+
+    #[test]
+    fn a_relist_forgets_a_site_deleted_inside_the_gap() {
+        let mut inputs = SiteMatchInputs::default();
+        let gone = test_site("site-e", "grid");
+        assert!(inputs.affects_providers(&watcher::Event::Apply(gone)));
+        assert!(!inputs.affects_providers(&watcher::Event::Init));
+        assert!(inputs.0.is_empty(), "the relist starts from nothing");
     }
 
     // -----------------------------------------------------------------------
@@ -1070,7 +1196,7 @@ mod tests {
     }
 
     fn secret_with_key(key: &str, value: &[u8]) -> Secret {
-        let mut data = std::collections::BTreeMap::new();
+        let mut data = BTreeMap::new();
         data.insert(key.to_owned(), ByteString(value.to_vec()));
         Secret {
             data: Some(data),
@@ -1976,7 +2102,7 @@ mod tests {
             "net",
             &[(crate::controller::grid_network::LABEL_AUTO_DISCOVERED, "true")],
         );
-        stub.metadata.annotations = Some(std::collections::BTreeMap::from([(
+        stub.metadata.annotations = Some(BTreeMap::from([(
             crate::controller::grid_network::ANNOTATION_SITE_ID.to_owned(),
             "site-d".to_owned(),
         )]));

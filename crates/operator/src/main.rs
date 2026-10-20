@@ -1421,10 +1421,10 @@ async fn run_site_controller(client: Client) -> Result<(), Box<dyn std::error::E
 
 /// Run the [`InferenceProvider`] controller (OP-02).
 ///
-/// Watches `InferenceProvider` resources.  Metrics TLS rotation is detected
-/// by bounded requeue rather than a cluster-wide Secret watch; the operator
-/// only reads referenced Secrets by explicit namespace/name during
-/// reconciliation.
+/// Watches `InferenceProvider` resources, and every `GridSite` because providers resolve
+/// `status.matchingSites` from them. Metrics TLS rotation is detected by bounded requeue
+/// rather than a cluster-wide Secret watch; the operator only reads referenced Secrets by
+/// explicit namespace/name during reconciliation.
 ///
 /// [`InferenceProvider`]: operator::crd::inference_provider::InferenceProvider
 async fn run_provider_controller(
@@ -1432,8 +1432,16 @@ async fn run_provider_controller(
     local_site: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api = Api::<InferenceProvider>::all(client.clone());
+    let site_api = Api::<GridSite>::all(client.clone());
+
+    // A site is not addressable as one provider, so a change re-resolves them all.
+    let mut inputs = inference_provider::SiteMatchInputs::default();
+    let site_events = watcher(site_api, watcher::Config::default()).filter_map(move |event| {
+        std::future::ready(event.ok().filter(|event| inputs.affects_providers(event)).map(|_| ()))
+    });
 
     Controller::new(api, watcher::Config::default())
+        .reconcile_all_on(site_events)
         .run(
             inference_provider::reconcile,
             inference_provider::error_policy,
