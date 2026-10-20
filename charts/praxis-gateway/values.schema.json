@@ -388,6 +388,14 @@
                       "unhealthyThreshold": {
                         "type": "integer",
                         "minimum": 1
+                      },
+                      "passiveUnhealthyThreshold": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "passiveHealthyThreshold": {
+                        "type": "integer",
+                        "minimum": 1
                       }
                     }
                   },
@@ -562,6 +570,14 @@
                     "minimum": 1
                   },
                   "unhealthyThreshold": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "passiveUnhealthyThreshold": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "passiveHealthyThreshold": {
                     "type": "integer",
                     "minimum": 1
                   }

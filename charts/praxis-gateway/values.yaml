@@ -285,7 +285,9 @@ gatewayConfig:
   # with sni set to the Service DNS name. plaintext is cleartext.
   # The health_check type defaults to tcp for TLS transports (the active http probe is
   # plaintext and cannot reach a TLS peer) and http for plaintext. Override per backend
-  # with healthCheck.type.
+  # with healthCheck.type. A mutual_tls backend, another site's gateway, defaults to
+  # connectTimeoutMs 2000, totalConnectTimeoutMs 4000 and a probe every 3s; other backends
+  # probe every 5s with praxis's connect timeouts. Every probe times out at 2s.
   # Keyed by site. For a provider, local is its one local backend. The older list of
   # {cluster, endpoints, ...} still renders.
   # backends:

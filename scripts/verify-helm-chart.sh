@@ -729,8 +729,8 @@ if echo "$SECURE_RENDER" | matches 'sni: "site-a.grid.internal"' && echo "$SECUR
 else
   fail "secure config: mutual_tls backend missing sni/verify"
 fi
-# site-b is plaintext and last: the first tls: after its stanza must not exist.
-if awk '/- name: "site-b"/{f=1} f&&/[^-] tls:/{print; exit}' <<<"$SECURE_RENDER" | matches 'tls:'; then
+# site-b is plaintext: no tls: inside any of its stanzas, which end at the next list item.
+if awk '/- name: "site-b"/{f=1; next} f&&/- /{f=0} f&&/[^-] tls:/{print; exit}' <<<"$SECURE_RENDER" | matches 'tls:'; then
   fail "secure config: plaintext backend must not render a tls block"
 else
   pass "secure config: plaintext backend renders no tls block"

@@ -49,6 +49,14 @@ candidates are unmeasured until it returns. A provider with `metricsConfig` whos
 scrape fails still publishes load: it goes silent and is routed around, and its
 `MetricsAvailable` condition is `False` with the scrape error.
 
+A site that returns from a partition takes requests again once both its signals have
+returned and its backend passes its health check, whichever is later. Silence clears
+after two new samples, about two peer polls; a `mutual_tls` backend is probed every 3 s
+and comes up after two passes. While both are down on every site, the front candidate
+is tried as a last resort. Requests already sent to a site when it goes down wait out
+the connect timeout, 2 s by default for a remote site, until grid#419 retries them on
+another site.
+
 Known issue: from outside its site, the operator cannot tell a peer's provider that has
 no metrics from one it cannot scrape. When every candidate that publishes load is
 silent, a peer candidate with no load rows takes every pick. Those picks count as
