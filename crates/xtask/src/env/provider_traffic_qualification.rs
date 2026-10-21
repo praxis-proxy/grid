@@ -3947,7 +3947,7 @@ fn activate_generated_consumer_config() -> Result<serde_json::Value, Box<dyn std
                 .flatten()
         })
         .any(|mount| {
-            mount.get("name").and_then(serde_json::Value::as_str) == Some("credential-vcr-inference-credential")
+            mount.get("name").and_then(serde_json::Value::as_str) == Some("credential-0")
                 && mount.get("mountPath").and_then(serde_json::Value::as_str)
                     == Some("/run/secrets/grid-credentials/grid-system/vcr-inference-credential")
                 && mount.get("readOnly").and_then(serde_json::Value::as_bool) == Some(true)
