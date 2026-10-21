@@ -896,26 +896,49 @@ const DERIVED_RENDER_GOLDEN: &str = include_str!("../../../../gateway/tests/test
 /// crate builds together with [`DERIVED_RENDER_GOLDEN`].
 const DERIVED_OVERLAY_GOLDEN: &str = include_str!("../../../../gateway/tests/testdata/routing-overlay-derived.json");
 
-/// The routing overlay both derived fixtures are produced from.
+/// The providers both derived fixtures are rendered from.
+fn derived_providers() -> Vec<InferenceProvider> {
+    vec![
+        provider("prov-a", "https://model-a.models.svc:8443", None),
+        provider("prov-b", "https://model-b.models.svc:8443", None),
+    ]
+}
+
+/// The one site both derived fixtures place every candidate at.
+fn derived_sites() -> Vec<GridSite> {
+    vec![site("site-a", None)]
+}
+
+/// The routing overlay both derived fixtures are produced from, rendered the
+/// way the controller renders it so every candidate carries the admission
+/// state, locality tier and stable id that Praxis validates at load.
 fn derived_overlay() -> crate::resources::routing_overlay::RoutingOverlay {
-    crate::resources::routing_overlay::RoutingOverlay {
-        network: "net".to_owned(),
-        local_site: "site-a".to_owned(),
-        candidates: vec![candidate("prov-a", "site-a"), candidate("prov-b", "site-a")],
-        excluded: Vec::new(),
-        selection_policy: None,
-        generated_at: None,
-    }
+    let network: crate::crd::grid_network::GridNetwork = serde_json::from_value(serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": "net" },
+        "spec": { "seeds": [] }
+    }))
+    .expect("network");
+    crate::resources::routing_overlay::render_routing_overlay(
+        &network,
+        &derived_sites(),
+        &derived_providers(),
+        &[],
+        &[],
+        "site-a",
+        None,
+        None,
+        &scoring::ScoringWeights::default(),
+    )
+    .expect("overlay")
 }
 
 #[test]
 #[expect(clippy::too_many_lines, reason = "the render takes every renderer input")]
 fn a_derived_tls_render_matches_the_fixture_praxis_loads() {
-    let providers = vec![
-        provider("prov-a", "https://model-a.models.svc:8443", None),
-        provider("prov-b", "https://model-b.models.svc:8443", None),
-    ];
-    let sites = vec![site("site-a", None)];
+    let providers = derived_providers();
+    let sites = derived_sites();
     let overlay = derived_overlay();
     let transport = declared(None, Some("models-ca"));
     let resolution = resolve(

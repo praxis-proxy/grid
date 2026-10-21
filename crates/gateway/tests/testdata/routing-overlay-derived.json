@@ -3,11 +3,11 @@
   "revision": {
     "kind": "content_addressed",
     "algorithm": "sha256",
-    "value": "8b76f19d51af88c8f58ce179b466cee6287205fcfb35b7e854dc211b74645f66"
+    "value": "a64db5eab2b149cc2864fd62b66ba5b8eb726b37f8a327aea9e8cf14ccc0ebe5"
   },
   "content_digest": {
     "algorithm": "sha256",
-    "value": "8b76f19d51af88c8f58ce179b466cee6287205fcfb35b7e854dc211b74645f66"
+    "value": "a64db5eab2b149cc2864fd62b66ba5b8eb726b37f8a327aea9e8cf14ccc0ebe5"
   },
   "scope": {
     "network": "net",
@@ -32,14 +32,44 @@
         "name": "model-x",
         "site": "site-a",
         "cluster": "prov-a",
-        "fresh": true
+        "fresh": true,
+        "stable_id": "d46cf009",
+        "admission_state": "new_and_existing",
+        "selection_tier": "same_site",
+        "score": 7.0,
+        "score_breakdown": {
+          "locality": 1.5,
+          "queue_depth": 1.5,
+          "kv_cache": 1.0,
+          "prefix_cache": 1.0,
+          "latency": 1.0,
+          "cost": 1.0,
+          "total": 7.0
+        },
+        "rank": 0,
+        "selection_group": 0
       },
       {
         "kind": "inference_model",
         "name": "model-x",
         "site": "site-a",
         "cluster": "prov-b",
-        "fresh": true
+        "fresh": true,
+        "stable_id": "d16ceb50",
+        "admission_state": "new_and_existing",
+        "selection_tier": "same_site",
+        "score": 7.0,
+        "score_breakdown": {
+          "locality": 1.5,
+          "queue_depth": 1.5,
+          "kv_cache": 1.0,
+          "prefix_cache": 1.0,
+          "latency": 1.0,
+          "cost": 1.0,
+          "total": 7.0
+        },
+        "rank": 1,
+        "selection_group": 0
       }
     ]
   }
