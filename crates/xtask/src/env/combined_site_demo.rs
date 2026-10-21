@@ -7678,7 +7678,7 @@ fn capture_deployment_image(
     }
 }
 
-/// Read a deployment's first container image reference from its Kubernetes context.
+/// Read a deployment's Praxis container image reference from its Kubernetes context.
 fn read_deployment_image(context: &str, deployment: &str) -> Result<String, String> {
     let output = Command::new("kubectl")
         .args([
@@ -7689,7 +7689,7 @@ fn read_deployment_image(context: &str, deployment: &str) -> Result<String, Stri
             "-n",
             "grid-system",
             "-o",
-            "jsonpath={.spec.template.spec.containers[0].image}",
+            r#"jsonpath={.spec.template.spec.containers[?(@.name=="praxis")].image}"#,
         ])
         .output()
         .map_err(|error| format!("could not start kubectl: {error}"))?;
