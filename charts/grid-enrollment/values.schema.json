@@ -511,7 +511,7 @@
       "additionalProperties": false
     },
     "invites": {
-      "description": "Sites to invite, keyed by site name, or the older list of {siteName, gridNetworkRef, expiresInSecs}.",
+      "description": "Sites for Helm-hook invitations and optional ACM delivery; use SiteInvite resources for GitOps-managed invitations.",
       "type": [
         "object",
         "array"

@@ -253,17 +253,13 @@ db:
     caConfigMapName: ""
     caConfigMapKey: ca.crt
 
-# -- Sites to invite, keyed by site name: network (default grid), expiresInSecs,
-# allowDeletedName to invite a site whose enrollment was deleted, and
-# cluster when the ManagedCluster is named something other than the site. Each run skips
-# sites whose invite Secret exists. The older list of {siteName, gridNetworkRef,
-# expiresInSecs} still renders.
+# -- Helm-hook invites for existing ACM deployments. Use SiteInvite for GitOps.
 # invites:
 #   site-a:
 #     network: grid
 #     cluster: prod-01
 
-# -- ACM Policy delivering each invited site its token, the CA bundle and the gossip key.
+# -- ACM Policy delivering each Helm-hook invite its token, CA bundle, and gossip key.
 # The site names come from `invites`, so they are not restated here.
 invitePolicy:
   # -- Render the policy. Needs ACM on this cluster and the sites imported.
