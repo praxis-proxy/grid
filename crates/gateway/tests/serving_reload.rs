@@ -249,7 +249,7 @@ mod tests {
         fn start(work: &Path, serving: &Mount) -> Self {
             let (listen, admin) = (free_port(), free_port());
             let config = format!(
-                "admin:\n  address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: static_response\n        status: 200\n"
+                "admin:\n  metrics_address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: static_response\n        status: 200\n"
             );
             Self::start_with_config(work, serving, listen, admin, &config)
         }
@@ -416,7 +416,7 @@ mod tests {
         let (listen, admin) = (free_port(), free_port());
         let config = |tls: &str| {
             format!(
-                "insecure_options:\n  allow_private_endpoints: true\nadmin:\n  address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: grid_site_route\n        model_header: X-Model\n      - filter: load_balancer\n        clusters:\n          - name: pool-east\n{tls}            endpoints: [\"{addr}\"]\n",
+                "insecure_options:\n  allow_private_endpoints: true\nadmin:\n  metrics_address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: grid_site_route\n        model_header: X-Model\n      - filter: load_balancer\n        clusters:\n          - name: pool-east\n{tls}            endpoints: [\"{addr}\"]\n",
                 addr = backend.addr
             )
         };

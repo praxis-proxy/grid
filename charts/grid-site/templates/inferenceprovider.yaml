@@ -15,8 +15,8 @@ spec:
   {{- with .capacityWeight }}
   capacityWeight: {{ . }}
   {{- end }}
-  {{- with .routingClusterRef }}
-  routingClusterRef: {{ . | quote }}
+  {{- with .clusterName }}
+  clusterName: {{ . | quote }}
   {{- end }}
   {{- with .siteSelector }}
   siteSelector:
@@ -46,8 +46,8 @@ spec:
   metricsConfig:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-  {{- with .gatewayRef }}
-  gatewayRef: {{ . | quote }}
+  {{- with .providerGateway }}
+  providerGateway: {{ . | quote }}
   {{- end }}
   {{- with .trafficPolicy }}
   trafficPolicy:

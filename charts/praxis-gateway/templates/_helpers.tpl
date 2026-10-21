@@ -36,6 +36,7 @@ otherwise config.inline serves.
 {{- if and (not ($v.config).existingConfigMap) $gridRouting }}{{- $_ := set $cfg "render" true }}{{- end }}
 {{- if not $v.service.type }}{{- $_ := set $v.service "type" (ternary "LoadBalancer" "ClusterIP" $provider) }}{{- end }}
 {{- if hasSuffix "/grid-gateway" $v.image.repository }}{{- $_ := set $v.image "flavor" "grid-gateway" }}{{- end }}
+{{- include "praxis-gateway.resolveMetricsListener" . }}
 {{- $t := $cfg.peerTrust | default dict }}
 {{- $digests := concat ($t.certDigests | default list) (compact (list $t.digest $t.nextDigest)) | uniq }}
 {{- $ids := concat ($t.spiffeIds | default list) (compact (list $t.spiffeId)) | uniq }}
@@ -461,6 +462,35 @@ The operator's serving config ConfigMap for this gateway: grid-serving-<network>
 {{- end -}}
 {{- end }}
 
+{{/* Service annotations, the platform's merged under the Service's own. Only a LoadBalancer gets the platform's. */}}
+{{- define "praxis-gateway.serviceAnnotations" -}}
+{{- $svc := .Values.service -}}
+{{- $own := $svc.annotations | default dict -}}
+{{- $platform := dict -}}
+{{- $cloud := .Values.platform | default "" -}}
+{{- $internal := eq (.Values.loadBalancerScope | default "internal") "internal" -}}
+{{- if eq $svc.type "LoadBalancer" -}}
+{{- /* Each cloud reads only its own keys, so "any" carries all of them. */ -}}
+{{- if has $cloud (list "aws" "any") -}}
+{{- $_ := set $platform "service.beta.kubernetes.io/aws-load-balancer-type" "nlb" -}}
+{{- /* Explicit false: the AWS Load Balancer Controller treats an absent annotation as internal. */ -}}
+{{- $_ := set $platform "service.beta.kubernetes.io/aws-load-balancer-internal" (toString $internal) -}}
+{{- end -}}
+{{- if and $internal (has $cloud (list "azure" "any")) -}}
+{{- $_ := set $platform "service.beta.kubernetes.io/azure-load-balancer-internal" "true" -}}
+{{- end -}}
+{{- if and $internal (has $cloud (list "gcp" "any")) -}}
+{{- $_ := set $platform "networking.gke.io/load-balancer-type" "Internal" -}}
+{{- /* Sites sit in different regions, and a GCP internal load balancer serves only its own without this. */ -}}
+{{- $_ := set $platform "networking.gke.io/internal-load-balancer-allow-global-access" "true" -}}
+{{- end -}}
+{{- end -}}
+{{- $merged := merge (deepCopy $own) $platform -}}
+{{- if $merged }}
+{{- toYaml $merged }}
+{{- end }}
+{{- end -}}
+
 {{/*
 Listener port name: port.name when set, else https when the listener terminates TLS.
 */}}
@@ -561,7 +591,8 @@ config, else config.inline. An existingConfigMap is opaque, so it yields nothing
 {{- if $v.gatewayConfig.render -}}
 {{- $addr = include "praxis-gateway.renderedAdminAddress" . -}}
 {{- else if not ($v.config).existingConfigMap -}}
-{{- $addr = (((fromYaml (($v.config).inline | default "")).admin | default dict).address | default "") | toString -}}
+{{- $admin := ((fromYaml (($v.config).inline | default "")).admin | default dict) -}}
+{{- $addr = ($admin.metrics_address | default $admin.address | default "") | toString -}}
 {{- end -}}
 {{- if regexMatch "^(127\\.0\\.0\\.1|localhost|0\\.0\\.0\\.0):[0-9]+$" $addr -}}
 {{- printf "127.0.0.1:%s" (regexReplaceAll "^.*:" $addr "") -}}
@@ -630,6 +661,51 @@ RUST_LOG for the gateway and overlay-sync: log.filter when set, else log.level, 
 {{- define "praxis-gateway.rustLog" -}}
 {{- $log := .Values.log | default dict -}}
 {{- $log.filter | default $log.level -}}
+{{- end }}
+
+{{/*
+Resolve metricsListener.enabled and serviceMonitor.enabled to booleans. auto turns the
+listener on for the grid-gateway image on OpenShift with the NetworkPolicy on, and fills
+each unset value from the platform: a service serving cert, user workload monitoring, and
+the service CA. Off OpenShift no cert source exists by default, so auto stays off.
+*/}}
+{{- define "praxis-gateway.resolveMetricsListener" -}}
+{{- $v := .Values }}
+{{- $m := $v.metricsListener }}
+{{- if eq (toString $m.enabled) "auto" }}
+{{- $openshift := include "praxis-gateway.openshift" . }}
+{{- $grid := eq $v.image.flavor "grid-gateway" }}
+{{- $on := and $grid $openshift $v.networkPolicy.enabled }}
+{{- $_ := set $m "enabled" (not (empty $on)) }}
+{{- if and $grid $openshift (not $v.networkPolicy.enabled) }}
+{{- $_ := set $m "skipped" "networkPolicy.enabled is false" }}
+{{- end }}
+{{- if $m.enabled }}
+{{- if not $m.existingSecret }}
+{{- $annotations := $m.service.annotations | default dict }}
+{{- /* The annotation names the Secret the platform creates, so the mount follows it. */}}
+{{- $named := index $annotations "service.beta.openshift.io/serving-cert-secret-name" }}
+{{- $secret := $named | default (printf "%s-metrics-tls" (include "praxis-gateway.fullname" .)) }}
+{{- $_ := set $m "existingSecret" $secret }}
+{{- $_ := set $annotations "service.beta.openshift.io/serving-cert-secret-name" $secret }}
+{{- $_ := set $m.service "annotations" $annotations }}
+{{- end }}
+{{- if not $m.fromNamespaces }}
+{{- $_ := set $m "fromNamespaces" (list "openshift-user-workload-monitoring") }}
+{{- end }}
+{{- if not $m.serviceMonitor.caConfigMap.name }}
+{{- $_ := set $m.serviceMonitor "caConfigMap" (dict "name" "openshift-service-ca.crt" "key" "service-ca.crt") }}
+{{- end }}
+{{- end }}
+{{- else }}
+{{- $_ := set $m "enabled" (eq (toString $m.enabled) "true") }}
+{{- end }}
+{{- $sm := $m.serviceMonitor }}
+{{- if eq (toString $sm.enabled) "auto" }}
+{{- $_ := set $sm "enabled" (and $m.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") (not (empty $sm.caConfigMap.name))) }}
+{{- else }}
+{{- $_ := set $sm "enabled" (eq (toString $sm.enabled) "true") }}
+{{- end }}
 {{- end }}
 
 {{/*

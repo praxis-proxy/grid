@@ -34,7 +34,7 @@ const KV_METRICS: [&str; 2] = [
 ];
 
 /// The deviation across the pool's units, the cheap bound on one hot unit behind a low mean.
-const KV_SPREAD_METRIC: &str = "llm_d_epp_stddev_kv_cache_utilization";
+const KV_SPREAD_METRIC: &str = "llm_d_epp_std_dev_kv_cache_utilization";
 
 /// Requests the EPP's flow control holds before scheduling: in flight, and a backlog. One
 /// series per priority and fairness partition, summed at each instant.
@@ -135,6 +135,20 @@ pub(crate) struct Mapped<'store> {
 }
 
 impl SiteSignals for Mapped<'_> {
+    fn relay_heard_ms(&self) -> Option<i64> {
+        self.store.relay_heard_ms()
+    }
+
+    fn round_ms(&self, site: &str) -> Option<i64> {
+        self.store
+            .newest_at(&LoadStore::key(site, grid_signals::poller::PROVIDER))
+    }
+
+    fn learning_state(&self, site: &str, cluster: &str, now_ms: i64, max_age_ms: i64) -> grid_signals::LearningState {
+        self.store
+            .learning_state(&LoadStore::key(site, cluster), now_ms, max_age_ms)
+    }
+
     fn read(&self, site: &str, cluster: &str, over: Over) -> SiteReading {
         let key = LoadStore::key(site, cluster);
         let sampled_at = self.store.newest_at(&key);
@@ -351,6 +365,18 @@ impl Mapped<'_> {
 
 /// The store read under the llm-d mapping.
 impl SiteSignals for LoadStore {
+    fn relay_heard_ms(&self) -> Option<i64> {
+        Self::relay_heard_ms(self)
+    }
+
+    fn round_ms(&self, site: &str) -> Option<i64> {
+        self.newest_at(&Self::key(site, grid_signals::poller::PROVIDER))
+    }
+
+    fn learning_state(&self, site: &str, cluster: &str, now_ms: i64, max_age_ms: i64) -> grid_signals::LearningState {
+        self.learning_state(&LoadStore::key(site, cluster), now_ms, max_age_ms)
+    }
+
     fn read(&self, site: &str, cluster: &str, over: Over) -> SiteReading {
         Mapped {
             store: self,
@@ -555,7 +581,7 @@ mod tests {
             store.ingest_at(
                 &format!(
                     "llm_d_epp_average_kv_cache_utilization{{{labels}}} {mean} {at}\n\
-                     llm_d_epp_stddev_kv_cache_utilization{{{labels}}} {spread} {at}"
+                     llm_d_epp_std_dev_kv_cache_utilization{{{labels}}} {spread} {at}"
                 ),
                 at,
                 at,

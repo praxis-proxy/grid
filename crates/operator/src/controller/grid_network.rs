@@ -63,7 +63,6 @@ use crate::{
 /// How long a leave waits for peers to hear it before the pod restarts.
 const SWIM_LEAVE_WAIT: Duration = Duration::from_secs(5);
 
-
 // ---------------------------------------------------------------------------
 // Operator context
 // ---------------------------------------------------------------------------
@@ -80,6 +79,14 @@ const SWIM_LEAVE_WAIT: Duration = Duration::from_secs(5);
     reason = "client is public API; the SWIM handle and caches are reached through methods"
 )]
 pub struct OperatorCtx {
+    /// One provider collection/publication pass at a time, across networks.
+    signal_pass: tokio::sync::Semaphore,
+    /// Monotonic batch sequence within this process's immutable publisher epoch.
+    signal_sequence: std::sync::atomic::AtomicU64,
+    /// A superseded publisher never reacquires authority in the same process.
+    signal_fenced: std::sync::atomic::AtomicBool,
+    /// Publication ordering is scoped to the single supported network.
+    signal_network: std::sync::OnceLock<String>,
     /// Kubernetes API client.
     pub client: Client,
 
@@ -125,6 +132,10 @@ pub struct OperatorCtx {
     /// Signals polled from peers, keyed by site name. Kept apart from local so a
     /// scoped read returns only what this site observed, never a second-hand copy.
     pub(crate) peers: signals::SignalStore,
+    /// When the poller's last round that included each peer ended.
+    pub(crate) peer_rounds: signals::PeerRounds,
+    /// Each peer provider the poller has received load rows for.
+    pub(crate) load_heard: signals::LoadHeard,
 
     /// This site's scraped signals, served to gateways and peers.
     pub(crate) signals: signals::SignalStore,
@@ -308,6 +319,10 @@ impl OperatorCtx {
     pub fn new(client: Client, swim: Option<Arc<SwimHandle>>, signal_mode: SignalMode) -> Self {
         Self {
             client,
+            signal_pass: tokio::sync::Semaphore::new(1),
+            signal_sequence: std::sync::atomic::AtomicU64::new(0),
+            signal_fenced: std::sync::atomic::AtomicBool::new(false),
+            signal_network: std::sync::OnceLock::new(),
             swim: swim.map(std::sync::OnceLock::from).unwrap_or_default(),
             metrics_cache: Mutex::new(provider_metrics::MetricsCache::new()),
             admission_memory: Mutex::new(provider_admission::AdmissionMemory::default()),
@@ -315,6 +330,8 @@ impl OperatorCtx {
             refused_sites: std::sync::Mutex::new(HashMap::new()),
             peer_identities: signals::PeerIdentities::new(),
             peers: signals::SignalStore::new(),
+            peer_rounds: signals::PeerRounds::default(),
+            load_heard: signals::LoadHeard::default(),
             signals: signals::SignalStore::new(),
             served_models: served_models::ServedModelStore::new(),
             readiness: readiness::ReadinessStore::default(),
@@ -396,6 +413,12 @@ impl OperatorCtx {
         self
     }
 
+    /// The signal transport this operator runs, fixed for its lifetime.
+    #[must_use]
+    pub const fn signal_mode(&self) -> SignalMode {
+        self.signal_mode
+    }
+
     /// The configured site name, when the install sets a valid one.
     #[must_use]
     pub fn site_name(&self) -> Option<&str> {
@@ -453,6 +476,18 @@ impl OperatorCtx {
         self.peers.clone()
     }
 
+    /// A handle to the poller's rounds, for the poller and this site's own gateway.
+    #[must_use]
+    pub fn peer_rounds(&self) -> signals::PeerRounds {
+        self.peer_rounds.clone()
+    }
+
+    /// A handle to the peer providers the poller has heard load for.
+    #[must_use]
+    pub fn load_heard(&self) -> signals::LoadHeard {
+        self.load_heard.clone()
+    }
+
     /// A handle to who may read, for the signals listener and poller.
     #[must_use]
     pub fn peer_identities(&self) -> signals::PeerIdentities {
@@ -487,6 +522,11 @@ fn site_signals_ttl() -> Duration {
 ///
 /// Returns [`OperatorError`] when providers or sites cannot be listed.
 pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &str) -> Result<(), OperatorError> {
+    let publisher = ctx.swim().map(Arc::as_ref);
+    let Some(_pass) = signal_pass(ctx, network_name, publisher) else {
+        return Ok(());
+    };
+    let collected_at = Instant::now();
     let providers = list_all_inference_providers(client).await?;
     ctx.signals.set_access(signal_access(&providers));
     Box::pin(register_peers(ctx, client)).await?;
@@ -499,9 +539,59 @@ pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &
     ))
     .await;
     ctx.record_scrape_pass(network_name, scrape_started.elapsed());
-    let collected = resolve_readiness(ctx, client, &providers, network_name);
-    publish_signals(ctx, collected);
+    let mut collected = resolve_readiness(ctx, client, &providers, network_name);
+    if !ctx.signal_fenced.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Some(swim) = publisher {
+            let Some((epoch, sequence)) = publication_order(ctx, client, swim).await? else {
+                return Ok(());
+            };
+            crate::provider_revision::qualify(&mut collected, &providers, network_name, epoch, sequence);
+        }
+        publish_signals(ctx, collected, collected_at);
+    }
     Ok(())
+}
+
+/// Serialize collection and bind ordered publication to one network.
+fn signal_pass<'context>(
+    ctx: &'context OperatorCtx,
+    network: &str,
+    publisher: Option<&SwimHandle>,
+) -> Option<tokio::sync::SemaphorePermit<'context>> {
+    let pass = ctx.signal_pass.try_acquire().ok()?;
+    if publisher.is_some() && ctx.signal_network.get_or_init(|| network.to_owned()) != network {
+        tracing::warn!(network, "skipping signals for a different GridNetwork");
+        return None;
+    }
+    Some(pass)
+}
+
+/// Allocate a publication order only while the pre-collection publisher still owns its fence.
+async fn publication_order(
+    ctx: &OperatorCtx,
+    client: &Client,
+    swim: &SwimHandle,
+) -> Result<Option<(u64, u64)>, OperatorError> {
+    let (epoch, high) = swim.publisher_reservation();
+    if !swim.is_running() || !crate::provider_revision::holds_fence(client, swim.site_name(), high).await? {
+        if !ctx.signal_fenced.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::error!(
+                site = swim.site_name(),
+                epoch,
+                "signals publisher lost its reservation; publication is fenced until restart"
+            );
+        }
+        return Ok(None);
+    }
+    Ok(ctx
+        .signal_sequence
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |value| value.checked_add(1),
+        )
+        .ok()
+        .map(|previous| (epoch, previous.saturating_add(1))))
 }
 
 /// Resolve each provider's readiness, write its `Ready` condition, and return what to publish.
@@ -761,7 +851,8 @@ async fn apply_ready_condition(
     Ok(())
 }
 
-/// The status patch carrying the provider's new `Ready` condition, `None` when unchanged.
+/// The status patch carrying the provider's `Ready` and `MetricsAvailable` conditions, `None`
+/// when neither changed. Both are always sent, since an apply that leaves one out removes it.
 fn ready_condition_patch<'provider>(
     provider: &'provider InferenceProvider,
     verdict: &readiness::Verdict,
@@ -772,14 +863,27 @@ fn ready_condition_patch<'provider>(
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .ok()?;
-    let condition = readiness::ready_condition(current, verdict, &now, provider.metadata.generation)?;
+    let generation = provider.metadata.generation;
+    let ready = readiness::ready_condition(current, verdict, &now, generation);
+    let metrics = readiness::metrics_condition(current, verdict, &now, generation);
+    if ready.is_none() && metrics.is_none() {
+        return None;
+    }
+    let held = |type_: &str| current.iter().find(|c| c.type_ == type_).cloned();
+    let conditions: Vec<_> = [
+        ready.or_else(|| held(readiness::READY_CONDITION)),
+        metrics.or_else(|| held(readiness::METRICS_CONDITION)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     Some((
         name,
         serde_json::json!({
             "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "InferenceProvider",
             "metadata": { "name": name },
-            "status": { "conditions": [condition] }
+            "status": { "conditions": conditions }
         }),
     ))
 }
@@ -888,11 +992,15 @@ fn signal_access(providers: &[InferenceProvider]) -> signals::AccessMap {
 /// The site label is applied here because this is where the membership identity
 /// is known. A provider that set it itself keeps its value under an exported
 /// name, so what a reader sees as the origin is what this site says it is.
-fn publish_signals(ctx: &OperatorCtx, collected: HashMap<String, Vec<signals::Observation>>) {
+fn publish_signals(ctx: &OperatorCtx, collected: HashMap<String, Vec<signals::Observation>>, collected_at: Instant) {
     let site = ctx.swim().map(|s| s.site_name().to_owned()).unwrap_or_default();
+    let age = collected_at.elapsed();
     let attributed = collected
         .into_iter()
-        .map(|(provider, observations)| {
+        .map(|(provider, mut observations)| {
+            for observation in &mut observations {
+                observation.age = observation.age.max(age);
+            }
             let attributed = signals::attribute(observations, &site, &provider);
             (provider, attributed)
         })
@@ -1049,8 +1157,8 @@ const WITHDRAWAL_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// When this label is present with value `"true"`, the `GridNetwork` controller
 /// creates `GridSite` resources for remote Alive SWIM members automatically.
-/// Networks without this label are unaffected; their overlay generation uses
-/// the existing `routingClusterRef`-based (Phase 1) fallback.
+/// Networks without this label are unaffected — their overlay generation uses
+/// the existing `clusterName`-based (Phase 1) fallback.
 ///
 /// This opt-in gate prevents auto-discovery from changing the overlay generation
 /// semantics for networks that were not designed with it in mind.
@@ -1418,9 +1526,9 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // List providers once; share between routing overlay rendering and CRDT publishing.
     let providers = list_all_inference_providers(client).await?;
     let mut requeue_interval = requeue_interval_for_network(&network, &providers)?;
-    if network.spec.gateway_refs.iter().any(|gateway| {
-        gateway.consumer_config.as_ref().is_some_and(|config| {
-            config.enabled
+    if network.spec.consumer_gateways.iter().any(|gateway| {
+        gateway.praxis_config.as_ref().is_some_and(|config| {
+            config.generate
                 && config
                     .mount_reconciliation
                     .as_ref()
@@ -1542,20 +1650,10 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let swim_runtime_running = ctx.swim().is_none_or(|handle| handle.is_running());
     let membership = ctx.swim().map(|h| h.snapshot());
 
-    // Downgrade providers from Dead/Suspect SWIM members to Degraded so the overlay
-    // emits fresh=false for their candidates.  The record is kept (not excluded) so
-    // Praxis can observe the stale-but-known state while preferring healthy fallbacks.
-    let remote_crdt_providers = apply_swim_staleness_override(&remote_crdt_providers, membership.as_ref());
-
-    // Apply stale candidate GC policy: omit remote providers whose Dead/Suspect age
-    // exceeds the configured TTL.  With the default policy (TTL=None, absent field)
-    // this is a no-op, so runtime behaviour is unchanged from pre-GC.
-    let stale_policy = routing_overlay::stale_policy_from_spec(network.spec.stale_candidate_ttl_seconds);
-    let remote_crdt_providers =
-        routing_overlay::apply_stale_gc_filter(&remote_crdt_providers, membership.as_ref(), &stale_policy);
+    let remote_crdt_providers = membership_staleness(&network, remote_crdt_providers, membership.as_ref());
 
     let scoring_weights = crate::crd::grid_network::resolve_scoring_weights(network.spec.scoring_policy.as_ref());
-    let serving = serving_source(&ctx);
+    let serving = serving_source(&ctx, &providers);
 
     // List tool providers once; shared between overlay rendering and CRDT publishing.
     let tool_providers = list_all_agent_tool_providers(client).await?;
@@ -1596,7 +1694,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     };
 
     // Publish provider CRDT state so peers learn this site's providers.
-    let distributed_provider_count = if let Some(swim) = ctx.swim().filter(|handle| handle.is_running()) {
+    let remote_provider_count = if let Some(swim) = ctx.swim().filter(|handle| handle.is_running()) {
         publish_real_provider_state(swim, name, &grid_id, &providers, &tool_providers, &raw_metrics);
         log_capacity_changes(&ctx.logged, name, &providers);
         count_remote_provider_records(swim, name)
@@ -1621,7 +1719,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         &grid_id,
         &phase,
         membership.as_ref(),
-        distributed_provider_count,
+        remote_provider_count,
         consumer_config_statuses,
         mount_reconciliation_statuses,
         overlay_statuses,
@@ -1630,10 +1728,12 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     )
     .await?;
 
+    Box::pin(apply_local_site_condition(client, &network, ctx.site_name())).await;
+
     // Auto-create or update GridSite records for remote Alive SWIM members.
     // Only runs when the GridNetwork explicitly opts in via LABEL_AUTO_DISCOVER_SITES.
     // This gate prevents auto-discovery from changing overlay generation semantics
-    // for networks that use the existing routingClusterRef-based (Phase 1) path.
+    // for networks that use the existing clusterName-based (Phase 1) path.
     let auto_discover_enabled = network
         .metadata
         .labels
@@ -1649,6 +1749,36 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     Ok(Action::requeue(
         serving_retry.map_or(requeue_interval, |wait| requeue_interval.min(wait)),
     ))
+}
+
+/// Report whether this site's own [`GridSite`] is declared and labelled.
+async fn apply_local_site_condition(client: &Client, network: &GridNetwork, local_site: Option<&str>) {
+    let Some(network_name) = network.metadata.name.as_deref() else {
+        return;
+    };
+    let site = match local_site {
+        Some(local) => match Api::<GridSite>::all(client.clone()).get_opt(local).await {
+            Ok(site) => site,
+            Err(error) => {
+                tracing::debug!(%error, site = local, "local GridSite not readable; retrying next reconcile");
+                return;
+            },
+        },
+        None => None,
+    };
+    let declared = crate::local_site::Declared::of(network_name, local_site, site.as_ref());
+    let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
+        return;
+    };
+    let Some((name, patch)) = crate::local_site::patch(network, local_site, declared, &now) else {
+        return;
+    };
+    let params = PatchParams::apply(crate::local_site::FIELD_MANAGER).force();
+    let api: Api<GridNetwork> = Api::all(client.clone());
+    match Box::pin(api.patch_status(name, &params, &Patch::Apply(patch))).await {
+        Ok(_) => tracing::info!(?declared, network = name, "local site condition written"),
+        Err(error) => tracing::warn!(%error, "local site condition not written; retrying next reconcile"),
+    }
 }
 
 /// Advance the explicitly configured local [`GridSite`] into discovery.
@@ -1695,7 +1825,7 @@ async fn reconcile_local_site(network_name: &str, local_site: &str, client: &Cli
     Ok(())
 }
 
-/// Apply `spec.tls.swimKeyRef` before any reconcile-triggered SWIM send.
+/// Apply `spec.tls.swimKeySecretRef` before any reconcile-triggered SWIM send.
 ///
 /// A configured Secret reference is mandatory for that reconcile: missing
 /// Secret, missing key field, invalid key length, RBAC denial, or a stopped
@@ -1708,25 +1838,26 @@ async fn apply_configured_swim_key(
     swim: &SwimHandle,
 ) -> Result<(), OperatorError> {
     let network_name = network.metadata.name.as_deref().unwrap_or("<unknown>");
-    let Some(swim_key_ref) = &network.spec.tls.swim_key_ref else {
+    let Some(swim_key_secret_ref) = &network.spec.tls.swim_key_secret_ref else {
         return release_plain_if_undeclared(client, swim, network_name).await;
     };
 
-    let key = secret::read_swim_key(client, swim_key_ref)
+    let key = secret::read_swim_key(client, swim_key_secret_ref)
         .await
-        .map_err(|e| OperatorError::SwimKeyConfig(format!("failed to read swimKeyRef for {network_name}: {e}")))?
+        .map_err(|e| OperatorError::SwimKeyConfig(format!("failed to read swimKeySecretRef for {network_name}: {e}")))?
         .ok_or_else(|| {
             OperatorError::SwimKeyConfig(format!(
-                "swimKeyRef for {network_name} did not resolve to a valid 32-byte key \
+                "swimKeySecretRef for {network_name} did not resolve to a valid 32-byte key \
                  (secret={}/{}, key={})",
-                swim_key_ref.namespace,
-                swim_key_ref.name,
-                swim_key_ref.key.as_deref().unwrap_or("key")
+                swim_key_secret_ref.namespace,
+                swim_key_secret_ref.name,
+                swim_key_secret_ref.key.as_deref().unwrap_or("key")
             ))
         })?;
 
-    swim.set_swim_key(key)
-        .map_err(|e| OperatorError::SwimKeyConfig(format!("failed to apply swimKeyRef for {network_name}: {e}")))?;
+    swim.set_swim_key(key).map_err(|e| {
+        OperatorError::SwimKeyConfig(format!("failed to apply swimKeySecretRef for {network_name}: {e}"))
+    })?;
     Ok(())
 }
 
@@ -1742,7 +1873,7 @@ async fn release_plain_if_undeclared(client: &Client, swim: &SwimHandle, network
     if !declares_swim_key(&networks) && swim.release_plain() {
         tracing::warn!(
             network,
-            "no GridNetwork declares a swimKeyRef; SWIM gossip is plaintext"
+            "no GridNetwork declares a swimKeySecretRef; SWIM gossip is plaintext"
         );
     }
     Ok(())
@@ -1751,7 +1882,9 @@ async fn release_plain_if_undeclared(client: &Client, swim: &SwimHandle, network
 /// Whether any of `networks` declares a SWIM key.
 #[must_use]
 pub fn declares_swim_key(networks: &[GridNetwork]) -> bool {
-    networks.iter().any(|network| network.spec.tls.swim_key_ref.is_some())
+    networks
+        .iter()
+        .any(|network| network.spec.tls.swim_key_secret_ref.is_some())
 }
 
 /// Return a monotonic-ish revision for public-cert metadata broadcasts.
@@ -2139,11 +2272,11 @@ fn site_phases(sites: &[GridSite]) -> impl Iterator<Item = (&str, &'static str)>
 /// Reconcile routing overlay `ConfigMap`s for a [`GridNetwork`].
 ///
 /// Lists all [`InferenceProvider`]s and [`GridSite`]s cluster-wide, then
-/// renders one overlay `ConfigMap` per `gatewayRef`.  Each gateway may
-/// declare its own `localSiteName`: the `local_site` in the overlay for
-/// gateway G is `G.localSiteName ?? network_name`.  This ensures that in a
+/// renders one overlay `ConfigMap` per `consumerGateways` entry.  Each gateway may
+/// declare its own `siteName` — the `local_site` in the overlay for
+/// gateway G is `G.siteName ?? network_name`.  This ensures that in a
 /// multi-gateway network each gateway's overlay identifies the correct local
-/// site.  A network with no `gatewayRefs` is a no-op.
+/// site.  A network with no `consumerGateways` is a no-op.
 ///
 /// Changes to [`InferenceProvider`] and [`GridSite`] resources trigger a
 /// [`GridNetwork`] reconcile via cross-resource watches in the controller
@@ -2189,6 +2322,7 @@ async fn reconcile_routing_overlay_inner(
     owning_site: Option<&str>,
 ) -> Result<OverlayOutcome, OperatorError> {
     let network_name = grid_network_name(network)?;
+    let signal = GridModes::of(network).signal;
 
     // Every reconcile lists the sites, so the phase gauge follows each status change and deletion.
     let sites = list_all_grid_sites(client)
@@ -2210,10 +2344,10 @@ async fn reconcile_routing_overlay_inner(
     let mut overlay_statuses: Vec<OverlayRevisionStatus> = Vec::new();
     let mut serving_retry: Option<Duration> = None;
 
-    for gw_ref in &network.spec.gateway_refs {
+    for gw_ref in &network.spec.consumer_gateways {
         // Each gateway identifies its own local site.  Fall back to the
         // network name for single-site deployments where the two are equal.
-        let local_site = gw_ref.local_site_name.as_deref().unwrap_or(network_name);
+        let local_site = gw_ref.site_name.as_deref().unwrap_or(network_name);
 
         // Filter remote CRDT providers to those whose source GridSite is Active.
         // Providers from sites in any other phase (Discovered, Connecting, Pending,
@@ -2221,7 +2355,7 @@ async fn reconcile_routing_overlay_inner(
         // This is the routing eligibility gate: SWIM membership alone does not
         // make a remote site routable.
         let eligible_remote: Vec<&crdt::ProviderState> =
-            filter_eligible_remote_crdt_providers(network_name, &sites, remote_crdt_providers);
+            filter_eligible_remote_crdt_providers(network_name, &sites, remote_crdt_providers, signal);
         let eligible_remote_owned: Vec<crdt::ProviderState> = eligible_remote.into_iter().cloned().collect();
         let filtered_count = remote_crdt_providers.len() - eligible_remote_owned.len();
         if filtered_count > 0 {
@@ -2262,7 +2396,7 @@ async fn reconcile_routing_overlay_inner(
                     gw_ref,
                     observed_generation,
                     None,
-                    "OverlayRenderFailed",
+                    "RoutingMapRenderFailed",
                     "overlay render failed",
                 ));
                 continue;
@@ -2278,6 +2412,7 @@ async fn reconcile_routing_overlay_inner(
                 network_name,
                 from_providers: &[],
                 transport: None,
+                signal,
             },
         );
         if !refused.is_empty() {
@@ -2303,7 +2438,7 @@ async fn reconcile_routing_overlay_inner(
                     gw_ref,
                     observed_generation,
                     None,
-                    "OverlayRenderFailed",
+                    "RoutingMapRenderFailed",
                     "overlay envelope build failed",
                 ));
                 continue;
@@ -2322,7 +2457,7 @@ async fn reconcile_routing_overlay_inner(
             .iter()
             .any(|candidate| candidate.credential.is_some());
         if credential_bearing
-            && let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled)
+            && let Some(cc) = gw_ref.praxis_config.as_ref().filter(|cc| cc.generate)
             && !cc.enable_projected_credentials
         {
             let error = OperatorError::ConsumerConfigRender(ConsumerConfigError::ProjectedCredentialsUnsupported);
@@ -2345,9 +2480,9 @@ async fn reconcile_routing_overlay_inner(
         let mut delegated_mount_reconciled = false;
         if !no_candidates
             && let Some(cc) = gw_ref
-                .consumer_config
+                .praxis_config
                 .as_ref()
-                .filter(|cc| cc.enabled && cc.mount_reconciliation.as_ref().is_some_and(|mounts| mounts.enabled))
+                .filter(|cc| cc.generate && cc.mount_reconciliation.as_ref().is_some_and(|mounts| mounts.enabled))
         {
             match Box::pin(apply_consumer_config_for_gateway(
                 &overlay,
@@ -2407,7 +2542,7 @@ async fn reconcile_routing_overlay_inner(
         }
 
         if credential_bearing
-            && let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled)
+            && let Some(cc) = gw_ref.praxis_config.as_ref().filter(|cc| cc.generate)
             && !cc.supports_projected_credentials
         {
             let error = OperatorError::ConsumerConfigRender(ConsumerConfigError::ProjectedCredentialsUnsupported);
@@ -2438,7 +2573,7 @@ async fn reconcile_routing_overlay_inner(
                     gw_ref,
                     observed_generation,
                     Some(&render),
-                    "OverlayApplyFailed",
+                    "RoutingMapApplyFailed",
                     "overlay ConfigMap apply failed",
                 ));
                 continue;
@@ -2472,9 +2607,9 @@ async fn reconcile_routing_overlay_inner(
             }
         }
 
-        // Gateways with consumerConfig.enabled=false get a Disabled entry.
-        // Gateways without a consumerConfig block are omitted from status.
-        if !delegated_mount_reconciled && let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) {
+        // Gateways with praxisConfig.generate=false get a Disabled entry.
+        // Gateways without a praxisConfig block are omitted from status.
+        if !delegated_mount_reconciled && let Some(cc) = gw_ref.praxis_config.as_ref().filter(|cc| cc.generate) {
             match Box::pin(apply_consumer_config_for_gateway(
                 &overlay,
                 network_name,
@@ -2521,7 +2656,7 @@ async fn reconcile_routing_overlay_inner(
                     ));
                 },
             }
-        } else if let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| !cc.enabled) {
+        } else if let Some(cc) = gw_ref.praxis_config.as_ref().filter(|cc| !cc.generate) {
             consumer_statuses.push(consumer_config_status_disabled(gw_ref, cc, observed_generation));
         }
     }
@@ -2532,6 +2667,10 @@ async fn reconcile_routing_overlay_inner(
         serving_retry,
     })
 }
+
+/// Legacy status reason used by retained-status compatibility tests.
+#[cfg(test)]
+const EMPTY_CANDIDATES: &str = "EmptyCandidates";
 
 /// What one routing overlay pass produced, per gateway.
 struct OverlayOutcome {
@@ -2555,18 +2694,31 @@ struct ServingSource<'src> {
     scrape_interval: Duration,
     /// Sites each network's serving config last refused.
     refused: &'src serving_config::RefusedSites,
+    /// Peer providers the poller has heard load for.
+    load_heard: &'src signals::LoadHeard,
+    /// This site's provider clusters with no metrics to scrape.
+    quiet_local: BTreeSet<String>,
 }
 
 /// Build the serving source, `None` outside poll mode.
-fn serving_source(ctx: &OperatorCtx) -> Option<ServingSource<'_>> {
+fn serving_source<'ctx>(ctx: &'ctx OperatorCtx, providers: &[InferenceProvider]) -> Option<ServingSource<'ctx>> {
     if ctx.signal_mode != SignalMode::Poll {
         return None;
     }
+    let quiet_local = providers
+        .iter()
+        // The same plan signal publication scrapes by, so a provider it cannot scrape publishes none.
+        .filter(|provider| provider_metrics::signal_scrape_plan(provider).is_none())
+        .filter_map(|provider| routing_overlay::routing_identity(provider))
+        .map(str::to_owned)
+        .collect();
     Some(ServingSource {
         gate: &ctx.serving_writes,
         settings: &ctx.peer_settings,
         scrape_interval: ctx.scrape_interval,
         refused: &ctx.refused_sites,
+        load_heard: &ctx.load_heard,
+        quiet_local,
     })
 }
 
@@ -2577,13 +2729,14 @@ fn render_serving_text(
     gw_ref: &GatewayRef,
 ) -> Result<String, OperatorError> {
     let tls_mount = gw_ref
-        .consumer_config
+        .praxis_config
         .as_ref()
         .map_or(crate::crd::grid_network::DEFAULT_TLS_CERT_MOUNT_PATH, |cc| {
             cc.tls_cert_mount_path.as_str()
         });
     let provider_hop_sni = serving_provider_hop_sni_for_overlay(overlay, gw_ref)?;
     let provider_hop_clusters: BTreeSet<String> = provider_hop_sni.keys().cloned().collect();
+    let heard = |site: &str, cluster: &str| source.load_heard.heard(site, cluster);
     let inputs = ServingInputs {
         provider_hop_clusters: &provider_hop_clusters,
         provider_hop_sni: &provider_hop_sni,
@@ -2592,6 +2745,8 @@ fn render_serving_text(
         scrape_interval: source.scrape_interval,
         peer_interval: source.settings.peer_interval,
         peer_budget: source.settings.peer_budget,
+        heard: &heard,
+        quiet_local: &source.quiet_local,
     };
     serving_config::to_text(&serving_config::render(overlay, &inputs)).map_err(OperatorError::Json)
 }
@@ -2701,11 +2856,21 @@ async fn apply_serving_config(
     Ok(None)
 }
 
+/// Whether the last recorded status for this gateway already had no candidates.
+#[cfg(test)]
+fn already_empty(network: &GridNetwork, gw_ref: &GatewayRef) -> bool {
+    network.status.as_ref().is_some_and(|status| {
+        status.routing_map_status.iter().any(|entry| {
+            entry.gateway_name == gw_ref.name && entry.namespace == gw_ref.namespace && entry.reason == EMPTY_CANDIDATES
+        })
+    })
+}
+
 /// Find the last successfully distributed overlay status for a gateway.
 fn find_prior_overlay<'net>(network: &'net GridNetwork, gw_ref: &GatewayRef) -> Option<&'net OverlayRevisionStatus> {
     network.status.as_ref().and_then(|status| {
         status
-            .overlay_status
+            .routing_map_status
             .iter()
             .find(|e| e.gateway_name == gw_ref.name && e.namespace == gw_ref.namespace)
             .filter(|e| !e.distributed_revision.is_empty())
@@ -2717,7 +2882,7 @@ fn keep_rendered_at(
     current: Option<&GridNetworkStatus>,
     desired: Vec<OverlayRevisionStatus>,
 ) -> Vec<OverlayRevisionStatus> {
-    let prior = current.map_or(&[][..], |status| status.overlay_status.as_slice());
+    let prior = current.map_or(&[][..], |status| status.routing_map_status.as_slice());
     desired
         .into_iter()
         .map(|mut entry| {
@@ -2746,13 +2911,13 @@ fn keep_consumer_config_status_at(
     let prior = network
         .status
         .as_ref()
-        .map_or(&[][..], |status| status.consumer_config_status.as_slice());
+        .map_or(&[][..], |status| status.praxis_config_status.as_slice());
     let mut kept = Vec::new();
-    for gw_ref in &network.spec.gateway_refs {
-        let Some(cc) = gw_ref.consumer_config.as_ref() else {
+    for gw_ref in &network.spec.consumer_gateways {
+        let Some(cc) = gw_ref.praxis_config.as_ref() else {
             continue;
         };
-        if !cc.enabled {
+        if !cc.generate {
             kept.push(consumer_config_status_disabled(
                 gw_ref,
                 cc,
@@ -2788,8 +2953,8 @@ fn keep_mount_reconciliation_status_at(
         .as_ref()
         .map_or(&[][..], |status| status.mount_reconciliation_status.as_slice());
     let mut kept = Vec::new();
-    for gw_ref in &network.spec.gateway_refs {
-        let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) else {
+    for gw_ref in &network.spec.consumer_gateways {
+        let Some(cc) = gw_ref.praxis_config.as_ref().filter(|cc| cc.generate) else {
             continue;
         };
         let expected_deployment = cc
@@ -2992,7 +3157,7 @@ async fn apply_consumer_config_for_gateway(
 ) -> Result<ConsumerApplyOutcome, OperatorError> {
     let rendered = consumer_config::render_consumer_config_with_projected(
         overlay,
-        &cc.credential_mount_base,
+        &cc.credential_mount_path,
         cluster_endpoints,
         &cc.tls_cert_mount_path,
         cc.listener_port,
@@ -3088,7 +3253,7 @@ fn delegated_mount_requirements_document(
     if cc.tls_cert_mount_path != GRID_SERVING_TLS_MOUNT_PATH {
         return Err(mount_failure(
             "GridServingTlsPathMismatch",
-            format!("gridServing requires consumerConfig.tlsCertMountPath={GRID_SERVING_TLS_MOUNT_PATH:?}"),
+            format!("gridServing requires praxisConfig.tlsCertMountPath={GRID_SERVING_TLS_MOUNT_PATH:?}"),
         )
         .into());
     }
@@ -5062,6 +5227,24 @@ fn count_remote_provider_records_in_snapshot(
     u32::try_from(count).unwrap_or(u32::MAX)
 }
 
+/// Apply SWIM liveness to remote providers under gossip only.
+///
+/// Under poll the gateway reads liveness from signal staleness, so a membership change
+/// must not rewrite the serving config.
+fn membership_staleness(
+    network: &GridNetwork,
+    providers: Vec<crdt::ProviderState>,
+    membership: Option<&MembershipSnapshot>,
+) -> Vec<crdt::ProviderState> {
+    if GridModes::of(network).signal == SignalMode::Poll {
+        return providers;
+    }
+    // Dead or Suspect members' providers go Degraded, so their candidates render fresh=false.
+    let providers = apply_swim_staleness_override(&providers, membership);
+    let stale_policy = routing_overlay::stale_policy_from_spec(network.spec.stale_candidate_ttl_seconds);
+    routing_overlay::apply_stale_gc_filter(&providers, membership, &stale_policy)
+}
+
 /// Override CRDT provider phases based on current SWIM membership status.
 ///
 /// Available or pending providers from `Dead` or `Suspect` SWIM members are
@@ -5102,10 +5285,10 @@ pub(crate) fn apply_swim_staleness_override(
 /// Patch the `GridNetwork` status subresource.
 ///
 /// `connected_sites` is derived from `membership`: count of peers with
-/// [`Alive`] status.  `distributed_provider_count` reflects providers received via
+/// [`Alive`] status.  `remote_provider_count` reflects providers received via
 /// CRDT state broadcasts.  Both are `0` when SWIM is disabled.
 /// `consumer_config_statuses` holds per-gateway render/apply outcomes for
-/// gateways with `consumerConfig.enabled: true`; empty when no gateways opted in.
+/// gateways with `praxisConfig.generate: true`; empty when no gateways opted in.
 /// `budget_statuses` holds per-tenant spend status derived from
 /// `spec.budgetPolicy` and merged CRDT spend state; empty when `budgetPolicy`
 /// is absent.
@@ -5121,7 +5304,7 @@ async fn update_status(
     grid_id: &str,
     phase: &GridNetworkPhase,
     membership: Option<&MembershipSnapshot>,
-    distributed_provider_count: u32,
+    remote_provider_count: u32,
     consumer_config_statuses: Vec<ConsumerConfigStatus>,
     mount_reconciliation_statuses: Vec<MountReconciliationStatus>,
     overlay_statuses: Vec<OverlayRevisionStatus>,
@@ -5138,13 +5321,13 @@ async fn update_status(
         gateway_age_reports: Vec::new(),
         gateway_age_report_overflow: false,
         connected_sites: membership.map_or(0, MembershipSnapshot::connected_count),
-        distributed_provider_count,
+        remote_provider_count,
         grid_id: grid_id.to_owned(),
         observed_generation: network.metadata.generation.unwrap_or(0),
         phase: phase.clone(),
-        consumer_config_status: keep_consumer_config_status_at(network, &consumer_config_statuses),
+        praxis_config_status: keep_consumer_config_status_at(network, &consumer_config_statuses),
         mount_reconciliation_status: keep_mount_reconciliation_status_at(network, &mount_reconciliation_statuses),
-        overlay_status: keep_rendered_at(network.status.as_ref(), overlay_statuses),
+        routing_map_status: keep_rendered_at(network.status.as_ref(), overlay_statuses),
         budget_status: budget_statuses,
         identity,
     };
@@ -5272,7 +5455,7 @@ fn gateway_cluster_endpoints<'gw>(
     Vec<derived_topology::Refused>,
 ) {
     // A disabled block renders nothing, so its gateway's overlay is not ours to withdraw from.
-    let Some(cc) = gw_ref.consumer_config.as_ref().filter(|cc| cc.enabled) else {
+    let Some(cc) = gw_ref.praxis_config.as_ref().filter(|cc| cc.generate) else {
         return (Cow::Borrowed(&[]), String::new(), Vec::new());
     };
     // Resolve even with nothing allowlisted, so a revoked derivation is withdrawn, not kept stale.
@@ -5354,7 +5537,7 @@ pub(crate) fn consumer_config_status_rendered(
 }
 
 /// Build a `Disabled` [`ConsumerConfigStatus`] for a gateway whose
-/// `consumerConfig.enabled` is `false`.
+/// `praxisConfig.generate` is `false`.
 pub(crate) fn consumer_config_status_disabled(
     gw_ref: &GatewayRef,
     cc: &ConsumerConfig,
@@ -5365,8 +5548,8 @@ pub(crate) fn consumer_config_status_disabled(
         namespace: gw_ref.namespace.clone(),
         config_map_name: cc.config_map_name.clone(),
         phase: ConsumerConfigPhase::Disabled,
-        reason: "ConsumerConfigDisabled".to_owned(),
-        message: "consumerConfig.enabled is false; no ConfigMap generated".to_owned(),
+        reason: "PraxisConfigDisabled".to_owned(),
+        message: "praxisConfig.generate is false; no ConfigMap generated".to_owned(),
         observed_generation,
     }
 }
@@ -5395,15 +5578,15 @@ pub(crate) fn consumer_config_status_error(
         OperatorError::ConsumerConfigRender(ConsumerConfigError::ProjectedCredentialsUnsupported) => {
             "ProjectedCredentialsUnsupported"
         },
-        OperatorError::ConsumerConfigRender(_) => "ConsumerConfigRenderFailed",
+        OperatorError::ConsumerConfigRender(_) => "PraxisConfigRenderFailed",
         OperatorError::MountReconciliation(failure) => failure.reason,
-        OperatorError::Kube(_) => "ConsumerConfigApplyFailed",
+        OperatorError::Kube(_) => "PraxisConfigApplyFailed",
         OperatorError::Certificate(_)
         | OperatorError::Json(_)
         | OperatorError::NotFound(_)
         | OperatorError::OverlayRender(_)
         | OperatorError::SwimKeyConfig(_)
-        | OperatorError::InvalidResource(_) => "ConsumerConfigError",
+        | OperatorError::InvalidResource(_) => "PraxisConfigError",
     };
     ConsumerConfigStatus {
         gateway_name: gw_ref.name.clone(),
@@ -5465,10 +5648,11 @@ pub(crate) fn filter_eligible_remote_crdt_providers<'ctx>(
     network_name: &str,
     sites: &[GridSite],
     remote_providers: &'ctx [crdt::ProviderState],
+    signal: SignalMode,
 ) -> Vec<&'ctx crdt::ProviderState> {
     remote_providers
         .iter()
-        .filter(|p| is_crdt_provider_routing_eligible(network_name, sites, p))
+        .filter(|p| is_crdt_provider_routing_eligible(network_name, sites, p, signal))
         .collect()
 }
 
@@ -5483,6 +5667,7 @@ pub(crate) fn is_crdt_provider_routing_eligible(
     network_name: &str,
     sites: &[GridSite],
     provider: &crdt::ProviderState,
+    signal: SignalMode,
 ) -> bool {
     if provider.network_id != network_name {
         return false;
@@ -5491,7 +5676,7 @@ pub(crate) fn is_crdt_provider_routing_eligible(
     sites.iter().any(|s| {
         s.metadata.name.as_deref() == Some(expected_name.as_str())
             && s.spec.grid_network_ref == network_name
-            && s.status.as_ref().is_some_and(|st| st.phase == GridSitePhase::Active)
+            && s.status.as_ref().is_some_and(|st| st.phase.routes(signal))
     })
 }
 
@@ -5811,21 +5996,21 @@ fn log_stub(site: &DiscoveredSite, network_name: &str, noteworthy: bool) {
     }
 }
 
-/// Whether applying `site` creates its stub or changes the egress or certificate the stub carries.
+/// Whether applying `site` creates its stub or changes the gateway endpoint or certificate the stub carries.
 fn stub_changed(existing: Option<&GridSite>, site: &DiscoveredSite) -> bool {
     let Some(existing) = existing else {
         return true;
     };
-    let egress = existing
+    let gateway_endpoint = existing
         .spec
-        .egress
+        .gateway_endpoint
         .as_ref()
-        .map_or("", |egress| egress.address.as_str());
+        .map_or("", |endpoint| endpoint.address.as_str());
     let cert = existing
         .status
         .as_ref()
         .and_then(|status| status.public_cert_pem.as_deref());
-    egress != site.egress_address || (site.site_cert_pem.is_some() && cert != site.site_cert_pem.as_deref())
+    gateway_endpoint != site.egress_address || (site.site_cert_pem.is_some() && cert != site.site_cert_pem.as_deref())
 }
 
 /// Derive a Kubernetes resource name for an auto-discovered `GridSite`.
@@ -5866,7 +6051,7 @@ pub(crate) fn discovered_site_k8s_name(network_name: &str, site_id: &str) -> Str
 
 /// Whether auto-discovered remote `GridSite` egress should use plaintext.
 ///
-/// Explicit `gatewayRefs[].consumerConfig.clusterEndpoints[].transport.mode`
+/// Explicit `consumerGateways[].praxisConfig.clusterEndpoints[].transport.mode`
 /// declarations are the source of truth when present.  If any endpoint is
 /// declared plaintext, auto-discovered `GridSite` egress is plaintext for this
 /// network.  This supports local/dev GLB demos where provider gateways are
@@ -5876,8 +6061,8 @@ pub(crate) fn discovered_site_k8s_name(network_name: &str, site_id: &str) -> Str
 /// TLS references: a network with no CA or site certificate refs is treated as
 /// plaintext, while a network with either TLS ref keeps mutual TLS.
 fn network_uses_plaintext_egress(network: &GridNetwork) -> bool {
-    let has_plaintext_endpoint = network.spec.gateway_refs.iter().any(|gw| {
-        gw.consumer_config.as_ref().is_some_and(|cc| {
+    let has_plaintext_endpoint = network.spec.consumer_gateways.iter().any(|gw| {
+        gw.praxis_config.as_ref().is_some_and(|cc| {
             cc.cluster_endpoints.iter().any(|ep| {
                 ep.transport
                     .as_ref()
@@ -6064,7 +6249,7 @@ fn discovered_site_spec(site: &DiscoveredSite, network_name: &str, plaintext: bo
             })
         };
         fields.insert(
-            "egress".to_owned(),
+            "gatewayEndpoint".to_owned(),
             serde_json::json!({ "address": site.egress_address, "tls": tls }),
         );
     }
@@ -6133,6 +6318,16 @@ async fn reconcile_discovered_sites(
         // Read before the apply, which writes only spec, so status is the same either side of it.
         let existing = api.get_opt(&site.name).await?;
         let noteworthy = stub_changed(existing.as_ref(), site);
+
+        if existing.is_some() && !site.egress_address.is_empty() {
+            let clear_legacy_endpoint = serde_json::json!({"spec": {"egress": null}});
+            api.patch(
+                &site.name,
+                &PatchParams::default(),
+                &Patch::Merge(&clear_legacy_endpoint),
+            )
+            .await?;
+        }
 
         api.patch(
             &site.name,
@@ -6332,6 +6527,7 @@ mod tests {
     #[expect(
         clippy::expect_used,
         clippy::indexing_slicing,
+        clippy::too_many_lines,
         reason = "test assertions on a JSON patch"
     )]
     fn the_ready_condition_is_patched_only_on_a_change() {
@@ -6339,12 +6535,16 @@ mod tests {
             reason: readiness::Reason::NoEndpointsReady,
             message: "0 ready endpoints".to_owned(),
         };
+        let metrics = serde_json::json!({
+            "type": "MetricsAvailable", "status": "True", "reason": "ScrapeSucceeded", "message": "metrics scraped",
+            "lastTransitionTime": "2026-10-03T00:00:00Z", "observedGeneration": 1
+        });
         let current = provider_with_status(&serde_json::json!({
-            "conditions": [ready_condition_json("False", "NoEndpointsReady")]
+            "conditions": [ready_condition_json("False", "NoEndpointsReady"), metrics]
         }));
         assert!(
             ready_condition_patch(&current, &down).is_none(),
-            "the condition already says so, so there is nothing to write"
+            "the conditions already say so, so there is nothing to write"
         );
         let up = readiness::Verdict {
             reason: readiness::Reason::Ready,
@@ -6352,6 +6552,20 @@ mod tests {
         };
         let (_, patch) = ready_condition_patch(&current, &up).expect("a transition is written");
         assert_eq!(patch["status"]["conditions"][0]["status"], "True");
+        assert_eq!(
+            patch["status"]["conditions"][1]["type"], "MetricsAvailable",
+            "the unchanged condition is sent too, or the apply would remove it"
+        );
+
+        let failing = readiness::Verdict {
+            reason: readiness::Reason::ScrapeTimedOut,
+            message: "no successful metrics scrape in the last 30s; the latest failed: timeout".to_owned(),
+        };
+        let (_, failed) = ready_condition_patch(&current, &failing).expect("a scrape failure is written");
+        let written = &failed["status"]["conditions"][1];
+        assert_eq!(written["status"], "False");
+        assert_eq!(written["reason"], "ScrapeTimedOut");
+        assert_eq!(written["message"], failing.message.as_str());
         assert!(
             patch["status"].get("state").is_none(),
             "the column reads the condition, so status carries no copy of it"
@@ -6669,6 +6883,31 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort())
     }
 
+    #[test]
+    fn empty_overlay_warns_only_on_entering_the_state() {
+        let gw: GatewayRef = serde_json::from_value(serde_json::json!({"name": "gw", "namespace": "ns"}))
+            .unwrap_or_else(|_| std::process::abort());
+        let with_reason = |reason: &str| {
+            let mut network = base_network();
+            network.status = Some(
+                serde_json::from_value(serde_json::json!({"routingMapStatus": [{
+                    "gatewayName": "gw", "namespace": "ns", "configMapName": "c", "schemaVersion": "v",
+                    "renderedRevision": "r", "distributedRevision": "r", "contentDigest": "r", "reason": reason,
+                }]}))
+                .unwrap_or_else(|_| std::process::abort()),
+            );
+            network
+        };
+        let cases = [
+            ("no status yet", base_network(), false),
+            ("was distributed", with_reason(""), false),
+            ("was already empty", with_reason("EmptyCandidates"), true),
+        ];
+        for (label, network, want) in cases {
+            assert_eq!(already_empty(&network, &gw), want, "{label}");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // reject_invalid_budget_policy
     // -----------------------------------------------------------------------
@@ -6786,11 +7025,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one fenced pass must refresh collection, readiness and peer inventory"
+    )]
+    async fn fenced_publication_keeps_scraping_readiness_and_refreshing_peers() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let response = "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n"
+            .as_bytes()
+            .to_vec();
+        let mut provider = make_inference_provider("provider-a", "net");
+        provider.spec.endpoint =
+            crate::resources::test_doubles::start_delayed_http_server(response, Duration::from_millis(25)).await;
+        provider.spec.metrics_config = Some(crate::crd::inference_provider::MetricsConfig {
+            timeout: "1s".to_owned(),
+            ..Default::default()
+        });
+        let client = crate::resources::test_doubles::mock_kube_client_with_providers(vec![provider.clone()]);
+        let ctx = OperatorCtx::new(client.clone(), None, SignalMode::Poll);
+        ctx.signal_fenced.store(true, std::sync::atomic::Ordering::Relaxed);
+        ctx.peer_identities.set(BTreeMap::from([(
+            "removed".to_owned(),
+            signals::PeerRecord {
+                labels: BTreeMap::new(),
+                pins: vec!["previous-pin".to_owned()],
+            },
+        )]));
+        assert!(
+            !ctx.peer_identities.refuses("removed"),
+            "the old peer is present before refresh"
+        );
+        refresh_signals(&ctx, &client, "net").await?;
+        assert!(
+            ctx.last_scrape_pass("net") >= Duration::from_millis(25),
+            "fencing publication cannot skip collection"
+        );
+        let verdict = provider_readiness(&ctx, &provider, Instant::now()).ok_or("readiness was not refreshed")?;
+        assert!(
+            ready_condition_patch(&provider, &verdict).is_some(),
+            "new readiness remains eligible for a Ready condition write"
+        );
+        assert!(
+            ctx.signals.current().is_empty(),
+            "the fenced process still cannot publish"
+        );
+        assert!(
+            ctx.peer_identities.refuses("removed"),
+            "fencing publication cannot freeze the peer inventory"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delayed_publication_retains_the_collection_pass_age() {
+        let client = crate::resources::test_doubles::mock_kube_client_with_providers(Vec::new());
+        let ctx = OperatorCtx::new(client, None, SignalMode::default());
+        let observations = signals::parse("queue 2\nready 1\n");
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(40))
+            .unwrap_or_else(|| std::process::abort());
+        publish_signals(&ctx, HashMap::from([("model".to_owned(), observations)]), started);
+        let published = ctx.signals.current();
+        assert_eq!(published.len(), 2);
+        assert!(
+            published.iter().all(|row| row.age >= Duration::from_secs(40)),
+            "collection and API delays cannot rejuvenate observations"
+        );
+        assert_eq!(
+            published.first().map(|row| row.age),
+            published.last().map(|row| row.age),
+            "one batch keeps one age"
+        );
+    }
+
     #[test]
     fn a_keyless_network_releases_plaintext_only_when_no_network_declares_a_key() {
         let keyless = base_network();
         let mut keyed = base_network();
-        keyed.spec.tls.swim_key_ref = Some(crate::crd::grid_network::SecretRef {
+        keyed.spec.tls.swim_key_secret_ref = Some(crate::crd::grid_network::SecretRef {
             name: "swim-key".to_owned(),
             namespace: "grid".to_owned(),
             key: None,
@@ -7185,7 +7498,7 @@ mod tests {
         let count = count_remote_provider_records_in_snapshot("site-local", "net", &snap);
         assert_eq!(
             count, 0,
-            "distributedProviderCount for one GridNetwork must not include records from another GridNetwork"
+            "remoteProviderCount for one GridNetwork must not include records from another GridNetwork"
         );
     }
 
@@ -7220,7 +7533,7 @@ mod tests {
                 "backendKind": "local",
                 "endpoint": "http://localhost:8080",
                 "models": [{ "name": "model-x" }],
-                "routingClusterRef": routing_ref
+                "clusterName": routing_ref
             }
         }))
         .unwrap_or_else(|_| std::process::abort())
@@ -7273,7 +7586,7 @@ mod tests {
         let state = provider_state_from_kube(&p, "net", "site-a", None).unwrap_or_else(|| std::process::abort());
         assert_eq!(
             state.routing_cluster, "site-override",
-            "routingClusterRef must override metadata.name"
+            "clusterName must override metadata.name"
         );
     }
 
@@ -7472,6 +7785,52 @@ mod tests {
                 signals_address: None,
             }],
         }
+    }
+
+    #[test]
+    fn poll_ignores_membership_and_gossip_degrades_on_it() {
+        let provider = make_crdt_provider("site-west", crdt::ProviderPhase::Available);
+        for status in [MemberStatus::Dead, MemberStatus::Suspect] {
+            let membership = make_swim_membership("site-west", status.clone());
+            let poll = network_with_modes(&serde_json::json!({"signalTransport": {"mode": "poll"}}));
+            let kept = membership_staleness(&poll, vec![provider.clone()], Some(&membership));
+            assert_eq!(
+                kept,
+                vec![provider.clone()],
+                "poll must not rewrite a provider on {status:?}"
+            );
+
+            let gossip = network_with_modes(&serde_json::json!({}));
+            let degraded = membership_staleness(&gossip, vec![provider.clone()], Some(&membership));
+            assert_eq!(
+                degraded.first().map(|p| &p.phase),
+                Some(&crdt::ProviderPhase::Degraded),
+                "gossip still degrades on {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn poll_ignores_the_stale_candidate_ttl() {
+        let provider = make_crdt_provider("site-west", crdt::ProviderPhase::Degraded);
+        let mut membership = make_swim_membership("site-west", MemberStatus::Dead);
+        if let Some(member) = membership.members.first_mut() {
+            member.age_secs = 3_600;
+        }
+        let poll = network_with_modes(&serde_json::json!({
+            "signalTransport": {"mode": "poll"},
+            "staleCandidateTtlSeconds": 60
+        }));
+        assert_eq!(
+            membership_staleness(&poll, vec![provider.clone()], Some(&membership)).len(),
+            1,
+            "a dead member's age must not evict its providers under poll"
+        );
+        let gossip = network_with_modes(&serde_json::json!({"staleCandidateTtlSeconds": 60}));
+        assert!(
+            membership_staleness(&gossip, vec![provider], Some(&membership)).is_empty(),
+            "gossip evicts past the TTL"
+        );
     }
 
     #[test]
@@ -7876,12 +8235,12 @@ mod tests {
             gateway_age_reports: Vec::new(),
             gateway_age_report_overflow: false,
             connected_sites: 2,
-            distributed_provider_count: 2,
+            remote_provider_count: 2,
             grid_id: "grid-id".to_owned(),
             observed_generation: 3,
             phase: GridNetworkPhase::Active,
-            consumer_config_status: Vec::new(),
-            overlay_status: Vec::new(),
+            praxis_config_status: Vec::new(),
+            routing_map_status: Vec::new(),
             budget_status: Vec::new(),
             identity: None,
             mount_reconciliation_status: Vec::new(),
@@ -7889,7 +8248,7 @@ mod tests {
         assert!(!grid_network_status_needs_update(Some(&baseline), &baseline));
 
         let changed = GridNetworkStatus {
-            distributed_provider_count: 1,
+            remote_provider_count: 1,
             ..baseline.clone()
         };
         assert!(grid_network_status_needs_update(Some(&baseline), &changed));
@@ -8269,7 +8628,7 @@ mod tests {
         };
         let spec = discovered_site_spec(&site, "net", true);
         assert_eq!(
-            spec.pointer("/spec/egress/tls"),
+            spec.pointer("/spec/gatewayEndpoint/tls"),
             Some(&serde_json::json!({ "mode": "Plaintext" }))
         );
     }
@@ -8561,7 +8920,8 @@ mod tests {
         };
         let spec = discovered_site_spec(&site, "net", false);
         assert_eq!(
-            spec.pointer("/spec/egress/tls/serverName").and_then(Value::as_str),
+            spec.pointer("/spec/gatewayEndpoint/tls/serverName")
+                .and_then(Value::as_str),
             Some("remote.grid.internal")
         );
         assert_eq!(
@@ -8738,11 +9098,11 @@ mod tests {
             "metadata": { "name": "glb-demo" },
             "spec": {
                 "gridId": "id",
-                "gatewayRefs": [{
+                "consumerGateways": [{
                     "name": "consumer-gateway",
                     "namespace": "grid-system",
-                    "consumerConfig": {
-                        "enabled": true,
+                    "praxisConfig": {
+                        "generate": true,
                         "clusterEndpoints": [{
                             "cluster": "sim-provider-us-west",
                             "address": "172.19.255.212:8080",
@@ -8753,7 +9113,7 @@ mod tests {
                 "tls": {
                     "caSecretRef": {"name": "ca", "namespace": "grid-system"},
                     "siteSecretRef": {"name": "site", "namespace": "grid-system"},
-                    "swimKeyRef": null
+                    "swimKeySecretRef": null
                 }
             }
         }))
@@ -9218,9 +9578,9 @@ mod tests {
         GatewayRef {
             name: name.to_owned(),
             namespace: ns.to_owned(),
-            local_site_name: None,
+            site_name: None,
             provider_hop_endpoints: Vec::new(),
-            consumer_config: None,
+            praxis_config: None,
         }
     }
 
@@ -9275,7 +9635,7 @@ mod tests {
 
     fn make_consumer_config(cm_name: &str) -> ConsumerConfig {
         ConsumerConfig {
-            enabled: true,
+            generate: true,
             config_map_name: cm_name.to_owned(),
             ..ConsumerConfig::default()
         }
@@ -9293,7 +9653,7 @@ mod tests {
                 namespace: "praxis-system".to_owned(),
                 key: None,
             }),
-            swim_key_ref: None,
+            swim_key_secret_ref: None,
         }
     }
 
@@ -9400,11 +9760,11 @@ mod tests {
         let prior = rendered_overlay_status(&gw);
         let mut network = base_network();
         network.status = Some(GridNetworkStatus {
-            overlay_status: vec![prior.clone()],
+            routing_map_status: vec![prior.clone()],
             ..GridNetworkStatus::default()
         });
 
-        let status = retained_overlay_status(&network, &gw, 5, None, "OverlayApplyFailed", "overlay apply failed");
+        let status = retained_overlay_status(&network, &gw, 5, None, "RoutingMapApplyFailed", "overlay apply failed");
 
         assert_eq!(status.phase, OverlayPhase::Retained);
         assert_eq!(status.rendered_revision, prior.rendered_revision);
@@ -9413,7 +9773,7 @@ mod tests {
         assert_eq!(status.config_map_resource_version, prior.config_map_resource_version);
         assert_eq!(status.candidate_count, prior.candidate_count);
         assert_eq!(status.rendered_at, prior.rendered_at);
-        assert_eq!(status.reason, "OverlayApplyFailed");
+        assert_eq!(status.reason, "RoutingMapApplyFailed");
         assert!(status.message.contains("previous valid overlay retained"));
         assert_eq!(status.observed_generation, 5);
     }
@@ -9428,7 +9788,7 @@ mod tests {
             &gw,
             1,
             None,
-            "OverlayApplyFailed",
+            "RoutingMapApplyFailed",
             "overlay ConfigMap apply failed",
         );
 
@@ -9437,17 +9797,18 @@ mod tests {
         assert!(status.distributed_revision.is_empty());
         assert!(status.content_digest.is_empty());
         assert!(status.config_map_resource_version.is_empty());
-        assert_eq!(status.reason, "OverlayApplyFailed");
+        assert_eq!(status.reason, "RoutingMapApplyFailed");
         assert!(status.message.contains("no valid overlay has been distributed"));
         assert_eq!(status.observed_generation, 1);
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "checks retention across an empty prior overlay")]
     fn retained_overlay_status_does_not_retain_an_error_without_revision() {
         let gw = make_gw_ref("gw", "grid-system");
         let mut network = base_network();
         network.status = Some(GridNetworkStatus {
-            overlay_status: vec![OverlayRevisionStatus {
+            routing_map_status: vec![OverlayRevisionStatus {
                 gateway_name: gw.name.clone(),
                 namespace: gw.namespace.clone(),
                 config_map_name: "grid-overlay-net-gw".to_owned(),
@@ -9459,19 +9820,26 @@ mod tests {
                 rendered_at: String::new(),
                 candidate_count: 0,
                 phase: OverlayPhase::Error,
-                reason: "OverlayApplyFailed".to_owned(),
+                reason: "RoutingMapApplyFailed".to_owned(),
                 message: "no valid overlay has been distributed".to_owned(),
                 observed_generation: 1,
             }],
             ..GridNetworkStatus::default()
         });
 
-        let status = retained_overlay_status(&network, &gw, 2, None, "OverlayRenderFailed", "overlay render failed");
+        let status = retained_overlay_status(
+            &network,
+            &gw,
+            2,
+            None,
+            "RoutingMapRenderFailed",
+            "overlay render failed",
+        );
 
         assert_eq!(status.phase, OverlayPhase::Error);
         assert!(status.rendered_revision.is_empty());
         assert!(status.distributed_revision.is_empty());
-        assert_eq!(status.reason, "OverlayRenderFailed");
+        assert_eq!(status.reason, "RoutingMapRenderFailed");
     }
 
     // -----------------------------------------------------------------------
@@ -9481,13 +9849,16 @@ mod tests {
     const FRESH: &str = "2026-10-01T12:00:00Z";
 
     fn only_overlay(status: &GridNetworkStatus) -> &OverlayRevisionStatus {
-        status.overlay_status.first().unwrap_or_else(|| std::process::abort())
+        status
+            .routing_map_status
+            .first()
+            .unwrap_or_else(|| std::process::abort())
     }
 
     fn network_with_overlay(prior: OverlayRevisionStatus) -> GridNetwork {
         let mut network = base_network();
         network.status = Some(GridNetworkStatus {
-            overlay_status: vec![prior],
+            routing_map_status: vec![prior],
             ..GridNetworkStatus::default()
         });
         network
@@ -9495,7 +9866,7 @@ mod tests {
 
     fn desired_with_overlay(network: &GridNetwork, overlay: OverlayRevisionStatus) -> GridNetworkStatus {
         GridNetworkStatus {
-            overlay_status: keep_rendered_at(network.status.as_ref(), vec![overlay]),
+            routing_map_status: keep_rendered_at(network.status.as_ref(), vec![overlay]),
             ..network.status.clone().unwrap_or_default()
         }
     }
@@ -9535,7 +9906,7 @@ mod tests {
         };
         let new_reason = OverlayRevisionStatus {
             phase: OverlayPhase::Error,
-            reason: "OverlayApplyFailed".to_owned(),
+            reason: "RoutingMapApplyFailed".to_owned(),
             message: "apply failed".to_owned(),
             rendered_at: FRESH.to_owned(),
             ..prior
@@ -9634,12 +10005,12 @@ mod tests {
         let prior = rendered_overlay_status(&gw);
         let mut network = base_network();
         network.status = Some(GridNetworkStatus {
-            overlay_status: vec![prior.clone()],
+            routing_map_status: vec![prior.clone()],
             ..GridNetworkStatus::default()
         });
         let render = make_render_result(&"b".repeat(64), 3);
 
-        let status = retained_overlay_status(&network, &gw, 5, Some(&render), "OverlayApplyFailed", "apply failed");
+        let status = retained_overlay_status(&network, &gw, 5, Some(&render), "RoutingMapApplyFailed", "apply failed");
 
         assert_eq!(
             status.rendered_revision,
@@ -9665,7 +10036,7 @@ mod tests {
         let network = base_network();
         let render = make_render_result(&"b".repeat(64), 2);
 
-        let status = retained_overlay_status(&network, &gw, 1, Some(&render), "OverlayApplyFailed", "apply failed");
+        let status = retained_overlay_status(&network, &gw, 1, Some(&render), "RoutingMapApplyFailed", "apply failed");
 
         assert_eq!(
             status.rendered_revision,
@@ -9683,11 +10054,11 @@ mod tests {
         let prior = rendered_overlay_status(&gw);
         let mut network = base_network();
         network.status = Some(GridNetworkStatus {
-            overlay_status: vec![prior.clone()],
+            routing_map_status: vec![prior.clone()],
             ..GridNetworkStatus::default()
         });
 
-        let status = retained_overlay_status(&network, &gw, 7, None, "OverlayRenderFailed", "render failed");
+        let status = retained_overlay_status(&network, &gw, 7, None, "RoutingMapRenderFailed", "render failed");
 
         assert_eq!(
             status.rendered_revision, prior.rendered_revision,
@@ -9762,6 +10133,7 @@ mod tests {
             network_name: "net",
             from_providers: &[],
             transport: None,
+            signal: SignalMode::Gossip,
         }
     }
 
@@ -9769,7 +10141,7 @@ mod tests {
     fn without_derive_topology_typed_entries_pass_through_and_an_untyped_candidate_is_withdrawn() {
         let mut gw = make_gw_ref("inference-gw", "praxis-system");
         let typed = vec![typed_endpoint("prov-a", "a.example.invalid:8080")];
-        gw.consumer_config = Some(ConsumerConfig {
+        gw.praxis_config = Some(ConsumerConfig {
             cluster_endpoints: typed.clone(),
             ..make_consumer_config("praxis-consumer-config")
         });
@@ -9787,8 +10159,8 @@ mod tests {
     #[test]
     fn a_disabled_consumer_config_withdraws_nothing() {
         let mut gw = make_gw_ref("inference-gw", "praxis-system");
-        gw.consumer_config = Some(ConsumerConfig {
-            enabled: false,
+        gw.praxis_config = Some(ConsumerConfig {
+            generate: false,
             ..make_consumer_config("praxis-consumer-config")
         });
         let candidates = vec![topology_candidate("prov-b", "site-b")];
@@ -9803,7 +10175,7 @@ mod tests {
     #[test]
     fn an_mcp_tool_candidate_is_never_withdrawn() {
         let mut gw = make_gw_ref("inference-gw", "praxis-system");
-        gw.consumer_config = Some(make_consumer_config("praxis-consumer-config"));
+        gw.praxis_config = Some(make_consumer_config("praxis-consumer-config"));
         let mut tool = topology_candidate("prov-b", "site-b");
         tool.kind = "mcp_tool".to_owned();
         let mut overlay = routing_overlay::RoutingOverlay {
@@ -9829,7 +10201,7 @@ mod tests {
         // An empty allowlist reads as no provider; typed entries pass through.
         let mut gw = make_gw_ref("inference-gw", "praxis-system");
         let typed = vec![typed_endpoint("prov-a", "a.example.invalid:8080")];
-        gw.consumer_config = Some(ConsumerConfig {
+        gw.praxis_config = Some(ConsumerConfig {
             derive_topology: Some(crate::crd::grid_network::DeriveTopology {
                 from_providers: Vec::new(),
                 transport: None,
@@ -9849,7 +10221,7 @@ mod tests {
     #[test]
     fn with_derive_topology_an_unresolvable_candidate_leaves_the_topology_empty() {
         let mut gw = make_gw_ref("inference-gw", "praxis-system");
-        gw.consumer_config = Some(ConsumerConfig {
+        gw.praxis_config = Some(ConsumerConfig {
             derive_topology: Some(crate::crd::grid_network::DeriveTopology {
                 from_providers: vec!["prov-a".to_owned(), "prov-b".to_owned(), "prov-ghost".to_owned()],
                 transport: None,
@@ -9905,7 +10277,7 @@ mod tests {
         // The renderer emits every entry, so a later overlay can route to it without a new config.
         let mut gw = make_gw_ref("inference-gw", "praxis-system");
         let typed = vec![typed_endpoint("retired", "retired.example.invalid:8080")];
-        gw.consumer_config = Some(ConsumerConfig {
+        gw.praxis_config = Some(ConsumerConfig {
             derive_topology: Some(crate::crd::grid_network::DeriveTopology {
                 from_providers: vec!["prov-a".to_owned(), "prov-b".to_owned(), "prov-ghost".to_owned()],
                 transport: None,
@@ -9960,13 +10332,13 @@ mod tests {
         ];
         for (derive_topology, live) in steps {
             let mut gw = make_gw_ref("inference-gw", "praxis-system");
-            gw.local_site_name = Some("site-a".to_owned());
+            gw.site_name = Some("site-a".to_owned());
             let cc = ConsumerConfig {
                 derive_topology,
                 cluster_endpoints: vec![typed_endpoint("typed-c", "typed-c.models.svc:8000")],
                 ..make_consumer_config("praxis-consumer-config")
             };
-            gw.consumer_config = Some(cc.clone());
+            gw.praxis_config = Some(cc.clone());
             let mut overlay = routing_overlay::RoutingOverlay {
                 network: "net".to_owned(),
                 local_site: "site-a".to_owned(),
@@ -9983,7 +10355,7 @@ mod tests {
             withdraw_refused(&mut overlay, &refused);
             let render = consumer_config::render_consumer_config_with_projected(
                 &overlay,
-                &cc.credential_mount_base,
+                &cc.credential_mount_path,
                 &endpoints,
                 &cc.tls_cert_mount_path,
                 cc.listener_port,
@@ -10672,7 +11044,7 @@ mod tests {
         let err = OperatorError::ConsumerConfigRender(ConsumerConfigError::BlankLocalSite);
         let status = consumer_config_status_error(&gw, &cc, &err, 1);
         assert_eq!(
-            status.reason, "ConsumerConfigRenderFailed",
+            status.reason, "PraxisConfigRenderFailed",
             "render error must map to ConsumerConfigRenderFailed reason"
         );
     }
@@ -10777,11 +11149,11 @@ mod tests {
     fn consumer_config_status_disabled_has_disabled_phase() {
         let gw = make_gw_ref("gw", "ns");
         let mut cc = make_consumer_config("cm");
-        cc.enabled = false;
+        cc.generate = false;
         let status = consumer_config_status_disabled(&gw, &cc, 2);
         assert_eq!(status.phase, ConsumerConfigPhase::Disabled, "must set phase=Disabled");
         assert_eq!(
-            status.reason, "ConsumerConfigDisabled",
+            status.reason, "PraxisConfigDisabled",
             "must have ConsumerConfigDisabled reason"
         );
         assert!(!status.message.is_empty(), "must have a non-empty diagnostic message");
@@ -10831,7 +11203,7 @@ mod tests {
             namespace: "ns".to_owned(),
             config_map_name: "cm".to_owned(),
             phase: ConsumerConfigPhase::Error,
-            reason: "ConsumerConfigRenderFailed".to_owned(),
+            reason: "PraxisConfigRenderFailed".to_owned(),
             message: "error".to_owned(),
             observed_generation: 1,
         };
@@ -10922,8 +11294,37 @@ mod tests {
         let sites = vec![make_active_grid_site("net-site-west", "net")];
         let provider = make_eligible_crdt_provider("net", "site-west");
         assert!(
-            is_crdt_provider_routing_eligible("net", &sites, &provider),
+            is_crdt_provider_routing_eligible("net", &sites, &provider, SignalMode::Gossip),
             "Active GridSite must make CRDT provider eligible"
+        );
+    }
+
+    #[test]
+    fn under_poll_an_unreachable_site_keeps_its_providers() {
+        let provider = make_eligible_crdt_provider("net", "site-west");
+        for (phase, kept) in [
+            ("Unreachable", true),
+            ("Active", true),
+            ("Connecting", false),
+            ("Discovered", false),
+            ("Pending", false),
+            ("Left", false),
+        ] {
+            let sites = vec![make_phase_grid_site("net-site-west", "net", phase)];
+            assert_eq!(
+                is_crdt_provider_routing_eligible("net", &sites, &provider, SignalMode::Poll),
+                kept,
+                "{phase} under poll"
+            );
+        }
+        let unreachable = vec![make_phase_grid_site("net-site-west", "net", "Unreachable")];
+        assert!(
+            !is_crdt_provider_routing_eligible("net", &unreachable, &provider, SignalMode::Gossip),
+            "gossip still withdraws an unreachable site"
+        );
+        assert!(
+            !is_crdt_provider_routing_eligible("net", &[], &provider, SignalMode::Poll),
+            "a deleted GridSite withdraws its providers under poll"
         );
     }
 
@@ -10932,7 +11333,7 @@ mod tests {
         let sites = vec![make_phase_grid_site("net-site-west", "net", "Connecting")];
         let provider = make_eligible_crdt_provider("net", "site-west");
         assert!(
-            !is_crdt_provider_routing_eligible("net", &sites, &provider),
+            !is_crdt_provider_routing_eligible("net", &sites, &provider, SignalMode::Gossip),
             "Connecting GridSite must NOT make CRDT provider eligible"
         );
     }
@@ -10942,7 +11343,7 @@ mod tests {
         let sites = vec![make_phase_grid_site("net-site-west", "net", "Discovered")];
         let provider = make_eligible_crdt_provider("net", "site-west");
         assert!(
-            !is_crdt_provider_routing_eligible("net", &sites, &provider),
+            !is_crdt_provider_routing_eligible("net", &sites, &provider, SignalMode::Gossip),
             "Discovered GridSite must NOT make CRDT provider eligible"
         );
     }
@@ -10952,7 +11353,7 @@ mod tests {
         let sites = vec![make_phase_grid_site("net-site-west", "net", "Pending")];
         let provider = make_eligible_crdt_provider("net", "site-west");
         assert!(
-            !is_crdt_provider_routing_eligible("net", &sites, &provider),
+            !is_crdt_provider_routing_eligible("net", &sites, &provider, SignalMode::Gossip),
             "Pending GridSite must NOT make CRDT provider eligible"
         );
     }
@@ -10962,7 +11363,7 @@ mod tests {
         let sites = vec![make_phase_grid_site("net-site-west", "net", "Unreachable")];
         let provider = make_eligible_crdt_provider("net", "site-west");
         assert!(
-            !is_crdt_provider_routing_eligible("net", &sites, &provider),
+            !is_crdt_provider_routing_eligible("net", &sites, &provider, SignalMode::Gossip),
             "Unreachable GridSite must NOT make CRDT provider eligible"
         );
     }
@@ -10972,7 +11373,7 @@ mod tests {
         let sites: Vec<GridSite> = vec![];
         let provider = make_eligible_crdt_provider("net", "site-west");
         assert!(
-            !is_crdt_provider_routing_eligible("net", &sites, &provider),
+            !is_crdt_provider_routing_eligible("net", &sites, &provider, SignalMode::Gossip),
             "No matching GridSite must NOT make CRDT provider eligible (fail-closed)"
         );
     }
@@ -10983,7 +11384,7 @@ mod tests {
         let sites = vec![make_active_grid_site("net-site-west", "other-net")];
         let provider = make_eligible_crdt_provider("net", "site-west");
         assert!(
-            !is_crdt_provider_routing_eligible("net", &sites, &provider),
+            !is_crdt_provider_routing_eligible("net", &sites, &provider, SignalMode::Gossip),
             "Wrong-network GridSite must NOT make CRDT provider eligible"
         );
     }
@@ -10993,7 +11394,7 @@ mod tests {
         let sites = vec![make_active_grid_site("other-net-site-west", "net")];
         let provider = make_eligible_crdt_provider("other-net", "site-west");
         assert!(
-            !is_crdt_provider_routing_eligible("net", &sites, &provider),
+            !is_crdt_provider_routing_eligible("net", &sites, &provider, SignalMode::Gossip),
             "Provider from another network must NOT become eligible even if a matching-name Active GridSite exists"
         );
     }
@@ -11011,7 +11412,7 @@ mod tests {
         let active_provider = make_tool_crdt_provider("site-a");
         let inactive_provider = make_tool_crdt_provider("site-b");
         let providers = vec![active_provider, inactive_provider.clone()];
-        let eligible = filter_eligible_remote_crdt_providers("net", &sites, &providers);
+        let eligible = filter_eligible_remote_crdt_providers("net", &sites, &providers, SignalMode::Gossip);
         assert_eq!(
             eligible.len(),
             1,
@@ -11045,7 +11446,7 @@ mod tests {
             make_eligible_crdt_provider("net", "site-b"), // Connecting → ineligible
             make_eligible_crdt_provider("net", "site-c"), // Missing → ineligible
         ];
-        let eligible = filter_eligible_remote_crdt_providers("net", &sites, &providers);
+        let eligible = filter_eligible_remote_crdt_providers("net", &sites, &providers, SignalMode::Gossip);
         assert_eq!(eligible.len(), 1, "only Active site provider must pass filter");
         let first = eligible.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(first.site_id, "site-a");
@@ -11055,8 +11456,8 @@ mod tests {
     fn filter_is_deterministic() {
         let sites = vec![make_active_grid_site("net-site-a", "net")];
         let providers = vec![make_eligible_crdt_provider("net", "site-a")];
-        let r1 = filter_eligible_remote_crdt_providers("net", &sites, &providers);
-        let r2 = filter_eligible_remote_crdt_providers("net", &sites, &providers);
+        let r1 = filter_eligible_remote_crdt_providers("net", &sites, &providers, SignalMode::Gossip);
+        let r2 = filter_eligible_remote_crdt_providers("net", &sites, &providers, SignalMode::Gossip);
         assert_eq!(r1.len(), r2.len(), "filter must be deterministic");
     }
 
@@ -11066,7 +11467,7 @@ mod tests {
         // The filter must not alter provider identity.
         let sites = vec![make_active_grid_site("net-site-a", "net")];
         let providers = vec![make_eligible_crdt_provider("net", "site-a")];
-        let eligible = filter_eligible_remote_crdt_providers("net", &sites, &providers);
+        let eligible = filter_eligible_remote_crdt_providers("net", &sites, &providers, SignalMode::Gossip);
         assert_eq!(eligible.len(), 1, "eligible provider must pass filter");
         let first = eligible.first().unwrap_or_else(|| std::process::abort());
         assert_eq!(first.site_id, "site-a", "filter must not alter provider identity");

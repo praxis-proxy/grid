@@ -98,7 +98,7 @@ pub struct SwimConfig {
     ///
     /// When set, this address is included in outbound `StateBroadcast` messages
     /// as the `gateway_address` field, and remote peers will use it for
-    /// `GridSite.spec.egress.address` instead of the SWIM UDP endpoint.
+    /// `GridSite.spec.gatewayEndpoint.address` instead of the SWIM UDP endpoint.
     pub gateway_address: Option<String>,
 
     /// SWIM packet protection at startup, never logged.
@@ -109,6 +109,20 @@ pub struct SwimConfig {
 
     /// Persists the next revision range as the lease runs low, `None` to stop at its end.
     pub revision_renewer: Option<RevisionRenewer>,
+
+    /// What a departed site's gossiped state does once its member record expires.
+    pub departed: Departed,
+}
+
+/// What a departed site's gossiped state does once its member record expires.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Departed {
+    /// Remove all of it.
+    #[default]
+    Evict,
+    /// Keep its providers, signals address and revision guards, within the origin bound; forget
+    /// its gateway address and certificate.
+    RetainProviders,
 }
 
 /// Persists a revision range past the given last revision before any of it is used, returning its bounds.
@@ -243,6 +257,7 @@ impl std::fmt::Debug for SwimConfig {
             .field("key", &self.key)
             .field("revision_lease", &self.revision_lease)
             .field("revision_renewer", &self.revision_renewer.is_some())
+            .field("departed", &self.departed)
             .finish()
     }
 }
@@ -443,13 +458,19 @@ fn publish_state(state_tx: &watch::Sender<GridStateSnapshot>, node: &SwimNode) {
     });
 }
 
-/// Evict departed origins and immediately expose their provider withdrawal to readers.
-fn evict_origins(origins: &[String], node: &SwimNode, state_tx: &watch::Sender<GridStateSnapshot>) {
+/// Evict departed origins and immediately expose the change to readers.
+///
+/// A retained origin keeps its providers, signals address and revision guards and loses its
+/// gateway address and certificate, so it is still polled and nothing older replays.
+fn evict_origins(origins: &[String], departed: Departed, node: &SwimNode, state_tx: &watch::Sender<GridStateSnapshot>) {
     if origins.is_empty() {
         return;
     }
     for origin in origins {
-        node.evict_origin(origin);
+        match departed {
+            Departed::RetainProviders => node.forget_departed_origin(origin),
+            Departed::Evict => node.evict_origin(origin),
+        }
     }
     publish_state(state_tx, node);
 }
@@ -859,6 +880,8 @@ pub enum SeedAnnounceError {
 /// and [`SwimHandle::state_snapshot`] by cloning the most recent watch value
 /// without blocking.
 pub struct SwimHandle {
+    /// Immutable node-generation reservation, also fencing signal publication.
+    publisher_reservation: (u64, u64),
     /// Stable local site identity advertised by this SWIM runtime.
     site_name: String,
 
@@ -907,6 +930,11 @@ pub struct SwimHandle {
 }
 
 impl SwimHandle {
+    /// Immutable publisher epoch and the persisted generation high-water mark.
+    pub(crate) fn publisher_reservation(&self) -> (u64, u64) {
+        self.publisher_reservation
+    }
+
     /// Return the signals endpoint gossiped to peers, if any.
     #[must_use]
     pub fn signals_address(&self) -> Option<&str> {
@@ -1279,6 +1307,10 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
     );
 
     let signals_address = config.signals_address.clone();
+    let publisher_reservation = (
+        config.revision_lease.first_node_generation,
+        config.revision_lease.last_node_generation,
+    );
     let run_loop_handle = tokio::spawn(run_loop(
         Arc::new(socket),
         config,
@@ -1299,6 +1331,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
     });
 
     Ok(Arc::new(SwimHandle {
+        publisher_reservation,
         site_name,
         advertise_addr,
         signals_address,
@@ -1677,7 +1710,7 @@ async fn run_loop(
                 let live: Vec<&NodeId> = node.live_identities().collect();
                 let gone = restore_from_foca(evicted, &mut tracked, &live, now);
                 let adopted = adopt_live_identities(&mut tracked, &live, now);
-                evict_origins(&gone, &node, &state_tx);
+                evict_origins(&gone, config.departed, &node, &state_tx);
                 // Republish while age changes or after eviction so readers see
                 // a coherent bounded membership view.
                 if has_aging_members(&tracked) || changed || adopted {
@@ -2183,6 +2216,7 @@ mod tests {
             key: KeyState::Plain,
             revision_lease: test_revision_lease(seed),
             revision_renewer: None,
+            departed: Departed::Evict,
         }
     }
 
@@ -2556,6 +2590,7 @@ mod tests {
         let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, _gateway_rx) = watch::channel(None);
         let handle = SwimHandle {
+            publisher_reservation: (1, 2),
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
             signals_address: None,
@@ -2725,6 +2760,7 @@ mod tests {
         let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, _gateway_rx) = watch::channel(Some("127.0.0.1:19080".to_owned()));
         let handle = SwimHandle {
+            publisher_reservation: (1, 2),
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
             signals_address: None,
@@ -2756,6 +2792,7 @@ mod tests {
         let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, _gateway_rx) = watch::channel(None);
         let handle = SwimHandle {
+            publisher_reservation: (1, 2),
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
             signals_address: None,
@@ -3030,7 +3067,7 @@ mod tests {
             "the initial publication must contain provider-a"
         );
 
-        evict_origins(&["site-a".to_owned()], &node, &state_tx);
+        evict_origins(&["site-a".to_owned()], Departed::Evict, &node, &state_tx);
 
         assert!(
             state_rx.has_changed()?,
@@ -3143,6 +3180,7 @@ mod tests {
         let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, _gateway_rx) = watch::channel(None);
         let handle = SwimHandle {
+            publisher_reservation: (1, 2),
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
             signals_address: None,
@@ -3175,6 +3213,7 @@ mod tests {
         let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, _gateway_rx) = watch::channel(None);
         let handle = SwimHandle {
+            publisher_reservation: (1, 2),
             site_name: "test".to_owned(),
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
             signals_address: None,
@@ -3214,6 +3253,7 @@ mod tests {
             key: KeyState::Plain,
             revision_lease: test_revision_lease(1),
             revision_renewer: None,
+            departed: Departed::Evict,
         };
         let handle = start(cfg).await;
         assert!(handle.is_ok(), "start must succeed with an available port");
@@ -3239,6 +3279,7 @@ mod tests {
             key: KeyState::Plain,
             revision_lease: test_revision_lease(20_000),
             revision_renewer: None,
+            departed: Departed::Evict,
         };
         let result = start(cfg).await;
         assert!(result.is_err(), "start on an already-bound port must fail");
@@ -3261,6 +3302,7 @@ mod tests {
             key: KeyState::Plain,
             revision_lease: test_revision_lease(40_000),
             revision_renewer: None,
+            departed: Departed::Evict,
         };
         let handle1 = start(cfg1).await.unwrap_or_else(|_| std::process::abort());
 
@@ -3274,6 +3316,7 @@ mod tests {
             key: KeyState::Plain,
             revision_lease: test_revision_lease(60_000),
             revision_renewer: None,
+            departed: Departed::Evict,
         };
         let handle2 = start(cfg2).await.unwrap_or_else(|_| std::process::abort());
 
@@ -3425,6 +3468,7 @@ mod tests {
             key: KeyState::Plain,
             revision_lease: test_revision_lease(80_000),
             revision_renewer: None,
+            departed: Departed::Evict,
         })
         .await
         .unwrap_or_else(|_| std::process::abort());
@@ -3439,6 +3483,7 @@ mod tests {
             key: KeyState::Plain,
             revision_lease: test_revision_lease(90_000),
             revision_renewer: None,
+            departed: Departed::Evict,
         })
         .await
         .unwrap_or_else(|_| std::process::abort());
@@ -3476,6 +3521,7 @@ mod tests {
             key: KeyState::Plain,
             revision_lease: test_revision_lease(100_000),
             revision_renewer: None,
+            departed: Departed::Evict,
         })
         .await
         .unwrap_or_else(|_| std::process::abort());
@@ -3524,6 +3570,31 @@ mod tests {
     // -----------------------------------------------------------------------
     // Dead-member eviction
     // -----------------------------------------------------------------------
+
+    /// A node holding site-a's providers, and the state it publishes.
+    fn holding_site_a() -> (SwimNode, watch::Sender<GridStateSnapshot>) {
+        let addr = "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort());
+        let mut node = SwimNode::new(NodeId::with_generation("site-local".to_owned(), addr, 1));
+        node.publish_state_broadcast(&provider_broadcast(0.1))
+            .unwrap_or_else(|_| std::process::abort());
+        let (state_tx, _) = watch::channel(GridStateSnapshot::new("site-local".to_owned()));
+        publish_state(&state_tx, &node);
+        (node, state_tx)
+    }
+
+    #[test]
+    fn a_retained_departed_origin_keeps_its_providers() {
+        let (node, state_tx) = holding_site_a();
+        evict_origins(&["site-a".to_owned()], Departed::RetainProviders, &node, &state_tx);
+        assert!(state_tx.borrow().provider("net", "site-a", "provider-a").is_some());
+    }
+
+    #[test]
+    fn an_evicted_departed_origin_loses_its_providers() {
+        let (node, state_tx) = holding_site_a();
+        evict_origins(&["site-a".to_owned()], Departed::Evict, &node, &state_tx);
+        assert!(state_tx.borrow().providers.is_empty());
+    }
 
     #[test]
     fn dead_member_evicted_after_ttl() {

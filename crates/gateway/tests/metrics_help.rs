@@ -7,11 +7,12 @@
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     /// Names `describe_metrics` documents, which a scrape must explain.
-    const DOCUMENTED: [&str; 21] = [
+    const DOCUMENTED: [&str; 25] = [
         "grid_route_decisions_total",
         "grid_route_selections_total",
         "grid_route_prefix_affinity_total",
         "grid_serving_config_reload_total",
+        "grid_route_site_silent_transitions_total",
         "grid_route_site_rho",
         "grid_route_site_rho_reported",
         "grid_route_site_rho_counted",
@@ -22,6 +23,9 @@ mod tests {
         "grid_route_site_in_flight",
         "grid_route_site_full",
         "grid_route_site_reading_age_seconds",
+        "grid_route_site_silent",
+        "grid_route_site_last_sample_age_seconds",
+        "grid_route_site_round_age_seconds",
         "grid_route_site_score",
         "grid_route_shedding",
         "grid_signals_poll_total",
@@ -29,6 +33,24 @@ mod tests {
         "grid_signals_feedback_failures_total",
         "grid_signals_last_success_timestamp_seconds",
         "grid_signals_response_bytes",
+    ];
+
+    /// The per-site gauges, set once each so their help text renders.
+    const SITE_GAUGES: [&str; 14] = [
+        "grid_route_site_rho",
+        "grid_route_site_rho_reported",
+        "grid_route_site_rho_counted",
+        "grid_route_site_weight",
+        "grid_route_site_ceiling",
+        "grid_route_site_ceiling_soft",
+        "grid_route_site_ceiling_hard",
+        "grid_route_site_in_flight",
+        "grid_route_site_full",
+        "grid_route_site_reading_age_seconds",
+        "grid_route_site_silent",
+        "grid_route_site_last_sample_age_seconds",
+        "grid_route_site_round_age_seconds",
+        "grid_route_site_score",
     ];
 
     #[test]
@@ -40,17 +62,10 @@ mod tests {
         metrics::counter!("grid_route_selections_total", "path" => "cross_site").increment(1);
         metrics::counter!("grid_route_prefix_affinity_total", "outcome" => "hit").increment(1);
         metrics::counter!("grid_serving_config_reload_total", "result" => "ok").increment(1);
-        metrics::gauge!("grid_route_site_rho", "site" => "east").set(0.5);
-        metrics::gauge!("grid_route_site_rho_reported", "site" => "east").set(0.5);
-        metrics::gauge!("grid_route_site_rho_counted", "site" => "east").set(0.5);
-        metrics::gauge!("grid_route_site_weight", "site" => "east").set(1.0);
-        metrics::gauge!("grid_route_site_ceiling", "site" => "east").set(8.0);
-        metrics::gauge!("grid_route_site_ceiling_soft", "site" => "east").set(8.0);
-        metrics::gauge!("grid_route_site_ceiling_hard", "site" => "east").set(8.0);
-        metrics::gauge!("grid_route_site_in_flight", "site" => "east").set(4.0);
-        metrics::gauge!("grid_route_site_full", "site" => "east").set(0.0);
-        metrics::gauge!("grid_route_site_reading_age_seconds", "site" => "east").set(1.0);
-        metrics::gauge!("grid_route_site_score", "site" => "east").set(0.25);
+        metrics::counter!("grid_route_site_silent_transitions_total", "to" => "silent").increment(1);
+        for name in SITE_GAUGES {
+            metrics::gauge!(name, "site" => "east").set(1.0);
+        }
         metrics::gauge!("grid_route_shedding", "model" => "llama").set(0.0);
         metrics::counter!("grid_signals_poll_total", "result" => "ok").increment(1);
         metrics::counter!("grid_signals_ingest_dropped_total", "reason" => "skew").increment(1);

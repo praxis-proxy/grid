@@ -27,6 +27,8 @@ pub struct Metric<'text> {
     name: &'text str,
     /// Reported value; always finite.
     value: f64,
+    /// Original value token, before floating-point conversion.
+    value_text: &'text str,
     /// Millisecond timestamp, when the line carried one.
     timestamp_ms: Option<i64>,
     /// Validated label section between the braces, for lazy iteration.
@@ -44,6 +46,12 @@ impl<'text> Metric<'text> {
     #[must_use]
     pub fn value(&self) -> f64 {
         self.value
+    }
+
+    /// The original value token, for exact integer contracts.
+    #[must_use]
+    pub fn value_text(&self) -> &'text str {
+        self.value_text
     }
 
     /// The millisecond timestamp, when the line carried one.
@@ -80,7 +88,8 @@ pub fn parse(line: &str) -> Option<Metric<'_>> {
     }
     let (labels, tail) = scan_labels(rest)?;
     let mut fields = tail.split_whitespace();
-    let value = fields.next()?.parse::<f64>().ok()?;
+    let value_text = fields.next()?;
+    let value = value_text.parse::<f64>().ok()?;
     // A non-finite value would poison any comparison downstream, so reject it at
     // the boundary.
     if !value.is_finite() {
@@ -96,6 +105,7 @@ pub fn parse(line: &str) -> Option<Metric<'_>> {
     Some(Metric {
         name,
         value,
+        value_text,
         timestamp_ms,
         labels,
     })

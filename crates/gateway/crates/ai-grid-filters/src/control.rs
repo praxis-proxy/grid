@@ -274,7 +274,8 @@ impl Control {
         Ok(Self {
             store: Arc::new(
                 LoadStore::with_combine(Duration::from_secs(config.window_secs), crate::signals::llm_d::combine)
-                    .with_local_site(&config.local_site),
+                    .with_local_site(&config.local_site)
+                    .with_revision_guard(i64::try_from(config.window_secs.saturating_mul(1_000)).unwrap_or(i64::MAX)),
             ),
             snapshot: Arc::new(ArcSwap::from_pointee(cold_start)),
             topology: Arc::new(ArcSwap::from_pointee(topology)),
@@ -882,6 +883,7 @@ mod tests {
             fresh: true,
             kind: CapabilityKind::InferenceModel,
             name: "llama".to_owned(),
+            publishes_load: true,
             site: site.to_owned(),
             stable_id: None,
         }
@@ -1099,6 +1101,45 @@ mod tests {
             None,
             "the adopted tuning is a no-op again"
         );
+    }
+
+    /// Applying plugin cache policy resizes live backend caches without restarting their pollers.
+    #[test]
+    fn plugin_cache_limits_resize_the_running_index_without_restarting_peers() {
+        let peers = Peers::default();
+        let initial = config(&["east", "west"]);
+        let grid = runtime(&peers, &initial);
+        let affinity = grid.affinity();
+        let keys = crate::prefix::PrefixKeys::from_keys((0..8).collect());
+        for cluster in ["pool-east", "pool-west"] {
+            affinity.index.confirm(&keys, &Arc::from(cluster));
+        }
+        let config = serde_yaml::from_str("prefix_affinity: {capacity: 4, ttl_secs: 120}").expect("plugin settings");
+        let _filter = crate::route::GridSiteRouteFilter::from_config(
+            &config,
+            grid.snapshot(),
+            Arc::clone(&affinity),
+            Arc::default(),
+            &grid.tuning(),
+        )
+        .expect("plugin builds against the running control");
+        assert_eq!(
+            affinity.index.depths(&keys, ["pool-east", "pool-west"]),
+            [4, 4],
+            "both backend caches adopt capacity 4"
+        );
+        assert_eq!(
+            affinity.settings.load().ttl_secs.get(),
+            120,
+            "the live plugin adopts ttl_secs = 120"
+        );
+        assert_eq!(
+            grid.reload(&initial).expect("reload"),
+            None,
+            "tuning was adopted immediately"
+        );
+        assert_eq!(peers.starts("east"), 1, "changing cache policy keeps existing pollers");
+        assert_eq!(peers.starts("west"), 1, "west also keeps its existing poller");
     }
 
     #[test]

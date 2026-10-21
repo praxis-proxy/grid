@@ -34,7 +34,7 @@ grid:
   #   qwen3:
   #     model: Qwen3-Coder-30B-A3B
   #     endpoint: http://qwen3-epp-service.llm-d.svc:80
-  #     routingClusterRef: site-d
+  #     clusterName: site-d
 
 # -- Grid CRDs.
 crds:
@@ -181,13 +181,23 @@ swim:
     # -- Optional CIDRs allowed to reach the SWIM and signals LoadBalancer, where it enforces them.
     loadBalancerSourceRanges: []
 
-# -- Cloud the grid runs on. `aws` asks for an NLB, since the default carries no UDP.
+# -- Cloud whose load balancer settings LoadBalancer Services get: `aws` (an NLB, since the
+# default carries no UDP), `azure`, `gcp`, or `any` for all three. Each cloud reads only its
+# own keys, so `any` suits a render that runs on every cloud.
 platform: ""
+
+# -- Reach of the SWIM and signals load balancers on a cloud platform. `internal` keeps them
+# on the cluster's private network, so sites need private connectivity between them.
+# `external` makes them internet-facing. AWS sets the scope only when a load balancer is
+# created: changing it means recreating the Service.
+loadBalancerScope: internal
 
 # -- The grid's other sites, separated by spaces or commas. Each becomes a SWIM seed and,
 # if a bare IPv4 address, a host route in both Services. That fits a peer that listens on
-# the address it egresses from. Where they differ, as on AWS (NAT address out, SWIM Service
-# hostname in), list the NAT addresses here and the SWIM hostnames in grid.seeds. Either
+# the address it egresses from. Where they differ, as on AWS with internet-facing load
+# balancers (NAT address out, SWIM Service hostname in), list the NAT addresses here and the
+# SWIM hostnames in grid.seeds. Internal load balancers see peers' private addresses: leave
+# this empty and set swim.service.loadBalancerSourceRanges to their machine networks. Either
 # seed key overrides the seeds, and either Service's loadBalancerSourceRanges the routes.
 peers: ""
 
@@ -216,19 +226,23 @@ signals:
   # -- Seconds between peer signal polls. Every site polls every other alive site, so
   # a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator's 5s.
   peerIntervalSeconds: ""
+
+  # -- Seconds between scrapes of this site's own EPPs. Local and unicast, so it costs
+  # one request per provider per interval. Empty keeps the operator's 1s.
+  scrapeIntervalSeconds: ""
 # -- Advertised site gateway address configuration.
 gateway:
   # -- Discover and advertise a LoadBalancer address for the site gateway.
   discoveryEnabled: true
-  # -- GridNetwork gatewayRefs[].consumerConfig for the site gateway, as the CRD
+  # -- GridNetwork consumerGateways[].praxisConfig for the site gateway, as the CRD
   # takes it. Empty renders no block.
-  consumerConfig: {}
+  praxisConfig: {}
   # -- Reachable site gateway host:port override. Set this for ClusterIP or
   # NodePort Services; otherwise the operator discovers a LoadBalancer address.
   address: ""
   # -- Site gateway Kubernetes Service name for the operator to discover. Defaults
   # to grid-gateway with enrollment enabled or grid.id set; it also names the
-  # gateway in GridNetwork spec.gatewayRefs. Maps to GRID_GATEWAY_SERVICE_NAME.
+  # gateway in GridNetwork spec.consumerGateways. Maps to GRID_GATEWAY_SERVICE_NAME.
   serviceName: ""
   # -- Namespace of the site gateway Service. Empty uses the release
   # namespace. Maps to GRID_GATEWAY_NAMESPACE.

@@ -210,6 +210,12 @@ impl SwimNode {
         self.origin_state.remove_origin(origin);
     }
 
+    /// Forget a departed origin's gateway address and certificate, keeping its providers, its
+    /// signals address and every revision guard.
+    pub fn forget_departed_origin(&self, origin: &str) {
+        self.origin_state.forget_departed(origin);
+    }
+
     /// Identities foca currently holds as active, suspect ones included.
     pub fn live_identities(&self) -> impl Iterator<Item = &NodeId> {
         self.foca.iter_members().map(foca::Member::id)

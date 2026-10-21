@@ -8,9 +8,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
-praxis-filter = { version = "0.7.1", package = "praxis-proxy-filter" }
-praxis-core = { version = "0.7.1", package = "praxis-proxy-core" }
-praxis-tls = { version = "0.7.1", package = "praxis-proxy-tls" }
+praxis-filter.workspace = true
+praxis-core.workspace = true
+praxis-tls.workspace = true
 grid-signals = { path = "../../../signals" }
 # The gateway wiring spawns the pollers and builds their mTLS scrapers, so the
 # poller and cert issuance are real dependencies, not just test ones.
@@ -51,7 +51,7 @@ tokio = { version = "1.53.1", features = [
 ] }
 tokio-rustls = "0.26.0"
 rustls = { version = "0.23.0", features = ["ring"] }
-praxis-tls = { version = "0.7.1", package = "praxis-proxy-tls" }
+praxis-tls.workspace = true
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 
 [[bench]]

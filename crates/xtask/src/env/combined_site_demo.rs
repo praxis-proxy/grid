@@ -39,7 +39,7 @@ use super::{
 const CERTS_DIR: &str = "tests/env/certs";
 
 /// Default published Praxis AI gateway image used by this qualification.
-const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.6.0";
+const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.7.0";
 
 /// Ordered cluster names in the combined-site scenario environment.
 const CLUSTERS: &[&str] = &["west", "central", "east"];
@@ -1204,7 +1204,7 @@ fn assert_site_auto_discovery() -> AssertionResult {
                         "-l", "grid.praxis.fast/auto-discovered=true",
                         "--context", &context,
                         "-n", GRID_SYSTEM_NS,
-                        "-o", "jsonpath={range .items[*]}{.metadata.name}\t{.status.phase}\t{.status.reason}\t{.spec.egress.address}\t{.spec.egress.tls.serverName}\t{.spec.trust.canonicalFingerprints}\n{end}",
+                        "-o", "jsonpath={range .items[*]}{.metadata.name}\t{.status.phase}\t{.status.reason}\t{.spec.gatewayEndpoint.address}\t{.spec.gatewayEndpoint.tls.serverName}\t{.spec.trust.canonicalFingerprints}\n{end}",
                     ])
                     .output()?;
                 if !output.status.success() {
@@ -4040,7 +4040,7 @@ fn read_cluster_overlay(cluster: &str) -> Result<OverlayData, Box<dyn std::error
 /// expectation from the descriptor.
 ///
 /// The overlay indexes candidates by their `cluster` field, which is the
-/// `routingClusterRef` from the `InferenceProvider` CRD, not the K8s
+/// `clusterName` from the `InferenceProvider` CRD, not the K8s
 /// resource name. The returned `ExpectedExternalCandidate` carries the
 /// routing_cluster, model, and site so that convergence validation can
 /// assert field-level agreement.
@@ -4826,7 +4826,7 @@ fn prepare_setup(
 ///
 /// For each local cluster, waits for the two remote auto-discovered GridSites,
 /// verifies the SWIM-advertised certificate matches the staged identity, then
-/// patches `spec.egress.tls.serverName` and `spec.trust.canonicalFingerprints`.
+/// patches `spec.gatewayEndpoint.tls.serverName` and `spec.trust.canonicalFingerprints`.
 /// The controller transitions the site to Active naturally after the patch.
 fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
     const TRUST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -4884,7 +4884,7 @@ fn wait_for_all_discovered_sites(network: &str, timeout: Duration) -> Result<(),
                         "gridsites",
                         &name,
                         "-o",
-                        "jsonpath={.spec.gridNetworkRef}/{.spec.egress.address}",
+                        "jsonpath={.spec.gridNetworkRef}/{.spec.gatewayEndpoint.address}",
                         "--ignore-not-found",
                     ])
                     .output()?;
@@ -5717,7 +5717,7 @@ spec:
       contextWindow: 200000
   auth:
     strategy: api_key
-    manual: true
+    credentialsManagedExternally: true
     secretRef:
       name: {secret_name}
       namespace: grid-system
@@ -5732,7 +5732,7 @@ spec:
     path: /v1/models
     interval: "60s"
     timeout: "10s"
-  routingClusterRef: {routing_cluster}
+  clusterName: {routing_cluster}
 "#,
         resource_name = external_provider.resource_name(),
         provider_kind = external_provider.provider_kind,
@@ -5901,7 +5901,7 @@ spec:
   accessPolicy:
     siteSelector:
       matchLabels: {{}}
-  routingClusterRef: {routing_cluster}
+  clusterName: {routing_cluster}
   healthCheck:
     path: /health
     interval: "30s"
@@ -7730,7 +7730,7 @@ mod tests {
     #[test]
     fn default_gateway_image_is_the_published_qualification_image() {
         assert_eq!(
-            DEFAULT_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.6.0",
+            DEFAULT_GATEWAY_IMAGE, "ghcr.io/praxis-proxy/ai:0.7.0",
             "combined-site qualification must use the published gateway release"
         );
     }
@@ -8546,7 +8546,7 @@ filter_chains:
             tls:
               sni: west.grid.internal
 admin:
-  address: 127.0.0.1:9901
+  metrics_address: 127.0.0.1:9901
 "#;
         let rendered = append_secondary_consumer_config(config).unwrap();
         let value: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();

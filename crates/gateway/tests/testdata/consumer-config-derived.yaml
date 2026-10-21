@@ -43,5 +43,5 @@ filter_chains:
             trusted_private_endpoints:
               - "model-b.models.svc"
 admin:
-  address: "127.0.0.1:9901"
+  metrics_address: "127.0.0.1:9901"
 shutdown_timeout_secs: 5

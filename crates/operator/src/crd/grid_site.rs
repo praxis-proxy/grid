@@ -9,9 +9,16 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::crd::grid_network::SignalMode;
+
 // ---------------------------------------------------------------------------
 // Spec
 // ---------------------------------------------------------------------------
+
+/// Add the deprecated `GridSite` endpoint field to the generated schema.
+fn add_grid_site_spec_legacy_fields(schema: &mut schemars::Schema) {
+    crate::crd::add_legacy_field_aliases(schema, &[("egress", "gatewayEndpoint")]);
+}
 
 /// Specification for a [`GridSite`].
 ///
@@ -30,14 +37,16 @@ use serde::{Deserialize, Serialize};
     printcolumn = r#"{"name":"Network","type":"string","jsonPath":".spec.gridNetworkRef"}"#
 )]
 #[serde(rename_all = "camelCase")]
+#[schemars(transform = add_grid_site_spec_legacy_fields)]
 pub struct GridSiteSpec {
     /// Name of the [`GridNetwork`] this site belongs to.
     ///
     /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
     pub grid_network_ref: String,
 
-    /// Egress endpoint for data-plane connectivity.
-    pub egress: Option<EgressConfig>,
+    /// Gateway endpoint for data-plane connectivity.
+    #[serde(alias = "egress")]
+    pub gateway_endpoint: Option<EgressConfig>,
 
     /// Deployment region.
     pub region: Option<String>,
@@ -255,6 +264,19 @@ pub enum GridSitePhase {
     Left,
 }
 
+impl GridSitePhase {
+    /// Whether this site's providers stay candidates. Under poll the gateway drops a silent
+    /// site on signal staleness, so a verified site that loses its connection stays.
+    #[must_use]
+    pub fn routes(&self, signal: SignalMode) -> bool {
+        match self {
+            Self::Active => true,
+            Self::Unreachable => signal == SignalMode::Poll,
+            Self::Pending | Self::Discovered | Self::Connecting | Self::Left => false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -264,6 +286,21 @@ mod tests {
     use kube::CustomResourceExt as _;
 
     use super::*;
+
+    #[test]
+    fn only_poll_keeps_an_unreachable_site_routable() {
+        for (phase, gossip, poll) in [
+            (GridSitePhase::Active, true, true),
+            (GridSitePhase::Unreachable, false, true),
+            (GridSitePhase::Pending, false, false),
+            (GridSitePhase::Discovered, false, false),
+            (GridSitePhase::Connecting, false, false),
+            (GridSitePhase::Left, false, false),
+        ] {
+            assert_eq!(phase.routes(SignalMode::Gossip), gossip, "{phase:?} under gossip");
+            assert_eq!(phase.routes(SignalMode::Poll), poll, "{phase:?} under poll");
+        }
+    }
 
     fn crd_json() -> serde_json::Value {
         serde_json::to_value(GridSite::crd()).unwrap_or_else(|_| std::process::abort())
@@ -291,7 +328,7 @@ mod tests {
     fn spec_serde_round_trip() {
         let json = serde_json::json!({
             "gridNetworkRef": "production",
-            "egress": {
+            "gatewayEndpoint": {
                 "address": "egress.cluster-b:8443",
                 "tls": {"mode": "Mutual"}
             },
@@ -428,10 +465,43 @@ mod tests {
     }
 
     #[test]
-    fn backward_compatible_spec_without_new_fields() {
+    fn legacy_egress_deserializes_into_gateway_endpoint() {
         let json = serde_json::json!({
             "gridNetworkRef": "production",
             "egress": {
+                "address": "egress.cluster-b:8443",
+                "tls": {"mode": "Mutual"}
+            }
+        });
+        let spec: GridSiteSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
+        let endpoint = spec.gateway_endpoint.unwrap_or_else(|| std::process::abort());
+        assert_eq!(endpoint.address, "egress.cluster-b:8443");
+        assert_eq!(endpoint.tls.mode, EgressTlsMode::Mutual);
+    }
+
+    #[test]
+    fn legacy_and_current_gateway_endpoint_names_are_rejected_together() {
+        let endpoint = serde_json::json!({
+            "address": "egress.cluster-b:8443",
+            "tls": {"mode": "Mutual"}
+        });
+        let json = serde_json::json!({
+            "gridNetworkRef": "production",
+            "egress": {
+                "address": "egress.cluster-b:8443",
+                "tls": {"mode": "Mutual"}
+            },
+            "gatewayEndpoint": endpoint
+        });
+        let result: Result<GridSiteSpec, _> = serde_json::from_value(json);
+        assert!(result.is_err(), "both endpoint names must be rejected");
+    }
+
+    #[test]
+    fn backward_compatible_spec_without_new_fields() {
+        let json = serde_json::json!({
+            "gridNetworkRef": "production",
+            "gatewayEndpoint": {
                 "address": "egress.cluster-b:8443",
                 "tls": {"mode": "Mutual"}
             },
@@ -441,7 +511,7 @@ mod tests {
         });
         let spec: GridSiteSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert_eq!(spec.grid_network_ref, "production", "network ref");
-        let egress = spec.egress.unwrap_or_else(|| std::process::abort());
+        let egress = spec.gateway_endpoint.unwrap_or_else(|| std::process::abort());
         assert_eq!(egress.tls.mode, EgressTlsMode::Mutual, "mode");
         assert!(egress.tls.server_name.is_none(), "no server_name in legacy spec");
         let trust = spec.trust.unwrap_or_else(|| std::process::abort());
@@ -454,6 +524,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "checks the complete generated GridSite schema")]
     fn grid_site_crd_bounds_identity_fields() {
         let crd = crd_json();
         let pins = crd
@@ -470,7 +541,7 @@ mod tests {
 
         let server_name = crd
             .pointer(
-                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/egress/properties/tls/properties/serverName",
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/gatewayEndpoint/properties/tls/properties/serverName",
             )
             .unwrap_or_else(|| std::process::abort());
         assert_eq!(
@@ -480,6 +551,25 @@ mod tests {
         assert_eq!(
             server_name.get("maxLength").and_then(serde_json::Value::as_u64),
             Some(253)
+        );
+
+        let spec = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec")
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            spec.pointer("/properties/egress").is_some(),
+            "CRD must preserve legacy egress"
+        );
+        let validations = spec
+            .get("x-kubernetes-validations")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            validations.iter().any(|validation| {
+                validation.get("rule").and_then(serde_json::Value::as_str)
+                    == Some("!(has(self.egress) && has(self.gatewayEndpoint))")
+            }),
+            "CRD must reject both endpoint names"
         );
     }
 }

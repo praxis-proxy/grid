@@ -11,7 +11,7 @@ KIND_CLUSTER=""
 
 OPERATOR_IMAGE="ghcr.io/praxis-proxy/grid-operator"
 OPERATOR_TAG="${GRID_OPERATOR_CI_TAG:-v0.1.5}"
-DEFAULT_GATEWAY_IMAGE="ghcr.io/praxis-proxy/ai:0.4.0"
+DEFAULT_GATEWAY_IMAGE="ghcr.io/praxis-proxy/ai:0.7.0"
 
 # Helpers
 
@@ -673,7 +673,7 @@ if echo "$SECURE_RENDER" | matches 'insecure_options'; then
 else
   pass "secure config: no insecure_options"
 fi
-if echo "$SECURE_RENDER" | matches 'address: "127.0.0.1:9901"'; then
+if echo "$SECURE_RENDER" | matches 'metrics_address: "127.0.0.1:9901"'; then
   pass "secure config: admin bound to 127.0.0.1"
 else
   fail "secure config: admin not bound to 127.0.0.1"
@@ -729,8 +729,8 @@ if echo "$SECURE_RENDER" | matches 'sni: "site-a.grid.internal"' && echo "$SECUR
 else
   fail "secure config: mutual_tls backend missing sni/verify"
 fi
-# site-b is plaintext and last: the first tls: after its stanza must not exist.
-if awk '/- name: "site-b"/{f=1} f&&/[^-] tls:/{print; exit}' <<<"$SECURE_RENDER" | matches 'tls:'; then
+# site-b is plaintext: no tls: inside any of its stanzas, which end at the next list item.
+if awk '/- name: "site-b"/{f=1; next} f&&/- /{f=0} f&&/[^-] tls:/{print; exit}' <<<"$SECURE_RENDER" | matches 'tls:'; then
   fail "secure config: plaintext backend must not render a tls block"
 else
   pass "secure config: plaintext backend renders no tls block"
@@ -785,10 +785,10 @@ try_reject_msg "$GW_DIR" "blank localSite (gw)" "localSite" "${R0[@]}" "${BK1[@]
 try_reject_msg "$GW_DIR" "blank model (gw)" "gatewayConfig.model is required" "${R0[@]}" "${BK1[@]}" --set-string "gatewayConfig.model= "
 try_reject_msg "$GW_DIR" "unknown healthCheck key (gw)" "healthCheck" "${R0[@]}" "${BK1[@]}" \
   --set "gatewayConfig.backends[0].healthCheck.bogus=1"
-try_reject_msg "$GW_DIR" "api-key on the default image (gw)" "unsupported on the default image" "${R0[@]}" "${BK1[@]}" \
+try_reject_msg "$GW_DIR" "api-key on the legacy 0.4.0 image (gw)" "unsupported on the default image" "${R0[@]}" "${BK1[@]}" \
+  --set image.tag=0.4.0 --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=https://maas/validate
+try_template "$GW_DIR" "api-key on the 0.7.0 image (gw)" "${R0[@]}" "${BK1[@]}" \
   --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=https://maas/validate
-try_reject_msg "$GW_DIR" "api-key on the default image via an empty tag (gw)" "unsupported on the default image" "${R0[@]}" "${BK1[@]}" \
-  --set image.tag="" --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=https://maas/validate
 try_reject_msg "$GW_DIR" "validateUrl without a host (gw)" "validateUrl" "${R0[@]}" "${BK1[@]}" \
   --set image.tag=verify-api-key --set gatewayConfig.auth.mode=api-key --set gatewayConfig.auth.validateUrl=https:///v
 try_reject_msg "$GW_DIR" "blank backend endpoint (gw)" "endpoints[./]0" "${R0[@]}" --set "gatewayConfig.backends[0].cluster=a" \
@@ -963,6 +963,12 @@ else
   fail "gridServing: unexpected render: $(grep -E 'route|GRID_SERVING|grid-serving|Error' <<<"$SERV_RENDER" | head -3 | tr '\n' ' ')"
 fi
 try_reject_msg "$GW_DIR" "gridServing without network or configMap (gw)" "gridServing.network" "${SERVING[@]}" --set gridServing.configMap=""
+for setting in capacity ttl_secs; do
+  for value in 0 -1 1.5; do
+    try_reject_msg "$GW_DIR" "prefixAffinity $setting=$value (gw)" "$setting" \
+      "${SERVING[@]}" --set "gridServing.siteRoute.prefixAffinity.$setting=$value"
+  done
+done
 if helm template v-serv "$GW_DIR" "${SERVING[@]}" --set gridServing.configMap="" --set gridServing.network=grid \
   --set fullnameOverride=gw 2>&1 | matches 'name: "grid-serving-grid-gw"'; then
   pass "gridServing: derives the operator's ConfigMap name from network and gatewayRef"
@@ -1085,9 +1091,9 @@ try_template "$SITE_DIR" "site with providers" "${SITE_REQ[@]}" --namespace grid
   --set 'inferenceProviders[1].backendKind=local_model' \
   --set 'inferenceProviders[1].endpoint=http://mock-b:8080'
 try_template "$SITE_DIR" "site with gateway refs" "${SITE_REQ[@]}" --namespace grid-system \
-  --set 'gridNetwork.gatewayRefs[0].name=consumer-gateway' \
-  --set 'gridNetwork.gatewayRefs[0].namespace=grid-system' \
-  --set 'gridNetwork.gatewayRefs[0].localSiteName=east-a'
+  --set 'gridNetwork.consumerGateways[0].name=consumer-gateway' \
+  --set 'gridNetwork.consumerGateways[0].namespace=grid-system' \
+  --set 'gridNetwork.consumerGateways[0].siteName=east-a'
 try_template "$SITE_DIR" "site with provider-site label" "${SITE_REQ[@]}" --namespace grid-system \
   --set gridSite.providerSiteLabel=test-site
 
@@ -1392,7 +1398,7 @@ CR_EOF
   fi
 
   kubectl --context "$KCTX" -n grid-system create configmap test-gateway-config \
-    --from-literal=praxis.yaml='admin: {address: "0.0.0.0:9901"}' 2>/dev/null || true
+    --from-literal=praxis.yaml='admin: {metrics_address: "0.0.0.0:9901"}' 2>/dev/null || true
 
   GW_IMAGE="${GRID_GATEWAY_CI_IMAGE:-registry.k8s.io/pause}"
   GW_TAG="${GRID_GATEWAY_CI_TAG:-3.9}"

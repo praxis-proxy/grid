@@ -224,6 +224,8 @@ impl ScrapeClass {
 /// What the signals loop last saw from one provider.
 #[derive(Clone, Debug, Default)]
 struct Probe {
+    /// Source object and spec revision whose observations this probe holds.
+    revision: Option<(String, i64)>,
     /// When the first scrape was attempted, which starts the grace before any success.
     first_attempt: Option<Instant>,
     /// When the last scrape succeeded.
@@ -303,6 +305,25 @@ pub(crate) fn provider_of(key: &str) -> &str {
 }
 
 impl ReadinessStore {
+    /// Forget observations when a provider is replaced or its spec changes.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the guard covers one atomic source binding"
+    )]
+    pub(crate) fn bind_revision(&self, key: &str, uid: Option<&str>, generation: Option<i64>) {
+        let revision = uid
+            .zip(generation)
+            .map(|(uid, generation)| (uid.to_owned(), generation));
+        let mut probes = self.probes();
+        let probe = probes.entry(key.to_owned()).or_default();
+        if revision.is_none() || probe.revision != revision {
+            *probe = Probe {
+                revision,
+                ..Probe::default()
+            };
+        }
+    }
+
     /// The probes, recovered if a panicking holder poisoned the lock: each write is whole.
     fn probes(&self) -> std::sync::MutexGuard<'_, HashMap<String, Probe>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
@@ -536,6 +557,9 @@ fn ready_message(count: f64, busy: bool) -> String {
 /// The condition type this module owns.
 pub const READY_CONDITION: &str = "Ready";
 
+/// Whether the provider's metrics are being scraped, apart from whether its endpoints are ready.
+pub const METRICS_CONDITION: &str = "MetricsAvailable";
+
 /// The `Ready` condition to write, or `None` when `current` already says the same.
 ///
 /// A changed message alone is not written, so a moving endpoint count does not
@@ -547,20 +571,62 @@ pub(crate) fn ready_condition(
     generation: Option<i64>,
 ) -> Option<Condition> {
     let held = current.iter().find(|c| c.type_ == READY_CONDITION);
-    let status = verdict.reason.status();
-    if held.is_some_and(|c| {
-        c.status == status && c.reason == verdict.reason.as_str() && c.observed_generation == generation
-    }) {
+    let state = (
+        verdict.reason.status(),
+        verdict.reason.as_str(),
+        verdict.message.as_str(),
+    );
+    changed(READY_CONDITION, held, state, now_rfc3339, generation)
+}
+
+/// The `MetricsAvailable` condition to write, or `None` when `current` already says the same.
+///
+/// True once a scrape succeeds, whatever the endpoints say; False with the scrape's failure, or
+/// when the provider declares no metrics; Unknown while it awaits its first scrape.
+pub(crate) fn metrics_condition(
+    current: &[Condition],
+    verdict: &Verdict,
+    now_rfc3339: &str,
+    generation: Option<i64>,
+) -> Option<Condition> {
+    let held = current.iter().find(|c| c.type_ == METRICS_CONDITION);
+    let state = match verdict.reason {
+        Reason::Ready | Reason::NoEndpointsReady | Reason::NoLivenessCheck => {
+            ("True", "ScrapeSucceeded", "metrics scraped")
+        },
+        Reason::AwaitingFirstScrape | Reason::ProviderUnavailable => {
+            ("Unknown", verdict.reason.as_str(), verdict.message.as_str())
+        },
+        Reason::MetricsStale
+        | Reason::ScrapeTimedOut
+        | Reason::ScrapeUnauthorized
+        | Reason::TlsHandshakeFailed
+        | Reason::MetricsBodyTooLarge
+        | Reason::ScrapeFailed
+        | Reason::MetricsNotConfigured => ("False", verdict.reason.as_str(), verdict.message.as_str()),
+    };
+    changed(METRICS_CONDITION, held, state, now_rfc3339, generation)
+}
+
+/// The condition `type_` in `(status, reason, message)`, or `None` when `held` already says so.
+fn changed(
+    type_: &str,
+    held: Option<&Condition>,
+    (status, reason, message): (&str, &str, &str),
+    now_rfc3339: &str,
+    generation: Option<i64>,
+) -> Option<Condition> {
+    if held.is_some_and(|c| c.status == status && c.reason == reason && c.observed_generation == generation) {
         return None;
     }
     let last_transition_time = held
         .filter(|c| c.status == status)
         .map_or_else(|| now_rfc3339.to_owned(), |c| c.last_transition_time.clone());
     Some(Condition {
-        type_: READY_CONDITION.to_owned(),
+        type_: type_.to_owned(),
         status: status.to_owned(),
-        reason: verdict.reason.as_str().to_owned(),
-        message: verdict.message.clone(),
+        reason: reason.to_owned(),
+        message: message.to_owned(),
         last_transition_time,
         observed_generation: generation,
     })
@@ -1018,6 +1084,40 @@ mod tests {
     }
 
     #[test]
+    fn revision_changes_clear_probe_history_but_equal_revisions_keep_it() {
+        let store = ReadinessStore::default();
+        let now = Instant::now();
+        store.bind_revision("p", Some("u1"), Some(1));
+        store.record_success("p", Some(3.0), None, Vec::new(), now);
+        store.bind_revision("p", Some("u1"), Some(1));
+        assert_eq!(
+            store.ready_endpoints("p"),
+            Some(3.0),
+            "status-only changes preserve observations"
+        );
+        store.bind_revision("p", Some("u1"), Some(2));
+        assert_eq!(store.ready_endpoints("p"), None, "spec updates clear old observations");
+        assert!(
+            store.take_fresh("p").is_none(),
+            "no unpublished old scrape may inherit the new revision"
+        );
+        store.record_success("p", Some(5.0), None, Vec::new(), now);
+        store.bind_revision("p", Some("u2"), Some(2));
+        assert_eq!(
+            store.ready_endpoints("p"),
+            None,
+            "replacement objects do not inherit readiness"
+        );
+        store.record_success("p", Some(7.0), None, Vec::new(), now);
+        store.bind_revision("p", None, None);
+        assert_eq!(
+            store.ready_endpoints("p"),
+            None,
+            "unknown identity cannot retain attributed history"
+        );
+    }
+
+    #[test]
     fn an_unavailable_provider_is_not_ready_whatever_its_metrics_say() {
         let store = ReadinessStore::default();
         let now = Instant::now();
@@ -1289,7 +1389,7 @@ mod tests {
     #[test]
     fn a_scrape_label_is_forgotten_under_the_name_it_was_recorded_under() {
         // The defect this pins: scrapes were counted under the routing identity and
-        // forgotten under the provider name, so a provider declaring routingClusterRef
+        // forgotten under the provider name, so a provider declaring clusterName
         // leaked its series and could collide with another provider's.
         for (network, provider) in [("net", "qwen3-east"), ("net", "qwen3-west")] {
             let key = key(network, provider);

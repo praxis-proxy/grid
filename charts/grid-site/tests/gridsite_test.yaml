@@ -1,0 +1,46 @@
+suite: GridSite template
+templates:
+  - templates/gridsite.yaml
+tests:
+  - it: translates a legacy egress value
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridSite.egress:
+        address: legacy.example:8443
+        tls:
+          mode: Mutual
+    asserts:
+      - equal:
+          path: spec.gatewayEndpoint.address
+          value: legacy.example:8443
+      - notExists:
+          path: spec.egress
+
+  - it: drops an empty legacy egress beside the current endpoint
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridSite.egress: {}
+      gridSite.gatewayEndpoint:
+        address: current.example:8443
+        tls:
+          mode: Mutual
+    asserts:
+      - equal:
+          path: spec.gatewayEndpoint.address
+          value: current.example:8443
+      - notExists:
+          path: spec.egress
+
+  - it: rejects non-empty legacy and current egress values together
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridSite.egress:
+        address: legacy.example:8443
+      gridSite.gatewayEndpoint:
+        address: current.example:8443
+    asserts:
+      - failedTemplate:
+          errorPattern: remove deprecated value

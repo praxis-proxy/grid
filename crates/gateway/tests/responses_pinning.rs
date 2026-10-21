@@ -126,7 +126,7 @@ mod tests {
             std::fs::write(
                 &config,
                 format!(
-                    "insecure_options:\n  allow_private_endpoints: true\nadmin:\n  address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: grid_site_route\n        model_header: X-Model\n        prefix_affinity: {{tag_key_path: {key:?}}}\n      - filter: load_balancer\n        clusters:\n          - name: pool-local\n            endpoints: [\"127.0.0.1:{backend}\"]\n"
+                    "insecure_options:\n  allow_private_endpoints: true\nadmin:\n  metrics_address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: grid_site_route\n        model_header: X-Model\n        prefix_affinity: {{tag_key_path: {key:?}}}\n      - filter: load_balancer\n        clusters:\n          - name: pool-local\n            endpoints: [\"127.0.0.1:{backend}\"]\n"
                 ),
             )
             .expect("praxis config");

@@ -7,7 +7,7 @@ metadata:
     grid.praxis.fast/auto-discovered: "true"
 spec:
   gridNetworkRef: grid-token-rate-limit
-  egress:
+  gatewayEndpoint:
     address: "{{ captures.west.swim-lb-ip }}:8443"
     tls:
       mode: Mutual
@@ -25,7 +25,7 @@ metadata:
     grid.praxis.fast/auto-discovered: "true"
 spec:
   gridNetworkRef: grid-token-rate-limit
-  egress:
+  gatewayEndpoint:
     address: "{{ captures.central.swim-lb-ip }}:8443"
     tls:
       mode: Mutual

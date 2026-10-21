@@ -15,20 +15,13 @@ use std::{
 
 use lru::LruCache;
 
-use super::PrefixKeys;
-
-/// Keys one candidate holds: 4 MiB of prompt. Sizing from the site's KV
-/// capacity needs a value the operator does not publish yet.
-const CANDIDATE_KEYS: NonZeroUsize = NonZeroUsize::new(16_384).expect("nonzero");
+use super::{AffinitySettings, PrefixKeys};
 
 /// Keys written under one hold of a candidate's lock.
 const WRITE_CHUNK: usize = 64;
 
-/// How long a key recorded for a request with no answer yet stays usable.
+/// How long a key recorded for a request with no answer yet stays pending.
 const PENDING_TTL: Duration = Duration::from_secs(30);
-
-/// How long a confirmed key stays usable, since the site evicts on its own.
-const CONFIRMED_TTL: Duration = Duration::from_secs(600);
 
 /// One recorded key.
 #[derive(Clone, Copy)]
@@ -48,8 +41,32 @@ type Keys = Arc<RwLock<LruCache<u64, Entry, foldhash::fast::RandomState>>>;
 /// The per-replica prefix index. Cheap to clone; clones share state.
 #[derive(Clone, Default)]
 pub(crate) struct PrefixIndex {
+    /// The candidate inventory and policy applied to new records.
+    inner: Arc<RwLock<IndexState>>,
+}
+
+/// Cache policy and candidate inventory, updated together on configuration apply.
+struct IndexState {
     /// Each candidate's keys, by cluster name.
-    inner: Arc<RwLock<HashMap<Arc<str>, Keys>>>,
+    candidates: HashMap<Arc<str>, Keys>,
+    /// Clusters the last apply adopted, absent before the first one.
+    adopted: Option<Vec<Arc<str>>>,
+    /// Maximum keys retained in each candidate's LRU.
+    capacity: NonZeroUsize,
+    /// Lifetime of a newly confirmed key.
+    confirmed_ttl: Duration,
+}
+
+impl Default for IndexState {
+    fn default() -> Self {
+        let settings = AffinitySettings::default();
+        Self {
+            candidates: HashMap::new(),
+            adopted: None,
+            capacity: settings.capacity,
+            confirmed_ttl: Duration::from_secs(settings.ttl_secs.get()),
+        }
+    }
 }
 
 /// Keys are prompt content, so the index never prints them.
@@ -62,23 +79,36 @@ impl fmt::Debug for PrefixIndex {
 impl PrefixIndex {
     /// How many leading keys of `keys` each of `candidates` holds, in order.
     ///
-    /// A candidate's held keys form a prefix of any prompt it holds: keys chain,
-    /// and a prompt's keys are inserted tail first, so its head is never older
-    /// than its tail. A binary search finds the depth in about nine lookups.
+    /// Stop at the first missing or expired key: a shorter TTL applied to a later
+    /// confirmation can make a prompt's head expire before its older tail.
     pub(crate) fn depths(
         &self,
         keys: &PrefixKeys,
         candidates: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Vec<usize> {
-        let now = Instant::now();
+        self.depths_at(keys, candidates, Instant::now())
+    }
+
+    /// Match prefixes at one observation time, including the exact expiry boundary.
+    fn depths_at(
+        &self,
+        keys: &PrefixKeys,
+        candidates: impl IntoIterator<Item = impl AsRef<str>>,
+        now: Instant,
+    ) -> Vec<usize> {
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         candidates
             .into_iter()
             .map(|candidate| {
-                index.get(candidate.as_ref()).map_or(0, |held| {
+                index.candidates.get(candidate.as_ref()).map_or(0, |held| {
                     let held = held.read().unwrap_or_else(PoisonError::into_inner);
                     keys.as_slice()
-                        .partition_point(|key| held.peek(key).is_some_and(|entry| entry.confirmed && now < entry.until))
+                        .iter()
+                        .take_while(|key| {
+                            held.peek(*key)
+                                .is_some_and(|entry| entry.confirmed && now < entry.until)
+                        })
+                        .count()
                 })
             })
             .collect()
@@ -86,9 +116,12 @@ impl PrefixIndex {
 
     /// Record `keys` as sent to `candidate`, waiting on [`Self::confirm`] or [`Self::forget`].
     pub(crate) fn record(&self, keys: &PrefixKeys, candidate: &Arc<str>) {
+        let Some((held, _)) = self.candidate(candidate) else {
+            return;
+        };
         let now = Instant::now();
         let until = now.checked_add(PENDING_TTL).unwrap_or(now);
-        self.update(keys, candidate, |held| match held {
+        Self::update(keys, &held, |held| match held {
             Some(entry) if now < entry.until => Entry {
                 pending: entry.pending.saturating_add(1),
                 ..entry
@@ -103,9 +136,12 @@ impl PrefixIndex {
 
     /// The request sent to `candidate` got a success: its keys hold there.
     pub(crate) fn confirm(&self, keys: &PrefixKeys, candidate: &Arc<str>) {
+        let Some((held, confirmed_ttl)) = self.candidate(candidate) else {
+            return;
+        };
         let now = Instant::now();
-        let until = now.checked_add(CONFIRMED_TTL).unwrap_or(now);
-        self.update(keys, candidate, |held| Entry {
+        let until = now.checked_add(confirmed_ttl).unwrap_or(now);
+        Self::update(keys, &held, |held| Entry {
             until,
             pending: held.map_or(0, |entry| entry.pending.saturating_sub(1)),
             confirmed: true,
@@ -140,15 +176,24 @@ impl PrefixIndex {
         }
     }
 
-    /// Keep only `candidates`, dropping the keys of any other.
-    pub(crate) fn retain(&self, candidates: &[Arc<str>]) {
+    /// Adopt cache limits and retain routed candidates. Existing keys keep their expiry times.
+    pub(crate) fn apply(&self, settings: &AffinitySettings, candidates: &[Arc<str>]) {
         let mut index = self.inner.write().unwrap_or_else(PoisonError::into_inner);
-        index.retain(|candidate, _| candidates.contains(candidate));
+        index.capacity = settings.capacity;
+        index.confirmed_ttl = Duration::from_secs(settings.ttl_secs.get());
+        index.candidates.retain(|candidate, _| candidates.contains(candidate));
+        index.adopted = Some(candidates.to_vec());
+        for candidate in candidates {
+            if let Some(held) = index.candidates.get(candidate) {
+                held.write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .resize(settings.capacity);
+            }
+        }
     }
 
     /// Update each of `keys` for `candidate`, tail first, so the head of a prompt is evicted last.
-    fn update(&self, keys: &PrefixKeys, candidate: &Arc<str>, entry: impl Fn(Option<Entry>) -> Entry) {
-        let held = self.candidate(candidate);
+    fn update(keys: &PrefixKeys, held: &Keys, entry: impl Fn(Option<Entry>) -> Entry) {
         // A short lock per chunk lets depth lookups in between; no reader needs the whole prompt at once.
         for chunk in keys.as_slice().rchunks(WRITE_CHUNK) {
             let mut held = held.write().unwrap_or_else(PoisonError::into_inner);
@@ -168,22 +213,37 @@ impl PrefixIndex {
         self.inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)
+            .candidates
             .get(candidate)
             .map(Arc::clone)
     }
 
-    /// `candidate`'s keys, created on first use.
-    fn candidate(&self, candidate: &Arc<str>) -> Keys {
-        if let Some(held) = self.inner.read().unwrap_or_else(PoisonError::into_inner).get(candidate) {
-            return Arc::clone(held);
+    /// The candidate's keys and confirmed lifetime, creating its LRU on first use.
+    ///
+    /// Absent once an apply has dropped the cluster, so an in-flight request cannot recreate it.
+    fn candidate(&self, candidate: &Arc<str>) -> Option<(Keys, Duration)> {
+        {
+            let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+            if let Some(held) = index.candidates.get(candidate) {
+                return Some((Arc::clone(held), index.confirmed_ttl));
+            }
         }
         let mut index = self.inner.write().unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(index.entry(Arc::clone(candidate)).or_insert_with(|| {
-            Arc::new(RwLock::new(LruCache::with_hasher(
-                CANDIDATE_KEYS,
-                foldhash::fast::RandomState::default(),
-            )))
-        }))
+        if index
+            .adopted
+            .as_ref()
+            .is_some_and(|adopted| !adopted.contains(candidate))
+        {
+            return None;
+        }
+        let capacity = index.capacity;
+        let held = Arc::clone(index.candidates.entry(Arc::clone(candidate)).or_insert_with(|| {
+            let mut cache = LruCache::unbounded_with_hasher(foldhash::fast::RandomState::default());
+            // Set the entry limit without reserving its full capacity.
+            cache.resize(capacity);
+            Arc::new(RwLock::new(cache))
+        }));
+        Some((held, index.confirmed_ttl))
     }
 
     /// Keys held for `candidate`.
@@ -191,6 +251,7 @@ impl PrefixIndex {
     fn len(&self, candidate: &str) -> usize {
         let index = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         index
+            .candidates
             .get(candidate)
             .map_or(0, |held| held.read().unwrap_or_else(PoisonError::into_inner).len())
     }
@@ -281,16 +342,13 @@ mod tests {
     fn eviction_takes_the_tail_first() {
         let index = PrefixIndex::default();
         let east = name("east");
-        let cap = u64::try_from(CANDIDATE_KEYS.get()).unwrap();
+        let capacity = AffinitySettings::default().capacity.get();
+        let cap = u64::try_from(capacity).unwrap();
         index.confirm(&keys(0..cap), &east);
         index.confirm(&keys(1_000_000..1_000_010), &east);
         let depth = index.depths(&keys(0..cap), ["east"])[0];
-        assert_eq!(
-            depth,
-            CANDIDATE_KEYS.get() - 10,
-            "the old prompt lost its tail and kept its head"
-        );
-        assert_eq!(index.len("east"), CANDIDATE_KEYS.get());
+        assert_eq!(depth, capacity - 10, "the old prompt lost its tail and kept its head");
+        assert_eq!(index.len("east"), capacity);
     }
 
     #[test]
@@ -299,8 +357,168 @@ mod tests {
         let (east, west) = (name("east"), name("west"));
         index.confirm(&keys(0..4), &east);
         index.confirm(&keys(0..4), &west);
-        index.retain(&[Arc::clone(&east)]);
+        index.apply(&AffinitySettings::default(), &[Arc::clone(&east)]);
         assert_eq!(index.depths(&keys(0..4), ["east", "west"]), [4, 0]);
+    }
+
+    /// Per-cluster limits isolate backends and resize existing caches without losing recent prefixes.
+    #[test]
+    fn configured_capacity_is_independent_for_each_cluster_and_resizes_live_caches() {
+        let index = PrefixIndex::default();
+        let clusters = [name("east"), name("west")];
+        let mut settings: AffinitySettings = serde_yaml::from_str("capacity: 4").expect("settings");
+        index.apply(&settings, &clusters);
+        for cluster in &clusters {
+            index.confirm(&keys(0..8), cluster);
+        }
+        assert_eq!(
+            index.depths(&keys(0..8), ["east", "west"]),
+            [4, 4],
+            "each cluster gets capacity 4"
+        );
+        index.confirm(&keys(100..108), &clusters[0]);
+        assert_eq!(index.depths(&keys(0..8), ["west"]), [4], "east cannot evict west");
+
+        settings.capacity = NonZeroUsize::new(2).expect("nonzero");
+        index.apply(&settings, &clusters);
+        assert_eq!(
+            index.depths(&keys(100..108), ["east"]),
+            [2],
+            "shrink retains recent keys"
+        );
+        assert_eq!(
+            index.depths(&keys(0..8), ["west"]),
+            [2],
+            "west also shrinks to capacity 2"
+        );
+        let north = name("north");
+        index.apply(&settings, &[name("east"), name("west"), Arc::clone(&north)]);
+        index.confirm(&keys(0..8), &north);
+        assert_eq!(index.len("north"), 2, "new clusters use the current capacity");
+
+        settings.capacity = NonZeroUsize::new(8).expect("nonzero");
+        index.apply(&settings, &clusters);
+        index.confirm(&keys(0..8), &clusters[1]);
+        assert_eq!(index.depths(&keys(0..8), ["west"]), [8], "growth allows more entries");
+        assert_eq!(index.len("north"), 0, "removed clusters release their cache");
+    }
+
+    /// A reload can drop a cluster while one of its requests is still in flight. The late
+    /// outcome must not bring the cache back, or its keys linger until the next apply.
+    #[test]
+    fn an_in_flight_request_does_not_resurrect_a_dropped_cluster() {
+        let index = PrefixIndex::default();
+        let settings = AffinitySettings::default();
+        let (east, west) = (name("east"), name("west"));
+        index.apply(&settings, &[Arc::clone(&east), Arc::clone(&west)]);
+
+        // East is sent a request, then the reload drops it.
+        index.record(&keys(0..8), &east);
+        index.apply(&settings, &[Arc::clone(&west)]);
+        assert_eq!(index.len("east"), 0, "the reload released east's cache");
+
+        // The in-flight request now finishes, either way round.
+        index.confirm(&keys(0..8), &east);
+        assert_eq!(index.len("east"), 0, "a late success does not recreate the cluster");
+        index.record(&keys(0..8), &east);
+        assert_eq!(index.len("east"), 0, "nor does a late send");
+        assert_eq!(index.depths(&keys(0..8), ["west"]), [0], "west is untouched");
+    }
+
+    /// A sparse cache must not reserve storage for every entry its configured limit permits.
+    #[test]
+    fn a_large_capacity_does_not_reserve_space_for_absent_entries() {
+        let index = PrefixIndex::default();
+        let east = name("east");
+        let settings = AffinitySettings {
+            capacity: NonZeroUsize::MAX,
+            ..AffinitySettings::default()
+        };
+        index.apply(&settings, &[Arc::clone(&east)]);
+        index.record(&keys(0..1), &east);
+        index.confirm(&keys(0..1), &east);
+        assert_eq!(
+            index.len("east"),
+            1,
+            "east stores only the single observed prefix entry"
+        );
+        assert_eq!(
+            index.depths(&keys(0..1), ["east"]),
+            [1],
+            "the sparse entry remains usable"
+        );
+        let held = index.existing("east").expect("east cache");
+        assert_eq!(
+            held.read().unwrap().cap(),
+            settings.capacity,
+            "the configured limit is retained"
+        );
+    }
+
+    /// Public TTL tuning affects confirmed mappings while pending bookkeeping keeps its fixed lifetime.
+    #[test]
+    fn pending_lifetime_is_fixed_and_confirmation_lifetime_is_configurable() {
+        let index = PrefixIndex::default();
+        let east = name("east");
+        let settings: AffinitySettings = serde_yaml::from_str("ttl_secs: 11").expect("settings");
+        index.apply(&settings, &[Arc::clone(&east)]);
+        let before = Instant::now();
+        index.record(&keys(0..4), &east);
+        let after = Instant::now();
+        let pending = deadline(&index, "east", 0);
+        assert!(
+            pending >= before + Duration::from_secs(30) && pending <= after + Duration::from_secs(30),
+            "pending TTL stays at 30 seconds"
+        );
+        assert_eq!(index.depths(&keys(0..4), ["east"]), [0], "pending entries do not match");
+
+        let before = Instant::now();
+        index.confirm(&keys(0..4), &east);
+        let after = Instant::now();
+        let confirmed = deadline(&index, "east", 0);
+        assert!(
+            confirmed >= before + Duration::from_secs(11) && confirmed <= after + Duration::from_secs(11),
+            "confirmation uses ttl_secs = 11"
+        );
+        assert_eq!(
+            index.depths_at(&keys(0..4), ["east"], before),
+            [4],
+            "east matches all confirmed keys before expiry"
+        );
+        assert_eq!(
+            index.depths_at(&keys(0..4), ["east"], confirmed),
+            [0],
+            "expiry is exclusive"
+        );
+    }
+
+    /// Shorter TTLs can expire a refreshed head first, so matching must stop before its live tail.
+    #[test]
+    fn ttl_reload_preserves_deadlines_and_an_expired_head_cannot_match_a_live_tail() {
+        let index = PrefixIndex::default();
+        let east = name("east");
+        index.confirm(&keys(0..8), &east);
+        let original = deadline(&index, "east", 0);
+        let settings: AffinitySettings = serde_yaml::from_str("ttl_secs: 1").expect("settings");
+        index.apply(&settings, &[Arc::clone(&east)]);
+        assert_eq!(
+            deadline(&index, "east", 0),
+            original,
+            "reload keeps the recorded deadline"
+        );
+        index.confirm(&keys(0..1), &east);
+        let shortened = deadline(&index, "east", 0);
+        assert!(shortened < original, "a later confirmation uses the new TTL");
+        assert_eq!(
+            deadline(&index, "east", 7),
+            original,
+            "the older tail remains unchanged"
+        );
+        assert_eq!(
+            index.depths_at(&keys(0..8), ["east"], shortened),
+            [0],
+            "a live tail cannot bridge the expired head"
+        );
     }
 
     /// Index cost under load: 512-key prompts (the cap, 128 KiB and more) from 2,000
@@ -392,5 +610,11 @@ mod tests {
         let index = PrefixIndex::default();
         index.record(&keys(41..42), &name("east"));
         assert_eq!(format!("{index:?}"), "PrefixIndex { .. }");
+    }
+
+    /// The recorded deadline of a key, without changing its recency.
+    fn deadline(index: &PrefixIndex, candidate: &str, key: u64) -> Instant {
+        let held = index.existing(candidate).expect("candidate");
+        held.read().unwrap().peek(&key).expect("key").until
     }
 }

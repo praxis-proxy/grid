@@ -33,6 +33,10 @@ pub mod enroll;
 pub mod error;
 /// A provider's recent request latency and error ratio, from deltas of its EPP's histograms.
 pub mod latency;
+/// Creates this site's `GridNetwork` and `GridSite` once its identity exists.
+pub mod local_records;
+/// The `LocalSiteDeclared` condition on the `GridNetwork`.
+pub mod local_site;
 /// Prometheus metrics for gateway probe and phase-transition observability.
 pub mod metrics;
 /// Pure Prometheus text-format parser for inference backend metrics.
@@ -45,10 +49,13 @@ pub mod metrics_tls;
 pub(crate) mod metrics_token;
 /// The `GridNetwork` condition naming peers whose relayed signal ages are rejected.
 pub mod peer_ages;
+mod provider_revision;
 pub mod readiness;
 /// Kubernetes resource builders.
 pub mod resources;
 pub mod served_models;
+/// The site name, from the site identity.
+pub mod site_name;
 
 pub use resources::{tls_backend::init_process_crypto, trust_bundle::sha256_fingerprint};
 /// Provider gateway address self-discovery.

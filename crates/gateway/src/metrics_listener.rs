@@ -93,7 +93,7 @@ impl MetricsListener {
         }))
     }
 
-    /// Refuse a port that a Praxis listener or the admin listener already binds.
+    /// Refuse a port that a Praxis data, admin, or metrics listener already binds.
     ///
     /// # Errors
     ///
@@ -103,7 +103,8 @@ impl MetricsListener {
             .listeners
             .iter()
             .map(|listener| listener.address.as_str())
-            .chain(config.admin.address.as_deref());
+            .chain(config.admin.address.as_deref())
+            .chain(config.admin.metrics_address.as_deref());
         for address in taken {
             let port = address
                 .rsplit_once(':')
@@ -392,6 +393,14 @@ mod tests {
         assert!(
             listener.check_ports(&config(&admin)).unwrap_err().contains("collides"),
             "admin"
+        );
+        let metrics = format!("{base}admin:\n  metrics_address: \"127.0.0.1:9443\"\n");
+        assert!(
+            listener
+                .check_ports(&config(&metrics))
+                .unwrap_err()
+                .contains("collides"),
+            "metrics"
         );
     }
 

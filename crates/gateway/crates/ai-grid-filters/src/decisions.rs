@@ -109,7 +109,7 @@ impl SiteDecisions {
         )
     }
 
-    /// Count one request sent to this site, as a fallback when no healthy site was left.
+    /// Count one request sent to this site, as a fallback when no healthy or live site was left.
     pub(crate) fn record(&self, fallback: bool) {
         if let Some(counter) = self.0.get(usize::from(fallback)) {
             counter.increment(1);

@@ -9,8 +9,8 @@ block that always follows it: the filter sets the cluster, the load balancer dia
 the health checks selection demotes on. A user sets it through the chart's
 `gridServing.siteRoute` values (`availability` and `prefixAffinity`, rendered as
 `availability` and `prefix_affinity`). Nothing needs setting: every field has a default and
-the block may be empty. The example sets the one switch, `shedding`. A change is a chart value
-and a rollout.
+the block may be empty. The example enables `shedding` and shows the default
+affinity cache limits. A change is a chart value and a rollout.
 
 `availability` governs how a site's availability is measured from its in-flight count, learned
 soft and hard capacity bounds, and provider-reported KV-cache fullness. The fields other than
@@ -34,9 +34,17 @@ soft and hard capacity bounds, and provider-reported KV-cache fullness. The fiel
 | `enabled` | true | Prefer the site holding a request's prompt. Off routes on load alone. |
 | `threshold` | 0.8 | Share of the request's keys a site must hold to be sticky. |
 | `exploration` | 0.02 | Share of requests that skip affinity, so a second site learns a shared prefix. |
+| `capacity` | 16384 | Positive entry limit for each backend cluster's LRU in each gateway replica. |
+| `ttl_secs` | 600 | Positive lifetime in seconds after a successful response confirms a prefix entry. |
 | `prefill_tokens_per_second` | 10000 | Prompt tokens a site prefills per second, pricing the cache a match saves. |
 | `queued_request_seconds` | 2.0 | Seconds one queued request adds to a wait, turning that price into queue depth. |
 | `tag_key_path` | none | A file holding the key that authenticates stored-state tags. |
+
+Cache limits reserve space separately for each backend cluster; total entry
+capacity grows with the cluster count. Plugin reconfiguration resizes existing
+LRUs while preserving their most recent entries. TTL changes affect subsequent
+confirmations; previously recorded deadlines stay unchanged. See
+[prefix affinity](../../docs/architecture/prefix-affinity.md) for the lifecycle.
 
 Tuning order, one metric against one truth per step: the soft and hard ceiling gauges against
 queue-free load and demonstrated limits, `grid_route_site_rho` against the engine queue and KV

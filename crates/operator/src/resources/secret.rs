@@ -153,7 +153,7 @@ pub(crate) async fn read_config_map_bytes(
 /// Returns `None` for missing, empty, invalid UTF-8, or private-key-looking
 /// content.  This is deliberately conservative because the returned value may
 /// be broadcast to peers and written to `GridSite.status.publicCertPem`.
-fn public_cert_pem_from_secret(secret: &Secret) -> Option<String> {
+pub(crate) fn public_cert_pem_from_secret(secret: &Secret) -> Option<String> {
     secret
         .data
         .as_ref()
@@ -205,7 +205,7 @@ pub async fn read_swim_key(
             secret = %secret_ref.name,
             namespace = %secret_ref.namespace,
             key_field = %key_field,
-            "swimKeyRef Secret missing key field; SWIM key not applied"
+            "swimKeySecretRef Secret missing key field; SWIM key not applied"
         );
         return Ok(None);
     };
@@ -215,7 +215,7 @@ pub async fn read_swim_key(
             namespace = %secret_ref.namespace,
             key_field = %key_field,
             len = bytes.0.len(),
-            "swimKeyRef key must be exactly 32 bytes; SWIM key not applied"
+            "swimKeySecretRef key must be exactly 32 bytes; SWIM key not applied"
         );
         return Ok(None);
     }

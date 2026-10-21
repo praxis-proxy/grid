@@ -6,7 +6,7 @@ pub(crate) mod geography;
 /// Operator-owned consumer Praxis config renderer.
 ///
 /// Generates the `praxis.yaml` content for consumer gateway `ConfigMap`s from
-/// routing overlays.  Used when `GatewayRef.consumerConfig.enabled` is true.
+/// routing overlays.  Used when `GatewayRef.praxisConfig.generate` is true.
 pub(crate) mod consumer_config;
 
 /// Deterministic projected volume layout and revision helpers for delegated mounts.
@@ -52,6 +52,8 @@ pub(crate) mod test_doubles;
 /// Trust bundle management for grid mTLS.
 pub mod trust_bundle;
 
+/// SSRF-safe endpoint validation, DNS resolution, and address pinning.
+pub(crate) mod endpoint_resolution;
 /// Shared TLS material resolution and validation for endpoint probes.
 pub(crate) mod endpoint_tls;
 /// Typed gateway probe outcome and phase-transition contracts.

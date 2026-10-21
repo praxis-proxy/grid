@@ -12,8 +12,8 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     sync::{
-        OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        Mutex, OnceLock,
+        atomic::{AtomicI64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -21,6 +21,10 @@ use std::{
 use dashmap::{DashMap, mapref::entry::Entry};
 
 use crate::exposition::{self, PROVIDER_LABEL, SITE_LABEL};
+
+mod guarded;
+
+pub use guarded::LearningState;
 
 /// Cap on providers retained, so a misconfigured or hostile endpoint cannot grow
 /// the store without bound. Keys are retained once seen (not LRU-evicted), so the
@@ -208,6 +212,8 @@ impl Series {
 /// Series held for one provider, keyed by metric name.
 #[derive(Debug, Default)]
 struct Provider {
+    /// Revision qualification and retained publication watermark.
+    guard: guarded::Guard,
     /// Metric name to its window.
     metrics: HashMap<Box<str>, Series>,
 }
@@ -261,6 +267,10 @@ static PROCESS_TIMELINE: OnceLock<Timeline> = OnceLock::new();
 /// ([`Self::key`]), a small `Box<str>` per lookup.
 #[derive(Debug)]
 pub struct LoadStore {
+    /// Site publication fences, serialized only during guarded ingestion.
+    revision_orders: Mutex<guarded::Orders>,
+    /// Maximum revision age at ingestion; `None` retains legacy ingestion.
+    revision_max_age_ms: Option<i64>,
     /// Provider key to its series.
     providers: DashMap<Box<str>, Provider>,
     /// Attributed site to the count of providers it holds, for the per-site cap.
@@ -284,8 +294,14 @@ pub struct LoadStore {
     local_site: Option<Box<str>>,
     /// The clock every sample is held on and every read is made at.
     timeline: Timeline,
+    /// When this site's own operator last answered a poll, on the timeline; `i64::MIN` until it has.
+    relay_heard_ms: AtomicI64,
 }
 
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "revision ingestion is isolated from the legacy store implementation"
+)]
 impl LoadStore {
     /// Create an empty store retaining `window` of history per series, combining
     /// same-instant lines of a metric by their larger value.
@@ -299,6 +315,8 @@ impl LoadStore {
     #[must_use]
     pub fn with_combine(window: Duration, combine: CombinePolicy) -> Self {
         Self {
+            revision_orders: Mutex::new(guarded::Orders::new()),
+            revision_max_age_ms: None,
             providers: DashMap::new(),
             owner_providers: DashMap::new(),
             admitted: AtomicUsize::new(0),
@@ -306,6 +324,7 @@ impl LoadStore {
             combine,
             local_site: None,
             timeline: Timeline::process(),
+            relay_heard_ms: AtomicI64::new(i64::MIN),
         }
     }
 
@@ -314,6 +333,17 @@ impl LoadStore {
     #[must_use]
     pub fn with_local_site(mut self, local_site: &str) -> Self {
         self.local_site = Some(local_site.into());
+        self
+    }
+
+    /// Require complete, ordered revision batches before learning from signals.
+    ///
+    /// `max_age_ms` bounds revision freshness at ingestion. Readers may impose a
+    /// shorter bound through [`Self::learning_state`]. Missing identity never
+    /// restores legacy learning; its fresh payload remains usable as pressure.
+    #[must_use]
+    pub fn with_revision_guard(mut self, max_age_ms: i64) -> Self {
+        self.revision_max_age_ms = Some(max_age_ms.max(0));
         self
     }
 
@@ -496,6 +526,12 @@ impl LoadStore {
             owner,
             local: self.local_site.as_deref() == Some(owner),
         };
+        if scrape.local {
+            self.relay_heard_ms.fetch_max(local_now_ms, Ordering::AcqRel);
+        }
+        if let Some(max_age_ms) = self.revision_max_age_ms {
+            return self.ingest_guarded(text, &scrape, max_age_ms);
+        }
         let mut tally = Ingested::default();
         for line in text.lines() {
             let Some(observation) = parse_sample(line) else {
@@ -509,6 +545,7 @@ impl LoadStore {
                 Err(Dropped::Skewed) => &mut tally.skewed,
                 Err(Dropped::Mismatched) => &mut tally.mismatched,
                 Err(Dropped::Capped) => &mut tally.capped,
+                Err(Dropped::Unparsed) => &mut tally.unparsed,
             };
             *counted = counted.saturating_add(1);
         }
@@ -553,6 +590,12 @@ impl LoadStore {
     #[must_use]
     pub fn local_site(&self) -> Option<&str> {
         self.local_site.as_deref()
+    }
+
+    /// When this site's own operator last answered a poll, on the store's timeline.
+    #[must_use]
+    pub fn relay_heard_ms(&self) -> Option<i64> {
+        Some(self.relay_heard_ms.load(Ordering::Acquire)).filter(|at| *at != i64::MIN)
     }
 
     /// Now on this store's timeline: the `local_now_ms` to ingest at and the
@@ -635,7 +678,10 @@ struct ScrapeClock<'scrape> {
 }
 
 /// Why a parsed line was not stored.
+#[derive(Clone, Copy)]
 enum Dropped {
+    /// The row was not a well-formed attributed sample.
+    Unparsed,
     /// Its age against the publisher's `Date` was implausible.
     Skewed,
     /// Its site label disagreed with the verified owner.
@@ -790,6 +836,22 @@ mod tests {
                 value: 3.0
             },
             "value and time as reported"
+        );
+    }
+
+    #[test]
+    fn only_the_local_operator_answering_counts_as_the_relay() {
+        let store = LoadStore::new(Duration::from_secs(60)).with_local_site("here");
+        assert_eq!(store.relay_heard_ms(), None, "nothing heard yet");
+        let _ = store.ingest_at("", 1_000, 5_000, "elsewhere");
+        assert_eq!(store.relay_heard_ms(), None, "another site is not the relay");
+        let _ = store.ingest_at("", 1_000, 6_000, "here");
+        assert_eq!(store.relay_heard_ms(), Some(6_000), "an empty answer still counts");
+        let _ = store.ingest_at("", 1_000, 4_000, "here");
+        assert_eq!(
+            store.relay_heard_ms(),
+            Some(6_000),
+            "an older clock never moves it back"
         );
     }
 

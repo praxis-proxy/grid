@@ -197,8 +197,9 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `swim.service.loadBalancerIP` | string | `""` | Static IP for LoadBalancer. Deprecated in Kubernetes, so prefer `metallb.io/loadBalancerIPs`. |
 | `swim.service.externalTrafficPolicy` | string | `""` | External traffic policy. Defaults to Local for LoadBalancer. |
 | `swim.service.loadBalancerSourceRanges` | list | `[]` | Optional CIDRs allowed to reach the SWIM and signals LoadBalancer, where the implementation enforces them. |
-| `platform` | string | `""` | Cloud the grid runs on. `aws` asks for an NLB on both Services, since the default load balancer carries no UDP. |
-| `peers` | string | `""` | The grid's other sites, separated by spaces or commas. Each is a SWIM seed unless `grid.seeds` or `swim.seeds` is set, and each bare IPv4 address a host route in both Services' source ranges unless they set their own. That fits a peer that listens on the address it egresses from; on AWS, list the NAT addresses here and the SWIM Service hostnames in `grid.seeds`. |
+| `platform` | string | `""` | Cloud whose load balancer settings LoadBalancer Services get: `aws` (an NLB, since the default carries no UDP, with cross-zone on the operator Services), `azure`, `gcp` (internal with global access), or `any` for all three. Each cloud reads only its own keys. |
+| `loadBalancerScope` | string | `internal` | Reach of the SWIM and signals load balancers on a cloud platform. `internal` keeps them on the private network, so sites need private connectivity between them. `external` makes them internet-facing. AWS fixes the scope when it creates the load balancer, so changing it means recreating the Service. |
+| `peers` | string | `""` | The grid's other sites, separated by spaces or commas. Each is a SWIM seed unless `grid.seeds` or `swim.seeds` is set, and each bare IPv4 address a host route in both Services' source ranges unless they set their own. That fits a peer that listens on the address it egresses from; on AWS with internet-facing load balancers, list the NAT addresses here and the SWIM Service hostnames in `grid.seeds`. Internal load balancers see peers' private addresses: leave this empty and set `swim.service.loadBalancerSourceRanges` to their machine networks. |
 | `signals.enabled` | bool | `false` | For signalTransport poll. Adds a TCP port named `signals` to the SWIM Service and points this site's gateway at it. Needs `swim.service.enabled`. A LoadBalancer must support mixed UDP and TCP ports. |
 | `signals.port` | int | `9091` | Signals port on the SWIM Service. Peers learn the LoadBalancer address and this port over gossip. |
 | `signals.advertiseAddress` | string | `""` | Signals endpoint gossiped to peers. Set it with `swim.advertiseAddress` or a NodePort Service, where the operator discovers no LoadBalancer address. |
@@ -250,7 +251,36 @@ enrollment: {enabled: true, url: https://enroll.example.com}
 ```
 
 `grid.id` renders the GridNetwork, with site discovery on and its TLS Secrets pointed at
-the site identity, the grid CA, and `grid.swimKeySecretName`, plus this site's GridSite.
+the site identity, the grid CA, and `grid.swimKeySecretName`, plus this site's GridSite,
+labelled `grid.praxis.fast/provider-site`.
+
+Without `grid.id` or `enrollment.enabled`, the operator creates these records once the site
+has an identity. It names the site from its SPIFFE ID and creates its GridNetwork
+(`GRID_NETWORK`, default `grid`) and labelled GridSite, each once, only when missing, and
+never edits them. A release with `grid.id` or `enrollment.enabled` turns this off from its
+first install, so Helm never meets an operator-created record. Without an identity or
+`site.name` the operator idles, and a `site.name` that disagrees with the identity stops it.
+The GridNetwork's `LocalSiteDeclared` condition reports a missing local GridSite.
+
+Enabling `grid.id` or `enrollment.enabled` on a release that ran without either needs one
+step first. The operator already created the GridNetwork and GridSite, and they carry its
+`grid.praxis.fast/created-by` label rather than Helm's ownership metadata. Turning the
+operator's creation off does not transfer them, so the upgrade that starts rendering them
+fails on ownership. Adopt them before it, naming the release and the namespace it installs
+into:
+
+```bash
+for record in gridnetwork/<grid.network> gridsite/<site.name>; do
+  kubectl label "${record}" app.kubernetes.io/managed-by=Helm --overwrite
+  kubectl annotate "${record}" \
+    meta.helm.sh/release-name=<release> \
+    meta.helm.sh/release-namespace=<namespace> --overwrite
+done
+```
+
+The chart's upgrade test cannot cover this, because it pauses the operator and so never has
+an operator-created record to adopt.
+
 `site.name` and `grid.seeds` default `swim.siteName` and `swim.seeds`, which win when set,
 and `grid.signals: poll` serves signals on the SWIM Service. `grid.seeds` also takes one
 string separated by spaces or commas, as `swim.seeds` does. The CRs need the grid CRDs

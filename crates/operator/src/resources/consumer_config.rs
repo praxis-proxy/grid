@@ -15,7 +15,7 @@
 //! # Security invariants
 //!
 //! - Token values are **never** emitted.  Credential entries use `file:` sources under
-//!   `ConsumerConfig::credential_mount_base`.
+//!   `ConsumerConfig::credential_mount_path`.
 //! - The `credential.secretRef` locating information (name, namespace, key) is included in the `intelligent_route`
 //!   candidate block and in the `credential_inject` entry.  This is reference data, not credential bytes.
 //!
@@ -56,9 +56,9 @@ pub enum ConsumerConfigError {
     #[error("overlay local_site must not be blank")]
     BlankLocalSite,
 
-    /// The `credential_mount_base` path is blank.
-    #[error("credential_mount_base must not be blank")]
-    BlankMountBase,
+    /// The `credential_mount_path` field is blank.
+    #[error("credential_mount_path must not be blank")]
+    BlankMountPath,
 
     /// A required Grid CA Secret reference was not configured.
     #[error("mutual TLS requires tls.caSecretRef")]
@@ -272,7 +272,7 @@ pub(crate) const BACKEND_CA_MOUNT_BASE: &str = "/run/secrets/grid-backend-ca";
 /// # Parameters
 ///
 /// - `overlay` - the routing overlay produced by the Grid operator for this gateway.
-/// - `credential_mount_base` - base directory where credential Secrets are mounted inside the consumer pod (e.g.
+/// - `credential_mount_path` - base directory where credential Secrets are mounted inside the consumer pod (e.g.
 ///   `/run/secrets/grid-credentials`).
 /// - `cluster_endpoints` - explicit endpoint topology for the `load_balancer` section. Every inference cluster must
 ///   have a matching endpoint entry with explicit transport configuration.
@@ -284,7 +284,7 @@ pub(crate) const BACKEND_CA_MOUNT_BASE: &str = "/run/secrets/grid-backend-ca";
 ///
 /// Returns [`ConsumerConfigError`] when:
 /// - `overlay.local_site` is blank.
-/// - `credential_mount_base` is blank.
+/// - `credential_mount_path` is blank.
 /// - The overlay has no inference candidates.
 /// - Any inference candidate has a blank cluster name.
 /// - Any inference cluster has no matching endpoint in `cluster_endpoints`.
@@ -293,14 +293,14 @@ pub(crate) const BACKEND_CA_MOUNT_BASE: &str = "/run/secrets/grid-backend-ca";
 #[cfg(test)]
 pub(crate) fn generate_consumer_praxis_config(
     overlay: &RoutingOverlay,
-    credential_mount_base: &str,
+    credential_mount_path: &str,
     cluster_endpoints: &[ClusterEndpointConfig],
     tls_cert_mount_path: &str,
     listener_port: u16,
 ) -> Result<String, ConsumerConfigError> {
     generate_consumer_praxis_config_with_telemetry(
         overlay,
-        credential_mount_base,
+        credential_mount_path,
         cluster_endpoints,
         tls_cert_mount_path,
         listener_port,
@@ -328,7 +328,7 @@ pub(crate) fn generate_consumer_praxis_config(
 #[cfg(test)]
 pub(crate) fn generate_consumer_praxis_config_with_telemetry(
     overlay: &RoutingOverlay,
-    credential_mount_base: &str,
+    credential_mount_path: &str,
     cluster_endpoints: &[ClusterEndpointConfig],
     tls_cert_mount_path: &str,
     listener_port: u16,
@@ -337,8 +337,8 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
     if overlay.local_site.trim().is_empty() {
         return Err(ConsumerConfigError::BlankLocalSite);
     }
-    if credential_mount_base.trim().is_empty() {
-        return Err(ConsumerConfigError::BlankMountBase);
+    if credential_mount_path.trim().is_empty() {
+        return Err(ConsumerConfigError::BlankMountPath);
     }
 
     let inference_candidates: Vec<&RoutingCandidate> = overlay
@@ -372,7 +372,7 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
     };
 
     let credential_inject_section =
-        render_credential_inject(&inference_candidates, credential_mount_base, &overlay.local_site, false);
+        render_credential_inject(&inference_candidates, credential_mount_path, &overlay.local_site, false);
     let load_balancer_section = render_load_balancer(&inference_candidates, cluster_endpoints, tls_cert_mount_path)?;
 
     // Listeners section: one public listener referencing the consumer filter chain.
@@ -407,7 +407,7 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
     }
 
     // Admin interface and graceful shutdown use standard constants for consumer gateways.
-    config.push_str("\nadmin:\n  address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n");
+    config.push_str("\nadmin:\n  metrics_address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n");
 
     Ok(config)
 }
@@ -478,7 +478,7 @@ fn render_telemetry(telemetry: &GatewayTelemetryConfig) -> Result<String, Consum
 )]
 fn generate_consumer_praxis_config_for_gateway_with_telemetry(
     overlay: &RoutingOverlay,
-    credential_mount_base: &str,
+    credential_mount_path: &str,
     cluster_endpoints: &[ClusterEndpointConfig],
     tls_cert_mount_path: &str,
     listener_port: u16,
@@ -570,9 +570,9 @@ fn generate_consumer_praxis_config_for_gateway_with_telemetry(
         .filter(|candidate| candidate.kind == INFERENCE_MODEL)
         .collect();
     let inject = if projected_credentials {
-        render_credential_inject(&[], credential_mount_base, &overlay.local_site, true)
+        render_credential_inject(&[], credential_mount_path, &overlay.local_site, true)
     } else {
-        render_credential_inject(&candidates, credential_mount_base, &overlay.local_site, false)
+        render_credential_inject(&candidates, credential_mount_path, &overlay.local_site, false)
     };
     config.push_str(&inject);
     config.push_str("\n      - filter: load_balancer\n        clusters:\n");
@@ -580,7 +580,7 @@ fn generate_consumer_praxis_config_for_gateway_with_telemetry(
     if let Some(telemetry) = telemetry {
         config.push_str(&render_telemetry(telemetry)?);
     }
-    config.push_str("\nadmin:\n  address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n");
+    config.push_str("\nadmin:\n  metrics_address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n");
     Ok(config)
 }
 
@@ -589,7 +589,7 @@ fn generate_consumer_praxis_config_for_gateway_with_telemetry(
 #[expect(clippy::too_many_arguments, reason = "matches the gateway renderer inputs")]
 fn generate_consumer_praxis_config_for_gateway(
     overlay: &RoutingOverlay,
-    credential_mount_base: &str,
+    credential_mount_path: &str,
     cluster_endpoints: &[ClusterEndpointConfig],
     tls_cert_mount_path: &str,
     listener_port: u16,
@@ -599,7 +599,7 @@ fn generate_consumer_praxis_config_for_gateway(
 ) -> Result<String, ConsumerConfigError> {
     generate_consumer_praxis_config_for_gateway_with_telemetry(
         overlay,
-        credential_mount_base,
+        credential_mount_path,
         cluster_endpoints,
         tls_cert_mount_path,
         listener_port,
@@ -625,7 +625,7 @@ fn generate_consumer_praxis_config_for_gateway(
 )]
 pub(crate) fn render_consumer_config_with_projected(
     overlay: &RoutingOverlay,
-    credential_mount_base: &str,
+    credential_mount_path: &str,
     cluster_endpoints: &[ClusterEndpointConfig],
     tls_cert_mount_path: &str,
     listener_port: u16,
@@ -643,7 +643,7 @@ pub(crate) fn render_consumer_config_with_projected(
         .collect();
     let config_yaml = generate_consumer_praxis_config_for_gateway_with_telemetry(
         overlay,
-        credential_mount_base,
+        credential_mount_path,
         cluster_endpoints,
         tls_cert_mount_path,
         listener_port,
@@ -663,12 +663,12 @@ pub(crate) fn render_consumer_config_with_projected(
         };
         let path = if projected_credentials {
             format!(
-                "{credential_mount_base}/{}/{}/{}",
+                "{credential_mount_path}/{}/{}/{}",
                 credential.secret_ref.namespace, credential.secret_ref.name, credential.secret_ref.key
             )
         } else {
             credential_file_path(
-                credential_mount_base,
+                credential_mount_path,
                 &credential.secret_ref.name,
                 &credential.secret_ref.key,
             )
@@ -776,7 +776,7 @@ pub(crate) fn render_consumer_config_with_projected(
 #[expect(clippy::too_many_arguments, reason = "matches the production renderer inputs")]
 fn render_consumer_config(
     overlay: &RoutingOverlay,
-    credential_mount_base: &str,
+    credential_mount_path: &str,
     cluster_endpoints: &[ClusterEndpointConfig],
     tls_cert_mount_path: &str,
     listener_port: u16,
@@ -788,7 +788,7 @@ fn render_consumer_config(
 ) -> Result<ConsumerRenderResult, ConsumerConfigError> {
     render_consumer_config_with_projected(
         overlay,
-        credential_mount_base,
+        credential_mount_path,
         cluster_endpoints,
         tls_cert_mount_path,
         listener_port,
@@ -1112,7 +1112,7 @@ fn render_credential_reference(cred: &crate::resources::routing_overlay::Project
 )]
 fn render_credential_inject(
     candidates: &[&RoutingCandidate],
-    credential_mount_base: &str,
+    credential_mount_path: &str,
     local_site: &str,
     enable_projected_credentials: bool,
 ) -> String {
@@ -1137,7 +1137,7 @@ fn render_credential_inject(
             continue;
         }
 
-        let file_path = credential_file_path(credential_mount_base, &cred.secret_ref.name, &cred.secret_ref.key);
+        let file_path = credential_file_path(credential_mount_path, &cred.secret_ref.name, &cred.secret_ref.key);
         let entry = format!(
             "          - name: {}\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  namespace: {}\n\
@@ -1167,7 +1167,7 @@ fn render_credential_inject(
     let projected_base = if enable_projected_credentials {
         format!(
             "        projected_credential_mount_base: {}\n",
-            yaml_scalar(credential_mount_base).unwrap_or_else(|_| "\"\"".to_owned())
+            yaml_scalar(credential_mount_path).unwrap_or_else(|_| "\"\"".to_owned())
         )
     } else {
         String::new()
@@ -1341,7 +1341,7 @@ fn render_trusted_private(address: &str) -> String {
 
 /// Compute the `file:` path for a credential entry.
 ///
-/// Uses `{credential_mount_base}/{secret-name}/{secret-key}`.
+/// Uses `{credential_mount_path}/{secret-name}/{secret-key}`.
 /// The secret name is sanitized to be DNS-label-safe before use.
 fn credential_file_path(mount_base: &str, secret_name: &str, secret_key: &str) -> String {
     let safe_name = dns_safe(secret_name);
@@ -1608,7 +1608,7 @@ mod tests {
                 namespace: "gateway-ns".to_owned(),
                 key: None,
             }),
-            swim_key_ref: None,
+            swim_key_secret_ref: None,
         };
         let rendered = render_consumer_config(
             &overlay,
@@ -2683,11 +2683,11 @@ mod tests {
     }
 
     #[test]
-    fn blank_mount_base_returns_error() {
+    fn blank_mount_path_returns_error() {
         let overlay = simple_overlay(vec![]);
         assert!(
             generate_consumer_praxis_config(&overlay, "", &[], "/etc/praxis/tls", 8080).is_err(),
-            "blank credential_mount_base must return error"
+            "blank credential_mount_path must return error"
         );
     }
 

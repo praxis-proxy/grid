@@ -35,6 +35,11 @@ restart the pods to load it right away:
 
   kubectl -n {{ .Release.Namespace }} rollout restart deployment/{{ $fullname }}
 {{- end }}
+{{- with .Values.metricsListener.skipped }}
+
+The metrics listener is off: {{ . }}. Set networkPolicy.enabled and networkPolicy.from to
+serve it, since the NetworkPolicy is the only control on who can scrape the port.
+{{- end }}
 {{- if .Values.overlay.enabled }}
 
 Overlay ConfigMap: {{ .Values.overlay.existingConfigMap }}

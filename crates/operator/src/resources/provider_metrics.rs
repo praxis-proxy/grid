@@ -136,13 +136,14 @@ pub(crate) async fn collect_provider_signals(
             .filter(|provider| provider.spec.grid_network_ref == network_name),
     )
     .for_each_concurrent(PROVIDER_SCRAPE_CONCURRENCY, |provider| async move {
-        let Some(plan) = signal_scrape_plan(provider) else {
-            return;
-        };
         let Some(name) = provider.metadata.name.as_deref() else {
             return;
         };
         let key = crate::readiness::key(network_name, name);
+        readiness.bind_revision(&key, provider.metadata.uid.as_deref(), provider.metadata.generation);
+        let Some(plan) = signal_scrape_plan(provider) else {
+            return;
+        };
         match scrape_provider_signals(provider, &plan, client).await {
             Ok(text) => record_scrape(readiness, &key, provider, &plan, &text),
             Err(class) => {
@@ -183,6 +184,8 @@ fn record_scrape(
         .zip(republishable)
         .filter_map(|(o, republishable)| republishable.then_some(o))
         .filter(|o| relayed(&o.metric))
+        .filter(|o| o.metric != grid_signals::revision::METRIC)
+        .filter(|o| pool.is_none_or(|pool| o.labels.get("name").or_else(|| o.labels.get(crate::signals::POOL_LABEL)).is_some_and(|name| name == pool)))
         // A local sample's freshness is its collection time, so drop any trailing
         // timestamp. Only relayed peer samples carry a per-sample stamp.
         .map(|mut o| {
@@ -303,12 +306,12 @@ pub(crate) fn signal_scrape_plan(provider: &InferenceProvider) -> Option<SignalS
     let mc = provider.spec.metrics_config.as_ref()?;
     let identity = routing_identity(provider)?;
     let endpoint = provider.spec.endpoint.trim();
-    if endpoint.is_empty() || mc.metrics_endpoint.as_deref().is_some_and(|ep| ep.trim().is_empty()) {
+    if endpoint.is_empty() || mc.endpoint.as_deref().is_some_and(|ep| ep.trim().is_empty()) {
         return None;
     }
     Some(SignalScrapePlan {
         identity,
-        url: metrics_url(mc.metrics_endpoint.as_deref().unwrap_or(endpoint), &mc.path),
+        url: metrics_url(mc.endpoint.as_deref().unwrap_or(endpoint), &mc.path),
         ready_override: mc.signal_names.ready_endpoints.as_deref(),
     })
 }
@@ -419,7 +422,7 @@ pub(crate) fn parse_metrics_timeout(s: &str) -> Duration {
 /// so watch-triggered reconciles can reuse the current scrape generation.
 ///
 /// Returns a map from provider routing identity (the value of
-/// `spec.routingClusterRef`, or `metadata.name` when absent) to
+/// `spec.clusterName`, or `metadata.name` when absent) to
 /// [`scoring::BackendMetrics`].
 ///
 /// Providers without `metricsConfig` or with a blank endpoint are skipped and
@@ -513,12 +516,12 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
         if endpoint.is_empty() {
             continue;
         }
-        if let Some(ep) = mc.metrics_endpoint.as_deref()
+        if let Some(ep) = mc.endpoint.as_deref()
             && ep.trim().is_empty()
         {
             tracing::warn!(
                 provider = identity,
-                "metricsEndpoint is present but blank; skipping metrics collection"
+                "metricsConfig.endpoint is present but blank; skipping metrics collection"
             );
             continue;
         }
@@ -531,7 +534,7 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
             );
             continue;
         }
-        let base = mc.metrics_endpoint.as_deref().unwrap_or(endpoint);
+        let base = mc.endpoint.as_deref().unwrap_or(endpoint);
         let url = metrics_url(base, &mc.path);
         let timeout = parse_metrics_timeout(&mc.timeout);
         let names = metric_names_from_config(&mc.signal_names, mc.pool_name.as_deref(), mc.queue_capacity);
@@ -930,7 +933,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "InferenceProvider",
-            "metadata": {"name": name},
+            "metadata": {"name": name, "uid": format!("uid-{name}"), "generation": 1},
             "spec": spec
         }))
         .unwrap_or_else(|_| std::process::abort())
@@ -1033,6 +1036,29 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
         );
     }
 
+    #[test]
+    fn raw_pool_samples_cannot_cross_attribution_or_spoof_revision() {
+        let readiness = crate::readiness::ReadinessStore::default();
+        let mut metrics = mc_with_queue("llm_d_epp_average_queue_size");
+        metrics.pool_name = Some("a".to_owned());
+        let provider = provider_fixture("p", "http://epp:9090", Some(metrics));
+        let plan = signal_scrape_plan(&provider).unwrap_or_else(|| std::process::abort());
+        record_scrape(
+            &readiness,
+            "net/p",
+            &provider,
+            &plan,
+            "llm_d_epp_average_queue_size{name=\"a\"} 2\nllm_d_epp_average_queue_size{name=\"b\"} 99\nllm_d_epp_average_queue_size 88\ngrid_provider_config_generation{name=\"a\"} 42\n",
+        );
+        let observations = readiness.take_fresh("net/p").unwrap_or_default();
+        assert_eq!(
+            observations.len(),
+            1,
+            "only the selected pool's genuine raw gauge survives"
+        );
+        assert_eq!(observations.first().map(|sample| sample.value), Some(2.0));
+    }
+
     fn mc_with_queue(metric_name: &str) -> MetricsConfig {
         MetricsConfig {
             path: "/metrics".to_owned(),
@@ -1042,7 +1068,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
                 ..Default::default()
             },
             stale_metrics_seconds: None,
-            metrics_endpoint: None,
+            endpoint: None,
             pool_name: None,
             queue_capacity: None,
             tls: None,
@@ -1059,7 +1085,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
                 ..Default::default()
             },
             stale_metrics_seconds: Some(ttl),
-            metrics_endpoint: None,
+            endpoint: None,
             pool_name: None,
             queue_capacity: None,
             tls: None,
@@ -1463,7 +1489,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
                 "backendKind": "local",
                 "endpoint": base_url,
                 "models": [{"name": "model-a"}],
-                "routingClusterRef": "site-x",
+                "clusterName": "site-x",
                 "metricsConfig": {
                     "path": "/metrics",
                     "timeout": "2s",
@@ -1476,11 +1502,11 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
         let result = collect_provider_metrics("net", &[provider], &empty_cache(), Instant::now(), None).await;
         assert!(
             result.metrics.contains_key("site-x"),
-            "metrics must be keyed by routingClusterRef, not metadata.name"
+            "metrics must be keyed by clusterName, not metadata.name"
         );
         assert!(
             !result.metrics.contains_key("prov-a"),
-            "metadata.name must not be used as key when routingClusterRef is set"
+            "metadata.name must not be used as key when clusterName is set"
         );
     }
 

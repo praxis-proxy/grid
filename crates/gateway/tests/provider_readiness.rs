@@ -220,7 +220,7 @@ mod tests {
             std::fs::write(
                 &config,
                 format!(
-                    "admin:\n  address: \"127.0.0.1:{admin}\"\n# The test backends are on loopback.\ninsecure_options:\n  allow_private_endpoints: true\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nclusters:\n{top}filter_chains:\n  - name: main\n    filters:\n      - filter: grid_site_route\n        model_header: X-Gateway-Model-Name\n      - filter: load_balancer\n        clusters:\n{inline}",
+                    "admin:\n  metrics_address: \"127.0.0.1:{admin}\"\n# The test backends are on loopback.\ninsecure_options:\n  allow_private_endpoints: true\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nclusters:\n{top}filter_chains:\n  - name: main\n    filters:\n      - filter: grid_site_route\n        model_header: X-Gateway-Model-Name\n      - filter: load_balancer\n        clusters:\n{inline}",
                     top = clusters("  "),
                     inline = clusters("          "),
                 ),

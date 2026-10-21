@@ -8,18 +8,18 @@ state.
 
 The default configuration has no collector endpoint, so it starts without an
 OTLP exporter and does not require a collector. To opt in, use either
-`GatewayRef.consumerConfig.telemetry` for operator-generated consumer config or
+`GatewayRef.praxisConfig.telemetry` for operator-generated consumer config or
 `gatewayConfig.telemetry` for the Helm-generated Praxis config.
 
 An operator example:
 
 ```yaml
 spec:
-  gatewayRefs:
+  consumerGateways:
     - name: edge
       namespace: grid
-      consumerConfig:
-        enabled: true
+      praxisConfig:
+        generate: true
         telemetry:
           otlpEndpoint: http://otel-collector.observability:4317
           samplingRate: 0.1
@@ -95,7 +95,7 @@ The `grid-gateway` binary built by `deploy/gateway/Containerfile` enables the
 Praxis `otel` feature and the Praxis AI v0.4.1 `opentelemetry` feature. The
 tracked gateway lockfile currently resolves Praxis 0.7.3. Use an image built
 from this Grid target, published as `ghcr.io/praxis-proxy/grid-gateway`, for
-this configuration. The chart's default `ghcr.io/praxis-proxy/ai:0.4.0` image
+this configuration. The chart's default `ghcr.io/praxis-proxy/ai:0.7.0` image
 does not include the Grid build features.
 
 With the AI feature enabled, these short semantic spans are supported when the

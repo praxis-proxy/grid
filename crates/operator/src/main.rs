@@ -13,7 +13,7 @@
 //! hostnames are accepted; DNS is resolved once, with a bounded timeout, before
 //! the runtime starts. When `GRID_SWIM_BIND_ADDR` is absent
 //! the operator runs in static mode (`membership = None`);
-//! `GridNetwork.status.connectedSites` and `distributedProviderCount` remain
+//! `GridNetwork.status.connectedSites` and `remoteProviderCount` remain
 //! 0, and the phase stays `Pending`/`Initializing` based on TLS configuration
 //! only.
 //! `GRID_SWIM_SERVICE_NAME` advertises that Service's `LoadBalancer` address instead, and
@@ -29,7 +29,7 @@
 //! This is the environment-variable path, intended for local development and
 //! Kind-based testing.  Environment variables are visible to same-host process
 //! inspectors, so the production configuration path uses
-//! `GridNetwork.spec.tls.swimKeyRef` to source the key from a Kubernetes
+//! `GridNetwork.spec.tls.swimKeySecretRef` to source the key from a Kubernetes
 //! Secret; the `GridNetwork` controller loads it and calls
 //! `SwimHandle::set_swim_key` at reconcile time.
 //! SWIM holds all traffic until a key loads or no `GridNetwork` declares one.
@@ -48,7 +48,7 @@
 )]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -102,7 +102,7 @@ async fn main() {
     // up front, before any reconciler builds a client.
     operator::init_process_crypto();
 
-    let config = Cli::parse();
+    let mut config = Cli::parse();
     version::get().log_startup("grid-operator");
 
     let client = match Client::try_default().await {
@@ -148,6 +148,32 @@ async fn main() {
             tracing::error!(%error, "site enrollment failed");
             std::process::exit(1);
         }
+    }
+    // The identity names the site, and without one the site idles.
+    let SiteIdentity {
+        at: identity,
+        present: has_identity,
+        name: site_name,
+    } = match site_from_identity(&client, &config).await {
+        Ok(found) => found,
+        Err(error) => {
+            tracing::error!(%error, "invalid site identity or name");
+            std::process::exit(1);
+        },
+    };
+    config.swim.site_name = site_name;
+    let startup = SiteStartup::resolve(config.swim.site_name.is_some(), has_identity);
+    match startup {
+        SiteStartup::Idle => {
+            tracing::info!("no site identity or site name: idle until an admin creates or joins a grid");
+        },
+        SiteStartup::AwaitingIdentity => {
+            tracing::info!("site named but not yet identified: waiting for its identity");
+        },
+        SiteStartup::Identified => {},
+    }
+    if startup.creates_records() && config.grid.create_local_records {
+        Box::pin(create_local_records(&client, &config, identity)).await;
     }
     let GridModes {
         signal: signal_mode,
@@ -246,6 +272,7 @@ async fn main() {
                     published: Published {
                         site: ctx.signals(),
                         peers: ctx.peers(),
+                        rounds: ctx.peer_rounds(),
                         feedback: operator::gateway_ages::GatewayFeedback::new(client.clone(), shutdown.clone()),
                     },
                     peer_identities: ctx.peer_identities(),
@@ -266,12 +293,26 @@ async fn main() {
         .map(|_joined| ())
     };
 
+    // Waiting exits once the identity appears, so the restart names the site from
+    // it and creates its records.
+    let identified = async {
+        if startup.waits_for_identity() {
+            identity_appears(&client, &config).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
     // Standing down wins, and dropping the work closes every connection pool
     // it owns. The listener drains while this waits, because both sides stay
     // polled until one of them finishes.
     let result = tokio::select! {
         biased;
         () = standing_down => Ok(()),
+        () = identified => {
+            // Exit 0 so the kubelet restarts the pod; its restart backoff still applies.
+            tracing::info!("restarting under the site identity's name");
+            return;
+        },
         result = serving => result,
     };
 
@@ -365,7 +406,7 @@ async fn start_swim(
     ready: Arc<std::sync::atomic::AtomicBool>,
     started: tokio::sync::watch::Sender<SwimStage>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let swim = Box::pin(maybe_start_swim(&client, &cli))
+    let swim = Box::pin(maybe_start_swim(&client, &cli, ctx.signal_mode()))
         .await
         .map_err(|error| format!("SWIM startup failed: {error}"))?;
     if let Some(handle) = &swim {
@@ -375,12 +416,7 @@ async fn start_swim(
             Arc::clone(handle),
             cli.gateway.clone(),
         ));
-        let (handle, ctx) = (Arc::clone(handle), Arc::clone(&ctx));
-        tokio::spawn(async move {
-            let members = || !handle.snapshot().members.is_empty();
-            converged(members, handle.reconciliation_events(), MEMBERSHIP_GRACE).await;
-            ctx.release_membership();
-        });
+        tokio::spawn(release_membership_once_settled(Arc::clone(handle), Arc::clone(&ctx)));
     } else {
         ctx.release_membership();
     }
@@ -389,8 +425,55 @@ async fn start_swim(
     Ok(())
 }
 
-/// Longest wait for a first peer before membership-derived writes run without one.
-const MEMBERSHIP_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+/// Release membership-derived writes once every live named peer has delivered, or after the grace.
+async fn release_membership_once_settled(handle: Arc<swim_runtime::SwimHandle>, ctx: Arc<OperatorCtx>) {
+    // Only the poll path hears load and gates on peers' state; push releases on a first member.
+    let poll = ctx.signal_mode() == SignalMode::Poll;
+    let settled = || {
+        let members = handle.snapshot();
+        if poll {
+            peers_delivered(
+                &members,
+                &handle.state_snapshot(),
+                &ctx.peer_identities(),
+                &ctx.load_heard(),
+                handle.site_name(),
+            )
+        } else {
+            !members.members.is_empty()
+        }
+    };
+    // Load arrives on poll rounds, which raise no SWIM event, so recheck each second too.
+    let ticks = futures::stream::unfold((), |()| async {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        Some(((), ()))
+    });
+    let changes = futures::stream::select(handle.reconciliation_events(), ticks);
+    converged(settled, changes, MEMBERSHIP_GRACE).await;
+    ctx.release_membership();
+}
+
+/// Longest wait for peers' state before membership-derived writes run without it: one state
+/// republish, every 30 s, and the membership convergence before it.
+const MEMBERSHIP_GRACE: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Whether a peer is a member and every live member a `GridSite` names has delivered providers
+/// and load, so the first serving write after a restart is not missing peers or their load. A
+/// live peer that publishes no load holds the write for the whole grace.
+fn peers_delivered(
+    members: &operator::swim::MembershipSnapshot,
+    state: &crdt::GridStateSnapshot,
+    identities: &operator::signals::PeerIdentities,
+    heard: &operator::signals::LoadHeard,
+    local_site: &str,
+) -> bool {
+    let mut peers = members.members.iter().filter(|m| m.site_id != local_site).peekable();
+    identities.loaded()
+        && peers.peek().is_some()
+        && peers
+            .filter(|m| m.status == operator::swim::MemberStatus::Alive && identities.knows(&m.site_id))
+            .all(|m| state.providers.values().any(|p| p.site_id == m.site_id) && heard.any_from(&m.site_id))
+}
 
 /// Wait until `has_members` holds, rechecked on each `changes` item, or `grace` passes.
 async fn converged(
@@ -470,7 +553,11 @@ async fn resolve_grid_modes(client: &Client, enrolled: bool, without_network: Gr
     clippy::large_stack_frames,
     reason = "sequential env-var parsing + runtime startup; splitting would obscure the startup sequence"
 )]
-async fn maybe_start_swim(client: &Client, cli: &Cli) -> Result<Option<Arc<swim_runtime::SwimHandle>>, String> {
+async fn maybe_start_swim(
+    client: &Client,
+    cli: &Cli,
+    signal_mode: SignalMode,
+) -> Result<Option<Arc<swim_runtime::SwimHandle>>, String> {
     let Some(addr_str) = std::env::var("GRID_SWIM_BIND_ADDR").ok() else {
         return Ok(None);
     };
@@ -481,7 +568,9 @@ async fn maybe_start_swim(client: &Client, cli: &Cli) -> Result<Option<Arc<swim_
             return Err(format!("GRID_SWIM_BIND_ADDR is not a valid socket address: {e}"));
         },
     };
-    let site_name = swim_site_name(cli.swim.site_name.clone())?;
+    let Some(site_name) = cli.swim.site_name.clone() else {
+        return Ok(None);
+    };
     let (advertise_addr, lb_watch) = swim_advertise_addr(client, bind_addr).await?;
     if advertise_addr.unwrap_or(bind_addr).ip().is_unspecified() {
         return Err("refusing to advertise an unspecified SWIM address; set GRID_SWIM_ADVERTISE_ADDR".to_owned());
@@ -539,6 +628,11 @@ async fn maybe_start_swim(client: &Client, cli: &Cli) -> Result<Option<Arc<swim_
         key,
         revision_lease,
         revision_renewer: Some(revision_renewer(client.clone(), site_name.clone())),
+        departed: if signal_mode == SignalMode::Poll {
+            swim_runtime::Departed::RetainProviders
+        } else {
+            swim_runtime::Departed::Evict
+        },
     };
     match swim_runtime::start(cfg).await {
         Ok(handle) => {
@@ -570,7 +664,7 @@ enum DeclaredKey {
     NoNetwork,
     /// A `GridNetwork` exists and names no key.
     None,
-    /// The first `swimKeyRef` found.
+    /// The first `swimKeySecretRef` found.
     Ref(operator::crd::grid_network::SecretRef),
 }
 
@@ -594,8 +688,8 @@ async fn key_state_for(client: &Client, declared: &DeclaredKey, require_key: boo
     };
     match operator::resources::secret::read_swim_key(client, key_ref).await {
         Ok(Some(key)) => return KeyState::Key(Arc::new(key)),
-        Ok(None) => tracing::warn!(secret = %key_ref.name, "swimKeyRef holds no valid key yet; holding SWIM"),
-        Err(error) => tracing::warn!(secret = %key_ref.name, %error, "swimKeyRef not readable yet; holding SWIM"),
+        Ok(None) => tracing::warn!(secret = %key_ref.name, "swimKeySecretRef holds no valid key yet; holding SWIM"),
+        Err(error) => tracing::warn!(secret = %key_ref.name, %error, "swimKeySecretRef not readable yet; holding SWIM"),
     }
     KeyState::Pending
 }
@@ -658,7 +752,7 @@ fn declared_of(networks: &[GridNetwork]) -> DeclaredKey {
     }
     networks
         .iter()
-        .find_map(|n| n.spec.tls.swim_key_ref.clone())
+        .find_map(|n| n.spec.tls.swim_key_secret_ref.clone())
         .map_or(DeclaredKey::None, DeclaredKey::Ref)
 }
 
@@ -1095,31 +1189,118 @@ fn parse_swim_key(hex: &str) -> Result<swim::crypto::SwimKey, &'static str> {
     Ok(key)
 }
 
-/// The SWIM site name, `configured` or else the hostname, refused unless it is a DNS label.
+/// What startup does about the site's name and its records.
 ///
-/// The name keys the revision-lease `ConfigMap` and the `GridSite`, so an empty or
-/// invalid one would leave SWIM off rather than fail.
-///
-/// # Errors
-///
-/// Returns the reason when the name is not a lowercase DNS label.
-fn swim_site_name(configured: Option<String>) -> Result<String, String> {
-    let name = configured.unwrap_or_else(hostname_or_default);
-    certs::validate_site_name(&name).map_err(|_invalid| {
-        format!(
-            "SWIM site name {name:?} is not a lowercase DNS label; set GRID_SWIM_SITE_NAME (swim.siteName or site.name)"
-        )
-    })?;
-    Ok(name)
+/// The identity names the site and the records need it, so a configured name
+/// alone is not enough to proceed: a named site still waits for its identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SiteStartup {
+    /// Neither a name nor an identity: nothing to do until an admin acts.
+    Idle,
+    /// Named, but the identity has not appeared yet.
+    AwaitingIdentity,
+    /// Identified, so the records this release owns can be created.
+    Identified,
 }
 
-/// Return the machine hostname or a safe fallback.
-fn hostname_or_default() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "grid-operator".to_owned())
+impl SiteStartup {
+    /// Decide from whether the site has a name and whether its identity is present.
+    const fn resolve(named: bool, has_identity: bool) -> Self {
+        match (named, has_identity) {
+            // The identity names the site, so being identified settles it either way.
+            (_, true) => Self::Identified,
+            (true, false) => Self::AwaitingIdentity,
+            (false, false) => Self::Idle,
+        }
+    }
+
+    /// Whether to poll for an identity and exit once one appears.
+    const fn waits_for_identity(self) -> bool {
+        !matches!(self, Self::Identified)
+    }
+
+    /// Whether the local records can be created now.
+    const fn creates_records(self) -> bool {
+        matches!(self, Self::Identified)
+    }
+}
+
+/// How often a site without an identity checks for one.
+const IDENTITY_POLL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Resolve once the site identity appears, warning once per distinct error.
+async fn identity_appears(client: &Client, config: &Cli) {
+    let mut last_error = None;
+    loop {
+        tokio::time::sleep(IDENTITY_POLL).await;
+        match site_from_identity(client, config).await {
+            Ok(SiteIdentity { present: true, .. }) => return,
+            Ok(_) => last_error = None,
+            Err(error) if last_error.as_ref() != Some(&error) => {
+                tracing::warn!(%error, "site identity present but unusable");
+                last_error = Some(error);
+            },
+            Err(_) => {},
+        }
+    }
+}
+
+/// Where the identity is, whether it exists, and the site name it gives.
+struct SiteIdentity {
+    /// The identity Secret.
+    at: operator::site_name::Identity,
+    /// Whether the Secret holds a certificate.
+    present: bool,
+    /// The site name, from the identity, else configured.
+    name: Option<String>,
+}
+
+/// Locate the identity and resolve the site name from it, else from configuration.
+async fn site_from_identity(client: &Client, config: &Cli) -> Result<SiteIdentity, String> {
+    let namespace = config
+        .grid
+        .identity_namespace
+        .clone()
+        .unwrap_or_else(|| client.default_namespace().to_owned());
+    let at = operator::site_name::locate(client, &namespace, &config.enrollment.identity_secret)
+        .await
+        .map_err(|e| e.to_string())?;
+    let pem = operator::site_name::identity_pem(client, &at)
+        .await
+        .map_err(|e| e.to_string())?;
+    let name = operator::site_name::resolve(pem.as_deref(), config.swim.site_name.as_deref())?;
+    Ok(SiteIdentity {
+        at,
+        present: pem.is_some(),
+        name,
+    })
+}
+
+/// Create this site's missing `GridNetwork` and `GridSite`, logging rather than failing startup.
+async fn create_local_records(client: &Client, config: &Cli, identity: operator::site_name::Identity) {
+    let Some(site) = config.swim.site_name.as_deref() else {
+        return;
+    };
+    let swim_key = operator::local_records::swim_key_beside(client, &identity, &config.grid.swim_key_secret)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "SWIM key Secret not readable; the GridNetwork names none");
+            None
+        });
+    let plan = operator::local_records::Plan {
+        network: config.grid.network.clone(),
+        site: site.to_owned(),
+        identity,
+        ca_secret: config.enrollment.ca_secret.clone(),
+        swim_key_secret: swim_key,
+        modes: GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust),
+    };
+    match operator::local_records::ensure(client, client.default_namespace(), &plan).await {
+        Ok(outcome) => tracing::info!(?outcome, "local grid records checked"),
+        Err(error) => {
+            tracing::warn!(%error, "local grid records not created; retrying on the next start");
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1240,10 +1421,10 @@ async fn run_site_controller(client: Client) -> Result<(), Box<dyn std::error::E
 
 /// Run the [`InferenceProvider`] controller (OP-02).
 ///
-/// Watches `InferenceProvider` resources.  Metrics TLS rotation is detected
-/// by bounded requeue rather than a cluster-wide Secret watch; the operator
-/// only reads referenced Secrets by explicit namespace/name during
-/// reconciliation.
+/// Watches `InferenceProvider` resources, and every `GridSite` because providers resolve
+/// `status.matchingSites` from them. Metrics TLS rotation is detected by bounded requeue
+/// rather than a cluster-wide Secret watch; the operator only reads referenced Secrets by
+/// explicit namespace/name during reconciliation.
 ///
 /// [`InferenceProvider`]: operator::crd::inference_provider::InferenceProvider
 async fn run_provider_controller(
@@ -1251,8 +1432,16 @@ async fn run_provider_controller(
     local_site: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api = Api::<InferenceProvider>::all(client.clone());
+    let site_api = Api::<GridSite>::all(client.clone());
+
+    // A site is not addressable as one provider, so a change re-resolves them all.
+    let mut inputs = inference_provider::SiteMatchInputs::default();
+    let site_events = watcher(site_api, watcher::Config::default()).filter_map(move |event| {
+        std::future::ready(event.ok().filter(|event| inputs.affects_providers(event)).map(|_| ()))
+    });
 
     Controller::new(api, watcher::Config::default())
+        .reconcile_all_on(site_events)
         .run(
             inference_provider::reconcile,
             inference_provider::error_policy,
@@ -1419,6 +1608,8 @@ struct Published {
     site: operator::signals::SignalStore,
     /// What peers reported about themselves.
     peers: operator::signals::SignalStore,
+    /// When the poller last tried each peer, for this site's own gateway only.
+    rounds: operator::signals::PeerRounds,
 }
 
 /// What the signals listener needs from startup.
@@ -2175,30 +2366,43 @@ async fn signals_handler(
     // Access policy bounds peer reads, not the site reading itself.
     let now = operator::signals::ClockReading::now();
     let (body, oldest) = match &caller {
-        Caller::Local => {
-            // One body under the gateway's read ceiling: the site first, so a
-            // flood of relayed rows can only cost the last peers, never this site.
-            let site = published
-                .site
-                .render_bounded(target, &collect, operator::signals::MAX_RELAY_BYTES, now);
-            // Peers relay only to Local, and the peers store carries no access map.
-            // A Peer(Some) relay would need per-target scoping added here.
-            let peers = published.peers.render_bounded(
-                target,
-                &collect,
-                operator::signals::MAX_RELAY_BYTES.saturating_sub(site.body.len()),
-                now,
-            );
-            operator::metrics::record_relay_truncated("site", &site);
-            operator::metrics::record_relay_truncated("peers", &peers);
-            let mut body = site.body;
-            body.push_str(&peers.body);
-            (body, site.oldest.max(peers.oldest))
-        },
+        Caller::Local => local_relay(&published, target, &collect, now),
         Caller::Peer(Some(labels)) => published.site.render(target, &collect, Some(labels), now),
         Caller::Peer(None) => return refused(),
     };
     served(body, oldest, now.wall)
+}
+
+/// This site's own gateway's read: the poller's rounds, then the site, then its peers, in one
+/// body under the gateway's read ceiling, so a flood of relayed rows can only cost the last peers,
+/// never this site.
+fn local_relay(
+    published: &Published,
+    target: Option<&str>,
+    collect: &[String],
+    now: operator::signals::ClockReading,
+) -> (String, std::time::Duration) {
+    let rounds = published.rounds.render();
+    let site = published.site.render_bounded(
+        target,
+        collect,
+        operator::signals::MAX_RELAY_BYTES.saturating_sub(rounds.len()),
+        now,
+    );
+    // Peers relay only to Local, and the peers store carries no access map.
+    // A Peer(Some) relay would need per-target scoping added here.
+    let peers = published.peers.render_bounded(
+        target,
+        collect,
+        operator::signals::MAX_RELAY_BYTES.saturating_sub(rounds.len().saturating_add(site.body.len())),
+        now,
+    );
+    operator::metrics::record_relay_truncated("site", &site);
+    operator::metrics::record_relay_truncated("peers", &peers);
+    let mut body = rounds;
+    body.push_str(&site.body);
+    body.push_str(&peers.body);
+    (body, site.oldest.max(peers.oldest))
 }
 
 /// Refuse a caller this site will not serve.
@@ -2247,12 +2451,7 @@ async fn signals_identity(client: &Client) -> (Option<ServerTlsConfig>, Option<g
 
 /// The `GridNetwork` this operator serves, `None` when absent or unlistable.
 async fn sole_network(client: &Client) -> Option<GridNetwork> {
-    let networks: Api<GridNetwork> = Api::all(client.clone());
-    networks
-        .list(&kube::api::ListParams::default())
-        .await
-        .ok()
-        .and_then(|list| list.items.into_iter().next())
+    Box::pin(operator::site_name::sole_network(client)).await.ok().flatten()
 }
 
 /// TLS for the listener, or `None` when unconfigured or unreadable.
@@ -2460,6 +2659,9 @@ async fn run_peer_poller(
         settings,
         shutdown,
         ages: operator::peer_ages::PeerAges::default(),
+        remembered: BTreeMap::new(),
+        unanswered: BTreeSet::new(),
+        turn: 0,
     }
     .run()
     .await;
@@ -2480,6 +2682,12 @@ struct PeerPoller {
     shutdown: operator::shutdown::Shutdown,
     /// Peers whose relayed ages the last rounds rejected, for the `GridNetwork` condition.
     ages: operator::peer_ages::PeerAges,
+    /// Each peer where it was last polled, so one SWIM no longer lists is still polled there.
+    remembered: BTreeMap<String, operator::signals::PeerSite>,
+    /// Peers polled last round that did not answer, polled last and briefly.
+    unanswered: BTreeSet<String>,
+    /// Rounds run, which rotates the order the unanswered peers are polled in.
+    turn: usize,
 }
 
 impl PeerPoller {
@@ -2545,27 +2753,37 @@ impl PeerPoller {
         }
     }
 
-    /// Collect from every alive peer, replace what is published for them, and say
+    /// Collect from every known peer, replace what is published for them, and say
     /// on the `GridNetwork` whose relayed ages are being rejected.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one round: targets, order, collection, then what it taught"
+    )]
     async fn poll_once(&mut self, source: &operator::signals::PollPeers) {
         let membership_ready = self.ctx.membership_hold().is_none();
-        let Some(sites) = poll_targets(
+        let Some(mut sites) = poll_targets(
             &self.swim.snapshot(),
             &self.ctx.peer_identities(),
             source.trust,
             self.swim.is_encrypted(),
             self.swim.site_name(),
-            self.settings.peer_port,
+            &mut self.remembered,
         ) else {
             return;
         };
+        self.turn = self.turn.wrapping_add(1);
+        order_targets(&mut sites, &self.unanswered, self.turn);
         // Each peer lands as it answers, so one slow peer cannot age out the rest.
         let peers = self.ctx.peers();
+        let heard = self.ctx.load_heard();
+        let identities = self.ctx.peer_identities();
+        heard.retain_sites(|site| identities.knows(site));
         let ttl = self.settings.peer_ttl();
         let mut answered = BTreeMap::new();
         source
             .collect_each(&sites, |peer, observations, rejected| {
                 answered.insert(peer.clone(), rejected);
+                heard.record(&peer, &observations);
                 peers.refresh(BTreeMap::from([(peer, observations)]), ttl);
             })
             .await;
@@ -2574,9 +2792,42 @@ impl PeerPoller {
             return;
         }
         let polled: Vec<String> = sites.into_iter().map(|site| site.name).collect();
+        self.ctx.peer_rounds().record(&polled, SystemTime::now());
+        self.unanswered = polled
+            .iter()
+            .filter(|site| !answered.contains_key(*site))
+            .cloned()
+            .collect();
         if observe_peer_ages(membership_ready, &mut self.ages, &polled, &answered) {
             Box::pin(write_peer_ages(&self.client, &self.ages, &self.shutdown)).await;
         }
+    }
+}
+
+/// The order a round polls `sites` in.
+///
+/// One peer that did not answer last round goes first, so a peer cut from a saturated round
+/// always has a way back; then the peers that answered; then the other unanswered peers. Both
+/// groups rotate by `turn`, so a round that runs out cuts different peers each time.
+fn order_targets(sites: &mut [operator::signals::PeerSite], unanswered: &BTreeSet<String>, turn: usize) {
+    for site in sites.iter_mut() {
+        site.answering = !unanswered.contains(&site.name);
+    }
+    sites.sort_by_key(|site| !site.answering);
+    let split = sites.partition_point(|site| site.answering);
+    let (answering, rest) = sites.split_at_mut(split);
+    for group in [&mut *answering, &mut *rest] {
+        if !group.is_empty() {
+            let len = group.len();
+            group.rotate_left(turn % len);
+        }
+    }
+    // The reserved slot: the head of the unanswered group moves ahead of every answering peer.
+    if !rest.is_empty() {
+        sites
+            .get_mut(..=split)
+            .into_iter()
+            .for_each(|front| front.rotate_right(1));
     }
 }
 
@@ -2645,7 +2896,11 @@ async fn apply_peer_ages(client: &Client, ages: &operator::peer_ages::PeerAges) 
     }
 }
 
-/// Alive peers this site would name under `trust`, `None` in SPIFFE mode over plaintext gossip.
+/// Peers this site would name under `trust`, `None` in SPIFFE mode over plaintext gossip.
+///
+/// Every member whatever its SWIM state at the signals address it gossiped, then each peer SWIM no
+/// longer lists at the address it was last polled at while its `GridSite` still names it, so
+/// polling never waits on gossip. A peer that never gossiped an address is not polled.
 #[expect(
     clippy::too_many_arguments,
     reason = "membership, trust, and addressing inputs of one round"
@@ -2656,25 +2911,31 @@ fn poll_targets(
     trust: operator::signals::PeerTrustMode,
     encrypted: bool,
     local_site: &str,
-    fallback_port: u16,
+    remembered: &mut BTreeMap<String, operator::signals::PeerSite>,
 ) -> Option<Vec<operator::signals::PeerSite>> {
     let pinned = trust == operator::signals::PeerTrustMode::Pin;
     if !pinned && !encrypted {
         tracing::debug!("SPIFFE peer polling waits for encrypted gossip");
         return None;
     }
-    let alive = snapshot
+    let named = |site: &str| {
+        if pinned {
+            !identities.refuses(site)
+        } else {
+            identities.labels_for(site).is_some()
+        }
+    };
+    let members = snapshot
         .members
         .iter()
-        .filter(|m| m.status == operator::swim::MemberStatus::Alive)
-        .filter(|m| {
-            if pinned {
-                !identities.refuses(&m.site_id)
-            } else {
-                identities.labels_for(&m.site_id).is_some()
-            }
-        });
-    let mut sites = operator::signals::peer_sites(alive, local_site, "https", fallback_port);
+        .filter(|m| m.signals_address.is_some() && named(&m.site_id));
+    let mut sites = operator::signals::peer_sites(members, local_site, "https", 0);
+    remembered.retain(|site, _| named(site));
+    for site in &sites {
+        remembered.insert(site.name.clone(), site.clone());
+    }
+    let listed: BTreeSet<String> = sites.iter().map(|site| site.name.clone()).collect();
+    sites.extend(remembered.values().filter(|site| !listed.contains(&site.name)).cloned());
     if pinned {
         for site in &mut sites {
             site.pins = identities.pins_for(&site.name);
@@ -2699,6 +2960,7 @@ async fn peer_source(
         attempts: settings.peer_attempts,
         backoff: std::time::Duration::from_millis(settings.peer_backoff_ms),
         budget: std::time::Duration::from_secs(settings.peer_budget_secs),
+        round: std::time::Duration::from_secs(settings.peer_interval_secs),
         slow_after: std::time::Duration::from_millis(settings.peer_slow_ms),
         shutdown,
         trust,
@@ -2744,6 +3006,7 @@ mod tests {
         let published = Published {
             site: operator::signals::SignalStore::new(),
             peers: operator::signals::SignalStore::new(),
+            rounds: operator::signals::PeerRounds::default(),
             feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
         };
         for caller in [Caller::Peer(None), Caller::Peer(Some(BTreeMap::new()))] {
@@ -2855,14 +3118,6 @@ mod tests {
             0,
             "shutdown must not start a diagnostic request"
         );
-    }
-
-    #[test]
-    fn a_swim_site_name_must_be_a_dns_label() {
-        for bad in ["", " ", "East", "east_1", "-east"] {
-            assert!(swim_site_name(Some(bad.to_owned())).is_err(), "{bad:?} is refused");
-        }
-        assert_eq!(swim_site_name(Some("east-1".to_owned())), Ok("east-1".to_owned()));
     }
 
     /// A caller is scoped from its certificate, and nothing is trusted for
@@ -3595,7 +3850,7 @@ mod tests {
         let network = |key: Option<&str>| {
             let tls = key.map_or_else(
                 || serde_json::json!({}),
-                |name| serde_json::json!({"swimKeyRef": {"name": name, "namespace": "grid"}}),
+                |name| serde_json::json!({"swimKeySecretRef": {"name": name, "namespace": "grid"}}),
             );
             let spec = serde_json::from_value(serde_json::json!({"seeds": [], "tls": tls}));
             GridNetwork::new("net", spec.unwrap_or_else(|_| std::process::abort()))
@@ -3636,6 +3891,79 @@ mod tests {
         started.send_replace(SwimStage::Settled(None));
         assert!(settled.await.is_none(), "settled without SWIM");
         assert!(readiness(&std::sync::atomic::AtomicBool::new(false)).0 == http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one fixture walked through each kind of peer")]
+    fn the_first_write_waits_for_every_live_named_peer_to_deliver() {
+        let member = |site: &str, status| operator::swim::MemberRecord {
+            site_id: site.to_owned(),
+            endpoint: "10.0.0.2:7946".to_owned(),
+            incarnation: 0,
+            status,
+            age_secs: 0,
+            gateway_address: None,
+            site_cert_pem: None,
+            signals_address: None,
+        };
+        let (alive, dead) = (operator::swim::MemberStatus::Alive, operator::swim::MemberStatus::Dead);
+        let identities = operator::signals::PeerIdentities::new();
+        let record = operator::signals::PeerRecord {
+            labels: BTreeMap::new(),
+            pins: vec!["aa".to_owned()],
+        };
+        let heard = operator::signals::LoadHeard::default();
+        let nothing = crdt::GridStateSnapshot::new("hub".to_owned());
+        let east_alone = operator::swim::MembershipSnapshot {
+            members: vec![member("east", alive.clone())],
+        };
+        assert!(
+            !peers_delivered(&east_alone, &nothing, &identities, &heard, "hub"),
+            "no GridSite read yet, so no peer is known not to need waiting on"
+        );
+        identities.set(BTreeMap::from([
+            ("east".to_owned(), record.clone()),
+            ("west".to_owned(), record),
+        ]));
+        let mut state = crdt::GridStateSnapshot::new("hub".to_owned());
+        let members = |list| operator::swim::MembershipSnapshot { members: list };
+        let delivered = |snapshot: &operator::swim::MembershipSnapshot, held: &crdt::GridStateSnapshot| {
+            peers_delivered(snapshot, held, &identities, &heard, "hub")
+        };
+
+        assert!(
+            !delivered(&members(vec![member("hub", alive.clone())]), &state),
+            "no peer yet"
+        );
+        let east_and_west = members(vec![member("east", alive.clone()), member("west", dead)]);
+        assert!(!delivered(&east_and_west, &state), "east is live and has said nothing");
+        state.upsert_provider(crdt::ProviderState {
+            network_id: "net".to_owned(),
+            site_id: "east".to_owned(),
+            provider_id: "p".to_owned(),
+            routing_cluster: "east".to_owned(),
+            models: Vec::new(),
+            tools: Vec::new(),
+            backend_kind: "local".to_owned(),
+            capacity_weight: 1,
+            phase: crdt::ProviderPhase::Available,
+            metrics: crdt::ProviderMetricsSnapshot::default(),
+            access_policy: crdt::ProviderAccessPolicy::default(),
+            revision: 1,
+            writer_id: "east".to_owned(),
+        });
+        assert!(!delivered(&east_and_west, &state), "east has sent no load yet");
+        let row = operator::signals::Observation {
+            metric: "inference_pool_average_queue_size".to_owned(),
+            labels: BTreeMap::from([("grid_provider".to_owned(), "p".to_owned())]),
+            value: 0.0,
+            timestamp_ms: None,
+            age: std::time::Duration::ZERO,
+        };
+        heard.record("east", &[row]);
+        assert!(delivered(&east_and_west, &state), "a dead peer is not waited on");
+        let stranger = members(vec![member("east", alive.clone()), member("stranger", alive)]);
+        assert!(delivered(&stranger, &state), "nor one no GridSite names");
     }
 
     #[tokio::test(start_paused = true)]
@@ -3806,7 +4134,7 @@ mod tests {
             age_secs: 0,
             gateway_address: None,
             site_cert_pem: None,
-            signals_address: None,
+            signals_address: Some(endpoint.replace(":7946", ":9443")),
         };
         let snapshot = operator::swim::MembershipSnapshot {
             members: vec![
@@ -3814,10 +4142,21 @@ mod tests {
                 member("east", "10.0.0.2:7946"),
                 member("west", "10.0.0.3:7946"),
                 member("stranger", "10.0.0.4:7946"),
+                operator::swim::MemberRecord {
+                    signals_address: None,
+                    ..member("mute", "10.0.0.5:7946")
+                },
             ],
         };
         let identities = operator::signals::PeerIdentities::new();
         identities.set(BTreeMap::from([
+            (
+                "mute".to_owned(),
+                operator::signals::PeerRecord {
+                    labels: gpu(),
+                    pins: vec!["bb".to_owned()],
+                },
+            ),
             (
                 "east".to_owned(),
                 operator::signals::PeerRecord {
@@ -3834,7 +4173,7 @@ mod tests {
             ),
         ]));
         let names = |trust, encrypted| {
-            poll_targets(&snapshot, &identities, trust, encrypted, "hub", 9091)
+            poll_targets(&snapshot, &identities, trust, encrypted, "hub", &mut BTreeMap::new())
                 .map(|sites| sites.into_iter().map(|site| site.name).collect::<Vec<_>>())
         };
         let (pin, spiffe) = (
@@ -3852,6 +4191,110 @@ mod tests {
             Some(vec!["east".to_owned(), "west".to_owned()]),
             "named sites only"
         );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "three rounds over one remembered set")]
+    fn a_peer_swim_lost_is_still_polled_while_its_grid_site_names_it() {
+        let member = |site: &str, endpoint: &str, status| operator::swim::MemberRecord {
+            site_id: site.to_owned(),
+            endpoint: endpoint.to_owned(),
+            incarnation: 0,
+            status,
+            age_secs: 0,
+            gateway_address: None,
+            site_cert_pem: None,
+            signals_address: Some(endpoint.replace(":7946", ":9443")),
+        };
+        let alive = || member("east", "10.0.0.2:7946", operator::swim::MemberStatus::Alive);
+        let dead = || member("west", "10.0.0.3:7946", operator::swim::MemberStatus::Dead);
+        let record = || operator::signals::PeerRecord {
+            labels: BTreeMap::new(),
+            pins: vec!["aa".to_owned()],
+        };
+        let identities = operator::signals::PeerIdentities::new();
+        identities.set(BTreeMap::from([
+            ("east".to_owned(), record()),
+            ("west".to_owned(), record()),
+        ]));
+        let mut remembered = BTreeMap::new();
+        let mut round = |members| {
+            let snapshot = operator::swim::MembershipSnapshot { members };
+            poll_targets(
+                &snapshot,
+                &identities,
+                operator::signals::PeerTrustMode::Pin,
+                false,
+                "hub",
+                &mut remembered,
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .map(|site| (site.name, site.url))
+            .collect::<Vec<_>>()
+        };
+        let east = ("east".to_owned(), "https://10.0.0.2:9443/v1/site/signals".to_owned());
+        let west = ("west".to_owned(), "https://10.0.0.3:9443/v1/site/signals".to_owned());
+
+        assert_eq!(
+            round(vec![dead(), alive()]),
+            [west.clone(), east.clone()],
+            "a dead member is polled"
+        );
+        assert_eq!(
+            round(vec![alive()]),
+            [east.clone(), west],
+            "a member SWIM dropped is polled where it last was"
+        );
+        identities.set(BTreeMap::from([("east".to_owned(), record())]));
+        assert_eq!(
+            round(vec![alive()]),
+            [east],
+            "a site whose GridSite is gone is forgotten"
+        );
+    }
+
+    #[test]
+    fn one_peer_that_did_not_answer_leads_each_round_in_turn() {
+        let site = |name: &str| operator::signals::PeerSite {
+            name: name.to_owned(),
+            url: format!("https://{name}:9443/v1/site/signals"),
+            pins: Vec::new(),
+            answering: true,
+        };
+        let unanswered: BTreeSet<String> = ["a", "b", "c"].iter().map(|name| (*name).to_owned()).collect();
+        let order = |turn| {
+            let mut sites: Vec<_> = ["a", "b", "c", "x", "y"].iter().map(|name| site(name)).collect();
+            order_targets(&mut sites, &unanswered, turn);
+            sites.into_iter().map(|target| target.name).collect::<Vec<_>>()
+        };
+        assert_eq!(order(0), ["a", "x", "y", "b", "c"]);
+        assert_eq!(order(1), ["b", "y", "x", "c", "a"]);
+        assert_eq!(order(2), ["c", "x", "y", "a", "b"]);
+    }
+
+    #[test]
+    fn a_round_too_small_for_every_peer_still_reaches_each_in_turn() {
+        // Four peers that each fill a slot, a round with room for two: whoever is dialled answers.
+        let names = ["a", "b", "c", "d"];
+        let mut unanswered = BTreeSet::new();
+        let mut reached = BTreeSet::new();
+        for turn in 1..=6 {
+            let mut sites: Vec<_> = names
+                .iter()
+                .map(|name| operator::signals::PeerSite {
+                    name: (*name).to_owned(),
+                    url: format!("https://{name}:9443/v1/site/signals"),
+                    pins: Vec::new(),
+                    answering: true,
+                })
+                .collect();
+            order_targets(&mut sites, &unanswered, turn);
+            let (dialled, cut) = sites.split_at(2);
+            reached.extend(dialled.iter().map(|target| target.name.clone()));
+            unanswered = cut.iter().map(|target| target.name.clone()).collect();
+        }
+        assert_eq!(reached.len(), names.len(), "every peer was dialled: {reached:?}");
     }
 
     #[test]
@@ -4173,6 +4616,7 @@ mod tests {
         let published = Published {
             site: operator::signals::SignalStore::new(),
             peers: operator::signals::SignalStore::new(),
+            rounds: operator::signals::PeerRounds::default(),
             feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
         };
         published.peers.refresh(
@@ -4264,6 +4708,73 @@ mod tests {
             }
         });
         Client::new(service, "default")
+    }
+
+    /// Startup's name and identity decision, over every combination.
+    mod site_startup {
+        use super::super::SiteStartup;
+
+        /// No name and no identity: idle, and still watching for an identity.
+        #[test]
+        fn unnamed_and_unidentified_idles_and_waits() {
+            let startup = SiteStartup::resolve(false, false);
+            assert_eq!(startup, SiteStartup::Idle);
+            assert!(
+                startup.waits_for_identity(),
+                "an idle site must notice an identity arriving"
+            );
+            assert!(!startup.creates_records(), "records need the identity");
+        }
+
+        /// Named but not yet identified: the gap that skipped both paths. The
+        /// records need the identity, so this site waits for it rather than
+        /// proceeding on the name alone.
+        #[test]
+        fn named_but_unidentified_waits_without_creating_records() {
+            let startup = SiteStartup::resolve(true, false);
+            assert_eq!(startup, SiteStartup::AwaitingIdentity);
+            assert!(
+                startup.waits_for_identity(),
+                "a named site must still wait for its identity"
+            );
+            assert!(!startup.creates_records(), "records need the identity");
+        }
+
+        /// Named and identified: create the records and stop watching.
+        #[test]
+        fn named_and_identified_creates_records_and_stops_waiting() {
+            let startup = SiteStartup::resolve(true, true);
+            assert_eq!(startup, SiteStartup::Identified);
+            assert!(
+                !startup.waits_for_identity(),
+                "an identified site has nothing to wait for"
+            );
+            assert!(startup.creates_records());
+        }
+
+        /// The identity names the site, so an identity without a configured name
+        /// is identified too.
+        #[test]
+        fn unnamed_but_identified_is_identified() {
+            let startup = SiteStartup::resolve(false, true);
+            assert_eq!(startup, SiteStartup::Identified);
+            assert!(!startup.waits_for_identity());
+            assert!(startup.creates_records());
+        }
+
+        /// Exactly one disposition creates records, and it is the only one that
+        /// stops waiting.
+        #[test]
+        fn creating_records_and_waiting_are_exclusive() {
+            for (named, has_identity) in [(false, false), (true, false), (true, true), (false, true)] {
+                let startup = SiteStartup::resolve(named, has_identity);
+                assert_ne!(
+                    startup.creates_records(),
+                    startup.waits_for_identity(),
+                    "named={named} has_identity={has_identity} must either create records or wait"
+                );
+            }
+        }
     }
 
     /// Real Kubernetes and mutual-TLS feedback proof for the isolated CI cluster.
@@ -4457,6 +4968,7 @@ mod tests {
             signals_app(Published {
                 site: operator::signals::SignalStore::new(),
                 peers: operator::signals::SignalStore::new(),
+                rounds: operator::signals::PeerRounds::default(),
                 feedback,
             })
         }

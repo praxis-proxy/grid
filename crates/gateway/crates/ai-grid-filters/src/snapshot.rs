@@ -7,7 +7,7 @@
 //! snapshots resolved order once rather than reading raw signals per request.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     sync::Arc,
 };
 
@@ -110,9 +110,13 @@ impl RouteSnapshot {
     ) -> Self {
         // Score each candidate once, then sort the pairs: load_of allocates a
         // store key and scans a window, too costly to repeat inside sort_by.
+        let mut reset_pairs = BTreeSet::new();
         let ranked = candidates
             .into_iter()
-            .map(|candidate| Self::resolve(candidate, inputs))
+            .map(|candidate| {
+                let local = *candidate.site == *local_site;
+                Self::resolve(candidate, local, inputs, &mut reset_pairs)
+            })
             .collect();
         Self::ranked(
             Self::explore_floor(ranked, inputs.availability.explore_floor),
@@ -124,25 +128,37 @@ impl RouteSnapshot {
     /// capacity and saturation were measured.
     fn resolve<S: SiteSignals>(
         mut candidate: RouteCandidate,
+        local: bool,
         inputs: &mut Inputs<'_, S>,
+        reset_pairs: &mut BTreeSet<SitePair>,
     ) -> (f64, RouteCandidate, bool) {
-        let (reading, recent) = Self::readings(&candidate, inputs);
+        let readings = observed(&mut candidate, local, inputs);
+        let reading = &readings.horizon;
+        let recent = &readings.recent;
         if reading.unready {
             candidate.admission_state = AdmissionState::Excluded;
         }
         // The site as a whole had work waiting at some instant of the settling time: its
         // average queue at queue_full, or any work held before scheduling, which is a count
-        // and blocks admission at one. One busy unit is not a full site; it only stops a
-        // sample teaching, in measured. Unknown without a queue reading.
-        candidate.backlog = recent.queued.map(|_| recent.congested_in_flight.is_some());
-        // A site's own in-flight count against the ceiling it has shown. A site that publishes
-        // none has no room and is chosen only when no site has any.
-        let measured = Self::measured(&candidate, &reading, &recent, inputs);
+        // and signals pressure at one. This evidence does not require a running count.
+        candidate.backlog = if recent
+            .queued
+            .is_some_and(|queued| queued >= inputs.availability.queue_full)
+            || recent.held.is_some_and(|held| held >= 1.0)
+        {
+            Some(true)
+        } else {
+            recent.queued.map(|_| false)
+        };
+        let measured = Self::measured(&candidate, &readings, inputs, reset_pairs);
         if let Some(measured) = &measured {
             candidate.capacity = Some(measured.ceiling);
             candidate.rho = Some(measured.rho);
             candidate.full = measured.full;
             candidate.relieved = measured.relieved;
+        } else {
+            // Direct pressure remains useful without a count or a learned ceiling.
+            candidate.rho = reported_limit(reading);
         }
         // Ordered by queue depth; a site publishing none sorts after every site that does.
         let load = if candidate.admission_state == AdmissionState::NewAndExisting {
@@ -157,7 +173,13 @@ impl RouteSnapshot {
     /// anchored at the site's newest fresh sample, so a site polled less often than either is
     /// still judged on what it last said. Fullness is judged from the second, so one spike a
     /// horizon ago does not hold a site full.
-    fn readings<S: SiteSignals>(candidate: &RouteCandidate, inputs: &Inputs<'_, S>) -> (SiteReading, SiteReading) {
+    fn readings<S: SiteSignals>(candidate: &RouteCandidate, inputs: &Inputs<'_, S>) -> Readings {
+        let state = || {
+            inputs
+                .signals
+                .learning_state(&candidate.site, &candidate.cluster, inputs.now_ms, inputs.window_ms)
+        };
+        let before = state();
         let over = |horizon_ms| Over {
             now_ms: inputs.now_ms,
             window_ms: inputs.window_ms,
@@ -173,7 +195,15 @@ impl RouteSnapshot {
             &candidate.cluster,
             over(inputs.availability.room_after_ms),
         );
-        (reading, recent)
+        if before != state() {
+            return Readings::default();
+        }
+        Readings {
+            coherent: true,
+            horizon: reading,
+            recent,
+            epoch: before.epoch,
+        }
     }
 
     /// Lift every measured site's weight to at least `share` of the largest ceiling.
@@ -214,34 +244,40 @@ impl RouteSnapshot {
     /// declared capacity is new.
     fn measured<S: SiteSignals>(
         candidate: &RouteCandidate,
-        reading: &SiteReading,
-        recent: &SiteReading,
+        readings: &Readings,
         inputs: &mut Inputs<'_, S>,
+        reset_pairs: &mut BTreeSet<SitePair>,
     ) -> Option<Measured> {
-        let in_flight = reading.in_flight?;
-        let availability = inputs.availability;
+        readings.coherent.then_some(())?;
         let key = (Arc::clone(&candidate.site), Arc::clone(&candidate.cluster));
+        inputs.learned.retire_changed(&key, readings.epoch, reset_pairs);
+        let epoch = readings.epoch?;
+        let reading = &readings.horizon;
+        let in_flight = reading.in_flight?;
         // The newest sample at or before now is the epoch a smoothing step belongs to.
         let sample_at = reading.sampled_at.map(|at| at.min(inputs.now_ms));
-        let previous = inputs.learned.0.get(&key).copied();
-        let ceiling = ceiling(previous, reading, inputs.now_ms, inputs.window_ms, availability);
+        let previous = inputs.learned.load.get(&key).copied();
+        let ceiling = ceiling(previous, reading, inputs.now_ms, inputs.window_ms, inputs.availability);
         let by_count = (in_flight / ceiling.read_against).clamp(0.0, 1.0);
         let raw = nearest_limit(reading, by_count, ceiling.hard.is_some());
-        let rho = smoothed(previous, sample_at, raw, availability.smoothing);
-        let (congested, full_since) = congestion(previous, recent, ceiling.read_against, inputs);
-        let full = full_for(candidate, full_since, inputs.now_ms, availability.full_after_ms);
+        let rho = smoothed(previous, sample_at, raw, inputs.availability.smoothing);
+        let (congested, full_since) = congestion(previous, &readings.recent, ceiling.read_against, inputs);
+        let reset = reset_pairs.contains(&key);
+        let full = (!reset)
+            .then(|| full_for(candidate, full_since, inputs.now_ms, inputs.availability.full_after_ms))
+            .flatten();
         let age_ms = sample_at.map(|at| inputs.now_ms.saturating_sub(at));
         let limits = Limits::read(in_flight, &ceiling, by_count, full, age_ms);
         publish_limits(&key, &ceiling, reading, &limits);
-        inputs.learned.0.insert(
+        inputs.learned.load.insert(
             key,
-            SiteLearned::at(&ceiling, rho, inputs.now_ms, sample_at, full_since),
+            SiteLearned::at(&ceiling, rho, inputs.now_ms, sample_at, full_since, epoch),
         );
         Some(Measured {
             ceiling: ceiling.read_against,
             rho,
             full,
-            relieved: candidate.backlog.map(|_| !congested),
+            relieved: candidate.backlog.filter(|_| !reset).map(|_| !congested),
         })
     }
 
@@ -257,12 +293,13 @@ impl RouteSnapshot {
     pub(crate) fn shed(mut self, previous: &BTreeSet<Arc<str>>, availability: &AvailabilitySettings) -> Self {
         // Per model: whether every healthy site is measured, and whether each is full.
         let mut models: BTreeMap<&Arc<str>, Fullness> = BTreeMap::new();
-        // A demoted cluster carries a NaN score and is not one of the model's sites here.
-        let healthy = self.candidates.iter().zip(&self.scores).filter(|(candidate, score)| {
-            candidate.kind == CapabilityKind::InferenceModel
-                && candidate.admission_state == AdmissionState::NewAndExisting
-                && !score.is_nan()
-        });
+        // A demoted cluster carries a NaN score and is not one of the model's sites here, nor
+        // is a silent one: it takes no overflow.
+        let healthy = self
+            .candidates
+            .iter()
+            .zip(&self.scores)
+            .filter(|(candidate, score)| sheds_on(candidate, **score));
         for (candidate, _) in healthy {
             let (measured, sites) = models.entry(&candidate.name).or_insert((true, Vec::new()));
             match (candidate.full, candidate.relieved) {
@@ -345,17 +382,23 @@ impl RouteSnapshot {
                 // showing the last ones it had, or a seed taken during an outage reads them.
                 if candidate.capacity.is_none() {
                     clear_measured(&key);
+                    site_gauge("grid_route_site_rho_reported", &key, candidate.rho.unwrap_or(f64::NAN));
                 }
             }
         }
         for gone in published.difference(&current) {
             site_score(gone, f64::NAN);
+            site_gauge("grid_route_site_silent", gone, f64::NAN);
+            site_gauge("grid_route_site_last_sample_age_seconds", gone, f64::NAN);
+            site_gauge("grid_route_site_round_age_seconds", gone, f64::NAN);
             site_gauge("grid_route_site_rho", gone, f64::NAN);
             site_gauge("grid_route_site_weight", gone, f64::NAN);
             clear_measured(gone);
             // Learned bounds outlive their samples, so a pair that leaves must not keep them:
             // a site rebuilt under the same name would resume them untaught.
-            learned.0.remove(gone);
+            learned.load.remove(gone);
+            learned.silence.remove(gone);
+            learned.judged_since.remove(gone);
         }
         *published = current;
         self
@@ -390,6 +433,8 @@ type SitePair = (Arc<str>, Arc<str>);
 /// What one site's own load has taught the gateway: its running ceiling and smoothed saturation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SiteLearned {
+    /// Qualified source revision that taught this state.
+    epoch: u64,
     /// The most it has held with nothing waiting: capacity is at least this. Absent until a
     /// queue-free sample teaches one.
     soft: Option<f64>,
@@ -536,8 +581,20 @@ impl Ceiling {
 
 impl SiteLearned {
     /// What this refresh leaves for the next one.
-    fn at(ceiling: &Ceiling, rho: f64, now_ms: i64, sample_at: Option<i64>, full_since: Option<i64>) -> Self {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "retained learning binds its bounds and timing to one revision"
+    )]
+    fn at(
+        ceiling: &Ceiling,
+        rho: f64,
+        now_ms: i64,
+        sample_at: Option<i64>,
+        full_since: Option<i64>,
+        epoch: u64,
+    ) -> Self {
         Self {
+            epoch,
             soft: ceiling.soft,
             hard: ceiling.hard,
             rho,
@@ -549,6 +606,19 @@ impl SiteLearned {
             shrunk_since: ceiling.shrunk_since,
         }
     }
+}
+
+/// Both observation horizons from a consistent publication state.
+#[derive(Default)]
+struct Readings {
+    /// Both horizons were read without an intervening publication.
+    coherent: bool,
+    /// Qualified learning history shared by both horizons.
+    epoch: Option<u64>,
+    /// Full measurement horizon.
+    horizon: SiteReading,
+    /// Recent pressure and congestion horizon.
+    recent: SiteReading,
 }
 
 /// What one refresh measured about a site.
@@ -565,7 +635,28 @@ struct Measured {
 
 /// Per-site learned load state, kept across refreshes.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Learned(BTreeMap<SitePair, SiteLearned>);
+pub(crate) struct Learned {
+    /// What each site's own load has taught.
+    load: BTreeMap<SitePair, SiteLearned>,
+    /// Each silent site on its way back.
+    silence: BTreeMap<SitePair, Silence>,
+    /// The first poller round each remote pair was judged against, for one never heard from.
+    judged_since: BTreeMap<SitePair, i64>,
+}
+
+/// A silent site on its way back: the newest sample seen while silent, and how many new
+/// samples have arrived since the silence.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Silence {
+    /// When the newest sample seen while silent was taken.
+    seen: Option<i64>,
+    /// New samples since the site went silent.
+    returned: u8,
+}
+
+/// New samples a silent site sends before it routes again, so one poll through a lossy link
+/// does not bring it back.
+const RETURN_SAMPLES: u8 = 2;
 
 /// Control state that outlives one snapshot: the pairs with a published score, and what each
 /// site's load has taught the gateway.
@@ -578,11 +669,19 @@ pub(crate) struct Gauged {
 }
 
 impl Learned {
+    /// Retire changed history once while marking every model sharing the provider.
+    fn retire_changed(&mut self, key: &SitePair, epoch: Option<u64>, reset_pairs: &mut BTreeSet<SitePair>) {
+        if self.load.get(key).is_some_and(|held| Some(held.epoch) != epoch) {
+            self.load.remove(key);
+            reset_pairs.insert(key.clone());
+        }
+    }
+
     /// Clear every site's soft bound, as a periodic reset would. Test-only, for the scenario
     /// that measures what such a reset would cost.
     #[cfg(test)]
     pub(crate) fn clear_soft(&mut self) {
-        for learned in self.0.values_mut() {
+        for learned in self.load.values_mut() {
             learned.soft = None;
         }
     }
@@ -626,17 +725,26 @@ fn ceiling(
     let soft = soft_bound(prior.and_then(|prior| prior.soft), queue_free);
     let kept = kept_hard(prior.filter(|_| !sized.grown), queue_free);
     let backlog_since = sample_spell_since(prior, reading.backlogged_at, window_ms);
-    let hard = hard_bound(
-        kept,
-        reading,
-        Backlog {
-            held: 0.0,
-            soft,
-            since: backlog_since,
-            now_ms: reading.backlogged_at.unwrap_or(now_ms),
-        },
-        availability,
-    );
+    let shrinking = lost_units(reading.units, prior.and_then(|prior| prior.units));
+    // A short-lived drop in ready units can happen while a Deployment replaces a pod. Its
+    // saturated sample describes that temporary smaller pool, not the size the retained
+    // bounds describe. Keep the old hard bound until the smaller size has persisted for the
+    // full shrink window; once retired, the new size can teach its own bound.
+    let hard = if shrinking && !sized.retired {
+        kept
+    } else {
+        hard_bound(
+            kept,
+            reading,
+            Backlog {
+                held: 0.0,
+                soft,
+                since: backlog_since,
+                now_ms: reading.backlogged_at.unwrap_or(now_ms),
+            },
+            availability,
+        )
+    };
     Ceiling {
         soft,
         hard,
@@ -826,9 +934,7 @@ fn publish_limits(key: &SitePair, ceiling: &Ceiling, reading: &SiteReading, limi
     site_gauge(
         "grid_route_site_reading_age_seconds",
         key,
-        limits.age_ms.map_or(f64::NAN, |age| {
-            f64::from(u32::try_from(age).unwrap_or(u32::MAX)) / 1000.0
-        }),
+        limits.age_ms.map_or(f64::NAN, seconds),
     );
 }
 
@@ -927,6 +1033,141 @@ const MEASURED_GAUGES: [&str; 8] = [
     "grid_route_site_reading_age_seconds",
 ];
 
+/// Whether `candidate` is one of the sites its model's shed waits on.
+fn sheds_on(candidate: &RouteCandidate, score: f64) -> bool {
+    candidate.kind == CapabilityKind::InferenceModel
+        && candidate.admission_state == AdmissionState::NewAndExisting
+        && !candidate.silent
+        && candidate.publishes_load
+        && !score.is_nan()
+}
+
+/// `candidate`'s readings, with its silence marked.
+fn observed<S: SiteSignals>(candidate: &mut RouteCandidate, local: bool, inputs: &mut Inputs<'_, S>) -> Readings {
+    let readings = RouteSnapshot::readings(candidate, inputs);
+    observe_silence(candidate, local, &readings, inputs);
+    readings
+}
+
+/// The instant `candidate`'s silence is judged at, `None` while it cannot be judged.
+///
+/// A peer is judged at the end of the operator's last poll round that tried it, so a stalled
+/// poller or relay stops the clock rather than silencing every peer; one whose operator reports no
+/// rounds is not judged. This site is judged at the last relay read. A store that has never been
+/// relayed to is judged now.
+fn judged_at<S: SiteSignals>(candidate: &RouteCandidate, local: bool, inputs: &Inputs<'_, S>) -> Option<i64> {
+    let relay = inputs.signals.relay_heard_ms();
+    let at = if local {
+        Some(relay.unwrap_or(inputs.now_ms))
+    } else {
+        match (inputs.signals.round_ms(&candidate.site), relay) {
+            (Some(round), _) => Some(round),
+            (None, Some(_)) => None,
+            (None, None) => Some(inputs.now_ms),
+        }
+    };
+    at.map(|at| at.min(inputs.now_ms))
+}
+
+/// Mark and publish whether `candidate`'s site is silent.
+///
+/// A full window without a sample, judged at [`judged_at`], makes it silent, as does a full window
+/// of a peer's rounds with no sample at all from a candidate that publishes load. It routes again
+/// after [`RETURN_SAMPLES`] new samples with no full window between them. An incoherent read, or
+/// one that cannot be judged, keeps the last verdict.
+fn observe_silence<S: SiteSignals>(
+    candidate: &mut RouteCandidate,
+    local: bool,
+    readings: &Readings,
+    inputs: &mut Inputs<'_, S>,
+) {
+    let key = (Arc::clone(&candidate.site), Arc::clone(&candidate.cluster));
+    let now_ms = inputs.now_ms;
+    let window_ms = inputs.window_ms;
+    let judged = judged_at(candidate, local, inputs);
+    let rounds = (!local).then(|| inputs.signals.round_ms(&candidate.site)).flatten();
+    let learned = &mut *inputs.learned;
+    let sampled_at = readings.horizon.sampled_at;
+    // A stalled poller holds every peer's verdict, so its round's age is published to alert on,
+    // NaN for a peer the poller reports no round for.
+    let round_age = rounds.map_or(f64::NAN, |round| seconds(now_ms.saturating_sub(round).max(0)));
+    site_gauge("grid_route_site_round_age_seconds", &key, round_age);
+    let Some(judged) = judged.filter(|_| readings.coherent) else {
+        candidate.silent = learned.silence.contains_key(&key);
+        publish_silence(&key, candidate.silent, sampled_at, now_ms);
+        return;
+    };
+    let quiet = match (sampled_at, rounds) {
+        (Some(at), _) => judged.saturating_sub(at) > window_ms,
+        (None, Some(round)) if candidate.publishes_load => {
+            let since = *learned.judged_since.entry(key.clone()).or_insert(round);
+            round.saturating_sub(since) > window_ms
+        },
+        (None, _) => false,
+    };
+    candidate.silent = silence_after(&mut learned.silence, &key, quiet, sampled_at);
+    publish_silence(&key, candidate.silent, sampled_at, now_ms);
+}
+
+/// Whether the site at `key` is silent after a read that was `quiet` or saw `sampled_at`.
+fn silence_after(held: &mut BTreeMap<SitePair, Silence>, key: &SitePair, quiet: bool, sampled_at: Option<i64>) -> bool {
+    if quiet {
+        // Every full window of silence starts the count again.
+        let restart = Silence {
+            seen: sampled_at,
+            returned: 0,
+        };
+        if held.insert(key.clone(), restart).is_none() {
+            silence_transition(key, "silent");
+        }
+        true
+    } else if let Entry::Occupied(mut silence) = held.entry(key.clone()) {
+        let back = silence.get_mut().heard(sampled_at);
+        if back {
+            silence.remove();
+            silence_transition(key, "live");
+        }
+        !back
+    } else {
+        false
+    }
+}
+
+impl Silence {
+    /// Count `sampled_at` if it is new; whether the site has now sent enough to route again.
+    fn heard(&mut self, sampled_at: Option<i64>) -> bool {
+        // Samples aging out of the store is not one arriving.
+        if sampled_at.is_some() && self.seen != sampled_at {
+            self.seen = sampled_at;
+            self.returned = self.returned.saturating_add(1);
+        }
+        self.returned >= RETURN_SAMPLES
+    }
+}
+
+/// Count a site entering or leaving silence.
+fn silence_transition((site, cluster): &SitePair, to: &'static str) {
+    metrics::counter!(
+        "grid_route_site_silent_transitions_total",
+        "site" => Arc::clone(site),
+        "cluster" => Arc::clone(cluster),
+        "to" => to
+    )
+    .increment(1);
+}
+
+/// Publish whether the site at `key` is silent and how long since its newest sample.
+fn publish_silence(key: &SitePair, silent: bool, sampled_at: Option<i64>, now_ms: i64) {
+    site_gauge("grid_route_site_silent", key, f64::from(u8::from(silent)));
+    let age = sampled_at.map_or(f64::NAN, |at| seconds(now_ms.saturating_sub(at).max(0)));
+    site_gauge("grid_route_site_last_sample_age_seconds", key, age);
+}
+
+/// `ms` milliseconds as seconds, for a gauge.
+fn seconds(ms: i64) -> f64 {
+    f64::from(u32::try_from(ms).unwrap_or(u32::MAX)) / 1000.0
+}
+
 /// Set every gauge a measured refresh owns to NaN.
 fn clear_measured(key: &SitePair) {
     for name in MEASURED_GAUGES {
@@ -973,6 +1214,7 @@ mod tests {
             fresh: true,
             kind: CapabilityKind::InferenceModel,
             name: name.to_owned(),
+            publishes_load: true,
             site: site.to_owned(),
             stable_id: None,
         }
@@ -1556,6 +1798,552 @@ mod tests {
         );
     }
 
+    /// East is live at `now_ms`; west last spoke at 1s, then went silent.
+    fn east_live_west_silent(store: &LoadStore, now_ms: i64) {
+        with_in_flight(store, "east", 10.0, now_ms);
+        with_queue(store, "east", 0.0, now_ms);
+        with_in_flight(store, "west", 0.0, 1_000);
+        with_queue(store, "west", 0.0, 1_000);
+    }
+
+    fn east_west() -> Vec<RouteCandidate> {
+        validate_candidates(vec![cand("m", "west", "pool-west"), cand("m", "east", "pool-east")]).unwrap()
+    }
+
+    fn picks(snapshot: &RouteSnapshot) -> Vec<(Arc<str>, bool)> {
+        (0..20)
+            .map(|turn| {
+                let pick = crate::route::select_spread(
+                    snapshot,
+                    CapabilityKind::InferenceModel,
+                    "m",
+                    turn,
+                    |_| true,
+                    &crate::route::KeepAll,
+                )
+                .unwrap();
+                (Arc::clone(&pick.candidate.site), pick.fallback)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_site_silent_past_the_window_is_never_chosen_while_another_is_live() {
+        let store = LoadStore::new(Duration::from_secs(600));
+        let availability = AvailabilitySettings::default();
+        let now_ms = 1_000 + 30_001;
+        east_live_west_silent(&store, now_ms);
+        let snapshot = RouteSnapshot::from_store(
+            east_west(),
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut Learned::default(), now_ms, 30_000),
+        );
+        assert!(snapshot.candidates.iter().any(|c| &*c.site == "west" && c.silent));
+        assert!(
+            picks(&snapshot)
+                .iter()
+                .all(|(site, fallback)| &**site == "east" && !fallback)
+        );
+    }
+
+    #[test]
+    fn a_silent_site_takes_no_overflow_and_does_not_hold_off_shedding() {
+        let store = LoadStore::new(Duration::from_secs(600));
+        let availability = AvailabilitySettings {
+            smoothing: 1.0,
+            shedding: true,
+            full_after_ms: 0,
+            room_after_ms: 0,
+            ..AvailabilitySettings::default()
+        };
+        let now_ms = 1_000 + 30_001;
+        // East is at its ceiling with work queued; west said it had room, then went silent.
+        with_in_flight(&store, "east", 100.0, now_ms);
+        with_queue(&store, "east", 5.0, now_ms);
+        with_in_flight(&store, "west", 0.0, 1_000);
+        with_queue(&store, "west", 0.0, 1_000);
+        let snapshot = RouteSnapshot::from_store(
+            east_west(),
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut Learned::default(), now_ms, 30_000),
+        );
+        assert!(
+            picks(&snapshot).iter().all(|(site, _)| &**site == "east"),
+            "overflow stays live"
+        );
+        let shed = snapshot.shed(&BTreeSet::new(), &availability);
+        assert!(shed.shedding.contains("m"), "{:?}", shed.shedding);
+    }
+
+    /// This site's operator reports a poll round of `sites` ending at `at_ms`, read at `at_ms`.
+    fn rounds(store: &LoadStore, sites: &[&str], at_ms: i64) {
+        let text: String = sites
+            .iter()
+            .map(|site| {
+                format!(
+                    "{}{{grid_site=\"{site}\",grid_provider=\"{}\"}} 1 {at_ms}\n",
+                    grid_signals::poller::METRIC,
+                    grid_signals::poller::PROVIDER
+                )
+            })
+            .collect();
+        let _ = store.ingest_at(&text, at_ms, at_ms, "hub");
+    }
+
+    /// Whether west is silent at `now_ms`, east live, its candidate publishing load or not.
+    fn west_silent_at(store: &LoadStore, learned: &mut Learned, publishes_load: bool, now_ms: i64) -> bool {
+        with_in_flight(store, "east", 10.0, now_ms);
+        let candidates = validate_candidates(vec![
+            CandidateConfig {
+                publishes_load,
+                ..cand("m", "west", "pool-west")
+            },
+            cand("m", "east", "pool-east"),
+        ])
+        .unwrap();
+        let availability = AvailabilitySettings::default();
+        let snapshot = RouteSnapshot::from_store(
+            candidates,
+            Arc::from("hub"),
+            &mut at(store, &availability, learned, now_ms, 30_000),
+        );
+        snapshot.candidates.iter().any(|c| &*c.site == "west" && c.silent)
+    }
+
+    #[test]
+    fn a_peer_never_heard_through_a_window_of_rounds_is_silent() {
+        let store = LoadStore::new(Duration::from_secs(600)).with_local_site("hub");
+        let mut learned = Learned::default();
+        rounds(&store, &["east", "west"], 1_000);
+        assert!(!west_silent_at(&store, &mut learned, true, 1_000), "the first round");
+        rounds(&store, &["east", "west"], 31_001);
+        assert!(
+            west_silent_at(&store, &mut learned, true, 31_001),
+            "a window of rounds and nothing"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_publishes_no_load_is_never_silent_for_saying_nothing() {
+        let store = LoadStore::new(Duration::from_secs(600)).with_local_site("hub");
+        let mut learned = Learned::default();
+        rounds(&store, &["east", "west"], 1_000);
+        assert!(!west_silent_at(&store, &mut learned, false, 1_000));
+        rounds(&store, &["east", "west"], 31_001);
+        assert!(!west_silent_at(&store, &mut learned, false, 31_001));
+    }
+
+    #[test]
+    fn a_stalled_poller_stops_the_clock_rather_than_silencing_peers() {
+        let store = LoadStore::new(Duration::from_secs(600)).with_local_site("hub");
+        let mut learned = Learned::default();
+        west_speaks(&store, 1_000);
+        rounds(&store, &["east", "west"], 1_000);
+        // The relay still answers, but the poller has ended no round since.
+        let _ = store.ingest_at("", 40_000, 40_000, "hub");
+        assert!(!west_silent_at(&store, &mut learned, true, 40_000));
+    }
+
+    #[test]
+    fn a_peer_is_not_judged_while_its_operator_reports_no_rounds() {
+        let store = LoadStore::new(Duration::from_secs(600)).with_local_site("hub");
+        let mut learned = Learned::default();
+        west_speaks(&store, 1_000);
+        let _ = store.ingest_at("", 40_000, 40_000, "hub");
+        assert!(!west_silent_at(&store, &mut learned, true, 40_000));
+        rounds(&store, &["east", "west"], 40_000);
+        assert!(
+            west_silent_at(&store, &mut learned, true, 40_000),
+            "judged once rounds are reported"
+        );
+    }
+
+    #[test]
+    fn a_candidate_that_publishes_no_load_takes_no_overflow_and_does_not_hold_off_shedding() {
+        let store = LoadStore::new(Duration::from_secs(600));
+        let availability = AvailabilitySettings {
+            smoothing: 1.0,
+            shedding: true,
+            full_after_ms: 0,
+            room_after_ms: 0,
+            ..AvailabilitySettings::default()
+        };
+        let now_ms = 1_000;
+        with_in_flight(&store, "east", 100.0, now_ms);
+        with_queue(&store, "east", 5.0, now_ms);
+        let candidates = validate_candidates(vec![
+            CandidateConfig {
+                publishes_load: false,
+                ..cand("m", "west", "pool-west")
+            },
+            cand("m", "east", "pool-east"),
+        ])
+        .unwrap();
+        let snapshot = RouteSnapshot::from_store(
+            candidates,
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut Learned::default(), now_ms, 30_000),
+        );
+        assert!(picks(&snapshot).iter().all(|(site, _)| &**site == "east"));
+        let shed = snapshot.shed(&BTreeSet::new(), &availability);
+        assert!(shed.shedding.contains("m"), "{:?}", shed.shedding);
+    }
+
+    #[test]
+    fn a_sample_aging_out_of_the_store_does_not_count_toward_a_return() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        let mut learned = Learned::default();
+        west_speaks(&store, 1_000);
+        assert!(west_at(&store, &mut learned, 31_001).0, "silent");
+        assert!(west_at(&store, &mut learned, 62_000).0, "its sample has left the store");
+        west_speaks(&store, 62_500);
+        assert!(
+            west_at(&store, &mut learned, 62_500).0,
+            "one sample is still not a return"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_publishes_no_load_is_a_fallback_while_every_site_that_does_is_silent() {
+        let store = LoadStore::new(Duration::from_secs(600));
+        with_in_flight(&store, "east", 0.0, 1_000);
+        with_queue(&store, "east", 0.0, 1_000);
+        let candidates = validate_candidates(vec![
+            CandidateConfig {
+                publishes_load: false,
+                ..cand("m", "west", "pool-west")
+            },
+            cand("m", "east", "pool-east"),
+        ])
+        .unwrap();
+        let availability = AvailabilitySettings::default();
+        let snapshot = RouteSnapshot::from_store(
+            candidates,
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut Learned::default(), 31_001, 30_000),
+        );
+        assert!(
+            picks(&snapshot)
+                .iter()
+                .all(|(site, fallback)| &**site == "west" && *fallback),
+            "east is silent, so west takes it, counted as a fallback"
+        );
+    }
+
+    #[test]
+    fn this_sites_provider_without_metrics_is_no_fallback() {
+        let store = LoadStore::new(Duration::from_secs(600));
+        with_in_flight(&store, "east", 0.0, 1_000);
+        with_queue(&store, "east", 0.0, 1_000);
+        let candidates = validate_candidates(vec![
+            CandidateConfig {
+                publishes_load: false,
+                ..cand("m", "hub", "pool-hub")
+            },
+            cand("m", "east", "pool-east"),
+        ])
+        .unwrap();
+        let availability = AvailabilitySettings::default();
+        let snapshot = RouteSnapshot::from_store(
+            candidates,
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut Learned::default(), 31_001, 30_000),
+        );
+        assert!(
+            picks(&snapshot)
+                .iter()
+                .all(|(site, fallback)| &**site == "hub" && !*fallback)
+        );
+    }
+
+    #[test]
+    fn a_site_never_heard_from_is_unmeasured_not_silent() {
+        let store = LoadStore::new(Duration::from_secs(600));
+        let availability = AvailabilitySettings::default();
+        let snapshot = RouteSnapshot::from_store(
+            east_west(),
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut Learned::default(), 60_000, 30_000),
+        );
+        assert!(snapshot.candidates.iter().all(|c| !c.silent));
+        let sites: BTreeSet<Arc<str>> = picks(&snapshot).into_iter().map(|(site, _)| site).collect();
+        assert_eq!(sites.len(), 2, "cold start still spreads over both");
+    }
+
+    /// West's silence and whether it is picked at `now_ms`, with `learned` carried across calls.
+    fn west_at(store: &LoadStore, learned: &mut Learned, now_ms: i64) -> (bool, bool) {
+        let availability = AvailabilitySettings::default();
+        // East stays live and busy, so a live west would take some of the draw.
+        with_in_flight(store, "east", 10.0, now_ms);
+        with_queue(store, "east", 5.0, now_ms);
+        let snapshot = RouteSnapshot::from_store(
+            east_west(),
+            Arc::from("hub"),
+            &mut at(store, &availability, learned, now_ms, 30_000),
+        );
+        let silent = snapshot.candidates.iter().any(|c| &*c.site == "west" && c.silent);
+        let picked = picks(&snapshot).iter().any(|(site, _)| &**site == "west");
+        (silent, picked)
+    }
+
+    /// West publishes an idle sample at `at_ms`.
+    fn west_speaks(store: &LoadStore, at_ms: i64) {
+        with_in_flight(store, "west", 0.0, at_ms);
+        with_queue(store, "west", 0.0, at_ms);
+    }
+
+    #[test]
+    fn a_silent_site_returns_on_its_second_new_sample() {
+        let store = LoadStore::new(Duration::from_secs(600));
+        let mut learned = Learned::default();
+        west_speaks(&store, 1_000);
+        assert_eq!(
+            west_at(&store, &mut learned, 31_001),
+            (true, false),
+            "a full window of silence"
+        );
+        west_speaks(&store, 32_000);
+        assert_eq!(
+            west_at(&store, &mut learned, 32_000),
+            (true, false),
+            "one sample is not a return"
+        );
+        assert_eq!(
+            west_at(&store, &mut learned, 33_000),
+            (true, false),
+            "a refresh is not a sample"
+        );
+        west_speaks(&store, 34_000);
+        assert_eq!(
+            west_at(&store, &mut learned, 34_000),
+            (false, true),
+            "the second sample returns it"
+        );
+    }
+
+    #[test]
+    fn a_site_silent_again_after_returning_needs_two_samples_again() {
+        let recorder = Captured::default();
+        metrics::with_local_recorder(&recorder, || {
+            let store = LoadStore::new(Duration::from_secs(600));
+            let mut learned = Learned::default();
+            west_speaks(&store, 1_000);
+            assert!(west_at(&store, &mut learned, 31_001).0);
+            west_speaks(&store, 32_000);
+            assert!(west_at(&store, &mut learned, 32_000).0);
+            west_speaks(&store, 33_000);
+            assert!(!west_at(&store, &mut learned, 33_000).0, "back after two");
+            assert!(west_at(&store, &mut learned, 63_001).0, "silent again");
+            west_speaks(&store, 64_000);
+            assert!(
+                west_at(&store, &mut learned, 64_000).0,
+                "the count restarts, so one sample is not a return"
+            );
+        });
+        assert_eq!(recorder.count("grid_route_site_silent_transitions_total:silent"), 2);
+        assert_eq!(recorder.count("grid_route_site_silent_transitions_total:live"), 1);
+    }
+
+    #[test]
+    fn a_site_serving_two_models_counts_each_sample_and_transition_once() {
+        let recorder = Captured::default();
+        metrics::with_local_recorder(&recorder, || {
+            let store = LoadStore::new(Duration::from_secs(600));
+            let availability = AvailabilitySettings::default();
+            let mut learned = Learned::default();
+            let two = || {
+                validate_candidates(vec![
+                    cand("m", "west", "pool-west"),
+                    cand("n", "west", "pool-west"),
+                    cand("m", "east", "pool-east"),
+                ])
+                .unwrap()
+            };
+            let mut silent_at = |now_ms| {
+                with_in_flight(&store, "east", 10.0, now_ms);
+                let snapshot = RouteSnapshot::from_store(
+                    two(),
+                    Arc::from("hub"),
+                    &mut at(&store, &availability, &mut learned, now_ms, 30_000),
+                );
+                let west: Vec<bool> = snapshot
+                    .candidates
+                    .iter()
+                    .filter(|c| &*c.site == "west")
+                    .map(|c| c.silent)
+                    .collect();
+                assert_eq!(west.len(), 2);
+                west
+            };
+            west_speaks(&store, 1_000);
+            assert_eq!(silent_at(31_001), [true, true]);
+            west_speaks(&store, 32_000);
+            assert_eq!(
+                silent_at(32_000),
+                [true, true],
+                "one sample, seen by both models, is one"
+            );
+            west_speaks(&store, 33_000);
+            assert_eq!(silent_at(33_000), [false, false]);
+        });
+        assert_eq!(recorder.count("grid_route_site_silent_transitions_total:silent"), 1);
+        assert_eq!(recorder.count("grid_route_site_silent_transitions_total:live"), 1);
+    }
+
+    #[test]
+    fn when_every_site_is_silent_the_pick_counts_as_a_fallback() {
+        let store = LoadStore::new(Duration::from_secs(600));
+        let availability = AvailabilitySettings::default();
+        west_speaks(&store, 1_000);
+        with_in_flight(&store, "east", 0.0, 1_000);
+        let snapshot = RouteSnapshot::from_store(
+            east_west(),
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut Learned::default(), 31_001, 30_000),
+        );
+        assert!(picks(&snapshot).iter().all(|(_, fallback)| *fallback));
+    }
+
+    #[test]
+    fn a_link_that_lets_one_poll_through_per_window_never_routes() {
+        let store = LoadStore::new(Duration::from_secs(600));
+        let mut learned = Learned::default();
+        west_speaks(&store, 1_000);
+        let mut sample_at = 1_000;
+        for _ in 0..5 {
+            let quiet_at = sample_at + 30_001;
+            assert_eq!(
+                west_at(&store, &mut learned, quiet_at),
+                (true, false),
+                "silent at {quiet_at}"
+            );
+            sample_at = quiet_at + 1;
+            west_speaks(&store, sample_at);
+            assert_eq!(
+                west_at(&store, &mut learned, sample_at),
+                (true, false),
+                "one poll at {sample_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_site_that_misses_polls_within_the_window_never_goes_silent() {
+        let store = LoadStore::new(Duration::from_secs(600));
+        let mut learned = Learned::default();
+        for at_ms in [1_000, 20_000, 49_000] {
+            west_speaks(&store, at_ms);
+            assert_eq!(
+                west_at(&store, &mut learned, at_ms + 29_000),
+                (false, true),
+                "at {at_ms}"
+            );
+        }
+    }
+
+    #[test]
+    fn when_every_site_is_silent_they_read_as_absent() {
+        let store = LoadStore::new(Duration::from_secs(600));
+        let availability = AvailabilitySettings::default();
+        with_in_flight(&store, "east", 0.0, 1_000);
+        with_in_flight(&store, "west", 0.0, 1_000);
+        let snapshot = RouteSnapshot::from_store(
+            east_west(),
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut Learned::default(), 1_000 + 30_001, 30_000),
+        );
+        let sites: BTreeSet<Arc<str>> = picks(&snapshot).into_iter().map(|(site, _)| site).collect();
+        assert_eq!(sites.len(), 2, "both stay in the draw, as when nothing is published");
+    }
+
+    #[test]
+    fn silence_is_published_per_site_with_a_growing_age() {
+        let recorder = Captured::default();
+        metrics::with_local_recorder(&recorder, || {
+            let store = LoadStore::new(Duration::from_secs(600));
+            let availability = AvailabilitySettings::default();
+            let mut gauged = Gauged::new();
+            with_in_flight(&store, "west", 0.0, 1_000);
+            for (now_ms, silent, age) in [
+                (2_000, 0.0, 1.0),
+                (31_000, 0.0, 30.0),
+                (31_001, 1.0, 30.001),
+                (91_000, 1.0, 90.0),
+            ] {
+                drop(
+                    RouteSnapshot::from_store(
+                        one("west"),
+                        Arc::from("hub"),
+                        &mut at(&store, &availability, &mut gauged.learned, now_ms, 30_000),
+                    )
+                    .published(&mut gauged),
+                );
+                assert_eq!(
+                    recorder.get("grid_route_site_silent").to_bits(),
+                    f64::to_bits(silent),
+                    "silent at {now_ms}"
+                );
+                assert!(
+                    (recorder.get("grid_route_site_last_sample_age_seconds") - age).abs() < 1e-9,
+                    "age at {now_ms}"
+                );
+            }
+            assert_eq!(recorder.count("grid_route_site_silent_transitions_total:silent"), 1);
+            assert_eq!(recorder.count("grid_route_site_silent_transitions_total:live"), 0);
+            drop(RouteSnapshot::from_static(Vec::new(), Arc::from("hub")).published(&mut gauged));
+            assert!(
+                recorder.get("grid_route_site_silent").is_nan(),
+                "a site that leaves is cleared"
+            );
+        });
+    }
+
+    /// Thread-local capture of every gauge by name; one site per test.
+    #[derive(Default)]
+    struct Captured(std::sync::Mutex<BTreeMap<String, Arc<metrics::atomics::AtomicU64>>>);
+
+    impl Captured {
+        fn count(&self, name: &str) -> u64 {
+            let counters = self.0.lock().unwrap();
+            counters
+                .get(name)
+                .map_or(0, |value| value.load(std::sync::atomic::Ordering::Relaxed))
+        }
+
+        fn get(&self, name: &str) -> f64 {
+            let gauges = self.0.lock().unwrap();
+            gauges.get(name).map_or(f64::NAN, |value| {
+                f64::from_bits(value.load(std::sync::atomic::Ordering::Relaxed))
+            })
+        }
+    }
+
+    impl metrics::Recorder for Captured {
+        fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+            let to = key
+                .labels()
+                .find(|label| label.key() == "to")
+                .map_or("", |label| label.value());
+            let name = format!("{}:{to}", key.name());
+            metrics::Counter::from_arc(Arc::clone(self.0.lock().unwrap().entry(name).or_default()))
+        }
+
+        fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            let mut gauges = self.0.lock().unwrap();
+            metrics::Gauge::from_arc(Arc::clone(gauges.entry(key.name().to_owned()).or_default()))
+        }
+
+        fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
     #[test]
     fn a_restarted_gateway_relearns_from_its_first_unqueued_sample() {
         // Learned state lives in the process. After a restart every site starts at the floor,
@@ -1635,6 +2423,67 @@ mod tests {
             ..SiteReading::default()
         };
         assert_eq!(reported_limit(&reading), Some(0.85));
+    }
+
+    #[test]
+    fn direct_pressure_is_published_without_capacity_and_cleared_on_expiry_or_withdrawal() {
+        use std::sync::atomic::Ordering;
+
+        let recorder = ReportedPressure(Arc::default());
+        metrics::with_local_recorder(&recorder, || {
+            let store = LoadStore::new(Duration::from_secs(60));
+            let mut gauged = Gauged::new();
+            let availability = AvailabilitySettings::default();
+            with_series(&store, "a", "llm_d_epp_average_kv_cache_utilization", 0.85, 1_000);
+            for now_ms in [1_000, 2_000] {
+                let snapshot = RouteSnapshot::from_store(
+                    one("a"),
+                    Arc::from("hub"),
+                    &mut at(&store, &availability, &mut gauged.learned, now_ms, 500),
+                )
+                .published(&mut gauged);
+                let candidate = &snapshot.candidates[0];
+                let reported = f64::from_bits(recorder.0.load(Ordering::Relaxed));
+                assert_eq!(candidate.capacity, None);
+                if now_ms == 1_000 {
+                    assert_eq!(candidate.rho, Some(0.85));
+                    assert_eq!(reported.to_bits(), 0.85_f64.to_bits());
+                    drop(RouteSnapshot::from_static(Vec::new(), Arc::from("hub")).published(&mut gauged));
+                    assert!(f64::from_bits(recorder.0.load(Ordering::Relaxed)).is_nan());
+                    drop(snapshot.published(&mut gauged));
+                } else {
+                    assert_eq!(candidate.rho, None);
+                    assert!(reported.is_nan(), "expired direct pressure must not remain visible");
+                }
+            }
+        });
+    }
+
+    /// Thread-local capture of the pressure input used without measured capacity.
+    struct ReportedPressure(Arc<metrics::atomics::AtomicU64>);
+
+    impl metrics::Recorder for ReportedPressure {
+        fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn register_counter(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+
+        fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            if key.name() == "grid_route_site_rho_reported" {
+                metrics::Gauge::from_arc(Arc::clone(&self.0))
+            } else {
+                metrics::Gauge::noop()
+            }
+        }
+
+        fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
     }
 
     #[test]
@@ -1931,6 +2780,63 @@ mod tests {
         assert!(
             (rho - expected).abs() < 1e-9,
             "smoothed, not snapped: {rho} vs {expected}"
+        );
+    }
+
+    #[test]
+    fn a_transient_endpoint_shrink_cannot_teach_a_smaller_hard_ceiling() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        let mut learned = Learned::default();
+        let availability = AvailabilitySettings::default();
+        let refresh = |now_ms: i64, state: &mut Learned| {
+            RouteSnapshot::from_store(
+                one("a"),
+                Arc::from("hub"),
+                &mut Inputs {
+                    signals: &store,
+                    now_ms,
+                    window_ms: 500,
+                    horizon_ms: 500,
+                    availability: &availability,
+                    learned: state,
+                },
+            )
+        };
+        let sample = |at_ms: i64, running: f64, queue: f64, endpoints: f64, kv: f64| {
+            let labels = r#"grid_site="a",grid_provider="pool-a""#;
+            for (metric, value) in [
+                ("llm_d_epp_average_running_requests", running),
+                ("llm_d_epp_average_queue_size", queue),
+                ("llm_d_epp_ready_endpoints", endpoints),
+                ("llm_d_epp_average_kv_cache_utilization", kv),
+                ("llm_d_epp_std_dev_kv_cache_utilization", 0.0),
+            ] {
+                let line = format!("{metric}{{{labels}}} {value} {at_ms}");
+                store.ingest_at(&line, at_ms, at_ms, "a");
+            }
+        };
+
+        sample(1_000, 20.0, 0.0, 2.0, 0.0);
+        let baseline = refresh(1_000, &mut learned);
+        assert_eq!(baseline.candidates[0].capacity, Some(40.0));
+
+        // While one simulator pod is being replaced, the remaining endpoint is saturated and
+        // queued. That transient nine-request sample must not become the two-endpoint site's
+        // hard bound.
+        sample(2_000, 8.0, 1.0, 1.0, 1.0);
+        let transient = refresh(2_000, &mut learned);
+        assert_eq!(
+            transient.candidates[0].capacity,
+            Some(40.0),
+            "the stable two-endpoint ceiling remains while one endpoint is briefly absent"
+        );
+
+        sample(3_000, 8.0, 1.0, 2.0, 1.0);
+        let restored = refresh(3_000, &mut learned);
+        assert_eq!(
+            restored.candidates[0].capacity,
+            Some(18.0),
+            "the restored two-endpoint sample teaches its actual saturated in-flight count"
         );
     }
 

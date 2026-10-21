@@ -38,33 +38,33 @@ tests:
             seeds: ["192.0.2.10:7946"]
             signalTransport: {mode: poll}
             peerTrust: {mode: spiffe}
-            gatewayRefs:
-              - {name: grid-gateway, namespace: grid, localSiteName: east}
+            consumerGateways:
+              - {name: grid-gateway, namespace: grid, siteName: east}
             tls:
               siteSecretRef: {name: grid-site-identity, namespace: grid}
               caSecretRef: {name: grid-ca, namespace: grid}
-              swimKeyRef: {name: grid-swim-key, namespace: grid}
+              swimKeySecretRef: {name: grid-swim-key, namespace: grid}
 
-  - it: passes gateway.consumerConfig through to the site gateway reference
+  - it: passes gateway.praxisConfig through to the site gateway reference
     template: templates/gridnetwork.yaml
     set:
       site.name: east
       grid.id: lab
-      gateway.consumerConfig:
-        enabled: true
+      gateway.praxisConfig:
+        generate: true
         deriveTopology:
           fromProviders: [qwen3]
     release:
       namespace: grid
     asserts:
       - equal:
-          path: spec.gatewayRefs
+          path: spec.consumerGateways
           value:
             - name: grid-gateway
               namespace: grid
-              localSiteName: east
-              consumerConfig:
-                enabled: true
+              siteName: east
+              praxisConfig:
+                generate: true
                 deriveTopology:
                   fromProviders: [qwen3]
 
@@ -76,6 +76,9 @@ tests:
     asserts:
       - equal:
           path: metadata.name
+          value: east
+      - equal:
+          path: metadata.labels["grid.praxis.fast/provider-site"]
           value: east
       - equal:
           path: spec
@@ -141,7 +144,7 @@ tests:
         qwen3:
           model: Qwen3-Coder-30B-A3B
           endpoint: http://qwen3.llm-d.svc:80
-          routingClusterRef: east
+          clusterName: east
     asserts:
       - equal:
           path: metadata.name
@@ -153,10 +156,61 @@ tests:
             providerKind: vllm
             backendKind: local_model
             endpoint: http://qwen3.llm-d.svc:80
-            routingClusterRef: east
+            clusterName: east
             models:
               - name: Qwen3-Coder-30B-A3B
                 capabilities: [text_generation]
+
+  - it: translates legacy provider values to current CRD fields
+    template: templates/inferenceprovider.yaml
+    set:
+      site.name: east
+      grid.id: lab
+      grid.providers:
+        qwen3:
+          model: Qwen3-Coder-30B-A3B
+          endpoint: http://qwen3.llm-d.svc:80
+          routingClusterRef: east
+          gatewayRef: provider-gateway
+          metricsConfig:
+            metricsEndpoint: http://metrics.example.com:9090
+          auth:
+            manual: true
+    asserts:
+      - equal:
+          path: spec.clusterName
+          value: east
+      - equal:
+          path: spec.providerGateway
+          value: provider-gateway
+      - equal:
+          path: spec.metricsConfig.endpoint
+          value: http://metrics.example.com:9090
+      - equal:
+          path: spec.auth.credentialsManagedExternally
+          value: true
+      - notExists:
+          path: spec.routingClusterRef
+      - notExists:
+          path: spec.gatewayRef
+
+  - it: drops an empty legacy provider value beside its current field
+    template: templates/inferenceprovider.yaml
+    set:
+      site.name: east
+      grid.id: lab
+      grid.providers:
+        qwen3:
+          endpoint: http://qwen3.llm-d.svc:80
+          auth:
+            manual: false
+            credentialsManagedExternally: true
+    asserts:
+      - equal:
+          path: spec.auth.credentialsManagedExternally
+          value: true
+      - notExists:
+          path: spec.auth.manual
 
   - it: keeps YAML-ambiguous names strings
     templates:
@@ -225,3 +279,45 @@ tests:
         contains:
           path: spec.template.spec.containers[0].env
           content: {name: GRID_SWIM_SEEDS, value: "[2001:db8::1]:7947,[2001:db8::2]:7948"}
+
+  - it: leaves the records to the chart when grid.id renders them
+    template: templates/deployment.yaml
+    set:
+      site.name: east
+      grid.id: lab
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_CREATE_LOCAL_RECORDS, value: "false"}
+
+  - it: leaves the records to an enrolling release from its first install, before grid.id
+    template: templates/deployment.yaml
+    set:
+      site.name: east
+      enrollment.enabled: true
+      enrollment.url: https://enroll.example.com
+      enrollment.caBundle.configMap: grid-ca
+      enrollment.tokenSecretRef.name: grid-invite
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_CREATE_LOCAL_RECORDS, value: "false"}
+
+  - it: lets the operator create the records when the chart renders none
+    template: templates/deployment.yaml
+    set:
+      site.name: east
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_CREATE_LOCAL_RECORDS, value: "false"}
+
+  - it: names the GridNetwork the operator creates after grid.network
+    template: templates/deployment.yaml
+    set:
+      site.name: east
+      grid.network: lab-net
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_NETWORK, value: lab-net}

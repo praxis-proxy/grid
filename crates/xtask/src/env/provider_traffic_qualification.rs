@@ -1067,7 +1067,7 @@ fn assert_site_auto_discovery() -> AssertionResult {
                         "-l", "grid.praxis.fast/auto-discovered=true",
                         "--context", &context,
                         "-n", GRID_SYSTEM_NS,
-                        "-o", "jsonpath={range .items[*]}{.metadata.name}\t{.status.phase}\t{.status.reason}\t{.spec.egress.address}\t{.spec.egress.tls.serverName}\t{.spec.trust.canonicalFingerprints}\n{end}",
+                        "-o", "jsonpath={range .items[*]}{.metadata.name}\t{.status.phase}\t{.status.reason}\t{.spec.gatewayEndpoint.address}\t{.spec.gatewayEndpoint.tls.serverName}\t{.spec.trust.canonicalFingerprints}\n{end}",
                     ])
                     .output()?;
                 if !output.status.success() {
@@ -2435,7 +2435,7 @@ fn forge_command(context: &ProviderTrafficContext) -> Command {
 ///
 /// For each local cluster, waits for the two remote auto-discovered `GridSites`,
 /// verifies the SWIM-advertised certificate matches the staged identity, then
-/// patches `spec.egress.tls.serverName` and `spec.trust.canonicalFingerprints`.
+/// patches `spec.gatewayEndpoint.tls.serverName` and `spec.trust.canonicalFingerprints`.
 /// The controller transitions the site to Active naturally after the patch.
 fn authorize_discovered_sites(certs_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     const TRUST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -2772,13 +2772,13 @@ fn enable_generated_consumer_config() -> Result<(), Box<dyn std::error::Error>> 
         ])
         .output()?;
     if !output.status.success() {
-        return Err("could not read provider-a GridNetwork before enabling consumerConfig".into());
+        return Err("could not read provider-a GridNetwork before enabling praxisConfig".into());
     }
     let network: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     let gateways = network
-        .pointer("/spec/gatewayRefs")
+        .pointer("/spec/consumerGateways")
         .and_then(serde_json::Value::as_array)
-        .ok_or("provider-a GridNetwork has no gatewayRefs array")?;
+        .ok_or("provider-a GridNetwork has no consumerGateways array")?;
     let index = gateways
         .iter()
         .position(|gateway| {
@@ -2787,12 +2787,12 @@ fn enable_generated_consumer_config() -> Result<(), Box<dyn std::error::Error>> 
         })
         .ok_or("provider-a GridNetwork does not declare its run-owned consumer-gateway")?;
     let gateway = gateways.get(index).ok_or("consumer-gateway index disappeared")?;
-    if gateway.get("consumerConfig").is_some() {
-        return Err("consumer-gateway already has consumerConfig; refusing to replace unexpected fixture state".into());
+    if gateway.get("praxisConfig").is_some() {
+        return Err("consumer-gateway already has praxisConfig; refusing to replace unexpected fixture state".into());
     }
 
     let consumer_config = serde_json::json!({
-        "enabled": true,
+        "generate": true,
         "enableProjectedCredentials": true,
         "supportsProjectedCredentials": false,
         "configMapName": "praxis-consumer-config",
@@ -2801,7 +2801,7 @@ fn enable_generated_consumer_config() -> Result<(), Box<dyn std::error::Error>> 
     });
     let patch = serde_json::json!([{
         "op": "add",
-        "path": format!("/spec/gatewayRefs/{index}/consumerConfig"),
+        "path": format!("/spec/consumerGateways/{index}/praxisConfig"),
         "value": consumer_config
     }]);
     let patched = Command::new("kubectl")
@@ -2820,7 +2820,7 @@ fn enable_generated_consumer_config() -> Result<(), Box<dyn std::error::Error>> 
         .output()?;
     if !patched.status.success() {
         return Err(format!(
-            "could not enable run-owned consumerConfig: {}",
+            "could not enable run-owned praxisConfig: {}",
             safe_truncate_str(String::from_utf8_lossy(&patched.stderr).trim(), 800)
         )
         .into());
@@ -2846,13 +2846,13 @@ fn set_generated_consumer_provider_a_transport_mode(mode: &str) -> Result<String
         ])
         .output()?;
     if !output.status.success() {
-        return Err("could not read provider-a GridNetwork before changing consumerConfig".into());
+        return Err("could not read provider-a GridNetwork before changing praxisConfig".into());
     }
     let network: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     let gateways = network
-        .pointer("/spec/gatewayRefs")
+        .pointer("/spec/consumerGateways")
         .and_then(serde_json::Value::as_array)
-        .ok_or("provider-a GridNetwork has no gatewayRefs array")?;
+        .ok_or("provider-a GridNetwork has no consumerGateways array")?;
     let gateway_index = gateways
         .iter()
         .position(|gateway| {
@@ -2862,15 +2862,15 @@ fn set_generated_consumer_provider_a_transport_mode(mode: &str) -> Result<String
         .ok_or("provider-a GridNetwork does not declare its run-owned consumer-gateway")?;
     let endpoints = gateways
         .get(gateway_index)
-        .and_then(|gateway| gateway.pointer("/consumerConfig/clusterEndpoints"))
+        .and_then(|gateway| gateway.pointer("/praxisConfig/clusterEndpoints"))
         .and_then(serde_json::Value::as_array)
-        .ok_or("run-owned consumerConfig has no clusterEndpoints array")?;
+        .ok_or("run-owned praxisConfig has no clusterEndpoints array")?;
     let endpoint_index = endpoints
         .iter()
         .position(|endpoint| {
             endpoint.get("cluster").and_then(serde_json::Value::as_str) == Some("vcr-provider-a-provider")
         })
-        .ok_or("run-owned consumerConfig has no Provider A endpoint")?;
+        .ok_or("run-owned praxisConfig has no Provider A endpoint")?;
     let previous_mode = endpoints
         .get(endpoint_index)
         .and_then(|endpoint| endpoint.pointer("/transport/mode"))
@@ -2878,7 +2878,7 @@ fn set_generated_consumer_provider_a_transport_mode(mode: &str) -> Result<String
         .ok_or("Provider A consumer endpoint has no transport mode")?
         .to_owned();
     let json_pointer =
-        format!("/spec/gatewayRefs/{gateway_index}/consumerConfig/clusterEndpoints/{endpoint_index}/transport/mode");
+        format!("/spec/consumerGateways/{gateway_index}/praxisConfig/clusterEndpoints/{endpoint_index}/transport/mode");
     let patch = serde_json::json!([{"op":"replace","path":json_pointer,"value":mode}]);
     let patched = Command::new("kubectl")
         .args([
@@ -2934,7 +2934,7 @@ fn wait_for_generated_consumer_config() -> Result<serde_json::Value, Box<dyn std
                 .pointer("/metadata/generation")
                 .and_then(serde_json::Value::as_i64);
             let status = network
-                .pointer("/status/consumerConfigStatus")
+                .pointer("/status/praxisConfigStatus")
                 .and_then(serde_json::Value::as_array);
             let current = status.and_then(|items| {
                 items.iter().find(|item| {
@@ -3012,7 +3012,7 @@ fn wait_for_generated_consumer_config_error(
                 .pointer("/metadata/generation")
                 .and_then(serde_json::Value::as_i64);
             let statuses = network
-                .pointer("/status/consumerConfigStatus")
+                .pointer("/status/praxisConfigStatus")
                 .and_then(serde_json::Value::as_array);
             let current = statuses.and_then(|items| {
                 items.iter().find(|item| {
@@ -3251,10 +3251,10 @@ fn patch_grid_network_for_serving(
     let context = cluster_context(cluster);
     let network = kubectl_get_json(&context, &format!("gridnetwork/{GRID_NETWORK_NAME}"))?;
     let mut gateway_refs = network
-        .pointer("/spec/gatewayRefs")
+        .pointer("/spec/consumerGateways")
         .and_then(serde_json::Value::as_array)
         .cloned()
-        .ok_or_else(|| format!("{cluster}: GridNetwork has no gatewayRefs array"))?;
+        .ok_or_else(|| format!("{cluster}: GridNetwork has no consumerGateways array"))?;
     if cluster == CONSUMER_SITE {
         if gateway_refs
             .iter()
@@ -3267,7 +3267,7 @@ fn patch_grid_network_for_serving(
     let patch = serde_json::json!({
         "spec": {
             "signalTransport": { "mode": "poll" },
-            "gatewayRefs": gateway_refs
+            "consumerGateways": gateway_refs
         }
     });
     kubectl_patch_merge(&context, &format!("gridnetwork/{GRID_NETWORK_NAME}"), &patch)?;
@@ -3282,10 +3282,10 @@ fn patch_embedded_provider_hop_endpoints(
     let context = cluster_context(CONSUMER_SITE);
     let network = kubectl_get_json(&context, &format!("gridnetwork/{GRID_NETWORK_NAME}"))?;
     let mut gateway_refs = network
-        .pointer("/spec/gatewayRefs")
+        .pointer("/spec/consumerGateways")
         .and_then(serde_json::Value::as_array)
         .cloned()
-        .ok_or("GridNetwork has no gatewayRefs array")?;
+        .ok_or("GridNetwork has no consumerGateways array")?;
     let index = gateway_refs
         .iter()
         .position(|gateway| gateway.get("name").and_then(serde_json::Value::as_str) == Some(GRID_SERVING_GATEWAY))
@@ -3305,7 +3305,7 @@ fn patch_embedded_provider_hop_endpoints(
     kubectl_patch_merge(
         &context,
         &format!("gridnetwork/{GRID_NETWORK_NAME}"),
-        &serde_json::json!({"spec": {"gatewayRefs": gateway_refs}}),
+        &serde_json::json!({"spec": {"consumerGateways": gateway_refs}}),
     )?;
     Ok(previous)
 }
@@ -3361,10 +3361,10 @@ fn embedded_serving_gateway_ref(endpoints: &[serde_json::Value]) -> serde_json::
     serde_json::json!({
         "name": GRID_SERVING_GATEWAY,
         "namespace": GRID_SYSTEM_NS,
-        "localSiteName": CONSUMER_SITE,
+        "siteName": CONSUMER_SITE,
         "providerHopEndpoints": provider_hop_endpoints,
-        "consumerConfig": {
-            "enabled": false,
+        "praxisConfig": {
+            "generate": false,
             "tlsCertMountPath": "/etc/praxis/tls",
             "clusterEndpoints": [
                 { "cluster": "", "address": "", "transport": null },
@@ -3507,7 +3507,7 @@ fn apply_embedded_gateway_config(
                 { "filter": "load_balancer", "clusters": clusters }
             ]
         }],
-        "admin": { "address": "127.0.0.1:9901" },
+        "admin": { "metrics_address": "127.0.0.1:9901" },
         "shutdown_timeout_secs": 5
     });
     let config_yaml = serde_yaml::to_string(&config)?;
@@ -4059,9 +4059,9 @@ fn declare_projected_credentials_ready() -> Result<serde_json::Value, Box<dyn st
     }
     let network: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     let gateways = network
-        .pointer("/spec/gatewayRefs")
+        .pointer("/spec/consumerGateways")
         .and_then(serde_json::Value::as_array)
-        .ok_or("GridNetwork has no gatewayRefs array")?;
+        .ok_or("GridNetwork has no consumerGateways array")?;
     let index = gateways
         .iter()
         .position(|gateway| {
@@ -4073,14 +4073,14 @@ fn declare_projected_credentials_ready() -> Result<serde_json::Value, Box<dyn st
         .get(index)
         .ok_or("GridNetwork consumer-gateway index is out of range")?;
     let already_ready = gateway
-        .pointer("/consumerConfig/supportsProjectedCredentials")
+        .pointer("/praxisConfig/supportsProjectedCredentials")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     if already_ready {
         return Err("consumer projected-credential readiness was already set before this rollout".into());
     }
     if gateway
-        .pointer("/consumerConfig/enableProjectedCredentials")
+        .pointer("/praxisConfig/enableProjectedCredentials")
         .and_then(serde_json::Value::as_bool)
         != Some(true)
     {
@@ -4088,7 +4088,7 @@ fn declare_projected_credentials_ready() -> Result<serde_json::Value, Box<dyn st
     }
     let patch = serde_json::json!([{
         "op": "replace",
-        "path": format!("/spec/gatewayRefs/{index}/consumerConfig/supportsProjectedCredentials"),
+        "path": format!("/spec/consumerGateways/{index}/praxisConfig/supportsProjectedCredentials"),
         "value": true
     }]);
     let patched = Command::new("kubectl")
@@ -6586,7 +6586,7 @@ mod tests {
         let gateway = embedded_serving_gateway_ref(&endpoints);
         assert_eq!(
             gateway
-                .pointer("/consumerConfig/enabled")
+                .pointer("/praxisConfig/generate")
                 .and_then(serde_json::Value::as_bool),
             Some(false)
         );
@@ -6604,7 +6604,7 @@ mod tests {
         }));
         assert_eq!(
             gateway
-                .pointer("/consumerConfig/clusterEndpoints/0/cluster")
+                .pointer("/praxisConfig/clusterEndpoints/0/cluster")
                 .and_then(serde_json::Value::as_str),
             Some("")
         );

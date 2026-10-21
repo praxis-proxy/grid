@@ -41,7 +41,7 @@ pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;
 
 /// Grid counters the gateway emits, with the help text a scrape shows.
-const COUNTER_HELP: [(&str, &str); 7] = [
+const COUNTER_HELP: [(&str, &str); 8] = [
     (
         "grid_route_decisions_total",
         "Requests the gateway decided, by outcome. A refusal records an empty site and cluster.",
@@ -55,6 +55,10 @@ const COUNTER_HELP: [(&str, &str); 7] = [
         "Prefix-affinity decisions by outcome.",
     ),
     ("grid_serving_config_reload_total", "Serving-config reloads by result."),
+    (
+        "grid_route_site_silent_transitions_total",
+        "Sites entering or leaving silence, by the state entered. A steady rate is a flapping link.",
+    ),
     ("grid_signals_poll_total", "Polls of the local operator by result."),
     (
         "grid_signals_ingest_dropped_total",
@@ -67,7 +71,7 @@ const COUNTER_HELP: [(&str, &str); 7] = [
 ];
 
 /// Grid gauges the gateway emits.
-const GAUGE_HELP: [(&str, &str); 14] = [
+const GAUGE_HELP: [(&str, &str); 17] = [
     (
         "grid_route_site_rho",
         "Saturation the draw weights the site by: the nearest limit it is up against, smoothed across samples. NaN when unmeasured.",
@@ -107,6 +111,18 @@ const GAUGE_HELP: [(&str, &str); 14] = [
     (
         "grid_route_site_reading_age_seconds",
         "Age of the sample the decision read. A frozen value and a steady one are the same picture without it.",
+    ),
+    (
+        "grid_route_site_silent",
+        "1 while a site that has published has sent nothing within the freshness window, so it takes no request while a live site can.",
+    ),
+    (
+        "grid_route_site_last_sample_age_seconds",
+        "Seconds since the site's newest sample, still counting past the freshness window.",
+    ),
+    (
+        "grid_route_site_round_age_seconds",
+        "Seconds since the operator's last poll round that tried this peer. NaN for this site or with no rounds reported.",
     ),
     (
         "grid_route_site_score",

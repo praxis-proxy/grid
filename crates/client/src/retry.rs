@@ -26,6 +26,8 @@ pub enum RequestOutcome {
     Config,
     /// The caller gave up, or shutdown fired.
     Cancelled,
+    /// The round it belonged to ended first.
+    Deadline,
 }
 
 impl RequestOutcome {
@@ -41,7 +43,8 @@ impl RequestOutcome {
             | Self::Throttled
             | Self::Encoding
             | Self::Config
-            | Self::Cancelled => false,
+            | Self::Cancelled
+            | Self::Deadline => false,
         }
     }
 
@@ -60,6 +63,7 @@ impl RequestOutcome {
             Self::Encoding => "encoding",
             Self::Config => "config",
             Self::Cancelled => "cancelled",
+            Self::Deadline => "deadline",
         }
     }
 }
@@ -150,7 +154,7 @@ mod tests {
     use super::*;
 
     /// Every variant, so a new one cannot be added without a verdict here.
-    const ALL: [RequestOutcome; 11] = [
+    const ALL: [RequestOutcome; 12] = [
         RequestOutcome::Ok,
         RequestOutcome::Timeout,
         RequestOutcome::Refused,
@@ -162,6 +166,7 @@ mod tests {
         RequestOutcome::Encoding,
         RequestOutcome::Config,
         RequestOutcome::Cancelled,
+        RequestOutcome::Deadline,
     ];
 
     #[test]

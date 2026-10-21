@@ -5,12 +5,22 @@
 //! sites: scores come from this replica's own index, and a [`LoadGate`] weighs
 //! the prefill a match saves against how much busier the sticky site is.
 
-use std::sync::LazyLock;
+use std::{
+    num::{NonZeroU64, NonZeroUsize},
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
 
 use serde::Deserialize;
 use xxhash_rust::xxh64::xxh64;
 
 use super::{BLOCK, PrefixIndex, PrefixKeys};
+
+/// Default number of prefix entries retained per backend cluster.
+const DEFAULT_CAPACITY: NonZeroUsize = NonZeroUsize::new(16_384).expect("nonzero");
+
+/// Default lifetime of a confirmed prefix, in seconds.
+const DEFAULT_TTL: NonZeroU64 = NonZeroU64::new(600).expect("nonzero");
 
 /// One admitted site selection would consider.
 #[derive(Clone, Copy, Debug)]
@@ -66,6 +76,8 @@ impl LoadGate for QueueGate {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AffinitySettings {
+    /// Maximum prefix entries retained per backend cluster in this gateway replica.
+    pub capacity: NonZeroUsize,
     /// Whether selection prefers the site holding a request's prompt. Off routes on load alone.
     pub enabled: bool,
     /// Share of the request's keys a site must hold to be sticky.
@@ -78,17 +90,21 @@ pub struct AffinitySettings {
     pub queued_request_seconds: f64,
     /// A file holding the key that authenticates stored-state tags. Without one, tags carry no mac.
     pub tag_key_path: Option<String>,
+    /// Lifetime in seconds after a successful response confirms a prefix.
+    pub ttl_secs: NonZeroU64,
 }
 
 impl Default for AffinitySettings {
     fn default() -> Self {
         Self {
+            capacity: DEFAULT_CAPACITY,
             enabled: true,
             threshold: 0.8,
             exploration: 0.02,
             prefill_tokens_per_second: 10_000.0,
             queued_request_seconds: 2.0,
             tag_key_path: None,
+            ttl_secs: DEFAULT_TTL,
         }
     }
 }
@@ -100,6 +116,12 @@ impl AffinitySettings {
     ///
     /// Returns a message naming the first field out of range.
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if Instant::now()
+            .checked_add(Duration::from_secs(self.ttl_secs.get()))
+            .is_none()
+        {
+            return Err("prefix_affinity.ttl_secs exceeds the supported lifetime".to_owned());
+        }
         if !(self.threshold > 0.0 && self.threshold <= 1.0) {
             return Err(format!(
                 "prefix_affinity.threshold must be in (0, 1], got {}",

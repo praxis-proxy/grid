@@ -123,9 +123,9 @@ fn overlay_configmap(cluster: &str) -> Result<String, Box<dyn std::error::Error>
 /// Select the `ConfigMap` for the consumer gateway from the `GridNetwork` status entries.
 fn overlay_configmap_from_status(grid_network: &serde_json::Value) -> Result<String, Box<dyn std::error::Error>> {
     let overlays = grid_network
-        .pointer("/status/overlayStatus")
+        .pointer("/status/routingMapStatus")
         .and_then(serde_json::Value::as_array)
-        .ok_or("GridNetwork status has no overlayStatus entries")?;
+        .ok_or("GridNetwork status has no routingMapStatus entries")?;
     overlays
         .iter()
         .find(|overlay| {
@@ -1165,7 +1165,7 @@ fn assert_site_auto_discovery() -> AssertionResult {
                         "-l", "grid.praxis.fast/auto-discovered=true",
                         "--context", &context,
                         "-n", GRID_SYSTEM_NS,
-                        "-o", "jsonpath={range .items[*]}{.metadata.name}\t{.status.phase}\t{.status.reason}\t{.spec.egress.address}\t{.spec.egress.tls.serverName}\t{.spec.trust.canonicalFingerprints}\n{end}",
+                        "-o", "jsonpath={range .items[*]}{.metadata.name}\t{.status.phase}\t{.status.reason}\t{.spec.gatewayEndpoint.address}\t{.spec.gatewayEndpoint.tls.serverName}\t{.spec.trust.canonicalFingerprints}\n{end}",
                     ])
                     .output()?;
                 if !output.status.success() {
@@ -2596,7 +2596,7 @@ fn prepare_setup(
 ///
 /// For each local cluster, waits for the two remote auto-discovered `GridSites`,
 /// verifies the SWIM-advertised certificate matches the staged identity, then
-/// patches `spec.egress.tls.serverName` and `spec.trust.canonicalFingerprints`.
+/// patches `spec.gatewayEndpoint.tls.serverName` and `spec.trust.canonicalFingerprints`.
 /// The controller transitions the site to Active naturally after the patch.
 fn authorize_discovered_sites(certs_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     const TRUST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -4894,7 +4894,7 @@ mod tests {
     fn overlay_configmap_uses_operator_reported_hashed_name() {
         let grid_network = serde_json::json!({
             "status": {
-                "overlayStatus": [
+                "routingMapStatus": [
                     {
                         "gatewayName": "other-gateway",
                         "namespace": GRID_SYSTEM_NS,
@@ -4917,7 +4917,7 @@ mod tests {
 
     #[test]
     fn overlay_configmap_requires_distributed_consumer_status() {
-        let grid_network = serde_json::json!({ "status": { "overlayStatus": [] } });
+        let grid_network = serde_json::json!({ "status": { "routingMapStatus": [] } });
         assert_eq!(
             overlay_configmap_from_status(&grid_network)
                 .err()

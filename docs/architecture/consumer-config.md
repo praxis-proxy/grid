@@ -70,9 +70,9 @@ Secrets across namespaces. This change does not affect
 health-check TLS references; those keep their existing explicit namespace
 behavior.
 
-## Implemented: GatewayRef.consumerConfig
+## Implemented: GatewayRef.praxisConfig
 
-When `spec.gatewayRefs[].consumerConfig.enabled: true`, the `GridNetwork`
+When `spec.consumerGateways[].praxisConfig.generate: true`, the `GridNetwork`
 controller renders a `praxis.yaml`-keyed `ConfigMap` in the gateway namespace
 when consumer configuration renders successfully. The generated config keeps
 the watched route filter and complete endpoint inventory even when the current
@@ -115,14 +115,14 @@ The generated config contains:
     written to the `ConfigMap`.
   - `load_balancer` entries for every configured endpoint, including currently
     inactive providers needed for restoration. Every potentially routable
-    cluster must have a matching `consumerConfig.clusterEndpoints[]` entry with
+    cluster must have a matching `praxisConfig.clusterEndpoints[]` entry with
     endpoint address and explicit `transport` configuration (`mutual_tls`,
     `tls`, or `plaintext`). Missing transport fails closed: the operator will
     not silently render a plain-HTTP cluster when transport intent is absent.
-- `admin:` with an admin listener at `127.0.0.1:9901`
+- `admin:` with a health and metrics listener at `127.0.0.1:9901` under `metrics_address`
 - `shutdown_timeout_secs: 5`
 
-Set `consumerConfig.telemetry` to add process-level OTLP settings and the
+Set `praxisConfig.telemetry` to add process-level OTLP settings and the
 `trace_context` propagation filter. These settings are written at the Praxis
 config root and never enter the routing overlay. The consumer ConfigMap does
 not contain collector headers; configure `OTEL_EXPORTER_OTLP_HEADERS` on the
@@ -147,7 +147,7 @@ credential-bearing revisions cannot bypass injection: Praxis resolves the
 selected reference or rejects with HTTP 503.
 
 In projected mode, mount each Secret at
-`{credentialMountBase}/{secretRef.namespace}/{secretRef.name}` with Secret data
+`{credentialMountPath}/{secretRef.namespace}/{secretRef.name}` with Secret data
 keys as files; Praxis resolves a selected key beneath that directory. This
 namespace segment prevents same-name Secrets from aliasing. Existing configured
 `file:` sources keep using their explicit paths and are not changed by this
@@ -184,10 +184,10 @@ can succeed when using a static credential table; `credential_inject` fails
 closed when the configured reference does not match the overlay. In
 projected-credential mode, a changed reference needs no config rollout when
 the credential filter is already running and the matching Secret is mounted
-under `{credentialMountBase}/{namespace}/{name}`. If that Secret projection
+under `{credentialMountPath}/{namespace}/{name}`. If that Secret projection
 is not mounted, the request fails closed until the consumer installs it.
 
-See [`docs/architecture/crds.md`](crds.md#gatewayrefconsumerconfig) for the full
+See [`docs/architecture/crds.md`](crds.md#gatewayrefpraxisconfig) for the full
 field reference.
 
 ## Grid-managed live-routing consumers
@@ -198,7 +198,7 @@ an empty list in arbitrary startup YAML:
 | Consumer path | Route-state source | Valid no-route state | Runtime update behavior |
 |---|---|---|---|
 | Praxis `intelligent_route` with `overlay_file` | Grid's versioned `routing-overlay.json` ConfigMap | A valid versioned envelope whose `overlay.candidates` is `[]` | Praxis validates and atomically serves the new snapshot; malformed replacements retain last-known-good. |
-| Generated `GatewayRef.consumerConfig` | The same scoped versioned overlay; generated `praxis.yaml` supplies filter and endpoint plumbing | The same empty envelope | Candidate-only updates hot reload. Credential-bearing revisions are held until `enableProjectedCredentials` has been rolled out and `supportsProjectedCredentials: true` attests the filter and Secret mounts are active. Listener, endpoint/TLS, and filter-pipeline changes still require the consumer owner to reload or roll out its Praxis configuration. |
+| Generated `GatewayRef.praxisConfig` | The same scoped versioned overlay; generated `praxis.yaml` supplies filter and endpoint plumbing | The same empty envelope | Candidate-only updates hot reload. Credential-bearing revisions are held until `enableProjectedCredentials` has been rolled out and `supportsProjectedCredentials: true` attests the filter and Secret mounts are active. Listener, endpoint/TLS, and filter-pipeline changes still require the consumer owner to reload or roll out its Praxis configuration. |
 | Embedded `grid-gateway` `grid_site_route` filter | The operator-published `grid-serving-<network>-<gateway>` ConfigMap | A valid serving config with `candidates: []` | The running gateway watches the projected serving file and atomically replaces its candidate snapshot and provider-hop allowlist. Malformed updates retain the previous snapshot. Provider-hop trust is declared separately with `GatewayRef.providerHopEndpoints`. |
 
 Grid publishes authoritative empty revisions without a capability flag. Every
@@ -210,7 +210,7 @@ The embedded gateway's filter chain and upstream cluster definitions remain in
 its startup Praxis configuration, but its changing candidate list is not a
 startup-only inline list: it comes from the watched Grid serving ConfigMap.
 Its provider-hop allowlist comes from the separate
-`GatewayRef.providerHopEndpoints` field, not from `consumerConfig`; each entry
+`GatewayRef.providerHopEndpoints` field, not from `praxisConfig`; each entry
 must declare `mutual_tls` and a nonblank SNI matching the embedded gateway's
 verified upstream configuration. The embedded gateway carries the Grid
 overlay's stable candidate ID and generates a fresh hop request ID.
@@ -227,8 +227,8 @@ static Praxis configuration.
 
 ## Derived endpoint topology
 
-`consumerConfig.deriveTopology.fromProviders` lists the routing identities (a
-provider's `routingClusterRef`, else its `metadata.name`) whose declarations the
+`praxisConfig.deriveTopology.fromProviders` lists the routing identities (a
+provider's `clusterName`, else its `metadata.name`) whose declarations the
 operator may use to fill `clusterEndpoints[]` for candidates that have no
 entry. An empty list derives nothing. An `InferenceProvider` is cluster scoped
 and its `gridNetworkRef` is self asserted, so only the allowlist decides where a
@@ -236,7 +236,7 @@ gateway dials.
 
 An explicit entry wins whole, never field by field. A candidate with no
 explicit entry that cannot be derived is withdrawn from this gateway's routes
-and named in the `consumerConfigStatus` message with a reason. With the list
+and named in the `praxisConfigStatus` message with a reason. With the list
 empty or `deriveTopology` absent, that is every candidate with no explicit
 entry, so removing a provider from the list withdraws its derived endpoint on
 the next render.
@@ -247,9 +247,9 @@ the next render.
 | Local site | `transport.mode` | `tls` for `https`, `plaintext` for `http` |
 | Local site | `transport.sni` | `deriveTopology.transport.sni`, else the endpoint host; an IP address or a host that is not a DNS hostname is refused |
 | Local site | `transport.caSecretRef` | `deriveTopology.transport.caSecretRef`, else the process trust store |
-| Remote site (`GridSite` must be `Active`) | `address` | `spec.egress.address` |
+| Remote site (`GridSite` must be `Active`) | `address` | `spec.gatewayEndpoint.address` |
 | Remote site | `transport.mode` | `mutual_tls` for `Mutual`, `plaintext` for `Plaintext` |
-| Remote site | `transport.sni` | `spec.egress.tls.serverName` |
+| Remote site | `transport.sni` | `spec.gatewayEndpoint.tls.serverName` |
 
 `deriveTopology.transport` declares backend trust once per gateway, for every
 derived local `https` endpoint. Providers behind one shared serving gateway
@@ -259,7 +259,7 @@ gateway namespace, mounted like an explicit entry's. A provider that needs
 different trust takes an explicit entry.
 
 ```yaml
-consumerConfig:
+praxisConfig:
   deriveTopology:
     fromProviders: [qwen2-7b, llama-3-8b]
     transport:
@@ -271,13 +271,13 @@ consumerConfig:
 
 ## Operational diagnostics
 
-After enabling `consumerConfig.enabled: true` for a gateway, the `GridNetwork`
-status reports the outcome under `status.consumerConfigStatus[]`.
+After enabling `praxisConfig.generate: true` for a gateway, the `GridNetwork`
+status reports the outcome under `status.praxisConfigStatus[]`.
 
 ### Delegated mount reconciliation
 
 Secret mount management remains opt-in. Set
-`consumerConfig.mountReconciliation.enabled: true` and name the exact Deployment
+`praxisConfig.mountReconciliation.enabled: true` and name the exact Deployment
 and Praxis container. The operator verifies that the Deployment carries the
 matching explicit opt-in annotations and mounts the generated `praxis.yaml`
 ConfigMap at `/etc/praxis` before it patches volumes or mounts.
@@ -291,8 +291,8 @@ Point the chart at the operator-generated config map with
 `mountReconciliation.managedCredentialNames`, and keep
 `mountReconciliation.releaseHelmMounts: false` for the preparation phase. The
 chart retains all credential and TLS mounts during this phase. For an existing
-release, move `consumerConfig.credentialMountBase` and (when consumer mTLS is
-used without Grid serving) `consumerConfig.tlsCertMountPath` to paths that do
+release, move `praxisConfig.credentialMountPath` and (when consumer mTLS is
+used without Grid serving) `praxisConfig.tlsCertMountPath` to paths that do
 not overlap Helm mounts. Grid installs its mounts and rolls the generated
 config while the prior Helm files remain available. After
 `mountReconciliationStatus: Ready`, set `releaseHelmMounts: true` and upgrade
@@ -365,12 +365,12 @@ Disabling mount reconciliation or deleting the `GridNetwork` does not remove
 previously Grid-owned Deployment mounts. Hand ownership back to the Deployment
 manager or remove those mounts explicitly after moving the gateway off the
 generated configuration. Before disabling delegation, move the Deployment's
-config volume back to `consumerConfig.configMapName` and wait for its rollout;
+config volume back to `praxisConfig.configMapName` and wait for its rollout;
 the alternate slot is only maintained while delegation is enabled. Do not
 treat disabling the feature as credential revocation; revoke or rotate the
 Secret and verify the Deployment separately.
 
-`consumerConfigStatus[].phase: Rendered` means the config map was rendered and
+`praxisConfigStatus[].phase: Rendered` means the config map was rendered and
 applied. It does not mean the gateway has restarted or become ready. With mount
 reconciliation enabled, `mountReconciliationStatus[]` reports
 `MountsReconciling`, `WaitingForSecret`, `WaitingForRollout`, `Ready`, or
@@ -396,7 +396,7 @@ the requirements document but does not read or patch gateway Deployments.
 ### Reading consumer config status
 
 ```console
-kubectl get gridnetwork production -o jsonpath='{.status.consumerConfigStatus}' | jq .
+kubectl get gridnetwork production -o jsonpath='{.status.praxisConfigStatus}' | jq .
 ```
 
 Example success output:
@@ -424,7 +424,7 @@ Example failure output:
     "namespace": "praxis-system",
     "configMapName": "praxis-consumer-config",
     "phase": "Error",
-    "reason": "ConsumerConfigApplyFailed",
+    "reason": "PraxisConfigApplyFailed",
     "message": "kube error: ...",
     "observedGeneration": 7
   }
@@ -436,45 +436,45 @@ Example failure output:
 | Reason | Phase | Meaning |
 |---|---|---|
 | _(empty)_ | `Rendered` | Config rendered and `ConfigMap` applied successfully |
-| `MissingClusterEndpoint` | `Error` | A candidate cluster is missing from `consumerConfig.clusterEndpoints[]`. Candidates the operator derives are withdrawn instead, so this reports a candidate it did not derive |
+| `MissingClusterEndpoint` | `Error` | A candidate cluster is missing from `praxisConfig.clusterEndpoints[]`. Candidates the operator derives are withdrawn instead, so this reports a candidate it did not derive |
 | `MissingTransport` | `Error` | A cluster endpoint has no `transport` configuration; the operator refuses to guess TLS vs plaintext |
 | `MissingSni` | `Error` | A `mutual_tls` or `tls` cluster endpoint has no (or blank) `sni`; TLS requires a server name |
 | `PlaintextWithSni` | `Error` | A `plaintext` cluster endpoint has `sni` set (`sni` does not enable TLS; use `mutual_tls` if TLS is intended) |
 | `ProjectedCredentialsUnsupported` | `Error` | A credential-bearing overlay is retained until the consumer declares that its projected credential filter is already running |
-| `ConsumerConfigRenderFailed` | `Error` | Overlay data produced an unrenderable config (e.g. blank local site) |
-| `ConsumerConfigApplyFailed` | `Error` | Kubernetes API rejected the `ConfigMap` apply (e.g. RBAC, namespace not found) |
-| `ConsumerConfigError` | `Error` | Other error during render or apply |
+| `PraxisConfigRenderFailed` | `Error` | Overlay data produced an unrenderable config (e.g. blank local site) |
+| `PraxisConfigApplyFailed` | `Error` | Kubernetes API rejected the `ConfigMap` apply (e.g. RBAC, namespace not found) |
+| `PraxisConfigError` | `Error` | Other error during render or apply |
 
 ### Troubleshooting
 
-**Phase is `Error` / reason `ConsumerConfigApplyFailed`**
+**Phase is `Error` / reason `PraxisConfigApplyFailed`**
 
 The operator could not apply the `ConfigMap`.  Common causes:
 
 - Missing RBAC: the operator's `ServiceAccount` lacks `configmaps` `create`
   and `patch` in the gateway namespace.  See the
   [RBAC permissions](operations.md#rbac-permissions) in the operations guide.
-- The namespace does not exist.  Create it before enabling `consumerConfig`.
+- The namespace does not exist.  Create it before enabling `praxisConfig`.
 - Kubernetes API server is temporarily unavailable.  The reconcile will retry on
   the next requeue (default 5 minutes) or when the `GridNetwork` or any watched
   `InferenceProvider` changes.
 
-**Phase is `Error` / reason `ConsumerConfigRenderFailed`**
+**Phase is `Error` / reason `PraxisConfigRenderFailed`**
 
-The overlay data produced a structural error.  Check that `localSiteName` is set
+The overlay data produced a structural error.  Check that `siteName` is set
 on the `GatewayRef` (or that the `GridNetwork` name is a valid site identity) and
-that all provider `routingClusterRef` values are non-empty.
+that all provider `clusterName` values are non-empty.
 
 **A model answers 503 and the `Rendered` message says `withdrew`**
 
-A route candidate references a cluster with no `consumerConfig.clusterEndpoints[]`
+A route candidate references a cluster with no `praxisConfig.clusterEndpoints[]`
 entry that could not be derived, so the operator withdrew it from this gateway.
 The message names the cluster and the reason. Add an endpoint entry for it, or
 allowlist its provider in `deriveTopology.fromProviders`.
 
 **Phase is `Error` / reason `MissingClusterEndpoint`**
 
-A route candidate references a cluster with no `consumerConfig.clusterEndpoints[]`
+A route candidate references a cluster with no `praxisConfig.clusterEndpoints[]`
 entry. Add an endpoint entry for the reported cluster, or let the operator derive it
 with `deriveTopology.fromProviders`, which withdraws a candidate it cannot resolve
 rather than failing the render.
@@ -594,5 +594,5 @@ The generated `ConfigMap` never contains credential token bytes.  Credential
 entries reference a mounted Kubernetes Secret via a `file:` path.  The Secret
 must be provisioned in the cluster where the final-hop gateway or provider-side
 component that calls the backend runs.  The
-`status.consumerConfigStatus[].message` field also never contains token bytes;
+`status.praxisConfigStatus[].message` field also never contains token bytes;
 error messages describe structural failures only.

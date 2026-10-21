@@ -7,6 +7,9 @@
   model_header: X-Gateway-Model-Name
   availability:
     shedding: true
+  prefix_affinity:
+    capacity: 16384
+    ttl_secs: 600
 - filter: load_balancer
   clusters:
     # One cluster per candidate, named as the serving config names it.

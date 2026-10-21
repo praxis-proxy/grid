@@ -9,7 +9,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    net::{IpAddr, Ipv6Addr},
+    net::IpAddr,
     sync::{Arc, Mutex, PoisonError, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -20,7 +20,10 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 pub use crate::crd::grid_network::PeerTrustMode;
 use crate::{
     metrics_scraper::{MetricsScrapeError, PeerTransport, scrape_peer},
-    resources::tls_backend::{self, ClientTlsConfig},
+    resources::{
+        endpoint_resolution,
+        tls_backend::{self, ClientTlsConfig},
+    },
     swim::MemberRecord,
 };
 
@@ -85,14 +88,90 @@ pub(crate) fn in_pool(o: &Observation, pool: Option<&str>) -> bool {
 
 /// Parse an exposition response into observations.
 ///
-/// An unparseable response yields nothing rather than an error: it is a copy of
-/// somebody else's scrape and the caller cannot repair it.
+/// Malformed revision metadata rejects payload while preserving independently
+/// valid ordering fences.
 #[must_use]
 pub fn parse(text: &str) -> Vec<Observation> {
-    parse_scrape(text)
+    let now = SystemTime::now();
+    if text.lines().any(|line| {
+        split_metric_name(line.trim()).is_some_and(|(name, _)| name == grid_signals::revision::METRIC)
+            && grid_signals::exposition::parse(line)
+                .and_then(|metric| grid_signals::revision::parse(&metric))
+                .filter(|revision| grid_signals::revision::valid_epoch(revision.publisher_epoch, now))
+                .is_none()
+    }) {
+        return revision_fences(text, now);
+    }
+    let observations: Vec<_> = parse_scrape(text)
         .into_iter()
         .filter_map(|(o, republishable)| republishable.then_some(o))
+        .collect();
+    retain_complete_batches(observations)
+}
+
+/// Retain unique, strictly valid metadata as invalidations after a framing failure.
+fn revision_fences(text: &str, now: SystemTime) -> Vec<Observation> {
+    let mut groups = BTreeMap::new();
+    for line in text
+        .lines()
+        .filter(|line| split_metric_name(line.trim()).is_some_and(|(name, _)| name == grid_signals::revision::METRIC))
+    {
+        let Some(observation) = parse_sample(line) else {
+            continue;
+        };
+        let key = (
+            observation.labels.get(SITE_LABEL).cloned(),
+            observation.labels.get(PROVIDER_LABEL).cloned(),
+        );
+        let fence = grid_signals::exposition::parse(line)
+            .and_then(|metric| grid_signals::revision::parse(&metric))
+            .filter(|revision| grid_signals::revision::valid_epoch(revision.publisher_epoch, now))
+            .map(|_| invalidation(&observation));
+        groups.entry(key).and_modify(|entry| *entry = None).or_insert(fence);
+    }
+    groups.into_values().flatten().collect()
+}
+
+/// Refuse incomplete revision groups before timestamp-to-age conversion loses information.
+fn retain_complete_batches(observations: Vec<Observation>) -> Vec<Observation> {
+    if !observations
+        .iter()
+        .any(|sample| sample.metric == grid_signals::revision::METRIC)
+    {
+        return observations;
+    }
+    let mut groups = BTreeMap::<_, Vec<Observation>>::new();
+    for observation in observations {
+        let key = (
+            observation.labels.get(SITE_LABEL).cloned(),
+            observation.labels.get(PROVIDER_LABEL).cloned(),
+        );
+        groups.entry(key).or_default().push(observation);
+    }
+    groups
+        .into_values()
+        .flat_map(|group| {
+            let metadata: Vec<_> = group
+                .iter()
+                .filter(|sample| sample.metric == grid_signals::revision::METRIC)
+                .collect();
+            match metadata.as_slice() {
+                [] => group,
+                [metadata] if complete_batch(&group.iter().collect::<Vec<_>>(), metadata) => group,
+                [metadata] => vec![invalidation(metadata)],
+                _ => Vec::new(),
+            }
+        })
         .collect()
+}
+
+/// Preserve a trustworthy revision fence without qualifying unusable payload.
+fn invalidation(metadata: &Observation) -> Observation {
+    let mut metadata = metadata.clone();
+    metadata
+        .labels
+        .insert(grid_signals::revision::SAMPLES_LABEL.to_owned(), "0".to_owned());
+    metadata
 }
 
 /// Parse a scrape this site made itself: every finite sample, each paired with whether
@@ -261,6 +340,110 @@ struct Cached {
     expires_at: Instant,
 }
 
+/// The providers each peer has sent load rows for since this process started, its most recently
+/// heard [`MAX_PEER_PROVIDERS`], so a candidate that publishes load can be told from one that
+/// never will.
+#[derive(Clone, Debug, Default)]
+pub struct LoadHeard(Arc<RwLock<BTreeMap<String, std::collections::VecDeque<String>>>>);
+
+impl LoadHeard {
+    /// Note each provider `peer` sent a load row for in `observations`, keeping each peer's
+    /// [`MAX_PEER_PROVIDERS`] most recently heard, so a renamed provider is learned, not refused.
+    pub fn record(&self, peer: &str, observations: &[Observation]) {
+        let Ok(mut heard) = self.0.write() else {
+            return;
+        };
+        let held = heard.entry(peer.to_owned()).or_default();
+        for observation in observations {
+            if observation.metric == grid_signals::revision::METRIC {
+                continue;
+            }
+            let Some(provider) = observation.labels.get(PROVIDER_LABEL) else {
+                continue;
+            };
+            if let Some(at) = held.iter().position(|seen| seen == provider) {
+                held.remove(at);
+            } else if held.len() >= MAX_PEER_PROVIDERS {
+                held.pop_front();
+            }
+            held.push_back(provider.clone());
+        }
+    }
+
+    /// Forget every site `keep` no longer names.
+    pub fn retain_sites<Keep: Fn(&str) -> bool>(&self, keep: Keep) {
+        if let Ok(mut heard) = self.0.write() {
+            heard.retain(|site, _| keep(site));
+        }
+    }
+
+    /// Whether `site` has sent load for `provider`.
+    #[must_use]
+    pub fn heard(&self, site: &str, provider: &str) -> bool {
+        self.0.read().is_ok_and(|heard| {
+            heard
+                .get(site)
+                .is_some_and(|held| held.iter().any(|seen| seen == provider))
+        })
+    }
+
+    /// Whether `site` has sent load for any provider.
+    #[must_use]
+    pub fn any_from(&self, site: &str) -> bool {
+        self.0
+            .read()
+            .is_ok_and(|heard| heard.get(site).is_some_and(|held| !held.is_empty()))
+    }
+}
+
+/// When the last poll round that included each peer ended, for this site's own gateway.
+#[derive(Clone, Debug, Default)]
+pub struct PeerRounds(Arc<RwLock<BTreeMap<String, SystemTime>>>);
+
+impl PeerRounds {
+    /// Record that a round polling `peers` ended `at`; a peer not in it is no longer polled.
+    pub fn record(&self, peers: &[String], at: SystemTime) {
+        if let Ok(mut rounds) = self.0.write() {
+            *rounds = peers.iter().map(|peer| (peer.clone(), at)).collect();
+        }
+    }
+
+    /// One row per peer, stamped at its last round, ahead of anything a byte budget can drop.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let Ok(rounds) = self.0.read() else {
+            return String::new();
+        };
+        let mut out = String::new();
+        // Names come from `GridSite` identities, so none needs escaping; one that would is skipped.
+        for (peer, at) in rounds
+            .iter()
+            .filter(|(peer, _)| certs::validate_site_name(peer).is_ok())
+        {
+            let stamp = at
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX));
+            for part in [
+                grid_signals::poller::METRIC,
+                "{",
+                SITE_LABEL,
+                "=\"",
+                peer,
+                "\",",
+                PROVIDER_LABEL,
+                "=\"",
+                grid_signals::poller::PROVIDER,
+                "\"} 1 ",
+                &stamp.to_string(),
+                "\n",
+            ] {
+                out.push_str(part);
+            }
+        }
+        out
+    }
+}
+
 /// Signals held per target, where a target is a provider routing identity.
 #[derive(Clone, Debug, Default)]
 pub struct SignalStore {
@@ -323,6 +506,8 @@ pub struct PeerRecord {
 pub struct PeerIdentities {
     /// Site name to what is held for it.
     inner: Arc<RwLock<BTreeMap<String, PeerRecord>>>,
+    /// Whether the peers have been read from the `GridSite` objects at least once.
+    loaded: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PeerIdentities {
@@ -337,6 +522,19 @@ impl PeerIdentities {
         if let Ok(mut guard) = self.inner.write() {
             *guard = identities;
         }
+        self.loaded.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the peers have been read at least once, so an empty registry means none.
+    #[must_use]
+    pub fn loaded(&self) -> bool {
+        self.loaded.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether a record is held for `site`.
+    #[must_use]
+    pub fn knows(&self, site: &str) -> bool {
+        self.inner.read().is_ok_and(|guard| guard.contains_key(site))
     }
 
     /// Fingerprints declared for `site`, empty when none are.
@@ -565,15 +763,9 @@ impl SignalStore {
             // TTL uses a monotonic instant; exposition wants epoch millis, so
             // derive from the age rather than store a wall clock that can jump.
             let held_for = now.instant.saturating_duration_since(held.collected_at);
-            for sample in held.samples.iter() {
-                if collect.is_empty() || collect.iter().any(|c| c == &sample.metric) {
-                    let age = held_for.saturating_add(sample.age);
-                    render_sample(&mut out, sample, wall_millis(now.wall, age));
-                    out.push('\n');
-                    // Age bounds the whole response by the oldest sample emitted.
-                    oldest = oldest.max(age);
-                }
-            }
+            let (block, age, _) = render_batches(&held.samples, collect, held_for, now.wall, false);
+            out.push_str(&block);
+            oldest = oldest.max(age);
         }
         (out, oldest)
     }
@@ -675,7 +867,14 @@ pub struct PeerSite {
     /// URL: a pin asserts a known key, not merely that some authority signed a
     /// name (which need not match the advertised address anyway).
     pub pins: Vec<String>,
+
+    /// Whether the site answered when last polled, or has not been polled. One that did not
+    /// gets [`UNANSWERED_PEER_BUDGET`], so a peer that cannot answer frees its slot quickly.
+    pub answering: bool,
 }
+
+/// The most one poll of a peer that did not answer last time may take, attempts included.
+pub const UNANSWERED_PEER_BUDGET: Duration = Duration::from_secs(2);
 
 /// Members other than this site, addressed at their dialable signals endpoint.
 pub fn peer_sites<'member, Members>(
@@ -694,6 +893,7 @@ where
                 name: member.site_id.clone(),
                 url: dialable_signals_endpoint(member, fallback_port)?.url(scheme)?,
                 pins: Vec::new(),
+                answering: true,
             })
         })
         .collect()
@@ -835,9 +1035,6 @@ fn warn_refused_once(site: &str, endpoint: &str) -> bool {
     first
 }
 
-/// AWS instance metadata over IPv6, inside the unique-local range peers may use.
-const AWS_METADATA_V6: Ipv6Addr = Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0254);
-
 /// Whether a peer IP may be dialed: anything but local and metadata addresses.
 pub(crate) fn is_dialable_ip(ip: IpAddr) -> bool {
     match ip.to_canonical() {
@@ -845,10 +1042,16 @@ pub(crate) fn is_dialable_ip(ip: IpAddr) -> bool {
             !(v4.is_loopback()
                 || v4.is_link_local()
                 || v4.is_unspecified()
-                || v4 == crate::resources::mcp_probe::ALIBABA_CLOUD_METADATA_V4)
+                || v4 == endpoint_resolution::ALIBABA_CLOUD_METADATA_V4)
         },
         IpAddr::V6(v6) => {
-            !(v6.is_loopback() || v6.is_unspecified() || v6.is_unicast_link_local() || v6 == AWS_METADATA_V6)
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unicast_link_local()
+                || v6 == endpoint_resolution::AWS_METADATA_V6
+                || v6 == endpoint_resolution::GCP_METADATA_V6
+                || v6 == endpoint_resolution::EKS_POD_IDENTITY_V6
+                || v6 == endpoint_resolution::AKAMAI_METADATA_V6)
         },
     }
 }
@@ -1043,6 +1246,9 @@ pub struct PollPeers {
     /// next one, and rounds would overlap until the pool was full of work
     /// nobody is waiting for any more.
     pub budget: Duration,
+    /// The most one round may take. A poll still running at its end times out and is tried again
+    /// next round, so peers that cannot answer never delay the rest.
+    pub round: Duration,
     /// Duration past which a poll is counted as slow.
     pub slow_after: Duration,
     /// Per-peer transports, held across rounds.
@@ -1066,6 +1272,7 @@ impl Default for PollPeers {
             attempts: 3,
             backoff: Duration::from_millis(50),
             budget: Duration::from_secs(5),
+            round: Duration::from_secs(5),
             slow_after: Duration::from_secs(1),
             shutdown: crate::shutdown::Shutdown::never(),
             trust: PeerTrustMode::Pin,
@@ -1080,10 +1287,21 @@ impl PollPeers {
     /// Returns the body, or nothing if every attempt failed. The outcome is
     /// recorded either way, because a peer that is never reachable has to be
     /// distinguishable from one that has nothing to say.
-    async fn poll_one(&self, peer: &str, url: &str, pins: &[String]) -> Option<(String, Option<SystemTime>)> {
+    async fn poll_one(
+        &self,
+        peer: &str,
+        url: &str,
+        pins: &[String],
+        (budget, cut): (Duration, bool),
+    ) -> Option<(String, Option<SystemTime>)> {
         // The guard owns the accounting, including the drop-mid-await path that
         // used to leave the in-flight gauge counting a poll that had ended.
         let mut guard = PollGuard::enter(peer, self.slow_after);
+        // A peer the round has no time left for is not dialled at all.
+        if budget.is_zero() {
+            guard.finish(RequestOutcome::Deadline, 0);
+            return None;
+        }
 
         let transport = match self.peer_transport(peer, pins) {
             Ok(transport) => transport,
@@ -1093,10 +1311,17 @@ impl PollPeers {
                 return None;
             },
         };
-        let (outcome, result) =
-            tokio::time::timeout(self.budget, self.attempt_until(peer, url, &transport, guard.started))
-                .await
-                .unwrap_or((RequestOutcome::Timeout, None));
+        let ran_out = if cut {
+            RequestOutcome::Deadline
+        } else {
+            RequestOutcome::Timeout
+        };
+        let (outcome, result) = tokio::time::timeout(
+            budget,
+            self.attempt_until(peer, url, &transport, (guard.started, budget)),
+        )
+        .await
+        .unwrap_or((ran_out, None));
         guard.finish(outcome, result.as_ref().map_or(0, |(body, _)| body.len()));
         result
     }
@@ -1138,7 +1363,7 @@ impl PollPeers {
     ///
     /// Without this a departed peer keeps its material for the life of the
     /// process.
-    fn retain_transports(&self, current: &[(String, String, Vec<String>)]) {
+    fn retain_transports(&self, current: &[(String, String, Vec<String>, bool)]) {
         self.transports
             .0
             .lock()
@@ -1161,11 +1386,12 @@ impl PollPeers {
         &self,
         url: &str,
         transport: &PeerTransport,
+        timeout: Duration,
     ) -> Option<Result<(String, Option<SystemTime>), MetricsScrapeError>> {
         tokio::select! {
             biased;
             () = self.shutdown.triggered() => None,
-            result = scrape_peer(url, self.timeout, transport) => Some(result),
+            result = scrape_peer(url, timeout, transport) => Some(result),
         }
     }
 
@@ -1173,9 +1399,9 @@ impl PollPeers {
     ///
     /// Waiting out a backoff is the easiest place to be stuck during shutdown,
     /// and the least excusable. Returns whether the wait completed.
-    async fn wait_before_retry(&self, peer: &str, attempt: u32, started: Instant) -> bool {
+    async fn wait_before_retry(&self, peer: &str, attempt: u32, started: Instant, budget: Duration) -> bool {
         let wait = backoff(self.backoff, attempt, peer);
-        let remaining = self.budget.saturating_sub(started.elapsed());
+        let remaining = budget.saturating_sub(started.elapsed());
         tokio::select! {
             biased;
             () = self.shutdown.triggered() => false,
@@ -1183,13 +1409,17 @@ impl PollPeers {
         }
     }
 
-    /// Attempt until one succeeds, the budget runs out, or retrying is pointless.
+    /// Attempt until one succeeds, the budget from `started` runs out, or retrying is pointless.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one retry loop with its budget, backoff and stand-down"
+    )]
     async fn attempt_until(
         &self,
         peer: &str,
         url: &str,
         transport: &PeerTransport,
-        started: Instant,
+        (started, budget): (Instant, Duration),
     ) -> (RequestOutcome, Option<(String, Option<SystemTime>)>) {
         let attempts = self.attempts.max(1);
         let mut outcome = RequestOutcome::Transport;
@@ -1197,11 +1427,14 @@ impl PollPeers {
             if self.shutdown.is_triggered() {
                 return (RequestOutcome::Cancelled, None);
             }
-            if started.elapsed() >= self.budget {
+            if started.elapsed() >= budget {
                 break;
             }
 
-            let Some(scrape) = self.scrape_or_stand_down(url, transport).await else {
+            // Each attempt may use what the budget has left, up to the configured timeout, so a slow
+            // peer on a short budget is not timed out sooner than it would answer.
+            let timeout = self.timeout.min(budget.saturating_sub(started.elapsed()));
+            let Some(scrape) = self.scrape_or_stand_down(url, transport, timeout).await else {
                 return (RequestOutcome::Cancelled, None);
             };
 
@@ -1214,7 +1447,7 @@ impl PollPeers {
                         break;
                     }
                     crate::metrics::record_peer_retry(peer, outcome.as_str());
-                    if !self.wait_before_retry(peer, attempt, started).await {
+                    if !self.wait_before_retry(peer, attempt, started, budget).await {
                         return (RequestOutcome::Cancelled, None);
                     }
                 },
@@ -1238,6 +1471,10 @@ impl PollPeers {
 
     /// Hand each site's observations to `publish` as its poll completes, with how
     /// many of its rows were dropped for an implausible age.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one round: targets, budgets, then each answer as it lands"
+    )]
     pub async fn collect_each<Publish>(&self, sites: &[PeerSite], mut publish: Publish)
     where
         Publish: FnMut(String, Vec<Observation>, usize),
@@ -1251,8 +1488,23 @@ impl PollPeers {
 
         let targets = peer_urls(sites, &collect_query);
         self.retain_transports(&targets);
-        let fetches = targets.into_iter().map(|(peer, url, pins)| async move {
-            let (body, date) = self.poll_one(&peer, &url, &pins).await?;
+        let deadline = Instant::now() + self.round;
+        let fetches = targets.into_iter().map(|(peer, url, pins, answering)| async move {
+            let budget = if answering {
+                self.budget
+            } else {
+                self.budget.min(UNANSWERED_PEER_BUDGET)
+            };
+            // Too little left for one attempt to finish is not dialled: it waits for the next round.
+            let left = deadline.saturating_duration_since(Instant::now());
+            let left = if left < self.timeout.min(UNANSWERED_PEER_BUDGET).min(self.round) / 2 {
+                Duration::ZERO
+            } else {
+                left
+            };
+            let (body, date) = self
+                .poll_one(&peer, &url, &pins, (budget.min(left), left < budget))
+                .await?;
             // Ages first, so a row dropped for its age never takes a provider slot.
             let (aged, rejected) = reexpress_peer_ages(stamp_origin(parse(&body), &peer), date, &peer);
             let observations = bound_peer(aged, &peer);
@@ -1334,7 +1586,7 @@ impl Drop for PollGuard<'_> {
 /// No `target`: it names a provider, not a site, so passing a site name matches
 /// nothing and the peer answers empty. Scoping a peer's answer is the
 /// publisher's job; the reader re-checks the site label on receipt.
-fn peer_urls(sites: &[PeerSite], collect_query: &str) -> Vec<(String, String, Vec<String>)> {
+fn peer_urls(sites: &[PeerSite], collect_query: &str) -> Vec<(String, String, Vec<String>, bool)> {
     sites
         .iter()
         .filter_map(|site| {
@@ -1343,7 +1595,7 @@ fn peer_urls(sites: &[PeerSite], collect_query: &str) -> Vec<(String, String, Ve
             } else {
                 with_query(&site.url, collect_query)?
             };
-            Some((site.name.clone(), url, site.pins.clone()))
+            Some((site.name.clone(), url, site.pins.clone(), site.answering))
         })
         .collect()
 }
@@ -1359,7 +1611,8 @@ fn with_query(url: &str, query: &str) -> Option<String> {
 /// Names a hub keeps from a peer: the cross-site contract, plus the EPP pool averages and
 /// ready counts the gateway routes on until it routes on saturation. A peer's custom
 /// `signalNames` are dropped here.
-const PEER_SIGNAL_NAMES: [&str; 19] = [
+const PEER_SIGNAL_NAMES: [&str; 20] = [
+    grid_signals::revision::METRIC,
     crate::readiness::READY_SIGNAL,
     crate::readiness::READY_ENDPOINTS_SIGNAL,
     crate::readiness::IN_FLIGHT_SIGNAL,
@@ -1375,7 +1628,7 @@ const PEER_SIGNAL_NAMES: [&str; 19] = [
     "llm_d_epp_average_kv_cache_utilization",
     // The deviation across a pool's units, which a gateway reads beside the mean. Without it
     // a remote site is routed from the mean alone and one hot unit stays hidden behind it.
-    "llm_d_epp_stddev_kv_cache_utilization",
+    "llm_d_epp_std_dev_kv_cache_utilization",
     "llm_d_epp_ready_endpoints",
     "inference_pool_ready_pods",
     // What a gateway reads as a backlog beside the averages, and the per-unit series whose
@@ -1397,7 +1650,7 @@ const UNIT_SIGNALS: [&str; 5] = [
     // read as a hundred times saturated.
     "llm_d_epp_average_kv_cache_utilization",
     "inference_pool_average_kv_cache_utilization",
-    "llm_d_epp_stddev_kv_cache_utilization",
+    "llm_d_epp_std_dev_kv_cache_utilization",
 ];
 
 /// Whether a hub accepts the value: finite, non-negative, and at most one for a share.
@@ -1415,6 +1668,7 @@ const MAX_PROVIDER_LABEL_LEN: usize = 253;
 /// valid, so this is wider than a site name.
 fn valid_provider(provider: &str) -> bool {
     !provider.trim().is_empty()
+        && provider != grid_signals::poller::PROVIDER
         && provider.len() <= MAX_PROVIDER_LABEL_LEN
         && !provider.chars().any(|ch| ch.is_control() || ch == '/')
 }
@@ -1440,27 +1694,76 @@ fn refusal(observation: &Observation) -> Option<&'static str> {
 /// routing cluster, a value in range, and at most [`MAX_PEER_PROVIDERS`] providers. Each
 /// refusal is counted by reason.
 fn bound_peer(observations: Vec<Observation>, peer: &str) -> Vec<Observation> {
+    let mut kept = project_peer(observations, peer);
+    let payload: std::collections::BTreeSet<&str> = kept
+        .iter()
+        .filter(|observation| observation.metric != grid_signals::revision::METRIC)
+        .filter_map(|observation| observation.labels.get(PROVIDER_LABEL).map(String::as_str))
+        .collect();
+    let providers: std::collections::BTreeSet<&str> = kept
+        .iter()
+        .filter_map(|observation| observation.labels.get(PROVIDER_LABEL).map(String::as_str))
+        .collect();
+    let accepted: std::collections::BTreeSet<_> = payload
+        .iter()
+        .copied()
+        .chain(providers.difference(&payload).copied())
+        .take(MAX_PEER_PROVIDERS)
+        .map(str::to_owned)
+        .collect();
+    let before = kept.len();
+    kept.retain(|observation| {
+        observation
+            .labels
+            .get(PROVIDER_LABEL)
+            .is_some_and(|provider| accepted.contains(provider))
+    });
+    for _ in kept.len()..before {
+        crate::metrics::record_peer_signal_refused(peer, "provider_cap");
+    }
+    retain_complete_batches(kept)
+}
+
+/// Apply the deliberate metric projection without hiding rejected payload rows.
+fn project_peer(observations: Vec<Observation>, peer: &str) -> Vec<Observation> {
     let mut kept = Vec::with_capacity(observations.len());
+    let mut projected = BTreeMap::<String, usize>::new();
     for observation in observations {
         match refusal(&observation) {
+            Some("name") => {
+                if let Some(provider) = observation.labels.get(PROVIDER_LABEL) {
+                    let removed = projected.entry(provider.clone()).or_default();
+                    *removed = removed.saturating_add(1);
+                }
+                crate::metrics::record_peer_signal_refused(peer, "name");
+            },
             Some(reason) => crate::metrics::record_peer_signal_refused(peer, reason),
             None => kept.push(observation),
         }
     }
-    let providers: std::collections::BTreeSet<&str> = kept
-        .iter()
-        .filter_map(|o| o.labels.get(PROVIDER_LABEL).map(String::as_str))
-        .collect();
-    let Some(&last) = providers.iter().nth(MAX_PEER_PROVIDERS.saturating_sub(1)) else {
-        return kept;
-    };
-    let last = last.to_owned();
-    let before = kept.len();
-    kept.retain(|o| o.labels.get(PROVIDER_LABEL).is_some_and(|p| *p <= last));
-    for _ in kept.len()..before {
-        crate::metrics::record_peer_signal_refused(peer, "provider_cap");
-    }
+    recount_projection(&mut kept, &projected);
     kept
+}
+
+/// Adjust metadata only for deliberate name filtering, never for corrupt payload.
+fn recount_projection(kept: &mut [Observation], projected: &BTreeMap<String, usize>) {
+    for observation in kept {
+        if observation.metric == grid_signals::revision::METRIC
+            && let Some(removed) = observation
+                .labels
+                .get(PROVIDER_LABEL)
+                .and_then(|provider| projected.get(provider))
+            && let Some(count) = observation
+                .labels
+                .get(grid_signals::revision::SAMPLES_LABEL)
+                .and_then(|count| count.parse::<usize>().ok())
+                .and_then(|count| count.checked_sub(*removed))
+        {
+            observation
+                .labels
+                .insert(grid_signals::revision::SAMPLES_LABEL.to_owned(), count.to_string());
+        }
+    }
 }
 
 /// Attribute every observation to the peer this site dialed, refusing one that
@@ -1522,25 +1825,95 @@ fn render_contract_block(
     held_for: Duration,
     wall: SystemTime,
 ) -> (String, Duration, usize) {
+    render_batches(samples, collect, held_for, wall, true)
+}
+
+/// Render whole provider batches, retaining metadata through metric selection.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one atomic provider render keeps filtering, row counts, and the line budget together"
+)]
+fn render_batches(
+    samples: &[Observation],
+    collect: &[String],
+    held_for: Duration,
+    wall: SystemTime,
+    bounded: bool,
+) -> (String, Duration, usize) {
+    let mut groups = BTreeMap::<_, Vec<&Observation>>::new();
+    for sample in samples {
+        let key = (sample.labels.get(SITE_LABEL), sample.labels.get(PROVIDER_LABEL));
+        groups.entry(key).or_default().push(sample);
+    }
     let mut block = String::new();
     let mut oldest = Duration::ZERO;
     let mut lines = 0_usize;
     let mut cut = 0_usize;
-    for sample in samples.iter().filter(|sample| is_peer_signal(&sample.metric)) {
-        if !collect.is_empty() && !collect.iter().any(|c| c == &sample.metric) {
+    for group in groups.values() {
+        let metadata = group
+            .iter()
+            .find(|sample| sample.metric == grid_signals::revision::METRIC)
+            .copied();
+        if let Some(metadata) = metadata
+            && !complete_batch(group, metadata)
+        {
+            cut = cut.saturating_add(group.len());
             continue;
         }
-        if lines >= MAX_RENDER_LINES_PER_TARGET {
-            cut = cut.saturating_add(1);
+        let selected: Vec<_> = group
+            .iter()
+            .copied()
+            .filter(|sample| {
+                sample.metric != grid_signals::revision::METRIC
+                    && (!bounded || is_peer_signal(&sample.metric))
+                    && (collect.is_empty() || collect.iter().any(|name| name == &sample.metric))
+            })
+            .collect();
+        let count = selected.len().saturating_add(usize::from(metadata.is_some()));
+        if bounded && lines.saturating_add(count) > MAX_RENDER_LINES_PER_TARGET {
+            cut = cut.saturating_add(count);
             continue;
         }
-        let age = held_for.saturating_add(sample.age);
-        render_sample(&mut block, sample, wall_millis(wall, age));
-        block.push('\n');
-        lines = lines.saturating_add(1);
-        oldest = oldest.max(age);
+        if let Some(metadata) = metadata {
+            let mut metadata = metadata.clone();
+            metadata.labels.insert(
+                grid_signals::revision::SAMPLES_LABEL.to_owned(),
+                selected.len().to_string(),
+            );
+            let age = held_for.saturating_add(metadata.age);
+            render_sample(&mut block, &metadata, wall_millis(wall, age));
+            block.push('\n');
+            oldest = oldest.max(age);
+        }
+        for sample in selected {
+            let age = held_for.saturating_add(sample.age);
+            render_sample(&mut block, sample, wall_millis(wall, age));
+            block.push('\n');
+            oldest = oldest.max(age);
+        }
+        lines = lines.saturating_add(count);
     }
     (block, oldest, cut)
+}
+
+/// Whether metadata binds every row in its provider group at the same age.
+fn complete_batch(group: &[&Observation], metadata: &Observation) -> bool {
+    let mut line = String::new();
+    render_sample(&mut line, metadata, metadata.timestamp_ms.unwrap_or(1));
+    let Some(revision) =
+        grid_signals::exposition::parse(&line).and_then(|metric| grid_signals::revision::parse(&metric))
+    else {
+        return false;
+    };
+    group
+        .iter()
+        .filter(|sample| sample.metric == grid_signals::revision::METRIC)
+        .count()
+        == 1
+        && group.len() == revision.batch_samples.saturating_add(1)
+        && group
+            .iter()
+            .all(|sample| sample.timestamp_ms == metadata.timestamp_ms && sample.age == metadata.age)
 }
 
 /// How far a relayed sample may be stamped past its peer's `Date` and still count
@@ -1567,6 +1940,10 @@ const MAX_RELAY_AGE_MS: i64 = 86_400_000; // one day
 /// the sample from its own clock reading and this age, so no wall time of this
 /// site's is stored. A missing `Date` or stamp leaves the row aged from its
 /// collection here, never from the peer's absolute clock.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one age conversion keeps invalidations and payload freshness together"
+)]
 fn reexpress_peer_ages(
     observations: Vec<Observation>,
     date: Option<SystemTime>,
@@ -1575,9 +1952,29 @@ fn reexpress_peer_ages(
     let date_ms = date
         .and_then(|when| when.duration_since(UNIX_EPOCH).ok())
         .and_then(|since| i64::try_from(since.as_millis()).ok());
+    let undated: std::collections::BTreeSet<_> = observations
+        .iter()
+        .filter(|observation| date_ms.is_none() && observation.metric == grid_signals::revision::METRIC)
+        .filter_map(|observation| observation.labels.get(PROVIDER_LABEL).cloned())
+        .collect();
     let mut kept = Vec::with_capacity(observations.len());
     let mut rejected = 0_usize;
     for mut observation in observations {
+        if observation
+            .labels
+            .get(PROVIDER_LABEL)
+            .is_some_and(|provider| undated.contains(provider))
+        {
+            if observation.metric == grid_signals::revision::METRIC {
+                let mut metadata = invalidation(&observation);
+                metadata.timestamp_ms = None;
+                metadata.age = Duration::from_millis(86_400_001);
+                kept.push(metadata);
+            }
+            rejected = rejected.saturating_add(1);
+            crate::metrics::record_peer_signal_refused(peer, "skew");
+            continue;
+        }
         let age = match (date_ms, observation.timestamp_ms.take()) {
             (Some(date_ms), Some(stamp_ms)) => relay_age(date_ms, stamp_ms),
             _ => Some(Duration::ZERO),
@@ -1586,11 +1983,16 @@ fn reexpress_peer_ages(
             observation.age = age;
             kept.push(observation);
         } else {
+            if observation.metric == grid_signals::revision::METRIC {
+                let mut metadata = invalidation(&observation);
+                metadata.age = Duration::from_millis(86_400_001);
+                kept.push(metadata);
+            }
             crate::metrics::record_peer_signal_refused(peer, "skew");
             rejected = rejected.saturating_add(1);
         }
     }
-    (kept, rejected)
+    (retain_complete_batches(kept), rejected)
 }
 
 /// The age `stamp_ms` carries against its peer's `date_ms`, `None` when it is
@@ -1852,6 +2254,7 @@ mod tests {
             name: site.to_owned(),
             url: format!("http://{addr}{SIGNALS_PATH}"),
             pins: Vec::new(),
+            answering: true,
         }
     }
 
@@ -1861,6 +2264,7 @@ mod tests {
             name: site.to_owned(),
             url: serve_once(body).await,
             pins: Vec::new(),
+            answering: true,
         }
     }
 
@@ -1962,6 +2366,7 @@ mod tests {
             name: site.to_owned(),
             url: format!("http://{addr}{SIGNALS_PATH}"),
             pins: Vec::new(),
+            answering: true,
         }
     }
 
@@ -1986,6 +2391,101 @@ mod tests {
                 .expect(label);
             assert_eq!(round.keys().collect::<Vec<_>>(), ["live"], "{label}");
         }
+    }
+
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "a peer that answers late, served inline")]
+    async fn a_slow_peer_that_missed_a_round_still_answers_inside_its_short_budget() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        crate::init_process_crypto();
+        let (date, date_ms) = dated(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let body = format!("inference_pool_average_queue_size{{grid_provider=\"pool-a\"}} 1 {date_ms}\n");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 1024];
+            drop(stream.read(&mut request).await);
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            let response = format!("HTTP/1.1 200 OK\r\n{date}Content-Length: {}\r\n\r\n{body}", body.len());
+            drop(stream.write_all(response.as_bytes()).await);
+        });
+        let slow = PeerSite {
+            name: "east".to_owned(),
+            url: format!("http://{addr}{SIGNALS_PATH}"),
+            pins: Vec::new(),
+            answering: false,
+        };
+        let poll = PollPeers {
+            timeout: Duration::from_secs(5),
+            budget: Duration::from_secs(10),
+            round: Duration::from_secs(5),
+            ..PollPeers::default()
+        };
+        let round = poll.collect(&[slow]).await;
+        assert!(
+            round.contains_key("east"),
+            "1.5 s fits the 2 s budget of one that missed a round"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_did_not_answer_gets_the_short_budget() {
+        crate::init_process_crypto();
+        let poll = PollPeers {
+            attempts: 1,
+            timeout: Duration::from_secs(20),
+            budget: Duration::from_secs(20),
+            round: Duration::from_secs(20),
+            ..PollPeers::default()
+        };
+        let unanswered = PeerSite {
+            answering: false,
+            ..stalled_peer("stalled").await
+        };
+        let started = Instant::now();
+        let round = tokio::time::timeout(Duration::from_secs(10), poll.collect(&[unanswered]))
+            .await
+            .expect("the short budget ends the poll");
+        assert!(round.is_empty());
+        assert!(started.elapsed() < UNANSWERED_PEER_BUDGET + Duration::from_secs(1));
+
+        let answering = stalled_peer("stalled").await;
+        assert!(
+            tokio::time::timeout(UNANSWERED_PEER_BUDGET * 2, poll.collect(&[answering]))
+                .await
+                .is_err(),
+            "a peer that answered keeps the full budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_round_ends_on_time_however_many_peers_cannot_answer() {
+        crate::init_process_crypto();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        release.send(()).unwrap_or(());
+        let mut sites = vec![held_peer("live", gate).await];
+        for index in 0..32 {
+            sites.push(PeerSite {
+                answering: false,
+                ..stalled_peer(&format!("dead-{index}")).await
+            });
+        }
+        let poll = PollPeers {
+            attempts: 1,
+            timeout: Duration::from_secs(20),
+            budget: Duration::from_secs(20),
+            round: Duration::from_secs(1),
+            ..PollPeers::default()
+        };
+        let started = Instant::now();
+        let round = poll.collect(&sites).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the round took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(round.keys().collect::<Vec<_>>(), ["live"]);
     }
 
     #[test]
@@ -2302,6 +2802,61 @@ mod tests {
         peers
     }
 
+    #[tokio::test]
+    async fn a_peer_cannot_relay_poller_rounds() {
+        crate::init_process_crypto();
+        let (date, date_ms) = dated(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let body = format!(
+            "inference_pool_average_queue_size{{grid_provider=\"pool-a\"}} 1 {date_ms}\n\
+             inference_pool_average_queue_size{{grid_provider=\"{provider}\"}} 1 {date_ms}\n\
+             {}{{grid_site=\"west\",grid_provider=\"{provider}\"}} 1 {date_ms}\n",
+            grid_signals::poller::METRIC,
+            provider = grid_signals::poller::PROVIDER,
+        );
+        let round = poll_one_peer("east", body, date).await;
+        let metrics: Vec<&str> = round
+            .get("east")
+            .expect("east answered")
+            .iter()
+            .map(|row| row.metric.as_str())
+            .collect();
+        assert_eq!(metrics, ["inference_pool_average_queue_size"]);
+    }
+
+    #[test]
+    fn heard_load_keeps_each_peers_most_recent_providers() {
+        let row = |provider: String| Observation {
+            metric: "inference_pool_average_queue_size".to_owned(),
+            labels: BTreeMap::from([(PROVIDER_LABEL.to_owned(), provider)]),
+            value: 0.0,
+            timestamp_ms: None,
+            age: Duration::ZERO,
+        };
+        let heard = LoadHeard::default();
+        let first: Vec<_> = (0..MAX_PEER_PROVIDERS).map(|i| row(format!("old-{i}"))).collect();
+        heard.record("east", &first);
+        heard.record("east", &[row("old-0".to_owned())]);
+        heard.record("east", &[row("renamed".to_owned())]);
+        assert!(heard.heard("east", "renamed"), "a new name past the cap is learned");
+        assert!(heard.heard("east", "old-0"), "one heard again is kept");
+        assert!(!heard.heard("east", "old-1"), "the least recently heard is dropped");
+        assert!(!heard.heard("west", "renamed"), "kept per peer");
+    }
+
+    #[test]
+    fn poller_rounds_render_one_stamped_row_per_peer() {
+        let rounds = PeerRounds::default();
+        let at = UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
+        rounds.record(&["east".to_owned(), "west".to_owned()], at);
+        assert_eq!(
+            rounds.render(),
+            "grid_peer_poll_round{grid_site=\"east\",grid_provider=\"_poller\"} 1 1700000000123\n\
+             grid_peer_poll_round{grid_site=\"west\",grid_provider=\"_poller\"} 1 1700000000123\n"
+        );
+        rounds.record(&["west".to_owned()], at);
+        assert!(!rounds.render().contains("east"), "a peer no longer polled has no row");
+    }
+
     /// One round polling `site`, which answers `body` under the extra header lines `headers`.
     async fn poll_one_peer(site: &str, body: String, headers: String) -> BTreeMap<String, Vec<Observation>> {
         one_attempt().collect(&[dated_peer(site, body, headers).await]).await
@@ -2313,6 +2868,7 @@ mod tests {
             name: site.to_owned(),
             url: serve_once_with(body, headers).await,
             pins: Vec::new(),
+            answering: true,
         }
     }
 
@@ -2366,6 +2922,302 @@ mod tests {
     }
 
     #[test]
+    fn revision_metadata_survives_metric_selection_with_exact_count() {
+        let store = SignalStore::new();
+        store.refresh(
+            BTreeMap::from([("model".to_owned(), parse(&revision_text()))]),
+            Duration::from_secs(60),
+        );
+        let selected = vec!["llm_d_epp_average_queue_size".to_owned()];
+        for bounded in [false, true] {
+            let body = if bounded {
+                store
+                    .render_bounded(None, &selected, MAX_RELAY_BYTES, ClockReading::now())
+                    .body
+            } else {
+                store.render_unrestricted(None, &selected, ClockReading::now()).0
+            };
+            let rows = parse(&body);
+            assert_eq!(rows.len(), 2, "one selected gauge and its metadata survive: {body}");
+            let metadata = rows
+                .iter()
+                .find(|row| row.metric == grid_signals::revision::METRIC)
+                .expect("metadata");
+            assert_eq!(
+                metadata
+                    .labels
+                    .get(grid_signals::revision::SAMPLES_LABEL)
+                    .map(String::as_str),
+                Some("1")
+            );
+            assert!(rows.iter().all(|row| row.timestamp_ms == metadata.timestamp_ms));
+        }
+    }
+
+    #[test]
+    fn incomplete_conflicting_and_malformed_revision_batches_are_refused() {
+        let valid = revision_text();
+        assert_eq!(parse(&valid).len(), 3);
+        for invalid in [
+            valid.replace("provider_uid=\"u1\"", "provider_uid=\"u1\",provider_uid=\"u2\""),
+            valid.replace("publisher_epoch=\"1\"", "publisher_epoch=\"0\""),
+            format!("{valid}{}\n", valid.lines().next().expect("metadata")),
+            format!("{valid}{}", valid.replace(" 7 2000", " 0 2000")),
+            format!("{}{valid}", valid.replace(" 7 2000", " 0 2000")),
+        ] {
+            assert!(
+                parse(&invalid).is_empty(),
+                "an invalid batch must never be relayed: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn future_publisher_epochs_are_never_relayed_as_payload_or_fences() {
+        assert_eq!(
+            grid_signals::revision::MAX_PUBLISHER_EPOCH_SKEW,
+            swim::identity::MAX_LEASE_SKEW,
+            "signals and SWIM enforce the same reservation bound"
+        );
+        let future = revision_text().replace("publisher_epoch=\"1\"", &format!("publisher_epoch=\"{}\"", u64::MAX));
+        for invalid in [
+            future.clone(),
+            future.replace("batch_samples=\"2\"", "batch_samples=\"3\""),
+            format!("{future}\nmalformed"),
+            future.replace(" 2 2000", " 2 99999999"),
+        ] {
+            for date in [None, Some(UNIX_EPOCH + Duration::from_secs(20_000_000_000))] {
+                let (rows, _) = reexpress_peer_ages(parse(&invalid), date, "east");
+                assert!(
+                    rows.is_empty(),
+                    "future epochs cannot survive as invalidations, even with a missing or forged Date"
+                );
+            }
+        }
+        assert_eq!(parse(&revision_text()).len(), 3, "ordinary revisions still relay");
+    }
+
+    #[test]
+    fn incomplete_payload_retains_only_its_revision_fence() {
+        let valid = revision_text();
+        for incomplete in [
+            valid.replace("batch_samples=\"2\"", "batch_samples=\"3\""),
+            valid.replace(" 2 2000", " 2 1999"),
+            valid.replace(" 2 2000", " 2"),
+        ] {
+            let rows = parse(&incomplete);
+            assert_eq!(
+                rows.len(),
+                1,
+                "valid metadata survives unusable payload as an invalidation"
+            );
+            assert_eq!(
+                rows.first()
+                    .and_then(|row| row.labels.get(grid_signals::revision::SAMPLES_LABEL))
+                    .map(String::as_str),
+                Some("0")
+            );
+        }
+    }
+
+    #[test]
+    fn peer_row_rejection_cannot_leave_a_partially_qualified_batch() {
+        let parsed = parse(&revision_text().replace(" 2 2000", " -2 2000"));
+        assert_eq!(parsed.len(), 3, "wire completeness precedes value policy");
+        let bounded = bound_peer(parsed, "east");
+        let (body, ..) = render_contract_block(&bounded, &[], Duration::ZERO, SystemTime::now());
+        let rows = parse(&body);
+        assert_eq!(rows.len(), 1, "rejected raw rows preserve only an ordered invalidation");
+        assert_eq!(
+            rows.first()
+                .and_then(|row| row.labels.get(grid_signals::revision::SAMPLES_LABEL))
+                .map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn peer_relay_keeps_revision_batch_timestamps_together() {
+        let (aged, rejected) = reexpress_peer_ages(
+            parse(&revision_text()),
+            Some(UNIX_EPOCH + Duration::from_millis(3000)),
+            "east",
+        );
+        assert_eq!(rejected, 0);
+        let (body, _, cut) = render_contract_block(
+            &bound_peer(aged, "east"),
+            &[],
+            Duration::from_secs(1),
+            UNIX_EPOCH + Duration::from_secs(10),
+        );
+        let reparsed = parse(&body);
+        assert_eq!(reparsed.len(), 3, "all rows survive a relay: {body}");
+        assert_eq!(cut, 0);
+        assert!(
+            reparsed.iter().all(|row| row.timestamp_ms == Some(8000)),
+            "the batch retains one relative age"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exercise HTTP projection, relay and guarded consumption together"
+    )]
+    async fn a_default_peer_poll_projects_custom_metrics_without_losing_revision() {
+        crate::init_process_crypto();
+        let body = format!(
+            "{}vendor_custom_gauge{{grid_site=\"east\",grid_provider=\"model\"}} 4 2000\n",
+            revision_text().replace("batch_samples=\"2\"", "batch_samples=\"3\"")
+        );
+        let (headers, _) = dated(UNIX_EPOCH + Duration::from_secs(3));
+        let peer = PeerSite {
+            name: "east".to_owned(),
+            url: serve_once_with(body, headers).await,
+            pins: Vec::new(),
+            answering: true,
+        };
+        let collected = one_attempt().collect(&[peer]).await;
+        let hub = SignalStore::new();
+        hub.refresh(collected, Duration::from_secs(60));
+        let clock = ClockReading::now();
+        let rendered = hub.render_bounded(None, &[], MAX_RELAY_BYTES, clock);
+        let rows = parse(&rendered.body);
+        assert_eq!(
+            rows.len(),
+            3,
+            "custom gauges cannot erase legitimate telemetry: {}",
+            rendered.body
+        );
+        assert!(!rendered.body.contains("vendor_custom_gauge"));
+        assert!(rendered.body.contains("batch_samples=\"2\""));
+        let receiver = grid_signals::LoadStore::new(Duration::from_secs(60)).with_revision_guard(30_000);
+        receiver.ingest_at(&rendered.body, wall_millis(clock.wall, Duration::ZERO), 10_000, "east");
+        assert!(receiver.learning_state("east/model", 10_000, 30_000).epoch.is_some());
+        assert_eq!(
+            receiver
+                .latest("east/model", "llm_d_epp_average_queue_size")
+                .map(|sample| sample.value),
+            Some(2.0)
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "invalidation, replay rejection and recovery share one receiver"
+    )]
+    fn relay_invalidation_fences_old_data_and_allows_later_learning() {
+        let old = revision_text();
+        let new = old
+            .replace("publisher_epoch=\"1\"", "publisher_epoch=\"2\"")
+            .replace("provider_uid=\"u1\"", "provider_uid=\"u2\"");
+        for invalid in [
+            new.replace("batch_samples=\"2\"", "batch_samples=\"3\""),
+            new.replace(" 2 2000", " -2 2000"),
+            new.replace(" 2 2000", " 2 1999"),
+            format!(
+                "{new}{}",
+                old.replace("grid_provider=\"model\"", "grid_provider=\"unrelated\"")
+                    .replace(" 7 2000", " 0 2000")
+            ),
+        ] {
+            let receiver = grid_signals::LoadStore::new(Duration::from_secs(60)).with_revision_guard(30_000);
+            ingest_revision_relay(&receiver, &old);
+            assert!(receiver.learning_state("east/model", 10_000, 30_000).epoch.is_some());
+            ingest_revision_relay(&receiver, &invalid);
+            assert_eq!(receiver.learning_state("east/model", 10_000, 30_000).epoch, None);
+            assert!(receiver.latest("east/model", "llm_d_epp_average_queue_size").is_none());
+            ingest_revision_relay(
+                &receiver,
+                &old.replace("batch_sequence=\"2\"", "batch_sequence=\"999\""),
+            );
+            ingest_revision_relay(&receiver, &new);
+            assert_eq!(
+                receiver.learning_state("east/model", 10_000, 30_000).epoch,
+                None,
+                "neither old authority nor an equal-order repair can re-enable learning"
+            );
+            ingest_revision_relay(&receiver, &new.replace("batch_sequence=\"2\"", "batch_sequence=\"3\""));
+            assert!(
+                receiver.learning_state("east/model", 10_000, 30_000).epoch.is_some(),
+                "a later complete publication restores learning"
+            );
+        }
+    }
+
+    /// Exercise peer parsing, age conversion, allowlist projection, relay and guarded ingest.
+    fn ingest_revision_relay(receiver: &grid_signals::LoadStore, body: &str) {
+        let (aged, _) = reexpress_peer_ages(parse(body), Some(UNIX_EPOCH + Duration::from_secs(3)), "east");
+        let (rendered, ..) = render_contract_block(
+            &bound_peer(aged, "east"),
+            &[],
+            Duration::ZERO,
+            UNIX_EPOCH + Duration::from_secs(10),
+        );
+        receiver.ingest_at(&rendered, 10_000, 10_000, "east");
+    }
+
+    #[tokio::test]
+    async fn a_revision_without_date_relays_only_a_stale_invalidation() {
+        crate::init_process_crypto();
+        let peer = peer_serving("east", revision_text()).await;
+        let collected = one_attempt().collect(&[peer]).await;
+        let rows = collected.get("east").expect("peer answered");
+        assert_eq!(rows.len(), 1, "undated payload cannot be rejuvenated");
+        let metadata = rows.first().expect("ordered invalidation");
+        assert_eq!(
+            metadata
+                .labels
+                .get(grid_signals::revision::SAMPLES_LABEL)
+                .map(String::as_str),
+            Some("0")
+        );
+        assert!(
+            metadata.age > Duration::from_secs(86_400),
+            "uncertain freshness never becomes current"
+        );
+    }
+
+    #[test]
+    fn metadata_only_providers_do_not_displace_a_live_pressure_batch() {
+        let metadata = parse(&revision_text())
+            .into_iter()
+            .find(|row| row.metric == grid_signals::revision::METRIC)
+            .expect("metadata");
+        let mut rows: Vec<_> = (0..MAX_PEER_PROVIDERS)
+            .map(|index| {
+                let mut row = invalidation(&metadata);
+                row.labels.insert(PROVIDER_LABEL.to_owned(), format!("a{index:02}"));
+                row
+            })
+            .collect();
+        rows.extend(parse(
+            &revision_text().replace("grid_provider=\"model\"", "grid_provider=\"z-live\""),
+        ));
+        let kept = bound_peer(rows, "east");
+        assert_eq!(
+            kept.iter()
+                .filter(|row| row
+                    .labels
+                    .get(PROVIDER_LABEL)
+                    .is_some_and(|provider| provider == "z-live"))
+                .count(),
+            3,
+            "a pressure-bearing provider survives metadata cardinality"
+        );
+    }
+
+    /// A complete provider batch before filtering or timestamp rebasing.
+    fn revision_text() -> String {
+        concat!(
+            "grid_provider_config_generation{grid_site=\"east\",grid_provider=\"model\",provider_uid=\"u1\",publisher_epoch=\"1\",batch_sequence=\"2\",batch_samples=\"2\"} 7 2000\n",
+            "llm_d_epp_average_queue_size{grid_site=\"east\",grid_provider=\"model\"} 2 2000\n",
+            "llm_d_epp_ready_endpoints{grid_site=\"east\",grid_provider=\"model\"} 1 2000\n"
+        ).to_owned()
+    }
+
+    #[test]
     fn a_target_past_the_line_cap_is_cut_and_the_others_still_render() {
         let store = SignalStore::new();
         let big = stocked("pool-big", MAX_RENDER_LINES_PER_TARGET + 10);
@@ -2373,8 +3225,8 @@ mod tests {
         store.refresh(BTreeMap::from([big, small]), Duration::from_secs(60));
         let rendered = store.render_bounded(None, &[], MAX_RELAY_BYTES, ClockReading::now());
         let big_lines = rendered.body.lines().filter(|line| line.contains("pool-big")).count();
-        assert_eq!(big_lines, MAX_RENDER_LINES_PER_TARGET, "cut at the cap");
-        assert_eq!(rendered.lines_cut, 10);
+        assert_eq!(big_lines, 0, "a provider group is never rendered as a prefix");
+        assert_eq!(rendered.lines_cut, MAX_RENDER_LINES_PER_TARGET + 10);
         assert!(rendered.body.contains("pool-small"), "the small target still renders");
         assert_eq!(rendered.targets_dropped, 0);
     }
@@ -2466,10 +3318,11 @@ mod tests {
             name: "pool-b".to_owned(),
             url: "http://10.0.0.2:9091/v1/site/signals".to_owned(),
             pins: Vec::new(),
+            answering: true,
         }];
         let urls = peer_urls(&sites, "");
         assert_eq!(
-            urls.first().map(|(_, u, _)| u.as_str()),
+            urls.first().map(|(_, u, ..)| u.as_str()),
             Some("http://10.0.0.2:9091/v1/site/signals"),
             "the whole site is asked for, with no target"
         );
@@ -2481,10 +3334,11 @@ mod tests {
             name: "pool-b".to_owned(),
             url: "http://10.0.0.2:9091/v1/site/signals".to_owned(),
             pins: Vec::new(),
+            answering: true,
         }];
         let urls = peer_urls(&sites, "collect[]=queue");
         assert_eq!(
-            urls.first().map(|(_, u, _)| u.as_str()),
+            urls.first().map(|(_, u, ..)| u.as_str()),
             Some("http://10.0.0.2:9091/v1/site/signals?collect[]=queue")
         );
     }
@@ -2617,7 +3471,7 @@ mod tests {
         drop(poll.peer_transport("west", &pins).expect("built"));
         assert_eq!(poll.held_transports(), 2);
 
-        poll.retain_transports(&[("east".to_owned(), String::new(), pins)]);
+        poll.retain_transports(&[("east".to_owned(), String::new(), pins, true)]);
         assert_eq!(poll.held_transports(), 1, "west left the grid and took its material");
     }
 
@@ -3220,5 +4074,22 @@ q{pool=\"d\"} 0.35
                 "{name} is a share the gateway refuses above one, but a hub accepts any value"
             );
         }
+    }
+
+    #[test]
+    fn llm_d_kv_cache_spread_is_relayed_as_a_bounded_share() {
+        let spread = peer_sample("llm_d_epp_std_dev_kv_cache_utilization", "pool-b", 0.71);
+        assert_eq!(
+            refusal(&spread),
+            None,
+            "the pinned EPP spread series must be accepted and relayed to remote gateways"
+        );
+
+        let invalid_spread = peer_sample("llm_d_epp_std_dev_kv_cache_utilization", "pool-b", 1.01);
+        assert_eq!(
+            refusal(&invalid_spread),
+            Some("value"),
+            "the KV-cache spread is a normalized share and must stay within one"
+        );
     }
 }

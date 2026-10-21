@@ -7,16 +7,60 @@ the consumer `intelligent_route` filter are a separate path, described in
 
 ## Site choice
 
-Each site's operator scrapes its EPP, polls every other site's operator, and relays
-each series per provider under the site it verified. The gateway polls its local
-operator and concludes what each site holds. It learns a soft bound from the most held with
-nothing waiting and a hard bound from the least held at a demonstrated limit. Saturation (rho)
-is the nearer of in-flight over the lesser bound and KV-cache mean plus spread. A site has room
-while rho is below 1. Among healthy sites with room, three or more are picked
-two by ceiling taking the lower rho, two are picked between weighted by ceiling over 1 + rho,
-one is taken. With no site that has room, the pick is by ceiling among the sites not full,
-tied on the best queue depth. A site that is not ready, or whose cluster praxis reports with
-no healthy endpoint, is chosen only when no healthy site is left.
+Each site's operator collects provider metrics, polls its peers, and relays
+readings under the verified site identity. The gateway polls its local operator.
+It learns a soft bound from the most held with nothing waiting and a hard bound
+from the least held at a demonstrated limit. Saturation (rho) combines in-flight
+load relative to that ceiling with direct KV-cache pressure.
+
+Pressure tiers precede prefix affinity. Selection prefers queue-free sites with
+room, then queued sites with room, then sites not marked full. If none remain,
+all healthy sites are eligible. Entirely missing telemetry stays a fallback.
+Affinity narrows only within the selected tier.
+
+Within either tier with room, selection uses pressure when every
+remaining site has fresh rho, even if capacity is unknown. With three or more
+sites, it draws two by capacity and takes the lower
+rho. With two, weights are capacity over 1 + rho, with each share bounded to
+10–90 percent. Unknown capacity receives the mean known capacity, or equal weights
+when all capacities are unknown. Missing rho uses capacity-weighted selection.
+Queue-only and saturated selection retain sites tied on the least queue depth.
+Selection excludes unready sites. A site demoted by gateway health checks is a last
+resort if it remains admitted.
+
+A site that has published and then sends nothing for the freshness window is silent.
+A peer is judged at the end of the operator's last poll round that tried it, and this
+site at the last read of its operator, so a stalled poller or relay pauses the judgement
+rather than silencing every peer. A peer whose operator reports no poll rounds is not
+judged. While any live site serves the model, a silent site takes no request, and
+shedding does not wait on it. It routes again after two new samples with no full window
+between them, about two peer polls, so one poll through a lossy link does not bring it
+back. When every site is silent they take the request, and the pick counts as a
+fallback.
+
+A peer candidate that publishes load and has sent nothing through a full window of
+rounds is silent too, so a gateway that starts during a partition does not send overflow
+to the partitioned site. A candidate publishes load unless it is this site's provider
+with no metrics to scrape, or a peer's provider that this operator has not received load
+rows for since it started.
+One that does not publish load is unmeasured, takes no overflow and never holds off
+shedding. After an operator restart during a partition, the partitioned site's
+candidates are unmeasured until it returns. A provider with `metricsConfig` whose
+scrape fails still publishes load: it goes silent and is routed around, and its
+`MetricsAvailable` condition is `False` with the scrape error.
+
+A site that returns from a partition takes requests again once both its signals have
+returned and its backend passes its health check, whichever is later. Silence clears
+after two new samples, about two peer polls; a `mutual_tls` backend is probed every 3 s
+and comes up after two passes. While both are down on every site, the front candidate
+is tried as a last resort. Requests already sent to a site when it goes down wait out
+the connect timeout, 2 s by default for a remote site, until grid#419 retries them on
+another site.
+
+Known issue: from outside its site, the operator cannot tell a peer's provider that has
+no metrics from one it cannot scrape. When every candidate that publishes load is
+silent, a peer candidate with no load rows takes every pick. Those picks count as
+`reason="fallback"`.
 
 With `availability.shedding` on, a model sheds once every healthy site serving it has been at
 its ceiling with work waiting for `full_after_ms`, and routes again once no sample from a site
@@ -25,21 +69,25 @@ no healthy routable site gets 503.
 
 ## Inputs
 
+These load metrics describe the llm-d EPP integration.
+
 | Input | Series | Source |
 |---|---|---|
 | Running per endpoint | `llm_d_epp_average_running_requests` | The EPP, relayed as is. |
 | Waiting per endpoint | `llm_d_epp_average_queue_size`, `inference_pool_per_pod_queue_size` | The EPP, relayed as is. |
 | Held before scheduling | `llm_d_epp_flow_control_queue_size` | The EPP, relayed as is. |
 | Ready endpoints | `llm_d_epp_ready_endpoints` | The EPP, relayed as is. Zero reads as not ready. |
-| KV-cache fullness | `llm_d_epp_average_kv_cache_utilization`, `llm_d_epp_stddev_kv_cache_utilization` | The EPP, relayed as is. Mean and spread are joined per scrape. |
+| KV-cache fullness | `llm_d_epp_average_kv_cache_utilization`, `llm_d_epp_std_dev_kv_cache_utilization` | The EPP, relayed as is. Mean and spread are joined per scrape. |
 
-The gateway concludes in-flight as running plus waiting per endpoint, times ready endpoints,
-plus what flow control holds. The operator's `grid_provider_*` series are its own conclusions
-for Prometheus and dashboards; the gateway reads none of them.
+The gateway concludes in-flight as running plus waiting per endpoint, times
+ready endpoints, plus what flow control holds. The operator adds one
+grid_provider_config_generation row per qualified batch to scope learning to a
+[provider revision](architecture/polling-metrics.md#provider-revisions).
+Fresh pressure remains usable without this row, but learning stays disabled.
 
-Every input comes from the EPP's `/metrics`. Point `metricsConfig.metricsEndpoint` at the EPP
-Service, since a pod address can reach a standby replica that reports nothing. The gateway
-keeps no count of its own requests.
+The EPP exposes load samples at /metrics. Point metricsConfig.endpoint at
+the EPP Service. A pod address can reach a standby replica that reports nothing.
+The gateway keeps no count of its own requests.
 
 ## Settings
 
@@ -47,7 +95,7 @@ Nothing needs setting. `availability.shedding` is the one switch, off by default
 fields of the filter's `availability` block, set from the chart's
 `gridServing.siteRoute.availability`, have defaults, and their table and tuning order are in
 [routing.md](routing.md#7b-measured-site-availability). On the operator,
-`GRID_SIGNALS_SCRAPE_INTERVAL_SECS` (default 5) sets how often it scrapes its EPP, and
+`GRID_SIGNALS_SCRAPE_INTERVAL_SECS` (default 1) sets how often it scrapes its EPP, and
 `metricsConfig.staleMetricsSeconds` how long a failing scrape keeps the last readiness.
 
 ## What to watch
@@ -75,6 +123,7 @@ failing and once when it recovers.
 | Symptom | Likely cause | Action |
 |---|---|---|
 | A site is never chosen | Zero ready endpoints, or its cluster has no healthy endpoint | Check `llm_d_epp_ready_endpoints` and the gateway's cluster health log line |
+| A site takes nothing though its engine is up | Its signals stopped reaching the gateway, so it is silent | `grid_route_site_silent` and `grid_route_site_last_sample_age_seconds`; a steady `grid_route_site_silent_transitions_total` rate is a lossy link |
 | Every remote site is unmeasured | The gateway's poll of its local operator is failing, or the operator is not collecting from peers | `grid_signals_poll_total` by result at the gateway; `grid_collection_up` and `grid_peer_signals_refused_total` at the operator |
 | A site's soft bound sits far below what its engine runs | It was queued whenever it ran high, so no queue-free sample taught it | Raise `explore_floor` |
 | A small or slow site takes little | Expected: picks follow measured ceilings, and two choices never pick the busiest of three | Nothing |

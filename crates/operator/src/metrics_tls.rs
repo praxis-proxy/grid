@@ -381,13 +381,14 @@ mod tests {
         axum::Router::new().route("/healthz", axum::routing::get(|| async { "ok" }))
     }
 
-    /// Serve `tls` on a fresh port without waiting for it to bind.
-    fn spawn_serving(tls: MetricsTls, every: Duration) -> u16 {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|probe| probe.local_addr())
-            .expect("fixture")
-            .port();
-        tokio::spawn(async move { serve_metrics_tls(&format!("127.0.0.1:{port}"), health(), tls, every).await });
+    /// Serve `tls` on an owned listener so another test cannot claim its port.
+    async fn spawn_serving(tls: MetricsTls, every: Duration) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("fixture");
+        let port = listener.local_addr().expect("fixture").port();
+        tokio::spawn(async move {
+            let config = watch_tls(tls, every).await.expect("fixture");
+            serve_tls(listener, health(), config).await
+        });
         port
     }
 
@@ -408,7 +409,7 @@ mod tests {
         tls_backend::init_process_crypto();
         let dir = temp_dir("serve");
         let ca = certs::generate_ca("metrics-ca").expect("fixture");
-        let port = spawn_serving(issue(&dir, &ca), Duration::from_secs(60));
+        let port = spawn_serving(issue(&dir, &ca), Duration::from_secs(60)).await;
         served_by(port, &ca).await;
         assert_eq!(get(port, "/healthz", &ca).await.as_deref(), Ok("ok"));
         std::fs::remove_dir_all(&dir).expect("cleanup");
@@ -419,7 +420,7 @@ mod tests {
         tls_backend::init_process_crypto();
         let dir = temp_dir("rotate");
         let old = certs::generate_ca("old-ca").expect("fixture");
-        let port = spawn_serving(issue(&dir, &old), Duration::from_millis(20));
+        let port = spawn_serving(issue(&dir, &old), Duration::from_millis(20)).await;
         served_by(port, &old).await;
 
         let new = certs::generate_ca("new-ca").expect("fixture");
@@ -432,16 +433,42 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
+    /// An absent identity delays binding; usable material then exposes an occupied port's bind error.
     #[tokio::test]
-    async fn a_site_waits_for_its_identity_then_serves_and_rotates_it() {
+    async fn a_site_loads_its_identity_before_binding_the_listener() {
         tls_backend::init_process_crypto();
         let material = Arc::new(Mutex::new(None));
-        let port = spawn_serving(MetricsTls::Fake(Arc::clone(&material)), Duration::from_millis(20));
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("fixture");
+        let addr = reserved.local_addr().expect("fixture").to_string();
+        let tls = MetricsTls::Fake(Arc::clone(&material));
+        let serving = serve_metrics_tls(&addr, health(), tls, Duration::from_millis(20));
+        tokio::pin!(serving);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), serving.as_mut())
+                .await
+                .is_err(),
+            "missing identity must delay binding even when the port is occupied"
+        );
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        tokio::net::TcpStream::connect(("127.0.0.1", port))
+        let ca = certs::generate_ca("grid-ca").expect("fixture");
+        *material.lock().expect("fixture") = Some(leaf(&ca));
+        let error = tokio::time::timeout(Duration::from_secs(5), serving)
             .await
-            .expect_err("nothing listens before the identity exists");
+            .expect("the identity allows binding to proceed")
+            .expect_err("the reserved port cannot be bound");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().expect("bind error").kind(),
+            std::io::ErrorKind::AddrInUse,
+            "binding begins only after the site identity becomes usable"
+        );
+    }
+
+    /// Site enrollment and renewal replace the served certificate without restarting the listener.
+    #[tokio::test]
+    async fn a_site_serves_and_rotates_its_identity() {
+        tls_backend::init_process_crypto();
+        let material = Arc::new(Mutex::new(None));
+        let port = spawn_serving(MetricsTls::Fake(Arc::clone(&material)), Duration::from_millis(20)).await;
 
         let enrolled = certs::generate_ca("grid-ca").expect("fixture");
         *material.lock().expect("fixture") = Some(leaf(&enrolled));

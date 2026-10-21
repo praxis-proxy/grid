@@ -1006,12 +1006,18 @@ impl RetainedOrigins {
         self.latest_by_scope.retain(|scope, _| scope.origin_site != origin);
         self.provider_networks_by_scope
             .retain(|scope, _| scope.origin_site != origin);
-        self.gateway_addrs.remove(origin);
+        self.forget_departed(origin);
         self.latest_gateway_revision_by_origin.remove(origin);
-        self.cert_pems.remove(origin);
         self.latest_cert_revision_by_origin.remove(origin);
         self.signals_addrs.remove(origin);
         self.latest_signals_revision_by_origin.remove(origin);
+    }
+
+    /// Remove a departed origin's gateway address and certificate, keeping its signals address
+    /// and every revision guard.
+    fn forget_departed(&mut self, origin: &str) {
+        self.gateway_addrs.remove(origin);
+        self.cert_pems.remove(origin);
     }
 }
 
@@ -1065,14 +1071,26 @@ impl OriginStateHandle {
         self.state_tx.send_modify(|snapshot| {
             snapshot.remove_origin_providers(origin);
         });
+        self.publish_departed(origin);
+        self.signals_addrs_tx.send_modify(|addresses| {
+            addresses.remove(origin);
+        });
+    }
+
+    /// Forget a departed origin's gateway address and certificate, keeping its providers, its
+    /// signals address and every revision guard, so it is still polled and nothing older replays.
+    pub(crate) fn forget_departed(&self, origin: &str) {
+        self.lock().forget_departed(origin);
+        self.publish_departed(origin);
+    }
+
+    /// Publish the removal of a departed origin's gateway address and certificate.
+    fn publish_departed(&self, origin: &str) {
         self.gateway_addrs_tx.send_modify(|addresses| {
             addresses.remove(origin);
         });
         self.cert_pems_tx.send_modify(|certs| {
             certs.remove(origin);
-        });
-        self.signals_addrs_tx.send_modify(|addresses| {
-            addresses.remove(origin);
         });
     }
 }
@@ -3846,6 +3864,86 @@ mod tests {
         assert_eq!(
             handler.gateway_address_for_site("site-a").as_deref(),
             Some("10.0.0.9:8443")
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one departure checked against every lane and both guards"
+    )]
+    fn a_departed_origin_keeps_its_providers_signals_and_guards() {
+        let (mut handler, origin_state) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 4);
+        let broadcast = |revision: u64, address: &str, cert: &str| {
+            StateBroadcast::new(
+                "site-a".to_owned(),
+                revision,
+                snapshot("site-a", revision, 0.4),
+                Some(address.to_owned()),
+            )
+            .with_signals_address(Some(format!("{address}-signals")))
+            .with_cert(Some(cert.to_owned()))
+        };
+        assert!(receive(&mut handler, &broadcast(10, "10.0.0.1:8443", "old-cert")).is_some());
+        origin_state.forget_departed("site-a");
+
+        assert!(
+            handler.snapshot().provider("net", "site-a", "provider").is_some(),
+            "provider state survives"
+        );
+        assert!(handler.gateway_address_for_site("site-a").is_none());
+        assert!(handler.cert_pem_for_site("site-a").is_none());
+        assert_eq!(
+            handler
+                .subscribe_signals_addrs()
+                .borrow()
+                .get("site-a")
+                .map(String::as_str),
+            Some("10.0.0.1:8443-signals"),
+            "the signals address survives, so the site is still polled"
+        );
+        assert!(
+            receive(&mut handler, &broadcast(9, "10.0.0.8:8443", "replayed-cert")).is_none(),
+            "the provider guard still refuses an older broadcast"
+        );
+        let replayed = StateBroadcast::new(
+            "site-a".to_owned(),
+            9,
+            GridStateSnapshot::new("site-a".to_owned()),
+            Some("10.0.0.8:8443".to_owned()),
+        );
+        drop(receive(&mut handler, &replayed));
+        assert!(
+            handler.gateway_address_for_site("site-a").is_none(),
+            "the gateway guard still refuses an older metadata-only broadcast"
+        );
+
+        assert!(receive(&mut handler, &broadcast(11, "10.0.0.9:8443", "new-cert")).is_some());
+        assert_eq!(
+            handler.gateway_address_for_site("site-a").as_deref(),
+            Some("10.0.0.9:8443")
+        );
+        assert_eq!(handler.cert_pem_for_site("site-a").as_deref(), Some("new-cert"));
+    }
+
+    #[test]
+    fn a_retained_origin_that_rejoins_without_a_provider_does_not_keep_it() {
+        let (mut handler, origin_state) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 4);
+        let held = StateBroadcast::new("site-a".to_owned(), 10, snapshot("site-a", 10, 0.4), None);
+        assert!(receive(&mut handler, &held).is_some());
+        origin_state.forget_departed("site-a");
+
+        let rejoined = StateBroadcast::new(
+            "site-a".to_owned(),
+            11,
+            GridStateSnapshot::new("site-a".to_owned()),
+            None,
+        )
+        .with_authoritative_provider_state();
+        assert!(receive(&mut handler, &rejoined).is_some());
+        assert!(
+            handler.snapshot().provider("net", "site-a", "provider").is_none(),
+            "the rejoined origin withdrew it"
         );
     }
 

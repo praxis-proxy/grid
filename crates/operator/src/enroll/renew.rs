@@ -279,13 +279,7 @@ async fn pending<S: IdentityStore + Sync>(
 
 /// The site a leaf's SPIFFE ID names.
 fn site_of(cert_pem: &str) -> Result<String, RenewError> {
-    let der = crate::resources::tls_backend::first_cert_der_from_pem(cert_pem)
-        .map_err(|e| RenewError::Material(format!("certificate: {e}")))?;
-    certs::leaf_spiffe_id(&der)
-        .as_deref()
-        .and_then(certs::site_of_spiffe_id)
-        .map(str::to_owned)
-        .ok_or_else(|| RenewError::Material("certificate names no grid site".to_owned()))
+    crate::site_name::of_cert(cert_pem).ok_or_else(|| RenewError::Material("certificate names no grid site".to_owned()))
 }
 
 /// The renewed leaf, if it is this site's, from the CA it already holds, for the CSR's key.

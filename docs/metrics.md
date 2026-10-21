@@ -9,8 +9,21 @@ components expose Prometheus endpoints and they answer different questions.
 | `/metrics` on the gateway metrics listener, `metricsListener.enabled` in the gateway chart, port 9443, TLS only | Grid gateway | Site selection, shedding, serving-config reloads, and its poll of the local operator |
 | `/metrics` on `OVERLAY_SYNC_HEALTH_ADDR`, default `0.0.0.0:9091` | Overlay-sync sidecar, when `overlay.sidecar.enabled` | Delivery of the serving overlay from its ConfigMap to the gateway |
 
-The gateway also serves the same series on the Praxis admin listener, which is
-reachable only from inside the pod.
+The `grid-gateway` operand built with Praxis 0.7.4 serves `/metrics`, `/healthy`,
+and `/ready` on `admin.metrics_address`. When upgrading from Praxis 0.7.3,
+move the probe listener from `admin.address` to `admin.metrics_address`:
+
+```yaml
+admin:
+  metrics_address: "127.0.0.1:9901"
+```
+
+Keep the listener address consistent with the deployment's probe commands.
+`admin.address` now serves administration endpoints; configure a different
+port if those are also needed. Chart defaults and operator-rendered configs
+must be qualified against the selected image before rolling out the new
+operand. The chart's separately released Praxis AI image has its own version
+and upgrade requirements.
 
 The operator exports each provider's resolved readings, not the raw engine
 series behind them. The series a gateway routes on travel over
@@ -117,6 +130,10 @@ state, so two replicas agree only in steady state.
 | `grid_route_site_in_flight` | gauge | `site`, `cluster` | Requests held in the reading used by the decision. |
 | `grid_route_site_full` | gauge | `site`, `cluster` | 1 after a backlog at the ceiling spans `full_after_ms`, 0 otherwise, `NaN` without a queue signal. |
 | `grid_route_site_reading_age_seconds` | gauge | `site`, `cluster` | Age of the newest sample used by the decision. |
+| `grid_route_site_silent` | gauge | `site`, `cluster` | 1 while a site that has published has sent nothing within the freshness window, until it sends two new samples; it takes no request while a live site can. 0 otherwise. |
+| `grid_route_site_silent_transitions_total` | counter | `site`, `cluster`, `to` | Sites entering (`silent`) or leaving (`live`) silence. A steady rate is a flapping link. |
+| `grid_route_site_last_sample_age_seconds` | gauge | `site`, `cluster` | Seconds since the site's newest sample. Unlike `grid_route_site_reading_age_seconds`, which goes `NaN` once the sample leaves the freshness window, this keeps counting. |
+| `grid_route_site_round_age_seconds` | gauge | `site`, `cluster` | Seconds since the operator's last poll round that tried this peer; a peer's silence is judged at that round. `NaN` for this site or when the operator reports no rounds. A growing value with the poller running is a stalled poller, under which no peer goes silent. |
 | `grid_route_site_score` | gauge | `site`, `cluster` | Score the site ranks by in the current snapshot. |
 | `grid_route_shedding` | gauge | `model` | 1 while the gateway sheds this model, 0 otherwise. |
 | `grid_route_prefix_affinity_total` | counter | `outcome` | Prefix-affinity decisions by outcome. |

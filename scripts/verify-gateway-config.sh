@@ -177,6 +177,18 @@ if "$CRT" run --rm -v "$WORK/tls:/etc/praxis:ro,z" -v "$bca:/etc/praxis/backend-
 else
   fail "tls backend: rejected by $DEFAULT_GATEWAY_IMAGE: $(tail -1 "$WORK/tls.log")"
 fi
+# A remote site's gateway on the chart's mutual_tls defaults: Praxis checks the probe and connect bounds.
+render "$WORK/peer" --set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.model=qwen3 \
+  --set gatewayConfig.auth.mode=none --set tls.enabled=true --set tls.existingSecret=site --set tls.caSecret=ca \
+  --set "gatewayConfig.backends[0].cluster=site-b" --set "gatewayConfig.backends[0].site=site-b" \
+  --set "gatewayConfig.backends[0].endpoints[0]=203.0.113.7:8443" --set "gatewayConfig.backends[0].transport.mode=mutual_tls"
+mkdir -p "$WORK/peer/tls"
+if "$CRT" run --rm -v "$WORK/peer:/etc/praxis:ro,z" -v "$bca:/etc/praxis/tls:ro,z" "$DEFAULT_GATEWAY_IMAGE" \
+    --config /etc/praxis/praxis.yaml --validate >"$WORK/peer.log" 2>&1; then
+  pass "mutual_tls backend: validates on $DEFAULT_GATEWAY_IMAGE"
+else
+  fail "mutual_tls backend: rejected by $DEFAULT_GATEWAY_IMAGE: $(tail -1 "$WORK/peer.log")"
+fi
 "$CRT" run -d --name "$NET-tls" --network "$NET" -p 127.0.0.1::8080 -v "$WORK/tls:/etc/praxis:ro,z" \
   -v "$bca:/etc/praxis/backend-ca/0:ro,z" "$DEFAULT_GATEWAY_IMAGE" --config /etc/praxis/praxis.yaml >/dev/null
 port=$("$CRT" port "$NET-tls" 8080 | head -1 | sed 's/.*://')

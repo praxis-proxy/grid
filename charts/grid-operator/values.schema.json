@@ -502,6 +502,20 @@
               "pattern": "^$|^[1-9][0-9]{0,4}$"
             }
           ]
+        },
+        "scrapeIntervalSeconds": {
+          "description": "Seconds between scrapes of this site's own EPPs, 1 to 99999. Local and unicast, so it costs one request per provider per interval. Empty keeps the operator default.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 99999
+            },
+            {
+              "type": "string",
+              "pattern": "^$|^[1-9][0-9]{0,4}$"
+            }
+          ]
         }
       }
     },
@@ -535,9 +549,9 @@
           "type": "boolean",
           "description": "Discover and advertise a LoadBalancer address for the site gateway."
         },
-        "consumerConfig": {
+        "praxisConfig": {
           "type": "object",
-          "description": "GridNetwork gatewayRefs[].consumerConfig for the site gateway, validated by the CRD."
+          "description": "GridNetwork consumerGateways[].praxisConfig for the site gateway, validated by the CRD."
         }
       }
     },
@@ -796,7 +810,19 @@
       "type": "string",
       "enum": [
         "",
-        "aws"
+        "aws",
+        "azure",
+        "gcp",
+        "any"
+      ],
+      "description": "Cloud whose load balancer settings LoadBalancer Services get: aws, azure, gcp, or any for all three, since each cloud reads only its own keys."
+    },
+    "loadBalancerScope": {
+      "description": "Reach of the SWIM and signals load balancers on a cloud platform: internal (private network) or external (internet-facing).",
+      "type": "string",
+      "enum": [
+        "internal",
+        "external"
       ]
     },
     "peers": {

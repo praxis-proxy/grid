@@ -47,3 +47,64 @@ tests:
       - equal:
           path: metadata.name
           value: old
+
+  - it: translates legacy keys in the list form
+    set:
+      inferenceProviders:
+        - name: legacy
+          gridNetworkRef: grid
+          providerKind: vllm
+          backendKind: local_model
+          endpoint: http://10.0.0.1:8000
+          routingClusterRef: legacy-cluster
+          gatewayRef: legacy-gateway
+          metricsConfig:
+            metricsEndpoint: http://metrics:9090
+          auth:
+            manual: true
+    asserts:
+      - equal:
+          path: spec.clusterName
+          value: legacy-cluster
+      - equal:
+          path: spec.providerGateway
+          value: legacy-gateway
+      - equal:
+          path: spec.metricsConfig.endpoint
+          value: http://metrics:9090
+      - equal:
+          path: spec.auth.credentialsManagedExternally
+          value: true
+      - notExists:
+          path: spec.routingClusterRef
+      - notExists:
+          path: spec.gatewayRef
+
+  - it: translates legacy keys in keyed provider values
+    set:
+      inferenceProviders:
+        legacy:
+          endpoint: http://10.0.0.1:8000
+          routingClusterRef: legacy-cluster
+          gatewayRef: legacy-gateway
+          metricsConfig:
+            metricsEndpoint: http://metrics:9090
+          auth:
+            manual: true
+    asserts:
+      - equal:
+          path: spec.clusterName
+          value: legacy-cluster
+      - equal:
+          path: spec.providerGateway
+          value: legacy-gateway
+      - equal:
+          path: spec.metricsConfig.endpoint
+          value: http://metrics:9090
+      - equal:
+          path: spec.auth.credentialsManagedExternally
+          value: true
+      - notExists:
+          path: spec.routingClusterRef
+      - notExists:
+          path: spec.gatewayRef

@@ -338,6 +338,12 @@
             },
             "loadBalancerIP": {
               "type": "string"
+            },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           },
           "additionalProperties": false
@@ -640,6 +646,25 @@
       "maxLength": 253,
       "pattern": "^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$",
       "description": "The enrollment name sites connect to: a serving cert name and the default route.host."
+    },
+    "platform": {
+      "description": "Cloud whose load balancer settings LoadBalancer Services get: aws, azure, gcp, or any for all three, since each cloud reads only its own keys.",
+      "type": "string",
+      "enum": [
+        "",
+        "aws",
+        "azure",
+        "gcp",
+        "any"
+      ]
+    },
+    "loadBalancerScope": {
+      "description": "Reach of the enrollment load balancer on a cloud platform: internal (private network) or external (internet-facing).",
+      "type": "string",
+      "enum": [
+        "internal",
+        "external"
+      ]
     },
     "log": {
       "type": "object",

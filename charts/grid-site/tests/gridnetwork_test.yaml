@@ -138,3 +138,48 @@ tests:
     asserts:
       - notExists:
           path: metadata.labels["grid.praxis.fast/auto-discover-sites"]
+
+  - it: translates legacy gateway values to current CRD fields
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.gatewayRefs:
+        - name: legacy-gateway
+          namespace: grid
+          localSiteName: legacy-site
+          consumerConfig:
+            enabled: true
+            credentialMountBase: /run/legacy
+      gridNetwork.tls.swimKeyRef:
+        name: legacy-key
+        namespace: grid
+    asserts:
+      - equal:
+          path: spec.consumerGateways[0].siteName
+          value: legacy-site
+      - equal:
+          path: spec.consumerGateways[0].praxisConfig.generate
+          value: true
+      - equal:
+          path: spec.consumerGateways[0].praxisConfig.credentialMountPath
+          value: /run/legacy
+      - equal:
+          path: spec.tls.swimKeySecretRef.name
+          value: legacy-key
+      - notExists:
+          path: spec.gatewayRefs
+
+  - it: drops an empty legacy gateway list beside current values
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.gatewayRefs: []
+      gridNetwork.consumerGateways:
+        - name: current-gateway
+          namespace: grid
+    asserts:
+      - equal:
+          path: spec.consumerGateways[0].name
+          value: current-gateway
+      - notExists:
+          path: spec.gatewayRefs

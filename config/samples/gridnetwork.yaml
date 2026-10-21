@@ -20,14 +20,14 @@ spec:
     gossipNodes: 3
 
   # Consumer gateway reference
-  gatewayRefs:
+  consumerGateways:
     - name: consumer-gateway
       namespace: default
-      consumerConfig:
-        enabled: true
+      praxisConfig:
+        generate: true
         configMapName: praxis-consumer-config
         listenerPort: 8080
-        credentialMountBase: /run/secrets/grid-credentials
+        credentialMountPath: /run/secrets/grid-credentials
         tlsCertMountPath: /etc/praxis/tls
         # Cluster endpoints populated by gateway deployment or platform automation
         clusterEndpoints: []
@@ -36,4 +36,4 @@ spec:
   tls:
     caSecretRef: null      # Auto-generated
     siteSecretRef: null    # Auto-generated
-    swimKeyRef: null       # Unencrypted SWIM for this example
+    swimKeySecretRef: null       # Unencrypted SWIM for this example

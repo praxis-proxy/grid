@@ -320,6 +320,46 @@ tests:
             name: GRID_SIGNALS_PEER_INTERVAL_SECS
           any: true
 
+  - it: sets the scrape interval only when asked
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.scrapeIntervalSeconds: 5
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SIGNALS_SCRAPE_INTERVAL_SECS
+            value: "5"
+
+  - it: leaves the scrape interval to the operator when unset
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SIGNALS_SCRAPE_INTERVAL_SECS
+          any: true
+
+  - it: refuses a scrape interval the operator would exit on
+    template: templates/deployment.yaml
+    set:
+      grid.id: aws
+      site.name: east
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.scrapeIntervalSeconds: 0
+    asserts:
+      - failedTemplate: {}
+
   - it: refuses an interval the operator would exit on
     template: templates/deployment.yaml
     set:

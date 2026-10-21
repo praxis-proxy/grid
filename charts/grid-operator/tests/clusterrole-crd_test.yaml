@@ -29,6 +29,15 @@ tests:
           path: rules[1].verbs
           value: ["get", "list", "watch", "patch", "create", "update", "delete"]
 
+  - it: grants gridnetworks create, so the operator can create its own grid
+    asserts:
+      - contains:
+          path: rules[3].resources
+          content: gridnetworks
+      - equal:
+          path: rules[3].verbs
+          value: ["create"]
+
   - it: renders nothing when rbac.create is false
     set:
       rbac.create: false

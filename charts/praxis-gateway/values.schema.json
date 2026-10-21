@@ -388,6 +388,14 @@
                       "unhealthyThreshold": {
                         "type": "integer",
                         "minimum": 1
+                      },
+                      "passiveUnhealthyThreshold": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "passiveHealthyThreshold": {
+                        "type": "integer",
+                        "minimum": 1
                       }
                     }
                   },
@@ -562,6 +570,14 @@
                     "minimum": 1
                   },
                   "unhealthyThreshold": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "passiveUnhealthyThreshold": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "passiveHealthyThreshold": {
                     "type": "integer",
                     "minimum": 1
                   }
@@ -745,7 +761,8 @@
       "description": "TLS listener serving only GET /metrics.",
       "properties": {
         "enabled": {
-          "type": "boolean"
+          "enum": [true, false, "true", "false", "auto"],
+          "description": "auto serves the listener for the grid-gateway image on OpenShift with networkPolicy.enabled and fills unset values from the platform. true needs each value set."
         },
         "port": {
           "type": "integer",
@@ -779,7 +796,8 @@
           "additionalProperties": false,
           "properties": {
             "enabled": {
-              "type": "boolean"
+              "enum": [true, false, "true", "false", "auto"],
+              "description": "auto renders the ServiceMonitor when the listener is on, monitoring.coreos.com/v1 is served, and a CA is set."
             },
             "interval": {
               "type": "string"
@@ -1122,6 +1140,25 @@
         }
       }
     },
+    "platform": {
+      "description": "Cloud whose load balancer settings LoadBalancer Services get: aws, azure, gcp, or any for all three, since each cloud reads only its own keys.",
+      "type": "string",
+      "enum": [
+        "",
+        "aws",
+        "azure",
+        "gcp",
+        "any"
+      ]
+    },
+    "loadBalancerScope": {
+      "description": "Reach of the provider load balancer on a cloud platform: internal (private network) or external (internet-facing).",
+      "type": "string",
+      "enum": [
+        "internal",
+        "external"
+      ]
+    },
     "route": {
       "type": "object",
       "additionalProperties": false,
@@ -1316,6 +1353,16 @@
               "additionalProperties": false,
               "description": "Rendered as the filter's prefix_affinity.",
               "properties": {
+                "capacity": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Maximum prefix entries per backend cluster in each gateway replica; defaults to 16384."
+                },
+                "ttl_secs": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Prefix lifetime after a successful response, in seconds; defaults to 600."
+                },
                 "enabled": {
                   "type": "boolean"
                 },

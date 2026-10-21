@@ -213,7 +213,7 @@ fn start_metrics_listener(config: &Config) -> Result<(), String> {
     let listener = metrics_listener::MetricsListener::from_env(|name| std::env::var(name).ok())?;
     // Praxis installs the recorder only when the admin server starts, after grid routing
     // publishes its first snapshot, so install it now when anything will serve metrics.
-    if listener.is_some() || config.admin.address.is_some() {
+    if listener.is_some() || config.admin.address.is_some() || config.admin.metrics_address.is_some() {
         praxis_protocol::http::pingora::metrics::install_prometheus_recorder();
         ai_grid_filters::describe_metrics();
     }
