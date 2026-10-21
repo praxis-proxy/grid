@@ -133,7 +133,9 @@ The hub hosts enrollment, so it cannot enroll itself. Set `hubSite.name` and the
 The invite token Secrets live in a namespace of their own, `<release-namespace>-invites`
 unless `enrollment.inviteSecrets.namespace` names another. The chart creates it, since
 nothing else owns it, and the render refuses both the release namespace and
-`hubSite.namespace` for it.
+`hubSite.namespace` for it. Naming one explicitly makes it yours: the chart then creates
+nothing, because a hook deletes what it finds before creating and a namespace you already
+filled would go with it. Create it before installing in that case.
 
 That separation is not tidiness. The service needs `get`, `create` and `delete` on Secrets
 there unscoped by name, because invite names are per site, and admission can confine the

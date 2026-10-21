@@ -96,14 +96,15 @@ tests:
           path: metadata.annotations["helm.sh/hook-weight"]
           value: "-30"
 
-  - it: creates an explicit invite namespace too
+  - it: leaves an explicitly named invite namespace alone
     template: templates/enrollment/invite-namespace.yaml
     set:
       enrollment.inviteSecrets.namespace: grid-invites
     asserts:
-      - equal:
-          path: metadata.name
-          value: grid-invites
+      # Its author owns it and may have filled it, and a hook deletes what it finds
+      # before creating, so creating it here would destroy it.
+      - hasDocuments:
+          count: 0
 
   - it: refuses sharing the hub operator's namespace
     template: templates/enrollment/site-invite-rbac.yaml

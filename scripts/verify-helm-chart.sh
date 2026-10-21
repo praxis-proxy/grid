@@ -1608,8 +1608,11 @@ GEN_EOF
   # The chart owns the invite namespace, so an install into a fresh namespace has to
   # succeed and the namespace has to be there afterwards. The old form of this check
   # asserted the opposite and counted any unrelated install failure as a pass.
-  if helm install enroll-fresh charts/grid-enrollment --namespace enroll-fresh \
-    --create-namespace --kube-context "$KCTX" --wait --timeout 5m >/dev/null 2>&1; then
+  FRESH_ARGS=(--namespace enroll-fresh --create-namespace --kube-context "$KCTX" --wait --timeout 5m)
+  if [ -n "${ENROLL_IMAGE_REF:-}" ]; then
+    FRESH_ARGS+=(--set "image.repository=${ENROLL_IMAGE_REF%%:*}" --set "image.tag=${ENROLL_IMAGE_REF##*:}")
+  fi
+  if helm install enroll-fresh charts/grid-enrollment "${FRESH_ARGS[@]}" >/dev/null 2>&1; then
     pass "kind: install creates its own invite namespace"
     if kubectl --context "$KCTX" get namespace enroll-fresh-invites >/dev/null 2>&1; then
       pass "kind: enroll-fresh-invites exists after install"

@@ -1,5 +1,9 @@
 {{- include "grid-enrollment.normalize" . }}
 {{- $ns := include "grid-enrollment.inviteSecretsNamespace" . }}
+{{- /* Only the derived namespace. An explicit value names a namespace its author owns and
+       may already have filled, and a hook deletes what it finds before creating, so this
+       would destroy it. */}}
+{{- if not .Values.enrollment.inviteSecrets.namespace }}
 {{/*
 The invite tokens need a namespace apart from the one holding the Grid CA signing key,
 because the service's get on Secrets there cannot be scoped by name and admission never
@@ -26,3 +30,4 @@ metadata:
     helm.sh/hook: pre-install
     helm.sh/hook-weight: "-30"
     helm.sh/hook-delete-policy: before-hook-creation
+{{- end }}
