@@ -66,9 +66,12 @@ struct BootstrapArgs {
     skip_ca: bool,
     /// Wait for the admission policy that confines this account's unscopable Secret
     /// create before writing anything. Off by default: only the renderer knows whether it
-    /// rendered that policy, so the chart sets this when it did. A deployment without the
-    /// policy, or an older chart that never rendered one, is unaffected.
-    #[arg(long)]
+    /// rendered that policy, so the chart sets this when it did.
+    ///
+    /// Carried as an environment variable rather than only a flag, because the chart has
+    /// to set it on whatever image it is pinned to. An image that predates this ignores an
+    /// env var it does not read, where an argument it does not know is fatal.
+    #[arg(long, env = "ENROLLMENT_WAIT_FOR_CONFINEMENT")]
     wait_for_confinement: bool,
     /// Secret for the builtin Postgres credentials, created once with a generated password.
     #[arg(long)]

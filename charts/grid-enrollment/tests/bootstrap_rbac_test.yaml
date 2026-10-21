@@ -233,7 +233,6 @@ tests:
           value:
             - --namespace
             - NAMESPACE
-            - --wait-for-confinement
             - --admin-tokens-secret
             - RELEASE-NAME-grid-enrollment-grid-admin-tokens
             - --skip-ca
@@ -318,6 +317,7 @@ tests:
           path: spec.template.spec.containers[0].env
           value:
             - {name: RUST_LOG, value: info}
+            - {name: ENROLLMENT_WAIT_FOR_CONFINEMENT, value: "true"}
 
   - it: grants the bootstrap only its Secrets in the hub namespace
     template: templates/certs/ca-bootstrap-rbac.yaml
@@ -450,14 +450,23 @@ tests:
     template: templates/certs/ca-bootstrap-job.yaml
     asserts:
       - contains:
-          path: spec.template.spec.containers[0].args
-          content: --wait-for-confinement
+          path: spec.template.spec.containers[0].env
+          content: {name: ENROLLMENT_WAIT_FOR_CONFINEMENT, value: "true"}
 
-  - it: asks for no wait when no policy renders, so an older chart is unaffected
+  - it: asks for no wait when no policy renders
     template: templates/certs/ca-bootstrap-job.yaml
     set:
       ca.bootstrap.policy.enabled: false
     asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content: {name: ENROLLMENT_WAIT_FOR_CONFINEMENT, value: "true"}
+
+  - it: never passes an argument the pinned image may not know
+    template: templates/certs/ca-bootstrap-job.yaml
+    asserts:
+      # An image predating the gate ignores an env var it does not read; an argument it
+      # does not know is fatal, which broke the chart's own default image.
       - notContains:
           path: spec.template.spec.containers[0].args
           content: --wait-for-confinement
