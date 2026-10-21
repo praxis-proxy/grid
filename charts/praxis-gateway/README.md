@@ -506,8 +506,11 @@ The operator's own charts grant no unrestricted Deployment access; certificate
 rotation retains a grant on the named gateway Deployment. With
 `mountReconciliation.enabled`, this chart renders a Role and RoleBinding in
 the release namespace that let `mountReconciliation.operator.serviceAccount`
-in `mountReconciliation.operator.namespace` `get` and `patch` this chart's Deployment and no other. The Role
-names the Deployment with the same helper as the Deployment itself, so
+in `mountReconciliation.operator.namespace` `get` and `patch` this chart's
+Deployment and no other. The account name defaults to `grid-operator`; its
+namespace has none, because a Helm install and a platform install put the
+operator in different ones. The Role names the Deployment with the same helper
+as the Deployment itself, so
 `fullnameOverride` moves both. Set `mountReconciliation.rbac.create: false`
 to bring your own Role, for example from an installer that may not create
 RBAC; the Role to create, and what the grant still allows (`patch` is
