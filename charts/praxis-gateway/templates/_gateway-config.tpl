@@ -220,7 +220,7 @@ load_balancer, which selects by the same name and endpoint order.
 {{- $root := .root }}
 {{- $i := .i }}
 {{- $b := .b }}
-{{- $mode := ($b.transport).mode | default (ternary "mutual_tls" "plaintext" $root.Values.tls.enabled) }}
+{{- $mode := ($b.transport).mode | default (ternary "mutual_tls" "plaintext" (not (empty $root.Values.gridIdentity.tlsSecretName))) }}
 {{- $hc := $b.healthCheck | default dict }}
 {{- /* A mutual_tls backend is another site's gateway: bounded connects and a faster probe, since little traffic reaches it to trip the passive check. */}}
 {{- $peer := eq $mode "mutual_tls" }}
@@ -230,16 +230,16 @@ load_balancer, which selects by the same name and endpoint order.
 {{- $probeTimeout := $hc.timeoutMs | default 2000 | int }}
 {{- $probeInterval := $hc.intervalMs | default (max (ternary 3000 5000 $peer) (add $probeTimeout 1000)) | int }}
 {{- if ge $probeTimeout $probeInterval }}
-{{- fail (printf "gatewayConfig.backends: %s healthCheck.timeoutMs (%d) must be less than intervalMs (%d)" $b.cluster $probeTimeout $probeInterval) }}
+{{- fail (printf "praxisConfig.render.backends: %s healthCheck.timeoutMs (%d) must be less than intervalMs (%d)" $b.cluster $probeTimeout $probeInterval) }}
 {{- end }}
 - name: {{ $b.cluster | quote }}
   {{- if eq $mode "mutual_tls" }}
   tls:
     ca:
-      ca_path: {{ printf "%s/ca.crt" $root.Values.tls.mountPath | quote }}
+      ca_path: {{ printf "%s/ca.crt" $root.Values.gridIdentity.mountPath | quote }}
     client_cert:
-      cert_path: {{ printf "%s/tls.crt" $root.Values.tls.mountPath | quote }}
-      key_path: {{ printf "%s/tls.key" $root.Values.tls.mountPath | quote }}
+      cert_path: {{ printf "%s/tls.crt" $root.Values.gridIdentity.mountPath | quote }}
+      key_path: {{ printf "%s/tls.key" $root.Values.gridIdentity.mountPath | quote }}
     sni: {{ include "praxis-gateway.backendSni" $b | quote }}
     verify: true
   {{- else if eq $mode "tls" }}

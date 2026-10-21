@@ -192,7 +192,7 @@ tests:
   - it: takes the passive thresholds from the backend's healthCheck
     template: templates/gateway-config.yaml
     set:
-      gatewayConfig.backends:
+      praxisConfig.render.backends:
         - cluster: pool-b
           endpoints: ["203.0.113.7:8443"]
           transport: { mode: mutual_tls, sni: site-b.grid.internal }
@@ -212,7 +212,7 @@ tests:
   - it: derives a remote site's omitted bound from the one set beside it
     template: templates/gateway-config.yaml
     set:
-      gatewayConfig.backends:
+      praxisConfig.render.backends:
         - cluster: pool-b
           endpoints: ["203.0.113.7:8443"]
           transport: { mode: mutual_tls, sni: site-b.grid.internal }
@@ -226,7 +226,7 @@ tests:
   - it: refuses a probe timeout Praxis would refuse
     template: templates/gateway-config.yaml
     set:
-      gatewayConfig.backends:
+      praxisConfig.render.backends:
         - cluster: pool-b
           endpoints: ["203.0.113.7:8443"]
           transport: { mode: mutual_tls, sni: site-b.grid.internal }
@@ -238,7 +238,7 @@ tests:
   - it: refuses a connect timeout past the total
     template: templates/deployment.yaml
     set:
-      gatewayConfig.backends:
+      praxisConfig.render.backends:
         - cluster: pool-b
           endpoints: ["203.0.113.7:8443"]
           transport: { mode: mutual_tls, sni: site-b.grid.internal }
@@ -251,7 +251,7 @@ tests:
   - it: leaves a local backend's connects to praxis and probes it every 5s
     template: templates/gateway-config.yaml
     set:
-      gatewayConfig.backends:
+      praxisConfig.render.backends:
         - cluster: local
           endpoints: ["10.96.0.20:8000"]
           transport: { mode: plaintext }
@@ -266,7 +266,7 @@ tests:
   - it: takes a remote site's timeouts and probe interval from the backend
     template: templates/gateway-config.yaml
     set:
-      gatewayConfig.backends:
+      praxisConfig.render.backends:
         - cluster: pool-b
           endpoints: ["203.0.113.7:8443"]
           transport: { mode: mutual_tls, sni: site-b.grid.internal }

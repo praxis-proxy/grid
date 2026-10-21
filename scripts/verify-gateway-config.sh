@@ -178,10 +178,10 @@ else
   fail "tls backend: rejected by $DEFAULT_GATEWAY_IMAGE: $(tail -1 "$WORK/tls.log")"
 fi
 # A remote site's gateway on the chart's mutual_tls defaults: Praxis checks the probe and connect bounds.
-render "$WORK/peer" --set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.model=qwen3 \
-  --set gatewayConfig.auth.mode=none --set tls.enabled=true --set tls.existingSecret=site --set tls.caSecret=ca \
-  --set "gatewayConfig.backends[0].cluster=site-b" --set "gatewayConfig.backends[0].site=site-b" \
-  --set "gatewayConfig.backends[0].endpoints[0]=203.0.113.7:8443" --set "gatewayConfig.backends[0].transport.mode=mutual_tls"
+render "$WORK/peer" --set praxisConfig.source=render --set grid.siteName=hub --set praxisConfig.render.model=qwen3 \
+  --set praxisConfig.render.auth.mode=none --set gridIdentity.tlsSecretName=site --set gridIdentity.caSecretName=ca \
+  --set "praxisConfig.render.backends[0].cluster=site-b" --set "praxisConfig.render.backends[0].site=site-b" \
+  --set "praxisConfig.render.backends[0].endpoints[0]=203.0.113.7:8443" --set "praxisConfig.render.backends[0].transport.mode=mutual_tls"
 mkdir -p "$WORK/peer/tls"
 if "$CRT" run --rm -v "$WORK/peer:/etc/praxis:ro,z" -v "$bca:/etc/praxis/tls:ro,z" "$DEFAULT_GATEWAY_IMAGE" \
     --config /etc/praxis/praxis.yaml --validate >"$WORK/peer.log" 2>&1; then
