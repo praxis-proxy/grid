@@ -7632,28 +7632,27 @@ fn collect_image_evidence() -> ImageEvidenceCollection {
     let mut collection = ImageEvidenceCollection::default();
 
     for cluster in CLUSTERS {
-        let context = format!("kind-grid-combined-{cluster}");
-        capture_deployment_image(&mut collection, cluster, &context, "operator", "grid-operator");
+        capture_deployment_image(&mut collection, cluster, "operator", "grid-operator", "operator");
         capture_deployment_image(
             &mut collection,
             cluster,
-            &context,
             "consumer_gateway",
             "consumer-gateway",
+            "praxis",
         );
         capture_deployment_image(
             &mut collection,
             cluster,
-            &context,
             "provider_gateway",
             "provider-gateway",
+            "praxis",
         );
         capture_deployment_image(
             &mut collection,
             cluster,
-            &context,
             "mock_inference",
             &format!("vcr-inference-{cluster}"),
+            "vcr",
         );
     }
 
@@ -7664,11 +7663,12 @@ fn collect_image_evidence() -> ImageEvidenceCollection {
 fn capture_deployment_image(
     collection: &mut ImageEvidenceCollection,
     cluster: &str,
-    context: &str,
     key: &str,
     deployment: &str,
+    container_name: &str,
 ) {
-    match read_deployment_image(context, deployment) {
+    let context = format!("kind-grid-combined-{cluster}");
+    match read_deployment_image(context.as_str(), deployment, container_name) {
         Ok(image) => {
             collection.images.insert(format!("{cluster}_{key}"), image);
         },
@@ -7678,8 +7678,9 @@ fn capture_deployment_image(
     }
 }
 
-/// Read a deployment's Praxis container image reference from its Kubernetes context.
-fn read_deployment_image(context: &str, deployment: &str) -> Result<String, String> {
+/// Read one deployment container's image reference from its Kubernetes context.
+fn read_deployment_image(context: &str, deployment: &str, container_name: &str) -> Result<String, String> {
+    let image_path = format!(r#"jsonpath={{.spec.template.spec.containers[?(@.name=="{container_name}")].image}}"#);
     let output = Command::new("kubectl")
         .args([
             "get",
@@ -7689,7 +7690,7 @@ fn read_deployment_image(context: &str, deployment: &str) -> Result<String, Stri
             "-n",
             "grid-system",
             "-o",
-            r#"jsonpath={.spec.template.spec.containers[?(@.name=="praxis")].image}"#,
+            image_path.as_str(),
         ])
         .output()
         .map_err(|error| format!("could not start kubectl: {error}"))?;

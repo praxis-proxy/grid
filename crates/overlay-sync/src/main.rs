@@ -326,47 +326,6 @@ async fn serve_health_connection<I>(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, reason = "tests")]
-mod tests {
-    use tokio::io::AsyncWriteExt as _;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn health_connection_closes_incomplete_headers_after_deadline() {
-        let (mut client, server) = tokio::io::duplex(64);
-        let state = AppState {
-            status: SharedStatus::new("ns", "cm", "routing-overlay.json"),
-            metrics: Arc::new(Metrics::new()),
-        };
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
-        let slot = Arc::clone(&semaphore).acquire_owned().await.unwrap();
-        client
-            .write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\n")
-            .await
-            .unwrap();
-        let started = std::time::Instant::now();
-        serve_health_connection(
-            server,
-            "127.0.0.1:9091".parse().unwrap(),
-            build_health_router(state),
-            slot,
-            Duration::from_millis(25),
-        )
-        .await;
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "an incomplete health request must not hold its connection open",
-        );
-    }
-}
-
 /// Build the axum router for health endpoints.
 fn build_health_router(state: AppState) -> Router {
     Router::new()
@@ -409,4 +368,44 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
         [(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         body,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, reason = "tests")]
+mod tests {
+    use tokio::io::AsyncWriteExt as _;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn health_connection_closes_incomplete_headers_after_deadline() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let state = AppState {
+            status: SharedStatus::new("ns", "cm", "routing-overlay.json"),
+            metrics: Arc::new(Metrics::new()),
+        };
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        client
+            .write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        serve_health_connection(
+            server,
+            "127.0.0.1:9091".parse().unwrap(),
+            build_health_router(state),
+            semaphore.acquire_owned().await.unwrap(),
+            Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an incomplete health request must not hold its connection open",
+        );
+    }
 }
