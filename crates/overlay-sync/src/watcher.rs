@@ -28,6 +28,9 @@ use crate::{
     validation::{self, ExpectedScope, RejectionReason},
 };
 
+/// How long the initial `ConfigMap` GET may take before the sidecar retries.
+const INITIAL_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -105,26 +108,47 @@ pub(crate) async fn initial_fetch(
 ) -> bool {
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
 
-    match api.get(&config.config_map_name).await {
-        Ok(cm) => matches!(
-            process_configmap(&cm, config, status, metrics),
-            ProcessOutcome::Written | ProcessOutcome::Unchanged
-        ),
-        Err(e) => {
-            tracing::warn!(
-                config_map = %config.config_map_name,
-                error = %e,
-                "initial GET failed"
-            );
-            status.mark_degraded("api_unavailable");
-            metrics.degraded.set(1);
-            metrics
-                .events_total
-                .with_label_values(&["error", "api_unavailable"])
-                .inc();
-            false
+    let config_map = match tokio::time::timeout(INITIAL_FETCH_TIMEOUT, api.get(&config.config_map_name)).await {
+        Ok(Ok(config_map)) => config_map,
+        Ok(Err(error)) => {
+            record_initial_get_failure(config, status, metrics, "api_unavailable", &error);
+            return false;
         },
-    }
+        Err(_) => {
+            record_initial_get_timeout(config, status, metrics);
+            return false;
+        },
+    };
+    matches!(
+        process_configmap(&config_map, config, status, metrics),
+        ProcessOutcome::Written | ProcessOutcome::Unchanged
+    )
+}
+
+/// Record a failed initial GET and leave the sidecar degraded.
+fn record_initial_get_failure(
+    config: &WatcherConfig,
+    status: &SharedStatus,
+    metrics: &Arc<Metrics>,
+    reason: &str,
+    error: &(dyn std::fmt::Display + Send + Sync + 'static),
+) {
+    tracing::warn!(config_map = %config.config_map_name, error = %error, "initial GET failed");
+    status.mark_degraded(reason);
+    metrics.degraded.set(1);
+    metrics.events_total.with_label_values(&["error", reason]).inc();
+}
+
+/// Record an initial GET that exceeded its complete-request deadline.
+fn record_initial_get_timeout(config: &WatcherConfig, status: &SharedStatus, metrics: &Arc<Metrics>) {
+    tracing::warn!(
+        config_map = %config.config_map_name,
+        timeout_secs = INITIAL_FETCH_TIMEOUT.as_secs(),
+        "initial GET timed out"
+    );
+    status.mark_degraded("api_timeout");
+    metrics.degraded.set(1);
+    metrics.events_total.with_label_values(&["error", "api_timeout"]).inc();
 }
 
 /// Wait until an operator-produced overlay has been fetched and published.
@@ -851,5 +875,22 @@ mod tests {
         assert_eq!(next_30s, Duration::from_secs(30));
         let (_, next_cap) = next_backoff(Duration::from_secs(30));
         assert_eq!(next_cap, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn initial_get_timeout_marks_the_sidecar_degraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("routing-overlay.json"));
+        let status = SharedStatus::new("ns", "cm", "key");
+        let metrics = Arc::new(Metrics::new());
+
+        record_initial_get_timeout(&config, &status, &metrics);
+        let response = serde_json::to_value(status.to_response()).unwrap();
+        assert_eq!(
+            response.pointer("/degraded_reason").and_then(serde_json::Value::as_str),
+            Some("api_timeout"),
+            "a timed-out initial GET must enter the retry path instead of hanging",
+        );
+        assert_eq!(metrics.degraded.get(), 1);
     }
 }
