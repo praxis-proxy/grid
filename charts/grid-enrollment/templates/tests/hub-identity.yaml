@@ -21,9 +21,13 @@ metadata:
 spec:
   restartPolicy: Never
   automountServiceAccountToken: false
+  securityContext:
+    {{- include "grid-enrollment.testPodSecurityContext" . | nindent 4 }}
   containers:
     - name: identity-check
       image: busybox:1.37
+      securityContext:
+        {{- toYaml .Values.enrollment.securityContext | nindent 8 }}
       command:
         - sh
         - -c

@@ -1566,12 +1566,15 @@ SA_TOKEN_EOF
 
   # The DELETE arm reads oldObject, which the create probes never exercise.
   SVC_SA="system:serviceaccount:${ENROLL_NS}:grid-enrollment"
-  kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" create secret generic not-an-invite \
-    --from-literal=a=b >/dev/null 2>&1
-  deny_probe "policy denies deleting a non-invite Secret" 15 \
-    kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" delete secret not-an-invite \
-    --as="$SVC_SA" --dry-run=server
-  kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" delete secret not-an-invite >/dev/null 2>&1 || true
+  if kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" create secret generic not-an-invite \
+    --from-literal=a=b >/dev/null 2>&1; then
+    deny_probe "policy denies deleting a non-invite Secret" 15 \
+      kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" delete secret not-an-invite \
+      --as="$SVC_SA" --dry-run=server
+    kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" delete secret not-an-invite >/dev/null 2>&1 || true
+  else
+    fail "kind: could not create the not-an-invite probe Secret, so the DELETE arm is untested"
+  fi
 
   # An invite name in the wrong namespace is still outside the grant.
   policy_deny_probe "policy denies an invite Secret outside the invite namespace" 15 \
@@ -1619,23 +1622,48 @@ GEN_EOF
     else
       fail "kind: enroll-fresh-invites missing after install"
     fi
+    # The namespace is kept, not hooked, so an uninstall and a reinstall must both leave
+    # an unredeemed token in place. As a hook, before-hook-creation deleted the namespace
+    # on the reinstall and took the token with it.
+    if kubectl --context "$KCTX" -n enroll-fresh-invites create secret generic grid-invite-reinstall \
+      --from-literal=token=outstanding >/dev/null 2>&1; then
+      helm uninstall enroll-fresh --namespace enroll-fresh --kube-context "$KCTX" >/dev/null 2>&1 || true
+      if kubectl --context "$KCTX" -n enroll-fresh-invites get secret grid-invite-reinstall >/dev/null 2>&1; then
+        pass "kind: an outstanding invite survives an uninstall"
+      else
+        fail "kind: the uninstall destroyed an outstanding invite"
+      fi
+      if helm install enroll-fresh charts/grid-enrollment "${FRESH_ARGS[@]}" >/dev/null 2>&1; then
+        if kubectl --context "$KCTX" -n enroll-fresh-invites get secret grid-invite-reinstall >/dev/null 2>&1; then
+          pass "kind: an outstanding invite survives a reinstall"
+        else
+          fail "kind: the reinstall destroyed an outstanding invite"
+        fi
+      else
+        fail "kind: reinstall over a kept invite namespace failed"
+      fi
+    else
+      fail "kind: could not create the reinstall probe invite, so survival is untested"
+    fi
   else
     fail "kind: install into a fresh namespace failed"
   fi
   helm uninstall enroll-fresh --namespace enroll-fresh --kube-context "$KCTX" >/dev/null 2>&1 || true
   kubectl --context "$KCTX" delete namespace enroll-fresh enroll-fresh-invites --wait=false >/dev/null 2>&1 || true
 
-  # An upgrade must not take the invite tokens with it. before-hook-creation on a
-  # pre-upgrade Namespace hook deletes the namespace and cascades to the Secrets inside,
-  # so the hook is pre-install only and this proves the token survives.
-  kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" create secret generic grid-invite-survivor \
-    --from-literal=token=outstanding >/dev/null 2>&1
-  if helm upgrade grid-enrollment charts/grid-enrollment --reuse-values \
-    --namespace "$ENROLL_NS" --kube-context "$KCTX" --wait --timeout 5m >/dev/null 2>&1 \
-    && kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" get secret grid-invite-survivor >/dev/null 2>&1; then
-    pass "kind: an outstanding invite survives an upgrade"
+  # An upgrade must not take the invite tokens with it either. The namespace is a kept
+  # regular resource, so no phase deletes it to recreate it.
+  if kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" create secret generic grid-invite-survivor \
+    --from-literal=token=outstanding >/dev/null 2>&1; then
+    if helm upgrade grid-enrollment charts/grid-enrollment --reuse-values \
+      --namespace "$ENROLL_NS" --kube-context "$KCTX" --wait --timeout 5m >/dev/null 2>&1 \
+      && kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" get secret grid-invite-survivor >/dev/null 2>&1; then
+      pass "kind: an outstanding invite survives an upgrade"
+    else
+      fail "kind: the upgrade destroyed an outstanding invite"
+    fi
   else
-    fail "kind: the upgrade destroyed an outstanding invite"
+    fail "kind: could not create the grid-invite-survivor Secret, so survival is untested"
   fi
   kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" delete secret grid-invite-survivor >/dev/null 2>&1 || true
 

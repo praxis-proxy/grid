@@ -134,8 +134,8 @@ The invite token Secrets live in a namespace of their own, `<release-namespace>-
 unless `enrollment.inviteSecrets.namespace` names another. The chart creates it, since
 nothing else owns it, and the render refuses both the release namespace and
 `hubSite.namespace` for it. Naming one explicitly makes it yours: the chart then creates
-nothing, because a hook deletes what it finds before creating and a namespace you already
-filled would go with it. Create it before installing in that case.
+nothing, since a namespace you already filled is not this release's to take over. Create
+it before installing in that case.
 
 That separation is not tidiness. The service needs `get`, `create` and `delete` on Secrets
 there unscoped by name, because invite names are per site, and admission can confine the
@@ -143,11 +143,16 @@ writes but never the `get`, since admission does not run on reads. Sharing the r
 namespace would let the service read the Grid CA signing key; sharing `hubSite.namespace`
 would let it read the hub's identity and the grid CA the bootstrap writes there.
 
-The namespace hook is pre-install only. Helm defaults a hook to
-`before-hook-creation`, which on `pre-upgrade` would delete the namespace before
-recreating it and take every unredeemed invite token with it. Nothing re-runs on upgrade,
-so changing `enrollment.inviteSecrets.namespace` on an existing release needs the new
-namespace created by hand; the Role apply fails if it is missing.
+The namespace is a regular resource annotated `helm.sh/resource-policy: keep`, not a
+hook. Helm cannot disable `before-hook-creation`, which deletes a hook resource it finds
+before creating it, and the Secrets here are unredeemed invite tokens: as a hook it would
+lose them on a reinstall after an uninstall, and on every Argo CD sync that maps
+`pre-install` to `PreSync`. Nothing in the pre-install phase writes here, so nothing needs
+it to be a hook. `keep` also means it outlives an uninstall, so the tokens survive one. A
+reinstall under the same release name and namespace adopts it; under a different release
+name Helm refuses the install on ownership rather than deleting it. Changing
+`enrollment.inviteSecrets.namespace` on an existing release needs the new namespace created
+by hand; the Role apply fails if it is missing.
 
 **Upgrading from a release that kept invites in the release namespace.** The service now
 reads them from the invite namespace, so a `grid-invite-*` Secret still sitting in the

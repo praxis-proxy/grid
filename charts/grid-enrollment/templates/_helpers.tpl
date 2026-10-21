@@ -381,3 +381,14 @@ RUST_LOG for the chart's Rust binaries: log.filter when set, else log.level.
 {{- $log := .Values.log | default dict -}}
 {{- $log.filter | default $log.level | default "info" -}}
 {{- end }}
+
+{{/*
+Pod security context for the helm tests. The chart's own context plus a non-root UID,
+because the test image is busybox and runAsNonRoot alone would refuse to start it. An
+explicit runAsUser wins, so an override still decides.
+*/}}
+{{- define "grid-enrollment.testPodSecurityContext" -}}
+{{- $ctx := deepCopy (.Values.enrollment.podSecurityContext | default dict) -}}
+{{- if not (hasKey $ctx "runAsUser") }}{{- $_ := set $ctx "runAsUser" 65534 -}}{{- end }}
+{{- toYaml $ctx -}}
+{{- end }}

@@ -92,17 +92,13 @@ tests:
       - equal:
           path: metadata.name
           value: NAMESPACE-invites
-      - equal:
-          path: metadata.annotations["helm.sh/hook-weight"]
-          value: "-30"
 
   - it: leaves an explicitly named invite namespace alone
     template: templates/enrollment/invite-namespace.yaml
     set:
       enrollment.inviteSecrets.namespace: grid-invites
     asserts:
-      # Its author owns it and may have filled it, and a hook deletes what it finds
-      # before creating, so creating it here would destroy it.
+      # Its author owns it and may have filled it, so this release does not take it over.
       - hasDocuments:
           count: 0
 
@@ -130,9 +126,26 @@ tests:
           path: metadata.namespace
           value: grid-invites
 
-  - it: never re-runs the namespace hook on upgrade, which would delete the tokens
+  # before-hook-creation cannot be disabled, so any hook phase would delete this
+  # namespace and the unredeemed tokens in it on a reinstall or an Argo CD sync.
+  - it: is not a hook, so nothing ever deletes it to recreate it
     template: templates/enrollment/invite-namespace.yaml
     asserts:
-      - equal:
+      - notExists:
           path: metadata.annotations["helm.sh/hook"]
-          value: pre-install
+      - notExists:
+          path: metadata.annotations["helm.sh/hook-delete-policy"]
+      - equal:
+          path: metadata.annotations["helm.sh/resource-policy"]
+          value: keep
+
+  # Helm's install order places a Namespace before a Role, so the invite RBAC must stay
+  # a regular resource: a hook would run before the namespace exists.
+  - it: keeps the invite RBAC a regular resource, which install order puts after it
+    template: templates/enrollment/site-invite-rbac.yaml
+    documentSelector:
+      path: kind
+      value: Role
+    asserts:
+      - notExists:
+          path: metadata.annotations["helm.sh/hook"]

@@ -528,7 +528,10 @@ after the `GridNetwork` stops delegating.
 
 Upgrading from v0.2.0 with delegation enabled: the v0.2.0 operator charts
 granted every Deployment in their resource namespaces, and that rule is
-gone. Upgrade this chart first, so the Role exists, then the operator. Out
+gone. Upgrade this chart first, so the Role exists, then the operator. Set
+`mountReconciliation.operator.namespace` on that upgrade: it no longer
+defaults, so a release that left it unset fails to render until it names the
+namespace the operator runs in. Out
 of order, the operator reports
 `mountReconciliationStatus[].reason: DeploymentForbidden`, patches nothing,
 retains the previous populated routing overlay, and cannot publish new
@@ -551,6 +554,8 @@ mountReconciliation:
   gatewayRef: consumer-gateway
   managedCredentialNames: [backend-api-token]
   releaseHelmMounts: false
+  operator:
+    namespace: grid-system # the operator's namespace, which has no default
 providerCredentials:
   - secretName: backend-api-token
     mountPath: /run/secrets/backend-api-token # retained during preparation

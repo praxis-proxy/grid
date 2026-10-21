@@ -236,7 +236,9 @@ the operator ServiceAccount from `mountReconciliation.operator`
 (`grid-operator`, whose namespace has no default, since a Helm and a
 platform install put the operator in different ones). For a Deployment the chart
 did not install, or with `mountReconciliation.rbac.create: false`, create
-the equivalent by hand:
+the equivalent by hand, substituting the namespace the operator runs in:
+`grid-system` in this example, `odh-ai-grid` under OpenDataHub and
+`redhat-ai-grid` under Red Hat OpenShift AI.
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -258,7 +260,7 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: grid-operator
-    namespace: grid-system
+    namespace: grid-system          # the operator namespace, not a default
 roleRef:
   kind: Role
   name: inference-gw-mount-reconciliation
@@ -374,7 +376,7 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: grid-operator
-    namespace: grid-system
+    namespace: grid-system          # the operator namespace, not a default
 roleRef:
   kind: ClusterRole
   name: grid-operator-resources

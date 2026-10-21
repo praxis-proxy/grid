@@ -1,8 +1,7 @@
 {{- include "grid-enrollment.normalize" . }}
 {{- $ns := include "grid-enrollment.inviteSecretsNamespace" . }}
 {{- /* Only the derived namespace. An explicit value names a namespace its author owns and
-       may already have filled, and a hook deletes what it finds before creating, so this
-       would destroy it. */}}
+       may already have filled, so this release does not take it over. */}}
 {{- if not .Values.enrollment.inviteSecrets.namespace }}
 {{/*
 The invite tokens need a namespace apart from the one holding the Grid CA signing key,
@@ -10,15 +9,20 @@ because the service's get on Secrets there cannot be scoped by name and admissio
 sees a read. Nothing else owns that namespace, so this release creates it rather than
 leaving a security property to a remembered kubectl command.
 
-A pre-install hook ahead of the RBAC at -10, since the Role lands inside it, and
-pre-install only. Helm defaults a hook to before-hook-creation, which on pre-upgrade
-would delete this Namespace before recreating it and take every unredeemed invite token
-with it. Nothing re-runs on upgrade, so the namespace and its Secrets survive. Changing
-inviteSecrets.namespace on an existing release therefore needs the new namespace created
-by hand; the Role apply fails loudly if it is missing.
+A regular resource rather than a hook. Helm cannot disable before-hook-creation, which
+deletes a hook resource it finds before creating it, and this namespace's Secrets are
+unredeemed invite tokens: a reinstall after an uninstall, or an Argo CD sync that maps
+pre-install to PreSync, would destroy them. Nothing in the pre-install phase writes here,
+so nothing needs it to be a hook: the invite Role and RoleBinding are regular resources
+that Helm's install order already places after a Namespace, the invite Job is
+post-install and runs in the release namespace, and the admission policy only names this
+namespace in a match condition.
 
-Like the hook RBAC and the admission policies it outlives an uninstall; the README says
-how to remove it.
+resource-policy keep makes it outlive an uninstall, so the tokens survive one. A
+reinstall under the same release name and namespace adopts it through Helm's ownership
+metadata; under a different release name Helm refuses the install rather than deleting
+it. Changing inviteSecrets.namespace on an existing release needs the new namespace
+created by hand; the Role apply fails loudly if it is missing.
 */}}
 apiVersion: v1
 kind: Namespace
@@ -27,7 +31,5 @@ metadata:
   labels:
     {{- include "grid-enrollment.labels" . | nindent 4 }}
   annotations:
-    helm.sh/hook: pre-install
-    helm.sh/hook-weight: "-30"
-    helm.sh/hook-delete-policy: before-hook-creation
+    helm.sh/resource-policy: keep
 {{- end }}
