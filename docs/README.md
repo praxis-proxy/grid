@@ -84,6 +84,8 @@ image preparation, execution, evidence, and cleanup.
 
 ## Installation
 
+- [Getting Started](installation/getting-started.md): a hub and one site on
+  two kind clusters, enrolled, with SPIFFE trust and polled signals.
 - [Existing-Cluster Helm Installation](installation/existing-clusters.md):
   install AGN and Praxis on running Kubernetes clusters with Helm.
 - [0.3.x CRD Field Migration](installation/migration-0.3.x.md) — migrate

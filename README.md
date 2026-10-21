@@ -58,11 +58,13 @@ controllers, trust lifecycle, signals, and deployment layouts.
 
 | Goal | Start here | What it creates or requires |
 | --- | --- | --- |
+| Run a hub and one site locally | [Getting started][getting-started] | Two kind clusters, a hub, an enrolled site, SPIFFE peer trust, polled signals, and one served request. Requires kind, kubectl, Helm 3.17 or later, and a container runtime. |
 | Exercise routing locally | [Single-cluster qualification][single-cluster] | One disposable kind cluster, an operator, two consumer gateways, three provider gateways, and attributed simulators. Requires Docker, kind, kubectl, Helm, OpenSSL, Rust, and the images/source described in the guide. |
 | Install on existing clusters | [Existing-cluster installation][installation] | Separate operator and gateway Helm releases, site resources, and optional mock providers. Requires cluster contexts, connectivity, TLS material, and provider credentials. |
 | Inspect a small external-API declaration | [Single-cluster API example][api-example] | Network, site, and provider manifests. Requires an installed operator, an API credential, and a separately configured gateway; the example alone does not route requests. |
 | Explore complete demonstrations | [Praxis demos] | Scenario-specific deployments and runtime checks, maintained in a separate repository. |
 
+[getting-started]: docs/installation/getting-started.md
 [single-cluster]: tests/e2e/topologies/grid-single-cluster-multi-gateway/README.md
 [installation]: docs/installation/existing-clusters.md
 [api-example]: deploy/examples/single-cluster-api-provider/README.md

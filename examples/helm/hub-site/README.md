@@ -66,7 +66,7 @@ helm upgrade --install grid-site charts/grid-site -n grid \
   --set gridNetwork.gridId=grid-1 --set gridSite.name=site-a --set peers.hub.digest="$HUB_DIGEST" \
   --set inferenceProviders.my-model.endpoint=http://10.96.0.20:8000
 helm upgrade --install grid-gateway charts/praxis-gateway -n grid \
-  --set image.repository=ghcr.io/praxis-proxy/grid-gateway --set image.tag=v0.1.4 \
+  --set image.repository=ghcr.io/praxis-proxy/grid-gateway --set image.tag=v0.2.0 \
   --set gatewayConfig.role=provider --set gatewayConfig.localSite=site-a \
   --set gatewayConfig.peerTrust.digest="$HUB_DIGEST" --set gatewayConfig.backends.local.endpoint=10.96.0.20:8000
 ```

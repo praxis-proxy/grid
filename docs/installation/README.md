@@ -1,5 +1,7 @@
 # Installation
 
+- [Getting Started](getting-started.md): a hub and one site on two kind
+  clusters, enrolled, with SPIFFE trust and polled signals.
 - [Existing-Cluster Helm Installation](existing-clusters.md): install
   AGN and Praxis on running Kubernetes clusters with Helm.
 - [0.3.x CRD Field Migration](migration-0.3.x.md) — migrate deprecated field
