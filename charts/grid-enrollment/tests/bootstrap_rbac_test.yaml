@@ -233,6 +233,7 @@ tests:
           value:
             - --namespace
             - NAMESPACE
+            - --wait-for-confinement
             - --admin-tokens-secret
             - RELEASE-NAME-grid-enrollment-grid-admin-tokens
             - --skip-ca
@@ -445,18 +446,18 @@ tests:
           path: spec.template.spec.containers[0].args
           content: svc.internal
 
-  - it: tells the bootstrap not to wait when no policy will deny its probe
+  - it: asks the bootstrap to wait only when it renders the policy
+    template: templates/certs/ca-bootstrap-job.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --wait-for-confinement
+
+  - it: asks for no wait when no policy renders, so an older chart is unaffected
     template: templates/certs/ca-bootstrap-job.yaml
     set:
       ca.bootstrap.policy.enabled: false
     asserts:
-      - contains:
-          path: spec.template.spec.containers[0].args
-          content: --skip-confinement-wait
-
-  - it: makes the bootstrap wait whenever a policy renders
-    template: templates/certs/ca-bootstrap-job.yaml
-    asserts:
       - notContains:
           path: spec.template.spec.containers[0].args
-          content: --skip-confinement-wait
+          content: --wait-for-confinement

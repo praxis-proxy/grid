@@ -60,10 +60,11 @@ spec:
           args:
             - "--namespace"
             - "{{ .Release.Namespace }}"
-            {{- if not (dig "bootstrap" "policy" "enabled" true .Values.ca) }}
-            {{- /* No policy renders, so nothing would ever deny the bootstrap's probe and
-                   it would wait out its retries and fail the install. */}}
-            - "--skip-confinement-wait"
+            {{- if dig "bootstrap" "policy" "enabled" true .Values.ca }}
+            {{- /* Only this chart knows it rendered the policy, so only it asks the
+                   bootstrap to wait for enforcement. Left off, an older chart or a
+                   deployment without the policy is unaffected. */}}
+            - "--wait-for-confinement"
             {{- end }}
             {{- if include "grid-enrollment.generatesDbCredentials" . }}
             - "--db-credentials-secret"

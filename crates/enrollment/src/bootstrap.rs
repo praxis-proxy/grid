@@ -64,10 +64,12 @@ struct BootstrapArgs {
     /// Leave the CA and every certificate alone: a provided CA serves instead.
     #[arg(long)]
     skip_ca: bool,
-    /// Write without waiting for the admission policy that confines this account's
-    /// unscopable Secret create. For a cluster where that policy is deliberately off.
+    /// Wait for the admission policy that confines this account's unscopable Secret
+    /// create before writing anything. Off by default: only the renderer knows whether it
+    /// rendered that policy, so the chart sets this when it did. A deployment without the
+    /// policy, or an older chart that never rendered one, is unaffected.
     #[arg(long)]
-    skip_confinement_wait: bool,
+    wait_for_confinement: bool,
     /// Secret for the builtin Postgres credentials, created once with a generated password.
     #[arg(long)]
     db_credentials_secret: Option<String>,
@@ -282,16 +284,14 @@ async fn probe_is_denied(
 /// that gap with the grant unconfined. Replacing the policy on upgrade reopens it.
 ///
 /// Probes with a name the policy cannot admit and requires the refusal. A 403 means the
-/// policy is live. A success means it is not yet, so this retries; `--skip-confinement-wait`
-/// is the escape hatch for a cluster where the policy is deliberately off.
+/// policy is live. A success means it is not yet, so this retries.
 async fn await_secret_confinement(
     secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
     args: &BootstrapArgs,
 ) -> Result<(), BoxError> {
     use kube::api::PostParams;
 
-    if args.skip_confinement_wait {
-        tracing::warn!("not waiting for Secret confinement; this account's create is unconfined");
+    if !args.wait_for_confinement {
         return Ok(());
     }
 
@@ -312,7 +312,7 @@ async fn await_secret_confinement(
     Err(
         "the admission policy confining this account's Secret writes is not enforcing; \
          it may be missing, or the API server has not compiled it. Re-run, or pass \
-         --skip-confinement-wait when ca.bootstrap.policy.enabled is false"
+         ca.bootstrap.policy.enabled=false if the policy is deliberately absent"
             .into(),
     )
 }
