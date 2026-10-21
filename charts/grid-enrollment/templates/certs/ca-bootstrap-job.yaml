@@ -60,6 +60,11 @@ spec:
           args:
             - "--namespace"
             - "{{ .Release.Namespace }}"
+            {{- if not (dig "bootstrap" "policy" "enabled" true .Values.ca) }}
+            {{- /* No policy renders, so nothing would ever deny the bootstrap's probe and
+                   it would wait out its retries and fail the install. */}}
+            - "--skip-confinement-wait"
+            {{- end }}
             {{- if include "grid-enrollment.generatesDbCredentials" . }}
             - "--db-credentials-secret"
             - "{{ include "grid-enrollment.dbUrlSecret" . }}"

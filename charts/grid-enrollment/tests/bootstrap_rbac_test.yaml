@@ -444,3 +444,19 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].args
           content: svc.internal
+
+  - it: tells the bootstrap not to wait when no policy will deny its probe
+    template: templates/certs/ca-bootstrap-job.yaml
+    set:
+      ca.bootstrap.policy.enabled: false
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --skip-confinement-wait
+
+  - it: makes the bootstrap wait whenever a policy renders
+    template: templates/certs/ca-bootstrap-job.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --skip-confinement-wait
