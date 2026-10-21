@@ -29,12 +29,21 @@ mod types;
 mod validation;
 mod watcher;
 
-use std::{net::SocketAddr, path::Path, sync::Arc};
+use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use clap::Parser;
 
 use crate::{metrics::Metrics, status::SharedStatus, validation::ExpectedScope, watcher::WatcherConfig};
+
+/// How long a health client may take to finish sending request headers.
+const HEALTH_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum bytes buffered while reading one health request.
+const HEALTH_MAX_BUFFER_BYTES: usize = 8192;
+
+/// Health connections served at once; the health port is for kubelet probes only.
+const MAX_HEALTH_CONNECTIONS: usize = 32;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -263,8 +272,98 @@ async fn bind_and_serve(addr: SocketAddr, state: AppState) {
             return;
         },
     };
-    if let Err(e) = axum::serve(listener, app).await {
-        tracing::error!(error = %e, "health server error");
+    serve_health_connections(listener, app).await;
+}
+
+/// Accept health connections while keeping a hard cap on concurrent clients.
+async fn serve_health_connections(listener: tokio::net::TcpListener, app: Router) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_HEALTH_CONNECTIONS));
+    loop {
+        let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+            tracing::error!("health server connection slots closed");
+            return;
+        };
+        let (stream, remote) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                tracing::warn!(error = %e, "health server accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            },
+        };
+        tokio::spawn(serve_health_connection(
+            stream,
+            remote,
+            app.clone(),
+            slot,
+            HEALTH_HEADER_READ_TIMEOUT,
+        ));
+    }
+}
+
+/// Serve one health connection, holding its concurrency slot until it closes.
+async fn serve_health_connection<I>(
+    stream: I,
+    remote: SocketAddr,
+    app: Router,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+    header_read_timeout: Duration,
+) where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let service = hyper::service::service_fn(move |request: http::Request<hyper::body::Incoming>| {
+        use tower::Service as _;
+        app.clone().call(request)
+    });
+    let served = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(header_read_timeout)
+        .max_buf_size(HEALTH_MAX_BUFFER_BYTES)
+        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+        .await;
+    if let Err(error) = served {
+        tracing::debug!(%remote, %error, "health connection ended");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, reason = "tests")]
+mod tests {
+    use tokio::io::AsyncWriteExt as _;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn health_connection_closes_incomplete_headers_after_deadline() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let state = AppState {
+            status: SharedStatus::new("ns", "cm", "routing-overlay.json"),
+            metrics: Arc::new(Metrics::new()),
+        };
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let slot = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+        client
+            .write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        serve_health_connection(
+            server,
+            "127.0.0.1:9091".parse().unwrap(),
+            build_health_router(state),
+            slot,
+            Duration::from_millis(25),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an incomplete health request must not hold its connection open",
+        );
     }
 }
 

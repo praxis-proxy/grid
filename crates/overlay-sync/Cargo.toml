@@ -22,6 +22,8 @@ axum = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 futures = { workspace = true }
 http = { workspace = true }
+hyper = { workspace = true, features = ["server"] }
+hyper-util = { workspace = true }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
 prometheus = { workspace = true }
@@ -30,6 +32,7 @@ serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+tower = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
