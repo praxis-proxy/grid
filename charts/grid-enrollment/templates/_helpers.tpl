@@ -287,22 +287,20 @@ Job reads, keys in sorted order.
 {{- end }}
 
 {{/*
-Refuse a Secret delivery target that belongs to the platform. The bootstrap's Role in
-hubSite.namespace carries namespace-wide create on Secrets, since Kubernetes cannot
-scope create by name, so a mistyped target hands that grant to a namespace holding
-another component's Secrets.
-*/}}
-{{/*
 Namespace for the per-site invite token Secrets, defaulting beside the release rather
 than inside it. The service needs get, create and delete there unscoped by name, because
 invite names are per site, and admission cannot constrain a read, so sharing a namespace
-with the Grid CA signing key would let the service read that key. The chart creates no
-namespace, so this one has to exist before install.
+with either the Grid CA signing key or the hub's identity would let the service read it.
+invite-namespace.yaml creates this namespace.
 */}}
 {{- define "grid-enrollment.inviteSecretsNamespace" -}}
 {{- $ns := .Values.enrollment.inviteSecrets.namespace | default (printf "%s-invites" .Release.Namespace | trunc 63 | trimSuffix "-") -}}
 {{- if eq $ns .Release.Namespace }}
 {{- fail "enrollment.inviteSecrets.namespace must not be the release namespace: the enrollment service holds get on every Secret there, and that namespace holds the Grid CA signing key. Leave it empty for <release-namespace>-invites, or name a namespace that holds only invite tokens." }}
+{{- end }}
+{{- /* The same read reaches the hub identity and the grid CA the bootstrap writes there. */}}
+{{- if and .Values.hubSite.name (eq $ns .Values.hubSite.namespace) }}
+{{- fail "enrollment.inviteSecrets.namespace must not be hubSite.namespace: the enrollment service holds get on every Secret there, and the bootstrap writes the hub's identity and the grid CA into it. Leave it empty for <release-namespace>-invites, or name a namespace that holds only invite tokens." }}
 {{- end }}
 {{- $ns -}}
 {{- end }}
@@ -312,6 +310,12 @@ namespace, so this one has to exist before install.
 It must be the grid operator's own namespace: grid or grid-system under a Helm install, odh-ai-grid or redhat-ai-grid under a platform install, which derives it from the applications namespace rather than sharing it.
 {{- end }}
 
+{{/*
+Refuse a Secret delivery target that belongs to the platform. The bootstrap's Role in
+hubSite.namespace carries namespace-wide create on Secrets, since Kubernetes cannot
+scope create by name, so a mistyped target hands that grant to a namespace holding
+another component's Secrets.
+*/}}
 {{- define "grid-enrollment.refuseDeliveryNamespace" -}}
 {{- $ns := .ns }}
 {{/*

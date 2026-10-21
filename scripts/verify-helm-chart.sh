@@ -15,6 +15,33 @@ DEFAULT_GATEWAY_IMAGE="ghcr.io/praxis-proxy/ai:0.7.0"
 
 # Helpers
 
+# Asserts ADMISSION refused a write, not RBAC. Grants the probe account create on Secrets
+# in the namespace under test first, because without it RBAC refuses the request before any
+# policy is consulted and the probe passes having proven nothing.
+policy_deny_probe() {
+  local label="$1" tries="$2" ns="$3" sa="$4"; shift 4
+  local role="probe-create-secrets" out i
+  kubectl --context "$KCTX" create namespace "$ns" >/dev/null 2>&1 || true
+  kubectl --context "$KCTX" -n "$ns" create role "$role" \
+    --verb=create,delete --resource=secrets >/dev/null 2>&1 || true
+  kubectl --context "$KCTX" -n "$ns" create rolebinding "$role" \
+    --role="$role" --user="$sa" >/dev/null 2>&1 || true
+  for ((i = 0; i < tries; i++)); do
+    out=$("$@" 2>&1 || true)
+    case "$out" in
+      *"denied request"*) pass "kind: $label"
+        kubectl --context "$KCTX" -n "$ns" delete rolebinding "$role" >/dev/null 2>&1 || true
+        kubectl --context "$KCTX" -n "$ns" delete role "$role" >/dev/null 2>&1 || true
+        return 0 ;;
+    esac
+    sleep 2
+  done
+  fail "kind: $label -- saw: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"
+  kubectl --context "$KCTX" -n "$ns" delete rolebinding "$role" >/dev/null 2>&1 || true
+  kubectl --context "$KCTX" -n "$ns" delete role "$role" >/dev/null 2>&1 || true
+  return 1
+}
+
 # Asserts a write is refused, by admission or by RBAC, and prints what it actually saw
 # when it is not. A bare grep reports every unexpected message as "admitted".
 deny_probe() {
@@ -1547,7 +1574,8 @@ SA_TOKEN_EOF
   kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" delete secret not-an-invite >/dev/null 2>&1 || true
 
   # An invite name in the wrong namespace is still outside the grant.
-  deny_probe "an invite Secret outside the invite namespace is refused" 15 \
+  policy_deny_probe "policy denies an invite Secret outside the invite namespace" 15 \
+    "$ENROLL_NS" "$SVC_SA" \
     kubectl --context "$KCTX" -n "$ENROLL_NS" create secret generic grid-invite-elsewhere \
     --from-literal=a=b --as="$SVC_SA" --dry-run=server
 
@@ -1564,8 +1592,8 @@ GEN_EOF
     --as="$BOOT_SA" --dry-run=server -f "$WORK/probe-generatename.yaml"
 
   # A namespace the chart never renders into is outside both arms.
-  kubectl --context "$KCTX" create namespace enroll-third >/dev/null 2>&1 || true
-  deny_probe "bootstrap cannot write a third namespace" 15 \
+  policy_deny_probe "policy denies the bootstrap a third namespace" 15 \
+    enroll-third "$BOOT_SA" \
     kubectl --context "$KCTX" -n enroll-third create secret generic anything \
     --from-literal=a=b --as="$BOOT_SA" --dry-run=server
 
@@ -1577,16 +1605,36 @@ GEN_EOF
     fail "kind: policies affected an unrelated principal"
   fi
 
-  # The chart creates no namespace, so a missing invite namespace has to fail the install
-  # rather than render RBAC nowhere.
-  if helm install enroll-no-ns charts/grid-enrollment --namespace enroll-no-ns \
-    --create-namespace --kube-context "$KCTX" --wait --timeout 2m >/dev/null 2>&1; then
-    fail "kind: install succeeded without the invite namespace"
-    helm uninstall enroll-no-ns --namespace enroll-no-ns --kube-context "$KCTX" >/dev/null 2>&1 || true
+  # The chart owns the invite namespace, so an install into a fresh namespace has to
+  # succeed and the namespace has to be there afterwards. The old form of this check
+  # asserted the opposite and counted any unrelated install failure as a pass.
+  if helm install enroll-fresh charts/grid-enrollment --namespace enroll-fresh \
+    --create-namespace --kube-context "$KCTX" --wait --timeout 5m >/dev/null 2>&1; then
+    pass "kind: install creates its own invite namespace"
+    if kubectl --context "$KCTX" get namespace enroll-fresh-invites >/dev/null 2>&1; then
+      pass "kind: enroll-fresh-invites exists after install"
+    else
+      fail "kind: enroll-fresh-invites missing after install"
+    fi
   else
-    pass "kind: install fails without the invite namespace"
-    helm uninstall enroll-no-ns --namespace enroll-no-ns --kube-context "$KCTX" >/dev/null 2>&1 || true
+    fail "kind: install into a fresh namespace failed"
   fi
+  helm uninstall enroll-fresh --namespace enroll-fresh --kube-context "$KCTX" >/dev/null 2>&1 || true
+  kubectl --context "$KCTX" delete namespace enroll-fresh enroll-fresh-invites --wait=false >/dev/null 2>&1 || true
+
+  # An upgrade must not take the invite tokens with it. before-hook-creation on a
+  # pre-upgrade Namespace hook deletes the namespace and cascades to the Secrets inside,
+  # so the hook is pre-install only and this proves the token survives.
+  kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" create secret generic grid-invite-survivor \
+    --from-literal=token=outstanding >/dev/null 2>&1
+  if helm upgrade grid-enrollment charts/grid-enrollment --reuse-values \
+    --namespace "$ENROLL_NS" --kube-context "$KCTX" --wait --timeout 5m >/dev/null 2>&1 \
+    && kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" get secret grid-invite-survivor >/dev/null 2>&1; then
+    pass "kind: an outstanding invite survives an upgrade"
+  else
+    fail "kind: the upgrade destroyed an outstanding invite"
+  fi
+  kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" delete secret grid-invite-survivor >/dev/null 2>&1 || true
 
   if helm upgrade grid-enrollment charts/grid-enrollment --reuse-values \
     --namespace "$ENROLL_NS" --kube-context "$KCTX" --wait --timeout 5m 2>&1; then

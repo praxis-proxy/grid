@@ -104,3 +104,34 @@ tests:
       - equal:
           path: metadata.name
           value: grid-invites
+
+  - it: refuses sharing the hub operator's namespace
+    template: templates/enrollment/site-invite-rbac.yaml
+    set:
+      hubSite.name: hub
+      hubSite.namespace: grid-system
+      enrollment.inviteSecrets.namespace: grid-system
+    asserts:
+      - failedTemplate:
+          errorPattern: must not be hubSite.namespace
+
+  - it: allows the hub namespace when the invites live elsewhere
+    template: templates/enrollment/site-invite-rbac.yaml
+    documentSelector:
+      path: kind
+      value: Role
+    set:
+      hubSite.name: hub
+      hubSite.namespace: grid-system
+      enrollment.inviteSecrets.namespace: grid-invites
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: grid-invites
+
+  - it: never re-runs the namespace hook on upgrade, which would delete the tokens
+    template: templates/enrollment/invite-namespace.yaml
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook"]
+          value: pre-install

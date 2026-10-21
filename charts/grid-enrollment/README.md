@@ -132,12 +132,39 @@ The hub hosts enrollment, so it cannot enroll itself. Set `hubSite.name` and the
 
 The invite token Secrets live in a namespace of their own, `<release-namespace>-invites`
 unless `enrollment.inviteSecrets.namespace` names another. The chart creates it, since
-nothing else owns it, and the render refuses the release namespace for it. That separation is not tidiness. The service needs `get`,
-`create` and `delete` on Secrets there unscoped by name, because invite names are per
-site, and admission can confine the writes but never the `get`, since admission does not
-run on reads. Sharing the release namespace would therefore let the enrollment service
-read the Grid CA signing key. The chart creates no namespace, so create this one before
-installing.
+nothing else owns it, and the render refuses both the release namespace and
+`hubSite.namespace` for it.
+
+That separation is not tidiness. The service needs `get`, `create` and `delete` on Secrets
+there unscoped by name, because invite names are per site, and admission can confine the
+writes but never the `get`, since admission does not run on reads. Sharing the release
+namespace would let the service read the Grid CA signing key; sharing `hubSite.namespace`
+would let it read the hub's identity and the grid CA the bootstrap writes there.
+
+The namespace hook is pre-install only. Helm defaults a hook to
+`before-hook-creation`, which on `pre-upgrade` would delete the namespace before
+recreating it and take every unredeemed invite token with it. Nothing re-runs on upgrade,
+so changing `enrollment.inviteSecrets.namespace` on an existing release needs the new
+namespace created by hand; the Role apply fails if it is missing.
+
+**Upgrading from a release that kept invites in the release namespace.** The service now
+reads them from the invite namespace, so a `grid-invite-*` Secret still sitting in the
+release namespace is invisible to it and that site cannot redeem its token. Minting a
+replacement while the old one is live is refused, so redeem or revoke outstanding invites
+before upgrading, or copy the Secrets across:
+
+```bash
+kubectl -n <release-namespace> get secret -o name \
+  | grep '^secret/grid-invite-' \
+  | sed 's|^secret/||' \
+  | while read -r n; do
+      kubectl -n <release-namespace> get secret "$n" -o json \
+        | jq 'del(.metadata.namespace, .metadata.uid, .metadata.resourceVersion,
+                  .metadata.creationTimestamp, .metadata.ownerReferences)' \
+        | kubectl -n <release-namespace>-invites create -f -
+    done
+```
+
 
 `hubSite.namespace` and `invitePolicy.namespace` are the grid operator's namespace on
 each cluster, not this release's. A Helm install puts the operator in `grid` or
@@ -155,8 +182,8 @@ bootstrap's namespace-wide `create` on Secrets does not belong in one.
 pre-install hooks, because each has to admit the writes of a hook that runs after it, so
 Helm neither updates nor deletes them: setting the value false stops rendering a policy
 but leaves one already on the cluster in place, and `helm uninstall` leaves both behind.
-The invite namespace is a pre-install hook too, so it also survives an uninstall. An
-orphaned policy matches nothing, since its condition pins a ServiceAccount username that
+The invite namespace is a pre-install hook too, so it also survives an uninstall, along
+with the invite tokens in it. An orphaned policy matches nothing, since its condition pins a ServiceAccount username that
 no longer resolves, but a stale one denies a renamed Secret on the next upgrade. On
 a cluster without `admissionregistration.k8s.io/v1`, or when changing a Secret name with
 the policies off, delete them by hand:
@@ -168,6 +195,13 @@ kubectl delete validatingadmissionpolicybinding \
 kubectl delete validatingadmissionpolicy \
   <release>-grid-enrollment-<namespace>-bootstrap-secrets \
   <release>-grid-enrollment-<namespace>-invite-secrets
+```
+
+The invite namespace outlives an uninstall too. Deleting it destroys every invite token
+still in it, so do that only once no site is waiting to redeem one:
+
+```bash
+kubectl delete namespace <namespace>-invites
 ```
 
 The identity is created once and rotates like an enrolled one: bootstrap signs a seed with the CA key into the `hubSite.seedSecretName` Secret, the service registers the hub's key from it, and the hub's operator rotates through the enrollment service. Under `pin` peer trust the hub's operator does not rotate, so re-issue the identity and update the peers' pins before it expires. A hub frozen after a rotation fork recovers only by a re-issue: delete its identity Secret and upgrade. Deleting the seed Secret alone re-signs the same key and leaves the freeze in place. The Job keeps an expired identity but fails on one issued to another name or by another CA. To re-issue it, delete the Secret before the next upgrade, or set `ca.forceRegenerate`, which re-issues every certificate. Do not also invite `hubSite.name`: the chart refuses it, because an invite would mint a second identity for the same name. A provided CA is refused too, since the Job has no signing key.
