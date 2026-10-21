@@ -100,10 +100,14 @@
           "type": "string"
         },
         "keySecretName": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$",
+          "maxLength": 253
         },
         "bundleSecretName": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$",
+          "maxLength": 253
         },
         "forceRegenerate": {
           "type": "boolean"
@@ -133,6 +137,16 @@
             },
             "resources": {
               "type": "object"
+            },
+            "policy": {
+              "description": "ValidatingAdmissionPolicy confining the bootstrap to the Secret names this chart renders.",
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": false
             }
           },
           "additionalProperties": false
@@ -150,10 +164,14 @@
       "type": "object",
       "properties": {
         "secretName": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$",
+          "maxLength": 253
         },
         "existingSecretRef": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^$|[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$",
+          "maxLength": 253
         },
         "extraDnsNames": {
           "type": "array",
@@ -344,6 +362,13 @@
               "additionalProperties": {
                 "type": "string"
               }
+            },
+            "loadBalancerSourceRanges": {
+              "description": "CIDRs allowed to reach a LoadBalancer enrollment endpoint.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             }
           },
           "additionalProperties": false
@@ -456,7 +481,9 @@
               "type": "object",
               "properties": {
                 "servingSecretName": {
-                  "type": "string"
+                  "type": "string",
+                  "pattern": "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$",
+                  "maxLength": 253
                 }
               },
               "additionalProperties": false
@@ -598,26 +625,34 @@
         "namespace": {
           "description": "Namespace of the hub's grid operator, where the identity Secrets go. Must exist before install.",
           "type": "string",
-          "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
         },
         "identitySecretName": {
           "description": "Secret for the site identity.",
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$",
+          "maxLength": 253
         },
         "caSecretName": {
           "description": "Secret for the grid CA beside the identity.",
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$",
+          "maxLength": 253
         },
         "swimKeySecretName": {
           "description": "Secret for the grid's SWIM key, created once in the release and hub namespaces. Empty skips it.",
-          "type": "string"
+          "type": "string",
+          "pattern": "^$|[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$",
+          "maxLength": 253
         },
         "seedSecretName": {
           "description": "Secret for the CA-signed seed that registers the hub's key so it can rotate.",
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$",
+          "maxLength": 253
         }
       }
     },
@@ -690,7 +725,7 @@
         },
         "namespace": {
           "type": "string",
-          "minLength": 1
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
         },
         "clusterSet": {
           "type": "string",

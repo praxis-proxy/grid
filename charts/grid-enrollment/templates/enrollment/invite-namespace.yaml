@@ -1,0 +1,22 @@
+{{- include "grid-enrollment.normalize" . }}
+{{- $ns := include "grid-enrollment.inviteSecretsNamespace" . }}
+{{/*
+The invite tokens need a namespace apart from the one holding the Grid CA signing key,
+because the service's get on Secrets there cannot be scoped by name and admission never
+sees a read. Nothing else owns that namespace, so this release creates it rather than
+leaving a security property to a remembered kubectl command.
+
+A pre-install hook ahead of the RBAC at -10, since the Role lands inside it. Like the
+hook RBAC and the admission policies it outlives the hook and an uninstall; the README
+says how to remove it.
+*/}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns | quote }}
+  labels:
+    {{- include "grid-enrollment.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-30"
+    helm.sh/hook-delete-policy: before-hook-creation

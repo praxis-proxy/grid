@@ -233,7 +233,8 @@ chart) is the one consenting to the operator patching its Deployment, so
 its chart renders the Role: `resourceNames` is the chart's Deployment
 name, `fullnameOverride` moves both together, and the RoleBinding names
 the operator ServiceAccount from `mountReconciliation.operator`
-(`grid-operator` in `grid-system` by default). For a Deployment the chart
+(`grid-operator`, whose namespace has no default, since a Helm and a
+platform install put the operator in different ones). For a Deployment the chart
 did not install, or with `mountReconciliation.rbac.create: false`, create
 the equivalent by hand:
 

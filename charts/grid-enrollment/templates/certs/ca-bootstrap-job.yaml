@@ -95,8 +95,10 @@ spec:
             - "--serving-dns"
             - "{{ . }}"
             {{- end }}
-            {{- if and (include "grid-enrollment.routeEnabled" .) .Values.route.host }}
-            {{- /* auto-add the Route host so passthrough validates against the serving cert SAN */}}
+            {{- if and (include "grid-enrollment.routeEnabled" .) .Values.route.host (not (has .Values.route.host .Values.serving.extraDnsNames)) }}
+            {{- /* auto-add the Route host so passthrough validates against the serving cert SAN,
+                   unless host already put it in extraDnsNames, which is the usual case since
+                   route.host defaults to host and a repeated SAN entry is just noise */}}
             - "--serving-dns"
             - "{{ .Values.route.host }}"
             {{- end }}

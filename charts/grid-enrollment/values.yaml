@@ -70,6 +70,18 @@ ca:
     resources: {}
     # Seconds a finished bootstrap Job is kept for its logs. Null keeps it until the next hook.
     ttlSecondsAfterFinished: 86400
+    policy:
+      # Two ValidatingAdmissionPolicies confining what this chart's unscopable create on
+      # Secrets may produce: the bootstrap to the names and types the chart renders, and
+      # the enrollment service to grid-invite- Secrets in its invite namespace. Kubernetes
+      # cannot scope create by name on that path, and with hubSite.name the bootstrap's
+      # grant lands in a namespace this release does not own.
+      #
+      # They are pre-install hooks, because they must admit the hook writes that follow
+      # them, so Helm does not reconcile or remove them: setting this false stops
+      # rendering a policy but does NOT delete one already on the cluster, and
+      # helm uninstall leaves both behind. The README gives the delete commands.
+      enabled: true
 
 # ------------------------------------------------------------------------------
 # Enrollment endpoint serving cert (in-process TLS). Default: issued from the
@@ -158,8 +170,16 @@ enrollment:
       # while the record is on. Needs admissionregistration.k8s.io/v1 (Kubernetes
       # 1.30); on an older cluster turn the record off instead.
       enabled: true
-  # Namespace that holds only SiteInvite token Secrets. Create it before install
-  # when setting a value different from the release namespace.
+  # Namespace that holds only SiteInvite token Secrets. Empty means
+  # <release-namespace>-invites, beside this release rather than inside it. The chart
+  # creates it, since nothing else owns it, as a pre-install hook that outlives an
+  # uninstall like the rest of the hook resources.
+  #
+  # It is a namespace of its own because it has to be. The service's Role needs create
+  # and delete on Secrets unscoped by name, since invite names are per site, and get so
+  # it can read them back. Admission confines the writes but cannot touch get, because
+  # admission does not run on reads. Sharing a namespace with the Grid CA signing key
+  # would therefore let the service read that key, so the render refuses it.
   inviteSecrets:
     namespace: ""
   # Audience a grid-admin token must be bound to under authz=kube, e.g.
@@ -194,6 +214,20 @@ enrollment:
     type: ""
     # Static LoadBalancer address, so the enrollment URL is known before install.
     loadBalancerIP: ""
+    # -- CIDRs allowed to reach the endpoint, for a LoadBalancer. Empty accepts every
+    # address the load balancer is reachable from, which for an internet-facing one is the
+    # internet. The endpoint holds the Grid CA and mints identities, so narrowing this is
+    # worth the bookkeeping even though a token is still required.
+    #
+    # It has to cover every site for the life of the grid, not just while one joins: sites
+    # rotate their identity through this same endpoint while enrollment.rotation.enabled,
+    # and whoever mints or revokes tokens reaches it too. Sites arrive from the address
+    # they egress on, so on a cloud that is each site's NAT address, and a site whose NAT
+    # address changes drops off the list silently. Nothing fails at the time; the site
+    # stops rotating and its identity expires at enrollment.certLifetimeSecs, 180 days by
+    # default, so the mistake surfaces months later. Keep it in step with the grid's
+    # membership, or leave it empty and put the restriction in front of the endpoint.
+    loadBalancerSourceRanges: []
     # Service annotations, merged over the platform's.
     annotations: {}
   resources: {}
@@ -268,8 +302,13 @@ db:
 invitePolicy:
   # -- Render the policy. Needs ACM on this cluster and the sites imported.
   enabled: false
-  # -- Namespace on each site that its operator reads the Secrets from.
-  namespace: grid
+  # -- Namespace on each site that its operator reads the Secrets from. Required when the
+  # policy is enabled, with no default: the grid operator's namespace is grid or
+  # grid-system under a Helm install and odh-ai-grid or redhat-ai-grid under a platform
+  # install, which derives it from the applications namespace, so any default would
+  # deliver every Secret where nothing reads it on some install path. A platform
+  # namespace is refused.
+  namespace: ""
   # -- ManagedClusterSet the sites belong to. The binding is named for it.
   clusterSet: default
 
@@ -279,8 +318,13 @@ invitePolicy:
 hubSite:
   # -- Hub site name. Empty disables it. Must not also be invited.
   name: ""
-  # -- Namespace of the hub's grid operator. Must exist before install: the chart does not create it.
-  namespace: grid
+  # -- Namespace of the hub's grid operator, where its identity Secrets go. Required when
+  # hubSite.name is set, with no default: it is grid or grid-system under a Helm install
+  # and odh-ai-grid or redhat-ai-grid under a platform install, which derives it from the
+  # applications namespace, so any default would deliver the hub's identity where nothing
+  # reads it on some install path. A platform namespace is refused. Must exist before
+  # install: the chart does not create it.
+  namespace: ""
   # -- Secret the site identity is written to.
   identitySecretName: grid-site-identity
   # -- Secret the grid CA is written to beside it.

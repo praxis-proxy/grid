@@ -283,6 +283,74 @@ Job reads, keys in sorted order.
 {{- end }}
 {{- $_ := set $v "invites" $list }}
 {{- end }}
+{{- include "grid-enrollment.validateDeliveryNamespaces" . }}
+{{- end }}
+
+{{/*
+Refuse a Secret delivery target that belongs to the platform. The bootstrap's Role in
+hubSite.namespace carries namespace-wide create on Secrets, since Kubernetes cannot
+scope create by name, so a mistyped target hands that grant to a namespace holding
+another component's Secrets.
+*/}}
+{{/*
+Namespace for the per-site invite token Secrets, defaulting beside the release rather
+than inside it. The service needs get, create and delete there unscoped by name, because
+invite names are per site, and admission cannot constrain a read, so sharing a namespace
+with the Grid CA signing key would let the service read that key. The chart creates no
+namespace, so this one has to exist before install.
+*/}}
+{{- define "grid-enrollment.inviteSecretsNamespace" -}}
+{{- $ns := .Values.enrollment.inviteSecrets.namespace | default (printf "%s-invites" .Release.Namespace | trunc 63 | trimSuffix "-") -}}
+{{- if eq $ns .Release.Namespace }}
+{{- fail "enrollment.inviteSecrets.namespace must not be the release namespace: the enrollment service holds get on every Secret there, and that namespace holds the Grid CA signing key. Leave it empty for <release-namespace>-invites, or name a namespace that holds only invite tokens." }}
+{{- end }}
+{{- $ns -}}
+{{- end }}
+
+{{/* The namespaces a grid operator actually runs in, named in every refusal that wants one. */}}
+{{- define "grid-enrollment.operatorNamespaceHint" -}}
+It must be the grid operator's own namespace: grid or grid-system under a Helm install, odh-ai-grid or redhat-ai-grid under a platform install, which derives it from the applications namespace rather than sharing it.
+{{- end }}
+
+{{- define "grid-enrollment.refuseDeliveryNamespace" -}}
+{{- $ns := .ns }}
+{{/*
+A guard against a typo, not a security boundary: whoever supplies these values also
+supplies ca.bootstrap.policy.enabled. The applications namespaces are on the list because
+a platform install derives its grid namespace FROM one of them, so they are the plausible
+wrong answer rather than an unlikely one.
+*/}}
+{{- $reserved := list "default" "openshift" "kubernetes" "opendatahub" "redhat-ods-applications" "open-cluster-management" "multicluster-engine" }}
+{{- if or (has $ns $reserved) (hasPrefix "kube-" $ns) (hasPrefix "openshift-" $ns) }}
+{{- fail (printf "%s=%q is a platform namespace, and this chart puts Secrets and a Role granting create on Secrets there. %s" .key $ns .hint) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Every namespace the chart puts a Secret or a Secret-granting Role in. Called from
+normalize rather than from one template, so the refusal does not depend on which
+templates happen to render.
+*/}}
+{{- define "grid-enrollment.validateDeliveryNamespaces" -}}
+{{/*
+Required, with no default. The grid operator's namespace differs per install path and the
+chart cannot read the cluster to tell which path it is on, so any default is wrong
+somewhere and wrong silently: the Secrets land where no operator reads them, the site
+never gets an identity, and nothing says so.
+*/}}
+{{- if and .Values.hubSite.name (not .Values.hubSite.namespace) }}
+{{- fail (printf "hubSite.namespace is required when hubSite.name is set. %s" (include "grid-enrollment.operatorNamespaceHint" .)) }}
+{{- end }}
+{{- if and .Values.invitePolicy.enabled (not .Values.invitePolicy.namespace) }}
+{{- fail (printf "invitePolicy.namespace is required when invitePolicy.enabled is true. %s" (include "grid-enrollment.operatorNamespaceHint" .)) }}
+{{- end }}
+{{- include "grid-enrollment.refuseDeliveryNamespace" (dict "key" "enrollment.inviteSecrets.namespace" "ns" (include "grid-enrollment.inviteSecretsNamespace" .) "hint" "Give the invite tokens a namespace of their own, holding nothing else.") }}
+{{- if .Values.hubSite.name }}
+{{- include "grid-enrollment.refuseDeliveryNamespace" (dict "key" "hubSite.namespace" "ns" .Values.hubSite.namespace "hint" (include "grid-enrollment.operatorNamespaceHint" .)) }}
+{{- end }}
+{{- if .Values.invitePolicy.enabled }}
+{{- include "grid-enrollment.refuseDeliveryNamespace" (dict "key" "invitePolicy.namespace" "ns" .Values.invitePolicy.namespace "hint" (include "grid-enrollment.operatorNamespaceHint" .)) }}
+{{- end }}
 {{- end }}
 
 {{/*

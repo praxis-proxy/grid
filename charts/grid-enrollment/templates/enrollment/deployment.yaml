@@ -91,7 +91,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
             - name: ENROLLMENT_INVITE_SECRET_NAMESPACE
-              value: {{ .Values.enrollment.inviteSecrets.namespace | default .Release.Namespace | quote }}
+              value: {{ include "grid-enrollment.inviteSecretsNamespace" . | quote }}
             {{- if eq .Values.enrollment.authz "kube" }}
             - name: ENROLLMENT_TOKEN_AUDIENCE
               value: {{ .Values.enrollment.tokenAudience | quote }}

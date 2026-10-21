@@ -132,6 +132,7 @@ tests:
   - it: reserves the hub's name so no token can claim it
     set:
       hubSite.name: hub
+      hubSite.namespace: grid-system
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
@@ -142,6 +143,7 @@ tests:
   - it: mounts the hub's CA-signed seed Secret, optional until bootstrap writes it
     set:
       hubSite.name: hub
+      hubSite.namespace: grid-system
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env

@@ -56,11 +56,15 @@ mountReconciliation:
   # create RBAC.
   rbac:
     create: true
-  # -- The operator ServiceAccount the Role binds. The defaults match the
-  # grid-operator chart installed as release grid-operator in grid-system.
+  # -- The operator ServiceAccount the Role binds. The name matches the grid-operator
+  # chart and the platform overlay alike, so it defaults. The namespace does not: a Helm
+  # install puts the operator in grid or grid-system, and a platform install derives
+  # odh-ai-grid or redhat-ai-grid from the applications namespace. A default would bind a
+  # ServiceAccount that does not exist on the other path, and the only symptom is that
+  # mount reconciliation never runs, so this is required.
   operator:
     serviceAccount: grid-operator
-    namespace: grid-system
+    namespace: ""
 
 # -- Extra pod-level securityContext fields (e.g. runAsUser, runAsGroup).
 # runAsNonRoot and seccompProfile are always set by the chart.

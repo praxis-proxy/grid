@@ -15,6 +15,36 @@ DEFAULT_GATEWAY_IMAGE="ghcr.io/praxis-proxy/ai:0.7.0"
 
 # Helpers
 
+# Asserts a write is refused, by admission or by RBAC, and prints what it actually saw
+# when it is not. A bare grep reports every unexpected message as "admitted".
+deny_probe() {
+  local label="$1" tries="$2"; shift 2
+  local i out
+  for ((i = 0; i < tries; i++)); do
+    out=$("$@" 2>&1 || true)
+    case "$out" in
+      *"denied request"*|*" is forbidden"*) pass "kind: $label"; return 0 ;;
+    esac
+    sleep 2
+  done
+  fail "kind: $label -- saw: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"
+  return 1
+}
+
+# Retries a command until its output contains the expected text, since a created
+# ValidatingAdmissionPolicy is not yet an enforcing one: compilation and the API server's
+# policy cache are asynchronous, so the first probe after install can race activation.
+await_output() {
+  local want="$1" tries="${2:-30}" i out
+  shift 2 || shift
+  for ((i = 0; i < tries; i++)); do
+    out=$("$@" 2>&1 || true)
+    case "$out" in *"$want"*) return 0 ;; esac
+    sleep 2
+  done
+  return 1
+}
+
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1" >&2; }
 
@@ -1245,7 +1275,19 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
   echo "  Kind Runtime Tests"
   echo "======================================================================"
   KIND_CLUSTER="helm-verify-$$"
-  kind create cluster --name "$KIND_CLUSTER" --wait 60s 2>&1
+  # Guarded: an unguarded create let the whole runtime section be skipped while the run
+  # still exited 0, so a broken provider read as a pass.
+  if kind create cluster --name "$KIND_CLUSTER" --wait 60s 2>&1; then
+    pass "kind: cluster created"
+  else
+    fail "kind: cluster create failed, runtime tests did not run"
+    echo "  (rootless podman needs systemd Delegate=yes; see kind.sigs.k8s.io/docs/user/rootless)"
+    echo ""
+    echo "=== Summary ==="
+    echo "  Passed: $PASS"
+    echo "  Failed: $FAIL"
+    exit 1
+  fi
 
   # Load operator image if available
   IMAGE_REF="${OPERATOR_IMAGE}:${OPERATOR_TAG}"
@@ -1379,6 +1421,186 @@ spec:
   gridNetworkRef: helm-test-network
 CR_EOF
 
+  # Grid enrollment lifecycle. Nothing else installs this chart, and it holds the Grid CA
+  # signing key, so install, helm test, upgrade and uninstall it here.
+  echo ""
+  echo "=== Grid Enrollment Kind lifecycle ==="
+
+  ENROLL_NS="grid-enroll"
+  ENROLL_HUB_NS="grid-system"
+  ENROLL_INVITE_NS="${ENROLL_NS}-invites"
+  # Only the hub operator's namespace is pre-created; the chart owns the invite one, and
+  # pre-creating it here would hide a regression in that.
+  kubectl --context "$KCTX" create namespace "$ENROLL_HUB_NS" >/dev/null 2>&1 || true
+
+  ENROLL_ARGS=(
+    --namespace "$ENROLL_NS" --create-namespace
+    --kube-context "$KCTX"
+    --set "hubSite.name=hub"
+    --set "hubSite.namespace=$ENROLL_HUB_NS"
+    --wait --timeout 5m
+  )
+  if [ -n "${ENROLL_IMAGE_REF:-}" ]; then
+    ENROLL_ARGS+=(--set "image.repository=${ENROLL_IMAGE_REF%%:*}" --set "image.tag=${ENROLL_IMAGE_REF##*:}")
+  fi
+
+  if helm install grid-enrollment charts/grid-enrollment "${ENROLL_ARGS[@]}" 2>&1; then
+    pass "kind: enrollment install"
+  else
+    fail "kind: enrollment install"
+  fi
+
+  if kubectl --context "$KCTX" get namespace "$ENROLL_INVITE_NS" >/dev/null 2>&1; then
+    pass "kind: the chart created the invite namespace"
+  else
+    fail "kind: the chart did not create the invite namespace"
+  fi
+
+  # The confinement policies have to exist, or the grants they cover are unconfined.
+  for pol in "grid-enrollment-${ENROLL_NS}-bootstrap-secrets" "grid-enrollment-${ENROLL_NS}-invite-secrets"; do
+    if kubectl --context "$KCTX" get validatingadmissionpolicy "$pol" >/dev/null 2>&1; then
+      pass "kind: enrollment policy $pol"
+    else
+      fail "kind: enrollment policy $pol missing"
+    fi
+  done
+
+  # The Role grants one namespace and the Deployment is told another unless they share a
+  # helper. That mismatch breaks every SiteInvite, so assert the two agree on the cluster.
+  ENROLL_ROLE_NS=$(kubectl --context "$KCTX" get role -A \
+    -o jsonpath='{range .items[?(@.metadata.name=="grid-enrollment-site-invite-secrets")]}{.metadata.namespace}{end}' 2>/dev/null || echo "")
+  ENROLL_ENV_NS=$(kubectl --context "$KCTX" -n "$ENROLL_NS" get deploy grid-enrollment \
+    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ENROLLMENT_INVITE_SECRET_NAMESPACE")].value}' 2>/dev/null || echo "")
+  if [ -n "$ENROLL_ROLE_NS" ] && [ "$ENROLL_ROLE_NS" = "$ENROLL_ENV_NS" ]; then
+    pass "kind: invite namespace agrees ($ENROLL_ROLE_NS)"
+  else
+    fail "kind: invite namespace mismatch (role=$ENROLL_ROLE_NS env=$ENROLL_ENV_NS)"
+  fi
+  if [ "$ENROLL_ROLE_NS" = "$ENROLL_NS" ]; then
+    fail "kind: invite Secrets share the namespace holding the CA key"
+  else
+    pass "kind: invite Secrets are out of the CA namespace"
+  fi
+
+  if helm test grid-enrollment --namespace "$ENROLL_NS" --kube-context "$KCTX" 2>&1; then
+    pass "kind: enrollment helm test"
+  else
+    fail "kind: enrollment helm test"
+  fi
+
+  # The bootstrap is the only account allowed those names, and only as Opaque or TLS.
+  BOOT_SA="system:serviceaccount:${ENROLL_NS}:grid-enrollment-ca-bootstrap"
+  deny_probe "policy denies an unlisted Secret name" 30 \
+    kubectl --context "$KCTX" create secret generic denied-by-policy \
+    --from-literal=a=b -n "$ENROLL_HUB_NS" --as="$BOOT_SA" --dry-run=server
+  cat >"$WORK/probe-sa-token.yaml" <<SA_TOKEN_EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grid-site-identity
+  annotations:
+    kubernetes.io/service-account.name: grid-operator
+type: kubernetes.io/service-account-token
+SA_TOKEN_EOF
+  deny_probe "policy denies minting a ServiceAccount token" 30 \
+    kubectl --context "$KCTX" create -n "$ENROLL_HUB_NS" \
+    --as="$BOOT_SA" --dry-run=server -f "$WORK/probe-sa-token.yaml"
+
+  # Misplacement, not absence: the bootstrap writes wherever hubSite.namespace points, so
+  # the helm test passes either way. Only the cluster knows where the operator actually
+  # runs, so derive it rather than trusting the value.
+  OP_NS=$(kubectl --context "$KCTX" get deploy -A -l app.kubernetes.io/name=grid-operator \
+    -o jsonpath='{.items[0].metadata.namespace}' 2>/dev/null || echo "")
+  if [ -n "$OP_NS" ] && kubectl --context "$KCTX" -n "$OP_NS" get secret grid-site-identity >/dev/null 2>&1; then
+    pass "kind: hub identity is in the operator's namespace ($OP_NS)"
+  else
+    fail "kind: hub identity is not in the operator's namespace (operator=$OP_NS)"
+  fi
+
+  # The helm test has to be able to fail, or it proves nothing. Only meaningful from a
+  # green baseline: a test already red for its own reasons would "fail" here for free.
+  if helm test grid-enrollment --namespace "$ENROLL_NS" --kube-context "$KCTX" >/dev/null 2>&1; then
+    kubectl --context "$KCTX" -n "$ENROLL_HUB_NS" delete secret grid-site-identity >/dev/null 2>&1
+    if helm test grid-enrollment --namespace "$ENROLL_NS" --kube-context "$KCTX" >/dev/null 2>&1; then
+      fail "kind: helm test passed with the hub identity deleted, so it is vacuous"
+    else
+      pass "kind: helm test fails when the hub identity is absent"
+    fi
+  else
+    fail "kind: helm test is not green, so its failure case proves nothing"
+  fi
+  if helm upgrade grid-enrollment charts/grid-enrollment --reuse-values \
+    --namespace "$ENROLL_NS" --kube-context "$KCTX" --wait --timeout 5m >/dev/null 2>&1 \
+    && helm test grid-enrollment --namespace "$ENROLL_NS" --kube-context "$KCTX" >/dev/null 2>&1; then
+    pass "kind: upgrade re-issues the identity and helm test recovers"
+  else
+    fail "kind: identity not re-issued, or helm test still failing"
+  fi
+
+  # The DELETE arm reads oldObject, which the create probes never exercise.
+  SVC_SA="system:serviceaccount:${ENROLL_NS}:grid-enrollment"
+  kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" create secret generic not-an-invite \
+    --from-literal=a=b >/dev/null 2>&1
+  deny_probe "policy denies deleting a non-invite Secret" 15 \
+    kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" delete secret not-an-invite \
+    --as="$SVC_SA" --dry-run=server
+  kubectl --context "$KCTX" -n "$ENROLL_INVITE_NS" delete secret not-an-invite >/dev/null 2>&1 || true
+
+  # An invite name in the wrong namespace is still outside the grant.
+  deny_probe "an invite Secret outside the invite namespace is refused" 15 \
+    kubectl --context "$KCTX" -n "$ENROLL_NS" create secret generic grid-invite-elsewhere \
+    --from-literal=a=b --as="$SVC_SA" --dry-run=server
+
+  # generateName is populated before validating admission, so the allowlist still applies.
+  cat >"$WORK/probe-generatename.yaml" <<GEN_EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  generateName: policy-probe-
+type: Opaque
+GEN_EOF
+  deny_probe "policy denies a generateName Secret" 15 \
+    kubectl --context "$KCTX" create -n "$ENROLL_HUB_NS" \
+    --as="$BOOT_SA" --dry-run=server -f "$WORK/probe-generatename.yaml"
+
+  # A namespace the chart never renders into is outside both arms.
+  kubectl --context "$KCTX" create namespace enroll-third >/dev/null 2>&1 || true
+  deny_probe "bootstrap cannot write a third namespace" 15 \
+    kubectl --context "$KCTX" -n enroll-third create secret generic anything \
+    --from-literal=a=b --as="$BOOT_SA" --dry-run=server
+
+  # Another account must be unaffected, or the policies are over-reaching.
+  if kubectl --context "$KCTX" -n "$ENROLL_HUB_NS" create secret generic unrelated-ok \
+    --from-literal=a=b --dry-run=server 2>&1 | grep -q "created"; then
+    pass "kind: policies leave other principals alone"
+  else
+    fail "kind: policies affected an unrelated principal"
+  fi
+
+  # The chart creates no namespace, so a missing invite namespace has to fail the install
+  # rather than render RBAC nowhere.
+  if helm install enroll-no-ns charts/grid-enrollment --namespace enroll-no-ns \
+    --create-namespace --kube-context "$KCTX" --wait --timeout 2m >/dev/null 2>&1; then
+    fail "kind: install succeeded without the invite namespace"
+    helm uninstall enroll-no-ns --namespace enroll-no-ns --kube-context "$KCTX" >/dev/null 2>&1 || true
+  else
+    pass "kind: install fails without the invite namespace"
+    helm uninstall enroll-no-ns --namespace enroll-no-ns --kube-context "$KCTX" >/dev/null 2>&1 || true
+  fi
+
+  if helm upgrade grid-enrollment charts/grid-enrollment --reuse-values \
+    --namespace "$ENROLL_NS" --kube-context "$KCTX" --wait --timeout 5m 2>&1; then
+    pass "kind: enrollment upgrade with --reuse-values"
+  else
+    fail "kind: enrollment upgrade with --reuse-values"
+  fi
+
+  if helm uninstall grid-enrollment --namespace "$ENROLL_NS" --kube-context "$KCTX" 2>&1; then
+    pass "kind: enrollment uninstall"
+  else
+    fail "kind: enrollment uninstall"
+  fi
+
   if helm uninstall grid-operator --namespace grid-system --kube-context "$KCTX" 2>&1; then
     pass "kind: operator uninstall"
   else
@@ -1437,6 +1659,7 @@ CR_EOF
     --set nameOverride=test-gateway \
     --set mountReconciliation.enabled=true \
     --set mountReconciliation.network=helm-test-network \
+    --set mountReconciliation.operator.namespace=grid-system \
     --set image.repository="$GW_IMAGE" \
     --set image.tag="$GW_TAG" \
     --set image.pullPolicy=IfNotPresent \
@@ -1801,6 +2024,70 @@ if helm lint "$ENROLL_DIR" --strict --set route.host=enroll.example.com 2>&1; th
   pass "helm lint --strict (enrollment)"
 else
   fail "helm lint --strict (enrollment)"
+fi
+
+echo ""
+echo "=== Bootstrap allowlist covers every Secret the Job is told to write ==="
+# The policy allowlist and the Job's --*-secret args are built separately from the same
+# values. If they drift, the bootstrap is denied its own writes and the install fails,
+# and no render test would notice, because each side is self-consistent.
+for case in "default" "hub" "local-authz" "external-db"; do
+  ENROLL_SETS=(--set host=enroll.example.com)
+  case "$case" in
+    hub)         ENROLL_SETS+=(--set hubSite.name=hub --set hubSite.namespace=grid-system) ;;
+    local-authz) ENROLL_SETS+=(--set enrollment.authz=local) ;;
+    external-db) ENROLL_SETS+=(--set db.type=external --set db.external.connectionUrlSecretRef=byo-db) ;;
+  esac
+  ENROLL_OUT="$WORK/enroll-allowlist-$case.yaml"
+  if ! helm template allow "$ENROLL_DIR" --namespace grid-enroll "${ENROLL_SETS[@]}" >"$ENROLL_OUT" 2>/dev/null; then
+    fail "allowlist: render failed ($case)"
+    continue
+  fi
+  MISSING=$(python3 - "$ENROLL_OUT" <<'PY_EOF'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+args, allowed = [], ""
+for d in docs:
+    if d.get("kind") == "Job":
+        a = d["spec"]["template"]["spec"]["containers"][0].get("args", [])
+        args = [a[i + 1] for i, v in enumerate(a[:-1]) if v.endswith("-secret")]
+    if d.get("kind") == "ValidatingAdmissionPolicy" and any(
+        c.get("name") == "grid-enrollment-bootstrap" for c in d["spec"].get("matchConditions", [])
+    ):
+        allowed = d["spec"]["validations"][0]["expression"]
+if not args:
+    print("NO-JOB")
+else:
+    print(" ".join(n for n in args if '"%s"' % n not in allowed) or "OK")
+PY_EOF
+)
+  if [ "$MISSING" = "OK" ]; then
+    pass "allowlist covers the Job's Secret args ($case)"
+  elif [ "$MISSING" = "NO-JOB" ]; then
+    pass "allowlist: no bootstrap Job renders ($case)"
+  else
+    fail "allowlist missing Secret names the Job writes ($case): $MISSING"
+  fi
+done
+
+echo ""
+echo "=== Confinement policies do not collide ==="
+# The signer policies and the two Secret policies all render by default and are cluster
+# scoped, so a shared name would have one silently replace another.
+POL_OUT="$WORK/enroll-policies.yaml"
+helm template pol "$ENROLL_DIR" --namespace grid-enroll --set host=enroll.example.com \
+  --set hubSite.name=hub --set hubSite.namespace=grid-system >"$POL_OUT" 2>/dev/null
+POL_NAMES=$(python3 -c "
+import yaml
+want={'csr-record','csr-record-confine','bootstrap-secrets','invite-secrets'}
+n=[d['metadata']['name'] for d in yaml.safe_load_all(open('$POL_OUT')) if d and d.get('kind')=='ValidatingAdmissionPolicy']
+got={x.rsplit('grid-enroll-',1)[-1] for x in n}
+print('OK' if len(n)==len(set(n)) and got==want else 'names=%s' % sorted(got))
+")
+if [ "$POL_NAMES" = "OK" ]; then
+  pass "the signer and Secret policies render under four distinct names"
+else
+  fail "ValidatingAdmissionPolicy set changed or names collide: $POL_NAMES"
 fi
 
 echo ""

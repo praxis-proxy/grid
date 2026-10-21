@@ -112,7 +112,8 @@ done
 Then install the release with `--set crds.enabled=false`, since the CRDs are now the
 platform's rather than Helm's.
 
-Enrollment on the hub. `hubSite.namespace` must exist first:
+Enrollment on the hub. `hubSite.namespace` must exist first, since the hub operator's own
+release owns it:
 
 ```bash
 kubectl create namespace grid
@@ -123,15 +124,23 @@ helm install grid charts/grid-enrollment -n grid-enroll --create-namespace \
   --set host=enrollment.apps.hub.example.com \
   --set route.host=enrollment.apps.hub.example.com \
   --set hubSite.name=hub \
+  --set hubSite.namespace=grid \
   --set invites.site-1.network=grid \
   --set invites.site-2.network=grid
 ```
 
 Three Secrets have to reach each cluster's operator namespace before its operator starts,
-since the operator reads them there and not from the release namespace. That namespace is
-`grid` for every cluster, the hub included: `hubSite.namespace` and `invitePolicy.namespace`
-both default to it, so installing the operator anywhere else delivers every Secret to a
-namespace it never reads.
+since the operator reads them there and not from the release namespace. `hubSite.namespace`
+and `invitePolicy.namespace` name it and neither has a default, because the right answer
+differs per install path and a wrong one is silent: the Secrets land where no operator
+reads them. This guide uses `grid` for every cluster, the hub included. A platform install
+derives the namespace from the applications namespace instead, giving `odh-ai-grid` under
+OpenDataHub and `redhat-ai-grid` under Red Hat OpenShift AI.
+
+The invite tokens get a namespace of their own, `<release-namespace>-invites` unless
+`enrollment.inviteSecrets.namespace` names another, which the chart creates. They are kept
+out of the release namespace because the enrollment service needs an unscopable `get` on
+Secrets where they live, and that namespace holds the Grid CA signing key.
 
 | Secret | From | To |
 |---|---|---|

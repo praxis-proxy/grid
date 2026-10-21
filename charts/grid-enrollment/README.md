@@ -1,14 +1,29 @@
 # Grid Enrollment Helm Chart
 
 Helm chart for the grid enrollment service: the enrollment authority for a grid,
-its self-provisioned Grid CA, and a Postgres store. A zero-config install stands
-up a site ready to enroll.
+its self-provisioned Grid CA, and a Postgres store. No values are required: given the
+namespaces under Prerequisites, an install stands up a site ready to enroll.
 
 ## Prerequisites
 
-- Kubernetes >= 1.26
+- Kubernetes >= 1.26, or >= 1.30 at the chart's defaults. The CSR signer and the
+  bootstrap confinement both render `admissionregistration.k8s.io/v1`
+  ValidatingAdmissionPolicy, which is Stable from 1.30. On an older cluster set
+  `enrollment.csrRecord.enabled=false` and `ca.bootstrap.policy.enabled=false`, which is
+  why `kubeVersion` stays at 1.26: the floor is conditional on those values and
+  `kubeVersion` cannot express that.
 - Helm >= 3.12
 - An etcd encryption-at-rest provider on the cluster before holding the CA key in a Secret (see Security below)
+- `hubSite.namespace`, the grid operator's own namespace, when `hubSite.name` is set. That
+  operator's own release owns it, so this chart does not create it, and it has to exist at
+  install time rather than at first use: the pre-install hook renders RBAC into it, so a
+  missing namespace fails the hook rather than the workload.
+
+  ```bash
+  kubectl create namespace odh-ai-grid    # named per install path; see Hub site identity
+  ```
+
+  The invite namespace is created for you, since nothing else owns it.
 
 ## Install
 
@@ -113,7 +128,47 @@ Each `invites` entry (`siteName`, `gridNetworkRef`, optional `expiresInSecs` up 
 
 ## Hub site identity
 
-The hub hosts enrollment, so it cannot enroll itself. Set `hubSite.name` and the bootstrap Job issues the hub's site identity straight from the grid CA, with the same SPIFFE name, key usage, and lifetime an enrolled site receives. It writes Secret `grid-site-identity` and the CA Secret `grid-ca` to `hubSite.namespace`. It also creates the grid's 32-byte SWIM key once, as `hubSite.swimKeySecretName` (default `grid-swim-key`), in both the release namespace, where a delivery channel such as an ACM Policy can copy it to sites, and `hubSite.namespace`. In `hubSite.namespace` the Job holds `create` on any Secret, since `create` cannot be scoped by name, `get` and `update` on the identity and CA Secrets, `delete` on the identity Secret to replace a placeholder, and `get` on the SWIM key Secret. Install the hub operator with `enrollment.enabled=false`. The chart does not create `hubSite.namespace`, since the hub operator's release owns it, so create it before installing this chart (`kubectl create namespace grid`); its hook RBAC fails otherwise. The enrollment service reserves the name too, refusing to mint or redeem a token for it, so no invite can issue a second identity for the hub.
+The hub hosts enrollment, so it cannot enroll itself. Set `hubSite.name` and the bootstrap Job issues the hub's site identity straight from the grid CA, with the same SPIFFE name, key usage, and lifetime an enrolled site receives. It writes Secret `grid-site-identity` and the CA Secret `grid-ca` to `hubSite.namespace`. It also creates the grid's 32-byte SWIM key once, as `hubSite.swimKeySecretName` (default `grid-swim-key`), in both the release namespace, where a delivery channel such as an ACM Policy can copy it to sites, and `hubSite.namespace`. In `hubSite.namespace` the Job holds `create` on any Secret, since `create` cannot be scoped by name, `get` and `update` on the identity and CA Secrets, `delete` on the identity Secret to replace a placeholder, and `get` on the SWIM key Secret. A ValidatingAdmissionPolicy confines that unscopable `create` to the Secret names this chart renders, in the two namespaces it renders them in, and to the `Opaque` and `kubernetes.io/tls` types the bootstrap writes. The type constraint is load bearing, not belt and braces: this account also holds `delete` on the identity Secret, so a name-only rule would let it delete that name and recreate it as a `kubernetes.io/service-account-token` annotated for another ServiceAccount, which the token controller then fills with a non-expiring token for that account. Install the hub operator with `enrollment.enabled=false`. The chart does not create `hubSite.namespace`, since the hub operator's release owns it, so create it before installing this chart (`kubectl create namespace grid`); its hook RBAC fails otherwise. The enrollment service reserves the name too, refusing to mint or redeem a token for it, so no invite can issue a second identity for the hub.
+
+The invite token Secrets live in a namespace of their own, `<release-namespace>-invites`
+unless `enrollment.inviteSecrets.namespace` names another. The chart creates it, since
+nothing else owns it, and the render refuses the release namespace for it. That separation is not tidiness. The service needs `get`,
+`create` and `delete` on Secrets there unscoped by name, because invite names are per
+site, and admission can confine the writes but never the `get`, since admission does not
+run on reads. Sharing the release namespace would therefore let the enrollment service
+read the Grid CA signing key. The chart creates no namespace, so create this one before
+installing.
+
+`hubSite.namespace` and `invitePolicy.namespace` are the grid operator's namespace on
+each cluster, not this release's. A Helm install puts the operator in `grid` or
+`grid-system`, whichever its own values chose. A platform install derives the namespace
+from the applications namespace instead, so it is `odh-ai-grid` under OpenDataHub and
+`redhat-ai-grid` under Red Hat OpenShift AI, and the operator reads the Secrets only
+there. Set the value to match, since neither the chart nor the operator reconciles a
+mismatch: the Secrets land where nothing reads them and the site never gets an identity.
+A platform namespace (`default`, `kube-*`, `openshift-*`) is refused, because the
+bootstrap's namespace-wide `create` on Secrets does not belong in one.
+
+### Removing the admission policies
+
+`ca.bootstrap.policy.enabled` renders the policies; it does not reconcile them. They are
+pre-install hooks, because each has to admit the writes of a hook that runs after it, so
+Helm neither updates nor deletes them: setting the value false stops rendering a policy
+but leaves one already on the cluster in place, and `helm uninstall` leaves both behind.
+The invite namespace is a pre-install hook too, so it also survives an uninstall. An
+orphaned policy matches nothing, since its condition pins a ServiceAccount username that
+no longer resolves, but a stale one denies a renamed Secret on the next upgrade. On
+a cluster without `admissionregistration.k8s.io/v1`, or when changing a Secret name with
+the policies off, delete them by hand:
+
+```
+kubectl delete validatingadmissionpolicybinding \
+  <release>-grid-enrollment-<namespace>-bootstrap-secrets \
+  <release>-grid-enrollment-<namespace>-invite-secrets
+kubectl delete validatingadmissionpolicy \
+  <release>-grid-enrollment-<namespace>-bootstrap-secrets \
+  <release>-grid-enrollment-<namespace>-invite-secrets
+```
 
 The identity is created once and rotates like an enrolled one: bootstrap signs a seed with the CA key into the `hubSite.seedSecretName` Secret, the service registers the hub's key from it, and the hub's operator rotates through the enrollment service. Under `pin` peer trust the hub's operator does not rotate, so re-issue the identity and update the peers' pins before it expires. A hub frozen after a rotation fork recovers only by a re-issue: delete its identity Secret and upgrade. Deleting the seed Secret alone re-signs the same key and leaves the freeze in place. The Job keeps an expired identity but fails on one issued to another name or by another CA. To re-issue it, delete the Secret before the next upgrade, or set `ca.forceRegenerate`, which re-issues every certificate. Do not also invite `hubSite.name`: the chart refuses it, because an invite would mint a second identity for the same name. A provided CA is refused too, since the Job has no signing key.
 
