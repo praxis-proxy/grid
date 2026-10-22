@@ -574,9 +574,9 @@ jobs:
             leg: pin, rotation off
           - peer-trust-mode: spiffe
             leg: spiffe, certificate rotation
-          - peer-trust-mode: pin
+          - peer-trust-mode: spiffe
             hub-router: operator
-            leg: pin, operator gridSiteRoute
+            leg: spiffe, operator gridSiteRoute
     timeout-minutes: 60
     permissions:
       contents: read
@@ -634,7 +634,7 @@ jobs:
         env:
           MODES: ${{ matrix.peer-trust-mode }}
           HUB_ROUTER: ${{ matrix.hub-router || 'render' }}
-          GRID_FEEDBACK_CONTRACT_TEST: ${{ matrix.peer-trust-mode == 'pin' && matrix.hub-router != 'operator' && '1' || '0' }}
+          GRID_FEEDBACK_CONTRACT_TEST: ${{ matrix.peer-trust-mode == 'pin' && '1' || '0' }}
           # The spiffe leg rotates 8 minute identities; pin trust does not rotate.
           ROTATION_LIFETIME: "480"
           SKIP_BUILD: "1"
