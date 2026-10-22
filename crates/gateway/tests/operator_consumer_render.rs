@@ -38,6 +38,14 @@ mod tests {
         loaded
     }
 
+    /// Written by the operator for a gateway whose generated config does not exist yet.
+    const BOOTSTRAP: &str = include_str!("testdata/consumer-config-bootstrap.yaml");
+
+    #[test]
+    fn the_bootstrap_config_loads() {
+        load(BOOTSTRAP).expect("the operator's bootstrap config loads");
+    }
+
     #[test]
     fn the_derived_render_loads() {
         load(RENDER).expect("the operator's derived render loads");

@@ -1,0 +1,12 @@
+listeners:
+  - name: public
+    address: "0.0.0.0:8080"
+    filter_chains: [consumer-chain]
+filter_chains:
+  - name: consumer-chain
+    filters:
+      - filter: static_response
+        status: 503
+admin:
+  metrics_address: "127.0.0.1:9901"
+shutdown_timeout_secs: 5

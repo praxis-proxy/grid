@@ -2549,6 +2549,20 @@ async fn reconcile_routing_overlay_inner(
                 },
             }
             if !delegated_mount_reconciled {
+                // A serving file no pod has started on serves nothing, and the gateway cannot
+                // start, nor its rollout finish, without one, so a missing one is written now.
+                if let Some(source) = serving
+                    && serving_config_absent(network_name, gw_ref, client).await
+                {
+                    let hops = site_route.map_or(HopSource::Declared, |_| HopSource::Rendered(&cluster_endpoints));
+                    match apply_serving_config(&overlay, source, network_name, gw_ref, hops, client).await {
+                        Ok(retry) => serving_retry = serving_retry.into_iter().chain(retry).min(),
+                        Err(error) => {
+                            tracing::warn!(network = network_name, gateway = %gw_ref.name, %error, "serving config bootstrap failed");
+                            serving_retry = serving_retry.into_iter().chain([SERVING_RETRY_REQUEUE]).min();
+                        },
+                    }
+                }
                 overlay_statuses.push(retained_overlay_status(
                     network,
                     gw_ref,
@@ -2877,6 +2891,16 @@ fn serving_provider_hop_clusters(gw_ref: &GatewayRef) -> Result<BTreeSet<String>
         }
     }
     Ok(clusters)
+}
+
+/// Whether this gateway's serving config `ConfigMap` does not exist yet. An unreadable one counts as present.
+async fn serving_config_absent(network_name: &str, gw_ref: &GatewayRef, client: &Client) -> bool {
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
+    matches!(
+        api.get_opt(&serving_config::configmap_name(network_name, &gw_ref.name))
+            .await,
+        Ok(None)
+    )
 }
 
 /// Apply the serving config `ConfigMap` when changed, returning when to retry a deferred write.
@@ -3895,7 +3919,20 @@ async fn reconcile_delegated_gateway(
         &gw_ref.name,
     );
     let config_api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
-    let active_config_current = Box::pin(config_map_current(&config_api, active_config_name, &active_cm)).await?;
+    let active = config_api.get_opt(active_config_name).await?;
+    if active.is_none() {
+        // A config no pod has started on serves nothing, and the first pod cannot start, nor
+        // the rollout finish, without one: a listener answering 503 until the next revision.
+        apply_consumer_config_map_named(
+            &consumer_config::bootstrap_praxis_config(cc.listener_port),
+            network_name,
+            gw_ref,
+            active_config_name,
+            client,
+        )
+        .await?;
+    }
+    let active_config_current = active.is_some_and(|current| current.data == active_cm.data);
     let needs_revision_rollout = !additions.is_empty()
         || !mount_additions.is_empty()
         || !has_mount_revision

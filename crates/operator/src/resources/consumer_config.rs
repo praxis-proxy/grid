@@ -769,6 +769,28 @@ impl Pipeline<'_> {
     }
 }
 
+/// A gateway config that starts and answers 503, for a pod whose generated config is not
+/// written yet.
+pub(crate) fn bootstrap_praxis_config(listener_port: u16) -> String {
+    format!(
+        concat!(
+            "listeners:\n",
+            "  - name: public\n",
+            "    address: \"0.0.0.0:{listener_port}\"\n",
+            "    filter_chains: [consumer-chain]\n",
+            "filter_chains:\n",
+            "  - name: consumer-chain\n",
+            "    filters:\n",
+            "      - filter: static_response\n",
+            "        status: 503\n",
+            "admin:\n",
+            "  metrics_address: \"127.0.0.1:9901\"\n",
+            "shutdown_timeout_secs: 5\n",
+        ),
+        listener_port = listener_port,
+    )
+}
+
 /// Test-facing wrapper for the production gateway config renderer.
 #[cfg(test)]
 #[expect(clippy::too_many_arguments, reason = "matches the gateway renderer inputs")]
@@ -1687,6 +1709,18 @@ mod tests {
         };
         crate::resources::serving_config::to_text(&crate::resources::serving_config::render(overlay, &inputs))
             .expect("serving text")
+    }
+
+    /// The bootstrap config, which the gateway crate loads through Praxis.
+    const BOOTSTRAP_PRAXIS: &str = include_str!("../../../gateway/tests/testdata/consumer-config-bootstrap.yaml");
+
+    #[test]
+    fn the_bootstrap_config_matches_the_fixture_the_gateway_loads() {
+        assert_eq!(
+            bootstrap_praxis_config(8080),
+            BOOTSTRAP_PRAXIS,
+            "bootstrap fixture drifted"
+        );
     }
 
     #[test]
