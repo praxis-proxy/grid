@@ -13,7 +13,9 @@ use crate::{
     resources::{
         geography::AdmissionState,
         overlay_envelope::hex_encode,
-        routing_overlay::{RoutingCandidate, RoutingOverlay, overlay_labels, scoped_configmap_name},
+        routing_overlay::{
+            ProjectedCredential, RoutingCandidate, RoutingOverlay, overlay_labels, scoped_configmap_name,
+        },
         tls_backend::sha256,
     },
     signals::SIGNALS_PATH,
@@ -139,6 +141,9 @@ pub(crate) struct ServingCandidate {
     /// operator has heard load for. Omitted when it does, as the gateway assumes when absent.
     #[serde(skip_serializing_if = "publishes")]
     pub(crate) publishes_load: bool,
+    /// A local candidate's credential locator, which `grid_site_route` selects for `credential_inject`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) credential: Option<ProjectedCredential>,
 }
 
 /// Whether `publishes_load` is the default, which the gateway assumes when absent.
@@ -201,6 +206,8 @@ pub(crate) struct ServingInputs<'input> {
     pub(crate) heard: &'input (dyn Fn(&str, &str) -> bool + Sync),
     /// This site's provider clusters with no metrics to scrape.
     pub(crate) quiet_local: &'input BTreeSet<String>,
+    /// Whether the gateway's generated config injects local credentials the router selects.
+    pub(crate) credentials: bool,
 }
 
 /// Render for one gateway. Its only peer is the local operator, which relays
@@ -265,6 +272,10 @@ fn dedup<'overlay>(
 /// Inference candidates within gateway limits, deduplicated and ordered.
 ///
 /// Past the cap, candidates taking new requests are kept before the rest.
+#[expect(
+    clippy::too_many_lines,
+    reason = "dedup, the gateway cap, and each candidate's fields are one pass"
+)]
 fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<ServingCandidate> {
     if overlay.candidates.is_empty() {
         return Vec::new();
@@ -292,9 +303,22 @@ fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<Servi
                 fresh,
                 admission,
                 publishes_load: publishes_load(inputs, remote, site, cluster),
+                credential: (inputs.credentials && !remote)
+                    .then(|| local_credential(overlay, site, name, cluster))
+                    .flatten(),
             },
         )
         .collect()
+}
+
+/// The credential a local `(site, name, cluster)` carries in the overlay, if any.
+fn local_credential(overlay: &RoutingOverlay, site: &str, name: &str, cluster: &str) -> Option<ProjectedCredential> {
+    overlay
+        .candidates
+        .iter()
+        .chain(&overlay.excluded)
+        .filter(|candidate| candidate.site == site && candidate.name == name && candidate.cluster == cluster)
+        .find_map(|candidate| candidate.credential.clone())
 }
 
 /// Whether `site` publishes load for `cluster`: a peer's once heard, this site's when it has metrics.
@@ -493,6 +517,7 @@ mod tests {
         peer_budget: Duration::from_secs(10),
         heard: &|_, _| true,
         quiet_local: &NO_PROVIDER_HOPS,
+        credentials: false,
     };
 
     fn cand(name: &str, site: &str, cluster: &str, admission: Option<&str>) -> RoutingCandidate {

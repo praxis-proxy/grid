@@ -574,6 +574,9 @@ jobs:
             leg: pin, rotation off
           - peer-trust-mode: spiffe
             leg: spiffe, certificate rotation
+          - peer-trust-mode: pin
+            hub-router: operator
+            leg: pin, operator gridSiteRoute
     timeout-minutes: 60
     permissions:
       contents: read
@@ -630,7 +633,8 @@ jobs:
       - name: Run hub and site e2e (${{ matrix.leg }})
         env:
           MODES: ${{ matrix.peer-trust-mode }}
-          GRID_FEEDBACK_CONTRACT_TEST: ${{ matrix.peer-trust-mode == 'pin' && '1' || '0' }}
+          HUB_ROUTER: ${{ matrix.hub-router || 'render' }}
+          GRID_FEEDBACK_CONTRACT_TEST: ${{ matrix.peer-trust-mode == 'pin' && matrix.hub-router != 'operator' && '1' || '0' }}
           # The spiffe leg rotates 8 minute identities; pin trust does not rotate.
           ROTATION_LIFETIME: "480"
           SKIP_BUILD: "1"
@@ -643,7 +647,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: hub-site-e2e-logs-${{ matrix.peer-trust-mode }}
+          name: hub-site-e2e-logs-${{ matrix.peer-trust-mode }}${{ matrix.hub-router && format('-{0}', matrix.hub-router) || '' }}
           path: /tmp/grid-hub-site-e2e/
           if-no-files-found: ignore
           retention-days: 5

@@ -1,0 +1,52 @@
+{
+  "local_site": "site-a",
+  "window_secs": 60,
+  "load_window_ms": 78000,
+  "horizon_ms": 17000,
+  "candidates": [
+    {
+      "kind": "inference_model",
+      "name": "llama",
+      "site": "site-a",
+      "cluster": "local-llama",
+      "fresh": true,
+      "credential": {
+        "strategy": "bearer_token",
+        "secretRef": {
+          "name": "grid-model-client",
+          "namespace": "models",
+          "key": "token"
+        }
+      }
+    },
+    {
+      "stable_id": "candidate-site-b",
+      "kind": "inference_model",
+      "name": "llama",
+      "site": "site-b",
+      "cluster": "site-b",
+      "fresh": true
+    }
+  ],
+  "provider_hop_clusters": [
+    "site-b"
+  ],
+  "provider_hop_sni": {
+    "site-b": "site-b.grid.internal"
+  },
+  "peers": [
+    {
+      "site": "site-a",
+      "addr": "grid-operator-signals.grid.svc:9091",
+      "server_name": "site-a.grid.internal",
+      "authority": "site-a.grid.internal",
+      "path": "/v1/site/signals",
+      "interval_ms": 1000,
+      "connect_timeout_ms": 2000,
+      "request_timeout_ms": 2000,
+      "grid_ca_path": "/etc/praxis/tls/ca.crt",
+      "client_cert_path": "/etc/praxis/tls/tls.crt",
+      "client_key_path": "/etc/praxis/tls/tls.key"
+    }
+  ]
+}

@@ -81,6 +81,8 @@ mod tests {
         addr: String,
         seen: Arc<Mutex<Vec<[u8; 32]>>>,
         hop_requests: Arc<AtomicUsize>,
+        routed: Arc<AtomicUsize>,
+        routed_heads: Arc<Mutex<Vec<String>>>,
         stop: Arc<AtomicBool>,
     }
 
@@ -110,6 +112,8 @@ mod tests {
             let addr = listener.local_addr().expect("peer addr").to_string();
             let seen = Arc::new(Mutex::new(Vec::new()));
             let hop_requests = Arc::new(AtomicUsize::new(0));
+            let routed = Arc::new(AtomicUsize::new(0));
+            let routed_heads = Arc::new(Mutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
             let body = format!(
                 "HTTP/1.1 200 OK\r\nDate: Thu, 01 Jan 1970 00:00:01 GMT\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{line}",
@@ -118,6 +122,8 @@ mod tests {
             );
             let (recorded, stopping) = (Arc::clone(&seen), Arc::clone(&stop));
             let recorded_hops = Arc::clone(&hop_requests);
+            let recorded_routes = Arc::clone(&routed);
+            let recorded_heads = Arc::clone(&routed_heads);
             thread::spawn(move || {
                 for stream in listener.incoming() {
                     if stopping.load(Ordering::SeqCst) {
@@ -137,11 +143,13 @@ mod tests {
                             Ok(n) => request.extend_from_slice(&buf[..n]),
                         }
                     }
-                    if String::from_utf8_lossy(&request)
-                        .to_ascii_lowercase()
-                        .contains("x-ai-routing-candidate: candidate-east")
-                    {
+                    let head = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    if head.contains("x-ai-routing-candidate: candidate-east") {
                         recorded_hops.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if head.contains("/v1/chat/completions") {
+                        recorded_routes.fetch_add(1, Ordering::SeqCst);
+                        recorded_heads.lock().expect("heads").push(head.clone());
                     }
                     let Some(leaf) = tls.conn.peer_certificates().and_then(<[_]>::first) else {
                         continue;
@@ -154,8 +162,14 @@ mod tests {
                 addr,
                 seen,
                 hop_requests,
+                routed,
+                routed_heads,
                 stop,
             }
+        }
+
+        fn routed(&self) -> usize {
+            self.routed.load(Ordering::SeqCst)
         }
 
         fn polls(&self) -> usize {
@@ -294,6 +308,11 @@ mod tests {
 
         /// The rejected count from the admin metrics, zero until the series exists.
         fn rejected(&self) -> u64 {
+            self.reloads("rejected")
+        }
+
+        /// The serving reloads that ended in `result`, zero until the series exists.
+        fn reloads(&self, result: &str) -> u64 {
             let Ok(mut stream) = TcpStream::connect(("127.0.0.1", self.admin)) else {
                 return 0;
             };
@@ -302,7 +321,8 @@ mod tests {
             let _read = stream.read_to_string(&mut body);
             body.lines()
                 .find(|line| {
-                    line.starts_with("grid_serving_config_reload_total") && line.contains(r#"result="rejected""#)
+                    line.starts_with("grid_serving_config_reload_total")
+                        && line.contains(&format!(r#"result="{result}""#))
                 })
                 .and_then(|line| line.rsplit(' ').next())
                 .and_then(|value| value.parse().ok())
@@ -471,6 +491,479 @@ mod tests {
             );
         }
 
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    /// A plaintext upstream that counts requests, and those carrying provider-hop context.
+    struct Plain {
+        addr: String,
+        requests: Arc<AtomicUsize>,
+        hops: Arc<AtomicUsize>,
+        heads: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Plain {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind plaintext");
+            let addr = listener.local_addr().expect("plaintext addr").to_string();
+            let (requests, hops) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let (counted, hopped) = (Arc::clone(&requests), Arc::clone(&hops));
+            let heads = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&heads);
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    if head.contains("/v1/chat/completions") {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        recorded.lock().expect("heads").push(head.clone());
+                    }
+                    if head.contains("x-ai-routing-candidate") {
+                        hopped.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let _sent = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                }
+            });
+            Self {
+                addr,
+                requests,
+                hops,
+                heads,
+            }
+        }
+    }
+
+    /// A `grid_site_route` gateway whose one `load_balancer` cluster, pool-east, dials `endpoint` over `tls`.
+    fn routed_praxis(listen: u16, admin: u16, endpoint: &str, tls: &str) -> String {
+        format!(
+            "insecure_options:\n  allow_private_endpoints: true\nadmin:\n  metrics_address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: grid_site_route\n        model_header: X-Model\n      - filter: load_balancer\n        clusters:\n          - name: pool-east\n{tls}            endpoints: [\"{endpoint}\"]\n"
+        )
+    }
+
+    /// Grid mutual TLS to pool-east at `sni`, with the identity in `identity`.
+    fn verified_tls(identity: &Mount, sni: &str) -> String {
+        format!(
+            "            tls:\n              ca: {{ ca_path: {ca} }}\n              client_cert: {{ cert_path: {cert}, key_path: {key} }}\n              sni: {sni}\n              verify: true\n",
+            ca = identity.path("ca.crt"),
+            cert = identity.path("tls.crt"),
+            key = identity.path("tls.key"),
+        )
+    }
+
+    /// A serving config routing llama to each `(cluster, candidate id, hop SNI)`, each a provider hop.
+    fn hop_serving(hops: &[(&str, &str, &str)]) -> String {
+        let candidates: Vec<String> = hops
+            .iter()
+            .map(|(cluster, id, _)| {
+                format!(r#"{{"kind":"inference_model","name":"llama","site":"local","cluster":"{cluster}","stable_id":"{id}"}}"#)
+            })
+            .collect();
+        let clusters: Vec<String> = hops.iter().map(|(cluster, ..)| format!(r#""{cluster}""#)).collect();
+        let sni: Vec<String> = hops
+            .iter()
+            .map(|(cluster, _, sni)| format!(r#""{cluster}":"{sni}""#))
+            .collect();
+        format!(
+            r#"{{"local_site":"local","window_secs":60,"load_window_ms":30000,"candidates":[{}],"provider_hop_clusters":[{}],"provider_hop_sni":{{{}}},"peers":[]}}"#,
+            candidates.join(","),
+            clusters.join(","),
+            sni.join(",")
+        )
+    }
+
+    /// The site identity a gateway presents to pool-east.
+    fn site_identity(work: &Path, ca: &CaCert) -> Mount {
+        let local = generate_site_cert(ca, "local").expect("client cert");
+        let mut identity = Mount::new(work.join("identity"));
+        identity.write(&[
+            ("ca.crt", ca.cert_pem.as_bytes()),
+            ("tls.crt", local.cert_pem.as_bytes()),
+            ("tls.key", local.key_pem.as_bytes()),
+        ]);
+        identity
+    }
+
+    fn fresh_work(name: &str) -> PathBuf {
+        let work = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
+        let _cleared = std::fs::remove_dir_all(&work);
+        work
+    }
+
+    fn logged(gateway: &Gateway, text: &str) -> bool {
+        gateway
+            .output
+            .lock()
+            .expect("output")
+            .iter()
+            .any(|line| line.contains(text))
+    }
+
+    #[test]
+    fn a_stale_serving_file_naming_a_withdrawn_hop_still_starts_the_gateway() {
+        let work = fresh_work("withdrawn-hop");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca);
+        let east = Peer::start(&ca, "east");
+        let mut serving = Mount::new(work.join("serving"));
+        // The rollout dropped pool-gone from praxis.yaml before the operator rewrote this file.
+        serving.write(&[(
+            "serving-config.json",
+            hop_serving(&[
+                ("pool-east", "candidate-east", "east.grid.internal"),
+                ("pool-gone", "candidate-gone", "gone.grid.internal"),
+            ])
+            .as_bytes(),
+        )]);
+        let (listen, admin) = (free_port(), free_port());
+        let praxis = routed_praxis(
+            listen,
+            admin,
+            &east.addr,
+            &verified_tls(&identity, "east.grid.internal"),
+        );
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
+        gateway.eventually("the gateway listens", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok()
+        });
+        for sent in 1..=10 {
+            assert_eq!(gateway.route_status(), 200, "request {sent} routes to the bound site");
+        }
+        assert_eq!(
+            east.hops(),
+            10,
+            "every request to the verified backend carries hop context"
+        );
+        assert!(
+            logged(&gateway, "lack a matching verified TLS backend"),
+            "the dropped hop is logged"
+        );
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_hop_whose_sni_changed_takes_no_traffic_until_its_file_binds() {
+        let work = fresh_work("changed-sni");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca);
+        let east = Peer::start(&ca, "east");
+        let mut serving = Mount::new(work.join("serving"));
+        serving.write(&[(
+            "serving-config.json",
+            hop_serving(&[("pool-east", "candidate-east", "stale.grid.internal")]).as_bytes(),
+        )]);
+        let (listen, admin) = (free_port(), free_port());
+        let praxis = routed_praxis(
+            listen,
+            admin,
+            &east.addr,
+            &verified_tls(&identity, "east.grid.internal"),
+        );
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
+        gateway.eventually("the gateway listens", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok()
+        });
+        assert_ne!(gateway.route_status(), 200, "no candidate binds, so nothing routes");
+        assert_eq!(east.routed(), 0, "no request reached the backend under the stale SNI");
+
+        serving.write(&[(
+            "serving-config.json",
+            hop_serving(&[("pool-east", "candidate-east", "east.grid.internal")]).as_bytes(),
+        )]);
+        gateway.eventually("the rewritten file binds and routes", || gateway.route_status() == 200);
+        assert!(east.hops() >= 1, "the bound route carries hop context");
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_hop_declared_on_a_plaintext_cluster_never_reaches_it() {
+        let work = fresh_work("plaintext-hop");
+        let plain = Plain::start();
+        let mut serving = Mount::new(work.join("serving"));
+        serving.write(&[(
+            "serving-config.json",
+            hop_serving(&[("pool-east", "candidate-east", "east.grid.internal")]).as_bytes(),
+        )]);
+        let (listen, admin) = (free_port(), free_port());
+        let praxis = routed_praxis(listen, admin, &plain.addr, "");
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
+        gateway.eventually("the gateway listens", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok()
+        });
+        for _ in 0..5 {
+            assert_ne!(gateway.route_status(), 200, "an unverified hop cluster is unroutable");
+        }
+        assert_eq!(
+            plain.requests.load(Ordering::SeqCst),
+            0,
+            "no request reached the plaintext backend"
+        );
+        assert_eq!(plain.hops.load(Ordering::SeqCst), 0, "no hop context left in cleartext");
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    /// The operator's gridSiteRoute fixtures, rendered by its consumer config golden test.
+    const SITE_ROUTE_PRAXIS: &str = include_str!("testdata/consumer-config-site-route.yaml");
+    const SITE_ROUTE_SERVING: &str = include_str!("testdata/serving-config-site-route.json");
+
+    /// The operator fixtures pointed at local test servers: the local model at `local`, site-b at
+    /// `remote` (east's identity), and the local operator's signals at `signals`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each address the fixtures point at is its own server"
+    )]
+    fn site_route_fixtures(
+        listen: u16,
+        admin: u16,
+        local: &str,
+        remote: &str,
+        signals: &str,
+        identity: &Mount,
+    ) -> (String, String) {
+        let tls = identity.dir.to_string_lossy().into_owned();
+        let credentials = identity.dir.with_file_name("credentials");
+        std::fs::create_dir_all(credentials.join("grid-model-client")).expect("credential dir");
+        std::fs::write(credentials.join("grid-model-client/token"), SITE_ROUTE_TOKEN).expect("token");
+        let credentials = credentials.to_string_lossy().into_owned();
+        let point = |text: &str| {
+            text.replace("site-b.grid.internal", "east.grid.internal")
+                .replace("candidate-site-b", "candidate-east")
+                .replace("/etc/praxis/tls", &tls)
+                .replace("/run/secrets/grid-credentials", &credentials)
+        };
+        let praxis = format!(
+            "insecure_options:\n  allow_private_endpoints: true\n  allow_private_health_checks: true\n{}",
+            point(SITE_ROUTE_PRAXIS)
+                .replace("0.0.0.0:8080", &format!("127.0.0.1:{listen}"))
+                .replace("127.0.0.1:9901", &format!("127.0.0.1:{admin}"))
+                .replace("10.96.0.20:8000", local)
+                .replace("203.0.113.20:8443", remote)
+        );
+        let serving = point(SITE_ROUTE_SERVING).replace("grid-operator-signals.grid.svc:9091", signals);
+        (praxis, serving)
+    }
+
+    /// The local model's bearer token, mounted where the operator's render reads it.
+    const SITE_ROUTE_TOKEN: &str = "grid-model-client-token";
+
+    /// POST a chat request whose body names `model`, with `header` as the caller's own X-Model.
+    fn chat(listen: u16, model: &str, header: Option<&str>) -> u16 {
+        chat_as(listen, model, header, None)
+    }
+
+    /// [`chat`], with the caller's own Authorization.
+    fn chat_as(listen: u16, model: &str, header: Option<&str>, authorization: Option<&str>) -> u16 {
+        let body = format!(r#"{{"model":"{model}","messages":[]}}"#);
+        let spoof = format!(
+            "{}{}",
+            header.map_or_else(String::new, |value| format!("X-Model: {value}\r\n")),
+            authorization.map_or_else(String::new, |value| format!("Authorization: {value}\r\n"))
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", listen)).expect("connect gateway");
+        stream
+            .write_all(
+                format!(
+                    "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{spoof}Content-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+                    len = body.len()
+                )
+                .as_bytes(),
+            )
+            .expect("send request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        response
+            .split_whitespace()
+            .nth(1)
+            .expect("HTTP status")
+            .parse()
+            .expect("numeric HTTP status")
+    }
+
+    /// A port with nothing listening on it.
+    fn dead_endpoint() -> String {
+        format!("127.0.0.1:{}", free_port())
+    }
+
+    #[test]
+    fn the_operator_site_route_render_runs_and_sends_hop_context_only_across_sites() {
+        let work = fresh_work("site-route-render");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca);
+        let (east, signals, local) = (Peer::start(&ca, "east"), Peer::start(&ca, "site-a"), Plain::start());
+        let (listen, admin) = (free_port(), free_port());
+        let (praxis, serving_json) =
+            site_route_fixtures(listen, admin, &local.addr, &east.addr, &signals.addr, &identity);
+        let mut serving = Mount::new(work.join("serving"));
+        serving.write(&[("serving-config.json", serving_json.as_bytes())]);
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
+        gateway.eventually("the gateway listens", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok()
+        });
+        for sent in 1..=30 {
+            assert_eq!(chat(listen, "llama", None), 200, "request {sent} routes");
+        }
+        let (to_local, to_east) = (local.requests.load(Ordering::SeqCst), east.routed());
+        assert_eq!(to_local + to_east, 30, "each request reached exactly one site");
+        assert_eq!(
+            local.hops.load(Ordering::SeqCst),
+            0,
+            "the local plaintext model never sees hop context"
+        );
+        assert_eq!(
+            east.hops(),
+            to_east,
+            "every request to the other site's gateway carries hop context"
+        );
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_dead_local_cluster_in_the_operator_render_is_demoted_by_its_health_check() {
+        let work = fresh_work("site-route-dead-local");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca);
+        let (east, signals) = (Peer::start(&ca, "east"), Peer::start(&ca, "site-a"));
+        let (listen, admin) = (free_port(), free_port());
+        let (praxis, serving_json) =
+            site_route_fixtures(listen, admin, &dead_endpoint(), &east.addr, &signals.addr, &identity);
+        let mut serving = Mount::new(work.join("serving"));
+        serving.write(&[("serving-config.json", serving_json.as_bytes())]);
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
+        gateway.eventually("the gateway listens", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok()
+        });
+        gateway.eventually(
+            "the dead local cluster is demoted, so ten requests in a row route",
+            || (0..10).all(|_| chat(listen, "llama", None) == 200),
+        );
+        let routed = east.routed();
+        for _ in 0..10 {
+            assert_eq!(
+                chat(listen, "llama", None),
+                200,
+                "demoted, the local cluster takes nothing"
+            );
+        }
+        assert_eq!(east.routed(), routed + 10, "the other site serves every request");
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_caller_model_header_does_not_steer_the_operator_site_route_render() {
+        let work = fresh_work("site-route-spoof");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca);
+        let (east, signals, local) = (Peer::start(&ca, "east"), Peer::start(&ca, "site-a"), Plain::start());
+        let (listen, admin) = (free_port(), free_port());
+        let (praxis, serving_json) =
+            site_route_fixtures(listen, admin, &local.addr, &east.addr, &signals.addr, &identity);
+        let mut serving = Mount::new(work.join("serving"));
+        serving.write(&[("serving-config.json", serving_json.as_bytes())]);
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
+        gateway.eventually("the gateway listens", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok()
+        });
+        gateway.eventually("the gateway routes llama", || chat(listen, "llama", None) == 200);
+        let reached = local.requests.load(Ordering::SeqCst) + east.routed();
+        for _ in 0..5 {
+            assert_ne!(
+                chat(listen, "unserved", Some("llama")),
+                200,
+                "the body names an unserved model, so a caller X-Model of llama must not route it"
+            );
+        }
+        assert_eq!(
+            local.requests.load(Ordering::SeqCst) + east.routed(),
+            reached,
+            "no spoofed request reached a backend"
+        );
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn the_operator_site_route_render_injects_the_local_credential_and_keeps_it_on_this_site() {
+        let work = fresh_work("site-route-credential");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca);
+        let (east, signals, local) = (Peer::start(&ca, "east"), Peer::start(&ca, "site-a"), Plain::start());
+        let (listen, admin) = (free_port(), free_port());
+        let (praxis, serving_json) =
+            site_route_fixtures(listen, admin, &local.addr, &east.addr, &signals.addr, &identity);
+        let mut serving = Mount::new(work.join("serving"));
+        serving.write(&[("serving-config.json", serving_json.as_bytes())]);
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
+        gateway.eventually("the gateway listens", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok()
+        });
+        for sent in 1..=30 {
+            assert_eq!(
+                chat_as(listen, "llama", None, Some("Bearer caller-token")),
+                200,
+                "request {sent} routes"
+            );
+        }
+        let local_heads = local.heads.lock().expect("heads").clone();
+        let east_heads = east.routed_heads.lock().expect("heads").clone();
+        assert!(
+            !local_heads.is_empty() && !east_heads.is_empty(),
+            "both sites took traffic"
+        );
+        let token = format!("authorization: bearer {SITE_ROUTE_TOKEN}");
+        for head in &local_heads {
+            assert!(head.contains(&token), "the local model gets the grid token: {head}");
+            assert!(
+                !head.contains("caller-token"),
+                "the caller's credential is replaced: {head}"
+            );
+        }
+        for head in &east_heads {
+            assert!(
+                !head.contains(SITE_ROUTE_TOKEN),
+                "this site's token never leaves it: {head}"
+            );
+        }
+
+        // A remote candidate naming this site's credential still never carries it across.
+        let mut doc: serde_yaml::Value = serde_yaml::from_str(&serving_json).expect("serving");
+        let local_credential = doc["candidates"][0]["credential"].clone();
+        assert!(
+            !local_credential.is_null(),
+            "the fixture's local candidate carries the credential"
+        );
+        doc["candidates"][1]["credential"] = local_credential;
+        let applied = gateway.reloads("applied");
+        serving.write(&[(
+            "serving-config.json",
+            serde_yaml::to_string(&doc).expect("yaml").as_bytes(),
+        )]);
+        gateway.eventually("the rewritten serving file is applied", || {
+            gateway.reloads("applied") > applied
+        });
+        let before = east.routed();
+        gateway.eventually("the remote site takes more traffic", || {
+            let _sent = chat_as(listen, "llama", None, Some("Bearer caller-token"));
+            east.routed() >= before + 10
+        });
+        for head in east.routed_heads.lock().expect("heads").iter().skip(before) {
+            assert!(
+                !head.contains(SITE_ROUTE_TOKEN),
+                "a remote candidate never selects a local credential: {head}"
+            );
+        }
         drop(gateway);
         let _cleaned = std::fs::remove_dir_all(&work);
     }

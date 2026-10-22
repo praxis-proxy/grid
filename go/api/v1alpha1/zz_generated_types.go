@@ -168,6 +168,14 @@ const (
 	TransportModePlaintext TransportMode = "plaintext"
 )
 
+// GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter is a string enumeration.
+type GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter string
+
+const (
+	GridNetworkConsumerGatewaysItemPraxisConfigSiteRouterIntelligentRoute GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter = "intelligentRoute"
+	GridNetworkConsumerGatewaysItemPraxisConfigSiteRouterGridSiteRoute    GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter = "gridSiteRoute"
+)
+
 // PeerTrustMode is a string enumeration.
 type PeerTrustMode string
 
@@ -521,7 +529,7 @@ type GridNetworkConsumerGatewaysItemPraxisConfigTelemetry struct {
 }
 
 // GridNetworkConsumerGatewaysItemPraxisConfig Opt-in configuration for operator-managed consumer Praxis config generation.
-// When absent or generate: false, this gateway behaves exactly as before: only the routing overlay ConfigMap is applied. When generate: true, the operator additionally renders a consumer Praxis ConfigMap containing the inference-model intelligent_route candidates (with credential secretRef data), a credential_inject section for credential-bearing inference candidates, and a load_balancer section with one cluster entry per unique inference cluster. Other capability kinds remain in the routing overlay for dedicated data-plane pipelines.
+// When absent or generate: false, this gateway behaves exactly as before: only the routing overlay ConfigMap is applied. When generate: true, the operator additionally renders a consumer Praxis ConfigMap containing the siteRouter filter (with credential secretRef data for intelligent_route), a credential_inject section for credential-bearing inference candidates, and a load_balancer section with one cluster entry per unique inference cluster. Other capability kinds remain in the routing overlay for dedicated data-plane pipelines.
 // The generated ConfigMap contains no token bytes. Credential-bearing overlays are withheld until the consumer has explicitly declared that its compatible filter config is already running.
 type GridNetworkConsumerGatewaysItemPraxisConfig struct {
 	// Endpoint topology for the generated load_balancer section.
@@ -552,6 +560,10 @@ type GridNetworkConsumerGatewaysItemPraxisConfig struct {
 	// Opt in to validating Secret references and reconciling required mounts into a specifically delegated gateway Deployment.
 	// Disabled by default. When enabled, the named Deployment must carry the grid.praxis-proxy.io/mount-reconciliation, .../network, and .../gateway annotations emitted by charts/praxis-gateway (or set them explicitly on an externally managed Deployment).
 	MountReconciliation *GridNetworkConsumerGatewaysItemPraxisConfigMountReconciliation `json:"mountReconciliation,omitempty"`
+	// The filter that picks a candidate for each request.
+	// gridSiteRoute reads the serving config, so it needs the operator's poll signal transport. It also needs an enabled mountReconciliation, whose rollout per config revision re-reads the provider-hop backends, and an empty providerHopEndpoints, since hops follow clusterEndpoints.
+	// Default: intelligentRoute.
+	SiteRouter GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter `json:"siteRouter,omitempty"`
 	// Declare that the running consumer has the dynamic credential_inject filter configured with the projected Secret mount root. This is a fail-closed capability gate for credential-bearing overlay revisions. Set it only after the consumer has loaded a config containing that filter; the Grid operator does not own or roll out the consumer Deployment.
 	// Default: false.
 	SupportsProjectedCredentials bool `json:"supportsProjectedCredentials,omitempty"`
@@ -586,10 +598,10 @@ type GridNetworkConsumerGatewaysItem struct {
 	// Gateway namespace.
 	Namespace string `json:"namespace"`
 	// Opt-in configuration for operator-managed consumer Praxis config generation.
-	// When absent or generate: false, this gateway behaves exactly as before: only the routing overlay ConfigMap is applied. When generate: true, the operator additionally renders a consumer Praxis ConfigMap containing the inference-model intelligent_route candidates (with credential secretRef data), a credential_inject section for credential-bearing inference candidates, and a load_balancer section with one cluster entry per unique inference cluster. Other capability kinds remain in the routing overlay for dedicated data-plane pipelines.
+	// When absent or generate: false, this gateway behaves exactly as before: only the routing overlay ConfigMap is applied. When generate: true, the operator additionally renders a consumer Praxis ConfigMap containing the siteRouter filter (with credential secretRef data for intelligent_route), a credential_inject section for credential-bearing inference candidates, and a load_balancer section with one cluster entry per unique inference cluster. Other capability kinds remain in the routing overlay for dedicated data-plane pipelines.
 	// The generated ConfigMap contains no token bytes. Credential-bearing overlays are withheld until the consumer has explicitly declared that its compatible filter config is already running.
 	PraxisConfig *GridNetworkConsumerGatewaysItemPraxisConfig `json:"praxisConfig,omitempty"`
-	// Explicit mTLS provider-hop endpoints for the embedded grid-gateway serving config. This allowlist is independent of praxisConfig, so a missing or disabled generated Praxis config cannot alter embedded serving behavior. Every entry must declare mutual_tls and a nonblank SNI. The embedded gateway compares each declaration against the loaded Praxis load-balancer's verified mTLS backend before it sends provider-hop context. Changing Praxis backend transport requires a gateway restart while gridServing is enabled.
+	// Explicit mTLS provider-hop endpoints for the embedded grid-gateway serving config. This allowlist is independent of a chart-rendered praxisConfig, so a missing or disabled generated Praxis config cannot alter embedded serving behavior. With praxisConfig.siteRouter gridSiteRoute the hops are the generated config's mutual TLS endpoints instead, and this must be empty. Every entry must declare mutual_tls and a nonblank SNI. The embedded gateway compares each declaration against the loaded Praxis load-balancer's verified mTLS backend before it sends provider-hop context. Changing Praxis backend transport requires a gateway restart while gridServing is enabled.
 	ProviderHopEndpoints []GridNetworkConsumerGatewaysItemProviderHopEndpointsItem `json:"providerHopEndpoints,omitempty"`
 	// Local site name for the intelligent_route overlay generated for this gateway.
 	// Identifies which [GridSite] this gateway's cluster represents. Praxis uses local_site to score candidates running on the same site higher than remote candidates.
@@ -597,7 +609,7 @@ type GridNetworkConsumerGatewaysItem struct {
 	// [GridSite]: crate::crd::grid_site::GridSite [GridNetwork]: crate::crd::grid_network::GridNetwork
 	SiteName *string `json:"siteName,omitempty"`
 	// Deprecated in favor of praxisConfig; this legacy field will be removed in a future release. Opt-in configuration for operator-managed consumer Praxis config generation.
-	// When absent or generate: false, this gateway behaves exactly as before: only the routing overlay ConfigMap is applied. When generate: true, the operator additionally renders a consumer Praxis ConfigMap containing the inference-model intelligent_route candidates (with credential secretRef data), a credential_inject section for credential-bearing inference candidates, and a load_balancer section with one cluster entry per unique inference cluster. Other capability kinds remain in the routing overlay for dedicated data-plane pipelines.
+	// When absent or generate: false, this gateway behaves exactly as before: only the routing overlay ConfigMap is applied. When generate: true, the operator additionally renders a consumer Praxis ConfigMap containing the siteRouter filter (with credential secretRef data for intelligent_route), a credential_inject section for credential-bearing inference candidates, and a load_balancer section with one cluster entry per unique inference cluster. Other capability kinds remain in the routing overlay for dedicated data-plane pipelines.
 	// The generated ConfigMap contains no token bytes. Credential-bearing overlays are withheld until the consumer has explicitly declared that its compatible filter config is already running.
 	ConsumerConfig *GridNetworkConsumerGatewaysItemPraxisConfig `json:"consumerConfig,omitempty"`
 	// Deprecated in favor of siteName; this legacy field will be removed in a future release. Local site name for the intelligent_route overlay generated for this gateway.

@@ -4,15 +4,16 @@
 {{- include "praxis-gateway.validateMounts" . }}
 {{- include "praxis-gateway.validateProbes" . }}
 {{- include "praxis-gateway.validateMetricsListener" . }}
+{{- $gridServing := include "praxis-gateway.gridServing" . | fromYaml }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "praxis-gateway.fullname" . }}
   labels:
     {{- include "praxis-gateway.labels" . | nindent 4 }}
-  {{- if or (.Values.praxisConfig.render.gridServing).enabled .Values.mountReconciliation.enabled }}
+  {{- if or $gridServing.enabled .Values.mountReconciliation.enabled }}
   annotations:
-    {{- if (.Values.praxisConfig.render.gridServing).enabled }}
+    {{- if $gridServing.enabled }}
     {{- /* The operator writes the serving ConfigMap only after the grid CRs (wave 1) exist. */}}
     argocd.argoproj.io/sync-wave: "2"
     {{- end }}
@@ -20,7 +21,7 @@ metadata:
     grid.praxis-proxy.io/mount-reconciliation: "enabled"
     grid.praxis-proxy.io/network: {{ .Values.mountReconciliation.network | quote }}
     grid.praxis-proxy.io/gateway: {{ (.Values.mountReconciliation.gatewayRef | default (include "praxis-gateway.fullname" .)) | quote }}
-    {{- if .Values.praxisConfig.render.gridServing.enabled }}
+    {{- if $gridServing.enabled }}
     grid.praxis-proxy.io/grid-serving-tls: "chart-managed"
     {{- end }}
     {{- end }}
@@ -208,7 +209,7 @@ spec:
           {{- $userLog := false }}
           {{- range .Values.env }}{{- if eq .name "RUST_LOG" }}{{- $userLog = true }}{{- end }}{{- end }}
           {{- $rustLog := and (not $userLog) (include "praxis-gateway.rustLog" .) }}
-          {{- if or $rustLog .Values.env (.Values.praxisConfig.render.gridServing).enabled $withCA (.Values.metricsListener).enabled }}
+          {{- if or $rustLog .Values.env $gridServing.enabled $withCA (.Values.metricsListener).enabled }}
           env:
             {{- if $rustLog }}
             - name: RUST_LOG
@@ -217,9 +218,9 @@ spec:
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-            {{- if (.Values.praxisConfig.render.gridServing).enabled }}
+            {{- if $gridServing.enabled }}
             - name: GRID_SERVING_CONFIG
-              value: {{ printf "%s/serving-config.json" .Values.praxisConfig.render.gridServing.mountPath | quote }}
+              value: {{ printf "%s/serving-config.json" $gridServing.mountPath | quote }}
             {{- end }}
             {{- if $withCA }}
             - name: SSL_CERT_FILE
@@ -288,14 +289,14 @@ spec:
               mountPath: {{ .Values.overlay.mountPath | quote }}
               readOnly: true
             {{- end }}
-            {{- if and .Values.gridIdentity.tlsSecretName (or (not .Values.mountReconciliation.enabled) (not .Values.mountReconciliation.releaseHelmMounts) .Values.praxisConfig.render.gridServing.enabled) }}
+            {{- if and .Values.gridIdentity.tlsSecretName (or (not .Values.mountReconciliation.enabled) (not .Values.mountReconciliation.releaseHelmMounts) $gridServing.enabled) }}
             - name: tls
               mountPath: {{ .Values.gridIdentity.mountPath | quote }}
               readOnly: true
             {{- end }}
-            {{- if (.Values.praxisConfig.render.gridServing).enabled }}
+            {{- if $gridServing.enabled }}
             - name: grid-serving
-              mountPath: {{ .Values.praxisConfig.render.gridServing.mountPath | quote }}
+              mountPath: {{ $gridServing.mountPath | quote }}
               readOnly: true
             {{- end }}
             {{- if .Values.upstreamCA.secretName }}
@@ -376,7 +377,7 @@ spec:
                 path: {{ .Values.overlay.sidecar.dataKey | quote }}
         {{- end }}
         {{- end }}
-        {{- if and .Values.gridIdentity.tlsSecretName (or (not .Values.mountReconciliation.enabled) (not .Values.mountReconciliation.releaseHelmMounts) .Values.praxisConfig.render.gridServing.enabled) }}
+        {{- if and .Values.gridIdentity.tlsSecretName (or (not .Values.mountReconciliation.enabled) (not .Values.mountReconciliation.releaseHelmMounts) $gridServing.enabled) }}
         - name: tls
           projected:
             sources:
@@ -393,7 +394,7 @@ spec:
                     - key: ca.crt
                       path: ca.crt
         {{- end }}
-        {{- if (.Values.praxisConfig.render.gridServing).enabled }}
+        {{- if $gridServing.enabled }}
         - name: grid-serving
           configMap:
             name: {{ include "praxis-gateway.servingConfigMap" . | quote }}

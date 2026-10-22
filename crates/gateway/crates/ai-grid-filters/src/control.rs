@@ -1,6 +1,7 @@
 //! Applies a grid serving config: the candidate topology and the peer pollers.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
     sync::{
@@ -261,8 +262,8 @@ impl Control {
         start: StartPeer,
         backend_tls: BTreeMap<String, String>,
     ) -> Result<Self, FilterError> {
-        validate_provider_hop_binding(config, &backend_tls)?;
-        let topology = Topology::from_config(config)?;
+        let bound = bind_provider_hops(config, &backend_tls)?;
+        let topology = Topology::from_config(&bound)?;
         // Cold start: config order until the first poll re-orders it by live load.
         let mut gauged = Gauged::new();
         let mut cold_start = RouteSnapshot::from_static(
@@ -318,17 +319,28 @@ impl Control {
         Arc::clone(&self.tuning)
     }
 
-    /// Make `config` the running one: its identity, the tuning's affinity settings at
-    /// `generation`, and only its clusters' prefixes.
-    fn adopt(&mut self, config: &GridServingConfig, identity: [u8; 32], tag_key: Option<TagKey>, generation: u64) {
-        let clusters: Vec<Arc<str>> = config
+    /// Make `raw` the running config: its identity, the tuning's affinity settings at
+    /// `generation`, and only the prefixes of `bound`, its clusters that route.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the running file and the view that routes are adopted together"
+    )]
+    fn adopt(
+        &mut self,
+        raw: &GridServingConfig,
+        bound: &GridServingConfig,
+        identity: [u8; 32],
+        tag_key: Option<TagKey>,
+        generation: u64,
+    ) {
+        let clusters: Vec<Arc<str>> = bound
             .candidates
             .iter()
             .map(|candidate| Arc::from(candidate.cluster.as_str()))
             .collect();
         self.affinity
             .apply(self.tuning.affinity().as_ref().clone(), tag_key, &clusters);
-        self.applied = Some(config.clone());
+        self.applied = Some(raw.clone());
         self.identity = Some(identity);
         self.tuned = generation;
     }
@@ -356,17 +368,18 @@ impl Control {
     /// [`Self::apply`] with the identity digest already computed.
     fn apply_with(
         &mut self,
-        config: &GridServingConfig,
+        raw: &GridServingConfig,
         identity: [u8; 32],
     ) -> Result<Option<ReloadOutcome>, FilterError> {
         let renewed = self.identity.is_some_and(|applied| applied != identity);
         // A filter configured after the last apply changes the tuning, so the same file re-applies.
         let generation = self.tuning.generation();
-        if self.applied.as_ref() == Some(config) && !renewed && self.tuned == generation {
+        if self.applied.as_ref() == Some(raw) && !renewed && self.tuned == generation {
             return Ok(None);
         }
         // Validated before any poller starts, so an invalid config starts and drops nothing.
-        validate_provider_hop_binding(config, &self.backend_tls)?;
+        let bound = bind_provider_hops(raw, &self.backend_tls)?;
+        let config = bound.as_ref();
         let topology = Arc::new(validate_config(config)?);
         let tag_key = load_tag_key(&self.tuning.affinity())?;
         if config.window_secs != self.window_secs {
@@ -389,7 +402,7 @@ impl Control {
         // The reload stands and its topology is published: only now may the new pollers write,
         // so their first refresh orders the new topology. Committing a kept poller is a no-op.
         self.peers.values().for_each(|running| running.handle.commit());
-        self.adopt(config, identity, tag_key, generation);
+        self.adopt(raw, config, identity, tag_key, generation);
         Ok(Some(outcome))
     }
 
@@ -522,26 +535,53 @@ fn validate_config(config: &GridServingConfig) -> Result<Topology, FilterError> 
     Ok(topology)
 }
 
-/// Bind every declared provider hop to one verified backend and its exact TLS SNI.
-fn validate_provider_hop_binding(
+/// `config` without each provider hop that does not bind to a startup-verified backend
+/// with its exact TLS SNI, and without that hop's candidates.
+///
+/// The verified map never grows, so hop context only reaches a startup-verified identity,
+/// and an unbound hop's site is unroutable until restart rather than routed without it.
+fn bind_provider_hops<'config>(
+    config: &'config GridServingConfig,
+    backend_tls: &BTreeMap<String, String>,
+) -> Result<Cow<'config, GridServingConfig>, FilterError> {
+    let unbound = unbound_provider_hops(config, backend_tls)?;
+    if unbound.is_empty() {
+        return Ok(Cow::Borrowed(config));
+    }
+    tracing::warn!(
+        clusters = ?unbound,
+        "grid: provider hops lack a matching verified TLS backend; their candidates stay unroutable until restart"
+    );
+    let mut bound = config.clone();
+    bound.provider_hop_clusters.retain(|cluster| !unbound.contains(cluster));
+    bound.provider_hop_sni.retain(|cluster, _| !unbound.contains(cluster));
+    bound
+        .candidates
+        .retain(|candidate| !unbound.contains(&candidate.cluster));
+    Ok(Cow::Owned(bound))
+}
+
+/// The declared provider hops with no startup-verified backend at their SNI, refusing a malformed declaration.
+fn unbound_provider_hops(
     config: &GridServingConfig,
     backend_tls: &BTreeMap<String, String>,
-) -> Result<(), FilterError> {
+) -> Result<BTreeSet<String>, FilterError> {
     let clusters = validate_provider_hop_clusters(config.provider_hop_clusters.clone())?;
     if config.provider_hop_sni.len() != clusters.len() {
         return Err("grid: provider-hop SNI declarations must match the allowlist".into());
     }
-    for cluster in &clusters {
+    let mut unbound = BTreeSet::new();
+    for cluster in clusters {
         let declared = config
             .provider_hop_sni
-            .get(cluster)
+            .get(&cluster)
             .filter(|sni| !sni.trim().is_empty())
             .ok_or_else(|| -> FilterError { format!("grid: missing provider-hop SNI for {cluster}").into() })?;
-        if backend_tls.get(cluster) != Some(declared) {
-            return Err(format!("grid: provider-hop backend {cluster} lacks matching verified TLS identity").into());
+        if backend_tls.get(&cluster) != Some(declared) {
+            unbound.insert(cluster);
         }
     }
-    Ok(())
+    Ok(unbound)
 }
 
 /// Order the current topology under the current availability tuning and swap it in.
@@ -1782,5 +1822,158 @@ mod tests {
             loud.contains("grid: serving config reloaded"),
             "a real reload logs at info: {loud}"
         );
+    }
+
+    /// `config` with a provider hop on `site`'s cluster declaring `sni`.
+    fn with_hop(mut config: GridServingConfig, site: &str, sni: &str) -> GridServingConfig {
+        let cluster = format!("pool-{site}");
+        for candidate in config
+            .candidates
+            .iter_mut()
+            .filter(|candidate| candidate.cluster == cluster)
+        {
+            candidate.stable_id = Some(format!("candidate-{site}"));
+        }
+        config.provider_hop_clusters.push(cluster.clone());
+        config.provider_hop_sni.insert(cluster, sni.to_owned());
+        config
+    }
+
+    /// Verified backend identities as the loaded praxis.yaml declares them.
+    fn verified(backends: &[(&str, &str)]) -> BTreeMap<String, String> {
+        backends
+            .iter()
+            .map(|(cluster, sni)| ((*cluster).to_owned(), (*sni).to_owned()))
+            .collect()
+    }
+
+    /// East and west, each a provider hop at its own SNI.
+    fn two_hops() -> GridServingConfig {
+        with_hop(
+            with_hop(config(&["east", "west"]), "east", "east.grid.internal"),
+            "west",
+            "west.grid.internal",
+        )
+    }
+
+    #[test]
+    fn a_config_whose_every_hop_binds_is_used_as_written() {
+        let backends = verified(&[("pool-east", "east.grid.internal"), ("pool-west", "west.grid.internal")]);
+        let config = two_hops();
+        let bound = bind_provider_hops(&config, &backends).expect("binds");
+        assert!(matches!(bound, Cow::Borrowed(_)), "nothing to drop, nothing copied");
+    }
+
+    #[test]
+    fn a_hop_that_does_not_bind_leaves_with_its_candidates() {
+        for (label, backends) in [
+            ("cluster absent", verified(&[("pool-east", "east.grid.internal")])),
+            (
+                "SNI changed",
+                verified(&[
+                    ("pool-east", "east.grid.internal"),
+                    ("pool-west", "west-new.grid.internal"),
+                ]),
+            ),
+        ] {
+            let config = two_hops();
+            let bound = bind_provider_hops(&config, &backends).expect("an unbound hop is dropped, not refused");
+            assert_eq!(
+                bound.provider_hop_clusters,
+                ["pool-east"],
+                "{label}: west's hop is gone"
+            );
+            assert_eq!(
+                bound.provider_hop_sni.keys().collect::<Vec<_>>(),
+                ["pool-east"],
+                "{label}: west's SNI is gone"
+            );
+            assert_eq!(
+                bound.candidates.iter().map(|c| c.site.as_str()).collect::<Vec<_>>(),
+                ["east"],
+                "{label}: west is unroutable, not routed without hop context"
+            );
+            assert_eq!(bound.peers, config.peers, "{label}: peers keep polling");
+        }
+    }
+
+    #[test]
+    fn a_malformed_hop_declaration_is_still_refused() {
+        let backends = verified(&[("pool-east", "east.grid.internal")]);
+        let mut duplicate = with_hop(config(&["east"]), "east", "east.grid.internal");
+        duplicate.provider_hop_clusters.push("pool-east".to_owned());
+        let mut blank = with_hop(config(&["east"]), "east", "east.grid.internal");
+        blank.provider_hop_sni.insert("pool-east".to_owned(), " ".to_owned());
+        let mut unpaired = with_hop(config(&["east"]), "east", "east.grid.internal");
+        unpaired
+            .provider_hop_sni
+            .insert("pool-west".to_owned(), "west.grid.internal".to_owned());
+        let mut unnamed = with_hop(config(&["east"]), "east", "east.grid.internal");
+        unnamed.provider_hop_sni.clear();
+        unnamed
+            .provider_hop_sni
+            .insert("pool-west".to_owned(), "west.grid.internal".to_owned());
+        for (label, config) in [
+            ("duplicate", duplicate),
+            ("blank SNI", blank),
+            ("SNI without a hop", unpaired),
+            ("hop without its SNI", unnamed),
+        ] {
+            assert!(bind_provider_hops(&config, &backends).is_err(), "{label} is refused");
+        }
+    }
+
+    #[test]
+    fn an_unbound_hop_starts_the_gateway_and_its_file_settles() {
+        let backends = verified(&[("pool-east", "east.grid.internal")]);
+        let config = two_hops();
+        let mut control =
+            Control::new_with_backend_tls(&config, Peers::default().starter(), backends).expect("starts, not fatal");
+        assert!(
+            control.apply(&config).expect("applies").is_some(),
+            "the first apply swaps in"
+        );
+        let snapshot = control.snapshot().load_full();
+        assert_eq!(sites(&snapshot), ["east"], "only the bound site routes");
+        assert!(snapshot.provider_hop_clusters.contains("pool-east"));
+        assert!(
+            !snapshot.provider_hop_clusters.contains("pool-west"),
+            "no hop context for the unbound cluster"
+        );
+        assert!(
+            control.apply(&config).expect("re-applies").is_none(),
+            "the same file is already applied, so the watcher settles"
+        );
+        control.readopt();
+        assert_eq!(
+            sites(&control.snapshot().load_full()),
+            ["east"],
+            "re-adopting keeps the bound view"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_that_binds_restores_the_dropped_site() {
+        let backends = verified(&[
+            ("pool-east", "east.grid.internal"),
+            ("pool-west", "west-new.grid.internal"),
+        ]);
+        let stale = two_hops();
+        let mut control = Control::new_with_backend_tls(&stale, Peers::default().starter(), backends).expect("starts");
+        control.apply(&stale).expect("applies");
+        assert_eq!(
+            sites(&control.snapshot().load_full()),
+            ["east"],
+            "the stale SNI keeps west out"
+        );
+        let mut current = two_hops();
+        current
+            .provider_hop_sni
+            .insert("pool-west".to_owned(), "west-new.grid.internal".to_owned());
+        assert!(control.apply(&current).expect("applies").is_some());
+        let mut routed = sites(&control.snapshot().load_full());
+        routed.sort();
+        assert_eq!(routed, ["east", "west"], "the matching SNI routes west again");
+        assert!(control.snapshot().load().provider_hop_clusters.contains("pool-west"));
     }
 }

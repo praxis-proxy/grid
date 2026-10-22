@@ -1,7 +1,7 @@
 //! Credential locator types carried on a route candidate.
 //!
-//! Only locator fields travel in Grid config, never secret bytes. This
-//! increment carries the type. It does not resolve or inject the credential.
+//! Only locator fields travel in Grid config, never secret bytes.
+//! `grid_site_route` selects a local candidate's reference for `credential_inject`.
 
 use serde::Deserialize;
 

@@ -1,0 +1,143 @@
+suite: operator grid serving
+templates:
+  - templates/deployment.yaml
+release:
+  name: gw
+  namespace: grid
+set:
+  image.flavor: grid-gateway
+  praxisConfig.source: operator
+  gridIdentity.tlsSecretName: grid-site-identity
+  gridIdentity.caSecretName: grid-ca
+  mountReconciliation.enabled: true
+  mountReconciliation.network: grid
+  mountReconciliation.gatewayRef: grid-gateway
+  mountReconciliation.releaseHelmMounts: true
+  mountReconciliation.rbac.create: false
+  praxisConfig.operator.gridServing.enabled: true
+tests:
+  - it: mounts the operator's serving ConfigMap for the gatewayRef it reconciles
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: grid-serving
+            configMap:
+              name: grid-serving-grid-grid-gateway
+              optional: false
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: grid-serving
+            mountPath: /etc/praxis/grid-serving
+            readOnly: true
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SERVING_CONFIG
+            value: /etc/praxis/grid-serving/serving-config.json
+
+  - it: keeps the site identity the serving pollers read, even once Helm mounts are released
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tls
+            mountPath: /etc/praxis/tls
+            readOnly: true
+      - equal:
+          path: metadata.annotations["grid.praxis-proxy.io/grid-serving-tls"]
+          value: chart-managed
+
+  - it: refuses a /ready probe, since praxis /ready fails while any health-checked site is down
+    set:
+      health.readiness:
+        httpGet: { path: /ready, port: 9901 }
+    asserts:
+      - failedTemplate:
+          errorPattern: health.readiness must not probe Praxis /ready while the gateway forwards to backends
+
+  - it: syncs after the grid CRs under Argo CD
+    asserts:
+      - equal:
+          path: metadata.annotations["argocd.argoproj.io/sync-wave"]
+          value: "2"
+
+  - it: names the ConfigMap from explicit values first
+    set:
+      praxisConfig.operator.gridServing.networkName: other
+      praxisConfig.operator.gridServing.gatewayRefName: edge
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: grid-serving
+            configMap:
+              name: grid-serving-other-edge
+              optional: false
+
+  - it: refuses operator gridServing without mount reconciliation
+    set:
+      mountReconciliation.enabled: false
+      mountReconciliation.releaseHelmMounts: false
+    asserts:
+      - failedTemplate:
+          errorPattern: praxisConfig.operator.gridServing needs mountReconciliation.enabled
+
+  - it: refuses operator gridServing on an image without grid_site_route
+    set:
+      image.flavor: ai
+    asserts:
+      - failedTemplate:
+          errorMessage: praxisConfig.operator.gridServing needs image.flavor grid-gateway
+
+  - it: refuses operator gridServing without the grid identity its pollers present
+    set:
+      gridIdentity.tlsSecretName: ""
+      gridIdentity.caSecretName: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: "praxisConfig.operator.gridServing polls peers with the grid identity: set gridIdentity.tlsSecretName"
+
+  - it: mounts nothing for serving when it is off
+    set:
+      praxisConfig.operator.gridServing.enabled: false
+    asserts:
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: grid-serving
+          any: true
+      - notExists:
+          path: metadata.annotations["grid.praxis-proxy.io/grid-serving-tls"]
+
+  - it: still refuses render gridServing under the operator source
+    set:
+      praxisConfig.operator.gridServing.enabled: false
+      praxisConfig.render.gridServing.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: praxisConfig.render settings are set but praxisConfig.source is operator
+
+  - it: falls back to grid.networkName for a render gridServing with no networkName
+    set:
+      praxisConfig.source: render
+      praxisConfig.operator.gridServing.enabled: false
+      mountReconciliation.enabled: false
+      mountReconciliation.releaseHelmMounts: false
+      grid.networkName: grid
+      grid.siteName: hub
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.gridServing.enabled: true
+      praxisConfig.render.backends:
+        - cluster: pool-b
+          endpoints: ["203.0.113.7:8443"]
+          transport: { mode: mutual_tls, sni: site-b.grid.internal }
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: grid-serving
+            configMap:
+              name: grid-serving-grid-gw-praxis-gateway
+              optional: false

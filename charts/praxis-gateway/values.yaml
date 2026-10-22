@@ -173,6 +173,19 @@ praxisConfig:
     # -- Allow a LoadBalancer or NodePort Service. The operator's praxis.yaml has no
     # caller authentication; use only when something outside this chart limits access.
     allowUnauthenticatedExposure: false
+    # -- Operator serving data for a GridNetwork gatewayRef with praxisConfig.siteRouter
+    # gridSiteRoute. Requires mountReconciliation and image.flavor grid-gateway.
+    gridServing:
+      # -- Mount the serving data and set GRID_SERVING_CONFIG.
+      enabled: false
+      # -- GridNetwork name. Empty uses mountReconciliation.network.
+      networkName: ""
+      # -- This gateway's name in the GridNetwork gatewayRefs. Empty uses mountReconciliation.gatewayRef.
+      gatewayRefName: ""
+      # -- Override the derived serving ConfigMap name grid-serving-<networkName>-<gatewayRefName>.
+      configMapName: ""
+      # -- Mount directory for the serving ConfigMap.
+      mountPath: "/etc/praxis/grid-serving"
 
   # -- Settings used only with source render. Other source modes reject these values. The
   # chart emits
@@ -316,7 +329,7 @@ praxisConfig:
     gridServing:
       # -- Mount the serving data, set GRID_SERVING_CONFIG, and use grid_site_route.
       enabled: false
-      # -- GridNetwork name, which with gatewayRefName names the operator's ConfigMap.
+      # -- GridNetwork name, which with gatewayRefName names the operator's ConfigMap. Empty uses grid.networkName.
       networkName: ""
       # -- This gateway's name in the GridNetwork gatewayRefs. Defaults to the release fullname.
       gatewayRefName: ""

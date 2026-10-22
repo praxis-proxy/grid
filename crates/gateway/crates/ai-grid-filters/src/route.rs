@@ -75,6 +75,37 @@ fn route_decision(snapshot: &RouteSnapshot, earlier_selected: bool) -> RouteDeci
     }
 }
 
+/// Request metadata `credential_inject` reads the selected credential from.
+const CREDENTIAL_METADATA: [&str; 4] = [
+    "intelligent_route.credential.strategy",
+    "intelligent_route.credential.name",
+    "intelligent_route.credential.namespace",
+    "intelligent_route.credential.key",
+];
+
+/// Select a local candidate's credential for `credential_inject`; a remote one is injected by its own site.
+fn write_credential(ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate, snapshot: &RouteSnapshot) {
+    for key in CREDENTIAL_METADATA {
+        ctx.filter_metadata.remove(key);
+    }
+    let Some(credential) = candidate
+        .credential
+        .as_ref()
+        .filter(|_| candidate.site == snapshot.local_site)
+    else {
+        return;
+    };
+    let values = [
+        &credential.strategy,
+        &credential.secret_ref.name,
+        &credential.secret_ref.namespace,
+        &credential.secret_ref.key,
+    ];
+    for (key, value) in CREDENTIAL_METADATA.into_iter().zip(values) {
+        ctx.filter_metadata.insert(key.to_owned(), value.clone());
+    }
+}
+
 /// Set hop context only for a candidate whose backend TLS identity remains verified across reloads.
 fn write_provider_context(
     ctx: &mut HttpFilterContext<'_>,
@@ -346,6 +377,7 @@ impl GridSiteRouteFilter {
         }
         ctx.cluster = Some(Arc::clone(&candidate.cluster));
         write_provider_context(ctx, candidate, snapshot)?;
+        write_credential(ctx, candidate, snapshot);
         Ok(())
     }
 
@@ -389,6 +421,7 @@ impl GridSiteRouteFilter {
         });
         ctx.cluster = Some(cluster);
         write_provider_context(ctx, candidate, &snapshot)?;
+        write_credential(ctx, candidate, &snapshot);
         ctx.rewritten_path = rewrite.or_else(|| ctx.rewritten_path.take());
         // Ids are tagged in the body, so it must come back uncompressed.
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);

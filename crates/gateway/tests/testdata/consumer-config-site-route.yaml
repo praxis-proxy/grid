@@ -1,0 +1,90 @@
+listeners:
+  - name: public
+    address: "0.0.0.0:8080"
+    filter_chains: [consumer-chain]
+filter_chains:
+  - name: consumer-chain
+    filters:
+      - filter: model_to_header
+        header: X-Model
+      - filter: grid_site_route
+        model_header: X-Model
+        clusters: ["local-llama", "site-b"]
+      - filter: credential_inject
+        credentials:
+          - name: "grid-model-client"
+            namespace: "models"
+            key: "token"
+            strategy: "bearer_token"
+            file: "/run/secrets/grid-credentials/grid-model-client/token"
+
+      - filter: load_balancer
+        clusters:
+          - name: "local-llama"
+            endpoints:
+              - "10.96.0.20:8000"
+            health_check:
+              type: tcp
+              interval_ms: 5000
+              timeout_ms: 2000
+              healthy_threshold: 2
+              unhealthy_threshold: 3
+              passive_unhealthy_threshold: 2
+              passive_healthy_threshold: 2
+          - name: "site-b"
+            tls:
+              ca:
+                ca_path: "/etc/praxis/tls/ca.crt"
+              client_cert:
+                cert_path: "/etc/praxis/tls/tls.crt"
+                key_path: "/etc/praxis/tls/tls.key"
+              sni: "site-b.grid.internal"
+              verify: true
+            endpoints:
+              - "203.0.113.20:8443"
+            connection_timeout_ms: 2000
+            total_connection_timeout_ms: 4000
+            health_check:
+              type: tcp
+              interval_ms: 3000
+              timeout_ms: 2000
+              healthy_threshold: 2
+              unhealthy_threshold: 3
+              passive_unhealthy_threshold: 2
+              passive_healthy_threshold: 2
+clusters:
+          - name: "local-llama"
+            endpoints:
+              - "10.96.0.20:8000"
+            health_check:
+              type: tcp
+              interval_ms: 5000
+              timeout_ms: 2000
+              healthy_threshold: 2
+              unhealthy_threshold: 3
+              passive_unhealthy_threshold: 2
+              passive_healthy_threshold: 2
+          - name: "site-b"
+            tls:
+              ca:
+                ca_path: "/etc/praxis/tls/ca.crt"
+              client_cert:
+                cert_path: "/etc/praxis/tls/tls.crt"
+                key_path: "/etc/praxis/tls/tls.key"
+              sni: "site-b.grid.internal"
+              verify: true
+            endpoints:
+              - "203.0.113.20:8443"
+            connection_timeout_ms: 2000
+            total_connection_timeout_ms: 4000
+            health_check:
+              type: tcp
+              interval_ms: 3000
+              timeout_ms: 2000
+              healthy_threshold: 2
+              unhealthy_threshold: 3
+              passive_unhealthy_threshold: 2
+              passive_healthy_threshold: 2
+admin:
+  metrics_address: "127.0.0.1:9901"
+shutdown_timeout_secs: 5
