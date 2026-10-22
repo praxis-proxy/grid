@@ -183,14 +183,15 @@ plan_addresses() {
   SITE_SWIM_IP=$(ip_add "$site" 1)
   SITE_GW_IP=$(ip_add "$site" 2)
   SITE_SIG_IP=$(ip_add "$site" 3)
+  MODEL_LB_IP=$(ip_add "$site" 4)
   MODEL_IP=$(kubectl --context "$SITE_CTX" -n model get service vcr-inference-site -o jsonpath='{.spec.clusterIP}')
   [[ -n $MODEL_IP ]] || die "no vcr-inference-site Service on the site"
   # Two Services asking MetalLB for one address leaves the loser pending forever,
   # which surfaces as an unrelated deployment never going ready.
   local planned
   planned=$(printf '%s\n' "$ENROLL_IP" "$HUB_SWIM_IP" "$HUB_SIG_IP" \
-    "$SITE_SWIM_IP" "$SITE_SIG_IP" "$SITE_GW_IP")
-  [[ $(printf '%s\n' "$planned" | sort -u | wc -l) -eq 6 ]] \
+    "$SITE_SWIM_IP" "$SITE_SIG_IP" "$SITE_GW_IP" "$MODEL_LB_IP")
+  [[ $(printf '%s\n' "$planned" | sort -u | wc -l) -eq 7 ]] \
     || die "planned addresses are not distinct: $(printf '%s ' "$planned")"
   log "enrollment $ENROLL_IP, hub SWIM $HUB_SWIM_IP, hub signals $HUB_SIG_IP"
   log "site SWIM $SITE_SWIM_IP, site signals $SITE_SIG_IP, site gateway $SITE_GW_IP"
@@ -232,6 +233,22 @@ renewal_args() {
   esac
 }
 
+# Test fixture: the site route leg's hub-local provider dials the site's model, which answers
+# only on a ClusterIP, through a LoadBalancer of its own.
+model_lb() {
+  kubectl --context "$SITE_CTX" -n model get service vcr-inference-site -o json \
+    | jq --arg ip "$MODEL_LB_IP" '{apiVersion: "v1", kind: "Service",
+        metadata: {name: "vcr-inference-hub-local", namespace: "model"},
+        spec: {type: "LoadBalancer", loadBalancerIP: $ip, selector: .spec.selector,
+          ports: [.spec.ports[] | {name, port, targetPort, protocol}]}}' \
+    | kubectl --context "$SITE_CTX" apply -f - >/dev/null
+}
+
+model_lb_ready() {
+  [[ $(kubectl --context "$SITE_CTX" -n model get service vcr-inference-hub-local \
+    -o jsonpath='{.status.loadBalancer.ingress[0].ip}') == "$MODEL_LB_IP" ]]
+}
+
 # site_route_providers <providers...>: the hub GridNetwork's generated gridSiteRoute config,
 # derived from these providers, and the hub-local provider beside the site's.
 site_route_providers() {
@@ -240,7 +257,7 @@ site_route_providers() {
     --set "gridNetwork.consumerGateways[0].praxisConfig.siteRouter=gridSiteRoute"
     --set "gridNetwork.consumerGateways[0].praxisConfig.mountReconciliation.enabled=true"
     --set "gridNetwork.consumerGateways[0].praxisConfig.mountReconciliation.deploymentName=grid-gateway"
-    --set "inferenceProviders.hub-local.endpoint=http://$MODEL_IP:8000"
+    --set "inferenceProviders.hub-local.endpoint=http://$MODEL_LB_IP:8000"
     --set "inferenceProviders.hub-local.model=$MODEL")
   for provider in "$@"; do
     SR+=(--set "gridNetwork.consumerGateways[0].praxisConfig.deriveTopology.fromProviders[$i]=$provider")
@@ -1102,6 +1119,10 @@ cmd_test() {
   done
   MODE=setup
   plan_addresses
+  if site_route; then
+    model_lb || die "expose the site model to the hub"
+    eventually "the site model answers on $MODEL_LB_IP" model_lb_ready || die "no address for the hub-local model"
+  fi
   for MODE in $MODES; do
     REFUSALS_FROM=""
     log "[$MODE] resetting the $NS namespace on both clusters"
