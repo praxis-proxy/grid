@@ -1776,7 +1776,7 @@ fn candidates_from_provider(
     if !model_inventory.is_static() {
         return Ok(Vec::new());
     }
-    for model in model_inventory.models.iter() {
+    for model in model_inventory.models() {
         if model.trim().is_empty() {
             return Err(format!("provider {provider_name} has a blank model name"));
         }
@@ -1811,7 +1811,7 @@ fn candidates_from_provider(
     let fresh = is_candidate_fresh(provider);
     let credential = projected_credential_from_provider(provider);
     let mut candidates = Vec::new();
-    for model in model_inventory.models.iter() {
+    for model in model_inventory.models() {
         for site in &sites {
             candidates.push(RoutingCandidate {
                 kind: CANDIDATE_KIND.to_owned(),

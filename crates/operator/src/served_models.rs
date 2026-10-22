@@ -99,56 +99,59 @@ struct ServedModel {
     expires_at_status: String,
 }
 
-/// Source and validity metadata for a selected model inventory.
+/// Model names configured directly in a provider spec.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ModelInventorySource {
-    /// Names configured directly on the provider.
-    Static,
-
-    /// Names discovered from the provider backend.
-    Discovered {
-        /// RFC 3339 UTC deadline persisted with the model set.
-        expires_at: String,
-
-        /// Provider generation that produced this inventory.
-        observed_generation: i64,
-    },
+pub(crate) struct StaticModelInventory {
+    /// Configured model names.
+    models: Arc<[String]>,
 }
 
-/// The model names selected for one inference provider.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ModelInventory {
-    /// Validated or configured model names.
-    pub(crate) models: Arc<[String]>,
+impl StaticModelInventory {
+    /// Build the inventory declared in a provider's spec.
+    fn for_provider(provider: &InferenceProvider) -> Self {
+        Self {
+            models: provider.spec.models.iter().map(|model| model.name.clone()).collect(),
+        }
+    }
+}
 
-    /// Whether names are configured or discovered, including their validity.
-    pub(crate) source: ModelInventorySource,
+/// Fresh discovered model names and the metadata that makes them valid.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DiscoveredModelInventory {
+    /// Validated model names.
+    models: Arc<[String]>,
+
+    /// RFC 3339 UTC deadline persisted with the model set.
+    expires_at: String,
+
+    /// Provider generation that produced this inventory.
+    observed_generation: i64,
+}
+
+/// Model names selected for an inference provider.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ModelInventory {
+    /// Names configured directly on the provider.
+    Static(StaticModelInventory),
+
+    /// Names discovered from the provider backend.
+    Discovered(DiscoveredModelInventory),
 }
 
 impl ModelInventory {
-    /// Build the static inventory declared in a provider's spec.
-    fn for_provider(provider: &InferenceProvider) -> ModelInventory {
-        ModelInventory {
-            models: provider.spec.models.iter().map(|model| model.name.clone()).collect(),
-            source: ModelInventorySource::Static,
+    /// Model names selected for routing or provider state.
+    #[must_use]
+    pub(crate) fn models(&self) -> &[String] {
+        match self {
+            Self::Static(inventory) => inventory.models.as_ref(),
+            Self::Discovered(inventory) => inventory.models.as_ref(),
         }
     }
 
     /// Whether the names came from the provider's static configuration.
     #[must_use]
     pub(crate) fn is_static(&self) -> bool {
-        matches!(&self.source, ModelInventorySource::Static)
-    }
-
-    /// Expiry metadata written by discovery status updates.
-    fn discovery_metadata(&self) -> Option<(&str, i64)> {
-        match &self.source {
-            ModelInventorySource::Static => None,
-            ModelInventorySource::Discovered {
-                expires_at,
-                observed_generation,
-            } => Some((expires_at, *observed_generation)),
-        }
+        matches!(self, Self::Static(_))
     }
 }
 
@@ -332,14 +335,14 @@ impl ServedModelStore {
     #[must_use]
     pub(crate) fn select_for(&self, provider: &InferenceProvider) -> Option<ModelInventory> {
         if provider.spec.model_discovery.is_some() {
-            self.fresh_inventory(provider)
+            self.fresh_inventory(provider).map(ModelInventory::Discovered)
         } else {
-            Some(ModelInventory::for_provider(provider))
+            Some(ModelInventory::Static(StaticModelInventory::for_provider(provider)))
         }
     }
 
     /// Fresh models, expiry deadline, and producing generation for one provider.
-    fn fresh_inventory(&self, provider: &InferenceProvider) -> Option<ModelInventory> {
+    fn fresh_inventory(&self, provider: &InferenceProvider) -> Option<DiscoveredModelInventory> {
         let name = provider.metadata.name.as_deref()?;
         let source = DiscoveryKey::for_provider(provider)?;
         let now = Instant::now();
@@ -347,12 +350,10 @@ impl ServedModelStore {
         guard
             .get(name)
             .filter(|held| held.source == source && held.expires_at > now)
-            .map(|held| ModelInventory {
+            .map(|held| DiscoveredModelInventory {
                 models: Arc::clone(&held.models),
-                source: ModelInventorySource::Discovered {
-                    expires_at: held.expires_at_status.clone(),
-                    observed_generation: held.source.generation,
-                },
+                expires_at: held.expires_at_status.clone(),
+                observed_generation: held.source.generation,
             })
     }
 
@@ -464,7 +465,7 @@ struct DiscoveryStatusPatch {
     failure_reason: Option<&'static str>,
 
     /// Fresh served-model inventory, or `None` when unknown, expired, or disabled.
-    inventory: Option<ModelInventory>,
+    inventory: Option<DiscoveredModelInventory>,
 }
 
 impl DiscoveryStatusPatch {
@@ -476,7 +477,7 @@ impl DiscoveryStatusPatch {
     /// empty model list is present and distinct from absence.
     fn for_provider(
         provider: &InferenceProvider,
-        inventory: Option<ModelInventory>,
+        inventory: Option<DiscoveredModelInventory>,
         failure_reason: Option<&'static str>,
     ) -> Option<Self> {
         let name = provider.metadata.name.as_deref()?;
@@ -513,11 +514,7 @@ impl DiscoveryStatusPatch {
     /// Whether `current` shows the generation associated with this inventory.
     fn has_same_generation(&self, current: Option<&InferenceProviderStatus>) -> bool {
         let current_generation = current.and_then(|status| status.served_models_observed_generation);
-        let desired_generation = self
-            .inventory
-            .as_ref()
-            .and_then(ModelInventory::discovery_metadata)
-            .map(|(_, generation)| generation);
+        let desired_generation = self.inventory.as_ref().map(|inventory| inventory.observed_generation);
         current_generation == desired_generation
     }
 
@@ -525,9 +522,8 @@ impl DiscoveryStatusPatch {
     ///
     /// The model set, expiry, and observed generation must all match.
     fn has_same_inventory(&self, current: Option<&InferenceProviderStatus>) -> bool {
-        let desired_metadata = self.inventory.as_ref().and_then(ModelInventory::discovery_metadata);
         let expiry_matches = current.and_then(|status| status.served_models_expires_at.as_deref())
-            == desired_metadata.map(|(expires_at, _)| expires_at);
+            == self.inventory.as_ref().map(|inventory| inventory.expires_at.as_str());
         self.has_same_models(current) && expiry_matches && self.has_same_generation(current)
     }
 
@@ -543,7 +539,7 @@ impl DiscoveryStatusPatch {
     /// are skipped while the persisted boundary remains more than one interval
     /// away. Missing or invalid persisted expiries need a patch.
     fn should_apply_patch(&self, current: Option<&InferenceProviderStatus>, interval: Duration) -> bool {
-        if self.inventory.as_ref().and_then(ModelInventory::discovery_metadata).is_none()
+        if self.inventory.is_none()
             || !self.has_same_error(current)
             || !self.has_same_models(current)
             || !self.has_same_generation(current)
@@ -577,13 +573,14 @@ impl DiscoveryStatusPatch {
         }
         if let Some(inventory) = &self.inventory {
             status.insert("servedModels".to_owned(), serde_json::json!(inventory.models.as_ref()));
-            if let Some((expires_at, observed_generation)) = inventory.discovery_metadata() {
-                status.insert("servedModelsExpiresAt".to_owned(), serde_json::json!(expires_at));
-                status.insert(
-                    "servedModelsObservedGeneration".to_owned(),
-                    serde_json::json!(observed_generation),
-                );
-            }
+            status.insert(
+                "servedModelsExpiresAt".to_owned(),
+                serde_json::json!(inventory.expires_at),
+            );
+            status.insert(
+                "servedModelsObservedGeneration".to_owned(),
+                serde_json::json!(inventory.observed_generation),
+            );
         }
         status.into()
     }
@@ -847,7 +844,7 @@ mod tests {
         let provider = test_provider_with_status("p", &serde_json::json!({}));
         let store = ServedModelStore::new();
         let selection = store.select_for(&provider);
-        let selected_names = selection.as_ref().map(|inventory| inventory.models.to_vec());
+        let selected_names = selection.as_ref().map(|inventory| inventory.models().to_vec());
 
         assert_eq!(
             selected_names,
@@ -856,7 +853,7 @@ mod tests {
         );
         assert!(
             selection.as_ref().is_some_and(ModelInventory::is_static),
-            "static names carry static source metadata"
+            "static names use the static inventory variant"
         );
     }
 
@@ -876,16 +873,14 @@ mod tests {
         assert!(
             matches!(
                 &fresh,
-                Some(ModelInventory {
-                    models,
-                    source: ModelInventorySource::Discovered { .. }
-                }) if models.as_ref() == [String::from("discovered")]
+                Some(ModelInventory::Discovered(inventory))
+                    if inventory.models.as_ref() == [String::from("discovered")]
             ),
             "fresh inventory is selected without using configured names"
         );
         assert!(
             fresh.as_ref().is_some_and(|inventory| !inventory.is_static()),
-            "fresh inventory carries discovered source metadata"
+            "fresh inventory uses the discovered variant"
         );
     }
 
@@ -901,7 +896,7 @@ mod tests {
         let inventory = store.select_for(&provider).unwrap_or_else(|| std::process::abort());
         assert!(!inventory.is_static(), "the fixture must hold discovered inventory");
         assert_eq!(
-            inventory.models.as_ref(),
+            inventory.models(),
             &["discovered".to_owned()],
             "the fixture must expose the discovered model"
         );
@@ -1066,12 +1061,10 @@ mod tests {
         let desired = DiscoveryStatusPatch {
             name: "p".to_owned(),
             failure_reason: None,
-            inventory: Some(ModelInventory {
+            inventory: Some(DiscoveredModelInventory {
                 models: owned(&["a"]).into(),
-                source: ModelInventorySource::Discovered {
-                    expires_at: expiry_after(Duration::from_secs(7200)),
-                    observed_generation: 1,
-                },
+                expires_at: expiry_after(Duration::from_secs(7200)),
+                observed_generation: 1,
             }),
         };
 
@@ -1094,12 +1087,10 @@ mod tests {
         let desired = DiscoveryStatusPatch {
             name: "p".to_owned(),
             failure_reason: None,
-            inventory: Some(ModelInventory {
+            inventory: Some(DiscoveredModelInventory {
                 models: owned(&["a"]).into(),
-                source: ModelInventorySource::Discovered {
-                    expires_at: expiry_after(Duration::from_secs(3600)),
-                    observed_generation: 1,
-                },
+                expires_at: expiry_after(Duration::from_secs(3600)),
+                observed_generation: 1,
             }),
         };
 
@@ -1121,12 +1112,10 @@ mod tests {
         let desired = DiscoveryStatusPatch {
             name: "p".to_owned(),
             failure_reason: None,
-            inventory: Some(ModelInventory {
+            inventory: Some(DiscoveredModelInventory {
                 models: owned(&["b"]).into(),
-                source: ModelInventorySource::Discovered {
-                    expires_at: expiry_after(Duration::from_secs(7200)),
-                    observed_generation: 1,
-                },
+                expires_at: expiry_after(Duration::from_secs(7200)),
+                observed_generation: 1,
             }),
         };
 
@@ -1150,12 +1139,10 @@ mod tests {
         let desired = DiscoveryStatusPatch {
             name: "p".to_owned(),
             failure_reason: None,
-            inventory: Some(ModelInventory {
+            inventory: Some(DiscoveredModelInventory {
                 models: owned(&["a"]).into(),
-                source: ModelInventorySource::Discovered {
-                    expires_at: expiry_after(Duration::from_secs(7200)),
-                    observed_generation: 1,
-                },
+                expires_at: expiry_after(Duration::from_secs(7200)),
+                observed_generation: 1,
             }),
         };
 
@@ -1344,12 +1331,10 @@ mod tests {
         let with_both = DiscoveryStatusPatch {
             name: "p".to_owned(),
             failure_reason: Some("timeout"),
-            inventory: Some(ModelInventory {
+            inventory: Some(DiscoveredModelInventory {
                 models: owned(&["a"]).into(),
-                source: ModelInventorySource::Discovered {
-                    expires_at: "2030-01-01T00:00:00Z".to_owned(),
-                    observed_generation: 1,
-                },
+                expires_at: "2030-01-01T00:00:00Z".to_owned(),
+                observed_generation: 1,
             }),
         };
         assert_eq!(
@@ -1626,7 +1611,7 @@ mod tests {
         refresh(store, vec![failed_poll], TTL);
 
         assert_eq!(
-            store.select_for(provider).map(|inventory| inventory.models),
+            store.select_for(provider).map(|inventory| inventory.models().to_vec()),
             None,
             "changed source must not read the old inventory"
         );
@@ -1657,11 +1642,7 @@ mod tests {
     fn stored_expiry(store: &ServedModelStore, provider: &str) -> Option<String> {
         store
             .fresh_inventory(&discovery_provider(provider, &serde_json::json!({})))
-            .and_then(|inventory| {
-                inventory
-                    .discovery_metadata()
-                    .map(|(expires_at, _)| expires_at.to_owned())
-            })
+            .map(|inventory| inventory.expires_at)
     }
 
     fn expiry_after(duration: Duration) -> String {
@@ -1688,7 +1669,7 @@ mod tests {
         store
             .select_for(&discovery_provider(provider, &serde_json::json!({})))
             .map(|inventory| {
-                let mut names = inventory.models.to_vec();
+                let mut names = inventory.models().to_vec();
                 names.sort_unstable();
                 names
             })

@@ -4959,7 +4959,7 @@ pub(crate) fn provider_state_from_kube(
     let routing_cluster = routing_overlay::routing_identity(provider)?.to_owned();
     let models = match served_model_store.select_for(provider) {
         // FIXME: we are currently only wiring static config, even if we support discovery.
-        Some(inventory) if inventory.is_static() => inventory.models.to_vec(),
+        Some(inventory) if inventory.is_static() => inventory.models().to_vec(),
         _ => Vec::new(),
     };
     let phase = crdt_phase_from_provider(
