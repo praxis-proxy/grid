@@ -18,7 +18,10 @@ use grid_signals::LoadStore;
 use praxis_filter::FilterError;
 
 use crate::{
-    descriptor::{RouteCandidate, validate_local_site, validate_provider_hop_clusters, validate_serving_candidates},
+    descriptor::{
+        CandidateConfig, RouteCandidate, validate_local_site, validate_provider_hop_clusters,
+        validate_serving_candidates,
+    },
     health::ClusterHealth,
     pin::TagKey,
     prefix::{AffinitySettings, PrefixAffinity},
@@ -262,7 +265,7 @@ impl Control {
         start: StartPeer,
         backend_tls: BTreeMap<String, String>,
     ) -> Result<Self, FilterError> {
-        let bound = bind_provider_hops(config, &backend_tls)?;
+        let bound = routed_view(config, &backend_tls)?;
         let topology = Topology::from_config(&bound)?;
         // Cold start: config order until the first poll re-orders it by live load.
         let mut gauged = Gauged::new();
@@ -378,7 +381,7 @@ impl Control {
             return Ok(None);
         }
         // Validated before any poller starts, so an invalid config starts and drops nothing.
-        let bound = bind_provider_hops(raw, &self.backend_tls)?;
+        let bound = routed_view(raw, &self.backend_tls)?;
         let config = bound.as_ref();
         let topology = Arc::new(validate_config(config)?);
         let tag_key = load_tag_key(&self.tuning.affinity())?;
@@ -535,30 +538,54 @@ fn validate_config(config: &GridServingConfig) -> Result<Topology, FilterError> 
     Ok(topology)
 }
 
-/// `config` without each provider hop that does not bind to a startup-verified backend
-/// with its exact TLS SNI, and without that hop's candidates.
+/// The view of `config` the router serves.
 ///
-/// The verified map never grows, so hop context only reaches a startup-verified identity,
-/// and an unbound hop's site is unroutable until restart rather than routed without it.
-fn bind_provider_hops<'config>(
+/// A provider hop that does not bind to a startup-verified backend at its exact SNI leaves
+/// with its candidates: the verified map never grows, so hop context only reaches a
+/// startup-verified identity, and an unbound hop's site is unroutable until restart rather
+/// than routed without it. A credential stays only on a local cluster that no Grid mutual
+/// TLS backend serves, so this site's secret is never sent to another site.
+fn routed_view<'config>(
     config: &'config GridServingConfig,
     backend_tls: &BTreeMap<String, String>,
 ) -> Result<Cow<'config, GridServingConfig>, FilterError> {
     let unbound = unbound_provider_hops(config, backend_tls)?;
-    if unbound.is_empty() {
+    let leaves_site = |candidate: &CandidateConfig| credential_leaves_site(candidate, config, backend_tls);
+    let crossing = config.candidates.iter().any(leaves_site);
+    if unbound.is_empty() && !crossing {
         return Ok(Cow::Borrowed(config));
     }
-    tracing::warn!(
-        clusters = ?unbound,
-        "grid: provider hops lack a matching verified TLS backend; their candidates stay unroutable until restart"
-    );
-    let mut bound = config.clone();
-    bound.provider_hop_clusters.retain(|cluster| !unbound.contains(cluster));
-    bound.provider_hop_sni.retain(|cluster, _| !unbound.contains(cluster));
-    bound
-        .candidates
+    if !unbound.is_empty() {
+        tracing::warn!(
+            clusters = ?unbound,
+            "grid: provider hops lack a matching verified TLS backend; their candidates stay unroutable until restart"
+        );
+    }
+    if crossing {
+        tracing::warn!("grid: a credential on a remote or provider-hop cluster is never injected");
+    }
+    let mut view = config.clone();
+    view.provider_hop_clusters.retain(|cluster| !unbound.contains(cluster));
+    view.provider_hop_sni.retain(|cluster, _| !unbound.contains(cluster));
+    view.candidates
         .retain(|candidate| !unbound.contains(&candidate.cluster));
-    Ok(Cow::Owned(bound))
+    for candidate in view.candidates.iter_mut().filter(|candidate| leaves_site(candidate)) {
+        candidate.credential = None;
+    }
+    Ok(Cow::Owned(view))
+}
+
+/// Whether `candidate` carries a credential its cluster would send off this site: a remote
+/// site's, or a cluster a Grid mutual TLS backend or provider hop serves.
+fn credential_leaves_site(
+    candidate: &CandidateConfig,
+    config: &GridServingConfig,
+    backend_tls: &BTreeMap<String, String>,
+) -> bool {
+    candidate.credential.is_some()
+        && (candidate.site != config.local_site
+            || backend_tls.contains_key(&candidate.cluster)
+            || config.provider_hop_clusters.contains(&candidate.cluster))
 }
 
 /// The declared provider hops with no startup-verified backend at their SNI, refusing a malformed declaration.
@@ -807,10 +834,7 @@ mod tests {
     use grid_signals::{Timeline, now_ms};
 
     use super::*;
-    use crate::{
-        descriptor::{CandidateConfig, CapabilityKind},
-        signals::llm_d::QUEUE_METRIC,
-    };
+    use crate::{descriptor::CapabilityKind, signals::llm_d::QUEUE_METRIC};
 
     /// Queue depth each mock peer reports, and how often each was scraped and started.
     #[derive(Clone, Default)]
@@ -1860,7 +1884,7 @@ mod tests {
     fn a_config_whose_every_hop_binds_is_used_as_written() {
         let backends = verified(&[("pool-east", "east.grid.internal"), ("pool-west", "west.grid.internal")]);
         let config = two_hops();
-        let bound = bind_provider_hops(&config, &backends).expect("binds");
+        let bound = routed_view(&config, &backends).expect("binds");
         assert!(matches!(bound, Cow::Borrowed(_)), "nothing to drop, nothing copied");
     }
 
@@ -1877,7 +1901,7 @@ mod tests {
             ),
         ] {
             let config = two_hops();
-            let bound = bind_provider_hops(&config, &backends).expect("an unbound hop is dropped, not refused");
+            let bound = routed_view(&config, &backends).expect("an unbound hop is dropped, not refused");
             assert_eq!(
                 bound.provider_hop_clusters,
                 ["pool-east"],
@@ -1894,6 +1918,47 @@ mod tests {
                 "{label}: west is unroutable, not routed without hop context"
             );
             assert_eq!(bound.peers, config.peers, "{label}: peers keep polling");
+        }
+    }
+
+    /// A bearer-token locator on a candidate.
+    fn token() -> crate::metadata::CandidateCredential {
+        serde_json::from_value(serde_json::json!({
+            "strategy": "bearer_token",
+            "secretRef": {"name": "grid-model-client", "namespace": "models", "key": "token"}
+        }))
+        .expect("credential")
+    }
+
+    #[test]
+    fn a_credential_stays_only_on_a_local_cluster_no_grid_backend_serves() {
+        let local_backends = verified(&[("pool-east", "east.grid.internal")]);
+        let mut local = with_hop(config(&["local", "east"]), "east", "east.grid.internal");
+        local.candidates[0].credential = Some(token());
+        assert!(
+            matches!(routed_view(&local, &local_backends).expect("view"), Cow::Borrowed(_)),
+            "a local plaintext cluster keeps its credential"
+        );
+        for (label, site, cluster) in [
+            ("a remote site's", "east", "pool-east"),
+            ("a provider hop relabelled local", "local", "pool-east"),
+            ("a verified mTLS backend relabelled local", "local", "pool-west"),
+        ] {
+            let mut crossing = with_hop(config(&["local", "east"]), "east", "east.grid.internal");
+            crossing.candidates[1].site = site.to_owned();
+            crossing.candidates[1].cluster = cluster.to_owned();
+            crossing.candidates[1].credential = Some(token());
+            let backends = verified(&[("pool-east", "east.grid.internal"), ("pool-west", "west.grid.internal")]);
+            let view = routed_view(&crossing, &backends).expect("view");
+            assert!(
+                view.candidates.iter().all(|candidate| candidate.credential.is_none()),
+                "{label} credential never rides off this site"
+            );
+            assert_eq!(
+                view.candidates.len(),
+                2,
+                "{label}: the candidate still routes, without the credential"
+            );
         }
     }
 
@@ -1919,7 +1984,7 @@ mod tests {
             ("SNI without a hop", unpaired),
             ("hop without its SNI", unnamed),
         ] {
-            assert!(bind_provider_hops(&config, &backends).is_err(), "{label} is refused");
+            assert!(routed_view(&config, &backends).is_err(), "{label} is refused");
         }
     }
 

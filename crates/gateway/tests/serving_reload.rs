@@ -329,6 +329,18 @@ mod tests {
                 .unwrap_or(0)
         }
 
+        /// Swap in `doc` as the serving config and wait until it is applied.
+        fn serve(&self, serving: &mut Mount, doc: &serde_yaml::Value) {
+            let applied = self.reloads("applied");
+            serving.write(&[(
+                "serving-config.json",
+                serde_yaml::to_string(doc).expect("yaml").as_bytes(),
+            )]);
+            self.eventually("the rewritten serving file is applied", || {
+                self.reloads("applied") > applied
+            });
+        }
+
         /// Wait for `done`, failing with the gateway's output after the deadline.
         fn eventually(&self, what: &str, done: impl Fn() -> bool) {
             let deadline = Instant::now() + DEADLINE;
@@ -764,12 +776,16 @@ mod tests {
 
     /// [`chat`], with the caller's own Authorization.
     fn chat_as(listen: u16, model: &str, header: Option<&str>, authorization: Option<&str>) -> u16 {
-        let body = format!(r#"{{"model":"{model}","messages":[]}}"#);
-        let spoof = format!(
+        let headers = format!(
             "{}{}",
             header.map_or_else(String::new, |value| format!("X-Model: {value}\r\n")),
             authorization.map_or_else(String::new, |value| format!("Authorization: {value}\r\n"))
         );
+        post(listen, &format!(r#"{{"model":"{model}","messages":[]}}"#), &headers)
+    }
+
+    /// POST `body` to the chat path with the caller's own `spoof` header lines.
+    fn post(listen: u16, body: &str, spoof: &str) -> u16 {
         let mut stream = TcpStream::connect(("127.0.0.1", listen)).expect("connect gateway");
         stream
             .write_all(
@@ -790,6 +806,22 @@ mod tests {
             .expect("numeric HTTP status")
     }
 
+    /// The heads of the next ten requests the other site's gateway takes.
+    fn east_heads_after(gateway: &Gateway, east: &Peer, listen: u16) -> Vec<String> {
+        let before = east.routed();
+        gateway.eventually("the other site takes ten more requests", || {
+            let _sent = chat_as(listen, "llama", None, Some("Bearer caller-token"));
+            east.routed() >= before + 10
+        });
+        east.routed_heads
+            .lock()
+            .expect("heads")
+            .iter()
+            .skip(before)
+            .cloned()
+            .collect()
+    }
+
     /// A port with nothing listening on it.
     fn dead_endpoint() -> String {
         format!("127.0.0.1:{}", free_port())
@@ -804,14 +836,45 @@ mod tests {
         let (listen, admin) = (free_port(), free_port());
         let (praxis, serving_json) =
             site_route_fixtures(listen, admin, &local.addr, &east.addr, &signals.addr, &identity);
+        // Uncredentialed, so the caller's own credentials are the only ones in play.
+        let mut doc: serde_yaml::Value = serde_yaml::from_str(&serving_json).expect("serving");
+        if let Some(local_candidate) = doc["candidates"][0].as_mapping_mut() {
+            local_candidate.remove("credential");
+        }
         let mut serving = Mount::new(work.join("serving"));
-        serving.write(&[("serving-config.json", serving_json.as_bytes())]);
+        serving.write(&[(
+            "serving-config.json",
+            serde_yaml::to_string(&doc).expect("yaml").as_bytes(),
+        )]);
         let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
         gateway.eventually("the gateway listens", || {
             TcpStream::connect(("127.0.0.1", listen)).is_ok()
         });
+        let caller = "X-Model: llama\r\nAuthorization: Bearer caller-token\r\nProxy-Authorization: Basic cHJveHk=\r\nCookie: session=caller\r\nx-api-key: caller-key\r\n";
         for sent in 1..=30 {
-            assert_eq!(chat(listen, "llama", None), 200, "request {sent} routes");
+            assert_eq!(
+                post(listen, r#"{"model":"llama","messages":[]}"#, caller),
+                200,
+                "request {sent} routes"
+            );
+        }
+        assert!(
+            !local.heads.lock().expect("heads").is_empty() && east.routed() > 0,
+            "both sites took traffic"
+        );
+        for head in local.heads.lock().expect("heads").iter() {
+            assert!(
+                head.contains("authorization: bearer caller-token"),
+                "an uncredentialed local model still authenticates the caller: {head}"
+            );
+        }
+        for head in east.routed_heads.lock().expect("heads").iter() {
+            for credential in ["authorization:", "cookie:", "x-api-key:", "caller-token", "caller-key"] {
+                assert!(
+                    !head.contains(credential),
+                    "{credential} never crosses to another site: {head}"
+                );
+            }
         }
         let (to_local, to_east) = (local.requests.load(Ordering::SeqCst), east.routed());
         assert_eq!(to_local + to_east, 30, "each request reached exactly one site");
@@ -885,6 +948,11 @@ mod tests {
                 "the body names an unserved model, so a caller X-Model of llama must not route it"
             );
         }
+        assert_ne!(
+            post(listen, r#"{"messages":[]}"#, "X-Model: llama\r\n"),
+            200,
+            "a body that names no model is not routed by a caller X-Model"
+        );
         assert_eq!(
             local.requests.load(Ordering::SeqCst) + east.routed(),
             reached,
@@ -945,25 +1013,21 @@ mod tests {
             "the fixture's local candidate carries the credential"
         );
         doc["candidates"][1]["credential"] = local_credential;
-        let applied = gateway.reloads("applied");
-        serving.write(&[(
-            "serving-config.json",
-            serde_yaml::to_string(&doc).expect("yaml").as_bytes(),
-        )]);
-        gateway.eventually("the rewritten serving file is applied", || {
-            gateway.reloads("applied") > applied
-        });
-        let before = east.routed();
-        gateway.eventually("the remote site takes more traffic", || {
-            let _sent = chat_as(listen, "llama", None, Some("Bearer caller-token"));
-            east.routed() >= before + 10
-        });
-        for head in east.routed_heads.lock().expect("heads").iter().skip(before) {
-            assert!(
-                !head.contains(SITE_ROUTE_TOKEN),
-                "a remote candidate never selects a local credential: {head}"
-            );
-        }
+        gateway.serve(&mut serving, &doc);
+        let remote = east_heads_after(&gateway, &east, listen);
+        assert!(
+            remote.iter().all(|head| !head.contains(SITE_ROUTE_TOKEN)),
+            "a remote candidate never selects a local credential: {remote:?}"
+        );
+
+        // Nor does the other site's hop cluster named by a candidate that claims this site.
+        doc["candidates"][1]["site"] = doc["candidates"][0]["site"].clone();
+        gateway.serve(&mut serving, &doc);
+        let relabelled = east_heads_after(&gateway, &east, listen);
+        assert!(
+            relabelled.iter().all(|head| !head.contains(SITE_ROUTE_TOKEN)),
+            "a hop cluster never carries this site's credential: {relabelled:?}"
+        );
         drop(gateway);
         let _cleaned = std::fs::remove_dir_all(&work);
     }

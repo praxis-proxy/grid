@@ -948,6 +948,8 @@ pub struct ConsumerConfig {
     /// poll signal transport. It also needs an enabled `mountReconciliation`,
     /// whose rollout per config revision re-reads the provider-hop backends,
     /// and an empty `providerHopEndpoints`, since hops follow `clusterEndpoints`.
+    /// Every cluster is health-checked, so the gateway's readiness probe must
+    /// ask Praxis `/healthy`: `/ready` fails while any one site is down.
     ///
     /// Default: `intelligentRoute`.
     #[serde(default)]

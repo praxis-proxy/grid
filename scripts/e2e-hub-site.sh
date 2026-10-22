@@ -663,18 +663,16 @@ routes_clusters() {
 
 # hop_clusters <clusters...>: the serving config's provider hops are exactly these.
 hop_clusters() {
-  serving_json | jq -e --argjson want "$(printf '%s\n' "$@" | jq -R . | jq -sc 'sort')" \
+  serving_json | jq -e --argjson want "$(jq -cn '$ARGS.positional | sort' --args "$@")" \
     '(.provider_hop_clusters // [] | sort) == $want'
 }
 
+# rolled_out: every replica runs the current template, which routes_clusters has already
+# shown mounts the generated config.
 rolled_out() {
-  k "$HUB_CTX" rollout status deployment/grid-gateway --timeout=5s >/dev/null 2>&1 \
-    && [[ $(k "$HUB_CTX" get deployment grid-gateway -o jsonpath='{.status.unavailableReplicas}') == "" ]]
-}
-
-consumer_status() {
-  k "$HUB_CTX" get gridnetwork grid -o json | jq -e --arg phase "$1" '[.status.consumerConfigStatus[]?
-    | select(.gatewayName == "grid-gateway" and .phase == $phase)] | length == 1'
+  k "$HUB_CTX" get deployment grid-gateway -o json | jq -e '.metadata.generation == .status.observedGeneration
+    and .status.replicas == .status.updatedReplicas and .status.updatedReplicas == .status.availableReplicas
+    and (.status.unavailableReplicas // 0) == 0'
 }
 
 assert_site_route() {
@@ -692,12 +690,12 @@ assert_site_route() {
   eventually "the withdrawn site leaves the generated config" routes_clusters hub-local || { consumer_praxis || true; }
   eventually "the withdrawn site's hop leaves the serving config" hop_clusters || { serving_json || true; }
   eventually "the gateway rolls out past the withdrawal" rolled_out || true
-  eventually "the consumer config reports Rendered after the withdrawal" consumer_status Rendered || true
 
   site_route_providers vcr hub-local
   helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "restore vcr on the hub"
   eventually "the restored site rejoins the generated config" routes_clusters hub-local vcr || true
   eventually "the restored site's hop returns" hop_clusters vcr || true
+  eventually "the gateway rolls out past the restore" rolled_out || true
   eventually "the hub gateway serves the site again after the restore" consumer_served || true
 }
 

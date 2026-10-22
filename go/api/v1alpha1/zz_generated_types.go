@@ -561,7 +561,7 @@ type GridNetworkConsumerGatewaysItemPraxisConfig struct {
 	// Disabled by default. When enabled, the named Deployment must carry the grid.praxis-proxy.io/mount-reconciliation, .../network, and .../gateway annotations emitted by charts/praxis-gateway (or set them explicitly on an externally managed Deployment).
 	MountReconciliation *GridNetworkConsumerGatewaysItemPraxisConfigMountReconciliation `json:"mountReconciliation,omitempty"`
 	// The filter that picks a candidate for each request.
-	// gridSiteRoute reads the serving config, so it needs the operator's poll signal transport. It also needs an enabled mountReconciliation, whose rollout per config revision re-reads the provider-hop backends, and an empty providerHopEndpoints, since hops follow clusterEndpoints.
+	// gridSiteRoute reads the serving config, so it needs the operator's poll signal transport. It also needs an enabled mountReconciliation, whose rollout per config revision re-reads the provider-hop backends, and an empty providerHopEndpoints, since hops follow clusterEndpoints. Every cluster is health-checked, so the gateway's readiness probe must ask Praxis /healthy: /ready fails while any one site is down.
 	// Default: intelligentRoute.
 	SiteRouter GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter `json:"siteRouter,omitempty"`
 	// Declare that the running consumer has the dynamic credential_inject filter configured with the projected Secret mount root. This is a fail-closed capability gate for credential-bearing overlay revisions. Set it only after the consumer has loaded a config containing that filter; the Grid operator does not own or roll out the consumer Deployment.

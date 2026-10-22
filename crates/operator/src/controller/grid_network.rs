@@ -47,7 +47,7 @@ use crate::{
     error::OperatorError,
     readiness,
     resources::{
-        consumer_config::{self, ConsumerConfigError},
+        consumer_config::{self, ConsumerConfigError, SiteRoutePrerequisite},
         derived_topology, gateway_mounts, overlay_envelope, provider_admission, provider_metrics, routing_overlay,
         secret,
         serving_config::{self, ServingInputs, WriteDecision, WriteGate},
@@ -2440,7 +2440,7 @@ async fn reconcile_routing_overlay_inner(
                 observed_generation,
                 None,
                 "SiteRouteUnsupported",
-                missing,
+                &missing.to_string(),
             ));
             continue;
         }
@@ -2618,8 +2618,8 @@ async fn reconcile_routing_overlay_inner(
 
         // The embedded gateway watches valid serving revisions independently.
         if let Some(source) = serving {
-            let derived_hops = site_route.map(|_| cluster_endpoints.as_ref());
-            match apply_serving_config(&overlay, source, network_name, gw_ref, derived_hops, client).await {
+            let hops = site_route.map_or(HopSource::Declared, |_| HopSource::Rendered(&cluster_endpoints));
+            match apply_serving_config(&overlay, source, network_name, gw_ref, hops, client).await {
                 Ok(retry) => serving_retry = serving_retry.into_iter().chain(retry).min(),
                 Err(error) => {
                     tracing::warn!(network = network_name, gateway = %gw_ref.name, %error, "serving config apply failed");
@@ -2744,14 +2744,13 @@ fn serving_source<'ctx>(ctx: &'ctx OperatorCtx, providers: &[InferenceProvider])
 }
 
 /// The first `grid_site_route` prerequisite this gateway does not meet.
-fn site_route_unmet(gw_ref: &GatewayRef, cc: &ConsumerConfig, polling: bool) -> Option<&'static str> {
+fn site_route_unmet(gw_ref: &GatewayRef, cc: &ConsumerConfig, polling: bool) -> Option<SiteRoutePrerequisite> {
     if !polling {
-        Some("requires the poll signal transport")
+        Some(SiteRoutePrerequisite::PollTransport)
     } else if !cc.mount_reconciliation.as_ref().is_some_and(|mounts| mounts.enabled) {
-        // A rollout per praxis.yaml revision is what re-reads the verified provider-hop backends.
-        Some("requires mountReconciliation.enabled")
+        Some(SiteRoutePrerequisite::MountReconciliation)
     } else if !gw_ref.provider_hop_endpoints.is_empty() {
-        Some("derives provider hops, so providerHopEndpoints must be empty")
+        Some(SiteRoutePrerequisite::DeclaredProviderHops)
     } else {
         None
     }
@@ -2762,7 +2761,7 @@ fn render_serving_text(
     overlay: &routing_overlay::RoutingOverlay,
     source: &ServingSource<'_>,
     gw_ref: &GatewayRef,
-    derived_hops: Option<&[ClusterEndpointConfig]>,
+    hops: HopSource<'_>,
 ) -> Result<String, OperatorError> {
     let tls_mount = gw_ref
         .praxis_config
@@ -2770,7 +2769,7 @@ fn render_serving_text(
         .map_or(crate::crd::grid_network::DEFAULT_TLS_CERT_MOUNT_PATH, |cc| {
             cc.tls_cert_mount_path.as_str()
         });
-    let provider_hop_sni = serving_hop_sni(overlay, gw_ref, derived_hops)?;
+    let provider_hop_sni = serving_hop_sni(overlay, gw_ref, hops)?;
     let provider_hop_clusters: BTreeSet<String> = provider_hop_sni.keys().cloned().collect();
     let heard = |site: &str, cluster: &str| source.load_heard.heard(site, cluster);
     let inputs = ServingInputs {
@@ -2783,24 +2782,33 @@ fn render_serving_text(
         peer_budget: source.settings.peer_budget,
         heard: &heard,
         quiet_local: &source.quiet_local,
-        credentials: derived_hops.is_some(),
+        inject_local_credentials: matches!(hops, HopSource::Rendered(_)),
     };
     serving_config::to_text(&serving_config::render(overlay, &inputs)).map_err(OperatorError::Json)
 }
 
-/// The serving config's provider hops: derived from the endpoints a generated `grid_site_route`
-/// config renders, so the gateway can bind each one, or else the declared `providerHopEndpoints`.
+/// Where a gateway's serving config takes its provider hops from.
+#[derive(Clone, Copy)]
+enum HopSource<'endpoints> {
+    /// The declared `providerHopEndpoints`.
+    Declared,
+    /// The mutual TLS endpoints a generated `grid_site_route` config renders, so the gateway
+    /// can bind each one. Its local credentials ride along for the router to select.
+    Rendered(&'endpoints [ClusterEndpointConfig]),
+}
+
+/// The serving config's provider hops, each with the SNI its backend verifies.
 fn serving_hop_sni(
     overlay: &routing_overlay::RoutingOverlay,
     gw_ref: &GatewayRef,
-    derived_hops: Option<&[ClusterEndpointConfig]>,
+    hops: HopSource<'_>,
 ) -> Result<BTreeMap<String, String>, OperatorError> {
-    match derived_hops {
-        Some(endpoints) if !overlay.candidates.is_empty() => {
-            consumer_config::provider_hop_sni(endpoints).map_err(OperatorError::ConsumerConfigRender)
+    match hops {
+        HopSource::Rendered(endpoints) if !overlay.candidates.is_empty() => {
+            consumer_config::provider_hops(endpoints).map_err(OperatorError::ConsumerConfigRender)
         },
-        Some(_) => Ok(BTreeMap::new()),
-        None => serving_provider_hop_sni_for_overlay(overlay, gw_ref),
+        HopSource::Rendered(_) => Ok(BTreeMap::new()),
+        HopSource::Declared => serving_provider_hop_sni_for_overlay(overlay, gw_ref),
     }
 }
 
@@ -2881,11 +2889,11 @@ async fn apply_serving_config(
     source: &ServingSource<'_>,
     network_name: &str,
     gw_ref: &GatewayRef,
-    derived_hops: Option<&[ClusterEndpointConfig]>,
+    hops: HopSource<'_>,
     client: &Client,
 ) -> Result<Option<Duration>, OperatorError> {
     serving_config::warn_refused_sites(overlay, network_name, source.refused);
-    let text = render_serving_text(overlay, source, gw_ref, derived_hops)?;
+    let text = render_serving_text(overlay, source, gw_ref, hops)?;
     let name = serving_config::configmap_name(network_name, &gw_ref.name);
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
     let existing = api.get_opt(&name).await?;
@@ -10259,7 +10267,7 @@ mod tests {
         assert_eq!(site_route_unmet(&gw, &cc, true), None, "every prerequisite met");
         assert_eq!(
             site_route_unmet(&gw, &cc, false),
-            Some("requires the poll signal transport"),
+            Some(SiteRoutePrerequisite::PollTransport),
             "no serving config is written outside poll"
         );
         for mounts in [None, Some(json!({"enabled": false}))] {
@@ -10270,7 +10278,7 @@ mod tests {
             };
             assert_eq!(
                 site_route_unmet(&gw, &cc, true),
-                Some("requires mountReconciliation.enabled"),
+                Some(SiteRoutePrerequisite::MountReconciliation),
                 "without a rollout per revision the gateway never re-reads its hop backends"
             );
         }
@@ -10283,7 +10291,7 @@ mod tests {
         ];
         assert_eq!(
             site_route_unmet(&declared, &cc, true),
-            Some("derives provider hops, so providerHopEndpoints must be empty")
+            Some(SiteRoutePrerequisite::DeclaredProviderHops)
         );
     }
 
@@ -10321,13 +10329,14 @@ mod tests {
             selection_policy: None,
             generated_at: None,
         };
-        let derived = serving_hop_sni(&overlay, &gw, Some(&endpoints)).unwrap_or_else(|_| std::process::abort());
+        let derived =
+            serving_hop_sni(&overlay, &gw, HopSource::Rendered(&endpoints)).unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             derived.into_iter().collect::<Vec<_>>(),
             [("site-b".to_owned(), "site-b.grid.internal".to_owned())],
             "the hop is the rendered mTLS endpoint at its rendered SNI, never the hand list"
         );
-        let declared = serving_hop_sni(&overlay, &gw, None).unwrap_or_else(|_| std::process::abort());
+        let declared = serving_hop_sni(&overlay, &gw, HopSource::Declared).unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             declared.keys().collect::<Vec<_>>(),
             ["declared"],
@@ -10338,7 +10347,7 @@ mod tests {
             ..overlay
         };
         assert!(
-            serving_hop_sni(&empty, &gw, Some(&endpoints))
+            serving_hop_sni(&empty, &gw, HopSource::Rendered(&endpoints))
                 .unwrap_or_else(|_| std::process::abort())
                 .is_empty(),
             "no candidate receives hop context after an authoritative withdrawal"

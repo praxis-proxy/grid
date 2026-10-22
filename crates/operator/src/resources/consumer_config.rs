@@ -171,11 +171,26 @@ pub enum ConsumerConfigError {
 
     /// A `grid_site_route` prerequisite is missing.
     #[error("siteRouter gridSiteRoute {0}")]
-    SiteRouteUnsupported(&'static str),
+    SiteRouteUnsupported(SiteRoutePrerequisite),
 
     /// JSON serialization failed.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+/// A `grid_site_route` prerequisite a gateway does not meet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[expect(unnameable_types, reason = "pub(crate) module restricts reachability")]
+pub enum SiteRoutePrerequisite {
+    /// No serving config is written outside poll.
+    #[error("requires the poll signal transport")]
+    PollTransport,
+    /// A rollout per praxis.yaml revision is what re-reads the verified provider-hop backends.
+    #[error("requires mountReconciliation.enabled")]
+    MountReconciliation,
+    /// The hops follow the generated endpoints.
+    #[error("derives provider hops, so providerHopEndpoints must be empty")]
+    DeclaredProviderHops,
 }
 
 /// Purpose of one Secret projection required by a generated gateway config.
@@ -477,8 +492,8 @@ fn render_telemetry(telemetry: &GatewayTelemetryConfig) -> Result<String, Consum
 struct RouterInputs<'input> {
     /// Every cluster the `load_balancer` can dial, sorted by name.
     endpoints: &'input [&'input ClusterEndpointConfig],
-    /// The mutual TLS clusters that are other sites' provider gateways.
-    provider_hops: &'input BTreeSet<String>,
+    /// The mutual TLS clusters that are other sites' provider gateways, with their SNI.
+    provider_hops: &'input BTreeMap<String, String>,
     /// This gateway's site, quoted.
     local_site: &'input str,
     /// The overlay's network, quoted.
@@ -489,23 +504,24 @@ struct RouterInputs<'input> {
     namespace: &'input str,
 }
 
-/// A request router the operator can generate a consumer pipeline for.
-trait Router {
+/// How the operator renders one request router into a consumer pipeline.
+trait RouterRender {
     /// The filter promoting the body's `model` to the `X-Model` header the router reads.
     const MODEL_FILTER: &'static str;
 
-    /// Whether the router demotes clusters praxis health-checks, which then need probes.
-    const HEALTH_CHECKED: bool;
-
     /// The router's filter block.
     fn filter(inputs: &RouterInputs<'_>) -> Result<String, ConsumerConfigError>;
+
+    /// What a cluster carries beside its endpoints for this router, `None` when nothing.
+    fn probe(_endpoint: &ClusterEndpointConfig) -> Option<String> {
+        None
+    }
 }
 
-/// `intelligent_route` over the routing overlay file.
-struct IntelligentRouteFilter;
+/// Renders `intelligent_route` over the routing overlay file.
+struct IntelligentRouteRender;
 
-impl Router for IntelligentRouteFilter {
-    const HEALTH_CHECKED: bool = false;
+impl RouterRender for IntelligentRouteRender {
     const MODEL_FILTER: &'static str =
         "      - filter: json_body_field\n        field: model\n        header: X-Model\n";
 
@@ -535,11 +551,21 @@ impl Router for IntelligentRouteFilter {
     }
 }
 
-/// `grid_site_route` over the serving config, routable to every cluster the pipeline dials.
-struct GridSiteRouteFilter;
+/// Renders `grid_site_route` over the serving config, routable to every cluster the pipeline dials.
+struct GridSiteRouteRender;
 
-impl Router for GridSiteRouteFilter {
-    const HEALTH_CHECKED: bool = true;
+/// How long another site's gateway may take to accept a connection, milliseconds.
+const PEER_CONNECT_TIMEOUT_MS: u32 = 2_000;
+/// How long another site's gateway may take to accept a connection over TLS, milliseconds.
+const PEER_TOTAL_CONNECT_TIMEOUT_MS: u32 = 4_000;
+/// Probe period for another site's gateway, which takes too little traffic for passive checks alone.
+const PEER_PROBE_INTERVAL_MS: u32 = 3_000;
+/// Probe period for a local backend.
+const LOCAL_PROBE_INTERVAL_MS: u32 = 5_000;
+/// How long one probe may take, milliseconds.
+const PROBE_TIMEOUT_MS: u32 = 2_000;
+
+impl RouterRender for GridSiteRouteRender {
     // model_to_header drops a caller's own X-Model, which grid_site_route would otherwise read first.
     const MODEL_FILTER: &'static str = "      - filter: model_to_header\n        header: X-Model\n";
 
@@ -552,6 +578,38 @@ impl Router for GridSiteRouteFilter {
             .join(", ");
         Ok(format!(
             "      - filter: grid_site_route\n        model_header: X-Model\n        clusters: [{clusters}]"
+        ))
+    }
+
+    /// Bounded connects for another site's gateway, and a probe that `grid_site_route` demotes on.
+    ///
+    /// The probe is tcp for every transport: the operator does not know a backend's health
+    /// path, and passive checks still mark an endpoint that fails requests.
+    fn probe(endpoint: &ClusterEndpointConfig) -> Option<String> {
+        let peer = endpoint
+            .transport
+            .as_ref()
+            .is_some_and(|transport| transport.mode == TransportMode::MutualTls);
+        let timeouts = if peer { peer_connect_limits() } else { String::new() };
+        Some(format!(
+            concat!(
+                "{timeouts}",
+                "\n            health_check:",
+                "\n              type: tcp",
+                "\n              interval_ms: {interval}",
+                "\n              timeout_ms: {timeout}",
+                "\n              healthy_threshold: 2",
+                "\n              unhealthy_threshold: 3",
+                "\n              passive_unhealthy_threshold: 2",
+                "\n              passive_healthy_threshold: 2",
+            ),
+            timeouts = timeouts,
+            interval = if peer {
+                PEER_PROBE_INTERVAL_MS
+            } else {
+                LOCAL_PROBE_INTERVAL_MS
+            },
+            timeout = PROBE_TIMEOUT_MS,
         ))
     }
 }
@@ -585,8 +643,8 @@ fn generate_consumer_praxis_config_for_gateway_with_telemetry(
         telemetry,
     };
     match site_router {
-        SiteRouter::IntelligentRoute => pipeline.render::<IntelligentRouteFilter>(),
-        SiteRouter::GridSiteRoute => pipeline.render::<GridSiteRouteFilter>(),
+        SiteRouter::IntelligentRoute => pipeline.render::<IntelligentRouteRender>(),
+        SiteRouter::GridSiteRoute => pipeline.render::<GridSiteRouteRender>(),
     }
 }
 
@@ -618,7 +676,7 @@ impl Pipeline<'_> {
         clippy::too_many_lines,
         reason = "validation and each pipeline section in filter order"
     )]
-    fn render<R: Router>(&self) -> Result<String, ConsumerConfigError> {
+    fn render<R: RouterRender>(&self) -> Result<String, ConsumerConfigError> {
         let overlay = self.overlay;
         if overlay.local_site.trim().is_empty() {
             return Err(ConsumerConfigError::BlankLocalSite);
@@ -626,7 +684,7 @@ impl Pipeline<'_> {
         if self.cluster_endpoints.is_empty() {
             return Err(ConsumerConfigError::NoClusterEndpoints);
         }
-        let provider_hops = provider_hop_clusters(self.cluster_endpoints)?;
+        let provider_hops = provider_hops(self.cluster_endpoints)?;
         let candidates: Vec<_> = overlay
             .candidates
             .iter()
@@ -647,13 +705,15 @@ impl Pipeline<'_> {
         }
         let mut endpoints = self.cluster_endpoints.iter().collect::<Vec<_>>();
         endpoints.sort_by(|left, right| left.cluster.cmp(&right.cluster));
+        let mut probed = false;
         let clusters = endpoints
             .iter()
             .map(|endpoint| {
                 let mut entry =
                     render_cluster_entry(&yaml_scalar(&endpoint.cluster)?, endpoint, self.tls_cert_mount_path)?;
-                if R::HEALTH_CHECKED {
-                    entry.push_str(&render_cluster_probe(endpoint));
+                if let Some(probe) = R::probe(endpoint) {
+                    entry.push_str(&probe);
+                    probed = true;
                 }
                 Ok(entry)
             })
@@ -696,7 +756,7 @@ impl Pipeline<'_> {
         });
         config.push_str("\n      - filter: load_balancer\n        clusters:\n");
         config.push_str(&clusters);
-        if R::HEALTH_CHECKED {
+        if probed {
             // Praxis health-checks only top-level clusters.
             config.push_str("\nclusters:\n");
             config.push_str(&clusters);
@@ -1104,34 +1164,29 @@ fn render_selection_policy(policy: Option<&crate::crd::grid_network::SelectionPo
 /// backends and do not receive provider-hop headers.
 #[cfg(test)]
 fn render_provider_hop_clusters(cluster_endpoints: &[ClusterEndpointConfig]) -> Result<String, ConsumerConfigError> {
-    render_hop_cluster_list(&provider_hop_clusters(cluster_endpoints)?)
+    render_hop_cluster_list(&provider_hops(cluster_endpoints)?)
 }
 
 /// The `provider_hop_clusters` line for `intelligent_route`, empty when there are none.
-fn render_hop_cluster_list(clusters: &BTreeSet<String>) -> Result<String, ConsumerConfigError> {
-    if clusters.is_empty() {
+fn render_hop_cluster_list(hops: &BTreeMap<String, String>) -> Result<String, ConsumerConfigError> {
+    let values = hops
+        .keys()
+        .map(|cluster| yaml_scalar(cluster))
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.is_empty() {
         return Ok(String::new());
     }
-    let values = clusters
-        .iter()
-        .map(|cluster| yaml_scalar(cluster))
-        .collect::<Result<Vec<_>, _>>()?
-        .join(", ");
-    Ok(format!("        provider_hop_clusters: [{values}]\n"))
+    Ok(format!("        provider_hop_clusters: [{}]\n", values.join(", ")))
 }
 
-/// The explicit mTLS endpoint names allowed to receive provider-hop context in
-/// generated consumer Praxis config. The embedded Grid gateway uses its
-/// independent `GatewayRef.providerHopEndpoints` contract.
-#[expect(
-    clippy::too_many_lines,
-    reason = "this validation keeps the mTLS provider-hop boundary explicit"
-)]
-pub(crate) fn provider_hop_clusters(
+/// The explicit mTLS endpoints allowed to receive provider-hop context, each with the SNI
+/// its generated `load_balancer` entry verifies. `intelligent_route` lists them, and a
+/// `grid_site_route` gateway's serving config binds them.
+pub(crate) fn provider_hops(
     cluster_endpoints: &[ClusterEndpointConfig],
-) -> Result<BTreeSet<String>, ConsumerConfigError> {
+) -> Result<BTreeMap<String, String>, ConsumerConfigError> {
     let mut seen = BTreeSet::new();
-    let mut hops = BTreeSet::new();
+    let mut hops = BTreeMap::new();
     for endpoint in cluster_endpoints {
         if endpoint.cluster.trim().is_empty() {
             return Err(ConsumerConfigError::BlankCluster {
@@ -1146,12 +1201,7 @@ pub(crate) fn provider_hop_clusters(
         }
         match endpoint.transport.as_ref() {
             Some(transport) if transport.mode == TransportMode::MutualTls => {
-                if transport.sni.as_deref().is_none_or(|sni| sni.trim().is_empty()) {
-                    return Err(ConsumerConfigError::MissingSni {
-                        cluster: endpoint.cluster.clone(),
-                    });
-                }
-                hops.insert(endpoint.cluster.clone());
+                hops.insert(endpoint.cluster.clone(), rendered_sni(endpoint)?.to_owned());
             },
             Some(transport)
                 if transport.mode == TransportMode::Plaintext
@@ -1177,18 +1227,6 @@ fn rendered_sni(ep: &ClusterEndpointConfig) -> Result<&str, ConsumerConfigError>
         .ok_or_else(|| ConsumerConfigError::MissingSni {
             cluster: ep.cluster.clone(),
         })
-}
-
-/// Each provider-hop cluster and the SNI its generated `load_balancer` entry verifies.
-pub(crate) fn provider_hop_sni(
-    cluster_endpoints: &[ClusterEndpointConfig],
-) -> Result<BTreeMap<String, String>, ConsumerConfigError> {
-    let hops = provider_hop_clusters(cluster_endpoints)?;
-    cluster_endpoints
-        .iter()
-        .filter(|endpoint| hops.contains(&endpoint.cluster))
-        .map(|endpoint| Ok((endpoint.cluster.clone(), rendered_sni(endpoint)?.to_owned())))
-        .collect()
 }
 
 /// Render one `intelligent_route` candidate.
@@ -1475,25 +1513,15 @@ fn render_cluster_entry(
     }
 }
 
-/// Bounded connects for another site's gateway, and a probe for every cluster.
-///
-/// The probe is tcp for every transport: the operator does not know a backend's health
-/// path, and passive checks still mark an endpoint that fails requests.
-fn render_cluster_probe(ep: &ClusterEndpointConfig) -> String {
-    let peer = ep
-        .transport
-        .as_ref()
-        .is_some_and(|transport| transport.mode == TransportMode::MutualTls);
-    let (timeouts, interval_ms) = if peer {
-        (
-            "\n            connection_timeout_ms: 2000\n            total_connection_timeout_ms: 4000",
-            3000,
-        )
-    } else {
-        ("", 5000)
-    };
+/// The connect limits for another site's gateway, so a partitioned site fails fast.
+fn peer_connect_limits() -> String {
     format!(
-        "{timeouts}\n            health_check:\n              type: tcp\n              interval_ms: {interval_ms}\n              timeout_ms: 2000\n              healthy_threshold: 2\n              unhealthy_threshold: 3\n              passive_unhealthy_threshold: 2\n              passive_healthy_threshold: 2"
+        concat!(
+            "\n            connection_timeout_ms: {connect}",
+            "\n            total_connection_timeout_ms: {total}",
+        ),
+        connect = PEER_CONNECT_TIMEOUT_MS,
+        total = PEER_TOTAL_CONNECT_TIMEOUT_MS,
     )
 }
 
@@ -1642,7 +1670,7 @@ mod tests {
     }
 
     fn site_route_serving(overlay: &RoutingOverlay, endpoints: &[ClusterEndpointConfig]) -> String {
-        let sni = provider_hop_sni(endpoints).expect("hop SNI");
+        let sni = provider_hops(endpoints).expect("hop SNI");
         let clusters: BTreeSet<String> = sni.keys().cloned().collect();
         let none = BTreeSet::new();
         let inputs = crate::resources::serving_config::ServingInputs {
@@ -1655,7 +1683,7 @@ mod tests {
             peer_budget: std::time::Duration::from_secs(10),
             heard: &|_, _| true,
             quiet_local: &none,
-            credentials: true,
+            inject_local_credentials: true,
         };
         crate::resources::serving_config::to_text(&crate::resources::serving_config::render(overlay, &inputs))
             .expect("serving text")
@@ -1741,7 +1769,7 @@ mod tests {
         let yaml = render_site_route(&overlay, &endpoints).expect("render").config_yaml;
         let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("yaml");
         let rendered = doc["clusters"][1]["tls"]["sni"].as_str().expect("rendered sni");
-        let hops = provider_hop_sni(&endpoints).expect("hops");
+        let hops = provider_hops(&endpoints).expect("hops");
         assert_eq!(
             hops.into_iter().collect::<Vec<_>>(),
             [("site-b".to_owned(), rendered.to_owned())],
@@ -1760,13 +1788,13 @@ mod tests {
             transport.sni = Some("   ".to_owned());
         }
         assert!(matches!(
-            provider_hop_sni(&endpoints),
+            provider_hops(&endpoints),
             Err(ConsumerConfigError::MissingSni { .. })
         ));
         let (_, mut duplicated) = site_route_topology();
         duplicated.push(duplicated[0].clone());
         assert!(matches!(
-            provider_hop_sni(&duplicated),
+            provider_hops(&duplicated),
             Err(ConsumerConfigError::DuplicateClusterEndpoint { .. })
         ));
     }
@@ -1827,6 +1855,21 @@ mod tests {
         assert!(
             remote.get("credential").is_none(),
             "a remote site's credential stays with its provider gateway"
+        );
+
+        let mut relabelled = overlay.clone();
+        relabelled.candidates[1].site = "site-a".to_owned();
+        let relabelled_serving: serde_json::Value =
+            serde_json::from_str(&site_route_serving(&relabelled, &endpoints)).expect("serving json");
+        let hop = relabelled_serving["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .find(|c| c["cluster"] == "site-b")
+            .expect("hop candidate");
+        assert!(
+            hop.get("credential").is_none(),
+            "a candidate claiming this site on another site's gateway never carries a credential"
         );
     }
 
