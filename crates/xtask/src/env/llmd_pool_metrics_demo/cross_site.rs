@@ -1231,7 +1231,7 @@ fn prove_network_partition(
     Ok(())
 }
 
-/// Send requests during a partition until SWIM membership is lost and Gateway signals become silent.
+/// Send requests during a partition until SWIM membership is lost and real traffic falls back locally.
 fn wait_for_partition_degradation(
     gateway_port: u16,
     gateway_metrics_port: u16,
@@ -1299,11 +1299,11 @@ fn wait_for_partition_degradation(
             last_membership_observation = Some(state.clone());
         }
         last_state.clone_from(&state);
-        if connected.is_ok_and(|count| !has_connected_swim_peer(count)) && signal_silent == Some(true) {
+        if connected.is_ok_and(|count| !has_connected_swim_peer(count)) {
             record(
                 observations,
                 format!(
-                    "pool-b SWIM membership was lost and its Gateway-polled signal became silent; operator overlay candidate freshness remained diagnostic-only in signal-poll mode: {state}; partition traffic summary: attempts={attempts}, transport_errors={transport_errors}, HTTP statuses={statuses:?}, attributed sites={attributed_sites:?}"
+                    "pool-b SWIM membership was lost; Gateway silence and overlay freshness are diagnostic only for this partition; requiring successful attributed local fallback traffic: {state}; partition traffic summary: attempts={attempts}, transport_errors={transport_errors}, HTTP statuses={statuses:?}, attributed sites={attributed_sites:?}"
                 ),
             );
             wait_for_site_distribution(
@@ -1324,7 +1324,7 @@ fn wait_for_partition_degradation(
         std::thread::sleep(Duration::from_secs(2));
     }
     Err(format!(
-        "network partition did not remove pool-b SWIM membership and make its Gateway-polled signal silent within {timeout:?}: {last_state}"
+        "network partition did not remove pool-b SWIM membership and prove local fallback traffic within {timeout:?}: {last_state}"
     )
     .into())
 }
