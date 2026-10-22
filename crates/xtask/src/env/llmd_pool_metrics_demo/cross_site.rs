@@ -31,6 +31,8 @@ const WEIGHTED_ROUTE_SAMPLE_REQUESTS: usize = 256;
 const WEIGHTED_ROUTE_SAMPLE_BATCH_REQUESTS: usize = 32;
 /// Maximum absolute difference between observed and metric-predicted two-site route share.
 const WEIGHTED_ROUTE_SHARE_TOLERANCE: f64 = 0.15;
+/// Permit small scrape-to-scrape gauge movement while requiring a stable effective route share.
+const WEIGHTED_ROUTE_METRIC_STABILITY_REL_TOLERANCE: f64 = 0.01;
 /// `grid_site_route` clamps a two-site weighted share to this range.
 const TWO_SITE_SHARE_RANGE: (f64, f64) = (0.1, 0.9);
 /// Queue capacity is four per endpoint; this pressure changes the score without making the site full.
@@ -1921,26 +1923,19 @@ fn verify_weighted_site_distribution(
     let mut previous: Option<WeightedRouteMetrics> = None;
     let mut stable_samples = 0_u32;
     let mut pre_sample_retries = 0_u32;
+    let mut metric_observations = 0_u32;
     while Instant::now() < deadline {
         match read_gateway_metrics(metrics_port).and_then(|metrics| {
             weighted_route_metrics(&metrics, expected_site, require_strict_pressure_preference).map_err(Into::into)
         }) {
             Ok(current) => {
-                last = format!(
-                    "expected site score={:.3}, weight={:.3}, rho={:.6}, weighted share={:.1}%; other site score={:.3}, weight={:.3}, rho={:.6}",
-                    current.preferred_score,
-                    current.preferred_weight,
-                    current.preferred_rho,
-                    current.preferred_share * 100.0,
-                    current.other_score,
-                    current.other_weight,
-                    current.other_rho
-                );
+                metric_observations = metric_observations.saturating_add(1);
                 if previous.is_some_and(|before| weighted_route_metrics_stable(before, current)) {
                     stable_samples = stable_samples.saturating_add(1);
                 } else {
                     stable_samples = 1;
                 }
+                last = format!("metrics={current:?}; consecutive stable observations={stable_samples}");
                 previous = Some(current);
                 if stable_samples >= 2 {
                     let before_snapshot: Result<_, Box<dyn std::error::Error>> = read_gateway_metrics(metrics_port)
@@ -2072,7 +2067,7 @@ fn verify_weighted_site_distribution(
         std::thread::sleep(Duration::from_secs(2));
     }
     Err(format!(
-        "Gateway did not expose a stable queue-score and pressure order with {expected_site} preferred within {timeout:?}: {last}"
+        "Gateway did not expose a stable queue-score and pressure order with {expected_site} preferred within {timeout:?} after {metric_observations} valid metric observations: {last}"
     )
     .into())
 }
@@ -2181,7 +2176,9 @@ fn weighted_route_metrics_stable(before: WeightedRouteMetrics, after: WeightedRo
         (before.preferred_share, after.preferred_share),
     ]
     .into_iter()
-    .all(|(left, right)| (left - right).abs() <= f64::EPSILON)
+    .all(|(left, right)| {
+        (left - right).abs() <= WEIGHTED_ROUTE_METRIC_STABILITY_REL_TOLERANCE * left.abs().max(right.abs()).max(1.0)
+    })
 }
 
 /// Whether an attributed sample is within the explicit tolerance of the Gateway's weighted choice.
@@ -3222,6 +3219,35 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0.5
             route.is_err_and(|error| error.contains("is not strictly lower")),
             "a tied score must not satisfy the recovery preference assertion"
         );
+    }
+
+    #[test]
+    fn weighted_route_stability_allows_small_scrape_jitter_but_rejects_route_changes() {
+        let stable = WeightedRouteMetrics {
+            preferred_score: 0.0,
+            other_score: 2.0,
+            preferred_weight: 8.0,
+            other_weight: 8.0,
+            preferred_rho: 0.20,
+            other_rho: 0.95,
+            preferred_share: 0.55,
+        };
+        let jittered = WeightedRouteMetrics {
+            preferred_score: 0.002,
+            other_score: 2.01,
+            preferred_weight: 8.01,
+            other_weight: 8.0,
+            preferred_rho: 0.205,
+            other_rho: 0.955,
+            preferred_share: 0.551,
+        };
+        let changed = WeightedRouteMetrics {
+            other_score: 2.1,
+            ..jittered
+        };
+
+        assert!(weighted_route_metrics_stable(stable, jittered));
+        assert!(!weighted_route_metrics_stable(stable, changed));
     }
 
     #[test]

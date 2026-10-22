@@ -125,10 +125,12 @@ The qualification uses upstream `llm-d-inference-sim` as the inference
 backend. Each simulator's startup `fake-metrics` values are mounted from its own
 ConfigMap. The runner updates those persistent configurations and normally
 rolls the simulator pods, so a restart cannot lose the requested values. For
-the learned-ceiling idle-retention phase, it instead updates `fake-metrics`
-through the simulator's `/admin/config` API and verifies that the pod UIDs and
-Deployment generations stay unchanged; this avoids a metrics-source interruption
-while the proof checks that the learned ceiling survives fresh idle samples.
+the learned-ceiling idle-retention and reported-only KV-cache phases, it updates
+`fake-metrics` through the simulator's `/admin/config` API and verifies that
+pod UIDs and Deployment generations stay unchanged. This avoids endpoint
+readiness churn while proving that idle ceilings persist and provider-reported
+KV pressure changes routing without a topology change. The later endpoint-shrink
+phase still scales a simulator Deployment explicitly.
 Existing quick and full proofs use
 the deterministic state sequence `0 -> 9 -> 0` for queue depth and
 `0.0 -> 0.95 -> 0.0` for KV-cache pressure. The new full-mode lifecycle proof

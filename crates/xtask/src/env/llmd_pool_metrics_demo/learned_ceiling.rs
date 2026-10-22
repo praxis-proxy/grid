@@ -28,7 +28,7 @@ use super::{
         read_operator_metrics, send_site_request, start_ready_port_forward,
     },
     deployment_generation, format_utc_iso, get_configmap_data_key, kind_context, kubectl, kubectl_exec_epp_metrics,
-    run_cluster_prefix, set_simulator_fake_metrics, set_simulator_fake_metrics_with_endpoint_kv, simulator_config,
+    run_cluster_prefix, set_simulator_fake_metrics, simulator_config,
 };
 use crate::env::verify::{PortForwardGuard, curl_post, find_free_port};
 
@@ -1163,14 +1163,13 @@ fn run_lifecycle(
         KV_HARD_BOUND_ROUTE_REQUESTS,
     )?;
 
-    set_simulator_fake_metrics_with_endpoint_kv(
+    observations.extend(set_simulator_fake_metrics_live_with_endpoint_kv(
         SITE,
         0,
         LOW_RUNNING_REQUESTS,
         KV_HARD_BOUND_CACHE_HIGH_ENDPOINT,
         KV_HARD_BOUND_CACHE_LOW_ENDPOINT,
-        context.metrics_transport == MetricsTransport::MtlsProxy,
-    )?;
+    )?);
     observations.push(format!(
         "pool-B simulator set low running-requests={LOW_RUNNING_REQUESTS}, waiting-requests={KV_REPORTED_ONLY_WAITING_REQUESTS}, vcr-1 KV-cache={KV_HARD_BOUND_CACHE_HIGH_ENDPOINT}, vcr-2 KV-cache={KV_HARD_BOUND_CACHE_LOW_ENDPOINT}; the provider signal must route as saturated without a learned hard ceiling"
     ));
@@ -1215,14 +1214,13 @@ fn run_lifecycle(
         (reported_only_soft_pool_b_share - reported_only_pool_b_share) * 100.0
     ));
 
-    set_simulator_fake_metrics_with_endpoint_kv(
+    observations.extend(set_simulator_fake_metrics_live_with_endpoint_kv(
         SITE,
         KV_HARD_BOUND_WAITING_REQUESTS,
         KV_HARD_BOUND_RUNNING_REQUESTS,
         KV_HARD_BOUND_CACHE_HIGH_ENDPOINT,
         KV_HARD_BOUND_CACHE_LOW_ENDPOINT,
-        context.metrics_transport == MetricsTransport::MtlsProxy,
-    )?;
+    )?);
     observations.push(format!(
         "pool-B simulator set running-requests={KV_HARD_BOUND_RUNNING_REQUESTS}, waiting-requests={KV_HARD_BOUND_WAITING_REQUESTS} per endpoint, vcr-1 KV-cache={KV_HARD_BOUND_CACHE_HIGH_ENDPOINT}, vcr-2 KV-cache={KV_HARD_BOUND_CACHE_LOW_ENDPOINT}; expected pinned EPP mean={KV_HARD_BOUND_CACHE_MEAN}, sample standard deviation={KV_HARD_BOUND_CACHE_SPREAD}, and zero held-work capacity"
     ));
@@ -1317,19 +1315,38 @@ fn run_lifecycle(
     Ok(())
 }
 
-/// Change the idle phase's fake metrics through the simulator's runtime API without restarting its endpoints.
+/// Change fake metrics through the simulator runtime API without restarting its endpoints.
 fn set_simulator_fake_metrics_live(
     cluster: &str,
     waiting_requests: u32,
     running_requests: u32,
     kv_cache_usage: f64,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    set_simulator_fake_metrics_live_with_endpoint_kv(
+        cluster,
+        waiting_requests,
+        running_requests,
+        kv_cache_usage,
+        kv_cache_usage,
+    )
+}
+
+/// Update persistent per-endpoint fake metrics through the simulator API without replacing endpoint pods.
+fn set_simulator_fake_metrics_live_with_endpoint_kv(
+    cluster: &str,
+    waiting_requests: u32,
+    running_requests: u32,
+    vcr1_kv_cache_usage: f64,
+    vcr2_kv_cache_usage: f64,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let context = kind_context(cluster);
     let mut observations = Vec::new();
     for (deployment, configmap) in SIMULATOR_CONFIGMAPS {
+        let kv_cache_usage = endpoint_kv_cache_for_deployment(deployment, vcr1_kv_cache_usage, vcr2_kv_cache_usage)
+            .map_err(std::io::Error::other)?;
         let expected_manifest = simulator_config(configmap, waiting_requests, running_requests, kv_cache_usage);
         kubectl::apply_manifest(&context, &expected_manifest)
-            .map_err(|error| format!("persist idle simulator configmap/{configmap} on {cluster}: {error}"))?;
+            .map_err(|error| format!("persist simulator configmap/{configmap} on {cluster}: {error}"))?;
         let expected_data = super::simulator_config_data(waiting_requests, running_requests, kv_cache_usage);
         let observed_data = get_configmap_data_key(&context, GRID_SYSTEM_NS, configmap, "config.yaml")
             .map_err(|error| format!("read persisted simulator configmap/{configmap} on {cluster}: {error}"))?;
@@ -1416,6 +1433,19 @@ fn set_simulator_fake_metrics_live(
 
     // The caller's stable Gateway observation verifies these updates reached EPP without losing the learned ceiling.
     Ok(observations)
+}
+
+/// Select the pinned KV-cache stimulus for one of the two simulator Deployments.
+fn endpoint_kv_cache_for_deployment(
+    deployment: &str,
+    vcr1_kv_cache_usage: f64,
+    vcr2_kv_cache_usage: f64,
+) -> Result<f64, &'static str> {
+    match deployment {
+        "vcr-1" => Ok(vcr1_kv_cache_usage),
+        "vcr-2" => Ok(vcr2_kv_cache_usage),
+        _ => Err("no per-endpoint KV-cache stimulus was specified for this simulator deployment"),
+    }
 }
 
 /// Identify the single Ready simulator pod behind a run-owned Deployment.
@@ -4260,6 +4290,21 @@ fn epp_readings_match(actual: &EppReadings, expected: &EppReadings) -> bool {
         && (actual.held_capacity_utilization - expected.held_capacity_utilization).abs() < f64::EPSILON
 }
 
+/// Accept an unchanged original mount when an unserved intermediate operator revision was never loaded.
+fn restored_revision_is_observed(
+    operator_digest: &str,
+    mounted_digest: &str,
+    gateway_reloads: f64,
+    original_digest: &str,
+    before_restore: Option<(&str, f64)>,
+) -> bool {
+    before_restore.is_none_or(|(previous_digest, previous_reloads)| {
+        operator_digest == previous_digest
+            || gateway_reloads > previous_reloads
+            || (operator_digest == original_digest && mounted_digest == original_digest)
+    })
+}
+
 /// Wait for the original operator topology, Gateway mount, and same Gateway pod after restoration.
 #[expect(
     clippy::too_many_arguments,
@@ -4287,10 +4332,13 @@ fn wait_for_restored_topology(
                     && candidate_set(&snapshot.mounted_candidates) == expected
                     && snapshot.operator_digest == snapshot.operator_digest_annotation
                     && snapshot.mounted_digest == snapshot.operator_digest
-                    && before_restore.is_none_or(|previous| {
-                        snapshot.operator_digest == previous.operator_digest
-                            || snapshot.gateway_reloads > previous.gateway_reloads
-                    })
+                    && restored_revision_is_observed(
+                        &snapshot.operator_digest,
+                        &snapshot.mounted_digest,
+                        snapshot.gateway_reloads,
+                        &original.baseline.operator_digest,
+                        before_restore.map(|previous| (previous.operator_digest.as_str(), previous.gateway_reloads)),
+                    )
                     && original_signals_restored(&snapshot, original);
                 if stable {
                     let response =
@@ -4310,10 +4358,14 @@ fn wait_for_restored_topology(
                         && candidate_set(&post_request.mounted_candidates) == expected
                         && post_request.operator_digest == post_request.operator_digest_annotation
                         && post_request.mounted_digest == post_request.operator_digest
-                        && before_restore.is_none_or(|previous| {
-                            post_request.operator_digest == previous.operator_digest
-                                || post_request.gateway_reloads > previous.gateway_reloads
-                        })
+                        && restored_revision_is_observed(
+                            &post_request.operator_digest,
+                            &post_request.mounted_digest,
+                            post_request.gateway_reloads,
+                            &original.baseline.operator_digest,
+                            before_restore
+                                .map(|previous| (previous.operator_digest.as_str(), previous.gateway_reloads)),
+                        )
                         && original_signals_restored(&post_request, original)
                     {
                         let response_evidence = response_value(&response);
@@ -4788,12 +4840,13 @@ mod tests {
         KV_HARD_BOUND_ROUTE_REQUESTS, KV_HARD_BOUND_WAITING_REQUESTS, KV_REPORTED_ONLY_WAITING_REQUESTS,
         LOW_RUNNING_REQUESTS, MIN_REPORTED_KV_POOL_B_SHARE_REDUCTION, MIN_SOFT_BASELINE_POOL_B_SHARE, QUEUE_METRIC,
         READY_METRIC, RUN_EXCLUSION_LABEL, RUNNING_METRIC, RouteDistribution, SITE, access_policy_json_patch,
-        capacity_metrics_are_cleared, counted_saturation_is_absent, expected_kv_cache_origin_in_flight,
-        gateway_config_observation_count, gateway_config_values_match, hard_bound_without_soft_is_valid,
-        hard_only_epp_in_flight, idle_ceiling_is_retained, kv_cache_hard_bound_is_valid,
-        kv_cache_reported_only_route_share_shift, kv_cache_route_share_shift, lifecycle_ceiling_sequence_valid,
-        local_relay_matches, metric_values, no_waiting_or_held_work, parse_epp_readings, policy_with_run_exclusion,
-        probe_failure_value, qualification_succeeded, reported_only_kv_cache_is_valid, returned_ceiling_is_valid,
+        capacity_metrics_are_cleared, counted_saturation_is_absent, endpoint_kv_cache_for_deployment,
+        expected_kv_cache_origin_in_flight, gateway_config_observation_count, gateway_config_values_match,
+        hard_bound_without_soft_is_valid, hard_only_epp_in_flight, idle_ceiling_is_retained,
+        kv_cache_hard_bound_is_valid, kv_cache_reported_only_route_share_shift, kv_cache_route_share_shift,
+        lifecycle_ceiling_sequence_valid, local_relay_matches, metric_values, no_waiting_or_held_work,
+        parse_epp_readings, policy_with_run_exclusion, probe_failure_value, qualification_succeeded,
+        reported_only_kv_cache_is_valid, restored_revision_is_observed, returned_ceiling_is_valid,
         validate_response_attribution,
     };
 
@@ -4802,6 +4855,41 @@ mod tests {
             sites: BTreeMap::from([("pool-a".to_owned(), pool_a), (SITE.to_owned(), pool_b)]),
             ..RouteDistribution::default()
         }
+    }
+
+    #[test]
+    fn live_simulator_stimulus_keeps_distinct_endpoint_cache_values() {
+        assert_eq!(endpoint_kv_cache_for_deployment("vcr-1", 1.0, 0.0).ok(), Some(1.0));
+        assert_eq!(endpoint_kv_cache_for_deployment("vcr-2", 1.0, 0.0).ok(), Some(0.0));
+        assert_eq!(
+            endpoint_kv_cache_for_deployment("other", 1.0, 0.0),
+            Err("no per-endpoint KV-cache stimulus was specified for this simulator deployment")
+        );
+    }
+
+    #[test]
+    fn restoration_accepts_an_original_revision_that_never_left_the_gateway() {
+        assert!(restored_revision_is_observed(
+            "original",
+            "original",
+            3.0,
+            "original",
+            Some(("unserved-intermediate", 3.0)),
+        ));
+        assert!(restored_revision_is_observed(
+            "original",
+            "original",
+            4.0,
+            "original",
+            Some(("served-intermediate", 3.0)),
+        ));
+        assert!(!restored_revision_is_observed(
+            "new",
+            "new",
+            3.0,
+            "original",
+            Some(("unserved-intermediate", 3.0)),
+        ));
     }
 
     #[test]
