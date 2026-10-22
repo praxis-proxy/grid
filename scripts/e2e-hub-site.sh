@@ -241,7 +241,27 @@ model_lb() {
         metadata: {name: "vcr-inference-hub-local", namespace: "model"},
         spec: {type: "LoadBalancer", loadBalancerIP: $ip, selector: .spec.selector,
           ports: [.spec.ports[] | {name, port, targetPort, protocol}]}}' \
-    | kubectl --context "$SITE_CTX" apply -f - >/dev/null
+    | kubectl --context "$SITE_CTX" apply -f - >/dev/null || return 1
+  # The model admits only its own site's grid namespace; the hub reaches it over the kind network.
+  kubectl --context "$SITE_CTX" apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vcr-inference-allow-hub-local
+  namespace: model
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: vllm-vcr
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: ${MODEL_LB_IP%.*.*}.0.0/16
+      ports:
+        - protocol: TCP
+          port: 8000
+EOF
 }
 
 model_lb_ready() {
