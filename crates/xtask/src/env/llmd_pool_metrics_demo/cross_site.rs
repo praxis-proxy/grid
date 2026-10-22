@@ -32,6 +32,10 @@ const WEIGHTED_ROUTE_SAMPLE_BATCH_REQUESTS: usize = 32;
 const WEIGHTED_ROUTE_SHARE_TOLERANCE: f64 = 0.15;
 /// `grid_site_route` clamps a two-site weighted share to this range.
 const TWO_SITE_SHARE_RANGE: (f64, f64) = (0.1, 0.9);
+/// Queue capacity is four per endpoint; this pressure changes the score without making the site full.
+const CROSS_SITE_HIGHER_WAITING_REQUESTS: u32 = 2;
+/// A lighter local signal than the peer's trusted baseline for the wrong-pin check.
+const WRONG_PIN_LOCAL_WAITING_REQUESTS: u32 = 1;
 /// Provider identity retained while pool-a's EPP signal expires.
 const POOL_A_PROVIDER: &str = "llmd-pool-a-provider";
 /// Gateway gauges that a measured refresh owns and must clear when its reading disappears.
@@ -466,7 +470,12 @@ fn run(
     let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
 
     set_simulator_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
-    set_simulator_waiting_requests("pool-b", 9, context.scoring_flavor, mtls)?;
+    set_simulator_waiting_requests(
+        "pool-b",
+        CROSS_SITE_HIGHER_WAITING_REQUESTS,
+        context.scoring_flavor,
+        mtls,
+    )?;
     prepare_poll_gateway(image)?;
 
     let local_context = kind_context(GRID_SERVING_SITE);
@@ -545,7 +554,12 @@ fn run(
     let gateway_uid = gateway_pod_uid(&local_context)?;
     let gateway_reloads_before_shift = applied_gateway_reload_count(gateway_metrics_port)?;
 
-    set_simulator_waiting_requests("pool-a", 9, context.scoring_flavor, mtls)?;
+    set_simulator_waiting_requests(
+        "pool-a",
+        CROSS_SITE_HIGHER_WAITING_REQUESTS,
+        context.scoring_flavor,
+        mtls,
+    )?;
     set_simulator_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
     wait_for_pressure_order(operator_metrics_port, "pool-b", Duration::from_secs(120))?;
     verify_weighted_site_distribution(
@@ -647,7 +661,12 @@ fn run(
 
     scale_epp("pool-a", 1)?;
     set_simulator_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
-    set_simulator_waiting_requests("pool-b", 9, context.scoring_flavor, mtls)?;
+    set_simulator_waiting_requests(
+        "pool-b",
+        CROSS_SITE_HIGHER_WAITING_REQUESTS,
+        context.scoring_flavor,
+        mtls,
+    )?;
     wait_for_relay_samples(operator_metrics_port, Duration::from_secs(120))?;
     verify_weighted_site_distribution(
         gateway_http_port,
@@ -665,7 +684,12 @@ fn run(
     );
 
     set_simulator_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
-    set_simulator_waiting_requests("pool-b", 9, context.scoring_flavor, mtls)?;
+    set_simulator_waiting_requests(
+        "pool-b",
+        CROSS_SITE_HIGHER_WAITING_REQUESTS,
+        context.scoring_flavor,
+        mtls,
+    )?;
     wait_for_pressure_order(operator_metrics_port, "pool-a", Duration::from_secs(120))?;
     let pre_pin_route = verify_weighted_site_distribution(
         gateway_http_port,
@@ -749,7 +773,7 @@ fn run(
         // pool-a must keep the exact trusted sample. The same failed identity
         // probe makes the remote GridSite Connecting, so fail-closed routing
         // must keep requests on pool-a until trust is restored.
-        set_simulator_waiting_requests("pool-a", 6, context.scoring_flavor, mtls)?;
+        set_simulator_waiting_requests("pool-a", WRONG_PIN_LOCAL_WAITING_REQUESTS, context.scoring_flavor, mtls)?;
         set_simulator_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
         let pool_b_origin = wait_for_signal_decrease(
             peer_operator_metrics_port,
@@ -1018,7 +1042,12 @@ fn prove_network_partition(
     attribution: &mut RoutingAttributionDiagnostics,
     observations: &mut Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    set_simulator_waiting_requests("pool-a", 9, context.scoring_flavor, mtls)?;
+    set_simulator_waiting_requests(
+        "pool-a",
+        CROSS_SITE_HIGHER_WAITING_REQUESTS,
+        context.scoring_flavor,
+        mtls,
+    )?;
     set_simulator_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
     wait_for_pressure_order(operator_port, "pool-b", Duration::from_secs(120))?;
     verify_weighted_site_distribution(

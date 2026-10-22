@@ -59,6 +59,11 @@ Gateway queue-score order and compares attributed responses with its measured
 two-site capacity-weighted share. This preserves the routing assertion after
 Grid's selector began weighting capacity and smoothed saturation.
 
+These routing stimuli use two waiting requests per simulator endpoint against
+the topology's queue capacity of four. That changes the EPP queue score while
+leaving both providers eligible, so the proof exercises the weighted two-site
+selector rather than the single-eligible-provider fallback.
+
 It also raises the returned pair's queue-free soft ceiling and records a
 2,048-request low-KV routing baseline. It lowers pool-B running load to two
 requests per endpoint, keeps waiting and held work at zero, and sets endpoint
