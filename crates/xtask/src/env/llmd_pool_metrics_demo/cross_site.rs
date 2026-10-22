@@ -1170,6 +1170,7 @@ fn prove_network_partition(
 
     let degradation_result = wait_for_partition_degradation(
         gateway_port,
+        gateway_metrics_port,
         &local_context,
         remote_cluster,
         Duration::from_secs(180),
@@ -1230,9 +1231,10 @@ fn prove_network_partition(
     Ok(())
 }
 
-/// Send requests during a partition until membership and the remote route both become stale.
+/// Send requests during a partition until SWIM membership is lost and Gateway signals become silent.
 fn wait_for_partition_degradation(
     gateway_port: u16,
+    gateway_metrics_port: u16,
     local_context: &str,
     remote_cluster: &str,
     timeout: Duration,
@@ -1276,19 +1278,32 @@ fn wait_for_partition_degradation(
         }
 
         let connected = read_connected_sites(local_context);
-        let fresh = read_overlay_candidate_fresh(GRID_SERVING_SITE, remote_cluster);
-        let state = format!("connectedSites={connected:?}, remote_candidate_fresh={fresh:?}");
+        let overlay_fresh = read_overlay_candidate_fresh(GRID_SERVING_SITE, remote_cluster);
+        let gateway_metrics = read_gateway_metrics(gateway_metrics_port);
+        let (signal_silent, last_sample_age) = gateway_metrics.as_ref().map_or((None, None), |metrics| {
+            (
+                gateway_site_signal_silent(metrics, GRID_SERVING_SITE, remote_cluster),
+                sample_value(
+                    metrics,
+                    "grid_route_site_last_sample_age_seconds",
+                    &[("site", GRID_SERVING_SITE), ("cluster", remote_cluster)],
+                ),
+            )
+        });
+        let state = format!(
+            "connectedSites={connected:?}, operator_overlay_candidate_fresh={overlay_fresh:?}, Gateway_signal_silent={signal_silent:?}, Gateway_last_sample_age_seconds={last_sample_age:?}, Gateway_metrics_error={:?}",
+            gateway_metrics.as_ref().err()
+        );
         if last_membership_observation.as_deref() != Some(state.as_str()) {
             record(observations, format!("partition control-plane state: {state}"));
             last_membership_observation = Some(state.clone());
         }
         last_state.clone_from(&state);
-        if connected.is_ok_and(|count| !has_connected_swim_peer(count)) && fresh.is_ok_and(|value| value != Some(true))
-        {
+        if connected.is_ok_and(|count| !has_connected_swim_peer(count)) && signal_silent == Some(true) {
             record(
                 observations,
                 format!(
-                    "partition traffic summary: attempts={attempts}, transport_errors={transport_errors}, HTTP statuses={statuses:?}, attributed sites={attributed_sites:?}"
+                    "pool-b SWIM membership was lost and its Gateway-polled signal became silent; operator overlay candidate freshness remained diagnostic-only in signal-poll mode: {state}; partition traffic summary: attempts={attempts}, transport_errors={transport_errors}, HTTP statuses={statuses:?}, attributed sites={attributed_sites:?}"
                 ),
             );
             wait_for_site_distribution(
@@ -1309,9 +1324,20 @@ fn wait_for_partition_degradation(
         std::thread::sleep(Duration::from_secs(2));
     }
     Err(format!(
-        "network partition did not make SWIM membership and the remote candidate stale within {timeout:?}: {last_state}"
+        "network partition did not remove pool-b SWIM membership and make its Gateway-polled signal silent within {timeout:?}: {last_state}"
     )
     .into())
+}
+
+/// Read whether the Gateway has aged one remote site's signal past its silence window.
+fn gateway_site_signal_silent(metrics: &str, site: &str, cluster: &str) -> Option<bool> {
+    sample_value(
+        metrics,
+        "grid_route_site_silent",
+        &[("site", site), ("cluster", cluster)],
+    )
+    .filter(|value| value.is_finite())
+    .map(|value| (value - 1.0).abs() <= f64::EPSILON)
 }
 
 /// Read one candidate's current freshness from the operator's distributed overlay.
@@ -3504,6 +3530,28 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0
             Some(0.0),
             "a longer metric name with the same prefix must not shadow the exact gauge"
         );
+    }
+
+    #[test]
+    fn gateway_silent_signal_requires_the_exact_finite_site_gauge() {
+        let exposition = r#"grid_route_site_silent{site="pool-b",cluster="llmd-pool-b-provider"} 1
+grid_route_site_silent{site="pool-a",cluster="llmd-pool-a-provider"} 0
+grid_route_site_silent{site="pool-c",cluster="llmd-pool-c-provider"} NaN
+"#;
+
+        assert_eq!(
+            gateway_site_signal_silent(exposition, "pool-b", "llmd-pool-b-provider"),
+            Some(true)
+        );
+        assert_eq!(
+            gateway_site_signal_silent(exposition, "pool-a", "llmd-pool-a-provider"),
+            Some(false)
+        );
+        assert_eq!(
+            gateway_site_signal_silent(exposition, "pool-c", "llmd-pool-c-provider"),
+            None
+        );
+        assert_eq!(gateway_site_signal_silent(exposition, "pool-b", "wrong-provider"), None);
     }
 
     #[test]
