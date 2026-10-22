@@ -589,7 +589,13 @@ fn run(
         mtls,
     )?;
     set_cross_site_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
-    wait_for_pressure_order(operator_metrics_port, "pool-b", Duration::from_secs(120))?;
+    wait_for_pressure_order_recorded(
+        operator_metrics_port,
+        "pool-b",
+        Duration::from_secs(120),
+        observations,
+        "pool-a operator observed the post-shift pressure order",
+    )?;
     verify_weighted_site_distribution(
         gateway_http_port,
         gateway_metrics_port,
@@ -718,7 +724,7 @@ fn run(
         context.scoring_flavor,
         mtls,
     )?;
-    wait_for_pressure_order(operator_metrics_port, "pool-a", Duration::from_secs(120))?;
+    let _restored_pressure_order = wait_for_pressure_order(operator_metrics_port, "pool-a", Duration::from_secs(120))?;
     let pre_pin_route = verify_weighted_site_distribution(
         gateway_http_port,
         gateway_metrics_port,
@@ -959,7 +965,7 @@ fn run(
         pool_b_before_bad_pin,
         Duration::from_secs(90),
     )?;
-    wait_for_pressure_order(operator_metrics_port, "pool-b", Duration::from_secs(90))?;
+    let _recovered_pressure_order = wait_for_pressure_order(operator_metrics_port, "pool-b", Duration::from_secs(90))?;
     verify_weighted_site_distribution(
         gateway_http_port,
         gateway_metrics_port,
@@ -1128,7 +1134,7 @@ fn prove_network_partition(
         mtls,
     )?;
     set_cross_site_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
-    wait_for_pressure_order(operator_port, "pool-b", Duration::from_secs(120))?;
+    let _partition_pressure_order = wait_for_pressure_order(operator_port, "pool-b", Duration::from_secs(120))?;
     verify_weighted_site_distribution(
         gateway_port,
         gateway_metrics_port,
@@ -2054,7 +2060,11 @@ fn verify_weighted_site_distribution(
                 }
             },
             Err(error) => {
-                last = error.to_string();
+                let telemetry = read_gateway_metrics(metrics_port).map_or_else(
+                    |metrics_error| format!("Gateway telemetry unavailable: {metrics_error}"),
+                    |metrics| route_metric_diagnostics(&metrics),
+                );
+                last = format!("{error}; latest Gateway signal and route gauges: {telemetry}");
                 previous = None;
                 stable_samples = 0;
             },
@@ -2145,8 +2155,11 @@ fn route_metric_diagnostics(metrics: &str) -> String {
     let samples = metrics
         .lines()
         .filter(|line| {
-            line.starts_with("grid_route_site_")
-                && (line.contains("site=\"pool-a\"") || line.contains("site=\"pool-b\""))
+            (line.starts_with("grid_route_site_")
+                && (line.contains("site=\"pool-a\"") || line.contains("site=\"pool-b\"")))
+                || line.starts_with("grid_signals_poll_total")
+                || line.starts_with("grid_signals_last_success_timestamp_seconds")
+                || line.starts_with("grid_signals_ingest_dropped_total")
         })
         .collect::<Vec<_>>();
     if samples.is_empty() {
@@ -2234,7 +2247,7 @@ fn wait_for_pressure_order(
     port: u16,
     lower_pressure_site: &str,
     timeout: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
     let (expected_lower, expected_higher) = if lower_pressure_site == "pool-a" {
         ("pool-a", "pool-b")
@@ -2257,7 +2270,7 @@ fn wait_for_pressure_order(
             last = format!("pool-a={a:?}, pool-b={b:?}");
             let (low, high) = if expected_lower == "pool-a" { (a, b) } else { (b, a) };
             if low.zip(high).is_some_and(|(low, high)| low < high) {
-                return Ok(());
+                return Ok(last);
             }
         }
         std::thread::sleep(Duration::from_secs(2));
@@ -2266,6 +2279,19 @@ fn wait_for_pressure_order(
         "operator did not relay the expected pressure order ({expected_lower} below {expected_higher}): {last}"
     )
     .into())
+}
+
+/// Wait for and record the operator-side pressure order before checking Gateway routing.
+fn wait_for_pressure_order_recorded(
+    port: u16,
+    lower_pressure_site: &str,
+    timeout: Duration,
+    observations: &mut Vec<String>,
+    description: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pressure_order = wait_for_pressure_order(port, lower_pressure_site, timeout)?;
+    record(observations, format!("{description}: {pressure_order}"));
+    Ok(())
 }
 
 /// Read a provider's in-flight sample from operator exposition.
@@ -3232,6 +3258,25 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0
         assert!(error.contains("current route metrics:"));
         assert!(error.contains("grid_route_site_rho{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} NaN"));
         assert!(error.contains("grid_route_site_rho{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 0.5"));
+    }
+
+    #[test]
+    fn route_diagnostics_include_signal_poll_freshness_and_both_sites() {
+        let metrics = "grid_signals_poll_total{result=\"ok\"} 17\n\
+                       grid_signals_last_success_timestamp_seconds 1792677000\n\
+                       grid_signals_ingest_dropped_total{reason=\"mismatched\"} 3\n\
+                       grid_route_site_rho_reported{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 0.95\n\
+                       grid_route_site_last_sample_age_seconds{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 0.4\n\
+                       grid_route_site_score{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 2\n";
+
+        let diagnostics = route_metric_diagnostics(metrics);
+
+        assert!(diagnostics.contains("grid_signals_poll_total{result=\"ok\"} 17"));
+        assert!(diagnostics.contains("grid_signals_last_success_timestamp_seconds 1792677000"));
+        assert!(diagnostics.contains("grid_signals_ingest_dropped_total{reason=\"mismatched\"} 3"));
+        assert!(diagnostics.contains("grid_route_site_rho_reported{site=\"pool-a\""));
+        assert!(diagnostics.contains("grid_route_site_last_sample_age_seconds{site=\"pool-b\""));
+        assert!(diagnostics.contains("grid_route_site_score{site=\"pool-a\""));
     }
 
     #[test]
