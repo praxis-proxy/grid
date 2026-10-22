@@ -830,10 +830,6 @@ pub struct GatewayRef {
     reason = "wire-compatible opt-in and attestation fields are separate"
 )]
 #[schemars(transform = add_consumer_config_legacy_fields)]
-#[schemars(extend("x-kubernetes-validations" = [{
-    "rule": "!has(self.siteRouter) || self.siteRouter != 'gridSiteRoute' || (has(self.mountReconciliation) && has(self.mountReconciliation.enabled) && self.mountReconciliation.enabled)",
-    "message": "siteRouter gridSiteRoute requires mountReconciliation.enabled"
-}]))]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumerConfig {
     /// Enable operator-managed consumer Praxis config generation for this gateway.
@@ -2297,22 +2293,11 @@ mod tests {
     }
 
     #[test]
-    fn grid_site_route_requires_mount_reconciliation_and_defaults_off() {
+    fn grid_site_route_is_opt_in() {
         let crd = crd_json();
         let praxis = crd
             .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/consumerGateways/items/properties/praxisConfig")
             .unwrap_or_else(|| std::process::abort());
-        let rules = praxis
-            .get("x-kubernetes-validations")
-            .and_then(serde_json::Value::as_array)
-            .unwrap_or_else(|| std::process::abort());
-        assert!(
-            rules.iter().any(|rule| rule
-                .get("rule")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|rule| rule.contains("gridSiteRoute") && rule.contains("mountReconciliation.enabled"))),
-            "{rules:?}"
-        );
         let router = praxis
             .pointer("/properties/siteRouter")
             .unwrap_or_else(|| std::process::abort());

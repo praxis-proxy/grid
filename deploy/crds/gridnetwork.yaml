@@ -915,8 +915,6 @@ spec:
                             type: string
                         type: object
                         x-kubernetes-validations:
-                          - message: siteRouter gridSiteRoute requires mountReconciliation.enabled
-                            rule: '!has(self.siteRouter) || self.siteRouter != ''gridSiteRoute'' || (has(self.mountReconciliation) && has(self.mountReconciliation.enabled) && self.mountReconciliation.enabled)'
                           - message: set only `enabled` or `generate`, not both
                             rule: '!(has(self.enabled) && has(self.generate))'
                           - message: set only `credentialMountBase` or `credentialMountPath`, not both
