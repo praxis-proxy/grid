@@ -325,6 +325,32 @@ impl PortForwardGuard {
         Self::start_inner(context, namespace, svc_name, local_port, svc_port, Stdio::inherit())
     }
 
+    /// Start a port-forward directly to a named Deployment.
+    pub(crate) fn start_deployment_with_diagnostics(
+        context: &str,
+        namespace: &str,
+        deployment: &str,
+        local_port: u16,
+        deployment_port: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let resource = format!("deployment/{deployment}");
+        let mapping = format!("{local_port}:{deployment_port}");
+        let child = Command::new("kubectl")
+            .args([
+                "--context",
+                context,
+                "-n",
+                namespace,
+                "port-forward",
+                &resource,
+                &mapping,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        Ok(Self { child: Some(child) })
+    }
+
     /// Spawn a port-forward with the requested stderr handling.
     #[expect(
         clippy::too_many_arguments,

@@ -106,9 +106,13 @@ to learn a hard request-count bound.
 
 The qualification uses upstream `llm-d-inference-sim` as the inference
 backend. Each simulator's startup `fake-metrics` values are mounted from its own
-ConfigMap. The runner updates those persistent configurations and rolls the
-simulator pods, so
-a restart cannot lose the requested values. Existing quick and full proofs use
+ConfigMap. The runner updates those persistent configurations and normally
+rolls the simulator pods, so a restart cannot lose the requested values. For
+the learned-ceiling idle-retention phase, it instead updates `fake-metrics`
+through the simulator's `/admin/config` API and verifies that the pod UIDs and
+Deployment generations stay unchanged; this avoids a metrics-source interruption
+while the proof checks that the learned ceiling survives fresh idle samples.
+Existing quick and full proofs use
 the deterministic state sequence `0 -> 9 -> 0` for queue depth and
 `0.0 -> 0.95 -> 0.0` for KV-cache pressure. The new full-mode lifecycle proof
 also changes `running-requests` while keeping waiting requests and KV-cache

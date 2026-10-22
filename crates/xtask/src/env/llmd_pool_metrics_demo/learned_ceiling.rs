@@ -27,10 +27,10 @@ use super::{
         RouteDistribution, SiteRouteResponse, has_connected_swim_peer, read_connected_sites, read_gateway_metrics,
         read_operator_metrics, send_site_request, start_ready_port_forward,
     },
-    format_utc_iso, get_configmap_data_key, kind_context, kubectl, kubectl_exec_epp_metrics, run_cluster_prefix,
-    set_simulator_fake_metrics, set_simulator_fake_metrics_with_endpoint_kv,
+    deployment_generation, format_utc_iso, get_configmap_data_key, kind_context, kubectl, kubectl_exec_epp_metrics,
+    run_cluster_prefix, set_simulator_fake_metrics, set_simulator_fake_metrics_with_endpoint_kv, simulator_config,
 };
-use crate::env::verify::PortForwardGuard;
+use crate::env::verify::{PortForwardGuard, curl_post, find_free_port};
 
 /// Remote site whose learned ceiling is exercised.
 const SITE: &str = "pool-b";
@@ -914,13 +914,7 @@ fn run_lifecycle(
         probe_failures,
     )?;
 
-    set_simulator_fake_metrics(
-        SITE,
-        0,
-        0,
-        0.0,
-        context.metrics_transport == MetricsTransport::MtlsProxy,
-    )?;
+    observations.extend(set_simulator_fake_metrics_live(SITE, 0, 0, 0.0)?);
     let idle = wait_for_ceiling(
         context,
         forwards,
@@ -1321,6 +1315,157 @@ fn run_lifecycle(
         probe_failures,
     )?;
     Ok(())
+}
+
+/// Change the idle phase's fake metrics through the simulator's runtime API without restarting its endpoints.
+fn set_simulator_fake_metrics_live(
+    cluster: &str,
+    waiting_requests: u32,
+    running_requests: u32,
+    kv_cache_usage: f64,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let context = kind_context(cluster);
+    let mut observations = Vec::new();
+    for (deployment, configmap) in SIMULATOR_CONFIGMAPS {
+        let expected_manifest = simulator_config(configmap, waiting_requests, running_requests, kv_cache_usage);
+        kubectl::apply_manifest(&context, &expected_manifest)
+            .map_err(|error| format!("persist idle simulator configmap/{configmap} on {cluster}: {error}"))?;
+        let expected_data = super::simulator_config_data(waiting_requests, running_requests, kv_cache_usage);
+        let observed_data = get_configmap_data_key(&context, GRID_SYSTEM_NS, configmap, "config.yaml")
+            .map_err(|error| format!("read persisted simulator configmap/{configmap} on {cluster}: {error}"))?;
+        if observed_data != expected_data {
+            return Err(format!(
+                "simulator configmap/{configmap} on {cluster} did not retain the requested fake metrics"
+            )
+            .into());
+        }
+
+        let generation_before = deployment_generation(&context, deployment)?;
+        let pod_uid_before = simulator_pod_uid(&context, deployment)?;
+        let local_port = find_free_port()?;
+        let mut forward = PortForwardGuard::start_deployment_with_diagnostics(
+            &context,
+            GRID_SYSTEM_NS,
+            deployment,
+            local_port,
+            8000,
+        )?;
+        forward.wait_until_ready(local_port)?;
+        let update = json!({
+            "fake-metrics": {
+                "waiting-requests": waiting_requests,
+                "running-requests": running_requests,
+                "kv-cache-usage": kv_cache_usage
+            }
+        });
+        let response = curl_post(
+            &format!("http://127.0.0.1:{local_port}/admin/config"),
+            &update.to_string(),
+        )?;
+        if response.status != 200 {
+            return Err(format!(
+                "simulator deployment/{deployment} on {cluster} rejected its runtime fake-metrics update with HTTP {}: {}",
+                response.status, response.body
+            )
+            .into());
+        }
+        let applied: Value = serde_json::from_str(&response.body)
+            .map_err(|error| format!("parse simulator deployment/{deployment} runtime config response: {error}"))?;
+        let fake_metrics = applied
+            .get("fake-metrics")
+            .ok_or_else(|| format!("simulator deployment/{deployment} response omitted fake-metrics"))?;
+        for (field, expected_value) in [
+            ("waiting-requests", f64::from(waiting_requests)),
+            ("running-requests", f64::from(running_requests)),
+            ("kv-cache-usage", kv_cache_usage),
+        ] {
+            let actual = fake_metrics
+                .get(field)
+                .and_then(Value::as_f64)
+                .ok_or_else(|| format!("simulator deployment/{deployment} response omitted numeric {field}"))?;
+            if (actual - expected_value).abs() > f64::EPSILON {
+                return Err(format!(
+                    "simulator deployment/{deployment} on {cluster} applied {field}={actual}, expected {expected_value}"
+                )
+                .into());
+            }
+        }
+        drop(forward);
+
+        let generation_after = deployment_generation(&context, deployment)?;
+        if generation_after != generation_before {
+            return Err(format!(
+                "simulator deployment/{deployment} on {cluster} changed generation during runtime metrics update: {generation_before} -> {generation_after}"
+            )
+            .into());
+        }
+        let pod_uid_after = simulator_pod_uid(&context, deployment)?;
+        if pod_uid_after != pod_uid_before {
+            return Err(format!(
+                "simulator deployment/{deployment} on {cluster} replaced its endpoint during runtime metrics update: {pod_uid_before} -> {pod_uid_after}"
+            )
+            .into());
+        }
+        eprintln!(
+            "  [OK] {cluster}/{deployment}: runtime fake-metrics update applied without replacing its endpoint (generation={generation_after}, pod UID={pod_uid_after})"
+        );
+        observations.push(format!(
+            "{cluster}/{deployment}: runtime fake-metrics update applied with /admin/config; Deployment generation stayed {generation_after} and pod UID stayed {pod_uid_after}"
+        ));
+    }
+
+    // The caller's stable Gateway observation verifies these updates reached EPP without losing the learned ceiling.
+    Ok(observations)
+}
+
+/// Identify the single Ready simulator pod behind a run-owned Deployment.
+fn simulator_pod_uid(context: &str, deployment: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let selector = format!("app=vllm-vcr,pool={SITE},instance={deployment}");
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "pods",
+            "-l",
+            &selector,
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "list simulator pods for deployment/{deployment}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let pods: Value = serde_json::from_slice(&output.stdout)?;
+    let items = pods
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or("kubectl simulator pod list omitted items")?;
+    let [pod] = items.as_slice() else {
+        return Err(format!(
+            "expected exactly one pod for deployment/{deployment}, found {}",
+            items.len()
+        )
+        .into());
+    };
+    if pod.pointer("/status/phase").and_then(Value::as_str) != Some("Running")
+        || pod
+            .pointer("/status/containerStatuses/0/ready")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err(format!("simulator deployment/{deployment} pod is not Ready: {pod}").into());
+    }
+    pod.pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("simulator deployment/{deployment} pod omitted metadata.uid").into())
 }
 
 /// Prove that a re-added saturated pair learns a hard bound without a queue-free soft sample.

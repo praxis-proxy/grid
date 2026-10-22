@@ -51,6 +51,8 @@ const ACTIVE_SIGNAL_GAUGES: [&str; 3] = [
     "grid_route_site_full",
     "grid_route_site_reading_age_seconds",
 ];
+/// The operator's serving-config builder currently polls its local peer every second.
+const EXPECTED_GATEWAY_POLL_INTERVAL_MS: u64 = 1_000;
 /// Site and cluster identity in the Gateway's serving topology.
 type ServingCandidatePair = (String, String);
 /// Parsed site/cluster pairs from the operator-generated serving configuration.
@@ -1566,7 +1568,7 @@ fn is_expected_local_operator_peer(peer: &serde_json::Value) -> bool {
         && peer.get("server_name").and_then(serde_json::Value::as_str) == Some(identity.as_str())
         && peer.get("authority").and_then(serde_json::Value::as_str) == Some(identity.as_str())
         && peer.get("path").and_then(serde_json::Value::as_str) == Some("/v1/site/signals")
-        && peer.get("interval_ms").and_then(serde_json::Value::as_u64) == Some(5_000)
+        && peer.get("interval_ms").and_then(serde_json::Value::as_u64) == Some(EXPECTED_GATEWAY_POLL_INTERVAL_MS)
         && peer
             .get("grid_ca_path")
             .and_then(serde_json::Value::as_str)
@@ -2684,7 +2686,7 @@ mod serving_peer_tests {
             "server_name": "pool-a.grid.internal",
             "authority": "pool-a.grid.internal",
             "path": "/v1/site/signals",
-            "interval_ms": 5000,
+            "interval_ms": 1000,
             "grid_ca_path": "/etc/praxis/tls/ca.crt",
             "client_cert_path": "/etc/praxis/tls/tls.crt",
             "client_key_path": "/etc/praxis/tls/tls.key"
@@ -2707,13 +2709,21 @@ mod serving_peer_tests {
         }
         assert!(!is_expected_local_operator_peer(&wrong_path));
 
-        let mut wrong_identity = valid;
+        let mut wrong_identity = valid.clone();
         if let Some(server_name) = wrong_identity.get_mut("server_name") {
             *server_name = serde_json::json!("pool-b.grid.internal");
         } else {
             std::process::abort();
         }
         assert!(!is_expected_local_operator_peer(&wrong_identity));
+
+        let mut wrong_interval = valid;
+        if let Some(interval) = wrong_interval.get_mut("interval_ms") {
+            *interval = serde_json::json!(5000);
+        } else {
+            std::process::abort();
+        }
+        assert!(!is_expected_local_operator_peer(&wrong_interval));
     }
 
     #[test]
