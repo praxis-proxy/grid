@@ -355,11 +355,9 @@ install_hub() {
     --set "peers.$SITE.address=$SITE_GW_IP:8080"
     --set gridNetwork.peerTrust.mode="$MODE" --set "gridNetwork.consumerGateways[0].name=grid-gateway"
     --set "gridNetwork.consumerGateways[0].namespace=$NS" --set "gridNetwork.consumerGateways[0].siteName=hub")
-  if site_route; then
-    site_route_providers vcr hub-local
-    HUB_SITE_ARGS+=("${SR[@]}")
-  fi
-  helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" || die "install hub grid-site"
+  SR=()
+  site_route && site_route_providers vcr hub-local
+  helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "install hub grid-site"
   images gateway
   if site_route; then
     helm_on "$HUB_CTX" "$NS" grid-gateway praxis-gateway \
@@ -446,8 +444,9 @@ install_site() {
     "${IMG[@]}" --set service.loadBalancerIP="$SITE_GW_IP" || die "install site grid-gateway"
   eventually "site operator enrolled from its copied invite through the hub enrollment URL" enrolled "$SITE_CTX" \
     || die "site not enrolled"
-  helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" \
-    --set "peers.$SITE.digest=$(leaf_digest "$SITE_CTX")" || die "pin the site on the hub"
+  # Every later hub grid-site upgrade carries the pin: helm does not reuse the release's values.
+  HUB_SITE_ARGS+=(--set "peers.$SITE.digest=$(leaf_digest "$SITE_CTX")")
+  helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "pin the site on the hub"
   snapshot_logs "$SITE_CTX" site || true
 }
 
