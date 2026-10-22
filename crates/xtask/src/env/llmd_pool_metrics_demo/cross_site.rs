@@ -19,7 +19,8 @@ use super::{
     GRID_SERVING_GATEWAY, GRID_SERVING_GATEWAY_PORT, GRID_SERVING_METRICS_PORT, GRID_SERVING_SITE, GRID_SYSTEM_NS,
     MetricsTransport, OPERATOR_METRICS_PORT, OVERLAY_CONFIGMAP, PROVIDER_GATEWAY_PORT, PortForwardGuard, ProofResult,
     VCR_MODEL, curl_probe_diagnostics, find_free_port, format_utc_iso, get_configmap_data_key, kind_context, kubectl,
-    run_cluster_prefix, set_simulator_waiting_requests, split_image_reference,
+    run_cluster_prefix, set_simulator_fake_metrics_with_endpoint_kv, set_simulator_waiting_requests,
+    split_image_reference,
 };
 
 /// One live peer is sufficient for the two-site topology used by this proof.
@@ -34,6 +35,12 @@ const WEIGHTED_ROUTE_SHARE_TOLERANCE: f64 = 0.15;
 const TWO_SITE_SHARE_RANGE: (f64, f64) = (0.1, 0.9);
 /// Queue capacity is four per endpoint; this pressure changes the score without making the site full.
 const CROSS_SITE_HIGHER_WAITING_REQUESTS: u32 = 2;
+/// The test Gateway keeps the moderate queue above its default backlog threshold but below EPP capacity.
+const CROSS_SITE_QUEUE_FULL_THRESHOLD: u32 = 3;
+/// The normal Gateway threshold is restored before the learned-ceiling proof runs.
+const DEFAULT_GATEWAY_QUEUE_FULL_THRESHOLD: u32 = 1;
+/// A reported load signal gives the embedded Gateway a nonzero rho while both sites remain eligible.
+const CROSS_SITE_HIGHER_KV_CACHE: f64 = 0.95;
 /// A lighter local signal than the peer's trusted baseline for the wrong-pin check.
 const WRONG_PIN_LOCAL_WAITING_REQUESTS: u32 = 1;
 /// Provider identity retained while pool-a's EPP signal expires.
@@ -389,6 +396,21 @@ pub(super) fn proof(context: &DemoContext) -> ProofResult {
         record(&mut observations, format!("primary proof assertion failed: {error}"));
     }
 
+    let restore_gateway = match context.images.grid_gateway.as_deref() {
+        Some(image) => restore_gateway_default_queue_threshold(image),
+        None => Err("full mode did not resolve a Grid Gateway image".into()),
+    };
+    match &restore_gateway {
+        Ok(()) => record(
+            &mut observations,
+            "Grid Gateway queue_full tuning restored to the chart default before later proofs".to_owned(),
+        ),
+        Err(error) => record(
+            &mut observations,
+            format!("Grid Gateway queue_full restoration failed: {error}"),
+        ),
+    }
+
     record(
         &mut observations,
         "final restoration started for EPP and simulator pressure".to_owned(),
@@ -425,9 +447,15 @@ pub(super) fn proof(context: &DemoContext) -> ProofResult {
         format!("Grid Gateway response attribution diagnostics: {attribution}"),
     );
     let attribution_error = attribution.contract_error();
-    let result = match (result, attribution_error) {
-        (Ok(()), Some(error)) => Err(error.into()),
-        (result, _) => result,
+    let result = match (result, restore_gateway, attribution_error) {
+        (Ok(()), Err(restore_error), _) => {
+            Err(format!("Grid Gateway tuning restoration failed: {restore_error}").into())
+        },
+        (Err(error), Err(restore_error), _) => {
+            Err(format!("{error}; Grid Gateway tuning restoration failed: {restore_error}").into())
+        },
+        (Ok(()), Ok(()), Some(error)) => Err(error.into()),
+        (result, Ok(()), _) => result,
     };
     let run_succeeded = result.is_ok();
     if let Err(error) = &result {
@@ -469,8 +497,8 @@ fn run(
         .ok_or("full mode did not resolve a Grid Gateway image")?;
     let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
 
-    set_simulator_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
-    set_simulator_waiting_requests(
+    set_cross_site_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
+    set_cross_site_waiting_requests(
         "pool-b",
         CROSS_SITE_HIGHER_WAITING_REQUESTS,
         context.scoring_flavor,
@@ -554,13 +582,13 @@ fn run(
     let gateway_uid = gateway_pod_uid(&local_context)?;
     let gateway_reloads_before_shift = applied_gateway_reload_count(gateway_metrics_port)?;
 
-    set_simulator_waiting_requests(
+    set_cross_site_waiting_requests(
         "pool-a",
         CROSS_SITE_HIGHER_WAITING_REQUESTS,
         context.scoring_flavor,
         mtls,
     )?;
-    set_simulator_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
+    set_cross_site_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
     wait_for_pressure_order(operator_metrics_port, "pool-b", Duration::from_secs(120))?;
     verify_weighted_site_distribution(
         gateway_http_port,
@@ -660,8 +688,8 @@ fn run(
     );
 
     scale_epp("pool-a", 1)?;
-    set_simulator_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
-    set_simulator_waiting_requests(
+    set_cross_site_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
+    set_cross_site_waiting_requests(
         "pool-b",
         CROSS_SITE_HIGHER_WAITING_REQUESTS,
         context.scoring_flavor,
@@ -683,8 +711,8 @@ fn run(
         "pool-a provider signal returned after EPP recovery".to_owned(),
     );
 
-    set_simulator_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
-    set_simulator_waiting_requests(
+    set_cross_site_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
+    set_cross_site_waiting_requests(
         "pool-b",
         CROSS_SITE_HIGHER_WAITING_REQUESTS,
         context.scoring_flavor,
@@ -773,8 +801,8 @@ fn run(
         // pool-a must keep the exact trusted sample. The same failed identity
         // probe makes the remote GridSite Connecting, so fail-closed routing
         // must keep requests on pool-a until trust is restored.
-        set_simulator_waiting_requests("pool-a", WRONG_PIN_LOCAL_WAITING_REQUESTS, context.scoring_flavor, mtls)?;
-        set_simulator_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
+        set_cross_site_waiting_requests("pool-a", WRONG_PIN_LOCAL_WAITING_REQUESTS, context.scoring_flavor, mtls)?;
+        set_cross_site_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
         let pool_b_origin = wait_for_signal_decrease(
             peer_operator_metrics_port,
             "pool-b",
@@ -997,9 +1025,60 @@ fn prepare_poll_gateway(image: &str) -> Result<(), Box<dyn std::error::Error>> {
     for cluster in CLUSTERS {
         restart_operator(cluster)?;
     }
-    install_grid_gateway(image, &endpoints)?;
+    install_grid_gateway(image, &endpoints, CROSS_SITE_QUEUE_FULL_THRESHOLD)?;
     wait_for_grid_serving_snapshot(Duration::from_secs(120))?;
     Ok(())
+}
+
+/// Restore the chart's normal queue threshold before the learned-ceiling proof uses backlog evidence.
+fn restore_gateway_default_queue_threshold(image: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let context = kind_context(GRID_SERVING_SITE);
+    let status = Command::new("helm")
+        .args([
+            "status",
+            GRID_SERVING_GATEWAY,
+            "--kube-context",
+            &context,
+            "--namespace",
+            GRID_SYSTEM_NS,
+        ])
+        .output()?;
+    if !status.status.success() {
+        let stderr = String::from_utf8_lossy(&status.stderr);
+        if stderr.contains("release: not found") {
+            return Ok(());
+        }
+        return Err(format!(
+            "could not inspect the run-owned Grid Gateway Helm release: {}",
+            stderr.trim()
+        )
+        .into());
+    }
+    let endpoints = [
+        provider_gateway_endpoint("pool-a")?,
+        provider_gateway_endpoint("pool-b")?,
+    ];
+    install_grid_gateway(image, &endpoints, DEFAULT_GATEWAY_QUEUE_FULL_THRESHOLD)
+}
+
+/// Apply EPP queue pressure plus a reported fullness signal so the embedded Gateway can weight both sites.
+fn set_cross_site_waiting_requests(
+    cluster: &str,
+    waiting_requests: u32,
+    scoring_flavor: super::ScoringFlavor,
+    mtls: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (waiting_requests, kv_cache_usage) = cross_site_simulator_metrics(waiting_requests, scoring_flavor);
+    set_simulator_fake_metrics_with_endpoint_kv(cluster, waiting_requests, 0, kv_cache_usage, kv_cache_usage, mtls)
+}
+
+/// Keep the EPP queue signal and Gateway saturation signal distinct and deterministic.
+fn cross_site_simulator_metrics(waiting_requests: u32, scoring_flavor: super::ScoringFlavor) -> (u32, f64) {
+    let (waiting_requests, mut kv_cache_usage) = super::simulator_metrics(waiting_requests, scoring_flavor);
+    if scoring_flavor == super::ScoringFlavor::QueueDepth && waiting_requests > 0 {
+        kv_cache_usage = CROSS_SITE_HIGHER_KV_CACHE;
+    }
+    (waiting_requests, kv_cache_usage)
 }
 
 /// Start one diagnostic port-forward and retry if its local listener exits during startup.
@@ -1042,13 +1121,13 @@ fn prove_network_partition(
     attribution: &mut RoutingAttributionDiagnostics,
     observations: &mut Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    set_simulator_waiting_requests(
+    set_cross_site_waiting_requests(
         "pool-a",
         CROSS_SITE_HIGHER_WAITING_REQUESTS,
         context.scoring_flavor,
         mtls,
     )?;
-    set_simulator_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
+    set_cross_site_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
     wait_for_pressure_order(operator_port, "pool-b", Duration::from_secs(120))?;
     verify_weighted_site_distribution(
         gateway_port,
@@ -1359,7 +1438,11 @@ fn patch_network_for_poll(cluster: &str, endpoints: &[serde_json::Value]) -> Res
 }
 
 /// Install the embedded Grid Gateway with a TLS metrics listener for proof evidence.
-fn install_grid_gateway(image: &str, endpoints: &[serde_json::Value]) -> Result<(), Box<dyn std::error::Error>> {
+fn install_grid_gateway(
+    image: &str,
+    endpoints: &[serde_json::Value],
+    queue_full_threshold: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (repository, tag) = split_image_reference(image)?;
     let chart = crate::workspace_root().join("charts/praxis-gateway");
     let chart = chart.to_str().ok_or("Praxis Gateway chart path is not UTF-8")?;
@@ -1429,11 +1512,8 @@ fn install_grid_gateway(image: &str, endpoints: &[serde_json::Value]) -> Result<
     command.args([
         "--set",
         "praxisConfig.render.gridServing.enabled=true",
-        // Keep a queue below the topology's EPP capacity routable. The Grid Gateway's
-        // default queue_full=1 would treat any nonzero queue as a backlog and bypass the
-        // two-site weighted selector, even though the EPP still reports spare capacity.
         "--set",
-        "praxisConfig.render.gridServing.siteRoute.availability.queue_full=4",
+        &format!("praxisConfig.render.gridServing.siteRoute.availability.queue_full={queue_full_threshold}"),
         "--set",
         "networkPolicy.enabled=true",
         "--set",
@@ -3023,6 +3103,21 @@ fn kubectl_patch_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cross_site_pressure_keeps_queue_depth_and_gateway_saturation_explicit() {
+        let queue_pressure = cross_site_simulator_metrics(2, super::super::ScoringFlavor::QueueDepth);
+        assert_eq!(queue_pressure, (2, CROSS_SITE_HIGHER_KV_CACHE));
+
+        let queue_clear = cross_site_simulator_metrics(0, super::super::ScoringFlavor::QueueDepth);
+        assert_eq!(queue_clear, (0, 0.0));
+
+        let kv_pressure = cross_site_simulator_metrics(2, super::super::ScoringFlavor::KvCachePressure);
+        assert_eq!(kv_pressure, (0, CROSS_SITE_HIGHER_KV_CACHE));
+
+        let kv_clear = cross_site_simulator_metrics(0, super::super::ScoringFlavor::KvCachePressure);
+        assert_eq!(kv_clear, (0, 0.0));
+    }
 
     #[test]
     fn repeated_sample_sequence_gets_a_unique_request_identity() {

@@ -59,13 +59,22 @@ Gateway queue-score order and compares attributed responses with its measured
 two-site capacity-weighted share. This preserves the routing assertion after
 Grid's selector began weighting capacity and smoothed saturation.
 
-These routing stimuli use two waiting requests per simulator endpoint against
+The cross-site proof uses two waiting requests per simulator endpoint against
 the topology's queue capacity of four. That changes the EPP queue score while
 leaving both providers eligible, so the proof exercises the weighted two-site
-selector rather than the single-eligible-provider fallback. The embedded test
-Gateway sets `availability.queue_full` to the same capacity of four; the default
-threshold of one would treat any nonzero queue as a backlog and exclude that
-provider from the two-site selector before EPP capacity is reached.
+selector rather than the single-eligible-provider fallback. For this proof only,
+the embedded test Gateway sets `availability.queue_full` to three: the queue of
+two stays below the inclusive backlog threshold and below EPP capacity. The
+normal threshold of one is restored before the learned-ceiling proof, which
+depends on a one-request queue being recognized as backlog.
+
+The queue-depth scoring flavor also reports KV-cache saturation of `0.95` for
+the pressured site's endpoints. EPP queue depth remains the Grid score/rank
+stimulus; the separate saturation reading gives the Gateway's capacity-weighted
+selector a measurable `rho` preference. The KV-cache scoring flavor already
+uses that same saturation stimulus. Both sites remain eligible, and the
+attributed request sample still has to match the Gateway's observed weighted
+share.
 
 It also raises the returned pair's queue-free soft ceiling and records a
 2,048-request low-KV routing baseline. It lowers pool-B running load to two
