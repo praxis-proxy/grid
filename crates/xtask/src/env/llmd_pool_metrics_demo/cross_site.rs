@@ -1429,6 +1429,11 @@ fn install_grid_gateway(image: &str, endpoints: &[serde_json::Value]) -> Result<
     command.args([
         "--set",
         "praxisConfig.render.gridServing.enabled=true",
+        // Keep a queue below the topology's EPP capacity routable. The Grid Gateway's
+        // default queue_full=1 would treat any nonzero queue as a backlog and bypass the
+        // two-site weighted selector, even though the EPP still reports spare capacity.
+        "--set",
+        "praxisConfig.render.gridServing.siteRoute.availability.queue_full=4",
         "--set",
         "networkPolicy.enabled=true",
         "--set",

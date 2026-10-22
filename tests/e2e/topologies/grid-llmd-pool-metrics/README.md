@@ -62,7 +62,10 @@ Grid's selector began weighting capacity and smoothed saturation.
 These routing stimuli use two waiting requests per simulator endpoint against
 the topology's queue capacity of four. That changes the EPP queue score while
 leaving both providers eligible, so the proof exercises the weighted two-site
-selector rather than the single-eligible-provider fallback.
+selector rather than the single-eligible-provider fallback. The embedded test
+Gateway sets `availability.queue_full` to the same capacity of four; the default
+threshold of one would treat any nonzero queue as a backlog and exclude that
+provider from the two-site selector before EPP capacity is reached.
 
 It also raises the returned pair's queue-free soft ceiling and records a
 2,048-request low-KV routing baseline. It lowers pool-B running load to two
