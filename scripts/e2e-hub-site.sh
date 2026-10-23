@@ -849,12 +849,15 @@ watch_mtls() {
 # watch_hub_path: every 5s, a chat completion through the hub consumer gateway, which
 # calls the site gateway with the hub's client certificate. Three tries, as above.
 watch_hub_path() {
-  local pf="" code try out="$WORK/hubpath"
+  local pf="" code try out="$WORK/hubpath" tries=3
+  # A port-forward pins one pod. Under the site route leg the gateway rolls on every
+  # renewal, so allow a pod swap: Service traffic stays up, this tunnel does not.
+  site_route && tries=8
   # stop_monitors kills this subshell; take its port-forward with it.
   trap '[[ -z $pf ]] || kill "$pf" 2>/dev/null; exit 0' TERM
   trap '[[ -z $pf ]] || kill "$pf" 2>/dev/null' EXIT
   while :; do
-    for try in 1 2 3; do
+    for ((try = 1; try <= tries; try++)); do
       if [[ -z $pf ]] || ! kill -0 "$pf" 2>/dev/null; then
         k "$HUB_CTX" port-forward service/grid-gateway 18081:8080 >/dev/null 2>&1 &
         pf=$!
