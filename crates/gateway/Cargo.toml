@@ -9,11 +9,11 @@ rust-version = "1.96"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-praxis-proxy = "0.7.4"
-praxis-core = { version = "0.7.4", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.7.4", package = "praxis-proxy-filter" }
-praxis-protocol = { version = "0.7.4", package = "praxis-proxy-protocol" }
-praxis-tls = { version = "0.7.4", package = "praxis-proxy-tls" }
+praxis-proxy = "0.7.5"
+praxis-core = { version = "0.7.5", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.7.5", package = "praxis-proxy-filter" }
+praxis-protocol = { version = "0.7.5", package = "praxis-proxy-protocol" }
+praxis-tls = { version = "0.7.5", package = "praxis-proxy-tls" }
 httpdate = "1.0.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { version = "0.10.7", package = "yaml_serde" }
@@ -329,7 +329,7 @@ praxis-core.workspace = true
 opentelemetry-otlp = { version = "0.33.0", default-features = false, features = [
   "tls-provider-agnostic",
 ] }
-praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "7acd82b421f61c0a8ccd91c58479aacbd34cb08d", default-features = false, features = [
+praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.8.0", default-features = false, features = [
   "opentelemetry",
 ] }
 ai-grid-filters = { path = "crates/ai-grid-filters" }

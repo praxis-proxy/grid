@@ -79,7 +79,7 @@ mod tests {
         let health = praxis_core::health::build_health_registry(&config.clusters);
         let kv_stores = praxis_core::kv::KvStoreRegistry::new();
         let session_stores = Arc::new(praxis_filter::SessionStoreRegistry::new());
-        let client = praxis::build_subrequest_client(config);
+        let client = praxis::build_subrequest_client(config).map_err(|error| error.to_string())?;
         praxis::resolve_pipelines(config, &registry, &health, &kv_stores, &session_stores, &client)
             .map(drop)
             .map_err(|error| error.to_string())
