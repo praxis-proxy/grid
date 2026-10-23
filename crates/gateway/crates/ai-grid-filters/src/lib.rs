@@ -71,7 +71,11 @@ const COUNTER_HELP: [(&str, &str); 8] = [
 ];
 
 /// Grid gauges the gateway emits.
-const GAUGE_HELP: [(&str, &str); 17] = [
+const GAUGE_HELP: [(&str, &str); 18] = [
+    (
+        "grid_serving_unbound_provider_hops",
+        "Provider hops the applied serving config declares that no startup-verified backend binds. Their candidates take no traffic until the gateway restarts.",
+    ),
     (
         "grid_route_site_rho",
         "Saturation the draw weights the site by: the nearest limit it is up against, smoothed across samples. NaN when unmeasured.",

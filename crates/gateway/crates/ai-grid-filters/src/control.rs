@@ -265,7 +265,7 @@ impl Control {
         start: StartPeer,
         backend_tls: BTreeMap<String, String>,
     ) -> Result<Self, FilterError> {
-        let bound = routed_view(config, &backend_tls)?;
+        let (bound, _) = narrowed(config, &backend_tls)?;
         let topology = Topology::from_config(&bound)?;
         // Cold start: config order until the first poll re-orders it by live load.
         let mut gauged = Gauged::new();
@@ -322,20 +322,9 @@ impl Control {
         Arc::clone(&self.tuning)
     }
 
-    /// Make `raw` the running config: its identity, the tuning's affinity settings at
-    /// `generation`, and only the prefixes of `bound`, its clusters that route.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the running file and the view that routes are adopted together"
-    )]
-    fn adopt(
-        &mut self,
-        raw: &GridServingConfig,
-        bound: &GridServingConfig,
-        identity: [u8; 32],
-        tag_key: Option<TagKey>,
-        generation: u64,
-    ) {
+    /// Adopt `bound`, the view that routes: its identity, the tuning's affinity settings at
+    /// `generation`, and only its clusters' prefixes.
+    fn adopt(&mut self, bound: &GridServingConfig, identity: [u8; 32], tag_key: Option<TagKey>, generation: u64) {
         let clusters: Vec<Arc<str>> = bound
             .candidates
             .iter()
@@ -343,7 +332,6 @@ impl Control {
             .collect();
         self.affinity
             .apply(self.tuning.affinity().as_ref().clone(), tag_key, &clusters);
-        self.applied = Some(raw.clone());
         self.identity = Some(identity);
         self.tuned = generation;
     }
@@ -405,7 +393,9 @@ impl Control {
         // The reload stands and its topology is published: only now may the new pollers write,
         // so their first refresh orders the new topology. Committing a kept poller is a no-op.
         self.peers.values().for_each(|running| running.handle.commit());
-        self.adopt(raw, config, identity, tag_key, generation);
+        self.adopt(config, identity, tag_key, generation);
+        // The file as written, so re-reading it settles.
+        self.applied = Some(raw.clone());
         Ok(Some(outcome))
     }
 
@@ -538,6 +528,34 @@ fn validate_config(config: &GridServingConfig) -> Result<Topology, FilterError> 
     Ok(topology)
 }
 
+/// The view of `config` the router serves, logging and exporting what it leaves out.
+fn routed_view<'config>(
+    config: &'config GridServingConfig,
+    backend_tls: &BTreeMap<String, String>,
+) -> Result<Cow<'config, GridServingConfig>, FilterError> {
+    let (view, narrowing) = narrowed(config, backend_tls)?;
+    metrics::gauge!("grid_serving_unbound_provider_hops")
+        .set(f64::from(u32::try_from(narrowing.unbound.len()).unwrap_or(u32::MAX)));
+    if !narrowing.unbound.is_empty() {
+        tracing::warn!(
+            clusters = ?narrowing.unbound,
+            "grid: provider hops lack a matching verified TLS backend; their candidates stay unroutable until restart"
+        );
+    }
+    if narrowing.crossing {
+        tracing::warn!("grid: a credential on a remote or provider-hop cluster is never injected");
+    }
+    Ok(view)
+}
+
+/// What [`narrowed`] left out of a serving config.
+struct Narrowing {
+    /// Declared provider hops with no startup-verified backend at their SNI.
+    unbound: BTreeSet<String>,
+    /// Whether a credential would have left this site.
+    crossing: bool,
+}
+
 /// The view of `config` the router serves.
 ///
 /// A provider hop that does not bind to a startup-verified backend at its exact SNI leaves
@@ -545,24 +563,15 @@ fn validate_config(config: &GridServingConfig) -> Result<Topology, FilterError> 
 /// startup-verified identity, and an unbound hop's site is unroutable until restart rather
 /// than routed without it. A credential stays only on a local cluster that no Grid mutual
 /// TLS backend serves, so this site's secret is never sent to another site.
-fn routed_view<'config>(
+fn narrowed<'config>(
     config: &'config GridServingConfig,
     backend_tls: &BTreeMap<String, String>,
-) -> Result<Cow<'config, GridServingConfig>, FilterError> {
+) -> Result<(Cow<'config, GridServingConfig>, Narrowing), FilterError> {
     let unbound = unbound_provider_hops(config, backend_tls)?;
     let leaves_site = |candidate: &CandidateConfig| credential_leaves_site(candidate, config, backend_tls);
     let crossing = config.candidates.iter().any(leaves_site);
     if unbound.is_empty() && !crossing {
-        return Ok(Cow::Borrowed(config));
-    }
-    if !unbound.is_empty() {
-        tracing::warn!(
-            clusters = ?unbound,
-            "grid: provider hops lack a matching verified TLS backend; their candidates stay unroutable until restart"
-        );
-    }
-    if crossing {
-        tracing::warn!("grid: a credential on a remote or provider-hop cluster is never injected");
+        return Ok((Cow::Borrowed(config), Narrowing { unbound, crossing }));
     }
     let mut view = config.clone();
     view.provider_hop_clusters.retain(|cluster| !unbound.contains(cluster));
@@ -572,7 +581,7 @@ fn routed_view<'config>(
     for candidate in view.candidates.iter_mut().filter(|candidate| leaves_site(candidate)) {
         candidate.credential = None;
     }
-    Ok(Cow::Owned(view))
+    Ok((Cow::Owned(view), Narrowing { unbound, crossing }))
 }
 
 /// Whether `candidate` carries a credential its cluster would send off this site: a remote

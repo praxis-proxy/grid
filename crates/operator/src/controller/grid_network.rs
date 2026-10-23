@@ -2428,6 +2428,7 @@ async fn reconcile_routing_overlay_inner(
             .praxis_config
             .as_ref()
             .filter(|cc| cc.generate && cc.site_router == SiteRouter::GridSiteRoute);
+        let hops = site_route.map_or(HopSource::Declared, |_| HopSource::Rendered(&cluster_endpoints));
         if let Some(cc) = site_route
             && let Some(missing) = site_route_unmet(gw_ref, cc, serving.is_some())
         {
@@ -2498,6 +2499,7 @@ async fn reconcile_routing_overlay_inner(
         // routing overlay. An empty overlay is published first so a mount or
         // config failure cannot retain a previously serving route.
         let mut delegated_mount_reconciled = false;
+        let mut awaiting_rollout = false;
         if !no_candidates
             && let Some(cc) = gw_ref
                 .praxis_config
@@ -2527,6 +2529,7 @@ async fn reconcile_routing_overlay_inner(
                     }
                     if let Some(status) = outcome.mount_status {
                         delegated_mount_reconciled = !status.applied_revision.is_empty();
+                        awaiting_rollout = status.phase == MountReconciliationPhase::WaitingForRollout;
                         mount_statuses.push(status);
                     }
                 },
@@ -2551,17 +2554,14 @@ async fn reconcile_routing_overlay_inner(
             if !delegated_mount_reconciled {
                 // A serving file no pod has started on serves nothing, and the gateway cannot
                 // start, nor its rollout finish, without one, so a missing one is written now.
-                if let Some(source) = serving
-                    && serving_config_absent(network_name, gw_ref, client).await
-                {
-                    let hops = site_route.map_or(HopSource::Declared, |_| HopSource::Rendered(&cluster_endpoints));
-                    match apply_serving_config(&overlay, source, network_name, gw_ref, hops, client).await {
-                        Ok(retry) => serving_retry = serving_retry.into_iter().chain(retry).min(),
-                        Err(error) => {
-                            tracing::warn!(network = network_name, gateway = %gw_ref.name, %error, "serving config bootstrap failed");
-                            serving_retry = serving_retry.into_iter().chain([SERVING_RETRY_REQUEUE]).min();
-                        },
-                    }
+                if let Some(source) = serving.filter(|_| awaiting_rollout) {
+                    let target = ServingTarget {
+                        gw_ref,
+                        hops,
+                        bootstrap: true,
+                    };
+                    let written = apply_serving_config(&overlay, source, network_name, target, client).await;
+                    fold_serving_write(&mut serving_retry, written, network_name, gw_ref);
                 }
                 overlay_statuses.push(retained_overlay_status(
                     network,
@@ -2632,14 +2632,13 @@ async fn reconcile_routing_overlay_inner(
 
         // The embedded gateway watches valid serving revisions independently.
         if let Some(source) = serving {
-            let hops = site_route.map_or(HopSource::Declared, |_| HopSource::Rendered(&cluster_endpoints));
-            match apply_serving_config(&overlay, source, network_name, gw_ref, hops, client).await {
-                Ok(retry) => serving_retry = serving_retry.into_iter().chain(retry).min(),
-                Err(error) => {
-                    tracing::warn!(network = network_name, gateway = %gw_ref.name, %error, "serving config apply failed");
-                    serving_retry = serving_retry.into_iter().chain([SERVING_RETRY_REQUEUE]).min();
-                },
-            }
+            let target = ServingTarget {
+                gw_ref,
+                hops,
+                bootstrap: false,
+            };
+            let written = apply_serving_config(&overlay, source, network_name, target, client).await;
+            fold_serving_write(&mut serving_retry, written, network_name, gw_ref);
         }
 
         // Gateways with praxisConfig.generate=false get a Disabled entry.
@@ -2893,29 +2892,48 @@ fn serving_provider_hop_clusters(gw_ref: &GatewayRef) -> Result<BTreeSet<String>
     Ok(clusters)
 }
 
-/// Whether this gateway's serving config `ConfigMap` does not exist yet. An unreadable one counts as present.
-async fn serving_config_absent(network_name: &str, gw_ref: &GatewayRef, client: &Client) -> bool {
-    let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
-    matches!(
-        api.get_opt(&serving_config::configmap_name(network_name, &gw_ref.name))
-            .await,
-        Ok(None)
-    )
+/// One gateway's serving config write.
+#[derive(Clone, Copy)]
+struct ServingTarget<'target> {
+    /// The gateway it is written for.
+    gw_ref: &'target GatewayRef,
+    /// Where its provider hops come from.
+    hops: HopSource<'target>,
+    /// Write only a missing one, for a gateway whose first pod needs it to start.
+    bootstrap: bool,
+}
+
+/// Fold one serving write into the soonest retry, requeueing a failed one.
+fn fold_serving_write(
+    retry: &mut Option<Duration>,
+    written: Result<Option<Duration>, OperatorError>,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+) {
+    let next = written.unwrap_or_else(|error| {
+        tracing::warn!(network = network_name, gateway = %gw_ref.name, %error, "serving config apply failed");
+        Some(SERVING_RETRY_REQUEUE)
+    });
+    *retry = retry.iter().copied().chain(next).min();
 }
 
 /// Apply the serving config `ConfigMap` when changed, returning when to retry a deferred write.
 #[expect(
-    clippy::too_many_arguments,
-    reason = "a generated gridSiteRoute config supplies the hops this gateway can bind"
+    clippy::too_many_lines,
+    reason = "the render, the write gate, and the apply are one serving write"
 )]
 async fn apply_serving_config(
     overlay: &routing_overlay::RoutingOverlay,
     source: &ServingSource<'_>,
     network_name: &str,
-    gw_ref: &GatewayRef,
-    hops: HopSource<'_>,
+    target: ServingTarget<'_>,
     client: &Client,
 ) -> Result<Option<Duration>, OperatorError> {
+    let ServingTarget {
+        gw_ref,
+        hops,
+        bootstrap,
+    } = target;
     serving_config::warn_refused_sites(overlay, network_name, source.refused);
     let text = render_serving_text(overlay, source, gw_ref, hops)?;
     let name = serving_config::configmap_name(network_name, &gw_ref.name);
@@ -2928,7 +2946,9 @@ async fn apply_serving_config(
         .map(String::as_str);
     let key = format!("{}/{name}", gw_ref.namespace);
     let now = Instant::now();
-    let decision = if overlay.candidates.is_empty() {
+    let decision = if bootstrap && existing.is_some() {
+        WriteDecision::Unchanged
+    } else if overlay.candidates.is_empty() {
         serving_config::decide_empty_withdrawal(stored, &text)
     } else {
         serving_config::decide_write(stored, &text, source.gate.last(&key), now)
@@ -3206,6 +3226,69 @@ const SECRET_REVISION_ANNOTATION: &str = "grid.praxis-proxy.io/secret-revision";
 const SECRET_RESOURCE_VERSIONS_ANNOTATION: &str = "grid.praxis-proxy.io/secret-resource-versions";
 /// Reserved prefix for projected volume names owned by Grid.
 const GRID_MOUNT_PREFIX: &str = "grid-mount-";
+
+/// The 503 config a delegated gateway's first pod starts on.
+fn bootstrap_config_map(name: &str, cc: &ConsumerConfig, network_name: &str, gw_ref: &GatewayRef) -> ConfigMap {
+    consumer_config::build_consumer_config_map(
+        &consumer_config::bootstrap_praxis_config(cc.listener_port),
+        name,
+        &gw_ref.namespace,
+        network_name,
+        &gw_ref.name,
+    )
+}
+
+/// Create the bootstrap config, keeping one another writer created first.
+async fn create_bootstrap_config(
+    api: &Api<ConfigMap>,
+    name: &str,
+    cc: &ConsumerConfig,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+) -> Result<(), OperatorError> {
+    match api
+        .create(
+            &kube::api::PostParams::default(),
+            &bootstrap_config_map(name, cc, network_name, gw_ref),
+        )
+        .await
+    {
+        Ok(_) => info!(config_map = %name, "bootstrapped the gateway's first Praxis config"),
+        Err(kube::Error::Api(response)) if response.code == 409 => {},
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+/// Replace a bootstrap left in the chart's own slot after the first flip, so a revert to that
+/// slot serves `config_yaml` rather than 503.
+async fn retire_bootstrap_slot(
+    api: &Api<ConfigMap>,
+    cc: &ConsumerConfig,
+    config_yaml: &str,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+) -> Result<(), OperatorError> {
+    let base = &cc.config_map_name;
+    let bootstrap = bootstrap_config_map(base, cc, network_name, gw_ref);
+    if api
+        .get_opt(base)
+        .await?
+        .is_some_and(|current| current.data == bootstrap.data)
+    {
+        let cm = consumer_config::build_consumer_config_map(
+            config_yaml,
+            base,
+            &gw_ref.namespace,
+            network_name,
+            &gw_ref.name,
+        );
+        api.patch(base, &PatchParams::apply(FIELD_MANAGER).force(), &Patch::Apply(&cm))
+            .await?;
+        info!(config_map = %base, "replaced the retired bootstrap Praxis config");
+    }
+    Ok(())
+}
 
 /// A second, bounded config slot lets old and new Pod revisions retain their matching files.
 fn alternate_consumer_config_map_name(base: &str) -> String {
@@ -3920,17 +4003,10 @@ async fn reconcile_delegated_gateway(
     );
     let config_api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
     let active = config_api.get_opt(active_config_name).await?;
-    if active.is_none() {
-        // A config no pod has started on serves nothing, and the first pod cannot start, nor
-        // the rollout finish, without one: a listener answering 503 until the next revision.
-        apply_consumer_config_map_named(
-            &consumer_config::bootstrap_praxis_config(cc.listener_port),
-            network_name,
-            gw_ref,
-            active_config_name,
-            client,
-        )
-        .await?;
+    if active.is_none() && !template_annotations.contains_key(CONFIG_REVISION_ANNOTATION) {
+        // Never staged, so no pod serves a config yet, and the first cannot start, nor the
+        // rollout finish, without one.
+        create_bootstrap_config(&config_api, active_config_name, cc, network_name, gw_ref).await?;
     }
     let active_config_current = active.is_some_and(|current| current.data == active_cm.data);
     let needs_revision_rollout = !additions.is_empty()
@@ -4097,6 +4173,9 @@ async fn reconcile_delegated_gateway(
         ));
     }
 
+    if active_config_name != cc.config_map_name {
+        retire_bootstrap_slot(&config_api, cc, &rendered.config_yaml, network_name, gw_ref).await?;
+    }
     Ok((
         mount_status(
             gw_ref,

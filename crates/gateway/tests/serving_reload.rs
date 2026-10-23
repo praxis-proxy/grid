@@ -329,6 +329,18 @@ mod tests {
                 .unwrap_or(0)
         }
 
+        /// The value of the first admin metrics series named `name`, if it exists.
+        fn metric(&self, name: &str) -> Option<f64> {
+            let mut stream = TcpStream::connect(("127.0.0.1", self.admin)).ok()?;
+            let _sent = stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            let mut body = String::new();
+            let _read = stream.read_to_string(&mut body);
+            body.lines()
+                .find(|line| line.split([' ', '{']).next() == Some(name))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+        }
+
         /// Swap in `doc` as the serving config and wait until it is applied.
         fn serve(&self, serving: &mut Mount, doc: &serde_yaml::Value) {
             let applied = self.reloads("applied");
@@ -658,6 +670,11 @@ mod tests {
             logged(&gateway, "lack a matching verified TLS backend"),
             "the dropped hop is logged"
         );
+        assert_eq!(
+            gateway.metric("grid_serving_unbound_provider_hops"),
+            Some(1.0),
+            "the dropped hop is exported"
+        );
         drop(gateway);
         let _cleaned = std::fs::remove_dir_all(&work);
     }
@@ -822,6 +839,19 @@ mod tests {
             .collect()
     }
 
+    /// Every credential header a caller might send, each carrying a marker.
+    const CALLER_CREDENTIALS: &str = "X-Model: llama\r\nAuthorization: Bearer caller-token\r\nProxy-Authorization: Basic cHJveHk=\r\nCookie: session=caller\r\nx-api-key: caller-key\r\napi-key: caller-key\r\nx-goog-api-key: caller-key\r\nOcp-Apim-Subscription-Key: caller-key\r\n";
+
+    /// What must not appear in a request that leaves this site.
+    const CALLER_CREDENTIAL_MARKERS: [&str; 6] = [
+        "authorization:",
+        "cookie:",
+        "api-key:",
+        "ocp-apim-subscription-key:",
+        "caller-token",
+        "caller-key",
+    ];
+
     /// A port with nothing listening on it.
     fn dead_endpoint() -> String {
         format!("127.0.0.1:{}", free_port())
@@ -838,9 +868,13 @@ mod tests {
             site_route_fixtures(listen, admin, &local.addr, &east.addr, &signals.addr, &identity);
         // Uncredentialed, so the caller's own credentials are the only ones in play.
         let mut doc: serde_yaml::Value = serde_yaml::from_str(&serving_json).expect("serving");
-        if let Some(local_candidate) = doc["candidates"][0].as_mapping_mut() {
-            local_candidate.remove("credential");
-        }
+        assert!(
+            doc["candidates"][0]
+                .as_mapping_mut()
+                .and_then(|local_candidate| local_candidate.remove("credential"))
+                .is_some(),
+            "the fixture's local candidate is credentialed"
+        );
         let mut serving = Mount::new(work.join("serving"));
         serving.write(&[(
             "serving-config.json",
@@ -850,7 +884,7 @@ mod tests {
         gateway.eventually("the gateway listens", || {
             TcpStream::connect(("127.0.0.1", listen)).is_ok()
         });
-        let caller = "X-Model: llama\r\nAuthorization: Bearer caller-token\r\nProxy-Authorization: Basic cHJveHk=\r\nCookie: session=caller\r\nx-api-key: caller-key\r\n";
+        let caller = CALLER_CREDENTIALS;
         for sent in 1..=30 {
             assert_eq!(
                 post(listen, r#"{"model":"llama","messages":[]}"#, caller),
@@ -869,7 +903,7 @@ mod tests {
             );
         }
         for head in east.routed_heads.lock().expect("heads").iter() {
-            for credential in ["authorization:", "cookie:", "x-api-key:", "caller-token", "caller-key"] {
+            for credential in CALLER_CREDENTIAL_MARKERS {
                 assert!(
                     !head.contains(credential),
                     "{credential} never crosses to another site: {head}"
@@ -1027,6 +1061,86 @@ mod tests {
         assert!(
             relabelled.iter().all(|head| !head.contains(SITE_ROUTE_TOKEN)),
             "a hop cluster never carries this site's credential: {relabelled:?}"
+        );
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_remote_site_without_a_hop_never_receives_the_caller_credentials() {
+        let work = fresh_work("remote-plaintext");
+        let remote = Plain::start();
+        let mut serving = Mount::new(work.join("serving"));
+        serving.write(&[(
+            "serving-config.json",
+            br#"{"local_site":"local","window_secs":60,"load_window_ms":30000,"candidates":[{"kind":"inference_model","name":"llama","site":"east","cluster":"pool-east"}],"peers":[]}"#,
+        )]);
+        let (listen, admin) = (free_port(), free_port());
+        let praxis = routed_praxis(listen, admin, &remote.addr, "");
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
+        gateway.eventually("the gateway listens", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok()
+        });
+        for sent in 1..=5 {
+            assert_eq!(
+                post(listen, r#"{"model":"llama","messages":[]}"#, CALLER_CREDENTIALS),
+                200,
+                "request {sent} routes to the other site"
+            );
+        }
+        let heads = remote.heads.lock().expect("heads").clone();
+        assert_eq!(heads.len(), 5, "every request reached the other site");
+        for head in &heads {
+            for credential in CALLER_CREDENTIAL_MARKERS {
+                assert!(
+                    !head.contains(credential),
+                    "{credential} never leaves this site: {head}"
+                );
+            }
+        }
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    /// The operator's bootstrap config, written before a delegated gateway's first rollout.
+    const BOOTSTRAP_PRAXIS: &str = include_str!("testdata/consumer-config-bootstrap.yaml");
+
+    #[test]
+    fn the_bootstrap_config_starts_beside_a_serving_file_and_answers_503_to_retry() {
+        let work = fresh_work("bootstrap");
+        let mut serving = Mount::new(work.join("serving"));
+        serving.write(&[(
+            "serving-config.json",
+            hop_serving(&[("pool-east", "candidate-east", "east.grid.internal")]).as_bytes(),
+        )]);
+        let (listen, admin) = (free_port(), free_port());
+        let praxis = BOOTSTRAP_PRAXIS
+            .replace("0.0.0.0:8080", &format!("127.0.0.1:{listen}"))
+            .replace("127.0.0.1:9901", &format!("127.0.0.1:{admin}"));
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
+        gateway.eventually("the gateway listens", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok()
+        });
+        let mut stream = TcpStream::connect(("127.0.0.1", listen)).expect("connect gateway");
+        stream
+            .write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .expect("send");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read");
+        let head = response.to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 503"), "{response}");
+        assert!(
+            head.contains("retry-after: 5"),
+            "a client backs off and retries: {response}"
+        );
+        assert!(
+            response.contains(r#""type":"service_unavailable""#),
+            "an OpenAI-shaped error: {response}"
+        );
+        assert_eq!(
+            gateway.metric("grid_serving_unbound_provider_hops"),
+            Some(1.0),
+            "the serving file's hop has no backend yet, so it is dropped rather than fatal"
         );
         drop(gateway);
         let _cleaned = std::fs::remove_dir_all(&work);

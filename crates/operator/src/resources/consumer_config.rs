@@ -425,8 +425,7 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
         config.push_str(&render_telemetry(telemetry)?);
     }
 
-    // Admin interface and graceful shutdown use standard constants for consumer gateways.
-    config.push_str("\nadmin:\n  metrics_address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n");
+    config.push_str(ADMIN_TRAILER);
 
     Ok(config)
 }
@@ -690,12 +689,15 @@ impl Pipeline<'_> {
             .iter()
             .filter(|candidate| candidate.kind == INFERENCE_MODEL)
             .collect();
-        if let Some(candidate) = candidates.iter().find(|candidate| {
-            !self
-                .cluster_endpoints
-                .iter()
-                .any(|endpoint| endpoint.cluster == candidate.cluster)
-        }) {
+        let dialed: BTreeSet<&str> = self
+            .cluster_endpoints
+            .iter()
+            .map(|endpoint| endpoint.cluster.as_str())
+            .collect();
+        if let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| !dialed.contains(candidate.cluster.as_str()))
+        {
             return Err(ConsumerConfigError::MissingClusterEndpoint {
                 cluster: candidate.cluster.clone(),
             });
@@ -733,20 +735,9 @@ impl Pipeline<'_> {
             ""
         };
         let mut config = format!(
-            concat!(
-                "listeners:\n",
-                "  - name: public\n",
-                "    address: \"0.0.0.0:{listener_port}\"\n",
-                "    filter_chains: [consumer-chain]\n",
-                "filter_chains:\n",
-                "  - name: consumer-chain\n",
-                "    filters:\n",
-                "{trace_context_filter}{model_filter}{route}",
-            ),
-            listener_port = self.listener_port,
-            trace_context_filter = trace_context_filter,
-            model_filter = R::MODEL_FILTER,
-            route = route,
+            "{}{trace_context_filter}{}{route}",
+            consumer_chain_head(self.listener_port),
+            R::MODEL_FILTER
         );
         // Each router writes the selected local credential where credential_inject reads it.
         config.push_str(&if self.projected_credentials {
@@ -764,14 +755,13 @@ impl Pipeline<'_> {
         if let Some(telemetry) = self.telemetry {
             config.push_str(&render_telemetry(telemetry)?);
         }
-        config.push_str("\nadmin:\n  metrics_address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n");
+        config.push_str(ADMIN_TRAILER);
         Ok(config)
     }
 }
 
-/// A gateway config that starts and answers 503, for a pod whose generated config is not
-/// written yet.
-pub(crate) fn bootstrap_praxis_config(listener_port: u16) -> String {
+/// The listener and the head of the consumer chain every generated config opens with.
+fn consumer_chain_head(listener_port: u16) -> String {
     format!(
         concat!(
             "listeners:\n",
@@ -781,13 +771,32 @@ pub(crate) fn bootstrap_praxis_config(listener_port: u16) -> String {
             "filter_chains:\n",
             "  - name: consumer-chain\n",
             "    filters:\n",
-            "      - filter: static_response\n",
-            "        status: 503\n",
-            "admin:\n",
-            "  metrics_address: \"127.0.0.1:9901\"\n",
-            "shutdown_timeout_secs: 5\n",
         ),
         listener_port = listener_port,
+    )
+}
+
+/// The admin listener and shutdown bound every generated config closes with.
+const ADMIN_TRAILER: &str = "\nadmin:\n  metrics_address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n";
+
+/// A gateway config that starts and answers 503, for a pod whose generated config is not
+/// written yet.
+pub(crate) fn bootstrap_praxis_config(listener_port: u16) -> String {
+    format!(
+        concat!(
+            "{head}",
+            "      - filter: static_response\n",
+            "        status: 503\n",
+            "        headers:\n",
+            "          - name: Content-Type\n",
+            "            value: application/json\n",
+            "          - name: Retry-After\n",
+            "            value: \"5\"\n",
+            "        body: '{{\"error\":{{\"message\":\"the gateway is starting\",\"type\":\"service_unavailable\"}}}}'",
+            "{trailer}",
+        ),
+        head = consumer_chain_head(listener_port),
+        trailer = ADMIN_TRAILER,
     )
 }
 

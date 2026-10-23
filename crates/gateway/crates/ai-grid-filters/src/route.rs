@@ -48,13 +48,16 @@ const SELECTED_CANDIDATE_HEADER: &str = "x-ai-routing-candidate";
 const PROVIDER_HOP_REQUEST_ID_HEADER: &str = "x-ai-routing-request-id";
 /// Internal request header carrying the serving overlay revision.
 const OVERLAY_REVISION_HEADER: &str = "x-ai-routing-revision";
-/// The caller's credentials, which never cross to another site: the hop is authorized by
+/// The caller's credentials, which never leave this site: another site authorizes the hop by
 /// its mutual TLS peer and candidate, so a caller's token would only leak.
-const CALLER_CREDENTIAL_HEADERS: [http::header::HeaderName; 4] = [
+const CALLER_CREDENTIAL_HEADERS: [http::header::HeaderName; 7] = [
     http::header::AUTHORIZATION,
     http::header::PROXY_AUTHORIZATION,
     http::header::COOKIE,
     http::header::HeaderName::from_static("x-api-key"),
+    http::header::HeaderName::from_static("api-key"),
+    http::header::HeaderName::from_static("x-goog-api-key"),
+    http::header::HeaderName::from_static("ocp-apim-subscription-key"),
 ];
 /// Response header carrying the site selected by Grid.
 const ROUTE_SITE_HEADER: &str = "x-grid-site";
@@ -92,11 +95,15 @@ const CREDENTIAL_METADATA: [&str; 4] = [
     "intelligent_route.credential.key",
 ];
 
-/// Select the picked candidate's credential for `credential_inject`. The control plane keeps one
-/// only on a local cluster no Grid mutual TLS backend serves.
-fn write_credential(ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate) {
+/// The picked candidate's credentials: the caller's never leave this site, and a local
+/// candidate's own is selected where `credential_inject` reads it.
+fn write_credentials(ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate, snapshot: &RouteSnapshot) {
     for key in CREDENTIAL_METADATA {
         ctx.filter_metadata.remove(key);
+    }
+    if candidate.site != snapshot.local_site || snapshot.provider_hop_clusters.contains(candidate.cluster.as_ref()) {
+        ctx.request_headers_to_remove.extend(CALLER_CREDENTIAL_HEADERS);
+        return;
     }
     let Some(credential) = candidate.credential.as_ref() else {
         return;
@@ -112,8 +119,7 @@ fn write_credential(ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate)
     }
 }
 
-/// Set hop context only for a candidate whose backend TLS identity remains verified across
-/// reloads, and keep the caller's credentials off the hop.
+/// Set hop context only for a candidate whose backend TLS identity remains verified across reloads.
 fn write_provider_context(
     ctx: &mut HttpFilterContext<'_>,
     candidate: &RouteCandidate,
@@ -135,7 +141,6 @@ fn write_provider_context(
         http::header::HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER),
         request_id,
     ));
-    ctx.request_headers_to_remove.extend(CALLER_CREDENTIAL_HEADERS);
     Ok(())
 }
 
@@ -385,7 +390,7 @@ impl GridSiteRouteFilter {
         }
         ctx.cluster = Some(Arc::clone(&candidate.cluster));
         write_provider_context(ctx, candidate, snapshot)?;
-        write_credential(ctx, candidate);
+        write_credentials(ctx, candidate, snapshot);
         Ok(())
     }
 
@@ -429,7 +434,7 @@ impl GridSiteRouteFilter {
         });
         ctx.cluster = Some(cluster);
         write_provider_context(ctx, candidate, &snapshot)?;
-        write_credential(ctx, candidate);
+        write_credentials(ctx, candidate, &snapshot);
         ctx.rewritten_path = rewrite.or_else(|| ctx.rewritten_path.take());
         // Ids are tagged in the body, so it must come back uncompressed.
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);

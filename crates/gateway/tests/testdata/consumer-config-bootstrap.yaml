@@ -7,6 +7,12 @@ filter_chains:
     filters:
       - filter: static_response
         status: 503
+        headers:
+          - name: Content-Type
+            value: application/json
+          - name: Retry-After
+            value: "5"
+        body: '{"error":{"message":"the gateway is starting","type":"service_unavailable"}}'
 admin:
   metrics_address: "127.0.0.1:9901"
 shutdown_timeout_secs: 5

@@ -9,8 +9,8 @@ use std::{
 };
 
 use ai_grid_filters::{
-    AdmissionState, CapabilityKind, ClusterHealth, RouteCandidate, RouteSnapshot, load_serving_config,
-    register_grid_filters, spawn_grid_routing,
+    AdmissionState, CandidateCredential, CapabilityKind, ClusterHealth, CredentialRef, RouteCandidate, RouteSnapshot,
+    load_serving_config, register_grid_filters, spawn_grid_routing,
 };
 use arc_swap::ArcSwap;
 use divan::Bencher;
@@ -211,6 +211,59 @@ fn measure(bencher: Bencher<'_, '_>, sites: u32, shape: Shape) {
     let mut ctx = context(&request);
     assert!(route(filter.as_ref(), &mut ctx), "the first request routes");
     bencher.bench_local(|| route(filter.as_ref(), &mut ctx));
+}
+
+/// A local pick whose candidate carries a credential the router selects for `credential_inject`.
+#[divan::bench(args = [4])]
+fn local_credentialed(bencher: Bencher<'_, '_>, sites: u32) {
+    let mut snapshot = snapshot(sites, Shape::Measured);
+    for candidate in &mut snapshot.candidates {
+        candidate.site = Arc::clone(&snapshot.local_site);
+        candidate.credential = Some(CandidateCredential {
+            strategy: "bearer_token".to_owned(),
+            secret_ref: CredentialRef {
+                key: "token".to_owned(),
+                name: "grid-model-client".to_owned(),
+                namespace: "models".to_owned(),
+            },
+        });
+    }
+    measure_fresh(bencher, snapshot);
+}
+
+/// A pick of another site's gateway: hop context, and the caller's credentials removed.
+#[divan::bench(args = [4])]
+fn provider_hop(bencher: Bencher<'_, '_>, sites: u32) {
+    let mut snapshot = snapshot(sites, Shape::Measured);
+    snapshot.local_site = Arc::from("local");
+    snapshot.provider_hop_clusters = Arc::new(
+        snapshot
+            .candidates
+            .iter()
+            .map(|candidate| candidate.cluster.to_string())
+            .collect(),
+    );
+    measure_fresh(bencher, snapshot);
+}
+
+/// One request per iteration on a fresh context, so growth in its buffers is counted.
+#[expect(clippy::expect_used, reason = "bench setup")]
+fn measure_fresh(bencher: Bencher<'_, '_>, snapshot: RouteSnapshot) {
+    let filter = filter(snapshot).expect("the filter builds");
+    let request = Request {
+        headers: [(HeaderName::from_static("x-model"), HeaderValue::from_static("llama"))]
+            .into_iter()
+            .collect(),
+        method: Method::POST,
+        uri: Uri::from_static("/v1/chat/completions"),
+    };
+    assert!(
+        route(filter.as_ref(), &mut context(&request)),
+        "the first request routes"
+    );
+    bencher
+        .with_inputs(|| context(&request))
+        .bench_local_refs(|ctx| route(filter.as_ref(), ctx));
 }
 
 fn main() {

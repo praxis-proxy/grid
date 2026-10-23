@@ -609,8 +609,9 @@ enroll_rogue() {
       "https://$ENROLL_HOST:$ENROLL_PORT/v1alpha1/enrollments" | jq -er .certificate >"$d/rogue.crt"
 }
 
-consumer_served() {
-  local out="$WORK/consumer"
+# hub_chat <out prefix>: one chat completion through the hub gateway, succeeding on HTTP 200.
+hub_chat() {
+  local out=$1
   # A gateway rollout ends the port-forward's pod, so start another.
   if [[ -z $PF_PID ]] || ! kill -0 "$PF_PID" 2>/dev/null; then
     k "$HUB_CTX" port-forward service/grid-gateway 18080:8080 >"$WORK/pf.log" 2>&1 &
@@ -618,8 +619,22 @@ consumer_served() {
     sleep 2
   fi
   [[ $(chat_body | curl -sS -o "$out.body" -D "$out.hdr" -w '%{http_code}' --max-time 15 \
-    -H 'Content-Type: application/json' -d @- http://127.0.0.1:18080/v1/chat/completions) == 200 ]] \
-    && served "$out"
+    -H 'Content-Type: application/json' -d @- http://127.0.0.1:18080/v1/chat/completions) == 200 ]]
+}
+
+consumer_served() { hub_chat "$WORK/consumer" && served "$WORK/consumer"; }
+
+# local_served: a completion the hub served from its own hub-local model.
+local_served() {
+  hub_chat "$WORK/local" && grep -qi '^x-grid-site: hub' "$WORK/local.hdr" \
+    && jq -e '.choices | length > 0' "$WORK/local.body" >/dev/null
+}
+
+# stale_hop_dropped: the rolled pod started on a serving file naming the withdrawn site's hop,
+# which the operator rewrites only once the rollout is ready, and dropped it rather than exiting.
+stale_hop_dropped() {
+  k "$HUB_CTX" logs deployment/grid-gateway -c praxis 2>/dev/null \
+    | grep -q 'provider hops lack a matching verified TLS backend'
 }
 
 assert_serving() {
@@ -726,6 +741,8 @@ assert_site_route() {
   eventually "the withdrawn site leaves the generated config" routes_clusters hub-local || { consumer_praxis || true; }
   eventually "the withdrawn site's hop leaves the serving config" hop_clusters || { serving_json || true; }
   eventually "the gateway rolls out past the withdrawal" rolled_out || true
+  eventually "the rolled pod dropped the stale hop of the withdrawn site" stale_hop_dropped || true
+  eventually "the hub serves its local model with the site withdrawn" local_served || true
 
   site_route_providers vcr hub-local
   helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "restore vcr on the hub"
