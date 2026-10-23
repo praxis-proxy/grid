@@ -1,4 +1,6 @@
 # AI Grid Network (AGN)
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fgrid.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fgrid?ref=badge_shield)
+
 
 AI Grid Network (AGN) connects inference providers across Kubernetes clusters,
 cloud services, and external APIs. Its operator discovers participating sites,
@@ -189,3 +191,7 @@ Read [CONTRIBUTING](CONTRIBUTING.md) and the canonical
 - [Operations and troubleshooting](docs/architecture/operations.md)
 - [Security reporting](SECURITY.md)
 - [Apache-2.0 license](LICENSE)
+
+
+## License
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fgrid.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fgrid?ref=badge_large)
