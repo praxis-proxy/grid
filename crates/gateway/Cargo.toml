@@ -2,6 +2,13 @@
 resolver = "3"
 members = ["crates/ai-grid-filters"]
 
+# Keep local and Helm CI build settings aligned with the root workspace.
+[profile.dev]
+opt-level = 1
+lto = "off"
+codegen-units = 16
+debug = 0
+
 [workspace.package]
 version = "0.2.2"
 edition = "2024"

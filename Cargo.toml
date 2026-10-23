@@ -114,6 +114,13 @@ strip = true
 panic = "abort"
 overflow-checks = true
 
+# Keep local builds and Helm CI images fast without debug-symbol overhead.
+[profile.dev]
+opt-level = 1
+lto = "off"
+codegen-units = 16
+debug = 0
+
 [profile.profiling]
 inherits = "release"
 debug = 2

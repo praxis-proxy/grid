@@ -162,7 +162,7 @@ jobs:
   # ----------------------------------------------------------------------------
   # Build each image once per commit; every kind job loads it from an artifact.
   # Artifacts work for fork PRs, which cannot push to a registry. Only main
-  # writes the layer cache, so a PR cannot seed layers that main reads.
+  # writes the layer and Cargo caches, so a PR cannot seed caches main reads.
   # ----------------------------------------------------------------------------
 
   images:
@@ -170,6 +170,8 @@ jobs:
     if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      CARGO_PROFILE: dev
     permissions:
       contents: read
     strategy:
@@ -187,13 +189,97 @@ jobs:
           persist-credentials: false
 
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Define Cargo cache keys
+        id: cargo-cache
+        env:
+          PLATFORM: ${{ runner.os }}-${{ runner.arch }}
+          IMAGE: ${{ matrix.name }}
+          TOOLCHAIN: ${{ hashFiles(matrix.file, 'rust-toolchain.toml', '.cargo/config.toml', 'Cargo.toml', 'crates/gateway/Cargo.toml') }}
+          LOCKFILES: ${{ hashFiles('Cargo.lock', 'crates/gateway/Cargo.lock') }}
+        run: |
+          echo "sources=helm-cargo-sources-v1-${PLATFORM}-${LOCKFILES}" >> "${GITHUB_OUTPUT}"
+          echo "target=helm-cargo-target-v1-${PLATFORM}-${IMAGE}-${CARGO_PROFILE}-${TOOLCHAIN}" >> "${GITHUB_OUTPUT}"
+          echo "locked-target=helm-cargo-target-v1-${PLATFORM}-${IMAGE}-${CARGO_PROFILE}-${TOOLCHAIN}-${LOCKFILES}" >> "${GITHUB_OUTPUT}"
+
+      # Each image writes a distinct key; fallback shares downloads across images.
+      # Register saves before cache-dance so its post step extracts mounts first.
+      - name: Cache Cargo downloads (main)
+        if: github.ref == 'refs/heads/main'
+        id: cargo-sources
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/cargo-sources
+          key: ${{ steps.cargo-cache.outputs.sources }}-${{ matrix.name }}
+          restore-keys: |
+            ${{ steps.cargo-cache.outputs.sources }}-
+
+      - name: Restore Cargo downloads (PRs and merge queue)
+        if: github.ref != 'refs/heads/main'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/cargo-sources
+          key: ${{ steps.cargo-cache.outputs.sources }}-${{ matrix.name }}
+          restore-keys: |
+            ${{ steps.cargo-cache.outputs.sources }}-
+
+      # Target artifacts must match the image's Alpine toolchain and workspace.
+      # A new key per commit lets immutable GHA caches retain source build updates.
+      - name: Cache Cargo target (main)
+        if: github.ref == 'refs/heads/main'
+        id: cargo-target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/cargo-target
+          key: ${{ steps.cargo-cache.outputs.locked-target }}-${{ github.sha }}
+          restore-keys: |
+            ${{ steps.cargo-cache.outputs.locked-target }}-
+            ${{ steps.cargo-cache.outputs.target }}-
+
+      - name: Restore Cargo target (PRs and merge queue)
+        if: github.ref != 'refs/heads/main'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/cargo-target
+          key: ${{ steps.cargo-cache.outputs.locked-target }}-${{ github.sha }}
+          restore-keys: |
+            ${{ steps.cargo-cache.outputs.locked-target }}-
+            ${{ steps.cargo-cache.outputs.target }}-
+
+      # The GHA layer exporter omits RUN cache mounts; persist them separately.
+      # Keep cache data and scratch files outside the whole-tree build context.
+      - name: Inject Cargo downloads into BuildKit
+        uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-map: |
+            {
+              "${{ runner.temp }}/cargo-sources/registry": "/usr/local/cargo/registry",
+              "${{ runner.temp }}/cargo-sources/git": "/usr/local/cargo/git"
+            }
+          scratch-dir: ${{ runner.temp }}/cargo-sources-dance
+          skip-extraction: ${{ github.ref != 'refs/heads/main' || steps.cargo-sources.outputs.cache-hit == 'true' }}
+
+      - name: Inject Cargo target into BuildKit
+        uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-map: |
+            {
+              "${{ runner.temp }}/cargo-target": "${{ matrix.name == 'gateway' && '/src/crates/gateway/target' || '/src/target' }}"
+            }
+          scratch-dir: ${{ runner.temp }}/cargo-target-dance
+          skip-extraction: ${{ github.ref != 'refs/heads/main' || steps.cargo-target.outputs.cache-hit == 'true' }}
 
       - name: Build ${{ matrix.name }} image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ${{ matrix.file }}
+          build-args: |
+            CARGO_PROFILE=${{ env.CARGO_PROFILE }}
           push: false
           tags: ghcr.io/praxis-proxy/grid-${{ matrix.name }}:ci
           outputs: type=docker,dest=/tmp/grid-${{ matrix.name }}.tar
