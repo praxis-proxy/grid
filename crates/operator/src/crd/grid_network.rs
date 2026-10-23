@@ -794,10 +794,9 @@ pub struct GatewayRef {
     /// When absent or `generate: false`, this gateway behaves exactly as before:
     /// only the routing overlay `ConfigMap` is applied.  When `generate: true`, the
     /// operator additionally renders a consumer Praxis `ConfigMap` containing the
-    /// `siteRouter` filter (with credential `secretRef` data for
-    /// `intelligent_route`), a `credential_inject` section for credential-bearing
-    /// inference candidates, and a `load_balancer` section with one cluster
-    /// entry per unique inference cluster. Other capability kinds remain in the
+    /// routing filter `siteRouter` selects, `intelligent_route` or `grid_site_route`,
+    /// a `credential_inject` section for credential-bearing inference candidates, and a `load_balancer` section with
+    /// one cluster entry per unique inference cluster. Other capability kinds remain in the
     /// routing overlay for dedicated data-plane pipelines.
     ///
     /// The generated `ConfigMap` contains no token bytes. Credential-bearing
@@ -812,7 +811,7 @@ pub struct GatewayRef {
 /// When `generate` is `true` on a [`GatewayRef`], the `GridNetwork` controller
 /// renders a `praxis.yaml`-keyed `ConfigMap` in the gateway namespace in addition
 /// to the normal routing overlay `ConfigMap`.  The generated config includes the
-/// `siteRouter` filter, `credential_inject` (when
+/// routing filter `siteRouter` selects, `credential_inject` (when
 /// credential-bearing inference candidates are present), and a `load_balancer`
 /// section.
 ///
@@ -2301,10 +2300,15 @@ mod tests {
         let router = praxis
             .pointer("/properties/siteRouter")
             .unwrap_or_else(|| std::process::abort());
-        assert_eq!(router.get("default"), Some(&serde_json::json!("intelligentRoute")));
+        assert_eq!(
+            router.get("default"),
+            Some(&serde_json::json!("intelligentRoute")),
+            "siteRouter defaults to intelligentRoute, so gridSiteRoute stays opt-in"
+        );
         assert_eq!(
             router.get("enum"),
-            Some(&serde_json::json!(["intelligentRoute", "gridSiteRoute"]))
+            Some(&serde_json::json!(["intelligentRoute", "gridSiteRoute"])),
+            "siteRouter admits exactly the two routers"
         );
         let parsed: ConsumerConfig =
             serde_json::from_value(serde_json::json!({"generate": true})).unwrap_or_else(|_| std::process::abort());

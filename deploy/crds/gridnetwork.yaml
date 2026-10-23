@@ -163,10 +163,9 @@ spec:
                           When absent or `generate: false`, this gateway behaves exactly as before:
                           only the routing overlay `ConfigMap` is applied.  When `generate: true`, the
                           operator additionally renders a consumer Praxis `ConfigMap` containing the
-                          `siteRouter` filter (with credential `secretRef` data for
-                          `intelligent_route`), a `credential_inject` section for credential-bearing
-                          inference candidates, and a `load_balancer` section with one cluster
-                          entry per unique inference cluster. Other capability kinds remain in the
+                          routing filter `siteRouter` selects, `intelligent_route` or `grid_site_route`,
+                          a `credential_inject` section for credential-bearing inference candidates, and a `load_balancer` section with
+                          one cluster entry per unique inference cluster. Other capability kinds remain in the
                           routing overlay for dedicated data-plane pipelines.
 
                           The generated `ConfigMap` contains no token bytes. Credential-bearing
@@ -548,10 +547,9 @@ spec:
                           When absent or `generate: false`, this gateway behaves exactly as before:
                           only the routing overlay `ConfigMap` is applied.  When `generate: true`, the
                           operator additionally renders a consumer Praxis `ConfigMap` containing the
-                          `siteRouter` filter (with credential `secretRef` data for
-                          `intelligent_route`), a `credential_inject` section for credential-bearing
-                          inference candidates, and a `load_balancer` section with one cluster
-                          entry per unique inference cluster. Other capability kinds remain in the
+                          routing filter `siteRouter` selects, `intelligent_route` or `grid_site_route`,
+                          a `credential_inject` section for credential-bearing inference candidates, and a `load_balancer` section with
+                          one cluster entry per unique inference cluster. Other capability kinds remain in the
                           routing overlay for dedicated data-plane pipelines.
 
                           The generated `ConfigMap` contains no token bytes. Credential-bearing
@@ -1028,10 +1026,9 @@ spec:
                           When absent or `generate: false`, this gateway behaves exactly as before:
                           only the routing overlay `ConfigMap` is applied.  When `generate: true`, the
                           operator additionally renders a consumer Praxis `ConfigMap` containing the
-                          `siteRouter` filter (with credential `secretRef` data for
-                          `intelligent_route`), a `credential_inject` section for credential-bearing
-                          inference candidates, and a `load_balancer` section with one cluster
-                          entry per unique inference cluster. Other capability kinds remain in the
+                          routing filter `siteRouter` selects, `intelligent_route` or `grid_site_route`,
+                          a `credential_inject` section for credential-bearing inference candidates, and a `load_balancer` section with
+                          one cluster entry per unique inference cluster. Other capability kinds remain in the
                           routing overlay for dedicated data-plane pipelines.
 
                           The generated `ConfigMap` contains no token bytes. Credential-bearing
@@ -1413,10 +1410,9 @@ spec:
                           When absent or `generate: false`, this gateway behaves exactly as before:
                           only the routing overlay `ConfigMap` is applied.  When `generate: true`, the
                           operator additionally renders a consumer Praxis `ConfigMap` containing the
-                          `siteRouter` filter (with credential `secretRef` data for
-                          `intelligent_route`), a `credential_inject` section for credential-bearing
-                          inference candidates, and a `load_balancer` section with one cluster
-                          entry per unique inference cluster. Other capability kinds remain in the
+                          routing filter `siteRouter` selects, `intelligent_route` or `grid_site_route`,
+                          a `credential_inject` section for credential-bearing inference candidates, and a `load_balancer` section with
+                          one cluster entry per unique inference cluster. Other capability kinds remain in the
                           routing overlay for dedicated data-plane pipelines.
 
                           The generated `ConfigMap` contains no token bytes. Credential-bearing

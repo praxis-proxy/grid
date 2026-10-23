@@ -1759,10 +1759,15 @@ mod tests {
                 "grid_site_route",
                 "credential_inject",
                 "load_balancer"
-            ]
+            ],
+            "grid_site_route takes intelligent_route's place in the generated chain"
         );
         let route = &filters[1];
-        assert_eq!(route["model_header"].as_str(), Some("X-Model"));
+        assert_eq!(
+            route["model_header"].as_str(),
+            Some("X-Model"),
+            "the router reads the header model_to_header writes"
+        );
         assert_eq!(
             filters[0]["header"].as_str(),
             Some("X-Model"),
@@ -1803,7 +1808,10 @@ mod tests {
             doc["clusters"][0].get("connection_timeout_ms").is_none(),
             "local keeps praxis's own"
         );
-        assert!(!yaml.contains("intelligent_route") && !yaml.contains("overlay_file"));
+        assert!(
+            !yaml.contains("intelligent_route") && !yaml.contains("overlay_file"),
+            "a site-route render carries no intelligent_route or its overlay"
+        );
     }
 
     #[test]
@@ -1926,6 +1934,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one render per router, each assertion naming its contract"
+    )]
     fn an_intelligent_route_render_is_unchanged_by_the_router_choice() {
         let (overlay, endpoints) = site_route_topology();
         let render = |router| {
@@ -1947,9 +1959,19 @@ mod tests {
             .config_yaml
         };
         let intelligent = render(SiteRouter::IntelligentRoute);
-        assert!(intelligent.contains("filter: intelligent_route") && intelligent.contains("filter: json_body_field"));
-        assert!(!intelligent.contains("health_check") && !intelligent.contains("\nclusters:"));
-        assert_ne!(intelligent, render(SiteRouter::GridSiteRoute));
+        assert!(
+            intelligent.contains("filter: intelligent_route") && intelligent.contains("filter: json_body_field"),
+            "intelligentRoute keeps its filter chain"
+        );
+        assert!(
+            !intelligent.contains("health_check") && !intelligent.contains("\nclusters:"),
+            "intelligentRoute gains no top-level clusters or health checks"
+        );
+        assert_ne!(
+            intelligent,
+            render(SiteRouter::GridSiteRoute),
+            "siteRouter selects a different render"
+        );
     }
 
     #[test]
