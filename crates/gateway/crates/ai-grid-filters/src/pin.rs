@@ -105,6 +105,9 @@ pub(crate) struct Pinned<'id> {
 
 /// Split a tagged id. `None` for an id the gateway did not tag, or, with `key`,
 /// one whose mac does not match.
+///
+/// Without a key a tag is shape-checked only, so any caller can name a site; the
+/// operator-rendered config must supply `tag_key_path` for pins to be authentic.
 pub(crate) fn untag<'id>(id: &'id str, key: Option<&TagKey>) -> Option<Pinned<'id>> {
     PREFIXES.iter().find_map(|prefix| {
         // Site names are DNS labels and marks and macs are hex, so the first three periods split it.
@@ -185,9 +188,13 @@ pub(crate) fn state_path(path: &str) -> Option<StatePath<'_>> {
         })
 }
 
-/// The path with the stored id replaced by `upstream`.
-pub(crate) fn upstream_path(collection: Collection, upstream: &str, rest: &str) -> String {
-    format!("{}/{upstream}{rest}", collection.path())
+/// The path with the stored id replaced by `upstream`, keeping the request's `query`.
+pub(crate) fn upstream_path(collection: Collection, upstream: &str, rest: &str, query: Option<&str>) -> String {
+    let path = collection.path();
+    match query {
+        Some(query) => format!("{path}/{upstream}{rest}?{query}"),
+        None => format!("{path}/{upstream}{rest}"),
+    }
 }
 
 #[cfg(test)]
@@ -619,8 +626,22 @@ mod tests {
         assert_eq!(state_path("/v1/responsesx"), None);
         assert_eq!(state_path("/v1/chat/completions"), None);
         assert_eq!(
-            upstream_path(Collection::Responses, "resp_a1", "/input_items"),
+            upstream_path(Collection::Responses, "resp_a1", "/input_items", None),
             "/v1/responses/resp_a1/input_items"
+        );
+    }
+
+    #[test]
+    fn the_upstream_path_keeps_the_request_query() {
+        assert_eq!(
+            upstream_path(
+                Collection::Responses,
+                "resp_a1",
+                "",
+                Some("stream=true&starting_after=3")
+            ),
+            "/v1/responses/resp_a1?stream=true&starting_after=3",
+            "a pinned rewrite carries the query the client sent"
         );
     }
 

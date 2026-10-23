@@ -50,7 +50,7 @@ const PROVIDER_HOP_REQUEST_ID_HEADER: &str = "x-ai-routing-request-id";
 const OVERLAY_REVISION_HEADER: &str = "x-ai-routing-revision";
 /// The caller's credentials, which never leave this site: another site authorizes the hop by
 /// its mutual TLS peer and candidate, so a caller's token would only leak.
-const CALLER_CREDENTIAL_HEADERS: [http::header::HeaderName; 7] = [
+const CALLER_CREDENTIAL_HEADERS: [http::header::HeaderName; 10] = [
     http::header::AUTHORIZATION,
     http::header::PROXY_AUTHORIZATION,
     http::header::COOKIE,
@@ -58,10 +58,13 @@ const CALLER_CREDENTIAL_HEADERS: [http::header::HeaderName; 7] = [
     http::header::HeaderName::from_static("api-key"),
     http::header::HeaderName::from_static("x-goog-api-key"),
     http::header::HeaderName::from_static("ocp-apim-subscription-key"),
+    http::header::HeaderName::from_static("x-amz-security-token"),
+    http::header::HeaderName::from_static("x-auth-token"),
+    http::header::HeaderName::from_static("x-access-token"),
 ];
 /// Query parameters that carry a caller's credential, stripped from a request that leaves this
 /// site for the same reason as the headers; every other parameter is kept as sent.
-const CALLER_CREDENTIAL_QUERY_PARAMS: [&str; 7] = [
+const CALLER_CREDENTIAL_QUERY_PARAMS: [&str; 13] = [
     "key",
     "api_key",
     "api-key",
@@ -69,6 +72,12 @@ const CALLER_CREDENTIAL_QUERY_PARAMS: [&str; 7] = [
     "access_token",
     "token",
     "subscription-key",
+    "client_secret",
+    "sig",
+    "signature",
+    "x-amz-signature",
+    "x-amz-security-token",
+    "x-amz-credential",
 ];
 /// Response header carrying the site selected by Grid.
 const ROUTE_SITE_HEADER: &str = "x-grid-site";
@@ -112,21 +121,27 @@ const CREDENTIAL_METADATA: [&str; 4] = [
 /// remaining parameters keep their order and encoding.
 fn strip_credential_query(path_and_query: &str) -> Option<String> {
     let (path, query) = path_and_query.split_once('?')?;
+    // Some backends split pairs on `;` as well as `&`, so both count as a separator.
+    let separator = |byte: char| byte == '&' || byte == ';';
     let is_credential = |pair: &str| {
-        let name = pair.split('=').next().unwrap_or_default();
+        let name = pair.trim_end_matches(separator).split('=').next().unwrap_or_default();
         let name = percent_encoding::percent_decode_str(name).decode_utf8_lossy();
         CALLER_CREDENTIAL_QUERY_PARAMS
             .iter()
             .any(|known| name.eq_ignore_ascii_case(known))
     };
-    if !query.split('&').any(is_credential) {
+    if !query.split(separator).any(is_credential) {
         return None;
     }
-    let kept: Vec<&str> = query.split('&').filter(|pair| !is_credential(pair)).collect();
+    let kept: String = query
+        .split_inclusive(separator)
+        .filter(|pair| !is_credential(pair))
+        .collect();
+    let kept = kept.trim_end_matches(separator);
     Some(if kept.is_empty() {
         path.to_owned()
     } else {
-        format!("{path}?{}", kept.join("&"))
+        format!("{path}?{kept}")
     })
 }
 
@@ -457,6 +472,11 @@ impl GridSiteRouteFilter {
             Ok(pinned) => pinned,
             Err(answer) => return Ok(Some(answer)),
         };
+        // A pin names where the state lives; it does not exempt the request from shedding.
+        if let Some(model) = model.filter(|model| snapshot.shedding.contains(*model)) {
+            let turn = self.turn.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(refuse(Refused::Shed, model, turn)));
+        }
         let site = holder.as_ref().map(|holder| &holder.site);
         let candidate = match pinned_target(&snapshot, holder.as_ref(), model) {
             Target::Found(candidate) => candidate,
@@ -793,7 +813,7 @@ fn pinned_site(
                 Err(FilterAction::Reject(Rejection::status(404)))
             },
             |pinned| {
-                let rewrite = pin::upstream_path(collection, &pinned.upstream, rest);
+                let rewrite = pin::upstream_path(collection, &pinned.upstream, rest, ctx.request.uri.query());
                 let holder = Holder {
                     site: Arc::from(pinned.site),
                     mark: Some(pinned.mark.to_owned()),
@@ -2486,6 +2506,25 @@ mod tests {
             strip_credential_query("/v1/models"),
             None,
             "no query, nothing rewritten"
+        );
+    }
+
+    #[test]
+    fn credential_query_names_match_across_separators_and_presigned_forms() {
+        assert_eq!(
+            strip_credential_query("/v1/models?a=1;key=s;b=2").as_deref(),
+            Some("/v1/models?a=1;b=2"),
+            "a semicolon separates pairs too, and the kept pairs keep their separator"
+        );
+        assert_eq!(
+            strip_credential_query("/v1/models?X-Amz-Signature=s&X-Amz-Credential=c&v=1").as_deref(),
+            Some("/v1/models?v=1"),
+            "presigned-URL credentials are stripped"
+        );
+        assert_eq!(
+            strip_credential_query("/v1/models?client_secret=s;sig=x").as_deref(),
+            Some("/v1/models"),
+            "a query of only credentials is dropped whichever separator it used"
         );
     }
 }
