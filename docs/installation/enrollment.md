@@ -246,6 +246,37 @@ site must re-enroll.
   upgrade`. Run `helm upgrade` at least every 30 days, or when the enrollment
   pod logs its daily warning that the serving certificate expires within 30
   days.
+- A serving certificate does not follow a name change. Bootstrap creates
+  `serving.secretName` only when it is absent, and renews it only inside 30 days
+  of expiry, so adding `route.host` or changing `host` leaves the old
+  certificate and the new name never joins its SANs. A site then fails
+  verification with `ssl_verify_result` 1 against a CA that is otherwise
+  correct. Delete the Secret and run `helm upgrade`, as under Recover the hub
+  identity. The CA is untouched, so pinned bundles and issued identities stay
+  valid.
+- Under Argo CD, deleting the Secret is not enough. The Job is a
+  `pre-install,pre-upgrade` hook, which Argo runs as PreSync and skips when the
+  sync has nothing else to do, so the Job keeps its old `startTime` and never
+  re-runs. Re-run it directly instead, under a name of its own, taking the spec
+  from the Job the chart rendered:
+
+```sh
+oc -n <namespace> get job <release>-ca-bootstrap -o json \
+  | jq 'del(.spec.selector, .spec.template.metadata.labels, .status, .metadata)
+        | .metadata = {name: "<release>-ca-reissue", namespace: "<namespace>"}' \
+  | oc apply -f -
+```
+
+  Then restart the enrollment Deployment, and confirm the new name is present
+  and the CA fingerprint is unchanged:
+
+```sh
+oc -n <namespace> get secret <serving secret> \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -ext subjectAltName
+oc -n <namespace> get secret <ca secret> \
+  -o jsonpath='{.data.ca\.crt}' | base64 -d | openssl x509 -noout -fingerprint -sha256
+```
+
 - The grid CA lasts 10 years. The CA cannot be rotated. `ca.forceRegenerate`
   re-issues every leaf and invalidates every enrolled site's trust anchor.
 - The service records the SHA-256 fingerprint of the CA's public key in the
