@@ -110,8 +110,8 @@ pub struct InferenceProviderSpec {
     ///
     /// When set, the operator polls the backend on a fixed cadence and holds
     /// the served-model set in memory, expiring it when polls stop succeeding.
-    /// Discovery does not yet affect routing or gossip; `spec.models` remains
-    /// the routing source.
+    /// Until route and provider-record formats support inventory expiry,
+    /// discovered names are withheld and do not fall back to `spec.models`.
     /// When absent, no discovery runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_discovery: Option<ModelDiscoveryConfig>,
@@ -675,6 +675,13 @@ pub struct InferenceProviderStatus {
     #[schemars(extend("format" = "date-time"))]
     pub served_models_expires_at: Option<String>,
 
+    /// Provider generation that produced the corresponding `servedModels` set.
+    ///
+    /// Readers must require this value to equal `metadata.generation`; a spec
+    /// change invalidates the inventory until discovery succeeds again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_models_observed_generation: Option<i64>,
+
     /// Effective model-listing URL when discovery is configured.
     ///
     /// This is the requested URL, not an indication that polling succeeded.
@@ -708,8 +715,8 @@ pub struct InferenceProviderStatus {
 
 impl InferenceProviderStatus {
     /// Compare the fields written by provider reconciliation, excluding the
-    /// discovery poller's fields (error, served models, and their expiry) and
-    /// the signals loop's conditions.
+    /// discovery poller's fields (error, served models, expiry, and observed
+    /// generation) and the signals loop's conditions.
     pub(crate) fn matches_reconciler_status(&self, desired: &Self) -> bool {
         self.matching_sites == desired.matching_sites
             && self.model_discovery_url == desired.model_discovery_url

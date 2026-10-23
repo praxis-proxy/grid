@@ -815,6 +815,10 @@ pub(crate) fn provider_readiness(
 }
 
 /// Write the provider's `Ready` condition when its status or reason changed.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the Kubernetes status patch future carries a full InferenceProvider response"
+)]
 async fn apply_ready_condition(
     client: &Client,
     provider: &InferenceProvider,
@@ -1669,6 +1673,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         &providers,
         &tool_providers,
         &remote_crdt_providers,
+        &ctx.served_models,
         &raw_metrics,
         &scoring_weights,
         &admission_states,
@@ -1695,7 +1700,15 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     // Publish provider CRDT state so peers learn this site's providers.
     let remote_provider_count = if let Some(swim) = ctx.swim().filter(|handle| handle.is_running()) {
-        publish_real_provider_state(swim, name, &grid_id, &providers, &tool_providers, &raw_metrics);
+        publish_real_provider_state(
+            swim,
+            name,
+            &grid_id,
+            &providers,
+            &tool_providers,
+            &raw_metrics,
+            &ctx.served_models,
+        );
         log_capacity_changes(&ctx.logged, name, &providers);
         count_remote_provider_records(swim, name)
     } else {
@@ -2307,7 +2320,7 @@ fn site_phases(sites: &[GridSite]) -> impl Iterator<Item = (&str, &'static str)>
 )]
 #[expect(
     clippy::too_many_arguments,
-    reason = "scoring_weights is threaded through overlay rendering without hiding the selected strategy"
+    reason = "scoring weights and served-model state are threaded through overlay rendering without hiding their use"
 )]
 async fn reconcile_routing_overlay_inner(
     network: &GridNetwork,
@@ -2315,6 +2328,7 @@ async fn reconcile_routing_overlay_inner(
     providers: &[InferenceProvider],
     tool_providers: &[AgentToolProvider],
     remote_crdt_providers: &[crdt::ProviderState],
+    served_model_store: &served_models::ServedModelStore,
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
     scoring_weights: &scoring::ScoringWeights,
     admission_states: &HashMap<String, crate::resources::geography::AdmissionState>,
@@ -2382,6 +2396,7 @@ async fn reconcile_routing_overlay_inner(
             timestamp.as_deref(),
             scoring_weights,
             Some(admission_states),
+            served_model_store,
         ) {
             Ok(overlay) => overlay,
             Err(error) => {
@@ -4750,15 +4765,20 @@ fn log_capacity_changes(logged: &ChangeLog, network: &str, providers: &[Inferenc
 /// advances on spec and status writes, and falls back to `metadata.generation`
 /// when no parseable resource version is present.  Equal revisions break ties
 /// via `writer_id`, which is the advertising SWIM site identity.
-fn provider_state_from_kube(
+pub(crate) fn provider_state_from_kube(
     provider: &InferenceProvider,
     network_id: &str,
     site_id: &str,
     metrics: Option<scoring::BackendMetrics>,
+    served_model_store: &served_models::ServedModelStore,
 ) -> Option<crdt::ProviderState> {
     let provider_id = provider.metadata.name.as_deref()?;
     let routing_cluster = routing_overlay::routing_identity(provider)?.to_owned();
-    let models = provider.spec.models.iter().map(|m| m.name.clone()).collect();
+    let models = match served_model_store.select_for(provider) {
+        // FIXME: we are currently only wiring static config, even if we support discovery.
+        Some(inventory) if inventory.is_static() => inventory.models().to_vec(),
+        _ => Vec::new(),
+    };
     let phase = crdt_phase_from_provider(
         provider.status.as_ref(),
         provider.metadata.generation.unwrap_or_default(),
@@ -5130,7 +5150,7 @@ fn provider_state_broadcast(
 /// to SWIM peers via [`SwimHandle::publish_state_broadcast`].
 #[expect(
     clippy::too_many_arguments,
-    reason = "tool_providers is the new distinct input alongside existing inference parameters"
+    reason = "tool providers and served-model state are distinct inputs alongside existing inference parameters"
 )]
 fn publish_real_provider_state(
     swim: &SwimHandle,
@@ -5139,6 +5159,7 @@ fn publish_real_provider_state(
     providers: &[InferenceProvider],
     tool_providers: &[AgentToolProvider],
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
+    served_model_store: &served_models::ServedModelStore,
 ) {
     let site_name = swim.site_name();
     let mut snap = crdt::GridStateSnapshot::new(site_name.to_owned());
@@ -5150,7 +5171,7 @@ fn publish_real_provider_state(
         }
         let routing_id = routing_overlay::routing_identity(provider).unwrap_or("");
         let metrics = raw_metrics.get(routing_id).copied();
-        if let Some(state) = provider_state_from_kube(provider, network_name, site_name, metrics) {
+        if let Some(state) = provider_state_from_kube(provider, network_name, site_name, metrics, served_model_store) {
             upsert_provider_with_capabilities(&mut snap, &mut max_revision, state);
         }
     }
@@ -7559,7 +7580,7 @@ mod tests {
     #[test]
     fn provider_state_from_kube_maps_basic_fields() {
         let p = make_provider("my-provider", "net", "local", 3);
-        let state = provider_state_from_kube(&p, "net", "site-a", None);
+        let state = provider_state_from_kube(&p, "net", "site-a", None, &served_models::ServedModelStore::new());
         let state = state.unwrap_or_else(|| std::process::abort());
         assert_eq!(state.network_id, "net", "network_id from owning GridNetwork");
         assert_eq!(state.provider_id, "my-provider", "provider_id from metadata.name");
@@ -7571,9 +7592,35 @@ mod tests {
     }
 
     #[test]
+    fn provider_state_from_kube_does_not_gossip_dynamic_spec_models() {
+        let p: InferenceProvider = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": "dynamic-provider", "uid": "provider-uid", "generation": 1 },
+            "spec": {
+                "gridNetworkRef": "net",
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8080",
+                "models": [{ "name": "configured-model" }],
+                "modelDiscovery": { "openAiModels": {} }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let state = provider_state_from_kube(&p, "net", "site-a", None, &served_models::ServedModelStore::new())
+            .unwrap_or_else(|| std::process::abort());
+
+        assert!(
+            state.models.is_empty(),
+            "dynamic providers without a fresh inventory must not gossip spec.models"
+        );
+    }
+
+    #[test]
     fn provider_state_from_kube_uses_metadata_name_as_routing_cluster_by_default() {
         let p = make_provider("prov-a", "net", "api_provider", 0);
-        let state = provider_state_from_kube(&p, "net", "site-a", None).unwrap_or_else(|| std::process::abort());
+        let state = provider_state_from_kube(&p, "net", "site-a", None, &served_models::ServedModelStore::new())
+            .unwrap_or_else(|| std::process::abort());
         assert_eq!(
             state.routing_cluster, "prov-a",
             "routing_cluster defaults to metadata.name"
@@ -7583,7 +7630,8 @@ mod tests {
     #[test]
     fn provider_state_from_kube_uses_routing_cluster_ref_when_set() {
         let p = make_provider_with_routing_ref("prov-x", "net", "site-override");
-        let state = provider_state_from_kube(&p, "net", "site-a", None).unwrap_or_else(|| std::process::abort());
+        let state = provider_state_from_kube(&p, "net", "site-a", None, &served_models::ServedModelStore::new())
+            .unwrap_or_else(|| std::process::abort());
         assert_eq!(
             state.routing_cluster, "site-override",
             "clusterName must override metadata.name"
@@ -7606,7 +7654,7 @@ mod tests {
         }))
         .unwrap_or_else(|_| std::process::abort());
         assert!(
-            provider_state_from_kube(&p, "net", "site-a", None).is_none(),
+            provider_state_from_kube(&p, "net", "site-a", None, &served_models::ServedModelStore::new()).is_none(),
             "provider with no metadata.name must yield None"
         );
     }
@@ -7673,7 +7721,8 @@ mod tests {
     #[test]
     fn provider_state_from_kube_propagates_provider_phase_via_status() {
         let p = make_provider_with_status("prov-a", "net", "Degraded");
-        let state = provider_state_from_kube(&p, "net", "s", None).unwrap_or_else(|| std::process::abort());
+        let state = provider_state_from_kube(&p, "net", "s", None, &served_models::ServedModelStore::new())
+            .unwrap_or_else(|| std::process::abort());
         assert_eq!(
             state.phase,
             crdt::ProviderPhase::Degraded,
@@ -7684,7 +7733,7 @@ mod tests {
     #[test]
     fn provider_state_from_kube_unavailable_is_included_not_skipped() {
         let p = make_provider_with_status("prov-a", "net", "Unavailable");
-        let state = provider_state_from_kube(&p, "net", "s", None);
+        let state = provider_state_from_kube(&p, "net", "s", None, &served_models::ServedModelStore::new());
         assert!(
             state.is_some(),
             "Unavailable providers must be published so remote sites know to avoid them"
@@ -7716,7 +7765,8 @@ mod tests {
     #[test]
     fn revision_falls_back_to_generation_field() {
         let p = make_provider("prov-g", "net", "local", 42);
-        let state = provider_state_from_kube(&p, "net", "s", None).unwrap_or_else(|| std::process::abort());
+        let state = provider_state_from_kube(&p, "net", "s", None, &served_models::ServedModelStore::new())
+            .unwrap_or_else(|| std::process::abort());
         assert_eq!(state.revision, 42, "revision must fall back to Kubernetes generation");
     }
 
@@ -7724,7 +7774,8 @@ mod tests {
     fn revision_prefers_resource_version_over_generation() {
         let mut p = make_provider("prov-rv", "net", "local", 42);
         p.metadata.resource_version = Some("99".to_owned());
-        let state = provider_state_from_kube(&p, "net", "s", None).unwrap_or_else(|| std::process::abort());
+        let state = provider_state_from_kube(&p, "net", "s", None, &served_models::ServedModelStore::new())
+            .unwrap_or_else(|| std::process::abort());
         assert_eq!(
             state.revision, 99,
             "resourceVersion advances on status writes and must win over generation"
@@ -7746,7 +7797,8 @@ mod tests {
             }
         }))
         .unwrap_or_else(|_| std::process::abort());
-        let state = provider_state_from_kube(&p, "net", "s", None).unwrap_or_else(|| std::process::abort());
+        let state = provider_state_from_kube(&p, "net", "s", None, &served_models::ServedModelStore::new())
+            .unwrap_or_else(|| std::process::abort());
         assert_eq!(state.revision, 0, "missing generation must default to revision=0");
     }
 

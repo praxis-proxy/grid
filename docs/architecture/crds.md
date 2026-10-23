@@ -1054,8 +1054,10 @@ as a normalized `0.0` to `1.0` gauge before the operator scrapes it.
 ### Model discovery
 
 `spec.modelDiscovery` makes the operator poll the backend for the models it
-serves. Discovery does not yet affect routing or gossip; `spec.models`
-remains the routing source.
+serves. For now, discovered model names are withheld from routes and provider
+records because those formats cannot enforce inventory expiry. A provider with
+discovery configured does not fall back to `spec.models`; providers without
+discovery continue to use `spec.models`.
 
 ```yaml
 spec:
@@ -1100,8 +1102,13 @@ require this timestamp to be in the future before using `servedModels`. The
 discovery loop may not clear the status until its next round after the TTL, so
 the presence of `servedModels` alone does not prove freshness. Failed polls do
 not extend the deadline. When the set is unknown, expired and cleared, or
-discovery is disabled, both fields are absent; readers must fail closed.
-Writing either field advances `metadata.resourceVersion`, so the CRDT revision
+discovery is disabled, these discovery inventory fields are absent; readers
+must fail closed.
+`status.servedModelsObservedGeneration` records the provider `metadata.generation`
+that produced the set. Readers must require it to equal the current generation;
+a spec change makes the prior inventory unusable until a successful poll writes
+a new set, expiry, and generation together.
+Updating these fields advances `metadata.resourceVersion`, so the CRDT revision
 of the gossiped provider record advances with discovery status changes.
 
 The bearer token comes from `spec.auth`. A model-discovery URL must use HTTPS

@@ -895,6 +895,7 @@ async fn update_status(
         reason,
         served_models: None,
         served_models_expires_at: None,
+        served_models_observed_generation: None,
     };
 
     if provider
@@ -939,6 +940,7 @@ mod tests {
             reason: None,
             served_models: None,
             served_models_expires_at: None,
+            served_models_observed_generation: None,
         };
         assert!(baseline.matches_reconciler_status(&baseline));
 
@@ -967,6 +969,7 @@ mod tests {
             reason: None,
             served_models: None,
             served_models_expires_at: None,
+            served_models_observed_generation: None,
         };
 
         let changed_discovery_error = InferenceProviderStatus {

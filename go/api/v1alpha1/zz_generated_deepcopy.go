@@ -1585,6 +1585,10 @@ func (in *InferenceProviderStatus) DeepCopyInto(out *InferenceProviderStatus) {
 		x := *in.ServedModelsExpiresAt
 		out.ServedModelsExpiresAt = &x
 	}
+	if in.ServedModelsObservedGeneration != nil {
+		x := *in.ServedModelsObservedGeneration
+		out.ServedModelsObservedGeneration = &x
+	}
 }
 
 func (in *InferenceProviderStatus) DeepCopy() *InferenceProviderStatus {

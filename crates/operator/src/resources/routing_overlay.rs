@@ -5,8 +5,8 @@
 //! `ConfigMap`.  Praxis reads this `ConfigMap` to configure its
 //! `intelligent_route` filter with routing candidates.
 //!
-//! This renderer is **pure**: it accepts already-fetched CRD data and
-//! produces structured output.  No Kubernetes API calls are made inside
+//! This renderer accepts already-fetched CRD data and the discovery store,
+//! then produces structured output. No Kubernetes API calls are made inside
 //! this module.
 //!
 //! # Phase 1 / OP-01 semantics
@@ -57,9 +57,9 @@ use crate::{
         inference_provider::{InferenceProvider, ProviderPhase},
     },
     resources::geography::{AdmissionState, LocalityTier},
+    served_models::ServedModelStore,
     swim::{MemberStatus, MembershipSnapshot},
 };
-
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -1273,6 +1273,7 @@ pub fn render_routing_overlay(
     generated_at: Option<&str>,
     weights: &scoring::ScoringWeights,
 ) -> Result<RoutingOverlay, String> {
+    let empty_served_models = ServedModelStore::new();
     render_routing_overlay_with_admission(
         network,
         sites,
@@ -1285,6 +1286,7 @@ pub fn render_routing_overlay(
         generated_at,
         weights,
         None,
+        &empty_served_models,
     )
 }
 
@@ -1340,9 +1342,9 @@ fn truncate_candidate_count(candidates: &mut Vec<RoutingCandidate>, network_name
     });
 }
 
-/// Render an overlay using controller-owned admission states for local
-/// providers. The compatibility wrapper above retains the pure renderer API
-/// used by callers and tests that do not have reconcile memory.
+/// Render an overlay using controller-owned admission states and the local
+/// discovery store. The compatibility wrapper above retains the renderer
+/// signature for callers without discovery state; it omits dynamic candidates.
 ///
 /// # Errors
 ///
@@ -1350,7 +1352,7 @@ fn truncate_candidate_count(candidates: &mut Vec<RoutingCandidate>, network_name
 /// metadata required to construct a valid routing candidate.
 #[expect(
     clippy::too_many_arguments,
-    reason = "admission states and tool_providers are distinct control-plane inputs"
+    reason = "admission states, tool providers, and discovery inventory are distinct control-plane inputs"
 )]
 #[expect(
     clippy::too_many_lines,
@@ -1368,6 +1370,7 @@ pub fn render_routing_overlay_with_admission(
     generated_at: Option<&str>,
     weights: &scoring::ScoringWeights,
     precomputed_admission: Option<&HashMap<String, AdmissionState>>,
+    served_model_store: &ServedModelStore,
 ) -> Result<RoutingOverlay, String> {
     let network_name = network
         .metadata
@@ -1409,6 +1412,7 @@ pub fn render_routing_overlay_with_admission(
         providers,
         consumer_site_labels,
         owning_site.unwrap_or(local_site),
+        served_model_store,
     )?;
     candidates.extend(collect_tool_candidates(
         network_name,
@@ -1598,12 +1602,17 @@ fn should_include_provider_for_consumer(
 /// evaluated against the `consumer_site_labels`. Providers with non-empty access
 /// policies will only generate candidates if the consumer site matches the required
 /// labels. Empty access policies allow all consumers (preserving existing behavior).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "network, site, access, placement, and inventory inputs are independent for this pass"
+)]
 fn collect_candidates(
     network_name: &str,
     sites: &[GridSite],
     providers: &[InferenceProvider],
     consumer_site_labels: Option<&BTreeMap<String, String>>,
     owning_site: &str,
+    served_model_store: &ServedModelStore,
 ) -> Result<Vec<RoutingCandidate>, String> {
     // Pre-filter sites to those in this network.
     let network_sites: Vec<&GridSite> = sites
@@ -1626,7 +1635,7 @@ fn collect_candidates(
         }
 
         let resolution = resolve_sites(provider, &network_sites, owning_site);
-        all.extend(candidates_from_provider(provider, &resolution)?);
+        all.extend(candidates_from_provider(provider, &resolution, served_model_store)?);
     }
     Ok(all)
 }
@@ -1748,6 +1757,7 @@ fn resolve_sites(provider: &InferenceProvider, network_sites: &[&GridSite], owni
 fn candidates_from_provider(
     provider: &InferenceProvider,
     site_resolution: &SiteResolution,
+    served_model_store: &ServedModelStore,
 ) -> Result<Vec<RoutingCandidate>, String> {
     let provider_name = provider
         .metadata
@@ -1759,14 +1769,20 @@ fn candidates_from_provider(
     // names at one provider collapse to a single routing candidate, so the second is
     // silently lost rather than served.
     let mut seen = BTreeSet::new();
-    for model in &provider.spec.models {
-        if model.name.trim().is_empty() {
+    let Some(model_inventory) = served_model_store.select_for(provider) else {
+        return Ok(Vec::new());
+    };
+    // FIXME: we are currently only wiring static config, even if we support discovery.
+    if !model_inventory.is_static() {
+        return Ok(Vec::new());
+    }
+    for model in model_inventory.models() {
+        if model.trim().is_empty() {
             return Err(format!("provider {provider_name} has a blank model name"));
         }
-        if !seen.insert(model.name.as_str()) {
+        if !seen.insert(model.as_str()) {
             return Err(format!(
-                "provider {provider_name} declares model {} more than once",
-                model.name
+                "provider {provider_name} declares model {model} more than once"
             ));
         }
     }
@@ -1795,11 +1811,11 @@ fn candidates_from_provider(
     let fresh = is_candidate_fresh(provider);
     let credential = projected_credential_from_provider(provider);
     let mut candidates = Vec::new();
-    for model in &provider.spec.models {
+    for model in model_inventory.models() {
         for site in &sites {
             candidates.push(RoutingCandidate {
                 kind: CANDIDATE_KIND.to_owned(),
-                name: model.name.clone(),
+                name: model.clone(),
                 site: (*site).to_owned(),
                 cluster: cluster.to_owned(),
                 fresh,
@@ -4021,6 +4037,31 @@ mod tests {
         assert!(
             overlay.candidates.iter().all(|c| !c.fresh),
             "all candidates from a Degraded provider must have fresh=false"
+        );
+    }
+
+    #[test]
+    fn local_candidates_do_not_fall_back_to_dynamic_spec_models() {
+        let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": "dynamic-provider", "uid": "provider-uid", "generation": 1 },
+            "spec": {
+                "gridNetworkRef": "net",
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8000",
+                "models": [{ "name": "configured-model" }],
+                "modelDiscovery": { "openAiModels": {} }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let candidates = candidates_from_provider(&provider, &SiteResolution::Unavailable, &ServedModelStore::new())
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert!(
+            candidates.is_empty(),
+            "dynamic providers without a fresh inventory must not route spec.models"
         );
     }
 

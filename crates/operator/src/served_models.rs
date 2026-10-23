@@ -13,15 +13,16 @@
 //!       provider not polled   → drop set
 //!       deadline passed       → drop set
 //!     patch the discovery-owned status fields
-//!       successful poll       → status.servedModels and servedModelsExpiresAt
-//!       expired set           → both status fields absent
+//!       successful poll       → status.servedModels, expiry, and observed generation
+//!       expired set           → inventory, expiry, and generation absent
 //!       failure reason        → status.modelDiscoveryError
 //! ```
 //!
-//! The in-memory store uses a monotonic TTL. The paired status expiry is a
-//! wall-clock boundary so readers can reject a status that remains uncleared
-//! between expiry and the next discovery round. `status.servedModels` and its
-//! expiry are the durable hand-off to reconcile.
+//! The in-memory store uses provider UID, generation, source URL, and a
+//! monotonic TTL. The paired status expiry is a wall-clock boundary so readers
+//! can reject a status that remains uncleared between expiry and the next
+//! discovery round. The model set, expiry, and observed generation are the
+//! durable hand-off to reconcile.
 
 use std::{
     collections::BTreeMap,
@@ -98,11 +99,70 @@ struct ServedModel {
     expires_at_status: String,
 }
 
+/// Model names configured directly in a provider spec.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StaticModelInventory {
+    /// Configured model names.
+    models: Arc<[String]>,
+}
+
+impl StaticModelInventory {
+    /// Build the inventory declared in a provider's spec.
+    fn for_provider(provider: &InferenceProvider) -> Self {
+        Self {
+            models: provider.spec.models.iter().map(|model| model.name.clone()).collect(),
+        }
+    }
+}
+
+/// Fresh discovered model names and the metadata that makes them valid.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DiscoveredModelInventory {
+    /// Validated model names.
+    models: Arc<[String]>,
+
+    /// RFC 3339 UTC deadline persisted with the model set.
+    expires_at: String,
+
+    /// Provider generation that produced this inventory.
+    observed_generation: i64,
+}
+
+/// Model names selected for an inference provider.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ModelInventory {
+    /// Names configured directly on the provider.
+    Static(StaticModelInventory),
+
+    /// Names discovered from the provider backend.
+    Discovered(DiscoveredModelInventory),
+}
+
+impl ModelInventory {
+    /// Model names selected for routing or provider state.
+    #[must_use]
+    pub(crate) fn models(&self) -> &[String] {
+        match self {
+            Self::Static(inventory) => inventory.models.as_ref(),
+            Self::Discovered(inventory) => inventory.models.as_ref(),
+        }
+    }
+
+    /// Whether the names came from the provider's static configuration.
+    #[must_use]
+    pub(crate) fn is_static(&self) -> bool {
+        matches!(self, Self::Static(_))
+    }
+}
+
 /// Identity of the provider and concrete endpoint used for discovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DiscoveryKey {
     /// Kubernetes UID distinguishes replacements with the same name.
     uid: String,
+
+    /// Provider spec generation that produced the inventory.
+    generation: i64,
 
     /// URL includes the configured endpoint fallback and models path.
     url: String,
@@ -112,10 +172,11 @@ impl DiscoveryKey {
     /// Resolve the identity for a discoverable provider.
     fn for_provider(provider: &InferenceProvider) -> Option<Self> {
         let uid = provider.metadata.uid.clone()?;
+        let generation = provider.metadata.generation?;
         let url = match provider.spec.model_discovery.as_ref()? {
             ModelDiscoveryConfig::OpenAiModels(source) => source.effective_url(&provider.spec.endpoint),
         };
-        Some(Self { uid, url })
+        Some(Self { uid, generation, url })
     }
 }
 
@@ -267,14 +328,21 @@ impl ServedModelStore {
         Self::default()
     }
 
-    /// Models `provider` serves, or `None` when unknown, changed, or expired.
+    /// Select the model inventory configured for `provider`.
+    ///
+    /// Static providers always have an inventory. Dynamic providers never fall
+    /// back to `spec.models` and have no inventory while discovery is unknown or expired.
     #[must_use]
-    pub fn models(&self, provider: &InferenceProvider) -> Option<Arc<[String]>> {
-        self.fresh_inventory(provider).map(|(models, _)| models)
+    pub(crate) fn select_for(&self, provider: &InferenceProvider) -> Option<ModelInventory> {
+        if provider.spec.model_discovery.is_some() {
+            self.fresh_inventory(provider).map(ModelInventory::Discovered)
+        } else {
+            Some(ModelInventory::Static(StaticModelInventory::for_provider(provider)))
+        }
     }
 
-    /// Models and their persisted expiry deadline for the same provider source.
-    fn fresh_inventory(&self, provider: &InferenceProvider) -> Option<(Arc<[String]>, String)> {
+    /// Fresh models, expiry deadline, and producing generation for one provider.
+    fn fresh_inventory(&self, provider: &InferenceProvider) -> Option<DiscoveredModelInventory> {
         let name = provider.metadata.name.as_deref()?;
         let source = DiscoveryKey::for_provider(provider)?;
         let now = Instant::now();
@@ -282,7 +350,11 @@ impl ServedModelStore {
         guard
             .get(name)
             .filter(|held| held.source == source && held.expires_at > now)
-            .map(|held| (Arc::clone(&held.models), held.expires_at_status.clone()))
+            .map(|held| DiscoveredModelInventory {
+                models: Arc::clone(&held.models),
+                expires_at: held.expires_at_status.clone(),
+                observed_generation: held.source.generation,
+            })
     }
 
     /// Apply one round of poll results.
@@ -346,7 +418,7 @@ pub(crate) async fn discover(
     Ok(())
 }
 
-/// Patch changed discovery-owned status: the failure reason, served set, and expiry.
+/// Patch changed discovery-owned status: the failure reason and served inventory.
 ///
 /// `store` is read after this round's refresh, so an expired or dropped set
 /// reads as absent and is cleared from the status.
@@ -358,7 +430,15 @@ async fn publish_discovery_status(
     interval: Duration,
 ) {
     for provider in providers {
-        if let Some(desired) = DiscoveryStatusPatch::for_provider(provider, store, polled) {
+        let name = provider.metadata.name.as_deref();
+        let failure_reason = name.and_then(|name| {
+            polled
+                .iter()
+                .find(|status| status.name == name)
+                .and_then(|status| status.failure_reason)
+        });
+        let inventory = store.fresh_inventory(provider);
+        if let Some(desired) = DiscoveryStatusPatch::for_provider(provider, inventory, failure_reason) {
             let current = provider.status.as_ref();
             if desired.should_apply_patch(current, interval) {
                 match patch_discovery_status(api, provider, &desired).await {
@@ -384,43 +464,30 @@ struct DiscoveryStatusPatch {
     /// Failure reason, or `None` after a successful poll.
     failure_reason: Option<&'static str>,
 
-    /// Served-model set, or `None` when unknown, expired, or discovery is off.
-    models: Option<Vec<String>>,
-
-    /// RFC 3339 expiry of the served-model set, absent with the set.
-    expires_at: Option<String>,
+    /// Fresh served-model inventory, or `None` when unknown, expired, or disabled.
+    inventory: Option<DiscoveredModelInventory>,
 }
 
 impl DiscoveryStatusPatch {
     /// Decide whether one provider's discovery status needs a patch.
     ///
     /// `None` when the current status already shows the desired failure reason
-    /// and served-model set. The desired set is the store's effective set, which
-    /// is absent for a provider whose discovery is disabled, never succeeded, or
-    /// expired: absence is the fail-closed state. An empty set is present and
-    /// distinct from absence.
+    /// and inventory. An absent inventory is the fail-closed state for a
+    /// provider whose discovery is disabled, never succeeded, or expired. An
+    /// empty model list is present and distinct from absence.
     fn for_provider(
         provider: &InferenceProvider,
-        store: &ServedModelStore,
-        polled: &[ProviderPollStatus],
+        inventory: Option<DiscoveredModelInventory>,
+        failure_reason: Option<&'static str>,
     ) -> Option<Self> {
         let name = provider.metadata.name.as_deref()?;
-        let failure_reason = polled
-            .iter()
-            .find(|status| status.name == name)
-            .and_then(|status| status.failure_reason);
-        let inventory = store.fresh_inventory(provider);
-        let (models, expires_at) = inventory.map_or((None, None), |(models, expires_at)| {
-            (Some(models.to_vec()), Some(expires_at))
-        });
         let desired = DiscoveryStatusPatch {
             name: name.to_owned(),
             failure_reason,
-            models,
-            expires_at,
+            inventory,
         };
         let current = provider.status.as_ref();
-        if desired.matches_status(current) {
+        if desired.has_same_error(current) && desired.has_same_inventory(current) {
             return None;
         }
         Some(desired)
@@ -434,14 +501,30 @@ impl DiscoveryStatusPatch {
     /// extra entries in the current status.
     fn has_same_models(&self, current: Option<&InferenceProviderStatus>) -> bool {
         let current_models = current.and_then(|status| status.served_models.as_deref());
-        match (current_models, self.models.as_deref()) {
+        match (current_models, self.inventory.as_ref()) {
             (None, None) => true,
-            (Some(current_names), Some(desired_names)) => {
-                current_names.len() == desired_names.len()
-                    && desired_names.iter().all(|name| current_names.contains(name))
+            (Some(current_names), Some(inventory)) => {
+                current_names.len() == inventory.models.len()
+                    && inventory.models.iter().all(|name| current_names.contains(name))
             },
             _ => false,
         }
+    }
+
+    /// Whether `current` shows the generation associated with this inventory.
+    fn has_same_generation(&self, current: Option<&InferenceProviderStatus>) -> bool {
+        let current_generation = current.and_then(|status| status.served_models_observed_generation);
+        let desired_generation = self.inventory.as_ref().map(|inventory| inventory.observed_generation);
+        current_generation == desired_generation
+    }
+
+    /// Whether `current` shows exactly this patch's served-model inventory.
+    ///
+    /// The model set, expiry, and observed generation must all match.
+    fn has_same_inventory(&self, current: Option<&InferenceProviderStatus>) -> bool {
+        let expiry_matches = current.and_then(|status| status.served_models_expires_at.as_deref())
+            == self.inventory.as_ref().map(|inventory| inventory.expires_at.as_str());
+        self.has_same_models(current) && expiry_matches && self.has_same_generation(current)
     }
 
     /// Whether `current` shows exactly this patch's failure reason.
@@ -450,18 +533,17 @@ impl DiscoveryStatusPatch {
         current_error == self.failure_reason
     }
 
-    /// Whether `current` shows exactly this served-model expiry boundary.
-    fn has_same_expiration(&self, current: Option<&InferenceProviderStatus>) -> bool {
-        current.and_then(|status| status.served_models_expires_at.as_deref()) == self.expires_at.as_deref()
-    }
-
     /// Whether to apply this desired status patch now.
     ///
     /// Changed fields and expiry clearing always apply. Expiry-only renewals
     /// are skipped while the persisted boundary remains more than one interval
     /// away. Missing or invalid persisted expiries need a patch.
     fn should_apply_patch(&self, current: Option<&InferenceProviderStatus>, interval: Duration) -> bool {
-        if self.expires_at.is_none() || !self.has_same_error(current) || !self.has_same_models(current) {
+        if self.inventory.is_none()
+            || !self.has_same_error(current)
+            || !self.has_same_models(current)
+            || !self.has_same_generation(current)
+        {
             return true;
         }
         let Some(expiration) = current.and_then(|status| status.served_models_expires_at.as_deref()) else {
@@ -480,11 +562,6 @@ impl DiscoveryStatusPatch {
         expiration <= renew_after
     }
 
-    /// Whether the patch already matches the discovery-owned status fields.
-    fn matches_status(&self, current: Option<&InferenceProviderStatus>) -> bool {
-        self.has_same_error(current) && self.has_same_expiration(current) && self.has_same_models(current)
-    }
-
     /// Build the discovery-owned status fields to apply.
     ///
     /// Server-side apply removes a field this manager owns when the applied
@@ -494,11 +571,16 @@ impl DiscoveryStatusPatch {
         if let Some(reason) = self.failure_reason {
             status.insert("modelDiscoveryError".to_owned(), serde_json::json!(reason));
         }
-        if let Some(models) = &self.models {
-            status.insert("servedModels".to_owned(), serde_json::json!(models));
-        }
-        if let Some(expires_at) = &self.expires_at {
-            status.insert("servedModelsExpiresAt".to_owned(), serde_json::json!(expires_at));
+        if let Some(inventory) = &self.inventory {
+            status.insert("servedModels".to_owned(), serde_json::json!(inventory.models.as_ref()));
+            status.insert(
+                "servedModelsExpiresAt".to_owned(),
+                serde_json::json!(inventory.expires_at),
+            );
+            status.insert(
+                "servedModelsObservedGeneration".to_owned(),
+                serde_json::json!(inventory.observed_generation),
+            );
         }
         status.into()
     }
@@ -758,6 +840,99 @@ mod tests {
     }
 
     #[test]
+    fn static_provider_selection_uses_configured_models() {
+        let provider = test_provider_with_status("p", &serde_json::json!({}));
+        let store = ServedModelStore::new();
+        let selection = store.select_for(&provider);
+        let selected_names = selection.as_ref().map(|inventory| inventory.models().to_vec());
+
+        assert_eq!(
+            selected_names,
+            Some(owned(&["model-a"])),
+            "static providers use configured names"
+        );
+        assert!(
+            selection.as_ref().is_some_and(ModelInventory::is_static),
+            "static names use the static inventory variant"
+        );
+    }
+
+    #[test]
+    fn dynamic_provider_selection_uses_only_fresh_inventory() {
+        let store = ServedModelStore::new();
+        let provider = discovery_provider("p", &serde_json::json!({}));
+
+        let unknown = store.select_for(&provider);
+        assert!(
+            unknown.is_none(),
+            "unknown dynamic inventory must not fall back to spec.models"
+        );
+
+        refresh(&store, round(&[("p", Some(&["discovered"]))]), TTL);
+        let fresh = store.select_for(&provider);
+        assert!(
+            matches!(
+                &fresh,
+                Some(ModelInventory::Discovered(inventory))
+                    if inventory.models.as_ref() == [String::from("discovered")]
+            ),
+            "fresh inventory is selected without using configured names"
+        );
+        assert!(
+            fresh.as_ref().is_some_and(|inventory| !inventory.is_static()),
+            "fresh inventory uses the discovered variant"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one fixture verifies discovered inventory is excluded from routing and gossip"
+    )]
+    fn fresh_discovered_inventory_is_not_routed_or_gossiped() {
+        let provider = discovery_provider("p", &serde_json::json!({}));
+        let store = ServedModelStore::new();
+        refresh(&store, round(&[("p", Some(&["discovered"]))]), TTL);
+        let inventory = store.select_for(&provider).unwrap_or_else(|| std::process::abort());
+        assert!(!inventory.is_static(), "the fixture must hold discovered inventory");
+        assert_eq!(
+            inventory.models(),
+            &["discovered".to_owned()],
+            "the fixture must expose the discovered model"
+        );
+        let network: crate::crd::grid_network::GridNetwork = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": "net" },
+            "spec": { "seeds": [], "gridId": "test-id" }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let overlay = crate::resources::routing_overlay::render_routing_overlay_with_admission(
+            &network,
+            &[],
+            std::slice::from_ref(&provider),
+            &[],
+            &[],
+            "site-a",
+            None,
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+            None,
+            &store,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let state = crate::controller::grid_network::provider_state_from_kube(&provider, "net", "site-a", None, &store)
+            .unwrap_or_else(|| std::process::abort());
+
+        assert!(
+            overlay.candidates.is_empty(),
+            "fresh discovered models must not produce routing candidates"
+        );
+        assert!(state.models.is_empty(), "fresh discovered models must not be gossiped");
+    }
+
+    #[test]
     fn failures_map_to_reasons() {
         assert_eq!(
             PollError::Credential(String::new()).as_reason(),
@@ -782,22 +957,17 @@ mod tests {
         let provider_name = "provider-a";
         let provider_without_status = test_provider(provider_name, None);
         let provider_with_error = test_provider(provider_name, Some("credential"));
-        let failed = vec![ProviderPollStatus {
-            name: provider_name.to_owned(),
-            failure_reason: Some("credential"),
-        }];
         assert_eq!(
-            DiscoveryStatusPatch::for_provider(&provider_without_status, &store, &failed),
+            patch_for_provider(&provider_without_status, &store, Some("credential")),
             Some(DiscoveryStatusPatch {
                 name: provider_name.to_owned(),
                 failure_reason: Some("credential"),
-                models: None,
-                expires_at: None,
+                inventory: None,
             }),
             "a failed poll should set its reason"
         );
         assert_eq!(
-            DiscoveryStatusPatch::for_provider(&provider_with_error, &store, &failed),
+            patch_for_provider(&provider_with_error, &store, Some("credential")),
             None,
             "an unchanged error should not be patched"
         );
@@ -808,28 +978,21 @@ mod tests {
         let store = ServedModelStore::new();
         let provider_name = "provider-a";
         let provider_with_error = test_provider(provider_name, Some("credential"));
-        let succeeded = vec![ProviderPollStatus {
-            name: provider_name.to_owned(),
-            failure_reason: None,
-        }];
         assert_eq!(
-            DiscoveryStatusPatch::for_provider(&provider_with_error, &store, &succeeded),
+            patch_for_provider(&provider_with_error, &store, None),
             Some(DiscoveryStatusPatch {
                 name: provider_name.to_owned(),
                 failure_reason: None,
-                models: None,
-                expires_at: None,
+                inventory: None,
             }),
             "a successful poll should clear the previous error"
         );
-        let polled = &[];
         assert_eq!(
-            DiscoveryStatusPatch::for_provider(&provider_with_error, &store, polled),
+            patch_for_provider(&provider_with_error, &store, None),
             Some(DiscoveryStatusPatch {
                 name: provider_name.to_owned(),
                 failure_reason: None,
-                models: None,
-                expires_at: None,
+                inventory: None,
             }),
             "removing model discovery should clear the previous error"
         );
@@ -841,16 +1004,14 @@ mod tests {
         refresh(&store, round(&[("p", Some(&["b", "a"]))]), TTL);
 
         let provider = &discovery_provider("p", &serde_json::json!({}));
-        let polled = &[];
-        let patch = DiscoveryStatusPatch::for_provider(provider, &store, polled);
+        let patch = patch_for_provider(provider, &store, None);
 
         assert_eq!(
             patch,
             Some(DiscoveryStatusPatch {
                 name: "p".to_owned(),
                 failure_reason: None,
-                models: Some(owned(&["b", "a"])),
-                expires_at: stored_expiry(&store, "p"),
+                inventory: store.fresh_inventory(provider),
             }),
             "a changed set should be written as polled"
         );
@@ -862,12 +1023,13 @@ mod tests {
         refresh(&store, round(&[("p", Some(&[]))]), TTL);
 
         let provider = &discovery_provider("p", &serde_json::json!({}));
-        let polled = &[];
-        let patch = DiscoveryStatusPatch::for_provider(provider, &store, polled);
+        let patch = patch_for_provider(provider, &store, None);
 
         assert_eq!(
-            patch.map(|desired| desired.models),
-            Some(Some(Vec::new())),
+            patch
+                .and_then(|desired| desired.inventory)
+                .map(|inventory| inventory.models.to_vec()),
+            Some(Vec::new()),
             "an empty discovered set is present, distinct from absence"
         );
     }
@@ -879,9 +1041,8 @@ mod tests {
 
         let provider = discovery_provider("p", &status_with_models(&store, &["a"]));
 
-        let polled = &[];
         assert_eq!(
-            DiscoveryStatusPatch::for_provider(&provider, &store, polled),
+            patch_for_provider(&provider, &store, None),
             None,
             "an unchanged set should not be patched"
         );
@@ -893,14 +1054,18 @@ mod tests {
             "p",
             &serde_json::json!({
                 "servedModels": ["a"],
-                "servedModelsExpiresAt": expiry_after(Duration::from_secs(3600))
+                "servedModelsExpiresAt": expiry_after(Duration::from_secs(3600)),
+                "servedModelsObservedGeneration": 1
             }),
         );
         let desired = DiscoveryStatusPatch {
             name: "p".to_owned(),
             failure_reason: None,
-            models: Some(owned(&["a"])),
-            expires_at: Some(expiry_after(Duration::from_secs(7200))),
+            inventory: Some(DiscoveredModelInventory {
+                models: owned(&["a"]).into(),
+                expires_at: expiry_after(Duration::from_secs(7200)),
+                observed_generation: 1,
+            }),
         };
 
         assert!(
@@ -915,14 +1080,18 @@ mod tests {
             "p",
             &serde_json::json!({
                 "servedModels": ["a"],
-                "servedModelsExpiresAt": expiry_after(Duration::from_secs(30))
+                "servedModelsExpiresAt": expiry_after(Duration::from_secs(30)),
+                "servedModelsObservedGeneration": 1
             }),
         );
         let desired = DiscoveryStatusPatch {
             name: "p".to_owned(),
             failure_reason: None,
-            models: Some(owned(&["a"])),
-            expires_at: Some(expiry_after(Duration::from_secs(3600))),
+            inventory: Some(DiscoveredModelInventory {
+                models: owned(&["a"]).into(),
+                expires_at: expiry_after(Duration::from_secs(3600)),
+                observed_generation: 1,
+            }),
         };
 
         assert!(
@@ -943,8 +1112,11 @@ mod tests {
         let desired = DiscoveryStatusPatch {
             name: "p".to_owned(),
             failure_reason: None,
-            models: Some(owned(&["b"])),
-            expires_at: Some(expiry_after(Duration::from_secs(7200))),
+            inventory: Some(DiscoveredModelInventory {
+                models: owned(&["b"]).into(),
+                expires_at: expiry_after(Duration::from_secs(7200)),
+                observed_generation: 1,
+            }),
         };
 
         assert!(
@@ -960,14 +1132,18 @@ mod tests {
             &serde_json::json!({
                 "modelDiscoveryError": "unreachable",
                 "servedModels": ["a"],
-                "servedModelsExpiresAt": expiry_after(Duration::from_secs(3600))
+                "servedModelsExpiresAt": expiry_after(Duration::from_secs(3600)),
+                "servedModelsObservedGeneration": 1
             }),
         );
         let desired = DiscoveryStatusPatch {
             name: "p".to_owned(),
             failure_reason: None,
-            models: Some(owned(&["a"])),
-            expires_at: Some(expiry_after(Duration::from_secs(7200))),
+            inventory: Some(DiscoveredModelInventory {
+                models: owned(&["a"]).into(),
+                expires_at: expiry_after(Duration::from_secs(7200)),
+                observed_generation: 1,
+            }),
         };
 
         assert!(
@@ -987,8 +1163,7 @@ mod tests {
         let desired = DiscoveryStatusPatch {
             name: "p".to_owned(),
             failure_reason: None,
-            models: None,
-            expires_at: None,
+            inventory: None,
         };
 
         assert!(
@@ -1004,9 +1179,8 @@ mod tests {
 
         let provider = discovery_provider("p", &status_with_models(&store, &["b", "a"]));
 
-        let polled = &[];
         assert_eq!(
-            DiscoveryStatusPatch::for_provider(&provider, &store, polled),
+            patch_for_provider(&provider, &store, None),
             None,
             "response order is not part of the set"
         );
@@ -1019,14 +1193,12 @@ mod tests {
 
         let provider = discovery_provider("p", &serde_json::json!({ "servedModels": ["a", "c"] }));
 
-        let polled = &[];
         assert_eq!(
-            DiscoveryStatusPatch::for_provider(&provider, &store, polled),
+            patch_for_provider(&provider, &store, None),
             Some(DiscoveryStatusPatch {
                 name: "p".to_owned(),
                 failure_reason: None,
-                models: Some(owned(&["a", "b"])),
-                expires_at: stored_expiry(&store, "p"),
+                inventory: store.fresh_inventory(&provider),
             }),
             "a substituted model must be written"
         );
@@ -1039,18 +1211,12 @@ mod tests {
         refresh(&store, round(&[("p", None)]), TTL);
 
         let provider = discovery_provider("p", &status_with_models(&store, &["a"]));
-        let failed = vec![ProviderPollStatus {
-            name: "p".to_owned(),
-            failure_reason: Some("unreachable"),
-        }];
-
         assert_eq!(
-            DiscoveryStatusPatch::for_provider(&provider, &store, &failed),
+            patch_for_provider(&provider, &store, Some("unreachable")),
             Some(DiscoveryStatusPatch {
                 name: "p".to_owned(),
                 failure_reason: Some("unreachable"),
-                models: Some(owned(&["a"])),
-                expires_at: stored_expiry(&store, "p"),
+                inventory: store.fresh_inventory(&provider),
             }),
             "a failed poll sets its reason and keeps the held set"
         );
@@ -1075,23 +1241,64 @@ mod tests {
     }
 
     #[test]
+    fn provider_generation_change_invalidates_held_inventory() {
+        let store = ServedModelStore::new();
+        refresh(&store, round(&[("p", Some(&["a"]))]), TTL);
+        let mut provider = discovery_provider("p", &status_with_models(&store, &["a"]));
+        provider.metadata.generation = Some(2);
+
+        assert!(
+            store.select_for(&provider).is_none(),
+            "an inventory from an earlier provider generation must not be selected"
+        );
+        assert_eq!(
+            patch_for_provider(&provider, &store, None),
+            Some(DiscoveryStatusPatch {
+                name: "p".to_owned(),
+                failure_reason: None,
+                inventory: None,
+            }),
+            "the old inventory must be cleared from status"
+        );
+    }
+
+    #[test]
+    fn a_generation_mismatch_is_a_status_change() {
+        let store = ServedModelStore::new();
+        refresh(&store, round(&[("p", Some(&["a"]))]), TTL);
+        let expiry = stored_expiry(&store, "p").unwrap_or_else(|| std::process::abort());
+        let provider = discovery_provider(
+            "p",
+            &serde_json::json!({
+                "servedModels": ["a"],
+                "servedModelsExpiresAt": expiry,
+                "servedModelsObservedGeneration": 0
+            }),
+        );
+
+        assert_eq!(
+            patch_for_provider(&provider, &store, None),
+            Some(DiscoveryStatusPatch {
+                name: "p".to_owned(),
+                failure_reason: None,
+                inventory: store.fresh_inventory(&provider),
+            }),
+            "matching names and expiry still require the current provider generation"
+        );
+    }
+
+    #[test]
     fn expired_set_is_cleared_from_status() {
         let store = ServedModelStore::new();
         refresh(&store, round(&[("p", Some(&["a"]))]), Duration::ZERO);
 
         let provider = discovery_provider("p", &serde_json::json!({ "servedModels": ["a"] }));
-        let failed = vec![ProviderPollStatus {
-            name: "p".to_owned(),
-            failure_reason: Some("unreachable"),
-        }];
-
         assert_eq!(
-            DiscoveryStatusPatch::for_provider(&provider, &store, &failed),
+            patch_for_provider(&provider, &store, Some("unreachable")),
             Some(DiscoveryStatusPatch {
                 name: "p".to_owned(),
                 failure_reason: Some("unreachable"),
-                models: None,
-                expires_at: None,
+                inventory: None,
             }),
             "an expired set must leave the status: fail closed"
         );
@@ -1108,14 +1315,12 @@ mod tests {
             }),
         );
 
-        let polled = &[];
         assert_eq!(
-            DiscoveryStatusPatch::for_provider(&provider, &store, polled),
+            patch_for_provider(&provider, &store, None),
             Some(DiscoveryStatusPatch {
                 name: "p".to_owned(),
                 failure_reason: None,
-                models: None,
-                expires_at: None,
+                inventory: None,
             }),
             "disabling discovery must clear the served set"
         );
@@ -1126,15 +1331,19 @@ mod tests {
         let with_both = DiscoveryStatusPatch {
             name: "p".to_owned(),
             failure_reason: Some("timeout"),
-            models: Some(owned(&["a"])),
-            expires_at: Some("2030-01-01T00:00:00Z".to_owned()),
+            inventory: Some(DiscoveredModelInventory {
+                models: owned(&["a"]).into(),
+                expires_at: "2030-01-01T00:00:00Z".to_owned(),
+                observed_generation: 1,
+            }),
         };
         assert_eq!(
             with_both.status_fields(),
             serde_json::json!({
                 "modelDiscoveryError": "timeout",
                 "servedModels": ["a"],
-                "servedModelsExpiresAt": "2030-01-01T00:00:00Z"
+                "servedModelsExpiresAt": "2030-01-01T00:00:00Z",
+                "servedModelsObservedGeneration": 1
             }),
             "present fields are carried by the apply"
         );
@@ -1142,8 +1351,7 @@ mod tests {
         let cleared = DiscoveryStatusPatch {
             name: "p".to_owned(),
             failure_reason: None,
-            models: None,
-            expires_at: None,
+            inventory: None,
         };
         assert_eq!(
             cleared.status_fields(),
@@ -1160,8 +1368,7 @@ mod tests {
         let desired = DiscoveryStatusPatch {
             name: "p".to_owned(),
             failure_reason: None,
-            models: None,
-            expires_at: None,
+            inventory: None,
         };
 
         assert!(
@@ -1325,7 +1532,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "InferenceProvider",
-            "metadata": { "name": name, "uid": "test-provider-uid" },
+            "metadata": { "name": name, "uid": "test-provider-uid", "generation": 1 },
             "spec": spec,
             "status": status.clone()
         }))
@@ -1349,6 +1556,7 @@ mod tests {
                     provider.to_owned(),
                     DiscoveryKey {
                         uid: "test-provider-uid".to_owned(),
+                        generation: 1,
                         url: "http://provider/v1/models".to_owned(),
                     },
                 )
@@ -1403,24 +1611,28 @@ mod tests {
         refresh(store, vec![failed_poll], TTL);
 
         assert_eq!(
-            store.models(provider),
+            store.select_for(provider).map(|inventory| inventory.models().to_vec()),
             None,
             "changed source must not read the old inventory"
         );
-        let failed = [ProviderPollStatus {
-            name: "p".to_owned(),
-            failure_reason: Some("credential"),
-        }];
         assert_eq!(
-            DiscoveryStatusPatch::for_provider(provider, store, &failed),
+            patch_for_provider(provider, store, Some("credential")),
             Some(DiscoveryStatusPatch {
                 name: "p".to_owned(),
                 failure_reason: Some("credential"),
-                models: None,
-                expires_at: None,
+                inventory: None,
             }),
             "a failed poll after a source change must clear old models and expiry"
         );
+    }
+
+    /// Build a desired status patch from the store's current inventory.
+    fn patch_for_provider(
+        provider: &InferenceProvider,
+        store: &ServedModelStore,
+        failure_reason: Option<&'static str>,
+    ) -> Option<DiscoveryStatusPatch> {
+        DiscoveryStatusPatch::for_provider(provider, store.fresh_inventory(provider), failure_reason)
     }
 
     fn owned(names: &[&str]) -> Vec<String> {
@@ -1430,7 +1642,7 @@ mod tests {
     fn stored_expiry(store: &ServedModelStore, provider: &str) -> Option<String> {
         store
             .fresh_inventory(&discovery_provider(provider, &serde_json::json!({})))
-            .map(|(_, expires_at)| expires_at)
+            .map(|inventory| inventory.expires_at)
     }
 
     fn expiry_after(duration: Duration) -> String {
@@ -1448,15 +1660,16 @@ mod tests {
     fn status_with_models(store: &ServedModelStore, models: &[&str]) -> serde_json::Value {
         serde_json::json!({
             "servedModels": models,
-            "servedModelsExpiresAt": stored_expiry(store, "p")
+            "servedModelsExpiresAt": stored_expiry(store, "p"),
+            "servedModelsObservedGeneration": 1
         })
     }
 
     fn names(store: &ServedModelStore, provider: &str) -> Option<Vec<String>> {
         store
-            .models(&discovery_provider(provider, &serde_json::json!({})))
-            .map(|models| {
-                let mut names = models.to_vec();
+            .select_for(&discovery_provider(provider, &serde_json::json!({})))
+            .map(|inventory| {
+                let mut names = inventory.models().to_vec();
                 names.sort_unstable();
                 names
             })
