@@ -59,6 +59,17 @@ const CALLER_CREDENTIAL_HEADERS: [http::header::HeaderName; 7] = [
     http::header::HeaderName::from_static("x-goog-api-key"),
     http::header::HeaderName::from_static("ocp-apim-subscription-key"),
 ];
+/// Query parameters that carry a caller's credential, stripped from a request that leaves this
+/// site for the same reason as the headers; every other parameter is kept as sent.
+const CALLER_CREDENTIAL_QUERY_PARAMS: [&str; 7] = [
+    "key",
+    "api_key",
+    "api-key",
+    "apikey",
+    "access_token",
+    "token",
+    "subscription-key",
+];
 /// Response header carrying the site selected by Grid.
 const ROUTE_SITE_HEADER: &str = "x-grid-site";
 /// Response header carrying the cluster selected by Grid.
@@ -95,6 +106,30 @@ const CREDENTIAL_METADATA: [&str; 4] = [
     "intelligent_route.credential.key",
 ];
 
+/// `path_and_query` without the caller's credential parameters, or `None` when it carries none.
+///
+/// Names are matched percent-decoded and case-folded, as `url_rewrite` matches them; the
+/// remaining parameters keep their order and encoding.
+fn strip_credential_query(path_and_query: &str) -> Option<String> {
+    let (path, query) = path_and_query.split_once('?')?;
+    let is_credential = |pair: &str| {
+        let name = pair.split('=').next().unwrap_or_default();
+        let name = percent_encoding::percent_decode_str(name).decode_utf8_lossy();
+        CALLER_CREDENTIAL_QUERY_PARAMS
+            .iter()
+            .any(|known| name.eq_ignore_ascii_case(known))
+    };
+    if !query.split('&').any(is_credential) {
+        return None;
+    }
+    let kept: Vec<&str> = query.split('&').filter(|pair| !is_credential(pair)).collect();
+    Some(if kept.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{path}?{}", kept.join("&"))
+    })
+}
+
 /// The picked candidate's credentials: the caller's never leave this site, and a local
 /// candidate's own is selected where `credential_inject` reads it.
 fn write_credentials(ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate, snapshot: &RouteSnapshot) {
@@ -103,6 +138,15 @@ fn write_credentials(ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate
     }
     if candidate.site != snapshot.local_site || snapshot.provider_hop_clusters.contains(candidate.cluster.as_ref()) {
         ctx.request_headers_to_remove.extend(CALLER_CREDENTIAL_HEADERS);
+        let sent = ctx.rewritten_path.as_deref().unwrap_or_else(|| {
+            ctx.request
+                .uri
+                .path_and_query()
+                .map_or("/", http::uri::PathAndQuery::as_str)
+        });
+        if let Some(stripped) = strip_credential_query(sent) {
+            ctx.rewritten_path = Some(stripped);
+        }
         return;
     }
     let Some(credential) = candidate.credential.as_ref() else {
@@ -434,8 +478,9 @@ impl GridSiteRouteFilter {
         });
         ctx.cluster = Some(cluster);
         write_provider_context(ctx, candidate, &snapshot)?;
-        write_credentials(ctx, candidate, &snapshot);
+        // The pinned path is rewritten first so a credential in its query is stripped too.
         ctx.rewritten_path = rewrite.or_else(|| ctx.rewritten_path.take());
+        write_credentials(ctx, candidate, &snapshot);
         // Ids are tagged in the body, so it must come back uncompressed.
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         Ok(Some(FilterAction::Continue))
@@ -2414,5 +2459,33 @@ mod tests {
             Arc::default(),
             tuning,
         )
+    }
+    #[test]
+    fn a_credential_query_parameter_never_leaves_this_site() {
+        assert_eq!(
+            strip_credential_query("/v1/models?key=caller-secret&trace=1").as_deref(),
+            Some("/v1/models?trace=1"),
+            "the credential goes, the other parameter stays in place"
+        );
+        assert_eq!(
+            strip_credential_query("/v1/models?trace=1&API_KEY=s&api%2Dkey=s&t=2").as_deref(),
+            Some("/v1/models?trace=1&t=2"),
+            "names match case-folded and percent-decoded"
+        );
+        assert_eq!(
+            strip_credential_query("/v1/models?token=s").as_deref(),
+            Some("/v1/models"),
+            "a query left empty is dropped with its separator"
+        );
+        assert_eq!(
+            strip_credential_query("/v1/models?limit=5"),
+            None,
+            "no credential, nothing rewritten"
+        );
+        assert_eq!(
+            strip_credential_query("/v1/models"),
+            None,
+            "no query, nothing rewritten"
+        );
     }
 }

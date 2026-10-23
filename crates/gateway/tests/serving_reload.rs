@@ -803,11 +803,16 @@ mod tests {
 
     /// POST `body` to the chat path with the caller's own `spoof` header lines.
     fn post(listen: u16, body: &str, spoof: &str) -> u16 {
+        post_to(listen, "/v1/chat/completions", body, spoof)
+    }
+
+    /// POST `body` to `path` with the caller's own `spoof` header lines.
+    fn post_to(listen: u16, path: &str, body: &str, spoof: &str) -> u16 {
         let mut stream = TcpStream::connect(("127.0.0.1", listen)).expect("connect gateway");
         stream
             .write_all(
                 format!(
-                    "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{spoof}Content-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+                    "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{spoof}Content-Length: {len}\r\nConnection: close\r\n\r\n{body}",
                     len = body.len()
                 )
                 .as_bytes(),
@@ -1098,6 +1103,43 @@ mod tests {
                 );
             }
         }
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_remote_site_never_receives_the_caller_credential_in_the_query() {
+        let work = fresh_work("remote-query");
+        let remote = Plain::start();
+        let mut serving = Mount::new(work.join("serving"));
+        serving.write(&[(
+            "serving-config.json",
+            br#"{"local_site":"local","window_secs":60,"load_window_ms":30000,"candidates":[{"kind":"inference_model","name":"llama","site":"east","cluster":"pool-east"}],"peers":[]}"#,
+        )]);
+        let (listen, admin) = (free_port(), free_port());
+        let praxis = routed_praxis(listen, admin, &remote.addr, "");
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
+        gateway.eventually("the gateway listens", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok()
+        });
+        assert_eq!(
+            post_to(
+                listen,
+                "/v1/chat/completions?key=caller-secret&trace=1",
+                r#"{"model":"llama","messages":[]}"#,
+                "X-Model: llama\r\n"
+            ),
+            200,
+            "the request routes to the other site"
+        );
+        let heads = remote.heads.lock().expect("heads").clone();
+        let head = heads.first().expect("the request reached the other site");
+        let line = head.lines().next().expect("request line");
+        assert!(
+            !head.contains("caller-secret"),
+            "the credential never leaves this site: {head}"
+        );
+        assert!(line.contains("trace=1"), "an ordinary parameter still arrives: {line}");
         drop(gateway);
         let _cleaned = std::fs::remove_dir_all(&work);
     }
