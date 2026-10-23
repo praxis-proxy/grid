@@ -699,6 +699,9 @@ fn duration(raw: &str) -> Result<time::Duration, ReconcileError> {
 }
 
 #[cfg(test)]
+mod conformance;
+
+#[cfg(test)]
 mod tests {
     use super::{ReconcileError, checkpoint_from_status, duration};
 

@@ -975,6 +975,7 @@ dependencies = [
  "site-invite-api",
  "socket2",
  "sqlx",
+ "status-harness",
  "thiserror 2.0.21",
  "time",
  "tokio",
@@ -2542,6 +2543,7 @@ dependencies = [
  "sha2 0.11.1",
  "site-invite-api",
  "socket2",
+ "status-harness",
  "swim",
  "thiserror 2.0.21",
  "time",
@@ -3827,6 +3829,19 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "status-harness"
+version = "0.2.2"
+dependencies = [
+ "http",
+ "http-body-util",
+ "k8s-openapi",
+ "kube",
+ "serde_json",
+ "tower",
+ "yaml_serde",
+]
 
 [[package]]
 name = "stringprep"

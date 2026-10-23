@@ -12,6 +12,7 @@ members = [
   "crates/scoring",
   "crates/signals",
   "crates/site-invite-api",
+  "crates/status-harness",
   "crates/swim",
   "crates/version",
   "crates/xtask",
@@ -27,6 +28,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 metrics = "0.24.6"
 version = { path = "crates/version" }
+status-harness = { path = "crates/status-harness" }
 aes-gcm = "0.11.1"
 axum = "0.8.9"
 bytes = "1.12.1"

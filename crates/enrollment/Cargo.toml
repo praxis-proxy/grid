@@ -87,3 +87,4 @@ rcgen = { workspace = true }
 time = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 x509-parser = { workspace = true }
+status-harness = { workspace = true }
