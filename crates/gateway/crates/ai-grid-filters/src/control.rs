@@ -539,7 +539,7 @@ fn routed_view<'config>(
     if !narrowing.unbound.is_empty() {
         tracing::warn!(
             clusters = ?narrowing.unbound,
-            "grid: provider hops lack a matching verified TLS backend; their candidates stay unroutable until restart"
+            "grid: provider hops lack a matching verified TLS backend; their candidates take no traffic until a serving config names the verified SNI, or until restart for a backend not verified at startup"
         );
     }
     if narrowing.crossing {
@@ -560,9 +560,10 @@ struct Narrowing {
 ///
 /// A provider hop that does not bind to a startup-verified backend at its exact SNI leaves
 /// with its candidates: the verified map never grows, so hop context only reaches a
-/// startup-verified identity, and an unbound hop's site is unroutable until restart rather
-/// than routed without it. A credential stays only on a local cluster that no Grid mutual
-/// TLS backend serves, so this site's secret is never sent to another site.
+/// startup-verified identity. An unbound hop's site takes no traffic rather than routing
+/// without hop context, until a serving config names the SNI its backend verified at startup,
+/// or, for a backend not verified at startup, until restart. A credential stays only on a local cluster that no Grid
+/// mutual TLS backend serves, so this site's secret is never sent to another site.
 fn narrowed<'config>(
     config: &'config GridServingConfig,
     backend_tls: &BTreeMap<String, String>,

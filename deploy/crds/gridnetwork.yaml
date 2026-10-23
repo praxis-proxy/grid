@@ -922,11 +922,11 @@ spec:
                       providerHopEndpoints:
                         description: |-
                           Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
-                          serving config. This allowlist is independent of a chart-rendered
-                          `praxisConfig`, so a missing or disabled generated Praxis config cannot
-                          alter embedded serving behavior. With `praxisConfig.siteRouter`
-                          `gridSiteRoute` the hops are the generated config's mutual TLS
-                          endpoints instead, and this must be empty. Every entry must declare `mutual_tls` and a nonblank
+                          serving config. With the default `praxisConfig.siteRouter`
+                          `intelligentRoute` this allowlist is independent of `praxisConfig`, so a
+                          missing or disabled generated Praxis config cannot alter embedded serving
+                          behavior. With `gridSiteRoute` the hops are the generated config's mutual
+                          TLS endpoints instead, and this must be empty. Every entry must declare `mutual_tls` and a nonblank
                           SNI. The embedded gateway compares each declaration against the
                           loaded Praxis load-balancer's verified mTLS backend before it sends
                           provider-hop context. Changing Praxis backend transport requires a
@@ -1771,11 +1771,11 @@ spec:
                       providerHopEndpoints:
                         description: |-
                           Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
-                          serving config. This allowlist is independent of a chart-rendered
-                          `praxisConfig`, so a missing or disabled generated Praxis config cannot
-                          alter embedded serving behavior. With `praxisConfig.siteRouter`
-                          `gridSiteRoute` the hops are the generated config's mutual TLS
-                          endpoints instead, and this must be empty. Every entry must declare `mutual_tls` and a nonblank
+                          serving config. With the default `praxisConfig.siteRouter`
+                          `intelligentRoute` this allowlist is independent of `praxisConfig`, so a
+                          missing or disabled generated Praxis config cannot alter embedded serving
+                          behavior. With `gridSiteRoute` the hops are the generated config's mutual
+                          TLS endpoints instead, and this must be empty. Every entry must declare `mutual_tls` and a nonblank
                           SNI. The embedded gateway compares each declaration against the
                           loaded Praxis load-balancer's verified mTLS backend before it sends
                           provider-hop context. Changing Praxis backend transport requires a
