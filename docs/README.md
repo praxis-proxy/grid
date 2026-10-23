@@ -20,6 +20,8 @@
 
 - [Overview](architecture/overview.md): operator responsibilities, data-plane
   boundaries, workspace crates, and terminology.
+- [Signed Gossip Trust](architecture/signed-gossip-trust.md): peer certificate
+  policy, certificate bootstrap, signed state verification, and source map.
 - [Auth and Policy](architecture/auth.md): provider authentication strategies,
   access policy, and trust model.
 - [Enrollment](architecture/enrollment.md): how a site becomes a member: parties,

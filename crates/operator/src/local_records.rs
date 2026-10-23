@@ -11,7 +11,9 @@ use kube::{
 use crate::{
     controller::grid_network::GridModes,
     crd::{
-        grid_network::{GridNetwork, GridNetworkSpec, PeerTrustConfig, SecretRef, SignalTransportConfig, TlsConfig},
+        grid_network::{
+            GridNetwork, GridNetworkSpec, PeerTrustConfig, SecretRef, SignalTransportConfig, SignedStateMode, TlsConfig,
+        },
         grid_site::{GridSite, GridSiteSpec},
     },
     error::OperatorError,
@@ -79,7 +81,10 @@ pub fn grid_network(plan: &Plan) -> Result<GridNetwork, OperatorError> {
     spec.signal_transport = Some(SignalTransportConfig {
         mode: plan.modes.signal,
     });
-    spec.peer_trust = Some(PeerTrustConfig { mode: plan.modes.trust });
+    spec.peer_trust = Some(PeerTrustConfig {
+        mode: plan.modes.trust,
+        signed_state: SignedStateMode::default(),
+    });
     let mut network = GridNetwork::new(&plan.network, spec);
     network.metadata.labels = Some(created_by());
     Ok(network)

@@ -10,7 +10,9 @@
 
 use ring::{
     rand::SystemRandom,
-    signature::{ECDSA_P256_SHA256_ASN1, ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, UnparsedPublicKey},
+    signature::{
+        ECDSA_P256_SHA256_ASN1, ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair as _, UnparsedPublicKey,
+    },
 };
 
 /// Errors produced while signing a payload.
@@ -31,6 +33,19 @@ pub enum VerificationError {
     /// The signature does not match the payload under the supplied public key.
     #[error("signature verification failed")]
     Invalid,
+}
+
+/// Derive the raw uncompressed P-256 public key from PKCS8 DER.
+///
+/// # Errors
+///
+/// Returns [`SigningError::InvalidKey`] when `pkcs8_der` is not a valid
+/// ECDSA P-256 key.
+pub fn public_key_ecdsa_p256(pkcs8_der: &[u8]) -> Result<Vec<u8>, SigningError> {
+    let rng = SystemRandom::new();
+    let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8_der, &rng)
+        .map_err(|_key_rejected| SigningError::InvalidKey)?;
+    Ok(key_pair.public_key().as_ref().to_vec())
 }
 
 /// Sign `payload` with an ECDSA P-256 key supplied as PKCS8 DER.

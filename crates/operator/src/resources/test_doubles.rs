@@ -27,6 +27,18 @@ pub(crate) fn mock_kube_client_with_config_maps(
     mock_kube_client_with_objects(config_maps)
 }
 
+/// Like [`mock_kube_client_with_secrets`], for raw JSON bodies keyed by the last path segment.
+pub(crate) fn mock_kube_client_with_json(objects: HashMap<&'static str, serde_json::Value>) -> kube::Client {
+    mock_kube_client_with_objects(objects)
+}
+
+/// Like [`mock_kube_client_with_secrets`], for `GridNetworks`.
+pub(crate) fn mock_kube_client_with_grid_networks(
+    networks: HashMap<&'static str, crate::crd::grid_network::GridNetwork>,
+) -> kube::Client {
+    mock_kube_client_with_objects(networks)
+}
+
 /// Build a `kube::Client` that lists the given `InferenceProvider` objects and no `GridSite` objects.
 pub(crate) fn mock_kube_client_with_providers(providers: Vec<InferenceProvider>) -> kube::Client {
     let providers = Arc::new(providers);

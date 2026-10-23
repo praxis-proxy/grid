@@ -53,6 +53,7 @@ site-invite-api = { path = "../site-invite-api" }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
 percent-encoding = { workspace = true }
+pem = { workspace = true }
 prometheus = { workspace = true }
 schemars = { workspace = true }
 reqwest = { workspace = true }

@@ -23,6 +23,8 @@
 #   TIMEOUT             seconds to wait for each converging condition (default 180)
 #   ROTATION_LIFETIME    site certificate lifetime in seconds for the spiffe leg, which
 #                       then polls signals and asserts renewal, a fork, and re-enrollment
+#   SIGNED_STATE        peerTrust.signedState, off or enforce (default off). enforce also
+#                       asserts that the hub refuses the site's state once it stops signing
 #   NET_PREFIX          command prefix for calls to LoadBalancer addresses, e.g. under
 #                       rootless podman: podman unshare --rootless-netns
 set -euo pipefail
@@ -30,6 +32,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TOPO="$ROOT/tests/e2e/topologies/grid-hub-site"
 MODES=${MODES:-pin spiffe}
+SIGNED_STATE=${SIGNED_STATE:-off}
 IMAGE_PREFIX=${IMAGE_PREFIX:-localhost/grid-}
 IMAGE_TAG=${IMAGE_TAG:-e2e}
 CONTAINER_TOOL=${CONTAINER_TOOL:-docker}
@@ -53,6 +56,8 @@ PF_PID=""
 WATCH_PID=""
 MTLS_PID=""
 HUBPATH_PID=""
+# When signed state was turned on, for the signing log check.
+SIGNED_FROM=""
 FAILED=0
 # Start of the deliberate-refusal checks; assert_health allows gateway handshake rejections after it.
 REFUSALS_FROM=""
@@ -221,6 +226,17 @@ renewal_args() {
     grid-operator) RA=(--set grid.signals=poll --set signals.enabled=true) ;;
     grid-site) RA=(--set gridNetwork.signalTransport.mode=poll) ;;
   esac
+}
+
+# signed_args: under enforce, signedState and the identity Secrets that sign, into SA.
+# Applied only after enrollment: naming absent Secrets makes the operator self-sign them,
+# and enrollment then finds an identity and never runs.
+signed_args() {
+  SA=()
+  [[ $SIGNED_STATE == enforce ]] || return 0
+  SA=(--set gridNetwork.peerTrust.signedState=enforce
+    --set gridNetwork.tls.siteSecretRef.name=grid-site-identity --set "gridNetwork.tls.siteSecretRef.namespace=$NS"
+    --set gridNetwork.tls.caSecretRef.name=grid-ca --set "gridNetwork.tls.caSecretRef.namespace=$NS")
 }
 
 # images <component>: this run's image for a chart, into IMG.
@@ -393,10 +409,10 @@ install_site() {
     fail "copied invite lacks its grid.praxis.fast/site label"
   fi
   renewal_args grid-site
-  helm_on "$SITE_CTX" "$NS" grid-site grid-site "${RA[@]}" \
-    --set gridNetwork.gridId="$PREFIX-e2e" --set "gridSite.name=$SITE" --set "peers.hub.digest=$HUB_DIGEST" \
-    --set "inferenceProviders.vcr.endpoint=http://$MODEL_IP:8000" \
-    --set "inferenceProviders.vcr.model=$MODEL" --set gridNetwork.peerTrust.mode="$MODE" || die "install site grid-site"
+  SITE_SITE_ARGS=("${RA[@]}" --set gridNetwork.gridId="$PREFIX-e2e" --set "gridSite.name=$SITE"
+    --set "peers.hub.digest=$HUB_DIGEST" --set "inferenceProviders.vcr.endpoint=http://$MODEL_IP:8000"
+    --set "inferenceProviders.vcr.model=$MODEL" --set gridNetwork.peerTrust.mode="$MODE")
+  helm_on "$SITE_CTX" "$NS" grid-site grid-site "${SITE_SITE_ARGS[@]}" || die "install site grid-site"
   trust=(--set "praxisConfig.render.peerTrust.digest=$HUB_DIGEST")
   [[ $MODE == pin ]] || trust=(--set praxisConfig.render.peerTrust.mode=spiffe
     --set praxisConfig.render.peerTrust.spiffeId=spiffe://grid.internal/site/hub)
@@ -408,6 +424,12 @@ install_site() {
     "${IMG[@]}" --set service.loadBalancerIP="$SITE_GW_IP" || die "install site grid-gateway"
   eventually "site operator enrolled from its copied invite through the hub enrollment URL" enrolled "$SITE_CTX" \
     || die "site not enrolled"
+  signed_args
+  SIGNED_FROM=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  HUB_SITE_ARGS+=("${SA[@]}")
+  SITE_SITE_ARGS+=("${SA[@]}")
+  ((${#SA[@]} == 0)) || helm_on "$SITE_CTX" "$NS" grid-site grid-site "${SITE_SITE_ARGS[@]}" \
+    || die "sign the site's state"
   helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" \
     --set "peers.$SITE.digest=$(leaf_digest "$SITE_CTX")" || die "pin the site on the hub"
   snapshot_logs "$SITE_CTX" site || true
@@ -633,6 +655,51 @@ assert_health() {
       printf '%s\n' "$hits"
     fi
   done
+}
+
+# ---------------------------------------------------------------------------
+# Signed state
+# ---------------------------------------------------------------------------
+
+# operator_logs <context> [kubectl logs args...]: this operator's log, ANSI stripped.
+operator_logs() {
+  local ctx=$1
+  shift
+  k "$ctx" logs deployment/grid-operator --all-containers "$@" | strip_ansi
+}
+
+# unsigned_refused <since>: the hub rejected the site's unsigned state after <since>.
+unsigned_refused() {
+  local logs
+  # Captured first: grep -q exits at its match, and pipefail would report the writer's SIGPIPE.
+  logs=$(operator_logs "$HUB_CTX" --since-time="$1")
+  grep 'rejecting pinned-origin state broadcast' <<<"$logs" | grep "origin_site=$SITE" | grep -q missing_signature
+}
+
+# assert_signed_state: under enforce, both operators sign, so the remote candidate
+# assert_membership saw came from verified state. Once the site stops signing, the hub
+# refuses its state.
+assert_signed_state() {
+  local ctx logs since
+  [[ $SIGNED_STATE == enforce ]] || return 0
+  for ctx in "$HUB_CTX" "$SITE_CTX"; do
+    logs=$(operator_logs "$ctx" --since-time="$SIGNED_FROM")
+    if grep -q 'signed gossip disabled' <<<"$logs"; then
+      fail "$ctx: operator has no usable signing identity"
+    else
+      pass "$ctx: operator signs its state"
+    fi
+    if grep -q 'failed to encode address broadcast' <<<"$logs"; then
+      fail "$ctx: operator could not publish its addresses under signed state"
+    else
+      pass "$ctx: operator publishes its addresses under signed state"
+    fi
+  done
+  since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  helm_on "$SITE_CTX" "$NS" grid-site grid-site "${SITE_SITE_ARGS[@]}" \
+    --set gridNetwork.peerTrust.signedState=off || die "turn signed state off on the site"
+  eventually "hub refuses the site's unsigned state" unsigned_refused "$since" || true
+  helm_on "$SITE_CTX" "$NS" grid-site grid-site "${SITE_SITE_ARGS[@]}" || die "turn signed state back on"
 }
 
 # ---------------------------------------------------------------------------
@@ -997,6 +1064,10 @@ cmd_test() {
   for m in $MODES; do
     case $m in pin | spiffe) ;; *) die "MODES entry $m is not pin or spiffe" ;; esac
   done
+  case $SIGNED_STATE in off | enforce) ;; *) die "SIGNED_STATE $SIGNED_STATE is not off or enforce" ;; esac
+  # A renewed key is locked out under enforce: see docs/architecture/signed-gossip-trust.md.
+  [[ $SIGNED_STATE == off || -z ${ROTATION_LIFETIME:-} || $MODES != *spiffe* ]] \
+    || die "SIGNED_STATE=enforce cannot rotate"
   for tool in kubectl helm jq openssl curl; do
     command -v "$tool" >/dev/null || die "$tool is required"
   done
@@ -1013,6 +1084,7 @@ cmd_test() {
     assert_serving
     assert_pin_no_renewal
     assert_renewal
+    assert_signed_state
     assert_health
   done
   if ((FAILED)); then

@@ -45,6 +45,17 @@ tests:
               caSecretRef: {name: grid-ca, namespace: grid}
               swimKeySecretRef: {name: grid-swim-key, namespace: grid}
 
+  - it: enforces signed gossip under the default peer trust
+    template: templates/gridnetwork.yaml
+    set:
+      site.name: east
+      grid.id: lab
+      grid.signedState: enforce
+    asserts:
+      - equal:
+          path: spec.peerTrust
+          value: {mode: pin, signedState: enforce}
+
   - it: passes gateway.praxisConfig through to the site gateway reference
     template: templates/gridnetwork.yaml
     set:

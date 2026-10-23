@@ -54,6 +54,15 @@
             "spiffe"
           ]
         },
+        "signedState": {
+          "description": "Signed state, off or enforce. Empty keeps the GridNetwork default.",
+          "type": "string",
+          "enum": [
+            "",
+            "off",
+            "enforce"
+          ]
+        },
         "signals": {
           "description": "Signal transport, gossip or poll. Empty keeps the GridNetwork default.",
           "type": "string",
