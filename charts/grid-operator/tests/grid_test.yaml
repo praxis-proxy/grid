@@ -295,9 +295,6 @@ tests:
     set:
       site.name: east
       enrollment.enabled: true
-      enrollment.url: https://enroll.example.com
-      enrollment.caBundle.configMap: grid-ca
-      enrollment.tokenSecretRef.name: grid-invite
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env

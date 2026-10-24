@@ -163,7 +163,7 @@ Service. Without enrollment nothing changes.
 {{- if not $e.siteName }}{{- $_ := set $e "siteName" $v.swim.siteName }}{{- end }}
 {{- if not $v.swim.siteName }}{{- $_ := set $v.swim "siteName" $e.siteName }}{{- end }}
 {{- if not $v.rbac.enrollmentNamespace }}{{- $_ := set $v.rbac "enrollmentNamespace" "grid-enrollment" }}{{- end }}
-{{- if not $e.url }}{{- $_ := set $e "url" (printf "https://grid-enrollment.%s.svc:8443" $v.rbac.enrollmentNamespace) }}{{- end }}
+{{- if and $grid.id (not $e.url) }}{{- $_ := set $e "url" (printf "https://grid-enrollment.%s.svc:8443" $v.rbac.enrollmentNamespace) }}{{- end }}
 {{- if not $v.gateway.serviceName }}{{- $_ := set $v.gateway "serviceName" "grid-gateway" }}{{- end }}
 {{- if kindIs "invalid" $svc.enabled }}{{- $_ := set $svc "enabled" true }}{{- if not $svc.type }}{{- $_ := set $svc "type" "LoadBalancer" }}{{- end }}{{- end }}
 {{- end }}

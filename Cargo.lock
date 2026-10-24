@@ -2531,6 +2531,7 @@ dependencies = [
  "percent-encoding",
  "prometheus",
  "rcgen",
+ "regex",
  "reqwest",
  "rmcp",
  "rustls",

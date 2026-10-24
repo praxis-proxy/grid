@@ -10,7 +10,10 @@ live serving-data updates when that separate mode is enabled.
 ## Prerequisites
 
 - A LoadBalancer implementation on every cluster. The enrollment, SWIM, and site gateway Services are type LoadBalancer. The SWIM Service carries UDP 7946 and, with signals on, TCP 9091 on one LoadBalancer, so the implementation must support mixed protocols.
-- `enroll.grid.example.com` resolves to the hub enrollment LoadBalancer from every site. On OpenShift, add `--set route.enabled=true`, use the Route host as `host`, and drop `:8443` from `enrollment.url`, since the Route serves on 443.
+- `enroll.grid.example.com` resolves to the hub enrollment LoadBalancer from
+  every site. On OpenShift, add `--set route.enabled=true`, use the Route host
+  as `host`, and drop `:8443` from the site's
+  `gridSite.local.signerEndpoint.url`, since the Route serves on 443.
 - Peers reach each other's SWIM UDP port 7946 and the site gateway port 8080.
 - The hub consumer gateway runs with `auth.mode=none`, which belongs only behind a trusted authenticating front. In production, use `api-key` with the maas-api validate URL.
 
@@ -37,9 +40,13 @@ kubectl -n grid-enrollment get secret grid-ca-bundle -o jsonpath='{.data.ca\.crt
 kubectl -n grid-enrollment get secret grid-invite-hub -o jsonpath='{.data.token}' | base64 -d \
   | kubectl -n grid create secret generic grid-invite-hub --from-file=token=/dev/stdin
 kubectl -n grid label secret grid-invite-hub grid.praxis.fast/site=hub
+kubectl -n grid label secret grid-ca-bundle grid.praxis.fast/signer-bundle=true
 head -c 32 /dev/urandom | kubectl -n grid create secret generic grid-swim-key --from-file=key=/dev/stdin
 helm upgrade --install grid-site charts/grid-site -n grid \
-  --set gridNetwork.gridId=grid-1 --set gridSite.name=hub --set peers.site-a.address=203.0.113.20:8080
+  --set gridNetwork.gridId=grid-1 --set gridSite.name=hub --set peers.site-a.address=203.0.113.20:8080 \
+  --set gridSite.local.signerEndpoint.url=https://grid-enrollment.grid-enrollment.svc:8443 \
+  --set gridSite.local.signerEndpoint.caBundleRef.kind=Secret --set gridSite.local.signerEndpoint.caBundleRef.name=grid-ca-bundle \
+  --set gridSite.local.inviteSecretRef.name=grid-invite-hub
 helm upgrade --install grid-gateway charts/praxis-gateway -n grid \
   --set fullnameOverride=grid-gateway --set praxisConfig.source=render --set grid.siteName=hub \
   --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca \
@@ -56,16 +63,20 @@ Set `HUB_DIGEST` to the hub's leaf digest, and use your grid release as the gate
 ```bash
 helm upgrade --install grid-operator charts/grid-operator -n grid --create-namespace \
   --set swim.siteName=site-a --set swim.seeds=203.0.113.11:7946 \
-  --set enrollment.enabled=true --set enrollment.url=https://enroll.grid.example.com:8443
+  --set enrollment.enabled=true
 kubectl --context hub -n grid-enrollment get secret grid-ca-bundle -o jsonpath='{.data.ca\.crt}' | base64 -d \
   | kubectl -n grid create secret generic grid-ca-bundle --from-file=ca.crt=/dev/stdin
 kubectl --context hub -n grid-enrollment get secret grid-invite-site-a -o jsonpath='{.data.token}' | base64 -d \
   | kubectl -n grid create secret generic grid-invite-site-a --from-file=token=/dev/stdin
 kubectl -n grid label secret grid-invite-site-a grid.praxis.fast/site=site-a
+kubectl -n grid label secret grid-ca-bundle grid.praxis.fast/signer-bundle=true
 kubectl --context hub -n grid get secret grid-swim-key -o jsonpath='{.data.key}' | base64 -d \
   | kubectl -n grid create secret generic grid-swim-key --from-file=key=/dev/stdin
 helm upgrade --install grid-site charts/grid-site -n grid \
   --set gridNetwork.gridId=grid-1 --set gridSite.name=site-a --set peers.hub.digest="$HUB_DIGEST" \
+  --set gridSite.local.signerEndpoint.url=https://enroll.grid.example.com:8443 \
+  --set gridSite.local.signerEndpoint.caBundleRef.kind=Secret --set gridSite.local.signerEndpoint.caBundleRef.name=grid-ca-bundle \
+  --set gridSite.local.inviteSecretRef.name=grid-invite-site-a \
   --set inferenceProviders.my-model.endpoint=http://10.96.0.20:8000
 helm upgrade --install grid-gateway charts/praxis-gateway -n grid \
   --set image.repository=ghcr.io/praxis-proxy/grid-gateway --set image.tag=v0.1.4 \
@@ -74,7 +85,14 @@ helm upgrade --install grid-gateway charts/praxis-gateway -n grid \
   --set praxisConfig.render.peerTrust.digest="$HUB_DIGEST" --set praxisConfig.render.backends.local.endpoint=10.96.0.20:8000
 ```
 
-The site needs three Secrets from the hub: the Grid CA bundle, its invite token with its site label, and the SWIM key. The commands above copy them one at a time. A fleet delivers them with ACM or External Secrets instead. The site operator redeems the token on its first start and writes the site identity. Then pin the site on the hub by rerunning the hub `grid-site` command with `--set peers.site-a.digest=<site-a leaf digest>` added.
+The site needs three Secrets from the hub: the Grid CA bundle, its invite
+token with its site label, and the SWIM key. The commands above copy them one
+at a time. A fleet delivers them with ACM or External Secrets instead. The
+site operator redeems the token once its GridSite names the invite, writes the
+site identity, and restarts under it. The GridSite's `Enrolled` condition
+reports the result. Then pin the site on the hub by rerunning the hub
+`grid-site` command with `--set peers.site-a.digest=<site-a leaf digest>`
+added.
 
 A later change returns the SWIM key and the CA bundle from enrollment, so you copy only the invite token (design-1s3). In the longer term, the grid-operator chart alone installs a site, and the operator bootstraps the rest. That design is in progress.
 
@@ -83,7 +101,12 @@ An invite expires after a day by default, and an unredeemed one stays in place. 
 ## Defaults These Commands Rely On
 
 - grid-enrollment: `host` joins the serving cert names, is the default Route host, and makes the enrollment Service a LoadBalancer when no Route renders. An invite's `network` defaults to `grid`.
-- grid-operator with `enrollment.enabled`: the site name follows `swim.siteName`, the URL is the in-cluster grid-enrollment Service, the CA bundle is Secret `grid-ca-bundle`, the token is `grid-invite-<site>`, the SWIM Service is a LoadBalancer, the gateway Service is `grid-gateway`, and the render refuses Secret access in `grid-enrollment`.
+- grid-operator with `enrollment.enabled`: the site name follows
+  `swim.siteName`, the SWIM Service is a LoadBalancer, the gateway Service is
+  `grid-gateway`, and the render refuses Secret access in `grid-enrollment`.
+- grid-site `gridSite.local`: the GridSite the operator enrolls from, as
+  `spec.local`. The hub's URL is the in-cluster grid-enrollment Service. The CA
+  bundle is Secret `grid-ca-bundle`, and the invite is `grid-invite-<site>`.
 - grid-site: the network is `grid`. Listing `peers` turns on site discovery and the TLS Secrets the operator writes. A peer's probe name is `<name>.grid.internal`.
 - praxis-gateway: it renders its own config without a BYO ConfigMap. Set `gridIdentity.tlsSecretName` to `grid-site-identity` and `gridIdentity.caSecretName` to `grid-ca` for mTLS. A site backend uses mutual TLS to `<site>.grid.internal`. A provider's Service is a LoadBalancer, and `local` is its one plaintext backend.
 

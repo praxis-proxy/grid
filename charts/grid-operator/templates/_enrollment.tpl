@@ -14,12 +14,25 @@
 
 {{- define "grid-operator.enrollment.validate" -}}
 {{- $e := include "grid-operator.enrollment.settings" . | fromYaml }}
-{{- if $e.enabled }}
+{{- if and $e.enabled (not .Values.grid.id) (or (ne ($e.identitySecretName | default "grid-site-identity") "grid-site-identity") (ne ($e.caSecretName | default "grid-ca") "grid-ca")) }}
+{{- fail "enrollment.identitySecretName and caSecretName name the Secrets in the GridNetwork this chart renders: set grid.id, or keep grid-site-identity and grid-ca" }}
+{{- end }}
+{{- $raw := .Values.enrollment | default dict }}
+{{- if and (not .Values.grid.id) (or $raw.url $raw.rotation (dig "caBundle" "configMap" "" $raw) (dig "caBundle" "secret" "" $raw) (dig "gridCaBundle" "configMap" "" $raw) (dig "gridCaBundle" "secret" "" $raw) (dig "tokenSecretRef" "name" "" $raw)) }}
+{{- fail "enrollment.url, caBundle, gridCaBundle, tokenSecretRef and rotation render onto this chart's GridSite, which needs grid.id. Without it, set them on the GridSite the grid-site chart renders: gridSite.local" }}
+{{- end }}
+{{- if and $e.rotation (not (or $e.enabled $e.url)) }}
+{{- fail "enrollment.rotation sits under signerEndpoint: set enrollment.url, or enrollment.enabled" }}
+{{- end }}
+{{- if and $e.url (not (hasPrefix "https://" $e.url)) }}
+{{- fail "enrollment.url must be an https URL" }}
+{{- end }}
+{{- if and $e.enabled (not $e.siteName) }}
+{{- fail "enrollment.siteName is required when enrollment.enabled is true" }}
+{{- end }}
+{{- if and $e.enabled .Values.grid.id }}
 {{- if not (hasPrefix "https://" ($e.url | default "")) }}
 {{- fail "enrollment.url must be an https URL when enrollment.enabled is true" }}
-{{- end }}
-{{- if not $e.siteName }}
-{{- fail "enrollment.siteName is required when enrollment.enabled is true" }}
 {{- end }}
 {{- if not (dig "tokenSecretRef" "name" "" $e) }}
 {{- fail "enrollment.tokenSecretRef.name is required when enrollment.enabled is true" }}
@@ -30,12 +43,48 @@
 {{- end }}
 {{- end }}
 
-{{/* Emits "true" when the operator rotates the site identity: rotation on and an enrollment URL known. */}}
-{{- define "grid-operator.enrollment.rotates" -}}
+{{/* A BundleRef for a caBundle-shaped value. */}}
+{{- define "grid-operator.enrollment.bundleRef" -}}
+{{- if dig "configMap" "" . }}
+kind: ConfigMap
+name: {{ .configMap | quote }}
+{{- else }}
+kind: Secret
+name: {{ dig "secret" "" . | quote }}
+{{- end }}
+key: {{ dig "key" "ca.crt" . | quote }}
+{{- end }}
+
+{{/* The local GridSite's spec.local: signerEndpoint with its rotation, and inviteSecretRef. A hub whose identity bootstrap issued sets only the URL, and renews pinned to the grid CA it holds. Unset, rotation renders Disabled unless grid.peerTrust is spiffe, since pin peer trust refuses a renewed leaf. */}}
+{{- define "grid-operator.enrollment.siteSpec" -}}
 {{- $e := include "grid-operator.enrollment.settings" . | fromYaml }}
-{{- if and (dig "rotation" "enabled" true $e) (or $e.enabled $e.url) -}}
-true
-{{- end -}}
+{{- $raw := .Values.enrollment | default dict }}
+{{- $pinned := or $e.enabled (dig "caBundle" "configMap" "" $raw) (dig "caBundle" "secret" "" $raw) }}
+{{- $rotation := $e.rotation }}
+{{- if and (not $rotation) (ne (.Values.grid.peerTrust | default "") "spiffe") }}
+{{- $rotation = "Disabled" }}
+{{- end }}
+{{- if or $e.enabled $e.url }}
+local:
+  signerEndpoint:
+    url: {{ $e.url | quote }}
+    {{- if $pinned }}
+    caBundleRef:
+      {{- include "grid-operator.enrollment.bundleRef" $e.caBundle | trim | nindent 6 }}
+    {{- end }}
+    {{- if include "grid-operator.enrollment.hasGridCa" . }}
+    gridCaBundleRef:
+      {{- include "grid-operator.enrollment.bundleRef" $e.gridCaBundle | trim | nindent 6 }}
+    {{- end }}
+    {{- with $rotation }}
+    rotation: {{ . | quote }}
+    {{- end }}
+  {{- if $e.enabled }}
+  inviteSecretRef:
+    name: {{ dig "tokenSecretRef" "name" "" $e | quote }}
+    key: {{ dig "tokenSecretRef" "key" "token" $e | quote }}
+  {{- end }}
+{{- end }}
 {{- end }}
 
 {{/* Emits "true" or nothing. */}}
@@ -44,80 +93,4 @@ true
 {{- if or (dig "gridCaBundle" "configMap" "" $e) (dig "gridCaBundle" "secret" "" $e) -}}
 true
 {{- end -}}
-{{- end }}
-
-{{- define "grid-operator.enrollment.env" -}}
-{{- $e := include "grid-operator.enrollment.settings" . | fromYaml }}
-{{- if $e.enabled }}
-- name: GRID_ENROLL_ENABLED
-  value: "true"
-- name: GRID_ENROLL_URL
-  value: {{ $e.url | quote }}
-- name: GRID_ENROLL_SITE_NAME
-  value: {{ $e.siteName | quote }}
-- name: GRID_ENROLL_CA_FILE
-  value: /etc/grid-enroll/pin/ca.crt
-{{- if include "grid-operator.enrollment.hasGridCa" . }}
-- name: GRID_ENROLL_GRID_CA_FILE
-  value: /etc/grid-enroll/grid-ca/ca.crt
-{{- end }}
-- name: GRID_ENROLL_TOKEN_SECRET
-  value: {{ dig "tokenSecretRef" "name" "" $e | quote }}
-- name: GRID_ENROLL_TOKEN_SECRET_KEY
-  value: {{ dig "tokenSecretRef" "key" "token" $e | quote }}
-- name: GRID_ENROLL_IDENTITY_SECRET
-  value: {{ $e.identitySecretName | default "grid-site-identity" | quote }}
-- name: GRID_ENROLL_CA_SECRET
-  value: {{ $e.caSecretName | default "grid-ca" | quote }}
-{{- end }}
-{{- if include "grid-operator.enrollment.rotates" . }}
-- name: GRID_ROTATION_ENABLED
-  value: "true"
-{{- if not $e.enabled }}
-- name: GRID_ENROLL_URL
-  value: {{ $e.url | quote }}
-- name: GRID_ENROLL_IDENTITY_SECRET
-  value: {{ $e.identitySecretName | default "grid-site-identity" | quote }}
-- name: GRID_ENROLL_CA_SECRET
-  value: {{ $e.caSecretName | default "grid-ca" | quote }}
-{{- end }}
-{{- end }}
-{{- end }}
-
-{{- define "grid-operator.enrollment.volumeMounts" -}}
-{{- if (include "grid-operator.enrollment.settings" . | fromYaml).enabled }}
-- name: enroll-pin
-  mountPath: /etc/grid-enroll/pin
-  readOnly: true
-{{- if include "grid-operator.enrollment.hasGridCa" . }}
-- name: enroll-grid-ca
-  mountPath: /etc/grid-enroll/grid-ca
-  readOnly: true
-{{- end }}
-{{- end }}
-{{- end }}
-
-{{- define "grid-operator.enrollment.bundleVolume" -}}
-{{- $b := .bundle | default dict }}
-- name: {{ .name }}
-  {{- if dig "configMap" "" $b }}
-  configMap:
-    name: {{ $b.configMap | quote }}
-  {{- else }}
-  secret:
-    secretName: {{ dig "secret" "" $b | quote }}
-  {{- end }}
-    items:
-      - key: {{ dig "key" "ca.crt" $b | quote }}
-        path: ca.crt
-{{- end }}
-
-{{- define "grid-operator.enrollment.volumes" -}}
-{{- $e := include "grid-operator.enrollment.settings" . | fromYaml }}
-{{- if $e.enabled }}
-{{ include "grid-operator.enrollment.bundleVolume" (dict "name" "enroll-pin" "bundle" $e.caBundle) }}
-{{- if include "grid-operator.enrollment.hasGridCa" . }}
-{{ include "grid-operator.enrollment.bundleVolume" (dict "name" "enroll-grid-ca" "bundle" $e.gridCaBundle) }}
-{{- end }}
-{{- end }}
 {{- end }}

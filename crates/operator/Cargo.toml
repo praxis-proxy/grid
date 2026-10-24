@@ -83,6 +83,7 @@ zeroize = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 pem = { workspace = true }
 rcgen = { workspace = true, features = ["x509-parser"] }
+regex = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }
 

@@ -175,7 +175,8 @@ RBAC is split into two `ClusterRoles`:
 1. **`grid-operator-crd`**: cluster-scoped CRD access,
    bound via a `ClusterRoleBinding`.
 2. **`grid-operator-resources`**: namespaced `Secret` and
-   `ConfigMap` access, bound via per-namespace
+   `ConfigMap` access, plus `get` and `patch` on the named
+   gateway `Deployment`, bound via per-namespace
    `RoleBindings`.
 
 The default install includes a `RoleBinding` in the
@@ -211,6 +212,7 @@ granted for `secrets` and `configmaps`.  `delete` and
 |---|---|---|
 | `secrets` | `get`, `create`, `patch` | Read TLS certs, SWIM key, credential refs; SSA-create CA and site cert `Secrets` |
 | `configmaps` | `get`, `create`, `patch`, `update` | Routing overlay, consumer config, and Secret requirements `ConfigMaps`; SWIM revision reservations |
+| `deployments` | `get`, `patch` on the named gateway Deployment only | Roll the gateway after an identity rotation; see Deployment access |
 
 The `grid-operator-resources` `ClusterRole` is never bound
 cluster-wide.  It takes effect only in namespaces where a
@@ -218,13 +220,16 @@ cluster-wide.  It takes effect only in namespaces where a
 
 ### Deployment access
 
-Neither `ClusterRole` grants unrestricted Deployment access. With rotation
-on, the resources `ClusterRole` grants `get` and `patch` on the named gateway
-Deployment. The operator reaches Deployments through two named grants only:
+Neither `ClusterRole` grants unrestricted Deployment access. The resources
+`ClusterRole` grants `get` and `patch` on the named gateway Deployment in
+every install path, whether or not rotation is on: the Helm chart names
+`gateway.serviceName`, the static operator manifests and the OpenShift overlay
+name `grid-gateway`, and the kind overlay names `provider-gateway`. The
+operator reaches Deployments through two named grants only:
 
 | Grant | Bound where | Why |
 |---|---|---|
-| `deployments` `get`, `patch` on `gateway.serviceName` (Helm chart only, with rotation on) | Release namespace, each `resourceNamespaces` entry, and `gateway.namespace` through the discovery Role | Roll the gateway after an identity rotation |
+| `deployments` `get`, `patch` on the named gateway Deployment | Helm: release namespace, each `resourceNamespaces` entry, and `gateway.namespace` through the discovery Role. Static manifests and overlays: the operator namespace through `grid-operator-resources` | Roll the gateway after an identity rotation |
 | `deployments` `get`, `patch` on one delegated gateway's Deployment | That gateway's namespace, through a Role its owner creates | Delegated Secret mount reconciliation |
 
 A gateway that delegates its mounts (`praxisConfig.mountReconciliation`
@@ -339,6 +344,12 @@ namespace.
 
 Credential token bytes are never written to `ConfigMaps`,
 overlays, status fields, or logs.
+
+The identity Secret keys are a contract any writer follows, the operator or another
+issuer: `tls.crt` holds the site leaf, `tls.key` its private key, and `ca.crt` the grid
+CA, in the site Secret or the CA Secret the GridNetwork names. A writer other than the
+operator sets `spec.local.signerEndpoint.rotation: Disabled`, or leaves the signer out,
+and the operator reads the new leaf on its next round.
 
 ### ConfigMap write scope
 

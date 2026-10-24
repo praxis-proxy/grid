@@ -20,6 +20,12 @@ rules:
       - "grid-operator-swim"
       - "grid-operator-signals"
     verbs: ["get"]
+  # A rotation rolls the gateway, which loads its upstream client certificate only at start.
+  # Unconditional: any identified site renews once its GridSite names a signer.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["provider-gateway"]
+    verbs: ["get", "patch"]
   - apiGroups: ["events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]

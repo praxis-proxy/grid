@@ -1,73 +1,45 @@
-suite: operator auto-enroll
+suite: operator enrollment through the local GridSite
 templates:
+  - templates/gridsite.yaml
   - templates/deployment.yaml
 set:
+  grid.id: grid-a
   enrollment.url: https://enroll.example.com
   enrollment.siteName: site-d
   enrollment.caBundle.configMap: grid-ca
   enrollment.tokenSecretRef.name: grid-invite-site-d
 tests:
-  - it: renders no enrollment wiring when disabled
+  - it: renders the signer and the invite on the local GridSite
+    template: templates/gridsite.yaml
+    set:
+      enrollment.enabled: true
+    asserts:
+      - equal:
+          path: metadata.name
+          value: site-d
+      - equal:
+          path: spec.local.signerEndpoint
+          value:
+            url: https://enroll.example.com
+            caBundleRef: { kind: ConfigMap, name: grid-ca, key: ca.crt }
+            rotation: Disabled
+      - equal:
+          path: spec.local.inviteSecretRef
+          value: { name: grid-invite-site-d, key: token }
+
+  - it: renders no enrollment env on the operator
+    template: templates/deployment.yaml
+    set:
+      enrollment.enabled: true
     asserts:
       - notContains:
           path: spec.template.spec.containers[0].env
-          content:
-            name: GRID_ENROLL_ENABLED
-            value: "true"
+          content: { name: GRID_ENROLL_ENABLED, value: "true" }
       - notExists:
           path: spec.template.spec.volumes
 
-  - it: passes the enrollment settings as env
-    set:
-      enrollment.enabled: true
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: GRID_ENROLL_URL
-            value: https://enroll.example.com
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: GRID_ENROLL_SITE_NAME
-            value: site-d
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: GRID_ENROLL_TOKEN_SECRET
-            value: grid-invite-site-d
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: GRID_ENROLL_TOKEN_SECRET_KEY
-            value: token
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: GRID_ENROLL_CA_FILE
-            value: /etc/grid-enroll/pin/ca.crt
-
-  - it: mounts the pinned CA bundle from a ConfigMap
-    set:
-      enrollment.enabled: true
-    asserts:
-      - equal:
-          path: spec.template.spec.volumes[0]
-          value:
-            name: enroll-pin
-            configMap:
-              name: grid-ca
-              items:
-                - key: ca.crt
-                  path: ca.crt
-      - equal:
-          path: spec.template.spec.containers[0].volumeMounts[0]
-          value:
-            name: enroll-pin
-            mountPath: /etc/grid-enroll/pin
-            readOnly: true
-
-  - it: mounts the pinned CA bundle from a Secret
+  - it: pins the signer from a Secret with a custom key
+    template: templates/gridsite.yaml
     set:
       enrollment.enabled: true
       enrollment.caBundle.configMap: ""
@@ -75,61 +47,71 @@ tests:
       enrollment.caBundle.key: bundle.pem
     asserts:
       - equal:
-          path: spec.template.spec.volumes[0].secret
-          value:
-            secretName: grid-ca-bundle
-            items:
-              - key: bundle.pem
-                path: ca.crt
+          path: spec.local.signerEndpoint.caBundleRef
+          value: { kind: Secret, name: grid-ca-bundle, key: bundle.pem }
 
   - it: reads the token from a custom key
+    template: templates/gridsite.yaml
     set:
       enrollment.enabled: true
       enrollment.tokenSecretRef.key: site-token
     asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: GRID_ENROLL_TOKEN_SECRET_KEY
-            value: site-token
+      - equal:
+          path: spec.local.inviteSecretRef.key
+          value: site-token
 
   - it: anchors the returned CA to gridCaBundle when set
+    template: templates/gridsite.yaml
     set:
       enrollment.enabled: true
-      enrollment.gridCaBundle.secret: grid-ca-bundle
+      enrollment.gridCaBundle.secret: grid-ca-anchor
     asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: GRID_ENROLL_GRID_CA_FILE
-            value: /etc/grid-enroll/grid-ca/ca.crt
       - equal:
-          path: spec.template.spec.volumes[1]
-          value:
-            name: enroll-grid-ca
-            secret:
-              secretName: grid-ca-bundle
-              items:
-                - key: ca.crt
-                  path: ca.crt
-      - equal:
-          path: spec.template.spec.containers[0].volumeMounts[1].mountPath
-          value: /etc/grid-enroll/grid-ca
+          path: spec.local.signerEndpoint.gridCaBundleRef
+          value: { kind: Secret, name: grid-ca-anchor, key: ca.crt }
 
   - it: anchors to the TLS pin by default
+    template: templates/gridsite.yaml
     set:
       enrollment.enabled: true
     asserts:
-      - notContains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: GRID_ENROLL_GRID_CA_FILE
-            value: /etc/grid-enroll/grid-ca/ca.crt
-      - lengthEqual:
-          path: spec.template.spec.volumes
-          count: 1
+      - notExists:
+          path: spec.local.signerEndpoint.gridCaBundleRef
+
+  - it: a hub whose identity bootstrap issued renews with only the URL, pinned to its grid CA
+    template: templates/gridsite.yaml
+    set:
+      enrollment.caBundle.configMap: ""
+      enrollment.tokenSecretRef.name: ""
+    asserts:
+      - equal:
+          path: spec.local.signerEndpoint
+          value: { url: https://enroll.example.com, rotation: Disabled }
+      - notExists:
+          path: spec.local.inviteSecretRef
+
+  - it: names no local site without enrollment or a URL
+    template: templates/gridsite.yaml
+    set:
+      enrollment.url: ""
+      enrollment.caBundle.configMap: ""
+      enrollment.tokenSecretRef.name: ""
+    asserts:
+      - notExists:
+          path: spec.local
+
+  - it: defaults the URL to the in-cluster grid-enrollment Service
+    template: templates/gridsite.yaml
+    set:
+      enrollment.enabled: true
+      enrollment.url: ""
+    asserts:
+      - equal:
+          path: spec.local.signerEndpoint.url
+          value: https://grid-enrollment.grid-enrollment.svc:8443
 
   - it: refuses a grid CA from both a ConfigMap and a Secret
+    template: templates/gridsite.yaml
     set:
       enrollment.enabled: true
       enrollment.gridCaBundle.secret: a
@@ -139,6 +121,7 @@ tests:
           errorPattern: "enrollment[./]gridCaBundle"
 
   - it: refuses a pin from both a ConfigMap and a Secret
+    template: templates/gridsite.yaml
     set:
       enrollment.enabled: true
       enrollment.caBundle.secret: a
@@ -147,6 +130,7 @@ tests:
           errorPattern: "enrollment[./]caBundle"
 
   - it: refuses a site name too long for its invite Secret
+    template: templates/gridsite.yaml
     set:
       enrollment.siteName: a23456789-123456789-123456789-123456789-123456789-12
     asserts:
@@ -154,6 +138,7 @@ tests:
           errorPattern: "enrollment[./]siteName"
 
   - it: refuses a plaintext URL
+    template: templates/gridsite.yaml
     set:
       enrollment.enabled: true
       enrollment.url: http://enroll.example.com
@@ -162,49 +147,139 @@ tests:
           errorPattern: "enrollment[./]url"
 
   - it: requires a site name
+    template: templates/deployment.yaml
     set:
+      grid.id: ""
       enrollment.enabled: true
       enrollment.siteName: ""
+      enrollment.url: ""
+      enrollment.caBundle.configMap: ""
+      enrollment.tokenSecretRef.name: ""
     asserts:
       - failedTemplate:
           errorPattern: enrollment.siteName is required
 
+  - it: refuses signer values with no GridSite to carry them
+    template: templates/deployment.yaml
+    set:
+      grid.id: ""
+      enrollment.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "gridSite.local"
+
+  - it: refuses a renamed identity Secret no rendered GridNetwork names
+    template: templates/deployment.yaml
+    set:
+      grid.id: ""
+      enrollment.enabled: true
+      enrollment.url: ""
+      enrollment.caBundle.configMap: ""
+      enrollment.tokenSecretRef.name: ""
+      enrollment.identitySecretName: east-identity
+    asserts:
+      - failedTemplate:
+          errorPattern: "set grid.id, or keep grid-site-identity and grid-ca"
+
+  - it: keeps an explicit rotation under spiffe peer trust
+    template: templates/gridsite.yaml
+    set:
+      grid.peerTrust: spiffe
+      enrollment.enabled: true
+      enrollment.rotation: Disabled
+    asserts:
+      - equal:
+          path: spec.local.signerEndpoint.rotation
+          value: Disabled
+
+  - it: renders rotation Disabled under pin peer trust, the default
+    template: templates/gridsite.yaml
+    set:
+      enrollment.enabled: true
+    asserts:
+      - equal:
+          path: spec.local.signerEndpoint.rotation
+          value: Disabled
+
+  - it: leaves rotation to the CRD default under spiffe peer trust
+    template: templates/gridsite.yaml
+    set:
+      grid.peerTrust: spiffe
+      enrollment.enabled: true
+    asserts:
+      - notExists:
+          path: spec.local.signerEndpoint.rotation
+
+  - it: refuses rotation with no signer to carry it
+    template: templates/deployment.yaml
+    set:
+      enrollment.enabled: false
+      enrollment.url: ""
+      enrollment.caBundle.configMap: ""
+      enrollment.tokenSecretRef.name: ""
+      enrollment.rotation: Disabled
+    asserts:
+      - failedTemplate:
+          errorPattern: "sits under signerEndpoint"
+
+  - it: refuses the old rotation switch
+    template: templates/gridsite.yaml
+    set:
+      enrollment.enabled: true
+      enrollment.rotation.enabled: false
+    asserts:
+      - failedTemplate:
+          errorPattern: "rotation"
+
+  - it: refuses rotation with no GridSite to carry it
+    template: templates/deployment.yaml
+    set:
+      grid.id: ""
+      enrollment.enabled: false
+      enrollment.url: ""
+      enrollment.caBundle.configMap: ""
+      enrollment.tokenSecretRef.name: ""
+      enrollment.rotation: Disabled
+    asserts:
+      - failedTemplate:
+          errorPattern: "gridSite.local"
+
   - it: defaults the token Secret to grid-invite-<siteName>
+    template: templates/gridsite.yaml
     set:
       enrollment.enabled: true
       enrollment.tokenSecretRef.name: ""
     asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: GRID_ENROLL_TOKEN_SECRET
-            value: grid-invite-site-d
+      - equal:
+          path: spec.local.inviteSecretRef.name
+          value: grid-invite-site-d
 
   - it: defaults the pinned bundle to the grid-ca-bundle Secret
+    template: templates/gridsite.yaml
     set:
       enrollment.enabled: true
       enrollment.caBundle.configMap: ""
     asserts:
       - equal:
-          path: spec.template.spec.volumes[?(@.name=="enroll-pin")].secret.secretName
-          value: grid-ca-bundle
+          path: spec.local.signerEndpoint.caBundleRef
+          value: { kind: Secret, name: grid-ca-bundle, key: ca.crt }
 
   - it: defaults both refs when they are nulled
+    template: templates/gridsite.yaml
     set:
       enrollment.enabled: true
       enrollment.caBundle: null
       enrollment.tokenSecretRef: null
     asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: GRID_ENROLL_TOKEN_SECRET
-            value: grid-invite-site-d
       - equal:
-          path: spec.template.spec.volumes[?(@.name=="enroll-pin")].secret.secretName
+          path: spec.local.inviteSecretRef.name
+          value: grid-invite-site-d
+      - equal:
+          path: spec.local.signerEndpoint.caBundleRef.name
           value: grid-ca-bundle
 
   - it: names the SWIM site after the enrolling site
+    template: templates/deployment.yaml
     set:
       enrollment.enabled: true
     asserts:
@@ -215,6 +290,7 @@ tests:
             value: site-d
 
   - it: keeps an explicit SWIM site name
+    template: templates/deployment.yaml
     set:
       enrollment.enabled: true
       swim.siteName: other
@@ -226,6 +302,13 @@ tests:
             value: other
 
   - it: sets no SWIM site name from a disabled enrollment
+    template: templates/deployment.yaml
+    set:
+      grid.id: ""
+      enrollment.url: ""
+      enrollment.caBundle.configMap: ""
+      enrollment.tokenSecretRef.name: ""
+      site.name: ""
     asserts:
       - notContains:
           path: spec.template.spec.containers[0].env

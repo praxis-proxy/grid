@@ -306,14 +306,19 @@ priorityClassName: ""
 
 # -- Site auto-enroll on startup.
 enrollment:
-  # -- Enroll when the site identity Secret is absent.
+  # -- Render this cluster's own GridSite with spec.local, naming the signer and the invite,
+  # so the operator enrolls the site while it has no identity, then renews through the same
+  # signer.
   enabled: false
-  # -- Enrollment service https base URL. Defaults to the in-cluster grid-enrollment
-  # Service in rbac.enrollmentNamespace, the hub's own.
+  # -- Signer https base URL, the GridSite's local.signerEndpoint.url. Defaults to the
+  # in-cluster grid-enrollment Service in rbac.enrollmentNamespace, the hub's own. A hub
+  # whose identity bootstrap issued sets only this and renews pinned to the grid CA it holds.
   url: ""
-  # -- Site name the token pins, at most 51 characters. Defaults to swim.siteName.
+  # -- Site name the token pins, at most 51 characters, and the GridSite's name. Defaults to swim.siteName.
   siteName: ""
-  # -- CA pinning the enrollment server, and the grid CA by default. With neither set, Secret grid-ca-bundle.
+  # -- CA pinning the signer, and the grid CA by default: local.signerEndpoint.caBundleRef.
+  # With neither set, Secret grid-ca-bundle when enabled; a hub with only url renews pinned
+  # to the grid CA it holds.
   caBundle:
     # -- ConfigMap holding the bundle. Set this or secret.
     configMap: ""
@@ -321,7 +326,7 @@ enrollment:
     secret: ""
     # -- Key holding the PEM bundle.
     key: ca.crt
-  # -- Grid CA anchor, when it differs from caBundle.
+  # -- Grid CA anchor, when it differs from caBundle: local.signerEndpoint.gridCaBundleRef.
   gridCaBundle:
     # -- ConfigMap holding the grid CA. Set this or secret.
     configMap: ""
@@ -329,19 +334,20 @@ enrollment:
     secret: ""
     # -- Key holding the PEM bundle.
     key: ca.crt
-  # -- Secret the site identity is written to when no GridNetwork names one.
+  # -- Identity Secret the rendered GridNetwork names. Without grid.id it must stay the
+  # operator's default, grid-site-identity.
   identitySecretName: grid-site-identity
-  # -- Secret the grid CA is written to when no GridNetwork names one.
+  # -- Grid CA Secret the rendered GridNetwork names. Without grid.id it must stay the
+  # operator's default, grid-ca.
   caSecretName: grid-ca
-  rotation:
-    # -- Rotate the site identity before it expires, presenting the current one. Needs an
-    # enrollment URL: the default with enabled, or url set, as on a hub whose identity
-    # bootstrap issued. Without caBundle the grid CA in caSecretName pins the service.
-    # Off under pin peer trust whatever this says: a pinned peer refuses a rotated leaf.
-    enabled: true
-  # -- Secret holding the one-time site token.
+  # -- Secret holding the one-time site token: the GridSite's local.inviteSecretRef.
   tokenSecretRef:
     # -- Secret name. Defaults to grid-invite-<siteName>.
     name: ""
     # -- Key holding the token.
     key: token
+  # -- Whether the operator renews the site identity through the signer, the GridSite's
+  # local.signerEndpoint.rotation: Enabled or Disabled. Empty renders Disabled unless
+  # grid.peerTrust is spiffe, since pin peer trust refuses a renewed leaf; under spiffe it
+  # leaves the CRD default, Enabled.
+  rotation: ""

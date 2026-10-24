@@ -495,8 +495,9 @@ embedded gateway's serving config is controlled separately by
 
 ## GridSite
 
-Represents another site in the grid. Created manually
-for seed peers or automatically by SWIM discovery.
+Represents a site in the grid. A peer is created manually for seed peers or
+automatically by SWIM discovery. This cluster's own site is the GridSite named
+after its identity, and before it has one, the GridSite that carries `spec.local`.
 
 ```yaml
 apiVersion: grid.praxis.fast/v1alpha1
@@ -524,7 +525,54 @@ spec:
 
 **Status fields**: `phase`, `reason`, `message`, `observedGeneration`,
 `publicCertPem`, `capabilities` (inference, agentTools, agentToAgent),
-`lastProbeTime`, `lastTransitionTime`, `absentSince` (auto-discovered sites only)
+`lastProbeTime`, `lastTransitionTime`, `absentSince` (auto-discovered sites only),
+`conditions` (on this cluster's own site: `Available`, `Progressing`, `Degraded`,
+`Accepted`, `ResolvedRefs`, `Enrolled`, `IdentityValid`, `RotationOnSchedule`)
+
+### This cluster's own site
+
+```yaml
+apiVersion: grid.praxis.fast/v1alpha1
+kind: GridSite
+metadata:
+  name: east2
+spec:
+  gridNetworkRef: production
+  local:
+    signerEndpoint:
+      url: https://enrollment.apps.example.com
+      caBundleRef: {kind: Secret, name: grid-ca-bundle, key: ca.crt}
+      gridCaBundleRef: {kind: Secret, name: grid-ca-anchor, key: ca.crt}
+      rotation: Enabled
+    inviteSecretRef: {name: grid-invite-east2, key: token}
+```
+
+| Field | Meaning |
+|---|---|
+| `local` | Marks this cluster's own site, and says how it enrolls and renews. Set on one GridSite only. |
+| `local.signerEndpoint.url` | The base URL of the signer the site enrolls and renews through. https, naming a host with an optional numeric port, without credentials, query or fragment, and not a host under `grid.internal`, enforced by CEL. |
+| `local.signerEndpoint.caBundleRef` | `Secret` or `ConfigMap` in the operator namespace pinning the signer, and by default the grid CA it returns. `kind` is required. Required with `inviteSecretRef`, by CEL. Renewal falls back to the grid CA the site holds. The object must carry `grid.praxis.fast/signer-bundle=true`, as must the `gridCaBundleRef` object. |
+| `local.signerEndpoint.gridCaBundleRef` | The grid CA the returned CA must match: a bootstrap override for a signer that cannot serve its own bundle, such as one behind a certificate from another CA. |
+| `local.signerEndpoint.rotation` | Whether this operator renews the identity through the signer. `Enabled` (default) renews when a third of its lifetime remains, and is refused under pin peer trust with `Accepted` `False` and `RotationUnsupportedUnderPinTrust`. `Disabled` uses the signer to enroll only. Enrollment runs whatever this says. |
+| `local.inviteSecretRef` | The Secret holding the one-time invite token, an opaque credential the signer issued, read once while the site has no identity. `key` defaults to `token`. The Secret must carry `grid.praxis.fast/site=<site name>`. |
+
+Before the site has an identity, the GridSite carrying `local` is this cluster's own
+site, and exactly one may carry it: with several, none enrolls and each reports
+`Accepted` `False` with `DuplicateLocalSite`. Once the site has an identity, the
+GridSite named after the identity's site is this cluster's own, whether or not it
+carries `local`, and a `local` on any other GridSite is reported there as `Accepted`
+`False` with `NotLocalSite` and never acted on. The chart declares `local`, on a hub as
+on a joining site, and the operator only reads it: renewal reads the own GridSite and
+nothing else. Under pin peer trust, `rotation: Enabled` reports `Accepted` `False` with
+`RotationUnsupportedUnderPinTrust` and nothing renews. Every condition and reason is listed in
+[Site Enrollment](../installation/enrollment.md#3-enroll-the-site).
+A local site may exist before its GridNetwork, and the GridSite controller
+waits for the network without reporting an error.
+
+The operator self-signs a grid CA and site identity for a GridNetwork that names TLS
+Secrets neither of which exists. It never does while a GridSite carries `local`, since
+enrollment writes both, and it waits 30 seconds after the GridNetwork is created, so a
+local GridSite applied with it is seen first.
 
 ### GridSite lifecycle
 
@@ -697,32 +745,26 @@ status:
   observedGeneration: 2
 ```
 
-### Status conditions (acceptance criterion open)
+### Status vocabulary
 
-The current `GridSite` status uses a flat
-`phase`/`reason`/`message` model rather than a
-Kubernetes-style `conditions[]` array.
+A `GridSite` carries both `phase`, with `reason` and `message`, and `conditions`.
+Which is authoritative depends on whose site the object is.
 
-Issue #11's acceptance criteria include a conditions-based
-status contract.  That criterion is **not yet resolved**:
-it requires either (a) implementing a `conditions[]` array
-or (b) formally amending the issue to accept the
-`phase`/`reason`/`message` model as the replacement.
-Neither has happened at the time of writing.
+- On a peer, `phase` is the contract: the lifecycle state, with `reason` the
+  machine-readable probe outcome and `message` a bounded explanation. A peer has
+  no conditions, and tools must not expect one.
+- On this cluster's own site, `conditions` is the contract and `phase` is
+  informational. `Available` rolls up `Accepted`, `ResolvedRefs`, `Enrolled` and
+  `IdentityValid`, copying the first failing gate's reason; `Degraded` is `True`
+  while `RotationOnSchedule` is `False`, the early warning that the identity will
+  expire; and `Progressing` says whether an enrollment is in flight. Each type
+  is written by the operator under its own field manager. `Unknown` means only
+  that a condition has not been evaluated yet. The own site's `phase` follows
+  the same probe as a peer's and says nothing about its identity.
 
-The flat model is the current contract:
-
-- `phase` provides the primary lifecycle state;
-  `reason` encodes the machine-readable probe outcome;
-  `message` gives a bounded human-readable explanation.
-- Richer conditions (e.g. `Reachable`, `IdentityVerified`,
-  `CertificatePinned`) may be added when multi-signal
-  readiness is needed (see `docs/architecture/overview.md`,
-  Trust and Readiness section).
-
-Tools and automation **must not** depend on a
-`conditions[]` field existing.  Match on `phase` for
-coarse state and on `reason` for specific probe outcomes.
+Richer peer conditions (`Reachable`, `IdentityVerified`, `CertificatePinned`)
+may follow when multi-signal readiness is needed (see
+`docs/architecture/overview.md`, Trust and Readiness section).
 
 ## InferenceProvider
 

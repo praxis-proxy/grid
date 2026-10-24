@@ -41,6 +41,21 @@ gridSite:
   region: ""
   zone: ""
   providerSiteLabel: ""
+  # -- This cluster's own site, rendered as spec.local: signerEndpoint names the signer it
+  # enrolls and renews through, with caBundleRef ({kind: Secret|ConfigMap, name, key: ca.crt})
+  # pinning the signer, required with an invite, gridCaBundleRef anchoring the grid CA when
+  # it differs, and rotation (Enabled or Disabled) saying whether the operator renews through
+  # it; inviteSecretRef names the Secret holding its invite token (key: token). Unset,
+  # rotation renders Disabled unless gridNetwork.peerTrust.mode is spiffe, since pin peer
+  # trust refuses a renewed leaf. Set on this cluster's own site only. To use the example,
+  # remove the empty `local: {}` and uncomment the block below it.
+  local: {}
+  # local:
+  #   signerEndpoint:
+  #     url: https://enroll.grid.example.com:8443
+  #     caBundleRef: {kind: Secret, name: grid-ca-bundle}
+  #   inviteSecretRef:
+  #     name: grid-invite-site-a
 
 # -- Remote sites this site trusts, keyed by site name, one GridSite <network>-<name>
 # each, the name the operator gives a peer it discovers. Listing peers also turns on

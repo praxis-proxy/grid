@@ -3,6 +3,16 @@ gridNetwork:
   gridId: grid-1
 gridSite:
   name: hub
+  # This cluster's own site: the signer hub enrolls and renews through, and the invite it
+  # enrolls with.
+  local:
+    signerEndpoint:
+      url: https://grid-enrollment.grid-enrollment.svc:8443
+      caBundleRef:
+        kind: Secret
+        name: grid-ca-bundle
+    inviteSecretRef:
+      name: grid-invite-hub
 peers:
   site-a:
     address: 203.0.113.20:8080

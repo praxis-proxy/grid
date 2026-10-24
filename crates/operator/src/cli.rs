@@ -6,7 +6,7 @@ use clap::{Args, Parser};
 
 use crate::{
     crd::grid_network::{PeerTrustMode, SignalMode},
-    enroll, gateway,
+    gateway,
 };
 
 /// grid-operator command-line interface.
@@ -16,10 +16,6 @@ pub struct Cli {
     /// Gateway self-discovery options.
     #[command(flatten)]
     pub gateway: gateway::Config,
-
-    /// Site auto-enroll options.
-    #[command(flatten)]
-    pub enrollment: enroll::Config,
 
     /// SWIM runtime options.
     #[command(flatten)]

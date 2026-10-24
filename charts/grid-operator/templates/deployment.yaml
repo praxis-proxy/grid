@@ -154,10 +154,7 @@ spec:
             {{- end }}
             - name: RUST_LOG
               value: {{ include "grid-operator.rustLog" . | quote }}
-            {{- with include "grid-operator.enrollment.env" . | trim }}
-            {{- . | nindent 12 }}
-            {{- end }}
-          {{- $mounts := list (include "grid-operator.enrollment.volumeMounts" . | trim) (include "grid-operator.metricsTls.volumeMount" . | trim) | compact }}
+          {{- $mounts := list (include "grid-operator.metricsTls.volumeMount" . | trim) | compact }}
           {{- with $mounts }}
           volumeMounts:
             {{- join "\n" . | nindent 12 }}
@@ -207,7 +204,7 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-      {{- $volumes := list (include "grid-operator.enrollment.volumes" . | trim) (include "grid-operator.metricsTls.volume" . | trim) | compact }}
+      {{- $volumes := list (include "grid-operator.metricsTls.volume" . | trim) | compact }}
       {{- with $volumes }}
       volumes:
         {{- join "\n" . | nindent 8 }}

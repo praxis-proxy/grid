@@ -1,15 +1,16 @@
 //! [`GridSite`] custom resource definition.
 //!
-//! Represents a remote site in the grid. Created manually for
-//! seed peers or automatically by SWIM discovery. The status
+//! Represents a site in the grid. A peer is created manually for
+//! seed peers or automatically by SWIM discovery, and its status
 //! tracks the site lifecycle from discovery through mTLS
-//! establishment to active connectivity.
+//! establishment to active connectivity. This cluster's own site
+//! carries `spec.local` and reports enrollment in conditions.
 
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::crd::grid_network::SignalMode;
+use crate::crd::{grid_network::SignalMode, inference_provider::Condition};
 
 // ---------------------------------------------------------------------------
 // Spec
@@ -65,6 +66,162 @@ pub struct GridSiteSpec {
     /// material.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust: Option<GridSiteTrustPolicy>,
+
+    /// This cluster's own site: how it enrolls and renews its identity.
+    ///
+    /// Set on one `GridSite` only. Before the site has an identity, the `GridSite`
+    /// carrying `local` is this cluster's own site. Once it has one, the `GridSite`
+    /// named after the identity's site is, and a `local` set elsewhere is reported
+    /// on that object and never acted on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<LocalSite>,
+}
+
+/// How this cluster's own site enrolls and renews its identity.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": "!has(self.inviteSecretRef) || (has(self.signerEndpoint) && has(self.signerEndpoint.caBundleRef))",
+    "message": "inviteSecretRef needs signerEndpoint with a caBundleRef to enroll through"
+}]))]
+pub struct LocalSite {
+    /// The signer this site enrolls and renews its identity through.
+    ///
+    /// Unset, nothing renews the identity, and `RotationOnSchedule` says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_endpoint: Option<SignerEndpoint>,
+
+    /// Secret holding the one-time invite token this site enrolls with.
+    ///
+    /// The token is an opaque credential the signer issued: the operator presents it and
+    /// never parses it. Read once, while the site has no identity. The Secret must carry
+    /// the label `grid.praxis.fast/site: <site name>`, naming this `GridSite`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite_secret_ref: Option<InviteSecretRef>,
+}
+
+/// Whether this operator renews the site identity through the signer.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub enum Rotation {
+    /// Renew through the signer when a third of the identity's lifetime remains. Refused
+    /// under pin peer trust, where a renewed leaf would not be trusted.
+    #[default]
+    Enabled,
+    /// Use the signer to enroll only. The identity is kept until it expires unless
+    /// another writer renews it.
+    Disabled,
+}
+
+/// The signer a site enrolls and renews its identity through.
+// The host rule spells out certs::SPIFFE_TRUST_DOMAIN, as signer_url in enroll.rs does.
+// One case table in enroll/tests.rs holds the two together. Raw CEL strings carry the
+// regex escapes, since a CEL string literal has no `\[` escape.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": "self.url.startsWith('https://')",
+    "message": "url must be an https URL"
+}, {
+    "rule": "!self.url.matches('[?#]')",
+    "message": "url is a base URL and carries no query or fragment"
+}, {
+    "rule": "self.url.matches(r'^https://(\\[[0-9a-fA-F:.]+\\]|[^/?#%:@\\[][^/?#%:@]*)(:|/|$)')",
+    "message": "url must name a host, with no percent-encoding before the path"
+}, {
+    "rule": "self.url.matches(r'^https://(\\[[^\\]]*\\]|[^/:\\[]*)(:[0-9]{1,5})?(/|$)')",
+    "message": "url port must be numeric"
+}, {
+    "rule": "!self.url.matches('^https://[^/?#]*@')",
+    "message": "url must not carry credentials"
+}, {
+    "rule": "!self.url.lowerAscii().matches('^https://([^/?#:]*[.])?grid[.]internal[.]?(:[0-9]*)?([/?#].*)?$')",
+    "message": "url must not name a host under grid.internal, where site certificates live"
+}]))]
+pub struct SignerEndpoint {
+    /// CA bundle pinning the signer's serving certificate.
+    ///
+    /// Required to enroll. Renewal falls back to the grid CA the site holds. The object
+    /// must carry the label `grid.praxis.fast/signer-bundle: "true"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_bundle_ref: Option<BundleRef>,
+
+    /// Grid CA the signer's returned CA must match, when it differs from `caBundleRef`.
+    ///
+    /// A bootstrap override for a signer that cannot serve its own bundle, such as one
+    /// behind a certificate from another CA. The object must carry the label
+    /// `grid.praxis.fast/signer-bundle: "true"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid_ca_bundle_ref: Option<BundleRef>,
+
+    /// Whether this operator renews the identity through the signer.
+    ///
+    /// `Enabled`, the default, renews when a third of the lifetime remains and is refused
+    /// under pin peer trust: the own site reports `Accepted` `False` with
+    /// `RotationUnsupportedUnderPinTrust` and nothing renews. `Disabled` uses the signer
+    /// to enroll only. Enrollment runs whatever this says.
+    #[serde(default)]
+    pub rotation: Rotation,
+
+    /// Base URL of the signer: https, naming a host with an optional numeric port, with
+    /// no credentials, no query or fragment, no percent-encoding before the path, and
+    /// not under `grid.internal`.
+    #[schemars(length(min = 1, max = 512))]
+    pub url: String,
+}
+
+/// A PEM bundle in a `Secret` or `ConfigMap` in the operator namespace.
+///
+/// The object must carry the label `grid.praxis.fast/signer-bundle: "true"`. The
+/// operator refuses one without it, so a `GridSite` cannot pin a bundle that happens
+/// to be in the namespace.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleRef {
+    /// Object name.
+    #[schemars(length(min = 1, max = 253))]
+    pub name: String,
+    /// Key holding the PEM bundle.
+    #[serde(default = "default_bundle_key")]
+    #[schemars(length(min = 1, max = 253))]
+    pub key: String,
+    /// Kind of the object holding the bundle: `Secret` or `ConfigMap`.
+    pub kind: BundleKind,
+}
+
+/// Kind of object a [`BundleRef`] names.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub enum BundleKind {
+    /// A `Secret`.
+    Secret,
+    /// A `ConfigMap`.
+    ConfigMap,
+}
+
+/// The invite token's `Secret` in the operator namespace.
+///
+/// The Secret must carry the label `grid.praxis.fast/site: <site name>`, naming this
+/// `GridSite`. The operator refuses one without it, so an unrelated Secret is never
+/// sent as a token.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InviteSecretRef {
+    /// Secret name.
+    #[schemars(length(min = 1, max = 253))]
+    pub name: String,
+    /// Key holding the token.
+    #[serde(default = "default_invite_key")]
+    #[schemars(length(min = 1, max = 253))]
+    pub key: String,
+}
+
+/// Default [`BundleRef::key`].
+fn default_bundle_key() -> String {
+    "ca.crt".to_owned()
+}
+
+/// Default [`InviteSecretRef::key`].
+fn default_invite_key() -> String {
+    "token".to_owned()
 }
 
 /// Trust policy controlling when a [`GridSite`] can advance to `Active`.
@@ -173,6 +330,13 @@ pub struct GridSiteStatus {
     /// Capabilities offered by this site.
     #[serde(default)]
     pub capabilities: SiteCapabilities,
+
+    /// On this cluster's own site: `Available`, `Progressing`, `Degraded`, `Accepted`,
+    /// `ResolvedRefs`, `Enrolled`, `IdentityValid` and `RotationOnSchedule`. Authoritative
+    /// there, where `phase` is informational.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["type"]))]
+    pub conditions: Vec<Condition>,
 
     /// Timestamp of the last probe whose resulting status was persisted.
     ///
@@ -571,5 +735,121 @@ mod tests {
             }),
             "CRD must reject both endpoint names"
         );
+    }
+
+    /// The rules of a schema node, as text.
+    fn rules(node: &serde_json::Value) -> Vec<&str> {
+        node.get("x-kubernetes-validations")
+            .and_then(serde_json::Value::as_array)
+            .map(|rules| {
+                rules
+                    .iter()
+                    .filter_map(|rule| rule.get("rule").and_then(serde_json::Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The `spec.local` schema node.
+    fn local_schema() -> serde_json::Value {
+        crd_json()
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/local")
+            .cloned()
+            .unwrap_or_else(|| std::process::abort())
+    }
+
+    #[test]
+    fn the_local_site_fields_live_under_spec_local() {
+        let crd = crd_json();
+        let spec = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec")
+            .unwrap_or_else(|| std::process::abort());
+        for moved in ["signerEndpoint", "inviteSecretRef", "rotation"] {
+            assert!(
+                spec.pointer(&format!("/properties/{moved}")).is_none(),
+                "{moved} belongs under local"
+            );
+        }
+        assert!(
+            local_schema().pointer("/properties/rotation").is_none(),
+            "rotation belongs under signerEndpoint"
+        );
+        assert!(
+            !rules(spec).iter().any(|rule| rule.contains("inviteSecretRef")),
+            "the invite rule belongs under local"
+        );
+        assert_eq!(
+            rules(&local_schema()),
+            ["!has(self.inviteSecretRef) || (has(self.signerEndpoint) && has(self.signerEndpoint.caBundleRef))"]
+        );
+    }
+
+    #[test]
+    fn rotation_defaults_to_enabled_under_the_signer_which_keeps_its_rules() {
+        let local = local_schema();
+        let signer = local
+            .pointer("/properties/signerEndpoint")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            signer.pointer("/properties/rotation/default"),
+            Some(&serde_json::json!("Enabled")),
+            "rotation defaults to Enabled"
+        );
+        assert_eq!(
+            signer.pointer("/properties/rotation/enum"),
+            Some(&serde_json::json!(["Enabled", "Disabled"]))
+        );
+        assert_eq!(
+            signer.pointer("/required"),
+            Some(&serde_json::json!(["url"])),
+            "rotation is defaulted, never required"
+        );
+        assert_eq!(
+            rules(signer).len(),
+            6,
+            "https, no query or fragment, a host, a numeric port, no credentials, and the grid domain: {:?}",
+            rules(signer)
+        );
+    }
+
+    #[test]
+    fn the_label_requirements_are_in_the_field_descriptions() {
+        let local = local_schema();
+        let describes = |path: &str, label: &str| {
+            local
+                .pointer(&format!("{path}/description"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.contains(label))
+        };
+        for bundle in ["caBundleRef", "gridCaBundleRef"] {
+            let path = format!("/properties/signerEndpoint/properties/{bundle}");
+            assert_eq!(
+                local.pointer(&format!("{path}/required")),
+                Some(&serde_json::json!(["kind", "name"])),
+                "{bundle}: kind is never defaulted"
+            );
+            assert!(describes(&path, "grid.praxis.fast/signer-bundle"), "{bundle}");
+        }
+        assert!(describes("/properties/inviteSecretRef", "grid.praxis.fast/site"));
+    }
+
+    #[test]
+    fn a_bundle_ref_without_a_kind_is_refused() {
+        let json = serde_json::json!({
+            "gridNetworkRef": "production",
+            "local": {"signerEndpoint": {"url": "https://enroll.example.com", "caBundleRef": {"name": "grid-ca-bundle"}}}
+        });
+        let result: Result<GridSiteSpec, _> = serde_json::from_value(json);
+        assert!(result.is_err(), "kind is required");
+        let complete = serde_json::json!({
+            "gridNetworkRef": "production",
+            "local": {"signerEndpoint": {"url": "https://enroll.example.com", "caBundleRef": {"kind": "ConfigMap", "name": "grid-ca"}}}
+        });
+        let spec: GridSiteSpec = serde_json::from_value(complete).unwrap_or_else(|_| std::process::abort());
+        let local = spec.local.unwrap_or_else(|| std::process::abort());
+        let signer = local.signer_endpoint.unwrap_or_else(|| std::process::abort());
+        assert_eq!(signer.rotation, Rotation::Enabled, "rotation defaults to Enabled");
+        let bundle = signer.ca_bundle_ref.unwrap_or_else(|| std::process::abort());
+        assert_eq!((bundle.kind, bundle.key.as_str()), (BundleKind::ConfigMap, "ca.crt"));
     }
 }

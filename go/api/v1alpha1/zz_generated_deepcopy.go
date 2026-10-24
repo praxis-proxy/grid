@@ -1141,6 +1141,82 @@ func (in *GridSiteGatewayEndpoint) DeepCopy() *GridSiteGatewayEndpoint {
 	return out
 }
 
+func (in *InviteSecretRef) DeepCopyInto(out *InviteSecretRef) {
+	*out = *in
+	if in.Key != nil {
+		x := *in.Key
+		out.Key = &x
+	}
+}
+
+func (in *InviteSecretRef) DeepCopy() *InviteSecretRef {
+	if in == nil {
+		return nil
+	}
+	out := new(InviteSecretRef)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *BundleRef) DeepCopyInto(out *BundleRef) {
+	*out = *in
+	if in.Key != nil {
+		x := *in.Key
+		out.Key = &x
+	}
+}
+
+func (in *BundleRef) DeepCopy() *BundleRef {
+	if in == nil {
+		return nil
+	}
+	out := new(BundleRef)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *GridSiteLocalSignerEndpoint) DeepCopyInto(out *GridSiteLocalSignerEndpoint) {
+	*out = *in
+	if in.CABundleRef != nil {
+		out.CABundleRef = new(BundleRef)
+		in.CABundleRef.DeepCopyInto(out.CABundleRef)
+	}
+	if in.GridCABundleRef != nil {
+		out.GridCABundleRef = new(BundleRef)
+		in.GridCABundleRef.DeepCopyInto(out.GridCABundleRef)
+	}
+}
+
+func (in *GridSiteLocalSignerEndpoint) DeepCopy() *GridSiteLocalSignerEndpoint {
+	if in == nil {
+		return nil
+	}
+	out := new(GridSiteLocalSignerEndpoint)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *GridSiteLocal) DeepCopyInto(out *GridSiteLocal) {
+	*out = *in
+	if in.InviteSecretRef != nil {
+		out.InviteSecretRef = new(InviteSecretRef)
+		in.InviteSecretRef.DeepCopyInto(out.InviteSecretRef)
+	}
+	if in.SignerEndpoint != nil {
+		out.SignerEndpoint = new(GridSiteLocalSignerEndpoint)
+		in.SignerEndpoint.DeepCopyInto(out.SignerEndpoint)
+	}
+}
+
+func (in *GridSiteLocal) DeepCopy() *GridSiteLocal {
+	if in == nil {
+		return nil
+	}
+	out := new(GridSiteLocal)
+	in.DeepCopyInto(out)
+	return out
+}
+
 func (in *GridSiteTrust) DeepCopyInto(out *GridSiteTrust) {
 	*out = *in
 	if in.CanonicalFingerprints != nil {
@@ -1167,6 +1243,10 @@ func (in *GridSiteSpec) DeepCopyInto(out *GridSiteSpec) {
 	if in.GatewayEndpoint != nil {
 		out.GatewayEndpoint = new(GridSiteGatewayEndpoint)
 		in.GatewayEndpoint.DeepCopyInto(out.GatewayEndpoint)
+	}
+	if in.Local != nil {
+		out.Local = new(GridSiteLocal)
+		in.Local.DeepCopyInto(out.Local)
 	}
 	if in.Region != nil {
 		x := *in.Region
@@ -1221,6 +1301,12 @@ func (in *GridSiteStatus) DeepCopyInto(out *GridSiteStatus) {
 	if in.Capabilities != nil {
 		out.Capabilities = new(GridSiteCapabilities)
 		in.Capabilities.DeepCopyInto(out.Capabilities)
+	}
+	if in.Conditions != nil {
+		out.Conditions = make([]metav1.Condition, len(in.Conditions))
+		for i := range in.Conditions {
+			in.Conditions[i].DeepCopyInto(&out.Conditions[i])
+		}
 	}
 	if in.LastProbeTime != nil {
 		x := *in.LastProbeTime

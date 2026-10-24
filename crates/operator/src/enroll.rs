@@ -1,25 +1,20 @@
 //! Site auto-enroll: redeem a one-time token for the grid identity.
 
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{collections::BTreeMap, time::Duration};
 
-use clap::Args;
 use k8s_openapi::{ByteString, api::core::v1::Secret};
 use kube::{
     Api, Client,
     api::{ListParams, ObjectMeta, PostParams},
 };
 use reqwest::{StatusCode, Url};
-use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize as _, Zeroizing};
 
-use crate::{crd::grid_network::GridNetwork, resources::tls_backend};
+use crate::{
+    crd::{grid_network::GridNetwork, grid_site::InviteSecretRef},
+    resources::tls_backend,
+};
 
-/// The enroll route on the enrollment service.
-const ENROLL_PATH: &str = "/v1alpha1/enrollments";
 
 /// Response size cap.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
@@ -40,59 +35,11 @@ const SITE_LABEL: &str = "grid.praxis.fast/site";
 const SPENT: &str = "Delete the site's enrollment on the hub with enrollment-admin, then mint a new invite with \
      allowDeletedName as a grid-admin that also holds enrollment-admin.";
 
-/// Auto-enroll configuration.
-#[derive(Args, Debug, Clone)]
-// clap panics on a duplicate default group id.
-#[group(id = "enrollment")]
-pub struct Config {
-    /// Enroll on startup when the site identity Secret is absent.
-    #[arg(long = "enroll", env = "GRID_ENROLL_ENABLED")]
-    pub enabled: bool,
+/// Secret the site identity is written to when no `GridNetwork` names one.
+pub const IDENTITY_SECRET: &str = "grid-site-identity";
 
-    /// Enrollment service base URL (https).
-    #[arg(long = "enroll-url", env = "GRID_ENROLL_URL")]
-    pub url: Option<String>,
-
-    /// PEM bundle pinning the enrollment server.
-    #[arg(long = "enroll-ca-file", env = "GRID_ENROLL_CA_FILE")]
-    pub ca_file: Option<PathBuf>,
-
-    /// Grid CA anchors, defaulting to the TLS pin.
-    #[arg(long = "enroll-grid-ca-file", env = "GRID_ENROLL_GRID_CA_FILE")]
-    pub grid_ca_file: Option<PathBuf>,
-
-    /// Site name the token pins.
-    #[arg(long = "enroll-site-name", env = "GRID_ENROLL_SITE_NAME")]
-    pub site_name: Option<String>,
-
-    /// Secret in the operator namespace holding the site token.
-    #[arg(long = "enroll-token-secret", env = "GRID_ENROLL_TOKEN_SECRET")]
-    pub token_secret: Option<String>,
-
-    /// Key of the site token within that Secret.
-    #[arg(
-        long = "enroll-token-secret-key",
-        env = "GRID_ENROLL_TOKEN_SECRET_KEY",
-        default_value = "token"
-    )]
-    pub token_secret_key: String,
-
-    /// Secret the site identity is written to, unless the `GridNetwork` names one.
-    #[arg(
-        long = "enroll-identity-secret",
-        env = "GRID_ENROLL_IDENTITY_SECRET",
-        default_value = "grid-site-identity"
-    )]
-    pub identity_secret: String,
-
-    /// Secret the grid CA is written to, unless the `GridNetwork` names one.
-    #[arg(long = "enroll-ca-secret", env = "GRID_ENROLL_CA_SECRET", default_value = "grid-ca")]
-    pub ca_secret: String,
-
-    /// Renew the site identity through the enrollment service before it expires.
-    #[arg(long = "rotate", env = "GRID_ROTATION_ENABLED")]
-    pub renew: bool,
-}
+/// Secret the grid CA is written to when no `GridNetwork` names one.
+pub const CA_SECRET: &str = "grid-ca";
 
 /// Why enrollment did not complete.
 #[derive(Debug, thiserror::Error)]
@@ -100,6 +47,23 @@ pub enum EnrollError {
     /// The configuration cannot work as given.
     #[error("enrollment misconfigured: {0}")]
     Config(String),
+
+    /// The signer's serving certificate does not chain to the pinned bundle.
+    #[error("TLS to the enrollment service failed, check local.signerEndpoint.caBundleRef: {0}")]
+    SignerUntrusted(String),
+
+    /// The signer's serving certificate is outside its validity window. Nothing was sent,
+    /// and the next poll retries, since the signer recovers by rotating it.
+    #[error("the enrollment service's serving certificate is expired or not yet valid; retried on the next poll: {0}")]
+    SignerLapsed(String),
+
+    /// An object the local `GridSite` names does not exist.
+    #[error("{0}")]
+    RefNotFound(String),
+
+    /// The invite was minted for another site.
+    #[error("{0}")]
+    NameMismatch(String),
 
     /// The service refused the token.
     #[error("site token rejected ({0}). If it expired or was revoked, mint a new one. {SPENT}")]
@@ -132,7 +96,7 @@ pub enum EnrollError {
     #[error("enrolled but the identity was not stored ({0}). The token is spent. {SPENT}")]
     NotStored(String),
 
-    /// A Kubernetes call failed in a way retrying cannot fix.
+    /// A Kubernetes call failed. Retried on the next poll.
     #[error("kubernetes: {0}")]
     Kube(String),
 }
@@ -207,8 +171,8 @@ where
 struct Settings {
     /// Service base URL, https.
     base: Url,
-    /// Client pinned to the service's CA bundle.
-    http: reqwest::Client,
+    /// PEM bundle pinning the service's serving certificate.
+    pin_pem: String,
     /// PEM bundle the returned grid CA must match.
     anchor_pem: String,
     /// Site name the token pins.
@@ -224,55 +188,101 @@ struct Settings {
 }
 
 impl Settings {
-    /// Validate `config`, reading the CA bundles and building the client.
-    fn from_config(config: &Config) -> Result<Self, EnrollError> {
-        let raw = required(config.url.as_deref(), "GRID_ENROLL_URL")?;
-        let base = Url::parse(&raw).map_err(|e| EnrollError::Config(format!("GRID_ENROLL_URL: {e}")))?;
-        // Plaintext would expose the token.
-        if base.scheme() != "https" {
-            return Err(EnrollError::Config("GRID_ENROLL_URL must be an https URL".to_owned()));
-        }
-        let site_name = required(config.site_name.as_deref(), "GRID_ENROLL_SITE_NAME")?;
-        certs::validate_site_name(&site_name)
-            .map_err(|e| EnrollError::Config(format!("GRID_ENROLL_SITE_NAME: {e}")))?;
-        let ca_file = config
-            .ca_file
-            .as_deref()
-            .ok_or_else(|| EnrollError::Config("GRID_ENROLL_CA_FILE is required".to_owned()))?;
-        let ca_pem = read_pem(ca_file)?;
-        let http = http_client(pem_roots(&ca_pem, "GRID_ENROLL_CA_FILE")?)?;
-        let anchor_pem = config.grid_ca_file.as_deref().map_or(Ok(ca_pem), read_anchors)?;
+    /// Validate the local site's signer and invite, with the bundles they name.
+    fn new(
+        site_name: &str,
+        url: &str,
+        invite: &InviteSecretRef,
+        pin_pem: &str,
+        anchor_pem: Option<&str>,
+    ) -> Result<Self, EnrollError> {
+        let base = signer_url(url).map_err(EnrollError::Config)?;
+        certs::validate_site_name(site_name).map_err(|e| EnrollError::Config(format!("site name {site_name}: {e}")))?;
+        pem_roots(pin_pem, "local.signerEndpoint.caBundleRef")?;
+        let anchor_pem = match anchor_pem {
+            Some(anchors) => {
+                pem_roots(anchors, "local.signerEndpoint.gridCaBundleRef")?;
+                anchors.to_owned()
+            },
+            None => pin_pem.to_owned(),
+        };
         Ok(Self {
             base,
-            http,
+            pin_pem: pin_pem.to_owned(),
             anchor_pem,
-            site_name,
-            token_secret: required(config.token_secret.as_deref(), "GRID_ENROLL_TOKEN_SECRET")?,
-            token_key: config.token_secret_key.clone(),
+            site_name: site_name.to_owned(),
+            token_secret: required(Some(&invite.name), "local.inviteSecretRef.name")?,
+            token_key: required(Some(&invite.key), "local.inviteSecretRef.key")?,
             backoff: STEP_BACKOFF,
-            defaults: Target {
-                site_secret: required(Some(&config.identity_secret), "GRID_ENROLL_IDENTITY_SECRET")?,
-                ca_secret: required(Some(&config.ca_secret), "GRID_ENROLL_CA_SECRET")?,
-            },
+            defaults: Target::defaults(),
         })
     }
 
-    /// `path` under the base URL.
-    fn endpoint(&self, path: &str) -> String {
-        format!("{}{path}", self.base.as_str().trim_end_matches('/'))
+    /// The signer these settings name, reusing `clients`.
+    fn signer<'clients>(&self, clients: &'clients signer::Clients) -> signer::HttpsSigner<'clients> {
+        signer::HttpsSigner::new(self.base.clone(), Some(self.pin_pem.clone()), clients)
     }
 }
 
-/// Read a PEM file.
-fn read_pem(path: &Path) -> Result<String, EnrollError> {
-    std::fs::read_to_string(path).map_err(|e| EnrollError::Config(format!("reading {}: {e}", path.display())))
+/// The signer's base URL: https, and outside the grid domain.
+///
+/// # Errors
+///
+/// Returns a message when the URL does not parse, is not https, carries credentials,
+/// percent-encodes its authority, or names a host under the grid domain.
+pub(crate) fn signer_url(raw: &str) -> Result<Url, String> {
+    let url = Url::parse(raw.trim()).map_err(|e| format!("local.signerEndpoint.url: {e}"))?;
+    // Plaintext would expose the token.
+    if url.scheme() != "https" {
+        return Err("local.signerEndpoint.url must be an https URL".to_owned());
+    }
+    // The operator appends its own paths, so a base URL carries neither.
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("local.signerEndpoint.url is a base URL and carries no query or fragment".to_owned());
+    }
+    // Credentials in the URL would be sent as Basic auth and published in the GridSite status.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("local.signerEndpoint.url must not carry credentials".to_owned());
+    }
+    raw_authority(raw)?;
+    // Any site leaf names a host under the grid domain, so one could stand in for the signer.
+    // The CRD's CEL rule on local.signerEndpoint spells the same domain out, since CEL cannot
+    // read this constant; one case table in tests.rs holds the two together.
+    let host = url
+        .host_str()
+        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        .unwrap_or_default();
+    let grid_domain = certs::SPIFFE_TRUST_DOMAIN;
+    if host == grid_domain || host.ends_with(&format!(".{grid_domain}")) {
+        return Err(format!(
+            "local.signerEndpoint.url must not name a host under {grid_domain}, where site certificates live"
+        ));
+    }
+    Ok(url)
 }
 
-/// Read the grid CA anchors, refusing a bundle with no certificate.
-fn read_anchors(path: &Path) -> Result<String, EnrollError> {
-    let pem = read_pem(path)?;
-    pem_roots(&pem, "GRID_ENROLL_GRID_CA_FILE")?;
-    Ok(pem)
+/// Refuse what parsing forgives in the authority of `raw`: an empty host, a
+/// percent-encoded one, or an empty or non-numeric port, each of which would slip past
+/// the domain rule. The CRD refuses the same on the raw text.
+fn raw_authority(raw: &str) -> Result<(), String> {
+    let authority = raw
+        .trim()
+        .split_once("://")
+        .map_or("", |(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default());
+    if authority.is_empty() {
+        return Err("local.signerEndpoint.url must name a host".to_owned());
+    }
+    if authority.contains('%') {
+        return Err("local.signerEndpoint.url must not percent-encode the host".to_owned());
+    }
+    let port = match authority.rsplit_once(']') {
+        Some((_host, after)) if authority.starts_with('[') => after.strip_prefix(':'),
+        Some(_) | None => authority.rsplit_once(':').map(|(_host, port)| port),
+    };
+    if port.is_some_and(|port| port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit())) {
+        return Err("local.signerEndpoint.url port must be numeric".to_owned());
+    }
+    Ok(())
 }
 
 /// The certificates in `pem`, refusing a bundle with none.
@@ -296,6 +306,16 @@ struct Target {
     site_secret: String,
     /// Secret holding `ca.crt`.
     ca_secret: String,
+}
+
+impl Target {
+    /// [`IDENTITY_SECRET`] and [`CA_SECRET`].
+    fn defaults() -> Self {
+        Self {
+            site_secret: IDENTITY_SECRET.to_owned(),
+            ca_secret: CA_SECRET.to_owned(),
+        }
+    }
 }
 
 /// The identity Secrets to enroll into. The token pins the grid, so no `GridNetwork` is needed.
@@ -436,25 +456,33 @@ fn secret_value(secret: Secret, key: &str) -> Option<Zeroizing<Vec<u8>>> {
         .map(|bytes| Zeroizing::new(bytes.0))
 }
 
+/// Refuse an invite Secret not labelled for `site`. Required, so a `GridSite` cannot
+/// send an unrelated Secret as a token.
+fn minted_for(secret: &Secret, name: &str, site: &str) -> Result<(), EnrollError> {
+    match secret
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(SITE_LABEL))
+    {
+        Some(minted_for) if minted_for == site => Ok(()),
+        Some(minted_for) => Err(EnrollError::NameMismatch(format!(
+            "Secret {name} holds the token for site {minted_for}, not {site}"
+        ))),
+        None => Err(EnrollError::NameMismatch(format!(
+            "Secret {name} lacks the label {SITE_LABEL}={site} an invite carries"
+        ))),
+    }
+}
+
 /// The site token, refused if minted for another site.
 async fn site_token<S: Store + Sync>(store: &S, settings: &Settings) -> Result<Zeroizing<String>, EnrollError> {
     let name = &settings.token_secret;
     let secret = store
         .get(name)
         .await?
-        .ok_or_else(|| EnrollError::Config(format!("site token Secret {name} not found")))?;
-    let site = &settings.site_name;
-    if let Some(minted_for) = secret
-        .metadata
-        .labels
-        .as_ref()
-        .and_then(|labels| labels.get(SITE_LABEL))
-        && minted_for != site
-    {
-        return Err(EnrollError::Config(format!(
-            "Secret {name} holds the token for site {minted_for}, not {site}"
-        )));
-    }
+        .ok_or_else(|| EnrollError::RefNotFound(format!("invite Secret {name} not found")))?;
+    minted_for(&secret, name, &settings.site_name)?;
     let raw = secret_value(secret, &settings.token_key)
         .ok_or_else(|| EnrollError::Config(format!("Secret {name} has no key {}", settings.token_key)))?;
     let token = std::str::from_utf8(&raw)
@@ -551,8 +579,13 @@ async fn check_not_enrolled_elsewhere<S: Store + Sync>(
     Ok(())
 }
 
-/// Enroll unless already enrolled, then store the identity.
-async fn enroll<S: Store + Sync>(store: &S, settings: &Settings, target: &Target) -> Result<Outcome, EnrollError> {
+/// Enroll through `signer` unless already enrolled, then store the identity.
+async fn enroll<S: Store + Sync, G: Signer + Sync>(
+    store: &S,
+    signer: &G,
+    settings: &Settings,
+    target: &Target,
+) -> Result<Outcome, EnrollError> {
     if store.exists(&target.site_secret).await? {
         return Ok(Outcome::AlreadyEnrolled);
     }
@@ -562,8 +595,8 @@ async fn enroll<S: Store + Sync>(store: &S, settings: &Settings, target: &Target
     let token = site_token(store, settings).await?;
     let certs::GeneratedCsr { csr_pem, key_pem } =
         certs::generate_csr(&settings.site_name).map_err(|e| EnrollError::Config(format!("generating a CSR: {e}")))?;
-    let enrollment = Box::pin(redeem(settings, &token, &csr_pem)).await?;
-    let verified = checked_identity(&enrollment, &csr_pem, settings)?;
+    let issued = Box::pin(redeem(signer, settings.backoff, &token, &csr_pem)).await?;
+    let verified = checked_identity(&issued, &csr_pem, settings)?;
     if !certs::has_svid_profile(&verified.cert).unwrap_or(false) {
         tracing::warn!("issued certificate lacks the X.509-SVID profile, peers in spiffe trust mode will reject it");
     }
@@ -580,67 +613,50 @@ async fn enroll<S: Store + Sync>(store: &S, settings: &Settings, target: &Target
     })
 }
 
-/// Enroll request body.
-#[derive(Serialize)]
-struct EnrollmentRequest<'csr> {
-    /// PKCS#10 request, PEM.
-    csr: &'csr str,
-}
-
-/// The enroll response fields a site keeps.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Enrollment {
-    /// Issued leaf, PEM.
-    certificate: String,
-    /// Grid CA, PEM.
-    ca_certificate: String,
-}
-
-/// Error body the service returns.
-#[derive(Deserialize)]
-struct ErrorBody {
-    /// Machine-readable code.
-    error: String,
-    /// Human message.
-    message: String,
-}
-
-/// POST the CSR, retrying only pre-send failures.
-async fn redeem(settings: &Settings, token: &str, csr_pem: &str) -> Result<Enrollment, EnrollError> {
-    let url = settings.endpoint(ENROLL_PATH);
-    let (http, url, body) = (&settings.http, &url, &EnrollmentRequest { csr: csr_pem });
-    with_backoff(settings.backoff, "reaching the enrollment service", || async move {
-        let response = match http.post(url).bearer_auth(token).json(body).send().await {
-            Ok(response) => response,
-            Err(e) => return pre_send(&e),
-        };
-        let status = response.status();
-        let bytes = read_capped(response).await.map_err(EnrollError::MaybeSpent)?;
-        classify(status, &bytes).map(Attempt::Done)
+/// Present the invite to `signer`, retrying only a request that never left.
+async fn redeem<G: Signer + Sync>(
+    signer: &G,
+    backoff: Backoff,
+    token: &str,
+    csr_pem: &str,
+) -> Result<Issued, EnrollError> {
+    with_backoff(backoff, "reaching the enrollment service", || async move {
+        match signer.enroll(token, csr_pem).await {
+            Ok(issued) => Ok(Attempt::Done(issued)),
+            Err(SignerError::Transport { sent: false, detail }) => Ok(Attempt::Retry(detail)),
+            Err(error) => Err(enroll_error(error)),
+        }
     })
     .await
 }
 
-/// Retry connect failures, but not TLS failures.
-fn pre_send<T>(error: &reqwest::Error) -> Result<Attempt<T>, EnrollError> {
-    if error.is_builder() {
-        return Err(EnrollError::Config(error_chain(error)));
+/// What a signer's refusal means for enrollment.
+fn enroll_error(error: SignerError) -> EnrollError {
+    match error {
+        SignerError::Unauthenticated(detail) => EnrollError::TokenRejected(detail),
+        SignerError::Refused {
+            status: StatusCode::CONFLICT,
+            code: Some(code),
+            detail,
+        } if code == "name_taken" => EnrollError::NameTaken(detail),
+        SignerError::Refused {
+            status: StatusCode::CONFLICT,
+            code: Some(code),
+            detail,
+        } if code == "name_deleted" => EnrollError::NameDeleted(detail),
+        SignerError::Refused { detail, .. } => EnrollError::Refused(detail),
+        SignerError::Disabled(detail) | SignerError::Transport { detail, .. } => EnrollError::MaybeSpent(detail),
+        SignerError::Untrusted { lapsed: true, detail } => EnrollError::SignerLapsed(detail),
+        SignerError::Untrusted { lapsed: false, detail } => EnrollError::SignerUntrusted(detail),
+        SignerError::Request(detail) => EnrollError::Config(detail),
+        SignerError::Invalid(detail) => EnrollError::InvalidResponse(format!("the enrollment: {detail}")),
     }
-    if is_tls_failure(error) {
-        return Err(EnrollError::Config(format!(
-            "TLS to the enrollment service failed, check GRID_ENROLL_CA_FILE: {}",
-            error_chain(error)
-        )));
-    }
-    if error.is_connect() {
-        return Ok(Attempt::Retry(error_chain(error)));
-    }
-    Err(EnrollError::MaybeSpent(error_chain(error)))
 }
 
-/// Whether `error`'s chain holds a TLS failure.
-fn is_tls_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+/// `error` and its sources, through the error an `io::Error` wraps.
+fn chain<'error>(
+    error: &'error (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'error (dyn std::error::Error + 'static)> {
     std::iter::successors(Some(error), |err| {
         // io::Error::source skips its wrapped error.
         err.downcast_ref::<std::io::Error>()
@@ -648,30 +664,11 @@ fn is_tls_failure(error: &(dyn std::error::Error + 'static)) -> bool {
             .map(|inner| -> &(dyn std::error::Error + 'static) { inner })
             .or_else(|| err.source())
     })
-    .any(tls_backend::is_tls_error)
 }
 
-/// Decode an enroll response.
-fn classify(status: StatusCode, body: &[u8]) -> Result<Enrollment, EnrollError> {
-    if status.is_success() {
-        return serde_json::from_slice(body)
-            .map_err(|e| EnrollError::InvalidResponse(format!("decoding the enrollment: {e}")));
-    }
-    let error = serde_json::from_slice::<ErrorBody>(body).ok();
-    let detail = error.as_ref().map_or_else(
-        || status.to_string(),
-        |err| format!("{status} {}: {}", err.error, err.message),
-    );
-    Err(match status {
-        StatusCode::UNAUTHORIZED => EnrollError::TokenRejected(detail),
-        StatusCode::CONFLICT => match error.as_ref().map(|err| err.error.as_str()) {
-            Some("name_taken") => EnrollError::NameTaken(detail),
-            Some("name_deleted") => EnrollError::NameDeleted(detail),
-            _ => EnrollError::Refused(detail),
-        },
-        _ if status.is_server_error() => EnrollError::MaybeSpent(detail),
-        _ => EnrollError::Refused(detail),
-    })
+/// Whether `error`'s chain holds a TLS failure.
+fn is_tls_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+    chain(error).any(tls_backend::is_tls_error)
 }
 
 /// Read a body, refusing one past [`MAX_RESPONSE_BYTES`].
@@ -707,7 +704,7 @@ struct Verified {
 }
 
 /// Check the identity against the pin, site name, and key.
-fn checked_identity(enrollment: &Enrollment, csr_pem: &str, settings: &Settings) -> Result<Verified, EnrollError> {
+fn checked_identity(enrollment: &Issued, csr_pem: &str, settings: &Settings) -> Result<Verified, EnrollError> {
     let invalid = EnrollError::InvalidResponse;
     let ca = certs::anchored_ca(&enrollment.ca_certificate, &settings.anchor_pem).map_err(|e| {
         if e == certs::VerifyError::NotAnchored {
@@ -845,37 +842,11 @@ async fn keep_existing_ca<S: Store + Sync>(
     }
 }
 
-/// A client that trusts only `roots`.
-fn http_client(roots: Vec<reqwest::Certificate>) -> Result<reqwest::Client, EnrollError> {
-    grid_client::trusted_client(roots, None, grid_client::Timeouts::ENROLLMENT)
-        .map_err(|e| EnrollError::Config(error_chain(&e)))
-}
-
-/// Resolve the target, then enroll into it.
-async fn run(client: &Client, settings: &Settings) -> Result<(), EnrollError> {
-    let namespace = client.default_namespace().to_owned();
-    let target = Box::pin(resolve_target(client, &namespace, &settings.defaults, settings.backoff)).await?;
-    let store = KubeStore(Api::namespaced(client.clone(), &namespace));
-    let site = &target.site_secret;
-    match Box::pin(enroll(&store, settings, &target)).await? {
-        Outcome::AlreadyEnrolled => tracing::info!(secret = %site, "site identity present, enrollment skipped"),
-        Outcome::Enrolled(spiffe_id) => tracing::info!(%spiffe_id, secret = %site, "site enrolled"),
-        Outcome::Discarded => tracing::info!(secret = %site, "site identity stored by another writer"),
-    }
-    Ok(())
-}
-
-/// Enroll this site unless its identity Secret already exists.
-///
-/// # Errors
-///
-/// Returns [`EnrollError`] when enrollment does not complete.
-pub async fn ensure_enrolled(client: &Client, config: &Config) -> Result<(), EnrollError> {
-    let settings = Settings::from_config(config)?;
-    Box::pin(run(client, &settings)).await
-}
-
+pub mod local;
 pub mod renew;
+mod signer;
+
+use signer::{Issued, Signer, SignerError};
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "tests")]

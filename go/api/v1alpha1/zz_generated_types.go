@@ -275,6 +275,22 @@ const (
 	EgressTLSModePlaintext EgressTLSMode = "Plaintext"
 )
 
+// BundleKind is a string enumeration.
+type BundleKind string
+
+const (
+	BundleKindSecret    BundleKind = "Secret"
+	BundleKindConfigMap BundleKind = "ConfigMap"
+)
+
+// GridSiteLocalSignerEndpointRotation is a string enumeration.
+type GridSiteLocalSignerEndpointRotation string
+
+const (
+	GridSiteLocalSignerEndpointRotationEnabled  GridSiteLocalSignerEndpointRotation = "Enabled"
+	GridSiteLocalSignerEndpointRotationDisabled GridSiteLocalSignerEndpointRotation = "Disabled"
+)
+
 // GridSitePhase is a string enumeration.
 type GridSitePhase string
 
@@ -918,6 +934,53 @@ type GridSiteGatewayEndpoint struct {
 	TLS *GridSiteGatewayEndpointTLS `json:"tls,omitempty"`
 }
 
+// InviteSecretRef Secret holding the one-time invite token this site enrolls with.
+// The token is an opaque credential the signer issued: the operator presents it and never parses it. Read once, while the site has no identity. The Secret must carry the label grid.praxis.fast/site: <site name>, naming this GridSite.
+type InviteSecretRef struct {
+	// Key holding the token.
+	Key *string `json:"key,omitempty"`
+	// Secret name.
+	Name string `json:"name"`
+}
+
+// BundleRef CA bundle pinning the signer's serving certificate.
+// Required to enroll. Renewal falls back to the grid CA the site holds. The object must carry the label grid.praxis.fast/signer-bundle: "true".
+type BundleRef struct {
+	// Key holding the PEM bundle.
+	Key *string `json:"key,omitempty"`
+	// Kind of the object holding the bundle: Secret or ConfigMap.
+	Kind BundleKind `json:"kind"`
+	// Object name.
+	Name string `json:"name"`
+}
+
+// GridSiteLocalSignerEndpoint The signer this site enrolls and renews its identity through.
+// Unset, nothing renews the identity, and RotationOnSchedule says so.
+type GridSiteLocalSignerEndpoint struct {
+	// CA bundle pinning the signer's serving certificate.
+	// Required to enroll. Renewal falls back to the grid CA the site holds. The object must carry the label grid.praxis.fast/signer-bundle: "true".
+	CABundleRef *BundleRef `json:"caBundleRef,omitempty"`
+	// Grid CA the signer's returned CA must match, when it differs from caBundleRef.
+	// A bootstrap override for a signer that cannot serve its own bundle, such as one behind a certificate from another CA. The object must carry the label grid.praxis.fast/signer-bundle: "true".
+	GridCABundleRef *BundleRef `json:"gridCaBundleRef,omitempty"`
+	// Whether this operator renews the identity through the signer.
+	// Enabled, the default, renews when a third of the lifetime remains and is refused under pin peer trust: the own site reports Accepted False with RotationUnsupportedUnderPinTrust and nothing renews. Disabled uses the signer to enroll only. Enrollment runs whatever this says.
+	Rotation GridSiteLocalSignerEndpointRotation `json:"rotation,omitempty"`
+	// Base URL of the signer: https, naming a host with an optional numeric port, with no credentials, no query or fragment, no percent-encoding before the path, and not under grid.internal.
+	URL string `json:"url"`
+}
+
+// GridSiteLocal This cluster's own site: how it enrolls and renews its identity.
+// Set on one GridSite only. Before the site has an identity, the GridSite carrying local is this cluster's own site. Once it has one, the GridSite named after the identity's site is, and a local set elsewhere is reported on that object and never acted on.
+type GridSiteLocal struct {
+	// Secret holding the one-time invite token this site enrolls with.
+	// The token is an opaque credential the signer issued: the operator presents it and never parses it. Read once, while the site has no identity. The Secret must carry the label grid.praxis.fast/site: <site name>, naming this GridSite.
+	InviteSecretRef *InviteSecretRef `json:"inviteSecretRef,omitempty"`
+	// The signer this site enrolls and renews its identity through.
+	// Unset, nothing renews the identity, and RotationOnSchedule says so.
+	SignerEndpoint *GridSiteLocalSignerEndpoint `json:"signerEndpoint,omitempty"`
+}
+
 // GridSiteTrust Trust policy for this site.
 // When configured, the operator verifies the received public certificate against this policy before promoting the site to Active. If absent, the site remains Connecting with reason TrustMaterialMissing regardless of certificate material.
 type GridSiteTrust struct {
@@ -939,6 +1002,9 @@ type GridSiteSpec struct {
 	// Name of the [GridNetwork] this site belongs to.
 	// [GridNetwork]: crate::crd::grid_network::GridNetwork
 	GridNetworkRef string `json:"gridNetworkRef"`
+	// This cluster's own site: how it enrolls and renews its identity.
+	// Set on one GridSite only. Before the site has an identity, the GridSite carrying local is this cluster's own site. Once it has one, the GridSite named after the identity's site is, and a local set elsewhere is reported on that object and never acted on.
+	Local *GridSiteLocal `json:"local,omitempty"`
 	// Deployment region.
 	Region *string `json:"region,omitempty"`
 	// Sovereignty zone for data residency constraints.
@@ -969,6 +1035,8 @@ type GridSiteStatus struct {
 	AbsentSince *string `json:"absentSince,omitempty"`
 	// Capabilities offered by this site.
 	Capabilities *GridSiteCapabilities `json:"capabilities,omitempty"`
+	// On this cluster's own site: Available, Progressing, Degraded, Accepted, ResolvedRefs, Enrolled, IdentityValid and RotationOnSchedule. Authoritative there, where phase is informational.
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 	// Timestamp of the last probe whose resulting status was persisted.
 	// This is not a liveness heartbeat; it may remain unchanged when a probe produces no status changes.
 	LastProbeTime *string `json:"lastProbeTime,omitempty"`

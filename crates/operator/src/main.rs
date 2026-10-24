@@ -134,32 +134,42 @@ async fn main() {
     let (trigger, shutdown) = operator::shutdown::Trigger::new();
     tokio::spawn(watch_for_termination(trigger));
 
-    if config.enrollment.enabled {
-        let enrolled = tokio::select! {
-            biased;
-            () = shutdown.triggered() => {
-                tracing::info!("stood down before enrolling");
-                return;
-            },
-            result = Box::pin(operator::enroll::ensure_enrolled(&client, &config.enrollment)) => result,
-        };
-        if let Err(error) = enrolled {
-            tracing::error!(%error, "site enrollment failed");
-            std::process::exit(1);
-        }
-    }
     // The identity names the site, and without one the site idles.
+    let invalid_identity = |error: &str| -> SiteIdentity {
+        tracing::error!(error, "invalid site identity or name");
+        std::process::exit(1)
+    };
+    let mut found = site_from_identity(&client, &config)
+        .await
+        .unwrap_or_else(|error| invalid_identity(&error));
+    // The local GridSite enrolls the site now, else while it waits for an identity.
+    let mut enrollment = operator::enroll::local::Enrollment::default();
+    let identified_as = found.name.as_deref().filter(|_name| found.present);
+    let stepped = tokio::select! {
+        biased;
+        () = shutdown.triggered() => {
+            tracing::info!("stood down before enrolling");
+            return;
+        },
+        stepped = Box::pin(enrollment.step(&client, identified_as)) => stepped,
+    };
+    match stepped {
+        // The identity just written names the site, so this process serves under it.
+        Ok(operator::enroll::local::Step::Enrolled) => {
+            found = site_from_identity(&client, &config)
+                .await
+                .unwrap_or_else(|error| invalid_identity(&error));
+        },
+        Ok(_) => {},
+        Err(error) => {
+            tracing::warn!(%error, "listing GridSites to enroll failed, retrying while waiting for an identity");
+        },
+    }
     let SiteIdentity {
         at: identity,
         present: has_identity,
         name: site_name,
-    } = match site_from_identity(&client, &config).await {
-        Ok(found) => found,
-        Err(error) => {
-            tracing::error!(%error, "invalid site identity or name");
-            std::process::exit(1);
-        },
-    };
+    } = found;
     config.swim.site_name = site_name;
     let startup = SiteStartup::resolve(config.swim.site_name.is_some(), has_identity);
     match startup {
@@ -179,7 +189,7 @@ async fn main() {
         }
     }
     let install_modes = GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust);
-    let modes = match resolve_grid_modes(&client, config.enrollment.enabled, install_modes).await {
+    let modes = match resolve_grid_modes(&client, has_identity, install_modes).await {
         Ok(modes) => modes,
         Err(error) => {
             tracing::error!(%error, "failed to resolve grid modes");
@@ -190,19 +200,15 @@ async fn main() {
     let trust = modes.trust;
     // The loop follows the declared peer trust, which may change after startup.
     let (declared_trust, trust_changes) = tokio::sync::watch::channel(trust);
-    let mut rotation_running = false;
-    if config.enrollment.renew {
-        match operator::enroll::renew::Settings::from_config(&config.enrollment) {
-            Ok(settings) => {
-                rotation_running = true;
-                let install = GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust);
-                let settings = settings
-                    .with_gateway(&config.gateway.namespace, &config.gateway.service_name)
-                    .with_declared_trust(install, trust_changes);
-                drop(tokio::spawn(operator::enroll::renew::run(client.clone(), settings)));
-            },
-            Err(error) => tracing::error!(%error, "site identity rotation is off: misconfigured"),
-        }
+    // Renews through the signer the local GridSite names; an unidentified site restarts once enrolled.
+    let rotation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if has_identity {
+        let settings = operator::enroll::renew::Settings::new()
+            .with_configured(Arc::clone(&rotation))
+            .with_site(config.swim.site_name.clone())
+            .with_gateway(&config.gateway.namespace, &config.gateway.service_name)
+            .with_declared_trust(install_modes, trust_changes);
+        drop(tokio::spawn(operator::enroll::renew::run(client.clone(), settings)));
     }
     let signals_enabled = matches!(signal_mode, SignalMode::Poll);
     let peer_settings = grid_network::PeerSettings {
@@ -216,7 +222,7 @@ async fn main() {
         OperatorCtx::new(client.clone(), None, signal_mode)
             .with_peer_settings(peer_settings)
             .with_declared_trust(declared_trust)
-            .with_rotation(rotation_running)
+            .with_rotation(rotation)
             .with_site_name(config.swim.site_name.clone())
             .with_scrape_interval(config.signals.scrape_interval())
             .hold_membership(),
@@ -294,7 +300,7 @@ async fn main() {
     // it and creates its records.
     let identified = async {
         if startup.waits_for_identity() {
-            identity_appears(&client, &config).await;
+            identity_appears(&client, &config, &mut enrollment).await;
         } else {
             std::future::pending::<()>().await;
         }
@@ -1225,11 +1231,15 @@ impl SiteStartup {
 /// How often a site without an identity checks for one.
 const IDENTITY_POLL: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Resolve once the site identity appears, warning once per distinct error.
-async fn identity_appears(client: &Client, config: &Cli) {
+/// Resolve once the site identity appears, enrolling the local `GridSite` meanwhile and
+/// warning once per distinct error.
+async fn identity_appears(client: &Client, config: &Cli, enrollment: &mut operator::enroll::local::Enrollment) {
     let mut last_error = None;
     loop {
         tokio::time::sleep(IDENTITY_POLL).await;
+        if let Err(error) = Box::pin(enrollment.step(client, None)).await {
+            tracing::debug!(%error, "listing GridSites to enroll failed");
+        }
         match site_from_identity(client, config).await {
             Ok(SiteIdentity { present: true, .. }) => return,
             Ok(_) => last_error = None,
@@ -1259,7 +1269,7 @@ async fn site_from_identity(client: &Client, config: &Cli) -> Result<SiteIdentit
         .identity_namespace
         .clone()
         .unwrap_or_else(|| client.default_namespace().to_owned());
-    let at = operator::site_name::locate(client, &namespace, &config.enrollment.identity_secret)
+    let at = operator::site_name::locate(client, &namespace, operator::enroll::IDENTITY_SECRET)
         .await
         .map_err(|e| e.to_string())?;
     let pem = operator::site_name::identity_pem(client, &at)
@@ -1286,7 +1296,7 @@ async fn create_local_records(
         network: config.grid.network.clone(),
         site: site.to_owned(),
         identity,
-        ca_secret: config.enrollment.ca_secret.clone(),
+        ca_secret: operator::enroll::CA_SECRET.to_owned(),
         swim_key_secret: None,
         modes: GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust),
     };

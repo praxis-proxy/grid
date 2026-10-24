@@ -44,3 +44,103 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: remove deprecated value
+
+  - it: carries the signer and the invite onto this cluster's own site
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: site-a
+      gridSite.local:
+        signerEndpoint:
+          url: https://enroll.example.com
+          caBundleRef: { kind: Secret, name: grid-ca-bundle }
+        inviteSecretRef:
+          name: grid-invite-site-a
+    asserts:
+      - equal:
+          path: spec.local
+          value:
+            signerEndpoint:
+              url: https://enroll.example.com
+              caBundleRef: { kind: Secret, name: grid-ca-bundle }
+              rotation: Disabled
+            inviteSecretRef: { name: grid-invite-site-a }
+
+  - it: renders rotation Disabled on a signer under pin peer trust, the default
+    set:
+      gridNetwork.name: prod-grid
+      gridNetwork.peerTrust.mode: pin
+      gridSite.name: site-a
+      gridSite.local.signerEndpoint.url: https://enroll.example.com
+    asserts:
+      - equal:
+          path: spec.local.signerEndpoint.rotation
+          value: Disabled
+
+  - it: leaves rotation to the CRD default under spiffe peer trust
+    set:
+      gridNetwork.name: prod-grid
+      gridNetwork.peerTrust.mode: spiffe
+      gridSite.name: site-a
+      gridSite.local.signerEndpoint.url: https://enroll.example.com
+    asserts:
+      - notExists:
+          path: spec.local.signerEndpoint.rotation
+
+  - it: keeps an explicit rotation whatever the peer trust
+    set:
+      gridNetwork.name: prod-grid
+      gridNetwork.peerTrust.mode: pin
+      gridSite.name: site-a
+      gridSite.local.signerEndpoint.url: https://enroll.example.com
+      gridSite.local.signerEndpoint.rotation: Enabled
+    asserts:
+      - equal:
+          path: spec.local.signerEndpoint.rotation
+          value: Enabled
+
+  - it: renders no rotation without a signer
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: site-a
+      gridSite.local.inviteSecretRef.name: grid-invite-site-a
+    asserts:
+      - equal:
+          path: spec.local
+          value:
+            inviteSecretRef: { name: grid-invite-site-a }
+
+  - it: renders no local site by default
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: site-a
+    asserts:
+      - notExists:
+          path: spec.local
+
+  - it: refuses a plaintext signer
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: site-a
+      gridSite.local.signerEndpoint.url: http://enroll.example.com
+    asserts:
+      - failedTemplate:
+          errorPattern: "signerEndpoint[./]url"
+
+  - it: refuses a bundle without a kind
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: site-a
+      gridSite.local.signerEndpoint.url: https://enroll.example.com
+      gridSite.local.signerEndpoint.caBundleRef.name: grid-ca-bundle
+    asserts:
+      - failedTemplate:
+          errorPattern: "kind"
+
+  - it: refuses the signer outside local
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: site-a
+      gridSite.signerEndpoint.url: https://enroll.example.com
+    asserts:
+      - failedTemplate:
+          errorPattern: "signerEndpoint"

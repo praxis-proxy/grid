@@ -119,6 +119,146 @@ spec:
 
                     [`GridNetwork`]: crate::crd::grid_network::GridNetwork
                   type: string
+                local:
+                  description: |-
+                    This cluster's own site: how it enrolls and renews its identity.
+
+                    Set on one `GridSite` only. Before the site has an identity, the `GridSite`
+                    carrying `local` is this cluster's own site. Once it has one, the `GridSite`
+                    named after the identity's site is, and a `local` set elsewhere is reported
+                    on that object and never acted on.
+                  nullable: true
+                  properties:
+                    inviteSecretRef:
+                      description: |-
+                        Secret holding the one-time invite token this site enrolls with.
+
+                        The token is an opaque credential the signer issued: the operator presents it and
+                        never parses it. Read once, while the site has no identity. The Secret must carry
+                        the label `grid.praxis.fast/site: <site name>`, naming this `GridSite`.
+                      nullable: true
+                      properties:
+                        key:
+                          default: token
+                          description: Key holding the token.
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                        name:
+                          description: Secret name.
+                          maxLength: 253
+                          minLength: 1
+                          type: string
+                      required:
+                        - name
+                      type: object
+                    signerEndpoint:
+                      description: |-
+                        The signer this site enrolls and renews its identity through.
+
+                        Unset, nothing renews the identity, and `RotationOnSchedule` says so.
+                      nullable: true
+                      properties:
+                        caBundleRef:
+                          description: |-
+                            CA bundle pinning the signer's serving certificate.
+
+                            Required to enroll. Renewal falls back to the grid CA the site holds. The object
+                            must carry the label `grid.praxis.fast/signer-bundle: "true"`.
+                          nullable: true
+                          properties:
+                            key:
+                              default: ca.crt
+                              description: Key holding the PEM bundle.
+                              maxLength: 253
+                              minLength: 1
+                              type: string
+                            kind:
+                              description: 'Kind of the object holding the bundle: `Secret` or `ConfigMap`.'
+                              enum:
+                                - Secret
+                                - ConfigMap
+                              type: string
+                            name:
+                              description: Object name.
+                              maxLength: 253
+                              minLength: 1
+                              type: string
+                          required:
+                            - kind
+                            - name
+                          type: object
+                        gridCaBundleRef:
+                          description: |-
+                            Grid CA the signer's returned CA must match, when it differs from `caBundleRef`.
+
+                            A bootstrap override for a signer that cannot serve its own bundle, such as one
+                            behind a certificate from another CA. The object must carry the label
+                            `grid.praxis.fast/signer-bundle: "true"`.
+                          nullable: true
+                          properties:
+                            key:
+                              default: ca.crt
+                              description: Key holding the PEM bundle.
+                              maxLength: 253
+                              minLength: 1
+                              type: string
+                            kind:
+                              description: 'Kind of the object holding the bundle: `Secret` or `ConfigMap`.'
+                              enum:
+                                - Secret
+                                - ConfigMap
+                              type: string
+                            name:
+                              description: Object name.
+                              maxLength: 253
+                              minLength: 1
+                              type: string
+                          required:
+                            - kind
+                            - name
+                          type: object
+                        rotation:
+                          default: Enabled
+                          description: |-
+                            Whether this operator renews the identity through the signer.
+
+                            `Enabled`, the default, renews when a third of the lifetime remains and is refused
+                            under pin peer trust: the own site reports `Accepted` `False` with
+                            `RotationUnsupportedUnderPinTrust` and nothing renews. `Disabled` uses the signer
+                            to enroll only. Enrollment runs whatever this says.
+                          enum:
+                            - Enabled
+                            - Disabled
+                          type: string
+                        url:
+                          description: |-
+                            Base URL of the signer: https, naming a host with an optional numeric port, with
+                            no credentials, no query or fragment, no percent-encoding before the path, and
+                            not under `grid.internal`.
+                          maxLength: 512
+                          minLength: 1
+                          type: string
+                      required:
+                        - url
+                      type: object
+                      x-kubernetes-validations:
+                        - message: url must be an https URL
+                          rule: self.url.startsWith('https://')
+                        - message: url is a base URL and carries no query or fragment
+                          rule: '!self.url.matches(''[?#]'')'
+                        - message: url must name a host, with no percent-encoding before the path
+                          rule: self.url.matches(r'^https://(\[[0-9a-fA-F:.]+\]|[^/?#%:@\[][^/?#%:@]*)(:|/|$)')
+                        - message: url port must be numeric
+                          rule: self.url.matches(r'^https://(\[[^\]]*\]|[^/:\[]*)(:[0-9]{1,5})?(/|$)')
+                        - message: url must not carry credentials
+                          rule: '!self.url.matches(''^https://[^/?#]*@'')'
+                        - message: url must not name a host under grid.internal, where site certificates live
+                          rule: '!self.url.lowerAscii().matches(''^https://([^/?#:]*[.])?grid[.]internal[.]?(:[0-9]*)?([/?#].*)?$'')'
+                  type: object
+                  x-kubernetes-validations:
+                    - message: inviteSecretRef needs signerEndpoint with a caBundleRef to enroll through
+                      rule: '!has(self.inviteSecretRef) || (has(self.signerEndpoint) && has(self.signerEndpoint.caBundleRef))'
                 region:
                   description: Deployment region.
                   nullable: true
@@ -210,6 +350,46 @@ spec:
                       description: Site offers inference access.
                       type: boolean
                   type: object
+                conditions:
+                  description: |-
+                    On this cluster's own site: `Available`, `Progressing`, `Degraded`, `Accepted`,
+                    `ResolvedRefs`, `Enrolled`, `IdentityValid` and `RotationOnSchedule`. Authoritative
+                    there, where `phase` is informational.
+                  items:
+                    description: One observed condition, shaped like `metav1.Condition`.
+                    properties:
+                      lastTransitionTime:
+                        description: When `status` last changed, RFC 3339.
+                        format: date-time
+                        type: string
+                      message:
+                        default: ""
+                        description: Human-readable detail.
+                        type: string
+                      observedGeneration:
+                        description: The `metadata.generation` this was computed against.
+                        format: int64
+                        nullable: true
+                        type: integer
+                      reason:
+                        description: CamelCase reason for the status.
+                        type: string
+                      status:
+                        description: '`True`, `False`, or `Unknown`.'
+                        type: string
+                      type:
+                        description: Condition type, such as `Ready`.
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
                 lastProbeTime:
                   description: |-
                     Timestamp of the last probe whose resulting status was persisted.

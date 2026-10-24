@@ -1,5 +1,17 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "bundleRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name"],
+      "properties": {
+        "kind": { "enum": ["Secret", "ConfigMap"] },
+        "name": { "type": "string", "minLength": 1 },
+        "key": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -247,6 +259,38 @@
           "properties": {
             "address": { "type": "string", "minLength": 1 },
             "tls": { "type": "object", "additionalProperties": true }
+          }
+        },
+        "local": {
+          "type": "object",
+          "description": "This cluster's own site, the GridSite's spec.local. Set on this cluster's own site only.",
+          "additionalProperties": false,
+          "properties": {
+            "signerEndpoint": {
+              "type": "object",
+              "description": "The signer this site enrolls and renews through.",
+              "additionalProperties": false,
+              "required": ["url"],
+              "properties": {
+                "url": { "type": "string", "pattern": "^https://[^\\s]+$" },
+                "caBundleRef": { "$ref": "#/$defs/bundleRef" },
+                "gridCaBundleRef": { "$ref": "#/$defs/bundleRef" },
+                "rotation": {
+                  "enum": ["Enabled", "Disabled"],
+                  "description": "Whether the operator renews the identity through this signer. Unset renders Disabled unless gridNetwork.peerTrust.mode is spiffe."
+                }
+              }
+            },
+            "inviteSecretRef": {
+              "type": "object",
+              "description": "Secret holding this site's invite token.",
+              "additionalProperties": false,
+              "required": ["name"],
+              "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "key": { "type": "string", "minLength": 1 }
+              }
+            }
           }
         }
       }

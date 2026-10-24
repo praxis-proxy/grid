@@ -678,16 +678,20 @@
     "enrollment": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Site auto-enroll on startup.",
+      "description": "The local GridSite's spec.local: signerEndpoint with its rotation, and inviteSecretRef.",
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Enroll on startup when the site identity Secret is absent."
+          "description": "Render the local GridSite with an invite, so the operator enrolls the site."
         },
         "url": {
           "type": "string",
           "pattern": "^(https://[^\\s]+)?$",
-          "description": "Enrollment service base URL (https)."
+          "description": "Signer base URL (https), the GridSite's local.signerEndpoint.url."
+        },
+        "rotation": {
+          "enum": ["", "Enabled", "Disabled"],
+          "description": "Whether the operator renews the site identity through the signer, the GridSite's local.signerEndpoint.rotation. Empty renders Disabled unless grid.peerTrust is spiffe."
         },
         "siteName": {
           "type": "string",
@@ -769,23 +773,12 @@
         "identitySecretName": {
           "type": "string",
           "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
-          "description": "Secret the site identity is written to when no GridNetwork names one."
+          "description": "Identity Secret the rendered GridNetwork names."
         },
         "caSecretName": {
           "type": "string",
           "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
-          "description": "Secret the grid CA is written to when no GridNetwork names one."
-        },
-        "rotation": {
-          "type": "object",
-          "additionalProperties": false,
-          "description": "Rotating the site identity before it expires.",
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "description": "Rotate the site identity, presenting the current one."
-            }
-          }
+          "description": "Grid CA Secret the rendered GridNetwork names."
         },
         "tokenSecretRef": {
           "type": "object",

@@ -303,6 +303,13 @@ leaf_digest() {
 
 enrolled() { k "$1" get secret grid-site-identity grid-ca; }
 
+# site_reports_enrolled <context> <site>: the signer issued the local GridSite's identity,
+# so a Secret some other writer left cannot pass as enrolled.
+site_reports_enrolled() {
+  [[ $(kubectl --context "$1" get gridsite "$2" \
+    -o jsonpath='{.status.conditions[?(@.type=="Enrolled")].status}/{.status.conditions[?(@.type=="Enrolled")].reason}') == True/Issued ]]
+}
+
 # snapshot_logs <context> <label>: every container, init and hook pods included.
 # Returns nonzero when any listing or log fetch fails.
 snapshot_logs() {
@@ -384,11 +391,16 @@ install_hub() {
     "${IMG[@]}" --set swim.service.loadBalancerIP="$HUB_SWIM_IP" \
     --set signals.service.loadBalancerIP="$HUB_SIG_IP" || die "install hub grid-operator"
   copy_key "$HUB_CTX" "$ENS" "$HUB_CTX" grid-ca-bundle ca.crt || die "copy the hub CA bundle"
+  k "$HUB_CTX" label secret grid-ca-bundle grid.praxis.fast/signer-bundle=true >/dev/null || die "opt the hub CA bundle in"
   copy_key "$HUB_CTX" "$ENS" "$HUB_CTX" grid-invite-hub token hub || die "copy the hub invite"
   head -c 32 /dev/urandom | k "$HUB_CTX" create secret generic grid-swim-key --from-file=key=/dev/stdin >/dev/null \
     || die "create grid-swim-key"
   renewal_args grid-site
+  # The hub's GridSite names the signer and the invite it enrolls with, as the README does.
   HUB_SITE_ARGS=("${RA[@]}" --set gridNetwork.gridId="$PREFIX-e2e" --set gridSite.name=hub
+    --set "gridSite.local.signerEndpoint.url=https://grid-enrollment.$ENS.svc:$ENROLL_PORT"
+    --set gridSite.local.signerEndpoint.caBundleRef.kind=Secret --set gridSite.local.signerEndpoint.caBundleRef.name=grid-ca-bundle
+    --set gridSite.local.inviteSecretRef.name=grid-invite-hub
     --set "peers.$SITE.address=$SITE_GW_IP:8080"
     --set gridNetwork.peerTrust.mode="$MODE" --set "gridNetwork.consumerGateways[0].name=grid-gateway"
     --set "gridNetwork.consumerGateways[0].namespace=$NS" --set "gridNetwork.consumerGateways[0].siteName=hub")
@@ -412,6 +424,8 @@ install_hub() {
   fi
   eventually "hub operator enrolled from its own invite through the in-cluster Service" enrolled "$HUB_CTX" \
     || die "hub not enrolled"
+  eventually "hub GridSite reports Enrolled, Issued by the signer" site_reports_enrolled "$HUB_CTX" hub \
+    || die "hub identity not issued by the signer"
   HUB_DIGEST=$(leaf_digest "$HUB_CTX")
   [[ $HUB_DIGEST =~ ^[0-9a-f]{64}$ ]] || die "no hub leaf digest"
   snapshot_logs "$HUB_CTX" hub || true
@@ -452,12 +466,13 @@ install_site() {
   renewal_args grid-operator
   helm_on "$SITE_CTX" "$NS" grid-operator grid-operator "${RA[@]}" \
     --set "swim.siteName=$SITE" --set "swim.seeds=$HUB_SWIM_IP:7946" \
-    --set enrollment.enabled=true --set "enrollment.url=https://grid-enrollment.$ENS.svc:$ENROLL_PORT" \
+    --set enrollment.enabled=true \
     --set grid.peerTrust="$MODE" \
     "${IMG[@]}" --set swim.service.loadBalancerIP="$SITE_SWIM_IP" \
     --set signals.service.loadBalancerIP="$SITE_SIG_IP" || die "install site grid-operator"
   enrollment_forward || die "enrollment forward"
   copy_key "$HUB_CTX" "$ENS" "$SITE_CTX" grid-ca-bundle ca.crt || die "copy the site CA bundle"
+  k "$SITE_CTX" label secret grid-ca-bundle grid.praxis.fast/signer-bundle=true >/dev/null || die "opt the site CA bundle in"
   copy_key "$HUB_CTX" "$ENS" "$SITE_CTX" "grid-invite-$SITE" token "$SITE" || die "copy the site invite"
   copy_key "$HUB_CTX" "$NS" "$SITE_CTX" grid-swim-key key || die "copy the SWIM key"
   if [[ $(k "$SITE_CTX" get secret "grid-invite-$SITE" -o jsonpath='{.metadata.labels.grid\.praxis\.fast/site}') == "$SITE" ]]; then
@@ -468,6 +483,9 @@ install_site() {
   renewal_args grid-site
   helm_on "$SITE_CTX" "$NS" grid-site grid-site "${RA[@]}" \
     --set gridNetwork.gridId="$PREFIX-e2e" --set "gridSite.name=$SITE" --set "peers.hub.digest=$HUB_DIGEST" \
+    --set "gridSite.local.signerEndpoint.url=https://grid-enrollment.$ENS.svc:$ENROLL_PORT" \
+    --set gridSite.local.signerEndpoint.caBundleRef.kind=Secret --set gridSite.local.signerEndpoint.caBundleRef.name=grid-ca-bundle \
+    --set "gridSite.local.inviteSecretRef.name=grid-invite-$SITE" \
     --set "inferenceProviders.vcr.endpoint=http://$MODEL_IP:8000" \
     --set "inferenceProviders.vcr.model=$MODEL" --set gridNetwork.peerTrust.mode="$MODE" || die "install site grid-site"
   trust=(--set "praxisConfig.render.peerTrust.digest=$HUB_DIGEST")
@@ -481,6 +499,8 @@ install_site() {
     "${IMG[@]}" --set service.loadBalancerIP="$SITE_GW_IP" || die "install site grid-gateway"
   eventually "site operator enrolled from its copied invite through the hub enrollment URL" enrolled "$SITE_CTX" \
     || die "site not enrolled"
+  eventually "$SITE GridSite reports Enrolled, Issued by the signer" site_reports_enrolled "$SITE_CTX" "$SITE" \
+    || die "$SITE identity not issued by the signer"
   # Every later hub grid-site upgrade carries the site's digest: helm does not reuse the release's values.
   HUB_SITE_ARGS+=(--set "peers.$SITE.digest=$(leaf_digest "$SITE_CTX")")
   helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "pin the site on the hub"
@@ -758,9 +778,12 @@ assert_health() {
     restarts=$(kubectl --context "$ctx" get pods -A -o json | jq -r --arg a "$NS" --arg b "$ENS" '.items[]
       | select(.metadata.namespace == $a or .metadata.namespace == $b) | .metadata.name as $p
       | ((.status.initContainerStatuses // []) + (.status.containerStatuses // []))[]
-      | select(.restartCount > 0) | "\($p)/\(.name)=\(.restartCount)"')
+      | select(.restartCount > 0)
+      # Enrolling while it waits for an identity, the operator exits 0 once to restart under it.
+      | select((.name == "operator" and .restartCount == 1 and .lastState.terminated.exitCode == 0) | not)
+      | "\($p)/\(.name)=\(.restartCount)"')
     if [[ -z $restarts ]]; then
-      pass "$ctx: zero container restarts in $NS and $ENS"
+      pass "$ctx: no container restarts in $NS and $ENS beyond the operator's one clean restart onto its identity"
     else
       fail "$ctx: container restarts: $(tr '\n' ' ' <<<"$restarts")"
     fi
@@ -1128,18 +1151,57 @@ assert_renewal() {
   pass "re-enrolled $SITE renews again"
 }
 
-# Pin trust does not renew: the operator says so once and schedules no renewal.
+# rotation_reads <context> <site> <status/reason>: the own GridSite's RotationOnSchedule.
+rotation_reads() {
+  [[ $(kubectl --context "$1" get gridsite "$2" \
+    -o jsonpath='{.status.conditions[?(@.type=="RotationOnSchedule")].status}/{.status.conditions[?(@.type=="RotationOnSchedule")].reason}') == "$3" ]]
+}
+
+# Rotation is declared where the object is generated, never derived at runtime: the chart
+# wrote signerEndpoint.rotation Disabled under pin, and the CRD default Enabled under
+# spiffe, and the own GridSite's conditions follow the declaration.
+assert_rotation_declared() {
+  local ctx site declared want
+  for ctx in "$HUB_CTX" "$SITE_CTX"; do
+    site=hub
+    [[ $ctx == "$SITE_CTX" ]] && site=$SITE
+    declared=$(kubectl --context "$ctx" get gridsite "$site" -o jsonpath='{.spec.local.signerEndpoint.rotation}')
+    want=Enabled
+    [[ $MODE == pin ]] && want=Disabled
+    if [[ $declared == "$want" ]]; then
+      pass "$ctx: $site declares signerEndpoint.rotation $declared"
+    else
+      fail "$ctx: $site declares signerEndpoint.rotation '$declared', want $want"
+    fi
+    if [[ $MODE == pin ]]; then
+      eventually "$ctx: $site reports RotationOnSchedule True, RotationDisabled" rotation_reads "$ctx" "$site" True/RotationDisabled || true
+      eventually "$ctx: $site is Accepted with rotation Disabled under pin" accepted_reads "$ctx" "$site" True/AsExpected || true
+    else
+      eventually "$ctx: $site reports RotationOnSchedule True, AsExpected through spec.local.signerEndpoint" \
+        renews_through_spec "$ctx" "$site" || true
+    fi
+  done
+}
+
+# accepted_reads <context> <site> <status/reason>: the own GridSite's Accepted.
+accepted_reads() {
+  [[ $(kubectl --context "$1" get gridsite "$2" \
+    -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}/{.status.conditions[?(@.type=="Accepted")].reason}') == "$3" ]]
+}
+
+# renews_through_spec <context> <site>: renewal names spec.local.signerEndpoint, and nothing else.
+renews_through_spec() {
+  rotation_reads "$1" "$2" True/AsExpected && kubectl --context "$1" get gridsite "$2" \
+    -o jsonpath='{.status.conditions[?(@.type=="RotationOnSchedule")].message}' | grep -q 'from spec.local.signerEndpoint'
+}
+
+# Pin trust does not renew: the own GridSite says so, and no renewal is scheduled.
 assert_pin_no_renewal() {
-  local ctx logs
+  local ctx site
   [[ $MODE == pin ]] || return 0
   for ctx in "$HUB_CTX" "$SITE_CTX"; do
-    # Captured first: grep -q exits at its match, and pipefail would report the writer's SIGPIPE.
-    logs=$(k "$ctx" logs deployment/grid-operator --all-containers | strip_ansi)
-    if grep -q 'rotation disabled: peerTrust pin' <<<"$logs"; then
-      pass "$ctx: operator logged that pin trust disables renewal"
-    else
-      fail "$ctx: no rotation disabled line under pin trust"
-    fi
+    site=hub
+    [[ $ctx == "$SITE_CTX" ]] && site=$SITE
     if [[ -z $(k "$ctx" get gridnetwork grid -o jsonpath='{.status.identity.rotateAfter}') ]]; then
       pass "$ctx: status.identity.rotateAfter is empty under pin trust"
     else
@@ -1173,6 +1235,7 @@ cmd_test() {
     assert_membership
     assert_serving
     assert_site_route
+    assert_rotation_declared
     assert_pin_no_renewal
     assert_renewal
     assert_health

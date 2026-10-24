@@ -17,4 +17,7 @@ spec:
   {{- with .Values.site.zone }}
   zone: {{ . | quote }}
   {{- end }}
+  {{- with include "grid-operator.enrollment.siteSpec" . | trim }}
+  {{- . | nindent 2 }}
+  {{- end }}
 {{- end }}

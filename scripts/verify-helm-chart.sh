@@ -277,14 +277,15 @@ try_template "$CHART_DIR" "SWIM advertise address" \
   --set swim.advertiseAddress=swim.example.com:7946
 try_template "$CHART_DIR" "scheduling" \
   --set nodeSelector.zone=us-east-1 --set priorityClassName=high-priority
-ENROLL_SET=(--set enrollment.enabled=true --set enrollment.url=https://enroll.example.com
+ENROLL_SET=(--set grid.id=grid-a --set enrollment.enabled=true --set enrollment.url=https://enroll.example.com
   --set enrollment.siteName=site-d --set enrollment.tokenSecretRef.name=grid-invite-site-d)
 try_template "$CHART_DIR" "auto-enroll with a ConfigMap CA" "${ENROLL_SET[@]}" \
   --set enrollment.caBundle.configMap=grid-ca
 try_template "$CHART_DIR" "auto-enroll with a Secret CA" "${ENROLL_SET[@]}" \
   --set enrollment.caBundle.secret=grid-ca-bundle
 for nulled in "" --set=enrollment.caBundle=null; do
-  if render v-enroll "$CHART_DIR" "${ENROLL_SET[@]}" ${nulled:+"$nulled"} && grep -q 'secretName: "grid-ca-bundle"' <<<"$RENDERED"; then
+  if render v-enroll "$CHART_DIR" "${ENROLL_SET[@]}" ${nulled:+"$nulled"} \
+    && grep -A2 'caBundleRef:' <<<"$RENDERED" | grep -q 'name: "grid-ca-bundle"'; then
     pass "auto-enroll without a CA bundle pins the grid-ca-bundle Secret ${nulled:-(unset)}"
   else
     fail "auto-enroll without a CA bundle did not default to grid-ca-bundle ${nulled:-(unset)}"
@@ -299,6 +300,8 @@ try_template "$CHART_DIR" "auto-enroll with a separate grid CA anchor" "${ENROLL
 try_reject_msg "$CHART_DIR" "auto-enroll with two grid CA sources" 'gridCaBundle' "${ENROLL_SET[@]}" \
   --set enrollment.caBundle.configMap=route-ca --set enrollment.gridCaBundle.secret=a \
   --set enrollment.gridCaBundle.configMap=b
+try_reject_msg "$CHART_DIR" "auto-enroll values with no GridSite to carry them" 'gridSite.local' \
+  --set enrollment.enabled=true --set enrollment.siteName=site-d --set enrollment.url=https://enroll.example.com
 try_template "$CHART_DIR" "SA annotations" \
   --set-string 'serviceAccount.annotations.eks\.amazonaws\.com/role-arn=arn:aws:iam::123456789012:role/grid'
 try_template "$CHART_DIR" "hostile podLabels" \
@@ -375,10 +378,10 @@ if render verify-gwns "$CHART_DIR" --namespace release-ns --set-string gateway.n
   else
     fail "gateway.namespace override: expected edge-ns, got '$GW_NS'"
   fi
-  # In the gateway namespace the operator may only get the one gateway Service.
+  # In the gateway namespace the operator may only get the gateway Service and roll its Deployment.
   GW_ROLE=$(yq 'select(.kind == "Role" and .metadata.namespace == "edge-ns") | .rules' -o json <<<"$RENDERED" | jq -c .)
-  if [ "$GW_ROLE" = '[{"apiGroups":[""],"resources":["services"],"resourceNames":["provider-gateway"],"verbs":["get"]}]' ]; then
-    pass "gateway namespace Role grants only get on the gateway Service"
+  if [ "$GW_ROLE" = '[{"apiGroups":[""],"resources":["services"],"resourceNames":["provider-gateway"],"verbs":["get"]},{"apiGroups":["apps"],"resources":["deployments"],"resourceNames":["provider-gateway"],"verbs":["get","patch"]}]' ]; then
+    pass "gateway namespace Role grants only the gateway Service and its Deployment roll"
   else
     fail "gateway namespace Role: unexpected rules '$GW_ROLE'"
   fi

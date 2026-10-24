@@ -21,4 +21,14 @@ spec:
   gatewayEndpoint:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+  {{- with .Values.gridSite.local }}
+  {{- $local := deepCopy . }}
+  {{- $signer := get $local "signerEndpoint" }}
+  {{- /* Pin peer trust refuses a renewed leaf, so a signer renews only under spiffe unless told otherwise. */}}
+  {{- if and (kindIs "map" $signer) (not (hasKey $signer "rotation")) (ne (dig "peerTrust" "mode" "" $.Values.gridNetwork) "spiffe") }}
+  {{- $_ := set $signer "rotation" "Disabled" }}
+  {{- end }}
+  local:
+    {{- toYaml $local | nindent 4 }}
+  {{- end }}
 {{- end }}

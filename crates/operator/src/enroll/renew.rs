@@ -2,8 +2,10 @@
 
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
-    sync::{Mutex, PoisonError},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -16,21 +18,23 @@ use kube::{
     api::{ListParams, Patch, PatchParams},
 };
 use reqwest::StatusCode;
-use sha2::{Digest as _, Sha256};
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
 use super::{
-    Enrollment, EnrollmentRequest, ErrorBody, Target, error_chain, jittered, pem_roots, read_capped, read_pem,
+    Issued, Signer, SignerError, Target, jittered,
+    local::{self, BundleError, Bundles, Local, Verdict},
+    signer::{Clients, HttpsSigner, RENEW_PATH},
 };
 use crate::{
     controller::grid_network::GridModes,
-    crd::grid_network::{GridNetwork, PeerTrustMode},
+    crd::{
+        grid_network::{GridNetwork, PeerTrustMode},
+        grid_site::{BundleRef, GridSite, LocalSite, Rotation, SignerEndpoint},
+    },
     metrics,
 };
 
-/// The renewal route on the enrollment service.
-const RENEW_PATH: &str = "/v1alpha1/rotations";
 
 /// Longest wait between checks, so an identity replaced out of band is still watched.
 const CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
@@ -82,7 +86,10 @@ pub fn renew_after(not_before: OffsetDateTime, not_after: OffsetDateTime) -> Off
 /// Why a renewal did not complete.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum RenewError {
-    /// The identity Secret is absent or incomplete.
+    /// The identity Secret or a key it needs is absent.
+    #[error("site identity absent: {0}")]
+    Missing(String),
+    /// The identity Secret holds material that cannot be used.
     #[error("site identity unreadable: {0}")]
     Material(String),
     /// A Kubernetes call failed.
@@ -100,6 +107,9 @@ pub(super) enum RenewError {
     /// The service answered with a certificate this site cannot use.
     #[error("rotation response invalid: {0}")]
     Invalid(String),
+    /// The service refuses every rotation: rotation is turned off on the hub.
+    #[error("rotation disabled at the signer ({0}); turn it on before the identity expires")]
+    SignerDisabled(String),
 }
 
 impl RenewError {
@@ -107,7 +117,12 @@ impl RenewError {
     const fn result(&self) -> &'static str {
         match self {
             Self::Unauthenticated(_) | Self::Refused(_) => "refused",
-            Self::Material(_) | Self::Kube(_) | Self::Transport(_) | Self::Invalid(_) => "failed",
+            Self::Missing(_)
+            | Self::Material(_)
+            | Self::Kube(_)
+            | Self::Transport(_)
+            | Self::Invalid(_)
+            | Self::SignerDisabled(_) => "failed",
         }
     }
 }
@@ -121,8 +136,56 @@ pub(super) enum Checked {
     Renewed(OffsetDateTime),
     /// Expired at this instant.
     Expired(OffsetDateTime),
-    /// Off: the grid declares pin peer trust, and a pinned peer refuses a renewed leaf.
-    Off,
+    /// Nothing renews this identity: why, and whether a renewal is already due.
+    Off {
+        /// Why.
+        why: Off,
+        /// Whether the renewal this would have made is due.
+        due: Due,
+    },
+}
+
+/// Why nothing renews the identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Off {
+    /// The signer's rotation is Enabled under pin peer trust, where a pinned peer refuses
+    /// a renewed leaf: the conflict is reported on `Accepted` and renewal is held back.
+    UnsupportedUnderPin,
+    /// This site's `GridSite` names no signer.
+    NoSigner,
+    /// The signer's rotation is Disabled.
+    Disabled,
+}
+
+/// The informational `RotationOnSchedule` reason while nothing renews and renewal is not due.
+const ROTATION_DISABLED: &str = "RotationDisabled";
+
+impl Off {
+    /// What the admin reads.
+    const fn message(self) -> &'static str {
+        match self {
+            Self::UnsupportedUnderPin => {
+                "rotation is held back: spec.local.signerEndpoint.rotation is Enabled under pin peer trust, see Accepted"
+            },
+            Self::NoSigner => {
+                "rotation disabled: spec.local names no signer, so the identity is kept until it expires unless \
+                 another writer renews it"
+            },
+            Self::Disabled => {
+                "rotation disabled: spec.local.signerEndpoint.rotation is Disabled, so the identity is kept until it \
+                 expires unless another writer renews it"
+            },
+        }
+    }
+
+    /// A stable word for logs.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::UnsupportedUnderPin => "unsupported-under-pin",
+            Self::NoSigner => "no-signer",
+            Self::Disabled => "disabled",
+        }
+    }
 }
 
 /// The identity as stored.
@@ -152,12 +215,6 @@ pub(super) trait IdentityStore {
         version: &str,
         data: BTreeMap<&'static str, Option<Zeroizing<String>>>,
     ) -> impl Future<Output = Result<String, RenewError>> + Send;
-}
-
-/// How a renewal reaches the enrollment service.
-pub(super) trait Renewer {
-    /// Present `held`'s certificate and ask for a certificate for `csr_pem`.
-    fn renew(&self, held: &Held, csr_pem: &str) -> impl Future<Output = Result<Enrollment, RenewError>> + Send;
 }
 
 /// What rolling the gateway onto a renewed identity did.
@@ -215,34 +272,50 @@ pub(super) async fn roll_gateway<S: IdentityStore + Sync, G: GatewayRoller + Syn
 /// # Errors
 ///
 /// Returns [`RenewError`] when a due renewal does not complete.
-pub(super) async fn check<S: IdentityStore + Sync, R: Renewer + Sync>(
+#[cfg(test)]
+pub(super) async fn check<S: IdentityStore + Sync, G: Signer + Sync>(
     store: &S,
-    renewer: &R,
+    signer: &G,
     target: &Target,
     now: OffsetDateTime,
 ) -> Result<Checked, RenewError> {
     let held = store.read(target).await?;
-    let (not_before, not_after) =
-        certs::cert_validity(&held.cert).map_err(|e| RenewError::Material(format!("certificate: {e}")))?;
+    check_held(store, signer, target, held, now).await
+}
+
+/// The validity of the certificate `held`.
+fn validity(held: &Held) -> Result<(OffsetDateTime, OffsetDateTime), RenewError> {
+    certs::cert_validity(&held.cert).map_err(|e| RenewError::Material(format!("certificate: {e}")))
+}
+
+/// Renew `held`, the identity in `target`, if it is due at `now`.
+async fn check_held<S: IdentityStore + Sync, G: Signer + Sync>(
+    store: &S,
+    signer: &G,
+    target: &Target,
+    held: Held,
+    now: OffsetDateTime,
+) -> Result<Checked, RenewError> {
+    let (not_before, not_after) = validity(&held)?;
     metrics::set_site_identity_expiry(not_after.unix_timestamp());
     match due(not_before, not_after, now) {
         Due::At(at) => Ok(Checked::Waiting(at)),
         Due::Expired => Ok(Checked::Expired(not_after)),
-        Due::Now => renew(store, renewer, target, held).await,
+        Due::Now => renew(store, signer, target, held).await,
     }
 }
 
 /// Renew `held` now and store the result in place.
-async fn renew<S: IdentityStore + Sync, R: Renewer + Sync>(
+async fn renew<S: IdentityStore + Sync, G: Signer + Sync>(
     store: &S,
-    renewer: &R,
+    signer: &G,
     target: &Target,
     mut held: Held,
 ) -> Result<Checked, RenewError> {
     let site = site_of(&held.cert)?;
     let (csr, key) = pending(store, target, &mut held, &site).await?;
-    let enrollment = renewer.renew(&held, &csr).await?;
-    let cert = verified(&enrollment, &held.ca, &site, &csr)?;
+    let issued = signer.renew(&held, &csr).await.map_err(renew_error)?;
+    let cert = verified(&issued, &held.ca, &site, &csr)?;
     let (_issued, valid_until) = certs::cert_validity(&cert).map_err(|e| RenewError::Invalid(e.to_string()))?;
     let replaced = BTreeMap::from([
         ("tls.crt", Some(Zeroizing::new(cert))),
@@ -282,8 +355,26 @@ fn site_of(cert_pem: &str) -> Result<String, RenewError> {
     crate::site_name::of_cert(cert_pem).ok_or_else(|| RenewError::Material("certificate names no grid site".to_owned()))
 }
 
+/// What a signer's refusal means for renewal.
+fn renew_error(error: SignerError) -> RenewError {
+    match error {
+        SignerError::Unauthenticated(detail) => RenewError::Unauthenticated(detail),
+        SignerError::Refused {
+            status: StatusCode::FORBIDDEN,
+            detail,
+            ..
+        } => RenewError::Refused(detail),
+        SignerError::Disabled(detail) => RenewError::SignerDisabled(detail),
+        SignerError::Refused { detail, .. }
+        | SignerError::Transport { detail, .. }
+        | SignerError::Untrusted { detail, .. } => RenewError::Transport(detail),
+        SignerError::Request(detail) => RenewError::Material(detail),
+        SignerError::Invalid(detail) => RenewError::Invalid(detail),
+    }
+}
+
 /// The renewed leaf, if it is this site's, from the CA it already holds, for the CSR's key.
-fn verified(enrollment: &Enrollment, held_ca: &str, site: &str, csr_pem: &str) -> Result<String, RenewError> {
+fn verified(enrollment: &Issued, held_ca: &str, site: &str, csr_pem: &str) -> Result<String, RenewError> {
     let invalid = RenewError::Invalid;
     let ca = certs::anchored_ca(&enrollment.ca_certificate, held_ca)
         .map_err(|e| invalid(format!("returned CA is not this site's grid CA ({e})")))?;
@@ -309,7 +400,7 @@ fn text(data: &BTreeMap<String, ByteString>, key: &str) -> Option<Zeroizing<Stri
 
 impl IdentityStore for KubeIdentity {
     async fn read(&self, target: &Target) -> Result<Held, RenewError> {
-        let missing = |what: &str| RenewError::Material(format!("{what} absent"));
+        let missing = |what: &str| RenewError::Missing(what.to_owned());
         let site = Box::pin(self.0.get_opt(&target.site_secret))
             .await
             .map_err(|e| RenewError::Kube(e.to_string()))?
@@ -358,113 +449,19 @@ impl IdentityStore for KubeIdentity {
     }
 }
 
-/// Renewal over HTTPS, presenting the current identity.
-pub(super) struct HttpsRenewer {
-    /// The renewal URL.
-    url: String,
-    /// Where the PEM pinning the enrollment server lives, else the site's own
-    /// grid CA.
-    pin_path: Option<PathBuf>,
-    /// The last read of that file, kept so the happy path does no file work.
-    pinned: Mutex<Option<String>>,
-    /// The client, with a digest of the material it presents. Rebuilt when that
-    /// material changes and otherwise held, so a retry keeps the warm pool.
-    held: Mutex<Option<([u8; 32], reqwest::Client)>>,
+/// The signer a renewal goes to, read from `spec.local.signerEndpoint` on this site's `GridSite`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Endpoint {
+    /// The signer's base URL.
+    pub(super) base: reqwest::Url,
+    /// The PEM pinning the signer, else the site's own grid CA.
+    pub(super) pin: Option<String>,
 }
 
-impl HttpsRenewer {
-    /// A renewer for the service at `base`, pinned to the PEM at `pin_path` or
-    /// to the held grid CA.
-    #[must_use]
-    pub(super) fn new(base: &str, pin_path: Option<PathBuf>) -> Self {
-        Self {
-            url: format!("{}{RENEW_PATH}", base.trim_end_matches('/')),
-            pin_path,
-            pinned: Mutex::new(None),
-            held: Mutex::new(None),
-        }
-    }
-
-    /// The pinning PEM, read on first use and held until a failure drops it.
-    fn pin(&self) -> Result<Option<String>, RenewError> {
-        let Some(path) = self.pin_path.as_deref() else {
-            return Ok(None);
-        };
-        let mut slot = self.pinned.lock().unwrap_or_else(PoisonError::into_inner);
-        if slot.is_none() {
-            *slot = Some(read_pem(path).map_err(|e| RenewError::Material(error_chain(&e)))?);
-        }
-        Ok(slot.clone())
-    }
-
-    /// Drop the cached pin, so the next renewal reads the file again.
-    ///
-    /// Called on a reload, because a snapshot taken at startup would otherwise
-    /// outlive a rotated enrollment CA until the pod restarted.
-    pub(super) fn forget_pin(&self) {
-        if self.pin_path.is_some() {
-            *self.pinned.lock().unwrap_or_else(PoisonError::into_inner) = None;
-            // The client embeds the roots it was built from.
-            *self.held.lock().unwrap_or_else(PoisonError::into_inner) = None;
-        }
-    }
-
-    /// A client presenting `held` and trusting only the pin.
-    ///
-    /// Built once per distinct trust anchor and identity. A renewal replaces the
-    /// identity, so the next call builds a new client and the pool it replaces
-    /// goes with the old entry.
-    fn client(&self, held: &Held) -> Result<reqwest::Client, RenewError> {
-        let pinned = self.pin()?;
-        let trust = pinned.as_deref().unwrap_or(&held.ca);
-        let key: [u8; 32] = Sha256::new()
-            .chain_update(trust.as_bytes())
-            .chain_update(held.cert.as_bytes())
-            .chain_update(&held.key)
-            .finalize()
-            .into();
-        let cached = self
-            .held
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .and_then(|(stored, client)| (*stored == key).then(|| client.clone()));
-        if let Some(client) = cached {
-            return Ok(client);
-        }
-        let roots = pem_roots(trust, "rotation trust").map_err(|e| RenewError::Material(e.to_string()))?;
-        let identity =
-            grid_client::identity(&held.cert, &held.key).map_err(|e| RenewError::Material(error_chain(&e)))?;
-        let client = grid_client::trusted_client(roots, Some(identity), grid_client::Timeouts::ENROLLMENT)
-            .map_err(|e| RenewError::Material(error_chain(&e)))?;
-        *self.held.lock().unwrap_or_else(PoisonError::into_inner) = Some((key, client.clone()));
-        Ok(client)
-    }
-}
-
-impl Renewer for HttpsRenewer {
-    async fn renew(&self, held: &Held, csr_pem: &str) -> Result<Enrollment, RenewError> {
-        let response = self
-            .client(held)?
-            .post(&self.url)
-            .json(&EnrollmentRequest { csr: csr_pem })
-            .send()
-            .await
-            .map_err(|e| RenewError::Transport(error_chain(&e)))?;
-        let status = response.status();
-        let body = read_capped(response).await.map_err(RenewError::Transport)?;
-        if status.is_success() {
-            return serde_json::from_slice(&body).map_err(|e| RenewError::Invalid(format!("decoding: {e}")));
-        }
-        let detail = serde_json::from_slice::<ErrorBody>(&body).map_or_else(
-            |_| status.to_string(),
-            |err| format!("{status} {}: {}", err.error, err.message),
-        );
-        Err(match status {
-            StatusCode::UNAUTHORIZED => RenewError::Unauthenticated(detail),
-            StatusCode::FORBIDDEN => RenewError::Refused(detail),
-            _ => RenewError::Transport(detail),
-        })
+impl Endpoint {
+    /// The renewal URL, for messages.
+    fn renewal_url(&self) -> String {
+        HttpsSigner::endpoint(&self.base, RENEW_PATH)
     }
 }
 
@@ -475,7 +472,7 @@ pub struct KubeGateway {
     /// The Deployment.
     name: String,
     /// Whether a missing Deployment was already logged.
-    missing_logged: std::sync::atomic::AtomicBool,
+    missing_logged: AtomicBool,
 }
 
 impl KubeGateway {
@@ -485,7 +482,7 @@ impl KubeGateway {
         Self {
             api: Api::namespaced(client, namespace),
             name: name.to_owned(),
-            missing_logged: std::sync::atomic::AtomicBool::new(false),
+            missing_logged: AtomicBool::new(false),
         }
     }
 }
@@ -521,10 +518,6 @@ impl GatewayRoller for KubeGateway {
 
 /// Settings for the renewal loop.
 pub struct Settings {
-    /// Enrollment service base URL.
-    url: String,
-    /// Where the PEM pinning the enrollment server lives, when configured.
-    pin_path: Option<PathBuf>,
     /// Where the identity lives when no `GridNetwork` names it.
     defaults: Target,
     /// The gateway Deployment to roll after a renewal: namespace and name.
@@ -533,35 +526,44 @@ pub struct Settings {
     install: GridModes,
     /// The declared peer trust, sent by the `GridNetwork` reconcile when it changes.
     trust_changes: Option<tokio::sync::watch::Receiver<PeerTrustMode>>,
+    /// Set while a signer to renew through is named.
+    configured: Arc<AtomicBool>,
+    /// The site the identity names, whose `GridSite` is this cluster's own.
+    site: Option<String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Settings {
-    /// Read the renewal settings from the enrollment configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message when the URL is missing or not https, or the pin is unreadable.
-    pub fn from_config(config: &super::Config) -> Result<Self, String> {
-        let url = renewal_url(config.url.as_deref())?;
-        // Read here so a bad path fails at startup. The renewer holds the PEM
-        // from first use until a reload clears it.
-        config
-            .ca_file
-            .as_deref()
-            .map(read_pem)
-            .transpose()
-            .map_err(|e| e.to_string())?;
-        Ok(Self {
-            url: url.to_owned(),
-            pin_path: config.ca_file.clone(),
-            defaults: Target {
-                site_secret: config.identity_secret.clone(),
-                ca_secret: config.ca_secret.clone(),
-            },
+    /// Renew the identity in the default Secrets through the signer this site's `GridSite` names.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            defaults: Target::defaults(),
             gateway: None,
             install: GridModes::WITHOUT_NETWORK,
             trust_changes: None,
-        })
+            configured: Arc::new(AtomicBool::new(false)),
+            site: None,
+        }
+    }
+
+    /// Renew through the `GridSite` named `site`, the name the identity carries.
+    #[must_use]
+    pub fn with_site(mut self, site: Option<String>) -> Self {
+        self.site = site;
+        self
+    }
+
+    /// Publish into `configured` whether a signer to renew through is named.
+    #[must_use]
+    pub fn with_configured(mut self, configured: Arc<AtomicBool>) -> Self {
+        self.configured = configured;
+        self
     }
 
     /// Roll the gateway Deployment `name` in `namespace` after each renewal.
@@ -592,25 +594,158 @@ impl Settings {
     }
 }
 
-/// The enrollment URL, https and outside the grid domain.
-fn renewal_url(url: Option<&str>) -> Result<&str, String> {
-    let url = url
-        .map(str::trim)
-        .filter(|url| url.starts_with("https://"))
-        .ok_or("GRID_ENROLL_URL must be an https URL to rotate")?;
-    // Any site leaf names a host under the grid domain, so one could stand in for the service.
-    let host = reqwest::Url::parse(url)
-        .map_err(|e| format!("GRID_ENROLL_URL: {e}"))?
-        .host_str()
-        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
-        .unwrap_or_default();
-    let grid_domain = certs::SPIFFE_TRUST_DOMAIN;
-    if host == grid_domain || host.ends_with(&format!(".{grid_domain}")) {
-        return Err(format!(
-            "GRID_ENROLL_URL must not name a host under {grid_domain}, where site certificates live"
-        ));
+/// This site's `GridSite` and the others wrongly carrying `spec.local`, as listed this round.
+struct Own {
+    /// The `GridSite` the identity names, when declared.
+    site: Option<GridSite>,
+    /// `GridSite`s carrying `spec.local` under another name.
+    strays: Vec<GridSite>,
+}
+
+/// List the `GridSite`s and pick this site's, the one `name` names, clearing what a
+/// stray left behind.
+async fn own_site(client: &Client, name: Option<&str>) -> Result<Own, RenewError> {
+    let sites: Api<GridSite> = Api::all(client.clone());
+    let listed = Box::pin(sites.list(&ListParams::default()))
+        .await
+        .map_err(|e| RenewError::Kube(e.to_string()))?
+        .items;
+    Box::pin(local::clear(client, &local::stale(&listed, name))).await;
+    Ok(match local::local(&listed, name) {
+        Local::Named { site, strays } => Own {
+            site: site.cloned(),
+            strays: strays.into_iter().cloned().collect(),
+        },
+        // Without the identity's name, no GridSite is this site's.
+        Local::Absent | Local::One(_) | Local::Several(_) => Own {
+            site: None,
+            strays: Vec::new(),
+        },
+    })
+}
+
+/// What this site's `GridSite` declares about renewal.
+#[derive(Debug, PartialEq, Eq)]
+enum Declared<'site> {
+    /// A signer whose rotation is Enabled.
+    Renews(&'site SignerEndpoint),
+    /// A signer whose rotation is Disabled: it enrolls only.
+    Disabled,
+    /// No `spec.local`, or none naming a signer.
+    NoSigner,
+}
+
+/// Read `spec.local` of `site`, this site's `GridSite` if declared.
+fn declared(site: Option<&GridSite>) -> Declared<'_> {
+    match site.and_then(|site| site.spec.local.as_ref()) {
+        Some(LocalSite {
+            signer_endpoint: Some(endpoint),
+            ..
+        }) => match endpoint.rotation {
+            Rotation::Enabled => Declared::Renews(endpoint),
+            Rotation::Disabled => Declared::Disabled,
+        },
+        Some(LocalSite {
+            signer_endpoint: None, ..
+        })
+        | None => Declared::NoSigner,
     }
-    Ok(url)
+}
+
+/// The signer this round renews through, else why nothing renews.
+#[derive(Debug, PartialEq, Eq)]
+enum Resolved {
+    /// Renew through this signer.
+    Signer(Endpoint),
+    /// Nothing renews.
+    Off(Off),
+}
+
+/// Resolve the signer `spec.local.signerEndpoint` on this site's `GridSite` names, with its pin.
+async fn resolve_signer(client: &Client, own: &Own) -> Result<Resolved, RenewError> {
+    let endpoint = match declared(own.site.as_ref()) {
+        Declared::Renews(endpoint) => endpoint,
+        Declared::Disabled => return Ok(Resolved::Off(Off::Disabled)),
+        Declared::NoSigner => return Ok(Resolved::Off(Off::NoSigner)),
+    };
+    let base = super::signer_url(&endpoint.url).map_err(RenewError::Material)?;
+    let pin = match &endpoint.ca_bundle_ref {
+        Some(reference) => Some(declared_pin(client, reference).await?),
+        None => None,
+    };
+    Ok(Resolved::Signer(Endpoint { base, pin }))
+}
+
+/// The PEM `local.signerEndpoint.caBundleRef` names; a bundle that does not opt in is material, not the API.
+async fn declared_pin(client: &Client, reference: &BundleRef) -> Result<String, RenewError> {
+    Bundles::new(client, client.default_namespace())
+        .pem(reference)
+        .await
+        .map_err(|error| match error {
+            BundleError::Api(why) => RenewError::Kube(why),
+            BundleError::Refused(why) => RenewError::Material(format!("local.signerEndpoint.caBundleRef: {why}")),
+        })?
+        .map(|(pem, _version)| pem)
+        .ok_or_else(|| RenewError::Material(format!("local.signerEndpoint.caBundleRef {} absent", reference.name)))
+}
+
+/// What renewal keeps across rounds: the identity store, the renewal clients and the gateway.
+pub struct Rounds {
+    /// The API.
+    client: Client,
+    /// The operator namespace, where the identity lives.
+    namespace: String,
+    /// The identity Secret.
+    store: KubeIdentity,
+    /// The renewal clients kept across rounds.
+    clients: Clients,
+    /// The gateway to roll after a renewal.
+    gateway: Option<KubeGateway>,
+    /// The modes the install declares, which apply until a `GridNetwork` exists.
+    install: GridModes,
+}
+
+impl Rounds {
+    /// Renewal rounds for `settings` against `client`.
+    #[must_use]
+    pub fn new(client: Client, settings: &Settings) -> Self {
+        let namespace = client.default_namespace().to_owned();
+        Self {
+            store: KubeIdentity(Api::namespaced(client.clone(), &namespace)),
+            clients: Clients::default(),
+            gateway: settings.gateway_in(&client),
+            install: settings.install,
+            client,
+            namespace,
+        }
+    }
+
+    /// One round: resolve the identity Secrets, check the identity through its signer,
+    /// report on this site's `GridSite`, and roll the gateway after a renewal. Returns
+    /// whether a renewal replaced the identity.
+    pub async fn round(&self, settings: &Settings) -> bool {
+        matches!(self.checked(settings).await, Ok(Checked::Renewed(_)))
+    }
+
+    /// One round, with what the check found.
+    async fn checked(&self, settings: &Settings) -> Result<Checked, RenewError> {
+        let loop_ = Loop {
+            client: &self.client,
+            store: &self.store,
+            clients: &self.clients,
+            install: self.install,
+        };
+        let target = Box::pin(super::resolve_target(
+            &self.client,
+            &self.namespace,
+            &settings.defaults,
+            super::STEP_BACKOFF,
+        ))
+        .await;
+        let round = Box::pin(tick(&loop_, settings, &target)).await;
+        roll_after_renewal(&self.store, self.gateway.as_ref(), &target, &round.checked).await;
+        round.checked
+    }
 }
 
 /// Keep the site identity renewed for the life of the process.
@@ -619,29 +754,333 @@ fn renewal_url(url: Option<&str>) -> Result<&str, String> {
     reason = "a background renewer runs for the life of the process"
 )]
 pub async fn run(client: Client, mut settings: Settings) {
-    let namespace = client.default_namespace().to_owned();
-    let store = KubeIdentity(Api::namespaced(client.clone(), &namespace));
-    let renewer = HttpsRenewer::new(&settings.url, settings.pin_path.clone());
-    let gateway = settings.gateway_in(&client);
+    let rounds = Rounds::new(client, &settings);
     let mut last: Option<String> = None;
     let mut failures = 0_u32;
     loop {
-        let target = Box::pin(super::resolve_target(
-            &client,
-            &namespace,
-            &settings.defaults,
-            super::STEP_BACKOFF,
+        let checked = Box::pin(rounds.checked(&settings)).await;
+        let wait = settle(&checked, &mut last, &mut failures);
+        pause(jittered(wait), &mut settings.trust_changes).await;
+    }
+}
+
+/// One round: resolve this site's `GridSite`, check `target` through its signer, and
+/// report on it.
+async fn tick(loop_: &Loop<'_>, settings: &Settings, target: &Result<Target, super::EnrollError>) -> Round {
+    let own = match Box::pin(own_site(loop_.client, settings.site.as_deref())).await {
+        Ok(own) => own,
+        Err(error) => return Round::failed(error),
+    };
+    let round = match target {
+        Err(error) => Round::failed(RenewError::Kube(error.to_string())),
+        Ok(target) => Box::pin(check_round(loop_, target, &own)).await,
+    };
+    settings.configured.store(round.signer.is_some(), Ordering::Relaxed);
+    if let Ok(target) = target {
+        Box::pin(report_round(
+            loop_.client,
+            &own,
+            target,
+            &round,
+            settings.site.as_deref(),
         ))
         .await;
-        let checked = match &target {
-            Ok(target) => Box::pin(check_declared(&client, &store, &renewer, target, settings.install)).await,
-            Err(e) => Err(RenewError::Kube(e.to_string())),
-        };
-        roll_after_renewal(&store, gateway.as_ref(), &target, &checked).await;
-        let wait = settle(&checked, &mut last, &mut failures);
-        if pause(jittered(wait), &mut settings.trust_changes).await {
-            renewer.forget_pin();
+    }
+    round
+}
+
+/// What every round of the loop reaches.
+struct Loop<'run> {
+    /// The API.
+    client: &'run Client,
+    /// The identity Secret.
+    store: &'run KubeIdentity,
+    /// The renewal clients kept across rounds.
+    clients: &'run Clients,
+    /// The modes the install declares, which apply until a `GridNetwork` exists.
+    install: GridModes,
+}
+
+/// What the identity Secret held this round.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Identity {
+    /// The Secret or a key is absent.
+    Missing(String),
+    /// The certificate cannot be parsed.
+    Unreadable(String),
+    /// Expired at this instant.
+    Expired(OffsetDateTime),
+    /// Peers under spiffe trust refuse it: no X.509-SVID profile.
+    Unusable,
+    /// Usable until this instant.
+    Valid(OffsetDateTime),
+}
+
+/// One round's check, the signer it went through, and the identity it read.
+struct Round {
+    /// What the check found or did.
+    checked: Result<Checked, RenewError>,
+    /// The signer's renewal URL, when one was named and renews.
+    signer: Option<String>,
+    /// The identity as read, `None` when the round failed before reading it.
+    identity: Option<Identity>,
+    /// Why `Accepted` is `False`: the signer's rotation is Enabled under pin peer trust.
+    refused: Option<String>,
+}
+
+impl Round {
+    /// A round that did not reach a check.
+    const fn failed(error: RenewError) -> Self {
+        Self {
+            checked: Err(error),
+            signer: None,
+            identity: None,
+            refused: None,
         }
+    }
+}
+
+/// The peer trust the grid declares, and whether it lets this site renew.
+#[derive(Debug, PartialEq, Eq)]
+struct Trust {
+    /// Whether a renewed leaf would be trusted.
+    renews: bool,
+    /// Who declares the mode, for the `Accepted` message when it refuses renewal.
+    declared: String,
+}
+
+impl Trust {
+    /// The `Accepted` message when the signer's rotation is Enabled under this trust.
+    fn refusal(&self) -> String {
+        format!(
+            "spec.local.signerEndpoint.rotation is Enabled but {}, which does not renew; set rotation Disabled or \
+             peerTrust.mode spiffe",
+            self.declared
+        )
+    }
+}
+
+/// The trust the grid declares: the sole `GridNetwork`'s peer trust, else the install's.
+async fn grid_trust(client: &Client, install: GridModes) -> Result<Trust, RenewError> {
+    let networks: Api<GridNetwork> = Api::all(client.clone());
+    let declared = Box::pin(networks.list(&ListParams::default()))
+        .await
+        .map_err(|e| RenewError::Kube(e.to_string()))?;
+    Ok(declared_trust(&declared.items, install))
+}
+
+/// The identity as read this round, with when its renewal is due.
+struct Read {
+    /// The identity.
+    held: Held,
+    /// When its renewal is due.
+    due: Due,
+    /// Its expiry.
+    not_after: OffsetDateTime,
+}
+
+/// Read the identity in `target`, or the round that reports why it could not be.
+async fn read_identity(loop_: &Loop<'_>, target: &Target) -> Result<Read, Round> {
+    let held = match loop_.store.read(target).await {
+        Ok(held) => held,
+        Err(RenewError::Missing(what)) => {
+            return Err(Round {
+                checked: Err(RenewError::Missing(what.clone())),
+                identity: Some(Identity::Missing(what)),
+                ..Round::failed(RenewError::Missing(String::new()))
+            });
+        },
+        Err(error) => return Err(Round::failed(error)),
+    };
+    let (not_before, not_after) = validity(&held).map_err(|error| Round {
+        identity: Some(Identity::Unreadable(error.to_string())),
+        ..Round::failed(error)
+    })?;
+    metrics::set_site_identity_expiry(not_after.unix_timestamp());
+    Ok(Read {
+        due: due(not_before, not_after, OffsetDateTime::now_utc()),
+        held,
+        not_after,
+    })
+}
+
+/// What `IdentityValid` reads off `read` in a grid that `renews` or not.
+fn identity_of(read: &Read, renews: bool) -> Identity {
+    match read.due {
+        Due::Expired => Identity::Expired(read.not_after),
+        Due::At(_) | Due::Now if renews && !certs::has_svid_profile(&read.held.cert).unwrap_or(false) => {
+            Identity::Unusable
+        },
+        Due::At(_) | Due::Now => Identity::Valid(read.not_after),
+    }
+}
+
+/// The signer this round renews through, else why nothing renews, else why it could not
+/// be resolved. A signer whose rotation is Enabled under a trust that does not renew is
+/// held back, since a pinned peer would refuse the renewed leaf.
+async fn through(client: &Client, own: &Own, trust: &Trust) -> Result<Endpoint, Result<Off, RenewError>> {
+    match Box::pin(resolve_signer(client, own)).await {
+        Ok(Resolved::Signer(signer)) if trust.renews => Ok(signer),
+        Ok(Resolved::Signer(_)) => Err(Ok(Off::UnsupportedUnderPin)),
+        Ok(Resolved::Off(why)) => Err(Ok(why)),
+        Err(error) => Err(Err(error)),
+    }
+}
+
+/// Read the identity in `target` and check it through the signer resolved for `own`.
+async fn check_round(loop_: &Loop<'_>, target: &Target, own: &Own) -> Round {
+    let read = match Box::pin(read_identity(loop_, target)).await {
+        Ok(read) => read,
+        Err(round) => return round,
+    };
+    let trust = match Box::pin(grid_trust(loop_.client, loop_.install)).await {
+        Ok(trust) => trust,
+        Err(error) => return Round::failed(error),
+    };
+    let identity = Some(identity_of(&read, trust.renews));
+    match Box::pin(through(loop_.client, own, &trust)).await {
+        Ok(signer) => Box::pin(renew_through(loop_, target, read, signer, identity)).await,
+        Err(Ok(why)) => Round {
+            checked: Ok(Checked::Off { why, due: read.due }),
+            signer: None,
+            identity,
+            refused: (why == Off::UnsupportedUnderPin).then(|| trust.refusal()),
+        },
+        Err(Err(error)) => Round {
+            identity,
+            ..Round::failed(error)
+        },
+    }
+}
+
+/// Renew the identity `read` from `target` through `signer` if it is due.
+async fn renew_through(
+    loop_: &Loop<'_>,
+    target: &Target,
+    read: Read,
+    endpoint: Endpoint,
+    identity: Option<Identity>,
+) -> Round {
+    let url = endpoint.renewal_url();
+    let signer = HttpsSigner::new(endpoint.base, endpoint.pin, loop_.clients);
+    Round {
+        checked: Box::pin(check_held(
+            loop_.store,
+            &signer,
+            target,
+            read.held,
+            OffsetDateTime::now_utc(),
+        ))
+        .await,
+        signer: Some(url),
+        identity,
+        refused: None,
+    }
+}
+
+/// Report the round on this site's `GridSite`: `Enrolled` by the identity in `target`,
+/// `IdentityValid` by what was read, `RotationOnSchedule` by the check, `Available` from
+/// those, and `spec.local` as ignored on every stray.
+async fn report_round(client: &Client, own: &Own, target: &Target, round: &Round, name: Option<&str>) {
+    if let Some(name) = name {
+        let strays: Vec<&GridSite> = own.strays.iter().collect();
+        Box::pin(local::report_strays(client, &strays, name)).await;
+    }
+    let Some(site) = &own.site else {
+        return;
+    };
+    let verdicts = round_verdicts(round, target, local::enrolled(site));
+    let written = Box::pin(local::report_many(client, site, &verdicts)).await;
+    Box::pin(local::report_available(client, &written)).await;
+}
+
+/// The conditions `round` writes on the own site, as (type, manager, verdict). An identity
+/// present reports `Enrolled` only while the site does not read enrolled, so `Issued` stays.
+/// `Accepted` is `False` while the signer's rotation conflicts with the grid's peer trust,
+/// a conflict CEL cannot see, and `True` again once either side changes.
+fn round_verdicts(round: &Round, target: &Target, enrolled: bool) -> Vec<(&'static str, &'static str, Verdict)> {
+    let mut verdicts = Vec::with_capacity(5);
+    let accepted = round.refused.as_ref().map_or_else(Verdict::own_site, |why| {
+        Verdict::new("False", "RotationUnsupportedUnderPinTrust", why.clone())
+    });
+    verdicts.push((local::ACCEPTED, local::ACCEPTED_FIELD_MANAGER, accepted));
+    if !enrolled && !matches!(round.identity, Some(Identity::Missing(_))) {
+        verdicts.push((
+            local::ENROLLED,
+            local::FIELD_MANAGER,
+            Verdict::present(&target.site_secret),
+        ));
+    }
+    if let Some(identity) = &round.identity {
+        verdicts.push((
+            local::IDENTITY_VALID,
+            local::IDENTITY_FIELD_MANAGER,
+            identity_verdict(identity),
+        ));
+    }
+    let rotation = rotation_verdict(&round.checked, round.signer.as_ref());
+    verdicts.push((
+        local::DEGRADED,
+        local::DEGRADED_FIELD_MANAGER,
+        local::degraded(&rotation),
+    ));
+    verdicts.push((local::ROTATION_ON_SCHEDULE, local::RENEWAL_FIELD_MANAGER, rotation));
+    verdicts
+}
+
+/// What `IdentityValid` says about `identity`.
+fn identity_verdict(identity: &Identity) -> Verdict {
+    match identity {
+        Identity::Missing(what) => Verdict::new("False", "IdentityMissing", format!("site identity absent: {what}")),
+        Identity::Unreadable(why) => Verdict::new("False", "CertificateUnreadable", why.clone()),
+        Identity::Expired(at) => Verdict::new(
+            "False",
+            "CertificateExpired",
+            format!("the site identity expired at {at}; re-enroll this site with a new site token"),
+        ),
+        Identity::Unusable => Verdict::new(
+            "False",
+            "CertificateUnusable",
+            "the certificate lacks the X.509-SVID profile peers under spiffe trust require; re-enroll through a \
+             current signer"
+                .to_owned(),
+        ),
+        Identity::Valid(at) => Verdict::new("True", "AsExpected", format!("valid until {at}")),
+    }
+}
+
+/// What `RotationOnSchedule` says after a check through the signer at `url`: whether this
+/// identity renews before it expires.
+fn rotation_verdict(checked: &Result<Checked, RenewError>, url: Option<&String>) -> Verdict {
+    match checked {
+        Err(error @ (RenewError::Unauthenticated(_) | RenewError::Refused(_))) => {
+            Verdict::new("False", "RenewalRefused", error.to_string())
+        },
+        Err(error @ RenewError::SignerDisabled(_)) => Verdict::new("False", "RotationOverdue", error.to_string()),
+        Err(error) => Verdict::new("False", "RenewalFailing", error.to_string()),
+        Ok(Checked::Waiting(_) | Checked::Renewed(_)) => match url {
+            Some(url) => Verdict::new(
+                "True",
+                "AsExpected",
+                format!("renews through {url}, from spec.local.signerEndpoint"),
+            ),
+            None => Verdict::new(
+                "False",
+                "RenewalFailing",
+                "renewal went through no named signer".to_owned(),
+            ),
+        },
+        Ok(Checked::Expired(at)) => Verdict::new(
+            "False",
+            "RotationOverdue",
+            format!("the site identity expired at {at} and cannot renew; re-enroll this site with a new site token"),
+        ),
+        Ok(Checked::Off { why, due: Due::At(_) }) => Verdict::new("True", ROTATION_DISABLED, why.message().to_owned()),
+        Ok(Checked::Off { why, .. }) => Verdict::new(
+            "False",
+            "RotationOverdue",
+            format!("renewal is due and nothing renews: {}", why.message()),
+        ),
     }
 }
 
@@ -662,51 +1101,60 @@ async fn roll_after_renewal(
 }
 
 /// Sleep for `wait`, or until the declared peer trust changes.
-async fn pause(wait: Duration, trust_changes: &mut Option<tokio::sync::watch::Receiver<PeerTrustMode>>) -> bool {
+async fn pause(wait: Duration, trust_changes: &mut Option<tokio::sync::watch::Receiver<PeerTrustMode>>) {
     let Some(changes) = trust_changes.as_mut() else {
         tokio::time::sleep(wait).await;
-        return false;
+        return;
     };
     tokio::select! {
-        () = tokio::time::sleep(wait) => false,
+        () = tokio::time::sleep(wait) => {},
         result = changes.changed() => {
             // A closed channel never changes again, so only the timer is left.
             if result.is_err() {
                 *trust_changes = None;
-                return false;
             }
-            true
         },
     }
 }
 
-/// Renew as [`check`] does, unless the grid declares pin peer trust.
-async fn check_declared<S: IdentityStore + Sync, R: Renewer + Sync>(
-    client: &Client,
-    store: &S,
-    renewer: &R,
-    target: &Target,
-    install: GridModes,
-) -> Result<Checked, RenewError> {
-    let networks: Api<GridNetwork> = Api::all(client.clone());
-    let declared = Box::pin(networks.list(&ListParams::default()))
-        .await
-        .map_err(|e| RenewError::Kube(e.to_string()))?;
-    if !declared_renews(&declared.items, install) {
-        return Ok(Checked::Off);
+/// The trust the declared grid puts this site under. Without a `GridNetwork`, the
+/// install's modes apply.
+fn declared_trust(networks: &[GridNetwork], install: GridModes) -> Trust {
+    // The mode as the admin writes it, lowercase.
+    let mode = |modes: GridModes| {
+        serde_json::to_value(modes.trust)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default()
+    };
+    match networks {
+        [] => Trust {
+            renews: install.renews(),
+            declared: format!(
+                "the install declares peerTrust.mode {} and no GridNetwork exists yet",
+                mode(install)
+            ),
+        },
+        [network] => Trust {
+            renews: GridModes::of(network).renews(),
+            declared: format!(
+                "GridNetwork {} declares peerTrust.mode {}",
+                network.metadata.name.as_deref().unwrap_or_default(),
+                mode(GridModes::of(network))
+            ),
+        },
+        // One operator serves one grid: with several declared, renew under none of them.
+        _ => Trust {
+            renews: false,
+            declared: "several GridNetworks are declared, so no peer trust applies".to_owned(),
+        },
     }
-    Box::pin(check(store, renewer, target, OffsetDateTime::now_utc())).await
 }
 
-/// Whether the declared grid lets this site renew. Without a `GridNetwork`, the
-/// install's modes apply.
+/// Whether the declared grid lets this site renew.
+#[cfg(test)]
 fn declared_renews(networks: &[GridNetwork], install: GridModes) -> bool {
-    match networks {
-        [] => install.renews(),
-        [network] => GridModes::of(network).renews(),
-        // One operator serves one grid: with several declared, renew under none of them.
-        _ => false,
-    }
+    declared_trust(networks, install).renews
 }
 
 /// Whether `checked` rolls the gateway: after a renewal, or on a later check that
@@ -715,7 +1163,7 @@ const fn rolls_after(checked: &Result<Checked, RenewError>) -> Option<bool> {
     match checked {
         Ok(Checked::Renewed(_)) => Some(true),
         Ok(Checked::Waiting(_)) => Some(false),
-        Ok(Checked::Expired(_) | Checked::Off) | Err(_) => None,
+        Ok(Checked::Expired(_) | Checked::Off { .. }) | Err(_) => None,
     }
 }
 
@@ -727,9 +1175,7 @@ fn log_roll(rolled: Result<GatewayRoll, RenewError>, gateway: &KubeGateway, rene
         Ok(GatewayRoll::Rolled) => tracing::info!(deployment, "rolled the gateway onto the rotated site identity"),
         Ok(GatewayRoll::Unchanged) => tracing::debug!(deployment, "gateway already runs the rotated site identity"),
         // Only a renewal's roll reports a missing gateway, once; a recheck has nothing to report.
-        Ok(GatewayRoll::NoGateway)
-            if renewed && !gateway.missing_logged.swap(true, std::sync::atomic::Ordering::Relaxed) =>
-        {
+        Ok(GatewayRoll::NoGateway) if renewed && !gateway.missing_logged.swap(true, Ordering::Relaxed) => {
             tracing::info!(
                 deployment,
                 "no gateway Deployment to roll onto the rotated site identity"
@@ -755,7 +1201,7 @@ fn settle(checked: &Result<Checked, RenewError>, last: &mut Option<String>, fail
         // Re-read soon, so the next renewal is scheduled from the new leaf.
         Ok(Checked::Renewed(_)) => ("rotated".to_owned(), RETRY_INITIAL),
         Ok(Checked::Expired(_)) => ("expired".to_owned(), CHECK_EVERY),
-        Ok(Checked::Off) => ("off".to_owned(), CHECK_EVERY),
+        Ok(Checked::Off { why, due }) => (format!("off {} {due:?}", why.label()), CHECK_EVERY),
         Err(error) => (error.to_string(), retry_delay(failures.saturating_add(1))),
     };
     report(checked, last.as_deref() != Some(state.as_str()), wait);
@@ -777,15 +1223,15 @@ fn report(checked: &Result<Checked, RenewError>, changed: bool, wait: Duration) 
             tracing::info!(not_after = %until, "site identity rotated");
         },
         Ok(Checked::Waiting(at)) if changed => tracing::info!(renew_after = %at, "site identity rotation scheduled"),
-        Ok(Checked::Off) if changed => {
-            tracing::info!("rotation disabled: peerTrust pin needs re-enrollment and re-pinning at expiry");
-        },
         Ok(Checked::Expired(at)) if changed => {
             metrics::record_site_identity_renewal("expired");
             tracing::error!(
                 not_after = %at,
                 "site identity expired and cannot rotate; re-enroll this site with a new site token"
             );
+        },
+        Ok(Checked::Off { why, due }) if changed => {
+            tracing::info!(why = why.label(), due = ?due, "{}", why.message());
         },
         Err(error) if changed => {
             metrics::record_site_identity_renewal(error.result());

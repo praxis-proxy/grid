@@ -230,15 +230,15 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `tolerations` | list | `[]` | Pod tolerations. |
 | `topologySpreadConstraints` | list | `[]` | Topology spread constraints. |
 | `priorityClassName` | string | `""` | Pod priority class. |
-| `enrollment.enabled` | bool | `false` | Enroll on startup when the site identity Secret is absent. |
-| `enrollment.url` | string | `""` | Enrollment service base URL (https). |
-| `enrollment.siteName` | string | `""` | Site name the token pins, at most 51 characters. |
-| `enrollment.caBundle` | object | `{configMap: "", secret: "", key: ca.crt}` | CA bundle that pins the enrollment server, from exactly one of `configMap` and `secret`. |
-| `enrollment.gridCaBundle` | object | `{configMap: "", secret: "", key: ca.crt}` | Grid CA the returned CA must match, from at most one source. Defaults to `caBundle`. |
-| `enrollment.tokenSecretRef` | object | `{name: "", key: token}` | Secret in the release namespace holding the one-time site token. |
-| `enrollment.identitySecretName` | string | `grid-site-identity` | Secret the site identity is written to when no `GridNetwork` names one. Installing the operator alone enrolls the site; no `GridNetwork` is needed. |
-| `enrollment.caSecretName` | string | `grid-ca` | Secret the grid CA is written to when no `GridNetwork` names one. |
-| `enrollment.rotation.enabled` | bool | `true` | Rotate the site identity before it expires, presenting the current one. Off under `pin` peer trust whatever this says. Needs an enrollment URL: the default with `enrollment.enabled`, or `enrollment.url` set, as on a hub whose identity bootstrap issued. |
+| `enrollment.enabled` | bool | `false` | This site enrolls: turns on the SWIM LoadBalancer Service, site-identity metrics TLS and the enrollment namespace guard, and with `grid.id` renders `spec.local` with the signer and the invite on the chart's GridSite. |
+| `enrollment.url` | string | `""` | Signer base URL (https), the GridSite's `local.signerEndpoint.url`. Defaults to the in-cluster `grid-enrollment` Service in `rbac.enrollmentNamespace` with `grid.id` and `enabled`. Needs `grid.id`. |
+| `enrollment.siteName` | string | `""` | Site name the token pins, at most 51 characters, and the GridSite's name. Defaults to `swim.siteName`. |
+| `enrollment.caBundle` | object | `{configMap: "", secret: "", key: ca.crt}` | `local.signerEndpoint.caBundleRef`, from exactly one of `configMap` and `secret`. With neither, Secret `grid-ca-bundle` when `enabled`. Needs `grid.id`. |
+| `enrollment.gridCaBundle` | object | `{configMap: "", secret: "", key: ca.crt}` | `local.signerEndpoint.gridCaBundleRef`, the grid CA the returned CA must match, from at most one source. Defaults to `caBundle`. Needs `grid.id`. |
+| `enrollment.tokenSecretRef` | object | `{name: "", key: token}` | `local.inviteSecretRef`, the Secret in the release namespace holding the one-time site token. Name defaults to `grid-invite-<siteName>`. Needs `grid.id`. |
+| `enrollment.rotation` | string | `""` | `local.signerEndpoint.rotation`: `Enabled` or `Disabled`. Empty renders `Disabled` unless `grid.peerTrust` is `spiffe`, and under `spiffe` leaves the CRD default, `Enabled`. Needs `grid.id` and a signer. |
+| `enrollment.identitySecretName` | string | `grid-site-identity` | Identity Secret the rendered GridNetwork names. Without `grid.id` it must stay `grid-site-identity`. |
+| `enrollment.caSecretName` | string | `grid-ca` | Grid CA Secret the rendered GridNetwork names. Without `grid.id` it must stay `grid-ca`. |
 
 ## Join a grid
 
@@ -257,7 +257,8 @@ labelled `grid.praxis.fast/provider-site`.
 Without `grid.id` or `enrollment.enabled`, the operator creates these records once the site
 has an identity. It names the site from its SPIFFE ID and creates its GridNetwork
 (`GRID_NETWORK`, default `grid`) and labelled GridSite, each once, only when missing, and
-never edits them. A release with `grid.id` or `enrollment.enabled` turns this off from its
+never edits them. That GridSite carries no `spec.local`, so nothing renews the identity
+until a chart or an admin declares `spec.local.signerEndpoint` on it. A release with `grid.id` or `enrollment.enabled` turns this off from its
 first install, so Helm never meets an operator-created record. Without an identity or
 `site.name` the operator idles, and a `site.name` that disagrees with the identity stops it.
 The GridNetwork's `LocalSiteDeclared` condition reports a missing local GridSite.
@@ -297,11 +298,11 @@ Service lookups; an explicit `gateway.address` still wins when discovery is off.
 For provider discovery, the Service must be `LoadBalancer`. ClusterIP and
 NodePort gateways need an explicit reachable `gateway.address`.
 
-## Auto-enroll
+## Enrollment
 
-With `enrollment.enabled`, the operator enrolls on startup when the site identity Secret is absent, and reports ready after it enrolls. No `GridNetwork` is needed: the token pins the grid. The operator writes to the Secrets a `GridNetwork`'s `spec.tls.siteSecretRef` and `caSecretRef` name when one exists, and otherwise to `enrollment.identitySecretName` and `enrollment.caSecretName`. Both must be in the release namespace. With `rbac.create=false`, grant the operator get, create, and patch on Secrets. [Site Enrollment](../../docs/installation/enrollment.md#enroll-a-site) covers the hub and site steps.
+The operator enrolls from this cluster's own GridSite, the one that carries `spec.local`, while it has no identity: at startup, and every 15 seconds while it waits. `spec.local.inviteSecretRef` names the invite, and `spec.local.signerEndpoint.caBundleRef` pins the signer. With `grid.id`, the chart renders `spec.local` from the `enrollment` values. Without it, setting `enrollment.url`, `caBundle`, `gridCaBundle`, `tokenSecretRef` or `rotation` fails the render; set `gridSite.local` on the grid-site chart instead. The GridSite's `Enrolled` condition reports the result, and `Available` rolls every condition on the own site up. No `GridNetwork` is needed: the token pins the grid. The operator writes to the Secrets a `GridNetwork`'s `spec.tls.siteSecretRef` and `caSecretRef` name when one exists, and otherwise to `grid-site-identity` and `grid-ca`, in the release namespace. An operator that enrolls while waiting exits 0 once and restarts under the identity. With `rbac.create=false`, grant the operator get, create, and patch on Secrets. [Site Enrollment](../../docs/installation/enrollment.md#3-enroll-the-site) covers the hub and site steps.
 
-With `enrollment.rotation.enabled`, the default, the operator rotates the site identity when less than a third of its lifetime remains. It presents the current certificate to the enrollment service, writes the new certificate and key into the same Secret, and keeps the replaced certificate under `previous.crt` until it expires. Consumers reload the Secret without a restart. The gateway loads its upstream client certificate only at start, so after each rotation the operator rolls the gateway Deployment named by `gateway.serviceName`, setting the pod template annotation `grid.praxis.fast/site-identity-fingerprint` to the new leaf's fingerprint. Rotation pins the enrollment service to `enrollment.caBundle` when set, and otherwise to the grid CA the site already holds. An identity that expired cannot rotate: `GridNetwork` `status.identity` reports `IdentityExpired`, and the site re-enrolls. The operator rotates only under `spiffe` peer trust, and follows the trust its `GridNetwork` declares. Before a `GridNetwork` exists it trusts by SPIFFE ID and rotates. Under `pin`, which a `GridNetwork` gets when it omits `peerTrust`, it logs `rotation disabled` when it finds pin trust, leaves `status.identity.rotateAfter` empty, and the site re-enrolls and is re-pinned before `status.identity.notAfter`. Setting `enrollment.rotation.enabled=false` stops this site's rotation and gateway roll and keeps its current identity until it expires. [Turn rotation off](../../docs/installation/enrollment.md#turn-rotation-off) covers turning it off for the whole grid.
+While the GridSite named after this site's identity names a signer under `spec.local.signerEndpoint` with `rotation: Enabled`, the default, the operator rotates the site identity when less than a third of its lifetime remains. It reads `spec.local` each round, so a URL edit applies without re-enrolling, and its `RotationOnSchedule` condition reports whether the identity renews before it expires. It presents the current certificate to the signer, writes the new certificate and key into the same Secret, and keeps the replaced certificate under `previous.crt` until it expires. Consumers reload the Secret without a restart. The gateway loads its upstream client certificate only at start, so after each rotation the operator rolls the gateway Deployment named by `gateway.serviceName`, setting the pod template annotation `grid.praxis.fast/site-identity-fingerprint` to the new leaf's fingerprint. Rotation pins the signer to `caBundleRef` when set, and otherwise to the grid CA the site already holds. An identity that expired cannot rotate: `GridNetwork` `status.identity` reports `IdentityExpired`, and the site re-enrolls. The operator rotates only under `spiffe` peer trust, and follows the trust its `GridNetwork` declares. Under `pin`, which a `GridNetwork` gets when it omits `peerTrust`, the chart renders `rotation: Disabled`; `Enabled` there reports `Accepted` `False` with `RotationUnsupportedUnderPinTrust` and nothing renews, so the site re-enrolls and is re-pinned before `status.identity.notAfter`. Setting `spec.local.signerEndpoint.rotation: Disabled` stops this site's rotation and gateway roll and keeps its current identity until it expires, unless another writer renews it. [Turn rotation off](../../docs/installation/enrollment.md#turn-rotation-off) covers turning it off for the whole grid.
 
 ## RBAC and namespace access
 
@@ -312,9 +313,9 @@ The chart creates two ClusterRoles:
    GridSites; get/patch on all three status subresources.
 2. **Resource access** (`<release>-resources`): get/create/patch on Secrets;
    get on the named gateway, SWIM, and signals Services; create/patch on
-   Events (`events.k8s.io`); get/create/patch/update on ConfigMaps; and,
-   with rotation on, get/patch on the one Deployment named by
-   `gateway.serviceName`.
+   Events (`events.k8s.io`); get/create/patch/update on ConfigMaps; and
+   get/patch on the one Deployment named by `gateway.serviceName`, which a
+   rotation rolls.
 
 It grants no other Deployment access. A gateway that delegates its Secret
 mounts to the operator renders a Role for its own Deployment from the

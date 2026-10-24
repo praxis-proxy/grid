@@ -665,6 +665,14 @@ func wellKnownTypeName(n schemaNode) (string, bool) {
 			return "EndpointTransport", true
 		}
 
+	// BundleRef: {key, kind, name}, a PEM bundle in a Secret or ConfigMap.
+	case eqKeys(keys, "key", "kind", "name") && hasRequired(n, "name"):
+		return "BundleRef", true
+
+	// InviteSecretRef: {key, name} whose key defaults to the invite token's.
+	case eqKeys(keys, "key", "name") && hasRequired(n, "name") && string(props["key"].Default) == `"token"`:
+		return "InviteSecretRef", true
+
 	// GatewayCASecretRef (transport caSecretRef with just name+key, no namespace).
 	case eqKeys(keys, "key", "name") && hasRequired(n, "name"):
 		return "GatewayCASecretRef", true
@@ -740,6 +748,8 @@ func wellKnownEnumName(schema schemaNode, proposedName string) string {
 		return "ProviderPhase"
 	case "Active,Connecting,Discovered,Left,Pending,Unreachable":
 		return "GridSitePhase"
+	case "ConfigMap,Secret":
+		return "BundleKind"
 	case "Active,Degraded,Initializing,Pending":
 		return "GridNetworkPhase"
 	case "Disabled,Error,Rendered":

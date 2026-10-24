@@ -1498,6 +1498,31 @@ pub(crate) fn is_tls_error(err: &(dyn std::error::Error + 'static)) -> bool {
     err.downcast_ref::<openssl::ssl::Error>().is_some() || err.downcast_ref::<openssl::error::ErrorStack>().is_some()
 }
 
+/// Whether `err` is a server certificate refused only for its validity window, which the
+/// server can fix by rotating without anything on this side changing.
+#[cfg(not(feature = "fips"))]
+pub(crate) fn is_lapsed_certificate(err: &(dyn std::error::Error + 'static)) -> bool {
+    use rustls::{CertificateError, Error};
+    matches!(
+        err.downcast_ref::<Error>(),
+        Some(Error::InvalidCertificate(
+            CertificateError::Expired
+                | CertificateError::ExpiredContext { .. }
+                | CertificateError::NotValidYet
+                | CertificateError::NotValidYetContext { .. }
+        ))
+    )
+}
+
+/// Whether `err` is a server certificate refused only for its validity window, which the
+/// server can fix by rotating without anything on this side changing.
+// native-tls carries the verify result only in its message, as OpenSSL's fixed text.
+#[cfg(feature = "fips")]
+pub(crate) fn is_lapsed_certificate(err: &(dyn std::error::Error + 'static)) -> bool {
+    let text = err.to_string();
+    text.contains("certificate has expired") || text.contains("certificate is not yet valid")
+}
+
 /// Classify a TLS/handshake I/O error into a `GatewayProbeOutcome`.
 ///
 /// Never exposes the raw error string in the outcome.

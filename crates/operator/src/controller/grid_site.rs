@@ -87,7 +87,15 @@ pub async fn reconcile(site: Arc<GridSite>, client: Arc<Client>) -> Result<Actio
 
     tracing::debug!(name, "reconciling GridSite");
 
-    let network = fetch_network(&site, client.as_ref()).await?;
+    let network = match fetch_network(&site, client.as_ref()).await {
+        Ok(network) => network,
+        // This cluster's own site can precede its GridNetwork while it enrolls.
+        Err(error @ OperatorError::NotFound(_)) if site.spec.local.is_some() => {
+            tracing::debug!(name, %error, "local GridSite has no GridNetwork yet");
+            return Ok(Action::requeue(REQUEUE_INTERVAL));
+        },
+        Err(error) => return Err(error),
+    };
     let current_phase = site.status.as_ref().map_or(&GridSitePhase::Pending, |s| &s.phase);
 
     let outcome = if needs_probe(current_phase) {
@@ -135,10 +143,18 @@ pub fn error_policy(_site: Arc<GridSite>, error: &OperatorError, _ctx: Arc<Clien
 async fn fetch_network(site: &GridSite, client: &Client) -> Result<GridNetwork, OperatorError> {
     let api: Api<GridNetwork> = Api::all(client.clone());
     let network_name = &site.spec.grid_network_ref;
-    api.get(network_name).await.map_err(|e| {
-        tracing::warn!(error = %e, network = %network_name, "lookup failed");
-        OperatorError::NotFound(format!("GridNetwork {network_name}"))
-    })
+    api.get(network_name)
+        .await
+        .map_err(|error| network_fetch_error(network_name, error))
+}
+
+/// A 404 is `NotFound`, which a local site requeues on quietly. Anything else stays a kube
+/// error, so a denial or an apiserver fault is logged and retried as a failure.
+fn network_fetch_error(network_name: &str, error: kube::Error) -> OperatorError {
+    if matches!(&error, kube::Error::Api(status) if status.code == 404) {
+        return OperatorError::NotFound(format!("GridNetwork {network_name}: {error}"));
+    }
+    OperatorError::Kube(error)
 }
 
 /// Whether the current phase requires a gateway probe.
@@ -527,6 +543,7 @@ async fn update_status(
         last_transition_time: transition_time,
         public_cert_pem: existing.and_then(|s| s.public_cert_pem.clone()),
         absent_since: existing.and_then(|s| s.absent_since.clone()),
+        conditions: existing.map_or_else(Vec::new, |s| s.conditions.clone()),
     };
 
     if !grid_site_status_needs_update(existing, &status) {
@@ -683,6 +700,29 @@ fn rfc3339_now() -> Option<String> {
 mod tests {
     use super::*;
 
+    /// An apiserver status with `code`, as `error::tests` scripts one.
+    fn api(code: u16) -> kube::Error {
+        kube::Error::Api(Box::new(kube::core::Status::failure("scripted", "r").with_code(code)))
+    }
+
+    /// Only a missing `GridNetwork` takes the local site's quiet requeue. A denial or an
+    /// apiserver fault must surface through the error policy.
+    #[test]
+    fn only_a_missing_grid_network_is_not_found() {
+        assert!(
+            matches!(network_fetch_error("net", api(404)), OperatorError::NotFound(_)),
+            "404 is a GridNetwork not yet applied"
+        );
+        assert!(
+            matches!(network_fetch_error("net", api(403)), OperatorError::Kube(_)),
+            "a denial is not a missing GridNetwork"
+        );
+        assert!(
+            matches!(network_fetch_error("net", api(503)), OperatorError::Kube(_)),
+            "an apiserver fault is not a missing GridNetwork"
+        );
+    }
+
     #[test]
     fn grid_site_status_update_is_skipped_when_semantically_unchanged() {
         let baseline = GridSiteStatus {
@@ -790,6 +830,7 @@ mod tests {
                 sovereignty_zone: None,
                 zone: None,
                 trust: None,
+                local: None,
             },
             status: phase.map(|p| GridSiteStatus {
                 phase: p,
@@ -821,6 +862,7 @@ mod tests {
                 sovereignty_zone: None,
                 zone: None,
                 trust: None,
+                local: None,
             },
             status: phase.map(|p| GridSiteStatus {
                 phase: p,
@@ -1241,6 +1283,7 @@ mod tests {
                 sovereignty_zone: None,
                 zone: None,
                 trust: None,
+                local: None,
             },
             status: phase.map(|p| GridSiteStatus {
                 phase: p,
@@ -1454,6 +1497,7 @@ mod tests {
                 sovereignty_zone: None,
                 zone: None,
                 trust,
+                local: None,
             },
             status: phase.map(|p| GridSiteStatus {
                 phase: p,

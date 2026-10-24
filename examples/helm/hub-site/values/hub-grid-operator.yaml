@@ -1,4 +1,4 @@
-# grid-operator on the hub. Enrollment defaults to the in-cluster grid-enrollment Service.
+# grid-operator on the hub. Its GridSite, in hub-grid-site.yaml, names the signer.
 swim:
   siteName: hub
 enrollment:

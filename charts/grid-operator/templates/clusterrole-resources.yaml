@@ -20,13 +20,12 @@ rules:
       - {{ printf "%s-swim" (include "grid-operator.fullname" .) | quote }}
       - {{ printf "%s-signals" (include "grid-operator.fullname" .) | quote }}
     verbs: ["get"]
-{{- if include "grid-operator.enrollment.rotates" . }}
   # A rotation rolls the gateway, which loads its upstream client certificate only at start.
+  # Unconditional: any identified site renews once its GridSite names a signer.
   - apiGroups: ["apps"]
     resources: ["deployments"]
     resourceNames: [{{ .Values.gateway.serviceName | default "provider-gateway" | quote }}]
     verbs: ["get", "patch"]
-{{- end }}
   - apiGroups: ["events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]

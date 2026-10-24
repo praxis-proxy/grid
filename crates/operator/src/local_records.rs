@@ -95,6 +95,8 @@ pub fn grid_site(plan: &Plan, network: &str) -> GridSite {
         sovereignty_zone: None,
         zone: None,
         trust: None,
+        // The chart declares spec.local; the operator only reads it.
+        local: None,
     };
     let mut site = GridSite::new(&plan.site, spec);
     let mut labels = created_by();
@@ -296,6 +298,10 @@ mod tests {
     fn the_site_is_labelled_so_its_providers_match_it() {
         let site = grid_site(&plan(None), "dagobah-local");
         assert_eq!(site.metadata.name.as_deref(), Some("hub"));
+        assert!(
+            site.spec.local.is_none(),
+            "the chart declares the signer, not the operator"
+        );
         assert_eq!(site.spec.grid_network_ref, "dagobah-local");
         let labels = site.metadata.labels.expect("labels");
         assert_eq!(labels.get(PROVIDER_SITE_LABEL).map(String::as_str), Some("hub"));
@@ -363,11 +369,9 @@ mod tests {
             ("POST", "/gridnetworks", 201, object("GridNetwork", "grid")),
             ("POST", "/gridsites", 201, object("GridSite", "hub")),
         ]);
-        let outcome = Box::pin(create(&client, "grid", plan(None), "grid-swim-key"))
-            .await
-            .expect("create");
+        let outcome = Box::pin(create(&client, "grid", plan(None), "grid-swim-key")).await;
         assert_eq!(
-            outcome,
+            outcome.expect("create"),
             Outcome::Checked {
                 network: true,
                 site: true
