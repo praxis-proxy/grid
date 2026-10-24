@@ -20,7 +20,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -85,6 +88,9 @@ const DATA_PLANE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Tolerance for comparing Prometheus-serialized EPP KV-cache means.
 const KV_CACHE_METRIC_TOLERANCE: f64 = 1e-6;
+
+/// Unique suffix for concurrent or same-second temporary curl Pods.
+static CURL_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Configured queue capacity (matches MOCK_MAX_NUM_SEQS on VCR pods).
 const QUEUE_CAPACITY: f64 = 4.0;
@@ -2481,19 +2487,74 @@ struct KubectlCurlOutput {
     stderr: String,
 }
 
-/// Run curl via kubectl in a temporary pod and retain its raw output.
+/// Delete only the temporary curl Pod created for one inference probe.
+struct CurlProbePodCleanup {
+    /// Kubernetes context containing the temporary Pod.
+    context: String,
+    /// Unique name of the temporary Pod.
+    name: String,
+}
+
+impl Drop for CurlProbePodCleanup {
+    fn drop(&mut self) {
+        drop(
+            Command::new("timeout")
+                .args([
+                    "15s",
+                    "kubectl",
+                    "--context",
+                    &self.context,
+                    "-n",
+                    GRID_SYSTEM_NS,
+                    "delete",
+                    "pod",
+                    &self.name,
+                    "--ignore-not-found=true",
+                    "--wait=false",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status(),
+        );
+    }
+}
+
+/// Return the curl container's exit code after Kubernetes observes termination.
+fn curl_probe_pod_exit_code(pod: &serde_json::Value) -> Option<i32> {
+    pod.pointer("/status/containerStatuses")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|statuses| statuses.first())
+        .and_then(|status| status.pointer("/state/terminated/exitCode"))
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|code| i32::try_from(code).ok())
+        .or_else(|| {
+            (pod.pointer("/status/phase").and_then(serde_json::Value::as_str) == Some("Succeeded")).then_some(0)
+        })
+}
+
+/// Run curl in a temporary Pod, then read its completed logs without relying on kubectl's attach stream.
 fn kubectl_exec_curl_raw(kube_context: &str, cmd: &str) -> Result<KubectlCurlOutput, Box<dyn std::error::Error>> {
-    let pod_name = format!("curl-probe-{}", &format_utc_timestamp()[9..15]);
-    let output = Command::new("kubectl")
+    let sequence = CURL_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let pod_name = format!(
+        "curl-probe-{}-{}-{sequence}",
+        &format_utc_timestamp()[9..15],
+        std::process::id()
+    );
+    let _cleanup = CurlProbePodCleanup {
+        context: kube_context.to_owned(),
+        name: pod_name.clone(),
+    };
+    let create = Command::new("timeout")
         .args([
+            "60s",
+            "kubectl",
             "--context",
             kube_context,
             "run",
             &pod_name,
             "--image=curlimages/curl:8.5.0",
             "--restart=Never",
-            "--rm",
-            "-i",
+            "--attach=false",
             "-n",
             GRID_SYSTEM_NS,
             "--",
@@ -2502,19 +2563,88 @@ fn kubectl_exec_curl_raw(kube_context: &str, cmd: &str) -> Result<KubectlCurlOut
             cmd,
         ])
         .output()?;
-    if !output.status.success() {
+    if !create.status.success() {
         return Err(format!(
             "kubectl run {pod_name} failed (kubectl exit code {:?}); stdout={:?}; stderr={:?}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim(),
+            create.status.code(),
+            String::from_utf8_lossy(&create.stdout).trim(),
+            String::from_utf8_lossy(&create.stderr).trim(),
         )
         .into());
     }
-    Ok(KubectlCurlOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-    })
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let observed = Command::new("timeout")
+            .args([
+                "10s",
+                "kubectl",
+                "--context",
+                kube_context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "get",
+                "pod",
+                &pod_name,
+                "-o",
+                "json",
+            ])
+            .output()?;
+        if observed.status.success() {
+            let pod: serde_json::Value = serde_json::from_slice(&observed.stdout)?;
+            if let Some(exit_code) = curl_probe_pod_exit_code(&pod) {
+                let logs = Command::new("timeout")
+                    .args([
+                        "30s",
+                        "kubectl",
+                        "--context",
+                        kube_context,
+                        "-n",
+                        GRID_SYSTEM_NS,
+                        "logs",
+                        &pod_name,
+                    ])
+                    .output()?;
+                if !logs.status.success() {
+                    return Err(format!(
+                        "could not read completed curl probe Pod {pod_name} logs (container exit {exit_code}): {}",
+                        String::from_utf8_lossy(&logs.stderr).trim()
+                    )
+                    .into());
+                }
+                if exit_code != 0 {
+                    return Err(format!(
+                        "curl probe Pod {pod_name} exited with status {exit_code}: {}",
+                        String::from_utf8_lossy(&logs.stdout).trim()
+                    )
+                    .into());
+                }
+                return Ok(KubectlCurlOutput {
+                    stdout: String::from_utf8_lossy(&logs.stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&logs.stderr).to_string(),
+                });
+            }
+            if pod.pointer("/status/phase").and_then(serde_json::Value::as_str) == Some("Failed") {
+                let reason = pod
+                    .pointer("/status/reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("PodFailed");
+                let message = pod
+                    .pointer("/status/message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("curl probe Pod failed before its container reported an exit code");
+                return Err(format!("curl probe Pod {pod_name} failed: {reason}: {message}").into());
+            }
+        } else {
+            let stderr = String::from_utf8_lossy(&observed.stderr);
+            if !stderr.contains("NotFound") {
+                return Err(format!("could not observe curl probe Pod {pod_name}: {}", stderr.trim()).into());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("curl probe Pod {pod_name} did not terminate within 60 seconds").into());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// Extract a specific data key from a ConfigMap as raw text.
@@ -4735,6 +4865,27 @@ mod tests {
     use serde::Deserialize as _;
 
     use super::*;
+
+    #[test]
+    fn curl_probe_waits_for_a_terminal_pod_before_reading_logs() -> Result<(), Box<dyn std::error::Error>> {
+        let running: serde_json::Value = serde_json::from_str(r#"{"status":{"phase":"Running"}}"#)?;
+        assert_eq!(curl_probe_pod_exit_code(&running), None);
+
+        let succeeded: serde_json::Value = serde_json::from_str(
+            r#"{"status":{"phase":"Succeeded","containerStatuses":[{"state":{"terminated":{"exitCode":0}}}]}}"#,
+        )?;
+        assert_eq!(curl_probe_pod_exit_code(&succeeded), Some(0));
+
+        let failed: serde_json::Value = serde_json::from_str(
+            r#"{"status":{"phase":"Failed","containerStatuses":[{"state":{"terminated":{"exitCode":22}}}]}}"#,
+        )?;
+        assert_eq!(curl_probe_pod_exit_code(&failed), Some(22));
+
+        let failed_before_container_start: serde_json::Value =
+            serde_json::from_str(r#"{"status":{"phase":"Failed","reason":"ImagePullBackOff"}}"#)?;
+        assert_eq!(curl_probe_pod_exit_code(&failed_before_container_start), None);
+        Ok(())
+    }
 
     #[test]
     fn curl_probe_output_preserves_no_response_transport_diagnostics() -> Result<(), Box<dyn std::error::Error>> {
