@@ -131,6 +131,10 @@ pub(crate) struct RoutingCandidate {
     /// Whether this candidate's metrics data is considered fresh.
     pub(crate) fresh: bool,
 
+    /// RFC 3339 UTC deadline for a discovered model candidate.
+    #[serde(default)]
+    pub(crate) expires_at: Option<String>,
+
     /// Credential reference projected by the operator, if any.
     ///
     /// Present when the provider's `spec.auth` declares a `bearer_token` strategy.
@@ -319,6 +323,10 @@ fn candidate_yaml_lines(c: &RoutingCandidate, emit_credential: bool) -> String {
         format!("           cluster: gateway-{}", c.site),
         format!("           fresh: {fresh_str}"),
     ];
+    if let Some(expires_at) = &c.expires_at {
+        let encoded = serde_json::to_string(expires_at).unwrap_or_default();
+        lines.push(format!("           expires_at: {encoded}"));
+    }
     if let Some(cred) = c.credential.as_ref().filter(|_| emit_credential) {
         emit_credential_yaml(&mut lines, cred);
     }
@@ -499,6 +507,21 @@ mod tests {
             "must use gateway-{{site}} convention"
         );
         assert!(yaml.contains("fresh: true"), "must include fresh");
+    }
+
+    #[test]
+    fn discovered_candidate_expiry_survives_yaml_projection() {
+        let overlay = parse_grid_config_json(
+            r#"{"network":"test","local_site":"site-a","candidates":[{"kind":"inference_model","name":"model","site":"site-a","cluster":"pool-a","fresh":true,"expires_at":"2030-01-01T00:00:00Z"}]}"#,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        let yaml = candidates_yaml(&overlay);
+
+        assert!(
+            yaml.contains("expires_at: \"2030-01-01T00:00:00Z\""),
+            "dynamic candidate deadline must reach the generated Praxis candidate"
+        );
     }
 
     #[test]

@@ -71,6 +71,7 @@ spec:
     - name: inference-gw
       namespace: praxis-system
       siteName: cluster-east   # optional; defaults to network name
+      modelDiscoveryContractVersion: v1 # only after the running gateway implements the model-discovery contract
       praxisConfig:               # optional; opt-in consumer Praxis config generation
         generate: true
         enableProjectedCredentials: true  # generate filter, then roll out consumer
@@ -413,6 +414,13 @@ embedded gateway's startup upstream configuration must use that TLS identity.
 This field is independent of `praxisConfig`; absent or disabled generated
 consumer Praxis config cannot make embedded serving fail validation or change
 its provider-hop allowlist.
+
+### GatewayRef.modelDiscoveryContractVersion
+
+Set `spec.consumerGateways[].modelDiscoveryContractVersion: v1` only after the
+running gateway image understands and enforces the `expires_at` field on local
+discovered-model candidates. Missing or unknown versions cause Grid to omit
+discovered candidates for that gateway while keeping static candidates.
 
 ### GatewayRef.praxisConfig
 
@@ -1054,8 +1062,11 @@ as a normalized `0.0` to `1.0` gauge before the operator scrapes it.
 ### Model discovery
 
 `spec.modelDiscovery` makes the operator poll the backend for the models it
-serves. Discovery does not yet affect routing or gossip; `spec.models`
-remains the routing source.
+serves. Discovered model names can appear in local route candidates only for a
+gateway that declares `modelDiscoveryContractVersion: v1`. They remain
+withheld from provider records because the current provider-record format
+cannot carry expiry. A provider with discovery configured does not fall back to
+`spec.models`; providers without discovery continue to use `spec.models`.
 
 ```yaml
 spec:
@@ -1100,9 +1111,26 @@ require this timestamp to be in the future before using `servedModels`. The
 discovery loop may not clear the status until its next round after the TTL, so
 the presence of `servedModels` alone does not prove freshness. Failed polls do
 not extend the deadline. When the set is unknown, expired and cleared, or
-discovery is disabled, both fields are absent; readers must fail closed.
-Writing either field advances `metadata.resourceVersion`, so the CRDT revision
+discovery is disabled, these discovery inventory fields are absent; readers
+must fail closed.
+`status.servedModelsObservedGeneration` records the provider `metadata.generation`
+that produced the set. Readers must require it to equal the current generation;
+a spec change makes the prior inventory unusable until a successful poll writes
+a new set, expiry, and generation together.
+Updating these fields advances `metadata.resourceVersion`, so the CRDT revision
 of the gossiped provider record advances with discovery status changes.
+
+### Gateway model discovery contract
+
+The operator adds `expires_at` (RFC 3339 UTC) to each discovered local route
+candidate. A gateway may receive these candidates only when its `GatewayRef`
+declares `modelDiscoveryContractVersion: v1`, after the running image has
+implemented this contract. At request time the gateway must treat the candidate
+as expired once its UTC clock reaches `expires_at` minus 30 seconds. This
+conservative allowance covers gateways whose clocks are up to 30 seconds behind
+the operator; a gateway with a clock ahead may withdraw the route early. The
+gateway must never extend the deadline or apply a grace period after it.
+Gateways without the declaration receive no discovered candidates.
 
 The bearer token comes from `spec.auth`. A model-discovery URL must use HTTPS
 when a bearer token is configured. With `auth.credentialsManagedExternally`, requests carry no

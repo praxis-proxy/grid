@@ -20,6 +20,7 @@ use tokio::sync::watch;
 
 use crate::{
     AccumulatedOutput, GridRuntime, NodeId,
+    model_inventory::{ModelInventory, ModelInventoryBroadcast},
     runtime::TimerEvent,
     state_broadcast::{
         DEFAULT_MAX_RETAINED_ORIGINS, MAX_PINNED_KEYS_PER_ORIGIN, OriginStateHandle, StateBroadcast,
@@ -69,6 +70,27 @@ pub enum PublishStateBroadcastError {
         /// Encoded payload length.
         actual_bytes: usize,
         /// Maximum payload length safe for every valid site identity.
+        maximum_bytes: usize,
+    },
+}
+
+/// Failure to encode or queue a signed model inventory frame.
+#[derive(Debug, thiserror::Error)]
+pub enum PublishModelInventoryError {
+    /// Bincode could not encode the frame.
+    #[error("failed to encode model inventory frame: {0}")]
+    Encode(#[from] bincode::error::EncodeError),
+    /// Foca rejected the encoded frame before queueing it.
+    #[error("failed to queue model inventory frame: {0}")]
+    Queue(#[from] foca::Error),
+    /// The frame cannot fit beside the SWIM broadcast header.
+    #[error(
+        "model inventory frame is {actual_bytes} bytes, exceeding safe SWIM payload budget of {maximum_bytes} bytes"
+    )]
+    TooLarge {
+        /// Encoded frame length.
+        actual_bytes: usize,
+        /// Maximum encoded payload length.
         maximum_bytes: usize,
     },
 }
@@ -138,6 +160,9 @@ pub struct SwimNode {
     /// Watch receiver for the signals address map, keyed by origin site.
     signals_addrs_rx: watch::Receiver<BTreeMap<String, String>>,
 
+    /// Watch receiver for complete signature-verified model inventories.
+    model_inventories_rx: watch::Receiver<Vec<ModelInventory>>,
+
     /// Immediate control path for coordinated per-origin state eviction.
     origin_state: OriginStateHandle,
 
@@ -190,6 +215,7 @@ impl SwimNode {
         let gateway_addrs_rx = handler.subscribe_gateway_addrs();
         let cert_pems_rx = handler.subscribe_cert_pems();
         let signals_addrs_rx = handler.subscribe_signals_addrs();
+        let model_inventories_rx = handler.subscribe_model_inventories();
         let trust_store_tx = handler.trust_store_sender();
 
         Self {
@@ -199,6 +225,7 @@ impl SwimNode {
             gateway_addrs_rx,
             cert_pems_rx,
             signals_addrs_rx,
+            model_inventories_rx,
             origin_state,
             trust_store_tx,
             warned_self_data: false,
@@ -391,6 +418,33 @@ impl SwimNode {
         Ok(())
     }
 
+    /// Queue one signed model inventory frame for SWIM gossip.
+    ///
+    /// The frame signature must already be bound to its origin and Grid ID.
+    /// Receivers accept it only from an origin with a pinned signing key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload cannot be encoded, exceeds the safe
+    /// UDP payload budget, or foca rejects it before queueing.
+    pub fn publish_model_inventory_broadcast(
+        &mut self,
+        broadcast: &ModelInventoryBroadcast,
+    ) -> Result<(), PublishModelInventoryError> {
+        let bytes = broadcast.encode()?;
+        let maximum_bytes = state_broadcast_byte_budget(self.foca.identity())?;
+        if bytes.len() > maximum_bytes {
+            return Err(PublishModelInventoryError::TooLarge {
+                actual_bytes: bytes.len(),
+                maximum_bytes,
+            });
+        }
+        match self.foca.add_broadcast(&bytes) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Return the current merged CRDT grid-state snapshot.
     ///
     /// The snapshot is updated each time a [`StateBroadcast`] is received from
@@ -399,6 +453,24 @@ impl SwimNode {
     #[must_use]
     pub fn state_snapshot(&self) -> GridStateSnapshot {
         self.state_rx.borrow().clone()
+    }
+
+    /// Return complete, signature-verified model inventories that have not expired.
+    #[must_use]
+    pub fn model_inventories(&self) -> Vec<ModelInventory> {
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        self.model_inventories_rx
+            .borrow()
+            .iter()
+            .filter(|inventory| inventory.expires_at_ms > now_ms)
+            .cloned()
+            .collect()
     }
 
     /// Return the current gateway address map from all received broadcasts.
@@ -1143,6 +1215,118 @@ mod tests {
             after.providers.len(),
             "malformed packet must not corrupt B's CRDT state"
         );
+    }
+
+    #[test]
+    fn signed_frames_exceeding_the_swim_budget_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut node, _) = make_node("site-a", 19_252);
+        let (private_key, _) = generate_signing_key_and_pubkey();
+        let inventory = ModelInventory {
+            origin_site: "site-a".to_owned(),
+            grid_id: "g".repeat(253),
+            network_id: "n".repeat(253),
+            provider_id: "p".repeat(253),
+            provider_uid: "u".repeat(128),
+            revision: 1,
+            expires_at_ms: now_ms().saturating_add(60_000),
+            models: vec!["m".repeat(crate::MAX_MODEL_NAME_BYTES)],
+        };
+        let frame = inventory
+            .frames()?
+            .pop()
+            .unwrap_or_else(|| std::process::abort())
+            .sign(&inventory.origin_site, &inventory.grid_id, &private_key, now_ms())?;
+        let broadcast = ModelInventoryBroadcast::new(inventory.origin_site, inventory.grid_id, frame);
+        assert!(matches!(
+            node.publish_model_inventory_broadcast(&broadcast),
+            Err(PublishModelInventoryError::TooLarge { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "two-node transport proof includes identity pinning, signed metadata, and multi-frame delivery"
+    )]
+    fn signed_inventory_frames_cross_foca_and_publish_only_after_completion() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let id_a = local_id("site-a", 19_250);
+        let id_b = local_id("site-b", 19_251);
+        let (mut node_a, _) = make_node("site-a", 19_250);
+        let (mut node_b, _) = make_node("site-b", 19_251);
+        establish_membership(&mut node_a, &mut node_b, &id_a, &id_b);
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        node_a.pin_origin("site-a".to_owned(), vec![public_key.clone()])?;
+        node_b.pin_origin("site-a".to_owned(), vec![public_key])?;
+        let mut snapshot = provider_snap("site-a", 0.2);
+        for provider in snapshot.providers.values_mut() {
+            provider.models.clear();
+        }
+        let mut state = StateBroadcast::new("site-a".to_owned(), 1, snapshot, None)
+            .with_grid_id(Some("grid-a".to_owned()))
+            .with_provider_uids(vec![crate::ProviderUid {
+                identity: crate::ProviderIdentity {
+                    network: "net".to_owned(),
+                    site: "site-a".to_owned(),
+                    provider: "provider-1".to_owned(),
+                },
+                uid: "uid-a".to_owned(),
+            }])
+            .with_signed_at(Some(now_ms()));
+        state.signature = Some(crate::signing::sign_ecdsa_p256(&private_key, &state.signable_bytes()?)?);
+        node_a.publish_state_broadcast(&state)?;
+        for message in node_a.broadcast().messages {
+            drop(node_b.handle_data(&message.data));
+        }
+        let expected = ModelInventory {
+            origin_site: "site-a".to_owned(),
+            grid_id: "grid-a".to_owned(),
+            network_id: "net".to_owned(),
+            provider_id: "provider-1".to_owned(),
+            provider_uid: "uid-a".to_owned(),
+            revision: 1,
+            expires_at_ms: now_ms().saturating_add(60_000),
+            models: vec![
+                "a".repeat(crate::MAX_MODEL_NAME_BYTES),
+                "b".repeat(crate::MAX_MODEL_NAME_BYTES),
+            ],
+        };
+        let mut frames = expected.frames()?;
+        let first =
+            frames
+                .pop()
+                .unwrap_or_else(|| std::process::abort())
+                .sign("site-a", "grid-a", &private_key, now_ms())?;
+        node_a.publish_model_inventory_broadcast(&ModelInventoryBroadcast::new(
+            "site-a".to_owned(),
+            "grid-a".to_owned(),
+            first,
+        ))?;
+        for message in node_a.broadcast().messages {
+            drop(node_b.handle_data(&message.data));
+        }
+        assert!(
+            node_b.model_inventories().is_empty(),
+            "a missing frame cannot produce an inventory"
+        );
+        for frame in frames {
+            let signed = frame.sign("site-a", "grid-a", &private_key, now_ms())?;
+            let broadcast = ModelInventoryBroadcast::new("site-a".to_owned(), "grid-a".to_owned(), signed);
+            assert!(broadcast.encode()?.len() <= state_broadcast_byte_budget(&id_a)?);
+            node_a.publish_model_inventory_broadcast(&broadcast)?;
+        }
+        for _ in 0..16 {
+            for message in node_a.broadcast().messages {
+                assert!(message.data.len() + crate::crypto::OVERHEAD <= MAX_SWIM_PACKET_BYTES);
+                drop(node_b.handle_data(&message.data));
+            }
+            if !node_b.model_inventories().is_empty() {
+                break;
+            }
+        }
+        assert_eq!(node_b.model_inventories(), [expected]);
+        Ok(())
     }
 
     #[test]

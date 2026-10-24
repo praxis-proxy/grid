@@ -15,7 +15,11 @@ use crdt::GridStateSnapshot;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-use crate::{NodeId, identity::MAX_LEASE_SKEW};
+use crate::{
+    NodeId,
+    identity::MAX_LEASE_SKEW,
+    model_inventory::{InventoryScope, ModelInventory, ModelInventoryAssembler, ModelInventoryBroadcast},
+};
 
 // ---------------------------------------------------------------------------
 // State broadcast envelope
@@ -44,6 +48,8 @@ const PROVIDER_STATE_EXTENSION_MAGIC: [u8; 8] = *b"AGNPSEXT";
 
 /// First framed provider-state extension version.
 const PROVIDER_STATE_EXTENSION_VERSION_V1: u8 = 1;
+/// Provider-state extension version carrying explicit provider metadata records.
+const PROVIDER_STATE_EXTENSION_VERSION_V2: u8 = 2;
 
 /// Domain-separation prefix mixed into every state-broadcast signature.
 ///
@@ -83,6 +89,10 @@ pub const MAX_BROADCAST_AGE_MS: u64 = 5 * 60 * 1_000;
 pub const MAX_CLOCK_SKEW_AHEAD_MS: u64 = 30_000;
 
 /// Broadcast envelope carrying one CRDT grid-state snapshot.
+#[expect(
+    clippy::partial_pub_fields,
+    reason = "decoded extension version is private signature compatibility state"
+)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StateBroadcast {
     /// Wire-format version.
@@ -176,6 +186,37 @@ pub struct StateBroadcast {
     /// Signals `host:port` this site serves peers on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signals_address: Option<String>,
+
+    /// Provider UIDs associated with explicit provider identities.
+    ///
+    /// Dynamic model inventory frames are accepted only when their UID matches
+    /// the latest provider-state record for that identity.
+    #[serde(skip)]
+    pub provider_uids: Vec<ProviderUid>,
+
+    /// Provider-state extension version received from the wire, if any.
+    #[serde(skip)]
+    provider_state_extension_version: Option<u8>,
+}
+
+/// Identity of one provider in a grid network and site.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ProviderIdentity {
+    /// Grid network metadata name.
+    pub network: String,
+    /// Site that owns the provider.
+    pub site: String,
+    /// Provider metadata name.
+    pub provider: String,
+}
+
+/// Kubernetes UID associated with a provider identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderUid {
+    /// Provider identity whose Kubernetes object has this UID.
+    pub identity: ProviderIdentity,
+    /// Kubernetes object UID.
+    pub uid: String,
 }
 
 /// Maximum number of raw public keys retained per pinned origin.
@@ -269,13 +310,31 @@ struct ProviderStateExtensionHeader {
     version: u8,
 }
 
-/// Provider-state extension payload understood by current peers.
+/// Legacy keyed provider-state extension retained for V1 decoding.
 #[derive(Default, Deserialize, Serialize)]
 struct ProviderStateExtensionV1 {
     /// Whether an empty provider set is an authoritative withdrawal.
     authoritative_provider_state: bool,
     /// MCP tool lists keyed by stable network/site/provider identity.
     provider_tools: BTreeMap<String, Vec<String>>,
+}
+
+/// Metadata associated with one explicitly identified provider.
+#[derive(Deserialize, Serialize)]
+struct ProviderMetadata {
+    /// MCP tools served by the provider.
+    tools: Vec<String>,
+    /// Kubernetes UID binding dynamic model inventories to this instance.
+    uid: Option<String>,
+}
+
+/// Provider-state extension carrying explicit provider metadata records.
+#[derive(Default, Deserialize, Serialize)]
+struct ProviderStateExtensionV2 {
+    /// Whether an empty provider set is an authoritative withdrawal.
+    authoritative_provider_state: bool,
+    /// Provider metadata keyed by `network/site/provider` identity.
+    providers: BTreeMap<String, ProviderMetadata>,
 }
 
 /// Extension format used by peers that predate provider capacity weights.
@@ -356,7 +415,16 @@ impl StateBroadcast {
             signed_at_ms: None,
             grid_id: None,
             signals_address: None,
+            provider_uids: Vec::new(),
+            provider_state_extension_version: None,
         }
+    }
+
+    /// Attach provider UIDs used to bind dynamic model frames to instances.
+    #[must_use]
+    pub fn with_provider_uids(mut self, provider_uids: Vec<ProviderUid>) -> Self {
+        self.provider_uids = provider_uids;
+        self
     }
 
     /// Mark this snapshot as an authoritative replacement of the origin's
@@ -560,19 +628,32 @@ impl StateBroadcast {
             .filter(|provider| provider.capacity_weight != 1)
             .map(|provider| (provider_capacity_key(provider), provider.capacity_weight))
             .collect::<BTreeMap<_, _>>();
-        let provider_tools = self
-            .snapshot
-            .providers
-            .values()
-            .filter(|provider| !provider.tools.is_empty())
-            .map(|provider| (provider_capacity_key(provider), provider.tools.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let provider_state_extension = ProviderStateExtensionV1 {
+        let provider_uids: BTreeMap<ProviderIdentity, &str> = self
+            .provider_uids
+            .iter()
+            .map(|provider_uid| (provider_uid.identity.clone(), provider_uid.uid.as_str()))
+            .collect();
+        let mut providers = BTreeMap::new();
+        for provider in self.snapshot.providers.values() {
+            let identity = provider_identity(provider);
+            let uid = provider_uids.get(&identity).map(|uid| (*uid).to_owned());
+            if !provider.tools.is_empty() || uid.is_some() {
+                providers.insert(
+                    provider_capacity_key(provider),
+                    ProviderMetadata {
+                        tools: provider.tools.clone(),
+                        uid,
+                    },
+                );
+            }
+        }
+
+        let provider_state_extension = ProviderStateExtensionV2 {
             authoritative_provider_state: self.authoritative_provider_state,
-            provider_tools,
+            providers,
         };
-        let carries_provider_state_extension = provider_state_extension.authoritative_provider_state
-            || !provider_state_extension.provider_tools.is_empty();
+        let carries_provider_state_extension =
+            provider_state_extension.authoritative_provider_state || !provider_state_extension.providers.is_empty();
         let carries_extension = self.gateway_address.is_some()
             || self.site_cert_pem.is_some()
             || self.signature.is_some()
@@ -595,14 +676,35 @@ impl StateBroadcast {
                 bincode::serde::encode_into_std_write(&self.signals_address, &mut bytes, bincode::config::standard())?;
             }
             if carries_provider_state_extension {
-                let payload = bincode::serde::encode_to_vec(&provider_state_extension, bincode::config::standard())?;
+                let (version, payload) =
+                    if self.provider_state_extension_version == Some(PROVIDER_STATE_EXTENSION_VERSION_V1) {
+                        let legacy = ProviderStateExtensionV1 {
+                            authoritative_provider_state: provider_state_extension.authoritative_provider_state,
+                            provider_tools: self
+                                .snapshot
+                                .providers
+                                .values()
+                                .filter(|provider| !provider.tools.is_empty())
+                                .map(|provider| (provider_capacity_key(provider), provider.tools.clone()))
+                                .collect(),
+                        };
+                        (
+                            PROVIDER_STATE_EXTENSION_VERSION_V1,
+                            bincode::serde::encode_to_vec(&legacy, bincode::config::standard())?,
+                        )
+                    } else {
+                        (
+                            PROVIDER_STATE_EXTENSION_VERSION_V2,
+                            bincode::serde::encode_to_vec(&provider_state_extension, bincode::config::standard())?,
+                        )
+                    };
                 let payload_length = u32::try_from(payload.len()).map_err(|_error| {
                     bincode::error::EncodeError::Other("provider-state extension exceeds the frame length limit")
                 })?;
                 let header = ProviderStateExtensionHeader {
                     magic: PROVIDER_STATE_EXTENSION_MAGIC,
                     payload_length,
-                    version: PROVIDER_STATE_EXTENSION_VERSION_V1,
+                    version,
                 };
                 bincode::serde::encode_into_std_write(header, &mut bytes, bincode::config::standard())?;
                 bytes.extend_from_slice(&payload);
@@ -640,7 +742,8 @@ impl StateBroadcast {
             bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
 
         let remaining = bytes.get(consumed..).unwrap_or(&[]);
-        let (ext, signals_address, provider_state_extension) = Self::decode_extension(remaining);
+        let (ext, signals_address, provider_state_extension, provider_state_extension_version) =
+            Self::decode_extension(remaining);
         for provider in v1.snapshot.providers.values_mut() {
             let key = provider_capacity_key(provider);
             if let Some(weight) = ext.provider_capacity_weights.get(&key)
@@ -652,8 +755,8 @@ impl StateBroadcast {
                     "ignoring out-of-range remote provider capacity weight"
                 );
             }
-            if let Some(tools) = provider_state_extension.provider_tools.get(&key) {
-                provider.tools.clone_from(tools);
+            if let Some(metadata) = provider_state_extension.providers.get(&key) {
+                provider.tools.clone_from(&metadata.tools);
             }
         }
 
@@ -669,6 +772,16 @@ impl StateBroadcast {
             signed_at_ms: ext.signed_at_ms,
             grid_id: ext.grid_id,
             signals_address,
+            provider_uids: provider_state_extension
+                .providers
+                .into_iter()
+                .filter_map(|(key, metadata)| {
+                    metadata
+                        .uid
+                        .and_then(|uid| parse_provider_identity(&key).map(|identity| ProviderUid { identity, uid }))
+                })
+                .collect(),
+            provider_state_extension_version,
         })
     }
 
@@ -679,13 +792,20 @@ impl StateBroadcast {
         clippy::too_many_lines,
         reason = "ordered decoding of every historical extension shape is one compatibility chain"
     )]
-    fn decode_extension(remaining: &[u8]) -> (BroadcastExtension, Option<String>, ProviderStateExtensionV1) {
+    fn decode_extension(
+        remaining: &[u8],
+    ) -> (BroadcastExtension, Option<String>, ProviderStateExtensionV2, Option<u8>) {
         /// Decode `remaining` as one historical extension shape and the bytes it used.
         fn shape<T: serde::de::DeserializeOwned>(remaining: &[u8]) -> Option<(T, usize)> {
             bincode::serde::decode_from_slice::<T, _>(remaining, bincode::config::standard()).ok()
         }
         if remaining.is_empty() {
-            return (BroadcastExtension::default(), None, ProviderStateExtensionV1::default());
+            return (
+                BroadcastExtension::default(),
+                None,
+                ProviderStateExtensionV2::default(),
+                None,
+            );
         }
         if let Some((ext, used)) = shape::<BroadcastExtension>(remaining) {
             let after_extension = remaining.get(used..).unwrap_or(&[]);
@@ -694,11 +814,11 @@ impl StateBroadcast {
                 .then_some((None, 0))
                 .or_else(|| shape::<Option<String>>(after_extension))
             else {
-                return (ext, None, ProviderStateExtensionV1::default());
+                return (ext, None, ProviderStateExtensionV2::default(), None);
             };
             let framed = after_extension.get(signals_used..).unwrap_or(&[]);
-            let provider_state = decode_provider_state_extension(framed);
-            return (ext, signals, provider_state);
+            let (provider_state, provider_state_version) = decode_provider_state_extension(framed);
+            return (ext, signals, provider_state, provider_state_version);
         }
         let ext = if let Some((ext, _)) = shape::<PreCapacityBroadcastExtension>(remaining) {
             BroadcastExtension {
@@ -729,42 +849,72 @@ impl StateBroadcast {
                 ..BroadcastExtension::default()
             }
         };
-        (ext, None, ProviderStateExtensionV1::default())
+        (ext, None, ProviderStateExtensionV2::default(), None)
     }
 }
 
 /// Decode a framed provider-state extension, ignoring unknown or malformed
 /// frames so legacy metadata remains usable.
-fn decode_provider_state_extension(remaining: &[u8]) -> ProviderStateExtensionV1 {
+#[expect(
+    clippy::too_many_lines,
+    reason = "versioned provider metadata keeps its legacy fallback in one parser"
+)]
+fn decode_provider_state_extension(remaining: &[u8]) -> (ProviderStateExtensionV2, Option<u8>) {
     if remaining.is_empty() {
-        return ProviderStateExtensionV1::default();
+        return (ProviderStateExtensionV2::default(), None);
     }
     let Ok((header, header_length)) =
         bincode::serde::decode_from_slice::<ProviderStateExtensionHeader, _>(remaining, bincode::config::standard())
     else {
-        return ProviderStateExtensionV1::default();
+        return (ProviderStateExtensionV2::default(), None);
     };
-    if header.magic != PROVIDER_STATE_EXTENSION_MAGIC || header.version != PROVIDER_STATE_EXTENSION_VERSION_V1 {
-        return ProviderStateExtensionV1::default();
+    if header.magic != PROVIDER_STATE_EXTENSION_MAGIC
+        || !matches!(
+            header.version,
+            PROVIDER_STATE_EXTENSION_VERSION_V1 | PROVIDER_STATE_EXTENSION_VERSION_V2
+        )
+    {
+        return (ProviderStateExtensionV2::default(), None);
     }
     let Ok(payload_length) = usize::try_from(header.payload_length) else {
-        return ProviderStateExtensionV1::default();
+        return (ProviderStateExtensionV2::default(), None);
     };
     let Some(payload_end) = header_length.checked_add(payload_length) else {
-        return ProviderStateExtensionV1::default();
+        return (ProviderStateExtensionV2::default(), None);
     };
     let Some(payload) = remaining.get(header_length..payload_end) else {
-        return ProviderStateExtensionV1::default();
+        return (ProviderStateExtensionV2::default(), None);
     };
+    if header.version == PROVIDER_STATE_EXTENSION_VERSION_V1 {
+        let Ok((extension, consumed)) =
+            bincode::serde::decode_from_slice::<ProviderStateExtensionV1, _>(payload, bincode::config::standard())
+        else {
+            return (ProviderStateExtensionV2::default(), None);
+        };
+        if consumed == payload.len() {
+            return (
+                ProviderStateExtensionV2 {
+                    authoritative_provider_state: extension.authoritative_provider_state,
+                    providers: extension
+                        .provider_tools
+                        .into_iter()
+                        .map(|(key, tools)| (key, ProviderMetadata { tools, uid: None }))
+                        .collect(),
+                },
+                Some(PROVIDER_STATE_EXTENSION_VERSION_V1),
+            );
+        }
+        return (ProviderStateExtensionV2::default(), None);
+    }
     let Ok((extension, consumed)) =
-        bincode::serde::decode_from_slice::<ProviderStateExtensionV1, _>(payload, bincode::config::standard())
+        bincode::serde::decode_from_slice::<ProviderStateExtensionV2, _>(payload, bincode::config::standard())
     else {
-        return ProviderStateExtensionV1::default();
+        return (ProviderStateExtensionV2::default(), None);
     };
     if consumed == payload.len() {
-        extension
+        (extension, Some(PROVIDER_STATE_EXTENSION_VERSION_V2))
     } else {
-        ProviderStateExtensionV1::default()
+        (ProviderStateExtensionV2::default(), None)
     }
 }
 
@@ -783,6 +933,31 @@ fn apply_capacity_weight(provider: &mut crdt::ProviderState, weight: u32) -> boo
 /// Build the stable extension key for one provider capacity.
 fn provider_capacity_key(provider: &crdt::ProviderState) -> String {
     format!("{}/{}/{}", provider.network_id, provider.site_id, provider.provider_id)
+}
+
+/// Build the structured identity for one provider state.
+fn provider_identity(provider: &crdt::ProviderState) -> ProviderIdentity {
+    ProviderIdentity {
+        network: provider.network_id.clone(),
+        site: provider.site_id.clone(),
+        provider: provider.provider_id.clone(),
+    }
+}
+
+/// Parse a provider identity from a historical flattened extension key.
+fn parse_provider_identity(key: &str) -> Option<ProviderIdentity> {
+    let mut parts = key.split('/');
+    let network_id = parts.next()?;
+    let site_id = parts.next()?;
+    let provider_id = parts.next()?;
+    if parts.next().is_some() || network_id.is_empty() || site_id.is_empty() || provider_id.is_empty() {
+        return None;
+    }
+    Some(ProviderIdentity {
+        network: network_id.to_owned(),
+        site: site_id.to_owned(),
+        provider: provider_id.to_owned(),
+    })
 }
 
 /// Key used to replace stale queued broadcasts in foca.
@@ -830,13 +1005,63 @@ enum StateBroadcastKeyKind {
     /// Combined metadata broadcasts must not invalidate provider/capability
     /// state broadcasts from the same origin.
     Metadata,
+
+    /// One signed model inventory frame. Each frame remains independent in foca.
+    ModelInventory {
+        /// `GridNetwork` metadata name.
+        network_id: String,
+        /// `InferenceProvider` metadata name.
+        provider_id: String,
+        /// Kubernetes UID of the provider instance.
+        provider_uid: String,
+        /// Frame position within this inventory revision.
+        frame_index: u16,
+    },
+}
+
+impl StateBroadcastKey {
+    /// Build the invalidation key for one inventory frame.
+    pub(crate) fn model_inventory(broadcast: &ModelInventoryBroadcast) -> Self {
+        Self {
+            origin_site: broadcast.origin_site.clone(),
+            revision: broadcast.frame.inventory_revision,
+            grid_id: Some(broadcast.grid_id.clone()),
+            kind: StateBroadcastKeyKind::ModelInventory {
+                network_id: broadcast.frame.network_id.clone(),
+                provider_id: broadcast.frame.provider_id.clone(),
+                provider_uid: broadcast.frame.provider_uid.clone(),
+                frame_index: broadcast.frame.frame_index,
+            },
+        }
+    }
 }
 
 impl foca::Invalidates for StateBroadcastKey {
     fn invalidates(&self, other: &Self) -> bool {
         self.origin_site == other.origin_site
             && self.grid_id == other.grid_id
-            && self.kind == other.kind
+            && match (&self.kind, &other.kind) {
+                (
+                    StateBroadcastKeyKind::ModelInventory {
+                        network_id: left_network,
+                        provider_id: left_provider,
+                        provider_uid: left_uid,
+                        frame_index: left_frame,
+                    },
+                    StateBroadcastKeyKind::ModelInventory {
+                        network_id: right_network,
+                        provider_id: right_provider,
+                        provider_uid: right_uid,
+                        frame_index: right_frame,
+                    },
+                ) => {
+                    left_network == right_network
+                        && left_provider == right_provider
+                        && left_uid == right_uid
+                        && left_frame == right_frame
+                },
+                (left, right) => left == right,
+            }
             && self.revision >= other.revision
     }
 }
@@ -860,6 +1085,24 @@ pub enum StateBroadcastError {
         /// Actual version.
         actual: u16,
     },
+
+    /// An inventory frame came from an origin without a pinned signing key.
+    #[error("model inventory from origin {origin_site} has no trusted signing key")]
+    UntrustedInventoryOrigin {
+        /// Site that originated the frame.
+        origin_site: String,
+    },
+
+    /// An inventory frame signature does not verify against the pinned key.
+    #[error("model inventory from origin {origin_site} failed signature verification")]
+    InvalidInventorySignature {
+        /// Site that originated the frame.
+        origin_site: String,
+    },
+
+    /// Inventory assembly rejected a malformed, stale, expired, or over-limit frame.
+    #[error("model inventory frame rejected: {0}")]
+    Inventory(#[from] crate::model_inventory::InventoryFrameError),
 
     /// The origin has a pinned identity but the broadcast carries no signature.
     #[error("state broadcast from pinned origin {origin_site} carries no signature")]
@@ -917,6 +1160,10 @@ struct RetainedOrigins {
     latest_by_scope: BTreeMap<ProviderStateScope, u64>,
     /// Provider network IDs last associated with each origin and Grid ID.
     provider_networks_by_scope: BTreeMap<ProviderStateScope, BTreeSet<String>>,
+    /// Provider UIDs keyed by structured identity for each origin/grid.
+    provider_uids_by_scope: BTreeMap<ProviderStateScope, BTreeMap<ProviderIdentity, String>>,
+    /// Origins with authenticated inventory assembly state.
+    inventory_origins: BTreeSet<String>,
     /// Gateway addresses received from each origin site.
     gateway_addrs: BTreeMap<String, String>,
     /// Highest gateway-address revision received from each origin.
@@ -991,6 +1238,7 @@ impl RetainedOrigins {
             .keys()
             .map(|scope| &scope.origin_site)
             .chain(self.provider_networks_by_scope.keys().map(|scope| &scope.origin_site))
+            .chain(self.inventory_origins.iter())
             .chain(self.gateway_addrs.keys())
             .chain(self.latest_gateway_revision_by_origin.keys())
             .chain(self.cert_pems.keys())
@@ -1006,6 +1254,9 @@ impl RetainedOrigins {
         self.latest_by_scope.retain(|scope, _| scope.origin_site != origin);
         self.provider_networks_by_scope
             .retain(|scope, _| scope.origin_site != origin);
+        self.provider_uids_by_scope
+            .retain(|scope, _| scope.origin_site != origin);
+        self.inventory_origins.remove(origin);
         self.forget_departed(origin);
         self.latest_gateway_revision_by_origin.remove(origin);
         self.latest_cert_revision_by_origin.remove(origin);
@@ -1037,6 +1288,10 @@ pub(crate) struct OriginStateHandle {
     cert_pems_tx: watch::Sender<BTreeMap<String, String>>,
     /// Signals-address publisher.
     signals_addrs_tx: watch::Sender<BTreeMap<String, String>>,
+    /// Completed signed model inventories.
+    model_inventories_tx: watch::Sender<Vec<ModelInventory>>,
+    /// Shared assembler cleared when an origin is evicted or withdrawn.
+    model_inventory_assembler: Arc<Mutex<ModelInventoryAssembler>>,
 }
 
 impl OriginStateHandle {
@@ -1074,6 +1329,13 @@ impl OriginStateHandle {
         self.publish_departed(origin);
         self.signals_addrs_tx.send_modify(|addresses| {
             addresses.remove(origin);
+        });
+        self.model_inventory_assembler
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove_origin(origin);
+        self.model_inventories_tx.send_modify(|inventories| {
+            inventories.retain(|inventory| inventory.origin_site != origin);
         });
     }
 
@@ -1119,6 +1381,12 @@ pub struct StateBroadcastHandler {
     /// Watch channel for signals address updates, keyed by origin site.
     signals_addrs_tx: watch::Sender<BTreeMap<String, String>>,
 
+    /// Watch channel for complete, verified model inventories.
+    model_inventories_tx: watch::Sender<Vec<ModelInventory>>,
+
+    /// Shared assembler for complete, verified model inventories.
+    model_inventory_assembler: Arc<Mutex<ModelInventoryAssembler>>,
+
     /// Sender half of the pinned-identity trust store.
     ///
     /// Exposed via [`trust_store_sender`](Self::trust_store_sender) so a
@@ -1160,21 +1428,29 @@ impl StateBroadcastHandler {
     /// a new origin is accepted. If all retained origins are pinned, new origins
     /// are refused without disturbing existing state or revision guards.
     #[must_use]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "shared publishers and their control handle are initialized together"
+    )]
     pub(crate) fn with_capacity(site_id: String, max_origins: usize) -> (Self, OriginStateHandle) {
         let (tx, _) = watch::channel(GridStateSnapshot::new(site_id));
         let (gw_tx, _) = watch::channel(BTreeMap::new());
         let (cert_tx, _) = watch::channel(BTreeMap::new());
         let (signals_tx, _) = watch::channel(BTreeMap::new());
+        let (inventories_tx, _) = watch::channel(Vec::new());
         let (trust_tx, trust_rx) = watch::channel(TrustStore::new());
         let max_origins = max_origins.max(1);
         let max_scopes = max_origins.saturating_mul(RETAINED_SCOPE_MULTIPLIER).max(1);
         let retained = Arc::new(Mutex::new(RetainedOrigins::default()));
+        let model_inventory_assembler = Arc::new(Mutex::new(ModelInventoryAssembler::default()));
         let control = OriginStateHandle {
             retained: Arc::clone(&retained),
             state_tx: tx.clone(),
             gateway_addrs_tx: gw_tx.clone(),
             cert_pems_tx: cert_tx.clone(),
             signals_addrs_tx: signals_tx.clone(),
+            model_inventories_tx: inventories_tx.clone(),
+            model_inventory_assembler: Arc::clone(&model_inventory_assembler),
         };
         (
             Self {
@@ -1183,6 +1459,8 @@ impl StateBroadcastHandler {
                 gateway_addrs_tx: gw_tx,
                 cert_pems_tx: cert_tx,
                 signals_addrs_tx: signals_tx,
+                model_inventories_tx: inventories_tx,
+                model_inventory_assembler,
                 trust_store_tx: trust_tx,
                 trust_store_rx: trust_rx,
                 max_origins,
@@ -1227,6 +1505,11 @@ impl StateBroadcastHandler {
     /// gateway address extension is received.
     pub fn subscribe_gateway_addrs(&self) -> watch::Receiver<BTreeMap<String, String>> {
         self.gateway_addrs_tx.subscribe()
+    }
+
+    /// Return a receiver for complete, signature-verified model inventories.
+    pub fn subscribe_model_inventories(&self) -> watch::Receiver<Vec<ModelInventory>> {
+        self.model_inventories_tx.subscribe()
     }
 
     /// Clone and return the currently merged grid-state snapshot.
@@ -1368,6 +1651,13 @@ impl StateBroadcastHandler {
         self.signals_addrs_tx.send_modify(|addresses| {
             addresses.remove(origin);
         });
+        self.model_inventory_assembler
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove_origin(origin);
+        self.model_inventories_tx.send_modify(|inventories| {
+            inventories.retain(|inventory| inventory.origin_site != origin);
+        });
     }
 
     /// Reject a broadcast that fails signature verification against a
@@ -1499,6 +1789,125 @@ impl StateBroadcastHandler {
         let retained = self.retained.lock().unwrap_or_else(PoisonError::into_inner);
         retained.latest_by_scope.contains_key(scope) || retained.latest_by_scope.len() < self.max_scopes
     }
+
+    /// Authenticate every frame before buffering; provider metadata gates publication.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "authentication, bounded insertion, and publication share one receive operation"
+    )]
+    fn receive_model_inventory(&self, data: &[u8]) -> Result<Option<StateBroadcastKey>, StateBroadcastError> {
+        let broadcast = ModelInventoryBroadcast::decode(data)?;
+        let keys = self
+            .trust_store_rx
+            .borrow()
+            .get(&broadcast.origin_site)
+            .cloned()
+            .filter(|keys| !keys.is_empty())
+            .ok_or_else(|| StateBroadcastError::UntrustedInventoryOrigin {
+                origin_site: broadcast.origin_site.clone(),
+            })?;
+        if !broadcast
+            .frame
+            .verifies(&broadcast.origin_site, &broadcast.grid_id, &keys)
+        {
+            return Err(StateBroadcastError::InvalidInventorySignature {
+                origin_site: broadcast.origin_site,
+            });
+        }
+        if !self.make_room_for(&broadcast.origin_site) {
+            return Ok(None);
+        }
+        self.retained
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .inventory_origins
+            .insert(broadcast.origin_site.clone());
+        let key = broadcast.key();
+        let result = self
+            .model_inventory_assembler
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(broadcast, wall_ms());
+        match result {
+            Ok(Some(_)) => {
+                self.publish_verified_inventories();
+                Ok(Some(key))
+            },
+            Ok(None) | Err(crate::model_inventory::InventoryFrameError::StaleRevision) => Ok(Some(key)),
+            Err(error) => {
+                self.publish_verified_inventories();
+                Err(error.into())
+            },
+        }
+    }
+
+    /// Publish only complete fresh inventories matching currently advertised provider UIDs.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "provider UID matching and watch publication share one immutable view"
+    )]
+    fn publish_verified_inventories(&self) {
+        let retained = self.retained.lock().unwrap_or_else(PoisonError::into_inner);
+        let inventories = self
+            .model_inventory_assembler
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .inventories(wall_ms())
+            .into_iter()
+            .filter(|inventory| {
+                let scope = ProviderStateScope {
+                    origin_site: inventory.origin_site.clone(),
+                    grid_id: Some(inventory.grid_id.clone()),
+                };
+                let identity = ProviderIdentity {
+                    network: inventory.network_id.clone(),
+                    site: inventory.origin_site.clone(),
+                    provider: inventory.provider_id.clone(),
+                };
+                retained
+                    .provider_uids_by_scope
+                    .get(&scope)
+                    .and_then(|uids| uids.get(&identity))
+                    == Some(&inventory.provider_uid)
+            })
+            .collect::<Vec<_>>();
+        drop(retained);
+        self.model_inventories_tx.send_if_modified(|current| {
+            if *current == inventories {
+                false
+            } else {
+                *current = inventories;
+                true
+            }
+        });
+    }
+
+    /// Drop old provider-instance buffers after an authoritative provider update.
+    fn invalidate_replaced_provider_inventories(
+        &self,
+        origin_site: &str,
+        grid_id: &str,
+        previous_uids: &BTreeMap<ProviderIdentity, String>,
+        incoming_uids: &BTreeMap<ProviderIdentity, String>,
+    ) {
+        let mut assembler = self
+            .model_inventory_assembler
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (identity, old_uid) in previous_uids {
+            if incoming_uids.get(identity) == Some(old_uid) {
+                continue;
+            }
+            assembler.withdraw_provider(&InventoryScope {
+                origin_site: origin_site.to_owned(),
+                grid_id: grid_id.to_owned(),
+                network_id: identity.network.clone(),
+                provider_id: identity.provider.clone(),
+                provider_uid: old_uid.clone(),
+            });
+        }
+        drop(assembler);
+    }
 }
 
 impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
@@ -1510,6 +1919,9 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
         reason = "decode, independent metadata lanes, and provider-state revision checks form one atomic receive path"
     )]
     fn receive_item(&mut self, data: &[u8], _sender: Option<&NodeId>) -> Result<Option<Self::Key>, Self::Error> {
+        if ModelInventoryBroadcast::recognizes(data) {
+            return self.receive_model_inventory(data);
+        }
         let broadcast = StateBroadcast::decode(data)?;
         if broadcast.version != STATE_BROADCAST_VERSION {
             return Err(StateBroadcastError::UnsupportedVersion {
@@ -1540,12 +1952,17 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
             );
             return Ok(None);
         }
-        let (latest, previous_networks) = {
+        let (latest, previous_networks, previous_provider_uids) = {
             let retained = self.retained.lock().unwrap_or_else(PoisonError::into_inner);
             (
                 retained.latest_by_scope.get(&provider_scope).copied(),
                 retained
                     .provider_networks_by_scope
+                    .get(&provider_scope)
+                    .cloned()
+                    .unwrap_or_default(),
+                retained
+                    .provider_uids_by_scope
                     .get(&provider_scope)
                     .cloned()
                     .unwrap_or_default(),
@@ -1596,7 +2013,35 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
                 .provider_networks_by_scope
                 .insert(provider_scope, accepted_networks);
         }
-        drop(retained);
+        if carries_provider_state {
+            let incoming_provider_identities: BTreeSet<ProviderIdentity> = broadcast
+                .snapshot
+                .providers
+                .values()
+                .filter(|provider| provider.site_id == broadcast.origin_site)
+                .map(provider_identity)
+                .collect();
+            let mut incoming_uids = BTreeMap::new();
+            for provider_uid in &broadcast.provider_uids {
+                if provider_uid.identity.site == broadcast.origin_site
+                    && incoming_provider_identities.contains(&provider_uid.identity)
+                {
+                    incoming_uids.insert(provider_uid.identity.clone(), provider_uid.uid.clone());
+                }
+            }
+            let scope = broadcast.provider_state_scope();
+            retained.provider_uids_by_scope.insert(scope, incoming_uids.clone());
+            drop(retained);
+            self.invalidate_replaced_provider_inventories(
+                &broadcast.origin_site,
+                broadcast.grid_id.as_deref().unwrap_or_default(),
+                &previous_provider_uids,
+                &incoming_uids,
+            );
+        } else {
+            drop(retained);
+        }
+        self.publish_verified_inventories();
         Ok(Some(broadcast.key()))
     }
 }
@@ -1774,6 +2219,82 @@ mod tests {
         (pkcs8_der, raw_pubkey)
     }
 
+    /// Sign a state snapshot with a fresh timestamp.
+    fn sign_state_broadcast(mut broadcast: StateBroadcast, private_key: &[u8]) -> StateBroadcast {
+        broadcast.signed_at_ms = Some(now_ms());
+        let signable = broadcast.signable_bytes().unwrap_or_else(|_| std::process::abort());
+        let signature =
+            crate::signing::sign_ecdsa_p256(private_key, &signable).unwrap_or_else(|_| std::process::abort());
+        broadcast.signature = Some(signature);
+        broadcast
+    }
+
+    /// Build a signed dynamic-provider UID advertisement.
+    fn dynamic_provider_state(site: &str, grid: &str, uid: &str, revision: u64, private_key: &[u8]) -> StateBroadcast {
+        let mut snap = snapshot(site, revision, 0.2);
+        for provider in snap.providers.values_mut() {
+            provider.models.clear();
+        }
+        let provider_uids = vec![ProviderUid {
+            identity: ProviderIdentity {
+                network: "net".to_owned(),
+                site: site.to_owned(),
+                provider: "provider".to_owned(),
+            },
+            uid: uid.to_owned(),
+        }];
+        sign_state_broadcast(
+            StateBroadcast::new(site.to_owned(), revision, snap, None)
+                .with_grid_id(Some(grid.to_owned()))
+                .with_provider_uids(provider_uids)
+                .with_authoritative_provider_state(),
+            private_key,
+        )
+    }
+
+    /// Sign every frame for the test provider and inventory revision.
+    fn signed_frames(models: &[String], uid: &str, revision: u64, private_key: &[u8]) -> Vec<ModelInventoryBroadcast> {
+        ModelInventory {
+            origin_site: "site-p".to_owned(),
+            grid_id: "grid-p".to_owned(),
+            network_id: "net".to_owned(),
+            provider_id: "provider".to_owned(),
+            provider_uid: uid.to_owned(),
+            revision,
+            expires_at_ms: now_ms().saturating_add(60_000),
+            models: models.to_vec(),
+        }
+        .frames()
+        .unwrap_or_else(|_| std::process::abort())
+        .into_iter()
+        .map(|frame| {
+            let frame = frame
+                .sign("site-p", "grid-p", private_key, now_ms())
+                .unwrap_or_else(|_| std::process::abort());
+            ModelInventoryBroadcast::new("site-p".to_owned(), "grid-p".to_owned(), frame)
+        })
+        .collect()
+    }
+
+    /// Deliver one encoded inventory frame to the handler.
+    fn receive_inventory(
+        handler: &mut StateBroadcastHandler,
+        broadcast: &ModelInventoryBroadcast,
+    ) -> Result<Option<StateBroadcastKey>, StateBroadcastError> {
+        let bytes = broadcast.encode().unwrap_or_else(|_| std::process::abort());
+        handler.receive_item(&bytes, None)
+    }
+
+    /// Build a receiver with the test origin signing key pinned.
+    fn pinned_handler(raw_public_key: Vec<u8>) -> (StateBroadcastHandler, watch::Receiver<Vec<ModelInventory>>) {
+        let (handler, _control) = StateBroadcastHandler::with_capacity("local".to_owned(), 8);
+        let inventories = handler.subscribe_model_inventories();
+        handler.trust_store_tx.send_modify(|store| {
+            store.insert("site-p".to_owned(), vec![raw_public_key]);
+        });
+        (handler, inventories)
+    }
+
     #[test]
     fn stored_pre_signature_extension_bytes_remain_decodable() -> Result<(), bincode::error::DecodeError> {
         let historical = [1, 1, b'a', 1, 1, b'a', 0, 0, 1, b'a', 0, 0, 0, 1, 1, b'g', 0];
@@ -1804,6 +2325,266 @@ mod tests {
             "old metadata cannot become a withdrawal"
         );
         Ok(())
+    }
+
+    #[test]
+    fn provider_uid_extension_round_trips() -> Result<(), bincode::error::DecodeError> {
+        let broadcast = StateBroadcast::new("site-p".to_owned(), 1, snapshot("site-p", 1, 0.2), None)
+            .with_grid_id(Some("grid-p".to_owned()))
+            .with_provider_uids(vec![ProviderUid {
+                identity: ProviderIdentity {
+                    network: "net".to_owned(),
+                    site: "site-p".to_owned(),
+                    provider: "provider".to_owned(),
+                },
+                uid: "uid-p".to_owned(),
+            }]);
+
+        let encoded = broadcast.encode().unwrap_or_else(|_| std::process::abort());
+        let decoded = StateBroadcast::decode(&encoded)?;
+
+        assert_eq!(decoded.provider_uids, broadcast.provider_uids);
+        assert_eq!(decoded.grid_id, broadcast.grid_id);
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the protocol assertion reads one broadcast from its base snapshot through the V2 metadata frame"
+    )]
+    fn v2_metadata_groups_tools_and_uids_by_provider_key() -> Result<(), Box<dyn std::error::Error>> {
+        let broadcast = provider_metadata_broadcast();
+        let bytes = broadcast.encode()?;
+        let (_, base_used): (StateBroadcastV1, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
+        let after_base = bytes.get(base_used..).unwrap_or(&[]);
+        let (_, extension_used): (BroadcastExtension, usize) =
+            bincode::serde::decode_from_slice(after_base, bincode::config::standard())?;
+        let after_extension = after_base.get(extension_used..).unwrap_or(&[]);
+        let (_, signals_used): (Option<String>, usize) =
+            bincode::serde::decode_from_slice(after_extension, bincode::config::standard())?;
+        let framed = after_extension.get(signals_used..).unwrap_or(&[]);
+        let (header, header_used): (ProviderStateExtensionHeader, usize) =
+            bincode::serde::decode_from_slice(framed, bincode::config::standard())?;
+        let payload = framed.get(header_used..).unwrap_or(&[]);
+        let (metadata, consumed): (ProviderStateExtensionV2, usize) =
+            bincode::serde::decode_from_slice(payload, bincode::config::standard())?;
+
+        assert_eq!(header.version, PROVIDER_STATE_EXTENSION_VERSION_V2);
+        assert_eq!(
+            consumed,
+            payload.len(),
+            "V2 must contain only the structured metadata payload"
+        );
+        assert!(metadata.authoritative_provider_state);
+        assert_eq!(
+            metadata.providers.len(),
+            3,
+            "each provider must have one metadata entry"
+        );
+        for (key, provider_metadata) in metadata.providers {
+            let provider = broadcast
+                .snapshot
+                .providers
+                .get(&key)
+                .ok_or("metadata key must identify an advertised provider")?;
+            assert_eq!(
+                provider_metadata.tools, provider.tools,
+                "tools must stay with their provider key"
+            );
+            let identity = provider_identity(provider);
+            let expected_uid = broadcast
+                .provider_uids
+                .iter()
+                .find(|provider_uid| provider_uid.identity == identity)
+                .map(|provider_uid| &provider_uid.uid);
+            assert_eq!(provider_metadata.uid.as_ref(), expected_uid);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn signed_v2_metadata_round_trips_without_changing_authenticated_bytes() -> Result<(), Box<dyn std::error::Error>> {
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        let broadcast = sign_state_broadcast(provider_metadata_broadcast(), &private_key);
+        let decoded = StateBroadcast::decode(&broadcast.encode()?)?;
+        let signature = decoded.signature.as_deref().ok_or("signature must survive decoding")?;
+
+        assert_eq!(
+            decoded.snapshot, broadcast.snapshot,
+            "tools must be restored to the correct providers"
+        );
+        assert_eq!(decoded.provider_uids, broadcast.provider_uids);
+        assert_eq!(
+            decoded.signable_bytes()?,
+            broadcast.signable_bytes()?,
+            "decoding and rebuilding lookup maps must preserve the signed bytes"
+        );
+        crate::signing::verify_ecdsa_p256(&public_key, &decoded.signable_bytes()?, signature)?;
+        Ok(())
+    }
+
+    #[test]
+    fn inventory_frames_require_a_pinned_origin_key() {
+        let (private_key, _) = generate_signing_key_and_pubkey();
+        let frame = signed_frames(&["model-a".to_owned()], "uid-p", 1, &private_key)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| std::process::abort());
+        let mut handler = StateBroadcastHandler::new("local".to_owned());
+
+        let result = receive_inventory(&mut handler, &frame);
+
+        assert!(
+            matches!(result, Err(StateBroadcastError::UntrustedInventoryOrigin { origin_site }) if origin_site == "site-p")
+        );
+        assert!(handler.model_inventories_tx.borrow().is_empty());
+    }
+
+    #[test]
+    fn new_inventory_replaces_current_only_after_every_signed_frame_arrives() {
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        let (mut handler, inventories_rx) = pinned_handler(public_key);
+        let state = dynamic_provider_state("site-p", "grid-p", "uid-p", 1, &private_key);
+        receive(&mut handler, &state);
+        let initial = signed_frames(&["model-a".to_owned()], "uid-p", 1, &private_key);
+        for frame in &initial {
+            receive_inventory(&mut handler, frame).unwrap_or_else(|_| std::process::abort());
+        }
+        let held = inventories_rx
+            .borrow()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| std::process::abort());
+
+        let next_state = dynamic_provider_state("site-p", "grid-p", "uid-p", 2, &private_key);
+        receive(&mut handler, &next_state);
+        let next = signed_frames(&["model-b".to_owned(), "model-c".to_owned()], "uid-p", 2, &private_key);
+        receive_inventory(&mut handler, next.first().unwrap_or_else(|| std::process::abort()))
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(inventories_rx.borrow().first(), Some(&held));
+
+        receive_inventory(&mut handler, next.get(1).unwrap_or_else(|| std::process::abort()))
+            .unwrap_or_else(|_| std::process::abort());
+
+        let inventory = inventories_rx
+            .borrow()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(inventory.revision, 2);
+        assert_eq!(inventory.models, vec!["model-b".to_owned(), "model-c".to_owned()]);
+    }
+
+    #[test]
+    fn frame_from_a_previous_provider_uid_is_discarded() {
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        let (mut handler, inventories_rx) = pinned_handler(public_key);
+        let state = dynamic_provider_state("site-p", "grid-p", "uid-new", 1, &private_key);
+        receive(&mut handler, &state);
+        let old_instance_frame = signed_frames(&["old-model".to_owned()], "uid-old", 2, &private_key)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| std::process::abort());
+
+        let result = receive_inventory(&mut handler, &old_instance_frame);
+
+        result.unwrap_or_else(|_| std::process::abort());
+        assert!(inventories_rx.borrow().is_empty());
+    }
+
+    #[test]
+    fn inventory_waits_for_the_provider_uid_advertisement() {
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        let (mut handler, inventories) = pinned_handler(public_key);
+        let frames = signed_frames(&["a".to_owned(), "b".to_owned()], "uid-p", 1, &private_key);
+        for frame in &frames {
+            receive_inventory(&mut handler, frame).unwrap_or_else(|_| std::process::abort());
+        }
+        assert!(
+            inventories.borrow().is_empty(),
+            "complete data still needs matching provider metadata"
+        );
+        receive(
+            &mut handler,
+            &dynamic_provider_state("site-p", "grid-p", "uid-p", 1, &private_key),
+        );
+        assert_eq!(inventories.borrow().len(), 1);
+    }
+
+    #[test]
+    fn signed_inventory_is_bound_to_origin_grid_uid_and_contents() {
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        let (mut handler, inventories) = pinned_handler(public_key);
+        let frames = signed_frames(&["a".to_owned()], "uid-p", 1, &private_key);
+        let frame = frames.first().unwrap_or_else(|| std::process::abort());
+        let mut wrong_grid = frame.clone();
+        wrong_grid.grid_id = "another-grid".to_owned();
+        let mut wrong_uid = frame.clone();
+        wrong_uid.frame.provider_uid = "another-uid".to_owned();
+        let mut wrong_contents = frame.clone();
+        wrong_contents.frame.models = vec!["forged".to_owned()];
+        let mut wrong_origin = frame.clone();
+        wrong_origin.origin_site = "another-site".to_owned();
+        let mut expired_signature = frame.clone();
+        expired_signature.frame.signed_at_ms = Some(1);
+        for forged in [wrong_grid, wrong_uid, wrong_contents, wrong_origin, expired_signature] {
+            assert!(matches!(
+                receive_inventory(&mut handler, &forged),
+                Err(StateBroadcastError::InvalidInventorySignature { .. }
+                    | StateBroadcastError::UntrustedInventoryOrigin { .. })
+            ));
+        }
+        assert!(inventories.borrow().is_empty());
+    }
+
+    #[test]
+    fn provider_withdrawal_discards_inventories_and_old_frames_cannot_restore_them() {
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        let (mut handler, inventories) = pinned_handler(public_key);
+        receive(
+            &mut handler,
+            &dynamic_provider_state("site-p", "grid-p", "uid-p", 1, &private_key),
+        );
+        let frames = signed_frames(&["a".to_owned()], "uid-p", 1, &private_key);
+        for frame in &frames {
+            receive_inventory(&mut handler, frame).unwrap_or_else(|_| std::process::abort());
+        }
+        assert_eq!(inventories.borrow().len(), 1);
+        let withdrawal = sign_state_broadcast(
+            StateBroadcast::new(
+                "site-p".to_owned(),
+                2,
+                GridStateSnapshot::new("site-p".to_owned()),
+                None,
+            )
+            .with_grid_id(Some("grid-p".to_owned()))
+            .with_authoritative_provider_state(),
+            &private_key,
+        );
+        receive(&mut handler, &withdrawal);
+        for frame in &frames {
+            receive_inventory(&mut handler, frame).unwrap_or_else(|_| std::process::abort());
+        }
+        assert!(inventories.borrow().is_empty());
+    }
+
+    #[test]
+    fn inventory_frame_keys_keep_distinct_parts_and_provider_instances() {
+        let (private_key, _) = generate_signing_key_and_pubkey();
+        let mut frames = signed_frames(&["a".to_owned(), "b".to_owned()], "uid-p", 1, &private_key);
+        let second = frames.pop().unwrap_or_else(|| std::process::abort());
+        let first = frames.pop().unwrap_or_else(|| std::process::abort());
+        assert!(!first.key().invalidates(&second.key()));
+        assert!(!second.key().invalidates(&first.key()));
+        let mut newer = first.clone();
+        newer.frame.inventory_revision = 2;
+        assert!(newer.key().invalidates(&first.key()));
+        assert!(!first.key().invalidates(&newer.key()));
+        newer.frame.provider_uid = "new-instance".to_owned();
+        assert!(!newer.key().invalidates(&first.key()));
     }
 
     #[test]
@@ -4248,6 +5029,33 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test Utilities
     // -----------------------------------------------------------------------
+
+    /// Build mixed tool-only, UID-only, and combined provider metadata.
+    fn provider_metadata_broadcast() -> StateBroadcast {
+        let tool_provider = provider_state("tool/my-mcp", Vec::new(), vec!["search".to_owned()], 3);
+        let combined_provider = provider_state("provider", Vec::new(), vec!["execute".to_owned()], 3);
+        let mut uid_provider = provider_state("provider", vec!["model".to_owned()], Vec::new(), 3);
+        uid_provider.network_id = "other-net".to_owned();
+        let mut snapshot = GridStateSnapshot::new("site-a".to_owned());
+        let mut provider_uids = Vec::new();
+        for (provider, uid) in [
+            (tool_provider, None),
+            (combined_provider, Some("combined-uid")),
+            (uid_provider, Some("inference-uid")),
+        ] {
+            if let Some(uid) = uid {
+                provider_uids.push(ProviderUid {
+                    identity: provider_identity(&provider),
+                    uid: uid.to_owned(),
+                });
+            }
+            snapshot.upsert_provider(provider);
+        }
+        StateBroadcast::new("site-a".to_owned(), 3, snapshot, None)
+            .with_grid_id(Some("grid-a".to_owned()))
+            .with_provider_uids(provider_uids)
+            .with_authoritative_provider_state()
+    }
 
     #[expect(
         clippy::too_many_lines,

@@ -1406,9 +1406,9 @@ status reconciliation reflects remote provider state in
 
 | CRDT field | Source |
 |---|---|
-| `network_id` | owning `GridNetwork.metadata.name` |
+| `network` | owning `GridNetwork.metadata.name` |
 | `site_id` | local SWIM site identity |
-| `provider_id` | `metadata.name` |
+| `provider` | `metadata.name` |
 | `routing_cluster` | `spec.clusterName` or `metadata.name` |
 | `models` | `spec.models[*].name` |
 | `backend_kind` | `spec.backendKind` |

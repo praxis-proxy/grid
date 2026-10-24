@@ -156,6 +156,16 @@ spec:
                   items:
                     description: Reference to a Praxis Gateway that participates in this grid.
                     properties:
+                      modelDiscoveryContractVersion:
+                        description: |-
+                          Model-discovery contract version supported by the running gateway.
+
+                          Set this only after the gateway is running an image that understands
+                          the `expires_at` routing-candidate field and enforces its deadline.
+                          The operator includes discovered model candidates only when this is
+                          exactly `v1`; absent or other values keep dynamic candidates withheld.
+                        nullable: true
+                        type: string
                       consumerConfig:
                         description: |-
                           Deprecated in favor of `praxisConfig`; this legacy field will be removed in a future release. Opt-in configuration for operator-managed consumer Praxis config generation.
@@ -1019,6 +1029,16 @@ spec:
                   items:
                     description: Reference to a Praxis Gateway that participates in this grid.
                     properties:
+                      modelDiscoveryContractVersion:
+                        description: |-
+                          Model-discovery contract version supported by the running gateway.
+
+                          Set this only after the gateway is running an image that understands
+                          the `expires_at` routing-candidate field and enforces its deadline.
+                          The operator includes discovered model candidates only when this is
+                          exactly `v1`; absent or other values keep dynamic candidates withheld.
+                        nullable: true
+                        type: string
                       consumerConfig:
                         description: |-
                           Deprecated in favor of `praxisConfig`; this legacy field will be removed in a future release. Opt-in configuration for operator-managed consumer Praxis config generation.

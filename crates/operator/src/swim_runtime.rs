@@ -31,7 +31,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crdt::GridStateSnapshot;
@@ -458,6 +458,18 @@ fn publish_state(state_tx: &watch::Sender<GridStateSnapshot>, node: &SwimNode) {
     });
 }
 
+/// Publish complete, verified, unexpired model inventories from the SWIM node.
+fn publish_model_inventories(inventories_tx: &watch::Sender<Vec<swim::ModelInventory>>, node: &SwimNode) {
+    let inventories = node.model_inventories();
+    inventories_tx.send_if_modified(|current| {
+        if *current == inventories {
+            return false;
+        }
+        *current = inventories;
+        true
+    });
+}
+
 /// Evict departed origins and immediately expose the change to readers.
 ///
 /// A retained origin keeps its providers, signals address and revision guards and loses its
@@ -505,6 +517,9 @@ struct RuntimeChannels {
     /// `SwimNode::publish_state_broadcast` and immediately gossips so that
     /// peers receive the broadcast on the next outbound message.
     broadcast_rx: mpsc::Receiver<swim::StateBroadcast>,
+
+    /// Receives signed provider inventory frames for SWIM publication.
+    inventory_broadcast_rx: mpsc::Receiver<swim::ModelInventoryBroadcast>,
 
     /// Receives batches of seed addresses to announce at runtime.
     ///
@@ -903,8 +918,14 @@ pub struct SwimHandle {
     /// custom broadcasts.
     state_rx: watch::Receiver<GridStateSnapshot>,
 
+    /// Watch channel receiver for complete verified dynamic model inventories.
+    model_inventories_rx: watch::Receiver<Vec<swim::ModelInventory>>,
+
     /// Channel for sending CRDT state broadcasts to the runtime loop.
     broadcast_tx: mpsc::Sender<swim::StateBroadcast>,
+
+    /// Channel for signed model inventory frame broadcasts.
+    inventory_broadcast_tx: mpsc::Sender<swim::ModelInventoryBroadcast>,
 
     /// Channel for withdrawing anti-entropy state for a deleted `GridNetwork` scope.
     withdraw_tx: mpsc::Sender<WithdrawalRequest>,
@@ -1033,6 +1054,24 @@ impl SwimHandle {
         self.state_rx.borrow().clone()
     }
 
+    /// Return complete, verified remote model inventories that have not expired.
+    #[must_use]
+    pub fn model_inventories(&self) -> Vec<swim::ModelInventory> {
+        let now_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        self.model_inventories_rx
+            .borrow()
+            .iter()
+            .filter(|inventory| inventory.expires_at_ms > now_ms)
+            .cloned()
+            .collect()
+    }
+
     /// Return a stream that emits when SWIM state relevant to a
     /// [`GridNetwork`] reconciliation changes.
     ///
@@ -1043,25 +1082,40 @@ impl SwimHandle {
     /// retained because stale-candidate TTL processing depends on it.
     ///
     /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
+    #[expect(
+        clippy::too_many_lines,
+        reason = "all distributed state watches share one reconciliation comparison loop"
+    )]
     pub fn reconciliation_events(&self) -> impl Stream<Item = ()> + Send + Sync + use<> {
         let membership_rx = self.snapshot_rx.clone();
         let state_rx = self.state_rx.clone();
+        let inventories_rx = self.model_inventories_rx.clone();
         let runtime_rx = self.runtime_tx.subscribe();
-        let previous = reconciliation_view(&membership_rx.borrow(), &state_rx.borrow(), *runtime_rx.borrow());
+        let previous = reconciliation_view(
+            &membership_rx.borrow(),
+            &state_rx.borrow(),
+            &inventories_rx.borrow(),
+            *runtime_rx.borrow(),
+        );
         stream::unfold(
-            (membership_rx, state_rx, runtime_rx, previous),
-            |(mut membership_rx, mut state_rx, mut runtime_rx, mut previous)| async move {
+            (membership_rx, state_rx, inventories_rx, runtime_rx, previous),
+            |(mut membership_rx, mut state_rx, mut inventories_rx, mut runtime_rx, mut previous)| async move {
                 loop {
                     tokio::select! {
                         result = membership_rx.changed() => result.ok()?,
                         result = state_rx.changed() => result.ok()?,
+                        result = inventories_rx.changed() => result.ok()?,
                         result = runtime_rx.changed() => result.ok()?,
                     }
-                    let current =
-                        reconciliation_view(&membership_rx.borrow(), &state_rx.borrow(), *runtime_rx.borrow());
+                    let current = reconciliation_view(
+                        &membership_rx.borrow(),
+                        &state_rx.borrow(),
+                        &inventories_rx.borrow(),
+                        *runtime_rx.borrow(),
+                    );
                     if current != previous {
                         previous = current;
-                        return Some(((), (membership_rx, state_rx, runtime_rx, previous)));
+                        return Some(((), (membership_rx, state_rx, inventories_rx, runtime_rx, previous)));
                     }
                 }
             },
@@ -1084,6 +1138,27 @@ impl SwimHandle {
             TrySendError::Full(_) => BroadcastError::ChannelFull,
             TrySendError::Closed(_) => BroadcastError::ChannelClosed,
         })
+    }
+
+    /// Queue a signed model inventory frame for delivery to SWIM peers.
+    ///
+    /// The runtime sends each frame through Foca's dedicated broadcast path.
+    /// Frames are accepted by peers only when their origin key is pinned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BroadcastError::ChannelFull`] when the queue is full, or
+    /// [`BroadcastError::ChannelClosed`] after the runtime exits.
+    pub fn publish_model_inventory_frame(
+        &self,
+        broadcast: swim::ModelInventoryBroadcast,
+    ) -> Result<(), BroadcastError> {
+        self.inventory_broadcast_tx
+            .try_send(broadcast)
+            .map_err(|error| match error {
+                TrySendError::Full(_) => BroadcastError::ChannelFull,
+                TrySendError::Closed(_) => BroadcastError::ChannelClosed,
+            })
     }
 
     /// Withdraw all anti-entropy state for the given `GridNetwork` scope.
@@ -1178,6 +1253,8 @@ struct ReconciliationView {
     members: Vec<ReconciliationMember>,
     /// Distributed provider and capability state.
     state: GridStateSnapshot,
+    /// Complete verified provider model inventories.
+    model_inventories: Vec<swim::ModelInventory>,
 }
 
 /// Membership fields consumed by Grid reconciliation.
@@ -1205,6 +1282,7 @@ struct ReconciliationMember {
 fn reconciliation_view(
     membership: &MembershipSnapshot,
     state: &GridStateSnapshot,
+    model_inventories: &[swim::ModelInventory],
     runtime_alive: bool,
 ) -> ReconciliationView {
     let mut members: Vec<ReconciliationMember> = membership
@@ -1231,6 +1309,7 @@ fn reconciliation_view(
         runtime_alive,
         members,
         state: state.clone(),
+        model_inventories: model_inventories.to_vec(),
     }
 }
 
@@ -1281,6 +1360,8 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
     let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new(site_name.clone()));
     let (timer_tx, timer_rx) = mpsc::channel::<TimerEvent>(256);
     let (broadcast_tx, broadcast_rx) = mpsc::channel::<swim::StateBroadcast>(32);
+    let (inventory_broadcast_tx, inventory_broadcast_rx) = mpsc::channel::<swim::ModelInventoryBroadcast>(256);
+    let (model_inventories_tx, model_inventories_rx) = watch::channel(Vec::new());
     let (withdraw_tx, withdraw_rx) = mpsc::channel::<WithdrawalRequest>(16);
     let (seed_tx, seed_rx) = mpsc::channel::<Vec<SocketAddr>>(16);
     let (leave_tx, leave_rx) = mpsc::channel::<()>(1);
@@ -1292,6 +1373,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         timer_tx,
         timer_rx,
         broadcast_rx,
+        inventory_broadcast_rx,
         seed_rx,
         leave_rx,
         withdraw_rx,
@@ -1317,6 +1399,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         advertise_addr,
         channels,
         state_tx,
+        model_inventories_tx,
         key_rx,
         gateway_loop_rx,
         revisions,
@@ -1337,7 +1420,9 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         signals_address,
         snapshot_rx,
         state_rx,
+        model_inventories_rx,
         broadcast_tx,
+        inventory_broadcast_tx,
         withdraw_tx,
         seed_tx,
         key_tx,
@@ -1389,6 +1474,7 @@ async fn run_loop(
     advertise_addr: SocketAddr,
     mut channels: RuntimeChannels,
     state_tx: watch::Sender<GridStateSnapshot>,
+    model_inventories_tx: watch::Sender<Vec<swim::ModelInventory>>,
     mut key_rx: watch::Receiver<KeyState>,
     mut gateway_loop_rx: watch::Receiver<Option<String>>,
     mut revisions: RevisionClock,
@@ -1487,6 +1573,7 @@ async fn run_loop(
                         // Broadcasts are received inside handle_data, so the snapshot
                         // may have advanced.
                         publish_state(&state_tx, &node);
+                        publish_model_inventories(&model_inventories_tx, &node);
                         // Gateway-address-only broadcasts update the node's gateway-address
                         // map but may not emit a membership event.  Republish the
                         // membership snapshot after every inbound packet so callers see the
@@ -1584,6 +1671,29 @@ async fn run_loop(
                     .await;
                 }
                 publish_state(&state_tx, &node);
+                publish_model_inventories(&model_inventories_tx, &node);
+            }
+            Some(frame) = channels.inventory_broadcast_rx.recv() => {
+                if pending_withdrawals.contains_key(&frame.grid_id) {
+                    tracing::debug!(grid_id = %frame.grid_id, "discarding model inventory for pending GridNetwork withdrawal");
+                    continue;
+                }
+                if let Err(error) = node.publish_model_inventory_broadcast(&frame) {
+                    tracing::warn!(error = %error, "failed to publish signed model inventory frame");
+                    continue;
+                }
+                let output = node.broadcast();
+                drain_output(
+                    output,
+                    &socket,
+                    &channels.timer_tx,
+                    &mut tracked,
+                    &channels.snapshot_tx,
+                    &node,
+                    &key,
+                )
+                .await;
+                publish_model_inventories(&model_inventories_tx, &node);
             }
             Some(()) = channels.leave_rx.recv() => {
                 let output = node.leave();
@@ -1638,6 +1748,7 @@ async fn run_loop(
             }
             _ = age_tick.tick() => {
                 let now = Instant::now();
+                publish_model_inventories(&model_inventories_tx, &node);
                 publish_pending_withdrawals(
                     &mut pending_withdrawals,
                     &mut retained_state_broadcasts,
@@ -1914,8 +2025,8 @@ fn is_from_the_future(generation: u64, now_nanos: u64) -> bool {
 
 /// Wall-clock nanoseconds, the unit generations are reserved in.
 fn unix_nanos_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map_or(0, |since| u64::try_from(since.as_nanos()).unwrap_or(u64::MAX))
 }
 
@@ -2578,17 +2689,22 @@ mod tests {
     // SwimHandle
     // -----------------------------------------------------------------------
 
-    fn make_test_handle() -> (
+    /// A handle paired with every distributed-state publisher used by its event stream.
+    type TestHandle = (
         SwimHandle,
         watch::Sender<MembershipSnapshot>,
         watch::Sender<GridStateSnapshot>,
-    ) {
+        watch::Sender<Vec<swim::ModelInventory>>,
+    );
+
+    fn make_test_handle() -> TestHandle {
         let (snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
         let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, _seed_rx) = mpsc::channel(16);
         let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, _gateway_rx) = watch::channel(None);
+        let (inventories_tx, model_inventories_rx) = watch::channel(Vec::new());
         let handle = SwimHandle {
             publisher_reservation: (1, 2),
             site_name: "test".to_owned(),
@@ -2596,7 +2712,9 @@ mod tests {
             signals_address: None,
             snapshot_rx,
             state_rx,
+            model_inventories_rx,
             broadcast_tx,
+            inventory_broadcast_tx: mpsc::channel(1).0,
             seed_tx,
             key_tx,
             gateway_tx,
@@ -2604,7 +2722,7 @@ mod tests {
             withdraw_tx: mpsc::channel(16).0,
             leave_tx: mpsc::channel(1).0,
         };
-        (handle, snapshot_tx, state_tx)
+        (handle, snapshot_tx, state_tx, inventories_tx)
     }
 
     fn reconciliation_member(status: MemberStatus, age_secs: u64) -> MemberRecord {
@@ -2626,7 +2744,7 @@ mod tests {
         reason = "one ordered test proves deduplication across membership, health, and provider-state changes"
     )]
     async fn reconciliation_events_emit_only_for_semantic_changes() {
-        let (handle, snapshot_tx, state_tx) = make_test_handle();
+        let (handle, snapshot_tx, state_tx, _inventories_tx) = make_test_handle();
         let mut events = Box::pin(handle.reconciliation_events());
 
         drop(snapshot_tx.send(MembershipSnapshot::default()));
@@ -2734,9 +2852,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one ordered watch test checks completion, duplicate publication, and withdrawal"
+    )]
+    async fn complete_inventory_changes_trigger_reconciliation() {
+        let (handle, _snapshot_tx, _state_tx, inventories_tx) = make_test_handle();
+        let mut events = Box::pin(handle.reconciliation_events());
+        let inventory = swim::ModelInventory {
+            origin_site: "remote".to_owned(),
+            grid_id: "grid".to_owned(),
+            network_id: "net".to_owned(),
+            provider_id: "provider".to_owned(),
+            provider_uid: "uid".to_owned(),
+            revision: 1,
+            expires_at_ms: u64::MAX,
+            models: vec!["model".to_owned()],
+        };
+        inventories_tx.send_replace(vec![inventory.clone()]);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), events.next())
+                .await
+                .is_ok_and(|event| event.is_some())
+        );
+        inventories_tx.send_replace(vec![inventory]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), events.next())
+                .await
+                .is_err(),
+            "identical inventories are deduplicated"
+        );
+        inventories_tx.send_replace(Vec::new());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), events.next())
+                .await
+                .is_ok_and(|event| event.is_some()),
+            "expiry or withdrawal starts reconciliation"
+        );
+    }
+
     #[test]
     fn stopped_runtime_never_reports_retained_members_alive() {
-        let (handle, snapshot_tx, _state_tx) = make_test_handle();
+        let (handle, snapshot_tx, _state_tx, _inventories_tx) = make_test_handle();
         drop(snapshot_tx.send(MembershipSnapshot {
             members: vec![reconciliation_member(MemberStatus::Alive, 0)],
         }));
@@ -2766,7 +2924,9 @@ mod tests {
             signals_address: None,
             snapshot_rx,
             state_rx,
+            model_inventories_rx: watch::channel(Vec::new()).1,
             broadcast_tx,
+            inventory_broadcast_tx: mpsc::channel(1).0,
             seed_tx,
             key_tx,
             gateway_tx,
@@ -2798,7 +2958,9 @@ mod tests {
             signals_address: None,
             snapshot_rx,
             state_rx,
+            model_inventories_rx: watch::channel(Vec::new()).1,
             broadcast_tx,
+            inventory_broadcast_tx: mpsc::channel(1).0,
             seed_tx,
             key_tx,
             gateway_tx,
@@ -2818,7 +2980,7 @@ mod tests {
 
     #[test]
     fn set_gateway_address_returns_error_without_runtime_receiver() {
-        let (handle, _snapshot_tx, _state_tx) = make_test_handle();
+        let (handle, _snapshot_tx, _state_tx, _inventories_tx) = make_test_handle();
         assert!(
             matches!(
                 handle.set_gateway_address(Some("10.0.0.5:8080".to_owned())),
@@ -3018,7 +3180,7 @@ mod tests {
 
     #[test]
     fn handle_snapshot_starts_empty() {
-        let (handle, snapshot_tx, _state_tx) = make_test_handle();
+        let (handle, snapshot_tx, _state_tx, _inventories_tx) = make_test_handle();
         let snap = handle.snapshot();
         assert!(snap.members.is_empty(), "initial snapshot must be empty");
         drop(snapshot_tx);
@@ -3026,7 +3188,7 @@ mod tests {
 
     #[test]
     fn handle_snapshot_reflects_published_update() {
-        let (handle, snapshot_tx, _state_tx) = make_test_handle();
+        let (handle, snapshot_tx, _state_tx, _inventories_tx) = make_test_handle();
 
         let snap_with_member = MembershipSnapshot {
             members: vec![MemberRecord {
@@ -3091,14 +3253,14 @@ mod tests {
 
     #[test]
     fn handle_state_snapshot_starts_empty() {
-        let (handle, _snap_tx, _state_tx) = make_test_handle();
+        let (handle, _snap_tx, _state_tx, _inventories_tx) = make_test_handle();
         let state = handle.state_snapshot();
         assert!(state.providers.is_empty(), "initial CRDT state must have no providers");
     }
 
     #[test]
     fn handle_state_snapshot_reflects_published_update() {
-        let (handle, _snap_tx, state_tx) = make_test_handle();
+        let (handle, _snap_tx, state_tx, _inventories_tx) = make_test_handle();
 
         let mut snap = GridStateSnapshot::new("site-a".to_owned());
         snap.upsert_provider(crdt::ProviderState {
@@ -3155,7 +3317,7 @@ mod tests {
 
     #[test]
     fn local_addr_returns_advertise_addr() {
-        let (handle, _snap_tx, _state_tx) = make_test_handle();
+        let (handle, _snap_tx, _state_tx, _inventories_tx) = make_test_handle();
         let addr: SocketAddr = "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             handle.local_addr(),
@@ -3166,7 +3328,7 @@ mod tests {
 
     #[test]
     fn announce_seeds_empty_is_noop() {
-        let (handle, _snap_tx, _state_tx) = make_test_handle();
+        let (handle, _snap_tx, _state_tx, _inventories_tx) = make_test_handle();
         let result = handle.announce_seeds(Vec::new());
         assert!(result.is_ok(), "announce_seeds with empty vec must return Ok");
     }
@@ -3186,7 +3348,9 @@ mod tests {
             signals_address: None,
             snapshot_rx,
             state_rx,
+            model_inventories_rx: watch::channel(Vec::new()).1,
             broadcast_tx,
+            inventory_broadcast_tx: mpsc::channel(1).0,
             seed_tx,
             key_tx,
             gateway_tx,
@@ -3219,7 +3383,9 @@ mod tests {
             signals_address: None,
             snapshot_rx,
             state_rx,
+            model_inventories_rx: watch::channel(Vec::new()).1,
             broadcast_tx,
+            inventory_broadcast_tx: mpsc::channel(1).0,
             seed_tx,
             key_tx,
             gateway_tx,
