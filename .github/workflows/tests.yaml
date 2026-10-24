@@ -136,7 +136,13 @@ jobs:
           tar -xzf /tmp/kustomize.tar.gz -C /tmp kustomize
           sudo install -m 0755 /tmp/kustomize /usr/local/bin/kustomize
 
-      - name: Check generated manifests and cloud overlays
+      - name: Check experimental A2A API artifacts
+        run: |
+          cargo clippy --locked -p operator --all-targets --features a2a -- -D warnings
+          cargo test --locked -p operator --features a2a crd::agent_to_agent_provider::tests
+          make crds-check-experimental
+
+      - name: Check install manifests match the chart
         run: make deploy-check
 
   # ----------------------------------------------------------------------------

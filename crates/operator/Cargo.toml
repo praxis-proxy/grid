@@ -9,6 +9,11 @@ publish = false
 
 [features]
 default = ["tls-rustls"]
+# Marker for builds containing one or more experimental capabilities.
+experimental = []
+# Experimental A2A provider API and integrations. Keep this capability
+# separate so other experimental work does not implicitly enable A2A.
+a2a = ["experimental"]
 tls-rustls = [
   "certs/rcgen",
   "grid-client/rcgen",
