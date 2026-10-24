@@ -17,3 +17,6 @@ tower = { workspace = true }
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["k8s-openapi"]

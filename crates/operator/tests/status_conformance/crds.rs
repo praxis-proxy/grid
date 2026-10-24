@@ -23,8 +23,8 @@ fn crds() -> Vec<(String, serde_json::Value)> {
 }
 
 #[test]
-#[ignore = "red on main: every kind's Phase column reads .status.phase (deploy/crds/*.yaml); STATUS-REVIEW part 3 \
-            moves Phase to priority 1 behind the trio's columns"]
+// Expected to fail: every kind's Phase column reads .status.phase (deploy/crds/*.yaml); STATUS-REVIEW part 3 moves
+// Phase to priority 1 behind the trio's columns
 fn invariant_9_printer_columns_read_conditions_or_spec_not_phase() {
     for (file, crd) in crds() {
         invariants::printer_columns_read_conditions(&crd).unwrap_or_else(|why| panic!("{file}: {why}"));

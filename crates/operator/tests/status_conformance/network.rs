@@ -114,8 +114,8 @@ async fn invariant_3_network_observed_generation_follows_a_spec_edit() {
 }
 
 #[tokio::test]
-#[ignore = "red on main: a GridNetwork writes no Available, Progressing or Degraded; STATUS-REVIEW part 3 adds \
-            the trio on v1alpha1"]
+// Expected to fail: a GridNetwork writes no Available, Progressing or Degraded; STATUS-REVIEW part 3 adds the trio on
+// v1alpha1
 async fn invariant_7_network_rollup_trio_is_present_after_round_one() {
     let (api, path) = seeded();
     let rounds = fixtures::rounds(&api, &path, 1, |_round| reconcile(&api, &path, None)).await;

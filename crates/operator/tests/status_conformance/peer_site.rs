@@ -38,8 +38,7 @@ async fn invariant_1_pending_peer_site_is_unchanged_across_five_rounds() {
     invariants::observed_generation_tracks(&rounds).expect("invariant 3");
     invariants::changes_explained(&rounds, &[]).expect("invariant 6");
     let first = rounds.first().expect("five rounds");
-    assert_eq!(first.field("phase"), "Pending");
-    assert_eq!(first.field("reason"), "AwaitingDiscovery", "invariant 8");
+    status_harness::diff::status_matches(first, &[("phase", "Pending", "AwaitingDiscovery")]).expect("invariant 8");
 }
 
 #[tokio::test]
@@ -60,8 +59,8 @@ async fn invariant_2_peer_site_transition_time_moves_only_with_the_phase() {
     invariants::changes_explained(&rounds, &[2]).expect("invariant 6");
     invariants::unchanged_from(&rounds, 3).expect("invariant 1 after the change");
     let after = rounds.get(2).expect("five rounds");
-    assert_eq!(after.field("phase"), "Discovered");
-    assert_eq!(after.field("reason"), "GatewayAddressMissing", "invariant 8");
+    status_harness::diff::status_matches(after, &[("phase", "Discovered", "GatewayAddressMissing")])
+        .expect("invariant 8");
 }
 
 #[tokio::test]
@@ -108,8 +107,8 @@ async fn invariant_5_peer_site_phase_has_no_field_manager_today() {
 }
 
 #[tokio::test]
-#[ignore = "red on main: a peer GridSite writes no conditions, so Available, Progressing and Degraded are absent; \
-            STATUS-REVIEW part 3 adds the trio with Connected and SignalsFresh on v1alpha1"]
+// Expected to fail: a peer GridSite writes no conditions, so Available, Progressing and Degraded are absent;
+// STATUS-REVIEW part 3 adds the trio with Connected and SignalsFresh on v1alpha1
 async fn invariant_7_peer_site_rollup_trio_is_present_after_round_one() {
     let (api, path) = seeded();
     let rounds = fixtures::rounds(&api, &path, 1, |_round| reconcile(&api, &path)).await;

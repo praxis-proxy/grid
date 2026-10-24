@@ -121,8 +121,8 @@ async fn invariant_1_provider_conditions_are_unchanged_across_repeated_signals_p
 }
 
 #[tokio::test]
-#[ignore = "red on main: Ready reads Unknown MetricsNotConfigured, an Unknown that is neither AwaitingFirst nor \
-            NotEvaluated (readiness.rs:124); STATUS-REVIEW ratifies MetricsReachable absent without an endpoint"]
+// Expected to fail: Ready reads Unknown MetricsNotConfigured, an Unknown that is neither AwaitingFirst nor
+// NotEvaluated (readiness.rs:124); STATUS-REVIEW ratifies MetricsReachable absent without an endpoint
 async fn invariant_4_provider_ready_is_unknown_only_before_its_first_evaluation() {
     let (api, path) = seeded();
     let rounds = fixtures::rounds(&api, &path, 2, |_round| async {
@@ -134,9 +134,9 @@ async fn invariant_4_provider_ready_is_unknown_only_before_its_first_evaluation(
 }
 
 #[tokio::test]
-#[ignore = "red on main: only the Poll-mode signals pass writes provider conditions (main.rs:2503-2505), so a \
-            provider keeps Ready Unknown MetricsNotConfigured for good once the mode turns Gossip; \
-            STATUS-REVIEW rule 9 wants Unknown NotEvaluated by the next round"]
+// Expected to fail: only the Poll-mode signals pass writes provider conditions (main.rs:2503-2505), so a provider
+// keeps Ready Unknown MetricsNotConfigured for good once the mode turns Gossip; STATUS-REVIEW rule 9 wants Unknown
+// NotEvaluated by the next round
 async fn invariant_11_provider_conditions_read_not_evaluated_once_gossip_turns_the_writer_off() {
     let (api, path) = seeded();
     signals_pass(&api, &path).await;
@@ -154,8 +154,8 @@ async fn invariant_11_provider_conditions_read_not_evaluated_once_gossip_turns_t
 }
 
 #[tokio::test]
-#[ignore = "red on main: an InferenceProvider writes no Available, Progressing or Degraded; STATUS-REVIEW part 3 \
-            adds the trio on v1alpha1"]
+// Expected to fail: an InferenceProvider writes no Available, Progressing or Degraded; STATUS-REVIEW part 3 adds the
+// trio on v1alpha1
 async fn invariant_7_provider_rollup_trio_is_present_after_round_one() {
     let (api, path) = seeded();
     let rounds = fixtures::rounds(&api, &path, 1, |_round| reconcile(&api, &path)).await;

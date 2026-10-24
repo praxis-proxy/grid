@@ -13,7 +13,30 @@ use std::{
 
 use serde_json::{Map, Value, json};
 
+pub mod diff;
 pub mod invariants;
+
+/// Why an invariant failed. Its debug form is the text itself, so `expect` prints the
+/// status table as written rather than as an escaped string.
+pub struct Failure(String);
+
+impl From<String> for Failure {
+    fn from(why: String) -> Self {
+        Self(why)
+    }
+}
+
+impl std::fmt::Debug for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "\n{}", self.0)
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// One write the API received.
 #[derive(Clone, Debug, PartialEq, Eq)]

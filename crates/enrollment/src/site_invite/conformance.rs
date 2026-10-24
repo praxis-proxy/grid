@@ -151,9 +151,8 @@ async fn invariant_6_redemption_changes_ready_in_the_round_it_is_observed() {
 }
 
 #[tokio::test]
-#[ignore = "red on main: invite_status keeps lastTransitionTime only when status and reason both match \
-            (site_invite.rs prior_transition), so Ready True Ready to Ready True Redeemed moves the time with no \
-            status change"]
+// Expected to fail: invite_status keeps lastTransitionTime only when status and reason both match (site_invite.rs
+// prior_transition), so Ready True Ready to Ready True Redeemed moves the time with no status change
 async fn invariant_2_redemption_keeps_the_transition_time_while_ready_stays_true() {
     let (api, ctx) = seeded();
     let mut rounds = rounds(&api, &ctx, 3).await;
@@ -168,9 +167,9 @@ async fn rounds_more(api: &FakeApi, ctx: &Arc<Context>, count: usize) -> Vec<Obs
 }
 
 #[tokio::test]
-#[ignore = "red on main: a redeemed SiteInvite reads Ready True Redeemed (site_invite.rs invite_status), so the Ready \
-            printer column shows True for a spent invite; STATUS-REVIEW ratifies Available False Redeemed with \
-            Minted, Redeemed and Issued beside it"]
+// Expected to fail: a redeemed SiteInvite reads Ready True Redeemed (site_invite.rs invite_status), so the Ready
+// printer column shows True for a spent invite; STATUS-REVIEW ratifies Available False Redeemed with Minted, Redeemed
+// and Issued beside it
 async fn invariant_7_redeemed_invite_reads_available_false_with_redeemed() {
     let (api, ctx) = seeded();
     drop(rounds(&api, &ctx, 2).await);
@@ -178,8 +177,17 @@ async fn invariant_7_redeemed_invite_reads_available_false_with_redeemed() {
     let after = rounds(&api, &ctx, 1).await;
     let observed = after.first().expect("one round");
 
-    invariants::rollup_present_and_equal(observed, &["Minted", "Redeemed", "Issued"]).expect("invariant 7");
-    let available = observed.condition("Available").expect("Available");
-    assert_eq!(available["status"], "False");
-    assert_eq!(available["reason"], "Redeemed");
+    // API-SITEINVITE: once spent, Available is False Redeemed and the facts stay True.
+    status_harness::diff::status_matches(
+        observed,
+        &[
+            ("Minted", "True", "AsExpected"),
+            ("Redeemed", "True", "AsExpected"),
+            ("Issued", "True", "AsExpected"),
+            ("Available", "False", "Redeemed"),
+            ("Progressing", "False", "AsExpected"),
+            ("Degraded", "False", "AsExpected"),
+        ],
+    )
+    .expect("a redeemed invite");
 }
