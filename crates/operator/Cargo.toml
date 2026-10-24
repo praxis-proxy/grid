@@ -85,6 +85,7 @@ pem = { workspace = true }
 rcgen = { workspace = true, features = ["x509-parser"] }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }
+status-harness = { workspace = true }
 
 [lints]
 workspace = true
