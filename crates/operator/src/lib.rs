@@ -31,8 +31,12 @@ pub mod crd;
 pub mod enroll;
 /// Operator error types.
 pub mod error;
+/// Routes the Services peers reach the operator on to the lease holder alone.
+pub mod holder_route;
 /// A provider's recent request latency and error ratio, from deltas of its EPP's histograms.
 pub mod latency;
+/// Leader election on a lease: the holder runs everything that writes.
+pub mod leader;
 /// Creates this site's `GridNetwork` and `GridSite` once its identity exists.
 pub mod local_records;
 /// The `LocalSiteDeclared` condition on the `GridNetwork`.
@@ -82,3 +86,5 @@ pub mod swim_endpoint;
 ///
 /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
 pub mod swim_runtime;
+/// Holds a candidate back from the lease while an unelected replica still writes.
+pub mod unelected;
