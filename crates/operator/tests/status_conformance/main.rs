@@ -4,7 +4,7 @@
 //! A test is named for the invariant it asserts. A test marked `ignore` is red on
 //! main, and its reason names the defect and the change that turns it green.
 
-#![allow(clippy::tests_outside_test_module, reason = "integration tests live in tests/")]
+#![expect(clippy::tests_outside_test_module, reason = "integration tests live in tests/")]
 #![expect(
     clippy::expect_used,
     clippy::panic,
