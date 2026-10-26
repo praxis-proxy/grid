@@ -37,6 +37,9 @@ spec:
       port: {{ .Values.swim.service.port }}
       targetPort: swim-udp
       protocol: UDP
+  {{- if not (include "grid-operator.ha" .) }}
   selector:
     {{- include "grid-operator.selectorLabels" . | nindent 4 }}
+  {{- end }}
+  {{- /* Under HA every replica is ready, and the lease holder writes this Service's EndpointSlice. */}}
 {{- end }}
