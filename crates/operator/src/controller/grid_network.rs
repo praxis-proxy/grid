@@ -42,7 +42,7 @@ use crate::{
             SiteIdentityStatus, SiteRouter, TenantBudgetStatus, TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
-        inference_provider::{InferenceProvider, InferenceProviderStatus},
+        inference_provider::{Condition, InferenceProvider, InferenceProviderStatus},
     },
     error::OperatorError,
     readiness,
@@ -54,7 +54,7 @@ use crate::{
         tls_backend::ServerTlsConfig,
         trust_bundle::{self, CertPemStatus},
     },
-    served_models, signals,
+    rollup, served_models, signals,
     swim::{MemberStatus, MembershipSnapshot},
     swim_endpoint::{SeedResolution, resolve_endpoint_list_partial},
     swim_runtime::SwimHandle,
@@ -851,32 +851,17 @@ async fn apply_ready_condition(
     Ok(())
 }
 
-/// The status patch carrying the provider's `Ready` and `MetricsAvailable` conditions, `None`
-/// when neither changed. Both are always sent, since an apply that leaves one out removes it.
+/// The status patch carrying the conditions the readiness pass owns, `None` when none changed.
+/// Every one is sent, since an apply that leaves one out removes it.
 fn ready_condition_patch<'provider>(
     provider: &'provider InferenceProvider,
     verdict: &readiness::Verdict,
 ) -> Option<(&'provider str, Value)> {
     let name = provider.metadata.name.as_deref()?;
-    let status = provider.status.as_ref();
-    let current = status.map_or(&[][..], |status| status.conditions.as_slice());
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .ok()?;
-    let generation = provider.metadata.generation;
-    let ready = readiness::ready_condition(current, verdict, &now, generation);
-    let metrics = readiness::metrics_condition(current, verdict, &now, generation);
-    if ready.is_none() && metrics.is_none() {
-        return None;
-    }
-    let held = |type_: &str| current.iter().find(|c| c.type_ == type_).cloned();
-    let conditions: Vec<_> = [
-        ready.or_else(|| held(readiness::READY_CONDITION)),
-        metrics.or_else(|| held(readiness::METRICS_CONDITION)),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let conditions = readiness_conditions(provider, verdict, &now)?;
     Some((
         name,
         serde_json::json!({
@@ -886,6 +871,59 @@ fn ready_condition_patch<'provider>(
             "status": { "conditions": conditions }
         }),
     ))
+}
+
+/// `Ready`, `MetricsAvailable`, `EndpointLive` and `MetricsReachable` for `verdict`, `None`
+/// when the live status already says them.
+fn readiness_conditions(
+    provider: &InferenceProvider,
+    verdict: &readiness::Verdict,
+    now: &str,
+) -> Option<Vec<Condition>> {
+    let current = provider
+        .status
+        .as_ref()
+        .map_or(&[][..], |status| status.conditions.as_slice());
+    let generation = provider.metadata.generation;
+    let stamp = rollup::Stamp { generation, now };
+    let ready = readiness::ready_condition(current, verdict, now, generation);
+    let metrics = readiness::metrics_condition(current, verdict, now, generation);
+    let live = readiness::endpoint_live(verdict, liveness_fallback(provider));
+    let live = rollup::condition(current, readiness::ENDPOINT_LIVE_CONDITION, live, stamp);
+    let reachable = readiness::metrics_reachable(verdict)
+        .map(|state| rollup::condition(current, readiness::METRICS_REACHABLE_CONDITION, state, stamp));
+    let held = |type_: &str| current.iter().find(|c| c.type_ == type_).cloned();
+    // Left out of the apply, a held MetricsReachable is removed once no endpoint is set.
+    let reachable_moved = reachable.as_ref().map_or_else(
+        || held(readiness::METRICS_REACHABLE_CONDITION).is_some(),
+        |reachable| rollup::differs(current, std::slice::from_ref(reachable)),
+    );
+    let live_moved = rollup::differs(current, std::slice::from_ref(&live));
+    if ready.is_none() && metrics.is_none() && !reachable_moved && !live_moved {
+        return None;
+    }
+    let conditions = [
+        ready.or_else(|| held(readiness::READY_CONDITION)),
+        metrics.or_else(|| held(readiness::METRICS_CONDITION)),
+        Some(live),
+        reachable,
+    ];
+    Some(conditions.into_iter().flatten().collect())
+}
+
+/// What stands in for metrics when judging a provider's liveness.
+fn liveness_fallback(provider: &InferenceProvider) -> readiness::Fallback {
+    let unavailable = provider
+        .status
+        .as_ref()
+        .is_some_and(|status| status.phase == crate::crd::inference_provider::ProviderPhase::Unavailable);
+    if unavailable {
+        readiness::Fallback::Unavailable
+    } else if provider.spec.health_check.is_some() {
+        readiness::Fallback::HealthChecked
+    } else {
+        readiness::Fallback::Unchecked
+    }
 }
 
 /// Server-side apply manager for the `Ready` condition, apart from provider reconciliation.
@@ -1713,6 +1751,8 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let budget_statuses =
         crate::crd::grid_network::resolve_budget_statuses(network.spec.budget_policy.as_ref(), &tenant_spend);
 
+    let declared = Box::pin(local_site_declared(client, &network, ctx.site_name())).await;
+    let conditions = network_rollup(&network, ctx.site_name(), declared);
     update_status(
         &network,
         client,
@@ -1725,10 +1765,13 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         overlay_statuses,
         budget_statuses,
         identity,
+        conditions,
     )
     .await?;
 
-    Box::pin(apply_local_site_condition(client, &network, ctx.site_name())).await;
+    if let Some(declared) = declared {
+        Box::pin(apply_local_site_condition(client, &network, ctx.site_name(), declared)).await;
+    }
 
     // Auto-create or update GridSite records for remote Alive SWIM members.
     // Only runs when the GridNetwork explicitly opts in via LABEL_AUTO_DISCOVER_SITES.
@@ -1751,22 +1794,78 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     ))
 }
 
-/// Report whether this site's own [`GridSite`] is declared and labelled.
-async fn apply_local_site_condition(client: &Client, network: &GridNetwork, local_site: Option<&str>) {
-    let Some(network_name) = network.metadata.name.as_deref() else {
-        return;
-    };
+/// Whether this site's own [`GridSite`] is declared and labelled, `None` when it cannot be read.
+async fn local_site_declared(
+    client: &Client,
+    network: &GridNetwork,
+    local_site: Option<&str>,
+) -> Option<crate::local_site::Declared> {
+    let network_name = network.metadata.name.as_deref()?;
     let site = match local_site {
         Some(local) => match Api::<GridSite>::all(client.clone()).get_opt(local).await {
             Ok(site) => site,
             Err(error) => {
                 tracing::debug!(%error, site = local, "local GridSite not readable; retrying next reconcile");
-                return;
+                return None;
             },
         },
         None => None,
     };
-    let declared = crate::local_site::Declared::of(network_name, local_site, site.as_ref());
+    Some(crate::local_site::Declared::of(network_name, local_site, site.as_ref()))
+}
+
+/// The network's roll-up: `LocalSiteDeclared` gates it, and rejected peer or gateway signal
+/// ages degrade it.
+fn network_rollup(
+    network: &GridNetwork,
+    local_site: Option<&str>,
+    declared: Option<crate::local_site::Declared>,
+) -> Vec<Condition> {
+    let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
+        return Vec::new();
+    };
+    let held = network
+        .status
+        .as_ref()
+        .map_or(&[][..], |status| status.conditions.as_slice());
+    let stamp = rollup::Stamp {
+        generation: network.metadata.generation,
+        now: &now,
+    };
+    // An unreadable GridSite keeps the last verdict rather than inventing one.
+    let gate = declared
+        .and_then(|declared| crate::local_site::desired(network, local_site, declared, &now))
+        .or_else(|| held_condition(held, crate::local_site::LOCAL_SITE_DECLARED).cloned())
+        .unwrap_or_else(|| {
+            let unread = (
+                "Unknown",
+                "AwaitingFirstCheck",
+                "the local GridSite has not been read".to_owned(),
+            );
+            rollup::condition(held, crate::local_site::LOCAL_SITE_DECLARED, unread, stamp)
+        });
+    let degraded = held_condition(held, crate::peer_ages::PEER_TIME_VALID)
+        .filter(|condition| condition.status == "False")
+        .or_else(|| {
+            held_condition(held, crate::gateway_ages::GATEWAY_AGES_REJECTED)
+                .filter(|condition| condition.status == "True")
+        })
+        .map(|condition| (condition.reason.as_str(), condition.message.as_str()));
+    rollup::trio(held, &[&gate], (degraded, None), stamp).into()
+}
+
+/// The condition of `type_` in `held`.
+fn held_condition<'held>(held: &'held [Condition], type_: &str) -> Option<&'held Condition> {
+    held.iter().find(|condition| condition.type_ == type_)
+}
+
+/// Report whether this site's own [`GridSite`] is declared and labelled.
+async fn apply_local_site_condition(
+    client: &Client,
+    network: &GridNetwork,
+    local_site: Option<&str>,
+    declared: crate::local_site::Declared,
+) {
     let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
         return;
     };
@@ -5493,14 +5592,14 @@ async fn update_status(
     overlay_statuses: Vec<OverlayRevisionStatus>,
     budget_statuses: Vec<TenantBudgetStatus>,
     identity: Option<SiteIdentityStatus>,
+    conditions: Vec<Condition>,
 ) -> Result<(), OperatorError> {
     let name = grid_network_name(network)?;
 
     let api: Api<GridNetwork> = Api::all(client.clone());
     let status = GridNetworkStatus {
-        // Signal publishers own this evidence under separate field managers. Left
-        // empty, it is not serialized, so this apply never claims or clears it.
-        conditions: Vec::new(),
+        // The roll-up only: other condition types belong to their own field managers.
+        conditions,
         gateway_age_reports: Vec::new(),
         gateway_age_report_overflow: false,
         connected_sites: membership.map_or(0, MembershipSnapshot::connected_count),
@@ -5613,13 +5712,14 @@ fn identity_status(cert_pem: &str, now: time::OffsetDateTime, renews: bool) -> O
 /// Ignore conditions and gateway evidence managed by the signal publishers.
 fn grid_network_status_needs_update(current: Option<&GridNetworkStatus>, desired: &GridNetworkStatus) -> bool {
     current.is_none_or(|current| {
-        *desired
-            != GridNetworkStatus {
-                conditions: desired.conditions.clone(),
-                gateway_age_reports: desired.gateway_age_reports.clone(),
-                gateway_age_report_overflow: desired.gateway_age_report_overflow,
-                ..current.clone()
-            }
+        rollup::differs(&current.conditions, &desired.conditions)
+            || *desired
+                != GridNetworkStatus {
+                    conditions: desired.conditions.clone(),
+                    gateway_age_reports: desired.gateway_age_reports.clone(),
+                    gateway_age_report_overflow: desired.gateway_age_report_overflow,
+                    ..current.clone()
+                }
     })
 }
 
@@ -6724,8 +6824,16 @@ mod tests {
             "type": "MetricsAvailable", "status": "True", "reason": "ScrapeSucceeded", "message": "metrics scraped",
             "lastTransitionTime": "2026-10-03T00:00:00Z", "observedGeneration": 1
         });
+        let live = serde_json::json!({
+            "type": "EndpointLive", "status": "False", "reason": "NoEndpointsReady", "message": "0 ready endpoints",
+            "lastTransitionTime": "2026-10-03T00:00:00Z", "observedGeneration": 1
+        });
+        let reachable = serde_json::json!({
+            "type": "MetricsReachable", "status": "True", "reason": "MetricsReachable", "message": "",
+            "lastTransitionTime": "2026-10-03T00:00:00Z", "observedGeneration": 1
+        });
         let current = provider_with_status(&serde_json::json!({
-            "conditions": [ready_condition_json("False", "NoEndpointsReady"), metrics]
+            "conditions": [ready_condition_json("False", "NoEndpointsReady"), metrics, live, reachable]
         }));
         assert!(
             ready_condition_patch(&current, &down).is_none(),
@@ -8444,7 +8552,7 @@ mod tests {
     fn independently_owned_evidence_is_omitted_and_does_not_trigger_reconcile() -> Result<(), serde_json::Error> {
         let baseline = GridNetworkStatus::default();
         let mut independently_owned = baseline.clone();
-        independently_owned.conditions = vec![crate::crd::inference_provider::Condition {
+        independently_owned.conditions = vec![Condition {
             type_: crate::peer_ages::PEER_TIME_VALID.to_owned(),
             status: "False".to_owned(),
             reason: "TimestampOutOfRange".to_owned(),
@@ -8474,6 +8582,58 @@ mod tests {
         Ok(())
     }
 
+    /// A network holding `conditions` as `(type, status, reason)`.
+    fn network_holding(conditions: &[(&str, &str, &str)]) -> GridNetwork {
+        let mut network = base_network();
+        network.status = Some(GridNetworkStatus {
+            conditions: conditions
+                .iter()
+                .map(|(type_, status, reason)| Condition {
+                    type_: (*type_).to_owned(),
+                    status: (*status).to_owned(),
+                    reason: (*reason).to_owned(),
+                    ..Condition::default()
+                })
+                .collect(),
+            ..GridNetworkStatus::default()
+        });
+        network
+    }
+
+    /// `(status, reason)` of `type_` in the network's roll-up with no site identity.
+    fn rolled_up(network: &GridNetwork, type_: &str) -> Option<(String, String)> {
+        network_rollup(network, None, Some(crate::local_site::Declared::NoSite))
+            .into_iter()
+            .find(|condition| condition.type_ == type_)
+            .map(|condition| (condition.status, condition.reason))
+    }
+
+    #[test]
+    fn rejected_peer_ages_degrade_first_and_the_local_site_gates() {
+        let network = network_holding(&[
+            (
+                crate::gateway_ages::GATEWAY_AGES_REJECTED,
+                "True",
+                "GatewayAgesRejected",
+            ),
+            (crate::peer_ages::PEER_TIME_VALID, "False", "TimestampOutOfRange"),
+        ]);
+        let pair = |status: &str, reason: &str| Some((status.to_owned(), reason.to_owned()));
+        assert_eq!(rolled_up(&network, "Available"), pair("False", "NoSiteIdentity"));
+        assert_eq!(rolled_up(&network, "Degraded"), pair("True", "TimestampOutOfRange"));
+    }
+
+    #[test]
+    fn rejected_gateway_ages_degrade() {
+        let network = network_holding(&[(
+            crate::gateway_ages::GATEWAY_AGES_REJECTED,
+            "True",
+            "GatewayAgesRejected",
+        )]);
+        let degraded = rolled_up(&network, "Degraded");
+        assert_eq!(degraded, Some(("True".to_owned(), "GatewayAgesRejected".to_owned())));
+    }
+
     #[test]
     fn a_condition_alone_never_calls_for_a_status_write() {
         let baseline = GridNetworkStatus {
@@ -8482,10 +8642,10 @@ mod tests {
             ..GridNetworkStatus::default()
         };
         let with_condition = GridNetworkStatus {
-            conditions: vec![crate::crd::inference_provider::Condition {
+            conditions: vec![Condition {
                 type_: crate::peer_ages::PEER_TIME_VALID.to_owned(),
                 status: "True".to_owned(),
-                ..crate::crd::inference_provider::Condition::default()
+                ..Condition::default()
             }],
             ..baseline.clone()
         };

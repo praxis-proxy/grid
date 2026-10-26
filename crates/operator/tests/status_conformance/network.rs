@@ -35,7 +35,38 @@ async fn reconcile(api: &FakeApi, path: &str, site_name: Option<&str>) {
 
 /// The field manager each network condition type belongs to.
 fn managers() -> BTreeMap<&'static str, &'static str> {
-    BTreeMap::from([("LocalSiteDeclared", "grid-operator-local-site")])
+    BTreeMap::from([
+        ("LocalSiteDeclared", "grid-operator-local-site"),
+        ("Available", "grid-operator"),
+        ("Progressing", "grid-operator"),
+        ("Degraded", "grid-operator"),
+    ])
+}
+
+/// The closed reason set: each `LocalSiteDeclared` verdict, and `Available` copying it.
+fn reasons() -> Vec<(&'static str, &'static str, &'static str)> {
+    let declared = [
+        ("False", "NoSiteIdentity"),
+        ("False", "LocalSiteMissing"),
+        ("False", "LocalSiteUnlabelled"),
+        ("True", "LocalSiteFound"),
+    ];
+    let mut allowed: Vec<_> = declared
+        .iter()
+        .map(|(status, reason)| ("LocalSiteDeclared", *status, *reason))
+        .chain(
+            declared
+                .iter()
+                .filter(|(status, _)| *status == "False")
+                .map(|(status, reason)| ("Available", *status, *reason)),
+        )
+        .collect();
+    allowed.extend([
+        ("Available", "True", "Available"),
+        ("Progressing", "False", "AsExpected"),
+        ("Degraded", "False", "AsExpected"),
+    ]);
+    allowed
 }
 
 #[tokio::test]
@@ -48,7 +79,7 @@ async fn invariant_1_pending_network_is_unchanged_across_five_rounds() {
     invariants::observed_generation_tracks(&rounds).expect("invariant 3");
     invariants::one_manager_per_type(&api.writes(), &path, &managers()).expect("invariant 5");
     invariants::changes_explained(&rounds, &[]).expect("invariant 6");
-    invariants::reasons_within(&rounds, &[("LocalSiteDeclared", "False", "NoSiteIdentity")]).expect("invariant 8");
+    invariants::reasons_within(&rounds, &reasons()).expect("invariant 8");
     assert_eq!(rounds.first().expect("five rounds").field("phase"), "Pending");
 }
 
@@ -70,15 +101,7 @@ async fn invariant_2_local_site_declared_transition_time_moves_only_with_its_sta
     invariants::transition_time_moves_only_with_status(&rounds).expect("invariant 2");
     invariants::changes_explained(&rounds, &[2, 3]).expect("invariant 6");
     invariants::one_manager_per_type(&api.writes(), &path, &managers()).expect("invariant 5");
-    invariants::reasons_within(
-        &rounds,
-        &[
-            ("LocalSiteDeclared", "False", "NoSiteIdentity"),
-            ("LocalSiteDeclared", "False", "LocalSiteMissing"),
-            ("LocalSiteDeclared", "True", "LocalSiteFound"),
-        ],
-    )
-    .expect("invariant 8");
+    invariants::reasons_within(&rounds, &reasons()).expect("invariant 8");
     assert_eq!(declared(&rounds, 1), ("False", "NoSiteIdentity"));
     assert_eq!(declared(&rounds, 2), ("False", "LocalSiteMissing"));
     assert_eq!(declared(&rounds, 4), ("True", "LocalSiteFound"));
@@ -114,8 +137,6 @@ async fn invariant_3_network_observed_generation_follows_a_spec_edit() {
 }
 
 #[tokio::test]
-// Expected to fail: a GridNetwork writes no Available, Progressing or Degraded; STATUS-REVIEW part 3 adds the trio on
-// v1alpha1
 async fn invariant_7_network_rollup_trio_is_present_after_round_one() {
     let (api, path) = seeded();
     let rounds = fixtures::rounds(&api, &path, 1, |_round| reconcile(&api, &path, None)).await;

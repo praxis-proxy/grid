@@ -9,7 +9,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::crd::grid_network::SignalMode;
+use crate::crd::{grid_network::SignalMode, inference_provider::Condition};
 
 // ---------------------------------------------------------------------------
 // Spec
@@ -178,6 +178,12 @@ pub struct GridSiteStatus {
     /// Capabilities offered by this site.
     #[serde(default)]
     pub capabilities: SiteCapabilities,
+
+    /// Observed conditions: `Connected`, and the `Available`, `Progressing` and `Degraded`
+    /// roll-up. The phase stays, kept for v1alpha1 readers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["type"]))]
+    pub conditions: Vec<Condition>,
 
     /// Timestamp of the last probe whose resulting status was persisted.
     ///

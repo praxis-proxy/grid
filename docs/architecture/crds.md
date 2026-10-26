@@ -8,6 +8,33 @@ unchanged by the project-name update.
 
 All CRDs are cluster-scoped and served at `v1alpha1`.
 
+## Status conditions
+
+`GridNetwork`, `GridSite`, `InferenceProvider` and `SiteInvite` each carry
+`Available`, `Progressing` and `Degraded` after their first reconcile, so one
+client reads any of them the same way.
+
+- `Available` is `True` with reason `Available` when every gating condition of
+  the kind is `True`. Otherwise it copies the status, reason and message of the
+  first gating condition, in the kind's order, that is not.
+- `Degraded` is `True` when a non-gating condition is bad, and copies its reason
+  and message. Otherwise it is `False` with reason `AsExpected`.
+- `Progressing` is `True` with reason `NewGeneration` while a gating condition
+  describes an older `metadata.generation`, or with a reason naming a change the
+  operator expects to finish without a person. Otherwise it is `False` with
+  reason `AsExpected`.
+- A positive condition's `True` reason is its own type name. `Unknown` means only
+  that the operator has not evaluated the condition: `AwaitingFirstCheck` or
+  `AwaitingFirstScrape` before the first evaluation, or `NotEvaluated`.
+
+Available `True` and Degraded `False` is healthy. Progressing `True` means wait.
+Available `False` with Progressing `False` means act, on the reason given.
+
+Every kind prints the same status columns: AVAILABLE, PROGRESSING and DEGRADED
+read those conditions, and SINCE is when Available last changed. `-o wide` adds
+MESSAGE, the Available message, then PHASE, kept while v1alpha1 has it, and on
+`InferenceProvider` READY.
+
 ## SiteInvite
 
 Declares an invitation on the signer cluster. The signer pins the site name and
@@ -57,6 +84,9 @@ The AGN logical network and top-level tenancy scope. `GridNetwork` is a
 cluster-scoped CRD. The current AGN deployment supports only one
 `GridNetwork` in the cluster. The operator fails startup when it finds more
 than one; adding another after startup is not supported.
+
+Its roll-up is gated by `LocalSiteDeclared`. A `PeerTimeValid` of `False`, or a
+`GatewayAgesRejected` of `True`, sets `Degraded` with that condition's reason.
 
 ```yaml
 apiVersion: grid.praxis.fast/v1alpha1
@@ -522,7 +552,7 @@ spec:
 
 **Phases**: Pending → Discovered → Connecting → Active → Unreachable → Left
 
-**Status fields**: `phase`, `reason`, `message`, `observedGeneration`,
+**Status fields**: `conditions`, `phase`, `reason`, `message`, `observedGeneration`,
 `publicCertPem`, `capabilities` (inference, agentTools, agentToAgent),
 `lastProbeTime`, `lastTransitionTime`, `absentSince` (auto-discovered sites only)
 
@@ -697,32 +727,24 @@ status:
   observedGeneration: 2
 ```
 
-### Status conditions (acceptance criterion open)
+### Status conditions
 
-The current `GridSite` status uses a flat
-`phase`/`reason`/`message` model rather than a
-Kubernetes-style `conditions[]` array.
+The operator writes `Connected` and the roll-up beside the phase, which stays for
+v1alpha1 readers. `Connected` is the only gate.
 
-Issue #11's acceptance criteria include a conditions-based
-status contract.  That criterion is **not yet resolved**:
-it requires either (a) implementing a `conditions[]` array
-or (b) formally amending the issue to accept the
-`phase`/`reason`/`message` model as the replacement.
-Neither has happened at the time of writing.
+| Status | Reason | When |
+|---|---|---|
+| `True` | `Connected` | The TLS handshake verified the chain, identity and pin. |
+| `Unknown` | `AwaitingFirstCheck` | An address is known and the first probe has not run. `Progressing` is `True` with `Probing`. |
+| `False` | `AwaitingDiscovery` | The record waits for discovery to supply its address. |
+| `False` | `AddressMissing` | No gateway address is configured. |
+| `False` | `AddressRefused` | The gossiped address is not a dialable literal `IP:port`. |
+| `False` | `Unreachable` | The TCP connect was refused or timed out. The message names which. After an address edit, `Progressing` is `True` with `Probing`. |
+| `False` | `TLSProtocolError` | The TLS handshake failed or timed out at the protocol level. |
+| `False` | `UntrustedIssuer`, `IdentityMismatch`, `CertificateExpired`, `CertificateNotYetValid`, `PinMismatch`, `TrustMaterialMissing`, `TrustMaterialInvalid`, `IdentityVerificationRequired` | The probe's trust failure, named as the probe reports it. |
 
-The flat model is the current contract:
-
-- `phase` provides the primary lifecycle state;
-  `reason` encodes the machine-readable probe outcome;
-  `message` gives a bounded human-readable explanation.
-- Richer conditions (e.g. `Reachable`, `IdentityVerified`,
-  `CertificatePinned`) may be added when multi-signal
-  readiness is needed (see `docs/architecture/overview.md`,
-  Trust and Readiness section).
-
-Tools and automation **must not** depend on a
-`conditions[]` field existing.  Match on `phase` for
-coarse state and on `reason` for specific probe outcomes.
+`Connected` is applied by the field manager `grid-operator-probe`, and the roll-up
+by `grid-operator-site`. The phase stays a merge patch.
 
 ## InferenceProvider
 
@@ -821,9 +843,27 @@ A provider whose `Ready` is `False` is excluded from routing: its site publishes
 `grid_provider_ready 0`, and its serving config entry carries `admission: none`.
 See [Polling Cross-Site Load Signals](polling-metrics.md#provider-readiness).
 
-Every kind prints the same status columns: AVAILABLE, PROGRESSING and DEGRADED
-read those conditions, and SINCE is when Available last changed. `-o wide` adds
-MESSAGE, the Available message, then READY and PHASE, kept while v1alpha1 has them.
+**Roll-up**: `Available` is gated by `Accepted`, `ResolvedRefs` and
+`EndpointLive`, in that order, and a `MetricsReachable` failure sets `Degraded`.
+The provider reconciler writes `Accepted`, `ResolvedRefs` and the roll-up. The
+signals loop writes `EndpointLive` and `MetricsReachable` with `Ready`.
+
+| Condition | Status | Reason | When |
+|---|---|---|---|
+| `Accepted` | `False` | `Invalid` | The endpoint or a model name is blank, or `spec.auth` does not parse. |
+| `ResolvedRefs` | `False` | `BackendNotFound` | The referenced `GridNetwork` does not exist. |
+| `ResolvedRefs` | `False` | `NoSitesMatched` | Sites exist and `siteSelector` matches none. |
+| `ResolvedRefs` | `Unknown` | `NotEvaluated` | An invalid spec or an unreadable credential stopped resolution first. |
+| `EndpointLive` | `True` | `EndpointLive` | The latest scrape counted ready endpoints, or, without metrics, the health check passes. |
+| `EndpointLive` | `True` | `NoHealthSignal` | Nothing checks liveness: no metrics endpoint and no health check, or metrics without a ready-endpoint series. Routing serves it, so the condition says so. |
+| `EndpointLive` | `False` | `NoEndpointsReady` | Scrapes count zero ready endpoints, or the provider is `Unavailable`. |
+| `EndpointLive` | `False` | `LivenessStale` | No scrape succeeded within the readiness window. `MetricsReachable` names why. |
+| `EndpointLive` | `Unknown` | `AwaitingFirstCheck` | No scrape has succeeded yet, within the grace window. |
+| `MetricsReachable` | `False` | The `Ready` scrape reason | The latest scrape failed. Absent when no metrics endpoint is set. |
+
+`Programmed`, from model discovery, joins the gates later. The phase is computed
+as before.
+
 
 ```text
 NAME           PROVIDER      AVAILABLE   PROGRESSING   DEGRADED   SINCE   AGE

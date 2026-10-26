@@ -81,6 +81,28 @@ impl Declared {
     }
 }
 
+/// The condition `declared` calls for, keeping the held `lastTransitionTime` while its
+/// status stands.
+#[must_use]
+pub fn desired(
+    network: &GridNetwork,
+    local_site: Option<&str>,
+    declared: Declared,
+    now_rfc3339: &str,
+) -> Option<Condition> {
+    let verdict = declared.verdict(network.metadata.name.as_deref()?, local_site);
+    let stamp = crate::rollup::Stamp {
+        generation: network.metadata.generation,
+        now: now_rfc3339,
+    };
+    Some(crate::rollup::condition(
+        held(network),
+        LOCAL_SITE_DECLARED,
+        verdict,
+        stamp,
+    ))
+}
+
 /// The condition for `declared`, or `None` when the live status already says it.
 #[must_use]
 pub fn condition(
@@ -89,31 +111,13 @@ pub fn condition(
     declared: Declared,
     now_rfc3339: &str,
 ) -> Option<Condition> {
-    let (state, reason, message) = declared.verdict(network.metadata.name.as_deref()?, local_site);
-    let generation = network.metadata.generation;
-    let held = network
-        .status
-        .as_ref()
-        .and_then(|live| live.conditions.iter().find(|held| held.type_ == LOCAL_SITE_DECLARED));
-    if held.is_some_and(|held| {
-        held.status == state
-            && held.reason == reason
-            && held.message == message
-            && held.observed_generation == generation
-    }) {
-        return None;
-    }
-    let last_transition_time = held
-        .filter(|held| held.status == state)
-        .map_or_else(|| now_rfc3339.to_owned(), |held| held.last_transition_time.clone());
-    Some(Condition {
-        type_: LOCAL_SITE_DECLARED.to_owned(),
-        status: state.to_owned(),
-        reason: reason.to_owned(),
-        message,
-        last_transition_time,
-        observed_generation: generation,
-    })
+    let want = desired(network, local_site, declared, now_rfc3339)?;
+    crate::rollup::differs(held(network), std::slice::from_ref(&want)).then_some(want)
+}
+
+/// The conditions the live status holds.
+fn held(network: &GridNetwork) -> &[Condition] {
+    network.status.as_ref().map_or(&[], |live| live.conditions.as_slice())
 }
 
 /// The status patch carrying the condition, or `None` when the live status already says it.

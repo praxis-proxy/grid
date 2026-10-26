@@ -1,5 +1,6 @@
-//! An `InferenceProvider`, reconciled by `controller::inference_provider`, with its
-//! `Ready` and `MetricsAvailable` conditions written by the signals pass in Poll mode.
+//! An `InferenceProvider`, reconciled by `controller::inference_provider`, which writes
+//! `Accepted`, `ResolvedRefs` and the roll-up, with `Ready`, `MetricsAvailable` and
+//! `EndpointLive` written by the signals pass.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -62,6 +63,13 @@ fn managers() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
         ("Ready", "grid-operator-readiness"),
         ("MetricsAvailable", "grid-operator-readiness"),
+        ("EndpointLive", "grid-operator-readiness"),
+        ("MetricsReachable", "grid-operator-readiness"),
+        ("Accepted", "grid-operator"),
+        ("ResolvedRefs", "grid-operator"),
+        ("Available", "grid-operator"),
+        ("Progressing", "grid-operator"),
+        ("Degraded", "grid-operator"),
     ])
 }
 
@@ -115,6 +123,12 @@ async fn invariant_1_provider_conditions_are_unchanged_across_repeated_signals_p
         &[
             ("Ready", "Unknown", "MetricsNotConfigured"),
             ("MetricsAvailable", "False", "MetricsNotConfigured"),
+            ("EndpointLive", "True", "NoHealthSignal"),
+            ("Accepted", "True", "Accepted"),
+            ("ResolvedRefs", "True", "ResolvedRefs"),
+            ("Available", "True", "Available"),
+            ("Progressing", "False", "AsExpected"),
+            ("Degraded", "False", "AsExpected"),
         ],
     )
     .expect("invariant 8");
@@ -154,11 +168,17 @@ async fn invariant_11_provider_conditions_read_not_evaluated_once_gossip_turns_t
 }
 
 #[tokio::test]
-// Expected to fail: an InferenceProvider writes no Available, Progressing or Degraded; STATUS-REVIEW part 3 adds the
-// trio on v1alpha1
 async fn invariant_7_provider_rollup_trio_is_present_after_round_one() {
+    // Programmed joins the gates when model discovery writes it.
     let (api, path) = seeded();
-    let rounds = fixtures::rounds(&api, &path, 1, |_round| reconcile(&api, &path)).await;
-    invariants::rollup_present_and_equal(rounds.first().expect("one round"), &["EndpointLive", "Programmed"])
-        .expect("invariant 7");
+    let rounds = fixtures::rounds(&api, &path, 1, |_round| async {
+        signals_pass(&api, &path).await;
+        reconcile(&api, &path).await;
+    })
+    .await;
+    invariants::rollup_present_and_equal(
+        rounds.first().expect("one round"),
+        &["Accepted", "ResolvedRefs", "EndpointLive"],
+    )
+    .expect("invariant 7");
 }

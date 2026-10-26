@@ -77,16 +77,18 @@ use crate::{
         grid_network::GridNetwork,
         grid_site::GridSite,
         inference_provider::{
-            HealthCheckConfig, InferenceProvider, InferenceProviderSpec, InferenceProviderStatus, ModelDiscoveryConfig,
-            ProviderPhase,
+            Condition, HealthCheckConfig, InferenceProvider, InferenceProviderSpec, InferenceProviderStatus,
+            ModelDiscoveryConfig, ProviderPhase,
         },
     },
     error::OperatorError,
+    readiness,
     resources::{
         credentials::{self, CredentialResolver as _},
         endpoint_tls, provider_metrics,
         tls_backend::ClientTlsConfig,
     },
+    rollup,
 };
 // ---------------------------------------------------------------------------
 // Constants
@@ -145,12 +147,98 @@ pub async fn reconcile(provider: Arc<InferenceProvider>, ctx: Arc<ProviderCtx>) 
     tracing::debug!(name, "reconciling InferenceProvider");
 
     let client = &ctx.client;
-    let (phase, matching_sites, reason) = resolve_phase_and_sites(&provider, client, ctx.local_site.as_deref()).await?;
+    let (phase, matching_sites, reason, refs) =
+        resolve_phase_and_sites(&provider, client, ctx.local_site.as_deref()).await?;
     let generation = provider.metadata.generation.unwrap_or(0);
-    update_status(&provider, client, phase, matching_sites, generation, reason).await?;
+    let conditions = provider_conditions(&provider, refs, reason.as_deref());
+    update_status(&provider, client, phase, matching_sites, generation, reason, conditions).await?;
 
     Ok(Action::requeue(requeue_interval_for_provider(&provider.spec)))
 }
+
+/// `Accepted`, `ResolvedRefs` and the roll-up. `EndpointLive`, written by the readiness pass,
+/// is the third gate, and a `MetricsReachable` failure degrades.
+fn provider_conditions(provider: &InferenceProvider, refs: Refs, phase_reason: Option<&str>) -> Vec<Condition> {
+    let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
+        return Vec::new();
+    };
+    let held = provider
+        .status
+        .as_ref()
+        .map_or(&[][..], |status| status.conditions.as_slice());
+    let find = |type_: &str| held.iter().find(|condition| condition.type_ == type_);
+    let stamp = rollup::Stamp {
+        generation: provider.metadata.generation,
+        now: &now,
+    };
+    let accepted = rollup::condition(held, ACCEPTED, accepted_verdict(provider), stamp);
+    let resolved = resolved_verdict(provider, refs, phase_reason);
+    let resolved = rollup::condition(held, RESOLVED_REFS, resolved, stamp);
+    let live = endpoint_live_gate(held, stamp);
+    let degraded = find(readiness::METRICS_REACHABLE_CONDITION)
+        .filter(|condition| condition.status == "False")
+        .map(|condition| (condition.reason.as_str(), condition.message.as_str()));
+    let trio = rollup::trio(held, &[&accepted, &resolved, &live], (degraded, None), stamp);
+    [accepted, resolved].into_iter().chain(trio).collect()
+}
+
+/// The readiness pass's `EndpointLive`, `Unknown` until its first pass.
+fn endpoint_live_gate(held: &[Condition], stamp: rollup::Stamp<'_>) -> Condition {
+    held.iter()
+        .find(|condition| condition.type_ == readiness::ENDPOINT_LIVE_CONDITION)
+        .cloned()
+        .unwrap_or_else(|| {
+            let awaiting = (
+                "Unknown",
+                "AwaitingFirstCheck",
+                "awaiting the first readiness pass".to_owned(),
+            );
+            rollup::condition(held, readiness::ENDPOINT_LIVE_CONDITION, awaiting, stamp)
+        })
+}
+
+/// `Accepted` as `(status, reason, message)`.
+fn accepted_verdict(provider: &InferenceProvider) -> (&'static str, &'static str, String) {
+    if let Some(why) = validate_provider_config(provider) {
+        ("False", "Invalid", format!("the spec has a {why}"))
+    } else if let Err(error) = credentials::credential_plan_from_auth(provider.spec.auth.as_ref()) {
+        ("False", "Invalid", format!("spec.auth: {error}"))
+    } else {
+        ("True", ACCEPTED, String::new())
+    }
+}
+
+/// `ResolvedRefs` as `(status, reason, message)`.
+fn resolved_verdict(
+    provider: &InferenceProvider,
+    refs: Refs,
+    phase_reason: Option<&str>,
+) -> (&'static str, &'static str, String) {
+    match refs {
+        Refs::Resolved => ("True", RESOLVED_REFS, String::new()),
+        Refs::NetworkMissing => (
+            "False",
+            "BackendNotFound",
+            format!("GridNetwork {:?} does not exist", provider.spec.grid_network_ref),
+        ),
+        Refs::NoSitesMatched => (
+            "False",
+            "NoSitesMatched",
+            "siteSelector matches no site in the network".to_owned(),
+        ),
+        Refs::NotChecked => (
+            "Unknown",
+            "NotEvaluated",
+            format!("not resolved while {}", phase_reason.unwrap_or("the spec is invalid")),
+        ),
+    }
+}
+
+/// The condition type for a valid, unconflicted spec.
+const ACCEPTED: &str = "Accepted";
+
+/// The condition type for references that resolve.
+const RESOLVED_REFS: &str = "ResolvedRefs";
 
 /// Error policy for the [`InferenceProvider`] controller.
 ///
@@ -595,9 +683,22 @@ async fn probe_provider_health(
     Ok(outcome)
 }
 
+/// What resolving the provider's references found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Refs {
+    /// The network exists and the provider matches a site.
+    Resolved,
+    /// The referenced `GridNetwork` does not exist.
+    NetworkMissing,
+    /// Sites exist and the selector matches none of them.
+    NoSitesMatched,
+    /// An invalid spec or unreadable credential stopped resolution first.
+    NotChecked,
+}
+
 /// Determine the provider phase, matching sites, and optional failure reason.
 ///
-/// Returns `(ProviderPhase, sorted_matching_site_names, Option<status_reason>)`.
+/// Returns `(ProviderPhase, sorted_matching_site_names, Option<status_reason>, Refs)`.
 ///
 /// # Errors
 ///
@@ -615,13 +716,13 @@ async fn resolve_phase_and_sites(
     provider: &InferenceProvider,
     client: &Client,
     local_site: Option<&str>,
-) -> Result<(ProviderPhase, Vec<String>, Option<String>), OperatorError> {
+) -> Result<(ProviderPhase, Vec<String>, Option<String>, Refs), OperatorError> {
     let name = provider.metadata.name.as_deref().unwrap_or("?");
 
     // Static validation: config errors map immediately to Unavailable.
     if let Some(config_error) = validate_provider_config(provider) {
         tracing::warn!(name, reason = config_error, "InferenceProvider config invalid");
-        return Ok((ProviderPhase::Unavailable, Vec::new(), None));
+        return Ok((ProviderPhase::Unavailable, Vec::new(), None, Refs::NotChecked));
     }
 
     // Credential plan validation: parse spec.auth without I/O.
@@ -630,7 +731,12 @@ async fn resolve_phase_and_sites(
         Err(e) => {
             let cr = credentials::credential_failure_reason_for_auth(provider.spec.auth.as_ref());
             tracing::warn!(name, error = %e, reason = cr.as_str(), "InferenceProvider auth config invalid");
-            return Ok((ProviderPhase::Unavailable, Vec::new(), Some(cr.as_str().to_owned())));
+            return Ok((
+                ProviderPhase::Unavailable,
+                Vec::new(),
+                Some(cr.as_str().to_owned()),
+                Refs::NotChecked,
+            ));
         },
         Ok(plan) => plan,
     };
@@ -644,7 +750,12 @@ async fn resolve_phase_and_sites(
             reason = cr.as_str(),
             "InferenceProvider credential Secret inaccessible"
         );
-        return Ok((ProviderPhase::Unavailable, Vec::new(), Some(cr.as_str().to_owned())));
+        return Ok((
+            ProviderPhase::Unavailable,
+            Vec::new(),
+            Some(cr.as_str().to_owned()),
+            Refs::NotChecked,
+        ));
     }
 
     // Validate: referenced GridNetwork must exist.
@@ -652,7 +763,7 @@ async fn resolve_phase_and_sites(
     let network_api: Api<GridNetwork> = Api::all(client.clone());
     if network_api.get_opt(network_ref).await?.is_none() {
         tracing::warn!(name, network = %network_ref, "referenced GridNetwork not found");
-        return Ok((ProviderPhase::Unavailable, Vec::new(), None));
+        return Ok((ProviderPhase::Unavailable, Vec::new(), None, Refs::NetworkMissing));
     }
 
     // Resolve matching sites.
@@ -666,7 +777,12 @@ async fn resolve_phase_and_sites(
     // provider back into Degraded, which remains routable as stale capacity in
     // the cross-site CRDT.
     if selector_has_no_matches {
-        return Ok((ProviderPhase::Pending, matching, no_matching_sites_reason(true)));
+        return Ok((
+            ProviderPhase::Pending,
+            matching,
+            no_matching_sites_reason(true),
+            Refs::NoSitesMatched,
+        ));
     }
 
     // Resolve health check TLS config (if configured).  On failure, map
@@ -685,7 +801,7 @@ async fn resolve_phase_and_sites(
                     error = %e,
                     "InferenceProvider health check TLS configuration invalid"
                 );
-                return Ok((ProviderPhase::Degraded, matching, Some(reason_str)));
+                return Ok((ProviderPhase::Degraded, matching, Some(reason_str), Refs::Resolved));
             },
         }
     } else {
@@ -707,7 +823,12 @@ async fn resolve_phase_and_sites(
     let probe_result = match probe_provider_health(provider, client, &plan, health_tls_config).await {
         Ok(outcome) => outcome,
         Err(HealthProbeError::Status(reason)) => {
-            return Ok((ProviderPhase::Unavailable, matching, Some(reason.to_owned())));
+            return Ok((
+                ProviderPhase::Unavailable,
+                matching,
+                Some(reason.to_owned()),
+                Refs::Resolved,
+            ));
         },
         Err(HealthProbeError::Operator(error)) => return Err(error),
     };
@@ -725,10 +846,10 @@ async fn resolve_phase_and_sites(
             reason = %tls_reason,
             "InferenceProvider metrics TLS configuration invalid"
         );
-        return Ok((ProviderPhase::Degraded, matching, Some(tls_reason)));
+        return Ok((ProviderPhase::Degraded, matching, Some(tls_reason), Refs::Resolved));
     }
 
-    Ok((phase, matching, reason))
+    Ok((phase, matching, reason, Refs::Resolved))
 }
 
 /// List all [`GridSite`]s whose `spec.gridNetworkRef` matches `network_ref`.
@@ -874,6 +995,7 @@ async fn update_status(
     matching_sites: Vec<String>,
     observed_generation: i64,
     reason: Option<String>,
+    conditions: Vec<Condition>,
 ) -> Result<(), OperatorError> {
     let name = provider
         .metadata
@@ -886,7 +1008,8 @@ async fn update_status(
         ModelDiscoveryConfig::OpenAiModels(openai) => openai.effective_url(&provider.spec.endpoint),
     });
     let status = InferenceProviderStatus {
-        conditions: Vec::new(),
+        // The reconciler's own types: the readiness pass and model discovery hold the rest.
+        conditions,
         matching_sites,
         model_discovery_error: None,
         model_discovery_url,
@@ -897,11 +1020,9 @@ async fn update_status(
         served_models_expires_at: None,
     };
 
-    if provider
-        .status
-        .as_ref()
-        .is_some_and(|current| current.matches_reconciler_status(&status))
-    {
+    if provider.status.as_ref().is_some_and(|current| {
+        current.matches_reconciler_status(&status) && !rollup::differs(&current.conditions, &status.conditions)
+    }) {
         return Ok(());
     }
 
@@ -989,7 +1110,7 @@ mod tests {
     fn a_conditions_change_is_not_the_reconcilers_to_write() {
         let baseline = InferenceProviderStatus::default();
         let changed_conditions = InferenceProviderStatus {
-            conditions: vec![crate::crd::inference_provider::Condition {
+            conditions: vec![Condition {
                 type_: "Ready".to_owned(),
                 status: "False".to_owned(),
                 ..Default::default()
@@ -1111,6 +1232,66 @@ mod tests {
             }
         }))
         .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// `(status, reason)` of `type_` in `conditions`.
+    fn verdict_of<'held>(conditions: &'held [Condition], type_: &str) -> Option<(&'held str, &'held str)> {
+        conditions
+            .iter()
+            .find(|condition| condition.type_ == type_)
+            .map(|condition| (condition.status.as_str(), condition.reason.as_str()))
+    }
+
+    #[test]
+    fn an_invalid_spec_is_not_accepted_and_leaves_refs_unevaluated() {
+        let provider = test_provider("p", "grid", &[" "]);
+        let conditions = provider_conditions(&provider, Refs::NotChecked, None);
+        assert_eq!(verdict_of(&conditions, ACCEPTED), Some(("False", "Invalid")));
+        assert_eq!(
+            verdict_of(&conditions, RESOLVED_REFS),
+            Some(("Unknown", "NotEvaluated"))
+        );
+        assert_eq!(verdict_of(&conditions, "Available"), Some(("False", "Invalid")));
+    }
+
+    #[test]
+    fn unresolved_refs_name_their_cause_and_gate_available() {
+        let provider = test_provider("p", "grid", &["m"]);
+        let missing = provider_conditions(&provider, Refs::NetworkMissing, None);
+        assert_eq!(verdict_of(&missing, RESOLVED_REFS), Some(("False", "BackendNotFound")));
+        assert_eq!(verdict_of(&missing, "Available"), Some(("False", "BackendNotFound")));
+        let unmatched = provider_conditions(&provider, Refs::NoSitesMatched, None);
+        assert_eq!(verdict_of(&unmatched, RESOLVED_REFS), Some(("False", "NoSitesMatched")));
+    }
+
+    #[test]
+    fn endpoint_live_gates_available_and_a_metrics_failure_degrades() {
+        let mut provider = test_provider("p", "grid", &["m"]);
+        let held = |type_: &str, status: &str, reason: &str| Condition {
+            type_: type_.to_owned(),
+            status: status.to_owned(),
+            reason: reason.to_owned(),
+            ..Condition::default()
+        };
+        let before = provider_conditions(&provider, Refs::Resolved, None);
+        assert_eq!(
+            verdict_of(&before, "Available"),
+            Some(("Unknown", "AwaitingFirstCheck"))
+        );
+        provider.status = Some(InferenceProviderStatus {
+            conditions: vec![
+                held(readiness::ENDPOINT_LIVE_CONDITION, "True", "EndpointLive"),
+                held(readiness::METRICS_REACHABLE_CONDITION, "False", "ScrapeFailed"),
+            ],
+            ..InferenceProviderStatus::default()
+        });
+        let after = provider_conditions(&provider, Refs::Resolved, None);
+        assert_eq!(verdict_of(&after, "Available"), Some(("True", "Available")));
+        assert_eq!(verdict_of(&after, "Degraded"), Some(("True", "ScrapeFailed")));
+        assert!(
+            verdict_of(&after, readiness::ENDPOINT_LIVE_CONDITION).is_none(),
+            "the readiness pass owns EndpointLive"
+        );
     }
 
     fn test_provider_with_selector(name: &str, network: &str, selector: &[(&str, &str)]) -> InferenceProvider {
@@ -1291,7 +1472,7 @@ mod tests {
         );
         let provider = provider_with_shared_health_tls("net-1", "shared-ca", &endpoint);
 
-        let (phase, matching, reason) = resolve_phase_and_sites(&provider, &client, None)
+        let (phase, matching, reason, _refs) = resolve_phase_and_sites(&provider, &client, None)
             .await
             .expect("mocked API and TLS probe must complete");
 
@@ -1322,7 +1503,7 @@ mod tests {
             health_check.tls = Some(crate::resources::test_doubles::endpoint_tls_for_ca("override-ca"));
         }
 
-        let (phase, _matching, reason) = resolve_phase_and_sites(&provider, &client, None)
+        let (phase, _matching, reason, _refs) = resolve_phase_and_sites(&provider, &client, None)
             .await
             .expect("mocked API and TLS probe must complete");
 
@@ -1339,7 +1520,7 @@ mod tests {
         let client = mock_kube_client_for_health_tls("net-1", HashMap::new());
         let provider = provider_with_shared_health_tls("net-1", "absent-shared-ca", "https://localhost:8443");
 
-        let (phase, _matching, reason) = resolve_phase_and_sites(&provider, &client, None)
+        let (phase, _matching, reason, _refs) = resolve_phase_and_sites(&provider, &client, None)
             .await
             .expect("mocked API calls must not fail");
 
@@ -1355,7 +1536,7 @@ mod tests {
         );
         let provider = provider_with_health_check_tls("net-1", "ca-secret");
 
-        let (phase, matching, reason) = resolve_phase_and_sites(&provider, &client, None)
+        let (phase, matching, reason, _refs) = resolve_phase_and_sites(&provider, &client, None)
             .await
             .expect("mocked API calls must not fail");
 
@@ -1375,7 +1556,7 @@ mod tests {
         let client = mock_kube_client_for_health_tls("net-1", HashMap::new());
         let provider = provider_with_health_check_tls("net-1", "absent-secret");
 
-        let (phase, _matching, reason) = resolve_phase_and_sites(&provider, &client, None)
+        let (phase, _matching, reason, _refs) = resolve_phase_and_sites(&provider, &client, None)
             .await
             .expect("mocked API calls must not fail");
 
@@ -1507,7 +1688,7 @@ mod tests {
         let client = protected_health_client(auth, &ca.cert_pem);
         let provider = protected_health_provider(auth, inference_endpoint, &endpoint);
 
-        let (phase, matching, reason) = resolve_phase_and_sites(&provider, &client, None)
+        let (phase, matching, reason, _refs) = resolve_phase_and_sites(&provider, &client, None)
             .await
             .expect("mock Kubernetes API must be valid");
 
@@ -1622,7 +1803,7 @@ mod tests {
     async fn authenticated_probe_reports_missing_and_invalid_secrets_without_values() {
         let provider = protected_provider_without_tls();
         let missing_client = mock_kube_client_for_health_tls("net-1", HashMap::new());
-        let (missing_phase, _, missing_reason) = resolve_phase_and_sites(&provider, &missing_client, None)
+        let (missing_phase, _, missing_reason, _) = resolve_phase_and_sites(&provider, &missing_client, None)
             .await
             .expect("mock Kubernetes API must be valid");
         assert_eq!(missing_phase, ProviderPhase::Unavailable);
@@ -1632,7 +1813,7 @@ mod tests {
             "net-1",
             HashMap::from([("provider-token", secret_with_key("token", b"bad\nvalue"))]),
         );
-        let (invalid_phase, _, invalid_reason) = resolve_phase_and_sites(&provider, &invalid_client, None)
+        let (invalid_phase, _, invalid_reason, _) = resolve_phase_and_sites(&provider, &invalid_client, None)
             .await
             .expect("mock Kubernetes API must be valid");
         assert_eq!(invalid_phase, ProviderPhase::Unavailable);

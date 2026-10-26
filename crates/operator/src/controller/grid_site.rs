@@ -37,6 +37,7 @@ use crate::{
             parse_private_key, probe_gateway,
         },
     },
+    rollup,
 };
 
 // ---------------------------------------------------------------------------
@@ -117,6 +118,7 @@ pub async fn reconcile(site: Arc<GridSite>, client: Arc<Client>) -> Result<Actio
         &object_ref,
     ))
     .await?;
+    Box::pin(apply_conditions(&site, client.as_ref(), &reason, &message)).await?;
 
     Ok(Action::requeue(REQUEUE_INTERVAL))
 }
@@ -523,6 +525,7 @@ async fn update_status(
         reason: reason.to_owned(),
         message: message.to_owned(),
         capabilities: existing.map_or_else(Default::default, |s| s.capabilities.clone()),
+        conditions: existing.map_or_else(Vec::new, |s| s.conditions.clone()),
         last_probe_time: probe_time,
         last_transition_time: transition_time,
         public_cert_pem: existing.and_then(|s| s.public_cert_pem.clone()),
@@ -597,6 +600,74 @@ async fn update_status(
     }
 
     Ok(())
+}
+
+/// Server-side apply manager for `Connected`.
+pub(crate) const PROBE_FIELD_MANAGER: &str = "grid-operator-probe";
+
+/// Server-side apply manager for the roll-up. Not `grid-operator`, whose discovery applies
+/// on this status omit conditions and would remove them.
+pub(crate) const ROLLUP_FIELD_MANAGER: &str = "grid-operator-site";
+
+/// The condition type for a verified gateway.
+pub(crate) const CONNECTED: &str = "Connected";
+
+/// `Connected` from the phase step's `reason` and `message`, and the change moving without a
+/// person, if any.
+fn connected_verdict<'step>(
+    reason: &str,
+    message: &'step str,
+) -> ((&'static str, String, String), Option<rollup::Cause<'step>>) {
+    let probing = Some(("Probing", message));
+    let (status, reason, moving) = match reason {
+        "TlsVerified" | "AdvertisedCertMismatch" => return (("True", CONNECTED.to_owned(), String::new()), None),
+        "GatewayAddressKnown" => ("Unknown", "AwaitingFirstCheck", probing),
+        // The probe on the edited address failed to connect, and the next probe retries it.
+        "SpecUnverified" => ("False", "Unreachable", probing),
+        "GatewayAddressMissing" => ("False", "AddressMissing", None),
+        "GossipedAddressRefused" => ("False", "AddressRefused", None),
+        "ConnectTimeout" | "ConnectionFailed" | "PlaintextUnreachable" => ("False", "Unreachable", None),
+        "HandshakeTimeout" | "TlsProtocolError" => ("False", "TLSProtocolError", None),
+        other => ("False", other, None),
+    };
+    ((status, reason.to_owned(), message.to_owned()), moving)
+}
+
+/// Write `Connected` and the roll-up when either changed.
+async fn apply_conditions(site: &GridSite, client: &Client, reason: &str, message: &str) -> Result<(), OperatorError> {
+    let name = site.metadata.name.as_deref().unwrap_or_else(|| std::process::abort());
+    let held = site
+        .status
+        .as_ref()
+        .map_or(&[][..], |status| status.conditions.as_slice());
+    let generation = site.metadata.generation;
+    let Some(now) = rfc3339_now() else {
+        return Ok(());
+    };
+    let ((status, reason, message), moving) = connected_verdict(reason, message);
+    let stamp = rollup::Stamp { generation, now: &now };
+    let connected = rollup::condition(held, CONNECTED, (status, reason.as_str(), message), stamp);
+    let trio = rollup::trio(held, &[&connected], (None, moving), stamp);
+    let api: Api<GridSite> = Api::all(client.clone());
+    for (manager, conditions) in [
+        (PROBE_FIELD_MANAGER, std::slice::from_ref(&connected)),
+        (ROLLUP_FIELD_MANAGER, trio.as_slice()),
+    ] {
+        if rollup::differs(held, conditions) {
+            let patch = Patch::Apply(conditions_patch(conditions));
+            Box::pin(api.patch_status(name, &PatchParams::apply(manager).force(), &patch)).await?;
+        }
+    }
+    Ok(())
+}
+
+/// A status apply carrying `conditions` alone.
+fn conditions_patch(conditions: &[crate::crd::inference_provider::Condition]) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridSite",
+        "status": { "conditions": conditions }
+    })
 }
 
 /// Map a status reason to a Kubernetes [`EventType`].
@@ -744,6 +815,59 @@ mod tests {
             .unwrap_or_else(|| std::process::abort());
         assert!(!owned.contains_key("capabilities"));
         assert!(!owned.contains_key("publicCertPem"));
+    }
+
+    /// `Connected` status, reason and in-flight reason for a phase step's `reason`.
+    fn connected_for(reason: &str) -> (&'static str, String, Option<&'static str>) {
+        let ((status, connected, _), moving) = connected_verdict(reason, "detail");
+        (
+            status,
+            connected,
+            moving.map(|(probing, _)| if probing == "Probing" { "Probing" } else { "other" }),
+        )
+    }
+
+    #[test]
+    fn connected_names_the_cause() {
+        assert_eq!(connected_for("TlsVerified"), ("True", CONNECTED.to_owned(), None));
+        assert_eq!(
+            connected_for("AdvertisedCertMismatch"),
+            ("True", CONNECTED.to_owned(), None)
+        );
+        assert_eq!(
+            connected_for("ConnectTimeout"),
+            ("False", "Unreachable".to_owned(), None)
+        );
+        assert_eq!(
+            connected_for("PlaintextUnreachable"),
+            ("False", "Unreachable".to_owned(), None)
+        );
+        assert_eq!(
+            connected_for("HandshakeTimeout"),
+            ("False", "TLSProtocolError".to_owned(), None)
+        );
+        assert_eq!(
+            connected_for("GatewayAddressMissing"),
+            ("False", "AddressMissing".to_owned(), None)
+        );
+        assert_eq!(
+            connected_for("GossipedAddressRefused"),
+            ("False", "AddressRefused".to_owned(), None)
+        );
+        assert_eq!(
+            connected_for("UntrustedIssuer"),
+            ("False", "UntrustedIssuer".to_owned(), None)
+        );
+    }
+
+    #[test]
+    fn probing_moves_without_a_person() {
+        let awaiting = connected_for("GatewayAddressKnown");
+        assert_eq!(awaiting, ("Unknown", "AwaitingFirstCheck".to_owned(), Some("Probing")));
+        assert_eq!(
+            connected_for("SpecUnverified"),
+            ("False", "Unreachable".to_owned(), Some("Probing"))
+        );
     }
 
     #[test]

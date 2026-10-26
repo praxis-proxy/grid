@@ -1,9 +1,9 @@
 //! A peer `GridSite`, reconciled by `controller::grid_site`.
 //!
-//! The kind writes a phase, not conditions, so the condition invariants apply through
-//! the phase triple and `lastTransitionTime`.
+//! The phase stays a merge patch with no manager. `Connected` and the roll-up are applied
+//! under their own managers.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use operator::{controller::grid_site, crd::grid_site::GridSite};
 use serde_json::json;
@@ -38,7 +38,17 @@ async fn invariant_1_pending_peer_site_is_unchanged_across_five_rounds() {
     invariants::observed_generation_tracks(&rounds).expect("invariant 3");
     invariants::changes_explained(&rounds, &[]).expect("invariant 6");
     let first = rounds.first().expect("five rounds");
-    status_harness::diff::status_matches(first, &[("phase", "Pending", "AwaitingDiscovery")]).expect("invariant 8");
+    status_harness::diff::status_matches(
+        first,
+        &[
+            ("phase", "Pending", "AwaitingDiscovery"),
+            ("Connected", "False", "AwaitingDiscovery"),
+            ("Available", "False", "AwaitingDiscovery"),
+            ("Progressing", "False", "AsExpected"),
+            ("Degraded", "False", "AsExpected"),
+        ],
+    )
+    .expect("invariant 8");
 }
 
 #[tokio::test]
@@ -56,11 +66,21 @@ async fn invariant_2_peer_site_transition_time_moves_only_with_the_phase() {
     .await;
 
     invariants::phase_transition_time_moves_only_with_phase(&rounds).expect("invariant 2");
+    invariants::transition_time_moves_only_with_status(&rounds).expect("invariant 2");
     invariants::changes_explained(&rounds, &[2]).expect("invariant 6");
     invariants::unchanged_from(&rounds, 3).expect("invariant 1 after the change");
     let after = rounds.get(2).expect("five rounds");
-    status_harness::diff::status_matches(after, &[("phase", "Discovered", "GatewayAddressMissing")])
-        .expect("invariant 8");
+    status_harness::diff::status_matches(
+        after,
+        &[
+            ("phase", "Discovered", "GatewayAddressMissing"),
+            ("Connected", "False", "AddressMissing"),
+            ("Available", "False", "AddressMissing"),
+            ("Progressing", "False", "AsExpected"),
+            ("Degraded", "False", "AsExpected"),
+        ],
+    )
+    .expect("invariant 8");
 }
 
 #[tokio::test]
@@ -81,34 +101,33 @@ async fn invariant_3_peer_site_observed_generation_follows_a_spec_edit() {
 }
 
 #[tokio::test]
-async fn invariant_5_peer_site_phase_has_no_field_manager_today() {
-    // The phase is a merge patch with no manager; the kind doc gives Connected to the
-    // grid-site controller once it writes conditions. Until then the record is that
-    // no condition is written at all.
+async fn invariant_5_peer_site_conditions_have_one_manager_each() {
+    // The phase stays an unmanaged merge patch; each condition type has one manager.
     let (api, path) = seeded();
     drop(fixtures::rounds(&api, &path, 2, |_round| reconcile(&api, &path)).await);
 
-    let status_writes: Vec<_> = api
+    let managers = BTreeMap::from([
+        ("Connected", "grid-operator-probe"),
+        ("Available", "grid-operator-site"),
+        ("Progressing", "grid-operator-site"),
+        ("Degraded", "grid-operator-site"),
+    ]);
+    invariants::one_manager_per_type(&api.writes(), &path, &managers).expect("invariant 5");
+    let phase_writes: Vec<_> = api
         .writes()
         .into_iter()
-        .filter(|write| write.path == path && write.status)
+        .filter(|write| write.path == path && write.status && write.body.pointer("/status/phase").is_some())
         .collect();
-    assert!(!status_writes.is_empty(), "the phase is written");
     assert!(
-        status_writes
-            .iter()
-            .all(|write| write.manager.is_none() && write.content_type.starts_with("application/merge-patch")),
-        "today's phase write is an unmanaged merge patch: {status_writes:?}"
-    );
-    assert!(
-        api.owners(&path).is_empty(),
-        "no condition is applied on a peer site on main"
+        !phase_writes.is_empty()
+            && phase_writes
+                .iter()
+                .all(|write| write.manager.is_none() && write.content_type.starts_with("application/merge-patch")),
+        "the phase is an unmanaged merge patch: {phase_writes:?}"
     );
 }
 
 #[tokio::test]
-// Expected to fail: a peer GridSite writes no conditions, so Available, Progressing and Degraded are absent;
-// STATUS-REVIEW part 3 adds the trio with Connected and SignalsFresh on v1alpha1
 async fn invariant_7_peer_site_rollup_trio_is_present_after_round_one() {
     let (api, path) = seeded();
     let rounds = fixtures::rounds(&api, &path, 1, |_round| reconcile(&api, &path)).await;

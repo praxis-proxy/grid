@@ -607,6 +607,73 @@ pub(crate) fn metrics_condition(
     changed(METRICS_CONDITION, held, state, now_rfc3339, generation)
 }
 
+/// Whether the provider's endpoints answer, gating `Available`.
+pub const ENDPOINT_LIVE_CONDITION: &str = "EndpointLive";
+
+/// Whether the provider's metrics endpoint is scraped, a concern that never gates.
+pub const METRICS_REACHABLE_CONDITION: &str = "MetricsReachable";
+
+/// What a provider without a metrics endpoint stands on for liveness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Fallback {
+    /// The provider is `Unavailable`, by its health check or its credentials.
+    Unavailable,
+    /// A health check passes.
+    HealthChecked,
+    /// Nothing checks liveness.
+    Unchecked,
+}
+
+/// `EndpointLive` for `verdict` as `(status, reason, message)`. `fallback` stands in when the
+/// provider declares no metrics. A provider routing serves without a check reads the
+/// informational `True` `NoHealthSignal`.
+pub(crate) fn endpoint_live(verdict: &Verdict, fallback: Fallback) -> (&'static str, &'static str, String) {
+    let message = || verdict.message.clone();
+    match verdict.reason {
+        Reason::Ready => ("True", ENDPOINT_LIVE_CONDITION, String::new()),
+        Reason::NoLivenessCheck | Reason::MetricsBodyTooLarge => ("True", "NoHealthSignal", message()),
+        Reason::NoEndpointsReady | Reason::ProviderUnavailable => ("False", "NoEndpointsReady", message()),
+        Reason::MetricsStale
+        | Reason::ScrapeTimedOut
+        | Reason::ScrapeUnauthorized
+        | Reason::TlsHandshakeFailed
+        | Reason::ScrapeFailed => ("False", "LivenessStale", message()),
+        Reason::AwaitingFirstScrape => ("Unknown", "AwaitingFirstCheck", message()),
+        Reason::MetricsNotConfigured => match fallback {
+            Fallback::Unavailable => ("False", "NoEndpointsReady", "the provider is Unavailable".to_owned()),
+            Fallback::HealthChecked => ("True", ENDPOINT_LIVE_CONDITION, String::new()),
+            Fallback::Unchecked => (
+                "True",
+                "NoHealthSignal",
+                "metrics.endpoint and healthCheck are not set, so liveness is not checked".to_owned(),
+            ),
+        },
+    }
+}
+
+/// `MetricsReachable` for `verdict` as `(status, reason, message)`, `None` when the provider
+/// declares no metrics endpoint.
+pub(crate) fn metrics_reachable(verdict: &Verdict) -> Option<(&'static str, &'static str, String)> {
+    Some(match verdict.reason {
+        Reason::Ready | Reason::NoEndpointsReady | Reason::NoLivenessCheck => {
+            ("True", METRICS_REACHABLE_CONDITION, String::new())
+        },
+        Reason::AwaitingFirstScrape => ("Unknown", verdict.reason.as_str(), verdict.message.clone()),
+        Reason::ProviderUnavailable => (
+            "Unknown",
+            "NotEvaluated",
+            "metrics are not judged while the provider is Unavailable".to_owned(),
+        ),
+        Reason::MetricsStale
+        | Reason::ScrapeTimedOut
+        | Reason::ScrapeUnauthorized
+        | Reason::TlsHandshakeFailed
+        | Reason::MetricsBodyTooLarge
+        | Reason::ScrapeFailed => ("False", verdict.reason.as_str(), verdict.message.clone()),
+        Reason::MetricsNotConfigured => return None,
+    })
+}
+
 /// The condition `type_` in `(status, reason, message)`, or `None` when `held` already says so.
 fn changed(
     type_: &str,
@@ -749,6 +816,67 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    fn verdict(reason: Reason) -> Verdict {
+        Verdict {
+            reason,
+            message: "detail".to_owned(),
+        }
+    }
+
+    #[test]
+    fn endpoint_live_agrees_with_routing() {
+        // Routing serves what excludes() keeps, so EndpointLive is True exactly there.
+        let every = [
+            Reason::Ready,
+            Reason::NoEndpointsReady,
+            Reason::NoLivenessCheck,
+            Reason::MetricsStale,
+            Reason::ScrapeTimedOut,
+            Reason::ScrapeUnauthorized,
+            Reason::TlsHandshakeFailed,
+            Reason::MetricsBodyTooLarge,
+            Reason::ScrapeFailed,
+            Reason::ProviderUnavailable,
+        ];
+        for reason in every {
+            let (status, ..) = endpoint_live(&verdict(reason), Fallback::Unchecked);
+            assert_eq!(status == "True", !reason.excludes(), "{reason:?}");
+        }
+        let awaiting = endpoint_live(&verdict(Reason::AwaitingFirstScrape), Fallback::Unchecked);
+        assert_eq!((awaiting.0, awaiting.1), ("Unknown", "AwaitingFirstCheck"));
+        assert_eq!(
+            endpoint_live(&verdict(Reason::Ready), Fallback::Unchecked).1,
+            ENDPOINT_LIVE_CONDITION
+        );
+        assert_eq!(
+            endpoint_live(&verdict(Reason::MetricsStale), Fallback::Unchecked).1,
+            "LivenessStale"
+        );
+        assert_eq!(
+            endpoint_live(&verdict(Reason::NoLivenessCheck), Fallback::Unchecked).1,
+            "NoHealthSignal"
+        );
+    }
+
+    #[test]
+    fn without_metrics_endpoint_live_stands_on_the_fallback() {
+        let none = verdict(Reason::MetricsNotConfigured);
+        assert_eq!(endpoint_live(&none, Fallback::Unchecked).1, "NoHealthSignal");
+        assert_eq!(endpoint_live(&none, Fallback::HealthChecked).1, ENDPOINT_LIVE_CONDITION);
+        let down = endpoint_live(&none, Fallback::Unavailable);
+        assert_eq!((down.0, down.1), ("False", "NoEndpointsReady"));
+    }
+
+    #[test]
+    fn metrics_reachable_is_absent_without_an_endpoint_and_names_a_failed_scrape() {
+        assert_eq!(metrics_reachable(&verdict(Reason::MetricsNotConfigured)), None);
+        let reached = metrics_reachable(&verdict(Reason::NoEndpointsReady)).map(|(status, reason, _)| (status, reason));
+        assert_eq!(reached, Some(("True", METRICS_REACHABLE_CONDITION)));
+        let failed =
+            metrics_reachable(&verdict(Reason::TlsHandshakeFailed)).map(|(status, reason, _)| (status, reason));
+        assert_eq!(failed, Some(("False", "TLSHandshakeFailed")));
+    }
 
     const STALE: Duration = Duration::from_secs(15);
 

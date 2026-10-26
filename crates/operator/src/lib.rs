@@ -57,6 +57,8 @@ mod provider_revision;
 pub mod readiness;
 /// Kubernetes resource builders.
 pub mod resources;
+/// The `Available`, `Progressing` and `Degraded` roll-up every kind writes.
+pub mod rollup;
 pub mod served_models;
 /// The site name, from the site identity.
 pub mod site_name;

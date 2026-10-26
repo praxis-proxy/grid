@@ -969,6 +969,8 @@ type GridSiteStatus struct {
 	AbsentSince *string `json:"absentSince,omitempty"`
 	// Capabilities offered by this site.
 	Capabilities *GridSiteCapabilities `json:"capabilities,omitempty"`
+	// Observed conditions: Connected, and the Available, Progressing and Degraded roll-up. The phase stays, kept for v1alpha1 readers.
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 	// Timestamp of the last probe whose resulting status was persisted.
 	// This is not a liveness heartbeat; it may remain unchanged when a probe produces no status changes.
 	LastProbeTime *string `json:"lastProbeTime,omitempty"`
