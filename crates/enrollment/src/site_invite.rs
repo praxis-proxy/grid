@@ -62,6 +62,100 @@ enum InviteState {
     Redeemed,
     /// Token was removed before redemption.
     Revoked,
+    /// The signer refused to mint: `NameTaken`, `TokenOutstanding` or `NameDeleted`.
+    Refused(&'static str, &'static str),
+}
+
+/// One condition as `(type, status, reason, message)`.
+type Row = (&'static str, &'static str, &'static str, &'static str);
+
+impl InviteState {
+    /// The minted, redeemed and issued facts, with `Available` copying whether the token can
+    /// still be presented.
+    #[expect(clippy::too_many_lines, reason = "one row per state, read as a table")]
+    const fn facts(self) -> [Row; 4] {
+        const SPENT: &str = "Invite token was redeemed";
+        match self {
+            Self::Pending => [
+                ("Minted", "False", "Minting", "Invite token mint is pending"),
+                ("Redeemed", "False", "AwaitingRequest", "Invite token mint is pending"),
+                ("Issued", "False", "AwaitingRequest", "No enrollment request yet"),
+                ("Available", "False", "Minting", "Invite token mint is pending"),
+            ],
+            Self::Refused(reason, message) => [
+                ("Minted", "False", reason, message),
+                ("Redeemed", "False", "AwaitingRequest", "Invite token was not minted"),
+                ("Issued", "False", "AwaitingRequest", "No enrollment request yet"),
+                ("Available", "False", reason, message),
+            ],
+            Self::Ready => [
+                ("Minted", "True", "Minted", ""),
+                ("Redeemed", "False", "AwaitingRequest", "Invite token is ready"),
+                ("Issued", "False", "AwaitingRequest", "No enrollment request yet"),
+                ("Available", "True", "Available", ""),
+            ],
+            Self::Expired => [
+                ("Minted", "True", "Minted", ""),
+                ("Redeemed", "False", "Expired", "Invite token expired"),
+                ("Issued", "False", "Expired", "Invite token expired"),
+                ("Available", "False", "Expired", "Invite token expired"),
+            ],
+            // Redemption issues the certificate in the same store transaction.
+            Self::Redeemed => [
+                ("Minted", "True", "Minted", ""),
+                ("Redeemed", "True", "Redeemed", ""),
+                ("Issued", "True", "Issued", ""),
+                ("Available", "False", "Redeemed", SPENT),
+            ],
+            Self::Revoked => [
+                ("Minted", "True", "Minted", ""),
+                ("Redeemed", "False", "Revoked", "Invite token was revoked"),
+                ("Issued", "False", "InviteRevoked", "Invite token was revoked"),
+                ("Available", "False", "Revoked", "Invite token was revoked"),
+            ],
+        }
+    }
+
+    /// `Progressing`, `Degraded` and the `Ready` condition v1alpha1 readers hold, mirroring
+    /// `Available` under its shipped reasons.
+    const fn rest(self) -> [Row; 3] {
+        let progressing = match self {
+            Self::Pending => ("Progressing", "True", "Minting", "Invite token mint is pending"),
+            Self::Refused(..) | Self::Ready | Self::Expired | Self::Redeemed | Self::Revoked => {
+                ("Progressing", "False", "AsExpected", "")
+            },
+        };
+        let ready = match self {
+            Self::Pending => ("Ready", "False", "Pending", "Invite token mint is pending"),
+            Self::Refused(_, message) => ("Ready", "False", "Pending", message),
+            Self::Ready => ("Ready", "True", "Ready", "Invite token is ready"),
+            Self::Expired => ("Ready", "False", "Expired", "Invite token expired"),
+            Self::Redeemed => ("Ready", "False", "Redeemed", "Invite token was redeemed"),
+            Self::Revoked => ("Ready", "False", "Revoked", "Invite token was revoked"),
+        };
+        [progressing, ("Degraded", "False", "AsExpected", ""), ready]
+    }
+
+    /// The state for a signer refusal at mint, `None` for any other failure.
+    const fn refused(error: &crate::StoreError) -> Option<Self> {
+        match error {
+            crate::StoreError::NameTaken => Some(Self::Refused("NameTaken", "Another member already holds this name")),
+            crate::StoreError::TokenOutstanding => Some(Self::Refused(
+                "TokenOutstanding",
+                "A live invite token already pins this site name",
+            )),
+            crate::StoreError::NameDeleted => Some(Self::Refused(
+                "NameDeleted",
+                "This name's enrollment was deleted; set allowDeletedName to reuse it",
+            )),
+            crate::StoreError::NotFound
+            | crate::StoreError::KeyReused
+            | crate::StoreError::KeyMismatch
+            | crate::StoreError::TokenInvalid
+            | crate::StoreError::Refused(_)
+            | crate::StoreError::Backend(_) => None,
+        }
+    }
 }
 
 /// State of the token row relative to the invite.
@@ -150,10 +244,8 @@ async fn apply_invite(invite: &SiteInvite, ctx: &Context) -> Result<Action, Reco
     let secrets = Api::<Secret>::namespaced(ctx.client.clone(), namespace);
     if invite.status.as_ref().is_some_and(|status| {
         status.conditions.iter().any(|condition| {
-            condition.type_ == "Ready"
-                && ((condition.status == "False" && condition.reason == "Expired")
-                    || (condition.status == "True" && condition.reason == "Redeemed")
-                    || (condition.status == "False" && condition.reason == "Revoked"))
+            // Ready read True Redeemed before it mirrored Available, so any status counts.
+            condition.type_ == "Ready" && ["Expired", "Redeemed", "Revoked"].contains(&condition.reason.as_str())
         })
     }) {
         return Ok(Action::await_change());
@@ -287,10 +379,13 @@ async fn activate_invite(
         InviteState::Pending,
         None,
     )?;
-    Box::pin(api_patch_status(&ctx.client, invite, pending)).await?;
-    Box::pin(ctx.state.store.mint_site_token(NewSiteToken {
+    // A refused mint already holds Pending, so a retry does not flap Progressing.
+    if !holds_pending(invite) {
+        Box::pin(api_patch_status(&ctx.client, invite, pending)).await?;
+    }
+    let minted = Box::pin(ctx.state.store.mint_site_token(NewSiteToken {
         token_id: Some(checkpoint.token_id),
-        token_sha256: checkpoint.token_sha256.ok_or_else(|| {
+        token_sha256: checkpoint.token_sha256.clone().ok_or_else(|| {
             ReconcileError::Invalid(
                 "invite Secret is missing for an outstanding token; delete and recreate this invite".to_owned(),
             )
@@ -302,9 +397,26 @@ async fn activate_invite(
         expires_at: checkpoint.expires_at,
         allow_deleted_name: invite.spec.allow_deleted_name,
     }))
-    .await?;
+    .await;
+    if let Err(error) = minted {
+        if let Some(refused) = InviteState::refused(&error) {
+            let refusal = invite_status(invite, &checkpoint, Some((namespace, secret_name)), refused, None)?;
+            Box::pin(api_patch_status(&ctx.client, invite, refusal)).await?;
+        }
+        return Err(error.into());
+    }
     Box::pin(api_patch_status(&ctx.client, invite, status)).await?;
     Ok(Action::requeue(REQUEUE))
+}
+
+/// Whether the invite already reads `Ready` `False` `Pending`: checkpointed, not yet minted.
+fn holds_pending(invite: &SiteInvite) -> bool {
+    invite.status.as_ref().is_some_and(|status| {
+        status
+            .conditions
+            .iter()
+            .any(|condition| condition.type_ == "Ready" && condition.status == "False" && condition.reason == "Pending")
+    })
 }
 
 /// Remove an expired token Secret and update its condition.
@@ -364,11 +476,7 @@ async fn delete_secret(secrets: &Api<Secret>, secret_name: &str) -> Result<(), R
     }
 }
 
-/// Build status with a Ready condition and optional Secret reference.
-#[expect(
-    clippy::too_many_lines,
-    reason = "status fields and the matching condition must be patched together"
-)]
+/// Build status with its conditions and optional Secret reference.
 fn invite_status(
     invite: &SiteInvite,
     checkpoint: &TokenCheckpoint,
@@ -376,33 +484,7 @@ fn invite_status(
     state: InviteState,
     redeemed_by: Option<&str>,
 ) -> Result<serde_json::Value, ReconcileError> {
-    let (condition_status, reason, message) = match state {
-        InviteState::Pending => ("False", "Pending", "Invite token mint is pending"),
-        InviteState::Ready => ("True", "Ready", "Invite token is ready"),
-        InviteState::Expired => ("False", "Expired", "Invite token expired"),
-        InviteState::Redeemed => ("True", "Redeemed", "Invite token was redeemed"),
-        InviteState::Revoked => ("False", "Revoked", "Invite token was revoked"),
-    };
-    let prior_transition = invite.status.as_ref().and_then(|status| {
-        status.conditions.iter().find(|condition| {
-            condition.type_ == "Ready" && condition.status == condition_status && condition.reason == reason
-        })
-    });
-    let last_transition_time = if let Some(condition) = prior_transition {
-        condition.last_transition_time.clone()
-    } else {
-        OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .map_err(|error| ReconcileError::Invalid(format!("formatting condition time: {error}")))?
-    };
-    let condition = serde_json::json!({
-        "type": "Ready",
-        "status": condition_status,
-        "reason": reason,
-        "message": message,
-        "observedGeneration": invite.metadata.generation.unwrap_or_default(),
-        "lastTransitionTime": last_transition_time
-    });
+    let conditions = invite_conditions(invite, state)?;
     let mut status = serde_json::Map::from_iter([
         (
             "observedGeneration".to_owned(),
@@ -414,7 +496,7 @@ fn invite_status(
             "publicKeySHA256".to_owned(),
             serde_json::json!(invite.spec.public_key_sha256),
         ),
-        ("conditions".to_owned(), serde_json::json!([condition])),
+        ("conditions".to_owned(), serde_json::json!(conditions)),
     ]);
     if let Some((namespace, name)) = secret {
         status.insert(
@@ -426,6 +508,36 @@ fn invite_status(
         status.insert("redeemedBy".to_owned(), serde_json::json!(request_name));
     }
     Ok(serde_json::json!({"status": status}))
+}
+
+/// Every condition `state` calls for, each keeping its `lastTransitionTime` while its status
+/// is unchanged.
+fn invite_conditions(invite: &SiteInvite, state: InviteState) -> Result<Vec<serde_json::Value>, ReconcileError> {
+    let now = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .map_err(|error| ReconcileError::Invalid(format!("formatting condition time: {error}")))?;
+    let held = invite
+        .status
+        .as_ref()
+        .map_or(&[][..], |status| status.conditions.as_slice());
+    let generation = invite.metadata.generation.unwrap_or_default();
+    let rows = state.facts().into_iter().chain(state.rest());
+    Ok(rows
+        .map(|(type_, status, reason, message)| {
+            let last_transition_time = held
+                .iter()
+                .find(|condition| condition.type_ == type_ && condition.status == status)
+                .map_or_else(|| now.clone(), |condition| condition.last_transition_time.clone());
+            serde_json::json!({
+                "type": type_,
+                "status": status,
+                "reason": reason,
+                "message": message,
+                "observedGeneration": generation,
+                "lastTransitionTime": last_transition_time
+            })
+        })
+        .collect())
 }
 
 /// Validate Secret ownership and extract only the values reconciliation needs.
@@ -703,7 +815,34 @@ mod conformance;
 
 #[cfg(test)]
 mod tests {
-    use super::{ReconcileError, checkpoint_from_status, duration};
+    use super::{InviteState, ReconcileError, checkpoint_from_status, duration, invite_conditions};
+
+    #[test]
+    fn a_reason_change_alone_keeps_the_transition_time() {
+        let mut invite: site_invite_api::SiteInvite = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "SiteInvite",
+            "metadata": { "name": "site-d", "generation": 1 },
+            "spec": { "siteName": "site-d", "jurisdictions": [], "lifetime": "1h" }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        invite.status = Some(site_invite_api::SiteInviteStatus {
+            conditions: vec![site_invite_api::SiteInviteCondition {
+                type_: "Redeemed".to_owned(),
+                status: "False".to_owned(),
+                reason: "AwaitingRequest".to_owned(),
+                message: String::new(),
+                observed_generation: 1,
+                last_transition_time: "2026-10-01T00:00:00Z".to_owned(),
+            }],
+            ..site_invite_api::SiteInviteStatus::default()
+        });
+        let conditions = invite_conditions(&invite, InviteState::Expired).unwrap_or_default();
+        let redeemed = conditions.iter().find(|condition| condition["type"] == "Redeemed");
+        assert!(redeemed.is_some_and(|condition| {
+            condition["reason"] == "Expired" && condition["lastTransitionTime"] == "2026-10-01T00:00:00Z"
+        }));
+    }
 
     #[test]
     fn parses_kubernetes_durations_within_the_invite_bounds() {

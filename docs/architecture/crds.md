@@ -62,6 +62,25 @@ referenced Secret as a credential and deliver it and the grid CA bundle to the
 joining site's operator namespace out of band. The token itself is never
 published in status.
 
+**Conditions**: `Minted`, `Redeemed` and `Issued` are the facts, and
+`Available` says whether the token can still be presented. An invite is one-shot,
+like a Job, so a spent invite reads `Available` `False` and stays not `Degraded`.
+
+| Condition | Status | Reason | When |
+|---|---|---|---|
+| `Minted` | `True` | `Minted` | The signer recorded the token. |
+| `Minted` | `False` | `Minting` | The token is checkpointed and the mint is in flight. `Progressing` is `True` with `Minting`. |
+| `Minted` | `False` | `NameTaken`, `TokenOutstanding`, `NameDeleted` | The signer refused the mint. The message names the fix. |
+| `Redeemed` | `True` | `Redeemed` | A site spent the token. |
+| `Redeemed` | `False` | `AwaitingRequest`, `Expired`, `Revoked` | No site has spent it, its lifetime ended, or it was revoked. |
+| `Issued` | `True` | `Issued` | The site's certificate was issued, today in the same step as redemption. |
+| `Issued` | `False` | `AwaitingRequest`, `Expired`, `InviteRevoked` | No certificate was issued. |
+| `Available` | `False` | `Redeemed`, `Expired`, `Revoked`, or the `Minted` reason | The token cannot be presented. |
+
+`Ready` stays for v1alpha1 readers and follows `Available` under its earlier
+reasons: `True` `Ready` while the token can be presented, `False` `Pending` until
+it is minted, and `False` `Redeemed`, `Expired` or `Revoked` after.
+
 In Kubernetes, the controller reads SiteInvite objects, stores each token in a
 Secret, and revokes unused tokens when an admin deletes an invite.
 Standalone enrollment does not start the controller. Enrollment enforces an

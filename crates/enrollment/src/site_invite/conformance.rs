@@ -74,7 +74,18 @@ async fn rounds(api: &FakeApi, ctx: &Arc<Context>, count: usize) -> Vec<Observed
 
 /// The field manager each invite condition type belongs to.
 fn managers() -> BTreeMap<&'static str, &'static str> {
-    BTreeMap::from([("Ready", "grid-enrollment")])
+    [
+        "Minted",
+        "Redeemed",
+        "Issued",
+        "Available",
+        "Progressing",
+        "Degraded",
+        "Ready",
+    ]
+    .into_iter()
+    .map(|type_| (type_, "grid-enrollment"))
+    .collect()
 }
 
 /// Redeem the minted token in the store, as an enrollment would.
@@ -124,9 +135,18 @@ async fn invariant_1_ready_invite_is_unchanged_across_five_rounds() {
     invariants::changes_explained(since_ready, &[]).expect("invariant 6");
     invariants::reasons_within(
         since_ready,
-        &[("Ready", "False", "Pending"), ("Ready", "True", "Ready")],
+        &[
+            ("Minted", "True", "Minted"),
+            ("Redeemed", "False", "AwaitingRequest"),
+            ("Issued", "False", "AwaitingRequest"),
+            ("Available", "True", "Available"),
+            ("Progressing", "False", "AsExpected"),
+            ("Degraded", "False", "AsExpected"),
+            ("Ready", "True", "Ready"),
+        ],
     )
     .expect("invariant 8");
+    invariants::rollup_present_and_equal(&since_ready[0], &["Minted"]).expect("invariant 7");
     let ready = since_ready[0].condition("Ready").expect("Ready after round 2");
     assert_eq!(ready["status"], "True");
     assert_eq!(ready["reason"], "Ready");
@@ -151,9 +171,7 @@ async fn invariant_6_redemption_changes_ready_in_the_round_it_is_observed() {
 }
 
 #[tokio::test]
-// Expected to fail: invite_status keeps lastTransitionTime only when status and reason both match (site_invite.rs
-// prior_transition), so Ready True Ready to Ready True Redeemed moves the time with no status change
-async fn invariant_2_redemption_keeps_the_transition_time_while_ready_stays_true() {
+async fn invariant_2_redemption_moves_each_transition_time_only_with_its_status() {
     let (api, ctx) = seeded();
     let mut rounds = rounds(&api, &ctx, 3).await;
     redeem(&api, &ctx).await;
@@ -167,9 +185,6 @@ async fn rounds_more(api: &FakeApi, ctx: &Arc<Context>, count: usize) -> Vec<Obs
 }
 
 #[tokio::test]
-// Expected to fail: a redeemed SiteInvite reads Ready True Redeemed (site_invite.rs invite_status), so the Ready
-// printer column shows True for a spent invite; STATUS-REVIEW ratifies Available False Redeemed with Minted, Redeemed
-// and Issued beside it
 async fn invariant_7_redeemed_invite_reads_available_false_with_redeemed() {
     let (api, ctx) = seeded();
     drop(rounds(&api, &ctx, 2).await);
@@ -177,17 +192,86 @@ async fn invariant_7_redeemed_invite_reads_available_false_with_redeemed() {
     let after = rounds(&api, &ctx, 1).await;
     let observed = after.first().expect("one round");
 
-    // API-SITEINVITE: once spent, Available is False Redeemed and the facts stay True.
+    // Once spent, Available is False Redeemed, the facts stay True, and Ready mirrors Available.
     status_harness::diff::status_matches(
         observed,
         &[
-            ("Minted", "True", "AsExpected"),
-            ("Redeemed", "True", "AsExpected"),
-            ("Issued", "True", "AsExpected"),
+            ("Minted", "True", "Minted"),
+            ("Redeemed", "True", "Redeemed"),
+            ("Issued", "True", "Issued"),
             ("Available", "False", "Redeemed"),
             ("Progressing", "False", "AsExpected"),
             ("Degraded", "False", "AsExpected"),
+            ("Ready", "False", "Redeemed"),
         ],
     )
     .expect("a redeemed invite");
+}
+
+/// Whether `write` carries a condition reading `Minting`.
+fn writes_minting(write: &status_harness::Write) -> bool {
+    write
+        .body
+        .pointer("/status/conditions")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|conditions| conditions.iter().any(|condition| condition["reason"] == "Minting"))
+}
+
+/// Mint another live token pinning `site-d`, so the invite's own mint is refused.
+async fn pin_site_d(ctx: &Context) {
+    ctx.state
+        .store
+        .mint_site_token(crate::store::NewSiteToken {
+            token_id: None,
+            token_sha256: "1".repeat(64),
+            public_key_sha256: None,
+            site_name: "site-d".to_owned(),
+            grid_network_ref: "site-invite".to_owned(),
+            issued_by: "test".to_owned(),
+            expires_at: time::OffsetDateTime::now_utc().saturating_add(time::Duration::hours(1)),
+            allow_deleted_name: false,
+        })
+        .await
+        .expect("the first token mints");
+}
+
+#[tokio::test]
+async fn a_refused_mint_reads_minted_false_with_the_signers_reason() {
+    let (api, ctx) = seeded();
+    pin_site_d(&ctx).await;
+    let mut rounds = Vec::new();
+    for _round in 0..4 {
+        let invite: SiteInvite = serde_json::from_value(api.get(PATH).expect("invite stored")).expect("invite parses");
+        drop(reconcile(Arc::new(invite), Arc::clone(&ctx)).await);
+        rounds.push(api.observe(PATH).expect("invite stored"));
+    }
+    // Round 1 adds the finalizer; each retry after the refusal writes nothing new.
+    invariants::unchanged_from(&rounds[1..], 1).expect("invariant 1");
+    let pending_writes = api.writes().iter().filter(|write| writes_minting(write)).count();
+    assert_eq!(pending_writes, 1, "only the first attempt writes Minting");
+    let observed = rounds.last().expect("four rounds");
+    status_harness::diff::status_matches(
+        observed,
+        &[
+            ("Minted", "False", "TokenOutstanding"),
+            ("Redeemed", "False", "AwaitingRequest"),
+            ("Issued", "False", "AwaitingRequest"),
+            ("Available", "False", "TokenOutstanding"),
+            ("Progressing", "False", "AsExpected"),
+            ("Degraded", "False", "AsExpected"),
+            ("Ready", "False", "Pending"),
+        ],
+    )
+    .expect("a refused mint");
+}
+
+#[tokio::test]
+async fn a_redeemed_invite_is_terminal_and_writes_nothing_more() {
+    let (api, ctx) = seeded();
+    drop(rounds(&api, &ctx, 2).await);
+    redeem(&api, &ctx).await;
+    drop(rounds(&api, &ctx, 1).await);
+    let written = api.writes().len();
+    drop(rounds(&api, &ctx, 3).await);
+    assert_eq!(api.writes().len(), written, "a redeemed invite is not reconciled again");
 }
