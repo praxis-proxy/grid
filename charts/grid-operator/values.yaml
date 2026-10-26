@@ -45,8 +45,9 @@ crds:
 
 # -- Number of operator replicas. Every replica is ready and elects: one holds the operator
 # lease and runs everything that writes, and the signals and SWIM Services route to it alone
-# through an EndpointSlice it writes. From a release before leader election, upgrade at the
-# same replicaCount first, then scale.
+# through an EndpointSlice it writes. An in-place upgrade from a release before leader
+# election, where that release supports one (see the README), keeps the same replicaCount,
+# then scales.
 replicaCount: 1
 
 # -- PodDisruptionBudget for the operator pods. The render fails for a budget that would
