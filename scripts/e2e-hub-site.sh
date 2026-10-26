@@ -73,6 +73,7 @@ PF_PID=""
 WATCH_PID=""
 MTLS_PID=""
 HUBPATH_PID=""
+CORDONED=""
 FRONTDOOR_PID=""
 CATALOG_PID=""
 DRAIN_PID=""
@@ -84,6 +85,7 @@ MODE=""
 
 cleanup() {
   [[ -z $PF_PID ]] || kill "$PF_PID" 2>/dev/null || true
+  uncordon_node
   stop_monitors
   if ((CREATED)) && [[ ${KEEP:-0} != 1 ]]; then
     log "deleting clusters this run created"
@@ -1069,8 +1071,17 @@ operator_prestop() {
     | grep -q sleep
 }
 
+# operator_pod: the lease holder, whose drain is worth watching. A candidate's address is in no
+# holder slice, so watching one would pass the drain-order check over nothing.
 operator_pod() {
-  k "$HUB_CTX" get pods -l app.kubernetes.io/instance=grid-operator -o jsonpath='{.items[0].metadata.name}'
+  local holder
+  holder=$(lease_holder)
+  if [[ -n $holder ]]; then
+    printf '%s' "$holder"
+  else
+    k "$HUB_CTX" get pods -l app.kubernetes.io/instance=grid-operator \
+      -o jsonpath='{.items[0].metadata.name}'
+  fi
 }
 
 # ready_replicas <deployment>
@@ -1180,8 +1191,8 @@ ha_gateway_pod_deleted() {
   assert_drain_order "gateway pod deleted"
 }
 
-# Scenario 3: the operator restarts. Not a rolling restart: the chart's strategy is Recreate,
-# one SWIM identity per site, so the old pod goes before the new one starts.
+# Scenario 3: the operator restarts. The chart rolls at every replica count: the surge pod
+# waits as a candidate and takes the lease when the holder releases it.
 ha_operator_restart() {
   local pod from
   pod=$(operator_pod) || return 1
@@ -1196,9 +1207,8 @@ ha_operator_restart() {
   keep drain operator-restart
   measure "operator restart" drain_order_samples "$(drain_order_samples)"
   measure "operator restart" late_endpoint_samples "$(late_endpoint_samples)"
-  # Above one replica the holder withdraws its own slices, so the order is the operator's to
-  # get right and worth asserting whether or not a preStop delay exists. At one replica the
-  # endpoint follows readiness, and without a delay the window can be shorter than a sample.
+  # The holder withdraws its own slices, so the order is the operator's to get right. At one
+  # replica without a preStop delay the window can be shorter than a sample.
   if ((HA_OPERATOR_REPLICAS > 1)) || operator_prestop; then
     assert_drain_order "operator restart"
   else
@@ -1219,7 +1229,7 @@ ha_operator_restart() {
       assert_signals_targets_holder "operator restart"
     fi
   else
-    skip "operator restart: no overlap between the old and new pod (strategy is Recreate at one replica)"
+    skip "operator restart: the handover checks need two replicas"
   fi
 }
 
@@ -1237,15 +1247,25 @@ ha_node_drain() {
     return 0
   fi
   log "[$MODE] draining $node, which runs $pod"
+  # Uncordon on every path, so a failed drain or an early return cannot leave the node cordoned.
+  CORDONED=$node
   kubectl --context "$HUB_CTX" drain "$node" --ignore-daemonsets --delete-emptydir-data \
     --timeout=120s >/dev/null || return 1
   eventually "node drain: a ready gateway replica remains" gateway_ready_at_least 1 || true
   # The strict spread refuses to put the evicted replica on the surviving node, so the
-  # Deployment runs short until the node returns. No chart ships a PodDisruptionBudget.
+  # Deployment runs short until the node returns. The gateway chart has no PodDisruptionBudget;
+  # the operator chart renders one above one replica.
   measure "node drain" ready_replicas_while_drained "$(ready_replicas grid-gateway)"
-  kubectl --context "$HUB_CTX" uncordon "$node" >/dev/null || return 1
+  uncordon_node
   eventually "node drain: the gateway returns to $HA_GATEWAY_REPLICAS ready replicas" \
     gateway_ready_at_least "$HA_GATEWAY_REPLICAS" || true
+}
+
+# uncordon_node: uncordons whatever this leg cordoned, from the scenario or from cleanup.
+uncordon_node() {
+  [[ -n ${CORDONED:-} ]] || return 0
+  kubectl --context "$HUB_CTX" uncordon "$CORDONED" >/dev/null 2>&1 || true
+  CORDONED=""
 }
 
 # assert_ha: runs after assert_serving, which wrote the identity files the catalog read uses.

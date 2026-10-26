@@ -15,6 +15,9 @@ HA=1 MODES=pin bash e2e-hub-site.sh
 
 The hub gateway runs at `HA_GATEWAY_REPLICAS` behind a LoadBalancer, load runs through that
 address for the whole scenario set, and the script records a time to recovery per scenario.
-The operator stays at one replica: `charts/grid-operator` pins `replicaCount` to 1 in its
-schema, its strategy is `Recreate`, and the operator has no leader election, so the
-multi-replica scenarios skip until all three move.
+
+The operator runs at `HA_OPERATOR_REPLICAS`, two by default. One replica holds the lease and
+the rest wait as candidates. The chart rolls at every replica count and renders a
+PodDisruptionBudget above one. The leg kills the holder twice, once by killing its container
+so it cannot release the lease and once by deleting the pod so it can, and records the
+handover from the operator logs.
