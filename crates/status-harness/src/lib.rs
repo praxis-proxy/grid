@@ -461,8 +461,14 @@ fn apply_conditions(target: &mut Value, conditions: &Value, manager: &str, owner
     owners.retain(|type_, owner| owner != manager || applied_types.contains(type_));
     for condition in applied {
         if let Some(type_) = type_of(&condition) {
-            held.retain(|existing| type_of(existing).as_deref() != Some(type_.as_str()));
-            held.push(condition);
+            // A held type keeps its position, as server-side apply merges a list map.
+            match held
+                .iter_mut()
+                .find(|existing| type_of(existing).as_deref() == Some(type_.as_str()))
+            {
+                Some(existing) => *existing = condition,
+                None => held.push(condition),
+            }
             owners.insert(type_, manager.to_owned());
         }
     }
@@ -780,6 +786,43 @@ mod tests {
     }
 
     #[test]
+    fn an_apply_that_drops_a_condition_removes_it() {
+        let api = seeded();
+        assert_eq!(apply(&api, "m", &["A", "B"]), 200, "first apply");
+        assert_eq!(apply(&api, "m", &["A"]), 200, "second apply");
+        assert_eq!(types(&api), ["A"], "B was dropped from the apply");
+        assert_eq!(api.owners(PATH).len(), 1, "B is no longer owned");
+    }
+
+    #[test]
+    fn an_apply_with_no_conditions_releases_every_condition_it_held() {
+        let api = seeded();
+        assert_eq!(apply(&api, "m", &["A"]), 200, "apply A");
+        let uri = format!("{PATH}/status?fieldManager=m&force=true");
+        assert_eq!(
+            send(&api, "PATCH", &uri, APPLY, &json!({ "status": { "phase": "Q" } })),
+            200,
+            "apply phase"
+        );
+        assert!(types(&api).is_empty(), "the manager released A");
+        assert_eq!(stored(&api)["status"]["phase"], "Q", "the phase applied");
+    }
+
+    #[test]
+    fn two_managers_keep_their_own_types() {
+        let api = seeded();
+        assert_eq!(apply(&api, "one", &["A"]), 200, "one applies A");
+        assert_eq!(apply(&api, "two", &["B"]), 200, "two applies B");
+        assert_eq!(apply(&api, "one", &["A", "C"]), 200, "one applies A and C");
+        assert_eq!(types(&api), ["A", "B", "C"], "two's B survives one's apply");
+        assert_eq!(apply(&api, "two", &[]), 200, "two applies none");
+        assert_eq!(types(&api), ["A", "C"], "two's empty apply removes only B");
+        let owners = api.owners(PATH);
+        assert_eq!(owners.get("A").map(String::as_str), Some("one"), "one owns A");
+        assert_eq!(owners.get("C").map(String::as_str), Some("one"), "one owns C");
+    }
+
+    #[test]
     fn a_main_resource_apply_leaves_the_status_conditions_alone() {
         let api = seeded();
         assert_eq!(apply(&api, "m", &["A"]), 200, "status apply");
@@ -800,5 +843,17 @@ mod tests {
             2,
             "the spec change bumps the generation"
         );
+    }
+
+    #[test]
+    fn a_dry_run_answers_and_leaves_no_state() {
+        let api = seeded();
+        let before = stored(&api);
+        let uri = format!("{PATH}/status?fieldManager=m&force=true&dryRun=All");
+        let body = json!({ "status": { "conditions": [{ "type": "A", "status": "True", "reason": "A" }] } });
+        assert_eq!(send(&api, "PATCH", &uri, APPLY, &body), 200, "the dry run answers");
+        assert_eq!(stored(&api), before, "the object is unchanged");
+        assert!(api.owners(PATH).is_empty(), "no ownership is recorded");
+        assert!(api.writes().is_empty(), "no write is recorded");
     }
 }
