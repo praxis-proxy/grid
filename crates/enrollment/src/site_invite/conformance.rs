@@ -154,6 +154,17 @@ async fn invariant_1_ready_invite_is_unchanged_across_five_rounds() {
 }
 
 #[tokio::test]
+async fn a_ready_invite_does_not_pass_through_pending_on_a_requeue() {
+    let (api, ctx) = seeded();
+    drop(rounds(&api, &ctx, 6).await);
+    let minting = api.writes().iter().filter(|write| writes_minting(write)).count();
+    assert_eq!(
+        minting, 1,
+        "only the first mint writes Minting, not each requeue of a Ready invite"
+    );
+}
+
+#[tokio::test]
 async fn invariant_6_redemption_changes_ready_in_the_round_it_is_observed() {
     let (api, ctx) = seeded();
     let mut rounds = rounds(&api, &ctx, 3).await;

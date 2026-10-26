@@ -379,8 +379,8 @@ async fn activate_invite(
         InviteState::Pending,
         None,
     )?;
-    // A refused mint already holds Pending, so a retry does not flap Progressing.
-    if !holds_pending(invite) {
+    // A refused mint holds Pending and a live token holds Ready, so neither rewrites Minting.
+    if !holds_pending_or_ready(invite) {
         Box::pin(api_patch_status(&ctx.client, invite, pending)).await?;
     }
     let minted = Box::pin(ctx.state.store.mint_site_token(NewSiteToken {
@@ -409,13 +409,14 @@ async fn activate_invite(
     Ok(Action::requeue(REQUEUE))
 }
 
-/// Whether the invite already reads `Ready` `False` `Pending`: checkpointed, not yet minted.
-fn holds_pending(invite: &SiteInvite) -> bool {
+/// Whether the invite already reads `Ready` `False` `Pending`, checkpointed and not yet
+/// minted, or `Ready` `True`, minted.
+fn holds_pending_or_ready(invite: &SiteInvite) -> bool {
     invite.status.as_ref().is_some_and(|status| {
-        status
-            .conditions
-            .iter()
-            .any(|condition| condition.type_ == "Ready" && condition.status == "False" && condition.reason == "Pending")
+        status.conditions.iter().any(|condition| {
+            condition.type_ == "Ready"
+                && ((condition.status == "False" && condition.reason == "Pending") || condition.status == "True")
+        })
     })
 }
 
