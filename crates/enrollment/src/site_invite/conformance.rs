@@ -254,9 +254,11 @@ async fn a_refused_mint_reads_minted_false_with_the_signers_reason() {
     let (api, ctx) = seeded();
     pin_site_d(&ctx).await;
     let mut rounds = Vec::new();
-    for _round in 0..4 {
+    for round in 0..4 {
         let invite: SiteInvite = serde_json::from_value(api.get(PATH).expect("invite stored")).expect("invite parses");
-        drop(reconcile(Arc::new(invite), Arc::clone(&ctx)).await);
+        let result = reconcile(Arc::new(invite), Arc::clone(&ctx)).await;
+        // Round 1 adds the finalizer; every later round must surface the refusal, not swallow it.
+        assert_eq!(result.is_err(), round > 0, "round {round}: {result:?}");
         rounds.push(api.observe(PATH).expect("invite stored"));
     }
     // Round 1 adds the finalizer; each retry after the refusal writes nothing new.
