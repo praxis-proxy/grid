@@ -145,24 +145,75 @@ async fn invariant_4_provider_ready_is_unknown_only_before_its_first_evaluation(
     invariants::unknown_only_before_first_evaluation(&rounds).expect("invariant 4");
 }
 
-#[tokio::test]
-// Expected to fail: only the Poll-mode signals pass writes provider conditions (main.rs:2503-2505), so a provider
-// keeps Ready Unknown MetricsNotConfigured for good once the mode turns Gossip; STATUS-REVIEW rule 9 wants Unknown
-// NotEvaluated by the next round
-async fn invariant_11_provider_conditions_read_not_evaluated_once_gossip_turns_the_writer_off() {
+/// A provider named `prov` whose metrics endpoint refuses every scrape.
+fn seeded_with_metrics() -> (FakeApi, String) {
     let (api, path) = seeded();
-    signals_pass(&api, &path).await;
-    let rounds = fixtures::rounds(&api, &path, 3, |_round| async {
-        let client = api.client("default");
-        let ctx = Arc::new(OperatorCtx::new(client, None, SignalMode::Gossip));
-        let network = fixtures::stored(&api, &fixtures::network_path(NETWORK));
-        grid_network::reconcile(Arc::new(network), ctx)
-            .await
-            .expect("network reconcile succeeds");
-        reconcile(&api, &path).await;
-    })
-    .await;
+    api.edit(&path, false, |object| {
+        object["spec"]["metricsConfig"] = serde_json::json!({ "endpoint": "http://127.0.0.1:1" });
+    });
+    (api, path)
+}
+
+/// Signals passes in `mode` until `type_` reads `reason`, or fail after a bounded wait.
+///
+/// A pass that finds the write slot held skips its writes, so the pass is retried.
+async fn signals_pass_until(api: &FakeApi, path: &str, mode: SignalMode, type_: &str, reason: &str) {
+    for _attempt in 0..50 {
+        {
+            let _pass = PASS.lock().await;
+            let client = api.client("default");
+            let ctx = OperatorCtx::new(client.clone(), None, mode);
+            grid_network::refresh_signals(&ctx, &client, NETWORK)
+                .await
+                .expect("signals pass succeeds");
+        }
+        for _poll in 0..10 {
+            if fixtures::reason_of(api, path, type_) == reason {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+    panic!("{type_} never read {reason}");
+}
+
+/// One Gossip-mode round: round 1 removes the metrics endpoint, then a readiness pass and a
+/// reconcile run.
+async fn gossip_round(api: &FakeApi, path: &str, round: usize) {
+    if round == 1 {
+        api.edit(path, true, |object| {
+            if let Some(spec) = object["spec"].as_object_mut() {
+                spec.remove("metricsConfig");
+            }
+        });
+    }
+    let want = if round == 0 {
+        "AwaitingFirstScrape"
+    } else {
+        "NotEvaluated"
+    };
+    signals_pass_until(api, path, SignalMode::Gossip, "Ready", want).await;
+    reconcile(api, path).await;
+}
+
+#[tokio::test]
+async fn invariant_11_provider_conditions_read_not_evaluated_once_metrics_endpoint_is_removed() {
+    // Gossip mode: the readiness pass runs in every signal mode.
+    let (api, path) = seeded_with_metrics();
+    let rounds = fixtures::rounds(&api, &path, 3, |round| gossip_round(&api, &path, round)).await;
+    let first = rounds.first().expect("three rounds");
+    assert!(
+        first.condition("MetricsReachable").is_some(),
+        "a metrics endpoint is scraped in Gossip mode"
+    );
     invariants::not_evaluated_once_off(&rounds, 1, &["Ready", "MetricsAvailable"]).expect("invariant 11");
+    assert!(
+        rounds
+            .iter()
+            .skip(1)
+            .all(|round| round.condition("MetricsReachable").is_none()),
+        "MetricsReachable is absent without a metrics endpoint"
+    );
 }
 
 #[tokio::test]

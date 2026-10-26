@@ -71,6 +71,9 @@ signal TTL when unset), or when it is `Unavailable`. The EPP counts endpoints
 with fresh metrics, so a saturated engine can read zero while serving, which is
 why two scrapes and the engine answer both gate the verdict.
 
+The readiness pass runs in every signal mode and writes each provider's
+conditions. Only Poll mode publishes what it scrapes.
+
 Provider scrapes run concurrently with a bound of 16. A network's readiness
 floor is one scrape interval plus the longer of one interval or the latest
 measured pass, and it overrides `staleMetricsSeconds` when longer. This keeps a

@@ -287,7 +287,8 @@ async fn main() {
     let writer_ctx = Arc::clone(&ctx);
     let writer_swim = swim_rx.clone();
     let writer_site_name = ctx.site_name().map(str::to_owned);
-    let writer_scrape_interval = signals_enabled.then(|| config.signals.scrape_interval());
+    // Every mode scrapes for readiness; only Poll mode publishes what it scrapes.
+    let writer_scrape_interval = config.signals.scrape_interval();
     let writer_group = async move {
         tokio::try_join!(
             run_network_controller(writer_client.clone(), Arc::clone(&writer_ctx), writer_swim),
@@ -2769,18 +2770,16 @@ async fn own_leaf(network: &GridNetwork, client: &Client) -> Option<grid_network
     }
 }
 
-/// Scrape this site's providers on their own interval and publish the result.
+/// Scrape this site's providers on their own interval, write their readiness, and in Poll
+/// mode publish the result.
 ///
 /// Separate from reconcile, which runs on an interval sized for declarations
 /// and is two orders of magnitude slower than these values move.
 async fn run_local_scraper(
-    interval: Option<std::time::Duration>,
+    interval: std::time::Duration,
     ctx: Arc<OperatorCtx>,
     client: Client,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let Some(interval) = interval else {
-        return Ok(());
-    };
     tracing::info!(interval_ms = interval.as_millis(), "local signals scraper started");
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

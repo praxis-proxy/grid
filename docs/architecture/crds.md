@@ -813,7 +813,8 @@ probe anonymously. Redirects are not followed; a 3xx response degrades health.
 **Phases**: Pending → Available → Degraded → Unavailable
 
 **Readiness**: `status.conditions` carries a `Ready` condition, written by the
-operator's signals loop from each scrape of the provider's metrics. Readiness is
+operator's signals loop from each scrape of the provider's metrics, in every
+signal mode. Readiness is
 a condition, not a phase: `phase` follows the provider's configuration only, and
 says nothing about whether it serves now.
 

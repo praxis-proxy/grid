@@ -88,6 +88,15 @@ where
     observed
 }
 
+/// The reason `path` holds on its condition of `type_`, empty when absent.
+pub(crate) fn reason_of(api: &FakeApi, path: &str, type_: &str) -> String {
+    observe(api, path)
+        .condition(type_)
+        .and_then(|condition| condition["reason"].as_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
 /// Wait until `path` holds a condition of `type_`, or fail after a bounded wait.
 ///
 /// The readiness pass writes from a spawned task, so a test polls for it.

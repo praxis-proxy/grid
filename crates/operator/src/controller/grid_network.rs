@@ -511,7 +511,8 @@ fn site_signals_ttl() -> Duration {
     Duration::from_secs(secs.max(1))
 }
 
-/// Scrape this site's providers once and publish the coarse signals observed.
+/// Scrape this site's providers once, write their readiness conditions, and, in Poll mode,
+/// publish the coarse signals observed.
 ///
 /// Called from its own loop rather than from reconcile. Reconcile runs on an
 /// interval sized for declarations, two orders of magnitude slower than these
@@ -522,25 +523,21 @@ fn site_signals_ttl() -> Duration {
 ///
 /// Returns [`OperatorError`] when providers or sites cannot be listed.
 pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &str) -> Result<(), OperatorError> {
-    let publisher = ctx.swim().map(Arc::as_ref);
+    // Under gossip, load travels the CRDT path, so this pass only judges readiness.
+    let polling = ctx.signal_mode == SignalMode::Poll;
+    let publisher = ctx.swim().filter(|_| polling).map(Arc::as_ref);
     let Some(_pass) = signal_pass(ctx, network_name, publisher) else {
         return Ok(());
     };
     let collected_at = Instant::now();
     let providers = list_all_inference_providers(client).await?;
-    ctx.signals.set_access(signal_access(&providers));
-    Box::pin(register_peers(ctx, client)).await?;
-    let scrape_started = Instant::now();
-    Box::pin(provider_metrics::collect_provider_signals(
-        network_name,
-        &providers,
-        Some(client),
-        &ctx.readiness,
-    ))
-    .await;
-    ctx.record_scrape_pass(network_name, scrape_started.elapsed());
+    if polling {
+        ctx.signals.set_access(signal_access(&providers));
+        Box::pin(register_peers(ctx, client)).await?;
+    }
+    Box::pin(scrape_providers(ctx, client, &providers, network_name)).await;
     let mut collected = resolve_readiness(ctx, client, &providers, network_name);
-    if !ctx.signal_fenced.load(std::sync::atomic::Ordering::Relaxed) {
+    if polling && !ctx.signal_fenced.load(std::sync::atomic::Ordering::Relaxed) {
         if let Some(swim) = publisher {
             let Some((epoch, sequence)) = publication_order(ctx, client, swim).await? else {
                 return Ok(());
@@ -550,6 +547,19 @@ pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &
         publish_signals(ctx, collected, collected_at);
     }
     Ok(())
+}
+
+/// Scrape `providers` once into the readiness store and record how long the pass took.
+async fn scrape_providers(ctx: &OperatorCtx, client: &Client, providers: &[InferenceProvider], network_name: &str) {
+    let scrape_started = Instant::now();
+    Box::pin(provider_metrics::collect_provider_signals(
+        network_name,
+        providers,
+        Some(client),
+        &ctx.readiness,
+    ))
+    .await;
+    ctx.record_scrape_pass(network_name, scrape_started.elapsed());
 }
 
 /// Serialize collection and bind ordered publication to one network.
