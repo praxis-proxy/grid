@@ -97,7 +97,11 @@ async fn invariant_3_peer_site_observed_generation_follows_a_spec_edit() {
     .await;
 
     invariants::observed_generation_tracks(&rounds).expect("invariant 3");
-    assert_eq!(rounds.get(3).expect("four rounds").generation, 2);
+    assert_eq!(
+        rounds.get(3).expect("four rounds").generation,
+        2,
+        "the spec edit bumps the generation"
+    );
 }
 
 #[tokio::test]

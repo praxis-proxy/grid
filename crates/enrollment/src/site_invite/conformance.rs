@@ -148,8 +148,8 @@ async fn invariant_1_ready_invite_is_unchanged_across_five_rounds() {
     .expect("invariant 8");
     invariants::rollup_present_and_equal(&since_ready[0], &["Minted"]).expect("invariant 7");
     let ready = since_ready[0].condition("Ready").expect("Ready after round 2");
-    assert_eq!(ready["status"], "True");
-    assert_eq!(ready["reason"], "Ready");
+    assert_eq!(ready["status"], "True", "a minted invite reads Ready True");
+    assert_eq!(ready["reason"], "Ready", "Ready keeps its shipped reason");
     assert!(api.get(SECRET).is_some(), "the token Secret is checkpointed");
 }
 
@@ -177,7 +177,10 @@ async fn invariant_6_redemption_changes_ready_in_the_round_it_is_observed() {
     invariants::unchanged_from(since_ready, 3).expect("invariant 1 after redemption");
     invariants::one_manager_per_type(&api.writes(), PATH, &managers()).expect("invariant 5");
     let redeemed = since_ready[2].condition("Ready").expect("Ready after redemption");
-    assert_eq!(redeemed["reason"], "Redeemed");
+    assert_eq!(
+        redeemed["reason"], "Redeemed",
+        "Ready names the redemption in the round it is seen"
+    );
     assert!(api.get(SECRET).is_none(), "a redeemed invite drops its token Secret");
 }
 

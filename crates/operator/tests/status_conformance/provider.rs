@@ -82,9 +82,13 @@ async fn invariant_1_available_provider_is_unchanged_across_five_rounds() {
     invariants::observed_generation_tracks(&rounds).expect("invariant 3");
     invariants::changes_explained(&rounds, &[]).expect("invariant 6");
     let first = rounds.first().expect("five rounds");
-    assert_eq!(first.field("phase"), "Available");
+    assert_eq!(first.field("phase"), "Available", "a resolved provider is Available");
     assert_eq!(first.field("reason"), "", "Available carries no reason");
-    assert_eq!(first.status["matchingSites"], serde_json::json!([LOCAL_SITE]));
+    assert_eq!(
+        first.status["matchingSites"],
+        serde_json::json!([LOCAL_SITE]),
+        "the provider matches the local site"
+    );
 }
 
 #[tokio::test]
@@ -102,7 +106,8 @@ async fn invariant_5_provider_conditions_belong_to_the_readiness_manager_alone()
     );
     assert_eq!(
         api.owners(&path).get("Ready").map(String::as_str),
-        Some("grid-operator-readiness")
+        Some("grid-operator-readiness"),
+        "Ready stays with the readiness manager"
     );
 }
 

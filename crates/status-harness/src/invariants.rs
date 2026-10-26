@@ -472,7 +472,10 @@ mod tests {
             ("Progressing", "False", "AsExpected"),
             ("Degraded", "False", "AsExpected"),
         ]);
-        assert!(rollup_present_and_equal(&trio_only, &["Connected"]).is_err());
+        assert!(
+            rollup_present_and_equal(&trio_only, &["Connected"]).is_err(),
+            "an absent gate fails"
+        );
     }
 
     #[test]
@@ -487,7 +490,10 @@ mod tests {
         rollup_present_and_equal(&observed(&held), &["Connected"]).expect("rolls up");
         let mut old = gates.to_vec();
         old.push(("Available", "True", "AsExpected"));
-        assert!(rollup_present_and_equal(&observed(&old), &["Connected"]).is_err());
+        assert!(
+            rollup_present_and_equal(&observed(&old), &["Connected"]).is_err(),
+            "Available True reads reason Available, not AsExpected"
+        );
     }
 
     #[test]
@@ -510,7 +516,10 @@ mod tests {
     #[test]
     fn a_default_phase_column_fails() {
         let columns = json!([{ "name": "Phase", "jsonPath": ".status.phase" }]);
-        assert!(printer_columns_read_conditions(&crd(&columns)).is_err());
+        assert!(
+            printer_columns_read_conditions(&crd(&columns)).is_err(),
+            "a default-priority phase column fails"
+        );
     }
 
     #[test]
@@ -518,6 +527,9 @@ mod tests {
         let phase = json!([{ "name": "Phase", "jsonPath": ".status.phase", "priority": 1 }]);
         printer_columns_read_conditions(&crd(&phase)).expect("a wide phase is derived");
         let reason = json!([{ "name": "Reason", "jsonPath": ".status.reason", "priority": 1 }]);
-        assert!(printer_columns_read_conditions(&crd(&reason)).is_err());
+        assert!(
+            printer_columns_read_conditions(&crd(&reason)).is_err(),
+            "a reason column fails"
+        );
     }
 }

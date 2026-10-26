@@ -80,7 +80,11 @@ async fn invariant_1_pending_network_is_unchanged_across_five_rounds() {
     invariants::one_manager_per_type(&api.writes(), &path, &managers()).expect("invariant 5");
     invariants::changes_explained(&rounds, &[]).expect("invariant 6");
     invariants::reasons_within(&rounds, &reasons()).expect("invariant 8");
-    assert_eq!(rounds.first().expect("five rounds").field("phase"), "Pending");
+    assert_eq!(
+        rounds.first().expect("five rounds").field("phase"),
+        "Pending",
+        "a network with no local site stays Pending"
+    );
 }
 
 #[tokio::test]
@@ -102,9 +106,17 @@ async fn invariant_2_local_site_declared_transition_time_moves_only_with_its_sta
     invariants::changes_explained(&rounds, &[2, 3]).expect("invariant 6");
     invariants::one_manager_per_type(&api.writes(), &path, &managers()).expect("invariant 5");
     invariants::reasons_within(&rounds, &reasons()).expect("invariant 8");
-    assert_eq!(declared(&rounds, 1), ("False", "NoSiteIdentity"));
-    assert_eq!(declared(&rounds, 2), ("False", "LocalSiteMissing"));
-    assert_eq!(declared(&rounds, 4), ("True", "LocalSiteFound"));
+    assert_eq!(declared(&rounds, 1), ("False", "NoSiteIdentity"), "no identity yet");
+    assert_eq!(
+        declared(&rounds, 2),
+        ("False", "LocalSiteMissing"),
+        "identity, no GridSite"
+    );
+    assert_eq!(
+        declared(&rounds, 4),
+        ("True", "LocalSiteFound"),
+        "the GridSite is declared"
+    );
 }
 
 /// The `LocalSiteDeclared` status and reason after `round`.
@@ -133,7 +145,11 @@ async fn invariant_3_network_observed_generation_follows_a_spec_edit() {
     .await;
 
     invariants::observed_generation_tracks(&rounds).expect("invariant 3");
-    assert_eq!(rounds.get(3).expect("four rounds").generation, 2);
+    assert_eq!(
+        rounds.get(3).expect("four rounds").generation,
+        2,
+        "the spec edit bumps the generation"
+    );
 }
 
 #[tokio::test]
