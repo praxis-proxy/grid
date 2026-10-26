@@ -470,9 +470,11 @@ their `<service>-holder` `EndpointSlice`, so peers reach only the holder.
 
 From a release before leader election, upgrade at the same `replicaCount` first,
 then scale: raising it in the same upgrade scales the old, unelected pods too.
-After that, scaling is safe in one step. A candidate does not contend while any
-unelected operator pod exists, or while it cannot list pods.
-`grid_operator_lease_waiting` shows why no replica holds the lease.
+That first upgrade leaves the signals and SWIM Services briefly without an
+endpoint, from the old pod's exit until the new holder publishes and writes its
+slices. After that, scaling is safe in one step. A candidate does not contend
+while any unelected operator pod exists, or while it cannot list pods.
+`grid_operator_lease_waiting` shows why this replica is not contending.
 
 The rollout surges one pod at a time at every replica count, and above one
 replica a `PodDisruptionBudget` keeps one up. No preStop delay is needed. `grid_operator_lease_held` and
