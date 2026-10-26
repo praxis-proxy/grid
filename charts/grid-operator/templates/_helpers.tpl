@@ -87,6 +87,10 @@ Signals are reached through the SWIM Service.
 {{- if and (.Values.signals).enabled (eq .Values.swim.service.type "LoadBalancer") (eq .Values.swim.service.externalTrafficPolicy "Cluster") }}
 {{- fail "signals on a LoadBalancer need swim.service.externalTrafficPolicy Local: the listener caps handshakes per source address" }}
 {{- end }}
+{{- /* The signals Service renders its own policy, so judge the one it renders. */}}
+{{- if and (.Values.signals).enabled .Values.signals.service.enabled (eq (.Values.signals.service.type | default .Values.swim.service.type) "LoadBalancer") (eq (toString .Values.signals.service.externalTrafficPolicy) "Cluster") }}
+{{- fail "signals on a LoadBalancer need signals.service.externalTrafficPolicy Local: the listener caps handshakes per source address" }}
+{{- end }}
 {{- end }}
 
 {{/*
@@ -302,3 +306,90 @@ RUST_LOG for the chart's Rust binaries: log.filter when set, else log.level.
 {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+The PodDisruptionBudget's minAvailable and maxUnavailable as strings, empty when unset.
+*/}}
+{{- define "grid-operator.pdb.bounds" -}}
+{{- $pdb := .Values.podDisruptionBudget | default dict }}
+{{- $min := "" }}
+{{- if not (kindIs "invalid" $pdb.minAvailable) }}{{ $min = toString $pdb.minAvailable }}{{ end }}
+{{- $max := "" }}
+{{- if not (kindIs "invalid" $pdb.maxUnavailable) }}{{ $max = toString $pdb.maxUnavailable }}{{ end }}
+{{- dict "min" $min "max" $max | toJson }}
+{{- end }}
+
+{{/*
+"true" when the PodDisruptionBudget renders: enabled true, or auto with more than one replica.
+*/}}
+{{- define "grid-operator.pdb.renders" -}}
+{{- $enabled := toString ((.Values.podDisruptionBudget | default dict).enabled) }}
+{{- if or (eq $enabled "true") (and (eq $enabled "auto") (gt (int .Values.replicaCount) 1)) }}true{{ end }}
+{{- end }}
+
+{{/*
+Pods a bound of `value` covers out of `replicas`, rounding a percentage up as Kubernetes does.
+*/}}
+{{- define "grid-operator.pdb.pods" -}}
+{{- if hasSuffix "%" .value }}
+{{- div (add (mul (int (trimSuffix "%" .value)) .replicas) 99) 100 }}
+{{- else }}
+{{- int .value }}
+{{- end }}
+{{- end }}
+
+{{/*
+Refuse a PodDisruptionBudget that names both bounds, neither, or one no node drain can satisfy.
+*/}}
+{{- define "grid-operator.pdb.validate" -}}
+{{- $enabled := toString ((.Values.podDisruptionBudget | default dict).enabled) }}
+{{- if not (has $enabled (list "auto" "true" "false")) }}
+{{- fail (printf "podDisruptionBudget.enabled must be auto, true or false, not %q" $enabled) }}
+{{- end }}
+{{- if include "grid-operator.pdb.renders" . }}
+{{- $bounds := include "grid-operator.pdb.bounds" . | fromJson }}
+{{- $replicas := int .Values.replicaCount }}
+{{- if and $bounds.min $bounds.max }}
+{{- fail "set one of podDisruptionBudget.minAvailable and podDisruptionBudget.maxUnavailable, not both" }}
+{{- else if $bounds.min }}
+{{- if ge (int (include "grid-operator.pdb.pods" (dict "value" $bounds.min "replicas" $replicas))) $replicas }}
+{{- fail (printf "podDisruptionBudget.minAvailable %s with replicaCount %d would block node drains: no operator pod could ever be evicted" $bounds.min $replicas) }}
+{{- end }}
+{{- else if $bounds.max }}
+{{- if le (int (include "grid-operator.pdb.pods" (dict "value" $bounds.max "replicas" $replicas))) 0 }}
+{{- fail (printf "podDisruptionBudget.maxUnavailable %s would block node drains: no operator pod could ever be evicted" $bounds.max) }}
+{{- end }}
+{{- else }}
+{{- fail "set podDisruptionBudget.minAvailable or podDisruptionBudget.maxUnavailable" }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+A PodDisruptionBudget bound as YAML: a percentage quoted, a count as a number.
+*/}}
+{{- define "grid-operator.pdb.value" -}}
+{{- if hasSuffix "%" . }}{{ quote . }}{{ else }}{{ int . }}{{ end }}
+{{- end }}
+
+{{/*
+The preStop delay: as set, else none. Under HA the holder withdraws its own EndpointSlices, so
+no selector Service waits on readiness for peers.
+*/}}
+{{- define "grid-operator.shutdownDelaySeconds" -}}
+{{- if kindIs "invalid" .Values.shutdownDelaySeconds }}0{{ else }}{{ int .Values.shutdownDelaySeconds }}{{ end }}
+{{- end }}
+
+{{/*
+The Services carrying signals that route to the lease holder alone.
+*/}}
+{{- define "grid-operator.holderSignalsServices" -}}
+{{- if and (.Values.signals).enabled .Values.signals.service.enabled }}{{ include "grid-operator.fullname" . }}-signals{{ end }}
+{{- end }}
+
+{{/*
+The Services carrying SWIM that route to the lease holder alone.
+*/}}
+{{- define "grid-operator.holderSwimServices" -}}
+{{- if .Values.swim.service.enabled }}{{ include "grid-operator.fullname" . }}-swim{{ end }}
+{{- end }}

@@ -132,7 +132,37 @@ async fn main() {
     // Watched before enrolling, because enrolling retries a retryable failure
     // for as long as it keeps failing and must still answer a SIGTERM.
     let (trigger, shutdown) = operator::shutdown::Trigger::new();
-    tokio::spawn(watch_for_termination(trigger, Arc::clone(&ready)));
+    let trigger = Arc::new(trigger);
+    let routes = match holder_routes(&client, &config) {
+        Ok(routes) => routes,
+        Err(error) => {
+            tracing::error!(%error, "invalid leader election settings");
+            std::process::exit(1);
+        },
+    };
+    tokio::spawn(watch_for_termination(StandDown {
+        trigger: Arc::clone(&trigger),
+        ready: Arc::clone(&ready),
+        routes: routes.clone(),
+    }));
+
+    // Everything below writes, so only the lease holder runs it.
+    let stand_down_on_loss = StandDown {
+        trigger: Arc::clone(&trigger),
+        ready: Arc::clone(&ready),
+        routes: routes.clone(),
+    };
+    let leadership = match elect(&client, &config.leader, &shutdown, stand_down_on_loss).await {
+        Ok(Some(leadership)) => leadership,
+        Ok(None) => {
+            tracing::info!("stood down before taking the operator lease");
+            return;
+        },
+        Err(error) => {
+            tracing::error!(%error, "invalid leader election settings");
+            std::process::exit(1);
+        },
+    };
 
     if config.enrollment.enabled {
         let enrolled = tokio::select! {
@@ -147,6 +177,18 @@ async fn main() {
             tracing::error!(%error, "site enrollment failed");
             std::process::exit(1);
         }
+        // Enrolling runs only at start: a site that loses its identity, with an invite to
+        // enroll again, stands down so its restart enrolls, rather than run on unidentified.
+        let stand_down = StandDown {
+            trigger: Arc::clone(&trigger),
+            ready: Arc::clone(&ready),
+            routes: routes.clone(),
+        };
+        let (watching, enrollment) = (client.clone(), config.enrollment.clone());
+        tokio::spawn(async move {
+            operator::enroll::lost_identity_with_invite(&watching, &enrollment).await;
+            stand_down.begin().await;
+        });
     }
     // The identity names the site, and without one the site idles.
     let SiteIdentity {
@@ -191,6 +233,9 @@ async fn main() {
     // The loop follows the declared peer trust, which may change after startup.
     let (declared_trust, trust_changes) = tokio::sync::watch::channel(trust);
     let mut rotation_running = false;
+    // Released once the renewal loop has returned, after any write it had under way.
+    let (renewal_done_tx, renewal_done) = operator::shutdown::Trigger::new();
+    let mut renewal_done_tx = Some(renewal_done_tx);
     if config.enrollment.renew {
         match operator::enroll::renew::Settings::from_config(&config.enrollment) {
             Ok(settings) => {
@@ -199,11 +244,16 @@ async fn main() {
                 let settings = settings
                     .with_gateway(&config.gateway.namespace, &config.gateway.service_name)
                     .with_declared_trust(install, trust_changes);
-                drop(tokio::spawn(operator::enroll::renew::run(client.clone(), settings)));
+                let (renewing, stop, done) = (client.clone(), shutdown.clone(), renewal_done_tx.take());
+                tokio::spawn(async move {
+                    operator::enroll::renew::run(renewing, settings, stop).await;
+                    drop(done);
+                });
             },
             Err(error) => tracing::error!(%error, "site identity rotation is off: misconfigured"),
         }
     }
+    drop(renewal_done_tx);
     let signals_enabled = matches!(signal_mode, SignalMode::Poll);
     let peer_settings = grid_network::PeerSettings {
         local_signals_addr: config.signals.local_addr(),
@@ -226,6 +276,7 @@ async fn main() {
 
     // Controllers run now. Only SWIM and what dials peers wait on the advertise address.
     let (swim_tx, swim_rx) = tokio::sync::watch::channel(SwimStage::Starting);
+    route_to_holder(&routes, signals_enabled.then(|| ctx.signals()), &leadership.holding());
 
     // Stop every state writer before leaving SWIM. Otherwise the leave event can
     // drive one last reconcile that publishes every peer as dead or tries to
@@ -250,7 +301,18 @@ async fn main() {
     };
     let writers = stop_writers_on_shutdown(writers_shutdown, writers_done_tx, writer_group);
 
-    let standing_down = stand_down(shutdown.clone(), writers_done, swim_rx.clone());
+    // The lease goes once no writer runs and the site has left, before the drain grace.
+    let (left_tx, left) = operator::shutdown::Trigger::new();
+    let releasing = tokio::spawn(async move {
+        left.triggered().await;
+        leadership.finish().await;
+    });
+    let standing_down = stand_down(
+        shutdown.clone(),
+        (writers_done, renewal_done.clone()),
+        swim_rx.clone(),
+        left_tx,
+    );
     let serving = async {
         tokio::try_join!(
             start_swim(
@@ -308,17 +370,76 @@ async fn main() {
         () = identified => {
             // Exit 0 so the kubelet restarts the pod; its restart backoff still applies.
             tracing::info!("restarting under the site identity's name");
+            trigger.trigger();
+            wait_for_renewal(&renewal_done).await;
+            for routed in [&routes.signals, &routes.swim].into_iter().flatten() {
+                routed.withdraw().await;
+            }
+            drop(releasing.await);
             return;
         },
         result = serving => result,
     };
 
+    drop(releasing.await);
     if let Err(e) = result {
         tracing::error!(error = %e, "controller error");
         std::process::exit(1);
     }
     // The one line that distinguishes a clean exit from a SIGKILL in pod logs.
     tracing::info!("stood down");
+}
+
+/// Take the operator lease named in `args`, standing down if it is later lost.
+///
+/// `Ok(None)` when shutdown comes first. With no lease configured, this replica writes unelected.
+async fn elect(
+    client: &Client,
+    args: &operator::cli::LeaderArgs,
+    shutdown: &operator::shutdown::Shutdown,
+    on_loss: StandDown,
+) -> Result<Option<Leadership>, String> {
+    let Some(lease) = args.lease.as_deref() else {
+        tracing::info!("no operator lease configured; writing unelected");
+        return Ok(Some(Leadership(None)));
+    };
+    let identity = args
+        .identity
+        .clone()
+        .filter(|identity| !identity.is_empty())
+        .ok_or("GRID_LEADER_LEASE is set but GRID_LEADER_IDENTITY is not")?;
+    let store = operator::leader::KubeLease::new(client.clone(), client.default_namespace(), lease);
+    let elector = operator::leader::Elector::new(store, identity);
+    // A candidate is ready: peers reach only the holder, through the slices it writes.
+    on_loss.ready.mark_started();
+    let lost = move || {
+        // Restarting is the only way back to candidacy: SWIM starts once per process.
+        tracing::warn!("lost the operator lease; standing down to restart as a candidate");
+        tokio::spawn(on_loss.begin_lost());
+    };
+    let replicas = operator::unelected::Replicas::new(client, args.replica_selector.clone());
+    let held = Box::pin(operator::leader::lead(elector, &replicas, shutdown, lost)).await;
+    Ok(held.map(|held| Leadership(Some(held))))
+}
+
+/// The operator lease while held, or nothing when this replica writes unelected.
+struct Leadership(Option<operator::leader::Leadership<operator::leader::KubeLease>>);
+
+impl Leadership {
+    /// Whether this replica may still act as the holder; always, unelected.
+    fn holding(&self) -> operator::leader::Holding {
+        self.0.as_ref().map_or_else(
+            operator::leader::Holding::unelected,
+            operator::leader::Leadership::holding,
+        )
+    }
+
+    /// Stop renewing and release the lease, so a successor takes over without waiting it out.
+    async fn finish(self) {
+        if let Some(held) = self.0 {
+            held.finish().await;
+        }
+    }
 }
 
 /// Cancel every state writer on shutdown, then release the leave barrier.
@@ -344,11 +465,13 @@ async fn stop_writers_on_shutdown<E>(
 /// is what the inbound listener drains in.
 async fn stand_down(
     shutdown: operator::shutdown::Shutdown,
-    writers_done: operator::shutdown::Shutdown,
+    (writers_done, renewal_done): (operator::shutdown::Shutdown, operator::shutdown::Shutdown),
     swim: SwimStartup,
+    left_site: operator::shutdown::Trigger,
 ) {
     shutdown.triggered().await;
     writers_done.triggered().await;
+    wait_for_renewal(&renewal_done).await;
     let left = match settled(&swim) {
         Some(handle) => {
             handle.leave(LEAVE_WAIT).await;
@@ -356,6 +479,7 @@ async fn stand_down(
         },
         None => false,
     };
+    left_site.trigger();
     tokio::time::sleep(SHUTDOWN_GRACE).await;
     // The work is still polled through the grace, so SWIM can finish starting
     // and advertise this site after the read above. Leaving a runtime that
@@ -364,6 +488,20 @@ async fn stand_down(
         handle.leave(LEAVE_WAIT).await;
     }
 }
+
+/// Wait, up to [`RENEWAL_DRAIN`], for the identity renewal loop to finish what it has under
+/// way, so it neither writes the identity nor rolls the gateway once the lease is released.
+async fn wait_for_renewal(renewal_done: &operator::shutdown::Shutdown) {
+    if tokio::time::timeout(RENEWAL_DRAIN, renewal_done.triggered())
+        .await
+        .is_err()
+    {
+        tracing::warn!("identity renewal still under way at the stand-down bound; releasing anyway");
+    }
+}
+
+/// How long a stand-down waits for an identity renewal under way.
+const RENEWAL_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The SWIM handle if one exists, read rather than awaited.
 ///
@@ -1567,11 +1705,130 @@ impl Readiness {
 const SIGNALS_TLS_POLL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Trigger cooperative shutdown on the first termination signal.
-async fn watch_for_termination(trigger: operator::shutdown::Trigger, ready: Arc<Readiness>) {
+async fn watch_for_termination(stand_down: StandDown) {
     let signal = first_termination_signal().await;
     tracing::info!(signal, "standing down");
-    begin_stand_down(&trigger, &ready);
+    stand_down.begin().await;
 }
+
+/// What standing down touches, in the order it touches them.
+struct StandDown {
+    /// Asks every worker to stop.
+    trigger: Arc<operator::shutdown::Trigger>,
+    /// Answers not ready.
+    ready: Arc<Readiness>,
+    /// Routes peers to this replica while it holds the lease.
+    routes: HolderRouting,
+}
+
+impl StandDown {
+    /// Route peers away first, then stop as [`begin_stand_down`] does.
+    async fn begin(self) {
+        for routes in [&self.routes.signals, &self.routes.swim].into_iter().flatten() {
+            routes.withdraw().await;
+        }
+        begin_stand_down(&self.trigger, &self.ready);
+    }
+
+    /// Stop every writer at once, then route peers away: having lost the lease, a successor
+    /// may take over before slow slice writes finish.
+    async fn begin_lost(self) {
+        begin_stand_down(&self.trigger, &self.ready);
+        for routes in [&self.routes.signals, &self.routes.swim].into_iter().flatten() {
+            routes.withdraw().await;
+        }
+    }
+}
+
+/// The Services peers reach the holder on, each routed to it alone.
+#[derive(Clone, Default)]
+struct HolderRouting {
+    /// Routed once the holder has signals to answer with.
+    signals: Option<Arc<operator::holder_route::HolderRoutes>>,
+    /// Routed at once: SWIM settles only once a `LoadBalancer` has an address, which some
+    /// publish only for a Service with an endpoint.
+    swim: Option<Arc<operator::holder_route::HolderRoutes>>,
+}
+
+/// The routes for the Services peers reach the holder on, none when unelected or none are named.
+fn holder_routes(client: &Client, config: &Cli) -> Result<HolderRouting, String> {
+    let args = &config.leader;
+    if args.lease.is_none() || (args.signals_services.is_empty() && args.swim_services.is_empty()) {
+        return Ok(HolderRouting::default());
+    }
+    let address = args.pod_ip.ok_or("holder Services are named but POD_IP is not set")?;
+    let pod = args
+        .identity
+        .clone()
+        .ok_or("holder Services are named but GRID_LEADER_IDENTITY is not set")?;
+    let me = operator::holder_route::Me {
+        address,
+        pod,
+        node: args.node_name.clone(),
+    };
+    let ports = holder_ports(config);
+    let routes = |names: &[String]| {
+        (!names.is_empty()).then(|| {
+            Arc::new(operator::holder_route::HolderRoutes::new(
+                client,
+                names.to_vec(),
+                me.clone(),
+                ports.clone(),
+            ))
+        })
+    };
+    Ok(HolderRouting {
+        signals: routes(&args.signals_services),
+        swim: routes(&args.swim_services),
+    })
+}
+
+/// Named target ports, resolved to the listeners this process binds.
+fn holder_ports(config: &Cli) -> BTreeMap<String, i32> {
+    let swim = std::env::var("GRID_SWIM_BIND_ADDR")
+        .ok()
+        .and_then(|bind| bind.parse::<SocketAddr>().ok())
+        .map(|bind| ("swim-udp".to_owned(), i32::from(bind.port())));
+    let signals = config.signals.addr.map_or(9091, |addr| addr.port());
+    std::iter::once(("signals".to_owned(), i32::from(signals)))
+        .chain(swim)
+        .collect()
+}
+
+/// Route the holder's Services to it: SWIM's at once, signals' once it has published or
+/// [`ROUTE_FALLBACK`] has passed, so a site with nothing to publish is still reachable. With
+/// no local signals collected, as under gossip, there is no publish to wait for.
+fn route_to_holder(
+    routes: &HolderRouting,
+    signals: Option<operator::signals::SignalStore>,
+    holding: &operator::leader::Holding,
+) {
+    if let Some(swim) = routes.swim.clone() {
+        let holding = holding.clone();
+        tokio::spawn(async move { swim.route_when(std::future::ready("holding the lease"), holding).await });
+    }
+    if let Some(routed) = routes.signals.clone() {
+        let holding = holding.clone();
+        tokio::spawn(async move {
+            let published = async {
+                let Some(signals) = signals else {
+                    return "no local signals to wait for";
+                };
+                tokio::select! {
+                    () = signals.published() => "signals published",
+                    () = tokio::time::sleep(ROUTE_FALLBACK) => {
+                        tracing::warn!("no signals published in time; routing peers to this holder anyway");
+                        "no signals published in time"
+                    },
+                }
+            };
+            routed.route_when(published, holding).await;
+        });
+    }
+}
+
+/// How long a holder waits for its first signals before peers are routed to it anyway.
+const ROUTE_FALLBACK: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Answer not ready first, so nothing new is routed here, then ask every worker to stop.
 fn begin_stand_down(trigger: &operator::shutdown::Trigger, ready: &Readiness) {
@@ -4575,22 +4832,147 @@ mod tests {
         assert!(settled(&rx).is_none(), "settled without a runtime carries no handle");
     }
 
+    /// An apiserver that routes one holder slice, then never answers again.
+    #[expect(clippy::too_many_lines, reason = "a scripted apiserver, one response per arm")]
+    fn routes_then_hangs() -> Arc<operator::holder_route::HolderRoutes> {
+        let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let seen = answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                let respond = |code: u16, body: serde_json::Value| {
+                    http::Response::builder()
+                        .status(code)
+                        .body(kube::client::Body::from(body.to_string().into_bytes()))
+                        .expect("response")
+                };
+                match seen {
+                    0 => Ok::<_, std::convert::Infallible>(respond(
+                        404,
+                        serde_json::json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}),
+                    )),
+                    1 => Ok(respond(
+                        200,
+                        serde_json::json!({"apiVersion":"v1","kind":"Service","metadata":{"name":"signals","namespace":"grid","uid":"u"},"spec":{"ports":[{"name":"signals","port":9091}]}}),
+                    )),
+                    2 => {
+                        drop(request);
+                        Ok(respond(
+                            200,
+                            serde_json::json!({"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSlice","metadata":{"name":"signals-holder","resourceVersion":"1"},"addressType":"IPv4","endpoints":[]}),
+                        ))
+                    },
+                    _ => std::future::pending().await,
+                }
+            }
+        });
+        let me = operator::holder_route::Me {
+            address: "10.0.0.1".parse().expect("address"),
+            pod: "a".to_owned(),
+            node: None,
+        };
+        Arc::new(operator::holder_route::HolderRoutes::new(
+            &Client::new(service, "grid"),
+            vec!["signals".to_owned()],
+            me,
+            BTreeMap::new(),
+        ))
+    }
+
+    /// Having lost the lease, every writer is told to stop before any slice write, so one that
+    /// hangs cannot keep a writer running past the moment a successor may take over.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_lease_stops_the_writers_before_routing_away() {
+        let routes = routes_then_hangs();
+        let routing = routes.route_when(std::future::ready("test"), operator::leader::Holding::unelected());
+        drop(tokio::time::timeout(std::time::Duration::from_millis(50), routing).await);
+        let (trigger, shutdown) = operator::shutdown::Trigger::new();
+        let ready = Arc::new(Readiness::default());
+        ready.mark_started();
+        let stand_down = StandDown {
+            trigger: Arc::new(trigger),
+            ready: Arc::clone(&ready),
+            routes: HolderRouting {
+                signals: Some(routes),
+                swim: None,
+            },
+        };
+        let standing_down = tokio::spawn(stand_down.begin_lost());
+        let stopped = tokio::time::timeout(std::time::Duration::from_millis(10), shutdown.triggered()).await;
+        assert!(stopped.is_ok(), "the writers are told to stop at once");
+        assert_eq!(ready.status().0, http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!standing_down.is_finished(), "while the slice write still hangs");
+        assert!(
+            operator::leader::RENEW_DEADLINE < operator::leader::LEASE_DURATION,
+            "a lost holder stops before a candidate could take the lease"
+        );
+        standing_down.abort();
+    }
+
+    /// An identity renewal under way holds the lease until it finishes, whether the stand-down
+    /// began on a signal or on a lost lease.
+    #[tokio::test(start_paused = true)]
+    #[expect(clippy::too_many_lines, reason = "one stand-down per path, followed step by step")]
+    async fn a_renewal_under_way_holds_the_lease_release_on_either_path() {
+        for lost in [false, true] {
+            let (trigger, shutdown) = operator::shutdown::Trigger::new();
+            let (writers_done_tx, writers_done) = operator::shutdown::Trigger::new();
+            let (renewal_done_tx, renewal_done) = operator::shutdown::Trigger::new();
+            let (_swim_tx, swim) = tokio::sync::watch::channel(SwimStage::Settled(None));
+            let (left_tx, left) = operator::shutdown::Trigger::new();
+            // The renewal loop with a Secret write in flight: it returns only once the write lands.
+            let (write_lands, landed) = tokio::sync::oneshot::channel::<()>();
+            let renewal_stop = shutdown.clone();
+            let renewal = tokio::spawn(async move {
+                renewal_stop.triggered().await;
+                drop(landed.await);
+                drop(renewal_done_tx);
+            });
+            let standing_down = tokio::spawn(stand_down(shutdown, (writers_done, renewal_done), swim, left_tx));
+            let begin = StandDown {
+                trigger: Arc::new(trigger),
+                ready: Arc::new(Readiness::default()),
+                routes: HolderRouting::default(),
+            };
+            if lost {
+                begin.begin_lost().await;
+            } else {
+                begin.begin().await;
+            }
+            drop(writers_done_tx);
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            assert!(
+                !left.is_triggered(),
+                "lost={lost}: the lease is held while the renewal writes"
+            );
+            let _sent = write_lands.send(());
+            renewal.await.expect("renewal task");
+            tokio::task::yield_now().await;
+            assert!(left.is_triggered(), "lost={lost}: released once the write has landed");
+            tokio::time::advance(SHUTDOWN_GRACE).await;
+            standing_down.await.expect("stand-down task");
+        }
+    }
+
     /// Stand-down cannot start its leave grace until every state writer has stopped.
     #[tokio::test(start_paused = true)]
     async fn stand_down_waits_for_writers_before_the_grace() {
         let (shutdown_tx, shutdown) = operator::shutdown::Trigger::new();
         let (writers_done_tx, writers_done) = operator::shutdown::Trigger::new();
         let (_swim_tx, swim) = tokio::sync::watch::channel(SwimStage::Settled(None));
-        let standing_down = tokio::spawn(stand_down(shutdown, writers_done, swim));
+        let (left_tx, left) = operator::shutdown::Trigger::new();
+        let (_, no_renewal) = operator::shutdown::Trigger::new();
+        let standing_down = tokio::spawn(stand_down(shutdown, (writers_done, no_renewal), swim, left_tx));
 
         shutdown_tx.trigger();
         tokio::time::advance(SHUTDOWN_GRACE * 2).await;
         tokio::task::yield_now().await;
         assert!(!standing_down.is_finished(), "writers hold the leave barrier");
+        assert!(!left.is_triggered(), "the lease stays while a writer may run");
 
         writers_done_tx.trigger();
         tokio::task::yield_now().await;
         assert!(!standing_down.is_finished(), "the grace begins only after writers stop");
+        assert!(left.is_triggered(), "the lease goes before the grace");
         tokio::time::advance(SHUTDOWN_GRACE).await;
         standing_down.await.expect("stand-down task");
     }

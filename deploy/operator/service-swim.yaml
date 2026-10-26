@@ -15,6 +15,3 @@ spec:
       port: 7946
       targetPort: swim-udp
       protocol: UDP
-  selector:
-    app.kubernetes.io/name: grid-operator
-    app.kubernetes.io/instance: grid-operator

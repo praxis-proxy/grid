@@ -105,6 +105,9 @@ relays every site's readings to its own gateway.
 | `grid_site_identity_expiry_timestamp_seconds` | gauge | | When the site identity certificate expires. |
 | `grid_site_identity_rotations_total` | counter | `result` | Site identity rotation attempts. |
 | `grid_swim_key_pending` | gauge | | 1 while SWIM holds traffic for its key. |
+| `grid_operator_lease_held` | gauge | | 1 while this replica holds the operator lease. At most one replica reports 1, and none while no replica holds it. |
+| `grid_operator_routed` | gauge | | 1 while the signals and SWIM Services route to this replica. It drops before the lease is released. |
+| `grid_operator_lease_waiting` | gauge | `reason` | 1 for why this replica is not contending for the lease: `unelected_replica` while a replica of the operator Deployment runs without leader election, `replicas_unreadable` while the replicas cannot be listed. |
 | `grid_swim_key_pending_dropped_total` | counter | | Inbound SWIM packets dropped while the key is pending. |
 
 Certificate expiry is the one to alert on. Renewal starts when a third of the

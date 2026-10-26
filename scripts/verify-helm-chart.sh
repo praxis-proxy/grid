@@ -460,7 +460,8 @@ done
 # Schema rejection
 echo ""
 echo "=== Schema rejection ==="
-try_reject "$CHART_DIR" "replicaCount=2" --set replicaCount=2
+try_reject "$CHART_DIR" "replicaCount=0" --set replicaCount=0
+try_reject "$CHART_DIR" "a budget that blocks node drains" --set replicaCount=2 --set podDisruptionBudget.minAvailable=2
 try_reject "$CHART_DIR" "invalid digest" --set image.digest=invalid
 try_reject "$CHART_DIR" "port zero" --set metrics.service.port=0
 try_reject "$CHART_DIR" "invalid SWIM type" --set swim.service.type=ExternalName

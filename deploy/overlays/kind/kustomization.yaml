@@ -12,7 +12,9 @@ resources:
   - clusterrolebinding-crd.yaml
   - clusterrolebinding-metrics-scraper.yaml
   - deployment.yaml
+  - role-leader-election.yaml
   - role-metrics-scraper-token.yaml
+  - rolebinding-leader-election.yaml
   - rolebinding-metrics-scraper-token.yaml
   - rolebinding-resources-default.yaml
   - rolebinding-resources.yaml

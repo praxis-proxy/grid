@@ -613,33 +613,36 @@ fn renewal_url(url: Option<&str>) -> Result<&str, String> {
     Ok(url)
 }
 
-/// Keep the site identity renewed for the life of the process.
-#[expect(
-    clippy::infinite_loop,
-    reason = "a background renewer runs for the life of the process"
-)]
-pub async fn run(client: Client, mut settings: Settings) {
+/// Keep the site identity renewed until `shutdown`.
+///
+/// A renewal or gateway roll already under way finishes before this returns, so nothing writes
+/// the identity or rolls the gateway once the caller has seen it return.
+pub async fn run(client: Client, mut settings: Settings, shutdown: crate::shutdown::Shutdown) {
     let namespace = client.default_namespace().to_owned();
     let store = KubeIdentity(Api::namespaced(client.clone(), &namespace));
     let renewer = HttpsRenewer::new(&settings.url, settings.pin_path.clone());
     let gateway = settings.gateway_in(&client);
     let mut last: Option<String> = None;
     let mut failures = 0_u32;
-    loop {
-        let target = Box::pin(super::resolve_target(
-            &client,
-            &namespace,
-            &settings.defaults,
-            super::STEP_BACKOFF,
-        ))
-        .await;
+    while !shutdown.is_triggered() {
+        // Resolving the target writes nothing, so a shutdown may cut it short.
+        let target = tokio::select! {
+            biased;
+            () = shutdown.triggered() => return,
+            target = Box::pin(super::resolve_target(&client, &namespace, &settings.defaults, super::STEP_BACKOFF)) => target,
+        };
         let checked = match &target {
             Ok(target) => Box::pin(check_declared(&client, &store, &renewer, target, settings.install)).await,
             Err(e) => Err(RenewError::Kube(e.to_string())),
         };
         roll_after_renewal(&store, gateway.as_ref(), &target, &checked).await;
         let wait = settle(&checked, &mut last, &mut failures);
-        if pause(jittered(wait), &mut settings.trust_changes).await {
+        let trust_changed = tokio::select! {
+            biased;
+            () = shutdown.triggered() => return,
+            changed = pause(jittered(wait), &mut settings.trust_changes) => changed,
+        };
+        if trust_changed {
             renewer.forget_pin();
         }
     }

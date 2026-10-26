@@ -182,9 +182,9 @@ tests:
             name: GRID_SWIM_REQUIRE_KEY
             value: "false"
 
-  - it: replaces the pod instead of surging a second SWIM identity
+  - it: surges a candidate, which runs no SWIM until it holds the lease
     template: templates/deployment.yaml
     asserts:
       - equal:
           path: spec.strategy.type
-          value: Recreate
+          value: RollingUpdate

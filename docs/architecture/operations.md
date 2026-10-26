@@ -427,6 +427,11 @@ unrelated address.
 | `GRID_GATEWAY_NAMESPACE` | Namespace for gateway Service lookup (default: `grid-system`) |
 | `GRID_GATEWAY_PORT` | Optional port override appended to the discovered address. When unset, use the first Service `spec.ports` entry; fall back to `8080` if no usable port exists |
 | `GRID_GATEWAY_DISCOVERY_INTERVAL_MS` | Polling interval for gateway discovery (default: `5000`) |
+| `GRID_LEADER_LEASE` | `Lease` in the operator namespace that the writing replica holds. Unset, the operator writes unelected |
+| `GRID_LEADER_IDENTITY` | This replica's holder identity; the chart sets the pod name |
+| `GRID_LEADER_SIGNALS_SERVICES` | Services carrying signals that route to the holder alone, comma separated |
+| `GRID_LEADER_SWIM_SERVICES` | Services carrying SWIM that route to the holder alone, comma separated |
+| `GRID_NODE_NAME` | The node this pod runs on, written on the holder's endpoint for a `Local` traffic policy |
 
 Gateway port discovery reads only the gateway Service's `spec.ports`; Pod health
 probes and metrics endpoints are not used for this selection.
@@ -441,6 +446,43 @@ address, and they share its cap.
 `GridNetwork.spec.tls.swimKeySecretRef` to reference a
 Kubernetes `Secret`.  The env var exists for local
 development and testing only.
+
+### Replicas and leader election
+
+Every replica is ready and they contend for one `Lease` named for the release,
+at one replica too. Only the holder enrolls, runs SWIM and the controllers,
+writes status and the serving config, renews the site identity, and serves and
+polls signals. The signals and SWIM Services have no selector. The holder writes
+their `<service>-holder` `EndpointSlice`, so peers reach only the holder.
+
+| Setting | Value |
+|---|---|
+| Lease duration | 10 s |
+| Renew interval | 5 s |
+| Renew deadline | 8 s |
+| Candidate retry | 1 s |
+
+- **Graceful handover.** The holder clears its slices, stops its writers, leaves
+  SWIM and releases the lease. A candidate takes over about 1 s later.
+- **Lost holder.** Replaced about 11 s after its last renewal.
+- **Lost lease.** The operator exits and contends again on restart.
+- **Lost identity.** An operator whose site identity Secret is gone re-enrolls within
+  about 30 s once an admin adds an invite for the site. No rollout is needed: the
+  holder stands down by itself and enrolls as its container restarts.
+- Load balancers add their own target update time on top.
+
+From a release before leader election, upgrade at the same `replicaCount` first,
+then scale: raising it in the same upgrade scales the old, unelected pods too.
+That first upgrade leaves the signals and SWIM Services briefly without an
+endpoint, from the old pod's exit until the new holder publishes and writes its
+slices. After that, scaling is safe in one step. A candidate does not contend
+while any unelected operator pod exists, or while it cannot list pods.
+`grid_operator_lease_waiting` shows why this replica is not contending.
+
+The rollout surges one pod at a time at every replica count, and above one
+replica a `PodDisruptionBudget` keeps one up. No preStop delay is needed. `grid_operator_lease_held` and
+`grid_operator_routed` show which replica holds the lease and which one the
+Services reach.
 
 ### Validate the install
 
