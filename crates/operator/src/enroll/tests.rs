@@ -206,6 +206,8 @@ struct FakeStore {
     create_calls: Mutex<u32>,
     /// Attempts at a dry-run write, so a retry is countable.
     check_calls: Mutex<u32>,
+    /// Every read fails, as a refused or timed-out apiserver read does.
+    reads_fail: bool,
 }
 
 impl FakeStore {
@@ -252,10 +254,16 @@ impl FakeStore {
 
 impl Store for FakeStore {
     async fn exists(&self, name: &str) -> Result<bool, EnrollError> {
+        if self.reads_fail {
+            return Err(EnrollError::Kube(format!("reading Secret {name}: forbidden")));
+        }
         Ok(self.secrets.lock().expect("lock").contains_key(name))
     }
 
     async fn get(&self, name: &str) -> Result<Option<Secret>, EnrollError> {
+        if self.reads_fail {
+            return Err(EnrollError::Kube(format!("reading Secret {name}: forbidden")));
+        }
         self.reads.lock().expect("lock").push(name.to_owned());
         Ok(self.secrets.lock().expect("lock").get(name).cloned())
     }
@@ -860,4 +868,54 @@ fn the_schedule_has_no_attempt_limit() {
     // A retryable failure must never run out of attempts: the delay keeps
     // coming back capped rather than the caller giving up.
     assert!((60..=66).contains(&STEP_BACKOFF.delay(u32::MAX).as_secs()));
+}
+
+/// A site whose identity is definitely gone, with an invite minted for it, restarts to enroll;
+/// anything less certain decides nothing.
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "one case per standing")]
+async fn a_lost_identity_restarts_only_on_a_definite_absence_and_an_invite_for_this_site() {
+    let settings = Mock::new(Reply::Sign).settings(1);
+    let site_secret = target().site_secret;
+    let gone_invited = FakeStore::invited();
+    gone_invited.label(TOKEN_SECRET, SITE_LABEL, SITE);
+    assert!(
+        identity_lost(&gone_invited, &site_secret, &settings).await,
+        "gone, and invited"
+    );
+
+    let gone_uninvited = FakeStore::default();
+    assert!(
+        !identity_lost(&gone_uninvited, &site_secret, &settings).await,
+        "no invite"
+    );
+
+    let unlabelled = FakeStore::invited();
+    assert!(
+        !identity_lost(&unlabelled, &site_secret, &settings).await,
+        "an invite not labelled for this site"
+    );
+    let other_site = FakeStore::invited();
+    other_site.label(TOKEN_SECRET, SITE_LABEL, "site-e");
+    assert!(
+        !identity_lost(&other_site, &site_secret, &settings).await,
+        "an invite for another site"
+    );
+
+    let present = FakeStore::invited();
+    present.label(TOKEN_SECRET, SITE_LABEL, SITE);
+    present.put(&site_secret, "tls.crt", "cert");
+    assert!(
+        !identity_lost(&present, &site_secret, &settings).await,
+        "the identity is present"
+    );
+
+    let unreadable = FakeStore {
+        reads_fail: true,
+        ..FakeStore::default()
+    };
+    assert!(
+        !identity_lost(&unreadable, &site_secret, &settings).await,
+        "a failed read is not an absence"
+    );
 }

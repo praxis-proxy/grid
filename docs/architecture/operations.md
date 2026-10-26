@@ -466,6 +466,9 @@ their `<service>-holder` `EndpointSlice`, so peers reach only the holder.
   SWIM and releases the lease. A candidate takes over about 1 s later.
 - **Lost holder.** Replaced about 11 s after its last renewal.
 - **Lost lease.** The operator exits and contends again on restart.
+- **Lost identity.** An operator whose site identity Secret is gone re-enrolls within
+  about 30 s once an admin adds an invite for the site. No rollout is needed: the
+  holder stands down by itself and enrolls as its container restarts.
 - Load balancers add their own target update time on top.
 
 From a release before leader election, upgrade at the same `replicaCount` first,

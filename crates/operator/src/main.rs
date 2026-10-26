@@ -177,6 +177,18 @@ async fn main() {
             tracing::error!(%error, "site enrollment failed");
             std::process::exit(1);
         }
+        // Enrolling runs only at start: a site that loses its identity, with an invite to
+        // enroll again, stands down so its restart enrolls, rather than run on unidentified.
+        let stand_down = StandDown {
+            trigger: Arc::clone(&trigger),
+            ready: Arc::clone(&ready),
+            routes: routes.clone(),
+        };
+        let (watching, enrollment) = (client.clone(), config.enrollment.clone());
+        tokio::spawn(async move {
+            operator::enroll::lost_identity_with_invite(&watching, &enrollment).await;
+            stand_down.begin().await;
+        });
     }
     // The identity names the site, and without one the site idles.
     let SiteIdentity {
