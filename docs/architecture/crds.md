@@ -751,6 +751,11 @@ status:
 The operator writes `Connected` and the roll-up beside the phase, which stays for
 v1alpha1 readers. `Connected` is the only gate.
 
+A peer's `GridSite` is a local object, and its conditions record what this site
+observes of that peer. Status is never shared between sites, so two sites can
+disagree about one peer during a partition. The peer's own health is in its own
+`GridSite` and its signals.
+
 | Status | Reason | When |
 |---|---|---|
 | `True` | `Connected` | The TLS handshake verified the chain, identity and pin. |
