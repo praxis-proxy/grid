@@ -43,10 +43,10 @@ crds:
   # -- Keep the CRDs on helm uninstall and an Argo CD delete or prune.
   keep: true
 
-# -- Number of operator replicas. Above 1 the operator runs highly available: every
-# replica is ready, one holds the operator lease and runs everything that writes, and the
-# signals and SWIM Services route to it alone through an EndpointSlice it writes. At 1 the
-# install is unelected and unchanged.
+# -- Number of operator replicas. Every replica is ready and elects: one holds the operator
+# lease and runs everything that writes, and the signals and SWIM Services route to it alone
+# through an EndpointSlice it writes. From a release before leader election, upgrade at the
+# same replicaCount first, then scale.
 replicaCount: 1
 
 # -- PodDisruptionBudget for the operator pods. The render fails for a budget that would

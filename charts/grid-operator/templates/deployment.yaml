@@ -12,19 +12,13 @@ metadata:
     {{- include "grid-operator.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
-  {{- if include "grid-operator.ha" . }}
   {{- /* Only the lease holder writes or gossips, and every replica is ready, so a surge pod
-  waits as a candidate while the old ones hand over. */}}
+  waits as a candidate while the old one hands over. */}}
   strategy:
     type: RollingUpdate
     rollingUpdate:
       maxSurge: 1
       maxUnavailable: 0
-  {{- else }}
-  # One SWIM identity per site: a surge pod would gossip a second one.
-  strategy:
-    type: Recreate
-  {{- end }}
   selector:
     matchLabels:
       {{- include "grid-operator.selectorLabels" . | nindent 6 }}
@@ -83,7 +77,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            {{- if include "grid-operator.ha" . }}
             - name: GRID_LEADER_LEASE
               value: {{ include "grid-operator.fullname" . | quote }}
             - name: GRID_LEADER_IDENTITY
@@ -104,7 +97,6 @@ spec:
             {{- with include "grid-operator.holderSwimServices" . }}
             - name: GRID_LEADER_SWIM_SERVICES
               value: {{ . | quote }}
-            {{- end }}
             {{- end }}
             - name: GRID_SWIM_BIND_ADDR
               value: {{ .Values.swim.bindAddress | quote }}

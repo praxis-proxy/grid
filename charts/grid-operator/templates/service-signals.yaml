@@ -36,9 +36,5 @@ spec:
       port: {{ .Values.signals.port }}
       targetPort: signals
       protocol: TCP
-  {{- if not (include "grid-operator.ha" .) }}
-  selector:
-    {{- include "grid-operator.selectorLabels" . | nindent 4 }}
-  {{- end }}
-  {{- /* Under HA every replica is ready, and the lease holder writes this Service's EndpointSlice. */}}
+  {{- /* Every replica is ready, so no selector: the lease holder writes this Service's EndpointSlice. */}}
 {{- end }}

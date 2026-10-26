@@ -373,13 +373,6 @@ A PodDisruptionBudget bound as YAML: a percentage quoted, a count as a number.
 {{- end }}
 
 {{/*
-"true" when the operator runs highly available: more than one replica, one elected to write.
-*/}}
-{{- define "grid-operator.ha" -}}
-{{- if gt (int .Values.replicaCount) 1 }}true{{ end }}
-{{- end }}
-
-{{/*
 The preStop delay: as set, else none. Under HA the holder withdraws its own EndpointSlices, so
 no selector Service waits on readiness for peers.
 */}}

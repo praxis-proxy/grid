@@ -1,4 +1,4 @@
-{{- if and .Values.rbac.create (include "grid-operator.ha" .) }}
+{{- if .Values.rbac.create }}
 {{- $fullname := include "grid-operator.fullname" . }}
 {{- $services := compact (list (include "grid-operator.holderSignalsServices" .) (include "grid-operator.holderSwimServices" .)) }}
 # The operator lease and the holder's EndpointSlices. Create cannot be limited to a name.

@@ -449,10 +449,8 @@ development and testing only.
 
 ### Replicas and leader election
 
-At `replicaCount` 1 the operator runs unelected and renders as before.
-
-Above one replica, every replica is ready and they contend for one `Lease`
-named for the release. Only the holder enrolls, runs SWIM and the controllers,
+Every replica is ready and they contend for one `Lease` named for the release,
+at one replica too. Only the holder enrolls, runs SWIM and the controllers,
 writes status and the serving config, renews the site identity, and serves and
 polls signals. The signals and SWIM Services have no selector. The holder writes
 their `<service>-holder` `EndpointSlice`, so peers reach only the holder.
@@ -470,12 +468,14 @@ their `<service>-holder` `EndpointSlice`, so peers reach only the holder.
 - **Lost lease.** The operator exits and contends again on restart.
 - Load balancers add their own target update time on top.
 
-Scaling from 1 replica to more is safe in one step. A candidate does not contend
-while any unelected operator pod exists, or while it cannot list pods.
+From a release before leader election, upgrade at the same `replicaCount` first,
+then scale: raising it in the same upgrade scales the old, unelected pods too.
+After that, scaling is safe in one step. A candidate does not contend while any
+unelected operator pod exists, or while it cannot list pods.
 `grid_operator_lease_waiting` shows why no replica holds the lease.
 
-The rollout surges one pod at a time, and a `PodDisruptionBudget` keeps one
-replica up. No preStop delay is needed. `grid_operator_lease_held` and
+The rollout surges one pod at a time at every replica count, and above one
+replica a `PodDisruptionBudget` keeps one up. No preStop delay is needed. `grid_operator_lease_held` and
 `grid_operator_routed` show which replica holds the lease and which one the
 Services reach.
 

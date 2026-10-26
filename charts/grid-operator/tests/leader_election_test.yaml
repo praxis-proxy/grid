@@ -9,37 +9,39 @@ release:
   name: grid
   namespace: grid-system
 tests:
-  - it: elects nothing at one replica
+  - it: elects at one replica too, so a later scale is safe
     template: templates/deployment.yaml
     asserts:
-      - notContains:
+      - contains:
           path: spec.template.spec.containers[0].env
           content: { name: GRID_LEADER_LEASE, value: grid-grid-operator }
       - equal:
           path: spec.strategy
-          value: { type: Recreate }
+          value:
+            type: RollingUpdate
+            rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
       - notExists:
           path: spec.template.spec.containers[0].lifecycle
       - notExists:
           path: spec.template.spec.terminationGracePeriodSeconds
 
-  - it: grants no lease or slice access at one replica
+  - it: grants lease access at one replica
     template: templates/role-leader-election.yaml
     asserts:
       - hasDocuments:
-          count: 0
+          count: 2
 
-  - it: keeps the Service selectors at one replica
+  - it: drops the signals selector at one replica, since the holder writes its endpoints
     template: templates/service-signals.yaml
     set:
       signals.enabled: true
       signals.service.enabled: true
       swim.service.enabled: true
     asserts:
-      - exists:
+      - notExists:
           path: spec.selector
 
-  - it: names the lease, the pod, its node and the holder Services above one replica
+  - it: names the lease, the pod, its node and the holder Services
     template: templates/deployment.yaml
     set:
       replicaCount: 2
@@ -76,22 +78,6 @@ tests:
           value:
             app.kubernetes.io/name: grid-operator
             app.kubernetes.io/instance: grid
-        documentIndex: 0
-
-  - it: renders, at one replica, the operator container the guard judges unelected
-    template: templates/deployment.yaml
-    asserts:
-      - equal:
-          path: spec.template.spec.containers[0].name
-          value: operator
-      - notContains:
-          path: spec.template.spec.containers[0].env
-          content: { name: GRID_LEADER_LEASE, value: grid-grid-operator }
-      - notContains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: GRID_LEADER_REPLICA_SELECTOR
-            value: app.kubernetes.io/name=grid-operator,app.kubernetes.io/instance=grid
 
   - it: lets the holder take its lease and write only its own slices
     template: templates/role-leader-election.yaml
@@ -144,17 +130,6 @@ tests:
     asserts:
       - hasDocuments:
           count: 0
-
-  - it: drops the signals selector above one replica, since the holder writes its endpoints
-    template: templates/service-signals.yaml
-    set:
-      replicaCount: 2
-      signals.enabled: true
-      signals.service.enabled: true
-      swim.service.enabled: true
-    asserts:
-      - notExists:
-          path: spec.selector
 
   - it: drops the SWIM selector above one replica
     template: templates/service-swim.yaml

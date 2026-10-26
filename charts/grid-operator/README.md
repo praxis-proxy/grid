@@ -87,8 +87,8 @@ annotation, which `crds.keep` set at that time.
 
 ### Grid SWIM and signals
 
-- The Deployment uses the Recreate strategy, so an upgrade stops the old pod
-  before the new one starts. Two pods would gossip two identities for one site.
+- Every replica elects, and only the lease holder runs SWIM, so a rollout surges a
+  candidate without gossiping a second identity for the site.
 - With a LoadBalancer SWIM Service the operator waits for its address and never
   falls back to the Pod IP. `GRID_SWIM_ADVERTISE_ADDR` still carries the Pod IP
   for an older binary.
@@ -159,7 +159,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `grid.providers` | object | `{}` | InferenceProviders this site serves, keyed by name. `model` defaults to the name, `providerKind` to `vllm`, `backendKind` to `local_model`. |
 | `rbac.enrollmentNamespace` | string | `""` | The grid-enrollment namespace. The render fails if the operator would get Secret access there. |
 | `rbac.metricsScraper` | bool | `true` | Create the metrics scraper ServiceAccount, allowed only GET on the nonResourceURL /metrics, and let the operator mint short-lived tokens for it. An llm-d EPP serving bearer-authenticated metrics (the default) admits a scrape with that token (metricsConfig.auth type serviceAccountToken). The operator never sends its own token. |
-| `replicaCount` | int | `1` | Operator replicas. Above 1 the operator runs highly available: one replica holds the operator lease and writes, every replica is ready, and the signals and SWIM Services route to the holder through an EndpointSlice it writes. At 1 nothing changes, and the operator is unelected: scaling it past 1 outside Helm, such as with `kubectl scale`, runs unelected writers, as before. Scale through `replicaCount`. |
+| `replicaCount` | int | `1` | Operator replicas. Every replica is ready and elects: one holds the operator lease and writes, and the signals and SWIM Services route to it alone through an EndpointSlice it writes. From a release before leader election, upgrade at the same replicaCount first, then scale. |
 | `podDisruptionBudget.enabled` | string or bool | `auto` | `auto` renders a PodDisruptionBudget when `replicaCount` is above 1; `true` or `false` forces it. |
 | `podDisruptionBudget.minAvailable` | int or string | `1` | Pods that must stay up. Set this or `maxUnavailable`. The render fails for a budget that would block every node drain. |
 | `podDisruptionBudget.maxUnavailable` | int or string | `""` | Pods that may be down at once. Set this or `minAvailable`. |
