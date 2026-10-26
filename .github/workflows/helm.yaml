@@ -577,6 +577,9 @@ jobs:
           - peer-trust-mode: spiffe
             hub-router: operator
             leg: spiffe, operator gridSiteRoute
+          - peer-trust-mode: pin
+            ha: "1"
+            leg: pin, HA faults
     timeout-minutes: 60
     permissions:
       contents: read
@@ -630,10 +633,15 @@ jobs:
             docker load -i "/tmp/images/grid-${name}.tar"
           done
 
+      - name: Check the HA verdicts against synthetic logs
+        if: matrix.ha
+        run: ./scripts/e2e-hub-site.sh selftest
+
       - name: Run hub and site e2e (${{ matrix.leg }})
         env:
           MODES: ${{ matrix.peer-trust-mode }}
           HUB_ROUTER: ${{ matrix.hub-router || 'render' }}
+          HA: ${{ matrix.ha || '0' }}
           GRID_FEEDBACK_CONTRACT_TEST: ${{ matrix.peer-trust-mode == 'pin' && '1' || '0' }}
           # The spiffe leg rotates 8 minute identities; pin trust does not rotate.
           ROTATION_LIFETIME: "480"
@@ -647,7 +655,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: hub-site-e2e-logs-${{ matrix.peer-trust-mode }}${{ matrix.hub-router && format('-{0}', matrix.hub-router) || '' }}
+          name: hub-site-e2e-logs-${{ matrix.peer-trust-mode }}${{ matrix.hub-router && format('-{0}', matrix.hub-router) || '' }}${{ matrix.ha && '-ha' || '' }}
           path: /tmp/grid-hub-site-e2e/
           if-no-files-found: ignore
           retention-days: 5
