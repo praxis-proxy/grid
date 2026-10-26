@@ -26,7 +26,8 @@ spec:
     {{- $ranges | nindent 4 }}
   {{- end }}
   {{- end }}
-  {{- if .Values.signals.service.externalTrafficPolicy }}
+  {{- /* The API server refuses an external traffic policy on a ClusterIP Service. */}}
+  {{- if and (ne $type "ClusterIP") .Values.signals.service.externalTrafficPolicy }}
   externalTrafficPolicy: {{ .Values.signals.service.externalTrafficPolicy | quote }}
   {{- else if eq $type "LoadBalancer" }}
   externalTrafficPolicy: "Local"

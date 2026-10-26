@@ -457,7 +457,7 @@ tests:
       - failedTemplate:
           errorPattern: signals.service.externalTrafficPolicy Local
 
-  - it: accepts a Cluster policy on a ClusterIP signals Service
+  - it: accepts a Cluster policy on a ClusterIP signals Service, and renders none, which the API server would refuse
     template: templates/service-signals.yaml
     set:
       signals.enabled: true
@@ -468,3 +468,5 @@ tests:
     asserts:
       - hasDocuments:
           count: 1
+      - notExists:
+          path: spec.externalTrafficPolicy

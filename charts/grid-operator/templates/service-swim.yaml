@@ -23,7 +23,8 @@ spec:
     {{- $ranges | nindent 4 }}
   {{- end }}
   {{- end }}
-  {{- if .Values.swim.service.externalTrafficPolicy }}
+  {{- /* The API server refuses an external traffic policy on a ClusterIP Service. */}}
+  {{- if and (ne .Values.swim.service.type "ClusterIP") .Values.swim.service.externalTrafficPolicy }}
   externalTrafficPolicy: {{ .Values.swim.service.externalTrafficPolicy | quote }}
   {{- else if eq .Values.swim.service.type "LoadBalancer" }}
   externalTrafficPolicy: "Local"
