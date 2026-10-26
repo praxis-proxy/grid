@@ -590,8 +590,13 @@ fn add_tls_config_legacy_fields(schema: &mut schemars::Schema) {
     status = "GridNetworkStatus",
     namespaced = false,
     printcolumn = r#"{"name":"Grid ID","type":"string","jsonPath":".status.gridId"}"#,
-    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
-    printcolumn = r#"{"name":"Sites","type":"integer","jsonPath":".status.connectedSites"}"#
+    printcolumn = r#"{"name":"Sites","type":"integer","jsonPath":".status.connectedSites"}"#,
+    printcolumn = r#"{"name":"Available","type":"string","jsonPath":".status.conditions[?(@.type==\"Available\")].status"}"#,
+    printcolumn = r#"{"name":"Progressing","type":"string","jsonPath":".status.conditions[?(@.type==\"Progressing\")].status"}"#,
+    printcolumn = r#"{"name":"Degraded","type":"string","jsonPath":".status.conditions[?(@.type==\"Degraded\")].status"}"#,
+    printcolumn = r#"{"name":"Since","type":"date","jsonPath":".status.conditions[?(@.type==\"Available\")].lastTransitionTime"}"#,
+    printcolumn = r#"{"name":"Message","type":"string","jsonPath":".status.conditions[?(@.type==\"Available\")].message","priority":1}"#,
+    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase","priority":1}"#
 )]
 #[schemars(extend("x-kubernetes-validations" = [{
     "rule": "has(self.placementPolicy) == (has(self.selectionPolicy) && self.selectionPolicy.mode == 'weightedRandom')",

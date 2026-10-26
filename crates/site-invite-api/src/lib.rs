@@ -14,8 +14,12 @@ use serde::{Deserialize, Serialize};
     status = "SiteInviteStatus",
     namespaced = false,
     printcolumn = r#"{"name":"Site","type":"string","jsonPath":".spec.siteName"}"#,
-    printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type=='Ready')].status"}"#,
-    printcolumn = r#"{"name":"Expires","type":"date","jsonPath":".status.expiresAt"}"#
+    printcolumn = r#"{"name":"Expires","type":"date","jsonPath":".status.expiresAt"}"#,
+    printcolumn = r#"{"name":"Available","type":"string","jsonPath":".status.conditions[?(@.type=='Available')].status"}"#,
+    printcolumn = r#"{"name":"Progressing","type":"string","jsonPath":".status.conditions[?(@.type=='Progressing')].status"}"#,
+    printcolumn = r#"{"name":"Degraded","type":"string","jsonPath":".status.conditions[?(@.type=='Degraded')].status"}"#,
+    printcolumn = r#"{"name":"Since","type":"date","jsonPath":".status.conditions[?(@.type=='Available')].lastTransitionTime"}"#,
+    printcolumn = r#"{"name":"Message","type":"string","jsonPath":".status.conditions[?(@.type=='Available')].message","priority":1}"#
 )]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(extend("x-kubernetes-validations" = [{

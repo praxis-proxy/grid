@@ -24,12 +24,29 @@ spec:
         - jsonPath: .status.gridId
           name: Grid ID
           type: string
-        - jsonPath: .status.phase
-          name: Phase
-          type: string
         - jsonPath: .status.connectedSites
           name: Sites
           type: integer
+        - jsonPath: .status.conditions[?(@.type=="Available")].status
+          name: Available
+          type: string
+        - jsonPath: .status.conditions[?(@.type=="Progressing")].status
+          name: Progressing
+          type: string
+        - jsonPath: .status.conditions[?(@.type=="Degraded")].status
+          name: Degraded
+          type: string
+        - jsonPath: .status.conditions[?(@.type=="Available")].lastTransitionTime
+          name: Since
+          type: date
+        - jsonPath: .status.conditions[?(@.type=="Available")].message
+          name: Message
+          priority: 1
+          type: string
+        - jsonPath: .status.phase
+          name: Phase
+          priority: 1
+          type: string
       name: v1alpha1
       schema:
         openAPIV3Schema:

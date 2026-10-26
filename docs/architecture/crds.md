@@ -592,7 +592,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 **Metrics:** `grid_site_phase{site,phase}` reports each `GridSite`'s phase as a state
 set, the shape of kube-state-metrics' `kube_pod_status_phase`. The series for the
 current phase is 1 and the other five are 0, so a site is ready when
-`grid_site_phase{phase="Active"} == 1`. It follows the phase the printer column shows,
+`grid_site_phase{phase="Active"} == 1`. It follows the phase the wide PHASE column shows,
 updates on every `GridNetwork` reconcile, and drops a site's series once its `GridSite`
 is gone. Cardinality is six series per site. `grid_site_phase_transition_total`
 still counts the transitions by phase and reason.
@@ -821,13 +821,14 @@ A provider whose `Ready` is `False` is excluded from routing: its site publishes
 `grid_provider_ready 0`, and its serving config entry carries `admission: none`.
 See [Polling Cross-Site Load Signals](polling-metrics.md#provider-readiness).
 
-The READY column reads the condition's status directly, so no status field
-repeats it. `-o wide` adds REASON, the condition's reason, and PHASE.
+Every kind prints the same status columns: AVAILABLE, PROGRESSING and DEGRADED
+read those conditions, and SINCE is when Available last changed. `-o wide` adds
+MESSAGE, the Available message, then READY and PHASE, kept while v1alpha1 has them.
 
 ```text
-NAME           PROVIDER      READY   AGE
-qwen3-site-a   self_hosted   True    3d
-qwen3-site-b   self_hosted   False   3d
+NAME           PROVIDER      AVAILABLE   PROGRESSING   DEGRADED   SINCE   AGE
+qwen3-site-a   self_hosted   True        False         False      3d      3d
+qwen3-site-b   self_hosted   False       False         False      2m      3d
 ```
 
 `spec.capacityWeight` is an optional positive relative provider capacity from

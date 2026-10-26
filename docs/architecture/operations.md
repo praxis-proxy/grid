@@ -1084,17 +1084,17 @@ fallback when Mutual TLS configuration is incomplete or invalid.
 
 ## GridSite Lifecycle Diagnostics
 
-Use `kubectl get gridsites` to inspect current lifecycle phases:
+Use `kubectl get gridsites -o wide` to inspect current lifecycle phases:
 
 ```console
-kubectl get gridsites
+kubectl get gridsites -o wide
 ```
 
 Example output:
 
 ```
-NAME                              PHASE        NETWORK
-op-e2e-sjd-net-grid-site-b       Connecting   op-e2e-sjd-net
+NAME                         NETWORK          AVAILABLE   PROGRESSING   DEGRADED   SINCE   MESSAGE   PHASE
+op-e2e-sjd-net-grid-site-b   op-e2e-sjd-net   Unknown     True          False      5s                Connecting
 ```
 
 To see the reason and diagnostic message:

@@ -26,7 +26,7 @@ use super::{
     status = "AgentToolProviderStatus",
     namespaced = false,
     printcolumn = r#"{"name":"Protocol","type":"string","jsonPath":".spec.protocol"}"#,
-    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#
+    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase","priority":1}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct AgentToolProviderSpec {
