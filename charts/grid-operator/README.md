@@ -162,7 +162,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `replicaCount` | int | `1` | Operator replicas. Every replica is ready and elects: one holds the operator lease and writes, and the signals and SWIM Services route to it alone through an EndpointSlice it writes. From a release before leader election, upgrade at the same replicaCount first, then scale. |
 | `podDisruptionBudget.enabled` | string or bool | `auto` | `auto` renders a PodDisruptionBudget when `replicaCount` is above 1; `true` or `false` forces it. |
 | `podDisruptionBudget.minAvailable` | int or string | `1` | Pods that must stay up. Set this or `maxUnavailable`. The render fails for a budget that would block every node drain. |
-| `podDisruptionBudget.maxUnavailable` | int or string | `""` | Pods that may be down at once. Set this or `minAvailable`. |
+| `podDisruptionBudget.maxUnavailable` | int or string | `""` | Pods that may be down at once. Set this or `minAvailable`: to use it, set `minAvailable` to null. |
 | `shutdownDelaySeconds` | int | `null` | preStop sleep before the operator stands down. Empty: none. Above one replica the holder withdraws its own signals and SWIM endpoints, so only the metrics Service follows readiness, and a restart may miss one metrics scrape. |
 | `terminationGracePeriodSeconds` | int | `null` | Empty: 30 plus `shutdownDelaySeconds` when there is a delay, else the Kubernetes default. Must cover 20 plus `shutdownDelaySeconds`. |
 | `image.repository` | string | `ghcr.io/praxis-proxy/grid-operator` | Image repository. |

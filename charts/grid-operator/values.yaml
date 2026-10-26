@@ -56,7 +56,8 @@ podDisruptionBudget:
   enabled: auto
   # -- Pods that must stay up, a count or a percentage. Set this or maxUnavailable.
   minAvailable: 1
-  # -- Pods that may be down at once, a count or a percentage. Set this or minAvailable.
+  # -- Pods that may be down at once, a count or a percentage. Set this or minAvailable:
+  # to use it, set minAvailable to null.
   maxUnavailable: ""
 
 # -- Seconds the pod keeps serving after it is asked to stop, so a selector Service drops its
