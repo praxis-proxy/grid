@@ -23,7 +23,8 @@ spec:
     {{- $ranges | nindent 4 }}
   {{- end }}
   {{- end }}
-  {{- if .Values.swim.service.externalTrafficPolicy }}
+  {{- /* The API server refuses an external traffic policy on a ClusterIP Service. */}}
+  {{- if and (ne .Values.swim.service.type "ClusterIP") .Values.swim.service.externalTrafficPolicy }}
   externalTrafficPolicy: {{ .Values.swim.service.externalTrafficPolicy | quote }}
   {{- else if eq .Values.swim.service.type "LoadBalancer" }}
   externalTrafficPolicy: "Local"
@@ -37,6 +38,5 @@ spec:
       port: {{ .Values.swim.service.port }}
       targetPort: swim-udp
       protocol: UDP
-  selector:
-    {{- include "grid-operator.selectorLabels" . | nindent 4 }}
+  {{- /* Every replica is ready, so no selector: the lease holder writes this Service's EndpointSlice. */}}
 {{- end }}

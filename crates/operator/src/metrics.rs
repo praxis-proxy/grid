@@ -61,6 +61,12 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SWIM_KEY_PENDING.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(LEASE_HELD.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(ROUTED.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(LEASE_WAITING.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SWIM_PENDING_DROPS.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SIGNALS_SHED.clone()))
@@ -174,6 +180,36 @@ static SITE_IDENTITY_RENEWALS: LazyLock<IntCounterVec> = LazyLock::new(|| {
 static SWIM_KEY_PENDING: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new("grid_swim_key_pending", "1 while SWIM holds traffic for its key")
         .unwrap_or_else(|_| std::process::abort())
+});
+
+/// 1 while this replica holds the operator lease.
+static LEASE_HELD: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "grid_operator_lease_held",
+        "1 while this replica holds the operator lease",
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// 1 while this replica's address is the endpoint of the Services peers reach the holder on.
+static ROUTED: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "grid_operator_routed",
+        "1 while the holder-only Services route to this replica",
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// 1 for the reason a candidate is not contending for the lease, while it is not.
+static LEASE_WAITING: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "grid_operator_lease_waiting",
+            "1 for the reason this replica is not contending for the operator lease",
+        ),
+        &["reason"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
 });
 
 /// Inbound SWIM packets dropped while the key is pending.
@@ -596,6 +632,25 @@ pub(crate) fn set_peer_collection_up(peer: &str, up: bool, at: std::time::System
 /// Move the in-flight count, so the worker pool's saturation is visible.
 pub(crate) fn peer_polls_in_flight(delta: i64) {
     PEER_POLLS_IN_FLIGHT.add(delta);
+}
+
+/// Set whether this replica holds the operator lease.
+pub(crate) fn set_lease_held(held: bool) {
+    LEASE_HELD.set(i64::from(held));
+}
+
+/// Report why this replica is not contending for the lease, or that it is.
+pub(crate) fn set_lease_waiting(reason: Option<&str>) {
+    for known in ["unelected_replica", "replicas_unreadable"] {
+        LEASE_WAITING
+            .with_label_values(&[known])
+            .set(i64::from(reason == Some(known)));
+    }
+}
+
+/// Set whether the holder-only Services route to this replica.
+pub(crate) fn set_routed(routed: bool) {
+    ROUTED.set(i64::from(routed));
 }
 
 /// Set whether SWIM is holding traffic for its key.

@@ -3,6 +3,7 @@
 {{- include "grid-operator.enrollment.validate" . }}
 {{- include "grid-operator.validateSignals" . }}
 {{- include "grid-operator.metricsTls.validate" . }}
+{{- include "grid-operator.pdb.validate" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -11,9 +12,13 @@ metadata:
     {{- include "grid-operator.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
-  # One SWIM identity per site: a surge pod would gossip a second one.
+  {{- /* Only the lease holder writes or gossips, and every replica is ready, so a surge pod
+  waits as a candidate while the old one hands over. */}}
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       {{- include "grid-operator.selectorLabels" . | nindent 6 }}
@@ -28,6 +33,17 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      {{- $delay := int (include "grid-operator.shutdownDelaySeconds" .) }}
+      {{- $grace := .Values.terminationGracePeriodSeconds }}
+      {{- if not (kindIs "invalid" $grace) }}
+      {{- if lt (int $grace) (add 20 $delay) }}
+      {{- fail (printf "terminationGracePeriodSeconds must be at least %d: the operator stands down for up to 20 seconds after the %d second shutdownDelaySeconds" (add 20 $delay) $delay) }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ $grace }}
+      {{- else if $delay }}
+      {{- /* The preStop delay comes out of the grace period, so add it on top of the stand-down. */}}
+      terminationGracePeriodSeconds: {{ add 30 $delay }}
+      {{- end }}
       serviceAccountName: {{ include "grid-operator.serviceAccountName" . }}
       # Service link env vars (a grid-gateway Service injects GRID_GATEWAY_PORT)
       # would collide with the operator's GRID_* settings.
@@ -61,6 +77,27 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: GRID_LEADER_LEASE
+              value: {{ include "grid-operator.fullname" . | quote }}
+            - name: GRID_LEADER_IDENTITY
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: GRID_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- /* A pod this matches without GRID_LEADER_LEASE runs unelected, so no candidate contends beside it. */}}
+            - name: GRID_LEADER_REPLICA_SELECTOR
+              value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s" (include "grid-operator.name" .) .Release.Name | quote }}
+            {{- with include "grid-operator.holderSignalsServices" . }}
+            - name: GRID_LEADER_SIGNALS_SERVICES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with include "grid-operator.holderSwimServices" . }}
+            - name: GRID_LEADER_SWIM_SERVICES
+              value: {{ . | quote }}
+            {{- end }}
             - name: GRID_SWIM_BIND_ADDR
               value: {{ .Values.swim.bindAddress | quote }}
             {{- if eq (toString .Values.swim.requireKey) "false" }}
@@ -203,6 +240,13 @@ spec:
               {{- end }}
             initialDelaySeconds: {{ .Values.health.readiness.initialDelaySeconds }}
             periodSeconds: {{ .Values.health.readiness.periodSeconds }}
+          {{- with int (include "grid-operator.shutdownDelaySeconds" .) }}
+          {{- /* Covers the time between /readyz turning 503 and the endpoint leaving every Service. */}}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", {{ . | quote }}]
+          {{- end }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}

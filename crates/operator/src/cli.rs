@@ -36,6 +36,52 @@ pub struct Cli {
     /// Metrics and health listener options.
     #[command(flatten)]
     pub metrics: MetricsArgs,
+
+    /// Leader election options.
+    #[command(flatten)]
+    pub leader: LeaderArgs,
+}
+
+/// Leader election options. With no lease, this replica writes unelected.
+#[derive(Args, Debug, Clone)]
+#[group(id = "leader")]
+pub struct LeaderArgs {
+    /// `Lease` in the operator's namespace that the writing replica holds.
+    #[arg(long = "leader-lease", env = "GRID_LEADER_LEASE")]
+    pub lease: Option<String>,
+
+    /// This replica's holder identity, its pod name.
+    #[arg(long = "leader-identity", env = "GRID_LEADER_IDENTITY")]
+    pub identity: Option<String>,
+
+    /// The operator Deployment's pod selector. A candidate does not contend while a pod it
+    /// matches runs unelected.
+    #[arg(long = "leader-replica-selector", env = "GRID_LEADER_REPLICA_SELECTOR")]
+    pub replica_selector: Option<String>,
+
+    /// Services carrying signals, routed to the holder alone once it has published signals.
+    #[arg(
+        long = "leader-signals-services",
+        env = "GRID_LEADER_SIGNALS_SERVICES",
+        value_delimiter = ','
+    )]
+    pub signals_services: Vec<String>,
+
+    /// Services carrying SWIM, routed to the holder alone as soon as it holds the lease.
+    #[arg(
+        long = "leader-swim-services",
+        env = "GRID_LEADER_SWIM_SERVICES",
+        value_delimiter = ','
+    )]
+    pub swim_services: Vec<String>,
+
+    /// This pod's address, the endpoint those Services route to.
+    #[arg(long = "leader-pod-ip", env = "POD_IP")]
+    pub pod_ip: Option<std::net::IpAddr>,
+
+    /// The node this pod runs on, which a `Local` traffic policy routes by.
+    #[arg(long = "leader-node-name", env = "GRID_NODE_NAME")]
+    pub node_name: Option<String>,
 }
 
 /// Grid-wide modes the install declares, used until its `GridNetwork` exists.

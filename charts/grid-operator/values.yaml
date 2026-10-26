@@ -43,9 +43,34 @@ crds:
   # -- Keep the CRDs on helm uninstall and an Argo CD delete or prune.
   keep: true
 
-# -- Number of operator replicas. Must be 1 until multi-replica operation
-# is qualified.
+# -- Number of operator replicas. Every replica is ready and elects: one holds the operator
+# lease and runs everything that writes, and the signals and SWIM Services route to it alone
+# through an EndpointSlice it writes. An in-place upgrade from a release before leader
+# election, where that release supports one (see the README), keeps the same replicaCount,
+# then scales.
 replicaCount: 1
+
+# -- PodDisruptionBudget for the operator pods. The render fails for a budget that would
+# block every node drain.
+podDisruptionBudget:
+  # -- auto renders one when replicaCount is above 1; true or false forces it.
+  enabled: auto
+  # -- Pods that must stay up, a count or a percentage. Set this or maxUnavailable.
+  minAvailable: 1
+  # -- Pods that may be down at once, a count or a percentage. Set this or minAvailable:
+  # to use it, set minAvailable to null.
+  maxUnavailable: ""
+
+# -- Seconds the pod keeps serving after it is asked to stop, so a selector Service drops its
+# endpoint before the operator stands down. Runs the image's sleep as a preStop hook. Empty
+# or 0: none. Above one replica the holder withdraws its own signals and SWIM endpoints, so
+# only the metrics Service follows readiness and may miss one scrape per restart.
+shutdownDelaySeconds: null
+
+# -- Seconds Kubernetes gives a terminating pod before killing it. Empty: 30 plus
+# shutdownDelaySeconds when there is a delay, else the Kubernetes default. Must cover 20 plus
+# shutdownDelaySeconds, the longest stand-down.
+terminationGracePeriodSeconds: null
 
 # -- Operator container image settings.
 image:

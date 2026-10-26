@@ -1,0 +1,20 @@
+{{- include "grid-operator.pdb.validate" . }}
+{{- if include "grid-operator.pdb.renders" . }}
+{{- $bounds := include "grid-operator.pdb.bounds" . | fromJson }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "grid-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "grid-operator.labels" . | nindent 4 }}
+spec:
+  {{- if $bounds.max }}
+  maxUnavailable: {{ include "grid-operator.pdb.value" $bounds.max }}
+  {{- else }}
+  minAvailable: {{ include "grid-operator.pdb.value" $bounds.min }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "grid-operator.selectorLabels" . | nindent 6 }}
+{{- end }}

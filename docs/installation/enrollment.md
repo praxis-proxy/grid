@@ -274,7 +274,8 @@ site must re-enroll.
 Where to look:
 
 ```bash
-kubectl -n grid-system logs deploy/grid-operator | grep -i "enroll\|rotation"
+# Every operator replica; above one replica only the lease holder enrolls and rotates.
+kubectl -n grid-system logs -l app.kubernetes.io/name=grid-operator --all-containers --prefix --max-log-requests 10 | grep -i "enroll\|rotation"
 kubectl -n grid-enrollment logs deploy/grid-enrollment
 kubectl get gridnetwork -o yaml   # status.identity: notAfter, rotateAfter, reason
 ```

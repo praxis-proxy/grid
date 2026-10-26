@@ -1,0 +1,66 @@
+{{- if .Values.rbac.create }}
+{{- $fullname := include "grid-operator.fullname" . }}
+{{- $services := compact (list (include "grid-operator.holderSignalsServices" .) (include "grid-operator.holderSwimServices" .)) }}
+# The operator lease and the holder's EndpointSlices. Create cannot be limited to a name.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "grid-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: [{{ $fullname | quote }}]
+    verbs: ["get", "update"]
+  # A candidate reads its own replicas, so it never contends beside one that runs unelected.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  {{- with $services }}
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames:
+      {{- range . }}
+      - {{ . | quote }}
+      {{- end }}
+    verbs: ["get"]
+  # create, and list and delete for the slices the controller leaves when a Service loses its
+  # selector, whose names it generates. The holder deletes only those on its own Services.
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["create", "list", "delete"]
+  # OpenShift admits an EndpointSlice naming a pod or service address only from a writer
+  # that can create this virtual subresource; elsewhere the rule is inert.
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices/restricted"]
+    verbs: ["create"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    resourceNames:
+      {{- range . }}
+      - {{ printf "%s-holder" . | quote }}
+      {{- end }}
+    verbs: ["get", "update"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "grid-operator.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "grid-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ $fullname }}-leader-election
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

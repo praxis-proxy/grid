@@ -5,4 +5,15 @@
 # only, so rsa is never compiled into any grid binary. cargo audit scans
 # Cargo.lock and flags the unactivated optional dep, while the graph-aware
 # dependency-check (cargo deny) correctly does not. No fixed rsa release exists.
-ignore = ["RUSTSEC-2023-0071"]
+ignore = [
+  "RUSTSEC-2023-0071",
+  # zstd 0.13.3 / zstd-safe 7.3.0 are pinned through the gateway's
+  # upstream Pingora header-serde dependency, which has no release with
+  # compatible requirements for the fixed zstd 0.14 / zstd-safe 8 APIs.
+  "RUSTSEC-2026-0391",
+  "RUSTSEC-2026-0398",
+  "RUSTSEC-2026-0403",
+  # The allocator-shim issue applies only to wasm32; grid-gateway is a native
+  # binary and does not build for WebAssembly.
+  "RUSTSEC-2026-0410",
+]

@@ -11,6 +11,13 @@ ignore = [
   # dependency of the gateway's rustls/Pingora TLS stack with no upstream
   # replacement wired yet.
   { id = "RUSTSEC-2025-0134", reason = "transitive via rustls; no upstream fix available" },
+  # The upstream Pingora header-serde release pins zstd 0.13 and zstd-safe 7;
+  # no compatible release is available for the fixed zstd 0.14 / zstd-safe 8.
+  { id = "RUSTSEC-2026-0391", reason = "upstream header-serde pins zstd 0.13; no compatible fixed release available" },
+  { id = "RUSTSEC-2026-0398", reason = "upstream header-serde pins zstd-safe 7; no compatible fixed release available" },
+  { id = "RUSTSEC-2026-0403", reason = "upstream header-serde pins zstd-safe 7; no compatible fixed release available" },
+  # This allocator-shim issue is wasm32-only; grid-gateway is a native binary.
+  { id = "RUSTSEC-2026-0410", reason = "wasm32-only allocator issue; grid-gateway does not target wasm32" },
 ]
 
 [licenses]

@@ -107,8 +107,70 @@
     "replicaCount": {
       "type": "integer",
       "minimum": 1,
-      "maximum": 1,
-      "description": "Number of operator replicas. Must be 1 until multi-replica operation is qualified."
+      "description": "Number of operator replicas. One holds the operator lease and runs everything that writes."
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "PodDisruptionBudget for the operator pods.",
+      "properties": {
+        "enabled": {
+          "enum": [
+            "auto",
+            true,
+            false
+          ],
+          "description": "auto renders one when replicaCount is above 1; true or false forces it."
+        },
+        "minAvailable": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "string",
+              "pattern": "^([0-9]+%?)?$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Pods that must stay up, a count or a percentage."
+        },
+        "maxUnavailable": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "string",
+              "pattern": "^([0-9]+%?)?$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Pods that may be down at once, a count or a percentage."
+        }
+      }
+    },
+    "shutdownDelaySeconds": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "Seconds of preStop sleep before the operator stands down. Empty: none."
+    },
+    "terminationGracePeriodSeconds": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "Seconds Kubernetes gives a terminating pod. Empty: 30 plus shutdownDelaySeconds."
     },
     "image": {
       "type": "object",

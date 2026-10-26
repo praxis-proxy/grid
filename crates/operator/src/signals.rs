@@ -456,6 +456,8 @@ pub struct SignalStore {
     /// because a policy changes only when its provider is edited, samples every
     /// scrape.
     access: Arc<RwLock<AccessMap>>,
+    /// Set once the first refresh lands.
+    published: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 /// SHA-256 of a DER certificate, lowercase hex.
@@ -652,6 +654,14 @@ impl SignalStore {
             );
         }
         guard.retain(|_, held| held.expires_at > now);
+        drop(guard);
+        self.published
+            .send_if_modified(|published| !std::mem::replace(published, true));
+    }
+
+    /// Resolve once the first refresh has landed, at once if one already has.
+    pub async fn published(&self) {
+        drop(self.published.subscribe().wait_for(|published| *published).await);
     }
 
     /// Targets this reader may not be served.

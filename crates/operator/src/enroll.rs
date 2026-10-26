@@ -875,6 +875,66 @@ pub async fn ensure_enrolled(client: &Client, config: &Config) -> Result<(), Enr
     Box::pin(run(client, &settings)).await
 }
 
+/// How often a running site checks whether it lost its identity.
+const LOST_IDENTITY_CHECK: Duration = Duration::from_secs(30);
+
+/// Resolve once this site's identity Secret is definitely gone and an invite minted for it is
+/// present, so a restart would enroll it again. Never resolves where enrollment cannot run.
+///
+/// A read that fails, times out or is refused decides nothing and is retried: only a
+/// definite not-found counts as gone, and only an invite labelled for this site counts.
+pub async fn lost_identity_with_invite(client: &Client, config: &Config) {
+    let Ok(settings) = Settings::from_config(config) else {
+        return std::future::pending().await;
+    };
+    let namespace = client.default_namespace().to_owned();
+    let Ok(target) = Box::pin(resolve_target(client, &namespace, &settings.defaults, settings.backoff)).await else {
+        return std::future::pending().await;
+    };
+    let store = KubeStore(Api::namespaced(client.clone(), &namespace));
+    loop {
+        tokio::time::sleep(jittered(LOST_IDENTITY_CHECK)).await;
+        if Box::pin(identity_lost(&store, &target.site_secret, &settings)).await {
+            tracing::warn!(
+                secret = %target.site_secret,
+                invite = %settings.token_secret,
+                "site identity is gone and an invite is present; standing down to enroll again"
+            );
+            return;
+        }
+    }
+}
+
+/// Whether `site_secret` is definitely absent and an invite for this site is present.
+async fn identity_lost<S: Store + Sync>(store: &S, site_secret: &str, settings: &Settings) -> bool {
+    match store.exists(site_secret).await {
+        Ok(false) => {},
+        Ok(true) => return false,
+        Err(error) => {
+            tracing::debug!(%error, "site identity not readable; deciding nothing this check");
+            return false;
+        },
+    }
+    match store.get(&settings.token_secret).await {
+        Ok(Some(invite)) => invited(&invite, &settings.site_name),
+        Ok(None) => false,
+        Err(error) => {
+            tracing::debug!(%error, "invite not readable; deciding nothing this check");
+            false
+        },
+    }
+}
+
+/// Whether `invite` was minted for `site`.
+fn invited(invite: &Secret, site: &str) -> bool {
+    invite
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(SITE_LABEL))
+        .is_some_and(|minted_for| minted_for == site)
+}
+
 pub mod renew;
 
 #[cfg(test)]

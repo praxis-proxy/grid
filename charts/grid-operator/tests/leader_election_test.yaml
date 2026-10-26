@@ -1,0 +1,347 @@
+suite: leader election and disruption
+templates:
+  - templates/deployment.yaml
+  - templates/role-leader-election.yaml
+  - templates/poddisruptionbudget.yaml
+  - templates/service-signals.yaml
+  - templates/service-swim.yaml
+release:
+  name: grid
+  namespace: grid-system
+tests:
+  - it: elects at one replica too, so a later scale is safe
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_LEADER_LEASE, value: grid-grid-operator }
+      - equal:
+          path: spec.strategy
+          value:
+            type: RollingUpdate
+            rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+      - notExists:
+          path: spec.template.spec.containers[0].lifecycle
+      - notExists:
+          path: spec.template.spec.terminationGracePeriodSeconds
+
+  - it: grants lease access at one replica
+    template: templates/role-leader-election.yaml
+    asserts:
+      - hasDocuments:
+          count: 2
+
+  - it: drops the signals selector at one replica, since the holder writes its endpoints
+    template: templates/service-signals.yaml
+    set:
+      signals.enabled: true
+      signals.service.enabled: true
+      swim.service.enabled: true
+    asserts:
+      - notExists:
+          path: spec.selector
+
+  - it: names the lease, the pod, its node and the holder Services
+    template: templates/deployment.yaml
+    set:
+      replicaCount: 2
+      signals.enabled: true
+      signals.service.enabled: true
+      swim.service.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_LEADER_LEASE, value: grid-grid-operator }
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_LEADER_IDENTITY
+            valueFrom: { fieldRef: { fieldPath: metadata.name } }
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_NODE_NAME
+            valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_LEADER_SIGNALS_SERVICES, value: grid-grid-operator-signals }
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_LEADER_SWIM_SERVICES, value: grid-grid-operator-swim }
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_LEADER_REPLICA_SELECTOR
+            value: app.kubernetes.io/name=grid-operator,app.kubernetes.io/instance=grid
+      - equal:
+          path: spec.selector.matchLabels
+          value:
+            app.kubernetes.io/name: grid-operator
+            app.kubernetes.io/instance: grid
+
+  - it: lets the holder take its lease and write only its own slices
+    template: templates/role-leader-election.yaml
+    set:
+      replicaCount: 2
+      signals.enabled: true
+      signals.service.enabled: true
+      swim.service.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 2
+      - equal:
+          path: rules
+          value:
+            - apiGroups: [coordination.k8s.io]
+              resources: [leases]
+              verbs: [create]
+            - apiGroups: [coordination.k8s.io]
+              resources: [leases]
+              resourceNames: [grid-grid-operator]
+              verbs: [get, update]
+            - apiGroups: [""]
+              resources: [pods]
+              verbs: [get, list]
+            - apiGroups: [""]
+              resources: [services]
+              resourceNames: [grid-grid-operator-signals, grid-grid-operator-swim]
+              verbs: [get]
+            - apiGroups: [discovery.k8s.io]
+              resources: [endpointslices]
+              verbs: [create, list, delete]
+            - apiGroups: [discovery.k8s.io]
+              resources: [endpointslices/restricted]
+              verbs: [create]
+            - apiGroups: [discovery.k8s.io]
+              resources: [endpointslices]
+              resourceNames: [grid-grid-operator-signals-holder, grid-grid-operator-swim-holder]
+              verbs: [get, update]
+        documentIndex: 0
+      - equal:
+          path: metadata.namespace
+          value: grid-system
+        documentIndex: 0
+
+  - it: renders no lease RBAC when the chart creates none
+    template: templates/role-leader-election.yaml
+    set:
+      replicaCount: 2
+      rbac.create: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: drops the SWIM selector above one replica
+    template: templates/service-swim.yaml
+    set:
+      replicaCount: 2
+      swim.service.enabled: true
+    asserts:
+      - notExists:
+          path: spec.selector
+
+  - it: rolls more than one replica one surge pod at a time
+    template: templates/deployment.yaml
+    set:
+      replicaCount: 2
+    asserts:
+      - equal:
+          path: spec.strategy
+          value:
+            type: RollingUpdate
+            rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+      - equal:
+          path: spec.replicas
+          value: 2
+
+  - it: does not sleep before standing down above one replica, since the holder withdraws its own endpoints
+    template: templates/deployment.yaml
+    set:
+      replicaCount: 2
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].lifecycle
+      - notExists:
+          path: spec.template.spec.terminationGracePeriodSeconds
+
+  - it: sleeps above one replica when a delay is set, and gives the stand-down its grace
+    template: templates/deployment.yaml
+    set:
+      replicaCount: 2
+      shutdownDelaySeconds: 5
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].lifecycle.preStop.exec.command
+          value: [sleep, "5"]
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 35
+
+  - it: sleeps at one replica when a delay is set
+    template: templates/deployment.yaml
+    set:
+      shutdownDelaySeconds: 3
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].lifecycle.preStop.exec.command
+          value: [sleep, "3"]
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 33
+
+  - it: refuses a grace shorter than the stand-down with no delay
+    template: templates/deployment.yaml
+    set:
+      replicaCount: 2
+      terminationGracePeriodSeconds: 19
+    asserts:
+      - failedTemplate:
+          errorPattern: terminationGracePeriodSeconds must be at least 20
+
+  - it: drops the preStop sleep at a delay of 0
+    template: templates/deployment.yaml
+    set:
+      replicaCount: 2
+      shutdownDelaySeconds: 0
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].lifecycle
+      - notExists:
+          path: spec.template.spec.terminationGracePeriodSeconds
+
+  - it: refuses a grace shorter than the stand-down plus the delay
+    template: templates/deployment.yaml
+    set:
+      replicaCount: 2
+      shutdownDelaySeconds: 5
+      terminationGracePeriodSeconds: 24
+    asserts:
+      - failedTemplate:
+          errorPattern: terminationGracePeriodSeconds must be at least 25
+
+  - it: keeps a grace that covers the stand-down plus the delay
+    template: templates/deployment.yaml
+    set:
+      replicaCount: 2
+      shutdownDelaySeconds: 5
+      terminationGracePeriodSeconds: 25
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 25
+
+  - it: renders no budget for a lone replica by default
+    template: templates/poddisruptionbudget.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders a budget of one for more than one replica by default
+    template: templates/poddisruptionbudget.yaml
+    set:
+      replicaCount: 2
+    asserts:
+      - equal:
+          path: spec.minAvailable
+          value: 1
+      - notExists:
+          path: spec.maxUnavailable
+      - equal:
+          path: spec.selector.matchLabels
+          value:
+            app.kubernetes.io/name: grid-operator
+            app.kubernetes.io/instance: grid
+
+  - it: renders no budget when forced off
+    template: templates/poddisruptionbudget.yaml
+    set:
+      replicaCount: 3
+      podDisruptionBudget.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders a budget when forced on with room to evict
+    template: templates/poddisruptionbudget.yaml
+    set:
+      replicaCount: 1
+      podDisruptionBudget.enabled: true
+      podDisruptionBudget.minAvailable: ""
+      podDisruptionBudget.maxUnavailable: 1
+    asserts:
+      - equal:
+          path: spec.maxUnavailable
+          value: 1
+      - notExists:
+          path: spec.minAvailable
+
+  - it: renders a percentage quoted
+    template: templates/poddisruptionbudget.yaml
+    set:
+      replicaCount: 4
+      podDisruptionBudget.minAvailable: 50%
+    asserts:
+      - equal:
+          path: spec.minAvailable
+          value: 50%
+
+  - it: refuses both bounds
+    template: templates/poddisruptionbudget.yaml
+    set:
+      replicaCount: 3
+      podDisruptionBudget.maxUnavailable: 1
+    asserts:
+      - failedTemplate:
+          errorPattern: not both
+
+  - it: refuses neither bound
+    template: templates/poddisruptionbudget.yaml
+    set:
+      replicaCount: 3
+      podDisruptionBudget.minAvailable: ""
+    asserts:
+      - failedTemplate:
+          errorPattern: set podDisruptionBudget.minAvailable or podDisruptionBudget.maxUnavailable
+
+  - it: refuses a budget forced on for a lone replica that must stay up
+    template: templates/poddisruptionbudget.yaml
+    set:
+      podDisruptionBudget.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: minAvailable 1 with replicaCount 1 would block node drains
+
+  - it: refuses a minAvailable as large as the replica count
+    template: templates/poddisruptionbudget.yaml
+    set:
+      replicaCount: 2
+      podDisruptionBudget.minAvailable: 2
+    asserts:
+      - failedTemplate:
+          errorPattern: would block node drains
+
+  - it: refuses a percentage that rounds up to every replica
+    template: templates/poddisruptionbudget.yaml
+    set:
+      replicaCount: 2
+      podDisruptionBudget.minAvailable: 60%
+    asserts:
+      - failedTemplate:
+          errorPattern: minAvailable 60% with replicaCount 2 would block node drains
+
+  - it: refuses a maxUnavailable of none
+    template: templates/poddisruptionbudget.yaml
+    set:
+      replicaCount: 3
+      podDisruptionBudget.minAvailable: ""
+      podDisruptionBudget.maxUnavailable: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: maxUnavailable 0 would block node drains
+
+  - it: refuses an enabled value outside auto, true and false
+    template: templates/poddisruptionbudget.yaml
+    set:
+      podDisruptionBudget.enabled: sometimes
+    asserts:
+      - failedTemplate: {}
