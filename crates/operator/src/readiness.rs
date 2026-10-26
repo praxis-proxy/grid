@@ -120,11 +120,9 @@ impl Reason {
     #[must_use]
     pub const fn status(self) -> &'static str {
         match self {
-            Self::Ready => "True",
-            Self::MetricsNotConfigured
-            | Self::AwaitingFirstScrape
-            | Self::NoLivenessCheck
-            | Self::MetricsBodyTooLarge => "Unknown",
+            // Routing serves an answered endpoint with no liveness series, so Ready says so.
+            Self::Ready | Self::NoLivenessCheck | Self::MetricsBodyTooLarge => "True",
+            Self::MetricsNotConfigured | Self::AwaitingFirstScrape => "Unknown",
             Self::NoEndpointsReady
             | Self::MetricsStale
             | Self::ScrapeTimedOut
@@ -135,15 +133,23 @@ impl Reason {
         }
     }
 
+    /// The reason the `Ready` condition carries: `NotEvaluated` without a metrics endpoint,
+    /// since `Unknown` names only a condition the operator does not evaluate.
+    #[must_use]
+    pub const fn condition_reason(self) -> &'static str {
+        if matches!(self, Self::MetricsNotConfigured) {
+            "NotEvaluated"
+        } else {
+            self.as_str()
+        }
+    }
+
     /// The one-word status shown in the STATUS column: `Ready`, `NotReady`, or `Unknown`.
     #[must_use]
     pub const fn display(self) -> &'static str {
         match self {
-            Self::Ready => "Ready",
-            Self::MetricsNotConfigured
-            | Self::AwaitingFirstScrape
-            | Self::NoLivenessCheck
-            | Self::MetricsBodyTooLarge => "Unknown",
+            Self::Ready | Self::NoLivenessCheck | Self::MetricsBodyTooLarge => "Ready",
+            Self::MetricsNotConfigured | Self::AwaitingFirstScrape => "Unknown",
             Self::NoEndpointsReady
             | Self::MetricsStale
             | Self::ScrapeTimedOut
@@ -572,7 +578,7 @@ pub(crate) fn ready_condition(
     let held = current.iter().find(|c| c.type_ == READY_CONDITION);
     let state = (
         verdict.reason.status(),
-        verdict.reason.as_str(),
+        verdict.reason.condition_reason(),
         verdict.message.as_str(),
     );
     changed(READY_CONDITION, held, state, now_rfc3339, generation)
@@ -580,8 +586,9 @@ pub(crate) fn ready_condition(
 
 /// The `MetricsAvailable` condition to write, or `None` when `current` already says the same.
 ///
-/// True once a scrape succeeds, whatever the endpoints say; False with the scrape's failure, or
-/// when the provider declares no metrics; Unknown while it awaits its first scrape.
+/// True once a scrape succeeds, whatever the endpoints say; False with the scrape's failure;
+/// Unknown while it awaits its first scrape, and `NotEvaluated` when the provider declares no
+/// metrics.
 pub(crate) fn metrics_condition(
     current: &[Condition],
     verdict: &Verdict,
@@ -593,16 +600,15 @@ pub(crate) fn metrics_condition(
         Reason::Ready | Reason::NoEndpointsReady | Reason::NoLivenessCheck => {
             ("True", "ScrapeSucceeded", "metrics scraped")
         },
-        Reason::AwaitingFirstScrape | Reason::ProviderUnavailable => {
-            ("Unknown", verdict.reason.as_str(), verdict.message.as_str())
+        Reason::AwaitingFirstScrape | Reason::ProviderUnavailable | Reason::MetricsNotConfigured => {
+            ("Unknown", verdict.reason.condition_reason(), verdict.message.as_str())
         },
         Reason::MetricsStale
         | Reason::ScrapeTimedOut
         | Reason::ScrapeUnauthorized
         | Reason::TlsHandshakeFailed
         | Reason::MetricsBodyTooLarge
-        | Reason::ScrapeFailed
-        | Reason::MetricsNotConfigured => ("False", verdict.reason.as_str(), verdict.message.as_str()),
+        | Reason::ScrapeFailed => ("False", verdict.reason.as_str(), verdict.message.as_str()),
     };
     changed(METRICS_CONDITION, held, state, now_rfc3339, generation)
 }
@@ -1188,7 +1194,7 @@ mod tests {
             .verdict("p", false, STALE, start + STALE + Duration::from_secs(1))
             .expect("judged");
         assert_eq!(verdict.reason, Reason::MetricsBodyTooLarge);
-        assert_eq!(verdict.reason.status(), "Unknown");
+        assert_eq!(verdict.reason.status(), "True", "routing serves it, so Ready says so");
         assert!(!verdict.reason.excludes(), "an answered endpoint is not down");
         assert!(verdict.message.ends_with("body_cap"), "{}", verdict.message);
     }
@@ -1259,7 +1265,7 @@ mod tests {
         assert_eq!(Reason::Ready.display(), "Ready");
         assert_eq!(Reason::MetricsNotConfigured.display(), "Unknown");
         assert_eq!(Reason::AwaitingFirstScrape.display(), "Unknown");
-        assert_eq!(Reason::NoLivenessCheck.display(), "Unknown");
+        assert_eq!(Reason::NoLivenessCheck.display(), "Ready");
         for reason in [
             Reason::NoEndpointsReady,
             Reason::MetricsStale,
@@ -1325,10 +1331,11 @@ mod tests {
         assert!(!Reason::MetricsNotConfigured.excludes(), "unknown is not down");
         assert_eq!(Reason::AwaitingFirstScrape.status(), "Unknown");
         assert!(!Reason::AwaitingFirstScrape.excludes(), "waiting is not down");
-        assert_eq!(Reason::NoLivenessCheck.status(), "Unknown");
+        assert_eq!(Reason::MetricsNotConfigured.condition_reason(), "NotEvaluated");
+        assert_eq!(Reason::NoLivenessCheck.status(), "True");
         assert!(
             !Reason::NoLivenessCheck.excludes(),
-            "a scrape carrying no ready-endpoint series leaves readiness unknown, not false"
+            "a scrape carrying no ready-endpoint series is served, so Ready reads True"
         );
         for reason in [
             Reason::NoEndpointsReady,

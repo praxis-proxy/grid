@@ -121,8 +121,8 @@ async fn invariant_1_provider_conditions_are_unchanged_across_repeated_signals_p
     invariants::reasons_within(
         &rounds,
         &[
-            ("Ready", "Unknown", "MetricsNotConfigured"),
-            ("MetricsAvailable", "False", "MetricsNotConfigured"),
+            ("Ready", "Unknown", "NotEvaluated"),
+            ("MetricsAvailable", "Unknown", "NotEvaluated"),
             ("EndpointLive", "True", "NoHealthSignal"),
             ("Accepted", "True", "Accepted"),
             ("ResolvedRefs", "True", "ResolvedRefs"),
@@ -135,8 +135,6 @@ async fn invariant_1_provider_conditions_are_unchanged_across_repeated_signals_p
 }
 
 #[tokio::test]
-// Expected to fail: Ready reads Unknown MetricsNotConfigured, an Unknown that is neither AwaitingFirst nor
-// NotEvaluated (readiness.rs:124); STATUS-REVIEW ratifies MetricsReachable absent without an endpoint
 async fn invariant_4_provider_ready_is_unknown_only_before_its_first_evaluation() {
     let (api, path) = seeded();
     let rounds = fixtures::rounds(&api, &path, 2, |_round| async {

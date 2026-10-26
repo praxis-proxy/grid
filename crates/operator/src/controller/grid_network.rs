@@ -722,7 +722,7 @@ fn readiness_entry<'provider>(
             identity,
             verdict: readiness::Verdict {
                 reason: readiness::Reason::MetricsNotConfigured,
-                message: "no metricsConfig endpoint to read readiness from".to_owned(),
+                message: "metrics.endpoint is not set".to_owned(),
             },
             published: None,
         });
