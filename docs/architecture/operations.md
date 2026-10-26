@@ -427,6 +427,11 @@ unrelated address.
 | `GRID_GATEWAY_NAMESPACE` | Namespace for gateway Service lookup (default: `grid-system`) |
 | `GRID_GATEWAY_PORT` | Optional port override appended to the discovered address. When unset, use the first Service `spec.ports` entry; fall back to `8080` if no usable port exists |
 | `GRID_GATEWAY_DISCOVERY_INTERVAL_MS` | Polling interval for gateway discovery (default: `5000`) |
+| `GRID_LEADER_LEASE` | `Lease` in the operator namespace that the writing replica holds. Unset, the operator writes unelected |
+| `GRID_LEADER_IDENTITY` | This replica's holder identity; the chart sets the pod name |
+| `GRID_LEADER_SIGNALS_SERVICES` | Services carrying signals that route to the holder alone, comma separated |
+| `GRID_LEADER_SWIM_SERVICES` | Services carrying SWIM that route to the holder alone, comma separated |
+| `GRID_NODE_NAME` | The node this pod runs on, written on the holder's endpoint for a `Local` traffic policy |
 
 Gateway port discovery reads only the gateway Service's `spec.ports`; Pod health
 probes and metrics endpoints are not used for this selection.
@@ -441,6 +446,53 @@ address, and they share its cap.
 `GridNetwork.spec.tls.swimKeySecretRef` to reference a
 Kubernetes `Secret`.  The env var exists for local
 development and testing only.
+
+### Replicas and leader election
+
+At `replicaCount` 1 the operator runs unelected, and the chart renders exactly
+what it rendered before leader election existed.
+
+Above one replica the operator runs highly available. Every replica is ready.
+They contend for one `Lease`, `coordination.k8s.io/v1`, named for the release
+in its namespace. Only the holder enrolls, starts SWIM, runs the controllers,
+writes status and the serving config, renews the site identity, and serves and
+polls signals. The signals and SWIM Services carry no selector; the holder
+writes their `EndpointSlice`, `<service>-holder`, naming its own address and
+node, so peers reach the holder alone. It writes the SWIM slice when it takes
+the lease, since some load balancers publish an address only once an endpoint
+exists, and the signals slice once it has published signals, so a peer never
+reads an empty answer from a new holder. A holder that collects no local signals,
+as under gossip, writes it at once, and one that has published nothing after 60
+seconds writes it anyway and logs a warning. A successor
+overwrites the slice, so two replicas are never endpoints at once.
+
+The lease holds for 10 seconds. The holder renews every 5 seconds and treats
+the lease as lost 8 seconds after its last renewal, before any other replica
+can take it. A candidate tries every second and takes a lease that has gone
+unchanged for its whole duration, timed on its own clock. Losing the lease
+stands the operator down and exits it, and the restarted pod contends again.
+
+Standing down clears the holder's slices first, then reports not ready, stops
+every writer, leaves SWIM, and releases the lease, so a candidate takes over on
+its next try instead of waiting out the lease. A candidate takes over about a
+second after the release. A holder lost without releasing is replaced about 11
+seconds after its last renewal, and its slice names it until then. Load
+balancer target changes add their own time on top, seconds with MetalLB and
+up to tens of seconds on a cloud load balancer that health checks its targets.
+
+Moving from one replica to more is safe in one step. The 1-replica render runs
+unelected and never yields, so a candidate lists the operator Deployment's pods
+and does not contend while any of them, terminating ones included, runs without
+leader election. The rollout deletes the unelected pod once the new one is
+ready, and the candidate takes the lease about a second after that pod is gone.
+If the pods cannot be listed, it does not contend.
+`grid_operator_lease_waiting` shows why no replica holds the lease.
+
+Above one replica the Deployment rolls one surge pod at a time, a
+`PodDisruptionBudget` keeps one replica up. No preStop delay is needed: the
+holder withdraws its own endpoints, and only the metrics Service follows
+readiness, so a restart may miss one metrics scrape. `grid_operator_lease_held` and `grid_operator_routed` show
+which replica holds the lease and which one the Services reach.
 
 ### Validate the install
 
