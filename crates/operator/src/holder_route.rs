@@ -15,7 +15,7 @@ use k8s_openapi::{
 };
 use kube::{
     Api, Client, Resource as _,
-    api::{ObjectMeta, PostParams, ResourceExt as _},
+    api::{DeleteParams, ListParams, ObjectMeta, PostParams, ResourceExt as _},
 };
 
 /// How long one Service's slice write may take.
@@ -23,6 +23,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How often the holder checks its slices still name it.
 const RECHECK_EVERY: Duration = Duration::from_secs(10);
+
+/// The `endpointslice.kubernetes.io/managed-by` value on the slices the built-in controller writes.
+const CONTROLLER: &str = "endpointslice-controller.k8s.io";
 
 /// The `endpointslice.kubernetes.io/managed-by` value on the slices this writes.
 pub const MANAGED_BY: &str = "grid-operator";
@@ -112,7 +115,7 @@ impl HolderRoutes {
                 return;
             }
             *state = Routing::Routed;
-            Box::pin(self.write_all(true)).await;
+            Box::pin(self.write_all(Some(&holding))).await;
         }
         tracing::info!(
             after_ms = started.elapsed().as_millis(),
@@ -129,7 +132,7 @@ impl HolderRoutes {
             if !holding.holds() {
                 continue;
             }
-            Box::pin(self.write_all(true)).await;
+            Box::pin(self.write_all(Some(&holding))).await;
         }
     }
 
@@ -144,19 +147,29 @@ impl HolderRoutes {
         if std::mem::replace(&mut *state, Routing::Withdrawn) != Routing::Routed {
             return;
         }
-        Box::pin(self.write_all(false)).await;
+        Box::pin(self.write_all(None)).await;
         crate::metrics::set_routed(false);
         tracing::info!("stopped routing peer traffic to this replica");
     }
 
-    /// Write every Service's slice, naming this replica when `routed`, each bounded.
-    async fn write_all(&self, routed: bool) {
+    /// Write every Service's slice: naming this replica while `holding` holds, checked before
+    /// each write so none lands once the lease has lapsed; with `None`, clearing what names it.
+    async fn write_all(&self, holding: Option<&crate::leader::Holding>) {
         for name in &self.names {
-            match tokio::time::timeout(WRITE_TIMEOUT, Box::pin(self.write(name, routed))).await {
-                Ok(Ok(())) => {},
-                Ok(Err(error)) => tracing::warn!(service = %name, %error, routed, "holder EndpointSlice not written"),
-                Err(_elapsed) => tracing::warn!(service = %name, routed, "holder EndpointSlice write timed out"),
+            if holding.is_some_and(|holding| !holding.holds()) {
+                tracing::warn!(service = %name, "lease lapsed mid-write; not routing to this replica");
+                return;
             }
+            Box::pin(self.write_logged(name, holding.is_some())).await;
+        }
+    }
+
+    /// Write `service`'s slice as [`HolderRoutes::write`] does, bounded, logging a failure.
+    async fn write_logged(&self, service: &str, routed: bool) {
+        match tokio::time::timeout(WRITE_TIMEOUT, Box::pin(self.write(service, routed))).await {
+            Ok(Ok(())) => {},
+            Ok(Err(error)) => tracing::warn!(service, %error, routed, "holder EndpointSlice not written"),
+            Err(_elapsed) => tracing::warn!(service, routed, "holder EndpointSlice write timed out"),
         }
     }
 
@@ -179,6 +192,7 @@ impl HolderRoutes {
         let Some(owner) = Box::pin(self.services.get_opt(service)).await? else {
             return Ok(());
         };
+        Box::pin(self.clear_controller_slices(service)).await?;
         let mut desired = self.slice(&owner);
         match live {
             Some(live) if same(&live, &desired) => Ok(()),
@@ -216,6 +230,26 @@ impl HolderRoutes {
                 })
             })
             .collect()
+    }
+
+    /// Delete the slices the `EndpointSlice` controller left on `service`. It stops managing a
+    /// Service once its selector goes, but never deletes what it wrote, which would route to
+    /// the pods that ran before the upgrade beside this replica's slice.
+    async fn clear_controller_slices(&self, service: &str) -> Result<(), kube::Error> {
+        let left = ListParams::default().labels(&format!(
+            "kubernetes.io/service-name={service},endpointslice.kubernetes.io/managed-by={CONTROLLER}"
+        ));
+        for slice in Box::pin(self.slices.list(&left)).await?.items {
+            let Some(name) = slice.metadata.name else {
+                continue;
+            };
+            match Box::pin(self.slices.delete(&name, &DeleteParams::default())).await {
+                Ok(_) => tracing::info!(service, slice = %name, "deleted an EndpointSlice the controller left"),
+                Err(kube::Error::Api(status)) if status.code == 404 => {},
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     /// The slice routing `service` to this replica.
@@ -306,9 +340,25 @@ mod tests {
 
     use super::{HolderRoutes, Me, slice_name};
 
-    /// An apiserver holding objects by path, refusing a stale `PUT` with 409.
+    /// An apiserver holding objects by path, refusing a stale `PUT` with 409, listing a
+    /// collection by label and deleting by name. `slow` delays the next write to a path.
     #[derive(Clone, Default)]
-    struct Objects(Arc<Mutex<BTreeMap<String, serde_json::Value>>>);
+    struct Objects(
+        Arc<Mutex<BTreeMap<String, serde_json::Value>>>,
+        Arc<Mutex<Option<(String, Duration)>>>,
+    );
+
+    /// Whether `object` carries every `key=value` in `selector`.
+    fn labelled(object: &serde_json::Value, selector: &str) -> bool {
+        selector.split(',').filter(|pair| !pair.is_empty()).all(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            object
+                .pointer("/metadata/labels")
+                .and_then(|labels| labels.get(key))
+                .and_then(serde_json::Value::as_str)
+                == Some(value)
+        })
+    }
 
     impl Objects {
         fn client(&self) -> kube::Client {
@@ -326,12 +376,48 @@ mod tests {
                     let status = |code: u16, reason: &str| serde_json::json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":reason,"code":code});
                     let method = request.method().clone();
                     let path = request.uri().path().to_owned();
+                    let query = request.uri().query().unwrap_or_default().to_owned();
                     let bytes = request.into_body().collect().await.expect("body").to_bytes();
+                    let slow = objects
+                        .1
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take_if(|(on, _)| method != http::Method::GET && path.contains(on.as_str()));
+                    if let Some((_, delay)) = slow {
+                        tokio::time::sleep(delay).await;
+                    }
                     let mut held = objects.0.lock().unwrap_or_else(PoisonError::into_inner);
-                    let reply = if method == http::Method::GET {
+                    let selector = query
+                        .split('&')
+                        .find_map(|pair| pair.strip_prefix("labelSelector="))
+                        .map(|selector| selector.replace("%3D", "=").replace("%2C", ",").replace("%2F", "/"));
+                    let reply = if method == http::Method::GET && path.ends_with("/endpointslices") {
+                        let prefix = format!("{path}/");
+                        let items: Vec<serde_json::Value> = held
+                            .iter()
+                            .filter(|(key, object)| {
+                                key.starts_with(&prefix) && labelled(object, selector.as_deref().unwrap_or_default())
+                            })
+                            .map(|(_, object)| object.clone())
+                            .collect();
+                        respond(
+                            200,
+                            serde_json::json!({"apiVersion": "discovery.k8s.io/v1", "kind": "EndpointSliceList", "metadata": {}, "items": items}),
+                        )
+                    } else if method == http::Method::GET {
                         held.get(&path)
                             .cloned()
                             .map_or_else(|| respond(404, status(404, "NotFound")), |object| respond(200, object))
+                    } else if method == http::Method::DELETE {
+                        held.remove(&path).map_or_else(
+                            || respond(404, status(404, "NotFound")),
+                            |_| {
+                                respond(
+                                    200,
+                                    serde_json::json!({"kind":"Status","apiVersion":"v1","status":"Success"}),
+                                )
+                            },
+                        )
                     } else {
                         let mut object: serde_json::Value = serde_json::from_slice(&bytes).expect("object");
                         let name = object
@@ -378,6 +464,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(path.to_owned(), object);
+        }
+
+        fn slow_next_write(&self, on: &str, delay: Duration) {
+            *self.1.lock().unwrap_or_else(PoisonError::into_inner) = Some((on.to_owned(), delay));
         }
 
         fn slice(&self, service: &str) -> Option<EndpointSlice> {
@@ -571,6 +661,86 @@ mod tests {
             addresses(&objects),
             vec!["10.0.0.2".to_owned()],
             "the successor's slice stands"
+        );
+    }
+
+    /// A slice the built-in controller wrote for `service` before its selector went.
+    fn controller_slice(objects: &Objects, name: &str, service: &str, managed_by: &str) {
+        objects.insert(
+            &format!("/apis/discovery.k8s.io/v1/namespaces/grid/endpointslices/{name}"),
+            serde_json::json!({
+                "apiVersion": "discovery.k8s.io/v1", "kind": "EndpointSlice",
+                "metadata": {"name": name, "namespace": "grid", "resourceVersion": "1", "labels": {
+                    "kubernetes.io/service-name": service,
+                    "endpointslice.kubernetes.io/managed-by": managed_by,
+                }},
+                "addressType": "IPv4",
+                "endpoints": [{"addresses": ["10.0.0.9"], "conditions": {"ready": true}}],
+            }),
+        );
+    }
+
+    fn stored(objects: &Objects, name: &str) -> bool {
+        let held = objects.0.lock().unwrap_or_else(PoisonError::into_inner);
+        held.contains_key(&format!(
+            "/apis/discovery.k8s.io/v1/namespaces/grid/endpointslices/{name}"
+        ))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_holder_deletes_the_slices_the_controller_left_on_its_services() {
+        let objects = with_service();
+        controller_slice(&objects, "grid-signals-abcde", "grid-signals", super::CONTROLLER);
+        controller_slice(&objects, "other-abcde", "other", super::CONTROLLER);
+        controller_slice(&objects, "grid-signals-mirror", "grid-signals", "someone-else");
+        route(&routes(&objects, "10.0.0.1", "a")).await;
+        assert!(
+            !stored(&objects, "grid-signals-abcde"),
+            "the controller's leftover would route to the old pod"
+        );
+        assert!(stored(&objects, "other-abcde"), "another Service's slice is left alone");
+        assert!(
+            stored(&objects, "grid-signals-mirror"),
+            "a slice another manager owns is left alone"
+        );
+        assert_eq!(addresses(&objects), vec!["10.0.0.1".to_owned()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_service_is_routed_once_the_lease_lapses_mid_pass() {
+        let objects = with_service();
+        objects.insert(
+            "/api/v1/namespaces/grid/services/grid-swim",
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "Service",
+                "metadata": {"name": "grid-swim", "namespace": "grid", "uid": "swim-uid", "resourceVersion": "1"},
+                "spec": {"ports": [{"name": "swim-udp", "port": 7946, "targetPort": 7946, "protocol": "UDP"}]}
+            }),
+        );
+        let me = Me {
+            address: "10.0.0.1".parse().expect("address"),
+            pod: "a".to_owned(),
+            node: None,
+        };
+        let routes = HolderRoutes::new(
+            &objects.client(),
+            vec!["grid-signals".to_owned(), "grid-swim".to_owned()],
+            me,
+            BTreeMap::from([("signals".to_owned(), 19091)]),
+        );
+        let holding = crate::leader::Holding::renewed_now();
+        // The pass starts with a little lease left, and its first write outlasts it.
+        tokio::time::advance(crate::leader::RENEW_DEADLINE.saturating_sub(Duration::from_millis(500))).await;
+        objects.slow_next_write("/endpointslices", Duration::from_secs(1));
+        let routing = routes.route_when(std::future::ready("test"), holding);
+        drop(tokio::time::timeout(Duration::from_secs(5), routing).await);
+        assert!(
+            objects.slice("grid-signals").is_some(),
+            "the write under way when the lease held lands"
+        );
+        assert!(
+            objects.slice("grid-swim").is_none(),
+            "the next one does not, once the lease has lapsed"
         );
     }
 }
