@@ -449,50 +449,35 @@ development and testing only.
 
 ### Replicas and leader election
 
-At `replicaCount` 1 the operator runs unelected, and the chart renders exactly
-what it rendered before leader election existed.
+At `replicaCount` 1 the operator runs unelected and renders as before.
 
-Above one replica the operator runs highly available. Every replica is ready.
-They contend for one `Lease`, `coordination.k8s.io/v1`, named for the release
-in its namespace. Only the holder enrolls, starts SWIM, runs the controllers,
+Above one replica, every replica is ready and they contend for one `Lease`
+named for the release. Only the holder enrolls, runs SWIM and the controllers,
 writes status and the serving config, renews the site identity, and serves and
-polls signals. The signals and SWIM Services carry no selector; the holder
-writes their `EndpointSlice`, `<service>-holder`, naming its own address and
-node, so peers reach the holder alone. It writes the SWIM slice when it takes
-the lease, since some load balancers publish an address only once an endpoint
-exists, and the signals slice once it has published signals, so a peer never
-reads an empty answer from a new holder. A holder that collects no local signals,
-as under gossip, writes it at once, and one that has published nothing after 60
-seconds writes it anyway and logs a warning. A successor
-overwrites the slice, so two replicas are never endpoints at once.
+polls signals. The signals and SWIM Services have no selector. The holder writes
+their `<service>-holder` `EndpointSlice`, so peers reach only the holder.
 
-The lease holds for 10 seconds. The holder renews every 5 seconds and treats
-the lease as lost 8 seconds after its last renewal, before any other replica
-can take it. A candidate tries every second and takes a lease that has gone
-unchanged for its whole duration, timed on its own clock. Losing the lease
-stands the operator down and exits it, and the restarted pod contends again.
+| Setting | Value |
+|---|---|
+| Lease duration | 10 s |
+| Renew interval | 5 s |
+| Renew deadline | 8 s |
+| Candidate retry | 1 s |
 
-Standing down clears the holder's slices first, then reports not ready, stops
-every writer, leaves SWIM, and releases the lease, so a candidate takes over on
-its next try instead of waiting out the lease. A candidate takes over about a
-second after the release. A holder lost without releasing is replaced about 11
-seconds after its last renewal, and its slice names it until then. Load
-balancer target changes add their own time on top, seconds with MetalLB and
-up to tens of seconds on a cloud load balancer that health checks its targets.
+- **Graceful handover.** The holder clears its slices, stops its writers, leaves
+  SWIM and releases the lease. A candidate takes over about 1 s later.
+- **Lost holder.** Replaced about 11 s after its last renewal.
+- **Lost lease.** The operator exits and contends again on restart.
+- Load balancers add their own target update time on top.
 
-Moving from one replica to more is safe in one step. The 1-replica render runs
-unelected and never yields, so a candidate lists the operator Deployment's pods
-and does not contend while any of them, terminating ones included, runs without
-leader election. The rollout deletes the unelected pod once the new one is
-ready, and the candidate takes the lease about a second after that pod is gone.
-If the pods cannot be listed, it does not contend.
+Scaling from 1 replica to more is safe in one step. A candidate does not contend
+while any unelected operator pod exists, or while it cannot list pods.
 `grid_operator_lease_waiting` shows why no replica holds the lease.
 
-Above one replica the Deployment rolls one surge pod at a time, a
-`PodDisruptionBudget` keeps one replica up. No preStop delay is needed: the
-holder withdraws its own endpoints, and only the metrics Service follows
-readiness, so a restart may miss one metrics scrape. `grid_operator_lease_held` and `grid_operator_routed` show
-which replica holds the lease and which one the Services reach.
+The rollout surges one pod at a time, and a `PodDisruptionBudget` keeps one
+replica up. No preStop delay is needed. `grid_operator_lease_held` and
+`grid_operator_routed` show which replica holds the lease and which one the
+Services reach.
 
 ### Validate the install
 
