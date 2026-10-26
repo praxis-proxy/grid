@@ -239,7 +239,7 @@ impl FakeApi {
         let answer = match parts.method {
             http::Method::GET => inner.read(&write.path),
             http::Method::POST => inner.create(&write.path, write.body),
-            http::Method::PUT => inner.replace(&write.path, write.body),
+            http::Method::PUT => inner.replace(&write.path, write.status, write.body),
             http::Method::PATCH => inner.patch(&write.path, target, &write.body),
             http::Method::DELETE => inner.delete(&write.path),
             _ => (405, failure(405, "MethodNotAllowed", "unsupported method")),
@@ -320,15 +320,16 @@ impl Inner {
         (201, body)
     }
 
-    /// PUT an object.
-    fn replace(&mut self, path: &str, mut body: Value) -> (u16, Value) {
-        if !self.objects.contains_key(path) {
+    /// PUT an object, or its status when `status`.
+    fn replace(&mut self, path: &str, status: bool, body: Value) -> (u16, Value) {
+        let Some(held) = self.objects.get(path) else {
             return (404, failure(404, "NotFound", &format!("{path} not found")));
-        }
+        };
+        let mut object = subresource(held, body, status);
         let version = self.next_version();
-        stamp(&mut body, &version);
-        self.objects.insert(path.to_owned(), body.clone());
-        (200, body)
+        stamp(&mut object, &version);
+        self.objects.insert(path.to_owned(), object.clone());
+        (200, object)
     }
 
     /// DELETE an object.
@@ -341,9 +342,10 @@ impl Inner {
 
     /// PATCH an object or its status.
     fn patch(&mut self, path: &str, target: PatchTarget<'_>, body: &Value) -> (u16, Value) {
-        let Some(mut object) = self.objects.get(path).cloned() else {
+        let Some(held) = self.objects.get(path).cloned() else {
             return (404, failure(404, "NotFound", &format!("{path} not found")));
         };
+        let mut object = held.clone();
         let scope = if target.status { "/status" } else { "" };
         let content_type = target.content_type;
         let outcome = if content_type.starts_with("application/apply-patch") {
@@ -360,11 +362,41 @@ impl Inner {
         if let Err(why) = outcome {
             return (422, failure(422, "Invalid", &why));
         }
+        let mut object = subresource(&held, object, target.status);
         let version = self.next_version();
         stamp(&mut object, &version);
         self.objects.insert(path.to_owned(), object.clone());
         (200, object)
     }
+}
+
+/// What a write may change of `held`, as the status subresource enforces: a status write
+/// changes only `status`, and a main-resource write keeps the stored `status` and bumps
+/// `metadata.generation` only when `spec` changed.
+fn subresource(held: &Value, mut written: Value, status: bool) -> Value {
+    if status {
+        let mut object = held.clone();
+        match written.get("status") {
+            Some(value) => set(&mut object, "/status", value.clone()),
+            None => remove_at(&mut object, "/status"),
+        }
+        return object;
+    }
+    match held.get("status") {
+        Some(value) => set(&mut written, "/status", value.clone()),
+        None => remove_at(&mut written, "/status"),
+    }
+    let generation = held
+        .pointer("/metadata/generation")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let bumped = if written.get("spec") == held.get("spec") {
+        generation
+    } else {
+        generation.saturating_add(1)
+    };
+    set(&mut written, "/metadata/generation", json!(bumped));
+    written
 }
 
 /// Server-side apply `body` under `manager`, within `scope`, with `owners` the condition
@@ -395,7 +427,8 @@ fn apply(
             set(target, &format!("/{key}"), value.clone());
         }
     }
-    if applied.get("conditions").is_none() && owners.values().any(|owner| owner == manager) {
+    // Condition ownership belongs to the status subresource; a main-resource apply leaves it.
+    if !scope.is_empty() && applied.get("conditions").is_none() && owners.values().any(|owner| owner == manager) {
         // An apply carrying no conditions gives up every condition this manager held.
         apply_conditions(target, &Value::Array(Vec::new()), manager, owners);
     }
@@ -604,4 +637,168 @@ fn query_param(query: Option<&str>, key: &str) -> Option<String> {
 /// A Kubernetes `Status` failure body.
 fn failure(code: u16, reason: &str, message: &str) -> Value {
     json!({ "kind": "Status", "apiVersion": "v1", "status": "Failure", "code": code, "reason": reason, "message": message })
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::FakeApi;
+
+    const PATH: &str = "/apis/grid.praxis.fast/v1alpha1/gridsites/west";
+    const APPLY: &str = "application/apply-patch+yaml";
+
+    /// An API holding one object at generation 1 with a spec and a status.
+    fn seeded() -> FakeApi {
+        let api = FakeApi::new();
+        api.put(
+            PATH,
+            json!({ "metadata": { "name": "west", "generation": 1 }, "spec": { "x": 1 }, "status": { "phase": "P" } }),
+        );
+        api
+    }
+
+    /// Send one request and return its status code.
+    fn send(api: &FakeApi, method: &str, uri: &str, content_type: &str, body: &Value) -> u16 {
+        let (parts, ()) = http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", content_type)
+            .body(())
+            .expect("request")
+            .into_parts();
+        api.answer(&parts, &serde_json::to_vec(body).expect("body")).0
+    }
+
+    /// Apply `conditions` to the status as `manager`.
+    fn apply(api: &FakeApi, manager: &str, conditions: &[&str]) -> u16 {
+        let conditions: Vec<Value> = conditions
+            .iter()
+            .map(|type_| json!({ "type": type_, "status": "True", "reason": type_ }))
+            .collect();
+        let uri = format!("{PATH}/status?fieldManager={manager}&force=true");
+        send(
+            api,
+            "PATCH",
+            &uri,
+            APPLY,
+            &json!({ "status": { "conditions": conditions } }),
+        )
+    }
+
+    /// The condition types stored, in order.
+    fn types(api: &FakeApi) -> Vec<String> {
+        api.observe(PATH)
+            .expect("stored")
+            .conditions
+            .iter()
+            .filter_map(|condition| condition["type"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// The stored object.
+    fn stored(api: &FakeApi) -> Value {
+        api.get(PATH).expect("stored")
+    }
+
+    #[test]
+    fn a_status_put_changes_only_the_status() {
+        let api = seeded();
+        let body =
+            json!({ "metadata": { "name": "west", "generation": 9 }, "spec": { "x": 2 }, "status": { "phase": "Q" } });
+        assert_eq!(
+            send(&api, "PUT", &format!("{PATH}/status"), "application/json", &body),
+            200,
+            "accepted"
+        );
+        let object = stored(&api);
+        assert_eq!(object["spec"], json!({ "x": 1 }), "the spec is kept");
+        assert_eq!(object["metadata"]["generation"], 1, "the generation is kept");
+        assert_eq!(object["status"]["phase"], "Q", "the status is replaced");
+    }
+
+    #[test]
+    fn a_main_put_keeps_the_status_and_bumps_the_generation_only_on_a_spec_change() {
+        let api = seeded();
+        let edited = json!({ "metadata": { "name": "west" }, "spec": { "x": 2 }, "status": { "phase": "Q" } });
+        assert_eq!(send(&api, "PUT", PATH, "application/json", &edited), 200, "accepted");
+        assert_eq!(
+            stored(&api)["status"]["phase"],
+            "P",
+            "a main-resource write drops status"
+        );
+        assert_eq!(
+            stored(&api)["metadata"]["generation"],
+            2,
+            "a spec change bumps the generation"
+        );
+        assert_eq!(
+            send(&api, "PUT", PATH, "application/json", &edited),
+            200,
+            "accepted again"
+        );
+        assert_eq!(
+            stored(&api)["metadata"]["generation"],
+            2,
+            "an unchanged spec keeps the generation"
+        );
+    }
+
+    #[test]
+    fn a_main_patch_drops_status_and_a_status_patch_drops_the_rest() {
+        let api = seeded();
+        let main = json!({ "metadata": { "labels": { "a": "b" } }, "status": { "phase": "Q" } });
+        assert_eq!(
+            send(&api, "PATCH", PATH, "application/merge-patch+json", &main),
+            200,
+            "merge"
+        );
+        assert_eq!(stored(&api)["metadata"]["labels"]["a"], "b", "metadata merges");
+        assert_eq!(
+            stored(&api)["status"]["phase"],
+            "P",
+            "a main-resource patch drops status"
+        );
+        assert_eq!(
+            stored(&api)["metadata"]["generation"],
+            1,
+            "metadata alone keeps the generation"
+        );
+        let operations = json!([
+            { "op": "replace", "path": "/spec/x", "value": 3 },
+            { "op": "replace", "path": "/status/phase", "value": "R" }
+        ]);
+        let uri = format!("{PATH}/status");
+        assert_eq!(
+            send(&api, "PATCH", &uri, "application/json-patch+json", &operations),
+            200,
+            "json patch"
+        );
+        assert_eq!(stored(&api)["spec"]["x"], 1, "a status patch drops the spec change");
+        assert_eq!(stored(&api)["status"]["phase"], "R", "a status patch changes status");
+    }
+
+    #[test]
+    fn a_main_resource_apply_leaves_the_status_conditions_alone() {
+        let api = seeded();
+        assert_eq!(apply(&api, "m", &["A"]), 200, "status apply");
+        let uri = format!("{PATH}?fieldManager=m&force=true");
+        assert_eq!(
+            send(&api, "PATCH", &uri, APPLY, &json!({ "spec": { "x": 2 } })),
+            200,
+            "main apply"
+        );
+        assert_eq!(types(&api), ["A"], "the status condition stays");
+        assert_eq!(
+            api.owners(PATH).get("A").map(String::as_str),
+            Some("m"),
+            "and stays owned"
+        );
+        assert_eq!(
+            stored(&api)["metadata"]["generation"],
+            2,
+            "the spec change bumps the generation"
+        );
+    }
 }
