@@ -438,6 +438,17 @@ material. It closes a connection whose response write stalls or that outlives
 five minutes. Restrict who can reach the listener with
 `loadBalancerSourceRanges` on its Service or with a NetworkPolicy.
 
+Behind an OpenShift Route the listener's own per-source caps stop separating
+peers. Every connection arrives from the router, so one busy peer spends the
+cap for all of them. Size `signals.maxHandshakesPerSource` for the whole peer
+set, not for one peer. The router still sees each peer's own address, so the
+limit that separates them belongs there. `signals.route` renders those limits
+by default, as the router's rate-limit-connections annotations, and a signals
+Route without them leaves the listener open to anyone who can reach the router.
+The Route is passthrough: peers authenticate with a client certificate, and a
+router that terminated TLS would present its own identity and never pass theirs
+on.
+
 The gateway polls only its local operator, from the serving config the operator
 renders, and checks that operator's SPIFFE ID. Pins apply where the operator
 polls its peers; the gateway reads none.

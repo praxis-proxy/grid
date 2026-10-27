@@ -254,6 +254,29 @@ signals:
     externalTrafficPolicy: ""
   # -- Signals endpoint gossiped to peers (ip:port, [ipv6]:port, or dns-name:port). Set it when swim.advertiseAddress is set or the Service is not a LoadBalancer.
   advertiseAddress: ""
+  # -- An OpenShift Route in front of the signals Service, so peers reach this site through
+  # the cluster's router rather than a load balancer of its own. Required when signals are
+  # exposed through a Route: without the rate limits below, the listener is open to anyone
+  # who can reach the router.
+  route:
+    # -- auto renders the Route where the cluster serves route.openshift.io/v1; true or
+    # false forces it. An offline render without --api-versions renders auto as off.
+    enabled: auto
+    # -- External hostname peers dial, the name the router matches the SNI against. The
+    # convention is <site>-signals.<domain>. Required when a Route renders.
+    host: ""
+    # -- Extra Route annotations. They override rateLimit's on a key clash.
+    annotations: {}
+    # -- Per-source-IP connection limits in the router. The router sees each peer's own
+    # address, so these count one peer at a time; the operator's own
+    # signals.maxHandshakesPerSource sees them all as the router.
+    rateLimit:
+      enabled: true
+      # -- Concurrent TCP connections per source IP.
+      concurrentTcp: 10
+      # -- TCP connection rate per source IP, in the router's rate window.
+      rateTcp: 20
+
 
   # -- Concurrent handshakes one source address may hold. Behind an OpenShift Route or a
   # load balancer that does not keep the client address every peer arrives from one

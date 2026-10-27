@@ -208,6 +208,12 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `signals.enabled` | bool | `false` | For signalTransport poll. Adds a TCP port named `signals` to the SWIM Service and points this site's gateway at it. Needs `swim.service.enabled`. A LoadBalancer must support mixed UDP and TCP ports. |
 | `signals.port` | int | `9091` | Signals port on the SWIM Service. Peers learn the LoadBalancer address and this port over gossip. |
 | `signals.advertiseAddress` | string | `""` | Signals endpoint gossiped to peers. Set it with `swim.advertiseAddress` or a NodePort Service, where the operator discovers no LoadBalancer address. |
+| `signals.route.enabled` | string or bool | `auto` | `auto` renders an OpenShift Route in front of the signals Service where the cluster serves `route.openshift.io/v1`; `true` or `false` forces it. An offline render without `--api-versions` renders `auto` as off. |
+| `signals.route.host` | string | `""` | External hostname peers dial, the name the router matches the SNI against. The convention is `<site>-signals.<domain>`. Required when a Route renders. |
+| `signals.route.annotations` | object | `{}` | Extra Route annotations. They override `rateLimit`'s on a key clash. |
+| `signals.route.rateLimit.enabled` | bool | `true` | Render the router's per-source connection limits. Required when signals are exposed through a Route: without them the listener is open to anyone who can reach the router. |
+| `signals.route.rateLimit.concurrentTcp` | int | `10` | Concurrent TCP connections per source IP, in the router. |
+| `signals.route.rateLimit.rateTcp` | int | `20` | TCP connection rate per source IP, in the router's rate window. |
 | `signals.peerIntervalSeconds` | int or string | `""` | Seconds between peer signal polls, 1 to 99999, as `GRID_SIGNALS_PEER_INTERVAL_SECS`. Every site polls every other alive site, so a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator's own default. |
 | `gateway.address` | string | `""` | Advertised site gateway `host:port` override. Use it when the site gateway Service is not a LoadBalancer. Maps to `GRID_GATEWAY_ADDRESS`. |
 | `gateway.serviceName` | string | `""` | Site gateway Service name the operator resolves and advertises to remote sites. Maps to `GRID_GATEWAY_SERVICE_NAME`. |
