@@ -126,37 +126,24 @@ impl MetricsScrapeError {
 /// timed out, else a connect failure.
 fn transport_class(source: &(dyn std::error::Error + 'static)) -> crate::readiness::ScrapeClass {
     use crate::readiness::ScrapeClass;
+
+    let (tls, io_kind) = crate::resources::tls_backend::transport_error_details(source);
+    if tls {
+        return ScrapeClass::Tls;
+    }
+    if io_kind == Some(std::io::ErrorKind::TimedOut) {
+        return ScrapeClass::Timeout;
+    }
+
     let mut cause = Some(source);
     while let Some(error) = cause {
-        if tls_within(error) {
-            return ScrapeClass::Tls;
-        }
         let text = error.to_string();
         if text.contains("dns error") || text.contains("failed to lookup address") {
             return ScrapeClass::Dns;
         }
-        if error
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
-        {
-            return ScrapeClass::Timeout;
-        }
         cause = error.source();
     }
     ScrapeClass::Connect
-}
-
-/// Whether `error` is a TLS failure or wraps one through any depth of `io::Error`.
-///
-/// `io::Error::source` skips the error it wraps, which is where a TLS failure sits, and
-/// hyper-rustls wraps the connector's `io::Error` in another, so the chain is walked by
-/// `get_ref`, not `source`.
-fn tls_within(error: &(dyn std::error::Error + 'static)) -> bool {
-    crate::resources::tls_backend::is_tls_error(error)
-        || error
-            .downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::get_ref)
-            .is_some_and(|inner| tls_within(inner))
 }
 
 // ---------------------------------------------------------------------------

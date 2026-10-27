@@ -1498,6 +1498,30 @@ pub(crate) fn is_tls_error(err: &(dyn std::error::Error + 'static)) -> bool {
     err.downcast_ref::<openssl::ssl::Error>().is_some() || err.downcast_ref::<openssl::error::ErrorStack>().is_some()
 }
 
+/// Find the TLS marker and innermost I/O kind in a transport error chain.
+///
+/// An [`std::io::Error`] does not expose its wrapped error through the same
+/// path as every other error, so its inner value is followed explicitly.
+pub(crate) fn transport_error_details(error: &(dyn std::error::Error + 'static)) -> (bool, Option<std::io::ErrorKind>) {
+    let mut current = Some(error);
+    let mut io_kind = None;
+    let mut tls = false;
+
+    while let Some(current_error) = current {
+        tls |= is_tls_error(current_error);
+        if let Some(io) = current_error.downcast_ref::<std::io::Error>() {
+            io_kind = Some(io.kind());
+            current = io
+                .get_ref()
+                .map(|inner| -> &(dyn std::error::Error + 'static) { inner });
+        } else {
+            current = current_error.source();
+        }
+    }
+
+    (tls, io_kind)
+}
+
 /// Classify a TLS/handshake I/O error into a `GatewayProbeOutcome`.
 ///
 /// Never exposes the raw error string in the outcome.
