@@ -3,7 +3,10 @@
 //! One implementation today, the enrollment service over HTTPS. The check that an issued
 //! leaf names this site stays with the callers, so every implementation passes it.
 
-use std::sync::{Mutex, PoisonError};
+use std::{
+    borrow::Cow,
+    sync::{Mutex, PoisonError},
+};
 
 use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -89,7 +92,8 @@ pub(super) struct Clients(Mutex<Option<([u8; 32], reqwest::Client)>>);
 pub(super) struct HttpsSigner<'clients> {
     /// The signer's base URL.
     base: Url,
-    /// The PEM pinning the signer to enroll. Renewal trusts only the held grid CA.
+    /// The PEM pinning the signer's serving certificate: the only trust to enroll, and
+    /// trusted beside the held grid CA to renew.
     pin: Option<String>,
     /// Clients kept across calls.
     clients: &'clients Clients,
@@ -168,10 +172,14 @@ impl Signer for HttpsSigner<'_> {
     }
 
     async fn renew(&self, held: &Held, csr_pem: &str) -> Result<Issued, SignerError> {
-        // The grid CA the site holds, never a pin its config names: a config edit cannot
-        // point renewal at a signer of its own.
+        // The held grid CA, and the pin: a Secret-only bundle on a host GRID_SIGNER_HOSTS
+        // confines, so a ConfigMap edit cannot point renewal at a signer of its own.
+        let trust = match &self.pin {
+            Some(pin) => Cow::Owned(format!("{}\n{pin}", held.ca)),
+            None => Cow::Borrowed(held.ca.as_str()),
+        };
         let request = self
-            .client(&held.ca, Some((&held.cert, &held.key)))?
+            .client(&trust, Some((&held.cert, &held.key)))?
             .post(Self::endpoint(&self.base, RENEW_PATH))
             .json(&CsrRequest { csr: csr_pem });
         Box::pin(post(request)).await

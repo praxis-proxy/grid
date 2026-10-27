@@ -136,7 +136,7 @@ fn signed(mock: &Mock, request: &Value) -> Value {
 }
 
 /// Serve one TLS connection with `app`.
-async fn serve_conn(tls: tls_backend::ServerTlsConfig, app: Router, stream: tokio::net::TcpStream) {
+pub(super) async fn serve_conn(tls: tls_backend::ServerTlsConfig, app: Router, stream: tokio::net::TcpStream) {
     let Ok(stream) = tls_backend::accept(stream, &tls).await else {
         return;
     };
@@ -170,6 +170,28 @@ fn serve_on(mock: &Arc<Mock>, listener: tokio::net::TcpListener) {
             tokio::spawn(serve_conn(Arc::clone(&tls), app.clone(), stream));
         }
     });
+}
+
+/// A signer on localhost serving a certificate from a CA of its own, accepting client
+/// certificates `client_ca` issued and answering 404 to everything, and that CA.
+pub(super) async fn byo_serving_signer(client_ca: &str) -> (Url, String) {
+    let serving = certs::generate_ca("corporate-ca").expect("ca");
+    let server = certs::generate_dns_cert(&serving, "localhost", "localhost").expect("server cert");
+    let tls = tls_backend::build_server_config_optional_client(
+        client_ca.as_bytes(),
+        server.cert_pem.as_bytes(),
+        server.key_pem.as_bytes(),
+    )
+    .expect("server TLS");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    drop(tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            drop(tokio::spawn(serve_conn(Arc::clone(&tls), Router::new(), stream)));
+        }
+    }));
+    let base = Url::parse(&format!("https://localhost:{port}")).expect("url");
+    (base, serving.cert_pem)
 }
 
 /// Start a mock, returning it and settings pinned to it.

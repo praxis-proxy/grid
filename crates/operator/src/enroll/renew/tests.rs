@@ -613,7 +613,7 @@ fn a_refused_operator_config_renews_through_nothing() {
 }
 
 /// Resolve the signer `loaded` names for site `east`.
-fn resolve(loaded: &Loaded) -> Resolved {
+fn resolve(loaded: &Loaded) -> Resolved<'_> {
     resolve_signer(&declared(loaded, Some("east"))).expect("resolved")
 }
 
@@ -633,6 +633,7 @@ fn only_the_operator_config_names_the_signer() {
         resolve(&loaded(&signer(""))),
         Resolved::Signer(Endpoint {
             base: reqwest::Url::parse("https://enroll.example.com").expect("url"),
+            pin: None,
         }),
         "a signer renews trusted through the held grid CA"
     );
@@ -648,14 +649,11 @@ fn only_the_operator_config_names_the_signer() {
     );
 }
 
-/// Renewal trusts the grid CA the site holds, never a pin its config names: a pin that is
-/// not even a certificate is never read.
-#[tokio::test]
-async fn renewal_trusts_the_held_grid_ca_and_never_the_config_pin() {
-    crate::init_process_crypto();
+/// An identity for `east` from a fresh grid CA.
+fn held_identity() -> Held {
     let ca = certs::generate_ca("grid-ca").expect("ca");
     let leaf = certs::generate_dns_cert(&ca, "east", "east").expect("leaf");
-    let held = Held {
+    Held {
         cert: leaf.cert_pem,
         key: Zeroizing::new(leaf.key_pem),
         ca: ca.cert_pem,
@@ -663,13 +661,33 @@ async fn renewal_trusts_the_held_grid_ca_and_never_the_config_pin() {
         version: "1".to_owned(),
         rotated: false,
         renewer: None,
-    };
+    }
+}
+
+#[tokio::test]
+async fn renewal_trusts_the_pin_beside_the_held_grid_ca() {
+    crate::init_process_crypto();
+    let held = held_identity();
+    let (base, pin) = super::super::tests::byo_serving_signer(&held.ca).await;
     let clients = Clients::default();
-    let base = reqwest::Url::parse("https://127.0.0.1:9").expect("url");
-    let signer = HttpsSigner::new(base, Some("not a certificate".to_owned()), &clients);
-    let renewed = signer.renew(&held, "csr").await;
-    let why = renewed.err().map(|error| error.to_string()).unwrap_or_default();
-    assert!(!why.contains("signer trust"), "the pin is never parsed: {why}");
+
+    let unpinned = HttpsSigner::new(base.clone(), None, &clients).renew(&held, "csr").await;
+    let unpinned = unpinned.err().map(renew_error);
+    assert!(
+        matches!(unpinned, Some(RenewError::Untrusted(_))),
+        "the held grid CA alone does not trust a serving certificate it did not issue: {unpinned:?}"
+    );
+    let reason = rotation_verdict(&Err(unpinned.expect("refused")), None).reason;
+    assert_eq!(
+        reason, "SignerUntrusted",
+        "an untrusted signer is not a transport failure"
+    );
+
+    let pinned = HttpsSigner::new(base, Some(pin), &clients).renew(&held, "csr").await;
+    assert!(
+        matches!(pinned, Err(SignerError::Refused { status, .. }) if status == StatusCode::NOT_FOUND),
+        "the pin trusts the signer's serving certificate, so the request reaches it"
+    );
 }
 
 /// A check, the signer it went through, and the status and reason it earns.

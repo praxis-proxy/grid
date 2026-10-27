@@ -336,6 +336,7 @@ conditions the renewal loop writes each round:
 | `False` | `RotationOverdue` | Renewal is due or the identity expired, and nothing renewed it: the cases above, an annotated Certificate that has not replaced the identity, the signer answering 503 `rotation_disabled`, or an expired identity. |
 | `False` | `RenewalFailing` | The last check or renewal failed and is retried with backoff. The message carries the error. |
 | `False` | `RenewalRefused` | The signer answered 401 or 403. Re-enroll this site with a new site token. |
+| `False` | `SignerUntrusted` | Neither the grid CA this site holds nor the `caBundleRef` bundle trusts the signer's serving certificate. Pin the CA that issued it in `site.signerEndpoint.caBundleRef`, or serve a certificate the grid CA issued. Retried with backoff. |
 
 ### Turn rotation off
 

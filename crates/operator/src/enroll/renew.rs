@@ -33,7 +33,7 @@ use crate::{
         grid_site::GridSite,
     },
     metrics,
-    operator_config::{ConfigWatch, Loaded, Rotation, Section, SignerEndpoint, Snapshot},
+    operator_config::{BundleRef, ConfigWatch, Loaded, Rotation, Section, SignerEndpoint, Snapshot},
 };
 
 
@@ -111,6 +111,12 @@ pub(super) enum RenewError {
     /// The service refuses every rotation: rotation is turned off on the hub.
     #[error("rotation disabled at the signer ({0}); turn it on before the identity expires")]
     SignerDisabled(String),
+    /// The signer's serving certificate is trusted by neither the grid CA held nor the pin.
+    #[error(
+        "the signer's serving certificate is not trusted ({0}); pin the CA that issued it in \
+         site.signerEndpoint.caBundleRef, or serve one the grid CA issued"
+    )]
+    Untrusted(String),
 }
 
 impl RenewError {
@@ -123,7 +129,8 @@ impl RenewError {
             | Self::Kube(_)
             | Self::Transport(_)
             | Self::Invalid(_)
-            | Self::SignerDisabled(_) => "failed",
+            | Self::SignerDisabled(_)
+            | Self::Untrusted(_) => "failed",
         }
     }
 }
@@ -373,9 +380,8 @@ fn renew_error(error: SignerError) -> RenewError {
             ..
         } => RenewError::Refused(detail),
         SignerError::Disabled(detail) => RenewError::SignerDisabled(detail),
-        SignerError::Refused { detail, .. }
-        | SignerError::Transport { detail, .. }
-        | SignerError::Untrusted { detail, .. } => RenewError::Transport(detail),
+        SignerError::Refused { detail, .. } | SignerError::Transport { detail, .. } => RenewError::Transport(detail),
+        SignerError::Untrusted { detail, .. } => RenewError::Untrusted(detail),
         SignerError::Request(detail) => RenewError::Material(detail),
         SignerError::Invalid(detail) => RenewError::Invalid(detail),
     }
@@ -471,12 +477,15 @@ impl IdentityStore for KubeIdentity {
 
 /// The signer a renewal goes to, read from `site.signerEndpoint` in the operator config.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Endpoint {
-    /// The signer's base URL. The signer is trusted through the grid CA the site holds.
+pub(super) struct Endpoint<'config> {
+    /// The signer's base URL. The signer is trusted through the grid CA the site holds, or
+    /// the bundle `pin` names.
     pub(super) base: reqwest::Url,
+    /// `site.signerEndpoint.caBundleRef`, the bundle pinning the signer's serving certificate.
+    pub(super) pin: Option<&'config BundleRef>,
 }
 
-impl Endpoint {
+impl Endpoint<'_> {
     /// The renewal URL, for messages.
     fn renewal_url(&self) -> String {
         HttpsSigner::endpoint(&self.base, RENEW_PATH)
@@ -675,15 +684,15 @@ fn declared<'config>(loaded: &'config Loaded, identity: Option<&str>) -> Declare
 
 /// The signer this round renews through, else why nothing renews.
 #[derive(Debug, PartialEq, Eq)]
-enum Resolved {
+enum Resolved<'config> {
     /// Renew through this signer.
-    Signer(Endpoint),
+    Signer(Endpoint<'config>),
     /// Nothing renews.
     Off(Off),
 }
 
 /// Resolve the signer `site.signerEndpoint` names.
-fn resolve_signer(declared: &Declared<'_>) -> Result<Resolved, RenewError> {
+fn resolve_signer<'config>(declared: &Declared<'config>) -> Result<Resolved<'config>, RenewError> {
     let endpoint = match declared {
         Declared::Renews(endpoint) => endpoint,
         Declared::Disabled => return Ok(Resolved::Off(Off::Disabled)),
@@ -691,7 +700,10 @@ fn resolve_signer(declared: &Declared<'_>) -> Result<Resolved, RenewError> {
         Declared::Refused(_) => return Ok(Resolved::Off(Off::Refused)),
     };
     let base = super::signer_url(&endpoint.url).map_err(RenewError::Material)?;
-    Ok(Resolved::Signer(Endpoint { base }))
+    Ok(Resolved::Signer(Endpoint {
+        base,
+        pin: endpoint.ca_bundle_ref.as_ref(),
+    }))
 }
 
 /// What renewal keeps across rounds: the identity store, the renewal clients and the gateway.
@@ -998,7 +1010,7 @@ fn untrusted(error: &certs::VerifyError, target: &Target, site: Option<&str>) ->
 /// The signer this round renews through, else why nothing renews, else why it could not
 /// be resolved. A signer whose rotation is Enabled under a trust that does not renew is
 /// held back, since a pinned peer would refuse the renewed leaf.
-fn through(declared: &Declared<'_>, trust: &Trust) -> Result<Endpoint, Result<Off, RenewError>> {
+fn through<'config>(declared: &Declared<'config>, trust: &Trust) -> Result<Endpoint<'config>, Result<Off, RenewError>> {
     match resolve_signer(declared) {
         Ok(Resolved::Signer(signer)) if trust.renews => Ok(signer),
         Ok(Resolved::Signer(_)) => Err(Ok(Off::UnsupportedUnderPin)),
@@ -1046,16 +1058,40 @@ fn off_round(why: Off, read: Read, identity: Option<Identity>, trust: &Trust, de
     }
 }
 
+/// The PEM `reference` pins the signer with. A bundle refused for its label is left out,
+/// as `ResolvedRefs` reports, and the held grid CA alone still trusts the signer.
+async fn signer_pin(client: &Client, reference: Option<&BundleRef>) -> Result<Option<String>, RenewError> {
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    match Box::pin(local::Bundles::new(client, client.default_namespace()).pem(reference)).await {
+        Ok(found) => Ok(found.map(|(pem, _version)| pem)),
+        Err(local::BundleError::Api(why)) => Err(RenewError::Kube(why)),
+        Err(local::BundleError::Refused(_)) => Ok(None),
+    }
+}
+
 /// Renew the identity `read` from `target` through `signer` if it is due.
 async fn renew_through(
     loop_: &Loop<'_>,
     target: &Target,
     read: Read,
-    endpoint: Endpoint,
+    endpoint: Endpoint<'_>,
     identity: Option<Identity>,
 ) -> Round {
     let url = endpoint.renewal_url();
-    let signer = HttpsSigner::new(endpoint.base, None, loop_.clients);
+    let pin = match Box::pin(signer_pin(loop_.client, endpoint.pin)).await {
+        Ok(pin) => pin,
+        Err(error) => {
+            return Round {
+                checked: Err(error),
+                signer: Some(url),
+                identity,
+                refused: None,
+            };
+        },
+    };
+    let signer = HttpsSigner::new(endpoint.base, pin, loop_.clients);
     Round {
         checked: Box::pin(check_held(
             loop_.store,
@@ -1150,6 +1186,7 @@ fn rotation_verdict(checked: &Result<Checked, RenewError>, url: Option<&String>)
             Verdict::new("False", "RenewalRefused", error.to_string())
         },
         Err(error @ RenewError::SignerDisabled(_)) => Verdict::new("False", "RotationOverdue", error.to_string()),
+        Err(error @ RenewError::Untrusted(_)) => Verdict::new("False", "SignerUntrusted", error.to_string()),
         Err(error) => Verdict::new("False", "RenewalFailing", error.to_string()),
         Ok(Checked::Waiting(_) | Checked::Renewed(_)) => match url {
             Some(url) => Verdict::new(

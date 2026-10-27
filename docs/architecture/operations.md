@@ -365,13 +365,16 @@ only to grid admins. A role that edits the config should name `grid-operator-con
 `resourceNames`, and no other role should get `create`, `patch` or `update` on ConfigMaps
 in that namespace.
 
-Three guards limit what a ConfigMap editor can still do:
+Two guards limit what a ConfigMap editor can still do:
 
 - A signer bundle must be a Secret, so the editor cannot pin a CA of their own.
 - `GRID_SIGNER_HOSTS`, the chart's `enrollment.signerHosts`, fixes the signer hosts at
   install time, outside the config. The chart defaults it to the host of
   `enrollment.url`. Unset, any host is allowed and the operator logs a warning at startup.
-- Renewal trusts only the grid CA the site holds, never a bundle the config names.
+
+Renewal trusts the grid CA the site holds and the `caBundleRef` bundle, so a signer
+serving a certificate from another CA still renews. Both guards above apply to that
+bundle: it is a labelled Secret, and it is used only for a host the install allows.
 
 The operator reads its config through a Role that names it, with no write verb. Its
 ServiceAccount still keeps `create`, `patch` and `update` on ConfigMaps in the operator

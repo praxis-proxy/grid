@@ -100,7 +100,7 @@ fn managers() -> BTreeMap<&'static str, &'static str> {
 
 /// The reasons the enrollment step writes, by type and status. `Available` copies the
 /// first failing gate's reason, so it carries the gates' reasons.
-const REASONS: [(&str, &str, &str); 26] = [
+const REASONS: [(&str, &str, &str); 28] = [
     (AVAILABLE, "True", "Available"),
     (AVAILABLE, "False", "AwaitingInvite"),
     (AVAILABLE, "False", "InviteMaybeSpent"),
@@ -127,6 +127,8 @@ const REASONS: [(&str, &str, &str); 26] = [
     (DEGRADED, "False", "AsExpected"),
     (ROTATION_ON_SCHEDULE, "True", "RotationDisabled"),
     (ROTATION_ON_SCHEDULE, "True", "RotationOnSchedule"),
+    (ROTATION_ON_SCHEDULE, "False", "SignerUntrusted"),
+    (DEGRADED, "True", "SignerUntrusted"),
 ];
 
 /// `Available` on `observed`, as (status, reason).
@@ -295,18 +297,23 @@ async fn invariant_8_an_identity_with_another_key_is_certificate_key_mismatch() 
 
 /// Run `count` rounds of the enrollment step and the renewal loop, as the operator does
 /// once the identity names the site, observing the site after each.
-async fn renewal_rounds(api: &FakeApi, count: usize, mut before: impl FnMut(usize)) -> Vec<Observed> {
+async fn renewal_rounds(api: &FakeApi, count: usize, before: impl FnMut(usize)) -> Vec<Observed> {
+    renewal_rounds_under(api, "", count, before).await
+}
+
+/// [`renewal_rounds`] with `rest` under the site section.
+async fn renewal_rounds_under(api: &FakeApi, rest: &str, count: usize, mut before: impl FnMut(usize)) -> Vec<Observed> {
     let client = api.client(NAMESPACE);
     let settings = crate::enroll::renew::Settings::new()
         .with_site(Some(SITE.to_owned()))
-        .with_config(ConfigWatch::fixed(config("")));
+        .with_config(ConfigWatch::fixed(config(rest)));
     let renewal = crate::enroll::renew::Rounds::new(client.clone(), &settings);
     let mut enrollment = Enrollment::default();
     let mut observed = Vec::with_capacity(count);
     for round in 0..count {
         before(round);
         let _step = enrollment
-            .step(&client, Some(SITE), &config(""))
+            .step(&client, Some(SITE), &config(rest))
             .await
             .expect("sites list");
         let _renewed = renewal.round(&settings).await;
@@ -496,4 +503,51 @@ async fn invariant_8_an_identity_cert_manager_issued_reads_renewed_by_its_certif
         )
     );
     assert_eq!(rounds[1].condition(DEGRADED).expect("Degraded")["status"], "False");
+}
+
+/// Store an identity five days from expiry, so renewal is due, returning the grid CA.
+fn store_due_identity(api: &FakeApi) -> String {
+    let ca = certs::generate_ca("grid-ca").expect("ca");
+    let csr = certs::generate_csr(SITE).expect("csr");
+    let now = time::OffsetDateTime::now_utc();
+    let validity = certs::Validity {
+        not_before: now.saturating_sub(time::Duration::days(25)),
+        not_after: now.saturating_add(time::Duration::days(5)),
+    };
+    let leaf = certs::sign_csr(&ca, SITE, &csr.csr_pem, validity).expect("a leaf due for renewal");
+    store_pair(api, &ca.cert_pem, &leaf.cert_pem, &csr.key_pem);
+    ca.cert_pem
+}
+
+#[tokio::test]
+async fn invariant_8_a_signer_neither_the_grid_ca_nor_a_pin_trusts_is_signer_untrusted() {
+    crate::init_process_crypto();
+    let api = seeded();
+    let ca = store_due_identity(&api);
+    let (base, _pin) = crate::enroll::tests::byo_serving_signer(&ca).await;
+    let rest = format!("  signerEndpoint:\n    url: {}\n", base.as_str());
+    let rounds = renewal_rounds_under(&api, &rest, 3, |_round| {}).await;
+
+    invariants::unchanged_from(&rounds, 1).expect("invariant 1");
+    invariants::transition_time_moves_only_with_status(&rounds).expect("invariant 2");
+    invariants::one_manager_per_type(&api.writes(), PATH, &managers()).expect("invariant 5");
+    invariants::reasons_within(&rounds, &REASONS).expect("invariant 8");
+    let rotation = rounds[1].condition(ROTATION_ON_SCHEDULE).expect("RotationOnSchedule");
+    assert_eq!(
+        (&rotation["status"], &rotation["reason"]),
+        (&json!("False"), &json!("SignerUntrusted"))
+    );
+    assert!(
+        rotation["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("site.signerEndpoint.caBundleRef"),
+        "says to pin the signer: {}",
+        rotation["message"]
+    );
+    assert_eq!(
+        available_of(&rounds[1]),
+        ("True", "Available"),
+        "the identity still serves"
+    );
 }
