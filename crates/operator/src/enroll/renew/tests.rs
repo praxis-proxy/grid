@@ -991,7 +991,7 @@ fn trust(renews: bool) -> Trust {
 
 #[test]
 fn rotation_enabled_under_pin_is_an_accepted_conflict_and_holds_renewal_back() {
-    let refused = accepted(&loaded(&signer("")), Some("east"), &trust(false));
+    let refused = accepted(&loaded(&signer("")), Some("east"), (&[], &trust(false)));
     assert_eq!(
         (refused.status, refused.reason.as_ref()),
         ("False", "RotationUnsupportedUnderPinTrust")
@@ -1007,7 +1007,7 @@ fn rotation_enabled_under_pin_is_an_accepted_conflict_and_holds_renewal_back() {
         vec![("True", local::ROTATION_ON_SCHEDULE.to_owned())],
         "the rotation reason set stays closed; the conflict is on Accepted"
     );
-    let accepted_once = accepted(&loaded(&signer("")), Some("east"), &trust(true));
+    let accepted_once = accepted(&loaded(&signer("")), Some("east"), (&[], &trust(true)));
     assert_eq!(
         accepted_once.status, "True",
         "spiffe trust renews, so nothing conflicts"
@@ -1017,17 +1017,47 @@ fn rotation_enabled_under_pin_is_an_accepted_conflict_and_holds_renewal_back() {
 #[test]
 fn disabled_rotation_no_signer_and_no_config_are_accepted() {
     for document in [signer("    rotation: Disabled\n"), String::new()] {
-        let verdict = accepted(&loaded(&document), Some("east"), &trust(false));
+        let verdict = accepted(&loaded(&document), Some("east"), (&[], &trust(false)));
         assert_eq!(
             (verdict.status, verdict.reason.as_ref()),
             ("True", local::ACCEPTED),
             "{document}"
         );
     }
-    let off = accepted(&Loaded::Absent, Some("east"), &trust(false));
+    let off = accepted(&Loaded::Absent, Some("east"), (&[], &trust(false)));
     assert_eq!(
         (off.status, off.message.as_str()),
         ("True", "no operator config, enrollment off")
+    );
+}
+
+#[test]
+fn a_site_section_without_a_grid_id_to_join_is_not_accepted() {
+    let unset: GridNetwork = serde_json::from_value(serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1", "kind": "GridNetwork",
+        "metadata": { "name": "grid" }, "spec": {}
+    }))
+    .expect("network");
+    let named = GridNetwork {
+        spec: crate::crd::grid_network::GridNetworkSpec {
+            grid_id: "dagobah".to_owned(),
+            ..unset.spec.clone()
+        },
+        ..unset.clone()
+    };
+    let verdict = accepted(&loaded(""), Some("east"), (std::slice::from_ref(&unset), &trust(true)));
+    assert_eq!((verdict.status, verdict.reason.as_ref()), ("False", "GridIdUnset"));
+    assert!(
+        verdict.message.contains("spec.gridId") && verdict.message.contains("GridNetwork grid"),
+        "{}",
+        verdict.message
+    );
+    let joined = accepted(&loaded(""), Some("east"), (std::slice::from_ref(&named), &trust(true)));
+    assert_eq!(joined.status, "True");
+    let standalone = accepted(&Loaded::Absent, None, (std::slice::from_ref(&unset), &trust(true)));
+    assert_eq!(
+        standalone.status, "True",
+        "with no site section the operator mints the grid ID"
     );
 }
 
@@ -1036,13 +1066,13 @@ fn a_refused_config_is_not_accepted_and_holds_renewal_back() {
     let invalid = accepted(
         &Loaded::Invalid("site.name: bad".to_owned()),
         Some("east"),
-        &trust(true),
+        (&[], &trust(true)),
     );
     assert_eq!(
         (invalid.status, invalid.reason.as_ref()),
         ("False", "OperatorConfigInvalid")
     );
-    let mismatch = accepted(&loaded(""), Some("west"), &trust(true));
+    let mismatch = accepted(&loaded(""), Some("west"), (&[], &trust(true)));
     assert_eq!(
         (mismatch.status, mismatch.reason.as_ref()),
         ("False", "SiteNameMismatch")

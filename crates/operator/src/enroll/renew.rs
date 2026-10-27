@@ -669,7 +669,12 @@ fn declared<'config>(loaded: &'config Loaded, identity: Option<&str>) -> Declare
 
 /// What `Accepted` says of `loaded` for the site `identity` names, under `trust`: the one
 /// verdict the enrollment step and the renewal loop both write.
-fn accepted(loaded: &Loaded, identity: Option<&str>, trust: &Trust) -> Verdict {
+fn accepted(loaded: &Loaded, identity: Option<&str>, (networks, trust): (&[GridNetwork], &Trust)) -> Verdict {
+    if let ([network], Section::Site(_)) = (networks, loaded.site())
+        && network.spec.grid_id.is_empty()
+    {
+        return Verdict::grid_id_unset(network.metadata.name.as_deref().unwrap_or_default());
+    }
     match declared(loaded, identity) {
         Declared::Refused(refusal) => refusal,
         Declared::Renews(_) if !trust.renews => trust.refusal(),
@@ -684,7 +689,11 @@ fn accepted(loaded: &Loaded, identity: Option<&str>, trust: &Trust) -> Verdict {
 /// [`accepted`] under the trust `networks` declare, for the enrollment step, which writes only
 /// while one exists.
 pub(super) fn accepted_over(loaded: &Loaded, identity: Option<&str>, networks: &[GridNetwork]) -> Verdict {
-    accepted(loaded, identity, &declared_trust(networks, GridModes::WITHOUT_NETWORK))
+    accepted(
+        loaded,
+        identity,
+        (networks, &declared_trust(networks, GridModes::WITHOUT_NETWORK)),
+    )
 }
 
 /// The signer this round renews through, else why nothing renews.
@@ -825,7 +834,7 @@ async fn round_over(
     };
     // A round given up for a stand-down says nothing new, and writing would hold the stand-down.
     if let (Ok(target), [own], false) = (&target, listed, matches!(round.checked, Err(RenewError::StoodDown))) {
-        let accepted = accepted(&snapshot.loaded, site, &trust);
+        let accepted = accepted(&snapshot.loaded, site, (listed, &trust));
         Box::pin(report_round(
             loop_.client,
             (own, target),

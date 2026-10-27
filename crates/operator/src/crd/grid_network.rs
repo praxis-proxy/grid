@@ -603,13 +603,18 @@ fn add_tls_config_legacy_fields(schema: &mut schemars::Schema) {
 #[schemars(extend("x-kubernetes-validations" = [{
     "rule": "has(self.placementPolicy) == (has(self.selectionPolicy) && self.selectionPolicy.mode == 'weightedRandom')",
     "message": "placementPolicy must be set if and only if selectionPolicy.mode is weightedRandom"
+}, {
+    "rule": "!has(oldSelf.gridId) || oldSelf.gridId == '' || (has(self.gridId) && self.gridId == oldSelf.gridId)",
+    "message": "gridId cannot change once set"
 }]))]
 #[schemars(transform = add_grid_network_spec_legacy_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct GridNetworkSpec {
-    /// Grid ID for tenancy. Empty on creation; auto-generated
-    /// on first join with another site.
+    /// The grid this network belongs to, set once. Empty only while unset: an install with no
+    /// operator config site section then mints one, and one with a site section holds the
+    /// grid runtime until it is set. Moving to another grid means recreating the network.
     #[serde(default)]
+    #[schemars(length(max = 63), regex(pattern = "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"))]
     pub grid_id: String,
 
     /// Initial SWIM seed peer endpoints in host:port form. Literal IPv4, bracketed

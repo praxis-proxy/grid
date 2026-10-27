@@ -689,7 +689,7 @@ type GridNetworkSpec struct {
 	BudgetPolicy *GridNetworkBudgetPolicy `json:"budgetPolicy,omitempty"`
 	// References to Praxis Gateways that participate in this grid.
 	ConsumerGateways []GridNetworkConsumerGatewaysItem `json:"consumerGateways,omitempty"`
-	// Grid ID for tenancy. Empty on creation; auto-generated on first join with another site.
+	// The grid this network belongs to, set once. Empty only while unset: an install with no operator config site section then mints one, and one with a site section holds the grid runtime until it is set. Moving to another grid means recreating the network.
 	GridID string `json:"gridId,omitempty"`
 	// Maximum time between metric refreshes and score/ranking recalculation.
 	// This controls the GridNetwork reconcile cadence for provider metrics; it does not change request-path routing or the overlay watch latency. Use a duration of at least one second, such as "10s" or "1500ms". The default cadence is 300 seconds. TLS-protected provider metrics cap the cadence at 60 seconds for bounded certificate-rotation detection.

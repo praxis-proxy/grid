@@ -127,6 +127,18 @@ impl Verdict {
         Self::new("True", ACCEPTED, "this cluster's own site".to_owned())
     }
 
+    /// `Accepted`: a site section, and a `GridNetwork` naming no grid to join.
+    pub(crate) fn grid_id_unset(network: &str) -> Self {
+        Self::new(
+            "False",
+            "GridIdUnset",
+            format!(
+                "GridNetwork {network} sets no spec.gridId: set it to this grid's ID, as the grid-operator chart's \
+                 grid.id does. The grid runtime waits until it is set"
+            ),
+        )
+    }
+
     /// `Accepted`: no site section to act on, so enrollment is off.
     pub(crate) fn no_site(absent: bool) -> Self {
         let message = if absent {

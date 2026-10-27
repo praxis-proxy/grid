@@ -1535,6 +1535,11 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     ctx.publish_declared_trust(&network);
 
     let client = &ctx.client;
+    if holds_for_grid_id(&network, &ctx.operator_config.current()) {
+        tracing::info!(name, "spec.gridId is not set; the grid runtime waits until it is");
+        Box::pin(apply_rollup(client, &network)).await;
+        return Ok(Action::await_change());
+    }
     let enrolls = config_enrolls(&ctx.operator_config.current());
     let tls_retry = Box::pin(ensure_tls_secrets(&network, client, ctx.site_name.as_deref(), enrolls)).await?;
 
@@ -4923,6 +4928,14 @@ async fn distribute_overlay_configmap(
 
 /// Resolve the grid ID: use spec if set, or status if
 /// previously generated, or generate a new one.
+/// Whether `network` must wait for `spec.gridId`: unset, while the operator config names a
+/// site, which joins a grid an admin names rather than one this operator would mint.
+fn holds_for_grid_id(network: &GridNetwork, config: &crate::operator_config::Snapshot) -> bool {
+    network.spec.grid_id.is_empty() && !matches!(config.loaded.site(), crate::operator_config::Section::Unset)
+}
+
+/// The grid ID: `spec.gridId` whenever set, else the one minted earlier, else a new one. Only
+/// an install whose operator config names no site gets here without `spec.gridId`.
 fn resolve_grid_id(network: &GridNetwork) -> String {
     if !network.spec.grid_id.is_empty() {
         return network.spec.grid_id.clone();

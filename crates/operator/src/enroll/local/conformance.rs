@@ -65,7 +65,7 @@ fn seeded() -> FakeApi {
             "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "GridNetwork",
             "metadata": { "name": "grid", "generation": 1, "uid": "uid-grid" },
-            "spec": { "peerTrust": { "mode": "spiffe" } }
+            "spec": { "gridId": "grid", "peerTrust": { "mode": "spiffe" } }
         }),
     );
     api.put(

@@ -291,7 +291,7 @@ fn own_network() -> GridNetwork {
         "apiVersion": "grid.praxis.fast/v1alpha1",
         "kind": "GridNetwork",
         "metadata": {"name": NETWORK, "uid": "uid-grid", "generation": 1},
-        "spec": { "peerTrust": { "mode": "spiffe" } },
+        "spec": { "gridId": "grid", "peerTrust": { "mode": "spiffe" } },
     }))
     .expect("network")
 }

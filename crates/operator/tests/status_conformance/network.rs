@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use operator::{
     controller::grid_network::{self, OperatorCtx},
     crd::grid_network::{GridNetwork, SignalMode},
+    operator_config::{ConfigWatch, Snapshot, parse},
 };
 use status_harness::{FakeApi, invariants};
 
@@ -25,8 +26,14 @@ fn seeded() -> (FakeApi, String) {
 
 /// One network reconcile.
 async fn reconcile(api: &FakeApi, path: &str) {
+    reconcile_under(api, path, Snapshot::absent()).await;
+}
+
+/// One network reconcile, under the operator config `config`.
+async fn reconcile_under(api: &FakeApi, path: &str, config: Snapshot) {
     let network: GridNetwork = fixtures::stored(api, path);
-    let ctx = OperatorCtx::new(api.client("default"), None, SignalMode::Gossip);
+    let ctx = OperatorCtx::new(api.client("default"), None, SignalMode::Gossip)
+        .with_operator_config(ConfigWatch::fixed(config));
     grid_network::reconcile(Arc::new(network), Arc::new(ctx))
         .await
         .expect("network reconcile succeeds");
@@ -156,4 +163,56 @@ async fn invariant_7_network_rollup_trio_is_present_after_round_one() {
     gates_true(&api, &path);
     let rounds = fixtures::rounds(&api, &path, 1, |_round| reconcile(&api, &path)).await;
     invariants::rollup_present_and_equal(rounds.first().expect("one round"), &GATES).expect("invariant 7");
+}
+
+/// An operator config naming site `site-a`.
+fn named_site() -> Snapshot {
+    Snapshot::of_config(parse("site:\n  name: site-a\n").expect("config parses").config)
+}
+
+/// The grid ID `path`'s status holds.
+fn status_grid_id(api: &FakeApi, path: &str) -> String {
+    api.observe(path).expect("network stored").field("gridId").to_owned()
+}
+
+#[tokio::test]
+async fn invariant_3_a_minted_grid_id_gives_way_to_the_spec_once_a_site_section_names_one() {
+    let (api, path) = seeded();
+    reconcile(&api, &path).await;
+    let minted = status_grid_id(&api, &path);
+    assert!(
+        !minted.is_empty(),
+        "with no site section, a standalone install mints one"
+    );
+
+    api.edit(&path, true, |network| {
+        network["spec"]["gridId"] = serde_json::json!("dagobah");
+    });
+    reconcile_under(&api, &path, named_site()).await;
+    assert_eq!(
+        status_grid_id(&api, &path),
+        "dagobah",
+        "status mirrors spec, over the minted ID"
+    );
+}
+
+#[tokio::test]
+async fn invariant_3_with_a_site_section_and_no_grid_id_nothing_is_minted_and_the_runtime_waits() {
+    let (api, path) = seeded();
+    for _round in 0..2 {
+        reconcile_under(&api, &path, named_site()).await;
+    }
+    assert_eq!(
+        status_grid_id(&api, &path),
+        "",
+        "an admin names the grid; the operator never mints one"
+    );
+    let observed = api.observe(&path).expect("network stored");
+    assert_eq!(
+        observed
+            .condition("Available")
+            .map(|available| available["status"].clone()),
+        Some(serde_json::json!("Unknown")),
+        "the roll-up is still written while the runtime waits"
+    );
 }
