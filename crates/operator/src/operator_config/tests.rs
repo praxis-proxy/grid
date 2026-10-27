@@ -327,7 +327,42 @@ async fn a_broken_edit_is_refused_whole_and_a_delete_reads_absent() {
 
     send(&events, watcher::Event::Delete(map(Some(FULL))));
     config.changed().await;
-    assert_eq!(config.current().loaded, Loaded::Absent);
+    let deleted = config.current();
+    assert_eq!(deleted.loaded, Loaded::Absent);
+    assert!(
+        deleted.site_seen,
+        "a delete after a site section was read keeps it seen"
+    );
+}
+
+#[tokio::test]
+async fn a_site_section_is_seen_only_once_one_is_read() {
+    let _watch = WATCH.lock().await;
+    let (events, mut config) = watching();
+    send(&events, watcher::Event::Init);
+    send(&events, watcher::Event::InitDone);
+    assert!(!config.read().await.site_seen, "nothing read names a site");
+
+    send(&events, watcher::Event::Apply(map(Some("version: 1\n"))));
+    config.changed().await;
+    assert!(
+        !config.current().site_seen,
+        "a document without a site section names none"
+    );
+
+    send(
+        &events,
+        watcher::Event::Apply(map(Some("site: {name: site-d, extra: 1}\n"))),
+    );
+    config.changed().await;
+    assert!(
+        config.current().site_seen,
+        "a refused document may name a site, so it counts"
+    );
+
+    send(&events, watcher::Event::Apply(map(Some("version: 1\n"))));
+    config.changed().await;
+    assert!(config.current().site_seen, "seen stays once set");
 }
 
 #[tokio::test]

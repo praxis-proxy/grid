@@ -371,6 +371,13 @@ impl<'config> Section<'config> {
 }
 
 impl Loaded {
+    /// Whether the document names this site, or was refused and may: either holds off
+    /// self-signing until it is read clean.
+    #[must_use]
+    pub fn names_site(&self) -> bool {
+        !matches!(self.site(), Section::Unset)
+    }
+
     /// The `site` section.
     #[must_use]
     pub fn site(&self) -> Section<'_> {
@@ -391,6 +398,10 @@ pub struct Snapshot {
     pub ignored: Vec<String>,
     /// The `ConfigMap`, for Events, `None` while absent.
     pub object: Option<ObjectReference>,
+    /// Whether a `site` section was read since this process started, by this document or an
+    /// earlier one. Once set it stays, so a deleted `ConfigMap` cannot hand the identity to
+    /// self-signing: a placeholder would read as enrolled.
+    pub site_seen: bool,
 }
 
 impl Snapshot {
@@ -401,6 +412,7 @@ impl Snapshot {
             loaded: Loaded::Unread,
             ignored: Vec::new(),
             object: None,
+            site_seen: false,
         }
     }
 
@@ -411,6 +423,7 @@ impl Snapshot {
             loaded: Loaded::Absent,
             ignored: Vec::new(),
             object: None,
+            site_seen: false,
         }
     }
 
@@ -421,14 +434,17 @@ impl Snapshot {
             loaded: Loaded::Invalid(why),
             ignored: Vec::new(),
             object: None,
+            site_seen: true,
         }
     }
 
     /// A valid document with no `ConfigMap` behind it.
     #[must_use]
     pub fn of_config(config: OperatorConfig) -> Self {
+        let loaded = Loaded::Valid(Box::new(config));
         Self {
-            loaded: Loaded::Valid(Box::new(config)),
+            site_seen: loaded.names_site(),
+            loaded,
             ignored: Vec::new(),
             object: None,
         }
@@ -455,6 +471,7 @@ impl Snapshot {
         let mut object = map.object_ref(&());
         object.resource_version = None;
         Self {
+            site_seen: loaded.names_site(),
             loaded,
             ignored,
             object: Some(object),
@@ -680,12 +697,15 @@ struct Fold {
     hosts: SignerHosts,
     /// What a relist found so far, published once it completes.
     relisting: Option<Snapshot>,
+    /// Whether any snapshot so far carried a `site` section.
+    site_seen: bool,
 }
 
 impl Fold {
-    /// The snapshot `event` settles on, `None` while a relist is under way.
+    /// The snapshot `event` settles on, `None` while a relist is under way. Once a snapshot
+    /// carried a `site` section, every later one says so too.
     fn apply(&mut self, event: watcher::Event<ConfigMap>) -> Option<Snapshot> {
-        match event {
+        let mut next = match event {
             watcher::Event::Init => {
                 self.relisting = Some(Snapshot::absent());
                 None
@@ -697,7 +717,10 @@ impl Fold {
             watcher::Event::InitDone => Some(self.relisting.take().unwrap_or_else(Snapshot::absent)),
             watcher::Event::Apply(map) => Some(Snapshot::read(&map, &self.hosts)),
             watcher::Event::Delete(_) => Some(Snapshot::absent()),
-        }
+        }?;
+        self.site_seen |= next.site_seen;
+        next.site_seen = self.site_seen;
+        Some(next)
     }
 }
 

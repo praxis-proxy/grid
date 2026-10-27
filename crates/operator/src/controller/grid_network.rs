@@ -1546,7 +1546,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     ctx.publish_declared_trust(&network);
 
     let client = &ctx.client;
-    let enrolls = config_enrolls(&ctx.operator_config.current().loaded);
+    let enrolls = config_enrolls(&ctx.operator_config.current());
     let tls_retry = Box::pin(ensure_tls_secrets(&network, client, ctx.site_name.as_deref(), enrolls)).await?;
 
     if let Some(swim) = ctx.swim() {
@@ -2297,9 +2297,10 @@ const fn unless_enrolling(action: TlsSecrets, enrolls: bool) -> TlsSecrets {
 }
 
 /// Whether the operator config names this site, so enrollment writes its Secrets. A refused
-/// config holds off too: a placeholder would read as enrolled once it is fixed.
-fn config_enrolls(loaded: &crate::operator_config::Loaded) -> bool {
-    !matches!(loaded.site(), crate::operator_config::Section::Unset)
+/// config holds off too, and so does one that named the site earlier in this process: a
+/// placeholder would read as enrolled once the config is fixed or restored.
+fn config_enrolls(config: &crate::operator_config::Snapshot) -> bool {
+    config.site_seen
 }
 
 /// Create a self-signed CA and site certificate when neither Secret exists.
@@ -8555,28 +8556,35 @@ mod tests {
         );
     }
 
-    /// Only an operator config naming this site holds off self-signing, a refused one included.
+    /// Only an operator config naming this site holds off self-signing, a refused one and one
+    /// seen earlier in this process included.
     #[test]
     fn only_an_operator_config_naming_this_site_holds_off_self_signing() {
-        use crate::operator_config::{Loaded, parse};
+        use crate::operator_config::{OperatorConfig, Snapshot, parse};
         assert!(
-            !config_enrolls(&Loaded::Absent),
+            !config_enrolls(&Snapshot::absent()),
             "no config leaves the grid to self-sign"
         );
         assert!(
-            !config_enrolls(&Loaded::Valid(Box::default())),
+            !config_enrolls(&Snapshot::of_config(OperatorConfig::default())),
             "a config without a site section does not enroll"
         );
         let named = parse("site:\n  name: site-a\n")
             .unwrap_or_else(|_| std::process::abort())
             .config;
         assert!(
-            config_enrolls(&Loaded::Valid(Box::new(named))),
+            config_enrolls(&Snapshot::of_config(named)),
             "a config naming this site enrolls"
         );
         assert!(
-            config_enrolls(&Loaded::Invalid("site.name: bad".to_owned())),
+            config_enrolls(&Snapshot::unreadable("site.name: bad".to_owned())),
             "a refused config holds off until it is fixed"
+        );
+        let mut deleted = Snapshot::absent();
+        deleted.site_seen = true;
+        assert!(
+            config_enrolls(&deleted),
+            "a config deleted after it named this site still holds off"
         );
     }
 
