@@ -30,6 +30,58 @@ const SITE_PATH: &str = "/apis/grid.praxis.fast/v1alpha1/gridsites/site-d";
 /// The types that read no spec field and so carry no `observedGeneration`.
 const UNSTAMPED: [&str; 3] = [ACCEPTED, RESOLVED_REFS, ROTATION_ON_SCHEDULE];
 
+/// The reasons the enrollment step writes, by type and status. `Available` copies the
+/// first failing gate's reason, so it carries the gates' reasons.
+const REASONS: [(&str, &str, &str); 47] = [
+    (AVAILABLE, "True", "Available"),
+    (AVAILABLE, "False", "AwaitingInvite"),
+    (AVAILABLE, "False", "InviteMaybeSpent"),
+    (AVAILABLE, "Unknown", "AwaitingFirstAttempt"),
+    (ACCEPTED, "True", "Accepted"),
+    (RESOLVED_REFS, "True", "ResolvedRefs"),
+    (ENROLLED, "Unknown", "Enrolling"),
+    (ENROLLED, "False", "AwaitingInvite"),
+    (ENROLLED, "False", "InviteMaybeSpent"),
+    (ENROLLED, "False", "InviteRefusedAfterLostAnswer"),
+    (AVAILABLE, "False", "InviteRefusedAfterLostAnswer"),
+    (ENROLLED, "True", "Enrolled"),
+    (IDENTITY_VALID, "Unknown", "AwaitingFirstAttempt"),
+    (IDENTITY_VALID, "True", "IdentityValid"),
+    (IDENTITY_VALID, "False", "IdentityMissing"),
+    (IDENTITY_VALID, "False", "CertificateUntrusted"),
+    (IDENTITY_VALID, "False", "CertificateNameMismatch"),
+    (IDENTITY_VALID, "False", "CertificateKeyMismatch"),
+    (IDENTITY_VALID, "False", "CertificateDnsNameMissing"),
+    (IDENTITY_VALID, "False", "CertificateOrganizationMismatch"),
+    (AVAILABLE, "False", "CertificateDnsNameMissing"),
+    (AVAILABLE, "False", "CertificateOrganizationMismatch"),
+    (AVAILABLE, "False", "CertificateUntrusted"),
+    (AVAILABLE, "False", "CertificateNameMismatch"),
+    (AVAILABLE, "False", "CertificateKeyMismatch"),
+    (PROGRESSING, "False", "AsExpected"),
+    (PROGRESSING, "True", "Enrolling"),
+    (PROGRESSING, "True", "Retrying"),
+    (DEGRADED, "False", "AsExpected"),
+    (ROTATION_ON_SCHEDULE, "True", "RotationOnSchedule"),
+    (ROTATION_ON_SCHEDULE, "False", "SignerUntrusted"),
+    (DEGRADED, "True", "SignerUntrusted"),
+    (ROTATION_ON_SCHEDULE, "False", "RenewalNeedsPassthrough"),
+    (DEGRADED, "True", "RenewalNeedsPassthrough"),
+    (ROTATION_ON_SCHEDULE, "False", "SignerLapsed"),
+    (DEGRADED, "True", "SignerLapsed"),
+    (ENROLLED, "False", "EnrollmentOff"),
+    (AVAILABLE, "False", "EnrollmentOff"),
+    (ENROLLED, "False", "IdentityMissing"),
+    (AVAILABLE, "False", "IdentityMissing"),
+    (ACCEPTED, "False", "RotationUnsupportedUnderPinTrust"),
+    (AVAILABLE, "False", "RotationUnsupportedUnderPinTrust"),
+    (ACCEPTED, "False", "OperatorConfigInvalid"),
+    (AVAILABLE, "False", "OperatorConfigInvalid"),
+    (ROTATION_ON_SCHEDULE, "Unknown", "NotEvaluated"),
+    (ROTATION_ON_SCHEDULE, "False", "RenewalFailing"),
+    (DEGRADED, "True", "RenewalFailing"),
+];
+
 /// The path of a Secret in the operator namespace.
 fn secret_path(name: &str) -> String {
     format!("/api/v1/namespaces/{NAMESPACE}/secrets/{name}")
@@ -124,58 +176,6 @@ fn managers() -> BTreeMap<&'static str, &'static str> {
         )
         .collect()
 }
-
-/// The reasons the enrollment step writes, by type and status. `Available` copies the
-/// first failing gate's reason, so it carries the gates' reasons.
-const REASONS: [(&str, &str, &str); 47] = [
-    (AVAILABLE, "True", "Available"),
-    (AVAILABLE, "False", "AwaitingInvite"),
-    (AVAILABLE, "False", "InviteMaybeSpent"),
-    (AVAILABLE, "Unknown", "AwaitingFirstAttempt"),
-    (ACCEPTED, "True", "Accepted"),
-    (RESOLVED_REFS, "True", "ResolvedRefs"),
-    (ENROLLED, "Unknown", "Enrolling"),
-    (ENROLLED, "False", "AwaitingInvite"),
-    (ENROLLED, "False", "InviteMaybeSpent"),
-    (ENROLLED, "False", "InviteRefusedAfterLostAnswer"),
-    (AVAILABLE, "False", "InviteRefusedAfterLostAnswer"),
-    (ENROLLED, "True", "Enrolled"),
-    (IDENTITY_VALID, "Unknown", "AwaitingFirstAttempt"),
-    (IDENTITY_VALID, "True", "IdentityValid"),
-    (IDENTITY_VALID, "False", "IdentityMissing"),
-    (IDENTITY_VALID, "False", "CertificateUntrusted"),
-    (IDENTITY_VALID, "False", "CertificateNameMismatch"),
-    (IDENTITY_VALID, "False", "CertificateKeyMismatch"),
-    (IDENTITY_VALID, "False", "CertificateDnsNameMissing"),
-    (IDENTITY_VALID, "False", "CertificateOrganizationMismatch"),
-    (AVAILABLE, "False", "CertificateDnsNameMissing"),
-    (AVAILABLE, "False", "CertificateOrganizationMismatch"),
-    (AVAILABLE, "False", "CertificateUntrusted"),
-    (AVAILABLE, "False", "CertificateNameMismatch"),
-    (AVAILABLE, "False", "CertificateKeyMismatch"),
-    (PROGRESSING, "False", "AsExpected"),
-    (PROGRESSING, "True", "Enrolling"),
-    (PROGRESSING, "True", "Retrying"),
-    (DEGRADED, "False", "AsExpected"),
-    (ROTATION_ON_SCHEDULE, "True", "RotationOnSchedule"),
-    (ROTATION_ON_SCHEDULE, "False", "SignerUntrusted"),
-    (DEGRADED, "True", "SignerUntrusted"),
-    (ROTATION_ON_SCHEDULE, "False", "RenewalNeedsPassthrough"),
-    (DEGRADED, "True", "RenewalNeedsPassthrough"),
-    (ROTATION_ON_SCHEDULE, "False", "SignerLapsed"),
-    (DEGRADED, "True", "SignerLapsed"),
-    (ENROLLED, "False", "EnrollmentOff"),
-    (AVAILABLE, "False", "EnrollmentOff"),
-    (ENROLLED, "False", "IdentityMissing"),
-    (AVAILABLE, "False", "IdentityMissing"),
-    (ACCEPTED, "False", "RotationUnsupportedUnderPinTrust"),
-    (AVAILABLE, "False", "RotationUnsupportedUnderPinTrust"),
-    (ACCEPTED, "False", "OperatorConfigInvalid"),
-    (AVAILABLE, "False", "OperatorConfigInvalid"),
-    (ROTATION_ON_SCHEDULE, "Unknown", "NotEvaluated"),
-    (ROTATION_ON_SCHEDULE, "False", "RenewalFailing"),
-    (DEGRADED, "True", "RenewalFailing"),
-];
 
 /// `Available` on `observed`, as (status, reason).
 fn available_of(observed: &Observed) -> (&str, &str) {
@@ -851,8 +851,8 @@ async fn invariant_8_cert_manager_replacing_the_identity_just_after_it_falls_due
     let api = seeded();
     store_lapsing_identity(&api, time::Duration::minutes(5), Some("site-d-identity"));
     let rounds = renewal_rounds(&api, 4, |round| {
-        // Round 2: cert-manager has issued the next certificate into the Secret.
         if round == 2 {
+            tracing::info!("cert-manager issues the next certificate into the Secret");
             store_lapsing_identity(&api, time::Duration::days(-10), Some("site-d-identity"));
         }
     })
@@ -980,11 +980,11 @@ async fn invariant_8_a_restart_after_a_lost_answer_reads_invite_maybe_spent_when
     let client = api.client(NAMESPACE);
     let mut observed = Vec::new();
     for round in 0..3 {
-        // Round 1: the signer had spent the token on the answer that was lost.
         if round == 1 {
+            tracing::info!("the signer spent the token on the answer that was lost");
             mock.answer(Reply::Spent);
         }
-        // Each round is a fresh process, as after a kill.
+        tracing::info!(round, "a fresh process, as after a kill");
         let _step = Enrollment::default()
             .step(&client, None, &config)
             .await
