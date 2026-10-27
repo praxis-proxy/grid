@@ -741,11 +741,20 @@ async fn stored<S: Store + Sync>(
     }
     let anchors = &settings.anchor_pem;
     let prepared = &prepare(target, verified, key);
+    // A write the budget gave up on is the store's to retry: the issued answer stays kept
+    // beside the identity, so the next poll stores it without asking the signer again. Only a
+    // refusal makes the token spent for nothing.
     let written = with_backoff(backoff, "writing the identity Secrets", EnrollError::Kube, || {
         write(store, prepared, anchors)
     })
     .await
-    .map_err(|e| EnrollError::NotStored(e.to_string()))?;
+    .map_err(|e| {
+        if matches!(e, EnrollError::Kube(_)) {
+            e
+        } else {
+            EnrollError::NotStored(e.to_string())
+        }
+    })?;
     drop(pending::clear(store, target, backoff).await?);
     Ok(written)
 }

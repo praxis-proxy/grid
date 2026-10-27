@@ -240,6 +240,18 @@ async fn closed_addr() -> SocketAddr {
     listener.local_addr().expect("addr")
 }
 
+/// Which of a store's writes fail transiently.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WriteFailure {
+    /// None.
+    #[default]
+    None,
+    /// Creates of the identity Secrets only: the enrollment kept beside them is still written.
+    IdentityCreates,
+    /// Creates and patches: the apiserver is away.
+    CreatesAndPatches,
+}
+
 /// In-memory Secrets, with scripted create failures.
 #[derive(Default)]
 struct FakeStore {
@@ -248,7 +260,8 @@ struct FakeStore {
     /// Names whose data was read.
     reads: Mutex<Vec<String>>,
     /// Every create reports a transient failure.
-    creates_fail: bool,
+    /// Which writes fail transiently.
+    writes_fail: WriteFailure,
     /// Creating this name reports a conflict.
     conflict_on: Option<&'static str>,
     /// Status every dry-run create answers.
@@ -375,7 +388,10 @@ impl Store for FakeStore {
     async fn create(&self, secret: &Secret) -> Result<Created, EnrollError> {
         let name = secret.metadata.name.clone().unwrap_or_default();
         *self.create_calls.lock().expect("lock") += 1;
-        if self.creates_fail {
+        let identity = name == target().site_secret || name == target().ca_secret;
+        if self.writes_fail == WriteFailure::CreatesAndPatches
+            || (self.writes_fail == WriteFailure::IdentityCreates && identity)
+        {
             return Ok(Created::Retry("apiserver unavailable".to_owned()));
         }
         if self.conflict_on == Some(name.as_str()) {
@@ -404,7 +420,7 @@ impl Store for FakeStore {
     }
 
     async fn patch(&self, name: &str, patch: &Value) -> Result<Attempt<()>, EnrollError> {
-        if self.creates_fail {
+        if self.writes_fail == WriteFailure::CreatesAndPatches {
             return Ok(Attempt::Retry("apiserver unavailable".to_owned()));
         }
         if patch.get("data").is_some() {
@@ -1007,7 +1023,7 @@ async fn an_unusable_certificate_is_refused_and_not_stored() {
 async fn transient_write_failures_keep_retrying_rather_than_lose_the_identity() {
     let (_mock, settings) = serve(Reply::Sign).await;
     let store = FakeStore {
-        creates_fail: true,
+        writes_fail: WriteFailure::CreatesAndPatches,
         ..FakeStore::invited()
     };
     // The token is spent and the certificate is only in memory, so giving up
