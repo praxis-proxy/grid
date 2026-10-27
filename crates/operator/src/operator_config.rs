@@ -7,7 +7,11 @@ use futures::{Stream, StreamExt as _};
 use k8s_openapi::api::core::v1::{ConfigMap, ObjectReference};
 use kube::{
     Api, Client, Resource as _,
-    runtime::{WatchStreamExt as _, watcher},
+    runtime::{
+        WatchStreamExt as _,
+        events::{Event, EventType, Recorder, Reporter},
+        watcher,
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,7 +21,9 @@ pub const DEFAULT_CONFIG_MAP: &str = "grid-operator-config";
 /// The key holding the document.
 pub const CONFIG_KEY: &str = "config.yaml";
 
-/// The document under [`CONFIG_KEY`]. Every section is optional, and an unknown key is refused.
+/// The document under [`CONFIG_KEY`]. Every section is optional. An unknown key inside a
+/// section is refused, and an unknown section is ignored, so an older operator keeps
+/// running on a document a newer one extends.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct OperatorConfig {
@@ -182,21 +188,92 @@ impl SiteConfig {
     }
 }
 
+/// The document version this operator reads. A document without `version` is this one.
+pub const VERSION: u64 = 1;
+
+/// The top-level sections this operator reads, beside `version`.
+const SECTIONS: [&str; 1] = ["site"];
+
+/// A parsed document, and the top-level sections this operator does not know and ignored.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Parsed {
+    /// What the known sections say.
+    pub config: OperatorConfig,
+    /// Unknown top-level sections, in document order.
+    pub ignored: Vec<String>,
+}
+
 /// Parse and validate the document `text`. An empty document sets nothing.
 ///
 /// # Errors
 ///
-/// Why the document is refused, naming the field at fault.
-pub fn parse(text: &str) -> Result<OperatorConfig, String> {
+/// Why the document is refused, naming the field at fault: an unsupported `version`, or an
+/// unknown or invalid field inside a known section.
+pub fn parse(text: &str) -> Result<Parsed, String> {
     let value: serde_yaml::Value = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
-    if value.is_null() {
-        return Ok(OperatorConfig::default());
-    }
-    let config: OperatorConfig = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+    let mut document = match value {
+        serde_yaml::Value::Null => return Ok(Parsed::default()),
+        serde_yaml::Value::Mapping(document) => document,
+        other @ (serde_yaml::Value::Bool(_)
+        | serde_yaml::Value::Number(_)
+        | serde_yaml::Value::String(_)
+        | serde_yaml::Value::Sequence(_)
+        | serde_yaml::Value::Tagged(_)) => {
+            return Err(format!(
+                "the document is a mapping of sections, not {}",
+                kind_of(&other)
+            ));
+        },
+    };
+    read_version(&mut document)?;
+    let ignored = unknown_sections(&mut document);
+    // Re-read as text, so an error names the path within the section.
+    let known = serde_yaml::to_string(&document).map_err(|e| e.to_string())?;
+    let config: OperatorConfig = serde_yaml::from_str(&known).map_err(|e| e.to_string())?;
     if let Some(site) = &config.site {
         site.validate()?;
     }
-    Ok(config)
+    Ok(Parsed { config, ignored })
+}
+
+/// Take `version` out of `document`, refusing any but [`VERSION`].
+fn read_version(document: &mut serde_yaml::Mapping) -> Result<(), String> {
+    let Some(version) = document.remove("version") else {
+        return Ok(());
+    };
+    if version.as_u64() == Some(VERSION) {
+        return Ok(());
+    }
+    Err(format!(
+        "version: {} is not supported: this operator reads version {VERSION}",
+        serde_yaml::to_string(&version).unwrap_or_default().trim()
+    ))
+}
+
+/// Take the sections this operator does not read out of `document`, returning their names.
+fn unknown_sections(document: &mut serde_yaml::Mapping) -> Vec<String> {
+    let mut ignored = Vec::new();
+    document.retain(|key, _section| {
+        let known = key.as_str().is_some_and(|name| SECTIONS.contains(&name));
+        if !known {
+            ignored.push(key.as_str().map_or_else(|| format!("{key:?}"), str::to_owned));
+        }
+        known
+    });
+    ignored
+}
+
+/// The YAML kind of `value`, for a refusal.
+const fn kind_of(value: &serde_yaml::Value) -> &'static str {
+    match value {
+        serde_yaml::Value::Null => "null",
+        serde_yaml::Value::Bool(_) => "a boolean",
+        serde_yaml::Value::Number(_) => "a number",
+        serde_yaml::Value::String(_) => "a string",
+        serde_yaml::Value::Sequence(_) => "a list",
+        serde_yaml::Value::Mapping(_) => "a mapping",
+        serde_yaml::Value::Tagged(_) => "a tagged value",
+    }
 }
 
 /// What the `ConfigMap` held when last read.
@@ -251,6 +328,8 @@ impl Loaded {
 pub struct Snapshot {
     /// What it held.
     pub loaded: Loaded,
+    /// Unknown top-level sections the document carried and this operator ignored.
+    pub ignored: Vec<String>,
     /// The `ConfigMap`, for Events, `None` while absent.
     pub object: Option<ObjectReference>,
 }
@@ -261,6 +340,7 @@ impl Snapshot {
     pub const fn unread() -> Self {
         Self {
             loaded: Loaded::Unread,
+            ignored: Vec::new(),
             object: None,
         }
     }
@@ -270,6 +350,7 @@ impl Snapshot {
     pub const fn absent() -> Self {
         Self {
             loaded: Loaded::Absent,
+            ignored: Vec::new(),
             object: None,
         }
     }
@@ -279,6 +360,7 @@ impl Snapshot {
     pub fn of_config(config: OperatorConfig) -> Self {
         Self {
             loaded: Loaded::Valid(Box::new(config)),
+            ignored: Vec::new(),
             object: None,
         }
     }
@@ -286,12 +368,17 @@ impl Snapshot {
     /// What `map` holds.
     #[must_use]
     pub fn of(map: &ConfigMap) -> Self {
-        let loaded = match map.data.as_ref().and_then(|data| data.get(CONFIG_KEY)) {
-            None => Loaded::Invalid(format!("{CONFIG_KEY}: key missing")),
-            Some(text) => parse(text).map_or_else(Loaded::Invalid, |config| Loaded::Valid(Box::new(config))),
+        let parsed = match map.data.as_ref().and_then(|data| data.get(CONFIG_KEY)) {
+            None => Err(format!("{CONFIG_KEY}: key missing")),
+            Some(text) => parse(text),
+        };
+        let (loaded, ignored) = match parsed {
+            Ok(Parsed { config, ignored }) => (Loaded::Valid(Box::new(config)), ignored),
+            Err(why) => (Loaded::Invalid(why), Vec::new()),
         };
         Self {
             loaded,
+            ignored,
             object: Some(map.object_ref(&())),
         }
     }
@@ -305,11 +392,11 @@ impl ConfigWatch {
     /// Watch the `ConfigMap` `name` in `namespace`.
     #[must_use]
     pub fn spawn(client: Client, namespace: &str, name: &str) -> Self {
-        let api: Api<ConfigMap> = Api::namespaced(client, namespace);
+        let api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
         let events =
             watcher(api, watcher::Config::default().fields(&format!("metadata.name={name}"))).default_backoff();
         let (tx, rx) = tokio::sync::watch::channel(Arc::new(Snapshot::unread()));
-        drop(tokio::spawn(follow(events, tx)));
+        drop(tokio::spawn(follow(events, tx, Some(client))));
         Self(rx)
     }
 
@@ -351,7 +438,7 @@ impl ConfigWatch {
 }
 
 /// Fold watch `events` into `tx` until every receiver is gone.
-async fn follow<S>(events: S, tx: tokio::sync::watch::Sender<Arc<Snapshot>>)
+async fn follow<S>(events: S, tx: tokio::sync::watch::Sender<Arc<Snapshot>>, client: Option<Client>)
 where
     S: Stream<Item = Result<watcher::Event<ConfigMap>, watcher::Error>> + Send,
 {
@@ -365,23 +452,77 @@ where
                 None
             },
         };
-        if let Some(next) = next {
-            tx.send_if_modified(|held| {
-                if **held == next {
-                    return false;
-                }
-                match &next.loaded {
-                    Loaded::Invalid(why) => tracing::warn!(error = %why, "operator config refused"),
-                    Loaded::Absent => tracing::info!("no operator config; running on defaults"),
-                    Loaded::Unread | Loaded::Valid(_) => tracing::info!("operator config read"),
-                }
-                *held = Arc::new(next);
-                true
-            });
+        if let Some(next) = next
+            && publish(&tx, &next)
+        {
+            crate::metrics::set_operator_config_ignored_sections(next.ignored.len());
+            Box::pin(note_ignored(client.as_ref(), &next)).await;
         }
         if tx.is_closed() {
             return;
         }
+    }
+}
+
+/// Send `next` down `tx` when it changed, logging what it holds. Returns whether it changed.
+fn publish(tx: &tokio::sync::watch::Sender<Arc<Snapshot>>, next: &Snapshot) -> bool {
+    tx.send_if_modified(|held| {
+        if **held == *next {
+            return false;
+        }
+        match &next.loaded {
+            Loaded::Invalid(why) => tracing::warn!(error = %why, "operator config refused"),
+            Loaded::Absent => tracing::info!("no operator config; running on defaults"),
+            Loaded::Unread | Loaded::Valid(_) => tracing::info!("operator config read"),
+        }
+        *held = Arc::new(next.clone());
+        true
+    })
+}
+
+/// The longest Event note, within the API's soft 1 KB limit.
+const MAX_NOTE: usize = 1000;
+
+/// What a Warning Event says about the sections `ignored`, bounded.
+fn ignored_note(ignored: &[String]) -> String {
+    let mut note = format!(
+        "sections this operator does not read were ignored, the rest applied: {}",
+        ignored.join(", ")
+    );
+    if note.len() > MAX_NOTE {
+        let mut end = MAX_NOTE.saturating_sub(3);
+        while !note.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        note.truncate(end);
+        note.push_str("...");
+    }
+    note
+}
+
+/// Log, and record as a Warning Event on the `ConfigMap`, the sections `snapshot` ignored.
+async fn note_ignored(client: Option<&Client>, snapshot: &Snapshot) {
+    if snapshot.ignored.is_empty() {
+        return;
+    }
+    let note = ignored_note(&snapshot.ignored);
+    tracing::warn!(sections = ?snapshot.ignored, "{note}");
+    let (Some(client), Some(object)) = (client, snapshot.object.as_ref()) else {
+        return;
+    };
+    let reporter = Reporter {
+        controller: "grid-operator".into(),
+        instance: None,
+    };
+    let event = Event {
+        type_: EventType::Warning,
+        reason: "OperatorConfigSectionIgnored".to_owned(),
+        note: Some(note),
+        action: "ReadConfig".to_owned(),
+        secondary: None,
+    };
+    if let Err(error) = Box::pin(Recorder::new(client.clone(), reporter).publish(&event, object)).await {
+        tracing::debug!(%error, "recording an ignored-section Event failed");
     }
 }
 

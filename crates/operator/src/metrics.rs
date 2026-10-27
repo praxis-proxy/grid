@@ -61,6 +61,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SWIM_KEY_PENDING.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(OPERATOR_CONFIG_IGNORED.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(LEASE_HELD.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(ROUTED.clone()))
@@ -180,6 +182,15 @@ static SITE_IDENTITY_RENEWALS: LazyLock<IntCounterVec> = LazyLock::new(|| {
 static SWIM_KEY_PENDING: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new("grid_swim_key_pending", "1 while SWIM holds traffic for its key")
         .unwrap_or_else(|_| std::process::abort())
+});
+
+/// Top-level sections of the operator config this operator does not read.
+static OPERATOR_CONFIG_IGNORED: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "grid_operator_config_ignored_sections",
+        "Top-level sections of the operator config this operator does not read and ignored",
+    )
+    .unwrap_or_else(|_| std::process::abort())
 });
 
 /// 1 while this replica holds the operator lease.
@@ -666,6 +677,17 @@ pub(crate) fn record_swim_pending_drop() {
 /// Count a signals connection shed by `limit`, `total` or `source`.
 pub fn record_signals_shed(limit: &str) {
     SIGNALS_SHED.with_label_values(&[limit]).inc();
+}
+
+/// Set how many top-level sections of the operator config were ignored.
+pub fn set_operator_config_ignored_sections(count: usize) {
+    OPERATOR_CONFIG_IGNORED.set(i64::try_from(count).unwrap_or(i64::MAX));
+}
+
+/// How many top-level sections of the operator config were ignored, as last set.
+#[cfg(test)]
+pub(crate) fn operator_config_ignored_sections() -> i64 {
+    OPERATOR_CONFIG_IGNORED.get()
 }
 
 /// Set when the site identity expires, Unix seconds.

@@ -559,7 +559,7 @@ fn retries_back_off_to_the_cap() {
 /// The operator config `document` as loaded, naming site `east`.
 fn loaded(document: &str) -> Loaded {
     match crate::operator_config::parse(&format!("site:\n  name: east\n{document}")) {
-        Ok(config) => Loaded::Valid(Box::new(config)),
+        Ok(parsed) => Loaded::Valid(Box::new(parsed.config)),
         Err(why) => Loaded::Invalid(why),
     }
 }

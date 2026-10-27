@@ -8567,7 +8567,9 @@ mod tests {
             !config_enrolls(&Loaded::Valid(Box::default())),
             "a config without a site section does not enroll"
         );
-        let named = parse("site:\n  name: site-a\n").unwrap_or_else(|_| std::process::abort());
+        let named = parse("site:\n  name: site-a\n")
+            .unwrap_or_else(|_| std::process::abort())
+            .config;
         assert!(
             config_enrolls(&Loaded::Valid(Box::new(named))),
             "a config naming this site enrolls"

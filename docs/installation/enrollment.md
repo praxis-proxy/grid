@@ -115,8 +115,11 @@ site:
 | `site.signerEndpoint.rotation` | `Enabled`, the default, or `Disabled`: whether this operator renews through the signer. See [Rotation](#5-rotation). |
 | `site.inviteSecretRef` | `name`, `key`. The token is an opaque credential the signer issued. The operator presents it and never parses it, and reads it once, while the site has no identity. The Secret must carry the label `grid.praxis.fast/site=<site.name>`. |
 
-The document never holds a credential: it names Secrets. An unknown key at any level
-refuses the whole document, so a typo never passes as an unset field. The operator
+The document never holds a credential: it names Secrets. An unknown key inside the `site`
+section refuses the whole document, so a typo never passes as an unset field. An unknown
+top-level section is ignored with an `OperatorConfigSectionIgnored` Warning Event, so an
+operator older than a new section keeps working. An optional `version: 1` names the
+document, and any other version is refused. The operator
 config decides where the invite token goes and which CA the site trusts, so write access
 to it is operator-level access: grant it only to grid admins. The two labels keep it from
 pinning a bundle that happens to be in the namespace, such as an injected service CA, or
@@ -173,7 +176,7 @@ evaluated yet. A wait an admin must end is `False`.
 | `Accepted` | Reason | Meaning |
 | --- | --- | --- |
 | `True` | `Accepted` | This GridSite is this cluster's own site, and the operator config's `site` section applies to it. |
-| `False` | `OperatorConfigInvalid` | The operator config was refused whole: it does not parse, carries an unknown key, or a field is invalid. The message names the field. Nothing in it is acted on, so nothing enrolls or renews. |
+| `False` | `OperatorConfigInvalid` | The operator config was refused whole: it does not parse, names a version other than `1`, carries an unknown key inside a section, or a field is invalid. The message names the field. Nothing in it is acted on, so nothing enrolls or renews. |
 | `False` | `SiteNameMismatch` | `site.name` differs from the site this cluster's identity names. Nothing renews through the config until they agree. |
 | `False` | `RotationUnsupportedUnderPinTrust` | `site.signerEndpoint.rotation` is `Enabled`, the default, but the GridNetwork declares `pin` peer trust, which does not renew. Renewal is held back and the rest of the config still acts. Set `rotation: Disabled`, or `peerTrust.mode: spiffe`. |
 

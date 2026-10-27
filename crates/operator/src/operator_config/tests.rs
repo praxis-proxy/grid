@@ -36,8 +36,9 @@ fn refused(text: &str) -> String {
 
 #[test]
 fn a_full_site_section_parses_with_its_defaults() {
-    let config = parse(FULL).expect("parses");
-    let site = config.site.expect("site");
+    let parsed = parse(FULL).expect("parses");
+    assert!(parsed.ignored.is_empty());
+    let site = parsed.config.site.expect("site");
     assert_eq!(site.name, SITE);
     let signer = site.signer_endpoint.expect("signer");
     assert_eq!(signer.rotation, Rotation::Enabled, "rotation defaults to Enabled");
@@ -48,23 +49,21 @@ fn a_full_site_section_parses_with_its_defaults() {
 
 #[test]
 fn every_section_is_optional() {
-    for empty in ["", "   \n", "# nothing set\n", "{}"] {
-        assert_eq!(parse(empty), Ok(OperatorConfig::default()), "{empty:?}");
+    for empty in ["", "   \n", "# nothing set\n", "{}", "version: 1\n"] {
+        assert_eq!(parse(empty), Ok(Parsed::default()), "{empty:?}");
     }
     let named_only = parse("site:\n  name: site-d\n").expect("parses");
-    assert_eq!(named_only.site.map(|site| site.signer_endpoint), Some(None));
+    assert_eq!(named_only.config.site.map(|site| site.signer_endpoint), Some(None));
 }
 
 #[test]
-fn an_unknown_key_is_refused_with_its_path() {
+fn an_unknown_key_inside_a_section_is_refused_with_its_path() {
     for (text, names) in [
-        ("membershp:\n  source: Swim\n", "membershp"),
         ("site:\n  name: site-d\n  sigerEndpoint: {}\n", "sigerEndpoint"),
         (
             "site:\n  name: site-d\n  signerEndpoint:\n    url: https://signer.example.com\n    rotate: Enabled\n",
             "site.signerEndpoint",
         ),
-        ("apiVersion: v1\n", "apiVersion"),
     ] {
         let why = refused(text);
         assert!(why.contains(names), "{text:?}: {why}");
@@ -137,11 +136,14 @@ fn the_site_section_reads_unset_invalid_or_the_site() {
 /// Where a test sends watch events.
 type Events = futures::channel::mpsc::UnboundedSender<Result<watcher::Event<ConfigMap>, watcher::Error>>;
 
+/// Held by every watch case: the ignored-sections gauge is one per process.
+static WATCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// A watch fed from the returned sender.
 fn watching() -> (Events, ConfigWatch) {
     let (events_tx, events_rx) = futures::channel::mpsc::unbounded();
     let (tx, rx) = tokio::sync::watch::channel(Arc::new(Snapshot::unread()));
-    drop(tokio::spawn(follow(events_rx, tx)));
+    drop(tokio::spawn(follow(events_rx, tx, None)));
     (events_tx, ConfigWatch(rx))
 }
 
@@ -152,6 +154,7 @@ fn send(events: &Events, event: watcher::Event<ConfigMap>) {
 
 #[tokio::test]
 async fn the_watch_picks_up_an_edit() {
+    let _watch = WATCH.lock().await;
     let (events, mut config) = watching();
     send(&events, watcher::Event::Init);
     send(&events, watcher::Event::InitApply(map(Some(FULL))));
@@ -183,6 +186,7 @@ async fn the_watch_picks_up_an_edit() {
 
 #[tokio::test]
 async fn a_broken_edit_is_refused_whole_and_a_delete_reads_absent() {
+    let _watch = WATCH.lock().await;
     let (events, mut config) = watching();
     send(&events, watcher::Event::Init);
     send(&events, watcher::Event::InitApply(map(Some(FULL))));
@@ -205,7 +209,26 @@ async fn a_broken_edit_is_refused_whole_and_a_delete_reads_absent() {
 }
 
 #[tokio::test]
+async fn an_ignored_section_is_counted_and_clears_with_it() {
+    let _watch = WATCH.lock().await;
+    let (events, mut config) = watching();
+    send(&events, watcher::Event::Init);
+    send(
+        &events,
+        watcher::Event::InitApply(map(Some(&format!("{FULL}membership: {{source: Local}}\n")))),
+    );
+    send(&events, watcher::Event::InitDone);
+    assert_eq!(config.read().await.ignored, ["membership"]);
+    assert_eq!(crate::metrics::operator_config_ignored_sections(), 1);
+    send(&events, watcher::Event::Apply(map(Some(FULL))));
+    config.changed().await;
+    assert!(config.current().ignored.is_empty());
+    assert_eq!(crate::metrics::operator_config_ignored_sections(), 0);
+}
+
+#[tokio::test]
 async fn a_relist_without_the_config_map_reads_absent() {
+    let _watch = WATCH.lock().await;
     let (events, mut config) = watching();
     send(&events, watcher::Event::Init);
     send(&events, watcher::Event::InitDone);

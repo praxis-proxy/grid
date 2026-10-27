@@ -307,7 +307,7 @@ NodePort gateways need an explicit reachable `gateway.address`.
 
 ## Enrollment
 
-The operator reads its own settings from the ConfigMap `operatorConfig.name` in its namespace, key `config.yaml`, through the API, and watches it, so an edit applies without a restart. The chart renders it from the `enrollment` values. Every section is optional, and an unknown key refuses the whole document. The `site` section names this site, the signer it enrolls and renews through, and the invite:
+The operator reads its own settings from the ConfigMap `operatorConfig.name` in its namespace, key `config.yaml`, through the API, and watches it, so an edit applies without a restart. The chart renders it from the `enrollment` values. Every section is optional. An unknown key inside a section refuses the whole document, and an unknown top-level section is ignored with a Warning Event, so an older operator keeps running on a newer document. An optional `version: 1` names the document. The `site` section names this site, the signer it enrolls and renews through, and the invite:
 
 ```yaml
 site:

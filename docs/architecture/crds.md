@@ -609,10 +609,15 @@ site:
 | `site.signerEndpoint.rotation` | Whether this operator renews the identity through the signer. `Enabled` (default) renews when a third of its lifetime remains, and is refused under pin peer trust with `Accepted` `False` and `RotationUnsupportedUnderPinTrust`. `Disabled` uses the signer to enroll only. Enrollment runs whatever this says. |
 | `site.inviteSecretRef` | The Secret holding the one-time invite token, an opaque credential the signer issued, read once while the site has no identity. `key` defaults to `token`. The Secret must carry `grid.praxis.fast/site=<site.name>`. |
 
-The operator parses the whole document and refuses it whole: an unknown key at any
-level, a bad URL or a missing field reports `Accepted` `False` with
-`OperatorConfigInvalid` on the own GridSite, the message naming the field, and no
-section of it is acted on. A `site.name` other than the site the held identity
+An optional top-level `version` says which document this is. Absent reads as `1`, the
+only version this operator reads, and any other refuses the document. A top-level
+section the operator does not read is ignored and the rest applies, so an operator
+older than a new section keeps running through a rollout. It logs the section, records
+an `OperatorConfigSectionIgnored` Warning Event on the ConfigMap and counts it in
+`grid_operator_config_ignored_sections`. Inside a section it reads, the operator refuses
+the whole document: an unknown key, a bad URL or a missing field reports `Accepted`
+`False` with `OperatorConfigInvalid` on the own GridSite, the message naming the field,
+and no section of it is acted on. A `site.name` other than the site the held identity
 names reports `SiteNameMismatch`. Before the own GridSite exists, the operator sends
 nothing, logs why and records an Event on the ConfigMap. Under pin peer trust,
 `rotation: Enabled` reports `Accepted` `False` with `RotationUnsupportedUnderPinTrust`

@@ -69,7 +69,9 @@ fn seeded() -> FakeApi {
 
 /// The operator config naming this site, with `rest` under its site section.
 fn config(rest: &str) -> Snapshot {
-    let config: OperatorConfig = parse(&format!("site:\n  name: {SITE}\n{rest}")).expect("config parses");
+    let config: OperatorConfig = parse(&format!("site:\n  name: {SITE}\n{rest}"))
+        .expect("config parses")
+        .config;
     Snapshot::of_config(config)
 }
 
