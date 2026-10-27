@@ -209,6 +209,7 @@ evaluated yet. A wait an admin must end is `False`.
 | `False` | `NameTaken`, `NameDeleted` | The name is enrolled, or was deleted and the invite does not re-admit it. |
 | `False` | `Refused` | The signer refused the request. |
 | `False` | `InviteMaybeSpent` | The request was sent and no usable answer came back, or the signer answered 408. The next poll sends the same request again. Or the token was refused after such a request, which may have spent it: a new invite may be needed. |
+| `False` | `PendingSecretForeign` | A Secret named `<identity Secret>-pending` exists that enrollment did not write, so nothing is sent. Delete it: enrollment keeps its request there. A request kept there for another site name, grid CA or invite is discarded and a new one is made. |
 | `False` | `InvalidResponse` | The returned certificate failed the pin, name or key checks. The token is spent. |
 | `False` | `IdentityNotStored` | The certificate was issued but could not be written. The token is spent. |
 
@@ -340,6 +341,7 @@ conditions the renewal loop writes each round:
 | `False` | `RenewalRefused` | The signer answered 401 or 403. Re-enroll this site with a new site token. |
 | `False` | `RenewalNeedsPassthrough` | The signer received no client certificate, so TLS ends before it. Renewal needs a passthrough Route, a load balancer, or the in-cluster Service. Retried with backoff. |
 | `False` | `SignerUntrusted` | Neither the grid CA this site holds nor the `caBundleRef` bundle trusts the signer's serving certificate. Pin the CA that issued it in `site.signerEndpoint.caBundleRef`, or serve a certificate the grid CA issued. Retried with backoff. |
+| `False` | `SignerLapsed` | The signer's serving certificate is expired or not yet valid. The signer must rotate its serving certificate. Retried with backoff. |
 
 ### Turn rotation off
 
