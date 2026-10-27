@@ -48,6 +48,50 @@ tests:
                 name: "grid-invite-hub"
                 key: "token"
 
+  - it: a hub whose bootstrap issued its identity names its signer with enrollment off
+    template: templates/configmap-operator-config.yaml
+    set:
+      swim.siteName: hub
+      enrollment.hub: true
+    asserts:
+      - equal:
+          path: data["config.yaml"]
+          value: |
+            site:
+              name: "hub"
+              signerEndpoint:
+                url: "https://grid-enrollment.grid-enrollment.svc:8443"
+                rotation: "Disabled"
+
+  - it: a hub with enrollment off allows its in-cluster signer host and guards its namespace
+    templates:
+      - templates/deployment.yaml
+      - templates/rolebindings-resources.yaml
+    set:
+      swim.siteName: hub
+      enrollment.hub: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_SIGNER_HOSTS, value: "grid-enrollment.grid-enrollment.svc:8443" }
+        template: templates/deployment.yaml
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_CREATE_LOCAL_RECORDS, value: "false" }
+        template: templates/deployment.yaml
+
+  - it: a hub with enrollment off and its own hubPort names that port
+    template: templates/configmap-operator-config.yaml
+    set:
+      swim.siteName: hub
+      enrollment.hub: true
+      enrollment.hubPort: 9443
+      rbac.enrollmentNamespace: signer
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'url: "https://grid-enrollment\.signer\.svc:9443"'
+
   - it: a hub under spiffe leaves rotation to the operator default, Enabled
     template: templates/configmap-operator-config.yaml
     set:
