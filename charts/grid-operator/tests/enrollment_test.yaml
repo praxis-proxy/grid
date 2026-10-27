@@ -162,6 +162,32 @@ tests:
           path: data["config.yaml"]
           pattern: 'url: "https://odh-enrollment.odh-ai-grid-enrollment.svc:8443"'
 
+  - it: names the grid-enrollment Service's port
+    template: templates/configmap-operator-config.yaml
+    set:
+      enrollment.enabled: true
+      enrollment.hub: true
+      enrollment.hubPort: 9443
+      enrollment.url: ""
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'url: "https://grid-enrollment.grid-enrollment.svc:9443"'
+
+  - it: allows the signer host and the grid-enrollment Service's port
+    template: templates/deployment.yaml
+    set:
+      enrollment.enabled: true
+      enrollment.hub: true
+      enrollment.hubPort: 9443
+      enrollment.url: ""
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SIGNER_HOSTS
+            value: grid-enrollment.grid-enrollment.svc:9443
+
   - it: requires the signer URL off the hub, where no grid-enrollment Service exists
     template: templates/deployment.yaml
     set:

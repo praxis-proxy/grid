@@ -169,7 +169,7 @@ Service. Without enrollment nothing changes.
 {{- if not $v.rbac.enrollmentNamespace }}{{- $_ := set $v.rbac "enrollmentNamespace" "grid-enrollment" }}{{- end }}
 {{- if not $e.url }}
 {{- if not $e.hub }}{{- fail "enrollment.url is required: name the hub's signer, or set enrollment.hub=true where grid-enrollment runs on this cluster" }}{{- end }}
-{{- $_ := set $e "url" (printf "https://%s.%s.svc:8443" ($e.hubService | default "grid-enrollment") $v.rbac.enrollmentNamespace) }}
+{{- $_ := set $e "url" (printf "https://%s.%s.svc:%v" ($e.hubService | default "grid-enrollment") $v.rbac.enrollmentNamespace ($e.hubPort | default 8443)) }}
 {{- end }}
 {{- if not $v.gateway.serviceName }}{{- $_ := set $v.gateway "serviceName" "grid-gateway" }}{{- end }}
 {{- if kindIs "invalid" $svc.enabled }}{{- $_ := set $svc "enabled" true }}{{- if not $svc.type }}{{- $_ := set $svc "type" "LoadBalancer" }}{{- end }}{{- end }}

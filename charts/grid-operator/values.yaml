@@ -350,8 +350,11 @@ enrollment:
   # -- The grid-enrollment release runs on this cluster, so url defaults to its Service.
   hub: false
   # -- With hub set and no url, the grid-enrollment release's full name: its Service, and
-  # the in-cluster name its serving certificate carries.
+  # the in-cluster name its serving certificate carries. Must match that release.
   hubService: grid-enrollment
+  # -- With hub set and no url, the grid-enrollment Service's port. Must match that release,
+  # whose Service port derives from its listenAddr.
+  hubPort: 8443
   # -- Site name the token pins, at most 51 characters, and the GridSite's name: the config's
   # site.name. Defaults to swim.siteName.
   siteName: ""

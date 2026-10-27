@@ -240,7 +240,8 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `enrollment.enabled` | bool | `false` | This site enrolls: turns on the SWIM LoadBalancer Service, site-identity metrics TLS and the enrollment namespace guard, and renders the signer and the invite into the operator config's `site` section. |
 | `enrollment.url` | string | `""` | Signer base URL (https), `site.signerEndpoint.url`. Required unless `enrollment.hub` is set. Set alone on a hub whose identity bootstrap issued, it renders a `site` section that renews only. |
 | `enrollment.hub` | bool | `false` | The grid-enrollment release runs on this cluster, so `enrollment.url` defaults to its Service in `rbac.enrollmentNamespace`. |
-| `enrollment.hubService` | string | `grid-enrollment` | With `hub` set and no `url`, the grid-enrollment release's full name: its Service and the in-cluster name its serving certificate carries. |
+| `enrollment.hubService` | string | `grid-enrollment` | With `hub` set and no `url`, the grid-enrollment release's full name: its Service and the in-cluster name its serving certificate carries. Must match that release. |
+| `enrollment.hubPort` | int | `8443` | With `hub` set and no `url`, the grid-enrollment Service's port. Must match that release, whose Service port derives from its `listenAddr`. The `GRID_SIGNER_HOSTS` default follows it. |
 | `enrollment.siteName` | string | `""` | Site name the token pins, at most 51 characters, and the GridSite's name: `site.name`. Defaults to `swim.siteName`. |
 | `enrollment.caBundle` | object | `{secret: "", key: ca.crt}` | `site.signerEndpoint.caBundleRef`, a Secret, since anyone who can edit a ConfigMap could pin a signer of their own. Unset, Secret `grid-ca-bundle` when `enabled`. |
 | `enrollment.signerHosts` | list | `[]` | Signer hosts the operator config may name, each `host` or `host:port`, as `GRID_SIGNER_HOSTS`. Empty defaults to the host and port of `enrollment.url`. |
