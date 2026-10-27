@@ -33,7 +33,7 @@ tests:
               verbs: ["create", "patch"]
             - apiGroups: [""]
               resources: ["configmaps"]
-              verbs: ["get", "list", "watch", "create", "patch", "update"]
+              verbs: ["get", "create", "patch", "update"]
   - it: grants no Deployment access of its own
     asserts:
       - notContains:

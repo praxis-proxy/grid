@@ -1,0 +1,17 @@
+# Source: grid-operator/templates/role-operator-config.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grid-operator-operator-config
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/name: grid-operator
+    app.kubernetes.io/instance: grid-operator
+subjects:
+  - kind: ServiceAccount
+    name: grid-operator
+    namespace: grid-system
+roleRef:
+  kind: Role
+  name: grid-operator-operator-config
+  apiGroup: rbac.authorization.k8s.io

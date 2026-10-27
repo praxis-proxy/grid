@@ -211,8 +211,14 @@ granted for `secrets` and `configmaps`.  `delete` and
 | Resource | Verbs | Why |
 |---|---|---|
 | `secrets` | `get`, `create`, `patch` | Read TLS certs, SWIM key, credential refs; SSA-create CA and site cert `Secrets` |
-| `configmaps` | `get`, `list`, `watch`, `create`, `patch`, `update` | Routing overlay, consumer config, and Secret requirements `ConfigMaps`, SWIM revision reservations, and the watched operator config |
+| `configmaps` | `get`, `create`, `patch`, `update` | Routing overlay, consumer config, and Secret requirements `ConfigMaps`, and SWIM revision reservations |
 | `deployments` | `get`, `patch` on the named gateway Deployment only | Roll the gateway after an identity rotation, as Deployment access describes |
+
+**Operator config (operator namespace, `grid-operator-operator-config`):**
+
+| Resource | Verbs | Why |
+|---|---|---|
+| `configmaps` | `get`, `list`, `watch` on the operator config only | Watch the operator config, so an edit applies without a restart. The watch selects the ConfigMap by name, so `resourceNames` confines `list` and `watch` too |
 
 The `grid-operator-resources` `ClusterRole` is never bound
 cluster-wide.  It takes effect only in namespaces where a
@@ -367,9 +373,11 @@ Three guards limit what a ConfigMap editor can still do:
   `enrollment.url`. Unset, any host is allowed and the operator logs a warning at startup.
 - Renewal trusts only the grid CA the site holds, never a bundle the config names.
 
-The operator's own ServiceAccount keeps `create`, `patch` and `update` on ConfigMaps for
-the overlays it writes. It derives their names at runtime, so RBAC cannot exclude the
-config by name, and its write on Secrets is the larger grant in any case.
+The operator reads its config through a Role that names it, with no write verb. Its
+ServiceAccount still keeps `create`, `patch` and `update` on ConfigMaps in the operator
+namespace for the records and reservations it writes there. It derives their names at
+runtime, so RBAC cannot exclude the config by name, and its write on Secrets is the larger
+grant in any case.
 
 ### ConfigMap write scope
 

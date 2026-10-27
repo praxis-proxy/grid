@@ -29,7 +29,6 @@ rules:
   - apiGroups: ["events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]
-  # The operator config is watched, so an edit applies without a restart.
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "list", "watch", "create", "patch", "update"]
+    verbs: ["get", "create", "patch", "update"]
