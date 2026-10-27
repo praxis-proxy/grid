@@ -49,7 +49,8 @@ enrollment and its database. On upgrade it keeps the CA.
 The chart README and the chart values file cover the rest.
 
 If a `reencrypt` or publicly trusted Route must front enrollment, set
-`enrollment.rotation.enabled=false`, pin that Route's CA in the site's
+`enrollment.rotation.enabled=false`, pin the intermediate that issued that Route's
+certificate, or the certificate itself, never a public root, in the site's
 `site.signerEndpoint.caBundleRef`, and set `site.signerEndpoint.gridCaBundleRef` to
 the grid CA, through the site's `enrollment.caBundle` and `enrollment.gridCaBundle`.
 
@@ -110,7 +111,7 @@ site:
 | --- | --- |
 | `site.name` | The site name. Required. The invite label and the issued certificate must match it, and the GridSite of this name is this cluster's own. |
 | `site.signerEndpoint.url` | The signer's base URL: https, a host with an optional numeric port, without credentials, query or fragment, and not a host under `grid.internal`, where site certificates live. Editable: renewal reads it each round. |
-| `site.signerEndpoint.caBundleRef` | `kind` (`Secret`, the only kind, required), `name`, `key`. Pins the signer's serving certificate to enroll and, by default, the grid CA it returns. Renewal trusts the grid CA the site holds together with this bundle. Required with `inviteSecretRef`. The object must carry the label `grid.praxis.fast/signer-bundle=true`. |
+| `site.signerEndpoint.caBundleRef` | `kind` (`Secret`, the only kind, required), `name`, `key`. Pins the signer's serving certificate to enroll and, by default, the grid CA it returns. Renewal trusts the grid CA the site holds together with this bundle. Required with `inviteSecretRef`. Pin the issuing intermediate or the signer's serving certificate, never a public root. The object must carry the label `grid.praxis.fast/signer-bundle=true`. |
 | `site.signerEndpoint.gridCaBundleRef` | The grid CA the returned CA must match: a bootstrap override for a signer that cannot serve its own bundle, such as one behind a certificate from another CA. Carries the same label. |
 | `site.signerEndpoint.rotation` | `Enabled`, the default, or `Disabled`: whether this operator renews through the signer. See [Rotation](#5-rotation). |
 | `site.inviteSecretRef` | `name`, `key`. The token is an opaque credential the signer issued. The operator presents it and never parses it, and reads it once, while the site has no identity. The Secret must carry the label `grid.praxis.fast/site=<site.name>`. |
@@ -215,7 +216,7 @@ evaluated yet. A wait an admin must end is `False`.
 | `False` | `AwaitingInvite` | No `site.inviteSecretRef` yet, or no `site.signerEndpoint` to send it to. |
 | `False` | `Misconfigured` | A setting cannot work, such as a missing `caBundleRef` or a bundle with no certificate. |
 | `False` | `GridIdMismatch` | `spec.gridId` pins a grid the invite does not name. Refused before the token is spent. Use an invite for the pinned grid, or move the cluster: delete the GridNetwork and the identity Secret, then enroll again. |
-| `False` | `SignerUntrusted` | The signer's serving certificate does not chain to `caBundleRef`. Nothing is sent. |
+| `False` | `SignerUntrusted` | The signer's serving certificate does not chain to `caBundleRef`. Nothing is sent. Pin the issuing intermediate or the signer's serving certificate, never a public root. |
 | `False` | `NameMismatch` | The invite Secret's `grid.praxis.fast/site` label is missing or names another site. Nothing is sent. |
 | `False` | `InviteInvalid` | The signer rejected the token: expired, revoked or spent. |
 | `False` | `NameTaken`, `NameDeleted` | The name is enrolled, or was deleted and the invite does not re-admit it. |
@@ -351,7 +352,7 @@ has expired. The GridNetwork carries two conditions the renewal loop writes each
 | `False` | `RenewalFailing` | The last check or renewal failed and is retried with backoff. The message carries the error. |
 | `False` | `RenewalRefused` | The signer answered 401 or 403. Re-enroll this site with a new site token. |
 | `False` | `RenewalNeedsPassthrough` | The signer received no client certificate, so TLS ends before it. Renewal needs a passthrough Route, a load balancer, or the in-cluster Service. Retried with backoff. |
-| `False` | `SignerUntrusted` | Neither the grid CA this site holds nor the `caBundleRef` bundle trusts the signer's serving certificate. Pin the CA that issued it in `site.signerEndpoint.caBundleRef`, or serve a certificate the grid CA issued. Retried with backoff. |
+| `False` | `SignerUntrusted` | Neither the grid CA this site holds nor the `caBundleRef` bundle trusts the signer's serving certificate. Pin the intermediate that issued it, or the certificate itself, never a public root, in `site.signerEndpoint.caBundleRef`, or serve a certificate the grid CA issued. Retried with backoff. |
 | `False` | `SignerLapsed` | The signer's serving certificate is expired or not yet valid. The signer must rotate its serving certificate. Retried with backoff. |
 
 ### Turn rotation off
@@ -448,7 +449,7 @@ Operator metrics: `grid_site_identity_expiry_timestamp_seconds` and
 | `site token rejected (...)` | The token expired or was revoked. | Delete `grid-invite-<siteName>` on the hub, run `helm upgrade` with the site still in `invites`, and copy the new token. |
 | `site name already enrolled (...)` | An earlier attempt spent a token for this name. | An admin with `enrollment-admin` runs `DELETE /v1alpha1/enrollments/<siteName>`, then an admin with both `grid-admin` and `enrollment-admin` invites the site again with `allowDeletedName`. Without that access, enroll under a new site name. |
 | `Progressing` stays `True` with `Enrolling` | `site.signerEndpoint.url` from the site. | Make it reachable. |
-| `TLS to the enrollment service failed, check site.signerEndpoint.caBundleRef` | The CA that issued the enrollment serving certificate. | Set `site.signerEndpoint.caBundleRef` to it. |
+| `TLS to the enrollment service failed, check site.signerEndpoint.caBundleRef` | The intermediate that issued the enrollment serving certificate. | Set `site.signerEndpoint.caBundleRef` to it, or to the certificate itself, never a public root. |
 | `returned CA is not the pinned grid CA` | The attempt spent the token. | Set `site.signerEndpoint.gridCaBundleRef` to the grid CA and enroll under a new site name. |
 | `Accepted` is `False` with `RotationUnsupportedUnderPinTrust` | The GridNetwork's `peerTrust.mode`. | Set `site.signerEndpoint.rotation: Disabled`, or move the grid to `spiffe`. |
 | `Accepted` is `False` with `OperatorConfigInvalid` | The field the message names in `grid-operator-config`. | Fix it. The operator picks the edit up without a restart. |
