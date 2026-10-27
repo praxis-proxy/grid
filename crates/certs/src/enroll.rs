@@ -261,6 +261,67 @@ mod tests {
         assert!(!key_matches_cert("not a key", &leaf.cert_pem), "an unreadable key");
     }
 
+    /// A P-256 key as cert-manager writes it by default: SEC1, `EC PRIVATE KEY`.
+    const P256_SEC1: &str = "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIJd1vz0LqJVW84pmLC00YCW9NpAFEjBQSmQPP5Scgh9coAoGCCqGSM49\nAwEHoUQDQgAEbtHgdCh90T5KyCtoumeC9fxUEvwk7CPi1MuGGNrlNDNk0shAjvEH\nW6JFoAGzTqCLuGPmOslPeQK3lhEbiUk0WA==\n-----END EC PRIVATE KEY-----\n";
+
+    /// The same key as PKCS#8.
+    const P256_PKCS8: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgl3W/PQuolVbzimYs\nLTRgJb02kAUSMFBKZA8/lJyCH1yhRANCAARu0eB0KH3RPkrIK2i6Z4L1/FQS/CTs\nI+LUy4YY2uU0M2TSyECO8QdbokWgAbNOoIu4Y+Y6yU95AreWERuJSTRY\n-----END PRIVATE KEY-----\n";
+
+    /// Another P-256 key, SEC1.
+    const OTHER_SEC1: &str = "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIPl5ub9EhekcVYcirMjEpkTQ9SSJ5n7KUdI2gZAZWqbSoAoGCCqGSM49\nAwEHoUQDQgAEZYIa93gRKf9tRKpEynbH+2vkTgTVyEqqh1Z+hk+/3AcCSwTuin2m\nUTgPRNyemEk/eQSfhRmmGDPf4saV/xzAIw==\n-----END EC PRIVATE KEY-----\n";
+
+    /// A P-384 key, SEC1: the curve comes from the key's parameters, not an assumption.
+    const P384_SEC1: &str = "-----BEGIN EC PRIVATE KEY-----\nMIGkAgEBBDAtf7zEZk1IqZUZQ2Uhp3Gkjw8olkgX3yUdB4krP2ZZ0sPxVpkqpKfD\nR/LOYct8TXegBwYFK4EEACKhZANiAAQYnivChliJV8Mw91Rfhit+Q9sXaF+mmr7b\n98E5bSTDqJSfyUVLHipARo5gAEJm9JysRf+bVG9BVLXUmxuEdGachlUhbUZZ40M1\n7yXPsxrx9vXsrxUDvpoc3dzTvi6LB84=\n-----END EC PRIVATE KEY-----\n";
+
+    /// A certificate for `key_pem`, whichever PEM form it is in, issued by a fresh CA.
+    fn certificate_for(key_pem: &str) -> String {
+        let block = pem::parse(key_pem).expect("pem");
+        let pkcs8 = if block.tag() == backend::SEC1_TAG {
+            backend::sec1_to_pkcs8(block.contents()).expect("wrapped")
+        } else {
+            block.contents().to_vec()
+        };
+        let key = KeyPair::try_from(pkcs8.as_slice()).expect("key pair");
+        let csr = CertificateParams::new(Vec::<String>::new())
+            .expect("params")
+            .serialize_request(&key)
+            .expect("request")
+            .pem()
+            .expect("request pem");
+        let ca = generate_ca("grid-ca").expect("ca");
+        sign_csr(&ca, "east", &csr, Validity::default()).expect("leaf").cert_pem
+    }
+
+    #[test]
+    fn a_sec1_key_matches_its_certificate_as_its_pkcs8_form_does() {
+        let leaf = certificate_for(P256_SEC1);
+        assert!(key_matches_cert(P256_SEC1, &leaf), "SEC1, as cert-manager writes it");
+        assert!(key_matches_cert(P256_PKCS8, &leaf), "the same key as PKCS#8");
+        assert_eq!(
+            backend::key_spki_der(P256_SEC1),
+            backend::key_spki_der(P256_PKCS8),
+            "one key, one public key, whichever encoding"
+        );
+        assert!(
+            !key_matches_cert(OTHER_SEC1, &leaf),
+            "another SEC1 key is still refused"
+        );
+        assert!(
+            backend::key_spki_der("-----BEGIN EC PRIVATE KEY-----\nbm90IGEga2V5\n-----END EC PRIVATE KEY-----\n")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_sec1_key_names_its_own_curve() {
+        let leaf = certificate_for(P384_SEC1);
+        assert!(
+            key_matches_cert(P384_SEC1, &leaf),
+            "P-384 is read from the key's parameters"
+        );
+        assert!(!key_matches_cert(P256_SEC1, &leaf));
+    }
+
     #[test]
     fn a_key_matches_only_its_own_request() {
         let csr = crate::generate_csr("east").expect("csr");
