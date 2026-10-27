@@ -39,7 +39,7 @@ pub mod latency;
 pub mod leader;
 /// Creates this site's `GridNetwork` and `GridSite` once its identity exists.
 pub mod local_records;
-/// The `LocalSiteDeclared` condition on the `GridNetwork`.
+/// The label providers select their site by.
 pub mod local_site;
 /// Prometheus metrics for gateway probe and phase-transition observability.
 pub mod metrics;

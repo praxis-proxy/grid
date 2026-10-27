@@ -1,6 +1,6 @@
 //! A `GridNetwork` in Gossip mode without a SWIM runtime, reconciled by
-//! `controller::grid_network`, which writes the phase and the `LocalSiteDeclared`
-//! condition.
+//! `controller::grid_network`, which writes the phase and rolls up the enrollment step's and
+//! the renewal loop's conditions.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -12,8 +12,8 @@ use status_harness::{FakeApi, invariants};
 
 use crate::fixtures::{self, NETWORK};
 
-/// The local site, once the operator knows its name.
-const LOCAL_SITE: &str = "site-a";
+/// The gates the enrollment step and the renewal loop write, in roll-up order.
+const GATES: [&str; 4] = ["Accepted", "ResolvedRefs", "Enrolled", "IdentityValid"];
 
 /// An API holding the network alone.
 fn seeded() -> (FakeApi, String) {
@@ -23,45 +23,51 @@ fn seeded() -> (FakeApi, String) {
     (api, path)
 }
 
-/// One network reconcile, run as `site_name`.
-async fn reconcile(api: &FakeApi, path: &str, site_name: Option<&str>) {
+/// One network reconcile.
+async fn reconcile(api: &FakeApi, path: &str) {
     let network: GridNetwork = fixtures::stored(api, path);
-    let ctx =
-        OperatorCtx::new(api.client("default"), None, SignalMode::Gossip).with_site_name(site_name.map(str::to_owned));
+    let ctx = OperatorCtx::new(api.client("default"), None, SignalMode::Gossip);
     grid_network::reconcile(Arc::new(network), Arc::new(ctx))
         .await
         .expect("network reconcile succeeds");
 }
 
-/// The field manager each network condition type belongs to.
+/// Add every gate `True` to `path`'s status, as the enrollment step and renewal loop write them.
+fn gates_true(api: &FakeApi, path: &str) {
+    api.edit(path, false, |object| {
+        let gates = GATES
+            .iter()
+            .map(|type_| {
+                serde_json::json!({
+                    "type": type_, "status": "True", "reason": type_, "message": "",
+                    "lastTransitionTime": "2026-10-27T10:00:00Z", "observedGeneration": 1
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut held = object
+            .pointer("/status/conditions")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        held.extend(gates);
+        object["status"]["conditions"] = serde_json::Value::Array(held);
+    });
+}
+
+/// The field manager each network condition type the reconcile writes belongs to.
 fn managers() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
-        ("LocalSiteDeclared", "grid-operator-local-site"),
-        ("Available", "grid-operator"),
-        ("Progressing", "grid-operator"),
-        ("Degraded", "grid-operator"),
+        ("Available", grid_network::ROLLUP_FIELD_MANAGER),
+        ("Progressing", grid_network::ROLLUP_FIELD_MANAGER),
+        ("Degraded", grid_network::ROLLUP_FIELD_MANAGER),
     ])
 }
 
-/// The closed reason set: each `LocalSiteDeclared` verdict, and `Available` copying it.
+/// The closed reason set of the roll-up, and the gates seeded `True`.
 fn reasons() -> Vec<(&'static str, &'static str, &'static str)> {
-    let declared = [
-        ("False", "NoSiteIdentity"),
-        ("False", "LocalSiteMissing"),
-        ("False", "LocalSiteUnlabelled"),
-        ("True", "LocalSiteFound"),
-    ];
-    let mut allowed: Vec<_> = declared
-        .iter()
-        .map(|(status, reason)| ("LocalSiteDeclared", *status, *reason))
-        .chain(
-            declared
-                .iter()
-                .filter(|(status, _)| *status == "False")
-                .map(|(status, reason)| ("Available", *status, *reason)),
-        )
-        .collect();
+    let mut allowed: Vec<_> = GATES.iter().map(|type_| (*type_, "True", *type_)).collect();
     allowed.extend([
+        ("Available", "Unknown", "AwaitingFirstCheck"),
         ("Available", "True", "Available"),
         ("Progressing", "False", "AsExpected"),
         ("Degraded", "False", "AsExpected"),
@@ -72,7 +78,7 @@ fn reasons() -> Vec<(&'static str, &'static str, &'static str)> {
 #[tokio::test]
 async fn invariant_1_pending_network_is_unchanged_across_five_rounds() {
     let (api, path) = seeded();
-    let rounds = fixtures::rounds(&api, &path, 5, |_round| reconcile(&api, &path, None)).await;
+    let rounds = fixtures::rounds(&api, &path, 5, |_round| reconcile(&api, &path)).await;
 
     invariants::unchanged_from(&rounds, 1).expect("invariant 1");
     invariants::transition_time_moves_only_with_status(&rounds).expect("invariant 2");
@@ -83,47 +89,39 @@ async fn invariant_1_pending_network_is_unchanged_across_five_rounds() {
     assert_eq!(
         rounds.first().expect("five rounds").field("phase"),
         "Pending",
-        "a network with no local site stays Pending"
+        "a network nothing has enrolled stays Pending"
     );
 }
 
 #[tokio::test]
-async fn invariant_2_local_site_declared_transition_time_moves_only_with_its_status() {
+async fn invariant_2_available_follows_the_enrollment_gates_and_moves_only_with_its_status() {
     let (api, path) = seeded();
     let rounds = fixtures::rounds(&api, &path, 5, |round| {
-        // Round 3: the operator learns its name. Round 4: the labelled GridSite appears.
-        if round == 3 {
-            api.put(
-                &fixtures::site_path(LOCAL_SITE),
-                fixtures::site(LOCAL_SITE, NETWORK, &[("grid.praxis.fast/provider-site", LOCAL_SITE)]),
-            );
+        // Round 2: the enrollment step and the renewal loop have written every gate.
+        if round == 2 {
+            gates_true(&api, &path);
         }
-        reconcile(&api, &path, (round >= 2).then_some(LOCAL_SITE))
+        reconcile(&api, &path)
     })
     .await;
 
     invariants::transition_time_moves_only_with_status(&rounds).expect("invariant 2");
-    invariants::changes_explained(&rounds, &[2, 3]).expect("invariant 6");
+    invariants::changes_explained(&rounds, &[2]).expect("invariant 6");
     invariants::one_manager_per_type(&api.writes(), &path, &managers()).expect("invariant 5");
     invariants::reasons_within(&rounds, &reasons()).expect("invariant 8");
-    assert_eq!(declared(&rounds, 1), ("False", "NoSiteIdentity"), "no identity yet");
     assert_eq!(
-        declared(&rounds, 2),
-        ("False", "LocalSiteMissing"),
-        "identity, no GridSite"
+        available(&rounds, 1),
+        ("Unknown", "AwaitingFirstCheck"),
+        "no gate written yet"
     );
-    assert_eq!(
-        declared(&rounds, 4),
-        ("True", "LocalSiteFound"),
-        "the GridSite is declared"
-    );
+    assert_eq!(available(&rounds, 2), ("True", "Available"), "every gate True");
 }
 
-/// The `LocalSiteDeclared` status and reason after `round`.
-fn declared(rounds: &[status_harness::Observed], round: usize) -> (&str, &str) {
+/// The `Available` status and reason after `round`.
+fn available(rounds: &[status_harness::Observed], round: usize) -> (&str, &str) {
     let condition = rounds
         .get(round)
-        .and_then(|observed| observed.condition("LocalSiteDeclared"))
+        .and_then(|observed| observed.condition("Available"))
         .expect("condition held");
     (
         condition["status"].as_str().unwrap_or_default(),
@@ -140,7 +138,7 @@ async fn invariant_3_network_observed_generation_follows_a_spec_edit() {
                 object["spec"]["region"] = serde_json::json!("eu");
             });
         }
-        reconcile(&api, &path, None)
+        reconcile(&api, &path)
     })
     .await;
 
@@ -155,7 +153,7 @@ async fn invariant_3_network_observed_generation_follows_a_spec_edit() {
 #[tokio::test]
 async fn invariant_7_network_rollup_trio_is_present_after_round_one() {
     let (api, path) = seeded();
-    let rounds = fixtures::rounds(&api, &path, 1, |_round| reconcile(&api, &path, None)).await;
-    invariants::rollup_present_and_equal(rounds.first().expect("one round"), &["LocalSiteDeclared"])
-        .expect("invariant 7");
+    gates_true(&api, &path);
+    let rounds = fixtures::rounds(&api, &path, 1, |_round| reconcile(&api, &path)).await;
+    invariants::rollup_present_and_equal(rounds.first().expect("one round"), &GATES).expect("invariant 7");
 }

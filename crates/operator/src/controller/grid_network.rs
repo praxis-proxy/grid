@@ -1788,8 +1788,6 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let budget_statuses =
         crate::crd::grid_network::resolve_budget_statuses(network.spec.budget_policy.as_ref(), &tenant_spend);
 
-    let declared = Box::pin(local_site_declared(client, &network, ctx.site_name())).await;
-    let conditions = network_rollup(&network, ctx.site_name(), declared);
     update_status(
         &network,
         client,
@@ -1802,13 +1800,9 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         overlay_statuses,
         budget_statuses,
         identity,
-        conditions,
     )
     .await?;
-
-    if let Some(declared) = declared {
-        Box::pin(apply_local_site_condition(client, &network, ctx.site_name(), declared)).await;
-    }
+    Box::pin(apply_rollup(client, &network)).await;
 
     // Auto-create or update GridSite records for remote Alive SWIM members.
     // Only runs when the GridNetwork explicitly opts in via LABEL_AUTO_DISCOVER_SITES.
@@ -1831,33 +1825,12 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     ))
 }
 
-/// Whether this site's own [`GridSite`] is declared and labelled, `None` when it cannot be read.
-async fn local_site_declared(
-    client: &Client,
-    network: &GridNetwork,
-    local_site: Option<&str>,
-) -> Option<crate::local_site::Declared> {
-    let network_name = network.metadata.name.as_deref()?;
-    let site = match local_site {
-        Some(local) => match Box::pin(Api::<GridSite>::all(client.clone()).get_opt(local)).await {
-            Ok(site) => site,
-            Err(error) => {
-                tracing::debug!(%error, site = local, "local GridSite not readable; retrying next reconcile");
-                return None;
-            },
-        },
-        None => None,
-    };
-    Some(crate::local_site::Declared::of(network_name, local_site, site.as_ref()))
-}
+/// Manager for the `GridNetwork`'s `Available`, `Progressing` and `Degraded`, written only here.
+pub const ROLLUP_FIELD_MANAGER: &str = "grid-operator-rollup";
 
-/// The network's roll-up: `LocalSiteDeclared` gates it, and rejected peer or gateway signal
-/// ages degrade it.
-fn network_rollup(
-    network: &GridNetwork,
-    local_site: Option<&str>,
-    declared: Option<crate::local_site::Declared>,
-) -> Vec<Condition> {
+/// The network's roll-up: the enrollment step's and the renewal loop's conditions gate it, and
+/// an off-schedule rotation or rejected peer or gateway signal ages degrade it.
+pub(crate) fn network_rollup(network: &GridNetwork) -> Vec<Condition> {
     let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
         return Vec::new();
     };
@@ -1869,52 +1842,65 @@ fn network_rollup(
         generation: network.metadata.generation,
         now: &now,
     };
-    // An unreadable GridSite keeps the last verdict rather than inventing one.
-    let gate = declared
-        .and_then(|declared| crate::local_site::desired(network, local_site, declared, &now))
-        .or_else(|| held_condition(held, crate::local_site::LOCAL_SITE_DECLARED).cloned())
-        .unwrap_or_else(|| {
-            let unread = (
-                "Unknown",
-                "AwaitingFirstCheck",
-                "the local GridSite has not been read".to_owned(),
-            );
-            rollup::condition(held, crate::local_site::LOCAL_SITE_DECLARED, unread, stamp)
-        });
-    let degraded = held_condition(held, crate::peer_ages::PEER_TIME_VALID)
+    let enrollment = enrollment_gates(held, stamp);
+    let gates: Vec<&Condition> = enrollment.iter().collect();
+    let degraded = held_condition(held, crate::enroll::local::ROTATION_ON_SCHEDULE)
         .filter(|condition| condition.status == "False")
+        .or_else(|| {
+            held_condition(held, crate::peer_ages::PEER_TIME_VALID).filter(|condition| condition.status == "False")
+        })
         .or_else(|| {
             held_condition(held, crate::gateway_ages::GATEWAY_AGES_REJECTED)
                 .filter(|condition| condition.status == "True")
         })
         .map(|condition| (condition.reason.as_str(), condition.message.as_str()));
-    rollup::trio(held, &[&gate], (degraded, None), stamp).into()
+    rollup::trio(held, &gates, (degraded, crate::enroll::local::in_flight(held)), stamp).into()
+}
+
+/// The enrollment step's and the renewal loop's gates as `held` has them, one not written
+/// yet reading `Unknown`.
+fn enrollment_gates(held: &[Condition], stamp: rollup::Stamp<'_>) -> Vec<Condition> {
+    crate::enroll::local::GATES
+        .iter()
+        .map(|type_| {
+            held_condition(held, type_).cloned().unwrap_or_else(|| {
+                let unwritten = ("Unknown", "AwaitingFirstCheck", "not evaluated yet".to_owned());
+                rollup::condition(&[], type_, unwritten, stamp)
+            })
+        })
+        .collect()
+}
+
+/// Write `network`'s roll-up under [`ROLLUP_FIELD_MANAGER`] when it changed. A failure is
+/// logged and retried on the next reconcile: the roll-up reports, it never gates.
+pub async fn apply_rollup(client: &Client, network: &GridNetwork) {
+    let Some(name) = network.metadata.name.as_deref() else {
+        return;
+    };
+    let trio = network_rollup(network);
+    let held = network
+        .status
+        .as_ref()
+        .map_or(&[][..], |status| status.conditions.as_slice());
+    if !rollup::differs(held, &trio) {
+        return;
+    }
+    let patch = serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": name },
+        "status": { "conditions": trio }
+    });
+    let params = PatchParams::apply(ROLLUP_FIELD_MANAGER).force();
+    let api: Api<GridNetwork> = Api::all(client.clone());
+    if let Err(error) = Box::pin(api.patch_status(name, &params, &Patch::Apply(patch))).await {
+        tracing::warn!(grid_network = name, %error, "writing the roll-up failed; retrying next reconcile");
+    }
 }
 
 /// The condition of `type_` in `held`.
 fn held_condition<'held>(held: &'held [Condition], type_: &str) -> Option<&'held Condition> {
     held.iter().find(|condition| condition.type_ == type_)
-}
-
-/// Report whether this site's own [`GridSite`] is declared and labelled.
-async fn apply_local_site_condition(
-    client: &Client,
-    network: &GridNetwork,
-    local_site: Option<&str>,
-    declared: crate::local_site::Declared,
-) {
-    let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
-        return;
-    };
-    let Some((name, patch)) = crate::local_site::patch(network, local_site, declared, &now) else {
-        return;
-    };
-    let params = PatchParams::apply(crate::local_site::FIELD_MANAGER).force();
-    let api: Api<GridNetwork> = Api::all(client.clone());
-    match Box::pin(api.patch_status(name, &params, &Patch::Apply(patch))).await {
-        Ok(_) => tracing::info!(?declared, network = name, "local site condition written"),
-        Err(error) => tracing::warn!(%error, "local site condition not written; retrying next reconcile"),
-    }
 }
 
 /// Advance the explicitly configured local [`GridSite`] into discovery.
@@ -5681,14 +5667,13 @@ async fn update_status(
     overlay_statuses: Vec<OverlayRevisionStatus>,
     budget_statuses: Vec<TenantBudgetStatus>,
     identity: Option<SiteIdentityStatus>,
-    conditions: Vec<Condition>,
 ) -> Result<(), OperatorError> {
     let name = grid_network_name(network)?;
 
     let api: Api<GridNetwork> = Api::all(client.clone());
     let status = GridNetworkStatus {
-        // The roll-up only: other condition types belong to their own field managers.
-        conditions,
+        // None: each condition type belongs to its own field manager.
+        conditions: Vec::new(),
         gateway_age_reports: Vec::new(),
         gateway_age_report_overflow: false,
         connected_sites: membership.map_or(0, MembershipSnapshot::connected_count),
@@ -8812,16 +8797,16 @@ mod tests {
         network
     }
 
-    /// `(status, reason)` of `type_` in the network's roll-up with no site identity.
+    /// `(status, reason)` of `type_` in the network's roll-up.
     fn rolled_up(network: &GridNetwork, type_: &str) -> Option<(String, String)> {
-        network_rollup(network, None, Some(crate::local_site::Declared::NoSite))
+        network_rollup(network)
             .into_iter()
             .find(|condition| condition.type_ == type_)
             .map(|condition| (condition.status, condition.reason))
     }
 
     #[test]
-    fn rejected_peer_ages_degrade_first_and_the_local_site_gates() {
+    fn rejected_peer_ages_degrade_and_an_unwritten_enrollment_gate_reads_unknown() {
         let network = network_holding(&[
             (
                 crate::gateway_ages::GATEWAY_AGES_REJECTED,
@@ -8831,8 +8816,79 @@ mod tests {
             (crate::peer_ages::PEER_TIME_VALID, "False", "TimestampOutOfRange"),
         ]);
         let pair = |status: &str, reason: &str| Some((status.to_owned(), reason.to_owned()));
-        assert_eq!(rolled_up(&network, "Available"), pair("False", "NoSiteIdentity"));
+        assert_eq!(
+            rolled_up(&network, "Available"),
+            pair("Unknown", "AwaitingFirstCheck"),
+            "a gate not written yet is not evaluated, never True"
+        );
         assert_eq!(rolled_up(&network, "Degraded"), pair("True", "TimestampOutOfRange"));
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one network per gate state")]
+    fn available_copies_the_first_failing_enrollment_gate_in_order() {
+        use crate::enroll::local::{ACCEPTED, ENROLLED, IDENTITY_VALID, RESOLVED_REFS, ROTATION_ON_SCHEDULE};
+        let pair = |status: &str, reason: &str| Some((status.to_owned(), reason.to_owned()));
+        let gates = |identity: (&'static str, &'static str)| {
+            network_holding(&[
+                (ROTATION_ON_SCHEDULE, "False", "RenewalFailing"),
+                (ENROLLED, "True", "Issued"),
+                (ACCEPTED, "True", ACCEPTED),
+                (RESOLVED_REFS, "False", "RefNotFound"),
+                (IDENTITY_VALID, identity.0, identity.1),
+            ])
+        };
+        let held = gates(("Unknown", "AwaitingFirstAttempt"));
+        assert_eq!(
+            rolled_up(&held, "Available"),
+            pair("False", "RefNotFound"),
+            "ResolvedRefs comes first"
+        );
+        let mut valid = gates(("True", IDENTITY_VALID));
+        if let Some(status) = valid.status.as_mut() {
+            for condition in &mut status.conditions {
+                if condition.type_ == RESOLVED_REFS {
+                    condition.status = "True".to_owned();
+                    condition.reason = RESOLVED_REFS.to_owned();
+                }
+            }
+        }
+        assert_eq!(
+            rolled_up(&valid, "Available"),
+            pair("True", "Available"),
+            "RotationOnSchedule does not gate"
+        );
+        assert_eq!(
+            rolled_up(&valid, "Degraded"),
+            pair("True", "RenewalFailing"),
+            "a rotation that will not happen degrades"
+        );
+    }
+
+    #[test]
+    fn progressing_reads_only_enrolling_or_retrying_off_enrolled() {
+        use crate::enroll::local::{ENROLLED, ENROLLING, RETRYING};
+        let pair = |status: &str, reason: &str| Some((status.to_owned(), reason.to_owned()));
+        let enrolled = |status, reason| network_holding(&[(ENROLLED, status, reason)]);
+        assert_eq!(
+            rolled_up(&enrolled("Unknown", ENROLLING), "Progressing"),
+            pair("True", ENROLLING)
+        );
+        assert_eq!(
+            rolled_up(&enrolled("False", "InviteMaybeSpent"), "Progressing"),
+            pair("True", RETRYING)
+        );
+        for (status, reason) in [
+            ("False", "AwaitingInvite"),
+            ("False", "InviteInvalid"),
+            ("True", "Issued"),
+        ] {
+            assert_eq!(
+                rolled_up(&enrolled(status, reason), "Progressing").map(|(status, _)| status),
+                Some("False".to_owned()),
+                "{reason} is nothing in flight"
+            );
+        }
     }
 
     #[test]

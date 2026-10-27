@@ -11,17 +11,20 @@ use super::*;
 use crate::{
     enroll::tests::{Reply, SITE, TOKEN_SECRET, serve},
     operator_config::{CONFIG_KEY, DEFAULT_CONFIG_MAP},
-    rollup::{AVAILABLE, DEGRADED, PROGRESSING},
+    rollup::{AVAILABLE, PROGRESSING},
 };
 
 const NAMESPACE: &str = "grid-system";
 
+/// This cluster's `GridNetwork`, where enrollment reports.
+const NETWORK: &str = "grid";
+
 /// The API objects the mock serves, and what was written.
 #[derive(Clone, Default)]
 struct World {
-    sites: Vec<GridSite>,
+    networks: Vec<GridNetwork>,
     secrets: BTreeMap<String, Secret>,
-    /// Status apply patches, by site name.
+    /// Status apply patches, by network name.
     patches: Vec<(String, Value)>,
     /// Secret names read by GET, data or metadata.
     reads: Vec<String>,
@@ -95,14 +98,6 @@ impl World {
             .collect()
     }
 
-    /// GET `GridSite` `name`, as last patched.
-    fn get_site(&self, name: &str) -> (u16, Value) {
-        self.sites
-            .iter()
-            .find(|site| site.metadata.name.as_deref() == Some(name))
-            .map_or_else(not_found, |site| (200, serde_json::to_value(site).unwrap_or_default()))
-    }
-
     /// GET Secret `name`.
     fn get_secret(&mut self, name: &str) -> (u16, Value) {
         self.reads.push(name.to_owned());
@@ -171,7 +166,7 @@ impl World {
         (201, event)
     }
 
-    /// Apply a status patch to `GridSite` `name`, holding its `Enrolled` condition.
+    /// Apply a status patch to `GridNetwork` `name`, holding its conditions.
     fn patch_status(&mut self, name: &str, body: &[u8]) -> (u16, Value) {
         let applied: Value = serde_json::from_slice(body).unwrap_or_default();
         let conditions: Vec<Condition> = applied
@@ -180,7 +175,11 @@ impl World {
             .and_then(|c| serde_json::from_value(c).ok())
             .unwrap_or_default();
         self.patches.push((name.to_owned(), applied));
-        let Some(site) = self.sites.iter_mut().find(|s| s.metadata.name.as_deref() == Some(name)) else {
+        let Some(site) = self
+            .networks
+            .iter_mut()
+            .find(|s| s.metadata.name.as_deref() == Some(name))
+        else {
             return not_found();
         };
         let status = site.status.get_or_insert_with(Default::default);
@@ -210,18 +209,19 @@ fn list(kind: &str, items: &Value) -> (u16, Value) {
     )
 }
 
-const SITES: &str = "/apis/grid.praxis.fast/v1alpha1/gridsites";
+const NETWORKS: &str = "/apis/grid.praxis.fast/v1alpha1/gridnetworks";
 
 /// Answer one request against `world`.
 fn answer(world: &mut World, method: &http::Method, path: &str, query: &str, body: &[u8]) -> (u16, Value) {
     let secrets = format!("/api/v1/namespaces/{NAMESPACE}/secrets");
     let site_status = path
-        .strip_prefix(&format!("{SITES}/"))
+        .strip_prefix(&format!("{NETWORKS}/"))
         .and_then(|rest| rest.strip_suffix("/status"));
     match (method.as_str(), path) {
-        ("GET", SITES) => list("GridSiteList", &serde_json::to_value(&world.sites).unwrap_or_default()),
-        ("GET", p) if p.starts_with(&format!("{SITES}/")) => world.get_site(p.trim_start_matches(&format!("{SITES}/"))),
-        ("GET", "/apis/grid.praxis.fast/v1alpha1/gridnetworks") => list("GridNetworkList", &json!([])),
+        ("GET", NETWORKS) => list(
+            "GridNetworkList",
+            &serde_json::to_value(&world.networks).unwrap_or_default(),
+        ),
         ("GET", p) if p.starts_with(&format!("{secrets}/")) => {
             world.get_secret(p.trim_start_matches(&format!("{secrets}/")))
         },
@@ -274,18 +274,15 @@ fn client(world: &Arc<Mutex<World>>) -> Client {
     Client::new(service, NAMESPACE)
 }
 
-fn site(name: &str, spec: &Value) -> GridSite {
-    let mut spec = spec.clone();
-    if let Some(object) = spec.as_object_mut() {
-        object.insert("gridNetworkRef".to_owned(), json!("grid"));
-    }
+/// This cluster's `GridNetwork`.
+fn own_network() -> GridNetwork {
     serde_json::from_value(json!({
         "apiVersion": "grid.praxis.fast/v1alpha1",
-        "kind": "GridSite",
-        "metadata": {"name": name, "uid": format!("uid-{name}"), "generation": 1},
-        "spec": spec,
+        "kind": "GridNetwork",
+        "metadata": {"name": NETWORK, "uid": "uid-grid", "generation": 1},
+        "spec": {},
     }))
-    .expect("site")
+    .expect("network")
 }
 
 /// The operator config naming this site, its signer at `url` pinned by Secret
@@ -302,15 +299,10 @@ fn document(url: &str, invite: bool) -> String {
     text
 }
 
-/// This cluster's own `GridSite`, declared.
-fn own_site() -> GridSite {
-    site(SITE, &json!({}))
-}
-
-/// A world holding the own `GridSite` and the operator config for `url`, with the invite
+/// A world holding the `GridNetwork` and the operator config for `url`, with the invite
 /// unless `invite` is false.
 fn enrolling(url: &str, invite: bool) -> Arc<Mutex<World>> {
-    let world = world(vec![own_site()]);
+    let world = world(vec![own_network()]);
     world.lock().expect("lock").configure(&document(url, invite));
     world
 }
@@ -332,16 +324,27 @@ async fn run_step(enrollment: &mut Enrollment, world: &Arc<Mutex<World>>, identi
         .expect("step")
 }
 
-/// The `Enrolled` conditions written to the local site, with the lock released.
+/// The `Enrolled` conditions written to the `GridNetwork`, with the lock released.
 fn verdicts(world: &Arc<Mutex<World>>) -> Vec<(String, String)> {
-    world.lock().expect("lock").verdicts(SITE)
+    world.lock().expect("lock").verdicts(NETWORK)
 }
 
-fn world(sites: Vec<GridSite>) -> Arc<Mutex<World>> {
+fn world(networks: Vec<GridNetwork>) -> Arc<Mutex<World>> {
     Arc::new(Mutex::new(World {
-        sites,
+        networks,
         ..World::default()
     }))
+}
+
+/// The controller's roll-up of the `GridNetwork` as it stands, as (status, reason) of `type_`.
+fn rolled_up(world: &Arc<Mutex<World>>, type_: &str) -> (String, String) {
+    let network = world.lock().expect("lock").networks.first().cloned().expect("network");
+    let rolled = crate::controller::grid_network::network_rollup(&network);
+    rolled
+        .into_iter()
+        .find(|condition| condition.type_ == type_)
+        .map(|condition| (condition.status, condition.reason))
+        .expect("rolled up")
 }
 
 fn invited(world: &Arc<Mutex<World>>, token: &str) {
@@ -360,35 +363,13 @@ fn pinned(world: &Arc<Mutex<World>>, ca_pem: &str) {
 }
 
 #[test]
-fn the_own_site_is_the_grid_site_of_the_name_given() {
-    let sites = [site("west", &json!({})), own_site()];
-    assert_eq!(
-        own(&sites, Some(SITE)).and_then(|site| site.metadata.name.as_deref()),
-        Some(SITE)
-    );
-    assert!(own(&sites, Some("north")).is_none(), "no GridSite of that name");
-    assert!(own(&sites, None).is_none(), "no name, no own site");
-}
-
-#[test]
-fn only_a_grid_site_holding_our_conditions_is_this_clusters_own() {
-    let mut site = own_site();
-    assert!(!is_own(&site), "a peer holds none");
-    site.status = Some(crate::crd::grid_site::GridSiteStatus {
-        conditions: vec![gate(ACCEPTED, "True", ACCEPTED)],
-        ..Default::default()
-    });
-    assert!(is_own(&site));
-}
-
-#[test]
 fn a_condition_already_held_is_not_rewritten_and_keeps_its_transition_time() {
-    let mut site = own_site();
+    let mut site = own_network();
     let verdict = Verdict::awaiting_invite();
     let first = condition(&site, ENROLLED, &verdict, "2026-10-22T10:00:00Z").expect("new");
     assert_eq!(first.last_transition_time, "2026-10-22T10:00:00Z");
     assert_eq!(first.observed_generation, Some(1));
-    site.status = Some(crate::crd::grid_site::GridSiteStatus {
+    site.status = Some(crate::crd::grid_network::GridNetworkStatus {
         conditions: vec![first],
         ..Default::default()
     });
@@ -412,19 +393,13 @@ fn a_condition_already_held_is_not_rewritten_and_keeps_its_transition_time() {
 
 #[test]
 fn a_status_change_moves_the_transition_time() {
-    let mut site = own_site();
+    let mut site = own_network();
     let held = condition(&site, ENROLLED, &Verdict::awaiting_invite(), "2026-10-22T10:00:00Z").expect("new");
-    site.status = Some(crate::crd::grid_site::GridSiteStatus {
+    site.status = Some(crate::crd::grid_network::GridNetworkStatus {
         conditions: vec![held],
         ..Default::default()
     });
-    let unknown = condition(
-        &site,
-        ENROLLED,
-        &Verdict::awaiting_first_attempt(),
-        "2026-10-22T11:00:00Z",
-    )
-    .expect("changed");
+    let unknown = condition(&site, ENROLLED, &Verdict::enrolling(), "2026-10-22T11:00:00Z").expect("changed");
     assert_eq!(
         unknown.last_transition_time, "2026-10-22T11:00:00Z",
         "False to Unknown is a transition"
@@ -432,8 +407,8 @@ fn a_status_change_moves_the_transition_time() {
 }
 
 #[test]
-fn a_lapsed_signer_certificate_reads_untrusted_and_is_retried() {
-    assert_eq!(reason(&EnrollError::SignerLapsed(String::new())), "SignerUntrusted");
+fn a_lapsed_signer_certificate_reads_lapsed_and_is_retried() {
+    assert_eq!(reason(&EnrollError::SignerLapsed(String::new())), "SignerLapsed");
     assert!(
         definitive(&EnrollError::SignerUntrusted(String::new()))
             && !definitive(&EnrollError::SignerLapsed(String::new())),
@@ -450,6 +425,7 @@ fn maybe_spent(refused: bool) -> EnrollError {
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "one case per enrollment error")]
 fn every_enrollment_failure_has_its_own_reason() {
     let errors = [
         EnrollError::Config(String::new()),
@@ -464,8 +440,17 @@ fn every_enrollment_failure_has_its_own_reason() {
         EnrollError::InvalidResponse(String::new()),
         EnrollError::NotStored(String::new()),
         EnrollError::Unreachable(String::new()),
+        EnrollError::SignerLapsed(String::new()),
+        EnrollError::PendingForeign(String::new()),
         EnrollError::Kube(String::new()),
     ];
+    for error in &errors {
+        assert_eq!(
+            definitive(error),
+            !RETRIED.contains(&reason(error)),
+            "Progressing reads Retrying exactly while the next poll retries: {error:?}"
+        );
+    }
     let reasons: std::collections::BTreeSet<_> = errors.iter().map(reason).collect();
     assert_eq!(reasons.len(), errors.len(), "{reasons:?}");
     assert_eq!(
@@ -483,7 +468,7 @@ fn every_enrollment_failure_has_its_own_reason() {
 
 #[tokio::test]
 async fn without_an_operator_config_nothing_is_read_or_written() {
-    let world = world(vec![site("west", &json!({}))]);
+    let world = world(vec![own_network()]);
     let step = run_step(&mut Enrollment::default(), &world, None).await;
     assert_eq!(step, Step::NoLocalSite);
     let world = world.lock().expect("lock").clone();
@@ -492,7 +477,7 @@ async fn without_an_operator_config_nothing_is_read_or_written() {
 
 #[tokio::test]
 async fn a_refused_config_is_accepted_false_on_the_own_site_and_nothing_is_sent() {
-    let world = world(vec![own_site()]);
+    let world = world(vec![own_network()]);
     world
         .lock()
         .expect("lock")
@@ -503,26 +488,29 @@ async fn a_refused_config_is_accepted_false_on_the_own_site_and_nothing_is_sent(
     assert_eq!(step, Step::Refused);
     let held = world.lock().expect("lock").clone();
     assert_eq!(
-        held.verdicts_of(SITE, ACCEPTED),
+        held.verdicts_of(NETWORK, ACCEPTED),
         [("False".to_owned(), "OperatorConfigInvalid".to_owned())]
     );
     assert!(
-        held.messages_of(SITE, ACCEPTED)
+        held.messages_of(NETWORK, ACCEPTED)
             .iter()
             .all(|message| message.contains("signerEndpont")),
         "the message names the field at fault"
     );
     assert_eq!(
-        held.verdicts_of(SITE, AVAILABLE),
-        [("False".to_owned(), "OperatorConfigInvalid".to_owned())],
+        rolled_up(&world, AVAILABLE),
+        ("False".to_owned(), "OperatorConfigInvalid".to_owned()),
         "the roll-up copies the failing gate"
     );
-    assert!(held.verdicts(SITE).is_empty(), "Enrolled says nothing about acceptance");
+    assert!(
+        held.verdicts(NETWORK).is_empty(),
+        "Enrolled says nothing about acceptance"
+    );
     assert!(!held.reads.contains(&TOKEN_SECRET.to_owned()), "the invite is not read");
 }
 
 #[tokio::test]
-async fn before_its_grid_site_exists_a_refused_config_is_an_event_once() {
+async fn before_its_grid_network_exists_a_refused_config_is_an_event_once() {
     let world = world(Vec::new());
     world.lock().expect("lock").configure("site: [");
     let mut enrollment = Enrollment::default();
@@ -536,7 +524,7 @@ async fn before_its_grid_site_exists_a_refused_config_is_an_event_once() {
         [("Warning".to_owned(), "OperatorConfigInvalid".to_owned())],
         "recorded once while unchanged"
     );
-    assert!(held.patches.is_empty(), "no GridSite to write to");
+    assert!(held.patches.is_empty(), "no GridNetwork to write to");
 }
 
 #[tokio::test]
@@ -549,7 +537,7 @@ async fn a_site_without_an_invite_waits_for_one() {
         [("False".to_owned(), "AwaitingInvite".to_owned())],
         "a state the admin must act on is False"
     );
-    let waiting = world.lock().expect("lock").messages_of(SITE, IDENTITY_VALID);
+    let waiting = world.lock().expect("lock").messages_of(NETWORK, IDENTITY_VALID);
     assert!(
         waiting
             .iter()
@@ -568,7 +556,7 @@ fn identified(world: &Arc<Mutex<World>>) {
 
 #[tokio::test]
 async fn a_config_naming_another_site_than_the_identity_is_refused_and_never_enrolled() {
-    let world = world(vec![own_site()]);
+    let world = world(vec![own_network()]);
     world
         .lock()
         .expect("lock")
@@ -579,7 +567,7 @@ async fn a_config_naming_another_site_than_the_identity_is_refused_and_never_enr
     assert_eq!(step, Step::Refused);
     let held = world.lock().expect("lock").clone();
     assert_eq!(
-        held.verdicts_of(SITE, ACCEPTED),
+        held.verdicts_of(NETWORK, ACCEPTED),
         [("False".to_owned(), "SiteNameMismatch".to_owned())]
     );
     assert!(!held.reads.contains(&TOKEN_SECRET.to_owned()), "the invite is not read");
@@ -587,41 +575,18 @@ async fn a_config_naming_another_site_than_the_identity_is_refused_and_never_enr
 
 #[tokio::test]
 async fn with_an_identity_and_no_config_the_named_site_reads_enrolled() {
-    let world = world(vec![own_site()]);
+    let world = world(vec![own_network()]);
     identified(&world);
     let step = run_step(&mut Enrollment::default(), &world, Some(SITE)).await;
     assert_eq!(step, Step::Present);
     let held = world.lock().expect("lock").clone();
     assert_eq!(
-        held.verdicts_of(SITE, ACCEPTED),
+        held.verdicts_of(NETWORK, ACCEPTED),
         [("True".to_owned(), "Accepted".to_owned())]
     );
-    assert_eq!(held.verdicts(SITE), [("True".to_owned(), "IdentityPresent".to_owned())]);
-}
-
-#[tokio::test]
-async fn a_renamed_site_clears_what_the_old_grid_site_held() {
-    let mut old = site("east", &json!({}));
-    old.status = Some(crate::crd::grid_site::GridSiteStatus {
-        conditions: vec![gate(ACCEPTED, "True", ACCEPTED)],
-        ..Default::default()
-    });
-    let world = world(vec![own_site(), old]);
-    world
-        .lock()
-        .expect("lock")
-        .configure(&document("https://enroll.example.com", false));
-    run_step(&mut Enrollment::default(), &world, None).await;
-    let held = world.lock().expect("lock").clone();
-    let cleared = held
-        .patches
-        .iter()
-        .filter(|(name, patch)| name == "east" && patch.pointer("/status/conditions") == Some(&json!([])))
-        .count();
     assert_eq!(
-        cleared,
-        TYPES.len() + 1,
-        "every manager, the own roll-up's included, gives up what it held on east"
+        held.verdicts(NETWORK),
+        [("True".to_owned(), "IdentityPresent".to_owned())]
     );
 }
 
@@ -642,7 +607,7 @@ async fn an_existing_identity_is_enrolled_and_the_invite_is_never_read() {
     );
     let world = world.lock().expect("lock").clone();
     assert_eq!(
-        world.verdicts(SITE),
+        world.verdicts(NETWORK),
         [("True".to_owned(), "IdentityPresent".to_owned())],
         "written once"
     );
@@ -667,9 +632,9 @@ async fn the_site_enrolls_through_the_operator_config() {
     assert_eq!(mock.calls(), 1);
     let world = world.lock().expect("lock").clone();
     assert_eq!(
-        world.verdicts(SITE),
+        world.verdicts(NETWORK),
         [
-            ("Unknown".to_owned(), "AwaitingFirstAttempt".to_owned()),
+            ("Unknown".to_owned(), ENROLLING.to_owned()),
             ("True".to_owned(), "Issued".to_owned())
         ]
     );
@@ -684,7 +649,7 @@ async fn the_site_enrolls_through_the_operator_config() {
 }
 
 #[tokio::test]
-async fn before_its_grid_site_exists_nothing_is_sent_and_an_event_says_why_once() {
+async fn before_its_grid_network_exists_nothing_is_sent_and_an_event_says_why_once() {
     crate::init_process_crypto();
     let (mock, settings) = serve(Reply::Sign).await;
     let world = world(Vec::new());
@@ -698,34 +663,33 @@ async fn before_its_grid_site_exists_nothing_is_sent_and_an_event_says_why_once(
     for _ in 0..2 {
         assert_eq!(run_step(&mut enrollment, &world, None).await, Step::NoLocalSite);
     }
-    assert_eq!(mock.calls(), 0, "nothing is sent without the GridSite to report on");
+    assert_eq!(mock.calls(), 0, "nothing is sent without the GridNetwork to report on");
     let held = world.lock().expect("lock").clone();
-    assert_eq!(held.events, [("Warning".to_owned(), "AwaitingGridSite".to_owned())]);
+    assert_eq!(held.events, [("Warning".to_owned(), "AwaitingGridNetwork".to_owned())]);
     assert!(held.patches.is_empty());
 
-    world.lock().expect("lock").sites.push(own_site());
+    world.lock().expect("lock").networks.push(own_network());
     assert_eq!(run_step(&mut enrollment, &world, None).await, Step::Enrolled);
     assert_eq!(verdicts(&world).last(), Some(&("True".to_owned(), "Issued".to_owned())));
 }
 
-/// `Progressing` went `True` then `False`, and `Available` rolled up `True`.
+/// `IdentityValid` waits for the renewal loop, so the controller's `Available` waits on it.
 fn progressed_then_available(world: &World) {
     assert_eq!(
-        world.verdicts_of(SITE, PROGRESSING),
-        [
-            ("True".to_owned(), "Enrolling".to_owned()),
-            ("False".to_owned(), "AsExpected".to_owned())
-        ]
-    );
-    assert_eq!(
-        world.verdicts_of(SITE, IDENTITY_VALID),
+        world.verdicts_of(NETWORK, IDENTITY_VALID),
         [("Unknown".to_owned(), "AwaitingFirstAttempt".to_owned())],
         "not evaluated until the renewal loop reads the identity"
     );
+    let shared = Arc::new(Mutex::new(world.clone()));
     assert_eq!(
-        world.verdicts_of(SITE, AVAILABLE).last(),
-        Some(&("Unknown".to_owned(), "AwaitingFirstAttempt".to_owned())),
+        rolled_up(&shared, AVAILABLE),
+        ("Unknown".to_owned(), "AwaitingFirstAttempt".to_owned()),
         "the roll-up waits on the one gate not evaluated yet"
+    );
+    assert_eq!(
+        rolled_up(&shared, PROGRESSING).0,
+        "False",
+        "nothing in flight once enrolled"
     );
 }
 
@@ -796,7 +760,7 @@ async fn a_missing_pin_is_reported_and_retried_once_it_appears() {
     let mut enrollment = Enrollment::default();
     assert_eq!(run_step(&mut enrollment, &world, None).await, Step::Failed);
     assert_eq!(
-        world.lock().expect("lock").verdicts_of(SITE, RESOLVED_REFS).last(),
+        world.lock().expect("lock").verdicts_of(NETWORK, RESOLVED_REFS).last(),
         Some(&("False".to_owned(), "RefNotFound".to_owned())),
         "a missing reference is on ResolvedRefs, not Enrolled"
     );
@@ -820,8 +784,8 @@ async fn a_pin_the_api_cannot_read_is_retried_and_never_reported_missing() {
     let (refs, enrolled) = {
         let world = world.lock().expect("lock");
         (
-            world.verdicts_of(SITE, RESOLVED_REFS),
-            world.verdicts_of(SITE, ENROLLED),
+            world.verdicts_of(NETWORK, RESOLVED_REFS),
+            world.verdicts_of(NETWORK, ENROLLED),
         )
     };
     assert!(
@@ -835,7 +799,7 @@ async fn a_pin_the_api_cannot_read_is_retried_and_never_reported_missing() {
     assert_eq!(mock.calls(), 0, "nothing is sent without the pin read");
     assert_eq!(run_step(&mut enrollment, &world, None).await, Step::Enrolled);
     assert_eq!(mock.calls(), 1, "the next poll reads the pin and enrolls");
-    retried_then_settled(&world.lock().expect("lock").verdicts_of(SITE, PROGRESSING));
+    assert_eq!(rolled_up(&world, PROGRESSING).0, "False", "enrolled, nothing in flight");
 }
 
 #[tokio::test]
@@ -845,12 +809,16 @@ async fn a_pin_the_api_cannot_read_leaves_resolved_refs_standing_while_waiting_f
     let mut enrollment = Enrollment::default();
     assert_eq!(run_step(&mut enrollment, &world, None).await, Step::AwaitingInvite);
     assert!(
-        world.lock().expect("lock").verdicts_of(SITE, RESOLVED_REFS).is_empty(),
+        world
+            .lock()
+            .expect("lock")
+            .verdicts_of(NETWORK, RESOLVED_REFS)
+            .is_empty(),
         "an unanswered read is no verdict on the reference, so nothing is written"
     );
     assert_eq!(run_step(&mut enrollment, &world, None).await, Step::AwaitingInvite);
     assert_eq!(
-        world.lock().expect("lock").verdicts_of(SITE, RESOLVED_REFS).last(),
+        world.lock().expect("lock").verdicts_of(NETWORK, RESOLVED_REFS).last(),
         Some(&("False".to_owned(), "RefNotFound".to_owned())),
         "the next poll reads the store and finds no pin"
     );
@@ -888,7 +856,7 @@ async fn a_bundle_that_does_not_opt_in_is_never_pinned() {
     assert_eq!(run_step(&mut Enrollment::default(), &world, None).await, Step::Failed);
     assert_eq!(mock.calls(), 0, "the token is not sent");
     assert_eq!(
-        world.lock().expect("lock").verdicts_of(SITE, RESOLVED_REFS).last(),
+        world.lock().expect("lock").verdicts_of(NETWORK, RESOLVED_REFS).last(),
         Some(&("False".to_owned(), "RefNotFound".to_owned())),
         "a missing reference is on ResolvedRefs, not Enrolled"
     );
@@ -913,12 +881,13 @@ async fn a_signer_error_is_retried_on_the_next_poll() {
         2,
         "a 503 may not have spent the token, so it is asked again"
     );
-    let progressing = world.lock().expect("lock").verdicts_of(SITE, PROGRESSING);
-    assert!(
-        !progressing.iter().any(|(status, _)| status == "False"),
-        "a resend holds Progressing True across polls, so lastTransitionTime does not churn: {progressing:?}"
+    let enrolled = verdicts(&world);
+    assert_eq!(
+        enrolled.iter().filter(|(_, reason)| reason == ENROLLING).count(),
+        1,
+        "a resend holds Enrolled on its retried reason, so Progressing does not churn: {enrolled:?}"
     );
-    assert_eq!(progressing.last(), Some(&("True".to_owned(), "Retrying".to_owned())));
+    assert_eq!(rolled_up(&world, PROGRESSING), ("True".to_owned(), RETRYING.to_owned()));
 }
 
 #[tokio::test]
@@ -940,19 +909,10 @@ async fn a_transient_api_failure_keeps_a_refused_invite_unsent() {
         );
     }
     assert_eq!(mock.calls(), 1, "a refused invite is never resent");
-    retried_then_settled(&world.lock().expect("lock").verdicts_of(SITE, PROGRESSING));
-}
-
-/// A store failure read as `Progressing` `True` `Retrying`, and the retry settled it.
-fn retried_then_settled(progressing: &[(String, String)]) {
-    assert!(
-        progressing.contains(&("True".to_owned(), "Retrying".to_owned())),
-        "a store failure is progress the next poll retries: {progressing:?}"
-    );
     assert_eq!(
-        progressing.last(),
-        Some(&("False".to_owned(), "AsExpected".to_owned())),
-        "the retry read the store and found nothing changed"
+        rolled_up(&world, PROGRESSING).0,
+        "False",
+        "a refused invite is settled, not in flight"
     );
 }
 
@@ -967,9 +927,8 @@ async fn an_unrelated_spec_edit_does_not_resend_a_refused_invite() {
     assert_eq!(run_step(&mut enrollment, &world, None).await, Step::Failed);
     {
         let mut held = world.lock().expect("lock");
-        let site = held.sites.first_mut().expect("site");
-        site.spec.zone = Some("us-east-1b".to_owned());
-        site.metadata.generation = Some(2);
+        let network = held.networks.first_mut().expect("network");
+        network.metadata.generation = Some(2);
         drop(held);
     }
     assert_eq!(run_step(&mut enrollment, &world, None).await, Step::Unchanged);
@@ -991,100 +950,4 @@ async fn the_condition_is_applied_by_its_own_field_manager() {
         "{queries:?}"
     );
     assert!(!queries.is_empty());
-}
-
-/// A condition as held.
-fn gate(type_: &str, status: &str, reason: &str) -> Condition {
-    Condition {
-        type_: type_.to_owned(),
-        status: status.to_owned(),
-        reason: reason.to_owned(),
-        message: format!("{reason} happened"),
-        last_transition_time: "2026-10-22T10:00:00Z".to_owned(),
-        observed_generation: Some(1),
-    }
-}
-
-/// Drop the condition `type_` from `held`.
-fn without(held: &mut GridSite, type_: &str) {
-    if let Some(status) = held.status.as_mut() {
-        status.conditions.retain(|c| c.type_ != type_);
-    }
-}
-
-/// The roll-up of `site` with nothing in flight, as (type, status, reason).
-fn rolled(site: &GridSite) -> Vec<(String, String, String)> {
-    own_rollup(site, None, "2026-10-22T12:00:00Z")
-        .into_iter()
-        .map(|c| (c.type_, c.status, c.reason))
-        .collect()
-}
-
-/// The (status, reason) `type_` reads in `rolled`.
-fn reads<'rolled>(rolled: &'rolled [(String, String, String)], type_: &str) -> (&'rolled str, &'rolled str) {
-    rolled
-        .iter()
-        .find(|(held, ..)| held == type_)
-        .map(|(_, status, reason)| (status.as_str(), reason.as_str()))
-        .expect("rolled up")
-}
-
-#[test]
-fn degraded_mirrors_a_rotation_that_will_not_happen() {
-    let mut site = own_site();
-    site.status = Some(crate::crd::grid_site::GridSiteStatus {
-        conditions: vec![gate(ROTATION_ON_SCHEDULE, "False", "RotationOverdue")],
-        ..Default::default()
-    });
-    assert_eq!(reads(&rolled(&site), DEGRADED), ("True", "RotationOverdue"));
-    for status in ["True", "Unknown"] {
-        site.status = Some(crate::crd::grid_site::GridSiteStatus {
-            conditions: vec![gate(ROTATION_ON_SCHEDULE, status, "RotationDisabled")],
-            ..Default::default()
-        });
-        assert_eq!(reads(&rolled(&site), DEGRADED), ("False", "AsExpected"), "{status}");
-    }
-}
-
-#[test]
-fn available_copies_the_first_failing_gate_in_order() {
-    let mut site = own_site();
-    assert_eq!(
-        reads(&rolled(&site), AVAILABLE),
-        ("Unknown", "AwaitingFirstCheck"),
-        "a gate not written yet is not evaluated, never True"
-    );
-    site.status = Some(crate::crd::grid_site::GridSiteStatus {
-        conditions: vec![
-            gate(ROTATION_ON_SCHEDULE, "False", "RenewalFailing"),
-            gate(ENROLLED, "True", "Issued"),
-            gate(ACCEPTED, "True", ACCEPTED),
-            gate(RESOLVED_REFS, "True", RESOLVED_REFS),
-            gate(IDENTITY_VALID, "Unknown", "AwaitingFirstAttempt"),
-        ],
-        ..Default::default()
-    });
-    assert_eq!(reads(&rolled(&site), AVAILABLE), ("Unknown", "AwaitingFirstAttempt"));
-    without(&mut site, IDENTITY_VALID);
-    site.status
-        .as_mut()
-        .expect("status")
-        .conditions
-        .push(gate(IDENTITY_VALID, "True", IDENTITY_VALID));
-    assert_eq!(
-        reads(&rolled(&site), AVAILABLE),
-        ("True", AVAILABLE),
-        "RotationOnSchedule False raises Degraded, not Available"
-    );
-    assert_eq!(reads(&rolled(&site), DEGRADED), ("True", "RenewalFailing"));
-}
-
-#[test]
-fn a_refused_config_without_an_identity_clears_no_conditions() {
-    assert!(!clears_stale(None, &Section::Invalid("bad")), "nothing names our site");
-    assert!(
-        clears_stale(Some("east2"), &Section::Invalid("bad")),
-        "the identity names our site"
-    );
-    assert!(clears_stale(None, &Section::Unset), "no site is ours");
 }

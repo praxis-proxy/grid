@@ -1,6 +1,6 @@
-//! Status conformance for this cluster's own `GridSite`: the enrollment step through
-//! [`Enrollment::step`] and the renewal loop through `renew::Rounds`, against
-//! `status_harness::FakeApi`.
+//! Status conformance for this cluster's `GridNetwork`: the enrollment step through
+//! [`Enrollment::step`], the renewal loop through `renew::Rounds` and the controller's
+//! roll-up, against `status_harness::FakeApi`.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -9,6 +9,7 @@ use status_harness::{FakeApi, Observed, invariants};
 
 use super::*;
 use crate::{
+    crd::grid_site::GridSite,
     enroll::{
         CA_SECRET, IDENTITY_SECRET, SITE_LABEL,
         tests::{Reply, SITE, TOKEN_SECRET, serve},
@@ -20,8 +21,11 @@ use crate::{
 /// The operator namespace.
 const NAMESPACE: &str = "grid-system";
 
-/// The own site's path.
-const PATH: &str = "/apis/grid.praxis.fast/v1alpha1/gridsites/site-d";
+/// The `GridNetwork`'s path, where the operator reports.
+const PATH: &str = "/apis/grid.praxis.fast/v1alpha1/gridnetworks/grid";
+
+/// The own `GridSite`'s path, which carries the peer roll-up only.
+const SITE_PATH: &str = "/apis/grid.praxis.fast/v1alpha1/gridsites/site-d";
 
 /// The path of a Secret in the operator namespace.
 fn secret_path(name: &str) -> String {
@@ -52,11 +56,20 @@ fn secret(name: &str, data: &[(&str, &str)], labels: &[(&str, &str)]) -> Value {
     serde_json::to_value(secret).expect("secret serializes")
 }
 
-/// An API holding the own site.
+/// An API holding this cluster's `GridNetwork` and its own `GridSite`.
 fn seeded() -> FakeApi {
     let api = FakeApi::new();
     api.put(
         PATH,
+        json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": "grid", "generation": 1, "uid": "uid-grid" },
+            "spec": { "peerTrust": { "mode": "spiffe" } }
+        }),
+    );
+    api.put(
+        SITE_PATH,
         json!({
             "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "GridSite",
@@ -65,6 +78,14 @@ fn seeded() -> FakeApi {
         }),
     );
     api
+}
+
+/// Write the controller's roll-up over the `GridNetwork` as it stands, as its reconcile does
+/// on every status change, and observe it.
+async fn rolled(api: &FakeApi, client: &Client) -> Observed {
+    let network: GridNetwork = serde_json::from_value(api.get(PATH).expect("network stored")).expect("a GridNetwork");
+    Box::pin(crate::controller::grid_network::apply_rollup(client, &network)).await;
+    api.observe(PATH).expect("network stored")
 }
 
 /// The operator config naming this site, with `rest` under its site section.
@@ -82,19 +103,22 @@ async fn rounds(api: &FakeApi, config: &Snapshot, count: usize, mut before: impl
     let mut observed = Vec::with_capacity(count);
     for round in 0..count {
         before(round);
-        let _step = enrollment.step(&client, None, config).await.expect("sites list");
-        observed.push(api.observe(PATH).expect("own site stored"));
+        let _step = enrollment.step(&client, None, config).await.expect("networks list");
+        observed.push(rolled(api, &client).await);
     }
     observed
 }
 
-/// The field manager each own-site condition type belongs to, the roll-up's apart from a
-/// peer's.
+/// The field manager each `GridNetwork` condition type belongs to, the controller's roll-up
+/// among them.
 fn managers() -> BTreeMap<&'static str, &'static str> {
     TYPES
         .iter()
         .copied()
-        .chain([AVAILABLE, PROGRESSING, DEGRADED].map(|type_| (type_, OWN_ROLLUP_FIELD_MANAGER)))
+        .chain(
+            [AVAILABLE, PROGRESSING, DEGRADED]
+                .map(|type_| (type_, crate::controller::grid_network::ROLLUP_FIELD_MANAGER)),
+        )
         .collect()
 }
 
@@ -107,7 +131,7 @@ const REASONS: [(&str, &str, &str); 32] = [
     (AVAILABLE, "Unknown", "AwaitingFirstAttempt"),
     (ACCEPTED, "True", "Accepted"),
     (RESOLVED_REFS, "True", "ResolvedRefs"),
-    (ENROLLED, "Unknown", "AwaitingFirstAttempt"),
+    (ENROLLED, "Unknown", "Enrolling"),
     (ENROLLED, "False", "AwaitingInvite"),
     (ENROLLED, "False", "InviteMaybeSpent"),
     (ENROLLED, "True", "IdentityPresent"),
@@ -319,9 +343,9 @@ async fn renewal_rounds_under(api: &FakeApi, rest: &str, count: usize, mut befor
         let _step = enrollment
             .step(&client, Some(SITE), &config(rest))
             .await
-            .expect("sites list");
+            .expect("networks list");
         let _renewed = renewal.round(&settings).await;
-        observed.push(api.observe(PATH).expect("own site stored"));
+        observed.push(rolled(api, &client).await);
     }
     observed
 }
@@ -438,50 +462,45 @@ async fn invariant_8_no_signer_reads_rotation_on_schedule_no_signer_and_never_bl
     assert_eq!(degraded["status"], "False");
 }
 
-/// The `GridNetwork` the own site names, so the `GridSite` controller reconciles it in full.
-fn with_network(api: &FakeApi) {
-    api.put(
-        "/apis/grid.praxis.fast/v1alpha1/gridnetworks/grid",
-        json!({
-            "apiVersion": "grid.praxis.fast/v1alpha1",
-            "kind": "GridNetwork",
-            "metadata": { "name": "grid", "generation": 1, "uid": "uid-grid" },
-            "spec": {}
-        }),
-    );
-}
-
 #[tokio::test]
-async fn invariant_5_the_own_sites_rollup_has_exactly_one_manager_beside_the_grid_site_controller() {
+#[expect(clippy::too_many_lines, reason = "three writers across two objects")]
+async fn invariant_5_the_own_grid_site_carries_only_the_peer_rollup_and_the_network_one_writer_each() {
     let api = seeded();
-    with_network(&api);
     let client = api.client(NAMESPACE);
     let mut enrollment = Enrollment::default();
     let mut observed = Vec::with_capacity(3);
     for _round in 0..3 {
-        let _step = enrollment.step(&client, None, &config("")).await.expect("sites list");
-        let site: GridSite = serde_json::from_value(api.get(PATH).expect("own site stored")).expect("a GridSite");
+        let _step = enrollment
+            .step(&client, None, &config(""))
+            .await
+            .expect("networks list");
+        observed.push(rolled(&api, &client).await);
+        let site: GridSite = serde_json::from_value(api.get(SITE_PATH).expect("own site stored")).expect("a GridSite");
         Box::pin(crate::controller::grid_site::reconcile(
             Arc::new(site),
             Arc::new(client.clone()),
         ))
         .await
         .expect("the GridSite controller reconciles the own site");
-        observed.push(api.observe(PATH).expect("own site stored"));
     }
 
-    let mut expected = managers();
-    expected.insert(crate::controller::grid_site::CONNECTED, "grid-operator-probe");
-    invariants::one_manager_per_type(&api.writes(), PATH, &expected).expect("invariant 5");
-    let owners = api.owners(PATH);
+    invariants::one_manager_per_type(&api.writes(), PATH, &managers()).expect("invariant 5");
+    invariants::unchanged_from(&observed, 1).expect("invariant 1: the writers do not flap");
+    let site = api.observe(SITE_PATH).expect("own site stored");
+    for (type_, _) in TYPES {
+        assert!(
+            site.condition(type_).is_none(),
+            "{type_} is the GridNetwork's, never the GridSite's"
+        );
+    }
+    let owners = api.owners(SITE_PATH);
     for type_ in [AVAILABLE, PROGRESSING, DEGRADED] {
         assert_eq!(
             owners.get(type_).map(String::as_str),
-            Some(OWN_ROLLUP_FIELD_MANAGER),
-            "{type_} has the own-site roll-up as its one manager"
+            Some("grid-operator-site"),
+            "{type_} on the own GridSite is the peer roll-up, as on any GridSite"
         );
     }
-    invariants::unchanged_from(&observed, 1).expect("invariant 1: the two writers do not flap");
 }
 
 #[tokio::test]

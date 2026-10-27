@@ -1,4 +1,4 @@
-//! Enroll this cluster's own site, as the operator config names it, and report it on its `GridSite`.
+//! Enroll this cluster's own site, as the operator config names it, and report it on its `GridNetwork`.
 
 use std::borrow::Cow;
 
@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::{EnrollError, KubeStore, Outcome, Settings, Store as _, Target};
 use crate::{
-    crd::{grid_site::GridSite, inference_provider::Condition},
+    crd::{grid_network::GridNetwork, inference_provider::Condition},
     operator_config::{
         BundleKind, BundleRef, ConfigWatch, InviteSecretRef, Section, SignerEndpoint, SiteConfig, Snapshot,
     },
@@ -34,13 +34,14 @@ pub const IDENTITY_VALID: &str = "IdentityValid";
 /// Whether the identity renews before it expires.
 pub const ROTATION_ON_SCHEDULE: &str = "RotationOnSchedule";
 
-/// The gates the own site's `Available` rolls up, in the order the first failing one is
-/// reported. `RotationOnSchedule` does not gate: it raises `Degraded` instead.
-const GATES: [&str; 4] = [ACCEPTED, RESOLVED_REFS, ENROLLED, IDENTITY_VALID];
+/// The gates the `GridNetwork`'s `Available` rolls up beside the controller's, in the order
+/// the first failing one is reported. `RotationOnSchedule` does not gate: it raises
+/// `Degraded` instead.
+pub(crate) const GATES: [&str; 4] = [ACCEPTED, RESOLVED_REFS, ENROLLED, IDENTITY_VALID];
 
-/// Every own-site condition type written here, each by its own manager, beside the roll-up
-/// under [`OWN_ROLLUP_FIELD_MANAGER`].
-const TYPES: [(&str, &str); 5] = [
+/// Every condition type written here, each by its own manager.
+#[cfg(test)]
+pub(crate) const TYPES: [(&str, &str); 5] = [
     (ENROLLED, FIELD_MANAGER),
     (ACCEPTED, ACCEPTED_FIELD_MANAGER),
     (RESOLVED_REFS, REFS_FIELD_MANAGER),
@@ -53,7 +54,7 @@ const TYPES: [(&str, &str); 5] = [
 /// An opt-in, so the config cannot pin a bundle that happens to be in the namespace.
 pub const SIGNER_BUNDLE_LABEL: &str = "grid.praxis.fast/signer-bundle";
 
-/// Server-side apply manager for `Enrolled`, apart from the `GridSite` reconcile.
+/// Server-side apply manager for `Enrolled`, apart from the `GridNetwork` reconcile.
 pub const FIELD_MANAGER: &str = "grid-operator-enrollment";
 
 /// Server-side apply manager for `RotationOnSchedule`: an apply replaces what its
@@ -66,24 +67,38 @@ pub const ACCEPTED_FIELD_MANAGER: &str = "grid-operator-accepted";
 /// Manager for `ResolvedRefs`.
 pub const REFS_FIELD_MANAGER: &str = "grid-operator-refs";
 
-/// Manager for the own site's `Available`, `Progressing` and `Degraded`. Apart from the peer
-/// roll-up's, so a second writer of the own site's roll-up shows as a manager conflict.
-pub const OWN_ROLLUP_FIELD_MANAGER: &str = "grid-operator-own-site";
-
 /// Manager for `IdentityValid`.
 pub const IDENTITY_FIELD_MANAGER: &str = "grid-operator-identity";
 
-/// This cluster's own `GridSite` among `sites`: the one named `name`.
-#[must_use]
-pub fn own<'sites>(sites: &'sites [GridSite], name: Option<&str>) -> Option<&'sites GridSite> {
-    let name = name?;
-    sites.iter().find(|site| site.metadata.name.as_deref() == Some(name))
-}
+/// `Enrolled`'s reason while a first request is out, which `Progressing` reads as `Enrolling`.
+pub const ENROLLING: &str = "Enrolling";
 
-/// Whether `site` holds a condition written here, as only this cluster's own site does.
+/// `Progressing`'s reason while a failed enrollment is retried.
+pub const RETRYING: &str = "Retrying";
+
+/// The `Enrolled` reasons of a failure the next poll retries with the same inputs, which
+/// `Progressing` reads as [`RETRYING`].
+pub(crate) const RETRIED: [&str; 5] = [
+    "SignerLapsed",
+    "SignerUnreachable",
+    "InviteMaybeSpent",
+    "IdentityNotStored",
+    "StoreUnavailable",
+];
+
+/// What `Progressing` reads off `held`'s `Enrolled`: `Enrolling` while a first request is
+/// out, `Retrying` while a failure is retried, else nothing in flight.
 #[must_use]
-pub fn is_own(site: &GridSite) -> bool {
-    held(site, ACCEPTED).is_some()
+pub(crate) fn in_flight(held: &[Condition]) -> Option<rollup::Cause<'_>> {
+    let enrolled = held.iter().find(|held| held.type_ == ENROLLED)?;
+    let reason = enrolled.reason.as_str();
+    if reason == ENROLLING {
+        Some((ENROLLING, enrolled.message.as_str()))
+    } else if RETRIED.contains(&reason) {
+        Some((RETRYING, enrolled.message.as_str()))
+    } else {
+        None
+    }
 }
 
 /// What a condition says.
@@ -107,7 +122,7 @@ impl Verdict {
         }
     }
 
-    /// `Accepted`: this `GridSite` is this cluster's own site, with nothing conflicting.
+    /// `Accepted`: the site section applies to this cluster's own site, with nothing conflicting.
     pub(crate) fn own_site() -> Self {
         Self::new("True", ACCEPTED, "this cluster's own site".to_owned())
     }
@@ -126,12 +141,30 @@ impl Verdict {
         )
     }
 
-    /// No `GridSite` of the site's name yet, so nothing is enrolled or reported there.
-    fn awaiting_grid_site(name: &str) -> Self {
+    /// No `GridNetwork` yet, so nothing is enrolled or reported there.
+    fn awaiting_grid_network(name: &str) -> Self {
         Self::new(
             "False",
-            "AwaitingGridSite",
-            format!("no GridSite named {name}: declare this site's GridSite, and it enrolls"),
+            "AwaitingGridNetwork",
+            format!("no GridNetwork yet: declare this cluster's GridNetwork, and site {name} enrolls"),
+        )
+    }
+
+    /// More than one `GridNetwork`, so none is this cluster's.
+    fn many_networks(count: usize) -> Self {
+        Self::new(
+            "False",
+            "MoreThanOneGridNetwork",
+            format!("{count} GridNetworks found, but one operator serves one grid: delete all but one"),
+        )
+    }
+
+    /// The first request is out.
+    fn enrolling() -> Self {
+        Self::new(
+            "Unknown",
+            ENROLLING,
+            "sending the enrollment request to the signer".to_owned(),
         )
     }
 
@@ -143,15 +176,6 @@ impl Verdict {
             "set site.inviteSecretRef in the operator config to the Secret holding this site's invite, beside \
              site.signerEndpoint"
                 .to_owned(),
-        )
-    }
-
-    /// Not evaluated yet: the first attempt has not returned.
-    fn awaiting_first_attempt() -> Self {
-        Self::new(
-            "Unknown",
-            "AwaitingFirstAttempt",
-            "the first enrollment attempt has not returned".to_owned(),
         )
     }
 
@@ -184,7 +208,8 @@ impl Verdict {
 const fn reason(error: &EnrollError) -> &'static str {
     match error {
         EnrollError::Config(_) => "Misconfigured",
-        EnrollError::SignerUntrusted(_) | EnrollError::SignerLapsed(_) => "SignerUntrusted",
+        EnrollError::SignerUntrusted(_) => "SignerUntrusted",
+        EnrollError::SignerLapsed(_) => "SignerLapsed",
         EnrollError::RefNotFound(_) => "RefNotFound",
         EnrollError::NameMismatch(_) => "NameMismatch",
         EnrollError::TokenRejected(_) => "InviteInvalid",
@@ -229,14 +254,14 @@ const fn definitive(error: &EnrollError) -> bool {
 }
 
 /// The live condition of `type_` on `site`.
-fn held<'site>(site: &'site GridSite, type_: &str) -> Option<&'site Condition> {
+fn held<'site>(site: &'site GridNetwork, type_: &str) -> Option<&'site Condition> {
     site.status
         .as_ref()
         .and_then(|live| live.conditions.iter().find(|held| held.type_ == type_))
 }
 
 /// The condition of `type_` for `verdict`, or `None` when the live status already says it.
-pub(crate) fn condition(site: &GridSite, type_: &str, verdict: &Verdict, now_rfc3339: &str) -> Option<Condition> {
+pub(crate) fn condition(site: &GridNetwork, type_: &str, verdict: &Verdict, now_rfc3339: &str) -> Option<Condition> {
     let generation = site.metadata.generation;
     let held = held(site, type_);
     if held.is_some_and(|held| {
@@ -260,23 +285,23 @@ pub(crate) fn condition(site: &GridSite, type_: &str, verdict: &Verdict, now_rfc
     })
 }
 
-/// The apply patch carrying `condition` on the `GridSite` `name`.
+/// The apply patch carrying `condition` on the `GridNetwork` `name`.
 fn patch(name: &str, condition: &Condition) -> Value {
     serde_json::json!({
         "apiVersion": "grid.praxis.fast/v1alpha1",
-        "kind": "GridSite",
+        "kind": "GridNetwork",
         "metadata": { "name": name },
         "status": { "conditions": [condition] }
     })
 }
 
 /// Whether the live `Enrolled` condition is already `True`.
-pub(crate) fn enrolled(site: &GridSite) -> bool {
+pub(crate) fn enrolled(site: &GridNetwork) -> bool {
     held(site, ENROLLED).is_some_and(|held| held.status == "True")
 }
 
 /// Write `verdict` as `Enrolled` on `site`.
-async fn report_enrolled(client: &Client, site: &GridSite, verdict: &Verdict) -> Option<GridSite> {
+async fn report_enrolled(client: &Client, site: &GridNetwork, verdict: &Verdict) -> Option<Box<GridNetwork>> {
     report(client, site, ENROLLED, FIELD_MANAGER, verdict).await
 }
 
@@ -285,22 +310,22 @@ async fn report_enrolled(client: &Client, site: &GridSite, verdict: &Verdict) ->
 /// condition reports, it never gates.
 pub(crate) async fn report(
     client: &Client,
-    site: &GridSite,
+    site: &GridNetwork,
     type_: &str,
     manager: &str,
     verdict: &Verdict,
-) -> Option<GridSite> {
+) -> Option<Box<GridNetwork>> {
     let name = site.metadata.name.as_deref()?;
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .ok()?;
     let condition = condition(site, type_, verdict, &now)?;
-    let api: Api<GridSite> = Api::all(client.clone());
+    let api: Api<GridNetwork> = Api::all(client.clone());
     let params = PatchParams::apply(manager).force();
     match Box::pin(api.patch_status(name, &params, &Patch::Apply(patch(name, &condition)))).await {
-        Ok(written) => Some(written),
+        Ok(written) => Some(Box::new(written)),
         Err(error) => {
-            tracing::warn!(grid_site = name, condition = type_, %error, "writing the condition failed");
+            tracing::warn!(grid_network = name, condition = type_, %error, "writing the condition failed");
             None
         },
     }
@@ -308,8 +333,12 @@ pub(crate) async fn report(
 
 /// Write each of `verdicts`, as (type, manager, verdict), on `site` in turn, returning
 /// the object as last written so a later write compares against it.
-pub(crate) async fn report_many(client: &Client, site: &GridSite, verdicts: &[(&str, &str, Verdict)]) -> GridSite {
-    let mut latest = site.clone();
+pub(crate) async fn report_many(
+    client: &Client,
+    site: &GridNetwork,
+    verdicts: &[(&str, &str, Verdict)],
+) -> Box<GridNetwork> {
+    let mut latest = Box::new(site.clone());
     for (type_, manager, verdict) in verdicts {
         if let Some(written) = Box::pin(report(client, &latest, type_, manager, verdict)).await {
             latest = written;
@@ -318,70 +347,9 @@ pub(crate) async fn report_many(client: &Client, site: &GridSite, verdicts: &[(&
     latest
 }
 
-/// `Progressing` while an enrollment request is sent.
-const ENROLLING: rollup::Cause<'static> = ("Enrolling", "sending the enrollment request to the signer");
-
-/// The own site's roll-up over the conditions `site` holds: `Available` from the gates, a
-/// gate not written yet reading `Unknown`, `Degraded` from a `RotationOnSchedule` that is
-/// `False`, and `Progressing` from `in_flight`.
-pub(crate) fn own_rollup(site: &GridSite, in_flight: Option<rollup::Cause<'_>>, now: &str) -> [Condition; 3] {
-    let current = site
-        .status
-        .as_ref()
-        .map_or(&[][..], |status| status.conditions.as_slice());
-    let stamp = rollup::Stamp {
-        generation: site.metadata.generation,
-        now,
-    };
-    let gates: Vec<Condition> = GATES
-        .iter()
-        .map(|type_| {
-            held(site, type_).cloned().unwrap_or_else(|| {
-                let unwritten = ("Unknown", "AwaitingFirstCheck", "not evaluated yet".to_owned());
-                rollup::condition(&[], type_, unwritten, stamp)
-            })
-        })
-        .collect();
-    let gates: Vec<&Condition> = gates.iter().collect();
-    let degraded = held(site, ROTATION_ON_SCHEDULE)
-        .filter(|rotation| rotation.status == "False")
-        .map(|rotation| (rotation.reason.as_str(), rotation.message.as_str()));
-    rollup::trio(current, &gates, (degraded, in_flight), stamp)
-}
-
-/// Write the own site's roll-up on `site` under [`OWN_ROLLUP_FIELD_MANAGER`], when it
-/// changed. A failure is logged: the roll-up reports, it never gates.
-pub(crate) async fn report_rollup(client: &Client, site: &GridSite, in_flight: Option<rollup::Cause<'_>>) {
-    let Some(name) = site.metadata.name.as_deref() else {
-        return;
-    };
-    let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
-        return;
-    };
-    let trio = own_rollup(site, in_flight, &now);
-    let current = site
-        .status
-        .as_ref()
-        .map_or(&[][..], |status| status.conditions.as_slice());
-    if !rollup::differs(current, &trio) {
-        return;
-    }
-    let patch = serde_json::json!({
-        "apiVersion": "grid.praxis.fast/v1alpha1",
-        "kind": "GridSite",
-        "metadata": { "name": name },
-        "status": { "conditions": trio }
-    });
-    let api: Api<GridSite> = Api::all(client.clone());
-    let params = PatchParams::apply(OWN_ROLLUP_FIELD_MANAGER).force();
-    if let Err(error) = Box::pin(api.patch_status(name, &params, &Patch::Apply(patch))).await {
-        tracing::warn!(grid_site = name, %error, "writing the roll-up failed");
-    }
-}
-
 /// Report `IdentityValid` as not evaluated yet on `site`, which has no identity: the
 /// renewal loop reads it once there is one.
-async fn identity_not_evaluated(client: &Client, site: &GridSite, secret: &str) {
+async fn identity_not_evaluated(client: &Client, site: &GridNetwork, secret: &str) {
     if held(site, IDENTITY_VALID).is_none() {
         let waiting = Verdict::new(
             "Unknown",
@@ -389,57 +357,6 @@ async fn identity_not_evaluated(client: &Client, site: &GridSite, secret: &str) 
             format!("waiting for a site identity: Secret {secret} does not exist yet, see Enrolled"),
         );
         drop(Box::pin(report(client, site, IDENTITY_VALID, IDENTITY_FIELD_MANAGER, &waiting)).await);
-    }
-}
-
-/// The `GridSites` among `sites` that hold a condition of ours without being this cluster's
-/// own site, `own`: what a renamed site leaves behind.
-pub(crate) fn stale<'sites>(sites: &'sites [GridSite], own: Option<&str>) -> Vec<&'sites GridSite> {
-    sites
-        .iter()
-        .filter(|site| site.metadata.name.as_deref() != own)
-        .filter(|site| TYPES.iter().any(|(type_, _)| held(site, type_).is_some()))
-        .collect()
-}
-
-/// Remove the conditions our managers hold on every `GridSite` in `stale`. An apply
-/// carrying no conditions gives up what its manager owned and nothing else.
-pub(crate) async fn clear(client: &Client, stale: &[&GridSite]) {
-    let api: Api<GridSite> = Api::all(client.clone());
-    for site in stale {
-        let Some(name) = site.metadata.name.as_deref() else {
-            continue;
-        };
-        let managers = TYPES
-            .iter()
-            .map(|(_, manager)| *manager)
-            .chain([OWN_ROLLUP_FIELD_MANAGER]);
-        for manager in managers {
-            let empty = serde_json::json!({
-                "apiVersion": "grid.praxis.fast/v1alpha1",
-                "kind": "GridSite",
-                "metadata": { "name": name },
-                "status": { "conditions": [] }
-            });
-            let params = PatchParams::apply(manager).force();
-            if let Err(error) = Box::pin(api.patch_status(name, &params, &Patch::Apply(empty))).await {
-                tracing::warn!(grid_site = name, manager, %error, "clearing a stale condition failed");
-            }
-        }
-    }
-}
-
-/// Whether a step may clear what a renamed site left behind: not while a refused config
-/// hides which site is ours.
-fn clears_stale(identity: Option<&str>, section: &Section<'_>) -> bool {
-    identity.is_some() || !matches!(section, Section::Invalid(_))
-}
-
-/// Clear what a renamed site left behind among `listed`, keeping `own`'s, unless `allowed` is
-/// false.
-async fn clear_stale(client: &Client, listed: &[GridSite], own: Option<&str>, allowed: bool) {
-    if allowed {
-        Box::pin(clear(client, &stale(listed, own))).await;
     }
 }
 
@@ -458,7 +375,7 @@ pub enum Step {
     Enrolled,
     /// The inputs that last failed are unchanged, so nothing was sent.
     Unchanged,
-    /// Ended without an identity, as reported on the `GridSite`.
+    /// Ended without an identity, as reported on the `GridNetwork`.
     Failed,
 }
 
@@ -506,34 +423,32 @@ struct Inputs {
 pub struct Enrollment {
     /// The inputs of the last attempt that ended without an identity.
     failed: Option<Inputs>,
-    /// Why the last attempt failed in a way the next poll retries, so `Progressing` holds
-    /// `Retrying`.
-    retrying: Option<String>,
     /// The last Event recorded on the operator config, so a repeat is not recorded again.
     noted: Option<Verdict>,
 }
 
 impl Enrollment {
-    /// Enroll the local site if it has an invite and no identity, reporting the result on its
-    /// `GridSite`. Until that `GridSite` is declared, nothing is sent, and an Event on the
-    /// operator config says why. `identity` is the site the identity names, once there is one.
+    /// Enroll the local site if it has an invite and no identity, reporting the result on the
+    /// `GridNetwork`. Until one exists, nothing is sent, and an Event on the operator config
+    /// says why. `identity` is the site the identity names, once there is one.
     ///
     /// # Errors
     ///
-    /// Returns the error when `GridSite`s cannot be listed.
+    /// Returns the error when `GridNetwork`s cannot be listed.
     pub async fn step(
         &mut self,
         client: &Client,
         identity: Option<&str>,
         config: &Snapshot,
     ) -> Result<Step, kube::Error> {
-        let sites: Api<GridSite> = Api::all(client.clone());
-        let listed = Box::pin(sites.list(&ListParams::default())).await?.items;
-        let section = config.loaded.site();
-        let named = identity.or_else(|| section.name());
-        Box::pin(clear_stale(client, &listed, named, clears_stale(identity, &section))).await;
-        let own = own(&listed, named);
-        let site = match section {
+        let networks: Api<GridNetwork> = Api::all(client.clone());
+        let listed = Box::pin(networks.list(&ListParams::default())).await?.items;
+        let own = match listed.as_slice() {
+            [] => None,
+            [own] => Some(own),
+            many => return Ok(Box::pin(self.many(client, config, many.len())).await),
+        };
+        let site = match config.loaded.site() {
             Section::Unset => {
                 return Ok(match (identity, own) {
                     (Some(_), Some(own)) => Box::pin(self.settle(client, own, None)).await,
@@ -551,27 +466,36 @@ impl Enrollment {
         }
         Ok(match own {
             Some(own) => Box::pin(self.settle(client, own, Some(site))).await,
-            None if identity.is_none() => Box::pin(self.await_grid_site(client, &site.name, config)).await,
+            None if identity.is_none() => Box::pin(self.await_grid_network(client, &site.name, config)).await,
             None => Step::NoLocalSite,
         })
     }
 
-    /// Wait for the `GridSite` `name`, saying so as an Event on the operator config.
-    async fn await_grid_site(&mut self, client: &Client, name: &str, config: &Snapshot) -> Step {
-        let waiting = Verdict::awaiting_grid_site(name);
+    /// Enroll nowhere among `count` `GridNetwork`s, saying so as an Event on the operator config.
+    async fn many(&mut self, client: &Client, config: &Snapshot, count: usize) -> Step {
+        Box::pin(self.note(client, config, Verdict::many_networks(count))).await;
+        Step::NoLocalSite
+    }
+
+    /// Wait for a `GridNetwork`, saying so as an Event on the operator config.
+    async fn await_grid_network(&mut self, client: &Client, name: &str, config: &Snapshot) -> Step {
+        let waiting = Verdict::awaiting_grid_network(name);
         tracing::info!(reason = %waiting.reason, "{}", waiting.message);
         Box::pin(self.note(client, config, waiting)).await;
         Step::NoLocalSite
     }
 
     /// Report `refusal` as `Accepted` on `own`, else as an Event on the operator config.
-    async fn refuse(&mut self, client: &Client, own: Option<&GridSite>, config: &Snapshot, refusal: Verdict) -> Step {
+    async fn refuse(
+        &mut self,
+        client: &Client,
+        own: Option<&GridNetwork>,
+        config: &Snapshot,
+        refusal: Verdict,
+    ) -> Step {
         tracing::error!(reason = %refusal.reason, error = %refusal.message, "operator config refused for this site");
         match own {
-            Some(own) => {
-                let written = Box::pin(report(client, own, ACCEPTED, ACCEPTED_FIELD_MANAGER, &refusal)).await;
-                Box::pin(report_rollup(client, written.as_ref().unwrap_or(own), None)).await;
-            },
+            Some(own) => drop(Box::pin(report(client, own, ACCEPTED, ACCEPTED_FIELD_MANAGER, &refusal)).await),
             None => Box::pin(self.note(client, config, refusal)).await,
         }
         Step::Refused
@@ -588,8 +512,8 @@ impl Enrollment {
         self.noted = Some(verdict);
     }
 
-    /// Accept `site` as this cluster's own, enroll it through `config`, and roll its conditions up.
-    async fn settle(&mut self, client: &Client, site: &GridSite, config: Option<&SiteConfig>) -> Step {
+    /// Accept the site section for `site`, this cluster's `GridNetwork`, and enroll through `config`.
+    async fn settle(&mut self, client: &Client, site: &GridNetwork, config: Option<&SiteConfig>) -> Step {
         let accepted = Box::pin(report(
             client,
             site,
@@ -598,18 +522,12 @@ impl Enrollment {
             &Verdict::own_site(),
         ))
         .await;
-        let site = accepted.as_ref().unwrap_or(site);
-        let step = Box::pin(self.enroll(client, site, config)).await;
-        // Settle against the object as enrollment left it, not as it stood before.
-        let site = Box::pin(latest(client, site)).await;
-        let retrying = self.retrying.take();
-        let in_flight = retrying.as_deref().map(|message| ("Retrying", message));
-        Box::pin(report_rollup(client, &site, in_flight)).await;
-        step
+        let site = accepted.as_deref().unwrap_or(site);
+        Box::pin(self.enroll(client, site, config)).await
     }
 
     /// Enroll `site`, the local one, through the signer and invite `config` names.
-    async fn enroll(&mut self, client: &Client, site: &GridSite, config: Option<&SiteConfig>) -> Step {
+    async fn enroll(&mut self, client: &Client, site: &GridNetwork, config: Option<&SiteConfig>) -> Step {
         let into = match Box::pin(Destination::resolve(client)).await {
             Ok(into) => into,
             Err(error) => return Box::pin(self.fail(client, site, None, &error)).await,
@@ -640,19 +558,17 @@ impl Enrollment {
     }
 
     /// Send the `attempt` and store the identity `into` its Secrets.
-    async fn redeem(&mut self, client: &Client, own: &GridSite, into: &Destination, attempt: Attempt) -> Step {
+    async fn redeem(&mut self, client: &Client, own: &GridNetwork, into: &Destination, attempt: Attempt) -> Step {
         let Attempt { settings, inputs } = attempt;
         let target = &into.target;
         let mut verdicts = vec![(RESOLVED_REFS, REFS_FIELD_MANAGER, Verdict::resolved())];
-        if held(own, ENROLLED).is_none() {
-            verdicts.push((ENROLLED, FIELD_MANAGER, Verdict::awaiting_first_attempt()));
+        // A resend after a retried failure is still the same progress, so Retrying holds.
+        let retried = held(own, ENROLLED).is_some_and(|held| RETRIED.contains(&held.reason.as_str()));
+        if !retried {
+            verdicts.push((ENROLLED, FIELD_MANAGER, Verdict::enrolling()));
         }
         let latest = Box::pin(report_many(client, own, &verdicts)).await;
-        let site = &latest;
-        // A resend after a retried failure is still the same progress, so Retrying holds.
-        if held(site, rollup::PROGRESSING).is_none_or(|progressing| progressing.status != "True") {
-            Box::pin(report_rollup(client, site, Some(ENROLLING))).await;
-        }
+        let site = &*latest;
         let clients = super::signer::Clients::default();
         let signer = settings.signer(&clients);
         match Box::pin(super::enroll(&into.store, &signer, &settings, target)).await {
@@ -673,7 +589,7 @@ impl Enrollment {
     }
 
     /// Report the identity in `target`, unless `site` already reads enrolled.
-    async fn present(&mut self, client: &Client, site: &GridSite, target: &Target) -> Step {
+    async fn present(&mut self, client: &Client, site: &GridNetwork, target: &Target) -> Step {
         if !enrolled(site) {
             drop(Box::pin(report_enrolled(client, site, &Verdict::present(&target.site_secret))).await);
         }
@@ -683,14 +599,9 @@ impl Enrollment {
 
     /// Report `error` on `site`. A definitive one holds `inputs` until one changes; a
     /// transient one leaves the held inputs alone, so the next poll retries.
-    async fn fail(&mut self, client: &Client, site: &GridSite, inputs: Option<Inputs>, error: &EnrollError) -> Step {
+    async fn fail(&mut self, client: &Client, site: &GridNetwork, inputs: Option<Inputs>, error: &EnrollError) -> Step {
         tracing::error!(%error, "site enrollment failed");
         let verdict = Verdict::failed(error);
-        // The next poll retries with the same inputs, so this is progress that holds across
-        // polls, not a settled verdict; Enrolled still records what the attempt returned.
-        if !definitive(error) {
-            self.retrying = Some(error.to_string());
-        }
         if matches!(error, EnrollError::Kube(_)) {
             // A store failure says nothing about the enrollment, so Enrolled keeps its last value.
         } else if about_refs(error) {
@@ -698,7 +609,7 @@ impl Enrollment {
         } else {
             let resolved = Verdict::resolved();
             let written = Box::pin(report(client, site, RESOLVED_REFS, REFS_FIELD_MANAGER, &resolved)).await;
-            drop(Box::pin(report_enrolled(client, written.as_ref().unwrap_or(site), &verdict)).await);
+            drop(Box::pin(report_enrolled(client, written.as_deref().unwrap_or(site), &verdict)).await);
         }
         if let Some(inputs) = inputs.filter(|_inputs| definitive(error)) {
             self.failed = Some(inputs);
@@ -768,20 +679,6 @@ async fn identity_lost(client: &Client, site: &str, config: &ConfigWatch) -> boo
     lost
 }
 
-/// `site` as the API holds it now, or `site` itself when the read fails.
-async fn latest(client: &Client, site: &GridSite) -> GridSite {
-    let Some(name) = site.metadata.name.as_deref() else {
-        return site.clone();
-    };
-    match Box::pin(Api::<GridSite>::all(client.clone()).get(name)).await {
-        Ok(current) => current,
-        Err(error) => {
-            tracing::debug!(grid_site = name, %error, "re-reading the site failed; settling on the last write");
-            site.clone()
-        },
-    }
-}
-
 /// The inputs an attempt for the site `config` names spends, and the settings they make.
 async fn prepare(
     client: &Client,
@@ -818,12 +715,12 @@ async fn prepare(
 
 /// Report on `site` that `config` names no invite to send yet, with what the bundles it
 /// does name resolve to.
-async fn await_invite(client: &Client, site: &GridSite, config: Option<&SiteConfig>) -> Step {
+async fn await_invite(client: &Client, site: &GridNetwork, config: Option<&SiteConfig>) -> Step {
     let written = match Box::pin(named_refs(client, config)).await {
         Some(refs) => Box::pin(report(client, site, RESOLVED_REFS, REFS_FIELD_MANAGER, &refs)).await,
         None => None,
     };
-    let site = written.as_ref().unwrap_or(site);
+    let site = written.as_deref().unwrap_or(site);
     drop(Box::pin(report_enrolled(client, site, &Verdict::awaiting_invite())).await);
     Step::AwaitingInvite
 }

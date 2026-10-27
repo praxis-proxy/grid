@@ -90,9 +90,9 @@ pub async fn reconcile(site: Arc<GridSite>, client: Arc<Client>) -> Result<Actio
 
     let network = match fetch_network(&site, client.as_ref()).await {
         Ok(network) => network,
-        // This cluster's own site can precede its GridNetwork while it enrolls.
-        Err(error @ OperatorError::NotFound(_)) if crate::enroll::local::is_own(&site) => {
-            tracing::debug!(name, %error, "this cluster's own GridSite has no GridNetwork yet");
+        // A declared site can precede its GridNetwork, as this cluster's own does while it enrolls.
+        Err(error @ OperatorError::NotFound(_)) => {
+            tracing::debug!(name, %error, "GridSite has no GridNetwork yet");
             return Ok(Action::requeue(REQUEUE_INTERVAL));
         },
         Err(error) => return Err(error),
@@ -663,12 +663,7 @@ async fn apply_conditions(site: &GridSite, client: &Client, reason: &str, messag
     let ((status, reason, message), moving) = connected_verdict(reason, message);
     let stamp = rollup::Stamp { generation, now: &now };
     let connected = rollup::condition(held, CONNECTED, (status, reason.as_str(), message), stamp);
-    // The own site's roll-up is the enrollment step's and renewal loop's, never this one's.
-    let trio = if crate::enroll::local::is_own(site) {
-        Vec::new()
-    } else {
-        rollup::trio(held, &[&connected], (None, moving), stamp).to_vec()
-    };
+    let trio = rollup::trio(held, &[&connected], (None, moving), stamp);
     let api: Api<GridSite> = Api::all(client.clone());
     for (manager, conditions) in [
         (PROBE_FIELD_MANAGER, std::slice::from_ref(&connected)),

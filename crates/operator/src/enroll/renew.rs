@@ -27,10 +27,7 @@ use super::{
 };
 use crate::{
     controller::grid_network::GridModes,
-    crd::{
-        grid_network::{GridNetwork, PeerTrustMode},
-        grid_site::GridSite,
-    },
+    crd::grid_network::{GridNetwork, PeerTrustMode},
     metrics,
     operator_config::{BundleRef, ConfigWatch, Loaded, Rotation, Section, SignerEndpoint, Snapshot},
     shutdown::Shutdown,
@@ -655,24 +652,21 @@ impl Settings {
     }
 }
 
-/// This site's `GridSite`, as listed this round.
+/// This cluster's `GridNetwork`, as listed this round.
 struct Own {
-    /// The `GridSite` the identity names, when declared.
-    site: Option<GridSite>,
+    /// The sole `GridNetwork`, where the round reports.
+    site: Option<GridNetwork>,
 }
 
-/// List the `GridSite`s and pick this site's, the one `name` names, clearing what a renamed
-/// site left behind.
-async fn own_site(client: &Client, name: Option<&str>) -> Result<Own, RenewError> {
-    let sites: Api<GridSite> = Api::all(client.clone());
-    let listed = Box::pin(sites.list(&ListParams::default()))
+/// List the `GridNetwork`s and pick this cluster's, the sole one.
+async fn own_network(client: &Client) -> Result<Own, RenewError> {
+    let networks: Api<GridNetwork> = Api::all(client.clone());
+    let mut listed = Box::pin(networks.list(&ListParams::default()))
         .await
         .map_err(|e| RenewError::Kube(e.to_string()))?
         .items;
-    Box::pin(local::clear(client, &local::stale(&listed, name))).await;
-    Ok(Own {
-        site: local::own(&listed, name).cloned(),
-    })
+    let site = (listed.len() == 1).then(|| listed.swap_remove(0));
+    Ok(Own { site })
 }
 
 /// What the operator config declares about renewal for the site `identity` names.
@@ -841,7 +835,7 @@ pub async fn run(client: Client, mut settings: Settings, shutdown: Shutdown) {
 /// One round: resolve this site's `GridSite`, check `target` through its signer, and
 /// report on it.
 async fn tick(loop_: &Loop<'_>, settings: &Settings, target: &Result<Target, super::EnrollError>) -> Round {
-    let own = match Box::pin(own_site(loop_.client, settings.site.as_deref())).await {
+    let own = match Box::pin(own_network(loop_.client)).await {
         Ok(own) => own,
         Err(error) => return Round::failed(error),
     };
@@ -1144,16 +1138,14 @@ async fn renew_through(
     }
 }
 
-/// Report the round on this site's `GridSite`: `Enrolled` by the identity in `target`,
-/// `IdentityValid` by what was read, `RotationOnSchedule` by the check, and `Available` from
-/// those.
+/// Report the round on this cluster's `GridNetwork`: `Enrolled` by the identity in `target`,
+/// `IdentityValid` by what was read and `RotationOnSchedule` by the check.
 async fn report_round(client: &Client, own: &Own, target: &Target, round: &Round, refs: Option<&Verdict>) {
     let Some(site) = &own.site else {
         return;
     };
     let verdicts = round_verdicts(round, target, local::enrolled(site), refs);
-    let written = Box::pin(local::report_many(client, site, &verdicts)).await;
-    Box::pin(local::report_rollup(client, &written, None)).await;
+    drop(Box::pin(local::report_many(client, site, &verdicts)).await);
 }
 
 /// The conditions `round` writes on the own site, as (type, manager, verdict). An identity
