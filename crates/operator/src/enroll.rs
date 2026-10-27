@@ -639,7 +639,7 @@ fn enroll_error(error: SignerError) -> EnrollError {
             code: Some(code),
             detail,
         } if code == "name_deleted" => EnrollError::NameDeleted(detail),
-        SignerError::Refused { detail, .. } => EnrollError::Refused(detail),
+        SignerError::Refused { detail, .. } | SignerError::NoClientCertificate(detail) => EnrollError::Refused(detail),
         SignerError::Disabled(detail) | SignerError::Transport { detail, .. } => EnrollError::MaybeSpent(detail),
         SignerError::Untrusted { lapsed: true, detail } => EnrollError::SignerLapsed(detail),
         SignerError::Untrusted { lapsed: false, detail } => EnrollError::SignerUntrusted(detail),

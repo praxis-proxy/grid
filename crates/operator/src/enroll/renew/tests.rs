@@ -668,7 +668,7 @@ fn held_identity() -> Held {
 async fn renewal_trusts_the_pin_beside_the_held_grid_ca() {
     crate::init_process_crypto();
     let held = held_identity();
-    let (base, pin) = super::super::tests::byo_serving_signer(&held.ca).await;
+    let (base, pin) = super::super::tests::byo_serving_signer(&held.ca, axum::Router::new()).await;
     let clients = Clients::default();
 
     let unpinned = HttpsSigner::new(base.clone(), None, &clients).renew(&held, "csr").await;
@@ -808,6 +808,30 @@ fn the_renewer_is_the_annotated_certificate() {
     );
     assert_eq!(renewer_of(&annotated("")), None);
     assert_eq!(renewer_of(&kube::api::ObjectMeta::default()), None);
+}
+
+#[test]
+fn a_401_for_a_missing_client_certificate_says_renewal_needs_passthrough() {
+    let body = br#"{"error":"identity_required","message":"rotation requires the site's current grid certificate over mutual TLS"}"#;
+    let refused = super::super::signer::classify(StatusCode::UNAUTHORIZED, body)
+        .err()
+        .map(renew_error);
+    assert!(matches!(refused, Some(RenewError::NeedsPassthrough(_))), "{refused:?}");
+    let verdict = rotation_verdict(&Err(refused.expect("refused")), None);
+    assert_eq!(verdict.reason, "RenewalNeedsPassthrough");
+    assert!(verdict.message.contains("passthrough Route"), "{}", verdict.message);
+    assert!(
+        !verdict.message.contains("re-enroll"),
+        "re-enrolling does not fix it: {}",
+        verdict.message
+    );
+    let invalid = br#"{"error":"invalid_token","message":"a valid site token is required"}"#;
+    assert!(matches!(
+        super::super::signer::classify(StatusCode::UNAUTHORIZED, invalid)
+            .err()
+            .map(renew_error),
+        Some(RenewError::Unauthenticated(_))
+    ));
 }
 
 #[test]

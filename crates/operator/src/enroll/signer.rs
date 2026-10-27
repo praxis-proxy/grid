@@ -37,6 +37,9 @@ pub(super) enum SignerError {
     /// The signer did not accept the credential or certificate presented.
     #[error("{0}")]
     Unauthenticated(String),
+    /// The signer received no client certificate, as when TLS ends before it.
+    #[error("{0}")]
+    NoClientCertificate(String),
     /// The signer refused the request, with its status and machine-readable code.
     #[error("{detail}")]
     Refused {
@@ -225,6 +228,9 @@ pub(super) fn classify(status: StatusCode, body: &[u8]) -> Result<Issued, Signer
     );
     let code = error.map(|err| err.error);
     Err(match status {
+        StatusCode::UNAUTHORIZED if code.as_deref() == Some("identity_required") => {
+            SignerError::NoClientCertificate(detail)
+        },
         StatusCode::UNAUTHORIZED => SignerError::Unauthenticated(detail),
         StatusCode::SERVICE_UNAVAILABLE if code.as_deref() == Some("rotation_disabled") => {
             SignerError::Disabled(detail)

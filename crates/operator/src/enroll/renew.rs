@@ -105,6 +105,13 @@ pub(super) enum RenewError {
     /// The service refused this identity.
     #[error("rotation refused ({0}); re-enroll this site with a new site token")]
     Refused(String),
+    /// The service received no client certificate: TLS ended before it.
+    #[error(
+        "the signer did not receive this site's certificate ({0}); renewal needs TLS end to end to the \
+         signer, through a passthrough Route, a load balancer or the in-cluster Service, not a terminating \
+         Route or an intercepting proxy"
+    )]
+    NeedsPassthrough(String),
     /// The service answered with a certificate this site cannot use.
     #[error("rotation response invalid: {0}")]
     Invalid(String),
@@ -130,7 +137,8 @@ impl RenewError {
             | Self::Transport(_)
             | Self::Invalid(_)
             | Self::SignerDisabled(_)
-            | Self::Untrusted(_) => "failed",
+            | Self::Untrusted(_)
+            | Self::NeedsPassthrough(_) => "failed",
         }
     }
 }
@@ -374,6 +382,7 @@ fn site_of(cert_pem: &str) -> Result<String, RenewError> {
 fn renew_error(error: SignerError) -> RenewError {
     match error {
         SignerError::Unauthenticated(detail) => RenewError::Unauthenticated(detail),
+        SignerError::NoClientCertificate(detail) => RenewError::NeedsPassthrough(detail),
         SignerError::Refused {
             status: StatusCode::FORBIDDEN,
             detail,
@@ -1187,6 +1196,9 @@ fn rotation_verdict(checked: &Result<Checked, RenewError>, url: Option<&String>)
         },
         Err(error @ RenewError::SignerDisabled(_)) => Verdict::new("False", "RotationOverdue", error.to_string()),
         Err(error @ RenewError::Untrusted(_)) => Verdict::new("False", "SignerUntrusted", error.to_string()),
+        Err(error @ RenewError::NeedsPassthrough(_)) => {
+            Verdict::new("False", "RenewalNeedsPassthrough", error.to_string())
+        },
         Err(error) => Verdict::new("False", "RenewalFailing", error.to_string()),
         Ok(Checked::Waiting(_) | Checked::Renewed(_)) => match url {
             Some(url) => Verdict::new(
