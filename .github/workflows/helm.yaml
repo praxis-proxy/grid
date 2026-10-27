@@ -47,6 +47,7 @@ jobs:
       contents: read
     outputs:
       runtime: ${{ steps.changed.outputs.runtime }}
+      hub-site-legs: ${{ steps.legs.outputs.legs }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -71,6 +72,26 @@ jobs:
           else
             echo "runtime=false" >> "${GITHUB_OUTPUT}"
           fi
+
+      # The hub-site legs. The llm-d sim leg runs only when dispatched by hand until it
+      # has proven itself, so the pull request matrix is unchanged.
+      - name: Choose the hub-site legs
+        id: legs
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          legs='[
+            {"peer-trust-mode": "pin", "leg": "pin, rotation off"},
+            {"peer-trust-mode": "spiffe", "leg": "spiffe, certificate rotation"},
+            {"peer-trust-mode": "spiffe", "hub-router": "operator", "leg": "spiffe, operator gridSiteRoute"},
+            {"peer-trust-mode": "pin", "ha": "1", "leg": "pin, HA faults"}
+          ]'
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            legs=$(jq -c '. + [{"peer-trust-mode": "spiffe", "hub-router": "operator", "llmd": "1",
+              "leg": "spiffe, operator gridSiteRoute, llm-d sim"}]' <<<"${legs}")
+          fi
+          echo "legs=$(jq -c . <<<"${legs}")" >> "${GITHUB_OUTPUT}"
 
   # ----------------------------------------------------------------------------
   # Static chart validation (lint, template, schema, CRD sync, package)
@@ -569,17 +590,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - peer-trust-mode: pin
-            leg: pin, rotation off
-          - peer-trust-mode: spiffe
-            leg: spiffe, certificate rotation
-          - peer-trust-mode: spiffe
-            hub-router: operator
-            leg: spiffe, operator gridSiteRoute
-          - peer-trust-mode: pin
-            ha: "1"
-            leg: pin, HA faults
+        include: ${{ fromJSON(needs.changes.outputs.hub-site-legs) }}
     timeout-minutes: 60
     permissions:
       contents: read
@@ -642,6 +653,7 @@ jobs:
           MODES: ${{ matrix.peer-trust-mode }}
           HUB_ROUTER: ${{ matrix.hub-router || 'render' }}
           HA: ${{ matrix.ha || '0' }}
+          LLMD: ${{ matrix.llmd || '0' }}
           GRID_FEEDBACK_CONTRACT_TEST: ${{ matrix.peer-trust-mode == 'pin' && '1' || '0' }}
           # The spiffe leg rotates 8 minute identities; pin trust does not rotate.
           ROTATION_LIFETIME: "480"
@@ -655,7 +667,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: hub-site-e2e-logs-${{ matrix.peer-trust-mode }}${{ matrix.hub-router && format('-{0}', matrix.hub-router) || '' }}${{ matrix.ha && '-ha' || '' }}
+          name: hub-site-e2e-logs-${{ matrix.peer-trust-mode }}${{ matrix.hub-router && format('-{0}', matrix.hub-router) || '' }}${{ matrix.ha && '-ha' || '' }}${{ matrix.llmd && '-llmd' || '' }}
           path: /tmp/grid-hub-site-e2e/
           if-no-files-found: ignore
           retention-days: 5

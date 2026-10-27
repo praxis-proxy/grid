@@ -29,7 +29,10 @@
 #   NET_PREFIX          command prefix for calls to LoadBalancer addresses, e.g. under
 #                       rootless podman: podman unshare --rootless-netns
 #   TOPOLOGY            topology under tests/e2e/topologies (default grid-hub-site, or
-#                       grid-hub-site-ha under HA=1)
+#                       grid-hub-site-ha under HA=1, or grid-hub-site-llmd under LLMD=1)
+#   LLMD=1              each cluster serves the model from two llm-d-inference-sim pods behind
+#                       the llm-d router (Envoy and EPP); providers are scraped through the EPP
+#                       and HUB_ROUTER defaults to operator, so routing runs on polled signals
 #   HA=1                run the HA fault scenarios: steady load through the hub gateway's
 #                       LoadBalancer while the gateway and the operator are restarted,
 #                       deleted and drained. Needs a hub with two worker nodes.
@@ -42,11 +45,13 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-# The HA leg needs worker nodes on the hub, so it has a topology of its own.
-TOPOLOGY=${TOPOLOGY:-$([[ ${HA:-0} == 1 ]] && echo grid-hub-site-ha || echo grid-hub-site)}
+LLMD=${LLMD:-0}
+# The HA leg needs worker nodes on the hub, and the llm-d leg a stack per cluster, so each has
+# a topology of its own.
+TOPOLOGY=${TOPOLOGY:-$(if [[ ${HA:-0} == 1 ]]; then echo grid-hub-site-ha; elif [[ $LLMD == 1 ]]; then echo grid-hub-site-llmd; else echo grid-hub-site; fi)}
 TOPO="$ROOT/tests/e2e/topologies/$TOPOLOGY"
 MODES=${MODES:-pin spiffe}
-HUB_ROUTER=${HUB_ROUTER:-render}
+HUB_ROUTER=${HUB_ROUTER:-$([[ $LLMD == 1 ]] && echo operator || echo render)}
 IMAGE_PREFIX=${IMAGE_PREFIX:-localhost/grid-}
 IMAGE_TAG=${IMAGE_TAG:-e2e}
 CONTAINER_TOOL=${CONTAINER_TOOL:-docker}
@@ -61,7 +66,10 @@ SITE_CTX=kind-$PREFIX-site
 NS=grid
 ENS=grid-enrollment
 SITE="site-a"
-MODEL=Qwen/Qwen3-0.6B
+MODEL=${MODEL:-Qwen/Qwen3-0.6B}
+# The site's provider, and the port its model answers on: the llm-d router's Envoy under LLMD=1.
+PROVIDER=$([[ $LLMD == 1 ]] && echo llmd || echo vcr)
+MODEL_PORT=$([[ $LLMD == 1 ]] && echo 8081 || echo 8000)
 ENROLL_HOST=enroll.grid.example.com
 ENROLL_PORT=8443
 FORGE_STATE="$ROOT/.forge/$PREFIX"
@@ -209,8 +217,14 @@ plan_addresses() {
   SITE_GW_IP=$(ip_add "$site" 2)
   SITE_SIG_IP=$(ip_add "$site" 3)
   MODEL_LB_IP=$(ip_add "$site" 4)
-  MODEL_IP=$(kubectl --context "$SITE_CTX" -n model get service vcr-inference-site -o jsonpath='{.spec.clusterIP}')
-  [[ -n $MODEL_IP ]] || die "no vcr-inference-site Service on the site"
+  if llmd; then
+    MODEL_IP=$(kubectl --context "$SITE_CTX" -n llmd get service llmd-router-epp -o jsonpath='{.spec.clusterIP}')
+    HUB_MODEL_IP=$(kubectl --context "$HUB_CTX" -n llmd get service llmd-router-epp -o jsonpath='{.spec.clusterIP}')
+    [[ -n $MODEL_IP && -n $HUB_MODEL_IP ]] || die "no llmd-router-epp Service on both clusters; run: $0 up"
+  else
+    MODEL_IP=$(kubectl --context "$SITE_CTX" -n model get service vcr-inference-site -o jsonpath='{.spec.clusterIP}')
+    [[ -n $MODEL_IP ]] || die "no vcr-inference-site Service on the site"
+  fi
   # Two Services asking MetalLB for one address leaves the loser pending forever,
   # which surfaces as an unrelated deployment never going ready.
   local planned
@@ -237,6 +251,21 @@ renews() { [[ $MODE == spiffe && -n ${ROTATION_LIFETIME:-} ]]; }
 
 # site_route: the hub gateway serves the operator's generated gridSiteRoute config.
 site_route() { [[ $HUB_ROUTER == operator ]]; }
+
+# llmd: each cluster's model is two llm-d-inference-sim pods behind the llm-d router.
+llmd() { [[ $LLMD == 1 ]]; }
+
+# metrics_args <provider> <router Service IP>: under LLMD=1, the provider's metricsConfig at
+# the EPP's metrics port on the router Service, with the pool's name, as
+# docs/architecture/polling-metrics.md asks. A pod address could reach a standby replica.
+metrics_args() {
+  MA=()
+  llmd || return 0
+  MA=(--set "inferenceProviders.$1.metricsConfig.endpoint=http://$2:9090"
+    --set "inferenceProviders.$1.metricsConfig.poolName=llmd-router"
+    --set "inferenceProviders.$1.metricsConfig.staleMetricsSeconds=20"
+    --set-string "inferenceProviders.$1.metricsConfig.timeout=2s")
+}
 
 # renewal_args <chart>: a short lifetime and a grid-admin for the renewal leg, and signals
 # polling for it and the site route leg.
@@ -308,13 +337,16 @@ model_lb_ready() {
 # site_route_providers <providers...>: the hub GridNetwork's generated gridSiteRoute config,
 # derived from these providers, and the hub-local provider beside the site's.
 site_route_providers() {
-  local i=0 provider
+  local i=0 provider hub_model="http://$MODEL_LB_IP:8000"
+  # Under LLMD=1 the hub has a router of its own, so hub-local is a real second candidate.
+  ! llmd || hub_model="http://$HUB_MODEL_IP:$MODEL_PORT"
+  metrics_args hub-local "${HUB_MODEL_IP:-}"
   SR=(--set "gridNetwork.consumerGateways[0].praxisConfig.generate=true"
     --set "gridNetwork.consumerGateways[0].praxisConfig.siteRouter=gridSiteRoute"
     --set "gridNetwork.consumerGateways[0].praxisConfig.mountReconciliation.enabled=true"
     --set "gridNetwork.consumerGateways[0].praxisConfig.mountReconciliation.deploymentName=grid-gateway"
-    --set "inferenceProviders.hub-local.endpoint=http://$MODEL_LB_IP:8000"
-    --set "inferenceProviders.hub-local.model=$MODEL")
+    --set "inferenceProviders.hub-local.endpoint=$hub_model"
+    --set "inferenceProviders.hub-local.model=$MODEL" "${MA[@]}")
   for provider in "$@"; do
     SR+=(--set "gridNetwork.consumerGateways[0].praxisConfig.deriveTopology.fromProviders[$i]=$provider")
     i=$((i + 1))
@@ -342,9 +374,10 @@ enrolled() { k "$1" get secret grid-site-identity grid-ca; }
 # snapshot_logs <context> <label>: every container, init and hook pods included.
 # Returns nonzero when any listing or log fetch fails.
 snapshot_logs() {
-  local dir="$ARTIFACTS/$MODE/$1" pods pod ns rc=0
+  local dir="$ARTIFACTS/$MODE/$1" pods pod ns rc=0 namespaces=("$NS" "$ENS")
   mkdir -p "$dir"
-  for ns in "$NS" "$ENS"; do
+  ! llmd || namespaces+=(llmd)
+  for ns in "${namespaces[@]}"; do
     pods=$(kubectl --context "$1" -n "$ns" get pods -o jsonpath='{.items[*].metadata.name}') || { rc=1; continue; }
     for pod in $pods; do
       kubectl --context "$1" -n "$ns" logs "$pod" --all-containers --prefix >"$dir/$2-$pod.log" 2>&1 || rc=1
@@ -445,7 +478,7 @@ install_hub() {
     --set gridNetwork.peerTrust.mode="$MODE" --set "gridNetwork.consumerGateways[0].name=grid-gateway"
     --set "gridNetwork.consumerGateways[0].namespace=$NS" --set "gridNetwork.consumerGateways[0].siteName=hub")
   SR=()
-  site_route && site_route_providers vcr hub-local
+  site_route && site_route_providers "$PROVIDER" hub-local
   helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "install hub grid-site"
   images gateway
   ha_gateway_args
@@ -520,10 +553,12 @@ install_site() {
     fail "copied invite lacks its grid.praxis.fast/site label"
   fi
   renewal_args grid-site
+  metrics_args "$PROVIDER" "$MODEL_IP"
   helm_on "$SITE_CTX" "$NS" grid-site grid-site "${RA[@]}" \
     --set gridNetwork.gridId="$PREFIX-e2e" --set "gridSite.name=$SITE" --set "peers.hub.digest=$HUB_DIGEST" \
-    --set "inferenceProviders.vcr.endpoint=http://$MODEL_IP:8000" \
-    --set "inferenceProviders.vcr.model=$MODEL" --set gridNetwork.peerTrust.mode="$MODE" || die "install site grid-site"
+    --set "inferenceProviders.$PROVIDER.endpoint=http://$MODEL_IP:$MODEL_PORT" \
+    --set "inferenceProviders.$PROVIDER.model=$MODEL" "${MA[@]}" --set gridNetwork.peerTrust.mode="$MODE" \
+    || die "install site grid-site"
   trust=(--set "praxisConfig.render.peerTrust.digest=$HUB_DIGEST")
   [[ $MODE == pin ]] || trust=(--set praxisConfig.render.peerTrust.mode=spiffe
     --set praxisConfig.render.peerTrust.spiffeId=spiffe://grid.internal/site/hub)
@@ -531,7 +566,7 @@ install_site() {
   helm_on "$SITE_CTX" "$NS" grid-gateway praxis-gateway \
     --set fullnameOverride=grid-gateway --set praxisConfig.source=render --set praxisConfig.render.role=provider \
     --set "grid.siteName=$SITE" --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca "${trust[@]}" \
-    --set "praxisConfig.render.backends.local.endpoint=$MODEL_IP:8000" \
+    --set "praxisConfig.render.backends.local.endpoint=$MODEL_IP:$MODEL_PORT" \
     "${IMG[@]}" --set service.loadBalancerIP="$SITE_GW_IP" || die "install site grid-gateway"
   eventually "site operator enrolled from its copied invite through the hub enrollment URL" enrolled "$SITE_CTX" \
     || die "site not enrolled"
@@ -784,27 +819,64 @@ rolled_out() {
 assert_site_route() {
   site_route || return 0
   eventually "the operator renders the hub config with grid_site_route over both derived clusters" \
-    routes_clusters hub-local vcr || { consumer_praxis || true; }
-  eventually "the serving config's only provider hop is the site's mTLS cluster" hop_clusters vcr \
+    routes_clusters hub-local "$PROVIDER" || { consumer_praxis || true; }
+  eventually "the serving config's only provider hop is the site's mTLS cluster" hop_clusters "$PROVIDER" \
     || { serving_json || true; }
   eventually "the hub gateway rolled out on the generated config" rolled_out || true
 
   # Withdraw the site's provider. The rollout runs on a praxis.yaml without it while the serving
   # file still names its hop, which must not stop the new pod.
   site_route_providers hub-local
-  helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "withdraw vcr on the hub"
+  helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "withdraw $PROVIDER on the hub"
   eventually "the withdrawn site leaves the generated config" routes_clusters hub-local || { consumer_praxis || true; }
   eventually "the withdrawn site's hop leaves the serving config" hop_clusters || { serving_json || true; }
   eventually "the gateway rolls out past the withdrawal" rolled_out || true
   eventually "the rolled pod dropped the stale hop of the withdrawn site" stale_hop_dropped || true
   eventually "the hub serves its local model with the site withdrawn" local_served || true
 
-  site_route_providers vcr hub-local
-  helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "restore vcr on the hub"
-  eventually "the restored site rejoins the generated config" routes_clusters hub-local vcr || true
-  eventually "the restored site's hop returns" hop_clusters vcr || true
+  site_route_providers "$PROVIDER" hub-local
+  helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "restore $PROVIDER on the hub"
+  eventually "the restored site rejoins the generated config" routes_clusters hub-local "$PROVIDER" || true
+  eventually "the restored site's hop returns" hop_clusters "$PROVIDER" || true
   eventually "the gateway rolls out past the restore" rolled_out || true
   eventually "the hub gateway serves the site again after the restore" consumer_served || true
+}
+
+# operator_metrics <context> <local port>: the operator's own /metrics, served over TLS from
+# its site identity, through a port-forward.
+operator_metrics() {
+  local pid rc=0 name=hub
+  [[ $1 == "$HUB_CTX" ]] || name=$SITE
+  k "$HUB_CTX" get secret grid-ca -o jsonpath='{.data.ca\.crt}' | base64 -d >"$WORK/grid-ca.crt" || return 1
+  k "$1" port-forward deployment/grid-operator "$2:9090" >/dev/null 2>&1 &
+  pid=$!
+  sleep 2
+  curl -sS --max-time 5 --cacert "$WORK/grid-ca.crt" --resolve "$name.grid.internal:$2:127.0.0.1" \
+    "https://$name.grid.internal:$2/metrics" || rc=1
+  kill "$pid" 2>/dev/null || true
+  return "$rc"
+}
+
+# provider_signal <context> <series> <site> <value>: the operator exports the series for one
+# of the site's providers at that value, from its own scrape or a peer poll.
+provider_signal() {
+  operator_metrics "$1" 19090 >"$WORK/operator-metrics.txt" 2>/dev/null \
+    && grep -qE "^$2\{[^}]*grid_site=\"$3\"[^}]*\} $4(\.0+)?( |\$)" "$WORK/operator-metrics.txt"
+}
+
+# assert_llmd_signals: under LLMD=1 the hub operator reads both EPPs, its own by scrape and
+# the site's over the peer poll, and publishes readiness and the two engine endpoints each.
+assert_llmd_signals() {
+  llmd || return 0
+  local site sites=("$SITE")
+  # The hub has a provider of its own only on the operator leg.
+  ! site_route || sites=(hub "$SITE")
+  for site in "${sites[@]}"; do
+    eventually "the hub operator publishes grid_provider_ready 1 for $site from its EPP" \
+      provider_signal "$HUB_CTX" grid_provider_ready "$site" 1 || true
+    eventually "the hub operator counts $site's two engine endpoints" \
+      provider_signal "$HUB_CTX" grid_provider_ready_endpoints "$site" 2 || true
+  done
 }
 
 assert_health() {
@@ -2081,7 +2153,7 @@ cmd_test() {
     log "operator replicas under HA: $HA_OPERATOR_REPLICAS"
   fi
   plan_addresses
-  if site_route; then
+  if site_route && ! llmd; then
     model_lb || die "expose the site model to the hub"
     eventually "the site model answers on $MODEL_LB_IP" model_lb_ready || die "no address for the hub-local model"
   fi
@@ -2094,6 +2166,7 @@ cmd_test() {
     start_renewal_watch
     assert_membership
     assert_serving
+    assert_llmd_signals
     assert_ha
     assert_site_route
     assert_pin_no_renewal

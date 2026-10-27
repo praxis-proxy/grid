@@ -1,0 +1,23 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: llmd-router-allow-grid
+  namespace: llmd
+  labels:
+    app.kubernetes.io/part-of: grid-hub-site-llmd
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: llmd-router-epp
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: grid
+      ports:
+        - protocol: TCP
+          port: 8081
+        - protocol: TCP
+          port: 9090
