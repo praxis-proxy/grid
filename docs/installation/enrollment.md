@@ -209,7 +209,7 @@ evaluated yet. A wait an admin must end is `False`.
 | `Progressing` | Reason | Meaning |
 | --- | --- | --- |
 | `True` | `Enrolling` | The first request is out. A step retries a failure within its budget, about one poll, then returns, so an edit to the config is seen. |
-| `True` | `Retrying` | `Enrolled` holds a reason the next poll retries with the same inputs: `SignerLapsed`, `SignerUnreachable`, `InviteMaybeSpent` for a request that got no usable answer, `IdentityNotStored` or `StoreUnavailable`. It holds across polls, so a resend does not move `lastTransitionTime`. |
+| `True` | `Retrying` | `Enrolled` holds a reason the next poll retries with the same inputs: `SignerLapsed`, `SignerUnreachable`, `InviteMaybeSpent`, `IdentityNotStored` or `StoreUnavailable`; `InviteRefusedAfterLostAnswer` is held, not retried. It holds across polls, so a resend does not move `lastTransitionTime`. |
 | `False` | `AsExpected` | Nothing is in flight. `Progressing` follows `Enrolled` alone. |
 
 | `Enrolled` | Reason | Meaning |
@@ -227,7 +227,8 @@ evaluated yet. A wait an admin must end is `False`.
 | `False` | `InviteInvalid` | The signer rejected the token: expired, revoked or spent. |
 | `False` | `NameTaken`, `NameDeleted` | The name is enrolled, or was deleted and the invite does not re-admit it. |
 | `False` | `Refused` | The signer refused the request. |
-| `False` | `InviteMaybeSpent` | The request was sent and no usable answer came back, or the signer answered 408. The next poll sends the same request again. Or the token was refused after such a request, which may have spent it: that refusal is not sent again until the invite, the site section or a bundle changes, and a new invite may be needed. |
+| `False` | `InviteMaybeSpent` | The request was sent and no usable answer came back, or the signer answered 408. The next poll sends the same request again. A token refused after such a request reads `InviteRefusedAfterLostAnswer` instead. |
+| `False` | `InviteRefusedAfterLostAnswer` | The token was refused after an earlier request got no answer, which may have spent it. Not resent until the invite or the config changes, and a restart resends once; a new invite may be needed. |
 | `False` | `PendingSecretForeign` | A Secret named `<identity Secret>-pending` exists that enrollment did not write, so nothing is sent. Delete it: enrollment keeps its request there. A request kept there for another site name, grid CA or invite is discarded and a new one is made. |
 | `False` | `InvalidResponse` | The returned certificate failed the pin, name or key checks. The token is spent. |
 | `False` | `IdentityNotStored` | The certificate was issued but could not be written. The token is spent. |
