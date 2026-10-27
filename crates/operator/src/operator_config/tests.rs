@@ -219,6 +219,23 @@ async fn the_watch_picks_up_an_edit() {
 }
 
 #[tokio::test]
+async fn a_metadata_only_write_is_not_republished() {
+    let _watch = WATCH.lock().await;
+    let (events, mut config) = watching();
+    send(&events, watcher::Event::Init);
+    send(&events, watcher::Event::InitApply(map(Some(FULL))));
+    send(&events, watcher::Event::InitDone);
+    let first = config.read().await;
+
+    let mut touched = map(Some(FULL));
+    touched.metadata.resource_version = Some("2".to_owned());
+    send(&events, watcher::Event::Apply(touched));
+    let republished = tokio::time::timeout(std::time::Duration::from_millis(100), config.changed()).await;
+    assert!(republished.is_err(), "a resourceVersion bump alone republishes nothing");
+    assert_eq!(config.current(), first);
+}
+
+#[tokio::test]
 async fn a_broken_edit_is_refused_whole_and_a_delete_reads_absent() {
     let _watch = WATCH.lock().await;
     let (events, mut config) = watching();

@@ -441,10 +441,13 @@ impl Snapshot {
             Ok(Parsed { config, ignored }) => (Loaded::Valid(Box::new(config)), ignored),
             Err(why) => (Loaded::Invalid(why), Vec::new()),
         };
+        // A metadata-only write moves resourceVersion and changes nothing read.
+        let mut object = map.object_ref(&());
+        object.resource_version = None;
         Self {
             loaded,
             ignored,
-            object: Some(map.object_ref(&())),
+            object: Some(object),
         }
     }
 }
