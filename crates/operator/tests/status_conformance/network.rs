@@ -89,7 +89,7 @@ async fn invariant_1_pending_network_is_unchanged_across_five_rounds() {
 
     invariants::unchanged_from(&rounds, 1).expect("invariant 1");
     invariants::transition_time_moves_only_with_status(&rounds).expect("invariant 2");
-    invariants::observed_generation_tracks(&rounds).expect("invariant 3");
+    invariants::observed_generation_tracks(&rounds, &[]).expect("invariant 3");
     invariants::one_manager_per_type(&api.writes(), &path, &managers()).expect("invariant 5");
     invariants::changes_explained(&rounds, &[]).expect("invariant 6");
     invariants::reasons_within(&rounds, &reasons()).expect("invariant 8");
@@ -149,7 +149,7 @@ async fn invariant_3_network_observed_generation_follows_a_spec_edit() {
     })
     .await;
 
-    invariants::observed_generation_tracks(&rounds).expect("invariant 3");
+    invariants::observed_generation_tracks(&rounds, &[]).expect("invariant 3");
     assert_eq!(
         rounds.get(3).expect("four rounds").generation,
         2,

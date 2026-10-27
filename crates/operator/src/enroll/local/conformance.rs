@@ -27,6 +27,9 @@ const PATH: &str = "/apis/grid.praxis.fast/v1alpha1/gridnetworks/grid";
 /// The own `GridSite`'s path, which carries the peer roll-up only.
 const SITE_PATH: &str = "/apis/grid.praxis.fast/v1alpha1/gridsites/site-d";
 
+/// The types that read no spec field and so carry no `observedGeneration`.
+const UNSTAMPED: [&str; 3] = [ACCEPTED, RESOLVED_REFS, ROTATION_ON_SCHEDULE];
+
 /// The path of a Secret in the operator namespace.
 fn secret_path(name: &str) -> String {
     format!("/api/v1/namespaces/{NAMESPACE}/secrets/{name}")
@@ -190,7 +193,7 @@ async fn invariant_1_own_site_awaiting_an_invite_is_unchanged_across_five_rounds
 
     invariants::unchanged_from(&rounds, 1).expect("invariant 1");
     invariants::transition_time_moves_only_with_status(&rounds).expect("invariant 2");
-    invariants::observed_generation_tracks(&rounds).expect("invariant 3");
+    invariants::observed_generation_tracks(&rounds, &UNSTAMPED).expect("invariant 3");
     invariants::unknown_only_before_first_evaluation(&rounds).expect("invariant 4");
     invariants::one_manager_per_type(&api.writes(), PATH, &managers()).expect("invariant 5");
     invariants::changes_explained(&rounds, &[]).expect("invariant 6");
@@ -208,7 +211,7 @@ async fn invariant_1_own_site_with_an_identity_is_unchanged_across_five_rounds()
     let rounds = renewal_rounds(&api, 5, |_round| {}).await;
 
     invariants::unchanged_from(&rounds, 1).expect("invariant 1");
-    invariants::observed_generation_tracks(&rounds).expect("invariant 3");
+    invariants::observed_generation_tracks(&rounds, &UNSTAMPED).expect("invariant 3");
     invariants::one_manager_per_type(&api.writes(), PATH, &managers()).expect("invariant 5");
     invariants::reasons_within(&rounds, &REASONS).expect("invariant 8");
     let first = rounds.first().expect("five rounds");

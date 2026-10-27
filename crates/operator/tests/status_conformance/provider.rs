@@ -96,7 +96,7 @@ async fn invariant_1_available_provider_is_unchanged_across_five_rounds() {
     let rounds = fixtures::rounds(&api, &path, 5, |_round| reconcile(&api, &path)).await;
 
     invariants::unchanged_from(&rounds, 1).expect("invariant 1");
-    invariants::observed_generation_tracks(&rounds).expect("invariant 3");
+    invariants::observed_generation_tracks(&rounds, &[]).expect("invariant 3");
     invariants::changes_explained(&rounds, &[]).expect("invariant 6");
     let first = rounds.first().expect("five rounds");
     assert_eq!(first.field("phase"), "Available", "a resolved provider is Available");
@@ -139,7 +139,7 @@ async fn invariant_1_provider_conditions_are_unchanged_across_repeated_signals_p
 
     invariants::unchanged_from(&rounds, 1).expect("invariant 1");
     invariants::transition_time_moves_only_with_status(&rounds).expect("invariant 2");
-    invariants::observed_generation_tracks(&rounds).expect("invariant 3");
+    invariants::observed_generation_tracks(&rounds, &[]).expect("invariant 3");
     invariants::reasons_within(
         &rounds,
         &[

@@ -35,7 +35,7 @@ async fn invariant_1_pending_peer_site_is_unchanged_across_five_rounds() {
     let rounds = fixtures::rounds(&api, &path, 5, |_round| reconcile(&api, &path)).await;
 
     invariants::unchanged_from(&rounds, 1).expect("invariant 1");
-    invariants::observed_generation_tracks(&rounds).expect("invariant 3");
+    invariants::observed_generation_tracks(&rounds, &[]).expect("invariant 3");
     invariants::changes_explained(&rounds, &[]).expect("invariant 6");
     let first = rounds.first().expect("five rounds");
     status_harness::diff::status_matches(
@@ -96,7 +96,7 @@ async fn invariant_3_peer_site_observed_generation_follows_a_spec_edit() {
     })
     .await;
 
-    invariants::observed_generation_tracks(&rounds).expect("invariant 3");
+    invariants::observed_generation_tracks(&rounds, &[]).expect("invariant 3");
     assert_eq!(
         rounds.get(3).expect("four rounds").generation,
         2,

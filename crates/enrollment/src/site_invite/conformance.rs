@@ -129,7 +129,7 @@ async fn invariant_1_ready_invite_is_unchanged_across_five_rounds() {
 
     invariants::unchanged_from(since_ready, 1).expect("invariant 1");
     invariants::transition_time_moves_only_with_status(since_ready).expect("invariant 2");
-    invariants::observed_generation_tracks(since_ready).expect("invariant 3");
+    invariants::observed_generation_tracks(since_ready, &[]).expect("invariant 3");
     invariants::unknown_only_before_first_evaluation(since_ready).expect("invariant 4");
     invariants::one_manager_per_type(&api.writes(), PATH, &managers()).expect("invariant 5");
     invariants::changes_explained(since_ready, &[]).expect("invariant 6");
