@@ -19,6 +19,9 @@ const NAMESPACE: &str = "grid-system";
 /// This cluster's `GridNetwork`, where enrollment reports.
 const NETWORK: &str = "grid";
 
+/// The `GridNetwork` collection path.
+const NETWORKS: &str = "/apis/grid.praxis.fast/v1alpha1/gridnetworks";
+
 /// The API objects the mock serves, and what was written.
 #[derive(Clone, Default)]
 struct World {
@@ -208,8 +211,6 @@ fn list(kind: &str, items: &Value) -> (u16, Value) {
         json!({"apiVersion": "v1", "kind": kind, "metadata": {"resourceVersion": "1"}, "items": items}),
     )
 }
-
-const NETWORKS: &str = "/apis/grid.praxis.fast/v1alpha1/gridnetworks";
 
 /// Answer one request against `world`.
 #[expect(clippy::too_many_lines, reason = "one arm per request the mock serves")]
