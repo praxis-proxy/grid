@@ -492,7 +492,8 @@ impl Destination {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Inputs {
     /// The site section the request was built from, so an unrelated edit does not resend.
-    site: String,
+    /// Boxed: it rides in the step's frame.
+    site: Box<SiteConfig>,
     /// Resource versions of the invite, pin, and anchor objects, `None` when absent.
     versions: [Option<String>; 3],
 }
@@ -801,7 +802,7 @@ async fn prepare(
         }
     }
     let inputs = Inputs {
-        site: serde_json::to_string(config).unwrap_or_default(),
+        site: Box::new(config.clone()),
         versions: [invite_version, pin.version(), anchors.version()],
     };
     let settings = pin.pem("site.signerEndpoint.caBundleRef").and_then(|pin_pem| {

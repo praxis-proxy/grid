@@ -23,7 +23,7 @@ use zeroize::Zeroizing;
 use super::{
     Issued, Signer, SignerError, Target, jittered,
     local::{self, Verdict},
-    signer::{Clients, HttpsSigner, SignerUrl},
+    signer::{Clients, HttpsSigner, LeafError, SignerUrl, issued_leaf},
 };
 use crate::{
     controller::grid_network::GridModes,
@@ -420,17 +420,17 @@ fn renew_error(error: SignerError) -> RenewError {
 
 /// The renewed leaf, if it is this site's, from the CA it already holds, for the CSR's key.
 fn verified(enrollment: &Issued, held_ca: &str, site: &str, csr_pem: &str) -> Result<String, RenewError> {
-    let invalid = RenewError::Invalid;
-    let ca = certs::anchored_ca(&enrollment.ca_certificate, held_ca)
-        .map_err(|e| invalid(format!("returned CA is not this site's grid CA ({e})")))?;
-    let cert = certs::leaf_only(&enrollment.certificate).map_err(|e| invalid(format!("certificate: {e}")))?;
-    certs::verify_site_cert(&ca, &cert, site).map_err(|e| invalid(format!("certificate is not {site}'s ({e})")))?;
-    let leaf_key = certs::cert_public_key(&cert).map_err(|e| invalid(e.to_string()))?;
-    let csr_key = certs::csr_public_key(csr_pem).map_err(|e| invalid(e.to_string()))?;
-    if leaf_key != csr_key {
-        return Err(invalid("certificate does not carry the requested key".to_owned()));
-    }
-    Ok(cert)
+    issued_leaf(enrollment, held_ca, site, csr_pem)
+        .map(|leaf| leaf.cert)
+        .map_err(|refused| {
+            RenewError::Invalid(match refused {
+                LeafError::Ca(e) => format!("returned CA is not this site's grid CA ({e})"),
+                LeafError::Certificate(e) => format!("certificate: {e}"),
+                LeafError::NotForSite(e) => format!("certificate is not {site}'s ({e})"),
+                LeafError::Key(e) => e,
+                LeafError::KeyMismatch => "certificate does not carry the requested key".to_owned(),
+            })
+        })
 }
 
 /// The cert-manager Certificate a Secret's annotation names as its renewer.

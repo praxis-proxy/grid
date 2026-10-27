@@ -80,6 +80,44 @@ pub(super) enum SignerError {
     Invalid(String),
 }
 
+/// A leaf a signer issued for this site, and the grid CA it chains to, both checked.
+pub(super) struct Leaf {
+    /// Issued leaf, PEM.
+    pub(super) cert: String,
+    /// Grid CA, PEM.
+    pub(super) ca: String,
+}
+
+/// Why an issued leaf was refused.
+#[derive(Debug)]
+pub(super) enum LeafError {
+    /// The returned CA does not pass against the one expected.
+    Ca(certs::VerifyError),
+    /// The leaf is not one certificate.
+    Certificate(String),
+    /// The leaf is not valid for the site from the returned CA.
+    NotForSite(String),
+    /// A public key could not be read.
+    Key(String),
+    /// The leaf carries a key other than the request's.
+    KeyMismatch,
+}
+
+/// The leaf `issued` holds, if its CA passes against `anchor_pem`, it is valid for `site`
+/// from that CA, and it carries the key of `csr_pem`. The one check both enrollment and
+/// renewal make; each words the refusal for its own report.
+pub(super) fn issued_leaf(issued: &Issued, anchor_pem: &str, site: &str, csr_pem: &str) -> Result<Leaf, LeafError> {
+    let ca = certs::anchored_ca(&issued.ca_certificate, anchor_pem).map_err(LeafError::Ca)?;
+    let cert = certs::leaf_only(&issued.certificate).map_err(|e| LeafError::Certificate(e.to_string()))?;
+    certs::verify_site_cert(&ca, &cert, site).map_err(|e| LeafError::NotForSite(e.to_string()))?;
+    let leaf_key = certs::cert_public_key(&cert).map_err(|e| LeafError::Key(e.to_string()))?;
+    let csr_key = certs::csr_public_key(csr_pem).map_err(|e| LeafError::Key(e.to_string()))?;
+    if leaf_key != csr_key {
+        return Err(LeafError::KeyMismatch);
+    }
+    Ok(Leaf { cert, ca })
+}
+
 /// A signer this site enrolls and renews through.
 pub(super) trait Signer {
     /// Present `credential`, the opaque invite the signer issued, and ask for a certificate for `csr_pem`.

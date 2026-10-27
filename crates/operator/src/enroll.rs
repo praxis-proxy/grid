@@ -544,7 +544,7 @@ async fn check_writable<S: Store + Sync>(
     ca_present: bool,
     backoff: Backoff,
 ) -> Result<(), EnrollError> {
-    let empty = Verified {
+    let empty = Leaf {
         cert: String::new(),
         ca: String::new(),
     };
@@ -640,7 +640,7 @@ async fn stored<S: Store + Sync>(
     store: &S,
     settings: &Settings,
     target: &Target,
-    (verified, key): (Verified, Zeroizing<String>),
+    (verified, key): (Leaf, Zeroizing<String>),
 ) -> Result<Written, EnrollError> {
     if !certs::has_svid_profile(&verified.cert).unwrap_or(false) {
         tracing::warn!("issued certificate lacks the X.509-SVID profile, peers in spiffe trust mode will reject it");
@@ -775,39 +775,23 @@ fn error_chain(error: &dyn std::error::Error) -> String {
     out
 }
 
-/// A leaf and CA that passed [`checked_identity`].
-struct Verified {
-    /// Issued leaf, PEM.
-    cert: String,
-    /// Pinned grid CA, PEM.
-    ca: String,
-}
-
 /// Check the identity against the pin, site name, and key.
-fn checked_identity(enrollment: &Issued, csr_pem: &str, settings: &Settings) -> Result<Verified, EnrollError> {
-    let invalid = EnrollError::InvalidResponse;
-    let ca = certs::anchored_ca(&enrollment.ca_certificate, &settings.anchor_pem).map_err(|e| {
-        if e == certs::VerifyError::NotAnchored {
-            invalid("returned CA is not the pinned grid CA".to_owned())
-        } else {
-            invalid(format!("returned CA: {e}"))
-        }
-    })?;
-    let cert = certs::leaf_only(&enrollment.certificate).map_err(|e| invalid(format!("issued certificate: {e}")))?;
+fn checked_identity(enrollment: &Issued, csr_pem: &str, settings: &Settings) -> Result<Leaf, EnrollError> {
     let site = &settings.site_name;
-    certs::verify_site_cert(&ca, &cert, site).map_err(|e| {
-        invalid(format!(
-            "issued certificate is not valid for {site} ({e}), possible interception, contact the hub"
-        ))
-    })?;
-    let leaf_key = certs::cert_public_key(&cert).map_err(|e| invalid(e.to_string()))?;
-    let csr_key = certs::csr_public_key(csr_pem).map_err(|e| invalid(e.to_string()))?;
-    if leaf_key != csr_key {
-        return Err(invalid(
-            "issued certificate does not carry this site's key, possible interception, contact the hub".to_owned(),
-        ));
-    }
-    Ok(Verified { cert, ca })
+    signer::issued_leaf(enrollment, &settings.anchor_pem, site, csr_pem).map_err(|refused| {
+        EnrollError::InvalidResponse(match refused {
+            LeafError::Ca(certs::VerifyError::NotAnchored) => "returned CA is not the pinned grid CA".to_owned(),
+            LeafError::Ca(e) => format!("returned CA: {e}"),
+            LeafError::Certificate(e) => format!("issued certificate: {e}"),
+            LeafError::NotForSite(e) => {
+                format!("issued certificate is not valid for {site} ({e}), possible interception, contact the hub")
+            },
+            LeafError::Key(e) => e,
+            LeafError::KeyMismatch => {
+                "issued certificate does not carry this site's key, possible interception, contact the hub".to_owned()
+            },
+        })
+    })
 }
 
 /// The Secrets to write.
@@ -829,7 +813,7 @@ impl Drop for Prepared {
 }
 
 /// Build the Secrets for `verified`.
-fn prepare(target: &Target, verified: Verified, mut key: Zeroizing<String>) -> Prepared {
+fn prepare(target: &Target, verified: Leaf, mut key: Zeroizing<String>) -> Prepared {
     let bytes = |text: String| ByteString(text.into_bytes());
     let mut site = BTreeMap::from([
         ("tls.crt".to_owned(), bytes(verified.cert)),
@@ -964,7 +948,7 @@ mod pending;
 pub mod renew;
 mod signer;
 
-use signer::{Issued, Signer, SignerError};
+use signer::{Issued, Leaf, LeafError, Signer, SignerError};
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "tests")]
