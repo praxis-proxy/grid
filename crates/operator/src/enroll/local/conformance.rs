@@ -376,6 +376,31 @@ async fn renewal_rounds_under(api: &FakeApi, rest: &str, count: usize, mut befor
     observed
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_write_to_the_identity_secret_wakes_a_renewal_loop_with_no_signer() {
+    use crate::enroll::renew::IDENTITY_POLL;
+    let api = seeded();
+    store_identity(&api);
+    let client = api.client(NAMESPACE);
+    let settings = crate::enroll::renew::Settings::new()
+        .with_site(Some(SITE.to_owned()))
+        .with_config(ConfigWatch::fixed(config("")));
+    let renewal = crate::enroll::renew::Rounds::new(client, &settings);
+    let _renewed = renewal.round(&settings).await;
+    let seen = renewal.identity_version().await.expect("read");
+    assert!(seen.is_some(), "the round named the identity Secret");
+    let moved = renewal.identity_moved(seen);
+    tokio::pin!(moved);
+    assert!(
+        tokio::time::timeout(IDENTITY_POLL * 3, &mut moved).await.is_err(),
+        "an unwritten Secret does not wake the loop"
+    );
+    store_identity(&api);
+    tokio::time::timeout(IDENTITY_POLL * 2, moved)
+        .await
+        .expect("a write by another manager wakes the loop within one poll");
+}
+
 #[tokio::test]
 async fn invariant_4_identity_valid_reads_false_identity_missing_once_the_secret_is_deleted() {
     let api = seeded();

@@ -34,6 +34,10 @@ use crate::{
 /// Longest wait between checks, so an identity replaced out of band is still watched.
 const CHECK_EVERY: Duration = Duration::from_secs(60 * 60);
 
+/// How often a waiting loop reads the identity Secret's version, so a write by any manager,
+/// cert-manager among them, is checked within this rather than at the next due time.
+pub(crate) const IDENTITY_POLL: Duration = Duration::from_secs(30);
+
 /// First retry after a failed renewal, doubling to [`RETRY_MAX`].
 const RETRY_INITIAL: Duration = Duration::from_secs(60);
 
@@ -736,6 +740,8 @@ pub struct Rounds {
     install: GridModes,
     /// Gives up a request to the signer, once the loop stands down.
     stop: Option<Shutdown>,
+    /// The identity Secret the last round checked.
+    checked_secret: std::sync::Mutex<Option<String>>,
 }
 
 impl Rounds {
@@ -751,6 +757,7 @@ impl Rounds {
             client,
             namespace,
             stop: None,
+            checked_secret: std::sync::Mutex::default(),
         }
     }
 
@@ -772,7 +779,43 @@ impl Rounds {
         };
         let (round, target) = Box::pin(tick(&loop_, settings, &self.namespace)).await;
         roll_after_renewal(&self.store, self.gateway.as_ref(), &target, &round.checked).await;
+        *self
+            .checked_secret
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = target.ok().map(|target| target.site_secret);
         round.checked
+    }
+
+    /// The resource version of the identity Secret the last round checked, `None` when it is
+    /// absent or no round named one.
+    ///
+    /// # Errors
+    ///
+    /// [`kube::Error`] when the read fails.
+    pub(crate) async fn identity_version(&self) -> Result<Option<String>, kube::Error> {
+        let name = self
+            .checked_secret
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(name) = name else {
+            return Ok(None);
+        };
+        let held = self.store.0.get_metadata_opt(&name).await?;
+        Ok(held.and_then(|secret| secret.metadata.resource_version))
+    }
+
+    /// Resolve once the identity Secret is written, created or deleted after `seen`, read every
+    /// [`IDENTITY_POLL`]. A failed read is not a change.
+    pub(crate) async fn identity_moved(&self, seen: Option<String>) {
+        loop {
+            tokio::time::sleep(IDENTITY_POLL).await;
+            match self.identity_version().await {
+                Ok(now) if now != seen => return,
+                Ok(_) => {},
+                Err(error) => tracing::debug!(%error, "identity Secret version unread; not a change"),
+            }
+        }
     }
 }
 
@@ -793,10 +836,12 @@ pub async fn run(client: Client, mut settings: Settings, shutdown: Shutdown) {
             return;
         }
         let wait = settle(&checked, &mut last, &mut failures);
+        let seen = Box::pin(rounds.identity_version()).await.ok().flatten();
         tokio::select! {
             biased;
             () = shutdown.triggered() => return,
             () = pause(jittered(wait), &mut settings.trust_changes, &mut settings.config) => {},
+            () = Box::pin(rounds.identity_moved(seen)) => tracing::debug!("identity Secret written; checking it now"),
         }
     }
 }
