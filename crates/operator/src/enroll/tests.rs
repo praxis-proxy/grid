@@ -301,7 +301,9 @@ impl Store for FakeStore {
         let inserted = match self.secrets.lock().expect("lock").entry(name) {
             std::collections::btree_map::Entry::Occupied(_) => false,
             std::collections::btree_map::Entry::Vacant(slot) => {
-                slot.insert(secret.clone());
+                let mut stored = secret.clone();
+                stored.metadata.resource_version = Some("1".to_owned());
+                slot.insert(stored);
                 true
             },
         };
@@ -317,6 +319,63 @@ impl Store for FakeStore {
             self.dry_run_status.map_or(Ok(()), |code| Err(api_error(code))),
         )
     }
+
+    async fn patch(&self, name: &str, patch: &Value) -> Result<Attempt<()>, EnrollError> {
+        if self.creates_fail {
+            return Ok(Attempt::Retry("apiserver unavailable".to_owned()));
+        }
+        let mut secrets = self.secrets.lock().expect("lock");
+        let held = secrets
+            .get_mut(name)
+            .ok_or_else(|| EnrollError::Kube(format!("Secret {name} not found")))?;
+        let merged = merge_patch(held, patch);
+        drop(secrets);
+        Ok(if merged {
+            Attempt::Done(())
+        } else {
+            Attempt::Retry(format!("Secret {name} changed under the write"))
+        })
+    }
+}
+
+/// Merge `from` into `held`'s annotations, a null removing one.
+fn merge_annotations(held: &mut Secret, from: Option<&Value>) {
+    let annotations = held.metadata.annotations.get_or_insert_default();
+    for (key, value) in from.and_then(Value::as_object).into_iter().flatten() {
+        match value.as_str() {
+            Some(text) => drop(annotations.insert(key.clone(), text.to_owned())),
+            None => drop(annotations.remove(key)),
+        }
+    }
+}
+
+/// Merge `patch` into `held` as the API server does, `false` when the resource version it
+/// names is not `held`'s.
+pub(super) fn merge_patch(held: &mut Secret, patch: &Value) -> bool {
+    let version: u64 = held
+        .metadata
+        .resource_version
+        .as_deref()
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0);
+    if patch
+        .pointer("/metadata/resourceVersion")
+        .and_then(Value::as_str)
+        .is_some_and(|named| named != version.to_string())
+    {
+        return false;
+    }
+    merge_annotations(held, patch.pointer("/metadata/annotations"));
+    let data = held.data.get_or_insert_default();
+    for (key, value) in patch.pointer("/data").and_then(Value::as_object).into_iter().flatten() {
+        match serde_json::from_value::<ByteString>(value.clone()) {
+            Ok(bytes) if !value.is_null() => drop(data.insert(key.clone(), bytes)),
+            _ => drop(data.remove(key)),
+        }
+    }
+    held.metadata.resource_version = Some((version + 1).to_string());
+    true
 }
 
 /// A Kubernetes API error with `code`.
@@ -399,6 +458,76 @@ async fn a_spent_token_fails_once_with_the_recovery() {
     );
     assert_eq!(mock.calls(), 1, "a rejected token is not retried");
     assert!(store.value("site-tls", "tls.crt").is_none(), "nothing is stored");
+}
+
+/// The pending Secret beside [`target`]'s identity.
+fn pending_name() -> String {
+    pending::name(&target())
+}
+
+#[tokio::test]
+async fn a_request_that_got_no_answer_is_sent_again_with_the_same_key() {
+    let (_lost, lost_settings) = serve(Reply::Timeout).await;
+    let store = FakeStore::invited();
+    let lost = run_flow(&store, &lost_settings).await;
+    assert!(matches!(lost, Err(EnrollError::MaybeSpent(_))), "{lost:?}");
+    let kept = store
+        .value(&pending_name(), "tls.key")
+        .expect("the key is kept before the request goes out");
+
+    let (signer, settings) = serve(Reply::Sign).await;
+    let outcome = run_flow(&store, &settings).await;
+    assert!(matches!(outcome, Ok(Outcome::Enrolled(_))), "{outcome:?}");
+    assert_eq!(signer.calls(), 1);
+    assert_eq!(
+        store.value("site-tls", "tls.key").as_deref(),
+        Some(kept.as_str()),
+        "the restart sends the request the signer may have recorded"
+    );
+    assert_eq!(store.value(&pending_name(), "tls.key"), None, "no key is left behind");
+    assert_eq!(store.value(&pending_name(), "csr.pem"), None);
+}
+
+#[tokio::test]
+async fn a_token_refused_after_an_unanswered_request_may_have_been_spent_by_it() {
+    let (_lost, lost_settings) = serve(Reply::Timeout).await;
+    let store = FakeStore::invited();
+    drop(run_flow(&store, &lost_settings).await);
+
+    let (_spent, settings) = serve(Reply::Spent).await;
+    let outcome = run_flow(&store, &settings).await;
+    assert!(
+        matches!(&outcome, Err(e @ EnrollError::MaybeSpent(_)) if e.to_string().contains("a new invite may be needed")),
+        "the earlier request may have spent it, so it is not called invalid: {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_certificate_issued_before_a_restart_is_stored_without_asking_again() {
+    let (issuer, settings) = serve(Reply::Sign).await;
+    let store = FakeStore::invited();
+    let csr = certs::generate_csr(SITE).expect("csr");
+    let mut held = pending::stash(&store, &target(), (csr.csr_pem.clone(), csr.key_pem.clone()), FAST)
+        .await
+        .expect("stashed");
+    let cert = certs::sign_csr(&issuer.ca, SITE, &csr.csr_pem, certs::Validity::default()).expect("signed");
+    let answer = Issued {
+        certificate: cert.cert_pem.clone(),
+        ca_certificate: issuer.ca.cert_pem.clone(),
+    };
+    held.issued(&store, &answer, FAST).await.expect("kept");
+
+    let outcome = run_flow(&store, &settings).await;
+    assert!(matches!(outcome, Ok(Outcome::Enrolled(_))), "{outcome:?}");
+    assert_eq!(issuer.calls(), 0, "the signer is not asked again for what it issued");
+    assert_eq!(
+        store.value("site-tls", "tls.crt").as_deref(),
+        Some(cert.cert_pem.as_str())
+    );
+    assert_eq!(
+        store.value("site-tls", "tls.key").as_deref(),
+        Some(csr.key_pem.as_str())
+    );
 }
 
 #[tokio::test]

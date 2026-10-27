@@ -208,7 +208,7 @@ evaluated yet. A wait an admin must end is `False`.
 | `False` | `InviteInvalid` | The signer rejected the token: expired, revoked or spent. |
 | `False` | `NameTaken`, `NameDeleted` | The name is enrolled, or was deleted and the invite does not re-admit it. |
 | `False` | `Refused` | The signer refused the request. |
-| `False` | `InviteMaybeSpent` | The request was sent and no usable answer came back, or the signer answered 408. |
+| `False` | `InviteMaybeSpent` | The request was sent and no usable answer came back, or the signer answered 408. The next poll sends the same request again. Or the token was refused after such a request, which may have spent it: a new invite may be needed. |
 | `False` | `InvalidResponse` | The returned certificate failed the pin, name or key checks. The token is spent. |
 | `False` | `IdentityNotStored` | The certificate was issued but could not be written. The token is spent. |
 

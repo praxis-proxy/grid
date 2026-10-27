@@ -340,6 +340,7 @@ across namespaces or list `Secrets`.
 |---|---|---|
 | `spec.tls.siteSecretRef` | `tls.crt`, `tls.key` (client cert + private key for mTLS gateway probes; key bytes wrapped in `Zeroizing`) | `tls.crt`, `tls.key` (create-if-absent via SSA patch) |
 | `spec.tls.caSecretRef` | `ca.crt` (existence check) | `ca.crt`, `ca.key` (create-if-absent via SSA patch) |
+| `<siteSecretRef>-pending` | `csr.pem`, `tls.key`, `tls.crt`, `ca.crt` | The same keys, while an enrollment is in flight: the request and its key before it is sent, and the issued certificate before the identity is written. Cleared by patch once the identity is stored |
 | `spec.tls.swimKeySecretRef` | `key` (or custom key field) | None |
 | `spec.auth.secretRef` | existence + UTF-8 validation | None |
 

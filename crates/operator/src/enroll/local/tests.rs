@@ -128,9 +128,25 @@ impl World {
         }
         if !query.contains("dryRun") {
             self.version = self.version.saturating_add(1);
-            self.secrets.insert(name, secret.clone());
+            let mut stored = secret.clone();
+            stored.metadata.resource_version = Some(self.version.to_string());
+            self.secrets.insert(name, stored);
         }
         (201, serde_json::to_value(&secret).unwrap_or_default())
+    }
+
+    /// Merge-patch Secret `name`, refusing a stale resource version.
+    fn patch_secret(&mut self, name: &str, body: &[u8]) -> (u16, Value) {
+        let patch: Value = serde_json::from_slice(body).unwrap_or_default();
+        let Some(held) = self.secrets.get_mut(name) else {
+            return not_found();
+        };
+        if !crate::enroll::tests::merge_patch(held, &patch) {
+            let conflict =
+                json!({"kind": "Status", "apiVersion": "v1", "status": "Failure", "reason": "Conflict", "code": 409});
+            return (409, conflict);
+        }
+        (200, serde_json::to_value(&*held).unwrap_or_default())
     }
 
     /// Set the operator config document to `text`.
@@ -211,6 +227,9 @@ fn answer(world: &mut World, method: &http::Method, path: &str, query: &str, bod
         },
         ("POST", p) if p == secrets => world.post_secret(query, body),
         ("POST", p) if p == format!("/apis/events.k8s.io/v1/namespaces/{NAMESPACE}/events") => world.post_event(body),
+        ("PATCH", p) if p.starts_with(&format!("{secrets}/")) => {
+            world.patch_secret(p.trim_start_matches(&format!("{secrets}/")), body)
+        },
         ("PATCH", _) if site_status.is_some() => {
             world.patch_queries.push(query.to_owned());
             world.patch_status(site_status.unwrap_or_default(), body)

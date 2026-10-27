@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, time::Duration};
 use k8s_openapi::{ByteString, api::core::v1::Secret};
 use kube::{
     Api, Client,
-    api::{ListParams, ObjectMeta, PostParams},
+    api::{ListParams, ObjectMeta, Patch, PatchParams, PostParams},
 };
 use reqwest::{StatusCode, Url};
 use zeroize::{Zeroize as _, Zeroizing};
@@ -377,6 +377,12 @@ trait Store {
     fn create(&self, secret: &Secret) -> impl Future<Output = Result<Created, EnrollError>> + Send;
     /// Dry-run creating `secret`, refusing what the API server would refuse.
     fn check_create(&self, secret: &Secret) -> impl Future<Output = Result<Attempt<()>, EnrollError>> + Send;
+    /// Merge `patch` into Secret `name`, refusing it when the resource version it names is stale.
+    fn patch(
+        &self,
+        name: &str,
+        patch: &serde_json::Value,
+    ) -> impl Future<Output = Result<Attempt<()>, EnrollError>> + Send;
 }
 
 /// Kubernetes-backed [`Store`] in the operator namespace.
@@ -415,6 +421,16 @@ impl Store for KubeStore {
         let name = secret.metadata.name.as_deref().unwrap_or_default();
         let namespace = self.0.namespace().unwrap_or_default();
         dry_run_result(namespace, name, self.0.create(&params, secret).await.map(drop))
+    }
+
+    async fn patch(&self, name: &str, patch: &serde_json::Value) -> Result<Attempt<()>, EnrollError> {
+        match self.0.patch(name, &PatchParams::default(), &Patch::Merge(patch)).await {
+            Ok(_) => Ok(Attempt::Done(())),
+            Err(kube::Error::Api(status)) if status.code == 409 => {
+                Err(EnrollError::Kube(format!("Secret {name} changed under the write")))
+            },
+            Err(e) => transient(name, &e).map(Attempt::Retry),
+        }
     }
 }
 
@@ -582,30 +598,75 @@ async fn enroll<S: Store + Sync, G: Signer + Sync>(
     target: &Target,
 ) -> Result<Outcome, EnrollError> {
     if store.exists(&target.site_secret).await? {
+        pending::clear(store, target, settings.backoff).await?;
         return Ok(Outcome::AlreadyEnrolled);
     }
     check_not_enrolled_elsewhere(store, &settings.defaults, target).await?;
     let ca_present = check_existing_ca(store, target, &settings.anchor_pem).await?;
     check_writable(store, target, ca_present, settings.backoff).await?;
-    let token = site_token(store, settings).await?;
-    let certs::GeneratedCsr { csr_pem, key_pem } =
-        certs::generate_csr(&settings.site_name).map_err(|e| EnrollError::Config(format!("generating a CSR: {e}")))?;
-    let issued = Box::pin(redeem(signer, settings.backoff, &token, &csr_pem)).await?;
-    let verified = checked_identity(&issued, &csr_pem, settings)?;
+    let mut held = Box::pin(in_flight(store, settings, target)).await?;
+    let issued = match held.issued.take() {
+        Some(issued) => issued,
+        None => Box::pin(sent(store, signer, settings, &mut held)).await?,
+    };
+    let verified = checked_identity(&issued, &held.csr, settings)?;
     if !certs::has_svid_profile(&verified.cert).unwrap_or(false) {
         tracing::warn!("issued certificate lacks the X.509-SVID profile, peers in spiffe trust mode will reject it");
     }
-    let prepared = prepare(target, verified, key_pem);
+    let prepared = prepare(target, verified, std::mem::take(&mut held.key));
     let anchors = &settings.anchor_pem;
     let written = with_backoff(settings.backoff, "writing the identity Secrets", || {
         write(store, &prepared, anchors)
     })
     .await
     .map_err(|e| EnrollError::NotStored(e.to_string()))?;
+    pending::clear(store, target, settings.backoff).await?;
     Ok(match written {
         Written::Stored => Outcome::Enrolled(certs::spiffe_id(&settings.site_name)),
         Written::Discarded => Outcome::Discarded,
     })
+}
+
+/// The enrollment in flight for `target`, else a new request kept before it is sent.
+async fn in_flight<S: Store + Sync>(
+    store: &S,
+    settings: &Settings,
+    target: &Target,
+) -> Result<pending::Pending, EnrollError> {
+    if let Some(held) = pending::read(store, target).await? {
+        return Ok(held);
+    }
+    let certs::GeneratedCsr { csr_pem, key_pem } =
+        certs::generate_csr(&settings.site_name).map_err(|e| EnrollError::Config(format!("generating a CSR: {e}")))?;
+    pending::stash(store, target, (csr_pem, key_pem), settings.backoff).await
+}
+
+/// Send `held`'s request with the invite and keep what comes back. A token refused after an
+/// earlier request went unanswered may have been spent by that request.
+async fn sent<S: Store + Sync, G: Signer + Sync>(
+    store: &S,
+    signer: &G,
+    settings: &Settings,
+    held: &mut pending::Pending,
+) -> Result<Issued, EnrollError> {
+    let token = site_token(store, settings).await?;
+    let resent = held.unanswered;
+    held.sending(store, settings.backoff).await?;
+    match Box::pin(redeem(signer, settings.backoff, &token, &held.csr)).await {
+        Ok(issued) => {
+            held.issued(store, &issued, settings.backoff).await?;
+            Ok(issued)
+        },
+        Err(error @ EnrollError::MaybeSpent(_)) => Err(error),
+        Err(EnrollError::TokenRejected(detail)) if resent => Err(EnrollError::MaybeSpent(format!(
+            "{detail}; an earlier request with this key got no answer and may have spent the invite, so a new \
+             invite may be needed"
+        ))),
+        Err(error) => {
+            held.answered(store, settings.backoff).await?;
+            Err(error)
+        },
+    }
 }
 
 /// Present the invite to `signer`, retrying only a request that never left.
@@ -875,6 +936,7 @@ fn invited(invite: &Secret, site: &str) -> bool {
 }
 
 pub mod local;
+mod pending;
 pub mod renew;
 mod signer;
 
