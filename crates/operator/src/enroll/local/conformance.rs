@@ -786,3 +786,33 @@ async fn invariant_2_a_refused_config_stays_refused_through_a_round_that_cannot_
         );
     }
 }
+
+#[tokio::test]
+async fn invariant_8_a_refused_config_with_no_identity_is_accepted_false_on_the_network_and_touches_no_grid_site() {
+    let api = seeded();
+    let refused = Snapshot {
+        loaded: crate::operator_config::Loaded::Invalid("site.signerEndpont: unknown field".to_owned()),
+        ..Snapshot::absent()
+    };
+    let rounds = rounds(&api, &refused, 3, |_round| {}).await;
+
+    invariants::unchanged_from(&rounds, 1).expect("invariant 1");
+    invariants::reasons_within(&rounds, &REASONS).expect("invariant 8");
+    let accepted = rounds[1].condition(ACCEPTED).expect("Accepted");
+    assert_eq!(
+        (&accepted["status"], &accepted["reason"]),
+        (&json!("False"), &json!("OperatorConfigInvalid"))
+    );
+    assert!(
+        accepted["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("signerEndpont"),
+        "names the field at fault: {}",
+        accepted["message"]
+    );
+    assert!(
+        api.writes().iter().all(|write| write.path != SITE_PATH),
+        "nothing is written to any GridSite, and nothing is cleared"
+    );
+}
