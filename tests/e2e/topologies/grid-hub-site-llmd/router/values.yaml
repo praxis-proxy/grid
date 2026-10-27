@@ -1,0 +1,72 @@
+router:
+  modelServers:
+    matchLabels:
+      app.kubernetes.io/name: llm-d-inference-sim
+    targetPorts:
+      - number: 8000
+  epp:
+    replicas: 1
+    image:
+      tag: v1.0.0
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        memory: 1Gi
+    podSecurityContext:
+      runAsNonRoot: true
+      seccompProfile:
+        type: RuntimeDefault
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+      readOnlyRootFilesystem: true
+    flags:
+      fairness-id-metric-label-limit: 0
+    pluginsConfigFile: grid-sim-plugins.yaml
+    pluginsConfig:
+      apiVersion: llm-d.ai/v1
+      kind: EndpointPickerConfig
+      plugins:
+        - type: queue-scorer
+        - type: kv-cache-utilization-scorer
+        - type: prefix-cache-scorer
+        - type: metrics-data-source
+          parameters:
+            scheme: http
+            path: /metrics
+            insecureSkipVerify: true
+        - type: core-metrics-extractor
+        - type: inflight-load-producer
+          name: inflight-load
+        - type: max-score-picker
+      schedulingProfiles:
+        - name: default
+          plugins:
+            - pluginRef: queue-scorer
+              weight: 2
+            - pluginRef: kv-cache-utilization-scorer
+              weight: 2
+            - pluginRef: prefix-cache-scorer
+              weight: 3
+            - pluginRef: max-score-picker
+  proxy:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+      readOnlyRootFilesystem: true
+  monitoring:
+    prometheus:
+      auth:
+        enabled: false
