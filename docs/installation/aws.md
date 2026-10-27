@@ -179,7 +179,7 @@ helm install grid-operator charts/grid-operator -n grid --create-namespace \
 ```
 
 The `enrollment` values render the `site` section of the operator config, the ConfigMap
-`grid-operator-config`, and the operator enrolls from it once the site's GridSite, which
+`grid-operator-config`, and the operator enrolls from it once the GridNetwork, which
 `grid.id` renders, exists. The hub sets `--set enrollment.enabled=false`, since its identity
 comes from the bootstrap Job. To renew that identity, the hub sets `enrollment.url` to its
 in-cluster `grid-enrollment` Service, which renders a `site` section that renews only.

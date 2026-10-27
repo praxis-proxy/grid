@@ -104,8 +104,17 @@ cluster-scoped CRD. The current AGN deployment supports only one
 `GridNetwork` in the cluster. The operator fails startup when it finds more
 than one; adding another after startup is not supported.
 
-Its roll-up is gated by `LocalSiteDeclared`. A `PeerTimeValid` of `False`, or a
-`GatewayAgesRejected` of `True`, sets `Degraded` with that condition's reason.
+It carries this cluster's own conditions. `Accepted`, `ResolvedRefs`, `Enrolled` and
+`IdentityValid` gate its roll-up, in that order. `RotationOnSchedule` `False`, a
+`PeerTimeValid` of `False`, or a `GatewayAgesRejected` of `True`, sets `Degraded` with
+that condition's reason. Each condition type has one writer, and the controller alone
+writes `Available`, `Progressing` and `Degraded`. Every reason is listed in
+[Site Enrollment](../installation/enrollment.md#3-enroll-the-site).
+
+`spec.gridId` is an optional admin pin, set once. Enrollment records the grid the
+identity names in `status.gridId`, and an invite for another grid is refused before it
+is spent, as `Enrolled` `False` with `GridIdMismatch`. Moving a cluster to another grid
+means deleting the GridNetwork and the identity Secret, then enrolling again.
 
 ```yaml
 apiVersion: grid.praxis.fast/v1alpha1
@@ -113,7 +122,7 @@ kind: GridNetwork
 metadata:
   name: production
 spec:
-  gridId: ""                    # auto-generated on first join
+  gridId: ""                    # optional admin pin; enrollment records the grid in status.gridId
   seeds:
     - "10.0.0.5:7946"
   consumerGateways:
@@ -574,13 +583,19 @@ spec:
 
 **Status fields**: `conditions`, `phase`, `reason`, `message`, `observedGeneration`,
 `publicCertPem`, `capabilities` (inference, agentTools, agentToAgent),
-`lastProbeTime`, `lastTransitionTime`, `absentSince` (auto-discovered sites only),
-`conditions` (on this cluster's own site: `Available`, `Progressing`, `Degraded`,
-`Accepted`, `ResolvedRefs`, `Enrolled`, `IdentityValid`, `RotationOnSchedule`)
+`lastProbeTime`, `lastTransitionTime`, `absentSince` (auto-discovered sites only).
+Status is membership only, each cluster's view of one site, this cluster's own site
+included. The own site's identity conditions live on the GridNetwork.
 
 ### This cluster's own site
 
-The own GridSite carries no local config. How this site enrolls and renews lives in
+This cluster's own GridSite is declared like any peer, by the grid-site chart, by
+`grid.id` on the grid-operator chart, by GitOps or by hand: named after the site the
+identity names and labelled `grid.praxis.fast/provider-site`. If nothing declares one,
+the operator creates it from the identity, as it does the GridNetwork, under
+`--grid-create-local-records`, on by default. It never overwrites a GridSite something
+else declared, and enrollment does not wait for it. The own GridSite carries no local
+config. How this site enrolls and renews lives in
 the operator config: the ConfigMap `grid-operator-config` in the operator namespace,
 key `config.yaml`, which the grid-operator chart renders from its `enrollment` values
 (`operatorConfig.name` renames it). The operator reads it through the API and watches
@@ -616,10 +631,10 @@ older than a new section keeps running through a rollout. It logs the section, r
 an `OperatorConfigSectionIgnored` Warning Event on the ConfigMap and counts it in
 `grid_operator_config_ignored_sections`. Inside a section it reads, the operator refuses
 the whole document: an unknown key, a bad URL or a missing field reports `Accepted`
-`False` with `OperatorConfigInvalid` on the own GridSite, the message naming the field,
+`False` with `OperatorConfigInvalid` on the GridNetwork, the message naming the field,
 and no section of it is acted on. A `site.name` other than the site the held identity
-names reports `SiteNameMismatch`. Before the own GridSite exists, the operator sends
-nothing, logs why and records an Event on the ConfigMap. Under pin peer trust,
+names reports `SiteNameMismatch`. Before the GridNetwork exists, the operator sends
+nothing, logs why and records an `AwaitingGridNetwork` Event on the ConfigMap, once. Under pin peer trust,
 `rotation: Enabled` reports `Accepted` `False` with `RotationUnsupportedUnderPinTrust`
 and nothing renews. Every condition and reason is listed in
 [Site Enrollment](../installation/enrollment.md#3-enroll-the-site). A local site may
@@ -823,18 +838,14 @@ disagree about one peer during a partition. The peer's own health is in its own
 | `False` | `TLSProtocolError` | The TLS handshake failed or timed out at the protocol level. |
 | `False` | `UntrustedIssuer`, `IdentityMismatch`, `CertificateExpired`, `CertificateNotYetValid`, `PinMismatch`, `TrustMaterialMissing`, `TrustMaterialInvalid`, `IdentityVerificationRequired` | The probe's trust failure, named as the probe reports it. |
 
-`Connected` is applied by the field manager `grid-operator-probe`, and the roll-up
-by `grid-operator-site`. The phase stays a merge patch.
+`Connected` and the roll-up have separate writers. The phase stays a merge patch.
 
-On this cluster's own site, the roll-up gates on `Accepted`, `ResolvedRefs`, `Enrolled`
-and `IdentityValid` instead, in that order, and `Connected` stays informational.
-`Degraded` is `True` while `RotationOnSchedule` is `False`, the early warning that the
-identity is about to expire, and `Progressing` is `True` while an enrollment is in
-flight or retried. Each gate has its own field manager. The enrollment step and the
-renewal loop write the own site's roll-up under `grid-operator-own-site`, apart from the
-peer roll-up's `grid-operator-site`, and the GridSite controller writes only `Connected`
-there. The own site's `phase` follows the same probe as a peer's and
-says nothing about its identity.
+This cluster's own site rolls up the same way, from a probe of its own gateway, and
+its GridSite says nothing about its identity. The identity conditions live on the
+GridNetwork, where `Accepted`, `ResolvedRefs`, `Enrolled` and `IdentityValid` gate the
+roll-up in that order. There `Degraded` is `True` while `RotationOnSchedule` is `False`,
+the early warning that the identity is about to expire, and `Progressing` is `True`
+while an enrollment is in flight or retried.
 
 ## InferenceProvider
 
