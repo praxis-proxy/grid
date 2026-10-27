@@ -676,8 +676,18 @@ async fn invariant_8_a_signer_serving_a_lapsed_certificate_is_signer_lapsed() {
     let ca = store_due_identity(&api);
     let rest = pinned_signer(&api, &ca, axum::Router::new(), true).await;
     let rounds = renewal_rounds_under(&api, &rest, 3, |_round| {}).await;
+    // A second on, as rounds are in production: the handshake error names the verification time.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let later = renewal_rounds_under(&api, &rest, 1, |_round| {}).await;
 
     invariants::unchanged_from(&rounds, 1).expect("invariant 1");
+    for type_ in [ROTATION_ON_SCHEDULE, DEGRADED] {
+        assert_eq!(
+            rounds[2].condition(type_).map(|held| held["message"].clone()),
+            later[0].condition(type_).map(|held| held["message"].clone()),
+            "{type_} says the same of the same lapsed signer"
+        );
+    }
     invariants::one_manager_per_type(&api.writes(), PATH, &managers()).expect("invariant 5");
     invariants::reasons_within(&rounds, &REASONS).expect("invariant 8");
     let rotation = rounds[1].condition(ROTATION_ON_SCHEDULE).expect("RotationOnSchedule");

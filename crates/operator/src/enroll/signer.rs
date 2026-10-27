@@ -265,19 +265,31 @@ async fn post(request: reqwest::RequestBuilder) -> Result<Issued, SignerError> {
 }
 
 /// Why a request did not complete before an answer: retried only when it never left.
+///
+/// The detail names the signer and the kind of failure only, since it reaches status and the
+/// raw error carries times and addresses that change between identical failures; it is logged.
 fn unsent(error: &reqwest::Error) -> SignerError {
     if error.is_builder() {
         return SignerError::Request(error_chain(error));
     }
+    let signer = error.url().map_or("the signer", Url::as_str);
+    tracing::warn!(signer, error = %error_chain(error), "the request to the signer did not complete");
     if is_tls_failure(error) {
         return SignerError::Untrusted {
             lapsed: chain(error).any(tls_backend::is_lapsed_certificate),
-            detail: error_chain(error),
+            detail: signer.to_owned(),
         };
     }
+    let detail = if error.is_connect() {
+        format!("could not connect to {signer}")
+    } else if error.is_timeout() {
+        format!("{signer} did not answer in time")
+    } else {
+        format!("the request to {signer} failed")
+    };
     SignerError::Transport {
         sent: !error.is_connect(),
-        detail: error_chain(error),
+        detail,
     }
 }
 
