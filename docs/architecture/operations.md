@@ -351,6 +351,26 @@ CA, in the site Secret or the CA Secret the GridNetwork names. A writer other th
 operator sets `site.signerEndpoint.rotation: Disabled` in the operator config, or leaves
 the signer out, and the operator reads the new leaf on its next round.
 
+### Operator config write access
+
+The operator config decides where the invite token goes and which CA pins the signer, so
+write access to ConfigMaps in the operator namespace is operator-level access. Grant it
+only to grid admins. A role that edits the config should name `grid-operator-config` in
+`resourceNames`, and no other role should get `create`, `patch` or `update` on ConfigMaps
+in that namespace.
+
+Three guards limit what a ConfigMap editor can still do:
+
+- A signer bundle must be a Secret, so the editor cannot pin a CA of their own.
+- `GRID_SIGNER_HOSTS`, the chart's `enrollment.signerHosts`, fixes the signer hosts at
+  install time, outside the config. The chart defaults it to the host of
+  `enrollment.url`. Unset, any host is allowed and the operator logs a warning at startup.
+- Renewal trusts only the grid CA the site holds, never a bundle the config names.
+
+The operator's own ServiceAccount keeps `create`, `patch` and `update` on ConfigMaps for
+the overlays it writes. It derives their names at runtime, so RBAC cannot exclude the
+config by name, and its write on Secrets is the larger grant in any case.
+
 ### ConfigMap write scope
 
 | `ConfigMap` | Naming | Data key | Namespace |

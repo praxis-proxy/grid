@@ -769,7 +769,11 @@
           "description": "Signer base URL (https), site.signerEndpoint.url."
         },
         "rotation": {
-          "enum": ["", "Enabled", "Disabled"],
+          "enum": [
+            "",
+            "Enabled",
+            "Disabled"
+          ],
           "description": "Whether the operator renews the site identity through the signer, site.signerEndpoint.rotation. Empty renders Disabled unless grid.peerTrust is spiffe."
         },
         "siteName": {
@@ -780,13 +784,8 @@
         "caBundle": {
           "type": "object",
           "additionalProperties": false,
-          "description": "CA bundle that pins the enrollment server, from at most one of configMap and secret.",
+          "description": "CA bundle that pins the signer to enroll, a Secret. ConfigMap bundles are refused.",
           "properties": {
-            "configMap": {
-              "type": "string",
-              "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
-              "description": "ConfigMap holding the bundle."
-            },
             "secret": {
               "type": "string",
               "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
@@ -796,33 +795,14 @@
               "type": "string",
               "minLength": 1,
               "description": "Key holding the PEM bundle."
-            }
-          },
-          "not": {
-            "required": [
-              "configMap",
-              "secret"
-            ],
-            "properties": {
-              "configMap": {
-                "minLength": 1
-              },
-              "secret": {
-                "minLength": 1
-              }
             }
           }
         },
         "gridCaBundle": {
           "type": "object",
           "additionalProperties": false,
-          "description": "Grid CA the returned CA must match, from at most one of configMap and secret.",
+          "description": "Grid CA the returned CA must match, a Secret.",
           "properties": {
-            "configMap": {
-              "type": "string",
-              "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
-              "description": "ConfigMap holding the bundle."
-            },
             "secret": {
               "type": "string",
               "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
@@ -832,20 +812,6 @@
               "type": "string",
               "minLength": 1,
               "description": "Key holding the PEM bundle."
-            }
-          },
-          "not": {
-            "required": [
-              "configMap",
-              "secret"
-            ],
-            "properties": {
-              "configMap": {
-                "minLength": 1
-              },
-              "secret": {
-                "minLength": 1
-              }
             }
           }
         },
@@ -875,6 +841,15 @@
               "description": "Key holding the token."
             }
           }
+        },
+        "signerHosts": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\s,/]+$"
+          },
+          "description": "Signer hosts, host or host:port, the operator config may name. Empty defaults to the host and port of enrollment.url."
         }
       }
     },

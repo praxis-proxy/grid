@@ -89,7 +89,7 @@ pub(super) struct Clients(Mutex<Option<([u8; 32], reqwest::Client)>>);
 pub(super) struct HttpsSigner<'clients> {
     /// The signer's base URL.
     base: Url,
-    /// The PEM pinning the signer. Renewal falls back to the held grid CA.
+    /// The PEM pinning the signer to enroll. Renewal trusts only the held grid CA.
     pin: Option<String>,
     /// Clients kept across calls.
     clients: &'clients Clients,
@@ -168,9 +168,10 @@ impl Signer for HttpsSigner<'_> {
     }
 
     async fn renew(&self, held: &Held, csr_pem: &str) -> Result<Issued, SignerError> {
-        let trust = self.pin.as_deref().unwrap_or(&held.ca);
+        // The grid CA the site holds, never a pin its config names: a config edit cannot
+        // point renewal at a signer of its own.
         let request = self
-            .client(trust, Some((&held.cert, &held.key)))?
+            .client(&held.ca, Some((&held.cert, &held.key)))?
             .post(Self::endpoint(&self.base, RENEW_PATH))
             .json(&CsrRequest { csr: csr_pem });
         Box::pin(post(request)).await

@@ -173,10 +173,18 @@ async fn main() {
         .await
         .unwrap_or_else(|error| invalid_identity(&error));
     // The operator config names the site and its signer; an edit applies without a restart.
+    let signer_hosts = operator::operator_config::SignerHosts::from_list(&config.signer_hosts);
+    if signer_hosts.is_any() {
+        tracing::warn!(
+            "GRID_SIGNER_HOSTS is unset: the operator config may name any signer host; set it to the signers \
+             this install trusts"
+        );
+    }
     let mut operator_config = operator::operator_config::ConfigWatch::spawn(
         client.clone(),
         client.default_namespace(),
         &config.operator_config,
+        signer_hosts,
     );
     // The site enrolls now, else while it waits for an identity.
     let mut enrollment = operator::enroll::local::Enrollment::default();

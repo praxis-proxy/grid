@@ -44,6 +44,11 @@ pub struct Cli {
         default_value = crate::operator_config::DEFAULT_CONFIG_MAP
     )]
     pub operator_config: String,
+
+    /// Signer hosts the operator config may name, comma-separated, each `host` or
+    /// `host:port`. Empty allows any.
+    #[arg(long = "signer-hosts", env = "GRID_SIGNER_HOSTS", default_value = "")]
+    pub signer_hosts: String,
 }
 
 /// Leader election options. With no lease, this replica writes unelected.

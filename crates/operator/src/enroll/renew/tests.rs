@@ -609,106 +609,63 @@ fn a_refused_operator_config_renews_through_nothing() {
     );
 }
 
-/// A client that answers nothing, for resolutions that never reach the API.
-fn no_client() -> Client {
-    let service = tower::service_fn(|_req: http::Request<kube::client::Body>| async {
-        Ok::<_, std::convert::Infallible>(
-            http::Response::builder()
-                .status(404)
-                .body(kube::client::Body::from(Vec::new()))
-                .expect("response"),
-        )
-    });
-    Client::new(service, "grid-system")
+/// Resolve the signer `loaded` names for site `east`.
+fn resolve(loaded: &Loaded) -> Resolved {
+    resolve_signer(&declared(loaded, Some("east"))).expect("resolved")
 }
 
-/// Resolve the signer `loaded` names for site `east`, off the API.
-async fn resolve(loaded: &Loaded) -> Resolved {
-    resolve_signer(&no_client(), &declared(loaded, Some("east")))
-        .await
-        .expect("resolved")
-}
-
-#[tokio::test]
-async fn only_the_operator_config_names_the_signer() {
+#[test]
+fn only_the_operator_config_names_the_signer() {
     assert_eq!(
-        resolve(&Loaded::Absent).await,
+        resolve(&Loaded::Absent),
         Resolved::Off(Off::NoSigner),
         "no config names no signer, whatever the identity Secret is annotated with"
     );
     assert_eq!(
-        resolve(&loaded("")).await,
+        resolve(&loaded("")),
         Resolved::Off(Off::NoSigner),
         "a site without a signer"
     );
     assert_eq!(
-        resolve(&loaded(&signer(""))).await,
+        resolve(&loaded(&signer(""))),
         Resolved::Signer(Endpoint {
             base: reqwest::Url::parse("https://enroll.example.com").expect("url"),
-            pin: None,
         }),
-        "a signer without a bundle renews pinned to the held grid CA"
+        "a signer renews trusted through the held grid CA"
     );
     assert_eq!(
-        resolve(&loaded(&signer("    rotation: Disabled\n"))).await,
+        resolve(&loaded(&signer("    rotation: Disabled\n"))),
         Resolved::Off(Off::Disabled),
         "Disabled keeps the signer for enrollment only"
     );
     assert_eq!(
-        resolve(&Loaded::Invalid("site.name: bad".to_owned())).await,
+        resolve(&Loaded::Invalid("site.name: bad".to_owned())),
         Resolved::Off(Off::Refused),
         "a refused config is not acted on"
     );
 }
 
-/// A client answering every request with `status` and `body`.
-fn client_answering(status: u16, body: serde_json::Value) -> Client {
-    let service = tower::service_fn(move |_req: http::Request<kube::client::Body>| {
-        let body = serde_json::to_vec(&body).expect("body");
-        async move {
-            Ok::<_, std::convert::Infallible>(
-                http::Response::builder()
-                    .status(status)
-                    .header("content-type", "application/json")
-                    .body(kube::client::Body::from(body))
-                    .expect("response"),
-            )
-        }
-    });
-    Client::new(service, "grid-system")
-}
-
-/// Resolve a declared signer pinned to the Secret `grid-ca-bundle`, read through `client`.
-async fn resolve_pinned(client: &Client) -> Result<Resolved, RenewError> {
-    let config = loaded(&signer("    caBundleRef: {name: grid-ca-bundle, kind: Secret}\n"));
-    resolve_signer(client, &declared(&config, Some("east"))).await
-}
-
+/// Renewal trusts the grid CA the site holds, never a pin its config names: a pin that is
+/// not even a certificate is never read.
 #[tokio::test]
-async fn a_bundle_secret_that_does_not_opt_in_is_material_not_kubernetes() {
-    let unlabelled = serde_json::json!({
-        "apiVersion": "v1", "kind": "Secret",
-        "metadata": {"name": "grid-ca-bundle", "namespace": "grid-system"},
-        "data": {"ca.crt": "LS0t"}
-    });
-    let refused = resolve_pinned(&client_answering(200, unlabelled)).await;
-    assert!(
-        matches!(
-            &refused,
-            Err(RenewError::Material(why))
-                if why.starts_with("site.signerEndpoint.caBundleRef: ") && why.contains(local::SIGNER_BUNDLE_LABEL)
-        ),
-        "{refused:?}"
-    );
-    let failed = resolve_pinned(&client_answering(
-        500,
-        serde_json::json!({"kind": "Status", "code": 500}),
-    ))
-    .await;
-    assert!(
-        matches!(&failed, Err(RenewError::Kube(why)) if why.starts_with("reading Secret grid-ca-bundle")),
-        "{failed:?}"
-    );
+async fn renewal_trusts_the_held_grid_ca_and_never_the_config_pin() {
+    crate::init_process_crypto();
+    let ca = certs::generate_ca("grid-ca").expect("ca");
+    let leaf = certs::generate_dns_cert(&ca, "east", "east").expect("leaf");
+    let held = Held {
+        cert: leaf.cert_pem,
+        key: Zeroizing::new(leaf.key_pem),
+        ca: ca.cert_pem,
+        pending: None,
+        version: "1".to_owned(),
+        rotated: false,
+    };
+    let clients = Clients::default();
+    let base = reqwest::Url::parse("https://127.0.0.1:9").expect("url");
+    let signer = HttpsSigner::new(base, Some("not a certificate".to_owned()), &clients);
+    let renewed = signer.renew(&held, "csr").await;
+    let why = renewed.err().map(|error| error.to_string()).unwrap_or_default();
+    assert!(!why.contains("signer trust"), "the pin is never parsed: {why}");
 }
 
 /// A check, the signer it went through, and the status and reason it earns.
@@ -846,7 +803,7 @@ fn disabled_rotation_neither_rolls_nor_retries() {
 
 /// The verdicts of `round` for condition `type_`, as (status, reason).
 fn verdicts_of(round: &Round, type_: &str) -> Vec<(&'static str, String)> {
-    round_verdicts(round, &target(), true)
+    round_verdicts(round, &target(), true, None)
         .into_iter()
         .filter(|(written, ..)| *written == type_)
         .map(|(_, _, verdict)| (verdict.status, verdict.reason.into_owned()))
@@ -880,7 +837,7 @@ fn rotation_enabled_under_pin_is_an_accepted_conflict_and_holds_renewal_back() {
         vec![("True", "RotationDisabled".to_owned())],
         "the rotation reason set stays closed; the conflict is on Accepted"
     );
-    let (manager, message) = round_verdicts(&refused, &target(), true)
+    let (manager, message) = round_verdicts(&refused, &target(), true, None)
         .into_iter()
         .find(|(type_, ..)| *type_ == local::ACCEPTED)
         .map(|(_, manager, verdict)| (manager, verdict.message))
@@ -934,7 +891,7 @@ fn an_enrolled_site_keeps_issued_while_the_identity_is_present() {
         refused: None,
     };
     let written = |enrolled: bool| -> Vec<String> {
-        round_verdicts(&round, &target(), enrolled)
+        round_verdicts(&round, &target(), enrolled, None)
             .into_iter()
             .filter(|(type_, ..)| *type_ == local::ENROLLED)
             .map(|(_, _, verdict)| verdict.reason.into_owned())
@@ -942,32 +899,4 @@ fn an_enrolled_site_keeps_issued_while_the_identity_is_present() {
     };
     assert!(written(true).is_empty(), "an enrolled site keeps Issued");
     assert_eq!(written(false), vec!["IdentityPresent".to_owned()]);
-}
-
-#[test]
-fn resolved_refs_follows_whether_the_signer_bundle_resolved() {
-    let now = OffsetDateTime::now_utc();
-    let reached = |checked: Result<Checked, RenewError>| Round {
-        checked,
-        signer: None,
-        identity: Some(Identity::Valid(now)),
-        refused: None,
-    };
-    let missing = RenewError::Material("site.signerEndpoint.caBundleRef grid-ca-bundle absent".to_owned());
-    let refs = |round: &Round| refs_verdict(round).map(|verdict| (verdict.status, verdict.reason.into_owned()));
-    assert_eq!(refs(&reached(Err(missing))), Some(("False", "RefNotFound".to_owned())));
-    assert_eq!(
-        refs(&reached(Ok(Checked::Waiting(now)))),
-        Some(("True", "ResolvedRefs".to_owned()))
-    );
-    assert_eq!(
-        refs(&reached(Err(RenewError::Kube("down".to_owned())))),
-        None,
-        "an API failure says nothing about the refs"
-    );
-    assert_eq!(
-        refs(&Round::failed(RenewError::Material("x".to_owned()))),
-        None,
-        "a round that never read the identity leaves it"
-    );
 }

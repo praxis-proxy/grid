@@ -23,7 +23,7 @@ use zeroize::Zeroizing;
 
 use super::{
     Issued, Signer, SignerError, Target, jittered,
-    local::{self, BundleError, Bundles, Verdict},
+    local::{self, Verdict},
     signer::{Clients, HttpsSigner, RENEW_PATH},
 };
 use crate::{
@@ -33,7 +33,7 @@ use crate::{
         grid_site::GridSite,
     },
     metrics,
-    operator_config::{BundleRef, ConfigWatch, Loaded, Rotation, Section, SignerEndpoint, Snapshot},
+    operator_config::{ConfigWatch, Loaded, Rotation, Section, SignerEndpoint, Snapshot},
 };
 
 
@@ -458,10 +458,8 @@ impl IdentityStore for KubeIdentity {
 /// The signer a renewal goes to, read from `site.signerEndpoint` in the operator config.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Endpoint {
-    /// The signer's base URL.
+    /// The signer's base URL. The signer is trusted through the grid CA the site holds.
     pub(super) base: reqwest::Url,
-    /// The PEM pinning the signer, else the site's own grid CA.
-    pub(super) pin: Option<String>,
 }
 
 impl Endpoint {
@@ -670,8 +668,8 @@ enum Resolved {
     Off(Off),
 }
 
-/// Resolve the signer `site.signerEndpoint` names, with its pin.
-async fn resolve_signer(client: &Client, declared: &Declared<'_>) -> Result<Resolved, RenewError> {
+/// Resolve the signer `site.signerEndpoint` names.
+fn resolve_signer(declared: &Declared<'_>) -> Result<Resolved, RenewError> {
     let endpoint = match declared {
         Declared::Renews(endpoint) => endpoint,
         Declared::Disabled => return Ok(Resolved::Off(Off::Disabled)),
@@ -679,24 +677,7 @@ async fn resolve_signer(client: &Client, declared: &Declared<'_>) -> Result<Reso
         Declared::Refused(_) => return Ok(Resolved::Off(Off::Refused)),
     };
     let base = super::signer_url(&endpoint.url).map_err(RenewError::Material)?;
-    let pin = match &endpoint.ca_bundle_ref {
-        Some(reference) => Some(declared_pin(client, reference).await?),
-        None => None,
-    };
-    Ok(Resolved::Signer(Endpoint { base, pin }))
-}
-
-/// The PEM `site.signerEndpoint.caBundleRef` names; a bundle that does not opt in is material, not the API.
-async fn declared_pin(client: &Client, reference: &BundleRef) -> Result<String, RenewError> {
-    Bundles::new(client, client.default_namespace())
-        .pem(reference)
-        .await
-        .map_err(|error| match error {
-            BundleError::Api(why) => RenewError::Kube(why),
-            BundleError::Refused(why) => RenewError::Material(format!("site.signerEndpoint.caBundleRef: {why}")),
-        })?
-        .map(|(pem, _version)| pem)
-        .ok_or_else(|| RenewError::Material(format!("site.signerEndpoint.caBundleRef {} absent", reference.name)))
+    Ok(Resolved::Signer(Endpoint { base }))
 }
 
 /// What renewal keeps across rounds: the identity store, the renewal clients and the gateway.
@@ -812,7 +793,12 @@ async fn tick(loop_: &Loop<'_>, settings: &Settings, target: &Result<Target, sup
     };
     settings.configured.store(round.signer.is_some(), Ordering::Relaxed);
     if let Ok(target) = target {
-        Box::pin(report_round(loop_.client, &own, target, &round)).await;
+        let refs = match snapshot.loaded.site() {
+            Section::Site(site) => Some(Box::pin(local::named_refs(loop_.client, Some(site))).await),
+            Section::Unset => Some(Verdict::resolved()),
+            Section::Invalid(_) => None,
+        };
+        Box::pin(report_round(loop_.client, &own, target, &round, refs.as_ref())).await;
     }
     round
 }
@@ -951,8 +937,8 @@ fn identity_of(read: &Read, renews: bool) -> Identity {
 /// The signer this round renews through, else why nothing renews, else why it could not
 /// be resolved. A signer whose rotation is Enabled under a trust that does not renew is
 /// held back, since a pinned peer would refuse the renewed leaf.
-async fn through(client: &Client, declared: &Declared<'_>, trust: &Trust) -> Result<Endpoint, Result<Off, RenewError>> {
-    match Box::pin(resolve_signer(client, declared)).await {
+fn through(declared: &Declared<'_>, trust: &Trust) -> Result<Endpoint, Result<Off, RenewError>> {
+    match resolve_signer(declared) {
         Ok(Resolved::Signer(signer)) if trust.renews => Ok(signer),
         Ok(Resolved::Signer(_)) => Err(Ok(Off::UnsupportedUnderPin)),
         Ok(Resolved::Off(why)) => Err(Ok(why)),
@@ -971,7 +957,7 @@ async fn check_round(loop_: &Loop<'_>, target: &Target, declared: &Declared<'_>)
         Err(error) => return Round::failed(error),
     };
     let identity = Some(identity_of(&read, trust.renews));
-    match Box::pin(through(loop_.client, declared, &trust)).await {
+    match through(declared, &trust) {
         Ok(signer) => Box::pin(renew_through(loop_, target, read, signer, identity)).await,
         Err(Ok(why)) => Round {
             checked: Ok(Checked::Off { why, due: read.due }),
@@ -999,7 +985,7 @@ async fn renew_through(
     identity: Option<Identity>,
 ) -> Round {
     let url = endpoint.renewal_url();
-    let signer = HttpsSigner::new(endpoint.base, endpoint.pin, loop_.clients);
+    let signer = HttpsSigner::new(endpoint.base, None, loop_.clients);
     Round {
         checked: Box::pin(check_held(
             loop_.store,
@@ -1018,11 +1004,11 @@ async fn renew_through(
 /// Report the round on this site's `GridSite`: `Enrolled` by the identity in `target`,
 /// `IdentityValid` by what was read, `RotationOnSchedule` by the check, and `Available` from
 /// those.
-async fn report_round(client: &Client, own: &Own, target: &Target, round: &Round) {
+async fn report_round(client: &Client, own: &Own, target: &Target, round: &Round, refs: Option<&Verdict>) {
     let Some(site) = &own.site else {
         return;
     };
-    let verdicts = round_verdicts(round, target, local::enrolled(site));
+    let verdicts = round_verdicts(round, target, local::enrolled(site), refs);
     let written = Box::pin(local::report_many(client, site, &verdicts)).await;
     Box::pin(local::report_rollup(client, &written, None)).await;
 }
@@ -1031,7 +1017,12 @@ async fn report_round(client: &Client, own: &Own, target: &Target, round: &Round
 /// present reports `Enrolled` only while the site does not read enrolled, so `Issued` stays.
 /// `Accepted` is `False` while the config is refused for this site or the signer's rotation
 /// conflicts with the grid's peer trust, and `True` again once that changes.
-fn round_verdicts(round: &Round, target: &Target, enrolled: bool) -> Vec<(&'static str, &'static str, Verdict)> {
+fn round_verdicts(
+    round: &Round,
+    target: &Target,
+    enrolled: bool,
+    refs: Option<&Verdict>,
+) -> Vec<(&'static str, &'static str, Verdict)> {
     let mut verdicts = Vec::with_capacity(5);
     let accepted = round.refused.clone().unwrap_or_else(Verdict::own_site);
     verdicts.push((local::ACCEPTED, local::ACCEPTED_FIELD_MANAGER, accepted));
@@ -1049,24 +1040,12 @@ fn round_verdicts(round: &Round, target: &Target, enrolled: bool) -> Vec<(&'stat
             identity_verdict(identity),
         ));
     }
-    if let Some(refs) = refs_verdict(round) {
-        verdicts.push((local::RESOLVED_REFS, local::REFS_FIELD_MANAGER, refs));
+    if let Some(refs) = refs {
+        verdicts.push((local::RESOLVED_REFS, local::REFS_FIELD_MANAGER, refs.clone()));
     }
     let rotation = rotation_verdict(&round.checked, round.signer.as_ref());
     verdicts.push((local::ROTATION_ON_SCHEDULE, local::RENEWAL_FIELD_MANAGER, rotation));
     verdicts
-}
-
-/// What `ResolvedRefs` says after `round`: `False` when the signer's bundle does not
-/// resolve, `None` when the round stopped before the config was read or the API failed.
-fn refs_verdict(round: &Round) -> Option<Verdict> {
-    match &round.checked {
-        Err(RenewError::Material(why)) if why.starts_with("site.signerEndpoint.caBundleRef") => {
-            Some(Verdict::new("False", "RefNotFound", why.clone()))
-        },
-        Err(RenewError::Kube(_)) => None,
-        _ => round.identity.as_ref().map(|_identity| Verdict::resolved()),
-    }
 }
 
 /// What `IdentityValid` says about `identity`.

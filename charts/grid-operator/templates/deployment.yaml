@@ -120,6 +120,10 @@ spec:
               value: {{ .Values.grid.network | quote }}
             - name: GRID_OPERATOR_CONFIG
               value: {{ include "grid-operator.operatorConfig.name" . | quote }}
+            {{- with include "grid-operator.enrollment.signerHosts" . }}
+            - name: GRID_SIGNER_HOSTS
+              value: {{ . | quote }}
+            {{- end }}
             {{- /* The chart renders the records with grid.id, and an enrolling release may set it later. */}}
             {{- if or .Values.grid.id .Values.enrollment.enabled }}
             - name: GRID_CREATE_LOCAL_RECORDS

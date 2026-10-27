@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use k8s_openapi::ByteString;
+use k8s_openapi::{ByteString, api::core::v1::ConfigMap};
 use kube::api::ObjectMeta;
 use serde_json::json;
 

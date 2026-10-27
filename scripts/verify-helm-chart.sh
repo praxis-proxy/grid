@@ -279,7 +279,7 @@ try_template "$CHART_DIR" "scheduling" \
   --set nodeSelector.zone=us-east-1 --set priorityClassName=high-priority
 ENROLL_SET=(--set enrollment.enabled=true --set enrollment.url=https://enroll.example.com
   --set enrollment.siteName=site-d --set enrollment.tokenSecretRef.name=grid-invite-site-d)
-try_template "$CHART_DIR" "auto-enroll with a ConfigMap CA" "${ENROLL_SET[@]}" \
+try_reject_msg "$CHART_DIR" "auto-enroll with a ConfigMap CA" 'configMap' "${ENROLL_SET[@]}" \
   --set enrollment.caBundle.configMap=grid-ca
 try_template "$CHART_DIR" "auto-enroll with a Secret CA" "${ENROLL_SET[@]}" \
   --set enrollment.caBundle.secret=grid-ca-bundle
@@ -296,10 +296,9 @@ try_reject_msg "$CHART_DIR" "auto-enroll site name past 51 characters" 'siteName
 try_reject_msg "$CHART_DIR" "auto-enroll over plaintext" 'enrollment[./]url' "${ENROLL_SET[@]}" \
   --set enrollment.caBundle.secret=grid-ca-bundle --set enrollment.url=http://enroll.example.com
 try_template "$CHART_DIR" "auto-enroll with a separate grid CA anchor" "${ENROLL_SET[@]}" \
-  --set enrollment.caBundle.configMap=route-ca --set enrollment.gridCaBundle.secret=grid-ca-bundle
-try_reject_msg "$CHART_DIR" "auto-enroll with two grid CA sources" 'gridCaBundle' "${ENROLL_SET[@]}" \
-  --set enrollment.caBundle.configMap=route-ca --set enrollment.gridCaBundle.secret=a \
-  --set enrollment.gridCaBundle.configMap=b
+  --set enrollment.caBundle.secret=route-ca --set enrollment.gridCaBundle.secret=grid-ca-bundle
+try_reject_msg "$CHART_DIR" "auto-enroll with a ConfigMap grid CA" 'configMap' "${ENROLL_SET[@]}" \
+  --set enrollment.caBundle.secret=route-ca --set enrollment.gridCaBundle.configMap=b
 try_reject_msg "$CHART_DIR" "a signer URL with no site to name" 'needs a site name' \
   --set enrollment.url=https://enroll.example.com
 try_template "$CHART_DIR" "SA annotations" \

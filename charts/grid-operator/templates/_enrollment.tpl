@@ -2,7 +2,7 @@
 {{- define "grid-operator.enrollment.settings" -}}
 {{- $e := deepCopy (.Values.enrollment | default dict) }}
 {{- $b := $e.caBundle | default dict }}
-{{- if not (or $b.configMap $b.secret) }}
+{{- if not $b.secret }}
 {{- $_ := set $e "caBundle" (merge (dict "secret" "grid-ca-bundle") $b) }}
 {{- end }}
 {{- $t := $e.tokenSecretRef | default dict }}
@@ -36,29 +36,34 @@
 {{- if not (dig "tokenSecretRef" "name" "" $e) }}
 {{- fail "enrollment.tokenSecretRef.name is required when enrollment.enabled is true" }}
 {{- end }}
-{{- if not (or (dig "caBundle" "configMap" "" $e) (dig "caBundle" "secret" "" $e)) }}
-{{- fail "enrollment.caBundle needs a configMap or a secret when enrollment.enabled is true" }}
+{{- if not (dig "caBundle" "secret" "" $e) }}
+{{- fail "enrollment.caBundle.secret is required when enrollment.enabled is true" }}
 {{- end }}
 {{- end }}
 {{- end }}
 
-{{/* A BundleRef for a caBundle-shaped value. */}}
+{{/* A BundleRef for a caBundle-shaped value: a Secret, the only kind a bundle may be. */}}
 {{- define "grid-operator.enrollment.bundleRef" -}}
-{{- if dig "configMap" "" . }}
-kind: ConfigMap
-name: {{ .configMap | quote }}
-{{- else }}
 kind: Secret
 name: {{ dig "secret" "" . | quote }}
-{{- end }}
 key: {{ dig "key" "ca.crt" . | quote }}
+{{- end }}
+
+{{/* The signer hosts the operator config may name, comma-separated: enrollment.signerHosts, else the host and port of the rendered URL. Empty when neither is set. */}}
+{{- define "grid-operator.enrollment.signerHosts" -}}
+{{- $e := include "grid-operator.enrollment.settings" . | fromYaml }}
+{{- if $e.signerHosts }}
+{{- join "," $e.signerHosts }}
+{{- else if $e.url }}
+{{- (urlParse $e.url).host }}
+{{- end }}
 {{- end }}
 
 {{/* The operator config's site section: the site name, signerEndpoint with its rotation, and inviteSecretRef. A hub whose identity bootstrap issued sets only the URL, and renews pinned to the grid CA it holds. Unset, rotation renders Disabled unless grid.peerTrust is spiffe, since pin peer trust refuses a renewed leaf. */}}
 {{- define "grid-operator.enrollment.site" -}}
 {{- $e := include "grid-operator.enrollment.settings" . | fromYaml }}
 {{- $raw := .Values.enrollment | default dict }}
-{{- $pinned := or $e.enabled (dig "caBundle" "configMap" "" $raw) (dig "caBundle" "secret" "" $raw) }}
+{{- $pinned := or $e.enabled (dig "caBundle" "secret" "" $raw) }}
 {{- $rotation := $e.rotation }}
 {{- if and (not $rotation) (ne (.Values.grid.peerTrust | default "") "spiffe") }}
 {{- $rotation = "Disabled" }}
@@ -95,7 +100,7 @@ site:
 {{/* Emits "true" or nothing. */}}
 {{- define "grid-operator.enrollment.hasGridCa" -}}
 {{- $e := include "grid-operator.enrollment.settings" . | fromYaml }}
-{{- if or (dig "gridCaBundle" "configMap" "" $e) (dig "gridCaBundle" "secret" "" $e) -}}
+{{- if dig "gridCaBundle" "secret" "" $e -}}
 true
 {{- end -}}
 {{- end }}

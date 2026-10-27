@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use k8s_openapi::api::core::v1::{ConfigMap, ObjectReference, Secret};
+use k8s_openapi::api::core::v1::{ObjectReference, Secret};
 use kube::{
     Api, Client,
     api::{ListParams, Patch, PatchParams},
@@ -49,7 +49,7 @@ const TYPES: [(&str, &str); 5] = [
     (ROTATION_ON_SCHEDULE, RENEWAL_FIELD_MANAGER),
 ];
 
-/// Label a `Secret` or `ConfigMap` carries, set to `true`, to serve as a signer bundle.
+/// Label a `Secret` carries, set to `true`, to serve as a signer bundle.
 ///
 /// An opt-in, so the config cannot pin a bundle that happens to be in the namespace.
 pub const SIGNER_BUNDLE_LABEL: &str = "grid.praxis.fast/signer-bundle";
@@ -793,8 +793,8 @@ async fn await_invite(client: &Client, site: &GridSite, config: Option<&SiteConf
     Step::AwaitingInvite
 }
 
-/// What `ResolvedRefs` says of the bundles `config` names while it names no invite to send.
-async fn named_refs(client: &Client, config: Option<&SiteConfig>) -> Verdict {
+/// What `ResolvedRefs` says of the bundles `config` names, read without trusting them.
+pub(crate) async fn named_refs(client: &Client, config: Option<&SiteConfig>) -> Verdict {
     let bundles = Bundles::new(client, client.default_namespace());
     let signer = config.and_then(|config| config.signer_endpoint.as_ref());
     for (field, reference) in [
@@ -852,12 +852,10 @@ impl Read {
     }
 }
 
-/// Bundle objects in the operator namespace.
+/// Bundle Secrets in the operator namespace.
 pub(crate) struct Bundles {
     /// Secrets.
     secrets: Api<Secret>,
-    /// `ConfigMap`s.
-    config_maps: Api<ConfigMap>,
 }
 
 impl Bundles {
@@ -865,7 +863,6 @@ impl Bundles {
     pub(crate) fn new(client: &Client, namespace: &str) -> Self {
         Self {
             secrets: Api::namespaced(client.clone(), namespace),
-            config_maps: Api::namespaced(client.clone(), namespace),
         }
     }
 
@@ -916,26 +913,16 @@ impl Bundles {
     async fn raw(&self, reference: &BundleRef) -> Result<Option<(Option<Vec<u8>>, Option<String>)>, BundleError> {
         let (name, key) = (&reference.name, &reference.key);
         let read = |e: kube::Error| BundleError::Api(format!("reading {:?} {name}: {e}", reference.kind));
-        Ok(match reference.kind {
-            BundleKind::Secret => Box::pin(self.secrets.get_opt(name))
-                .await
-                .map_err(read)?
-                .map(|secret| {
-                    labelled(&secret.metadata, reference)?;
-                    let bytes = secret.data.and_then(|mut data| data.remove(key)).map(|bytes| bytes.0);
-                    Ok::<_, BundleError>((bytes, secret.metadata.resource_version))
-                })
-                .transpose()?,
-            BundleKind::ConfigMap => Box::pin(self.config_maps.get_opt(name))
-                .await
-                .map_err(read)?
-                .map(|map| {
-                    labelled(&map.metadata, reference)?;
-                    let text = map.data.and_then(|mut data| data.remove(key)).map(String::into_bytes);
-                    Ok::<_, BundleError>((text, map.metadata.resource_version))
-                })
-                .transpose()?,
-        })
+        let BundleKind::Secret = reference.kind;
+        Box::pin(self.secrets.get_opt(name))
+            .await
+            .map_err(read)?
+            .map(|secret| {
+                labelled(&secret.metadata, reference)?;
+                let bytes = secret.data.and_then(|mut data| data.remove(key)).map(|bytes| bytes.0);
+                Ok::<_, BundleError>((bytes, secret.metadata.resource_version))
+            })
+            .transpose()
     }
 }
 

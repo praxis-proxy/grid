@@ -5,7 +5,7 @@ templates:
 set:
   enrollment.url: https://enroll.example.com
   enrollment.siteName: site-d
-  enrollment.caBundle.configMap: grid-ca
+  enrollment.caBundle.secret: grid-ca
   enrollment.tokenSecretRef.name: grid-invite-site-d
 tests:
   - it: renders the site, its signer and its invite into the operator config
@@ -24,7 +24,7 @@ tests:
               signerEndpoint:
                 url: "https://enroll.example.com"
                 caBundleRef:
-                  kind: ConfigMap
+                  kind: Secret
                   name: "grid-ca"
                   key: "ca.crt"
                 rotation: "Disabled"
@@ -68,7 +68,6 @@ tests:
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.enabled: true
-      enrollment.caBundle.configMap: ""
       enrollment.caBundle.secret: grid-ca-bundle
       enrollment.caBundle.key: bundle.pem
     asserts:
@@ -110,7 +109,7 @@ tests:
     set:
       swim.siteName: hub
       enrollment.siteName: ""
-      enrollment.caBundle.configMap: ""
+      enrollment.caBundle.secret: ""
       enrollment.tokenSecretRef.name: ""
     asserts:
       - equal:
@@ -126,7 +125,7 @@ tests:
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.url: ""
-      enrollment.caBundle.configMap: ""
+      enrollment.caBundle.secret: ""
       enrollment.tokenSecretRef.name: ""
     asserts:
       - equal:
@@ -143,24 +142,55 @@ tests:
           path: data["config.yaml"]
           pattern: 'url: "https://grid-enrollment.grid-enrollment.svc:8443"'
 
-  - it: refuses a grid CA from both a ConfigMap and a Secret
+  - it: refuses a grid CA from a ConfigMap
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.enabled: true
-      enrollment.gridCaBundle.secret: a
       enrollment.gridCaBundle.configMap: b
     asserts:
       - failedTemplate:
           errorPattern: "enrollment[./]gridCaBundle"
 
-  - it: refuses a pin from both a ConfigMap and a Secret
+  - it: refuses a pin from a ConfigMap
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.enabled: true
-      enrollment.caBundle.secret: a
+      enrollment.caBundle.configMap: a
     asserts:
       - failedTemplate:
           errorPattern: "enrollment[./]caBundle"
+
+  - it: allows the signer host the URL names, by default
+    template: templates/deployment.yaml
+    set:
+      enrollment.enabled: true
+      enrollment.url: https://enroll.example.com:8443
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_SIGNER_HOSTS, value: "enroll.example.com:8443" }
+
+  - it: allows the signer hosts the install lists
+    template: templates/deployment.yaml
+    set:
+      enrollment.enabled: true
+      enrollment.signerHosts: [enroll.example.com, backup.example.com:8443]
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_SIGNER_HOSTS, value: "enroll.example.com,backup.example.com:8443" }
+
+  - it: names no signer hosts without a signer
+    template: templates/deployment.yaml
+    set:
+      enrollment.url: ""
+      enrollment.caBundle.secret: ""
+      enrollment.tokenSecretRef.name: ""
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          any: true
+          content: { name: GRID_SIGNER_HOSTS }
 
   - it: refuses a site name too long for its invite Secret
     template: templates/configmap-operator-config.yaml
@@ -185,7 +215,7 @@ tests:
       enrollment.enabled: true
       enrollment.siteName: ""
       enrollment.url: ""
-      enrollment.caBundle.configMap: ""
+      enrollment.caBundle.secret: ""
       enrollment.tokenSecretRef.name: ""
     asserts:
       - failedTemplate:
@@ -205,7 +235,7 @@ tests:
     set:
       enrollment.enabled: true
       enrollment.url: ""
-      enrollment.caBundle.configMap: ""
+      enrollment.caBundle.secret: ""
       enrollment.tokenSecretRef.name: ""
       enrollment.identitySecretName: east-identity
     asserts:
@@ -247,7 +277,7 @@ tests:
     set:
       enrollment.enabled: false
       enrollment.url: ""
-      enrollment.caBundle.configMap: ""
+      enrollment.caBundle.secret: ""
       enrollment.tokenSecretRef.name: ""
       enrollment.rotation: Disabled
     asserts:
@@ -277,7 +307,7 @@ tests:
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.enabled: true
-      enrollment.caBundle.configMap: ""
+      enrollment.caBundle.secret: ""
     asserts:
       - matchRegex:
           path: data["config.yaml"]
@@ -324,7 +354,7 @@ tests:
     template: templates/deployment.yaml
     set:
       enrollment.url: ""
-      enrollment.caBundle.configMap: ""
+      enrollment.caBundle.secret: ""
       enrollment.tokenSecretRef.name: ""
       site.name: ""
     asserts:

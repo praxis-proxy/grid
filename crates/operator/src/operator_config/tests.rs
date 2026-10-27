@@ -113,6 +113,40 @@ fn a_refused_field_is_named_in_the_message() {
 }
 
 #[test]
+fn a_bundle_must_be_a_secret() {
+    let why = refused(&FULL.replace(
+        "{kind: Secret, name: grid-ca-bundle}",
+        "{kind: ConfigMap, name: grid-ca}",
+    ));
+    assert!(why.contains("ConfigMap") && why.contains("Secret"), "{why}");
+}
+
+#[test]
+fn only_the_signer_hosts_the_install_allows_are_used() {
+    let allowed = SignerHosts::from_list(" grid-enrollment.grid-enrollment.svc:8443 , signer.example.com. ");
+    assert!(!allowed.is_any());
+    drop(parse_with(FULL, &allowed).expect("host and port match"));
+    let other_port = FULL.replace(":8443", ":9443");
+    assert!(
+        parse_with(&other_port, &allowed).is_err(),
+        "a host:port entry pins the port"
+    );
+    let any_port = FULL.replace("grid-enrollment.grid-enrollment.svc:8443", "SIGNER.example.com:9443");
+    assert!(
+        parse_with(&any_port, &allowed).is_ok(),
+        "a host entry allows any port, in any case"
+    );
+    let elsewhere = FULL.replace("grid-enrollment.grid-enrollment.svc", "attacker.example.net");
+    let why = parse_with(&elsewhere, &allowed).expect_err("refused");
+    assert!(
+        why.contains("site.signerEndpoint.url") && why.contains("attacker.example.net"),
+        "{why}"
+    );
+    assert!(SignerHosts::from_list(" , ").is_any(), "an empty list allows any");
+    drop(parse_with(&elsewhere, &SignerHosts::any()).expect("no list allows any host"));
+}
+
+#[test]
 fn a_config_map_without_the_key_is_invalid_and_never_absent() {
     let snapshot = Snapshot::of(&map(None));
     assert_eq!(snapshot.loaded, Loaded::Invalid(format!("{CONFIG_KEY}: key missing")));
@@ -143,7 +177,7 @@ static WATCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 fn watching() -> (Events, ConfigWatch) {
     let (events_tx, events_rx) = futures::channel::mpsc::unbounded();
     let (tx, rx) = tokio::sync::watch::channel(Arc::new(Snapshot::unread()));
-    drop(tokio::spawn(follow(events_rx, tx, None)));
+    drop(tokio::spawn(follow(events_rx, tx, None, SignerHosts::any())));
     (events_tx, ConfigWatch(rx))
 }
 
@@ -164,7 +198,7 @@ async fn the_watch_picks_up_an_edit() {
 
     let edited = FULL.replace(
         "caBundleRef: {kind: Secret, name: grid-ca-bundle}",
-        "caBundleRef: {kind: ConfigMap, name: grid-ca}",
+        "caBundleRef: {kind: Secret, name: grid-ca}",
     );
     send(&events, watcher::Event::Apply(map(Some(&edited))));
     config.changed().await;
@@ -179,7 +213,7 @@ async fn the_watch_picks_up_an_edit() {
     .expect("pin");
     assert_eq!(
         (pin.kind, pin.name.as_str()),
-        (BundleKind::ConfigMap, "grid-ca"),
+        (BundleKind::Secret, "grid-ca"),
         "the edit applies"
     );
 }
@@ -237,7 +271,10 @@ async fn a_relist_without_the_config_map_reads_absent() {
 
 #[test]
 fn a_relist_publishes_only_once_it_completes() {
-    let mut fold = Fold::default();
+    let mut fold = Fold {
+        hosts: SignerHosts::any(),
+        relisting: None,
+    };
     assert_eq!(fold.apply(watcher::Event::Init), None);
     assert_eq!(fold.apply(watcher::Event::InitApply(map(Some(FULL)))), None);
     let done = fold.apply(watcher::Event::InitDone).expect("published");

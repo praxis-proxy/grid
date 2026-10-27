@@ -87,7 +87,7 @@ pub struct SignerEndpoint {
     pub rotation: Rotation,
 }
 
-/// A PEM bundle in a `Secret` or `ConfigMap` in the operator namespace. The object must
+/// A PEM bundle in a `Secret` in the operator namespace. The object must
 /// carry the label `grid.praxis.fast/signer-bundle: "true"`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -101,13 +101,12 @@ pub struct BundleRef {
     pub key: String,
 }
 
-/// Kind of object a [`BundleRef`] names.
+/// Kind of object a [`BundleRef`] names. Only a `Secret`: a `ConfigMap` bundle could be
+/// created by anyone who can edit this config, pinning a signer of their own.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum BundleKind {
     /// A `Secret`.
     Secret,
-    /// A `ConfigMap`.
-    ConfigMap,
 }
 
 /// The invite token's `Secret` in the operator namespace. The Secret must carry the label
@@ -157,13 +156,63 @@ impl BundleRef {
     }
 }
 
+/// The signer hosts the install allows, set where the operator runs and never in its config,
+/// so an edit to the config cannot point enrollment at a signer of its own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SignerHosts(Option<Vec<String>>);
+
+impl SignerHosts {
+    /// Any host: the install names none.
+    #[must_use]
+    pub const fn any() -> Self {
+        Self(None)
+    }
+
+    /// The hosts in `list`, comma-separated, each `host` or `host:port`. Empty allows any.
+    #[must_use]
+    pub fn from_list(list: &str) -> Self {
+        let hosts: Vec<String> = list
+            .split(',')
+            .map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
+            .filter(|host| !host.is_empty())
+            .collect();
+        Self((!hosts.is_empty()).then_some(hosts))
+    }
+
+    /// Whether the install names no hosts, so any is used.
+    #[must_use]
+    pub const fn is_any(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// Refuse `url` unless its host, or its host and port, is allowed.
+    fn admit(&self, url: &reqwest::Url) -> Result<(), String> {
+        let Some(hosts) = &self.0 else {
+            return Ok(());
+        };
+        let host = url
+            .host_str()
+            .unwrap_or_default()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        let with_port = format!("{host}:{}", url.port_or_known_default().unwrap_or(443));
+        if hosts.iter().any(|allowed| *allowed == host || *allowed == with_port) {
+            return Ok(());
+        }
+        Err(format!(
+            "site.signerEndpoint.url: host {host} is not a signer this install allows ({})",
+            hosts.join(", ")
+        ))
+    }
+}
+
 impl SiteConfig {
     /// Refuse what the operator cannot act on, naming the field.
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self, hosts: &SignerHosts) -> Result<(), String> {
         certs::validate_site_name(&self.name).map_err(|e| format!("site.name: {e}"))?;
         if let Some(signer) = &self.signer_endpoint {
             bounded("site.signerEndpoint.url", &signer.url, MAX_URL)?;
-            crate::enroll::signer_url(&signer.url)?;
+            hosts.admit(&crate::enroll::signer_url(&signer.url)?)?;
             if let Some(pin) = &signer.ca_bundle_ref {
                 pin.validate("site.signerEndpoint.caBundleRef")?;
             }
@@ -203,13 +252,23 @@ pub struct Parsed {
     pub ignored: Vec<String>,
 }
 
-/// Parse and validate the document `text`. An empty document sets nothing.
+/// Parse and validate the document `text`, allowing any signer host. An empty document sets
+/// nothing.
 ///
 /// # Errors
 ///
 /// Why the document is refused, naming the field at fault: an unsupported `version`, or an
 /// unknown or invalid field inside a known section.
 pub fn parse(text: &str) -> Result<Parsed, String> {
+    parse_with(text, &SignerHosts::any())
+}
+
+/// Parse and validate the document `text`, allowing only the signer `hosts`.
+///
+/// # Errors
+///
+/// As [`parse`], and a signer host `hosts` does not allow.
+pub fn parse_with(text: &str, hosts: &SignerHosts) -> Result<Parsed, String> {
     let value: serde_yaml::Value = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
     let mut document = match value {
         serde_yaml::Value::Null => return Ok(Parsed::default()),
@@ -231,7 +290,7 @@ pub fn parse(text: &str) -> Result<Parsed, String> {
     let known = serde_yaml::to_string(&document).map_err(|e| e.to_string())?;
     let config: OperatorConfig = serde_yaml::from_str(&known).map_err(|e| e.to_string())?;
     if let Some(site) = &config.site {
-        site.validate()?;
+        site.validate(hosts)?;
     }
     Ok(Parsed { config, ignored })
 }
@@ -365,12 +424,18 @@ impl Snapshot {
         }
     }
 
-    /// What `map` holds.
+    /// What `map` holds, allowing any signer host.
     #[must_use]
     pub fn of(map: &ConfigMap) -> Self {
+        Self::read(map, &SignerHosts::any())
+    }
+
+    /// What `map` holds, allowing only the signer `hosts`.
+    #[must_use]
+    pub fn read(map: &ConfigMap, hosts: &SignerHosts) -> Self {
         let parsed = match map.data.as_ref().and_then(|data| data.get(CONFIG_KEY)) {
             None => Err(format!("{CONFIG_KEY}: key missing")),
-            Some(text) => parse(text),
+            Some(text) => parse_with(text, hosts),
         };
         let (loaded, ignored) = match parsed {
             Ok(Parsed { config, ignored }) => (Loaded::Valid(Box::new(config)), ignored),
@@ -389,14 +454,14 @@ impl Snapshot {
 pub struct ConfigWatch(tokio::sync::watch::Receiver<Arc<Snapshot>>);
 
 impl ConfigWatch {
-    /// Watch the `ConfigMap` `name` in `namespace`.
+    /// Watch the `ConfigMap` `name` in `namespace`, allowing only the signer `hosts`.
     #[must_use]
-    pub fn spawn(client: Client, namespace: &str, name: &str) -> Self {
+    pub fn spawn(client: Client, namespace: &str, name: &str, hosts: SignerHosts) -> Self {
         let api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
         let events =
             watcher(api, watcher::Config::default().fields(&format!("metadata.name={name}"))).default_backoff();
         let (tx, rx) = tokio::sync::watch::channel(Arc::new(Snapshot::unread()));
-        drop(tokio::spawn(follow(events, tx, Some(client))));
+        drop(tokio::spawn(follow(events, tx, Some(client), hosts)));
         Self(rx)
     }
 
@@ -438,11 +503,11 @@ impl ConfigWatch {
 }
 
 /// Fold watch `events` into `tx` until every receiver is gone.
-async fn follow<S>(events: S, tx: tokio::sync::watch::Sender<Arc<Snapshot>>, client: Option<Client>)
+async fn follow<S>(events: S, tx: tokio::sync::watch::Sender<Arc<Snapshot>>, client: Option<Client>, hosts: SignerHosts)
 where
     S: Stream<Item = Result<watcher::Event<ConfigMap>, watcher::Error>> + Send,
 {
-    let mut fold = Fold::default();
+    let mut fold = Fold { hosts, relisting: None };
     let mut events = std::pin::pin!(events);
     while let Some(event) = events.next().await {
         let next = match event {
@@ -529,6 +594,8 @@ async fn note_ignored(client: Option<&Client>, snapshot: &Snapshot) {
 /// Watch events folded into what the `ConfigMap` holds.
 #[derive(Debug, Default)]
 struct Fold {
+    /// The signer hosts the install allows.
+    hosts: SignerHosts,
     /// What a relist found so far, published once it completes.
     relisting: Option<Snapshot>,
 }
@@ -542,11 +609,11 @@ impl Fold {
                 None
             },
             watcher::Event::InitApply(map) => {
-                self.relisting = Some(Snapshot::of(&map));
+                self.relisting = Some(Snapshot::read(&map, &self.hosts));
                 None
             },
             watcher::Event::InitDone => Some(self.relisting.take().unwrap_or_else(Snapshot::absent)),
-            watcher::Event::Apply(map) => Some(Snapshot::of(&map)),
+            watcher::Event::Apply(map) => Some(Snapshot::read(&map, &self.hosts)),
             watcher::Event::Delete(_) => Some(Snapshot::absent()),
         }
     }
