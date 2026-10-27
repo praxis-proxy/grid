@@ -124,7 +124,7 @@ fn managers() -> BTreeMap<&'static str, &'static str> {
 
 /// The reasons the enrollment step writes, by type and status. `Available` copies the
 /// first failing gate's reason, so it carries the gates' reasons.
-const REASONS: [(&str, &str, &str); 41] = [
+const REASONS: [(&str, &str, &str); 45] = [
     (AVAILABLE, "True", "Available"),
     (AVAILABLE, "False", "AwaitingInvite"),
     (AVAILABLE, "False", "InviteMaybeSpent"),
@@ -141,6 +141,10 @@ const REASONS: [(&str, &str, &str); 41] = [
     (IDENTITY_VALID, "False", "CertificateUntrusted"),
     (IDENTITY_VALID, "False", "CertificateNameMismatch"),
     (IDENTITY_VALID, "False", "CertificateKeyMismatch"),
+    (IDENTITY_VALID, "False", "CertificateDnsNameMissing"),
+    (IDENTITY_VALID, "False", "CertificateOrganizationMismatch"),
+    (AVAILABLE, "False", "CertificateDnsNameMissing"),
+    (AVAILABLE, "False", "CertificateOrganizationMismatch"),
     (AVAILABLE, "False", "CertificateUntrusted"),
     (AVAILABLE, "False", "CertificateNameMismatch"),
     (AVAILABLE, "False", "CertificateKeyMismatch"),
@@ -259,7 +263,7 @@ async fn invariant_6_deleting_the_identity_secret_turns_available_false_in_the_s
 /// the grid CA Secret.
 fn store_identity(api: &FakeApi) {
     let ca = certs::generate_ca("grid-ca").expect("ca");
-    let leaf = certs::generate_dns_cert(&ca, SITE, SITE).expect("leaf");
+    let leaf = certs::generate_site_cert(&ca, SITE).expect("leaf");
     store_pair(api, &ca.cert_pem, &leaf.cert_pem, &leaf.key_pem);
 }
 
@@ -296,7 +300,7 @@ async fn invariant_8_an_identity_another_ca_issued_is_certificate_untrusted() {
         |api| {
             let held = certs::generate_ca("grid-ca").expect("ca");
             let other = certs::generate_ca("other-ca").expect("ca");
-            let leaf = certs::generate_dns_cert(&other, SITE, SITE).expect("leaf");
+            let leaf = certs::generate_site_cert(&other, SITE).expect("leaf");
             store_pair(api, &held.cert_pem, &leaf.cert_pem, &leaf.key_pem);
         },
         "CertificateUntrusted",
@@ -313,7 +317,7 @@ async fn invariant_8_an_identity_for_another_site_is_certificate_name_mismatch()
     let message = refused_identity(
         |api| {
             let ca = certs::generate_ca("grid-ca").expect("ca");
-            let leaf = certs::generate_dns_cert(&ca, "site-e", "site-e").expect("leaf");
+            let leaf = certs::generate_site_cert(&ca, "site-e").expect("leaf");
             store_pair(api, &ca.cert_pem, &leaf.cert_pem, &leaf.key_pem);
         },
         "CertificateNameMismatch",
@@ -330,8 +334,8 @@ async fn invariant_8_an_identity_with_another_key_is_certificate_key_mismatch() 
     let message = refused_identity(
         |api| {
             let ca = certs::generate_ca("grid-ca").expect("ca");
-            let leaf = certs::generate_dns_cert(&ca, SITE, SITE).expect("leaf");
-            let other = certs::generate_dns_cert(&ca, SITE, SITE).expect("leaf");
+            let leaf = certs::generate_site_cert(&ca, SITE).expect("leaf");
+            let other = certs::generate_site_cert(&ca, SITE).expect("leaf");
             store_pair(api, &ca.cert_pem, &leaf.cert_pem, &other.key_pem);
         },
         "CertificateKeyMismatch",
@@ -886,5 +890,39 @@ async fn invariant_8_an_unrenewed_identity_reads_overdue_once_the_grace_runs_out
             .contains("site-d-identity"),
         "names the Certificate that has not replaced it: {}",
         rotation["message"]
+    );
+}
+
+#[tokio::test]
+async fn invariant_8_an_identity_without_the_dns_name_peers_dial_is_certificate_dns_name_missing() {
+    let message = refused_identity(
+        |api| {
+            let ca = certs::generate_ca("grid-ca").expect("ca");
+            let leaf = certs::generate_dns_cert(&ca, SITE, "site-d.example.com").expect("leaf");
+            store_pair(api, &ca.cert_pem, &leaf.cert_pem, &leaf.key_pem);
+        },
+        "CertificateDnsNameMissing",
+    )
+    .await;
+    assert!(
+        message.contains("site-d.grid.internal"),
+        "names the DNS name to issue: {message}"
+    );
+}
+
+#[tokio::test]
+async fn invariant_8_an_identity_naming_another_organization_is_certificate_organization_mismatch() {
+    let message = refused_identity(
+        |api| {
+            let ca = certs::generate_ca("grid-ca").expect("ca");
+            let leaf = certs::generate_cert_with_org(&ca, SITE, "acme").expect("leaf");
+            store_pair(api, &ca.cert_pem, &leaf.cert_pem, &leaf.key_pem);
+        },
+        "CertificateOrganizationMismatch",
+    )
+    .await;
+    assert!(
+        message.contains("O=site-d"),
+        "names the organization to issue: {message}"
     );
 }

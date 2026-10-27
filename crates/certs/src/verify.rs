@@ -288,6 +288,20 @@ pub fn cert_dns_sans(cert_pem: &str) -> Result<Vec<String>, VerifyError> {
     })
 }
 
+/// The subject organizations on a certificate, as encoded.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the certificate is oversized or unparseable.
+pub fn cert_organizations(cert_pem: &str) -> Result<Vec<String>, VerifyError> {
+    with_cert(cert_pem, |cert| {
+        cert.subject()
+            .iter_organization()
+            .filter_map(|organization| organization.as_str().ok().map(str::to_owned))
+            .collect()
+    })
+}
+
 /// The public key a certificate request carries, as `SubjectPublicKeyInfo` DER.
 ///
 /// An enrollee proves it is the one that made a request by signing with the key
@@ -494,6 +508,18 @@ mod tests {
         enroll::sign_csr,
         generate::{generate_ca, generate_expired_dns_cert, generate_site_cert},
     };
+
+    #[test]
+    fn a_site_certificate_names_its_site_as_organization_and_grid_dns_name() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let leaf = generate_site_cert(&ca, "east").expect("leaf");
+        assert_eq!(cert_organizations(&leaf.cert_pem).expect("parses"), ["east"]);
+        assert_eq!(cert_dns_sans(&leaf.cert_pem).expect("parses"), ["east.grid.internal"]);
+        assert!(
+            cert_organizations(&ca.cert_pem).expect("parses").is_empty(),
+            "a CA names no site"
+        );
+    }
 
     fn csr_for(_site: &str) -> String {
         let key = rcgen::KeyPair::generate().expect("key");

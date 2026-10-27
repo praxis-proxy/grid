@@ -886,6 +886,8 @@ enum Identity {
     NameMismatch(String),
     /// The key is not the certificate's: what to fix.
     KeyMismatch(String),
+    /// Missing what peers check, with the reason naming the field and what to fix.
+    Unservable(&'static str, String),
     /// Usable until this instant, with the fingerprint peers pin.
     Valid(OffsetDateTime, String),
 }
@@ -1000,11 +1002,41 @@ fn held_by(held: &Held, target: &Target, site: Option<&str>) -> Result<(), Ident
         None => certs::verify_issued_by(&held.ca, &held.cert),
     };
     checked.map_err(|error| untrusted(&error, target, site))?;
+    if let Some(site) = site {
+        served_as(&held.cert, target, site)?;
+    }
     if !certs::key_matches_cert(&held.key, &held.cert) {
         return Err(Identity::KeyMismatch(format!(
             "tls.key in Secret {} is not the key of its tls.crt; write the certificate and its key together",
             target.site_secret
         )));
+    }
+    Ok(())
+}
+
+/// Whether `cert`, in `target`, carries what peers check for `site`: the DNS name they dial
+/// and the organization a gateway authorizes on.
+fn served_as(cert: &str, target: &Target, site: &str) -> Result<(), Identity> {
+    let secret = &target.site_secret;
+    let dns = format!("{site}.{}", certs::SPIFFE_TRUST_DOMAIN);
+    let named = certs::cert_dns_sans(cert)
+        .unwrap_or_default()
+        .iter()
+        .any(|san| san.eq_ignore_ascii_case(&dns));
+    if !named {
+        return Err(Identity::Unservable(
+            "CertificateDnsNameMissing",
+            format!("tls.crt in Secret {secret} lacks the DNS name {dns} peers dial; issue it with that name"),
+        ));
+    }
+    if certs::cert_organizations(cert).unwrap_or_default() != [site] {
+        return Err(Identity::Unservable(
+            "CertificateOrganizationMismatch",
+            format!(
+                "tls.crt in Secret {secret} must name organization {site} alone, which a gateway authorizes \
+                 peers on; issue it with subject O={site}"
+            ),
+        ));
     }
     Ok(())
 }
@@ -1231,6 +1263,7 @@ fn identity_verdict(identity: &Identity) -> Verdict {
         Identity::Untrusted(why) => Verdict::new("False", "CertificateUntrusted", why.clone()),
         Identity::NameMismatch(why) => Verdict::new("False", "CertificateNameMismatch", why.clone()),
         Identity::KeyMismatch(why) => Verdict::new("False", "CertificateKeyMismatch", why.clone()),
+        Identity::Unservable(reason, why) => Verdict::new("False", *reason, why.clone()),
         Identity::Valid(at, fingerprint) => Verdict::new(
             "True",
             local::IDENTITY_VALID,

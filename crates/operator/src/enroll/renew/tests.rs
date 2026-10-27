@@ -682,7 +682,7 @@ fn only_the_operator_config_names_the_signer() {
 /// An identity for `east` from a fresh grid CA.
 fn held_identity() -> Held {
     let ca = certs::generate_ca("grid-ca").expect("ca");
-    let leaf = certs::generate_dns_cert(&ca, "east", "east").expect("leaf");
+    let leaf = certs::generate_site_cert(&ca, "east").expect("leaf");
     Held {
         cert: leaf.cert_pem,
         key: Zeroizing::new(leaf.key_pem),
