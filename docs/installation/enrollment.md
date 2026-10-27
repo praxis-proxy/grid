@@ -144,8 +144,10 @@ kubectl -n grid-system label secret grid-invite-east2 grid.praxis.fast/site=east
      --set enrollment.url=https://enrollment.apps.example.com
    ```
 
-   On the hub itself, `enrollment.url` defaults to the in-cluster `grid-enrollment`
-   Service in `rbac.enrollmentNamespace`.
+   Off the hub `enrollment.url` is required, and the render fails without it. On the hub
+   itself, set `enrollment.hub=true` instead: the URL defaults to the in-cluster Service
+   `enrollment.hubService` (default `grid-enrollment`, the grid-enrollment release's full
+   name and the name its serving certificate carries) in `rbac.enrollmentNamespace`.
 
 2. Create the site's GridSite, named `site.name`, with the grid-site chart or by hand.
    The operator sends nothing until it exists, and records an `AwaitingGridSite` Event
@@ -297,7 +299,7 @@ Requirements:
    gateway reads its client certificate only at start. The chart grants `get`
    and `patch` on that Deployment. A hub declares its signer the same way: the
    grid-operator chart renders `site.signerEndpoint` from `enrollment.url`,
-   which defaults to the in-cluster enrollment Service with `enrollment.enabled`.
+   which defaults to the in-cluster enrollment Service with `enrollment.hub`.
    A hub installed without either does not renew and reports
    `RotationDisabled`, then `RotationOverdue`.
 5. Keep clocks on the enrollment service and its database within five minutes of

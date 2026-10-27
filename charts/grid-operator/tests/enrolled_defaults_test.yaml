@@ -13,6 +13,7 @@ tests:
     set:
       swim.siteName: hub
       enrollment.enabled: true
+      enrollment.hub: true
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
@@ -29,6 +30,7 @@ tests:
     set:
       swim.siteName: hub
       enrollment.enabled: true
+      enrollment.hub: true
     asserts:
       - equal:
           path: data["config.yaml"]
@@ -52,6 +54,7 @@ tests:
       swim.siteName: hub
       grid.peerTrust: spiffe
       enrollment.enabled: true
+      enrollment.hub: true
     asserts:
       - notMatchRegex:
           path: data["config.yaml"]
@@ -62,6 +65,7 @@ tests:
     set:
       swim.siteName: hub
       enrollment.enabled: true
+      enrollment.hub: true
     asserts:
       - equal:
           path: spec.type
@@ -72,6 +76,7 @@ tests:
     set:
       swim.siteName: hub
       enrollment.enabled: true
+      enrollment.hub: true
       swim.service.enabled: false
     asserts:
       - hasDocuments:
@@ -99,6 +104,7 @@ tests:
     set:
       swim.siteName: hub
       enrollment.enabled: true
+      enrollment.hub: true
     asserts:
       - failedTemplate:
           errorPattern: must not get operator Secret access

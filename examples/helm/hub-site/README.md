@@ -31,7 +31,7 @@ The commands run from the repository root. Enrollment runs in its own namespace,
 helm upgrade --install grid-enrollment charts/grid-enrollment -n grid-enrollment --create-namespace \
   --set host=enroll.grid.example.com --set invites.hub.network=grid --set invites.site-a.network=grid
 helm upgrade --install grid-operator charts/grid-operator -n grid --create-namespace \
-  --set swim.siteName=hub --set enrollment.enabled=true
+  --set swim.siteName=hub --set enrollment.enabled=true --set enrollment.hub=true
 kubectl -n grid-enrollment get secret grid-ca-bundle -o jsonpath='{.data.ca\.crt}' | base64 -d \
   | kubectl -n grid create secret generic grid-ca-bundle --from-file=ca.crt=/dev/stdin
 kubectl -n grid-enrollment get secret grid-invite-hub -o jsonpath='{.data.token}' | base64 -d \

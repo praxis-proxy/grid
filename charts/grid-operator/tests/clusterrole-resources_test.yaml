@@ -45,6 +45,7 @@ tests:
   - it: lets rotation roll only the gateway Deployment
     set:
       enrollment.enabled: true
+      enrollment.hub: true
     asserts:
       - contains:
           path: rules

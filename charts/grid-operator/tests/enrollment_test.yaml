@@ -12,6 +12,7 @@ tests:
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
     asserts:
       - equal:
           path: metadata.name
@@ -36,6 +37,7 @@ tests:
     template: templates/deployment.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       operatorConfig.name: site-d-operator
     asserts:
       - contains:
@@ -68,6 +70,7 @@ tests:
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       enrollment.caBundle.secret: grid-ca-bundle
       enrollment.caBundle.key: bundle.pem
     asserts:
@@ -79,6 +82,7 @@ tests:
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       enrollment.tokenSecretRef.key: site-token
     asserts:
       - matchRegex:
@@ -89,6 +93,7 @@ tests:
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       enrollment.gridCaBundle.secret: grid-ca-anchor
     asserts:
       - matchRegex:
@@ -99,6 +104,7 @@ tests:
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
     asserts:
       - notMatchRegex:
           path: data["config.yaml"]
@@ -136,16 +142,40 @@ tests:
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       enrollment.url: ""
     asserts:
       - matchRegex:
           path: data["config.yaml"]
           pattern: 'url: "https://grid-enrollment.grid-enrollment.svc:8443"'
 
+  - it: names a renamed grid-enrollment release's Service, the name its serving certificate carries
+    template: templates/configmap-operator-config.yaml
+    set:
+      enrollment.enabled: true
+      enrollment.hub: true
+      enrollment.hubService: odh-enrollment
+      enrollment.url: ""
+      rbac.enrollmentNamespace: odh-ai-grid-enrollment
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'url: "https://odh-enrollment.odh-ai-grid-enrollment.svc:8443"'
+
+  - it: requires the signer URL off the hub, where no grid-enrollment Service exists
+    template: templates/deployment.yaml
+    set:
+      enrollment.enabled: true
+      enrollment.url: ""
+    asserts:
+      - failedTemplate:
+          errorPattern: "enrollment.url is required"
+
   - it: refuses a grid CA from a ConfigMap
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       enrollment.gridCaBundle.configMap: b
     asserts:
       - failedTemplate:
@@ -155,6 +185,7 @@ tests:
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       enrollment.caBundle.configMap: a
     asserts:
       - failedTemplate:
@@ -174,6 +205,7 @@ tests:
     template: templates/deployment.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       enrollment.signerHosts: [enroll.example.com, backup.example.com:8443]
     asserts:
       - contains:
@@ -214,6 +246,7 @@ tests:
     set:
       enrollment.enabled: true
       enrollment.siteName: ""
+      enrollment.hub: true
       enrollment.url: ""
       enrollment.caBundle.secret: ""
       enrollment.tokenSecretRef.name: ""
@@ -234,6 +267,7 @@ tests:
     template: templates/deployment.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       enrollment.url: ""
       enrollment.caBundle.secret: ""
       enrollment.tokenSecretRef.name: ""
@@ -247,6 +281,7 @@ tests:
     set:
       grid.peerTrust: spiffe
       enrollment.enabled: true
+      enrollment.hub: true
       enrollment.rotation: Disabled
     asserts:
       - matchRegex:
@@ -257,6 +292,7 @@ tests:
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
     asserts:
       - matchRegex:
           path: data["config.yaml"]
@@ -267,6 +303,7 @@ tests:
     set:
       grid.peerTrust: spiffe
       enrollment.enabled: true
+      enrollment.hub: true
     asserts:
       - notMatchRegex:
           path: data["config.yaml"]
@@ -288,6 +325,7 @@ tests:
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       enrollment.rotation.enabled: false
     asserts:
       - failedTemplate:
@@ -297,6 +335,7 @@ tests:
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       enrollment.tokenSecretRef.name: ""
     asserts:
       - matchRegex:
@@ -307,6 +346,7 @@ tests:
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       enrollment.caBundle.secret: ""
     asserts:
       - matchRegex:
@@ -317,6 +357,7 @@ tests:
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       enrollment.caBundle: null
       enrollment.tokenSecretRef: null
     asserts:
@@ -331,6 +372,7 @@ tests:
     template: templates/deployment.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
@@ -342,6 +384,7 @@ tests:
     template: templates/deployment.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       swim.siteName: other
     asserts:
       - contains:

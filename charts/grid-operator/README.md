@@ -238,7 +238,9 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `operatorConfig.create` | bool | `true` | Render the ConfigMap holding this operator's own settings. Set `false` to manage it yourself under `operatorConfig.name`. |
 | `operatorConfig.name` | string | `grid-operator-config` | ConfigMap name, in the release namespace. The operator watches it, so an edit applies without a restart. |
 | `enrollment.enabled` | bool | `false` | This site enrolls: turns on the SWIM LoadBalancer Service, site-identity metrics TLS and the enrollment namespace guard, and renders the signer and the invite into the operator config's `site` section. |
-| `enrollment.url` | string | `""` | Signer base URL (https), `site.signerEndpoint.url`. Defaults to the in-cluster `grid-enrollment` Service in `rbac.enrollmentNamespace` with `enabled`. Set alone on a hub whose identity bootstrap issued, it renders a `site` section that renews only. |
+| `enrollment.url` | string | `""` | Signer base URL (https), `site.signerEndpoint.url`. Required unless `enrollment.hub` is set. Set alone on a hub whose identity bootstrap issued, it renders a `site` section that renews only. |
+| `enrollment.hub` | bool | `false` | The grid-enrollment release runs on this cluster, so `enrollment.url` defaults to its Service in `rbac.enrollmentNamespace`. |
+| `enrollment.hubService` | string | `grid-enrollment` | With `hub` set and no `url`, the grid-enrollment release's full name: its Service and the in-cluster name its serving certificate carries. |
 | `enrollment.siteName` | string | `""` | Site name the token pins, at most 51 characters, and the GridSite's name: `site.name`. Defaults to `swim.siteName`. |
 | `enrollment.caBundle` | object | `{secret: "", key: ca.crt}` | `site.signerEndpoint.caBundleRef`, a Secret, since anyone who can edit a ConfigMap could pin a signer of their own. Unset, Secret `grid-ca-bundle` when `enabled`. |
 | `enrollment.signerHosts` | list | `[]` | Signer hosts the operator config may name, each `host` or `host:port`, as `GRID_SIGNER_HOSTS`. Empty defaults to the host and port of `enrollment.url`. |

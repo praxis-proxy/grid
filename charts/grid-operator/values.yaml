@@ -343,10 +343,15 @@ enrollment:
   # -- Name the signer and the invite, so the operator enrolls the site while it has no
   # identity, then renews through the same signer.
   enabled: false
-  # -- Signer https base URL, the config's site.signerEndpoint.url. Defaults to the
-  # in-cluster grid-enrollment Service in rbac.enrollmentNamespace, the hub's own. A hub
-  # whose identity bootstrap issued sets only this and renews pinned to the grid CA it holds.
+  # -- Signer https base URL, the config's site.signerEndpoint.url. Required unless hub is
+  # set, which defaults it to the in-cluster grid-enrollment Service in
+  # rbac.enrollmentNamespace.
   url: ""
+  # -- The grid-enrollment release runs on this cluster, so url defaults to its Service.
+  hub: false
+  # -- With hub set and no url, the grid-enrollment release's full name: its Service, and
+  # the in-cluster name its serving certificate carries.
+  hubService: grid-enrollment
   # -- Site name the token pins, at most 51 characters, and the GridSite's name: the config's
   # site.name. Defaults to swim.siteName.
   siteName: ""
