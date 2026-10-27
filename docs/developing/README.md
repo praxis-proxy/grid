@@ -135,9 +135,11 @@ curl -s http://127.0.0.1:9901/metrics | grep -E '^grid_route_(site_rho|site_in_f
 
 `grid_route_site_in_flight` for `site-a` reads 8 and its `grid_route_site_rho`,
 the saturation the gateway routes on, climbs past 0.5 while `hub-local` stays at
-0. To see the decisions themselves, send requests through the hub gateway and
-count the site each answer names. A site answer carries `x-grid-provider-site`;
-one the hub served itself carries only `x-grid-site: hub`:
+0. `grid_route_site_weight` stays at 8 for both: the pick moves on rho and
+in-flight, not on weight. To see the decisions themselves, send requests through
+the hub gateway and count the site each answer names. A site answer carries
+`x-grid-provider-site`; an answer the hub served itself carries only
+`x-grid-site: hub`:
 
 ```bash
 kubectl --context kind-grid-hub-site-llmd-hub -n grid port-forward service/grid-gateway 18080:8080 &
