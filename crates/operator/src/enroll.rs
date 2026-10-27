@@ -800,11 +800,27 @@ async fn sent<S: Store + Sync, G: Signer + Sync>(
             ),
             refused: true,
         }),
+        // A request the signer never answered stays unanswered: an answer may still be out
+        // there, so a later refusal reads as one after a lost answer.
+        Err(error) if resent && !answered_by_signer(&error) => Err(error),
         Err(error) => {
             held.answered(store, settings.backoff.started_now()).await?;
             Err(error)
         },
     }
+}
+
+/// Whether `error` is the signer's answer to the request, rather than a failure to reach it,
+/// trust it, or build the request.
+const fn answered_by_signer(error: &EnrollError) -> bool {
+    matches!(
+        error,
+        EnrollError::TokenRejected(_)
+            | EnrollError::NameTaken(_)
+            | EnrollError::NameDeleted(_)
+            | EnrollError::Refused(_)
+            | EnrollError::InvalidResponse(_)
+    )
 }
 
 /// Present the invite to `signer`, retrying only a request that never left.

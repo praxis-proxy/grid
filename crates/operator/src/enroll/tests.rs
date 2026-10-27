@@ -1051,6 +1051,65 @@ async fn transient_write_failures_keep_retrying_rather_than_lose_the_identity() 
 }
 
 #[tokio::test]
+async fn an_identity_write_the_budget_gave_up_on_is_the_stores_and_the_next_poll_stores_the_kept_answer() {
+    let (mock, settings) = serve(Reply::Sign).await;
+    let store = FakeStore {
+        writes_fail: WriteFailure::IdentityCreates,
+        ..FakeStore::invited()
+    };
+    let outcome = run_flow(&store, &settings).await;
+    assert!(
+        matches!(outcome, Err(EnrollError::Kube(_))),
+        "a write given up on is StoreUnavailable, not a spent token: {outcome:?}"
+    );
+    assert!(
+        store.value(&pending_name(), "tls.crt").is_some(),
+        "the issued answer stays kept beside the identity"
+    );
+    assert_eq!(mock.calls(), 1);
+    let store = FakeStore {
+        secrets: Mutex::new(store.secrets.into_inner().expect("lock")),
+        ..FakeStore::default()
+    };
+    let stored_later = run_flow(&store, &settings).await;
+    assert!(matches!(stored_later, Ok(Outcome::Enrolled(_))), "{stored_later:?}");
+    assert_eq!(
+        mock.calls(),
+        1,
+        "the kept answer is stored without asking the signer again"
+    );
+    assert!(store.value("site-tls", "tls.crt").is_some());
+}
+
+#[tokio::test]
+async fn a_lost_answer_stays_lost_through_a_failure_the_signer_did_not_answer() {
+    let (mock, settings) = serve(Reply::Timeout).await;
+    let store = FakeStore::invited();
+    let lost = run_flow(&store, &settings).await;
+    assert!(
+        matches!(lost, Err(EnrollError::MaybeSpent { refused: false, .. })),
+        "{lost:?}"
+    );
+
+    // The signer's serving certificate lapses: no request reaches it, so the earlier one is
+    // still unanswered.
+    let (url, pin) = byo_serving_signer(&mock.ca.cert_pem, Router::new(), true).await;
+    let mut lapsed = mock_settings(&settings);
+    lapsed.base = signer::SignerUrl::parse(url.as_str()).expect("url");
+    lapsed.pin_pem = pin;
+    let tls = run_flow(&store, &lapsed).await;
+    assert!(matches!(tls, Err(EnrollError::SignerLapsed(_))), "{tls:?}");
+
+    mock.answer(Reply::Spent);
+    let outcome = run_flow(&store, &settings).await;
+    assert!(
+        matches!(outcome, Err(EnrollError::MaybeSpent { refused: true, .. })),
+        "a refusal after the lost answer still reads as one, whatever failed in between: {outcome:?}"
+    );
+    assert_eq!(mock.calls(), 2, "the lapsed signer never saw the request");
+}
+
+#[tokio::test]
 async fn an_existing_matching_ca_secret_is_kept() {
     let (mock, settings) = serve(Reply::Sign).await;
     let store = FakeStore::invited();
