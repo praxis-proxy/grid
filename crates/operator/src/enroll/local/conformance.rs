@@ -926,3 +926,87 @@ async fn invariant_8_an_identity_naming_another_organization_is_certificate_orga
         "names the organization to issue: {message}"
     );
 }
+
+#[tokio::test]
+async fn invariant_5_a_site_name_change_writes_nothing_to_any_grid_site() {
+    let api = seeded();
+    let mut observed = rounds(&api, &config(""), 2, |_round| {}).await;
+    let renamed: OperatorConfig = parse("site:\n  name: site-e\n").expect("config parses").config;
+    observed.extend(rounds(&api, &Snapshot::of_config(renamed), 2, |_round| {}).await);
+
+    invariants::one_manager_per_type(&api.writes(), PATH, &managers()).expect("invariant 5");
+    assert!(
+        api.writes().iter().all(|write| !write.path.contains("/gridsites")),
+        "the operator's conditions live on the GridNetwork, so a rename clears nothing elsewhere"
+    );
+    assert_eq!(
+        available_of(&observed[3]).0,
+        "False",
+        "the renamed site still waits for its invite"
+    );
+}
+
+/// The operator config naming the signer at `base`, pinned to `ca_pem`, and the invite, with
+/// the pin and the invite stored in `api`.
+fn invited_through(api: &FakeApi, base: &str, ca_pem: &str) -> Snapshot {
+    api.put(
+        &secret_path("grid-ca-bundle"),
+        secret(
+            "grid-ca-bundle",
+            &[("ca.crt", ca_pem)],
+            &[(SIGNER_BUNDLE_LABEL, "true")],
+        ),
+    );
+    api.put(
+        &secret_path(TOKEN_SECRET),
+        secret(TOKEN_SECRET, &[("token", "tok")], &[(SITE_LABEL, SITE)]),
+    );
+    config(&format!(
+        "  signerEndpoint:\n    url: {base}\n    caBundleRef: {{kind: Secret, name: grid-ca-bundle}}\n  inviteSecretRef:\n    name: {TOKEN_SECRET}\n"
+    ))
+}
+
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "three restarts and what each must read")]
+async fn invariant_8_a_restart_after_a_lost_answer_reads_invite_maybe_spent_when_the_token_is_refused() {
+    let (mock, settings) = serve(Reply::Timeout).await;
+    let api = seeded();
+    let config = invited_through(&api, settings.base.as_str(), &mock.ca.cert_pem);
+    let client = api.client(NAMESPACE);
+    let mut observed = Vec::new();
+    for round in 0..3 {
+        // Round 1: the signer had spent the token on the answer that was lost.
+        if round == 1 {
+            mock.answer(Reply::Spent);
+        }
+        // Each round is a fresh process, as after a kill.
+        let _step = Enrollment::default()
+            .step(&client, None, &config)
+            .await
+            .expect("networks list");
+        observed.push(rolled(&api, &client).await);
+    }
+
+    invariants::transition_time_moves_only_with_status(&observed).expect("invariant 2");
+    invariants::reasons_within(&observed, &REASONS).expect("invariant 8");
+    for round in &observed[1..] {
+        let enrolled = round.condition(ENROLLED).expect("Enrolled");
+        assert_eq!(
+            (&enrolled["status"], &enrolled["reason"]),
+            (&json!("False"), &json!("InviteMaybeSpent")),
+            "a refusal after an unanswered request is never read as an invalid invite"
+        );
+        assert!(
+            enrolled["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("a new invite may be needed"),
+            "{}",
+            enrolled["message"]
+        );
+    }
+    assert!(
+        api.get(&secret_path(&format!("{IDENTITY_SECRET}-pending"))).is_some(),
+        "the request is kept across the restarts"
+    );
+}

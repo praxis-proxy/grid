@@ -216,3 +216,44 @@ async fn invariant_3_with_a_site_section_and_no_grid_id_nothing_is_minted_and_th
         "the roll-up is still written while the runtime waits"
     );
 }
+
+/// A network naming this site's identity Secrets, which the controller self-signs when
+/// nothing enrolls.
+fn naming_secrets(api: &FakeApi, path: &str) {
+    api.edit(path, true, |network| {
+        network["spec"]["tls"] = serde_json::json!({
+            "siteSecretRef": { "name": "grid-site-identity", "namespace": "default" },
+            "caSecretRef": { "name": "grid-ca", "namespace": "default" }
+        });
+    });
+}
+
+/// Whether any Secret was created in `api`.
+fn created_a_secret(api: &FakeApi) -> bool {
+    api.writes()
+        .iter()
+        .any(|write| write.path.contains("/secrets") && write.method == "POST")
+}
+
+#[tokio::test]
+async fn invariant_6_a_config_deleted_after_it_named_a_site_never_lets_the_controller_self_sign() {
+    let (api, path) = seeded();
+    naming_secrets(&api, &path);
+    let mut deleted = Snapshot::absent();
+    deleted.site_seen = true;
+    for _round in 0..2 {
+        reconcile_under(&api, &path, deleted.clone()).await;
+    }
+    assert!(
+        !created_a_secret(&api),
+        "a placeholder identity would read as enrolled, and the site never enroll"
+    );
+
+    let (control, control_path) = seeded();
+    naming_secrets(&control, &control_path);
+    reconcile(&control, &control_path).await;
+    assert!(
+        created_a_secret(&control),
+        "with no site ever named, a standalone install self-signs"
+    );
+}
