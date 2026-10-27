@@ -70,7 +70,7 @@ impl Mock {
     }
 
     /// Answer `reply` from now on.
-    fn answer(&self, reply: Reply) {
+    pub(super) fn answer(&self, reply: Reply) {
         *self.reply.lock().expect("lock") = reply;
     }
 
@@ -525,7 +525,10 @@ async fn a_request_that_got_no_answer_is_sent_again_with_the_same_key() {
     let (signer, settings) = serve(Reply::Timeout).await;
     let store = FakeStore::invited();
     let lost = run_flow(&store, &settings).await;
-    assert!(matches!(lost, Err(EnrollError::MaybeSpent(_))), "{lost:?}");
+    assert!(
+        matches!(lost, Err(EnrollError::MaybeSpent { refused: false, .. })),
+        "{lost:?}"
+    );
     let kept = store
         .value(&pending_name(), "tls.key")
         .expect("the key is kept before the request goes out");
@@ -552,8 +555,8 @@ async fn a_token_refused_after_an_unanswered_request_may_have_been_spent_by_it()
     signer.answer(Reply::Spent);
     let outcome = run_flow(&store, &settings).await;
     assert!(
-        matches!(&outcome, Err(e @ EnrollError::MaybeSpent(_)) if e.to_string().contains("a new invite may be needed")),
-        "the earlier request may have spent it, so it is not called invalid: {outcome:?}"
+        matches!(&outcome, Err(e @ EnrollError::MaybeSpent { refused: true, .. }) if e.to_string().contains("a new invite may be needed")),
+        "the earlier request may have spent it, so it is not called invalid, and not sent again: {outcome:?}"
     );
 }
 
@@ -668,7 +671,7 @@ async fn a_server_error_after_sending_is_not_retried() {
     let (mock, settings) = serve(Reply::ServerError).await;
     let outcome = run_flow(&FakeStore::invited(), &settings).await;
     assert!(
-        matches!(&outcome, Err(e @ EnrollError::MaybeSpent(_)) if e.to_string().contains("may be spent")),
+        matches!(&outcome, Err(e @ EnrollError::MaybeSpent { .. }) if e.to_string().contains("may be spent")),
         "a sent request is never replayed: {outcome:?}"
     );
     assert_eq!(mock.calls(), 1, "one request only");
@@ -679,7 +682,7 @@ async fn an_oversized_response_is_refused() {
     let (_mock, settings) = serve(Reply::Huge).await;
     let outcome = run_flow(&FakeStore::invited(), &settings).await;
     assert!(
-        matches!(&outcome, Err(EnrollError::MaybeSpent(m)) if m.contains("size limit")),
+        matches!(&outcome, Err(EnrollError::MaybeSpent { detail, .. }) if detail.contains("size limit")),
         "the body is capped: {outcome:?}"
     );
 }

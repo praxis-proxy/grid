@@ -191,7 +191,7 @@ const fn reason(error: &EnrollError) -> &'static str {
         EnrollError::NameTaken(_) => "NameTaken",
         EnrollError::NameDeleted(_) => "NameDeleted",
         EnrollError::Refused(_) => "Refused",
-        EnrollError::MaybeSpent(_) => "InviteMaybeSpent",
+        EnrollError::MaybeSpent { .. } => "InviteMaybeSpent",
         EnrollError::InvalidResponse(_) => "InvalidResponse",
         EnrollError::NotStored(_) => "IdentityNotStored",
         EnrollError::PendingForeign(_) => "PendingSecretForeign",
@@ -206,9 +206,11 @@ const fn about_refs(error: &EnrollError) -> bool {
 }
 
 /// Whether retrying `error` with the same inputs cannot succeed. A request that may
-/// have spent the token is retried: a spent token then answers as rejected.
+/// have spent the token is retried, and a spent token then answers as rejected; that
+/// refusal is definitive, so the token is not presented again until an input changes.
 const fn definitive(error: &EnrollError) -> bool {
     match error {
+        EnrollError::MaybeSpent { refused, .. } => *refused,
         EnrollError::Config(_)
         | EnrollError::SignerUntrusted(_)
         | EnrollError::RefNotFound(_)
@@ -220,7 +222,6 @@ const fn definitive(error: &EnrollError) -> bool {
         | EnrollError::InvalidResponse(_)
         | EnrollError::PendingForeign(_) => true,
         EnrollError::SignerLapsed(_)
-        | EnrollError::MaybeSpent(_)
         | EnrollError::NotStored(_)
         | EnrollError::Unreachable(_)
         | EnrollError::Kube(_) => false,

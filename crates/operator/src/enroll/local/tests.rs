@@ -441,6 +441,14 @@ fn a_lapsed_signer_certificate_reads_untrusted_and_is_retried() {
     );
 }
 
+/// A request the signer may have spent, `refused` after an unanswered one.
+fn maybe_spent(refused: bool) -> EnrollError {
+    EnrollError::MaybeSpent {
+        detail: String::new(),
+        refused,
+    }
+}
+
 #[test]
 fn every_enrollment_failure_has_its_own_reason() {
     let errors = [
@@ -452,7 +460,7 @@ fn every_enrollment_failure_has_its_own_reason() {
         EnrollError::NameTaken(String::new()),
         EnrollError::NameDeleted(String::new()),
         EnrollError::Refused(String::new()),
-        EnrollError::MaybeSpent(String::new()),
+        maybe_spent(false),
         EnrollError::InvalidResponse(String::new()),
         EnrollError::NotStored(String::new()),
         EnrollError::Unreachable(String::new()),
@@ -739,6 +747,44 @@ async fn a_spent_invite_is_not_sent_again_until_it_is_replaced() {
     invited(&world, "fresh");
     assert_eq!(run_step(&mut enrollment, &world, None).await, Step::Failed);
     assert_eq!(mock.calls(), 2, "a replaced invite is sent");
+}
+
+/// The last `Enrolled` message written on the own site.
+fn last_enrolled_message(world: &Arc<Mutex<World>>) -> String {
+    world
+        .lock()
+        .expect("lock")
+        .messages_of(SITE, ENROLLED)
+        .last()
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_token_refused_after_an_unanswered_request_is_not_resent_until_the_invite_changes() {
+    crate::init_process_crypto();
+    let (mock, settings) = serve(Reply::Timeout).await;
+    let world = enrolling(settings.base.as_str(), true);
+    invited(&world, "maybe-spent");
+    pinned(&world, &mock.ca.cert_pem);
+    let mut enrollment = Enrollment::default();
+    assert_eq!(run_step(&mut enrollment, &world, None).await, Step::Failed);
+    assert_eq!(mock.calls(), 1, "a 408 may not have spent the token");
+    mock.answer(Reply::Spent);
+    assert_eq!(run_step(&mut enrollment, &world, None).await, Step::Failed);
+    assert_eq!(mock.calls(), 2, "the same key is presented again, and refused");
+    assert_eq!(run_step(&mut enrollment, &world, None).await, Step::Unchanged);
+    assert_eq!(mock.calls(), 2, "a refused token is not presented again");
+    let last = verdicts(&world).last().cloned();
+    assert_eq!(last, Some(("False".to_owned(), "InviteMaybeSpent".to_owned())));
+    let message = last_enrolled_message(&world);
+    assert!(
+        message.contains("a new invite may be needed"),
+        "keeps the recovery: {message}"
+    );
+    invited(&world, "fresh");
+    assert_eq!(run_step(&mut enrollment, &world, None).await, Step::Failed);
+    assert_eq!(mock.calls(), 3, "a replaced invite is sent");
 }
 
 #[tokio::test]

@@ -88,9 +88,16 @@ pub enum EnrollError {
     #[error("enrollment refused: {0}")]
     Refused(String),
 
-    /// The request was sent but no usable answer came back.
-    #[error("enrollment failed after the request was sent ({0}). The token may be spent. {SPENT}")]
-    MaybeSpent(String),
+    /// The request was sent but no usable answer came back, or the token was refused after an
+    /// earlier request got none. `refused` is set for the refusal: it is not sent again with
+    /// the same inputs, since the earlier request may have spent the token.
+    #[error("enrollment failed after the request was sent ({detail}). The token may be spent. {SPENT}")]
+    MaybeSpent {
+        /// What happened.
+        detail: String,
+        /// Whether the signer refused the token after an unanswered request.
+        refused: bool,
+    },
 
     /// The service answered with an unusable certificate.
     #[error("enrollment response invalid ({0}). The token is spent. {SPENT}")]
@@ -778,11 +785,14 @@ async fn sent<S: Store + Sync, G: Signer + Sync>(
             held.issued(store, &issued, settings.backoff).await?;
             Ok(issued)
         },
-        Err(error @ EnrollError::MaybeSpent(_)) => Err(error),
-        Err(EnrollError::TokenRejected(detail)) if resent => Err(EnrollError::MaybeSpent(format!(
-            "{detail}; an earlier request with this key got no answer and may have spent the invite, so a new \
-             invite may be needed"
-        ))),
+        Err(error @ EnrollError::MaybeSpent { .. }) => Err(error),
+        Err(EnrollError::TokenRejected(detail)) if resent => Err(EnrollError::MaybeSpent {
+            detail: format!(
+                "{detail}; an earlier request with this key got no answer and may have spent the invite, so a \
+                 new invite may be needed"
+            ),
+            refused: true,
+        }),
         Err(error) => {
             held.answered(store, settings.backoff).await?;
             Err(error)
@@ -821,7 +831,9 @@ fn enroll_error(error: SignerError) -> EnrollError {
         SignerError::Forbidden(detail) | SignerError::Refused(detail) | SignerError::NoClientCertificate(detail) => {
             EnrollError::Refused(detail)
         },
-        SignerError::Disabled(detail) | SignerError::Transport { detail, .. } => EnrollError::MaybeSpent(detail),
+        SignerError::Disabled(detail) | SignerError::Transport { detail, .. } => {
+            EnrollError::MaybeSpent { detail, refused: false }
+        },
         SignerError::Untrusted { lapsed: true, detail } => EnrollError::SignerLapsed(detail),
         SignerError::Untrusted { lapsed: false, detail } => EnrollError::SignerUntrusted(detail),
         SignerError::Request(detail) => EnrollError::Config(detail),
