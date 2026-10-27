@@ -216,6 +216,12 @@ pub fn key_matches_cert(key_pem: &str, cert_pem: &str) -> bool {
     backend::key_spki_der(key_pem).is_some_and(|key| crate::cert_public_key(cert_pem).is_ok_and(|cert| cert == key))
 }
 
+/// Whether `key_pem` is the private key `csr_pem` was made for.
+#[must_use]
+pub fn key_matches_csr(key_pem: &str, csr_pem: &str) -> bool {
+    backend::key_spki_der(key_pem).is_some_and(|key| crate::csr_public_key(csr_pem).is_ok_and(|csr| csr == key))
+}
+
 /// Map a backend request failure onto the request-side error it stands for.
 fn map_backend_error(err: BackendError) -> EnrollError {
     match err {
@@ -253,6 +259,15 @@ mod tests {
         let other = crate::generate_csr("east").expect("other");
         assert!(!key_matches_cert(&other.key_pem, &leaf.cert_pem), "another key");
         assert!(!key_matches_cert("not a key", &leaf.cert_pem), "an unreadable key");
+    }
+
+    #[test]
+    fn a_key_matches_only_its_own_request() {
+        let csr = crate::generate_csr("east").expect("csr");
+        assert!(key_matches_csr(&csr.key_pem, &csr.csr_pem));
+        let other = crate::generate_csr("east").expect("other");
+        assert!(!key_matches_csr(&other.key_pem, &csr.csr_pem), "another key");
+        assert!(!key_matches_csr(&csr.key_pem, "not a request"), "an unreadable request");
     }
 
     #[test]

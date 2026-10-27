@@ -93,6 +93,9 @@ pub enum EnrollError {
     #[error("enrolled but the identity was not stored ({0}). The token is spent. {SPENT}")]
     NotStored(String),
 
+    /// A Secret by the pending name was not written by enrollment, so it is never adopted.
+    #[error("{0}")]
+    PendingForeign(String),
     /// A Kubernetes call failed. Retried on the next poll.
     #[error("kubernetes: {0}")]
     Kube(String),
@@ -371,6 +374,8 @@ enum Created {
 trait Store {
     /// Whether Secret `name` exists, without reading its data.
     fn exists(&self, name: &str) -> impl Future<Output = Result<bool, EnrollError>> + Send;
+    /// Secret `name`'s metadata, if present, without reading its data.
+    fn metadata(&self, name: &str) -> impl Future<Output = Result<Option<ObjectMeta>, EnrollError>> + Send;
     /// Secret `name`, if present.
     fn get(&self, name: &str) -> impl Future<Output = Result<Option<Secret>, EnrollError>> + Send;
     /// Create `secret`, reporting a conflict.
@@ -390,10 +395,14 @@ struct KubeStore(Api<Secret>);
 
 impl Store for KubeStore {
     async fn exists(&self, name: &str) -> Result<bool, EnrollError> {
+        self.metadata(name).await.map(|meta| meta.is_some())
+    }
+
+    async fn metadata(&self, name: &str) -> Result<Option<ObjectMeta>, EnrollError> {
         self.0
             .get_metadata_opt(name)
             .await
-            .map(|meta| meta.is_some())
+            .map(|meta| meta.map(|meta| meta.metadata))
             .map_err(|e| EnrollError::Kube(format!("reading Secret {name}: {e}")))
     }
 
@@ -604,55 +613,76 @@ async fn enroll<S: Store + Sync, G: Signer + Sync>(
     check_not_enrolled_elsewhere(store, &settings.defaults, target).await?;
     let ca_present = check_existing_ca(store, target, &settings.anchor_pem).await?;
     check_writable(store, target, ca_present, settings.backoff).await?;
-    let mut held = Box::pin(in_flight(store, settings, target)).await?;
+    let token = site_token(store, settings).await?;
+    let binding = pending::Binding::of(settings, &token);
+    let mut held = Box::pin(in_flight(store, settings, target, &binding)).await?;
     let issued = match held.issued.take() {
         Some(issued) => issued,
-        None => Box::pin(sent(store, signer, settings, &mut held)).await?,
+        None => Box::pin(sent(signer, (store, settings), &mut held, &token)).await?,
     };
     let verified = checked_identity(&issued, &held.csr, settings)?;
-    if !certs::has_svid_profile(&verified.cert).unwrap_or(false) {
-        tracing::warn!("issued certificate lacks the X.509-SVID profile, peers in spiffe trust mode will reject it");
-    }
-    let prepared = prepare(target, verified, std::mem::take(&mut held.key));
-    let anchors = &settings.anchor_pem;
-    let written = with_backoff(settings.backoff, "writing the identity Secrets", || {
-        write(store, &prepared, anchors)
-    })
-    .await
-    .map_err(|e| EnrollError::NotStored(e.to_string()))?;
-    pending::clear(store, target, settings.backoff).await?;
+    let written = Box::pin(stored(
+        store,
+        settings,
+        target,
+        (verified, std::mem::take(&mut held.key)),
+    ))
+    .await?;
     Ok(match written {
         Written::Stored => Outcome::Enrolled(certs::spiffe_id(&settings.site_name)),
         Written::Discarded => Outcome::Discarded,
     })
 }
 
-/// The enrollment in flight for `target`, else a new request kept before it is sent.
+/// Write `verified` and its key as the identity for `target`, and clear the enrollment kept
+/// for it.
+async fn stored<S: Store + Sync>(
+    store: &S,
+    settings: &Settings,
+    target: &Target,
+    (verified, key): (Verified, Zeroizing<String>),
+) -> Result<Written, EnrollError> {
+    if !certs::has_svid_profile(&verified.cert).unwrap_or(false) {
+        tracing::warn!("issued certificate lacks the X.509-SVID profile, peers in spiffe trust mode will reject it");
+    }
+    let anchors = &settings.anchor_pem;
+    let prepared = &prepare(target, verified, key);
+    let written = with_backoff(settings.backoff, "writing the identity Secrets", || {
+        write(store, prepared, anchors)
+    })
+    .await
+    .map_err(|e| EnrollError::NotStored(e.to_string()))?;
+    pending::clear(store, target, settings.backoff).await?;
+    Ok(written)
+}
+
+/// The enrollment in flight for `target`, made for `binding`, else a new request kept before
+/// it is sent.
 async fn in_flight<S: Store + Sync>(
     store: &S,
     settings: &Settings,
     target: &Target,
+    binding: &pending::Binding,
 ) -> Result<pending::Pending, EnrollError> {
-    if let Some(held) = pending::read(store, target).await? {
+    if let Some(held) = pending::read(store, target, binding, settings.backoff).await? {
         return Ok(held);
     }
     let certs::GeneratedCsr { csr_pem, key_pem } =
         certs::generate_csr(&settings.site_name).map_err(|e| EnrollError::Config(format!("generating a CSR: {e}")))?;
-    pending::stash(store, target, (csr_pem, key_pem), settings.backoff).await
+    pending::stash(store, target, (csr_pem, key_pem), (binding, settings.backoff)).await
 }
 
 /// Send `held`'s request with the invite and keep what comes back. A token refused after an
 /// earlier request went unanswered may have been spent by that request.
 async fn sent<S: Store + Sync, G: Signer + Sync>(
-    store: &S,
     signer: &G,
-    settings: &Settings,
+    (store, settings): (&S, &Settings),
     held: &mut pending::Pending,
+    token: &str,
 ) -> Result<Issued, EnrollError> {
-    let token = site_token(store, settings).await?;
     let resent = held.unanswered;
     held.sending(store, settings.backoff).await?;
-    match Box::pin(redeem(signer, settings.backoff, &token, &held.csr)).await {
+    match Box::pin(redeem(signer, settings.backoff, token, &held.csr)).await {
         Ok(issued) => {
             held.issued(store, &issued, settings.backoff).await?;
             Ok(issued)

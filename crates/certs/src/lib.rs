@@ -20,7 +20,7 @@ mod verify;
 
 pub use enroll::{
     CLOCK_SKEW_ALLOWANCE, DEFAULT_SITE_CERT_LIFETIME, EnrollError, EnrolledCert, MAX_CSR_PEM_BYTES, Validity,
-    key_matches_cert, sign_csr, validate_site_name, verify_csr,
+    key_matches_cert, key_matches_csr, sign_csr, validate_site_name, verify_csr,
 };
 pub use generate::{
     CaCert, GenerateError, GeneratedCsr, MAX_SITE_NAME_LEN, SPIFFE_TRUST_DOMAIN, SiteCertOutput, generate_ca,

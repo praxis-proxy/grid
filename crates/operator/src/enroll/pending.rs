@@ -4,10 +4,11 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::{ByteString, api::core::v1::Secret};
+use kube::api::ObjectMeta;
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
-use super::{Attempt, Backoff, Created, EnrollError, Issued, Store, Target, with_backoff};
+use super::{Attempt, Backoff, Created, EnrollError, Issued, MANAGED_BY, Settings, Store, Target, with_backoff};
 
 /// The request, PEM.
 const CSR: &str = "csr.pem";
@@ -24,9 +25,61 @@ const CA: &str = "ca.crt";
 /// Set while a request has gone out and no definitive answer came back.
 const UNANSWERED: &str = "grid.praxis.fast/enrollment-unanswered";
 
+/// The site the request names.
+const SITE: &str = "grid.praxis.fast/enrollment-site";
+
+/// A digest of the grid CA the answer must anchor to.
+const ANCHOR: &str = "grid.praxis.fast/enrollment-anchor";
+
+/// A digest of the invite the request is sent with.
+const INVITE: &str = "grid.praxis.fast/enrollment-invite";
+
+/// Every annotation written here.
+const ANNOTATIONS: [&str; 4] = [UNANSWERED, SITE, ANCHOR, INVITE];
+
 /// The Secret holding `target`'s enrollment in flight.
 pub(super) fn name(target: &Target) -> String {
     format!("{}-pending", target.site_secret)
+}
+
+/// What a kept request was made for: a request made for anything else is discarded.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Binding {
+    /// The site name.
+    site: String,
+    /// A digest of the grid CA the answer must anchor to.
+    anchor: String,
+    /// A digest of the invite.
+    invite: String,
+}
+
+impl Binding {
+    /// What a request under `settings` with the invite `token` is made for.
+    pub(super) fn of(settings: &Settings, token: &str) -> Self {
+        Self {
+            site: settings.site_name.clone(),
+            anchor: digest(settings.anchor_pem.as_bytes()),
+            invite: digest(token.as_bytes()),
+        }
+    }
+
+    /// The binding `meta` records, `None` when one is missing.
+    fn recorded(meta: &ObjectMeta) -> Option<Self> {
+        let annotations = meta.annotations.as_ref()?;
+        Some(Self {
+            site: annotations.get(SITE)?.clone(),
+            anchor: annotations.get(ANCHOR)?.clone(),
+            invite: annotations.get(INVITE)?.clone(),
+        })
+    }
+}
+
+/// `bytes`' SHA-256, in hex.
+fn digest(bytes: &[u8]) -> String {
+    crate::resources::tls_backend::sha256(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// An enrollment in flight.
@@ -45,18 +98,90 @@ pub(super) struct Pending {
     version: String,
 }
 
-/// One value of `secret` as text.
+/// Refuse a Secret by the pending name that enrollment did not write, so a planted one is never
+/// adopted: it carries exactly enrollment's label, only its annotations, and no owner or finalizer.
+fn ours(name: &str, meta: &ObjectMeta, type_: Option<&str>) -> Result<(), EnrollError> {
+    let why = foreign(meta).or_else(|| (type_ != Some("Opaque")).then_some("it is not of type Opaque"));
+    match why {
+        None => Ok(()),
+        Some(why) => Err(EnrollError::PendingForeign(format!(
+            "Secret {name} was not written by enrollment ({why}); delete it so enrollment can keep its request \
+             there"
+        ))),
+    }
+}
+
+/// Why `meta` is not enrollment's, as far as its metadata shows.
+fn foreign(meta: &ObjectMeta) -> Option<&'static str> {
+    let labelled = meta.labels.as_ref().is_some_and(|labels| {
+        labels.len() == 1 && labels.get("app.kubernetes.io/managed-by").map(String::as_str) == Some(MANAGED_BY)
+    });
+    let annotated = meta
+        .annotations
+        .iter()
+        .flatten()
+        .all(|(key, _)| ANNOTATIONS.contains(&key.as_str()));
+    if !labelled {
+        Some("it lacks exactly the label app.kubernetes.io/managed-by=grid-operator")
+    } else if !annotated {
+        Some("it carries annotations enrollment does not write")
+    } else if meta.owner_references.as_ref().is_some_and(|owners| !owners.is_empty()) {
+        Some("it has owner references")
+    } else if meta
+        .finalizers
+        .as_ref()
+        .is_some_and(|finalizers| !finalizers.is_empty())
+    {
+        Some("it has finalizers")
+    } else {
+        None
+    }
+}
+
+/// One value of `data` as text.
 fn text(data: &BTreeMap<String, ByteString>, key: &str) -> Option<String> {
     data.get(key).and_then(|value| String::from_utf8(value.0.clone()).ok())
 }
 
-/// The enrollment in flight for `target`, `None` when none is held.
-pub(super) async fn read<S: Store + Sync>(store: &S, target: &Target) -> Result<Option<Pending>, EnrollError> {
+/// The enrollment in flight for `target`, made for `binding`. `None` when none is held. One
+/// made for anything else, holding a key not its request's, or whose kept certificate expired
+/// is discarded.
+pub(super) async fn read<S: Store + Sync>(
+    store: &S,
+    target: &Target,
+    binding: &Binding,
+    backoff: Backoff,
+) -> Result<Option<Pending>, EnrollError> {
     let name = name(target);
     let Some(secret) = store.get(&name).await? else {
         return Ok(None);
     };
-    Ok(of(name, secret))
+    ours(&name, &secret.metadata, secret.type_.as_deref())?;
+    let recorded = Binding::recorded(&secret.metadata);
+    let Some(held) = of(name, secret) else {
+        return Ok(None);
+    };
+    let why = if recorded.as_ref() != Some(binding) {
+        Some("it was made for another site name, grid CA or invite")
+    } else if !certs::key_matches_csr(&held.key, &held.csr) {
+        Some("its key is not the request's")
+    } else if held.issued.as_ref().is_some_and(|issued| expired(&issued.certificate)) {
+        Some("the certificate kept for it has expired")
+    } else {
+        None
+    };
+    if let Some(why) = why {
+        tracing::warn!(secret = %held.name, why, "discarding the enrollment request in flight");
+        clear(store, target, backoff).await?;
+        return Ok(None);
+    }
+    Ok(Some(held))
+}
+
+/// Whether `certificate` is past its validity, or unreadable.
+fn expired(certificate: &str) -> bool {
+    let now = time::OffsetDateTime::now_utc();
+    !certs::cert_validity(certificate).is_ok_and(|(_, not_after)| not_after > now)
 }
 
 /// The enrollment `secret` holds, `None` once cleared.
@@ -85,26 +210,27 @@ fn of(name: String, secret: Secret) -> Option<Pending> {
     })
 }
 
-/// Keep `csr` and `key` for `target` before the request goes out. A cleared Secret left by
-/// an earlier enrollment is reused.
+/// Keep `csr` and `key` for `target`, made for `binding`, before the request goes out. The
+/// Secret is created; one by its name is reused only when enrollment wrote it.
 pub(super) async fn stash<S: Store + Sync>(
     store: &S,
     target: &Target,
     (csr, key): (String, Zeroizing<String>),
-    backoff: Backoff,
+    (binding, backoff): (&Binding, Backoff),
 ) -> Result<Pending, EnrollError> {
     let name = name(target);
     let data = BTreeMap::from([
         (CSR.to_owned(), ByteString(csr.clone().into_bytes())),
         (KEY.to_owned(), ByteString(key.as_bytes().to_vec())),
     ]);
-    if !created(store, &super::secret(&name, "Opaque", data), backoff).await? {
-        let version = version_of(store, &name).await?;
-        let patch = json!({
-            "metadata": { "resourceVersion": version, "annotations": { UNANSWERED: Value::Null } },
-            "data": { CSR: ByteString(csr.clone().into_bytes()), KEY: ByteString(key.as_bytes().to_vec()) },
-        });
-        patched(store, &name, &patch, backoff).await?;
+    let mut secret = super::secret(&name, "Opaque", data);
+    secret.metadata.annotations = Some(BTreeMap::from([
+        (SITE.to_owned(), binding.site.clone()),
+        (ANCHOR.to_owned(), binding.anchor.clone()),
+        (INVITE.to_owned(), binding.invite.clone()),
+    ]));
+    if !created(store, &secret, backoff).await? {
+        Box::pin(reuse(store, &name, &secret, backoff)).await?;
     }
     Ok(Pending {
         version: version_of(store, &name).await?,
@@ -113,6 +239,46 @@ pub(super) async fn stash<S: Store + Sync>(
         key,
         issued: None,
         unanswered: false,
+    })
+}
+
+/// Write `secret` over the Secret `name` enrollment left, refusing one it did not write.
+async fn reuse<S: Store + Sync>(store: &S, name: &str, secret: &Secret, backoff: Backoff) -> Result<(), EnrollError> {
+    let held = store
+        .get(name)
+        .await?
+        .ok_or_else(|| EnrollError::Kube(format!("Secret {name} vanished under the write")))?;
+    ours(name, &held.metadata, held.type_.as_deref())?;
+    let patch = overwrite(secret, held.metadata.resource_version.as_deref());
+    patched(store, name, &patch, backoff).await
+}
+
+/// The merge patch writing `secret` over the Secret at `version`. Every key and annotation is
+/// named, so the merge drops what an earlier request kept.
+fn overwrite(secret: &Secret, version: Option<&str>) -> Value {
+    let named = |keys: &[&str]| -> serde_json::Map<String, Value> {
+        keys.iter().map(|key| ((*key).to_owned(), Value::Null)).collect()
+    };
+    let mut annotations = named(&ANNOTATIONS);
+    annotations.extend(
+        secret
+            .metadata
+            .annotations
+            .iter()
+            .flatten()
+            .map(|(key, value)| (key.clone(), json!(value))),
+    );
+    let mut data = named(&[CSR, KEY, CERT, CA]);
+    data.extend(
+        secret
+            .data
+            .iter()
+            .flatten()
+            .map(|(key, value)| (key.clone(), json!(value))),
+    );
+    json!({
+        "metadata": { "resourceVersion": version, "annotations": annotations },
+        "data": data,
     })
 }
 
@@ -143,7 +309,7 @@ async fn patched<S: Store + Sync>(store: &S, name: &str, patch: &Value, backoff:
 }
 
 impl Pending {
-    /// Mark a request about to go out again as unanswered.
+    /// Mark a request about to go out as unanswered.
     pub(super) async fn sending<S: Store + Sync>(&mut self, store: &S, backoff: Backoff) -> Result<(), EnrollError> {
         if self.unanswered {
             return Ok(());
@@ -192,14 +358,20 @@ impl Pending {
     }
 }
 
-/// Clear `target`'s enrollment in flight once its identity is stored, leaving no key behind.
+/// Clear `target`'s enrollment in flight, leaving no key behind. A Secret by the pending name
+/// that enrollment did not write is left alone.
 pub(super) async fn clear<S: Store + Sync>(store: &S, target: &Target, backoff: Backoff) -> Result<(), EnrollError> {
     let name = name(target);
-    if !store.exists(&name).await? {
+    let Some(meta) = store.metadata(&name).await? else {
+        return Ok(());
+    };
+    if foreign(&meta).is_some() {
         return Ok(());
     }
     let patch = json!({
-        "metadata": { "annotations": { UNANSWERED: Value::Null } },
+        "metadata": {
+            "annotations": { UNANSWERED: Value::Null, SITE: Value::Null, ANCHOR: Value::Null, INVITE: Value::Null },
+        },
         "data": { CSR: Value::Null, KEY: Value::Null, CERT: Value::Null, CA: Value::Null },
     });
     patched(store, &name, &patch, backoff).await

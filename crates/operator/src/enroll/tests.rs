@@ -49,8 +49,8 @@ pub(super) struct Mock {
     pub(super) ca: certs::CaCert,
     /// A CA nobody pinned.
     stranger: certs::CaCert,
-    /// Scripted reply.
-    reply: Reply,
+    /// Scripted reply, changed with [`Mock::answer`].
+    reply: Mutex<Reply>,
     /// Requests seen.
     calls: AtomicUsize,
 }
@@ -61,9 +61,14 @@ impl Mock {
         Arc::new(Self {
             ca: certs::generate_ca("grid-ca").expect("ca"),
             stranger: certs::generate_ca("grid-ca").expect("stranger ca"),
-            reply,
+            reply: Mutex::new(reply),
             calls: AtomicUsize::new(0),
         })
+    }
+
+    /// Answer `reply` from now on.
+    fn answer(&self, reply: Reply) {
+        *self.reply.lock().expect("lock") = reply;
     }
 
     pub(super) fn calls(&self) -> usize {
@@ -92,7 +97,8 @@ fn error(status: StatusCode, code: &str) -> (StatusCode, Json<Value>) {
 /// The mock enroll handler.
 async fn enroll_handler(State(mock): State<Arc<Mock>>, Json(request): Json<Value>) -> (StatusCode, Json<Value>) {
     mock.calls.fetch_add(1, Ordering::SeqCst);
-    match mock.reply {
+    let reply = *mock.reply.lock().expect("lock");
+    match reply {
         Reply::Spent => return error(StatusCode::UNAUTHORIZED, "invalid_token"),
         Reply::ServerError => return error(StatusCode::SERVICE_UNAVAILABLE, "internal"),
         Reply::Timeout => return error(StatusCode::REQUEST_TIMEOUT, "timeout"),
@@ -104,8 +110,9 @@ async fn enroll_handler(State(mock): State<Arc<Mock>>, Json(request): Json<Value
 
 /// Sign the request the way `mock.reply` scripts.
 fn signed(mock: &Mock, request: &Value) -> Value {
-    let site = if mock.reply == Reply::WrongSite { "site-e" } else { SITE };
-    let issuer = if mock.reply == Reply::OtherCa {
+    let reply = *mock.reply.lock().expect("lock");
+    let site = if reply == Reply::WrongSite { "site-e" } else { SITE };
+    let issuer = if reply == Reply::OtherCa {
         &mock.stranger
     } else {
         &mock.ca
@@ -115,13 +122,13 @@ fn signed(mock: &Mock, request: &Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let csr = if mock.reply == Reply::OtherKey {
+    let csr = if reply == Reply::OtherKey {
         certs::generate_csr(SITE).expect("other csr").csr_pem
     } else {
         requested
     };
     let cert = certs::sign_csr(issuer, site, &csr, certs::Validity::default()).expect("mock signs");
-    let certificate = if mock.reply == Reply::Padded {
+    let certificate = if reply == Reply::Padded {
         format!("{}{}junk\n", cert.cert_pem, mock.stranger.cert_pem)
     } else {
         cert.cert_pem
@@ -192,6 +199,20 @@ pub(super) async fn byo_serving_signer(client_ca: &str, app: Router) -> (Url, St
     }));
     let base = Url::parse(&format!("https://localhost:{port}")).expect("url");
     (base, serving.cert_pem)
+}
+
+/// A copy of `settings`.
+fn mock_settings(settings: &Settings) -> Settings {
+    Settings {
+        base: settings.base.clone(),
+        pin_pem: settings.pin_pem.clone(),
+        anchor_pem: settings.anchor_pem.clone(),
+        site_name: settings.site_name.clone(),
+        token_secret: settings.token_secret.clone(),
+        token_key: settings.token_key.clone(),
+        backoff: settings.backoff,
+        defaults: settings.defaults.clone(),
+    }
 }
 
 /// Start a mock, returning it and settings pinned to it.
@@ -267,6 +288,18 @@ impl FakeStore {
             .insert(key.to_owned(), value.to_owned());
     }
 
+    /// Set `key` of the Secret `name`, keeping its metadata.
+    fn put_value(&self, name: &str, key: &str, value: &str) {
+        self.secrets
+            .lock()
+            .expect("lock")
+            .get_mut(name)
+            .expect("secret")
+            .data
+            .get_or_insert_default()
+            .insert(key.to_owned(), ByteString(value.as_bytes().to_vec()));
+    }
+
     fn value(&self, name: &str, key: &str) -> Option<String> {
         let secret = self.secrets.lock().expect("lock").get(name).cloned()?;
         String::from_utf8(secret.data?.get(key)?.0.clone()).ok()
@@ -279,6 +312,18 @@ impl Store for FakeStore {
             return Err(EnrollError::Kube(format!("reading Secret {name}: forbidden")));
         }
         Ok(self.secrets.lock().expect("lock").contains_key(name))
+    }
+
+    async fn metadata(&self, name: &str) -> Result<Option<ObjectMeta>, EnrollError> {
+        if self.reads_fail {
+            return Err(EnrollError::Kube(format!("reading Secret {name}: forbidden")));
+        }
+        Ok(self
+            .secrets
+            .lock()
+            .expect("lock")
+            .get(name)
+            .map(|secret| secret.metadata.clone()))
     }
 
     async fn get(&self, name: &str) -> Result<Option<Secret>, EnrollError> {
@@ -467,18 +512,18 @@ fn pending_name() -> String {
 
 #[tokio::test]
 async fn a_request_that_got_no_answer_is_sent_again_with_the_same_key() {
-    let (_lost, lost_settings) = serve(Reply::Timeout).await;
+    let (signer, settings) = serve(Reply::Timeout).await;
     let store = FakeStore::invited();
-    let lost = run_flow(&store, &lost_settings).await;
+    let lost = run_flow(&store, &settings).await;
     assert!(matches!(lost, Err(EnrollError::MaybeSpent(_))), "{lost:?}");
     let kept = store
         .value(&pending_name(), "tls.key")
         .expect("the key is kept before the request goes out");
 
-    let (signer, settings) = serve(Reply::Sign).await;
+    signer.answer(Reply::Sign);
     let outcome = run_flow(&store, &settings).await;
     assert!(matches!(outcome, Ok(Outcome::Enrolled(_))), "{outcome:?}");
-    assert_eq!(signer.calls(), 1);
+    assert_eq!(signer.calls(), 2);
     assert_eq!(
         store.value("site-tls", "tls.key").as_deref(),
         Some(kept.as_str()),
@@ -490,11 +535,11 @@ async fn a_request_that_got_no_answer_is_sent_again_with_the_same_key() {
 
 #[tokio::test]
 async fn a_token_refused_after_an_unanswered_request_may_have_been_spent_by_it() {
-    let (_lost, lost_settings) = serve(Reply::Timeout).await;
+    let (signer, settings) = serve(Reply::Timeout).await;
     let store = FakeStore::invited();
-    drop(run_flow(&store, &lost_settings).await);
+    drop(run_flow(&store, &settings).await);
 
-    let (_spent, settings) = serve(Reply::Spent).await;
+    signer.answer(Reply::Spent);
     let outcome = run_flow(&store, &settings).await;
     assert!(
         matches!(&outcome, Err(e @ EnrollError::MaybeSpent(_)) if e.to_string().contains("a new invite may be needed")),
@@ -503,13 +548,91 @@ async fn a_token_refused_after_an_unanswered_request_may_have_been_spent_by_it()
 }
 
 #[tokio::test]
+async fn a_planted_pending_secret_is_refused_and_never_sent() {
+    let (signer, settings) = serve(Reply::Sign).await;
+    let store = FakeStore::invited();
+    store.put(&pending_name(), "csr.pem", "planted");
+    store.label(&pending_name(), "app.kubernetes.io/managed-by", "someone-else");
+    let outcome = run_flow(&store, &settings).await;
+    assert!(
+        matches!(&outcome, Err(e @ EnrollError::PendingForeign(_)) if e.to_string().contains(&pending_name())),
+        "names the Secret to delete: {outcome:?}"
+    );
+    assert_eq!(
+        signer.calls(),
+        0,
+        "nothing is sent beside a Secret enrollment did not write"
+    );
+    assert_eq!(
+        store.value(&pending_name(), "csr.pem").as_deref(),
+        Some("planted"),
+        "it is left alone"
+    );
+}
+
+/// A request kept for `settings` with the test invite, and its key.
+async fn kept_request(store: &FakeStore, settings: &Settings) -> String {
+    let csr = certs::generate_csr(SITE).expect("csr");
+    let binding = pending::Binding::of(settings, "site-token");
+    drop(
+        pending::stash(store, &target(), (csr.csr_pem, csr.key_pem.clone()), (&binding, FAST))
+            .await
+            .expect("stashed"),
+    );
+    csr.key_pem.to_string()
+}
+
+#[tokio::test]
+async fn a_request_kept_for_another_site_grid_ca_or_invite_is_discarded() {
+    let (_signer, settings) = serve(Reply::Sign).await;
+    let (_other, elsewhere) = serve(Reply::Sign).await;
+    let renamed = Settings {
+        site_name: "site-e".to_owned(),
+        ..mock_settings(&settings)
+    };
+    for (name, binding) in [
+        ("site name", pending::Binding::of(&renamed, "site-token")),
+        ("grid CA", pending::Binding::of(&elsewhere, "site-token")),
+        ("invite", pending::Binding::of(&settings, "another-token")),
+    ] {
+        let store = FakeStore::invited();
+        drop(kept_request(&store, &settings).await);
+        let read = pending::read(&store, &target(), &binding, FAST).await.expect("read");
+        assert!(read.is_none(), "a {name} change discards the request");
+        assert_eq!(
+            store.value(&pending_name(), "tls.key"),
+            None,
+            "{name}: no key is left behind"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_request_whose_key_is_not_its_own_is_discarded() {
+    let (_signer, settings) = serve(Reply::Sign).await;
+    let store = FakeStore::invited();
+    drop(kept_request(&store, &settings).await);
+    let other = certs::generate_csr(SITE).expect("other");
+    store.put_value(&pending_name(), "tls.key", &other.key_pem);
+    let binding = pending::Binding::of(&settings, "site-token");
+    let read = pending::read(&store, &target(), &binding, FAST).await.expect("read");
+    assert!(read.is_none(), "a key that is not the request's is never sent");
+}
+
+#[tokio::test]
 async fn a_certificate_issued_before_a_restart_is_stored_without_asking_again() {
     let (issuer, settings) = serve(Reply::Sign).await;
     let store = FakeStore::invited();
     let csr = certs::generate_csr(SITE).expect("csr");
-    let mut held = pending::stash(&store, &target(), (csr.csr_pem.clone(), csr.key_pem.clone()), FAST)
-        .await
-        .expect("stashed");
+    let binding = pending::Binding::of(&settings, "site-token");
+    let mut held = pending::stash(
+        &store,
+        &target(),
+        (csr.csr_pem.clone(), csr.key_pem.clone()),
+        (&binding, FAST),
+    )
+    .await
+    .expect("stashed");
     let cert = certs::sign_csr(&issuer.ca, SITE, &csr.csr_pem, certs::Validity::default()).expect("signed");
     let answer = Issued {
         certificate: cert.cert_pem.clone(),

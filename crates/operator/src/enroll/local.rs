@@ -195,6 +195,7 @@ const fn reason(error: &EnrollError) -> &'static str {
         EnrollError::MaybeSpent(_) => "InviteMaybeSpent",
         EnrollError::InvalidResponse(_) => "InvalidResponse",
         EnrollError::NotStored(_) => "IdentityNotStored",
+        EnrollError::PendingForeign(_) => "PendingSecretForeign",
         EnrollError::Kube(_) => "StoreUnavailable",
     }
 }
@@ -216,7 +217,8 @@ const fn definitive(error: &EnrollError) -> bool {
         | EnrollError::NameTaken(_)
         | EnrollError::NameDeleted(_)
         | EnrollError::Refused(_)
-        | EnrollError::InvalidResponse(_) => true,
+        | EnrollError::InvalidResponse(_)
+        | EnrollError::PendingForeign(_) => true,
         EnrollError::SignerLapsed(_)
         | EnrollError::MaybeSpent(_)
         | EnrollError::NotStored(_)
@@ -651,7 +653,9 @@ impl Enrollment {
             Ok(Outcome::AlreadyEnrolled | Outcome::Discarded) => Box::pin(self.present(client, site, target)).await,
             // A Config from the attempt itself reads state the inputs do not track, such as
             // the CA Secret or the GridNetwork, so a fix there must resend.
-            Err(error @ EnrollError::Config(_)) => Box::pin(self.fail(client, site, None, &error)).await,
+            Err(error @ (EnrollError::Config(_) | EnrollError::PendingForeign(_))) => {
+                Box::pin(self.fail(client, site, None, &error)).await
+            },
             Err(error) => Box::pin(self.fail(client, site, Some(inputs), &error)).await,
         }
     }
