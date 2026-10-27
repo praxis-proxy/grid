@@ -195,7 +195,7 @@ evaluated yet. A wait an admin must end is `False`.
 
 | `Accepted` | Reason | Meaning |
 | --- | --- | --- |
-| `True` | `Accepted` | The operator config's `site` section applies to this site, the one the identity names. |
+| `True` | `Accepted` | The operator config's `site` section applies to this site, the one the identity names. With no config, or no `site` section, the message reads `no operator config, enrollment off` or `the operator config names no site, enrollment off`. |
 | `False` | `OperatorConfigInvalid` | The operator config was refused whole: it does not parse, names a version other than `1`, carries an unknown key inside a section, or a field is invalid. The message names the field. Nothing in it is acted on, so nothing enrolls or renews. |
 | `False` | `SiteNameMismatch` | `site.name` differs from the site this cluster's identity names. Nothing renews through the config until they agree. |
 | `False` | `RotationUnsupportedUnderPinTrust` | `site.signerEndpoint.rotation` is `Enabled`, the default, but the GridNetwork declares `pin` peer trust, which does not renew. Renewal is held back and the rest of the config still acts. Set `rotation: Disabled`, or `peerTrust.mode: spiffe`. |
@@ -208,23 +208,26 @@ evaluated yet. A wait an admin must end is `False`.
 
 | `Progressing` | Reason | Meaning |
 | --- | --- | --- |
-| `True` | `Enrolling` | The request is being sent. Retryable failures retry without a deadline. |
-| `True` | `Retrying` | The last attempt failed in a way the next poll retries with the same inputs: a Secret could not be read or written, or the request may not have reached the signer. It holds across polls, so a resend does not move `lastTransitionTime`. |
-| `True` | `NewGeneration` | A gate describes an older `metadata.generation` of the GridNetwork than it holds now. |
-| `False` | `AsExpected` | Nothing is in flight. |
+| `True` | `Enrolling` | The first request is out. A step retries a failure within its budget, about one poll, then returns, so an edit to the config is seen. |
+| `True` | `Retrying` | `Enrolled` holds a reason the next poll retries with the same inputs: `SignerLapsed`, `SignerUnreachable`, `InviteMaybeSpent` for a request that got no usable answer, `IdentityNotStored` or `StoreUnavailable`. It holds across polls, so a resend does not move `lastTransitionTime`. |
+| `False` | `AsExpected` | Nothing is in flight. `Progressing` follows `Enrolled` alone. |
 
 | `Enrolled` | Reason | Meaning |
 | --- | --- | --- |
-| `True` | `Enrolled` | The signer issued this site's identity, or the identity Secret already existed and this process did not enroll it, so the invite is never read. It stays once written. |
-| `Unknown` | `AwaitingFirstAttempt` | The first enrollment attempt has not returned. |
+| `True` | `Enrolled` | The signer issued this site's identity, or the identity Secret already existed and this process did not enroll it, so the invite is never read. It stays once written. For an identity written outside the signer the message reads `identity provisioned outside the signer, renewed by cert-manager Certificate <name>` when the Secret names one, else `identity provisioned outside the signer; nothing is known to renew it`. |
+| `Unknown` | `Enrolling` | The first request is out and no answer has returned. |
+| `False` | `EnrollmentOff` | No identity, and the config names no site to enroll: nothing is sent. Name the site and its invite in the operator config. |
+| `False` | `IdentityMissing` | An identity this process held is gone. Restore it, or name `site.inviteSecretRef` to enroll again. |
 | `False` | `AwaitingInvite` | No `site.inviteSecretRef` yet, or no `site.signerEndpoint` to send it to. |
-| `False` | `Misconfigured` | A setting cannot work, such as a missing `caBundleRef` or a bundle with no certificate. |
+| `False` | `Misconfigured` | A setting cannot work, such as a missing `caBundleRef`, a bundle with no certificate, or a Secret enrollment would both write and read, such as a grid CA Secret named `<identity Secret>-pending`. The message names the field or the Secret. |
 | `False` | `SignerUntrusted` | The signer's serving certificate does not chain to `caBundleRef`. Nothing is sent. Pin the issuing intermediate or the signer's serving certificate, never a public root. |
+| `False` | `SignerLapsed` | The signer's serving certificate is expired or not yet valid. Nothing is sent, and the next poll retries: the signer must rotate its serving certificate. |
+| `False` | `SignerUnreachable` | The signer could not be reached within the step, so the request never left. The next poll retries, so a corrected `site.signerEndpoint.url` takes effect without a restart. |
 | `False` | `NameMismatch` | The invite Secret's `grid.praxis.fast/site` label is missing or names another site. Nothing is sent. |
 | `False` | `InviteInvalid` | The signer rejected the token: expired, revoked or spent. |
 | `False` | `NameTaken`, `NameDeleted` | The name is enrolled, or was deleted and the invite does not re-admit it. |
 | `False` | `Refused` | The signer refused the request. |
-| `False` | `InviteMaybeSpent` | The request was sent and no usable answer came back, or the signer answered 408. The next poll sends the same request again. Or the token was refused after such a request, which may have spent it: a new invite may be needed. |
+| `False` | `InviteMaybeSpent` | The request was sent and no usable answer came back, or the signer answered 408. The next poll sends the same request again. Or the token was refused after such a request, which may have spent it: that refusal is not sent again until the invite, the site section or a bundle changes, and a new invite may be needed. |
 | `False` | `PendingSecretForeign` | A Secret named `<identity Secret>-pending` exists that enrollment did not write, so nothing is sent. Delete it: enrollment keeps its request there. A request kept there for another site name, grid CA or invite is discarded and a new one is made. |
 | `False` | `InvalidResponse` | The returned certificate failed the pin, name or key checks. The token is spent. |
 | `False` | `IdentityNotStored` | The certificate was issued but could not be written. The token is spent. |
@@ -337,7 +340,7 @@ has expired. The GridNetwork carries two conditions the renewal loop writes each
 
 | `IdentityValid` | Reason | Meaning |
 | --- | --- | --- |
-| `True` | `IdentityValid` | The identity reads, is current, names this site, is issued by the grid CA the operator holds, and `tls.key` is its key. The message starts with the expiry in RFC 3339, then names the fingerprint. |
+| `True` | `IdentityValid` | The identity reads, is current, names this site, is issued by the grid CA the operator holds, and `tls.key` is its key. The message reads `<notAfter, RFC 3339> is the expiry; fingerprint sha256:<hex>`. |
 | `Unknown` | `AwaitingFirstAttempt` | No identity yet: the renewal loop evaluates it once one exists. |
 | `False` | `IdentityMissing` | The identity Secret, or a key in it, is absent. |
 | `False` | `CertificateUnreadable` | The Secret holds something that is not a certificate. |
@@ -346,12 +349,14 @@ has expired. The GridNetwork carries two conditions the renewal loop writes each
 | `False` | `CertificateUntrusted` | The grid CA in the CA Secret did not issue the certificate, or it is not yet valid. Replace it with one that CA issued, or re-enroll. |
 | `False` | `CertificateNameMismatch` | The certificate names another site, or no single site. Issue it for this site's SPIFFE ID, or set `site.name` to the site it names. |
 | `False` | `CertificateKeyMismatch` | `tls.key` is not the key of `tls.crt`. Write the certificate and its key together. |
+| `False` | `CertificateDnsNameMissing` | `tls.crt` lacks the DNS name `<site>.grid.internal`, which peers dial. Issue it with that name. Checked on every identity, signer-issued or external. |
+| `False` | `CertificateOrganizationMismatch` | The subject organization must name the site alone, `O=<site>`, which a gateway authorizes peers on. Issue it with that organization. Checked on every identity, signer-issued or external. |
 
 | `RotationOnSchedule` | Reason | Meaning |
 | --- | --- | --- |
 | `True` | `RotationOnSchedule` | Renewal is not due, and the message says what renews. The signer `site.signerEndpoint` names: the message carries the due time and the URL. The cert-manager Certificate the identity Secret's `cert-manager.io/certificate-name` annotation names: the operator reads only the annotation. Or nothing, so the identity is kept until it expires: `rotation` is `Disabled`, no signer is declared, or `Accepted` reports `RotationUnsupportedUnderPinTrust`. A newer leaf another writer puts in the identity Secret resets the clock. |
 | `Unknown` | `NotEvaluated` | The operator config is refused for this site, so renewal is held back and not evaluated. See `Accepted`. Once renewal falls due this reads `False` with `RotationOverdue`. |
-| `False` | `RotationOverdue` | Renewal is due or the identity expired, and nothing renewed it: the cases above, an annotated Certificate that has not replaced the identity, the signer answering 503 `rotation_disabled`, or an expired identity. |
+| `False` | `RotationOverdue` | Renewal is due or the identity expired, and nothing renewed it: the cases above, an annotated Certificate that has not replaced the identity within 15 minutes of its due time, the signer answering 503 `rotation_disabled`, or an expired identity. |
 | `False` | `RenewalFailing` | The last check or renewal failed and is retried with backoff. The message carries the error. |
 | `False` | `RenewalRefused` | The signer answered 401 or 403. Re-enroll this site with a new site token. |
 | `False` | `RenewalNeedsPassthrough` | The signer received no client certificate, so TLS ends before it. Renewal needs a passthrough Route, a load balancer, or the in-cluster Service. Retried with backoff. |
