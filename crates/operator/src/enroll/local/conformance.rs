@@ -816,3 +816,75 @@ async fn invariant_8_a_refused_config_with_no_identity_is_accepted_false_on_the_
         "nothing is written to any GridSite, and nothing is cleared"
     );
 }
+
+/// Store a 30-day identity whose renewal fell due `past` ago, annotated with the cert-manager
+/// Certificate `renewer` when one is given.
+fn store_lapsing_identity(api: &FakeApi, past: time::Duration, renewer: Option<&str>) {
+    let ca = certs::generate_ca("grid-ca").expect("ca");
+    let csr = certs::generate_csr(SITE).expect("csr");
+    let now = time::OffsetDateTime::now_utc();
+    let not_before = now.saturating_sub(time::Duration::days(20)).saturating_sub(past);
+    let validity = certs::Validity {
+        not_before,
+        not_after: not_before.saturating_add(time::Duration::days(30)),
+    };
+    let leaf = certs::sign_csr(&ca, SITE, &csr.csr_pem, validity).expect("leaf");
+    store_pair(api, &ca.cert_pem, &leaf.cert_pem, &csr.key_pem);
+    if let Some(renewer) = renewer {
+        let mut held = api.get(&secret_path(IDENTITY_SECRET)).expect("identity stored");
+        held["metadata"]["annotations"] = json!({ "cert-manager.io/certificate-name": renewer });
+        api.put(&secret_path(IDENTITY_SECRET), held);
+    }
+}
+
+#[tokio::test]
+async fn invariant_8_cert_manager_replacing_the_identity_just_after_it_falls_due_never_reads_overdue() {
+    let api = seeded();
+    store_lapsing_identity(&api, time::Duration::minutes(5), Some("site-d-identity"));
+    let rounds = renewal_rounds(&api, 4, |round| {
+        // Round 2: cert-manager has issued the next certificate into the Secret.
+        if round == 2 {
+            store_lapsing_identity(&api, time::Duration::days(-10), Some("site-d-identity"));
+        }
+    })
+    .await;
+
+    invariants::transition_time_moves_only_with_status(&rounds).expect("invariant 2");
+    invariants::reasons_within(&rounds, &REASONS).expect("invariant 8");
+    for round in &rounds {
+        let rotation = round.condition(ROTATION_ON_SCHEDULE).expect("RotationOnSchedule");
+        assert_eq!(
+            (&rotation["status"], &rotation["message"]),
+            (
+                &json!("True"),
+                &json!("renewed by cert-manager Certificate site-d-identity")
+            ),
+            "within the grace past due an external renewer is not overdue"
+        );
+        assert_eq!(
+            round.condition(DEGRADED).expect("Degraded")["status"],
+            "False",
+            "no false alarm"
+        );
+    }
+}
+
+#[tokio::test]
+async fn invariant_8_an_unrenewed_identity_reads_overdue_once_the_grace_runs_out() {
+    let api = seeded();
+    store_lapsing_identity(&api, time::Duration::hours(1), Some("site-d-identity"));
+    let rounds = renewal_rounds(&api, 2, |_round| {}).await;
+    let rotation = rounds[1].condition(ROTATION_ON_SCHEDULE).expect("RotationOnSchedule");
+    assert_eq!(
+        (&rotation["status"], &rotation["reason"]),
+        (&json!("False"), &json!("RotationOverdue"))
+    );
+    assert!(
+        rotation["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("site-d-identity"),
+        "names the Certificate that has not replaced it: {}",
+        rotation["message"]
+    );
+}

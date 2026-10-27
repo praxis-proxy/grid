@@ -943,6 +943,8 @@ struct Read {
     due: Due,
     /// Its expiry.
     not_after: OffsetDateTime,
+    /// When its renewal falls due.
+    renew_at: OffsetDateTime,
 }
 
 /// Read the identity in `target`, or the round that reports why it could not be.
@@ -971,6 +973,7 @@ async fn read_identity(loop_: &Loop<'_>, target: &Target) -> Result<Read, Round>
         due: due(not_before, not_after, OffsetDateTime::now_utc()),
         held,
         not_after,
+        renew_at: renew_after(not_before, not_after),
     })
 }
 
@@ -1063,14 +1066,34 @@ async fn check_round(
 
 /// The round in which the operator does not renew `read`, for `why`.
 fn off_round(why: Off, read: Read, identity: Option<Identity>) -> Round {
+    let due = external_due(
+        read.due,
+        read.renew_at,
+        read.held.renewer.is_some(),
+        OffsetDateTime::now_utc(),
+    );
     Round {
         checked: Ok(Checked::Off {
             why,
-            due: read.due,
+            due,
             renewer: read.held.renewer,
         }),
         signer: None,
         identity,
+    }
+}
+
+/// How long past due an external renewer, a cert-manager Certificate the Secret names, has to
+/// replace the identity before it reads overdue: cert-manager renews at the same point.
+const EXTERNAL_GRACE: time::Duration = time::Duration::minutes(15);
+
+/// When renewal is due for an identity renewed `externally` or not, at `now`: within
+/// [`EXTERNAL_GRACE`] of `renew_at`, an external renewer is not yet overdue.
+fn external_due(due: Due, renew_at: OffsetDateTime, externally: bool, now: OffsetDateTime) -> Due {
+    let grace_ends = renew_at.saturating_add(EXTERNAL_GRACE);
+    match due {
+        Due::Now if externally && now < grace_ends => Due::At(grace_ends),
+        held @ (Due::At(_) | Due::Now | Due::Expired) => held,
     }
 }
 
@@ -1416,7 +1439,14 @@ fn settle(checked: &Result<Checked, RenewError>, last: &mut Option<String>, fail
         // Re-read soon, so the next renewal is scheduled from the new leaf.
         Ok(Checked::Renewed(_)) => ("rotated".to_owned(), RETRY_INITIAL),
         Ok(Checked::Expired(_)) => ("expired".to_owned(), CHECK_EVERY),
-        Ok(Checked::Off { why, due, .. }) => (format!("off {} {due:?}", why.label()), CHECK_EVERY),
+        // Checked again when renewal falls due, so an overdue identity is reported then.
+        Ok(Checked::Off { why, due, .. }) => (
+            format!("off {} {due:?}", why.label()),
+            match due {
+                Due::At(at) => until(*at, OffsetDateTime::now_utc()).min(CHECK_EVERY),
+                Due::Now | Due::Expired => CHECK_EVERY,
+            },
+        ),
         Err(error) => (error.to_string(), retry_delay(failures.saturating_add(1))),
     };
     report(checked, last.as_deref() != Some(state.as_str()), wait);

@@ -297,7 +297,7 @@ fn renewal_follows_the_declared_peer_trust() {
     let (mut last, mut failures) = (None, 0);
     let off = Checked::Off {
         why: Off::UnsupportedUnderPin,
-        due: Due::At(OffsetDateTime::now_utc()),
+        due: Due::At(OffsetDateTime::now_utc().saturating_add(Span::days(2))),
         renewer: None,
     };
     assert_eq!(settle(&Ok(off), &mut last, &mut failures), CHECK_EVERY);
@@ -949,12 +949,22 @@ fn identity_valid_follows_what_was_read() {
 fn disabled_rotation_neither_rolls_nor_retries() {
     let disabled = || Checked::Off {
         why: Off::Disabled,
-        due: Due::At(OffsetDateTime::now_utc()),
+        due: Due::At(OffsetDateTime::now_utc().saturating_add(Span::days(2))),
         renewer: None,
     };
     assert_eq!(rolls_after(&Ok(disabled())), None, "Disabled never rolls");
     let (mut last, mut failures) = (None, 0);
     assert_eq!(settle(&Ok(disabled()), &mut last, &mut failures), CHECK_EVERY);
+    let soon = Checked::Off {
+        why: Off::Disabled,
+        due: Due::At(OffsetDateTime::now_utc().saturating_add(Span::minutes(10))),
+        renewer: None,
+    };
+    let wait = settle(&Ok(soon), &mut last, &mut failures);
+    assert!(
+        wait <= Duration::from_secs(600) && wait > Duration::from_secs(590),
+        "checked again when renewal falls due, so an overdue identity is reported then: {wait:?}"
+    );
     assert!(Off::Disabled.message().contains("Disabled"));
 }
 
@@ -1151,4 +1161,27 @@ fn an_enrolled_site_keeps_its_issuance_message_while_the_identity_is_present() {
     };
     assert!(written(true).is_empty(), "an enrolled site keeps its issuance message");
     assert_eq!(written(false), vec![local::ENROLLED.to_owned()]);
+}
+
+#[test]
+fn an_external_renewer_has_a_grace_past_due_before_it_reads_overdue() {
+    let renew_at = OffsetDateTime::now_utc();
+    let within = renew_at.saturating_add(Span::minutes(5));
+    let past = renew_at.saturating_add(EXTERNAL_GRACE).saturating_add(Span::minutes(1));
+    assert_eq!(
+        external_due(Due::Now, renew_at, true, within),
+        Due::At(renew_at.saturating_add(EXTERNAL_GRACE)),
+        "cert-manager renews at the same point, so it has the grace to replace the identity"
+    );
+    assert_eq!(
+        external_due(Due::Now, renew_at, true, past),
+        Due::Now,
+        "then it is overdue"
+    );
+    assert_eq!(
+        external_due(Due::Now, renew_at, false, within),
+        Due::Now,
+        "no renewer named, no grace"
+    );
+    assert_eq!(external_due(Due::Expired, renew_at, true, within), Due::Expired);
 }
