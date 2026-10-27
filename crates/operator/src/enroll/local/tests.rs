@@ -56,6 +56,8 @@ impl World {
                 labels: Some(labels.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()),
                 ..ObjectMeta::default()
             },
+            // The API server defaults a Secret's type to Opaque and always returns it.
+            type_: Some("Opaque".to_owned()),
             data: Some(
                 data.iter()
                     .map(|(k, v)| ((*k).to_owned(), ByteString(v.as_bytes().to_vec())))

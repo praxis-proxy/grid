@@ -382,19 +382,15 @@ pub(super) enum Swept {
 /// left alone.
 pub(super) async fn clear<S: Store + Sync>(store: &S, target: &Target, backoff: Backoff) -> Result<Swept, EnrollError> {
     let name = name(target);
-    let Some(meta) = store.metadata(&name).await? else {
+    let Some(secret) = store.get(&name).await? else {
         return Ok(Swept::Nothing);
     };
-    if let Some(why) = foreign(&meta) {
-        return Ok(Swept::Foreign(format!(
-            "Secret {name} was not written by enrollment ({why}), left alone"
-        )));
+    // The whole object decides, as it does before a request is kept there: a Secret of
+    // another type with enrollment's labels is not enrollment's either.
+    if let Err(why) = ours(&name, &secret.metadata, secret.type_.as_deref()) {
+        return Ok(Swept::Foreign(format!("{why}, left alone")));
     }
-    let held = store
-        .get(&name)
-        .await?
-        .is_some_and(|secret| secret.data.is_some_and(|data| !data.is_empty()));
-    if !held {
+    if secret.data.as_ref().is_none_or(BTreeMap::is_empty) {
         return Ok(Swept::Nothing);
     }
     let patch = json!({

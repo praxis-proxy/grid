@@ -300,6 +300,11 @@ impl FakeStore {
             .insert(key.to_owned(), value.to_owned());
     }
 
+    /// Give the Secret `name` the type `type_`, keeping everything else.
+    fn set_type(&self, name: &str, type_: &str) {
+        self.secrets.lock().expect("lock").get_mut(name).expect("secret").type_ = Some(type_.to_owned());
+    }
+
     /// Set `key` of the Secret `name`, keeping its metadata.
     fn put_value(&self, name: &str, key: &str, value: &str) {
         self.secrets
@@ -594,6 +599,25 @@ async fn a_planted_pending_secret_is_refused_and_never_sent() {
     );
 }
 
+#[tokio::test]
+async fn an_enrolled_site_clears_only_a_pending_secret_that_is_wholly_its_own() {
+    let (signer, settings) = serve(Reply::Sign).await;
+    for (type_, cleared) in [("kubernetes.io/tls", false), ("Opaque", true)] {
+        let store = FakeStore::invited();
+        store.put("site-tls", "tls.crt", "enrolled");
+        store.put(&pending_name(), "csr.pem", "kept");
+        store.set_type(&pending_name(), type_);
+        let outcome = run_flow(&store, &settings).await;
+        assert!(matches!(outcome, Ok(Outcome::AlreadyEnrolled)), "{type_}: {outcome:?}");
+        assert_eq!(
+            store.value(&pending_name(), "csr.pem").is_none(),
+            cleared,
+            "{type_}: enrollment's labels on a Secret of another type do not make it enrollment's"
+        );
+    }
+    assert_eq!(signer.calls(), 0);
+}
+
 /// A request kept for `settings` with the test invite, and its key.
 async fn kept_request(store: &FakeStore, settings: &Settings) -> String {
     let csr = certs::generate_csr(SITE).expect("csr");
@@ -863,7 +887,11 @@ async fn an_existing_identity_skips_enrollment_without_reading_the_token() {
         "restart is a no-op: {outcome:?}"
     );
     assert_eq!(mock.calls(), 0, "no token is spent on restart");
-    assert!(store.reads.lock().expect("lock").is_empty(), "no Secret data is read");
+    let reads = store.reads.lock().expect("lock").clone();
+    assert!(
+        reads.iter().all(|name| *name == pending_name()),
+        "only the pending enrollment is read, never the token: {reads:?}"
+    );
 }
 
 #[tokio::test]
