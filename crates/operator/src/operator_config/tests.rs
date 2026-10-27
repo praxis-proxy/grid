@@ -177,8 +177,79 @@ static WATCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 fn watching() -> (Events, ConfigWatch) {
     let (events_tx, events_rx) = futures::channel::mpsc::unbounded();
     let (tx, rx) = tokio::sync::watch::channel(Arc::new(Snapshot::unread()));
-    drop(tokio::spawn(follow(events_rx, tx, None, SignerHosts::any())));
+    let what = format!("ConfigMap grid-system/{DEFAULT_CONFIG_MAP}");
+    drop(tokio::spawn(follow(events_rx, tx, None, SignerHosts::any(), what)));
     (events_tx, ConfigWatch(rx))
+}
+
+/// The API answering `code` with `reason` to the list.
+fn list_failed(code: u16, reason: &str) -> watcher::Error {
+    watcher::Error::InitialListFailed(kube::Error::Api(
+        kube::core::Status::failure("listing configmaps failed", reason)
+            .with_code(code)
+            .boxed(),
+    ))
+}
+
+#[tokio::test]
+async fn a_forbidden_watch_refuses_the_document_until_it_reads() {
+    let _watch = WATCH.lock().await;
+    let (events, mut config) = watching();
+    events.unbounded_send(Err(list_failed(403, "Forbidden"))).expect("send");
+    let first = config.read().await;
+    let why = refusal(&first);
+    assert!(
+        why.contains("cannot read ConfigMap grid-system/grid-operator-config") && why.contains("403"),
+        "a forbidden watch reads invalid, naming the ConfigMap and the error: {why}"
+    );
+
+    send(&events, watcher::Event::Init);
+    send(&events, watcher::Event::InitApply(map(Some(FULL))));
+    send(&events, watcher::Event::InitDone);
+    config.changed().await;
+    assert!(
+        matches!(config.current().loaded.site(), Section::Site(_)),
+        "a later read replaces the refusal"
+    );
+}
+
+#[tokio::test]
+async fn a_watch_error_after_a_read_keeps_the_last_read() {
+    let _watch = WATCH.lock().await;
+    let (events, mut config) = watching();
+    send(&events, watcher::Event::Init);
+    send(&events, watcher::Event::InitApply(map(Some(FULL))));
+    send(&events, watcher::Event::InitDone);
+    let first = config.read().await;
+    for (code, reason) in [(500, "InternalError"), (403, "Forbidden")] {
+        events.unbounded_send(Err(list_failed(code, reason))).expect("send");
+        let republished = tokio::time::timeout(std::time::Duration::from_millis(100), config.changed()).await;
+        assert!(republished.is_err(), "a {code} after a read changes nothing");
+        assert_eq!(config.current(), first, "{code}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_first_read_that_never_completes_refuses_the_document() {
+    let _watch = WATCH.lock().await;
+    let (events, mut config) = watching();
+    events
+        .unbounded_send(Err(list_failed(500, "InternalError")))
+        .expect("send");
+    let first = config.read().await;
+    let why = refusal(&first);
+    assert!(
+        why.starts_with("cannot read ConfigMap grid-system/grid-operator-config within 30s: "),
+        "an unread document times out as invalid, naming the ConfigMap, the wait and the last error: {why}"
+    );
+}
+
+/// Why `snapshot` was refused, else what it holds instead.
+fn refusal(snapshot: &Snapshot) -> String {
+    match &snapshot.loaded {
+        Loaded::Invalid(why) => why.clone(),
+        other @ (Loaded::Unread | Loaded::Absent | Loaded::Valid(_)) => format!("not refused: {other:?}"),
+    }
 }
 
 /// Send `event` down `events`.
@@ -288,10 +359,7 @@ async fn a_relist_without_the_config_map_reads_absent() {
 
 #[test]
 fn a_relist_publishes_only_once_it_completes() {
-    let mut fold = Fold {
-        hosts: SignerHosts::any(),
-        relisting: None,
-    };
+    let mut fold = Fold::default();
     assert_eq!(fold.apply(watcher::Event::Init), None);
     assert_eq!(fold.apply(watcher::Event::InitApply(map(Some(FULL)))), None);
     let done = fold.apply(watcher::Event::InitDone).expect("published");

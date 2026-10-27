@@ -414,6 +414,16 @@ impl Snapshot {
         }
     }
 
+    /// A `ConfigMap` that cannot be read, refused with `why`.
+    #[must_use]
+    pub const fn unreadable(why: String) -> Self {
+        Self {
+            loaded: Loaded::Invalid(why),
+            ignored: Vec::new(),
+            object: None,
+        }
+    }
+
     /// A valid document with no `ConfigMap` behind it.
     #[must_use]
     pub fn of_config(config: OperatorConfig) -> Self {
@@ -464,7 +474,8 @@ impl ConfigWatch {
         let events =
             watcher(api, watcher::Config::default().fields(&format!("metadata.name={name}"))).default_backoff();
         let (tx, rx) = tokio::sync::watch::channel(Arc::new(Snapshot::unread()));
-        drop(tokio::spawn(follow(events, tx, Some(client), hosts)));
+        let what = format!("ConfigMap {namespace}/{name}");
+        drop(tokio::spawn(follow(events, tx, Some(client), hosts, what)));
         Self(rx)
     }
 
@@ -505,30 +516,98 @@ impl ConfigWatch {
     }
 }
 
-/// Fold watch `events` into `tx` until every receiver is gone.
-async fn follow<S>(events: S, tx: tokio::sync::watch::Sender<Arc<Snapshot>>, client: Option<Client>, hosts: SignerHosts)
-where
+/// How long the first read may take before the document is refused as unreadable, so a
+/// watch that never completes, as under RBAC drift, does not hold startup.
+const FIRST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Fold watch `events` into `tx` until every receiver is gone. `what` names the `ConfigMap`
+/// for a refusal. A watch the API forbids, or one that completes no read within
+/// [`FIRST_READ_TIMEOUT`], publishes the document as refused, naming the error; a later
+/// read replaces that.
+async fn follow<S>(
+    events: S,
+    tx: tokio::sync::watch::Sender<Arc<Snapshot>>,
+    client: Option<Client>,
+    hosts: SignerHosts,
+    what: String,
+) where
     S: Stream<Item = Result<watcher::Event<ConfigMap>, watcher::Error>> + Send,
 {
-    let mut fold = Fold { hosts, relisting: None };
+    let mut fold = Fold {
+        hosts,
+        ..Fold::default()
+    };
     let mut events = std::pin::pin!(events);
-    while let Some(event) = events.next().await {
-        let next = match event {
-            Ok(event) => fold.apply(event),
-            Err(error) => {
-                tracing::warn!(%error, "watching the operator config failed; retrying");
-                None
-            },
+    let mut deadline = std::pin::pin!(tokio::time::sleep(FIRST_READ_TIMEOUT));
+    let mut read = false;
+    let mut last_error: Option<String> = None;
+    while !tx.is_closed() {
+        let event = if read {
+            events.next().await
+        } else {
+            tokio::select! {
+                event = events.next() => event,
+                () = &mut deadline => {
+                    read = true;
+                    let why = timed_out(&what, last_error.as_deref());
+                    Box::pin(publish_next(&tx, client.as_ref(), &Snapshot::unreadable(why))).await;
+                    continue;
+                },
+            }
         };
-        if let Some(next) = next
-            && publish(&tx, &next)
-        {
-            crate::metrics::set_operator_config_ignored_sections(next.ignored.len());
-            Box::pin(note_ignored(client.as_ref(), &next)).await;
+        let Some(event) = event else { return };
+        if let Some(next) = settle(&mut fold, event, (&what, read), &mut last_error) {
+            read = true;
+            Box::pin(publish_next(&tx, client.as_ref(), &next)).await;
         }
-        if tx.is_closed() {
-            return;
-        }
+    }
+}
+
+/// Why the first read gave up: the wait, and the last watcher error if any.
+fn timed_out(what: &str, last_error: Option<&str>) -> String {
+    let after = last_error.map(|error| format!(": {error}")).unwrap_or_default();
+    format!("cannot read {what} within {}s{after}", FIRST_READ_TIMEOUT.as_secs())
+}
+
+/// The snapshot `event` settles on: a watch event through `fold`; a forbidden watch before
+/// any read, as a refusal; and any other watcher error as nothing new, remembered in
+/// `last_error`. Once `read`, every error keeps the last read: the watch reconnects, and a
+/// document that applied stays applied.
+fn settle(
+    fold: &mut Fold,
+    event: Result<watcher::Event<ConfigMap>, watcher::Error>,
+    (what, read): (&str, bool),
+    last_error: &mut Option<String>,
+) -> Option<Snapshot> {
+    match event {
+        Ok(event) => fold.apply(event),
+        Err(error) if !read && forbidden(&error) => Some(Snapshot::unreadable(format!("cannot read {what}: {error}"))),
+        Err(error) => {
+            tracing::warn!(%error, "watching the operator config failed; retrying");
+            *last_error = Some(error.to_string());
+            None
+        },
+    }
+}
+
+/// Whether the API refused the watch outright, which no retry fixes.
+fn forbidden(error: &watcher::Error) -> bool {
+    match error {
+        watcher::Error::InitialListFailed(error)
+        | watcher::Error::WatchStartFailed(error)
+        | watcher::Error::WatchFailed(error) => {
+            matches!(error, kube::Error::Api(status) if status.is_forbidden())
+        },
+        watcher::Error::WatchError(status) => status.is_forbidden(),
+        watcher::Error::NoResourceVersion => false,
+    }
+}
+
+/// Publish `next` when it changed, with its metrics and Events.
+async fn publish_next(tx: &tokio::sync::watch::Sender<Arc<Snapshot>>, client: Option<&Client>, next: &Snapshot) {
+    if publish(tx, next) {
+        crate::metrics::set_operator_config_ignored_sections(next.ignored.len());
+        note_ignored(client, next).await;
     }
 }
 
