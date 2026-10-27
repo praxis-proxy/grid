@@ -39,7 +39,20 @@ const ANNOTATIONS: [&str; 4] = [UNANSWERED, SITE, ANCHOR, INVITE];
 
 /// The Secret holding `target`'s enrollment in flight.
 pub(super) fn name(target: &Target) -> String {
-    format!("{}-pending", target.site_secret)
+    name_for(&target.site_secret)
+}
+
+/// The Secret holding the enrollment in flight for the identity Secret `site_secret`.
+fn name_for(site_secret: &str) -> String {
+    format!("{site_secret}-pending")
+}
+
+/// Whether `secrets` holds enrollment's own request in flight for the identity Secret
+/// `site_secret`, which only a configured site leaves.
+pub(super) async fn held_for(secrets: &kube::Api<Secret>, site_secret: &str) -> Result<bool, kube::Error> {
+    let name = name_for(site_secret);
+    let held = secrets.get_opt(&name).await?;
+    Ok(held.is_some_and(|secret| ours(&name, &secret.metadata, secret.type_.as_deref()).is_ok()))
 }
 
 /// What a kept request was made for: a request made for anything else is discarded.

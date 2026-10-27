@@ -1051,6 +1051,16 @@ fn invited(invite: &Secret, site: &str) -> bool {
 
 pub mod local;
 mod pending;
+
+/// Whether `secrets` holds enrollment's own request in flight for the identity Secret
+/// `site_secret`: a site was configured here, whatever the operator config says now.
+///
+/// # Errors
+///
+/// [`kube::Error`] when the read fails.
+pub(crate) async fn in_flight_for(secrets: &Api<Secret>, site_secret: &str) -> Result<bool, kube::Error> {
+    pending::held_for(secrets, site_secret).await
+}
 pub mod renew;
 mod signer;
 

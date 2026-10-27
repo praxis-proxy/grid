@@ -2318,7 +2318,9 @@ async fn ensure_tls_secrets(
             );
             return Ok(Some(wait));
         }
-        action = unless_enrolling(action, enrolls);
+        // A request enrollment kept outlives a restart that lost the config, so it holds too.
+        let enrolling = enrolls || crate::enroll::in_flight_for(&site_api, &site_ref.name).await?;
+        action = unless_enrolling(action, enrolling);
     }
     if note_inconsistent(
         ObjectRef::new(&network_site_name(network)),
@@ -8471,6 +8473,49 @@ mod tests {
         assert!(
             config_enrolls(&deleted),
             "a config deleted after it named this site still holds off"
+        );
+    }
+
+    /// What `ensure_tls_secrets` writes, after a restart that lost the config, beside a
+    /// pending Secret labelled `labels`.
+    async fn writes_beside_pending(labels: &Value) -> Vec<status_harness::Write> {
+        let api = status_harness::FakeApi::new();
+        api.put(
+            "/api/v1/namespaces/grid-system/secrets/site-tls-pending",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "type": "Opaque",
+                "metadata": {"name": "site-tls-pending", "namespace": "grid-system", "labels": labels},
+            }),
+        );
+        let network: GridNetwork = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": {"name": "grid", "creationTimestamp": "2020-01-01T00:00:00Z"},
+            "spec": {"tls": {
+                "caSecretRef": {"name": "grid-ca", "namespace": "grid-system"},
+                "siteSecretRef": {"name": "site-tls", "namespace": "grid-system"},
+            }},
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let client = api.client("grid-system");
+        let held = Box::pin(ensure_tls_secrets(&network, &client, Some("site-d"), false)).await;
+        assert!(held.is_ok(), "{held:?}");
+        api.writes()
+    }
+
+    #[tokio::test]
+    async fn a_restart_with_no_config_beside_enrollments_pending_secret_self_signs_nothing() {
+        let ours = serde_json::json!({"app.kubernetes.io/managed-by": "grid-operator"});
+        assert!(
+            writes_beside_pending(&ours).await.is_empty(),
+            "a site was configured here: enrollment writes the Secrets"
+        );
+        let planted = serde_json::json!({"app.kubernetes.io/managed-by": "someone-else"});
+        assert!(
+            !writes_beside_pending(&planted).await.is_empty(),
+            "a pending Secret enrollment did not write holds nothing off"
         );
     }
 
