@@ -789,7 +789,7 @@ async fn tick(loop_: &Loop<'_>, settings: &Settings, target: &Result<Target, sup
     let declared = declared(&snapshot.loaded, settings.site.as_deref());
     let round = match target {
         Err(error) => Round::failed(RenewError::Kube(error.to_string())),
-        Ok(target) => Box::pin(check_round(loop_, target, &declared)).await,
+        Ok(target) => Box::pin(check_round(loop_, target, settings.site.as_deref(), &declared)).await,
     };
     settings.configured.store(round.signer.is_some(), Ordering::Relaxed);
     if let Ok(target) = target {
@@ -826,6 +826,12 @@ enum Identity {
     Expired(OffsetDateTime),
     /// Peers under spiffe trust refuse it: no X.509-SVID profile.
     Unusable,
+    /// Not issued by the grid CA held, or outside its validity: what to fix.
+    Untrusted(String),
+    /// Issued for another site, or for no single one: what to fix.
+    NameMismatch(String),
+    /// The key is not the certificate's: what to fix.
+    KeyMismatch(String),
     /// Usable until this instant.
     Valid(OffsetDateTime),
 }
@@ -923,14 +929,55 @@ async fn read_identity(loop_: &Loop<'_>, target: &Target) -> Result<Read, Round>
     })
 }
 
-/// What `IdentityValid` reads off `read` in a grid that `renews` or not.
-fn identity_of(read: &Read, renews: bool) -> Identity {
-    match read.due {
-        Due::Expired => Identity::Expired(read.not_after),
-        Due::At(_) | Due::Now if renews && !certs::has_svid_profile(&read.held.cert).unwrap_or(false) => {
-            Identity::Unusable
-        },
-        Due::At(_) | Due::Now => Identity::Valid(read.not_after),
+/// What `IdentityValid` reads off `read` from `target`, as `site`'s, in a grid that `renews`
+/// or not.
+fn identity_of(read: &Read, target: &Target, site: Option<&str>, renews: bool) -> Identity {
+    if read.due == Due::Expired {
+        return Identity::Expired(read.not_after);
+    }
+    if let Err(why) = held_by(&read.held, target, site) {
+        return why;
+    }
+    if renews && !certs::has_svid_profile(&read.held.cert).unwrap_or(false) {
+        return Identity::Unusable;
+    }
+    Identity::Valid(read.not_after)
+}
+
+/// Whether `held` is `site`'s identity from the grid CA it holds, with its own key.
+fn held_by(held: &Held, target: &Target, site: Option<&str>) -> Result<(), Identity> {
+    let checked = match site {
+        Some(site) => certs::verify_site_cert(&held.ca, &held.cert, site).map(drop),
+        None => certs::verify_issued_by(&held.ca, &held.cert),
+    };
+    checked.map_err(|error| untrusted(&error, target, site))?;
+    if !certs::key_matches_cert(&held.key, &held.cert) {
+        return Err(Identity::KeyMismatch(format!(
+            "tls.key in Secret {} is not the key of its tls.crt; write the certificate and its key together",
+            target.site_secret
+        )));
+    }
+    Ok(())
+}
+
+/// What `IdentityValid` says about a leaf in `target` that `error` refused as `site`'s.
+fn untrusted(error: &certs::VerifyError, target: &Target, site: Option<&str>) -> Identity {
+    let (secret, ca) = (&target.site_secret, &target.ca_secret);
+    if matches!(
+        error,
+        certs::VerifyError::NameMismatch { .. } | certs::VerifyError::NotOneSpiffeName
+    ) {
+        let site = site.unwrap_or_default();
+        Identity::NameMismatch(format!(
+            "tls.crt in Secret {secret} is not site {site}'s ({error}); issue it for {}, or set site.name to the \
+             site it names",
+            certs::spiffe_id(site)
+        ))
+    } else {
+        Identity::Untrusted(format!(
+            "tls.crt in Secret {secret} is not trusted by the grid CA in Secret {ca} ({error}); replace it with a \
+             certificate that CA issued, or re-enroll this site"
+        ))
     }
 }
 
@@ -947,7 +994,7 @@ fn through(declared: &Declared<'_>, trust: &Trust) -> Result<Endpoint, Result<Of
 }
 
 /// Read the identity in `target` and check it through the signer `declared` names.
-async fn check_round(loop_: &Loop<'_>, target: &Target, declared: &Declared<'_>) -> Round {
+async fn check_round(loop_: &Loop<'_>, target: &Target, site: Option<&str>, declared: &Declared<'_>) -> Round {
     let read = match Box::pin(read_identity(loop_, target)).await {
         Ok(read) => read,
         Err(round) => return round,
@@ -956,7 +1003,7 @@ async fn check_round(loop_: &Loop<'_>, target: &Target, declared: &Declared<'_>)
         Ok(trust) => trust,
         Err(error) => return Round::failed(error),
     };
-    let identity = Some(identity_of(&read, trust.renews));
+    let identity = Some(identity_of(&read, target, site, trust.renews));
     match through(declared, &trust) {
         Ok(signer) => Box::pin(renew_through(loop_, target, read, signer, identity)).await,
         Err(Ok(why)) => Round {
@@ -1065,6 +1112,9 @@ fn identity_verdict(identity: &Identity) -> Verdict {
              current signer"
                 .to_owned(),
         ),
+        Identity::Untrusted(why) => Verdict::new("False", "CertificateUntrusted", why.clone()),
+        Identity::NameMismatch(why) => Verdict::new("False", "CertificateNameMismatch", why.clone()),
+        Identity::KeyMismatch(why) => Verdict::new("False", "CertificateKeyMismatch", why.clone()),
         Identity::Valid(at) => Verdict::new("True", local::IDENTITY_VALID, format!("valid until {at}")),
     }
 }

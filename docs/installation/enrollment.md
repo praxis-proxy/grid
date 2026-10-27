@@ -318,12 +318,15 @@ conditions the renewal loop writes each round:
 
 | `IdentityValid` | Reason | Meaning |
 | --- | --- | --- |
-| `True` | `IdentityValid` | The identity reads and is current. The message names `notAfter`. |
+| `True` | `IdentityValid` | The identity reads, is current, names this site, is issued by the grid CA the operator holds, and `tls.key` is its key. The message names `notAfter`. |
 | `Unknown` | `AwaitingFirstAttempt` | No identity yet: the renewal loop evaluates it once one exists. |
 | `False` | `IdentityMissing` | The identity Secret, or a key in it, is absent. |
 | `False` | `CertificateUnreadable` | The Secret holds something that is not a certificate. |
 | `False` | `CertificateExpired` | The identity expired and cannot renew. Re-enroll with a new site token. |
 | `False` | `CertificateUnusable` | The certificate lacks the X.509-SVID profile peers under spiffe trust require. |
+| `False` | `CertificateUntrusted` | The grid CA in the CA Secret did not issue the certificate, or it is not yet valid. Replace it with one that CA issued, or re-enroll. |
+| `False` | `CertificateNameMismatch` | The certificate names another site, or no single site. Issue it for this site's SPIFFE ID, or set `site.name` to the site it names. |
+| `False` | `CertificateKeyMismatch` | `tls.key` is not the key of `tls.crt`. Write the certificate and its key together. |
 
 | `RotationOnSchedule` | Reason | Meaning |
 | --- | --- | --- |

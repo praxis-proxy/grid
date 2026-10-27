@@ -100,7 +100,7 @@ fn managers() -> BTreeMap<&'static str, &'static str> {
 
 /// The reasons the enrollment step writes, by type and status. `Available` copies the
 /// first failing gate's reason, so it carries the gates' reasons.
-const REASONS: [(&str, &str, &str); 19] = [
+const REASONS: [(&str, &str, &str); 25] = [
     (AVAILABLE, "True", "Available"),
     (AVAILABLE, "False", "AwaitingInvite"),
     (AVAILABLE, "False", "InviteMaybeSpent"),
@@ -115,6 +115,12 @@ const REASONS: [(&str, &str, &str); 19] = [
     (IDENTITY_VALID, "Unknown", "AwaitingFirstAttempt"),
     (IDENTITY_VALID, "True", "IdentityValid"),
     (IDENTITY_VALID, "False", "IdentityMissing"),
+    (IDENTITY_VALID, "False", "CertificateUntrusted"),
+    (IDENTITY_VALID, "False", "CertificateNameMismatch"),
+    (IDENTITY_VALID, "False", "CertificateKeyMismatch"),
+    (AVAILABLE, "False", "CertificateUntrusted"),
+    (AVAILABLE, "False", "CertificateNameMismatch"),
+    (AVAILABLE, "False", "CertificateKeyMismatch"),
     (PROGRESSING, "False", "AsExpected"),
     (PROGRESSING, "True", "Enrolling"),
     (PROGRESSING, "True", "Retrying"),
@@ -206,18 +212,84 @@ async fn invariant_6_deleting_the_identity_secret_turns_available_false_in_the_s
 fn store_identity(api: &FakeApi) {
     let ca = certs::generate_ca("grid-ca").expect("ca");
     let leaf = certs::generate_dns_cert(&ca, SITE, SITE).expect("leaf");
+    store_pair(api, &ca.cert_pem, &leaf.cert_pem, &leaf.key_pem);
+}
+
+/// Store `cert` and `key` as the identity and `ca` as the grid CA.
+fn store_pair(api: &FakeApi, ca: &str, cert: &str, key: &str) {
     api.put(
         &secret_path(IDENTITY_SECRET),
-        secret(
-            IDENTITY_SECRET,
-            &[("tls.crt", &leaf.cert_pem), ("tls.key", &leaf.key_pem)],
-            &[],
-        ),
+        secret(IDENTITY_SECRET, &[("tls.crt", cert), ("tls.key", key)], &[]),
     );
-    api.put(
-        &secret_path(CA_SECRET),
-        secret(CA_SECRET, &[("ca.crt", &ca.cert_pem)], &[]),
+    api.put(&secret_path(CA_SECRET), secret(CA_SECRET, &[("ca.crt", ca)], &[]));
+}
+
+/// Three renewal rounds over an identity that fails `reason`'s check, holding the
+/// invariants, and the message `IdentityValid` gives.
+async fn refused_identity(store: impl FnOnce(&FakeApi), reason: &str) -> String {
+    let api = seeded();
+    store(&api);
+    let rounds = renewal_rounds(&api, 3, |_round| {}).await;
+
+    invariants::unchanged_from(&rounds, 1).expect("invariant 1");
+    invariants::transition_time_moves_only_with_status(&rounds).expect("invariant 2");
+    invariants::one_manager_per_type(&api.writes(), PATH, &managers()).expect("invariant 5");
+    invariants::reasons_within(&rounds, &REASONS).expect("invariant 8");
+    invariants::available_equals_rollup(&rounds[1], &GATES).expect("invariant 7, Available");
+    let valid = rounds[1].condition(IDENTITY_VALID).expect("IdentityValid");
+    assert_eq!((&valid["status"], &valid["reason"]), (&json!("False"), &json!(reason)));
+    assert_eq!(available_of(&rounds[1]), ("False", reason));
+    valid["message"].as_str().unwrap_or_default().to_owned()
+}
+
+#[tokio::test]
+async fn invariant_8_an_identity_another_ca_issued_is_certificate_untrusted() {
+    let message = refused_identity(
+        |api| {
+            let held = certs::generate_ca("grid-ca").expect("ca");
+            let other = certs::generate_ca("other-ca").expect("ca");
+            let leaf = certs::generate_dns_cert(&other, SITE, SITE).expect("leaf");
+            store_pair(api, &held.cert_pem, &leaf.cert_pem, &leaf.key_pem);
+        },
+        "CertificateUntrusted",
+    )
+    .await;
+    assert!(
+        message.contains(IDENTITY_SECRET) && message.contains(CA_SECRET),
+        "names both Secrets: {message}"
     );
+}
+
+#[tokio::test]
+async fn invariant_8_an_identity_for_another_site_is_certificate_name_mismatch() {
+    let message = refused_identity(
+        |api| {
+            let ca = certs::generate_ca("grid-ca").expect("ca");
+            let leaf = certs::generate_dns_cert(&ca, "site-e", "site-e").expect("leaf");
+            store_pair(api, &ca.cert_pem, &leaf.cert_pem, &leaf.key_pem);
+        },
+        "CertificateNameMismatch",
+    )
+    .await;
+    assert!(
+        message.contains(&certs::spiffe_id(SITE)) && message.contains("site.name"),
+        "says what to issue or set: {message}"
+    );
+}
+
+#[tokio::test]
+async fn invariant_8_an_identity_with_another_key_is_certificate_key_mismatch() {
+    let message = refused_identity(
+        |api| {
+            let ca = certs::generate_ca("grid-ca").expect("ca");
+            let leaf = certs::generate_dns_cert(&ca, SITE, SITE).expect("leaf");
+            let other = certs::generate_dns_cert(&ca, SITE, SITE).expect("leaf");
+            store_pair(api, &ca.cert_pem, &leaf.cert_pem, &other.key_pem);
+        },
+        "CertificateKeyMismatch",
+    )
+    .await;
+    assert!(message.contains("tls.key"), "names the key: {message}");
 }
 
 /// Run `count` rounds of the enrollment step and the renewal loop, as the operator does
