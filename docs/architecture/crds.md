@@ -111,10 +111,12 @@ that condition's reason. Each condition type has one writer, and the controller 
 writes `Available`, `Progressing` and `Degraded`. Every reason is listed in
 [Site Enrollment](../installation/enrollment.md#3-enroll-the-site).
 
-`spec.gridId` is an optional admin pin, set once. Enrollment records the grid the
-identity names in `status.gridId`, and an invite for another grid is refused before it
-is spent, as `Enrolled` `False` with `GridIdMismatch`. Moving a cluster to another grid
-means deleting the GridNetwork and the identity Secret, then enrolling again.
+`spec.gridId` is the grid the network belongs to, set once: a DNS label of at most 63
+characters, and a change is refused. `status.gridId` mirrors it. The operator mints an
+ID only while `spec.gridId` is empty and the operator config names no site, the
+standalone install. Beside a site section it mints nothing, holds the grid runtime, and
+`Accepted` reads `False` with `GridIdUnset` until `spec.gridId` is set. Moving a cluster
+to another grid means deleting and recreating its GridNetwork, and its identity with it.
 
 ```yaml
 apiVersion: grid.praxis.fast/v1alpha1
@@ -122,7 +124,7 @@ kind: GridNetwork
 metadata:
   name: production
 spec:
-  gridId: ""                    # optional admin pin; enrollment records the grid in status.gridId
+  gridId: ""                    # the grid, set once; minted only without an operator config site section
   seeds:
     - "10.0.0.5:7946"
   consumerGateways:

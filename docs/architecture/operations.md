@@ -1258,11 +1258,10 @@ site lifecycle cleanup by the deployment owner.
 
 ### Moving a cluster to another grid
 
-A cluster belongs to the grid its identity names, recorded in `GridNetwork`
-`status.gridId`. To move it, delete the GridNetwork and the identity Secret, then
-invite it to the new grid and enroll again. While the old GridNetwork stands, an
-invite for another grid is refused before the token is spent, as `Enrolled` `False`
-with `GridIdMismatch`, and a `spec.gridId` pin cannot change once set.
+A cluster belongs to the grid its `GridNetwork` `spec.gridId` names, set once, and
+`status.gridId` mirrors it. To move it, delete the GridNetwork and the identity Secret,
+recreate the GridNetwork with the new grid's ID, then invite the cluster to that grid
+and enroll again. A `spec.gridId` cannot change in place.
 
 ## Adding a New Site to an Existing AI Grid Network
 

@@ -152,8 +152,11 @@ kubectl -n grid-system label secret grid-invite-east2 grid.praxis.fast/site=east
    `8443`) in `rbac.enrollmentNamespace`. Both must match the grid-enrollment release,
    whose Service port derives from its `listenAddr`.
 
-2. Create the GridNetwork with the grid-site chart or by hand, `spec.gridId` empty
-   unless you pin the grid. The operator sends nothing until it exists, and records an
+2. Create the GridNetwork with the grid-site chart or by hand, with `spec.gridId` naming
+   the grid, as the grid-site chart's `gridNetwork.gridId` and the grid-operator chart's
+   `grid.id` do. Beside a site section the operator mints no ID, so an empty
+   `spec.gridId` holds the grid runtime and `Accepted` reads `False` with `GridIdUnset`.
+   The operator sends nothing until the GridNetwork exists, and records an
    `AwaitingGridNetwork` Event on the ConfigMap once meanwhile. The site's GridSite,
    named `site.name`, is declared like any peer, with the grid-site chart, GitOps or by
    hand; when nothing declares one the operator creates it from the identity. Enrollment
@@ -177,12 +180,12 @@ waits for one, and at once on an edit to the operator config. It writes the iden
 GridNetwork's `spec.tls.siteSecretRef` and `caSecretRef` name. An operator that enrolls
 while waiting exits 0 once and restarts under the identity. Enrollment waits for the
 GridNetwork, where it records its result. The grid-site chart renders one before
-enrollment, with `spec.gridId` empty until an admin pins it, and `spec.gridId` cannot
-change once set. Enrollment writes the grid the identity names to `status.gridId`. A
-pinned `spec.gridId` the invite does not name is refused before the token is spent, as
-`Enrolled` `False` with `GridIdMismatch`. Until a GridNetwork exists nothing is sent, and
-the operator logs why and records an `AwaitingGridNetwork` Event on the operator config,
-once.
+enrollment, and `spec.gridId` names the grid, set once: a change is refused, and
+`status.gridId` mirrors it. The operator mints an ID only while `spec.gridId` is empty
+and the operator config names no site; beside a site section an empty `spec.gridId`
+holds the grid runtime and `Accepted` reads `False` with `GridIdUnset`. Until a
+GridNetwork exists nothing is sent, and the operator logs why and records an
+`AwaitingGridNetwork` Event on the operator config, once.
 
 This site's conditions live on the GridNetwork, and they are the contract. Its GridSite
 carries membership only, each cluster's view of one site: `phase` and `Connected` follow
@@ -196,6 +199,7 @@ evaluated yet. A wait an admin must end is `False`.
 | `False` | `OperatorConfigInvalid` | The operator config was refused whole: it does not parse, names a version other than `1`, carries an unknown key inside a section, or a field is invalid. The message names the field. Nothing in it is acted on, so nothing enrolls or renews. |
 | `False` | `SiteNameMismatch` | `site.name` differs from the site this cluster's identity names. Nothing renews through the config until they agree. |
 | `False` | `RotationUnsupportedUnderPinTrust` | `site.signerEndpoint.rotation` is `Enabled`, the default, but the GridNetwork declares `pin` peer trust, which does not renew. Renewal is held back and the rest of the config still acts. Set `rotation: Disabled`, or `peerTrust.mode: spiffe`. |
+| `False` | `GridIdUnset` | The GridNetwork has no `spec.gridId` while the operator config names a site, so no ID is minted and the grid runtime waits. Set `spec.gridId`, as the chart's `grid.id` does. The message names the GridNetwork. |
 
 | `ResolvedRefs` | Reason | Meaning |
 | --- | --- | --- |
@@ -215,7 +219,6 @@ evaluated yet. A wait an admin must end is `False`.
 | `Unknown` | `AwaitingFirstAttempt` | The first enrollment attempt has not returned. |
 | `False` | `AwaitingInvite` | No `site.inviteSecretRef` yet, or no `site.signerEndpoint` to send it to. |
 | `False` | `Misconfigured` | A setting cannot work, such as a missing `caBundleRef` or a bundle with no certificate. |
-| `False` | `GridIdMismatch` | `spec.gridId` pins a grid the invite does not name. Refused before the token is spent. Use an invite for the pinned grid, or move the cluster: delete the GridNetwork and the identity Secret, then enroll again. |
 | `False` | `SignerUntrusted` | The signer's serving certificate does not chain to `caBundleRef`. Nothing is sent. Pin the issuing intermediate or the signer's serving certificate, never a public root. |
 | `False` | `NameMismatch` | The invite Secret's `grid.praxis.fast/site` label is missing or names another site. Nothing is sent. |
 | `False` | `InviteInvalid` | The signer rejected the token: expired, revoked or spent. |

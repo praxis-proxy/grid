@@ -32,9 +32,10 @@ tests:
           path: spec.gridId
           value: ""
 
-  - it: renders an unpinned GridNetwork before enrollment by default
-    # The operator never writes spec. Enrollment records the grid in status.gridId, and
-    # an empty spec.gridId accepts whichever grid the invite names.
+  - it: renders a GridNetwork with no grid ID by default
+    # The operator never writes spec. An empty gridId serves only an install without an
+    # operator config site section, where the operator mints one; a site that enrolls sets
+    # gridId, as the hub-site e2e does.
     set:
       gridSite.name: prod-site
     asserts:
@@ -47,7 +48,7 @@ tests:
           path: spec.gridId
           value: ""
 
-  - it: renders the admin's grid pin
+  - it: renders the grid ID the install sets
     set:
       gridSite.name: prod-site
       gridNetwork.gridId: lab-7
