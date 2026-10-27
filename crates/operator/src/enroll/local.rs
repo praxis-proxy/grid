@@ -73,7 +73,6 @@ pub const OWN_ROLLUP_FIELD_MANAGER: &str = "grid-operator-own-site";
 /// Manager for `IdentityValid`.
 pub const IDENTITY_FIELD_MANAGER: &str = "grid-operator-identity";
 
-
 /// This cluster's own `GridSite` among `sites`: the one named `name`.
 #[must_use]
 pub fn own<'sites>(sites: &'sites [GridSite], name: Option<&str>) -> Option<&'sites GridSite> {
@@ -427,9 +426,18 @@ pub(crate) async fn clear(client: &Client, stale: &[&GridSite]) {
     }
 }
 
-/// Clear what a renamed site left behind among `listed`, keeping `own`'s.
-async fn clear_stale(client: &Client, listed: &[GridSite], own: Option<&str>) {
-    Box::pin(clear(client, &stale(listed, own))).await;
+/// Whether a step may clear what a renamed site left behind: not while a refused config
+/// hides which site is ours.
+fn clears_stale(identity: Option<&str>, section: &Section<'_>) -> bool {
+    identity.is_some() || !matches!(section, Section::Invalid(_))
+}
+
+/// Clear what a renamed site left behind among `listed`, keeping `own`'s, unless `allowed` is
+/// false.
+async fn clear_stale(client: &Client, listed: &[GridSite], own: Option<&str>, allowed: bool) {
+    if allowed {
+        Box::pin(clear(client, &stale(listed, own))).await;
+    }
 }
 
 /// What one [`Enrollment::step`] found or did.
@@ -519,7 +527,7 @@ impl Enrollment {
         let listed = Box::pin(sites.list(&ListParams::default())).await?.items;
         let section = config.loaded.site();
         let named = identity.or_else(|| section.name());
-        Box::pin(clear_stale(client, &listed, named)).await;
+        Box::pin(clear_stale(client, &listed, named, clears_stale(identity, &section))).await;
         let own = own(&listed, named);
         let site = match section {
             Section::Unset => {

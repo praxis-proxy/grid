@@ -982,3 +982,13 @@ fn available_copies_the_first_failing_gate_in_order() {
     );
     assert_eq!(reads(&rolled(&site), DEGRADED), ("True", "RenewalFailing"));
 }
+
+#[test]
+fn a_refused_config_without_an_identity_clears_no_conditions() {
+    assert!(!clears_stale(None, &Section::Invalid("bad")), "nothing names our site");
+    assert!(
+        clears_stale(Some("east2"), &Section::Invalid("bad")),
+        "the identity names our site"
+    );
+    assert!(clears_stale(None, &Section::Unset), "no site is ours");
+}
