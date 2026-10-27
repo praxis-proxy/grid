@@ -100,7 +100,7 @@ fn managers() -> BTreeMap<&'static str, &'static str> {
 
 /// The reasons the enrollment step writes, by type and status. `Available` copies the
 /// first failing gate's reason, so it carries the gates' reasons.
-const REASONS: [(&str, &str, &str); 25] = [
+const REASONS: [(&str, &str, &str); 26] = [
     (AVAILABLE, "True", "Available"),
     (AVAILABLE, "False", "AwaitingInvite"),
     (AVAILABLE, "False", "InviteMaybeSpent"),
@@ -126,6 +126,7 @@ const REASONS: [(&str, &str, &str); 25] = [
     (PROGRESSING, "True", "Retrying"),
     (DEGRADED, "False", "AsExpected"),
     (ROTATION_ON_SCHEDULE, "True", "RotationDisabled"),
+    (ROTATION_ON_SCHEDULE, "True", "RotationOnSchedule"),
 ];
 
 /// `Available` on `observed`, as (status, reason).
@@ -410,6 +411,14 @@ async fn invariant_8_no_signer_reads_rotation_on_schedule_no_signer_and_never_bl
     assert_eq!(rotation["status"], "True");
     assert_eq!(rotation["reason"], "RotationDisabled");
     assert!(
+        rotation["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("nothing is known to renew this identity"),
+        "{}",
+        rotation["message"]
+    );
+    assert!(
         !rotation["message"].as_str().unwrap_or_default().contains("pin"),
         "no identity message names pin peer trust: {}",
         rotation["message"]
@@ -462,4 +471,29 @@ async fn invariant_5_the_own_sites_rollup_has_exactly_one_manager_beside_the_gri
         );
     }
     invariants::unchanged_from(&observed, 1).expect("invariant 1: the two writers do not flap");
+}
+
+#[tokio::test]
+async fn invariant_8_an_identity_cert_manager_issued_reads_renewed_by_its_certificate() {
+    let api = seeded();
+    store_identity(&api);
+    let mut held = api.get(&secret_path(IDENTITY_SECRET)).expect("identity stored");
+    held["metadata"]["annotations"] = json!({ "cert-manager.io/certificate-name": "site-d-identity" });
+    api.put(&secret_path(IDENTITY_SECRET), held);
+    let rounds = renewal_rounds(&api, 3, |_round| {}).await;
+
+    invariants::unchanged_from(&rounds, 1).expect("invariant 1");
+    invariants::transition_time_moves_only_with_status(&rounds).expect("invariant 2");
+    invariants::one_manager_per_type(&api.writes(), PATH, &managers()).expect("invariant 5");
+    invariants::reasons_within(&rounds, &REASONS).expect("invariant 8");
+    let rotation = rounds[1].condition(ROTATION_ON_SCHEDULE).expect("RotationOnSchedule");
+    assert_eq!(
+        (&rotation["status"], &rotation["reason"], &rotation["message"]),
+        (
+            &json!("True"),
+            &json!("RotationOnSchedule"),
+            &json!("renewed by cert-manager Certificate site-d-identity")
+        )
+    );
+    assert_eq!(rounds[1].condition(DEGRADED).expect("Degraded")["status"], "False");
 }

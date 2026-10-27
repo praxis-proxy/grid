@@ -330,10 +330,10 @@ conditions the renewal loop writes each round:
 
 | `RotationOnSchedule` | Reason | Meaning |
 | --- | --- | --- |
-| `True` | `RotationOnSchedule` | Renewing before expiry through the signer `site.signerEndpoint` names. |
-| `True` | `RotationDisabled` | Nothing here renews and renewal is not due yet: `rotation` is `Disabled`, no signer is declared, or `Accepted` reports `RotationUnsupportedUnderPinTrust`. Informational. A newer leaf another writer puts in the identity Secret resets the clock. |
+| `True` | `RotationOnSchedule` | Renewing before expiry through the signer `site.signerEndpoint` names. Or no signer renews, and the identity Secret carries the `cert-manager.io/certificate-name` annotation: the message names that Certificate. The operator reads only the annotation. |
+| `True` | `RotationDisabled` | Nothing here renews and renewal is not due yet: `rotation` is `Disabled`, no signer is declared, or `Accepted` reports `RotationUnsupportedUnderPinTrust`. With no Certificate annotated, the message says nothing is known to renew the identity and it is kept until it expires. Informational. A newer leaf another writer puts in the identity Secret resets the clock. |
 | `Unknown` | `NotEvaluated` | The operator config is refused for this site, so renewal is held back and not evaluated. See `Accepted`. Once renewal falls due this reads `False` with `RotationOverdue`. |
-| `False` | `RotationOverdue` | Renewal is due or the identity expired, and nothing renews it: the cases above, the signer answering 503 `rotation_disabled`, or an expired identity. |
+| `False` | `RotationOverdue` | Renewal is due or the identity expired, and nothing renewed it: the cases above, an annotated Certificate that has not replaced the identity, the signer answering 503 `rotation_disabled`, or an expired identity. |
 | `False` | `RenewalFailing` | The last check or renewal failed and is retried with backoff. The message carries the error. |
 | `False` | `RenewalRefused` | The signer answered 401 or 403. Re-enroll this site with a new site token. |
 

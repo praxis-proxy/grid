@@ -42,6 +42,7 @@ impl IdentityStore for Memory {
             pending: get(PENDING_CSR).zip(get(PENDING_KEY).map(Zeroizing::new)),
             version: version.to_string(),
             rotated: data.contains_key(PREVIOUS_CERT),
+            renewer: None,
         })
     }
 
@@ -300,6 +301,7 @@ fn renewal_follows_the_declared_peer_trust() {
     let off = Checked::Off {
         why: Off::UnsupportedUnderPin,
         due: Due::At(OffsetDateTime::now_utc()),
+        renewer: None,
     };
     assert_eq!(settle(&Ok(off), &mut last, &mut failures), CHECK_EVERY);
 
@@ -374,6 +376,7 @@ fn a_renewal_or_a_recheck_rolls_but_not_an_expiry_or_a_failure() {
     let off = Checked::Off {
         why: Off::UnsupportedUnderPin,
         due: Due::At(now),
+        renewer: None,
     };
     assert_eq!(rolls_after(&Ok(off)), None, "pin trust never rolls");
     assert_eq!(rolls_after(&Err(RenewError::Transport("down".to_owned()))), None);
@@ -659,6 +662,7 @@ async fn renewal_trusts_the_held_grid_ca_and_never_the_config_pin() {
         pending: None,
         version: "1".to_owned(),
         rotated: false,
+        renewer: None,
     };
     let clients = Clients::default();
     let base = reqwest::Url::parse("https://127.0.0.1:9").expect("url");
@@ -686,7 +690,13 @@ fn declared_signer() -> String {
 fn rotation_on_schedule_follows_the_check() {
     let now = OffsetDateTime::now_utc();
     let named = declared_signer();
-    let off = |why: Off, due: Due| Ok(Checked::Off { why, due });
+    let off = |why: Off, due: Due| {
+        Ok(Checked::Off {
+            why,
+            due,
+            renewer: None,
+        })
+    };
     let cases: [Case<'_>; 10] = [
         (Ok(Checked::Waiting(now)), Some(&named), "True", "RotationOnSchedule"),
         (Ok(Checked::Renewed(now)), Some(&named), "True", "RotationOnSchedule"),
@@ -719,6 +729,67 @@ fn rotation_on_schedule_follows_the_check() {
             verdict.message
         );
     }
+}
+
+#[test]
+fn a_cert_manager_certificate_on_the_secret_reads_as_renewed_until_due() {
+    let now = OffsetDateTime::now_utc();
+    let named = Some("site-d-identity");
+    for why in [Off::NoSigner, Off::Disabled] {
+        let held = off_verdict(why, Due::At(now), named);
+        assert_eq!(
+            (held.status, held.reason.as_ref(), held.message.as_str()),
+            (
+                "True",
+                "RotationOnSchedule",
+                "renewed by cert-manager Certificate site-d-identity"
+            ),
+            "{why:?}"
+        );
+        let unknown = off_verdict(why, Due::At(now), None);
+        assert_eq!((unknown.status, unknown.reason.as_ref()), ("True", "RotationDisabled"));
+        assert!(
+            unknown
+                .message
+                .ends_with("nothing is known to renew this identity; it is kept until it expires"),
+            "{}",
+            unknown.message
+        );
+    }
+    let held_back = off_verdict(Off::Refused, Due::At(now), named);
+    assert_eq!(
+        held_back.reason, "NotEvaluated",
+        "a refused config is never read as renewed"
+    );
+}
+
+#[test]
+fn a_due_identity_its_certificate_has_not_replaced_is_overdue() {
+    for why in [Off::NoSigner, Off::Disabled] {
+        for due in [Due::Now, Due::Expired] {
+            let overdue = off_verdict(why, due, Some("site-d-identity"));
+            assert_eq!((overdue.status, overdue.reason.as_ref()), ("False", "RotationOverdue"));
+            assert!(overdue.message.contains("site-d-identity"), "{}", overdue.message);
+            assert_eq!(off_verdict(why, due, None).reason, "RotationOverdue");
+        }
+    }
+}
+
+#[test]
+fn the_renewer_is_the_annotated_certificate() {
+    let annotated = |value: &str| kube::api::ObjectMeta {
+        annotations: Some(BTreeMap::from([(
+            CERT_MANAGER_CERTIFICATE.to_owned(),
+            value.to_owned(),
+        )])),
+        ..kube::api::ObjectMeta::default()
+    };
+    assert_eq!(
+        renewer_of(&annotated("site-d-identity")).as_deref(),
+        Some("site-d-identity")
+    );
+    assert_eq!(renewer_of(&annotated("")), None);
+    assert_eq!(renewer_of(&kube::api::ObjectMeta::default()), None);
 }
 
 #[test]
@@ -794,6 +865,7 @@ fn disabled_rotation_neither_rolls_nor_retries() {
     let disabled = || Checked::Off {
         why: Off::Disabled,
         due: Due::At(OffsetDateTime::now_utc()),
+        renewer: None,
     };
     assert_eq!(rolls_after(&Ok(disabled())), None, "Disabled never rolls");
     let (mut last, mut failures) = (None, 0);
@@ -814,7 +886,11 @@ fn verdicts_of(round: &Round, type_: &str) -> Vec<(&'static str, String)> {
 fn off_round(why: Off, refused: Option<Verdict>) -> Round {
     let now = OffsetDateTime::now_utc();
     Round {
-        checked: Ok(Checked::Off { why, due: Due::At(now) }),
+        checked: Ok(Checked::Off {
+            why,
+            due: Due::At(now),
+            renewer: None,
+        }),
         signer: None,
         identity: Some(Identity::Valid(now)),
         refused,

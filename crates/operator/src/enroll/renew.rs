@@ -137,12 +137,15 @@ pub(super) enum Checked {
     Renewed(OffsetDateTime),
     /// Expired at this instant.
     Expired(OffsetDateTime),
-    /// Nothing renews this identity: why, and whether a renewal is already due.
+    /// The operator does not renew this identity: why, whether a renewal is already due, and
+    /// the cert-manager Certificate the Secret names as its renewer, if any.
     Off {
         /// Why.
         why: Off,
         /// Whether the renewal this would have made is due.
         due: Due,
+        /// The Certificate in the Secret's [`CERT_MANAGER_CERTIFICATE`] annotation.
+        renewer: Option<String>,
     },
 }
 
@@ -164,6 +167,9 @@ pub(super) enum Off {
 /// The informational `RotationOnSchedule` reason while nothing renews and renewal is not due.
 const ROTATION_DISABLED: &str = "RotationDisabled";
 
+/// The annotation cert-manager puts on a Secret it issues, naming its Certificate.
+pub(super) const CERT_MANAGER_CERTIFICATE: &str = "cert-manager.io/certificate-name";
+
 impl Off {
     /// What the admin reads.
     const fn message(self) -> &'static str {
@@ -172,14 +178,8 @@ impl Off {
                 "rotation is held back: site.signerEndpoint.rotation is Enabled under pin peer trust, see Accepted"
             },
             Self::Refused => "renewal is held back: the operator config is refused for this site, see Accepted",
-            Self::NoSigner => {
-                "rotation disabled: the operator config names no site.signerEndpoint, so the identity is kept until \
-                 it expires unless another writer renews it"
-            },
-            Self::Disabled => {
-                "rotation disabled: site.signerEndpoint.rotation is Disabled, so the identity is kept until it \
-                 expires unless another writer renews it"
-            },
+            Self::NoSigner => "the operator config names no site.signerEndpoint",
+            Self::Disabled => "site.signerEndpoint.rotation is Disabled",
         }
     }
 
@@ -208,6 +208,8 @@ pub(super) struct Held {
     pub(super) version: String,
     /// The identity has rotated at least once: the Secret holds the leaf it replaced.
     pub(super) rotated: bool,
+    /// The cert-manager Certificate the Secret names as its renewer.
+    pub(super) renewer: Option<String>,
 }
 
 /// Where the identity is read and written.
@@ -394,6 +396,16 @@ fn verified(enrollment: &Issued, held_ca: &str, site: &str, csr_pem: &str) -> Re
     Ok(cert)
 }
 
+/// The cert-manager Certificate a Secret's annotation names as its renewer.
+fn renewer_of(metadata: &kube::api::ObjectMeta) -> Option<String> {
+    metadata
+        .annotations
+        .as_ref()?
+        .get(CERT_MANAGER_CERTIFICATE)
+        .filter(|name| !name.is_empty())
+        .cloned()
+}
+
 /// The site identity Secret, through the Kubernetes API.
 pub(super) struct KubeIdentity(pub(super) Api<Secret>);
 
@@ -412,6 +424,7 @@ impl IdentityStore for KubeIdentity {
             .map_err(|e| RenewError::Kube(e.to_string()))?
             .ok_or_else(|| missing(&format!("Secret {}", target.site_secret)))?;
         let version = site.metadata.resource_version.clone().unwrap_or_default();
+        let renewer = renewer_of(&site.metadata);
         let data = site.data.unwrap_or_default();
         let ca = if target.ca_secret == target.site_secret {
             text(&data, "ca.crt")
@@ -430,6 +443,7 @@ impl IdentityStore for KubeIdentity {
             pending: pending.map(|(csr, key)| (csr.to_string(), key)),
             version,
             rotated: data.contains_key(PREVIOUS_CERT),
+            renewer,
         })
     }
 
@@ -1006,19 +1020,28 @@ async fn check_round(loop_: &Loop<'_>, target: &Target, site: Option<&str>, decl
     let identity = Some(identity_of(&read, target, site, trust.renews));
     match through(declared, &trust) {
         Ok(signer) => Box::pin(renew_through(loop_, target, read, signer, identity)).await,
-        Err(Ok(why)) => Round {
-            checked: Ok(Checked::Off { why, due: read.due }),
-            signer: None,
-            identity,
-            refused: match (why, declared) {
-                (Off::UnsupportedUnderPin, _) => Some(trust.refusal()),
-                (Off::Refused, Declared::Refused(refusal)) => Some(refusal.clone()),
-                _ => None,
-            },
-        },
+        Err(Ok(why)) => off_round(why, read, identity, &trust, declared),
         Err(Err(error)) => Round {
             identity,
             ..Round::failed(error)
+        },
+    }
+}
+
+/// The round in which the operator does not renew `read`, for `why`.
+fn off_round(why: Off, read: Read, identity: Option<Identity>, trust: &Trust, declared: &Declared<'_>) -> Round {
+    Round {
+        checked: Ok(Checked::Off {
+            why,
+            due: read.due,
+            renewer: read.held.renewer,
+        }),
+        signer: None,
+        identity,
+        refused: match (why, declared) {
+            (Off::UnsupportedUnderPin, _) => Some(trust.refusal()),
+            (Off::Refused, Declared::Refused(refusal)) => Some(refusal.clone()),
+            _ => None,
         },
     }
 }
@@ -1145,26 +1168,38 @@ fn rotation_verdict(checked: &Result<Checked, RenewError>, url: Option<&String>)
             "RotationOverdue",
             format!("the site identity expired at {at} and cannot renew; re-enroll this site with a new site token"),
         ),
-        Ok(Checked::Off { why, due }) => off_verdict(*why, *due),
+        Ok(Checked::Off { why, due, renewer }) => off_verdict(*why, *due, renewer.as_deref()),
     }
 }
 
-/// What `RotationOnSchedule` says while nothing renews for `why`, with renewal `due`. A
-/// refused config is not evaluated until renewal falls due, so it never reads as a choice.
-fn off_verdict(why: Off, due: Due) -> Verdict {
-    match (why, due) {
-        (Off::Refused, Due::At(_)) => Verdict::new("Unknown", "NotEvaluated", why.message().to_owned()),
-        (Off::Refused, Due::Now | Due::Expired) => Verdict::new(
-            "False",
-            "RotationOverdue",
+/// What `RotationOnSchedule` says while the operator does not renew for `why`, with renewal
+/// `due` and `renewer` the cert-manager Certificate the Secret names, if any. A refused config
+/// is not evaluated until renewal falls due, so it never reads as a choice.
+fn off_verdict(why: Off, due: Due, renewer: Option<&str>) -> Verdict {
+    let overdue = |message: String| Verdict::new("False", "RotationOverdue", message);
+    match (why, due, renewer) {
+        (Off::Refused, Due::At(_), _) => Verdict::new("Unknown", "NotEvaluated", why.message().to_owned()),
+        (Off::Refused, Due::Now | Due::Expired, _) => overdue(
             "renewal is overdue and held back: the operator config is refused for this site, see Accepted".to_owned(),
         ),
-        (_, Due::At(_)) => Verdict::new("True", ROTATION_DISABLED, why.message().to_owned()),
-        (_, Due::Now | Due::Expired) => Verdict::new(
-            "False",
-            "RotationOverdue",
-            format!("renewal is due and nothing renews: {}", why.message()),
+        (Off::UnsupportedUnderPin, Due::At(_), _) => Verdict::new("True", ROTATION_DISABLED, why.message().to_owned()),
+        (Off::NoSigner | Off::Disabled, Due::At(_), Some(certificate)) => Verdict::new(
+            "True",
+            local::ROTATION_ON_SCHEDULE,
+            format!("renewed by cert-manager Certificate {certificate}"),
         ),
+        (Off::NoSigner | Off::Disabled, Due::At(_), None) => Verdict::new(
+            "True",
+            ROTATION_DISABLED,
+            format!(
+                "{}: nothing is known to renew this identity; it is kept until it expires",
+                why.message()
+            ),
+        ),
+        (Off::NoSigner | Off::Disabled, Due::Now | Due::Expired, Some(certificate)) => overdue(format!(
+            "renewal is due and cert-manager Certificate {certificate} has not replaced the identity"
+        )),
+        (_, Due::Now | Due::Expired, _) => overdue(format!("renewal is due and nothing renews: {}", why.message())),
     }
 }
 
@@ -1293,7 +1328,7 @@ fn settle(checked: &Result<Checked, RenewError>, last: &mut Option<String>, fail
         // Re-read soon, so the next renewal is scheduled from the new leaf.
         Ok(Checked::Renewed(_)) => ("rotated".to_owned(), RETRY_INITIAL),
         Ok(Checked::Expired(_)) => ("expired".to_owned(), CHECK_EVERY),
-        Ok(Checked::Off { why, due }) => (format!("off {} {due:?}", why.label()), CHECK_EVERY),
+        Ok(Checked::Off { why, due, .. }) => (format!("off {} {due:?}", why.label()), CHECK_EVERY),
         Err(error) => (error.to_string(), retry_delay(failures.saturating_add(1))),
     };
     report(checked, last.as_deref() != Some(state.as_str()), wait);
@@ -1322,7 +1357,7 @@ fn report(checked: &Result<Checked, RenewError>, changed: bool, wait: Duration) 
                 "site identity expired and cannot rotate; re-enroll this site with a new site token"
             );
         },
-        Ok(Checked::Off { why, due }) if changed => {
+        Ok(Checked::Off { why, due, .. }) if changed => {
             tracing::info!(why = why.label(), due = ?due, "{}", why.message());
         },
         Err(error) if changed => {
