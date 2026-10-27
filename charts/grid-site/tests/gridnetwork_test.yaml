@@ -32,6 +32,30 @@ tests:
           path: spec.gridId
           value: ""
 
+  - it: renders an unpinned GridNetwork before enrollment by default
+    # The operator never writes spec. Enrollment records the grid in status.gridId, and
+    # an empty spec.gridId accepts whichever grid the invite names.
+    set:
+      gridSite.name: prod-site
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.name
+          value: grid
+      - equal:
+          path: spec.gridId
+          value: ""
+
+  - it: renders the admin's grid pin
+    set:
+      gridSite.name: prod-site
+      gridNetwork.gridId: lab-7
+    asserts:
+      - equal:
+          path: spec.gridId
+          value: lab-7
+
   - it: defaults a new GridNetwork to roundRobin selection
     set:
       gridNetwork.name: prod-grid
