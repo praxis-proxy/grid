@@ -761,6 +761,55 @@ async fn a_missing_pin_is_reported_and_retried_once_it_appears() {
 }
 
 #[tokio::test]
+async fn a_pin_the_api_cannot_read_is_retried_and_never_reported_missing() {
+    crate::init_process_crypto();
+    let (mock, settings) = serve(Reply::Sign).await;
+    let world = enrolling(settings.base.as_str(), true);
+    invited(&world, "secret");
+    pinned(&world, &mock.ca.cert_pem);
+    world.lock().expect("lock").flaky.push("grid-ca-bundle".to_owned());
+    let mut enrollment = Enrollment::default();
+    assert_eq!(run_step(&mut enrollment, &world, None).await, Step::Failed);
+    let (refs, enrolled) = {
+        let world = world.lock().expect("lock");
+        (
+            world.verdicts_of(SITE, RESOLVED_REFS),
+            world.verdicts_of(SITE, ENROLLED),
+        )
+    };
+    assert!(
+        !refs.contains(&("False".to_owned(), "RefNotFound".to_owned())),
+        "a pin the API did not answer for is not reported missing: {refs:?}"
+    );
+    assert!(
+        enrolled.is_empty(),
+        "a store failure says nothing about the enrollment: {enrolled:?}"
+    );
+    assert_eq!(mock.calls(), 0, "nothing is sent without the pin read");
+    assert_eq!(run_step(&mut enrollment, &world, None).await, Step::Enrolled);
+    assert_eq!(mock.calls(), 1, "the next poll reads the pin and enrolls");
+    retried_then_settled(&world.lock().expect("lock").verdicts_of(SITE, PROGRESSING));
+}
+
+#[tokio::test]
+async fn a_pin_the_api_cannot_read_leaves_resolved_refs_standing_while_waiting_for_an_invite() {
+    let world = enrolling("https://enroll.example.com", false);
+    world.lock().expect("lock").flaky.push("grid-ca-bundle".to_owned());
+    let mut enrollment = Enrollment::default();
+    assert_eq!(run_step(&mut enrollment, &world, None).await, Step::AwaitingInvite);
+    assert!(
+        world.lock().expect("lock").verdicts_of(SITE, RESOLVED_REFS).is_empty(),
+        "an unanswered read is no verdict on the reference, so nothing is written"
+    );
+    assert_eq!(run_step(&mut enrollment, &world, None).await, Step::AwaitingInvite);
+    assert_eq!(
+        world.lock().expect("lock").verdicts_of(SITE, RESOLVED_REFS).last(),
+        Some(&("False".to_owned(), "RefNotFound".to_owned())),
+        "the next poll reads the store and finds no pin"
+    );
+}
+
+#[tokio::test]
 async fn an_invite_minted_for_another_site_is_refused_unsent() {
     crate::init_process_crypto();
     let (mock, settings) = serve(Reply::Sign).await;

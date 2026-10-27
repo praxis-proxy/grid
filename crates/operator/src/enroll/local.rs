@@ -791,6 +791,15 @@ async fn prepare(
         .map_err(|e| EnrollError::Kube(format!("reading Secret {}: {e}", invite.name)))?;
     let pin = Box::pin(bundles.read(signer.ca_bundle_ref.as_ref())).await;
     let anchors = Box::pin(bundles.read(signer.grid_ca_bundle_ref.as_ref())).await;
+    // An API failure is retried, and says nothing about whether the objects exist.
+    for (field, read) in [
+        ("site.signerEndpoint.caBundleRef", &pin),
+        ("site.signerEndpoint.gridCaBundleRef", &anchors),
+    ] {
+        if let Read::Unavailable(why) = read {
+            return Err(EnrollError::Kube(format!("{field}: {why}")));
+        }
+    }
     let inputs = Inputs {
         site: serde_json::to_string(config).unwrap_or_default(),
         versions: [invite_version, pin.version(), anchors.version()],
@@ -805,15 +814,19 @@ async fn prepare(
 /// Report on `site` that `config` names no invite to send yet, with what the bundles it
 /// does name resolve to.
 async fn await_invite(client: &Client, site: &GridSite, config: Option<&SiteConfig>) -> Step {
-    let refs = Box::pin(named_refs(client, config)).await;
-    let written = Box::pin(report(client, site, RESOLVED_REFS, REFS_FIELD_MANAGER, &refs)).await;
+    let written = match Box::pin(named_refs(client, config)).await {
+        Some(refs) => Box::pin(report(client, site, RESOLVED_REFS, REFS_FIELD_MANAGER, &refs)).await,
+        None => None,
+    };
     let site = written.as_ref().unwrap_or(site);
     drop(Box::pin(report_enrolled(client, site, &Verdict::awaiting_invite())).await);
     Step::AwaitingInvite
 }
 
 /// What `ResolvedRefs` says of the bundles `config` names, read without trusting them.
-pub(crate) async fn named_refs(client: &Client, config: Option<&SiteConfig>) -> Verdict {
+/// `None` when the API did not answer a read: that says nothing new, so the last verdict
+/// stands and the next poll reads again.
+pub(crate) async fn named_refs(client: &Client, config: Option<&SiteConfig>) -> Option<Verdict> {
     let bundles = Bundles::new(client, client.default_namespace());
     let signer = config.and_then(|config| config.signer_endpoint.as_ref());
     for (field, reference) in [
@@ -826,11 +839,16 @@ pub(crate) async fn named_refs(client: &Client, config: Option<&SiteConfig>) -> 
             signer.and_then(|signer| signer.grid_ca_bundle_ref.as_ref()),
         ),
     ] {
-        if let Read::Missing(why) = Box::pin(bundles.read(reference)).await {
-            return Verdict::new("False", "RefNotFound", format!("{field}: {why}"));
+        match Box::pin(bundles.read(reference)).await {
+            Read::Missing(why) => return Some(Verdict::new("False", "RefNotFound", format!("{field}: {why}"))),
+            Read::Unavailable(why) => {
+                tracing::warn!(field, error = %why, "reading a bundle failed; ResolvedRefs keeps its last verdict");
+                return None;
+            },
+            Read::Unset | Read::Found(..) => {},
         }
     }
-    Verdict::resolved()
+    Some(Verdict::resolved())
 }
 
 /// A bundle as read: absent, unreadable, or its PEM and resource version.
@@ -840,6 +858,8 @@ enum Read {
     Unset,
     /// The reference does not resolve, with why.
     Missing(String),
+    /// The API did not answer the read, with why. Retried; the object may well exist.
+    Unavailable(String),
     /// The PEM, and the object's resource version.
     Found(String, Option<String>),
 }
@@ -849,7 +869,7 @@ impl Read {
     fn version(&self) -> Option<String> {
         match self {
             Self::Found(_, version) => version.clone(),
-            Self::Unset | Self::Missing(_) => None,
+            Self::Unset | Self::Missing(_) | Self::Unavailable(_) => None,
         }
     }
 
@@ -858,6 +878,7 @@ impl Read {
         match self {
             Self::Found(pem, _) => Ok(pem.clone()),
             Self::Missing(why) => Err(EnrollError::RefNotFound(format!("{field}: {why}"))),
+            Self::Unavailable(why) => Err(EnrollError::Kube(format!("{field}: {why}"))),
             Self::Unset => Err(EnrollError::Config(format!("{field} is required to enroll"))),
         }
     }
@@ -866,7 +887,7 @@ impl Read {
     fn optional_pem(&self, field: &str) -> Result<Option<String>, EnrollError> {
         match self {
             Self::Unset => Ok(None),
-            Self::Found(..) | Self::Missing(_) => self.pem(field).map(Some),
+            Self::Found(..) | Self::Missing(_) | Self::Unavailable(_) => self.pem(field).map(Some),
         }
     }
 }
@@ -903,7 +924,8 @@ impl Bundles {
                 "{:?} {} has no key {}",
                 reference.kind, reference.name, reference.key
             )),
-            Err(why) => Read::Missing(why.to_string()),
+            Err(BundleError::Refused(why)) => Read::Missing(why),
+            Err(BundleError::Api(why)) => Read::Unavailable(why),
         }
     }
 

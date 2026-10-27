@@ -864,7 +864,7 @@ async fn tick(loop_: &Loop<'_>, settings: &Settings, target: &Result<Target, sup
     // A round given up for a stand-down says nothing new, and writing would hold the stand-down.
     if let (Ok(target), false) = (target, matches!(round.checked, Err(RenewError::StoodDown))) {
         let refs = match snapshot.loaded.site() {
-            Section::Site(site) => Some(Box::pin(local::named_refs(loop_.client, Some(site))).await),
+            Section::Site(site) => Box::pin(local::named_refs(loop_.client, Some(site))).await,
             Section::Unset => Some(Verdict::resolved()),
             Section::Invalid(_) => None,
         };
