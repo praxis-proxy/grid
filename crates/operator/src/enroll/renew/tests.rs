@@ -701,7 +701,7 @@ fn held_identity() -> Held {
 async fn renewal_trusts_the_pin_beside_the_held_grid_ca() {
     crate::init_process_crypto();
     let held = held_identity();
-    let (base, pin) = super::super::tests::byo_serving_signer(&held.ca, axum::Router::new()).await;
+    let (base, pin) = super::super::tests::byo_serving_signer(&held.ca, axum::Router::new(), false).await;
     let clients = Clients::default();
 
     let unpinned = HttpsSigner::new(base.clone(), None, &clients).renew(&held, "csr").await;

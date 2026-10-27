@@ -179,11 +179,16 @@ fn serve_on(mock: &Arc<Mock>, listener: tokio::net::TcpListener) {
     });
 }
 
-/// A signer on localhost serving a certificate from a CA of its own, accepting client
-/// certificates `client_ca` issued and answering through `app`, and that CA.
-pub(super) async fn byo_serving_signer(client_ca: &str, app: Router) -> (Url, String) {
+/// A signer on localhost serving a certificate from a CA of its own, expired when `lapsed`,
+/// accepting client certificates `client_ca` issued and answering through `app`, and that CA.
+pub(super) async fn byo_serving_signer(client_ca: &str, app: Router, lapsed: bool) -> (Url, String) {
     let serving = certs::generate_ca("corporate-ca").expect("ca");
-    let server = certs::generate_dns_cert(&serving, "localhost", "localhost").expect("server cert");
+    let server = if lapsed {
+        certs::generate_expired_dns_cert(&serving, "localhost", "localhost")
+    } else {
+        certs::generate_dns_cert(&serving, "localhost", "localhost")
+    }
+    .expect("server cert");
     let tls = tls_backend::build_server_config_optional_client(
         client_ca.as_bytes(),
         server.cert_pem.as_bytes(),

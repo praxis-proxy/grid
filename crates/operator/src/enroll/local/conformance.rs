@@ -100,7 +100,7 @@ fn managers() -> BTreeMap<&'static str, &'static str> {
 
 /// The reasons the enrollment step writes, by type and status. `Available` copies the
 /// first failing gate's reason, so it carries the gates' reasons.
-const REASONS: [(&str, &str, &str); 30] = [
+const REASONS: [(&str, &str, &str); 32] = [
     (AVAILABLE, "True", "Available"),
     (AVAILABLE, "False", "AwaitingInvite"),
     (AVAILABLE, "False", "InviteMaybeSpent"),
@@ -131,6 +131,8 @@ const REASONS: [(&str, &str, &str); 30] = [
     (DEGRADED, "True", "SignerUntrusted"),
     (ROTATION_ON_SCHEDULE, "False", "RenewalNeedsPassthrough"),
     (DEGRADED, "True", "RenewalNeedsPassthrough"),
+    (ROTATION_ON_SCHEDULE, "False", "SignerLapsed"),
+    (DEGRADED, "True", "SignerLapsed"),
 ];
 
 /// `Available` on `observed`, as (status, reason).
@@ -526,7 +528,7 @@ async fn invariant_8_a_signer_neither_the_grid_ca_nor_a_pin_trusts_is_signer_unt
     crate::init_process_crypto();
     let api = seeded();
     let ca = store_due_identity(&api);
-    let (base, _pin) = crate::enroll::tests::byo_serving_signer(&ca, axum::Router::new()).await;
+    let (base, _pin) = crate::enroll::tests::byo_serving_signer(&ca, axum::Router::new(), false).await;
     let rest = format!("  signerEndpoint:\n    url: {}\n", base.as_str());
     let rounds = renewal_rounds_under(&api, &rest, 3, |_round| {}).await;
 
@@ -557,8 +559,8 @@ async fn invariant_8_a_signer_neither_the_grid_ca_nor_a_pin_trusts_is_signer_unt
 
 /// A signer answering through `app`, its serving CA pinned by a bundle in `api`, accepting
 /// client certificates `ca` issued, as the site section naming it.
-async fn pinned_signer(api: &FakeApi, ca: &str, app: axum::Router) -> String {
-    let (base, pin) = crate::enroll::tests::byo_serving_signer(ca, app).await;
+async fn pinned_signer(api: &FakeApi, ca: &str, app: axum::Router, lapsed: bool) -> String {
+    let (base, pin) = crate::enroll::tests::byo_serving_signer(ca, app, lapsed).await;
     api.put(
         &secret_path("signer-pin"),
         secret("signer-pin", &[("ca.crt", &pin)], &[(SIGNER_BUNDLE_LABEL, "true")]),
@@ -583,7 +585,7 @@ async fn invariant_8_a_signer_that_never_sees_the_client_certificate_needs_passt
             )
         }),
     );
-    let rest = pinned_signer(&api, &ca, stripped).await;
+    let rest = pinned_signer(&api, &ca, stripped, false).await;
     let rounds = renewal_rounds_under(&api, &rest, 3, |_round| {}).await;
 
     invariants::unchanged_from(&rounds, 1).expect("invariant 1");
@@ -594,5 +596,31 @@ async fn invariant_8_a_signer_that_never_sees_the_client_certificate_needs_passt
     assert_eq!(
         (&rotation["status"], &rotation["reason"]),
         (&json!("False"), &json!("RenewalNeedsPassthrough"))
+    );
+}
+
+#[tokio::test]
+async fn invariant_8_a_signer_serving_a_lapsed_certificate_is_signer_lapsed() {
+    crate::init_process_crypto();
+    let api = seeded();
+    let ca = store_due_identity(&api);
+    let rest = pinned_signer(&api, &ca, axum::Router::new(), true).await;
+    let rounds = renewal_rounds_under(&api, &rest, 3, |_round| {}).await;
+
+    invariants::unchanged_from(&rounds, 1).expect("invariant 1");
+    invariants::one_manager_per_type(&api.writes(), PATH, &managers()).expect("invariant 5");
+    invariants::reasons_within(&rounds, &REASONS).expect("invariant 8");
+    let rotation = rounds[1].condition(ROTATION_ON_SCHEDULE).expect("RotationOnSchedule");
+    assert_eq!(
+        (&rotation["status"], &rotation["reason"]),
+        (&json!("False"), &json!("SignerLapsed"))
+    );
+    assert!(
+        rotation["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("must rotate its serving certificate"),
+        "names the signer's fix, not a pin: {}",
+        rotation["message"]
     );
 }

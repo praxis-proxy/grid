@@ -122,6 +122,12 @@ pub(super) enum RenewError {
     /// The process stood down before the signer answered. The kept request goes out again.
     #[error("renewal stood down before the signer answered; the kept request is sent again on the next start")]
     StoodDown,
+    /// The signer's serving certificate is outside its validity window: the signer must rotate it.
+    #[error(
+        "the signer's serving certificate is expired or not yet valid ({0}); the signer must rotate its serving \
+         certificate, and renewal retries"
+    )]
+    SignerLapsed(String),
     /// The signer's serving certificate is trusted by neither the grid CA held nor the pin.
     #[error(
         "the signer's serving certificate is not trusted ({0}); pin the CA that issued it in \
@@ -143,6 +149,7 @@ impl RenewError {
             | Self::SignerDisabled(_)
             | Self::Untrusted(_)
             | Self::NeedsPassthrough(_)
+            | Self::SignerLapsed(_)
             | Self::StoodDown => "failed",
         }
     }
@@ -406,7 +413,8 @@ fn renew_error(error: SignerError) -> RenewError {
         } => RenewError::Refused(detail),
         SignerError::Disabled(detail) => RenewError::SignerDisabled(detail),
         SignerError::Refused { detail, .. } | SignerError::Transport { detail, .. } => RenewError::Transport(detail),
-        SignerError::Untrusted { detail, .. } => RenewError::Untrusted(detail),
+        SignerError::Untrusted { lapsed: true, detail } => RenewError::SignerLapsed(detail),
+        SignerError::Untrusted { lapsed: false, detail } => RenewError::Untrusted(detail),
         SignerError::Request(detail) => RenewError::Material(detail),
         SignerError::Invalid(detail) => RenewError::Invalid(detail),
     }
@@ -1225,6 +1233,7 @@ fn rotation_verdict(checked: &Result<Checked, RenewError>, url: Option<&String>)
         },
         Err(error @ RenewError::SignerDisabled(_)) => Verdict::new("False", "RotationOverdue", error.to_string()),
         Err(error @ RenewError::Untrusted(_)) => Verdict::new("False", "SignerUntrusted", error.to_string()),
+        Err(error @ RenewError::SignerLapsed(_)) => Verdict::new("False", "SignerLapsed", error.to_string()),
         Err(error @ RenewError::NeedsPassthrough(_)) => {
             Verdict::new("False", "RenewalNeedsPassthrough", error.to_string())
         },
