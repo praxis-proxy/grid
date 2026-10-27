@@ -34,6 +34,7 @@ use crate::{
     },
     metrics,
     operator_config::{BundleRef, ConfigWatch, Loaded, Rotation, Section, SignerEndpoint, Snapshot},
+    shutdown::Shutdown,
 };
 
 
@@ -118,6 +119,9 @@ pub(super) enum RenewError {
     /// The service refuses every rotation: rotation is turned off on the hub.
     #[error("rotation disabled at the signer ({0}); turn it on before the identity expires")]
     SignerDisabled(String),
+    /// The process stood down before the signer answered. The kept request goes out again.
+    #[error("renewal stood down before the signer answered; the kept request is sent again on the next start")]
+    StoodDown,
     /// The signer's serving certificate is trusted by neither the grid CA held nor the pin.
     #[error(
         "the signer's serving certificate is not trusted ({0}); pin the CA that issued it in \
@@ -138,7 +142,8 @@ impl RenewError {
             | Self::Invalid(_)
             | Self::SignerDisabled(_)
             | Self::Untrusted(_)
-            | Self::NeedsPassthrough(_) => "failed",
+            | Self::NeedsPassthrough(_)
+            | Self::StoodDown => "failed",
         }
     }
 }
@@ -303,7 +308,7 @@ pub(super) async fn check<S: IdentityStore + Sync, G: Signer + Sync>(
     now: OffsetDateTime,
 ) -> Result<Checked, RenewError> {
     let held = store.read(target).await?;
-    check_held(store, signer, target, held, now).await
+    check_held(store, signer, target, held, (now, None)).await
 }
 
 /// The validity of the certificate `held`.
@@ -311,33 +316,44 @@ fn validity(held: &Held) -> Result<(OffsetDateTime, OffsetDateTime), RenewError>
     certs::cert_validity(&held.cert).map_err(|e| RenewError::Material(format!("certificate: {e}")))
 }
 
-/// Renew `held`, the identity in `target`, if it is due at `now`.
+/// Renew `held`, the identity in `target`, if it is due at `now`, giving up the request to the
+/// signer once `stop` triggers.
 async fn check_held<S: IdentityStore + Sync, G: Signer + Sync>(
     store: &S,
     signer: &G,
     target: &Target,
     held: Held,
-    now: OffsetDateTime,
+    (now, stop): (OffsetDateTime, Option<&Shutdown>),
 ) -> Result<Checked, RenewError> {
     let (not_before, not_after) = validity(&held)?;
     metrics::set_site_identity_expiry(not_after.unix_timestamp());
     match due(not_before, not_after, now) {
         Due::At(at) => Ok(Checked::Waiting(at)),
         Due::Expired => Ok(Checked::Expired(not_after)),
-        Due::Now => renew(store, signer, target, held).await,
+        Due::Now => renew(store, signer, target, (held, stop)).await,
     }
 }
 
-/// Renew `held` now and store the result in place.
+/// Renew `held` now and store the result in place. The request is given up once `stop`
+/// triggers, since the kept key makes a resend safe; the write is not.
 async fn renew<S: IdentityStore + Sync, G: Signer + Sync>(
     store: &S,
     signer: &G,
     target: &Target,
-    mut held: Held,
+    (mut held, stop): (Held, Option<&Shutdown>),
 ) -> Result<Checked, RenewError> {
     let site = site_of(&held.cert)?;
     let (csr, key) = pending(store, target, &mut held, &site).await?;
-    let issued = signer.renew(&held, &csr).await.map_err(renew_error)?;
+    let request = signer.renew(&held, &csr);
+    let answer = match stop {
+        Some(stop) => tokio::select! {
+            biased;
+            () = stop.triggered() => return Err(RenewError::StoodDown),
+            answer = request => answer,
+        },
+        None => request.await,
+    };
+    let issued = answer.map_err(renew_error)?;
     let cert = verified(&issued, &held.ca, &site, &csr)?;
     let (_issued, valid_until) = certs::cert_validity(&cert).map_err(|e| RenewError::Invalid(e.to_string()))?;
     let replaced = BTreeMap::from([
@@ -729,6 +745,8 @@ pub struct Rounds {
     gateway: Option<KubeGateway>,
     /// The modes the install declares, which apply until a `GridNetwork` exists.
     install: GridModes,
+    /// Gives up a request to the signer, once the loop stands down.
+    stop: Option<Shutdown>,
 }
 
 impl Rounds {
@@ -743,6 +761,7 @@ impl Rounds {
             install: settings.install,
             client,
             namespace,
+            stop: None,
         }
     }
 
@@ -781,6 +800,7 @@ impl Rounds {
             store: &self.store,
             clients: &self.clients,
             install: self.install,
+            stop: self.stop.as_ref(),
         };
         let round = Box::pin(tick(&loop_, settings, target)).await;
         roll_after_renewal(&self.store, self.gateway.as_ref(), target, &round.checked).await;
@@ -790,10 +810,13 @@ impl Rounds {
 
 /// Keep the site identity renewed until `shutdown`.
 ///
-/// A renewal or gateway roll already under way finishes before this returns, so nothing writes
-/// the identity or rolls the gateway once the caller has seen it return.
-pub async fn run(client: Client, mut settings: Settings, shutdown: crate::shutdown::Shutdown) {
-    let rounds = Rounds::new(client, &settings);
+/// A request to the signer is given up at once. An identity write or gateway roll already under
+/// way finishes before this returns, so neither starts once the caller has seen it return.
+pub async fn run(client: Client, mut settings: Settings, shutdown: Shutdown) {
+    let rounds = Rounds {
+        stop: Some(shutdown.clone()),
+        ..Rounds::new(client, &settings)
+    };
     let mut last: Option<String> = None;
     let mut failures = 0_u32;
     while !shutdown.is_triggered() {
@@ -804,6 +827,9 @@ pub async fn run(client: Client, mut settings: Settings, shutdown: crate::shutdo
             target = Box::pin(rounds.target(&settings)) => target,
         };
         let checked = Box::pin(rounds.checked_into(&settings, &target)).await;
+        if matches!(checked, Err(RenewError::StoodDown)) {
+            return;
+        }
         let wait = settle(&checked, &mut last, &mut failures);
         tokio::select! {
             biased;
@@ -827,7 +853,8 @@ async fn tick(loop_: &Loop<'_>, settings: &Settings, target: &Result<Target, sup
         Ok(target) => Box::pin(check_round(loop_, target, settings.site.as_deref(), &declared)).await,
     };
     settings.configured.store(round.signer.is_some(), Ordering::Relaxed);
-    if let Ok(target) = target {
+    // A round given up for a stand-down says nothing new, and writing would hold the stand-down.
+    if let (Ok(target), false) = (target, matches!(round.checked, Err(RenewError::StoodDown))) {
         let refs = match snapshot.loaded.site() {
             Section::Site(site) => Some(Box::pin(local::named_refs(loop_.client, Some(site))).await),
             Section::Unset => Some(Verdict::resolved()),
@@ -848,6 +875,8 @@ struct Loop<'run> {
     clients: &'run Clients,
     /// The modes the install declares, which apply until a `GridNetwork` exists.
     install: GridModes,
+    /// Gives up a request to the signer.
+    stop: Option<&'run Shutdown>,
 }
 
 /// What the identity Secret held this round.
@@ -1107,7 +1136,7 @@ async fn renew_through(
             &signer,
             target,
             read.held,
-            OffsetDateTime::now_utc(),
+            (OffsetDateTime::now_utc(), loop_.stop),
         ))
         .await,
         signer: Some(url),

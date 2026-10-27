@@ -517,8 +517,9 @@ async fn stand_down(
     }
 }
 
-/// Wait, up to [`RENEWAL_DRAIN`], for the identity renewal loop to finish what it has under
-/// way, so it neither writes the identity nor rolls the gateway once the lease is released.
+/// Wait, up to [`RENEWAL_DRAIN`], for the identity renewal loop to stand down. It gives up a
+/// request to the signer at once and finishes only an identity write or gateway roll under way,
+/// so neither starts once the lease is released.
 async fn wait_for_renewal(renewal_done: &operator::shutdown::Shutdown) {
     if tokio::time::timeout(RENEWAL_DRAIN, renewal_done.triggered())
         .await
@@ -528,7 +529,7 @@ async fn wait_for_renewal(renewal_done: &operator::shutdown::Shutdown) {
     }
 }
 
-/// How long a stand-down waits for an identity renewal under way.
+/// How long a stand-down waits for an identity write or gateway roll under way.
 const RENEWAL_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The SWIM handle if one exists, read rather than awaited.

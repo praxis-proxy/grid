@@ -496,6 +496,39 @@ async fn a_lost_response_retries_with_the_same_key() {
     assert_eq!(asked.first(), asked.last(), "the retry asks for the same key");
 }
 
+/// A signer that never answers.
+struct Silent;
+
+impl Signer for Silent {
+    async fn enroll(&self, _credential: &str, _csr_pem: &str) -> Result<Issued, SignerError> {
+        std::future::pending().await
+    }
+
+    async fn renew(&self, _held: &Held, _csr_pem: &str) -> Result<Issued, SignerError> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn a_stand_down_gives_up_the_request_and_keeps_the_identity_and_the_kept_key() {
+    let (_ca, store, now) = site(Span::days(25));
+    let before = store.get("tls.crt");
+    let (trigger, stop) = crate::shutdown::Trigger::new();
+    trigger.trigger();
+    let held = store.read(&target()).await.expect("held");
+    let given_up = check_held(&store, &Silent, &target(), held, (now, Some(&stop))).await;
+    assert!(matches!(given_up, Err(RenewError::StoodDown)), "{given_up:?}");
+    assert_eq!(
+        store.get("tls.crt"),
+        before,
+        "nothing is written once the request is given up"
+    );
+    assert!(
+        store.get(PENDING_KEY).is_some(),
+        "the kept key lets the next start resend it"
+    );
+}
+
 #[tokio::test]
 async fn a_refusal_or_a_bad_answer_leaves_the_identity_unchanged() {
     for answer in [Answer::Refuse, Answer::Wrong] {
