@@ -766,6 +766,39 @@ async fn calls_that_share_a_started_budget_spend_it_together() {
 }
 
 #[tokio::test]
+async fn a_signer_url_corrected_mid_retry_is_used_on_the_next_poll_with_the_kept_request() {
+    let mock = Mock::new(Reply::Sign);
+    let wrong = mock.settings(closed_addr().await.port());
+    let store = FakeStore::invited();
+    let unreachable = run_flow(&store, &wrong).await;
+    assert!(
+        matches!(unreachable, Err(EnrollError::Unreachable(_))),
+        "{unreachable:?}"
+    );
+    let csr = store
+        .value(&pending_name(), "csr.pem")
+        .expect("the request is kept before it goes out");
+    assert_eq!(mock.calls(), 0, "nothing reached the wrong URL");
+
+    // The admin corrects site.signerEndpoint.url: the next poll builds its settings from
+    // the edit, with no restart, and the kept request is still bound to the same site,
+    // grid CA and invite.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let corrected = mock.settings(listener.local_addr().expect("addr").port());
+    serve_on(&mock, listener);
+    let outcome = run_flow(&store, &corrected).await;
+    assert!(matches!(outcome, Ok(Outcome::Enrolled(_))), "{outcome:?}");
+    assert_eq!(mock.calls(), 1, "the corrected URL is used");
+    let stored = store.value("site-tls", "tls.crt").expect("stored");
+    assert_eq!(
+        certs::cert_public_key(&stored).expect("leaf key"),
+        certs::csr_public_key(&csr).expect("csr key"),
+        "the kept request went out, not a new one"
+    );
+    assert_eq!(store.value(&pending_name(), "csr.pem"), None, "the stash is cleared");
+}
+
+#[tokio::test]
 async fn a_step_with_no_budget_makes_one_attempt_then_gives_up() {
     let none = Backoff {
         initial: Duration::from_millis(1),
