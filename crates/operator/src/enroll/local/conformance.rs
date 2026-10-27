@@ -124,7 +124,7 @@ fn managers() -> BTreeMap<&'static str, &'static str> {
 
 /// The reasons the enrollment step writes, by type and status. `Available` copies the
 /// first failing gate's reason, so it carries the gates' reasons.
-const REASONS: [(&str, &str, &str); 45] = [
+const REASONS: [(&str, &str, &str); 47] = [
     (AVAILABLE, "True", "Available"),
     (AVAILABLE, "False", "AwaitingInvite"),
     (AVAILABLE, "False", "InviteMaybeSpent"),
@@ -134,6 +134,8 @@ const REASONS: [(&str, &str, &str); 45] = [
     (ENROLLED, "Unknown", "Enrolling"),
     (ENROLLED, "False", "AwaitingInvite"),
     (ENROLLED, "False", "InviteMaybeSpent"),
+    (ENROLLED, "False", "InviteRefusedAfterLostAnswer"),
+    (AVAILABLE, "False", "InviteRefusedAfterLostAnswer"),
     (ENROLLED, "True", "Enrolled"),
     (IDENTITY_VALID, "Unknown", "AwaitingFirstAttempt"),
     (IDENTITY_VALID, "True", "IdentityValid"),
@@ -993,7 +995,7 @@ async fn invariant_8_a_restart_after_a_lost_answer_reads_invite_maybe_spent_when
         let enrolled = round.condition(ENROLLED).expect("Enrolled");
         assert_eq!(
             (&enrolled["status"], &enrolled["reason"]),
-            (&json!("False"), &json!("InviteMaybeSpent")),
+            (&json!("False"), &json!("InviteRefusedAfterLostAnswer")),
             "a refusal after an unanswered request is never read as an invalid invite"
         );
         assert!(

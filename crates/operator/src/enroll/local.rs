@@ -269,7 +269,9 @@ const fn reason(error: &EnrollError) -> &'static str {
         EnrollError::NameTaken(_) => "NameTaken",
         EnrollError::NameDeleted(_) => "NameDeleted",
         EnrollError::Refused(_) => "Refused",
-        EnrollError::MaybeSpent { .. } => "InviteMaybeSpent",
+        EnrollError::MaybeSpent { refused: false, .. } => "InviteMaybeSpent",
+        // Never resent, so Progressing does not read it as retried.
+        EnrollError::MaybeSpent { refused: true, .. } => "InviteRefusedAfterLostAnswer",
         EnrollError::InvalidResponse(_) => "InvalidResponse",
         EnrollError::NotStored(_) => "IdentityNotStored",
         EnrollError::PendingForeign(_) => "PendingSecretForeign",
@@ -647,7 +649,10 @@ impl Enrollment {
         let target = &into.target;
         let mut verdicts = vec![(RESOLVED_REFS, REFS_FIELD_MANAGER, Verdict::resolved())];
         // A resend after a retried failure is still the same progress, so Retrying holds.
-        let retried = held(own, ENROLLED).is_some_and(|held| RETRIED.contains(&held.reason.as_str()));
+        // A refusal after a lost answer holds too: a restart resends once, and says nothing new.
+        let retried = held(own, ENROLLED).is_some_and(|held| {
+            RETRIED.contains(&held.reason.as_str()) || held.reason == "InviteRefusedAfterLostAnswer"
+        });
         if !retried {
             verdicts.push((ENROLLED, FIELD_MANAGER, Verdict::enrolling()));
         }

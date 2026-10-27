@@ -453,6 +453,7 @@ fn every_enrollment_failure_has_its_own_reason() {
         EnrollError::NameDeleted(String::new()),
         EnrollError::Refused(String::new()),
         maybe_spent(false),
+        maybe_spent(true),
         EnrollError::InvalidResponse(String::new()),
         EnrollError::NotStored(String::new()),
         EnrollError::Unreachable(String::new()),
@@ -759,7 +760,7 @@ fn last_enrolled_message(world: &Arc<Mutex<World>>) -> String {
     world
         .lock()
         .expect("lock")
-        .messages_of(SITE, ENROLLED)
+        .messages_of(NETWORK, ENROLLED)
         .last()
         .cloned()
         .unwrap_or_default()
@@ -781,7 +782,10 @@ async fn a_token_refused_after_an_unanswered_request_is_not_resent_until_the_inv
     assert_eq!(run_step(&mut enrollment, &world, None).await, Step::Unchanged);
     assert_eq!(mock.calls(), 2, "a refused token is not presented again");
     let last = verdicts(&world).last().cloned();
-    assert_eq!(last, Some(("False".to_owned(), "InviteMaybeSpent".to_owned())));
+    assert_eq!(
+        last,
+        Some(("False".to_owned(), "InviteRefusedAfterLostAnswer".to_owned()))
+    );
     let message = last_enrolled_message(&world);
     assert!(
         message.contains("a new invite may be needed"),
