@@ -51,6 +51,8 @@ pub mod metrics_scraper;
 pub mod metrics_tls;
 /// Short-lived tokens for the metrics scraper ServiceAccount.
 pub(crate) mod metrics_token;
+/// This operator's own settings, from its `ConfigMap`.
+pub mod operator_config;
 /// The `GridNetwork` condition naming peers whose relayed signal ages are rejected.
 pub mod peer_ages;
 mod provider_revision;

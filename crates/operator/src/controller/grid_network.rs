@@ -176,8 +176,10 @@ pub struct OperatorCtx {
     /// Where the declared peer trust goes, so site identity rotation follows it.
     declared_trust: Option<tokio::sync::watch::Sender<PeerTrustMode>>,
 
-    /// Whether this process runs the site identity rotation loop.
-    rotation: bool,
+    /// Set while the rotation loop has a signer to renew through.
+    rotation: Arc<std::sync::atomic::AtomicBool>,
+    /// This operator's own settings, which say whether this site enrolls.
+    operator_config: crate::operator_config::ConfigWatch,
 
     /// This site's name, which a certificate the operator issues itself carries.
     site_name: Option<String>,
@@ -316,6 +318,7 @@ impl OperatorCtx {
     /// This is the canonical constructor used by the operator binary so that
     /// the internal metrics cache type does not need to be exported from the
     /// library crate.
+    #[expect(clippy::too_many_lines, reason = "one line per field")]
     pub fn new(client: Client, swim: Option<Arc<SwimHandle>>, signal_mode: SignalMode) -> Self {
         Self {
             client,
@@ -342,17 +345,25 @@ impl OperatorCtx {
             peer_settings: PeerSettings::default(),
             membership_ready: std::sync::atomic::AtomicBool::new(true),
             declared_trust: None,
-            rotation: false,
+            rotation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            operator_config: crate::operator_config::ConfigWatch::fixed(crate::operator_config::Snapshot::absent()),
             site_name: None,
             logged: ChangeLog::default(),
             started: Instant::now(),
         }
     }
 
-    /// Report a rotation schedule only when this process runs the rotation loop.
+    /// Report a rotation schedule only while the rotation loop has a signer.
     #[must_use]
-    pub const fn with_rotation(mut self, rotation: bool) -> Self {
+    pub fn with_rotation(mut self, rotation: Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.rotation = rotation;
+        self
+    }
+
+    /// Read this operator's own settings from `config`.
+    #[must_use]
+    pub fn with_operator_config(mut self, config: crate::operator_config::ConfigWatch) -> Self {
+        self.operator_config = config;
         self
     }
 
@@ -1535,7 +1546,8 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     ctx.publish_declared_trust(&network);
 
     let client = &ctx.client;
-    ensure_tls_secrets(&network, client, ctx.site_name.as_deref()).await?;
+    let enrolls = config_enrolls(&ctx.operator_config.current().loaded);
+    let tls_retry = Box::pin(ensure_tls_secrets(&network, client, ctx.site_name.as_deref(), enrolls)).await?;
 
     if let Some(swim) = ctx.swim() {
         // When a GridNetwork configures a SWIM key Secret, resolve and apply it
@@ -1588,6 +1600,9 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         })
     }) {
         requeue_interval = requeue_interval.min(MOUNT_RECONCILIATION_REQUEUE);
+    }
+    if let Some(wait) = tls_retry {
+        requeue_interval = requeue_interval.min(wait);
     }
     // In poll mode, load travels the signals path:
     // the operator neither scrapes providers for scoring nor lets a metric
@@ -1731,13 +1746,12 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     .await?;
 
     let grid_id = resolve_grid_id(&network);
-    let identity = site_identity_status(
-        &network,
-        client,
-        time::OffsetDateTime::now_utc(),
-        ctx.rotation && GridModes::of(&network).renews(),
-    )
-    .await;
+    let rotation = if ctx.rotation.load(std::sync::atomic::Ordering::Relaxed) {
+        Rotation::On
+    } else {
+        Rotation::Off
+    };
+    let identity = site_identity_status(&network, client, time::OffsetDateTime::now_utc(), rotation).await;
     // An expired or unreadable identity degrades the network.
     let identity_failed = identity.as_ref().is_some_and(|status| !status.reason.is_empty());
     let phase = if swim_runtime_running && !identity_failed {
@@ -1825,7 +1839,7 @@ async fn local_site_declared(
 ) -> Option<crate::local_site::Declared> {
     let network_name = network.metadata.name.as_deref()?;
     let site = match local_site {
-        Some(local) => match Api::<GridSite>::all(client.clone()).get_opt(local).await {
+        Some(local) => match Box::pin(Api::<GridSite>::all(client.clone()).get_opt(local)).await {
             Ok(site) => site,
             Err(error) => {
                 tracing::debug!(%error, site = local, "local GridSite not readable; retrying next reconcile");
@@ -1916,7 +1930,7 @@ async fn apply_local_site_condition(
 )]
 async fn reconcile_local_site(network_name: &str, local_site: &str, client: &Client) -> Result<(), OperatorError> {
     let api: Api<GridSite> = Api::all(client.clone());
-    let Ok(site) = api.get(local_site).await else {
+    let Ok(site) = Box::pin(api.get(local_site)).await.map(Box::new) else {
         return Ok(());
     };
     if site.spec.grid_network_ref != network_name {
@@ -1938,11 +1952,11 @@ async fn reconcile_local_site(network_name: &str, local_site: &str, client: &Cli
             "message": "local site configured and ready for gateway probing"
         }
     });
-    api.patch_status(
+    Box::pin(api.patch_status(
         local_site,
         &PatchParams::apply(FIELD_MANAGER).force(),
         &Patch::Apply(&status_doc),
-    )
+    ))
     .await?;
     Ok(())
 }
@@ -2247,6 +2261,8 @@ enum TlsSecrets {
     Create,
     /// Only one exists. A new CA would replace the grid's, so nothing is written.
     Inconsistent,
+    /// Neither exists, and the operator config names this site, so enrollment writes both.
+    Enrolls,
 }
 
 /// Decide from which of the CA and site Secrets exist.
@@ -2256,6 +2272,34 @@ fn tls_secrets_action(ca_exists: bool, site_exists: bool) -> TlsSecrets {
         (false, false) => TlsSecrets::Create,
         _ => TlsSecrets::Inconsistent,
     }
+}
+
+/// How long a new `GridNetwork` waits before the operator self-signs for it, so an operator
+/// config applied with it, naming this site, is seen first.
+const SELF_SIGN_GRACE: Duration = Duration::from_secs(30);
+
+/// The wait left before self-signing for a `GridNetwork` created at `created_s`, `None` once
+/// the grace has passed. Both in Unix seconds.
+fn self_sign_wait(created_s: Option<i64>, now_s: i64) -> Option<Duration> {
+    let age = u64::try_from(now_s.saturating_sub(created_s?)).unwrap_or(0);
+    SELF_SIGN_GRACE
+        .checked_sub(Duration::from_secs(age))
+        .filter(|left| !left.is_zero())
+}
+
+/// `action`, unless it would create Secrets enrollment writes: a placeholder would read
+/// as enrolled, and the site would never enroll.
+const fn unless_enrolling(action: TlsSecrets, enrolls: bool) -> TlsSecrets {
+    match action {
+        TlsSecrets::Create if enrolls => TlsSecrets::Enrolls,
+        held @ (TlsSecrets::Present | TlsSecrets::Create | TlsSecrets::Inconsistent | TlsSecrets::Enrolls) => held,
+    }
+}
+
+/// Whether the operator config names this site, so enrollment writes its Secrets. A refused
+/// config holds off too: a placeholder would read as enrolled once it is fixed.
+fn config_enrolls(loaded: &crate::operator_config::Loaded) -> bool {
+    !matches!(loaded.site(), crate::operator_config::Section::Unset)
 }
 
 /// Create a self-signed CA and site certificate when neither Secret exists.
@@ -2273,10 +2317,11 @@ async fn ensure_tls_secrets(
     network: &GridNetwork,
     client: &Client,
     this_site: Option<&str>,
-) -> Result<(), OperatorError> {
+    enrolls: bool,
+) -> Result<Option<Duration>, OperatorError> {
     let tls = &network.spec.tls;
     let (Some(ca_ref), Some(site_ref)) = (&tls.ca_secret_ref, &tls.site_secret_ref) else {
-        return Ok(());
+        return Ok(None);
     };
 
     let ca_api: Api<Secret> = Api::namespaced(client.clone(), &ca_ref.namespace);
@@ -2285,7 +2330,19 @@ async fn ensure_tls_secrets(
     let ca_exists = ca_api.get_opt(&ca_ref.name).await?.is_some();
     let site_exists = site_api.get_opt(&site_ref.name).await?.is_some();
 
-    let action = tls_secrets_action(ca_exists, site_exists);
+    let mut action = tls_secrets_action(ca_exists, site_exists);
+    if action == TlsSecrets::Create {
+        let created = network.metadata.creation_timestamp.as_ref().map(|at| at.0.as_second());
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        if let Some(wait) = self_sign_wait(created, now) {
+            tracing::debug!(
+                wait_s = wait.as_secs(),
+                "waiting for the operator config before self-signing"
+            );
+            return Ok(Some(wait));
+        }
+        action = unless_enrolling(action, enrolls);
+    }
     if note_inconsistent(
         ObjectRef::new(&network_site_name(network)),
         action == TlsSecrets::Inconsistent,
@@ -2298,7 +2355,7 @@ async fn ensure_tls_secrets(
         );
     }
     if action != TlsSecrets::Create {
-        return Ok(());
+        return Ok(None);
     }
 
     let Some(site_name) = issued_site_name(network, this_site) else {
@@ -2309,7 +2366,7 @@ async fn ensure_tls_secrets(
             network = %network_site_name(network),
             "no valid site name for a self-signed identity; enroll this site instead"
         );
-        return Ok(());
+        return Ok(None);
     };
     let ca = certs::generate_ca("grid-ca")?;
     let site_cert = certs::generate_site_cert(&ca, &site_name)?;
@@ -2323,7 +2380,7 @@ async fn ensure_tls_secrets(
     .await?
     {
         tracing::debug!(ca = %ca_ref.name, "another writer created the grid CA; not self-signing a site identity");
-        return Ok(());
+        return Ok(None);
     }
     let site = secret::build(
         &site_ref.name,
@@ -2340,7 +2397,7 @@ async fn ensure_tls_secrets(
              chain to it"
         );
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Create `secret`, returning whether this call created it: a Secret another writer
@@ -5672,7 +5729,7 @@ async fn site_identity_status(
     network: &GridNetwork,
     client: &Client,
     now: time::OffsetDateTime,
-    renews: bool,
+    rotation: Rotation,
 ) -> Option<SiteIdentityStatus> {
     use crate::resources::endpoint_tls::TlsFailureReason;
 
@@ -5690,7 +5747,7 @@ async fn site_identity_status(
     };
     let status = String::from_utf8(bytes)
         .ok()
-        .and_then(|pem| identity_status(&pem, now, renews));
+        .and_then(|pem| identity_status(&pem, now, rotation));
     Some(status.unwrap_or_else(|| unreadable_identity("tls.crt is not a certificate")))
 }
 
@@ -5707,8 +5764,27 @@ fn unreadable_identity(detail: &str) -> SiteIdentityStatus {
     }
 }
 
+/// Whether this site's identity renews, for `status.identity`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rotation {
+    /// The renewal loop has a signer that renews.
+    On,
+    /// Nothing renews: the own `GridSite`'s conditions say why.
+    Off,
+}
+
+impl Rotation {
+    /// What `status.identity.message` says while the identity is current.
+    const fn message(self) -> &'static str {
+        match self {
+            Self::On => "",
+            Self::Off => "rotation is off: see the RotationOnSchedule and Accepted conditions on this site's GridSite",
+        }
+    }
+}
+
 /// The identity status of `cert_pem` at `now`; without renewal, no renewal time.
-fn identity_status(cert_pem: &str, now: time::OffsetDateTime, renews: bool) -> Option<SiteIdentityStatus> {
+fn identity_status(cert_pem: &str, now: time::OffsetDateTime, rotation: Rotation) -> Option<SiteIdentityStatus> {
     use time::format_description::well_known::Rfc3339;
     let (not_before, not_after) = certs::cert_validity(cert_pem).ok()?;
     crate::metrics::set_site_identity_expiry(not_after.unix_timestamp());
@@ -5716,7 +5792,7 @@ fn identity_status(cert_pem: &str, now: time::OffsetDateTime, renews: bool) -> O
     let expired = now >= not_after;
     Some(SiteIdentityStatus {
         not_after: not_after.format(&Rfc3339).ok()?,
-        rotate_after: if renews {
+        rotate_after: if rotation == Rotation::On {
             renew_after.format(&Rfc3339).ok()?
         } else {
             String::new()
@@ -5731,10 +5807,8 @@ fn identity_status(cert_pem: &str, now: time::OffsetDateTime, renews: bool) -> O
             "the site identity expired and cannot renew: a grid-admin deletes this site's enrollment, mints a new \
              site token, and the site re-enrolls"
                 .to_owned()
-        } else if renews {
-            String::new()
         } else {
-            "rotation is off under pin peer trust: re-enroll and re-pin this site before notAfter".to_owned()
+            rotation.message().to_owned()
         },
     })
 }
@@ -8466,6 +8540,57 @@ mod tests {
             "an enrolled CA, identity gone"
         );
         assert_eq!(tls_secrets_action(false, true), TlsSecrets::Inconsistent);
+        assert_eq!(
+            unless_enrolling(tls_secrets_action(false, false), true),
+            TlsSecrets::Enrolls,
+            "a site that enrolls never gets a self-signed placeholder"
+        );
+        assert_eq!(
+            unless_enrolling(tls_secrets_action(false, false), false),
+            TlsSecrets::Create
+        );
+        assert_eq!(
+            unless_enrolling(tls_secrets_action(true, false), true),
+            TlsSecrets::Inconsistent
+        );
+    }
+
+    /// Only an operator config naming this site holds off self-signing, a refused one included.
+    #[test]
+    fn only_an_operator_config_naming_this_site_holds_off_self_signing() {
+        use crate::operator_config::{Loaded, parse};
+        assert!(
+            !config_enrolls(&Loaded::Absent),
+            "no config leaves the grid to self-sign"
+        );
+        assert!(
+            !config_enrolls(&Loaded::Valid(Box::default())),
+            "a config without a site section does not enroll"
+        );
+        let named = parse("site:\n  name: site-a\n").unwrap_or_else(|_| std::process::abort());
+        assert!(
+            config_enrolls(&Loaded::Valid(Box::new(named))),
+            "a config naming this site enrolls"
+        );
+        assert!(
+            config_enrolls(&Loaded::Invalid("site.name: bad".to_owned())),
+            "a refused config holds off until it is fixed"
+        );
+    }
+
+    /// A new `GridNetwork` waits for an operator config applied with it before it self-signs.
+    #[test]
+    fn self_signing_waits_out_the_grace_for_a_new_grid_network() {
+        assert_eq!(self_sign_wait(Some(100), 100), Some(SELF_SIGN_GRACE));
+        assert_eq!(self_sign_wait(Some(100), 110), Some(Duration::from_secs(20)));
+        assert_eq!(self_sign_wait(Some(100), 130), None, "the grace has passed");
+        assert_eq!(self_sign_wait(Some(100), 10_000), None);
+        assert_eq!(self_sign_wait(None, 100), None, "no timestamp, no wait");
+        assert_eq!(
+            self_sign_wait(Some(200), 100),
+            Some(SELF_SIGN_GRACE),
+            "a clock behind the server waits the full grace"
+        );
     }
 
     /// The inconsistency warning fires on the transition, not on every reconcile.
@@ -8506,7 +8631,7 @@ mod tests {
         };
         let leaf = certs::sign_csr(&ca, "east", &csr.csr_pem, validity).expect("leaf");
 
-        let current = identity_status(&leaf.cert_pem, time::OffsetDateTime::now_utc(), true).expect("status");
+        let current = identity_status(&leaf.cert_pem, time::OffsetDateTime::now_utc(), Rotation::On).expect("status");
         assert!(current.reason.is_empty(), "a current identity reports no reason");
         let (not_before, not_after) = certs::cert_validity(&leaf.cert_pem).expect("validity");
         let renew_after = crate::enroll::renew::renew_after(not_before, not_after);
@@ -8521,14 +8646,29 @@ mod tests {
             certs::canonical_fingerprint(&leaf.cert_pem).expect("fp")
         );
 
-        let expired = identity_status(&leaf.cert_pem, not_after, true).expect("status");
+        let expired = identity_status(&leaf.cert_pem, not_after, Rotation::On).expect("status");
         assert_eq!(expired.reason, IDENTITY_EXPIRED);
         assert!(expired.message.contains("re-enrolls"), "names the recovery");
 
-        let pinned = identity_status(&leaf.cert_pem, time::OffsetDateTime::now_utc(), false).expect("status");
-        assert!(pinned.rotate_after.is_empty(), "pin trust schedules no renewal");
-        assert!(pinned.reason.is_empty(), "a current pinned identity is not degraded");
-        assert!(pinned.message.contains("re-pin"), "names the manual step");
+        let off = identity_status(&leaf.cert_pem, time::OffsetDateTime::now_utc(), Rotation::Off).expect("status");
+        assert!(
+            off.rotate_after.is_empty() && off.reason.is_empty(),
+            "nothing renewing schedules no renewal and does not degrade a current identity"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test")]
+    fn rotation_off_without_a_signer_does_not_blame_pin_trust() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let leaf = certs::generate_site_cert(&ca, "east").expect("leaf");
+        let off = identity_status(&leaf.cert_pem, time::OffsetDateTime::now_utc(), Rotation::Off).expect("status");
+        assert!(off.rotate_after.is_empty());
+        assert!(
+            off.message.contains("RotationOnSchedule") && !off.message.contains("pin"),
+            "no signer is not pin trust: {}",
+            off.message
+        );
     }
 
     #[test]

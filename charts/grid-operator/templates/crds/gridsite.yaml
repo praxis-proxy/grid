@@ -230,7 +230,9 @@ spec:
                 conditions:
                   description: |-
                     Observed conditions: `Connected`, and the `Available`, `Progressing` and `Degraded`
-                    roll-up. The phase stays, kept for v1alpha1 readers.
+                    roll-up. On this cluster's own site also `Accepted`, `ResolvedRefs`, `Enrolled`,
+                    `IdentityValid` and `RotationOnSchedule`, which gate its roll-up. The phase stays,
+                    kept for v1alpha1 readers.
                   items:
                     description: One observed condition, shaped like `metav1.Condition`.
                     properties:

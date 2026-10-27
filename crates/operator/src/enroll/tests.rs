@@ -11,9 +11,9 @@ use serde_json::{Value, json};
 
 use super::*;
 
-const SITE: &str = "site-d";
+pub(super) const SITE: &str = "site-d";
 
-const TOKEN_SECRET: &str = "grid-invite-site-d";
+pub(super) const TOKEN_SECRET: &str = "grid-invite-site-d";
 
 const FAST: Backoff = Backoff {
     initial: Duration::from_millis(1),
@@ -22,7 +22,7 @@ const FAST: Backoff = Backoff {
 
 /// How the mock enrollment service answers.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Reply {
+pub(super) enum Reply {
     /// Sign the request for [`SITE`].
     Sign,
     /// Sign for another site.
@@ -35,6 +35,8 @@ enum Reply {
     Spent,
     /// Fail with 503.
     ServerError,
+    /// Answer 408, so the token may have been spent.
+    Timeout,
     /// Answer 200 with a body past the cap.
     Huge,
     /// Sign, then append another certificate and junk.
@@ -42,9 +44,9 @@ enum Reply {
 }
 
 /// Mock enrollment service state.
-struct Mock {
+pub(super) struct Mock {
     /// Serves TLS and is the pinned grid CA.
-    ca: certs::CaCert,
+    pub(super) ca: certs::CaCert,
     /// A CA nobody pinned.
     stranger: certs::CaCert,
     /// Scripted reply.
@@ -64,7 +66,7 @@ impl Mock {
         })
     }
 
-    fn calls(&self) -> usize {
+    pub(super) fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
 
@@ -72,7 +74,7 @@ impl Mock {
     fn settings(&self, port: u16) -> Settings {
         Settings {
             base: Url::parse(&format!("https://localhost:{port}")).expect("url"),
-            http: pinned(&self.ca.cert_pem),
+            pin_pem: self.ca.cert_pem.clone(),
             anchor_pem: self.ca.cert_pem.clone(),
             site_name: SITE.to_owned(),
             token_secret: TOKEN_SECRET.to_owned(),
@@ -81,11 +83,6 @@ impl Mock {
             defaults: target(),
         }
     }
-}
-
-/// A client pinned to `ca_pem`.
-fn pinned(ca_pem: &str) -> reqwest::Client {
-    http_client(pem_roots(ca_pem, "test CA").expect("roots")).expect("client")
 }
 
 fn error(status: StatusCode, code: &str) -> (StatusCode, Json<Value>) {
@@ -98,6 +95,7 @@ async fn enroll_handler(State(mock): State<Arc<Mock>>, Json(request): Json<Value
     match mock.reply {
         Reply::Spent => return error(StatusCode::UNAUTHORIZED, "invalid_token"),
         Reply::ServerError => return error(StatusCode::SERVICE_UNAVAILABLE, "internal"),
+        Reply::Timeout => return error(StatusCode::REQUEST_TIMEOUT, "timeout"),
         Reply::Huge => return (StatusCode::OK, Json(json!({"pad": "x".repeat(MAX_RESPONSE_BYTES)}))),
         Reply::Sign | Reply::WrongSite | Reply::OtherKey | Reply::OtherCa | Reply::Padded => {},
     }
@@ -165,7 +163,7 @@ fn serve_on(mock: &Arc<Mock>, listener: tokio::net::TcpListener) {
     )
     .expect("server TLS");
     let app = Router::new()
-        .route(ENROLL_PATH, post(enroll_handler))
+        .route(signer::ENROLL_PATH, post(enroll_handler))
         .with_state(Arc::clone(mock));
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
@@ -175,7 +173,7 @@ fn serve_on(mock: &Arc<Mock>, listener: tokio::net::TcpListener) {
 }
 
 /// Start a mock, returning it and settings pinned to it.
-async fn serve(reply: Reply) -> (Arc<Mock>, Settings) {
+pub(super) async fn serve(reply: Reply) -> (Arc<Mock>, Settings) {
     let mock = Mock::new(reply);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let settings = mock.settings(listener.local_addr().expect("addr").port());
@@ -225,6 +223,7 @@ impl FakeStore {
     fn invited() -> Self {
         let store = Self::default();
         store.put(TOKEN_SECRET, "token", "site-token");
+        store.label(TOKEN_SECRET, SITE_LABEL, SITE);
         store
     }
 
@@ -312,7 +311,8 @@ fn target() -> Target {
 
 /// Run the flow into [`target`].
 async fn run_flow(store: &FakeStore, settings: &Settings) -> Result<Outcome, EnrollError> {
-    Box::pin(enroll(store, settings, &target())).await
+    let clients = signer::Clients::default();
+    Box::pin(enroll(store, &settings.signer(&clients), settings, &target())).await
 }
 
 #[tokio::test]
@@ -358,7 +358,8 @@ async fn one_secret_holds_everything_when_site_and_ca_share_it() {
         site_secret: "site-tls".to_owned(),
         ca_secret: "site-tls".to_owned(),
     };
-    let outcome = Box::pin(enroll(&store, &settings, &shared)).await;
+    let clients = signer::Clients::default();
+    let outcome = Box::pin(enroll(&store, &settings.signer(&clients), &settings, &shared)).await;
     assert!(matches!(outcome, Ok(Outcome::Enrolled(_))), "enrolls: {outcome:?}");
     for key in ["tls.crt", "tls.key", "ca.crt"] {
         assert!(store.value("site-tls", key).is_some(), "{key} is in the shared Secret");
@@ -500,14 +501,23 @@ async fn transient_write_failures_keep_retrying_rather_than_lose_the_identity() 
     // The token is spent and the certificate is only in memory, so giving up
     // would cost a new invite. A refused write still fails fast, which
     // kube_write_errors_retry_unless_refused covers.
-    let outcome = tokio::time::timeout(Duration::from_millis(60), Box::pin(run_flow(&store, &settings))).await;
+    // Wait on attempts, not a clock: building the TLS client first takes longer on some runners.
+    let flow = Box::pin(run_flow(&store, &settings));
+    let retried = async {
+        while store.create_calls() < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    let raced = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            outcome = flow => Err(outcome),
+            () = retried => Ok(()),
+        }
+    })
+    .await;
     assert!(
-        outcome.is_err(),
-        "a transient write failure must keep retrying: {outcome:?}"
-    );
-    assert!(
-        store.create_calls() > 1,
-        "pending alone would hold for a stall too: {} attempts",
+        matches!(raced, Ok(Ok(()))),
+        "a transient write failure must keep retrying: {raced:?} after {} attempts",
         store.create_calls()
     );
 }
@@ -608,7 +618,7 @@ async fn a_token_minted_for_another_site_is_not_spent() {
     store.label(TOKEN_SECRET, SITE_LABEL, "site-e");
     let outcome = run_flow(&store, &settings).await;
     assert!(
-        matches!(&outcome, Err(EnrollError::Config(m)) if m.contains("site-e")),
+        matches!(&outcome, Err(EnrollError::NameMismatch(m)) if m.contains("site-e")),
         "refused: {outcome:?}"
     );
     assert_eq!(mock.calls(), 0, "the token is not sent");
@@ -617,10 +627,10 @@ async fn a_token_minted_for_another_site_is_not_spent() {
 #[tokio::test]
 async fn a_server_outside_the_tls_pin_fails_fast() {
     let (mock, mut settings) = serve(Reply::Sign).await;
-    settings.http = pinned(&mock.stranger.cert_pem);
+    settings.pin_pem = mock.stranger.cert_pem.clone();
     let outcome = run_flow(&FakeStore::invited(), &settings).await;
     assert!(
-        matches!(&outcome, Err(EnrollError::Config(m)) if m.contains("GRID_ENROLL_CA_FILE")),
+        matches!(&outcome, Err(EnrollError::SignerUntrusted(_))),
         "a pin mismatch is not retried: {outcome:?}"
     );
     assert_eq!(mock.calls(), 0, "the token is not sent");
@@ -675,11 +685,53 @@ fn responses_classify_as_done_or_hard_failures() {
     ];
     for (code, body, want) in cases {
         let status = StatusCode::from_u16(code).expect("status");
-        let got = classify(status, body).err().map(|e| e.to_string()).unwrap_or_default();
+        let got = signer::classify(status, body)
+            .err()
+            .map(|e| enroll_error(e).to_string())
+            .unwrap_or_default();
         assert!(got.contains(want), "{code}: want {want:?}, got {got:?}");
     }
     let ok = br#"{"certificate":"c","caCertificate":"a"}"#;
-    assert!(classify(StatusCode::CREATED, ok).is_ok(), "a decodable 201 is done");
+    assert!(
+        signer::classify(StatusCode::CREATED, ok).is_ok(),
+        "a decodable 201 is done"
+    );
+}
+
+#[test]
+fn a_lapsed_signer_certificate_is_retried_and_a_pin_mismatch_is_not() {
+    let untrusted = |window: bool| SignerError::Untrusted {
+        lapsed: window,
+        detail: String::new(),
+    };
+    assert!(matches!(enroll_error(untrusted(true)), EnrollError::SignerLapsed(_)));
+    assert!(matches!(
+        enroll_error(untrusted(false)),
+        EnrollError::SignerUntrusted(_)
+    ));
+}
+
+#[cfg(not(feature = "fips"))]
+#[test]
+fn rustls_reads_only_a_validity_window_as_lapsed() {
+    use rustls::{CertificateError, Error};
+    let lapsed = |error: Error| tls_backend::is_lapsed_certificate(&error);
+    assert!(lapsed(Error::InvalidCertificate(CertificateError::Expired)));
+    assert!(lapsed(Error::InvalidCertificate(CertificateError::NotValidYet)));
+    assert!(!lapsed(Error::InvalidCertificate(CertificateError::UnknownIssuer)));
+    assert!(!lapsed(Error::InvalidCertificate(CertificateError::NotValidForName)));
+}
+
+#[cfg(feature = "fips")]
+#[test]
+fn openssl_reads_only_a_validity_window_as_lapsed() {
+    let lapsed = |text: &str| tls_backend::is_lapsed_certificate(&std::io::Error::other(text.to_owned()));
+    assert!(lapsed("certificate verify failed (certificate has expired)"));
+    assert!(lapsed("certificate verify failed (certificate is not yet valid)"));
+    assert!(!lapsed(
+        "certificate verify failed (unable to get local issuer certificate)"
+    ));
+    assert!(!lapsed("certificate verify failed (hostname mismatch)"));
 }
 
 #[test]
@@ -719,22 +771,83 @@ fn dry_runs_pass_on_success_or_conflict_and_retry_like_writes() {
     );
 }
 
+fn invite() -> InviteSecretRef {
+    InviteSecretRef {
+        name: TOKEN_SECRET.to_owned(),
+        key: "token".to_owned(),
+    }
+}
+
+/// Signer URLs, and whether a signer may answer there: a host under the grid domain is
+/// refused, since any site leaf names one, and so are credentials, which the status
+/// would publish. A percent-encoded authority is refused, since parsing would decode it
+/// past the host rule.
+const SIGNER_URL_CASES: &[(&str, bool)] = &[
+    ("https://grid-enrollment.grid-enrollment.svc:8443", true),
+    ("https://enroll.example.com", true),
+    ("https://enroll.example.com:8443/", true),
+    ("https://enroll.example.com:8443/est", true),
+    ("https://10.0.0.1:8443", true),
+    ("https://[2001:db8::1]:8443", true),
+    ("https://[::1]:8443", true),
+    ("https://[::1]", true),
+    ("https://grid.internal.example.com", true),
+    ("https://gridxinternal", true),
+    ("https://enroll.example.com/grid.internal", true),
+    ("https://enroll.example.com/%2e", true),
+    ("https://enroll.example.com?host=grid.internal", false),
+    ("https://enroll.example.com/%2e?x=%25", false),
+    ("https://enroll.example.com#f", false),
+    ("https://enroll.example.com:abc", false),
+    ("https://enroll.example.com:/", false),
+    ("https://enroll.example.com:8443:1/", false),
+    ("https://[::1]:abc", false),
+    ("https://user@enroll.example.com", false),
+    ("https://user:secret@enroll.example.com", false),
+    ("http://enroll.example.com", false),
+    ("not a url", false),
+    ("https://", false),
+    ("https:///path", false),
+    ("https://:8443", false),
+    ("https://grid%2einternal", false),
+    ("https://hub.grid%2Einternal:8443/", false),
+    ("https://enroll%2eexample.com", false),
+    ("https://hub.grid.internal", false),
+    ("https://hub.grid.internal:8443", false),
+    ("https://HUB.GRID.INTERNAL.:8443", false),
+    ("https://grid.internal", false),
+    ("https://grid.internal/", false),
+    ("https://enroll.example.com@hub.grid.internal", false),
+    ("https://a.b.grid.internal/path?x#y", false),
+];
+
 #[test]
-fn urls_must_parse_and_be_https() {
-    let config = |url: &str| Config {
-        enabled: true,
-        url: Some(url.to_owned()),
-        ca_file: None,
-        grid_ca_file: None,
-        site_name: Some(SITE.to_owned()),
-        token_secret: Some(TOKEN_SECRET.to_owned()),
-        token_secret_key: "token".to_owned(),
-        identity_secret: "grid-site-identity".to_owned(),
-        ca_secret: "grid-ca".to_owned(),
-        renew: false,
-    };
-    for (url, want) in [("http://enroll.example.com", "https"), ("not a url", "GRID_ENROLL_URL")] {
-        let got = Settings::from_config(&config(url))
+fn the_signer_refuses_a_url_a_site_certificate_could_answer() {
+    for (url, accepted) in SIGNER_URL_CASES {
+        assert_eq!(signer_url(url).is_ok(), *accepted, "{url}");
+    }
+}
+
+/// The operator config refuses the same signer URLs, before anything reads them.
+#[test]
+fn the_operator_config_refuses_the_same_signer_urls() {
+    for (url, accepted) in SIGNER_URL_CASES {
+        let document = format!("site:\n  name: {SITE}\n  signerEndpoint:\n    url: '{url}'\n");
+        let parsed = crate::operator_config::parse(&document);
+        assert_eq!(parsed.is_ok(), *accepted, "{url}: {parsed:?}");
+    }
+}
+
+#[test]
+fn settings_name_the_field_a_refused_url_came_from() {
+    crate::init_process_crypto();
+    let ca = certs::generate_ca("grid-ca").expect("ca").cert_pem;
+    for (url, want) in [
+        ("http://enroll.example.com", "https"),
+        ("not a url", "signerEndpoint.url"),
+        ("https://hub.grid.internal", "grid.internal"),
+    ] {
+        let got = Settings::new(SITE, url, &invite(), &ca, None)
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
@@ -742,52 +855,43 @@ fn urls_must_parse_and_be_https() {
     }
 }
 
-/// A temp file, removed on drop.
-struct TempFile(PathBuf);
-
-impl TempFile {
-    fn new(contents: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("grid-enroll-{}", uuid::Uuid::new_v4()));
-        std::fs::write(&path, contents).expect("write");
-        Self(path)
-    }
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        drop(std::fs::remove_file(&self.0));
-    }
-}
-
 #[test]
 fn bundles_without_a_certificate_are_refused_before_anything_is_sent() {
     crate::init_process_crypto();
-    let ca = TempFile::new(&certs::generate_ca("grid-ca").expect("ca").cert_pem);
-    let junk = TempFile::new("not a certificate\n");
-    let with = |ca_file: &TempFile, grid_ca_file: Option<&TempFile>| Config {
-        enabled: true,
-        url: Some("https://enroll.example.com".to_owned()),
-        ca_file: Some(ca_file.0.clone()),
-        grid_ca_file: grid_ca_file.map(|file| file.0.clone()),
-        site_name: Some(SITE.to_owned()),
-        token_secret: Some(TOKEN_SECRET.to_owned()),
-        token_secret_key: "token".to_owned(),
-        identity_secret: "grid-site-identity".to_owned(),
-        ca_secret: "grid-ca".to_owned(),
-        renew: false,
-    };
-    assert!(Settings::from_config(&with(&ca, None)).is_ok(), "a PEM CA is accepted");
-    for (config, name) in [
-        (with(&junk, None), "GRID_ENROLL_CA_FILE"),
-        (with(&ca, Some(&junk)), "GRID_ENROLL_GRID_CA_FILE"),
+    let ca = certs::generate_ca("grid-ca").expect("ca").cert_pem;
+    let url = "https://enroll.example.com";
+    let settings = Settings::new(SITE, url, &invite(), &ca, None).expect("a PEM CA is accepted");
+    assert_eq!(settings.anchor_pem, ca, "the pin anchors the grid CA by default");
+    let other = certs::generate_ca("grid-ca").expect("other").cert_pem;
+    let anchored = Settings::new(SITE, url, &invite(), &ca, Some(&other)).expect("separate anchors");
+    assert_eq!(anchored.anchor_pem, other, "gridCaBundleRef anchors the grid CA");
+    for (pin, anchors, name) in [
+        ("not a certificate\n", None, "signerEndpoint.caBundleRef"),
+        (
+            ca.as_str(),
+            Some("not a certificate\n"),
+            "signerEndpoint.gridCaBundleRef",
+        ),
     ] {
-        let got = Settings::from_config(&config);
+        let got = Settings::new(SITE, url, &invite(), pin, anchors);
         assert!(
             matches!(&got, Err(EnrollError::Config(m)) if m.contains(name)),
             "{name}: {:?}",
             got.err()
         );
     }
+}
+
+#[test]
+fn the_site_name_is_the_grid_site_name_and_must_be_valid() {
+    crate::init_process_crypto();
+    let ca = certs::generate_ca("grid-ca").expect("ca").cert_pem;
+    let got = Settings::new("Not_A_Label", "https://enroll.example.com", &invite(), &ca, None);
+    assert!(
+        matches!(&got, Err(EnrollError::Config(m)) if m.contains("Not_A_Label")),
+        "{:?}",
+        got.err()
+    );
 }
 
 fn network(tls: &Value) -> GridNetwork {
@@ -875,30 +979,30 @@ fn the_schedule_has_no_attempt_limit() {
 #[tokio::test]
 #[expect(clippy::too_many_lines, reason = "one case per standing")]
 async fn a_lost_identity_restarts_only_on_a_definite_absence_and_an_invite_for_this_site() {
-    let settings = Mock::new(Reply::Sign).settings(1);
     let site_secret = target().site_secret;
     let gone_invited = FakeStore::invited();
     gone_invited.label(TOKEN_SECRET, SITE_LABEL, SITE);
     assert!(
-        identity_lost(&gone_invited, &site_secret, &settings).await,
+        identity_lost(&gone_invited, &site_secret, TOKEN_SECRET, SITE).await,
         "gone, and invited"
     );
 
     let gone_uninvited = FakeStore::default();
     assert!(
-        !identity_lost(&gone_uninvited, &site_secret, &settings).await,
+        !identity_lost(&gone_uninvited, &site_secret, TOKEN_SECRET, SITE).await,
         "no invite"
     );
 
-    let unlabelled = FakeStore::invited();
+    let unlabelled = FakeStore::default();
+    unlabelled.put(TOKEN_SECRET, "token", "site-token");
     assert!(
-        !identity_lost(&unlabelled, &site_secret, &settings).await,
+        !identity_lost(&unlabelled, &site_secret, TOKEN_SECRET, SITE).await,
         "an invite not labelled for this site"
     );
     let other_site = FakeStore::invited();
     other_site.label(TOKEN_SECRET, SITE_LABEL, "site-e");
     assert!(
-        !identity_lost(&other_site, &site_secret, &settings).await,
+        !identity_lost(&other_site, &site_secret, TOKEN_SECRET, SITE).await,
         "an invite for another site"
     );
 
@@ -906,7 +1010,7 @@ async fn a_lost_identity_restarts_only_on_a_definite_absence_and_an_invite_for_t
     present.label(TOKEN_SECRET, SITE_LABEL, SITE);
     present.put(&site_secret, "tls.crt", "cert");
     assert!(
-        !identity_lost(&present, &site_secret, &settings).await,
+        !identity_lost(&present, &site_secret, TOKEN_SECRET, SITE).await,
         "the identity is present"
     );
 
@@ -915,7 +1019,20 @@ async fn a_lost_identity_restarts_only_on_a_definite_absence_and_an_invite_for_t
         ..FakeStore::default()
     };
     assert!(
-        !identity_lost(&unreadable, &site_secret, &settings).await,
+        !identity_lost(&unreadable, &site_secret, TOKEN_SECRET, SITE).await,
         "a failed read is not an absence"
     );
+}
+
+#[tokio::test]
+async fn an_unlabelled_secret_is_never_sent_as_a_token() {
+    let (mock, settings) = serve(Reply::Sign).await;
+    let store = FakeStore::default();
+    store.put(TOKEN_SECRET, "token", "provider-api-key");
+    let outcome = run_flow(&store, &settings).await;
+    assert!(
+        matches!(&outcome, Err(EnrollError::NameMismatch(m)) if m.contains(SITE_LABEL)),
+        "refused: {outcome:?}"
+    );
+    assert_eq!(mock.calls(), 0, "nothing is sent");
 }

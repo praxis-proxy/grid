@@ -6,7 +6,7 @@ use clap::{Args, Parser};
 
 use crate::{
     crd::grid_network::{PeerTrustMode, SignalMode},
-    enroll, gateway,
+    gateway,
 };
 
 /// grid-operator command-line interface.
@@ -16,10 +16,6 @@ pub struct Cli {
     /// Gateway self-discovery options.
     #[command(flatten)]
     pub gateway: gateway::Config,
-
-    /// Site auto-enroll options.
-    #[command(flatten)]
-    pub enrollment: enroll::Config,
 
     /// SWIM runtime options.
     #[command(flatten)]
@@ -40,6 +36,14 @@ pub struct Cli {
     /// Leader election options.
     #[command(flatten)]
     pub leader: LeaderArgs,
+
+    /// The `ConfigMap` in the operator namespace holding this operator's own settings.
+    #[arg(
+        long = "operator-config",
+        env = "GRID_OPERATOR_CONFIG",
+        default_value = crate::operator_config::DEFAULT_CONFIG_MAP
+    )]
+    pub operator_config: String,
 }
 
 /// Leader election options. With no lease, this replica writes unelected.

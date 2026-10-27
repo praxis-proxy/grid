@@ -164,44 +164,51 @@ async fn main() {
         },
     };
 
-    if config.enrollment.enabled {
-        let enrolled = tokio::select! {
-            biased;
-            () = shutdown.triggered() => {
-                tracing::info!("stood down before enrolling");
-                return;
-            },
-            result = Box::pin(operator::enroll::ensure_enrolled(&client, &config.enrollment)) => result,
-        };
-        if let Err(error) = enrolled {
-            tracing::error!(%error, "site enrollment failed");
-            std::process::exit(1);
-        }
-        // Enrolling runs only at start: a site that loses its identity, with an invite to
-        // enroll again, stands down so its restart enrolls, rather than run on unidentified.
-        let stand_down = StandDown {
-            trigger: Arc::clone(&trigger),
-            ready: Arc::clone(&ready),
-            routes: routes.clone(),
-        };
-        let (watching, enrollment) = (client.clone(), config.enrollment.clone());
-        tokio::spawn(async move {
-            operator::enroll::lost_identity_with_invite(&watching, &enrollment).await;
-            stand_down.begin().await;
-        });
-    }
     // The identity names the site, and without one the site idles.
+    let invalid_identity = |error: &str| -> SiteIdentity {
+        tracing::error!(error, "invalid site identity or name");
+        std::process::exit(1)
+    };
+    let mut found = site_from_identity(&client, &config)
+        .await
+        .unwrap_or_else(|error| invalid_identity(&error));
+    // The operator config names the site and its signer; an edit applies without a restart.
+    let mut operator_config = operator::operator_config::ConfigWatch::spawn(
+        client.clone(),
+        client.default_namespace(),
+        &config.operator_config,
+    );
+    // The site enrolls now, else while it waits for an identity.
+    let mut enrollment = operator::enroll::local::Enrollment::default();
+    let identified_as = found.name.as_deref().filter(|_name| found.present);
+    let stepped = tokio::select! {
+        biased;
+        () = shutdown.triggered() => {
+            tracing::info!("stood down before enrolling");
+            return;
+        },
+        stepped = async {
+            let read = operator_config.read().await;
+            Box::pin(enrollment.step(&client, identified_as, &read)).await
+        } => stepped,
+    };
+    match stepped {
+        // The identity just written names the site, so this process serves under it.
+        Ok(operator::enroll::local::Step::Enrolled) => {
+            found = site_from_identity(&client, &config)
+                .await
+                .unwrap_or_else(|error| invalid_identity(&error));
+        },
+        Ok(_) => {},
+        Err(error) => {
+            tracing::warn!(%error, "listing GridSites to enroll failed, retrying while waiting for an identity");
+        },
+    }
     let SiteIdentity {
         at: identity,
         present: has_identity,
         name: site_name,
-    } = match site_from_identity(&client, &config).await {
-        Ok(found) => found,
-        Err(error) => {
-            tracing::error!(%error, "invalid site identity or name");
-            std::process::exit(1);
-        },
-    };
+    } = found;
     config.swim.site_name = site_name;
     let startup = SiteStartup::resolve(config.swim.site_name.is_some(), has_identity);
     match startup {
@@ -221,7 +228,7 @@ async fn main() {
         }
     }
     let install_modes = GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust);
-    let modes = match resolve_grid_modes(&client, config.enrollment.enabled, install_modes).await {
+    let modes = match resolve_grid_modes(&client, has_identity, install_modes).await {
         Ok(modes) => modes,
         Err(error) => {
             tracing::error!(%error, "failed to resolve grid modes");
@@ -232,25 +239,36 @@ async fn main() {
     let trust = modes.trust;
     // The loop follows the declared peer trust, which may change after startup.
     let (declared_trust, trust_changes) = tokio::sync::watch::channel(trust);
-    let mut rotation_running = false;
+    // Renews through the signer the operator config names; an unidentified site restarts once enrolled.
+    let rotation = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Released once the renewal loop has returned, after any write it had under way.
     let (renewal_done_tx, renewal_done) = operator::shutdown::Trigger::new();
     let mut renewal_done_tx = Some(renewal_done_tx);
-    if config.enrollment.renew {
-        match operator::enroll::renew::Settings::from_config(&config.enrollment) {
-            Ok(settings) => {
-                rotation_running = true;
-                let install = GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust);
-                let settings = settings
-                    .with_gateway(&config.gateway.namespace, &config.gateway.service_name)
-                    .with_declared_trust(install, trust_changes);
-                let (renewing, stop, done) = (client.clone(), shutdown.clone(), renewal_done_tx.take());
-                tokio::spawn(async move {
-                    operator::enroll::renew::run(renewing, settings, stop).await;
-                    drop(done);
-                });
-            },
-            Err(error) => tracing::error!(%error, "site identity rotation is off: misconfigured"),
+    if has_identity {
+        let settings = operator::enroll::renew::Settings::new()
+            .with_config(operator_config.clone())
+            .with_configured(Arc::clone(&rotation))
+            .with_site(config.swim.site_name.clone())
+            .with_gateway(&config.gateway.namespace, &config.gateway.service_name)
+            .with_declared_trust(install_modes, trust_changes);
+        let (renewing, stop, done) = (client.clone(), shutdown.clone(), renewal_done_tx.take());
+        tokio::spawn(async move {
+            operator::enroll::renew::run(renewing, settings, stop).await;
+            drop(done);
+        });
+        // Enrolling runs only while unidentified: a site that loses its identity, with an
+        // invite to enroll again, stands down so its restart enrolls, rather than run on unidentified.
+        if let Some(site) = config.swim.site_name.clone() {
+            let stand_down = StandDown {
+                trigger: Arc::clone(&trigger),
+                ready: Arc::clone(&ready),
+                routes: routes.clone(),
+            };
+            let (watching, invites) = (client.clone(), operator_config.clone());
+            tokio::spawn(async move {
+                operator::enroll::local::lost_identity_with_invite(&watching, &site, invites).await;
+                stand_down.begin().await;
+            });
         }
     }
     drop(renewal_done_tx);
@@ -266,7 +284,8 @@ async fn main() {
         OperatorCtx::new(client.clone(), None, signal_mode)
             .with_peer_settings(peer_settings)
             .with_declared_trust(declared_trust)
-            .with_rotation(rotation_running)
+            .with_rotation(rotation)
+            .with_operator_config(operator_config.clone())
             .with_site_name(config.swim.site_name.clone())
             .with_scrape_interval(config.signals.scrape_interval())
             .hold_membership(),
@@ -357,7 +376,7 @@ async fn main() {
     // it and creates its records.
     let identified = async {
         if startup.waits_for_identity() {
-            identity_appears(&client, &config).await;
+            identity_appears(&client, &config, &mut enrollment, &mut operator_config).await;
         } else {
             std::future::pending::<()>().await;
         }
@@ -1364,11 +1383,24 @@ impl SiteStartup {
 /// How often a site without an identity checks for one.
 const IDENTITY_POLL: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Resolve once the site identity appears, warning once per distinct error.
-async fn identity_appears(client: &Client, config: &Cli) {
+/// Resolve once the site identity appears, enrolling the site meanwhile, at once on an edit to
+/// the operator config, and warning once per distinct error.
+async fn identity_appears(
+    client: &Client,
+    config: &Cli,
+    enrollment: &mut operator::enroll::local::Enrollment,
+    operator_config: &mut operator::operator_config::ConfigWatch,
+) {
     let mut last_error = None;
     loop {
-        tokio::time::sleep(IDENTITY_POLL).await;
+        tokio::select! {
+            () = tokio::time::sleep(IDENTITY_POLL) => {},
+            () = operator_config.changed() => {},
+        }
+        let read = operator_config.current();
+        if let Err(error) = Box::pin(enrollment.step(client, None, &read)).await {
+            tracing::debug!(%error, "listing GridSites to enroll failed");
+        }
         match site_from_identity(client, config).await {
             Ok(SiteIdentity { present: true, .. }) => return,
             Ok(_) => last_error = None,
@@ -1398,7 +1430,7 @@ async fn site_from_identity(client: &Client, config: &Cli) -> Result<SiteIdentit
         .identity_namespace
         .clone()
         .unwrap_or_else(|| client.default_namespace().to_owned());
-    let at = operator::site_name::locate(client, &namespace, &config.enrollment.identity_secret)
+    let at = operator::site_name::locate(client, &namespace, operator::enroll::IDENTITY_SECRET)
         .await
         .map_err(|e| e.to_string())?;
     let pem = operator::site_name::identity_pem(client, &at)
@@ -1425,7 +1457,7 @@ async fn create_local_records(
         network: config.grid.network.clone(),
         site: site.to_owned(),
         identity,
-        ca_secret: config.enrollment.ca_secret.clone(),
+        ca_secret: operator::enroll::CA_SECRET.to_owned(),
         swim_key_secret: None,
         modes: GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust),
     };

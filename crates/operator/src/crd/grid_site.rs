@@ -1,9 +1,10 @@
 //! [`GridSite`] custom resource definition.
 //!
-//! Represents a remote site in the grid. Created manually for
-//! seed peers or automatically by SWIM discovery. The status
+//! Represents a site in the grid. A peer is created manually for
+//! seed peers or automatically by SWIM discovery, and its status
 //! tracks the site lifecycle from discovery through mTLS
-//! establishment to active connectivity.
+//! establishment to active connectivity. This cluster's own site
+//! reports enrollment in conditions.
 
 use kube::CustomResource;
 use schemars::JsonSchema;
@@ -180,7 +181,9 @@ pub struct GridSiteStatus {
     pub capabilities: SiteCapabilities,
 
     /// Observed conditions: `Connected`, and the `Available`, `Progressing` and `Degraded`
-    /// roll-up. The phase stays, kept for v1alpha1 readers.
+    /// roll-up. On this cluster's own site also `Accepted`, `ResolvedRefs`, `Enrolled`,
+    /// `IdentityValid` and `RotationOnSchedule`, which gate its roll-up. The phase stays,
+    /// kept for v1alpha1 readers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["type"]))]
     pub conditions: Vec<Condition>,
@@ -581,6 +584,16 @@ mod tests {
                     == Some("!(has(self.egress) && has(self.gatewayEndpoint))")
             }),
             "CRD must reject both endpoint names"
+        );
+    }
+
+    #[test]
+    fn the_own_site_carries_no_local_config() {
+        let crd = crd_json();
+        assert!(
+            crd.pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/local")
+                .is_none(),
+            "this site's own config lives in the operator ConfigMap"
         );
     }
 }
