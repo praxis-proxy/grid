@@ -544,8 +544,9 @@ embedded gateway's serving config is controlled separately by
 
 ## GridSite
 
-Represents another site in the grid. Created manually
-for seed peers or automatically by SWIM discovery.
+Represents a site in the grid. A peer is created manually for seed peers or
+automatically by SWIM discovery. This cluster's own site is the GridSite named
+after its identity, and before it has one, the GridSite named in the operator config.
 
 ```yaml
 apiVersion: grid.praxis.fast/v1alpha1
@@ -573,7 +574,57 @@ spec:
 
 **Status fields**: `conditions`, `phase`, `reason`, `message`, `observedGeneration`,
 `publicCertPem`, `capabilities` (inference, agentTools, agentToAgent),
-`lastProbeTime`, `lastTransitionTime`, `absentSince` (auto-discovered sites only)
+`lastProbeTime`, `lastTransitionTime`, `absentSince` (auto-discovered sites only),
+`conditions` (on this cluster's own site: `Available`, `Progressing`, `Degraded`,
+`Accepted`, `ResolvedRefs`, `Enrolled`, `IdentityValid`, `RotationOnSchedule`)
+
+### This cluster's own site
+
+The own GridSite carries no local config. How this site enrolls and renews lives in
+the operator config: the ConfigMap `grid-operator-config` in the operator namespace,
+key `config.yaml`, which the grid-operator chart renders from its `enrollment` values
+(`operatorConfig.name` renames it). The operator reads it through the API and watches
+it, so an edit applies without a restart. It holds only this operator's or this site's
+own settings. Grid-wide settings stay on the GridNetwork, and credentials stay in
+Secrets it names.
+
+```yaml
+site:
+  name: east2
+  signerEndpoint:
+    url: https://enrollment.apps.example.com
+    caBundleRef: {kind: Secret, name: grid-ca-bundle, key: ca.crt}
+    gridCaBundleRef: {kind: Secret, name: grid-ca-anchor, key: ca.crt}
+    rotation: Enabled
+  inviteSecretRef: {name: grid-invite-east2, key: token}
+```
+
+| Field | Meaning |
+|---|---|
+| `site` | This cluster's own site. Optional, like every section. Unset, the site does not enroll itself. |
+| `site.name` | The site name, and the name of its GridSite. Required. The invite label and the issued certificate must match it. |
+| `site.signerEndpoint.url` | The base URL of the signer the site enrolls and renews through. https, naming a host with an optional numeric port, without credentials, query or fragment, and not a host under `grid.internal`. |
+| `site.signerEndpoint.caBundleRef` | `Secret` or `ConfigMap` in the operator namespace pinning the signer, and by default the grid CA it returns. `kind` is required. Required with `inviteSecretRef`. Renewal falls back to the grid CA the site holds. The object must carry `grid.praxis.fast/signer-bundle=true`, as must the `gridCaBundleRef` object. |
+| `site.signerEndpoint.gridCaBundleRef` | The grid CA the returned CA must match: a bootstrap override for a signer that cannot serve its own bundle, such as one behind a certificate from another CA. |
+| `site.signerEndpoint.rotation` | Whether this operator renews the identity through the signer. `Enabled` (default) renews when a third of its lifetime remains, and is refused under pin peer trust with `Accepted` `False` and `RotationUnsupportedUnderPinTrust`. `Disabled` uses the signer to enroll only. Enrollment runs whatever this says. |
+| `site.inviteSecretRef` | The Secret holding the one-time invite token, an opaque credential the signer issued, read once while the site has no identity. `key` defaults to `token`. The Secret must carry `grid.praxis.fast/site=<site.name>`. |
+
+The operator parses the whole document and refuses it whole: an unknown key at any
+level, a bad URL or a missing field reports `Accepted` `False` with
+`OperatorConfigInvalid` on the own GridSite, the message naming the field, and no
+section of it is acted on. A `site.name` other than the site the held identity
+names reports `SiteNameMismatch`. Before the own GridSite exists, the operator sends
+nothing, logs why and records an Event on the ConfigMap. Under pin peer trust,
+`rotation: Enabled` reports `Accepted` `False` with `RotationUnsupportedUnderPinTrust`
+and nothing renews. Every condition and reason is listed in
+[Site Enrollment](../installation/enrollment.md#3-enroll-the-site). A local site may
+exist before its GridNetwork, and the GridSite controller waits for the network
+without reporting an error.
+
+The operator self-signs a grid CA and site identity for a GridNetwork that names TLS
+Secrets neither of which exists. It never does while the operator config names this
+site, or is refused, since enrollment writes both. It waits 30 seconds after the
+GridNetwork is created, so an operator config applied with it is seen first.
 
 ### GridSite lifecycle
 
@@ -749,7 +800,7 @@ status:
 ### Status conditions
 
 The operator writes `Connected` and the roll-up beside the phase, which stays for
-v1alpha1 readers. `Connected` is the only gate.
+v1alpha1 readers. On a peer, `Connected` is the only gate.
 
 A peer's `GridSite` is a local object, and its conditions record what this site
 observes of that peer. Status is never shared between sites, so two sites can
@@ -769,6 +820,14 @@ disagree about one peer during a partition. The peer's own health is in its own
 
 `Connected` is applied by the field manager `grid-operator-probe`, and the roll-up
 by `grid-operator-site`. The phase stays a merge patch.
+
+On this cluster's own site, the roll-up gates on `Accepted`, `ResolvedRefs`, `Enrolled`
+and `IdentityValid` instead, in that order, and `Connected` stays informational.
+`Degraded` is `True` while `RotationOnSchedule` is `False`, the early warning that the
+identity is about to expire, and `Progressing` is `True` while an enrollment is in
+flight or retried. Each gate has its own field manager, and the roll-up keeps
+`grid-operator-site`. The own site's `phase` follows the same probe as a peer's and
+says nothing about its identity.
 
 ## InferenceProvider
 

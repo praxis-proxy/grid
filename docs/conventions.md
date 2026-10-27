@@ -327,7 +327,7 @@ let client = reqwest::Client::builder()
     .build()?;
 
 // Good - the grid's bounds and trust posture:
-let roots = grid_client::roots_from_pem(pem, "GRID_ENROLL_CA_FILE")?;
+let roots = grid_client::roots_from_pem(pem, "site.signerEndpoint.caBundleRef")?;
 let client = grid_client::trusted_client(
     roots,
     Some(identity),
