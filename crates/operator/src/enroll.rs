@@ -7,7 +7,7 @@ use kube::{
     Api, Client,
     api::{ListParams, ObjectMeta, Patch, PatchParams, PostParams},
 };
-use reqwest::{StatusCode, Url};
+use reqwest::Url;
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::{crd::grid_network::GridNetwork, operator_config::InviteSecretRef, resources::tls_backend};
@@ -170,7 +170,7 @@ where
 /// Validated settings.
 struct Settings {
     /// Service base URL, https.
-    base: Url,
+    base: signer::SignerUrl,
     /// PEM bundle pinning the service's serving certificate.
     pin_pem: String,
     /// PEM bundle the returned grid CA must match.
@@ -196,7 +196,7 @@ impl Settings {
         pin_pem: &str,
         anchor_pem: Option<&str>,
     ) -> Result<Self, EnrollError> {
-        let base = signer_url(url).map_err(EnrollError::Config)?;
+        let base = signer::SignerUrl::parse(url).map_err(EnrollError::Config)?;
         certs::validate_site_name(site_name).map_err(|e| EnrollError::Config(format!("site name {site_name}: {e}")))?;
         pem_roots(pin_pem, "site.signerEndpoint.caBundleRef")?;
         let anchor_pem = match anchor_pem {
@@ -219,8 +219,8 @@ impl Settings {
     }
 
     /// The signer these settings name, reusing `clients`.
-    fn signer<'clients>(&self, clients: &'clients signer::Clients) -> signer::HttpsSigner<'clients> {
-        signer::HttpsSigner::new(self.base.clone(), Some(self.pin_pem.clone()), clients)
+    fn signer<'signer>(&'signer self, clients: &'signer signer::Clients) -> signer::HttpsSigner<'signer> {
+        signer::HttpsSigner::new(&self.base, Some(&self.pin_pem), clients)
     }
 }
 
@@ -720,17 +720,11 @@ async fn redeem<G: Signer + Sync>(
 fn enroll_error(error: SignerError) -> EnrollError {
     match error {
         SignerError::Unauthenticated(detail) => EnrollError::TokenRejected(detail),
-        SignerError::Refused {
-            status: StatusCode::CONFLICT,
-            code: Some(code),
-            detail,
-        } if code == "name_taken" => EnrollError::NameTaken(detail),
-        SignerError::Refused {
-            status: StatusCode::CONFLICT,
-            code: Some(code),
-            detail,
-        } if code == "name_deleted" => EnrollError::NameDeleted(detail),
-        SignerError::Refused { detail, .. } | SignerError::NoClientCertificate(detail) => EnrollError::Refused(detail),
+        SignerError::NameTaken(detail) => EnrollError::NameTaken(detail),
+        SignerError::NameDeleted(detail) => EnrollError::NameDeleted(detail),
+        SignerError::Forbidden(detail) | SignerError::Refused(detail) | SignerError::NoClientCertificate(detail) => {
+            EnrollError::Refused(detail)
+        },
         SignerError::Disabled(detail) | SignerError::Transport { detail, .. } => EnrollError::MaybeSpent(detail),
         SignerError::Untrusted { lapsed: true, detail } => EnrollError::SignerLapsed(detail),
         SignerError::Untrusted { lapsed: false, detail } => EnrollError::SignerUntrusted(detail),

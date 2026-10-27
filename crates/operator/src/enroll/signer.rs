@@ -40,16 +40,18 @@ pub(super) enum SignerError {
     /// The signer received no client certificate, as when TLS ends before it.
     #[error("{0}")]
     NoClientCertificate(String),
-    /// The signer refused the request, with its status and machine-readable code.
-    #[error("{detail}")]
-    Refused {
-        /// The answer's status.
-        status: StatusCode,
-        /// The error code the signer named, if any.
-        code: Option<String>,
-        /// What the signer said.
-        detail: String,
-    },
+    /// The site name is enrolled already.
+    #[error("{0}")]
+    NameTaken(String),
+    /// The site name's enrollment was deleted and the credential does not re-admit it.
+    #[error("{0}")]
+    NameDeleted(String),
+    /// The signer refused the identity or credential presented, which a new one fixes.
+    #[error("{0}")]
+    Forbidden(String),
+    /// The signer refused the request for another reason it answered.
+    #[error("{0}")]
+    Refused(String),
     /// The signer refuses every renewal: rotation is turned off at the signer.
     #[error("{0}")]
     Disabled(String),
@@ -91,15 +93,46 @@ pub(super) trait Signer {
 #[derive(Debug, Default)]
 pub(super) struct Clients(Mutex<Option<([u8; 32], reqwest::Client)>>);
 
+/// A signer's base URL, as [`super::signer_url`] admits it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SignerUrl(Url);
+
+impl SignerUrl {
+    /// `raw` as a signer base URL.
+    ///
+    /// # Errors
+    ///
+    /// As [`super::signer_url`].
+    pub(super) fn parse(raw: &str) -> Result<Self, String> {
+        super::signer_url(raw).map(Self)
+    }
+
+    /// The URL as text.
+    #[cfg(test)]
+    pub(super) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// `path` under the base URL.
+    pub(super) fn join(&self, path: &str) -> String {
+        format!("{}{path}", self.0.as_str().trim_end_matches('/'))
+    }
+
+    /// The renewal route.
+    pub(super) fn renewal(&self) -> String {
+        self.join(RENEW_PATH)
+    }
+}
+
 /// The enrollment service over HTTPS.
-pub(super) struct HttpsSigner<'clients> {
+pub(super) struct HttpsSigner<'signer> {
     /// The signer's base URL.
-    base: Url,
+    base: &'signer SignerUrl,
     /// The PEM pinning the signer's serving certificate: the only trust to enroll, and
     /// trusted beside the held grid CA to renew.
-    pin: Option<String>,
+    pin: Option<&'signer str>,
     /// Clients kept across calls.
-    clients: &'clients Clients,
+    clients: &'signer Clients,
 }
 
 /// Request body for both routes.
@@ -118,16 +151,11 @@ struct ErrorBody {
     message: String,
 }
 
-impl<'clients> HttpsSigner<'clients> {
+impl<'signer> HttpsSigner<'signer> {
     /// The signer at `base`, pinned to `pin`, reusing `clients`.
     #[must_use]
-    pub(super) const fn new(base: Url, pin: Option<String>, clients: &'clients Clients) -> Self {
+    pub(super) const fn new(base: &'signer SignerUrl, pin: Option<&'signer str>, clients: &'signer Clients) -> Self {
         Self { base, pin, clients }
-    }
-
-    /// `path` under the base URL.
-    pub(super) fn endpoint(base: &Url, path: &str) -> String {
-        format!("{}{path}", base.as_str().trim_end_matches('/'))
     }
 
     /// A client trusting only `trust`, presenting `identity` (cert, key) when set, built
@@ -164,11 +192,10 @@ impl Signer for HttpsSigner<'_> {
     async fn enroll(&self, credential: &str, csr_pem: &str) -> Result<Issued, SignerError> {
         let pin = self
             .pin
-            .as_deref()
             .ok_or_else(|| SignerError::Request("enrolling needs a caBundleRef pinning the signer".to_owned()))?;
         let request = self
             .client(pin, None)?
-            .post(Self::endpoint(&self.base, ENROLL_PATH))
+            .post(self.base.join(ENROLL_PATH))
             .bearer_auth(credential)
             .json(&CsrRequest { csr: csr_pem });
         Box::pin(post(request)).await
@@ -177,13 +204,13 @@ impl Signer for HttpsSigner<'_> {
     async fn renew(&self, held: &Held, csr_pem: &str) -> Result<Issued, SignerError> {
         // The held grid CA, and the pin: a Secret-only bundle on a host GRID_SIGNER_HOSTS
         // confines, so a ConfigMap edit cannot point renewal at a signer of its own.
-        let trust = match &self.pin {
+        let trust = match self.pin {
             Some(pin) => Cow::Owned(format!("{}\n{pin}", held.ca)),
             None => Cow::Borrowed(held.ca.as_str()),
         };
         let request = self
             .client(&trust, Some((&held.cert, &held.key)))?
-            .post(Self::endpoint(&self.base, RENEW_PATH))
+            .post(self.base.renewal())
             .json(&CsrRequest { csr: csr_pem });
         Box::pin(post(request)).await
     }
@@ -227,17 +254,16 @@ pub(super) fn classify(status: StatusCode, body: &[u8]) -> Result<Issued, Signer
         |err| format!("{status} {}: {}", err.error, err.message),
     );
     let code = error.map(|err| err.error);
-    Err(match status {
-        StatusCode::UNAUTHORIZED if code.as_deref() == Some("identity_required") => {
-            SignerError::NoClientCertificate(detail)
-        },
-        StatusCode::UNAUTHORIZED => SignerError::Unauthenticated(detail),
-        StatusCode::SERVICE_UNAVAILABLE if code.as_deref() == Some("rotation_disabled") => {
-            SignerError::Disabled(detail)
-        },
+    Err(match (status, code.as_deref()) {
+        (StatusCode::UNAUTHORIZED, Some("identity_required")) => SignerError::NoClientCertificate(detail),
+        (StatusCode::UNAUTHORIZED, _) => SignerError::Unauthenticated(detail),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("rotation_disabled")) => SignerError::Disabled(detail),
+        (StatusCode::CONFLICT, Some("name_taken")) => SignerError::NameTaken(detail),
+        (StatusCode::CONFLICT, Some("name_deleted")) => SignerError::NameDeleted(detail),
+        (StatusCode::FORBIDDEN, _) => SignerError::Forbidden(detail),
         // A timeout or a server error may have reached the signer.
-        StatusCode::REQUEST_TIMEOUT => SignerError::Transport { sent: true, detail },
+        (StatusCode::REQUEST_TIMEOUT, _) => SignerError::Transport { sent: true, detail },
         _ if status.is_server_error() => SignerError::Transport { sent: true, detail },
-        _ => SignerError::Refused { status, code, detail },
+        _ => SignerError::Refused(detail),
     })
 }

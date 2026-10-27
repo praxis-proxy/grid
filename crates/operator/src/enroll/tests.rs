@@ -7,6 +7,7 @@ use std::{
 };
 
 use axum::{Json, Router, extract::State, routing::post};
+use reqwest::StatusCode;
 use serde_json::{Value, json};
 
 use super::*;
@@ -78,7 +79,7 @@ impl Mock {
     /// Settings pinned to this mock at `port`.
     fn settings(&self, port: u16) -> Settings {
         Settings {
-            base: Url::parse(&format!("https://localhost:{port}")).expect("url"),
+            base: signer::SignerUrl::parse(&format!("https://localhost:{port}")).expect("url"),
             pin_pem: self.ca.cert_pem.clone(),
             anchor_pem: self.ca.cert_pem.clone(),
             site_name: SITE.to_owned(),
@@ -975,6 +976,45 @@ fn responses_classify_as_done_or_hard_failures() {
         signer::classify(StatusCode::CREATED, ok).is_ok(),
         "a decodable 201 is done"
     );
+}
+
+/// The variant `error` is, for a table test.
+fn signer_variant(error: &SignerError) -> &'static str {
+    match error {
+        SignerError::NameTaken(_) => "NameTaken",
+        SignerError::NameDeleted(_) => "NameDeleted",
+        SignerError::Forbidden(_) => "Forbidden",
+        SignerError::Refused(_) => "Refused",
+        SignerError::NoClientCertificate(_) => "NoClientCertificate",
+        SignerError::Unauthenticated(_) => "Unauthenticated",
+        SignerError::Disabled(_) => "Disabled",
+        SignerError::Transport { sent: true, .. } => "Transport sent",
+        SignerError::Transport { sent: false, .. } | SignerError::Untrusted { .. } => "never sent",
+        SignerError::Request(_) | SignerError::Invalid(_) => "local",
+    }
+}
+
+#[test]
+fn the_signer_classifies_a_refusal_by_what_it_means() {
+    let cases: [(u16, &str, &str); 9] = [
+        (409, "name_taken", "NameTaken"),
+        (409, "name_deleted", "NameDeleted"),
+        (409, "other", "Refused"),
+        (403, "identity_refused", "Forbidden"),
+        (400, "bad", "Refused"),
+        (401, "identity_required", "NoClientCertificate"),
+        (401, "invalid_token", "Unauthenticated"),
+        (503, "rotation_disabled", "Disabled"),
+        (503, "internal", "Transport sent"),
+    ];
+    for (status, code, want) in cases {
+        let body = format!(r#"{{"error":"{code}","message":"m"}}"#);
+        let got = signer::classify(StatusCode::from_u16(status).expect("status"), body.as_bytes())
+            .as_ref()
+            .err()
+            .map(signer_variant);
+        assert_eq!(got, Some(want), "{status} {code}");
+    }
 }
 
 #[test]

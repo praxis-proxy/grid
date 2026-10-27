@@ -17,14 +17,13 @@ use kube::{
     Api, Client,
     api::{ListParams, Patch, PatchParams},
 };
-use reqwest::StatusCode;
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
 use super::{
     Issued, Signer, SignerError, Target, jittered,
     local::{self, Verdict},
-    signer::{Clients, HttpsSigner, RENEW_PATH},
+    signer::{Clients, HttpsSigner, SignerUrl},
 };
 use crate::{
     controller::grid_network::GridModes,
@@ -406,13 +405,12 @@ fn renew_error(error: SignerError) -> RenewError {
     match error {
         SignerError::Unauthenticated(detail) => RenewError::Unauthenticated(detail),
         SignerError::NoClientCertificate(detail) => RenewError::NeedsPassthrough(detail),
-        SignerError::Refused {
-            status: StatusCode::FORBIDDEN,
-            detail,
-            ..
-        } => RenewError::Refused(detail),
+        SignerError::Forbidden(detail) => RenewError::Refused(detail),
         SignerError::Disabled(detail) => RenewError::SignerDisabled(detail),
-        SignerError::Refused { detail, .. } | SignerError::Transport { detail, .. } => RenewError::Transport(detail),
+        SignerError::NameTaken(detail)
+        | SignerError::NameDeleted(detail)
+        | SignerError::Refused(detail)
+        | SignerError::Transport { detail, .. } => RenewError::Transport(detail),
         SignerError::Untrusted { lapsed: true, detail } => RenewError::SignerLapsed(detail),
         SignerError::Untrusted { lapsed: false, detail } => RenewError::Untrusted(detail),
         SignerError::Request(detail) => RenewError::Material(detail),
@@ -513,16 +511,9 @@ impl IdentityStore for KubeIdentity {
 pub(super) struct Endpoint<'config> {
     /// The signer's base URL. The signer is trusted through the grid CA the site holds, or
     /// the bundle `pin` names.
-    pub(super) base: reqwest::Url,
+    pub(super) base: SignerUrl,
     /// `site.signerEndpoint.caBundleRef`, the bundle pinning the signer's serving certificate.
     pub(super) pin: Option<&'config BundleRef>,
-}
-
-impl Endpoint<'_> {
-    /// The renewal URL, for messages.
-    fn renewal_url(&self) -> String {
-        HttpsSigner::endpoint(&self.base, RENEW_PATH)
-    }
 }
 
 /// The gateway Deployment, named like its Service.
@@ -732,7 +723,7 @@ fn resolve_signer<'config>(declared: &Declared<'config>) -> Result<Resolved<'con
         Declared::NoSigner => return Ok(Resolved::Off(Off::NoSigner)),
         Declared::Refused(_) => return Ok(Resolved::Off(Off::Refused)),
     };
-    let base = super::signer_url(&endpoint.url).map_err(RenewError::Material)?;
+    let base = SignerUrl::parse(&endpoint.url).map_err(RenewError::Material)?;
     Ok(Resolved::Signer(Endpoint {
         base,
         pin: endpoint.ca_bundle_ref.as_ref(),
@@ -1125,7 +1116,7 @@ async fn renew_through(
     endpoint: Endpoint<'_>,
     identity: Option<Identity>,
 ) -> Round {
-    let url = endpoint.renewal_url();
+    let url = endpoint.base.renewal();
     let pin = match Box::pin(signer_pin(loop_.client, endpoint.pin)).await {
         Ok(pin) => pin,
         Err(error) => {
@@ -1137,7 +1128,7 @@ async fn renew_through(
             };
         },
     };
-    let signer = HttpsSigner::new(endpoint.base, pin, loop_.clients);
+    let signer = HttpsSigner::new(&endpoint.base, pin.as_deref(), loop_.clients);
     Round {
         checked: Box::pin(check_held(
             loop_.store,

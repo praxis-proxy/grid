@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 
+use reqwest::StatusCode;
 use time::Duration as Span;
 
 use super::*;
@@ -141,11 +142,7 @@ impl Signer for Service {
 
 /// The signer's 403 for a refused identity.
 fn forbidden() -> SignerError {
-    SignerError::Refused {
-        status: StatusCode::FORBIDDEN,
-        code: Some("identity_refused".to_owned()),
-        detail: "403".to_owned(),
-    }
+    SignerError::Forbidden("403 identity_refused".to_owned())
 }
 
 /// A gateway Deployment in memory: its identity annotation and how often it was patched.
@@ -665,7 +662,7 @@ fn only_the_operator_config_names_the_signer() {
     assert_eq!(
         resolve(&loaded(&signer(""))),
         Resolved::Signer(Endpoint {
-            base: reqwest::Url::parse("https://enroll.example.com").expect("url"),
+            base: SignerUrl::parse("https://enroll.example.com").expect("url"),
             pin: None,
         }),
         "a signer renews trusted through the held grid CA"
@@ -702,9 +699,10 @@ async fn renewal_trusts_the_pin_beside_the_held_grid_ca() {
     crate::init_process_crypto();
     let held = held_identity();
     let (base, pin) = super::super::tests::byo_serving_signer(&held.ca, axum::Router::new(), false).await;
+    let base = SignerUrl::parse(base.as_str()).expect("signer url");
     let clients = Clients::default();
 
-    let unpinned = HttpsSigner::new(base.clone(), None, &clients).renew(&held, "csr").await;
+    let unpinned = HttpsSigner::new(&base, None, &clients).renew(&held, "csr").await;
     let unpinned = unpinned.err().map(renew_error);
     assert!(
         matches!(unpinned, Some(RenewError::Untrusted(_))),
@@ -716,9 +714,9 @@ async fn renewal_trusts_the_pin_beside_the_held_grid_ca() {
         "an untrusted signer is not a transport failure"
     );
 
-    let pinned = HttpsSigner::new(base, Some(pin), &clients).renew(&held, "csr").await;
+    let pinned = HttpsSigner::new(&base, Some(&pin), &clients).renew(&held, "csr").await;
     assert!(
-        matches!(pinned, Err(SignerError::Refused { status, .. }) if status == StatusCode::NOT_FOUND),
+        matches!(&pinned, Err(SignerError::Refused(detail)) if detail.starts_with("404")),
         "the pin trusts the signer's serving certificate, so the request reaches it"
     );
 }
@@ -877,15 +875,23 @@ fn why_nothing_renews_names_the_fix() {
 
 #[test]
 fn a_signer_refusal_maps_to_what_renewal_reports() {
-    let refused = |status: u16| SignerError::Refused {
-        status: StatusCode::from_u16(status).expect("status"),
-        code: None,
-        detail: status.to_string(),
-    };
-    assert!(matches!(renew_error(refused(403)), RenewError::Refused(_)));
+    assert!(matches!(
+        renew_error(SignerError::Forbidden("403".to_owned())),
+        RenewError::Refused(_)
+    ));
     assert!(
-        matches!(renew_error(refused(409)), RenewError::Transport(_)),
-        "only 403 needs re-enrollment"
+        matches!(
+            renew_error(SignerError::Refused("409".to_owned())),
+            RenewError::Transport(_)
+        ),
+        "only a forbidden identity needs re-enrollment"
+    );
+    assert!(
+        matches!(
+            renew_error(SignerError::NameTaken("409".to_owned())),
+            RenewError::Transport(_)
+        ),
+        "an enrollment-only refusal is not a renewal verdict"
     );
     assert!(matches!(
         renew_error(SignerError::Disabled("off".to_owned())),
