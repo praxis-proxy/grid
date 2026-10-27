@@ -3,8 +3,9 @@
 //! Represents a site in the grid. A peer is created manually for
 //! seed peers or automatically by SWIM discovery, and its status
 //! tracks the site lifecycle from discovery through mTLS
-//! establishment to active connectivity. This cluster's own site
-//! reports enrollment in conditions.
+//! establishment to active connectivity. Status is membership only,
+//! each cluster's view of one site, this cluster's own site included:
+//! its enrollment and identity conditions live on the `GridNetwork`.
 
 use kube::CustomResource;
 use schemars::JsonSchema;
@@ -181,9 +182,9 @@ pub struct GridSiteStatus {
     pub capabilities: SiteCapabilities,
 
     /// Observed conditions: `Connected`, and the `Available`, `Progressing` and `Degraded`
-    /// roll-up. On this cluster's own site also `Accepted`, `ResolvedRefs`, `Enrolled`,
-    /// `IdentityValid` and `RotationOnSchedule`, which gate its roll-up. The phase stays,
-    /// kept for v1alpha1 readers.
+    /// roll-up, on every site, this cluster's own included. Its `Accepted`, `ResolvedRefs`,
+    /// `Enrolled`, `IdentityValid` and `RotationOnSchedule` live on the `GridNetwork`. The
+    /// phase stays, kept for v1alpha1 readers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["type"]))]
     pub conditions: Vec<Condition>,
