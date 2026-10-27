@@ -10,7 +10,11 @@ use kube::{
 use reqwest::Url;
 use zeroize::{Zeroize as _, Zeroizing};
 
-use crate::{crd::grid_network::GridNetwork, operator_config::InviteSecretRef, resources::tls_backend};
+use crate::{
+    crd::grid_network::GridNetwork,
+    operator_config::{BundleRef, InviteSecretRef},
+    resources::tls_backend,
+};
 
 
 /// Response size cap.
@@ -216,6 +220,8 @@ struct Settings {
     backoff: Backoff,
     /// Where the identity goes when no `GridNetwork` names its Secrets.
     defaults: Target,
+    /// The Secrets enrollment reads, by the field naming each, so none is also written.
+    read_secrets: Vec<(&'static str, String)>,
 }
 
 impl Settings {
@@ -248,7 +254,21 @@ impl Settings {
             // signer and the identity write.
             backoff: STEP_BACKOFF.started_now(),
             defaults: Target::defaults(),
+            read_secrets: vec![("site.inviteSecretRef", invite.name.clone())],
         })
+    }
+
+    /// Also reading the bundles `pin` and `anchor` name.
+    fn with_bundles(mut self, pin: Option<&BundleRef>, anchor: Option<&BundleRef>) -> Self {
+        for (field, reference) in [
+            ("site.signerEndpoint.caBundleRef", pin),
+            ("site.signerEndpoint.gridCaBundleRef", anchor),
+        ] {
+            if let Some(reference) = reference {
+                self.read_secrets.push((field, reference.name.clone()));
+            }
+        }
+        self
     }
 
     /// The signer these settings name, reusing `clients`.
@@ -637,6 +657,35 @@ async fn check_not_enrolled_elsewhere<S: Store + Sync>(
     Ok(())
 }
 
+/// Refuse a layout where a Secret enrollment writes is also one it reads or clears: the
+/// pending Secret named for the grid CA would be erased with the enrollment it kept, and
+/// an invite or bundle Secret named for the identity would be written over.
+fn check_names(settings: &Settings, target: &Target) -> Result<(), EnrollError> {
+    let pending = pending::name(target);
+    let written = [
+        ("the identity Secret", target.site_secret.as_str()),
+        ("the grid CA Secret", target.ca_secret.as_str()),
+        ("the enrollment kept beside the identity", pending.as_str()),
+    ];
+    if pending == target.ca_secret {
+        return Err(EnrollError::Config(format!(
+            "Secret {pending} is both the grid CA Secret and the enrollment kept beside the identity: clearing \
+             the enrollment would erase the grid CA; name the identity and CA Secrets apart"
+        )));
+    }
+    for (writes, name) in written {
+        for (reads, read) in &settings.read_secrets {
+            if name == read {
+                return Err(EnrollError::Config(format!(
+                    "Secret {name} is both {writes} and {reads}: enrollment would write over what it reads; name \
+                     them apart"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Enroll through `signer` unless already enrolled, then store the identity.
 async fn enroll<S: Store + Sync, G: Signer + Sync>(
     store: &S,
@@ -644,6 +693,7 @@ async fn enroll<S: Store + Sync, G: Signer + Sync>(
     settings: &Settings,
     target: &Target,
 ) -> Result<Outcome, EnrollError> {
+    check_names(settings, target)?;
     if store.exists(&target.site_secret).await? {
         pending::clear(store, target, settings.backoff).await?;
         return Ok(Outcome::AlreadyEnrolled);

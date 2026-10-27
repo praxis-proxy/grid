@@ -810,6 +810,7 @@ async fn prepare(
     let settings = pin.pem("site.signerEndpoint.caBundleRef").and_then(|pin_pem| {
         let anchor_pem = anchors.optional_pem("site.signerEndpoint.gridCaBundleRef")?;
         Settings::new(&config.name, &signer.url, invite, &pin_pem, anchor_pem.as_deref())
+            .map(|settings| settings.with_bundles(signer.ca_bundle_ref.as_ref(), signer.grid_ca_bundle_ref.as_ref()))
     });
     Ok((inputs, settings))
 }

@@ -89,6 +89,7 @@ impl Mock {
             token_key: "token".to_owned(),
             backoff: FAST,
             defaults: target(),
+            read_secrets: vec![("site.inviteSecretRef", TOKEN_SECRET.to_owned())],
         }
     }
 }
@@ -220,6 +221,7 @@ fn mock_settings(settings: &Settings) -> Settings {
         token_key: settings.token_key.clone(),
         backoff: settings.backoff,
         defaults: settings.defaults.clone(),
+        read_secrets: settings.read_secrets.clone(),
     }
 }
 
@@ -948,6 +950,39 @@ async fn a_dry_run_that_keeps_failing_transiently_never_spends_the_token() {
         store.check_calls() > 1,
         "the step retries within its budget before giving up: {} attempts",
         store.check_calls()
+    );
+    assert_eq!(mock.calls(), 0, "the token is not sent");
+}
+
+#[tokio::test]
+async fn a_grid_ca_secret_named_for_the_pending_enrollment_is_refused_before_the_invite_is_spent() {
+    let (mock, settings) = serve(Reply::Sign).await;
+    let colliding = Target {
+        site_secret: "site-tls".to_owned(),
+        ca_secret: pending_name(),
+    };
+    let store = FakeStore::invited();
+    let clients = signer::Clients::default();
+    let outcome = Box::pin(enroll(&store, &settings.signer(&clients), &settings, &colliding)).await;
+    assert!(
+        matches!(&outcome, Err(EnrollError::Config(why)) if why.contains(&pending_name()) && why.contains("grid CA")),
+        "names the colliding Secret and both roles: {outcome:?}"
+    );
+    assert_eq!(mock.calls(), 0, "the token is not sent");
+    assert!(store.value(&pending_name(), "csr.pem").is_none(), "nothing is kept");
+}
+
+#[tokio::test]
+async fn an_invite_or_bundle_secret_named_for_what_enrollment_writes_is_refused() {
+    let (mock, mut settings) = serve(Reply::Sign).await;
+    settings
+        .read_secrets
+        .push(("site.signerEndpoint.caBundleRef", "site-tls".to_owned()));
+    let store = FakeStore::invited();
+    let outcome = run_flow(&store, &settings).await;
+    assert!(
+        matches!(&outcome, Err(EnrollError::Config(why)) if why.contains("site-tls") && why.contains("caBundleRef") && why.contains("identity")),
+        "names the colliding Secret and both fields: {outcome:?}"
     );
     assert_eq!(mock.calls(), 0, "the token is not sent");
 }
