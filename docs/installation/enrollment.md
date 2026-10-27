@@ -110,7 +110,7 @@ site:
 | --- | --- |
 | `site.name` | The site name. Required. The invite label and the issued certificate must match it, and the GridSite of this name is this cluster's own. |
 | `site.signerEndpoint.url` | The signer's base URL: https, a host with an optional numeric port, without credentials, query or fragment, and not a host under `grid.internal`, where site certificates live. Editable: renewal reads it each round. |
-| `site.signerEndpoint.caBundleRef` | `kind` (`Secret`, the only kind, required), `name`, `key`. Pins the signer's serving certificate to enroll and, by default, the grid CA it returns. Renewal trusts the grid CA the site holds instead. Required with `inviteSecretRef`. The object must carry the label `grid.praxis.fast/signer-bundle=true`. |
+| `site.signerEndpoint.caBundleRef` | `kind` (`Secret`, the only kind, required), `name`, `key`. Pins the signer's serving certificate to enroll and, by default, the grid CA it returns. Renewal trusts the grid CA the site holds together with this bundle. Required with `inviteSecretRef`. The object must carry the label `grid.praxis.fast/signer-bundle=true`. |
 | `site.signerEndpoint.gridCaBundleRef` | The grid CA the returned CA must match: a bootstrap override for a signer that cannot serve its own bundle, such as one behind a certificate from another CA. Carries the same label. |
 | `site.signerEndpoint.rotation` | `Enabled`, the default, or `Disabled`: whether this operator renews through the signer. See [Rotation](#5-rotation). |
 | `site.inviteSecretRef` | `name`, `key`. The token is an opaque credential the signer issued. The operator presents it and never parses it, and reads it once, while the site has no identity. The Secret must carry the label `grid.praxis.fast/site=<site.name>`. |
@@ -296,7 +296,7 @@ Requirements:
    enrollment.
 4. Keep `site.signerEndpoint` in the operator config, with `rotation` at
    `Enabled`, the default. The operator renews through the signer it names,
-   trusted through the grid CA the site holds, never `caBundleRef`, and rolls the gateway Deployment after each rotation, since the
+   trusted through the grid CA the site holds together with `caBundleRef`, and rolls the gateway Deployment after each rotation, since the
    gateway reads its client certificate only at start. The chart grants `get`
    and `patch` on that Deployment. A hub declares its signer the same way: the
    grid-operator chart renders `site.signerEndpoint` from `enrollment.url`,

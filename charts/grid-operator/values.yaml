@@ -365,7 +365,7 @@ enrollment:
   # -- CA pinning the signer to enroll, and the grid CA by default:
   # site.signerEndpoint.caBundleRef. A Secret only, since anyone who can edit a ConfigMap
   # could pin a signer of their own. Unset, Secret grid-ca-bundle when enabled. Renewal
-  # trusts the grid CA the site holds, never this bundle.
+  # trusts the grid CA the site holds together with this bundle.
   caBundle:
     # -- Secret holding the bundle.
     secret: ""
