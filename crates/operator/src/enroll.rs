@@ -702,7 +702,7 @@ async fn enroll<S: Store + Sync, G: Signer + Sync>(
 ) -> Result<Outcome, EnrollError> {
     check_names(settings, target)?;
     if store.exists(&target.site_secret).await? {
-        pending::clear(store, target, settings.backoff).await?;
+        drop(pending::clear(store, target, settings.backoff).await?);
         return Ok(Outcome::AlreadyEnrolled);
     }
     check_not_enrolled_elsewhere(store, &settings.defaults, target).await?;
@@ -750,7 +750,7 @@ async fn stored<S: Store + Sync>(
     )
     .await
     .map_err(|e| EnrollError::NotStored(e.to_string()))?;
-    pending::clear(store, target, settings.backoff).await?;
+    drop(pending::clear(store, target, settings.backoff).await?);
     Ok(written)
 }
 

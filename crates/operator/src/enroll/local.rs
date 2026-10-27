@@ -677,6 +677,8 @@ impl Enrollment {
     /// Report the identity in `target`, unless `site` already reads enrolled.
     async fn present(&mut self, client: &Client, site: &GridNetwork, into: &Destination, outside: bool) -> Step {
         let secret = &into.target.site_secret;
+        // Whatever stopped an earlier process before it cleared the request, its key goes now.
+        Box::pin(clear_kept(into)).await;
         // Written outside a signer, the identity says what renews it, as the renewal loop does.
         let verdict = if outside {
             let meta = Box::pin(into.store.metadata(secret)).await.ok().flatten();
@@ -711,6 +713,20 @@ impl Enrollment {
             self.failed = Some(inputs);
         }
         Step::Failed
+    }
+}
+
+/// Clear the enrollment kept beside the identity `into` holds, saying what was found.
+async fn clear_kept(into: &Destination) {
+    match Box::pin(super::pending::clear(&into.store, &into.target, super::STEP_BACKOFF)).await {
+        Ok(super::pending::Swept::Foreign(why)) => tracing::warn!(%why, "pending enrollment Secret"),
+        Ok(super::pending::Swept::Cleared) => {
+            tracing::info!(secret = %into.target.site_secret, "cleared the enrollment kept beside the identity");
+        },
+        Ok(super::pending::Swept::Nothing) => {},
+        Err(error) => {
+            tracing::warn!(%error, "clearing the enrollment kept beside the identity failed: retried next poll");
+        },
     }
 }
 

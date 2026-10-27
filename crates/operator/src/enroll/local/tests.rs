@@ -992,3 +992,43 @@ async fn the_condition_is_applied_by_its_own_field_manager() {
     );
     assert!(!queries.is_empty());
 }
+
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "owned and foreign, cleared and then left")]
+async fn an_existing_identity_clears_the_request_an_earlier_process_kept_and_leaves_a_foreign_one() {
+    let pending = format!("{}-pending", crate::enroll::IDENTITY_SECRET);
+    for (label, cleared) in [("grid-operator", true), ("someone-else", false)] {
+        let world = enrolling("https://enroll.example.com", true);
+        identified(&world);
+        world.lock().expect("lock").put_secret(
+            &pending,
+            &[("tls.key", "a private key"), ("csr.pem", "a request")],
+            &[("app.kubernetes.io/managed-by", label)],
+        );
+        let mut enrollment = Enrollment::default();
+        for _poll in 0..2 {
+            assert_eq!(run_step(&mut enrollment, &world, None).await, Step::Present);
+        }
+        let held = world.lock().expect("lock").clone();
+        let key = held
+            .secrets
+            .get(&pending)
+            .and_then(|secret| secret.data.as_ref())
+            .and_then(|data| data.get("tls.key"))
+            .is_some();
+        assert_eq!(!key, cleared, "{label}: enrollment clears only its own request");
+        let version = |seen: &World| {
+            seen.secrets
+                .get(&pending)
+                .and_then(|secret| secret.metadata.resource_version.clone())
+        };
+        let before = version(&held);
+        drop(held);
+        assert_eq!(run_step(&mut enrollment, &world, None).await, Step::Present);
+        assert_eq!(
+            version(&world.lock().expect("lock")),
+            before,
+            "{label}: a cleared request is not written again"
+        );
+    }
+}

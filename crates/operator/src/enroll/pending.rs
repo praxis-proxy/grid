@@ -366,15 +366,36 @@ impl Pending {
     }
 }
 
-/// Clear `target`'s enrollment in flight, leaving no key behind. A Secret by the pending name
-/// that enrollment did not write is left alone.
-pub(super) async fn clear<S: Store + Sync>(store: &S, target: &Target, backoff: Backoff) -> Result<(), EnrollError> {
+/// What [`clear`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Swept {
+    /// No Secret by the pending name, or one enrollment wrote and holds nothing.
+    Nothing,
+    /// Enrollment's Secret held a request or key, now gone.
+    Cleared,
+    /// A Secret by the pending name that enrollment did not write, left alone, with why.
+    Foreign(String),
+}
+
+/// Clear `target`'s enrollment in flight, leaving no key behind. Idempotent: a Secret already
+/// cleared is not written again. A Secret by the pending name that enrollment did not write is
+/// left alone.
+pub(super) async fn clear<S: Store + Sync>(store: &S, target: &Target, backoff: Backoff) -> Result<Swept, EnrollError> {
     let name = name(target);
     let Some(meta) = store.metadata(&name).await? else {
-        return Ok(());
+        return Ok(Swept::Nothing);
     };
-    if foreign(&meta).is_some() {
-        return Ok(());
+    if let Some(why) = foreign(&meta) {
+        return Ok(Swept::Foreign(format!(
+            "Secret {name} was not written by enrollment ({why}), left alone"
+        )));
+    }
+    let held = store
+        .get(&name)
+        .await?
+        .is_some_and(|secret| secret.data.is_some_and(|data| !data.is_empty()));
+    if !held {
+        return Ok(Swept::Nothing);
     }
     let patch = json!({
         "metadata": {
@@ -382,5 +403,6 @@ pub(super) async fn clear<S: Store + Sync>(store: &S, target: &Target, backoff: 
         },
         "data": { CSR: Value::Null, KEY: Value::Null, CERT: Value::Null, CA: Value::Null },
     });
-    patched(store, &name, &patch, backoff).await
+    patched(store, &name, &patch, backoff).await?;
+    Ok(Swept::Cleared)
 }
