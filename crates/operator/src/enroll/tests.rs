@@ -19,6 +19,8 @@ pub(super) const TOKEN_SECRET: &str = "grid-invite-site-d";
 const FAST: Backoff = Backoff {
     initial: Duration::from_millis(1),
     max: Duration::from_millis(5),
+    budget: Duration::from_millis(40),
+    started: None,
 };
 
 /// How the mock enrollment service answers.
@@ -688,6 +690,8 @@ async fn a_refused_connection_is_retried_until_the_service_is_up() {
     settings.backoff = Backoff {
         initial: Duration::from_millis(5),
         max: Duration::from_millis(25),
+        budget: Duration::from_secs(5),
+        started: None,
     };
     let late = Arc::clone(&mock);
     tokio::spawn(async move {
@@ -703,20 +707,75 @@ async fn a_refused_connection_is_retried_until_the_service_is_up() {
 }
 
 #[tokio::test]
-async fn an_unreachable_service_is_retried_without_a_limit() {
+async fn an_unreachable_service_is_given_up_within_the_step_budget_for_the_next_poll() {
     let mock = Mock::new(Reply::Sign);
     let settings = mock.settings(closed_addr().await.port());
-    // Giving up would leave the site unenrolled until something restarted the
-    // pod, so a retryable failure must never resolve to an error.
+    // The step returns within its budget, so a config edit is seen and the controllers
+    // start; the next poll tries again, and the site is not reported as spent.
+    let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(
-        Duration::from_millis(60),
+        Duration::from_secs(5),
         Box::pin(run_flow(&FakeStore::invited(), &settings)),
     )
-    .await;
+    .await
+    .expect("the step gives up within its budget");
     assert!(
-        outcome.is_err(),
-        "enrollment stopped retrying a reachable-again service: {outcome:?}"
+        matches!(outcome, Err(EnrollError::Unreachable(_))),
+        "a service never reached is unreachable, not spent: {outcome:?}"
     );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "gave up near the budget, not after it: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(mock.calls(), 0, "nothing was sent");
+}
+
+#[tokio::test(start_paused = true)]
+async fn calls_that_share_a_started_budget_spend_it_together() {
+    let shared = Backoff {
+        initial: Duration::from_millis(10),
+        max: Duration::from_millis(10),
+        budget: Duration::from_millis(25),
+        started: None,
+    }
+    .started_now();
+    let attempts = AtomicUsize::new(0);
+    let failing = || async {
+        attempts.fetch_add(1, Ordering::SeqCst);
+        Ok(Attempt::<()>::Retry("down".to_owned()))
+    };
+    assert!(with_backoff(shared, "first", EnrollError::Kube, failing).await.is_err());
+    let first = attempts.load(Ordering::SeqCst);
+    assert!(first > 1, "the first call retries within the budget: {first}");
+    assert!(
+        with_backoff(shared, "second", EnrollError::Kube, failing)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        first + 1,
+        "a later call on the spent budget makes one attempt and gives up"
+    );
+}
+
+#[tokio::test]
+async fn a_step_with_no_budget_makes_one_attempt_then_gives_up() {
+    let none = Backoff {
+        initial: Duration::from_millis(1),
+        max: Duration::from_millis(1),
+        budget: Duration::ZERO,
+        started: None,
+    };
+    let attempts = AtomicUsize::new(0);
+    let outcome: Result<(), EnrollError> = with_backoff(none, "testing", EnrollError::Kube, || async {
+        attempts.fetch_add(1, Ordering::SeqCst);
+        Ok(Attempt::Retry("down".to_owned()))
+    })
+    .await;
+    assert!(matches!(outcome, Err(EnrollError::Kube(reason)) if reason == "down"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -878,14 +937,16 @@ async fn a_dry_run_that_keeps_failing_transiently_never_spends_the_token() {
         dry_run_status: Some(503),
         ..FakeStore::invited()
     };
-    let outcome = tokio::time::timeout(Duration::from_millis(60), Box::pin(run_flow(&store, &settings))).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(5), Box::pin(run_flow(&store, &settings)))
+        .await
+        .expect("the step gives up within its budget");
     assert!(
-        outcome.is_err(),
-        "a transient dry-run failure must keep retrying rather than fail: {outcome:?}"
+        matches!(outcome, Err(EnrollError::Kube(_))),
+        "a transient dry-run failure is the store's, retried on the next poll: {outcome:?}"
     );
     assert!(
         store.check_calls() > 1,
-        "pending alone would hold for a stall too: {} attempts",
+        "the step retries within its budget before giving up: {} attempts",
         store.check_calls()
     );
     assert_eq!(mock.calls(), 0, "the token is not sent");

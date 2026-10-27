@@ -16,10 +16,13 @@ use crate::{crd::grid_network::GridNetwork, operator_config::InviteSecretRef, re
 /// Response size cap.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
-/// Retry schedule per startup step.
+/// Retry schedule per enrollment step: about one poll round, so a step that keeps failing
+/// returns to the poll loop, where a config edit is seen, instead of holding it.
 const STEP_BACKOFF: Backoff = Backoff {
     initial: Duration::from_secs(2),
     max: Duration::from_secs(60),
+    budget: Duration::from_secs(15),
+    started: None,
 };
 
 /// `app.kubernetes.io/managed-by` on the Secrets enrollment writes.
@@ -96,21 +99,38 @@ pub enum EnrollError {
     /// A Secret by the pending name was not written by enrollment, so it is never adopted.
     #[error("{0}")]
     PendingForeign(String),
+    /// The service could not be reached within the step, so nothing was sent. Retried on the
+    /// next poll.
+    #[error("the enrollment service could not be reached ({0}); retried on the next poll")]
+    Unreachable(String),
     /// A Kubernetes call failed. Retried on the next poll.
     #[error("kubernetes: {0}")]
     Kube(String),
 }
 
-/// Capped exponential retry schedule, without an attempt limit.
+/// Capped exponential retry schedule, bounded by a time budget.
 #[derive(Clone, Copy, Debug)]
 struct Backoff {
     /// Delay after the first failure.
     initial: Duration,
     /// Delay cap.
     max: Duration,
+    /// How long retrying may go on before the step gives up and returns.
+    budget: Duration,
+    /// When the budget started, shared by every retry of one step; `None` starts it at the
+    /// first retry of each call.
+    started: Option<tokio::time::Instant>,
 }
 
 impl Backoff {
+    /// This schedule with its budget started now, so the calls that share it spend one budget.
+    fn started_now(self) -> Self {
+        Self {
+            started: Some(tokio::time::Instant::now()),
+            ..self
+        }
+    }
+
     /// Delay after failed attempt `attempt` (1-based), spread by [`jittered`].
     fn delay(self, attempt: u32) -> Duration {
         jittered(
@@ -146,13 +166,20 @@ enum Attempt<T> {
     Retry(String),
 }
 
-/// Run `attempt` under `backoff`.
-async fn with_backoff<T, F, Fut>(backoff: Backoff, what: &'static str, mut attempt: F) -> Result<T, EnrollError>
+/// Run `attempt` under `backoff` until it is done, or its budget would run out, when the
+/// last reason is given up as `give_up`'s error for the next poll to retry.
+async fn with_backoff<T, F, Fut>(
+    backoff: Backoff,
+    what: &'static str,
+    give_up: fn(String) -> EnrollError,
+    mut attempt: F,
+) -> Result<T, EnrollError>
 where
     F: FnMut() -> Fut + Send,
     Fut: Future<Output = Result<Attempt<T>, EnrollError>> + Send,
     T: Send,
 {
+    let started = backoff.started.unwrap_or_else(tokio::time::Instant::now);
     let mut failures = 0_u32;
     loop {
         match attempt().await? {
@@ -160,6 +187,10 @@ where
             Attempt::Retry(reason) => {
                 failures = failures.saturating_add(1);
                 let delay = backoff.delay(failures);
+                if started.elapsed().saturating_add(delay) > backoff.budget {
+                    tracing::warn!(what, attempts = failures, error = %reason, "giving up until the next poll");
+                    return Err(give_up(reason));
+                }
                 tracing::warn!(what, attempt = failures, retry_in_ms = delay.as_millis(), error = %reason, "retrying");
                 tokio::time::sleep(delay).await;
             },
@@ -213,7 +244,9 @@ impl Settings {
             site_name: site_name.to_owned(),
             token_secret: required(Some(&invite.name), "site.inviteSecretRef.name")?,
             token_key: required(Some(&invite.key), "site.inviteSecretRef.key")?,
-            backoff: STEP_BACKOFF,
+            // One budget for the whole step from here: the dry run, the kept request, the
+            // signer and the identity write.
+            backoff: STEP_BACKOFF.started_now(),
             defaults: Target::defaults(),
         })
     }
@@ -325,7 +358,7 @@ async fn resolve_target(
 ) -> Result<Target, EnrollError> {
     let networks: Api<GridNetwork> = Api::all(client.clone());
     let networks = &networks;
-    with_backoff(backoff, "listing GridNetworks", || async move {
+    with_backoff(backoff, "listing GridNetworks", EnrollError::Kube, || async move {
         match networks.list(&ListParams::default()).await {
             Ok(list) => target_for(&list.items, namespace, defaults).map(Attempt::Done),
             Err(e) => Ok(Attempt::Retry(e.to_string())),
@@ -549,15 +582,20 @@ async fn check_writable<S: Store + Sync>(
         ca: String::new(),
     };
     let placeholder = &prepare(target, empty, Zeroizing::default());
-    with_backoff(backoff, "dry-running the identity Secret writes", || async move {
-        if let Some((ca_secret, _)) = &placeholder.ca
-            && !ca_present
-            && let Attempt::Retry(reason) = store.check_create(ca_secret).await?
-        {
-            return Ok(Attempt::Retry(reason));
-        }
-        store.check_create(&placeholder.site).await
-    })
+    with_backoff(
+        backoff,
+        "dry-running the identity Secret writes",
+        EnrollError::Kube,
+        || async move {
+            if let Some((ca_secret, _)) = &placeholder.ca
+                && !ca_present
+                && let Attempt::Retry(reason) = store.check_create(ca_secret).await?
+            {
+                return Ok(Attempt::Retry(reason));
+            }
+            store.check_create(&placeholder.site).await
+        },
+    )
     .await
 }
 
@@ -647,9 +685,12 @@ async fn stored<S: Store + Sync>(
     }
     let anchors = &settings.anchor_pem;
     let prepared = &prepare(target, verified, key);
-    let written = with_backoff(settings.backoff, "writing the identity Secrets", || {
-        write(store, prepared, anchors)
-    })
+    let written = with_backoff(
+        settings.backoff,
+        "writing the identity Secrets",
+        EnrollError::Kube,
+        || write(store, prepared, anchors),
+    )
     .await
     .map_err(|e| EnrollError::NotStored(e.to_string()))?;
     pending::clear(store, target, settings.backoff).await?;
@@ -706,13 +747,18 @@ async fn redeem<G: Signer + Sync>(
     token: &str,
     csr_pem: &str,
 ) -> Result<Issued, EnrollError> {
-    with_backoff(backoff, "reaching the enrollment service", || async move {
-        match signer.enroll(token, csr_pem).await {
-            Ok(issued) => Ok(Attempt::Done(issued)),
-            Err(SignerError::Transport { sent: false, detail }) => Ok(Attempt::Retry(detail)),
-            Err(error) => Err(enroll_error(error)),
-        }
-    })
+    with_backoff(
+        backoff,
+        "reaching the enrollment service",
+        EnrollError::Unreachable,
+        || async move {
+            match signer.enroll(token, csr_pem).await {
+                Ok(issued) => Ok(Attempt::Done(issued)),
+                Err(SignerError::Transport { sent: false, detail }) => Ok(Attempt::Retry(detail)),
+                Err(error) => Err(enroll_error(error)),
+            }
+        },
+    )
     .await
 }
 

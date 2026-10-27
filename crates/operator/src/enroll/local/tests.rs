@@ -455,6 +455,7 @@ fn every_enrollment_failure_has_its_own_reason() {
         EnrollError::MaybeSpent(String::new()),
         EnrollError::InvalidResponse(String::new()),
         EnrollError::NotStored(String::new()),
+        EnrollError::Unreachable(String::new()),
         EnrollError::Kube(String::new()),
     ];
     let reasons: std::collections::BTreeSet<_> = errors.iter().map(reason).collect();

@@ -195,6 +195,7 @@ const fn reason(error: &EnrollError) -> &'static str {
         EnrollError::InvalidResponse(_) => "InvalidResponse",
         EnrollError::NotStored(_) => "IdentityNotStored",
         EnrollError::PendingForeign(_) => "PendingSecretForeign",
+        EnrollError::Unreachable(_) => "SignerUnreachable",
         EnrollError::Kube(_) => "StoreUnavailable",
     }
 }
@@ -221,6 +222,7 @@ const fn definitive(error: &EnrollError) -> bool {
         EnrollError::SignerLapsed(_)
         | EnrollError::MaybeSpent(_)
         | EnrollError::NotStored(_)
+        | EnrollError::Unreachable(_)
         | EnrollError::Kube(_) => false,
     }
 }

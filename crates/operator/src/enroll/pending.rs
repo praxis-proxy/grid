@@ -284,13 +284,18 @@ fn overwrite(secret: &Secret, version: Option<&str>) -> Value {
 
 /// Create `secret`, `false` when one by its name exists, retrying what is transient.
 async fn created<S: Store + Sync>(store: &S, secret: &Secret, backoff: Backoff) -> Result<bool, EnrollError> {
-    with_backoff(backoff, "keeping the enrollment request", || async move {
-        Ok(match store.create(secret).await? {
-            Created::Yes => Attempt::Done(true),
-            Created::AlreadyExists => Attempt::Done(false),
-            Created::Retry(reason) => Attempt::Retry(reason),
-        })
-    })
+    with_backoff(
+        backoff,
+        "keeping the enrollment request",
+        EnrollError::Kube,
+        || async move {
+            Ok(match store.create(secret).await? {
+                Created::Yes => Attempt::Done(true),
+                Created::AlreadyExists => Attempt::Done(false),
+                Created::Retry(reason) => Attempt::Retry(reason),
+            })
+        },
+    )
     .await
 }
 
@@ -305,7 +310,10 @@ async fn version_of<S: Store + Sync>(store: &S, name: &str) -> Result<String, En
 
 /// Merge `patch` into Secret `name`, retrying what is transient.
 async fn patched<S: Store + Sync>(store: &S, name: &str, patch: &Value, backoff: Backoff) -> Result<(), EnrollError> {
-    with_backoff(backoff, "keeping the enrollment in flight", || store.patch(name, patch)).await
+    with_backoff(backoff, "keeping the enrollment in flight", EnrollError::Kube, || {
+        store.patch(name, patch)
+    })
+    .await
 }
 
 impl Pending {
