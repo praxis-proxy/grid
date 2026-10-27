@@ -259,6 +259,8 @@ struct FakeStore {
     check_calls: Mutex<u32>,
     /// Every read fails, as a refused or timed-out apiserver read does.
     reads_fail: bool,
+    /// Patches that write data fail transiently this many more times.
+    data_patches_fail: Mutex<u32>,
 }
 
 impl FakeStore {
@@ -378,6 +380,15 @@ impl Store for FakeStore {
     async fn patch(&self, name: &str, patch: &Value) -> Result<Attempt<()>, EnrollError> {
         if self.creates_fail {
             return Ok(Attempt::Retry("apiserver unavailable".to_owned()));
+        }
+        if patch.get("data").is_some() {
+            let mut left = self.data_patches_fail.lock().expect("lock");
+            let failing = *left > 0;
+            *left = left.saturating_sub(1);
+            drop(left);
+            if failing {
+                return Ok(Attempt::Retry("apiserver unavailable".to_owned()));
+            }
         }
         let mut secrets = self.secrets.lock().expect("lock");
         let held = secrets
@@ -762,6 +773,31 @@ async fn calls_that_share_a_started_budget_spend_it_together() {
         attempts.load(Ordering::SeqCst),
         first + 1,
         "a later call on the spent budget makes one attempt and gives up"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_after_the_step_budget_is_spent_is_still_kept_through_a_transient_write_failure() {
+    let (mock, mut settings) = serve(Reply::Sign).await;
+    settings.backoff = Backoff {
+        initial: Duration::from_millis(5),
+        max: Duration::from_millis(25),
+        budget: Duration::from_secs(2),
+        started: tokio::time::Instant::now().checked_sub(Duration::from_secs(2)),
+    };
+    let store = FakeStore {
+        data_patches_fail: Mutex::new(1),
+        ..FakeStore::invited()
+    };
+    let outcome = run_flow(&store, &settings).await;
+    assert!(
+        matches!(outcome, Ok(Outcome::Enrolled(_))),
+        "the writes after the answer retry on their own budget: {outcome:?}"
+    );
+    assert_eq!(mock.calls(), 1, "the token is sent once");
+    assert!(
+        store.value("site-tls", "tls.crt").is_some(),
+        "the issued certificate is stored"
     );
 }
 

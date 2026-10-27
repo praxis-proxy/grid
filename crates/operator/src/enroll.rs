@@ -257,8 +257,7 @@ impl Settings {
             site_name: site_name.to_owned(),
             token_secret: required(Some(&invite.name), "site.inviteSecretRef.name")?,
             token_key: required(Some(&invite.key), "site.inviteSecretRef.key")?,
-            // One budget for the whole step from here: the dry run, the kept request, the
-            // signer and the identity write.
+            // One budget up to the signer's answer; writes that keep the answer start their own.
             backoff: STEP_BACKOFF.started_now(),
             defaults: Target::defaults(),
             read_secrets: vec![("site.inviteSecretRef", invite.name.clone())],
@@ -711,14 +710,14 @@ async fn enroll<S: Store + Sync, G: Signer + Sync>(
     let token = site_token(store, settings).await?;
     let binding = pending::Binding::of(settings, &token);
     let mut held = Box::pin(in_flight(store, settings, target, &binding)).await?;
-    let issued = match held.issued.take() {
-        Some(issued) => issued,
+    let (issued, keep) = match held.issued.take() {
+        Some(issued) => (issued, settings.backoff),
         None => Box::pin(sent(signer, (store, settings), &mut held, &token)).await?,
     };
     let verified = checked_identity(&issued, &held.csr, settings)?;
     let written = Box::pin(stored(
         store,
-        settings,
+        (settings, keep),
         target,
         (verified, std::mem::take(&mut held.key)),
     ))
@@ -733,7 +732,7 @@ async fn enroll<S: Store + Sync, G: Signer + Sync>(
 /// for it.
 async fn stored<S: Store + Sync>(
     store: &S,
-    settings: &Settings,
+    (settings, backoff): (&Settings, Backoff),
     target: &Target,
     (verified, key): (Leaf, Zeroizing<String>),
 ) -> Result<Written, EnrollError> {
@@ -742,15 +741,12 @@ async fn stored<S: Store + Sync>(
     }
     let anchors = &settings.anchor_pem;
     let prepared = &prepare(target, verified, key);
-    let written = with_backoff(
-        settings.backoff,
-        "writing the identity Secrets",
-        EnrollError::Kube,
-        || write(store, prepared, anchors),
-    )
+    let written = with_backoff(backoff, "writing the identity Secrets", EnrollError::Kube, || {
+        write(store, prepared, anchors)
+    })
     .await
     .map_err(|e| EnrollError::NotStored(e.to_string()))?;
-    drop(pending::clear(store, target, settings.backoff).await?);
+    drop(pending::clear(store, target, backoff).await?);
     Ok(written)
 }
 
@@ -770,20 +766,22 @@ async fn in_flight<S: Store + Sync>(
     pending::stash(store, target, (csr_pem, key_pem), (binding, settings.backoff)).await
 }
 
-/// Send `held`'s request with the invite and keep what comes back. A token refused after an
-/// earlier request went unanswered may have been spent by that request.
+/// Send `held`'s request with the invite and keep what comes back, under a budget started at
+/// the answer and returned for the writes after it. A token refused after an earlier request
+/// went unanswered may have been spent by that request.
 async fn sent<S: Store + Sync, G: Signer + Sync>(
     signer: &G,
     (store, settings): (&S, &Settings),
     held: &mut pending::Pending,
     token: &str,
-) -> Result<Issued, EnrollError> {
+) -> Result<(Issued, Backoff), EnrollError> {
     let resent = held.unanswered;
     held.sending(store, settings.backoff).await?;
     match Box::pin(redeem(signer, settings.backoff, token, &held.csr)).await {
         Ok(issued) => {
-            held.issued(store, &issued, settings.backoff).await?;
-            Ok(issued)
+            let keep = settings.backoff.started_now();
+            held.issued(store, &issued, keep).await?;
+            Ok((issued, keep))
         },
         Err(error @ EnrollError::MaybeSpent { .. }) => Err(error),
         Err(EnrollError::TokenRejected(detail)) if resent => Err(EnrollError::MaybeSpent {
@@ -794,7 +792,7 @@ async fn sent<S: Store + Sync, G: Signer + Sync>(
             refused: true,
         }),
         Err(error) => {
-            held.answered(store, settings.backoff).await?;
+            held.answered(store, settings.backoff.started_now()).await?;
             Err(error)
         },
     }
