@@ -33,15 +33,12 @@ To build the images yourself, unset `SKIP_BUILD`, `IMAGE_PREFIX` and `IMAGE_TAG`
 
 ## Run a simulated llm-d stack
 
-The default topology serves the model from one recorded-response pod with
-nothing to scrape, so the grid routes without load signals. `LLMD=1` gives each
-cluster a small llm-d stack instead: two
-[llm-d-inference-sim](https://github.com/llm-d/llm-d-inference-sim) pods (no
-GPU), the llm-d router (an Envoy proxy and the endpoint picker, EPP) in front of
-them, and an InferencePool. Each site's provider points at its router, and its
-`metricsConfig` at the EPP's metrics port, so the operators poll real
-`llm_d_epp_*` series and the hub gateway picks a site on them. Image pins and
-the render command are in
+`LLMD=1` replaces the recorded-response model with a small llm-d stack on each
+cluster: two [llm-d-inference-sim](https://github.com/llm-d/llm-d-inference-sim)
+pods (no GPU) behind the llm-d router (Envoy and the EPP). Each provider's
+`metricsConfig` points at the EPP, so the operators poll real `llm_d_epp_*`
+series and the hub gateway picks a site on them. It implies
+`HUB_ROUTER=operator` and the poll transport. Pins are in
 [tests/e2e/topologies/grid-hub-site-llmd](../../tests/e2e/topologies/grid-hub-site-llmd/README.md).
 
 ```bash
@@ -49,100 +46,50 @@ LLMD=1 ./scripts/e2e-hub-site.sh up
 LLMD=1 MODES=spiffe ./scripts/e2e-hub-site.sh test
 ```
 
-`LLMD=1` implies `HUB_ROUTER=operator` and the poll transport. What runs, per
-cluster:
-
-| Namespace | Workload | Role |
-|---|---|---|
-| `llmd` | `llm-d-inference-sim` (2 pods) | the engine: four requests at a time per pod, 200 ms to first token, 20 ms per token |
-| `llmd` | `llmd-router-epp` (Envoy + EPP) | takes requests on 8081, picks a pod, serves `/metrics` on 9090 |
-| `grid` | `grid-operator` | scrapes the EPP, serves `/v1/site/signals`, polls the peer |
-| `grid` | `grid-gateway` | the hub: picks a site from the signals; the site: forwards to its router |
-| `grid-enrollment` | `grid-enrollment` | hub only |
-
-The hub has two candidates for the model: `hub-local`, its own router, and
-`site-a`.
-
 ### Try it
 
-Every step below reads state; only the load loop sends requests. Contexts are
-`kind-grid-hub-site-llmd-hub` and `kind-grid-hub-site-llmd-site`.
-
-Each cluster's provider is Ready, its EPP scraped:
+Both providers read Ready once their EPP is scraped:
 
 ```bash
 kubectl --context kind-grid-hub-site-llmd-hub -n grid get inferenceproviders
-kubectl --context kind-grid-hub-site-llmd-site -n grid get inferenceproviders
 ```
 
-The hub operator's own `/metrics` carries one row per provider and site, its own
-by scrape and the site's by peer poll. `grid_provider_ready_endpoints` is the
-EPP's count of engine pods with fresh metrics, 2 per site:
+Fetch the hub's grid identity, then read the site's signals as a peer does:
 
 ```bash
-kubectl --context kind-grid-hub-site-llmd-hub -n grid get secret grid-ca \
-  -o jsonpath='{.data.ca\.crt}' | base64 -d > /tmp/grid-ca.crt
-kubectl --context kind-grid-hub-site-llmd-hub -n grid port-forward deployment/grid-operator 19090:9090 &
-curl -s --cacert /tmp/grid-ca.crt --resolve hub.grid.internal:19090:127.0.0.1 https://hub.grid.internal:19090/metrics \
-  | grep -E '^grid_provider_(ready|ready_endpoints|in_flight_requests|ttft_p50_seconds)\{'
-```
-
-The same readings as the site serves them to a peer, in the wire format of
-[signals.md](../architecture/signals.md). Peers present a grid site certificate,
-so use the hub's:
-
-```bash
-kubectl --context kind-grid-hub-site-llmd-hub -n grid get secret grid-site-identity \
-  -o jsonpath='{.data.tls\.crt}' | base64 -d > /tmp/hub.crt
-kubectl --context kind-grid-hub-site-llmd-hub -n grid get secret grid-site-identity \
-  -o jsonpath='{.data.tls\.key}' | base64 -d > /tmp/hub.key
-kubectl --context kind-grid-hub-site-llmd-site -n grid port-forward deployment/grid-operator 19091:9091 &
-curl -s --cacert /tmp/grid-ca.crt --cert /tmp/hub.crt --key /tmp/hub.key \
+hub=kind-grid-hub-site-llmd-hub site=kind-grid-hub-site-llmd-site
+kubectl --context $hub -n grid get secret grid-ca -o jsonpath='{.data.ca\.crt}' | base64 -d > /tmp/ca.crt
+kubectl --context $hub -n grid get secret grid-site-identity -o jsonpath='{.data.tls\.crt}' | base64 -d > /tmp/hub.crt
+kubectl --context $hub -n grid get secret grid-site-identity -o jsonpath='{.data.tls\.key}' | base64 -d > /tmp/hub.key
+kubectl --context $site -n grid port-forward deployment/grid-operator 19091:9091 &
+curl -s --cacert /tmp/ca.crt --cert /tmp/hub.crt --key /tmp/hub.key \
   --resolve site-a.grid.internal:19091:127.0.0.1 https://site-a.grid.internal:19091/v1/site/signals
 ```
 
-Now load one site. The site gateway takes mTLS from grid identities, so the loop
-below presents the hub's. Eight streaming requests at a time against two pods
-that run four each queues work at the engine; `include_usage` lets the EPP
-record tokens and time per token:
+Load site-a with eight streaming requests at a time, more than its two pods run
+at once (`include_usage` lets the EPP time tokens):
 
 ```bash
-SITE_GW=$(kubectl --context kind-grid-hub-site-llmd-site -n grid get svc grid-gateway \
-  -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-body='{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"ping"}],
-  "max_tokens":64,"stream":true,"stream_options":{"include_usage":true}}'
+gw=$(kubectl --context $site -n grid get svc grid-gateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+body='{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"ping"}],"max_tokens":64,'
+body+='"stream":true,"stream_options":{"include_usage":true}}'
 end=$((SECONDS + 60))
 while ((SECONDS < end)); do
   for _ in 1 2 3 4 5 6 7 8; do
-    curl -s -o /dev/null --cacert /tmp/grid-ca.crt --cert /tmp/hub.crt --key /tmp/hub.key \
-      --resolve "site-a.grid.internal:8080:$SITE_GW" -H 'Content-Type: application/json' \
+    curl -s -o /dev/null --cacert /tmp/ca.crt --cert /tmp/hub.crt --key /tmp/hub.key \
+      --resolve "site-a.grid.internal:8080:$gw" -H 'Content-Type: application/json' \
       -d "$body" https://site-a.grid.internal:8080/v1/chat/completions &
   done
   wait
 done
 ```
 
-While it runs, the operator rows above move for `site-a` only:
-`grid_provider_in_flight_requests` reads 8 and `grid_provider_ttft_p50_seconds`
-appears once 20 requests completed in a 30 s window. The hub gateway reads the
-same signals; its admin listener on the pod's loopback shows how it reads the
-two sites:
-
-```bash
-kubectl --context kind-grid-hub-site-llmd-hub -n grid port-forward deployment/grid-gateway 9901:9901 &
-curl -s http://127.0.0.1:9901/metrics | grep -E '^grid_route_(site_rho|site_in_flight|decisions_total)\{'
-```
-
-`grid_route_site_in_flight` for `site-a` reads 8 and its `grid_route_site_rho`,
-the saturation the gateway routes on, climbs past 0.5 while `hub-local` stays at
-0. `grid_route_site_weight` stays at 8 for both: the pick moves on rho and
-in-flight, not on weight. To see the decisions themselves, send requests through
-the hub gateway and count the site each answer names. A site answer carries
-`x-grid-provider-site`; an answer the hub served itself carries only
+Meanwhile, ask the hub 20 times and count which site answers. A site answer
+carries `x-grid-provider-site`, and one the hub served itself carries only
 `x-grid-site: hub`:
 
 ```bash
-kubectl --context kind-grid-hub-site-llmd-hub -n grid port-forward service/grid-gateway 18080:8080 &
+kubectl --context $hub -n grid port-forward service/grid-gateway 18080:8080 &
 for _ in $(seq 20); do
   curl -s -o /dev/null -D - -H 'Content-Type: application/json' \
     -d '{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"ping"}],"max_tokens":8}' \
@@ -150,11 +97,10 @@ for _ in $(seq 20); do
 done | sort | uniq -c
 ```
 
-Idle, the two sites split the answers. During the load every answer comes from
-the hub. Once the loop ends the site's readings return within a few polls;
-[polling-metrics.md](../architecture/polling-metrics.md) gives the timings.
-Which series are required for routing and which are optional is in the same
-document.
+Idle, the sites split the answers. Under load the hub answers them all, because
+site-a's in-flight and `grid_route_site_rho` rise. Its per-site weight stays at
+8: the pick moves on rho and in-flight. The signals return to idle within a few
+polls, as [polling-metrics.md](../architecture/polling-metrics.md) describes.
 
 ## Look around
 
