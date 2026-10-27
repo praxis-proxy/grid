@@ -590,7 +590,11 @@ async fn a_renamed_site_clears_what_the_old_grid_site_held() {
         .iter()
         .filter(|(name, patch)| name == "east" && patch.pointer("/status/conditions") == Some(&json!([])))
         .count();
-    assert_eq!(cleared, TYPES.len(), "every manager gives up what it held on east");
+    assert_eq!(
+        cleared,
+        TYPES.len() + 1,
+        "every manager, the own roll-up's included, gives up what it held on east"
+    );
 }
 
 #[tokio::test]

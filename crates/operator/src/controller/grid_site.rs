@@ -663,7 +663,7 @@ async fn apply_conditions(site: &GridSite, client: &Client, reason: &str, messag
     let ((status, reason, message), moving) = connected_verdict(reason, message);
     let stamp = rollup::Stamp { generation, now: &now };
     let connected = rollup::condition(held, CONNECTED, (status, reason.as_str(), message), stamp);
-    // This cluster's own site rolls up its enrollment gates, written where those are.
+    // The own site's roll-up is the enrollment step's and renewal loop's, never this one's.
     let trio = if crate::enroll::local::is_own(site) {
         Vec::new()
     } else {

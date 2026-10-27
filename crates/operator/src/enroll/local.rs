@@ -12,7 +12,6 @@ use serde_json::Value;
 
 use super::{EnrollError, KubeStore, Outcome, Settings, Store as _, Target};
 use crate::{
-    controller::grid_site::ROLLUP_FIELD_MANAGER,
     crd::{grid_site::GridSite, inference_provider::Condition},
     operator_config::{
         BundleKind, BundleRef, ConfigWatch, InviteSecretRef, Section, SignerEndpoint, SiteConfig, Snapshot,
@@ -39,8 +38,8 @@ pub const ROTATION_ON_SCHEDULE: &str = "RotationOnSchedule";
 /// reported. `RotationOnSchedule` does not gate: it raises `Degraded` instead.
 const GATES: [&str; 4] = [ACCEPTED, RESOLVED_REFS, ENROLLED, IDENTITY_VALID];
 
-/// Every own-site condition type written here, each by its own manager. The roll-up is
-/// the `GridSite` controller's manager, which writes a peer's.
+/// Every own-site condition type written here, each by its own manager, beside the roll-up
+/// under [`OWN_ROLLUP_FIELD_MANAGER`].
 const TYPES: [(&str, &str); 5] = [
     (ENROLLED, FIELD_MANAGER),
     (ACCEPTED, ACCEPTED_FIELD_MANAGER),
@@ -66,6 +65,10 @@ pub const ACCEPTED_FIELD_MANAGER: &str = "grid-operator-accepted";
 
 /// Manager for `ResolvedRefs`.
 pub const REFS_FIELD_MANAGER: &str = "grid-operator-refs";
+
+/// Manager for the own site's `Available`, `Progressing` and `Degraded`. Apart from the peer
+/// roll-up's, so a second writer of the own site's roll-up shows as a manager conflict.
+pub const OWN_ROLLUP_FIELD_MANAGER: &str = "grid-operator-own-site";
 
 /// Manager for `IdentityValid`.
 pub const IDENTITY_FIELD_MANAGER: &str = "grid-operator-identity";
@@ -342,7 +345,7 @@ pub(crate) fn own_rollup(site: &GridSite, in_flight: Option<rollup::Cause<'_>>, 
     rollup::trio(current, &gates, (degraded, in_flight), stamp)
 }
 
-/// Write the own site's roll-up on `site` under the `GridSite` controller's manager, when it
+/// Write the own site's roll-up on `site` under [`OWN_ROLLUP_FIELD_MANAGER`], when it
 /// changed. A failure is logged: the roll-up reports, it never gates.
 pub(crate) async fn report_rollup(client: &Client, site: &GridSite, in_flight: Option<rollup::Cause<'_>>) {
     let Some(name) = site.metadata.name.as_deref() else {
@@ -366,7 +369,7 @@ pub(crate) async fn report_rollup(client: &Client, site: &GridSite, in_flight: O
         "status": { "conditions": trio }
     });
     let api: Api<GridSite> = Api::all(client.clone());
-    let params = PatchParams::apply(ROLLUP_FIELD_MANAGER).force();
+    let params = PatchParams::apply(OWN_ROLLUP_FIELD_MANAGER).force();
     if let Err(error) = Box::pin(api.patch_status(name, &params, &Patch::Apply(patch))).await {
         tracing::warn!(grid_site = name, %error, "writing the roll-up failed");
     }
@@ -403,7 +406,11 @@ pub(crate) async fn clear(client: &Client, stale: &[&GridSite]) {
         let Some(name) = site.metadata.name.as_deref() else {
             continue;
         };
-        for (_, manager) in TYPES {
+        let managers = TYPES
+            .iter()
+            .map(|(_, manager)| *manager)
+            .chain([OWN_ROLLUP_FIELD_MANAGER]);
+        for manager in managers {
             let empty = serde_json::json!({
                 "apiVersion": "grid.praxis.fast/v1alpha1",
                 "kind": "GridSite",

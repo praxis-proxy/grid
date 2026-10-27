@@ -88,13 +88,13 @@ async fn rounds(api: &FakeApi, config: &Snapshot, count: usize, mut before: impl
     observed
 }
 
-/// The field manager each own-site condition type belongs to: the roll-up is the
-/// `GridSite` controller's, as on a peer.
+/// The field manager each own-site condition type belongs to, the roll-up's apart from a
+/// peer's.
 fn managers() -> BTreeMap<&'static str, &'static str> {
     TYPES
         .iter()
         .copied()
-        .chain([AVAILABLE, PROGRESSING, DEGRADED].map(|type_| (type_, ROLLUP_FIELD_MANAGER)))
+        .chain([AVAILABLE, PROGRESSING, DEGRADED].map(|type_| (type_, OWN_ROLLUP_FIELD_MANAGER)))
         .collect()
 }
 
@@ -344,4 +344,50 @@ async fn invariant_8_no_signer_reads_rotation_on_schedule_no_signer_and_never_bl
     );
     let degraded = rounds[1].condition(DEGRADED).expect("Degraded");
     assert_eq!(degraded["status"], "False");
+}
+
+/// The `GridNetwork` the own site names, so the `GridSite` controller reconciles it in full.
+fn with_network(api: &FakeApi) {
+    api.put(
+        "/apis/grid.praxis.fast/v1alpha1/gridnetworks/grid",
+        json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": "grid", "generation": 1, "uid": "uid-grid" },
+            "spec": {}
+        }),
+    );
+}
+
+#[tokio::test]
+async fn invariant_5_the_own_sites_rollup_has_exactly_one_manager_beside_the_grid_site_controller() {
+    let api = seeded();
+    with_network(&api);
+    let client = api.client(NAMESPACE);
+    let mut enrollment = Enrollment::default();
+    let mut observed = Vec::with_capacity(3);
+    for _round in 0..3 {
+        let _step = enrollment.step(&client, None, &config("")).await.expect("sites list");
+        let site: GridSite = serde_json::from_value(api.get(PATH).expect("own site stored")).expect("a GridSite");
+        Box::pin(crate::controller::grid_site::reconcile(
+            Arc::new(site),
+            Arc::new(client.clone()),
+        ))
+        .await
+        .expect("the GridSite controller reconciles the own site");
+        observed.push(api.observe(PATH).expect("own site stored"));
+    }
+
+    let mut expected = managers();
+    expected.insert(crate::controller::grid_site::CONNECTED, "grid-operator-probe");
+    invariants::one_manager_per_type(&api.writes(), PATH, &expected).expect("invariant 5");
+    let owners = api.owners(PATH);
+    for type_ in [AVAILABLE, PROGRESSING, DEGRADED] {
+        assert_eq!(
+            owners.get(type_).map(String::as_str),
+            Some(OWN_ROLLUP_FIELD_MANAGER),
+            "{type_} has the own-site roll-up as its one manager"
+        );
+    }
+    invariants::unchanged_from(&observed, 1).expect("invariant 1: the two writers do not flap");
 }

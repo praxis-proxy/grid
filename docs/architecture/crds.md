@@ -830,8 +830,10 @@ On this cluster's own site, the roll-up gates on `Accepted`, `ResolvedRefs`, `En
 and `IdentityValid` instead, in that order, and `Connected` stays informational.
 `Degraded` is `True` while `RotationOnSchedule` is `False`, the early warning that the
 identity is about to expire, and `Progressing` is `True` while an enrollment is in
-flight or retried. Each gate has its own field manager, and the roll-up keeps
-`grid-operator-site`. The own site's `phase` follows the same probe as a peer's and
+flight or retried. Each gate has its own field manager. The enrollment step and the
+renewal loop write the own site's roll-up under `grid-operator-own-site`, apart from the
+peer roll-up's `grid-operator-site`, and the GridSite controller writes only `Connected`
+there. The own site's `phase` follows the same probe as a peer's and
 says nothing about its identity.
 
 ## InferenceProvider
