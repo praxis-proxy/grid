@@ -191,6 +191,19 @@ pub(super) enum Off {
 /// The annotation cert-manager puts on a Secret it issues, naming its Certificate.
 pub(super) const CERT_MANAGER_CERTIFICATE: &str = "cert-manager.io/certificate-name";
 
+/// The annotation cert-manager puts on a Secret it issues, counting its issuances from 1.
+const CERT_MANAGER_REVISION: &str = "cert-manager.io/certificate-revision";
+
+/// Whether cert-manager has issued the identity in a Secret with `metadata` more than once.
+fn reissued(metadata: &kube::api::ObjectMeta) -> bool {
+    metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(CERT_MANAGER_REVISION))
+        .and_then(|revision| revision.parse::<u64>().ok())
+        .is_some_and(|revision| revision > 1)
+}
+
 impl Off {
     /// What the admin reads.
     const fn message(self) -> &'static str {
@@ -457,6 +470,7 @@ impl IdentityStore for KubeIdentity {
             .ok_or_else(|| missing(&format!("Secret {}", target.site_secret)))?;
         let version = site.metadata.resource_version.clone().unwrap_or_default();
         let renewer = renewer_of(&site.metadata);
+        let reissued = reissued(&site.metadata);
         let data = site.data.unwrap_or_default();
         let ca = if target.ca_secret == target.site_secret {
             text(&data, "ca.crt")
@@ -474,7 +488,7 @@ impl IdentityStore for KubeIdentity {
             ca: ca.ok_or_else(|| missing("ca.crt"))?.to_string(),
             pending: pending.map(|(csr, key)| (csr.to_string(), key)),
             version,
-            rotated: data.contains_key(PREVIOUS_CERT),
+            rotated: reissued || data.contains_key(PREVIOUS_CERT),
             renewer,
         })
     }
@@ -1474,11 +1488,19 @@ fn declared_renews(networks: &[GridNetwork], install: GridModes) -> bool {
 }
 
 /// Whether `checked` rolls the gateway: after a renewal, or on a later check that
-/// catches up a missed roll. `Some(true)` after a renewal.
+/// catches up a missed roll, this loop's or the cert-manager Certificate's that renews the
+/// identity instead. `Some(true)` after a renewal.
 const fn rolls_after(checked: &Result<Checked, RenewError>) -> Option<bool> {
     match checked {
         Ok(Checked::Renewed(_)) => Some(true),
-        Ok(Checked::Waiting(_)) => Some(false),
+        Ok(
+            Checked::Waiting(_)
+            | Checked::Off {
+                why: Off::NoSigner | Off::Disabled,
+                renewer: Some(_),
+                ..
+            },
+        ) => Some(false),
         Ok(Checked::Expired(_) | Checked::Off { .. }) | Err(_) => None,
     }
 }

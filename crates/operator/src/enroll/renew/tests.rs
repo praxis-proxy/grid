@@ -380,6 +380,36 @@ fn a_renewal_or_a_recheck_rolls_but_not_an_expiry_or_a_failure() {
 }
 
 #[test]
+fn a_gateway_follows_an_identity_cert_manager_renews_and_a_reissue_is_owed_a_roll() {
+    let off = |why, renewer: Option<&str>| Checked::Off {
+        why,
+        due: Due::At(OffsetDateTime::now_utc()),
+        renewer: renewer.map(str::to_owned),
+    };
+    let cert_manager = Some("site-d-identity");
+    assert_eq!(rolls_after(&Ok(off(Off::NoSigner, cert_manager))), Some(false));
+    assert_eq!(rolls_after(&Ok(off(Off::Disabled, cert_manager))), Some(false));
+    assert_eq!(rolls_after(&Ok(off(Off::NoSigner, None))), None, "nothing renews it");
+    assert_eq!(
+        rolls_after(&Ok(off(Off::UnsupportedUnderPin, cert_manager))),
+        None,
+        "pin trust never rolls"
+    );
+    assert_eq!(rolls_after(&Ok(off(Off::Refused, cert_manager))), None);
+
+    let revision = |value: &str| kube::api::ObjectMeta {
+        annotations: Some(BTreeMap::from([(CERT_MANAGER_REVISION.to_owned(), value.to_owned())])),
+        ..kube::api::ObjectMeta::default()
+    };
+    assert!(
+        !reissued(&revision("1")),
+        "a first issuance leaves a fresh install running"
+    );
+    assert!(reissued(&revision("2")), "a reissue is owed a roll");
+    assert!(!reissued(&revision("x")) && !reissued(&kube::api::ObjectMeta::default()));
+}
+
+#[test]
 fn the_roll_patch_sets_the_identity_annotation_only_when_it_changes() {
     assert!(roll_patch(Some("ab"), "ab", true).is_none());
     assert!(
