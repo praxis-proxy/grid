@@ -159,7 +159,56 @@ impl BundleRef {
 /// The signer hosts the install allows, set where the operator runs and never in its config,
 /// so an edit to the config cannot point enrollment at a signer of its own.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SignerHosts(Option<Vec<String>>);
+pub struct SignerHosts(Option<Vec<Authority>>);
+
+/// One allowed signer: a host, with the port it pins or any port.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Authority {
+    /// The host as a URL names it: lowercase, no trailing dot, IPv6 in its canonical form.
+    host: String,
+    /// The port the entry pins, `None` for any.
+    port: Option<u16>,
+}
+
+impl Authority {
+    /// `entry` as `host` or `host:port`, read with the rules a URL's host follows so that
+    /// `Signer.example.com.:8443`, `[2001:DB8::1]:8443` and `2001:db8::1` all match what the
+    /// config's URL canonicalizes to. `None` when it is not a host.
+    fn parse(entry: &str) -> Option<Self> {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return None;
+        }
+        // A bare IPv6 address has no brackets; a URL needs them.
+        let url = reqwest::Url::parse(&format!("https://{entry}"))
+            .or_else(|_| reqwest::Url::parse(&format!("https://[{entry}]")))
+            .ok()?;
+        // The URL parser drops a port equal to the scheme's default, so read whether the
+        // entry wrote one from its text: after the bracket of an IPv6 host, else the one
+        // colon a host or IPv4 address may carry.
+        let wrote_port = match entry.rsplit_once(']') {
+            Some((_host, rest)) => rest.starts_with(':'),
+            None => entry.matches(':').count() == 1,
+        };
+        Some(Self {
+            host: canonical_host(&url)?,
+            port: wrote_port.then(|| url.port_or_known_default()).flatten(),
+        })
+    }
+
+    /// Whether `url` is this host, on this port when one is pinned.
+    fn admits(&self, url: &reqwest::Url) -> bool {
+        canonical_host(url).as_deref() == Some(self.host.as_str())
+            && self.port.is_none_or(|port| url.port_or_known_default() == Some(port))
+    }
+}
+
+/// `url`'s host as compared: lowercase, no trailing dot, IPv6 in brackets as the URL parser
+/// writes it.
+fn canonical_host(url: &reqwest::Url) -> Option<String> {
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
 
 impl SignerHosts {
     /// Any host: the install names none.
@@ -168,13 +217,23 @@ impl SignerHosts {
         Self(None)
     }
 
-    /// The hosts in `list`, comma-separated, each `host` or `host:port`. Empty allows any.
+    /// The hosts in `list`, comma-separated, each `host` or `host:port`, read with the
+    /// rules the config's URL follows. Empty allows any. An entry that is not a host is
+    /// kept as unmatched, so it allows nothing.
     #[must_use]
     pub fn from_list(list: &str) -> Self {
-        let hosts: Vec<String> = list
+        let hosts: Vec<Authority> = list
             .split(',')
-            .map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
-            .filter(|host| !host.is_empty())
+            .filter(|entry| !entry.trim().is_empty())
+            .map(|entry| {
+                Authority::parse(entry).unwrap_or_else(|| {
+                    tracing::warn!(entry, "GRID_SIGNER_HOSTS entry is not a host; it allows nothing");
+                    Authority {
+                        host: String::new(),
+                        port: None,
+                    }
+                })
+            })
             .collect();
         Self((!hosts.is_empty()).then_some(hosts))
     }
@@ -190,18 +249,20 @@ impl SignerHosts {
         let Some(hosts) = &self.0 else {
             return Ok(());
         };
-        let host = url
-            .host_str()
-            .unwrap_or_default()
-            .trim_end_matches('.')
-            .to_ascii_lowercase();
-        let with_port = format!("{host}:{}", url.port_or_known_default().unwrap_or(443));
-        if hosts.iter().any(|allowed| *allowed == host || *allowed == with_port) {
+        if hosts.iter().any(|allowed| allowed.admits(url)) {
             return Ok(());
         }
+        let listed: Vec<String> = hosts
+            .iter()
+            .map(|allowed| match allowed.port {
+                Some(port) => format!("{}:{port}", allowed.host),
+                None => allowed.host.clone(),
+            })
+            .collect();
         Err(format!(
-            "site.signerEndpoint.url: host {host} is not a signer this install allows ({})",
-            hosts.join(", ")
+            "site.signerEndpoint.url: host {} is not a signer this install allows ({})",
+            canonical_host(url).unwrap_or_default(),
+            listed.join(", ")
         ))
     }
 }

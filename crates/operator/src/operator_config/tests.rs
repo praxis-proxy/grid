@@ -147,6 +147,39 @@ fn only_the_signer_hosts_the_install_allows_are_used() {
 }
 
 #[test]
+fn signer_hosts_are_compared_the_way_a_url_names_them() {
+    // (allowlist entry, config URL, admitted)
+    let cases: [(&str, &str, bool); 15] = [
+        ("Signer.Example.COM.", "https://signer.example.com:8443", true),
+        ("signer.example.com", "https://SIGNER.EXAMPLE.COM.:9443", true),
+        ("signer.example.com.:8443", "https://signer.example.com:8443", true),
+        ("signer.example.com:8443", "https://signer.example.com.:9443", false),
+        ("signer.example.com:443", "https://signer.example.com", true),
+        ("signer.example.com:443", "https://signer.example.com:9443", false),
+        ("[2001:db8::1]:443", "https://[2001:db8::1]:9443", false),
+        ("192.0.2.10:443", "https://192.0.2.10:8443", false),
+        ("signer.example.com", "https://other.example.com", false),
+        ("[2001:DB8::1]:8443", "https://[2001:db8:0:0:0:0:0:1]:8443", true),
+        ("2001:db8::1", "https://[2001:DB8::1]:9443", true),
+        ("[2001:db8::1]:8443", "https://[2001:db8::1]:9443", false),
+        ("[::1]", "https://[0:0:0:0:0:0:0:1]:8443", true),
+        ("192.0.2.10:8443", "https://192.0.2.10:8443", true),
+        ("192.0.2.10", "https://192.0.2.11", false),
+    ];
+    for (entry, url, admitted) in cases {
+        let hosts = SignerHosts::from_list(entry);
+        let parsed = reqwest::Url::parse(url).expect("url");
+        assert_eq!(hosts.admit(&parsed).is_ok(), admitted, "{entry} against {url}");
+    }
+    let junk = SignerHosts::from_list("not a host, signer.example.com");
+    assert!(!junk.is_any(), "an entry that is not a host does not open the list");
+    let beside = reqwest::Url::parse("https://signer.example.com").expect("url");
+    assert_eq!(junk.admit(&beside), Ok(()), "the host beside it is allowed");
+    let other = reqwest::Url::parse("https://not.example.com").expect("url");
+    assert!(matches!(junk.admit(&other), Err(why) if why.contains("not.example.com")));
+}
+
+#[test]
 fn a_config_map_without_the_key_is_invalid_and_never_absent() {
     let snapshot = Snapshot::of(&map(None));
     assert_eq!(snapshot.loaded, Loaded::Invalid(format!("{CONFIG_KEY}: key missing")));
