@@ -184,9 +184,6 @@ pub(super) enum Off {
     Disabled,
 }
 
-/// The informational `RotationOnSchedule` reason while nothing renews and renewal is not due.
-const ROTATION_DISABLED: &str = "RotationDisabled";
-
 /// The annotation cert-manager puts on a Secret it issues, naming its Certificate.
 pub(super) const CERT_MANAGER_CERTIFICATE: &str = "cert-manager.io/certificate-name";
 
@@ -428,7 +425,7 @@ fn verified(enrollment: &Issued, held_ca: &str, site: &str, csr_pem: &str) -> Re
 }
 
 /// The cert-manager Certificate a Secret's annotation names as its renewer.
-fn renewer_of(metadata: &kube::api::ObjectMeta) -> Option<String> {
+pub(super) fn renewer_of(metadata: &kube::api::ObjectMeta) -> Option<String> {
     metadata
         .annotations
         .as_ref()?
@@ -639,23 +636,6 @@ impl Settings {
     }
 }
 
-/// This cluster's `GridNetwork`, as listed this round.
-struct Own {
-    /// The sole `GridNetwork`, where the round reports.
-    site: Option<GridNetwork>,
-}
-
-/// List the `GridNetwork`s and pick this cluster's, the sole one.
-async fn own_network(client: &Client) -> Result<Own, RenewError> {
-    let networks: Api<GridNetwork> = Api::all(client.clone());
-    let mut listed = Box::pin(networks.list(&ListParams::default()))
-        .await
-        .map_err(|e| RenewError::Kube(e.to_string()))?
-        .items;
-    let site = (listed.len() == 1).then(|| listed.swap_remove(0));
-    Ok(Own { site })
-}
-
 /// What the operator config declares about renewal for the site `identity` names.
 #[derive(Debug, PartialEq, Eq)]
 enum Declared<'config> {
@@ -685,6 +665,26 @@ fn declared<'config>(loaded: &'config Loaded, identity: Option<&str>) -> Declare
             },
         },
     }
+}
+
+/// What `Accepted` says of `loaded` for the site `identity` names, under `trust`: the one
+/// verdict the enrollment step and the renewal loop both write.
+fn accepted(loaded: &Loaded, identity: Option<&str>, trust: &Trust) -> Verdict {
+    match declared(loaded, identity) {
+        Declared::Refused(refusal) => refusal,
+        Declared::Renews(_) if !trust.renews => trust.refusal(),
+        Declared::Renews(_) | Declared::Disabled => Verdict::own_site(),
+        Declared::NoSigner => match loaded.site() {
+            Section::Site(_) => Verdict::own_site(),
+            Section::Unset | Section::Invalid(_) => Verdict::no_site(matches!(loaded, Loaded::Absent | Loaded::Unread)),
+        },
+    }
+}
+
+/// [`accepted`] under the trust `networks` declare, for the enrollment step, which writes only
+/// while one exists.
+pub(super) fn accepted_over(loaded: &Loaded, identity: Option<&str>, networks: &[GridNetwork]) -> Verdict {
+    accepted(loaded, identity, &declared_trust(networks, GridModes::WITHOUT_NETWORK))
 }
 
 /// The signer this round renews through, else why nothing renews.
@@ -754,27 +754,6 @@ impl Rounds {
 
     /// One round, with what the check found.
     async fn checked(&self, settings: &Settings) -> Result<Checked, RenewError> {
-        let target = Box::pin(self.target(settings)).await;
-        Box::pin(self.checked_into(settings, &target)).await
-    }
-
-    /// The identity Secrets the `GridNetwork` names, else the defaults.
-    async fn target(&self, settings: &Settings) -> Result<Target, super::EnrollError> {
-        Box::pin(super::resolve_target(
-            &self.client,
-            &self.namespace,
-            &settings.defaults,
-            super::STEP_BACKOFF,
-        ))
-        .await
-    }
-
-    /// One round against `target`, with what the check found.
-    async fn checked_into(
-        &self,
-        settings: &Settings,
-        target: &Result<Target, super::EnrollError>,
-    ) -> Result<Checked, RenewError> {
         let loop_ = Loop {
             client: &self.client,
             store: &self.store,
@@ -782,8 +761,8 @@ impl Rounds {
             install: self.install,
             stop: self.stop.as_ref(),
         };
-        let round = Box::pin(tick(&loop_, settings, target)).await;
-        roll_after_renewal(&self.store, self.gateway.as_ref(), target, &round.checked).await;
+        let (round, target) = Box::pin(tick(&loop_, settings, &self.namespace)).await;
+        roll_after_renewal(&self.store, self.gateway.as_ref(), &target, &round.checked).await;
         round.checked
     }
 }
@@ -800,13 +779,7 @@ pub async fn run(client: Client, mut settings: Settings, shutdown: Shutdown) {
     let mut last: Option<String> = None;
     let mut failures = 0_u32;
     while !shutdown.is_triggered() {
-        // Resolving the target writes nothing, so a shutdown may cut it short.
-        let target = tokio::select! {
-            biased;
-            () = shutdown.triggered() => return,
-            target = Box::pin(rounds.target(&settings)) => target,
-        };
-        let checked = Box::pin(rounds.checked_into(&settings, &target)).await;
+        let checked = Box::pin(rounds.checked(&settings)).await;
         if matches!(checked, Err(RenewError::StoodDown)) {
             return;
         }
@@ -819,29 +792,58 @@ pub async fn run(client: Client, mut settings: Settings, shutdown: Shutdown) {
     }
 }
 
-/// One round: resolve this site's `GridSite`, check `target` through its signer, and
-/// report on it.
-async fn tick(loop_: &Loop<'_>, settings: &Settings, target: &Result<Target, super::EnrollError>) -> Round {
-    let own = match Box::pin(own_network(loop_.client)).await {
-        Ok(own) => own,
-        Err(error) => return Round::failed(error),
+/// One round: list the `GridNetwork`s once for the identity Secrets they name, the trust
+/// they declare and where to report, check the identity through its signer, and report.
+async fn tick(loop_: &Loop<'_>, settings: &Settings, namespace: &str) -> (Round, Result<Target, RenewError>) {
+    let listed = match Box::pin(list_networks(loop_.client)).await {
+        Ok(listed) => listed,
+        Err(error) => {
+            return (
+                Round::failed(error),
+                Err(RenewError::Kube("GridNetworks not listed".to_owned())),
+            );
+        },
     };
+    Box::pin(round_over(loop_, settings, &listed, namespace)).await
+}
+
+/// One round over `listed`, the `GridNetwork`s as this round sees them.
+async fn round_over(
+    loop_: &Loop<'_>,
+    settings: &Settings,
+    listed: &[GridNetwork],
+    namespace: &str,
+) -> (Round, Result<Target, RenewError>) {
+    let target = super::target_for(listed, namespace, &settings.defaults).map_err(|e| RenewError::Kube(e.to_string()));
+    let trust = declared_trust(listed, loop_.install);
     let snapshot = settings.config.current();
-    let declared = declared(&snapshot.loaded, settings.site.as_deref());
-    let round = match target {
+    let site = settings.site.as_deref();
+    let declared = declared(&snapshot.loaded, site);
+    let round = match &target {
         Err(error) => Round::failed(RenewError::Kube(error.to_string())),
-        Ok(target) => Box::pin(check_round(loop_, target, settings.site.as_deref(), &declared)).await,
+        Ok(target) => Box::pin(check_round(loop_, target, site, (&declared, &trust))).await,
     };
     // A round given up for a stand-down says nothing new, and writing would hold the stand-down.
-    if let (Ok(target), false) = (target, matches!(round.checked, Err(RenewError::StoodDown))) {
-        let refs = match snapshot.loaded.site() {
-            Section::Site(site) => Box::pin(local::named_refs(loop_.client, Some(site))).await,
-            Section::Unset => Some(Verdict::resolved()),
-            Section::Invalid(_) => None,
-        };
-        Box::pin(report_round(loop_.client, &own, target, &round, refs.as_ref())).await;
+    if let (Ok(target), [own], false) = (&target, listed, matches!(round.checked, Err(RenewError::StoodDown))) {
+        let accepted = accepted(&snapshot.loaded, site, &trust);
+        Box::pin(report_round(
+            loop_.client,
+            (own, target),
+            &round,
+            (accepted, &snapshot.loaded),
+        ))
+        .await;
     }
-    round
+    (round, target)
+}
+
+/// The `GridNetwork`s, listed.
+async fn list_networks(client: &Client) -> Result<Vec<GridNetwork>, RenewError> {
+    let networks: Api<GridNetwork> = Api::all(client.clone());
+    Box::pin(networks.list(&ListParams::default()))
+        .await
+        .map(|list| list.items)
+        .map_err(|e| RenewError::Kube(e.to_string()))
 }
 
 /// What every round of the loop reaches.
@@ -887,9 +889,6 @@ struct Round {
     signer: Option<String>,
     /// The identity as read, `None` when the round failed before reading it.
     identity: Option<Identity>,
-    /// What `Accepted` says when it is `False`: the config is refused, or the signer's
-    /// rotation is Enabled under pin peer trust.
-    refused: Option<Verdict>,
 }
 
 impl Round {
@@ -899,7 +898,6 @@ impl Round {
             checked: Err(error),
             signer: None,
             identity: None,
-            refused: None,
         }
     }
 }
@@ -926,15 +924,6 @@ impl Trust {
             ),
         )
     }
-}
-
-/// The trust the grid declares: the sole `GridNetwork`'s peer trust, else the install's.
-async fn grid_trust(client: &Client, install: GridModes) -> Result<Trust, RenewError> {
-    let networks: Api<GridNetwork> = Api::all(client.clone());
-    let declared = Box::pin(networks.list(&ListParams::default()))
-        .await
-        .map_err(|e| RenewError::Kube(e.to_string()))?;
-    Ok(declared_trust(&declared.items, install))
 }
 
 /// The identity as read this round, with when its renewal is due.
@@ -1042,19 +1031,20 @@ fn through<'config>(declared: &Declared<'config>, trust: &Trust) -> Result<Endpo
 }
 
 /// Read the identity in `target` and check it through the signer `declared` names.
-async fn check_round(loop_: &Loop<'_>, target: &Target, site: Option<&str>, declared: &Declared<'_>) -> Round {
+async fn check_round(
+    loop_: &Loop<'_>,
+    target: &Target,
+    site: Option<&str>,
+    (declared, trust): (&Declared<'_>, &Trust),
+) -> Round {
     let read = match Box::pin(read_identity(loop_, target)).await {
         Ok(read) => read,
         Err(round) => return round,
     };
-    let trust = match Box::pin(grid_trust(loop_.client, loop_.install)).await {
-        Ok(trust) => trust,
-        Err(error) => return Round::failed(error),
-    };
     let identity = Some(identity_of(&read, target, site, trust.renews));
-    match through(declared, &trust) {
+    match through(declared, trust) {
         Ok(signer) => Box::pin(renew_through(loop_, target, read, signer, identity)).await,
-        Err(Ok(why)) => off_round(why, read, identity, &trust, declared),
+        Err(Ok(why)) => off_round(why, read, identity),
         Err(Err(error)) => Round {
             identity,
             ..Round::failed(error)
@@ -1063,7 +1053,7 @@ async fn check_round(loop_: &Loop<'_>, target: &Target, site: Option<&str>, decl
 }
 
 /// The round in which the operator does not renew `read`, for `why`.
-fn off_round(why: Off, read: Read, identity: Option<Identity>, trust: &Trust, declared: &Declared<'_>) -> Round {
+fn off_round(why: Off, read: Read, identity: Option<Identity>) -> Round {
     Round {
         checked: Ok(Checked::Off {
             why,
@@ -1072,11 +1062,6 @@ fn off_round(why: Off, read: Read, identity: Option<Identity>, trust: &Trust, de
         }),
         signer: None,
         identity,
-        refused: match (why, declared) {
-            (Off::UnsupportedUnderPin, _) => Some(trust.refusal()),
-            (Off::Refused, Declared::Refused(refusal)) => Some(refusal.clone()),
-            _ => None,
-        },
     }
 }
 
@@ -1109,7 +1094,6 @@ async fn renew_through(
                 checked: Err(error),
                 signer: Some(url),
                 identity,
-                refused: None,
             };
         },
     };
@@ -1125,53 +1109,74 @@ async fn renew_through(
         .await,
         signer: Some(url),
         identity,
-        refused: None,
     }
 }
 
-/// Report the round on this cluster's `GridNetwork`: `Enrolled` by the identity in `target`,
-/// `IdentityValid` by what was read and `RotationOnSchedule` by the check.
-async fn report_round(client: &Client, own: &Own, target: &Target, round: &Round, refs: Option<&Verdict>) {
-    let Some(site) = &own.site else {
-        return;
+/// Report the round on `own`, this cluster's `GridNetwork`: `Accepted` as given, `ResolvedRefs`
+/// by what `loaded` names, `Enrolled` by the identity in `target`, `IdentityValid` by what was
+/// read and `RotationOnSchedule` by the check.
+async fn report_round(
+    client: &Client,
+    (own, target): (&GridNetwork, &Target),
+    round: &Round,
+    (accepted, loaded): (Verdict, &Loaded),
+) {
+    let refs = match loaded.site() {
+        Section::Site(section) => Box::pin(local::named_refs(client, Some(section))).await,
+        Section::Unset => Some(Verdict::resolved()),
+        Section::Invalid(_) => None,
     };
-    let verdicts = round_verdicts(round, target, local::enrolled(site), refs);
-    drop(Box::pin(local::report_many(client, site, &verdicts)).await);
+    let verdicts = round_verdicts(round, target, local::enrolled(own), (accepted, refs));
+    drop(Box::pin(local::report_many(client, own, &verdicts)).await);
 }
 
-/// The conditions `round` writes on the own site, as (type, manager, verdict). An identity
-/// present reports `Enrolled` only while the site does not read enrolled, so `Issued` stays.
-/// `Accepted` is `False` while the config is refused for this site or the signer's rotation
-/// conflicts with the grid's peer trust, and `True` again once that changes.
+/// The conditions `round` writes, as (type, manager, verdict), beside the `accepted` and
+/// `refs` verdicts given. A round that failed before reading the identity says nothing about
+/// it. An identity present through a signer reports `Enrolled` only while the network does
+/// not read enrolled, so the issuance message stays. One written outside a signer always
+/// says what renews it.
 fn round_verdicts(
     round: &Round,
     target: &Target,
     enrolled: bool,
-    refs: Option<&Verdict>,
+    (accepted, refs): (Verdict, Option<Verdict>),
 ) -> Vec<(&'static str, &'static str, Verdict)> {
     let mut verdicts = Vec::with_capacity(5);
-    let accepted = round.refused.clone().unwrap_or_else(Verdict::own_site);
     verdicts.push((local::ACCEPTED, local::ACCEPTED_FIELD_MANAGER, accepted));
-    if !enrolled && !matches!(round.identity, Some(Identity::Missing(_))) {
-        verdicts.push((
-            local::ENROLLED,
-            local::FIELD_MANAGER,
-            Verdict::present(&target.site_secret),
-        ));
-    }
-    if let Some(identity) = &round.identity {
-        verdicts.push((
-            local::IDENTITY_VALID,
-            local::IDENTITY_FIELD_MANAGER,
-            identity_verdict(identity),
-        ));
-    }
     if let Some(refs) = refs {
-        verdicts.push((local::RESOLVED_REFS, local::REFS_FIELD_MANAGER, refs.clone()));
+        verdicts.push((local::RESOLVED_REFS, local::REFS_FIELD_MANAGER, refs));
     }
+    let Some(identity) = &round.identity else {
+        return verdicts;
+    };
+    if let Some(held) = enrolled_verdict(round, identity, target, enrolled) {
+        verdicts.push((local::ENROLLED, local::FIELD_MANAGER, held));
+    }
+    verdicts.push((
+        local::IDENTITY_VALID,
+        local::IDENTITY_FIELD_MANAGER,
+        identity_verdict(identity),
+    ));
     let rotation = rotation_verdict(&round.checked, round.signer.as_ref());
     verdicts.push((local::ROTATION_ON_SCHEDULE, local::RENEWAL_FIELD_MANAGER, rotation));
     verdicts
+}
+
+/// What `Enrolled` says of `identity` this round, `None` to leave an issuance message standing.
+fn enrolled_verdict(round: &Round, identity: &Identity, target: &Target, enrolled: bool) -> Option<Verdict> {
+    let outside = match &round.checked {
+        Ok(Checked::Off {
+            why: Off::NoSigner,
+            renewer,
+            ..
+        }) => Some(renewer.as_deref()),
+        _ => None,
+    };
+    match (identity, outside) {
+        (Identity::Missing(_), _) => Some(Verdict::identity_lost(&target.site_secret)),
+        (_, Some(renewer)) => Some(Verdict::provisioned(renewer)),
+        (_, None) => (!enrolled).then(|| Verdict::present(&target.site_secret)),
+    }
 }
 
 /// What `IdentityValid` says about `identity`.
@@ -1254,7 +1259,9 @@ fn off_verdict(why: Off, due: Due, renewer: Option<&str>) -> Verdict {
         (Off::Refused, Due::Now | Due::Expired, _) => overdue(
             "renewal is overdue and held back: the operator config is refused for this site, see Accepted".to_owned(),
         ),
-        (Off::UnsupportedUnderPin, Due::At(_), _) => Verdict::new("True", ROTATION_DISABLED, why.message().to_owned()),
+        (Off::UnsupportedUnderPin, Due::At(_), _) => {
+            Verdict::new("True", local::ROTATION_ON_SCHEDULE, why.message().to_owned())
+        },
         (Off::NoSigner | Off::Disabled, Due::At(_), Some(certificate)) => Verdict::new(
             "True",
             local::ROTATION_ON_SCHEDULE,
@@ -1262,7 +1269,7 @@ fn off_verdict(why: Off, due: Due, renewer: Option<&str>) -> Verdict {
         ),
         (Off::NoSigner | Off::Disabled, Due::At(_), None) => Verdict::new(
             "True",
-            ROTATION_DISABLED,
+            local::ROTATION_ON_SCHEDULE,
             format!(
                 "{}: nothing is known to renew this identity; it is kept until it expires",
                 why.message()
@@ -1279,7 +1286,7 @@ fn off_verdict(why: Off, due: Due, renewer: Option<&str>) -> Verdict {
 async fn roll_after_renewal(
     store: &KubeIdentity,
     gateway: Option<&KubeGateway>,
-    target: &Result<Target, super::EnrollError>,
+    target: &Result<Target, RenewError>,
     checked: &Result<Checked, RenewError>,
 ) {
     if let (Some(renewed), Ok(target), Some(gateway)) = (rolls_after(checked), target, gateway) {

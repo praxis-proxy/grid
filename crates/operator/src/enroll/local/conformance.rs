@@ -124,7 +124,7 @@ fn managers() -> BTreeMap<&'static str, &'static str> {
 
 /// The reasons the enrollment step writes, by type and status. `Available` copies the
 /// first failing gate's reason, so it carries the gates' reasons.
-const REASONS: [(&str, &str, &str); 32] = [
+const REASONS: [(&str, &str, &str); 41] = [
     (AVAILABLE, "True", "Available"),
     (AVAILABLE, "False", "AwaitingInvite"),
     (AVAILABLE, "False", "InviteMaybeSpent"),
@@ -134,8 +134,7 @@ const REASONS: [(&str, &str, &str); 32] = [
     (ENROLLED, "Unknown", "Enrolling"),
     (ENROLLED, "False", "AwaitingInvite"),
     (ENROLLED, "False", "InviteMaybeSpent"),
-    (ENROLLED, "True", "IdentityPresent"),
-    (ENROLLED, "True", "Issued"),
+    (ENROLLED, "True", "Enrolled"),
     (IDENTITY_VALID, "Unknown", "AwaitingFirstAttempt"),
     (IDENTITY_VALID, "True", "IdentityValid"),
     (IDENTITY_VALID, "False", "IdentityMissing"),
@@ -149,7 +148,6 @@ const REASONS: [(&str, &str, &str); 32] = [
     (PROGRESSING, "True", "Enrolling"),
     (PROGRESSING, "True", "Retrying"),
     (DEGRADED, "False", "AsExpected"),
-    (ROTATION_ON_SCHEDULE, "True", "RotationDisabled"),
     (ROTATION_ON_SCHEDULE, "True", "RotationOnSchedule"),
     (ROTATION_ON_SCHEDULE, "False", "SignerUntrusted"),
     (DEGRADED, "True", "SignerUntrusted"),
@@ -157,6 +155,17 @@ const REASONS: [(&str, &str, &str); 32] = [
     (DEGRADED, "True", "RenewalNeedsPassthrough"),
     (ROTATION_ON_SCHEDULE, "False", "SignerLapsed"),
     (DEGRADED, "True", "SignerLapsed"),
+    (ENROLLED, "False", "EnrollmentOff"),
+    (AVAILABLE, "False", "EnrollmentOff"),
+    (ENROLLED, "False", "IdentityMissing"),
+    (AVAILABLE, "False", "IdentityMissing"),
+    (ACCEPTED, "False", "RotationUnsupportedUnderPinTrust"),
+    (AVAILABLE, "False", "RotationUnsupportedUnderPinTrust"),
+    (ACCEPTED, "False", "OperatorConfigInvalid"),
+    (AVAILABLE, "False", "OperatorConfigInvalid"),
+    (ROTATION_ON_SCHEDULE, "Unknown", "NotEvaluated"),
+    (ROTATION_ON_SCHEDULE, "False", "RenewalFailing"),
+    (DEGRADED, "True", "RenewalFailing"),
 ];
 
 /// `Available` on `observed`, as (status, reason).
@@ -452,7 +461,7 @@ async fn invariant_8_no_signer_reads_rotation_on_schedule_no_signer_and_never_bl
     invariants::rollup_present_and_equal(&rounds[0], &GATES).expect("invariant 7");
     let rotation = rounds[1].condition(ROTATION_ON_SCHEDULE).expect("RotationOnSchedule");
     assert_eq!(rotation["status"], "True");
-    assert_eq!(rotation["reason"], "RotationDisabled");
+    assert_eq!(rotation["reason"], "RotationOnSchedule");
     assert!(
         rotation["message"]
             .as_str()
@@ -650,4 +659,130 @@ async fn invariant_8_a_signer_serving_a_lapsed_certificate_is_signer_lapsed() {
         "names the signer's fix, not a pin: {}",
         rotation["message"]
     );
+}
+
+/// Hold this cluster's `GridNetwork` under pin peer trust.
+fn pinned_trust(api: &FakeApi) {
+    api.edit(PATH, true, |network| {
+        network["spec"]["peerTrust"] = json!({ "mode": "pin" });
+    });
+}
+
+#[tokio::test]
+async fn invariant_1_rotation_enabled_under_pin_holds_accepted_false_without_a_second_writer_flapping_it() {
+    let api = seeded();
+    pinned_trust(&api);
+    store_identity(&api);
+    let rounds = renewal_rounds_under(
+        &api,
+        "  signerEndpoint:\n    url: https://signer.example.com\n",
+        4,
+        |_round| {},
+    )
+    .await;
+
+    invariants::unchanged_from(&rounds, 1).expect("invariant 1: the enrollment step and the renewal loop agree");
+    invariants::transition_time_moves_only_with_status(&rounds).expect("invariant 2");
+    invariants::one_manager_per_type(&api.writes(), PATH, &managers()).expect("invariant 5");
+    invariants::reasons_within(&rounds, &REASONS).expect("invariant 8");
+    for round in &rounds {
+        let accepted = round.condition(ACCEPTED).expect("Accepted");
+        assert_eq!(
+            (&accepted["status"], &accepted["reason"]),
+            (&json!("False"), &json!("RotationUnsupportedUnderPinTrust"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn invariant_8_without_an_operator_config_the_network_says_enrollment_is_off() {
+    let api = seeded();
+    let rounds = rounds(&api, &Snapshot::absent(), 3, |_round| {}).await;
+
+    invariants::unchanged_from(&rounds, 1).expect("invariant 1");
+    invariants::one_manager_per_type(&api.writes(), PATH, &managers()).expect("invariant 5");
+    invariants::reasons_within(&rounds, &REASONS).expect("invariant 8");
+    invariants::available_equals_rollup(&rounds[1], &GATES).expect("invariant 7, Available");
+    let accepted = rounds[1].condition(ACCEPTED).expect("Accepted");
+    assert_eq!(accepted["message"], "no operator config, enrollment off");
+    assert_eq!(
+        rounds[1].condition(RESOLVED_REFS).expect("ResolvedRefs")["status"],
+        "True"
+    );
+    assert_eq!(available_of(&rounds[1]), ("False", "EnrollmentOff"));
+}
+
+#[tokio::test]
+async fn invariant_8_an_identity_written_outside_a_signer_reads_enrolled_with_what_renews_it() {
+    let api = seeded();
+    store_identity(&api);
+    let rounds = renewal_rounds(&api, 3, |_round| {}).await;
+
+    invariants::unchanged_from(&rounds, 1).expect("invariant 1");
+    invariants::reasons_within(&rounds, &REASONS).expect("invariant 8");
+    let enrolled = rounds[1].condition(ENROLLED).expect("Enrolled");
+    assert_eq!(
+        (&enrolled["status"], &enrolled["message"]),
+        (
+            &json!("True"),
+            &json!("identity provisioned outside the signer; nothing is known to renew it")
+        )
+    );
+    assert_eq!(available_of(&rounds[1]), ("True", "Available"));
+}
+
+#[tokio::test]
+async fn invariant_4_a_restart_after_the_identity_is_deleted_never_keeps_identity_valid_true() {
+    let api = seeded();
+    store_identity(&api);
+    let held = renewal_rounds(&api, 2, |_round| {}).await;
+    assert_eq!(
+        held[1].condition(IDENTITY_VALID).expect("IdentityValid")["status"],
+        "True"
+    );
+
+    api.remove(&secret_path(IDENTITY_SECRET));
+    let restarted = rounds(&api, &config(""), 2, |_round| {}).await;
+    let valid = restarted[0].condition(IDENTITY_VALID).expect("IdentityValid");
+    assert_eq!(
+        (&valid["status"], &valid["reason"]),
+        (&json!("Unknown"), &json!("AwaitingFirstAttempt")),
+        "a restart without the identity rewrites what an earlier process held"
+    );
+    invariants::unchanged_from(&restarted, 1).expect("invariant 1");
+}
+
+#[tokio::test]
+async fn invariant_2_a_refused_config_stays_refused_through_a_round_that_cannot_read() {
+    let api = seeded();
+    store_identity(&api);
+    let client = api.client(NAMESPACE);
+    let refused = Snapshot {
+        loaded: crate::operator_config::Loaded::Invalid("site.extra: unknown field".to_owned()),
+        ..Snapshot::absent()
+    };
+    let settings = crate::enroll::renew::Settings::new()
+        .with_site(Some(SITE.to_owned()))
+        .with_config(ConfigWatch::fixed(refused.clone()));
+    let renewal = crate::enroll::renew::Rounds::new(client.clone(), &settings);
+    let mut enrollment = Enrollment::default();
+    let mut observed = Vec::new();
+    for round in 0..4 {
+        if round == 2 {
+            api.fail_reads(&secret_path(IDENTITY_SECRET), 2);
+        }
+        drop(enrollment.step(&client, Some(SITE), &refused).await);
+        let _renewed = renewal.round(&settings).await;
+        observed.push(rolled(&api, &client).await);
+    }
+
+    invariants::transition_time_moves_only_with_status(&observed).expect("invariant 2");
+    invariants::unchanged_from(&observed, 1).expect("invariant 1: a failed read changes nothing");
+    for round in &observed {
+        let accepted = round.condition(ACCEPTED).expect("Accepted");
+        assert_eq!(
+            (&accepted["status"], &accepted["reason"]),
+            (&json!("False"), &json!("OperatorConfigInvalid"))
+        );
+    }
 }

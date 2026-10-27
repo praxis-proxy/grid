@@ -169,9 +169,10 @@ pub fn observed_generation_tracks(rounds: &[Observed]) -> Result<(), Failure> {
                 "round {index}: status.observedGeneration {held} lags generation {want}"
             )));
         }
+        // A condition that never read the spec carries no observedGeneration, and claims none.
         for condition in &round.conditions {
             let held = condition.get("observedGeneration").and_then(Value::as_i64);
-            if held != Some(want) {
+            if held.is_some_and(|held| held != want) {
                 return Err(Failure::from(format!(
                     "round {index}: {} observedGeneration {held:?} lags generation {want}",
                     condition.get("type").and_then(Value::as_str).unwrap_or_default()

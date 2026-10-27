@@ -127,6 +127,47 @@ impl Verdict {
         Self::new("True", ACCEPTED, "this cluster's own site".to_owned())
     }
 
+    /// `Accepted`: no site section to act on, so enrollment is off.
+    pub(crate) fn no_site(absent: bool) -> Self {
+        let message = if absent {
+            "no operator config, enrollment off"
+        } else {
+            "the operator config names no site, enrollment off"
+        };
+        Self::new("True", ACCEPTED, message.to_owned())
+    }
+
+    /// `Enrolled`: an identity written outside a signer, with what renews it.
+    pub(crate) fn provisioned(renewer: Option<&str>) -> Self {
+        let message = match renewer {
+            Some(certificate) => {
+                format!("identity provisioned outside the signer, renewed by cert-manager Certificate {certificate}")
+            },
+            None => "identity provisioned outside the signer; nothing is known to renew it".to_owned(),
+        };
+        Self::new("True", ENROLLED, message)
+    }
+
+    /// `Enrolled`: the identity this site held is gone.
+    pub(crate) fn identity_lost(secret: &str) -> Self {
+        Self::new(
+            "False",
+            "IdentityMissing",
+            format!("site identity Secret {secret} is gone: restore it, or name site.inviteSecretRef to enroll again"),
+        )
+    }
+
+    /// `Enrolled`: no identity, and nothing to enroll with.
+    fn enrollment_off(secret: &str) -> Self {
+        Self::new(
+            "False",
+            "EnrollmentOff",
+            format!(
+                "no site identity: Secret {secret} does not exist, and the operator config names no site to enroll"
+            ),
+        )
+    }
+
     /// `Accepted`: the operator config was refused as a whole, so no section of it is acted on.
     pub(crate) fn config_invalid(why: &str) -> Self {
         Self::new("False", "OperatorConfigInvalid", why.to_owned())
@@ -186,16 +227,16 @@ impl Verdict {
 
     /// The signer issued `spiffe_id`.
     fn issued(spiffe_id: &str) -> Self {
-        Self::new("True", "Issued", format!("enrolled as {spiffe_id}"))
+        Self::new(
+            "True",
+            ENROLLED,
+            format!("enrolled as {spiffe_id}, issued by the signer"),
+        )
     }
 
     /// The identity Secret already exists.
     pub(crate) fn present(secret: &str) -> Self {
-        Self::new(
-            "True",
-            "IdentityPresent",
-            format!("site identity Secret {secret} exists"),
-        )
+        Self::new("True", ENROLLED, format!("site identity Secret {secret} exists"))
     }
 
     /// Enrollment ended without an identity.
@@ -262,7 +303,11 @@ fn held<'site>(site: &'site GridNetwork, type_: &str) -> Option<&'site Condition
 
 /// The condition of `type_` for `verdict`, or `None` when the live status already says it.
 pub(crate) fn condition(site: &GridNetwork, type_: &str, verdict: &Verdict, now_rfc3339: &str) -> Option<Condition> {
-    let generation = site.metadata.generation;
+    // Only a verdict that read the spec says which generation it saw: Enrolled and
+    // IdentityValid read spec.tls.
+    let generation = matches!(type_, ENROLLED | IDENTITY_VALID)
+        .then_some(site.metadata.generation)
+        .flatten();
     let held = held(site, type_);
     if held.is_some_and(|held| {
         held.status == verdict.status
@@ -319,8 +364,17 @@ pub(crate) async fn report(
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .ok()?;
-    let condition = condition(site, type_, verdict, &now)?;
+    condition(site, type_, verdict, &now)?;
     let api: Api<GridNetwork> = Api::all(client.clone());
+    // Judged again against the object as it stands, for the generation it carries now.
+    let fresh = match Box::pin(api.get(name)).await {
+        Ok(fresh) => fresh,
+        Err(error) => {
+            tracing::warn!(grid_network = name, condition = type_, %error, "reading the GridNetwork failed");
+            return None;
+        },
+    };
+    let condition = condition(&fresh, type_, verdict, &now)?;
     let params = PatchParams::apply(manager).force();
     match Box::pin(api.patch_status(name, &params, &Patch::Apply(patch(name, &condition)))).await {
         Ok(written) => Some(Box::new(written)),
@@ -350,14 +404,13 @@ pub(crate) async fn report_many(
 /// Report `IdentityValid` as not evaluated yet on `site`, which has no identity: the
 /// renewal loop reads it once there is one.
 async fn identity_not_evaluated(client: &Client, site: &GridNetwork, secret: &str) {
-    if held(site, IDENTITY_VALID).is_none() {
-        let waiting = Verdict::new(
-            "Unknown",
-            "AwaitingFirstAttempt",
-            format!("waiting for a site identity: Secret {secret} does not exist yet, see Enrolled"),
-        );
-        drop(Box::pin(report(client, site, IDENTITY_VALID, IDENTITY_FIELD_MANAGER, &waiting)).await);
-    }
+    // Written whenever it differs, so a verdict on an identity since deleted never stands.
+    let waiting = Verdict::new(
+        "Unknown",
+        "AwaitingFirstAttempt",
+        format!("waiting for a site identity: Secret {secret} does not exist yet, see Enrolled"),
+    );
+    drop(Box::pin(report(client, site, IDENTITY_VALID, IDENTITY_FIELD_MANAGER, &waiting)).await);
 }
 
 /// What one [`Enrollment::step`] found or did.
@@ -425,6 +478,8 @@ pub struct Enrollment {
     failed: Option<Inputs>,
     /// The last Event recorded on the operator config, so a repeat is not recorded again.
     noted: Option<Verdict>,
+    /// The process holds an identity, so a lost one is the renewal loop's to report.
+    identified: bool,
 }
 
 impl Enrollment {
@@ -448,27 +503,36 @@ impl Enrollment {
             [own] => Some(own),
             many => return Ok(Box::pin(self.many(client, config, many.len())).await),
         };
-        let site = match config.loaded.site() {
-            Section::Unset => {
-                return Ok(match (identity, own) {
-                    (Some(_), Some(own)) => Box::pin(self.settle(client, own, None)).await,
-                    _ => Step::NoLocalSite,
-                });
-            },
-            Section::Invalid(why) => {
-                return Ok(Box::pin(self.refuse(client, own, config, Verdict::config_invalid(why))).await);
-            },
-            Section::Site(site) => site,
+        let Some(own) = own else {
+            return Ok(Box::pin(self.without_network(client, identity, config)).await);
         };
-        if let Some(identity) = identity.filter(|identity| *identity != site.name) {
-            let mismatch = Verdict::name_mismatch(&site.name, identity);
-            return Ok(Box::pin(self.refuse(client, own, config, mismatch)).await);
-        }
-        Ok(match own {
-            Some(own) => Box::pin(self.settle(client, own, Some(site))).await,
-            None if identity.is_none() => Box::pin(self.await_grid_network(client, &site.name, config)).await,
-            None => Step::NoLocalSite,
+        self.identified = identity.is_some();
+        // The one verdict the renewal loop writes too, so the two never disagree.
+        let accepted = super::renew::accepted_over(&config.loaded, identity, &listed);
+        Ok(match config.loaded.site() {
+            Section::Invalid(_) => Box::pin(Self::refuse(client, own, &accepted)).await,
+            Section::Site(site) if identity.is_some_and(|identity| identity != site.name) => {
+                Box::pin(Self::refuse(client, own, &accepted)).await
+            },
+            Section::Site(site) => Box::pin(self.settle(client, own, Some(site), &accepted)).await,
+            Section::Unset => Box::pin(self.settle(client, own, None, &accepted)).await,
         })
+    }
+
+    /// With no `GridNetwork` to report on, say on the operator config why nothing is sent.
+    async fn without_network(&mut self, client: &Client, identity: Option<&str>, config: &Snapshot) -> Step {
+        let refusal = match config.loaded.site() {
+            Section::Invalid(why) => Verdict::config_invalid(why),
+            Section::Site(site) => match identity {
+                Some(identity) if identity != site.name => Verdict::name_mismatch(&site.name, identity),
+                Some(_) => return Step::NoLocalSite,
+                None => return Box::pin(self.await_grid_network(client, &site.name, config)).await,
+            },
+            Section::Unset => return Step::NoLocalSite,
+        };
+        tracing::error!(reason = %refusal.reason, error = %refusal.message, "operator config refused for this site");
+        Box::pin(self.note(client, config, refusal)).await;
+        Step::Refused
     }
 
     /// Enroll nowhere among `count` `GridNetwork`s, saying so as an Event on the operator config.
@@ -485,19 +549,10 @@ impl Enrollment {
         Step::NoLocalSite
     }
 
-    /// Report `refusal` as `Accepted` on `own`, else as an Event on the operator config.
-    async fn refuse(
-        &mut self,
-        client: &Client,
-        own: Option<&GridNetwork>,
-        config: &Snapshot,
-        refusal: Verdict,
-    ) -> Step {
+    /// Report `refusal` as `Accepted` on `own`; nothing is sent.
+    async fn refuse(client: &Client, own: &GridNetwork, refusal: &Verdict) -> Step {
         tracing::error!(reason = %refusal.reason, error = %refusal.message, "operator config refused for this site");
-        match own {
-            Some(own) => drop(Box::pin(report(client, own, ACCEPTED, ACCEPTED_FIELD_MANAGER, &refusal)).await),
-            None => Box::pin(self.note(client, config, refusal)).await,
-        }
+        drop(Box::pin(report(client, own, ACCEPTED, ACCEPTED_FIELD_MANAGER, refusal)).await);
         Step::Refused
     }
 
@@ -512,16 +567,16 @@ impl Enrollment {
         self.noted = Some(verdict);
     }
 
-    /// Accept the site section for `site`, this cluster's `GridNetwork`, and enroll through `config`.
-    async fn settle(&mut self, client: &Client, site: &GridNetwork, config: Option<&SiteConfig>) -> Step {
-        let accepted = Box::pin(report(
-            client,
-            site,
-            ACCEPTED,
-            ACCEPTED_FIELD_MANAGER,
-            &Verdict::own_site(),
-        ))
-        .await;
+    /// Report `verdict` as `Accepted` on `site`, this cluster's `GridNetwork`, and enroll through
+    /// `config`.
+    async fn settle(
+        &mut self,
+        client: &Client,
+        site: &GridNetwork,
+        config: Option<&SiteConfig>,
+        verdict: &Verdict,
+    ) -> Step {
+        let accepted = Box::pin(report(client, site, ACCEPTED, ACCEPTED_FIELD_MANAGER, verdict)).await;
         let site = accepted.as_deref().unwrap_or(site);
         Box::pin(self.enroll(client, site, config)).await
     }
@@ -532,18 +587,35 @@ impl Enrollment {
             Ok(into) => into,
             Err(error) => return Box::pin(self.fail(client, site, None, &error)).await,
         };
+        let outside = config.and_then(|config| config.signer_endpoint.as_ref()).is_none();
         match Box::pin(into.store.exists(&into.target.site_secret)).await {
-            Ok(true) => return Box::pin(self.present(client, site, &into.target)).await,
+            Ok(true) => return Box::pin(self.present(client, site, &into, outside)).await,
+            // The renewal loop reports an identity this process held and lost.
+            Ok(false) if self.identified => return Step::NoLocalSite,
             Ok(false) => Box::pin(identity_not_evaluated(client, site, &into.target.site_secret)).await,
             Err(error) => return Box::pin(self.fail(client, site, None, &error)).await,
         }
-        let (Some(config), Some(signer), Some(invite)) = (
-            config,
-            config.and_then(|config| config.signer_endpoint.as_ref()),
-            config.and_then(|config| config.invite_secret_ref.as_ref()),
-        ) else {
-            return Box::pin(await_invite(client, site, config)).await;
+        let Some((config, signer, invite)) = config.and_then(|config| {
+            Some((
+                config,
+                config.signer_endpoint.as_ref()?,
+                config.invite_secret_ref.as_ref()?,
+            ))
+        }) else {
+            return Box::pin(await_invite(client, site, config, &into.target.site_secret)).await;
         };
+        Box::pin(self.attempt(client, site, &into, (config, signer, invite))).await
+    }
+
+    /// Prepare an attempt through `signer` with `invite`, as `config` names them, and send it
+    /// unless the same inputs were refused already.
+    async fn attempt(
+        &mut self,
+        client: &Client,
+        site: &GridNetwork,
+        into: &Destination,
+        (config, signer, invite): (&SiteConfig, &SignerEndpoint, &InviteSecretRef),
+    ) -> Step {
         let (inputs, settings) = match Box::pin(prepare(client, config, signer, invite)).await {
             Ok(prepared) => prepared,
             Err(error) => return Box::pin(self.fail(client, site, None, &error)).await,
@@ -552,7 +624,7 @@ impl Enrollment {
             return Step::Unchanged;
         }
         match settings {
-            Ok(settings) => Box::pin(self.redeem(client, site, &into, Attempt { settings, inputs })).await,
+            Ok(settings) => Box::pin(self.redeem(client, site, into, Attempt { settings, inputs })).await,
             Err(error) => Box::pin(self.fail(client, site, Some(inputs), &error)).await,
         }
     }
@@ -578,7 +650,9 @@ impl Enrollment {
                 self.failed = None;
                 Step::Enrolled
             },
-            Ok(Outcome::AlreadyEnrolled | Outcome::Discarded) => Box::pin(self.present(client, site, target)).await,
+            Ok(Outcome::AlreadyEnrolled | Outcome::Discarded) => {
+                Box::pin(self.present(client, site, into, false)).await
+            },
             // A Config from the attempt itself reads state the inputs do not track, such as
             // the CA Secret or the GridNetwork, so a fix there must resend.
             Err(error @ (EnrollError::Config(_) | EnrollError::PendingForeign(_))) => {
@@ -589,9 +663,19 @@ impl Enrollment {
     }
 
     /// Report the identity in `target`, unless `site` already reads enrolled.
-    async fn present(&mut self, client: &Client, site: &GridNetwork, target: &Target) -> Step {
-        if !enrolled(site) {
-            drop(Box::pin(report_enrolled(client, site, &Verdict::present(&target.site_secret))).await);
+    async fn present(&mut self, client: &Client, site: &GridNetwork, into: &Destination, outside: bool) -> Step {
+        let secret = &into.target.site_secret;
+        // Written outside a signer, the identity says what renews it, as the renewal loop does.
+        let verdict = if outside {
+            let meta = Box::pin(into.store.metadata(secret)).await.ok().flatten();
+            Some(Verdict::provisioned(
+                meta.as_ref().and_then(super::renew::renewer_of).as_deref(),
+            ))
+        } else {
+            (!enrolled(site)).then(|| Verdict::present(secret))
+        };
+        if let Some(verdict) = verdict {
+            drop(Box::pin(report_enrolled(client, site, &verdict)).await);
         }
         self.failed = None;
         Step::Present
@@ -715,14 +799,21 @@ async fn prepare(
 
 /// Report on `site` that `config` names no invite to send yet, with what the bundles it
 /// does name resolve to.
-async fn await_invite(client: &Client, site: &GridNetwork, config: Option<&SiteConfig>) -> Step {
+async fn await_invite(client: &Client, site: &GridNetwork, config: Option<&SiteConfig>, secret: &str) -> Step {
     let written = match Box::pin(named_refs(client, config)).await {
         Some(refs) => Box::pin(report(client, site, RESOLVED_REFS, REFS_FIELD_MANAGER, &refs)).await,
         None => None,
     };
     let site = written.as_deref().unwrap_or(site);
-    drop(Box::pin(report_enrolled(client, site, &Verdict::awaiting_invite())).await);
-    Step::AwaitingInvite
+    let waiting = match config {
+        Some(_) => Verdict::awaiting_invite(),
+        None => Verdict::enrollment_off(secret),
+    };
+    drop(Box::pin(report_enrolled(client, site, &waiting)).await);
+    match config {
+        Some(_) => Step::AwaitingInvite,
+        None => Step::NoLocalSite,
+    }
 }
 
 /// What `ResolvedRefs` says of the bundles `config` names, read without trusting them.

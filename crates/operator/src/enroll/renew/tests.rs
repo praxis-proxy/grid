@@ -755,11 +755,11 @@ fn rotation_on_schedule_follows_the_check() {
             off(Off::UnsupportedUnderPin, Due::At(now)),
             None,
             "True",
-            "RotationDisabled",
+            "RotationOnSchedule",
         ),
         (off(Off::NoSigner, Due::Now), None, "False", "RotationOverdue"),
-        (off(Off::NoSigner, Due::At(now)), None, "True", "RotationDisabled"),
-        (off(Off::Disabled, Due::At(now)), None, "True", "RotationDisabled"),
+        (off(Off::NoSigner, Due::At(now)), None, "True", "RotationOnSchedule"),
+        (off(Off::Disabled, Due::At(now)), None, "True", "RotationOnSchedule"),
         (off(Off::Refused, Due::At(now)), None, "Unknown", "NotEvaluated"),
         (off(Off::Refused, Due::Now), None, "False", "RotationOverdue"),
     ];
@@ -773,7 +773,7 @@ fn rotation_on_schedule_follows_the_check() {
         let named_in_message =
             verdict.message.contains("/v1alpha1/rotations") && verdict.message.contains("site.signerEndpoint");
         assert!(
-            reason != "RotationOnSchedule" || named_in_message,
+            signer.is_none() || reason != "RotationOnSchedule" || named_in_message,
             "{}",
             verdict.message
         );
@@ -781,6 +781,7 @@ fn rotation_on_schedule_follows_the_check() {
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "both off reasons, both renewers")]
 fn a_cert_manager_certificate_on_the_secret_reads_as_renewed_until_due() {
     let now = OffsetDateTime::now_utc();
     let named = Some("site-d-identity");
@@ -796,7 +797,10 @@ fn a_cert_manager_certificate_on_the_secret_reads_as_renewed_until_due() {
             "{why:?}"
         );
         let unknown = off_verdict(why, Due::At(now), None);
-        assert_eq!((unknown.status, unknown.reason.as_ref()), ("True", "RotationDisabled"));
+        assert_eq!(
+            (unknown.status, unknown.reason.as_ref()),
+            ("True", "RotationOnSchedule")
+        );
         assert!(
             unknown
                 .message
@@ -956,7 +960,7 @@ fn disabled_rotation_neither_rolls_nor_retries() {
 
 /// The verdicts of `round` for condition `type_`, as (status, reason).
 fn verdicts_of(round: &Round, type_: &str) -> Vec<(&'static str, String)> {
-    round_verdicts(round, &target(), true, None)
+    round_verdicts(round, &target(), true, (Verdict::own_site(), None))
         .into_iter()
         .filter(|(written, ..)| *written == type_)
         .map(|(_, _, verdict)| (verdict.status, verdict.reason.into_owned()))
@@ -964,7 +968,7 @@ fn verdicts_of(round: &Round, type_: &str) -> Vec<(&'static str, String)> {
 }
 
 /// A round in which nothing renews for `why`, with the identity valid.
-fn off_round(why: Off, refused: Option<Verdict>) -> Round {
+fn off_round(why: Off) -> Round {
     let now = OffsetDateTime::now_utc();
     Round {
         checked: Ok(Checked::Off {
@@ -974,86 +978,147 @@ fn off_round(why: Off, refused: Option<Verdict>) -> Round {
         }),
         signer: None,
         identity: Some(Identity::Valid(now, String::new())),
-        refused,
+    }
+}
+
+/// Peer trust that does or does not renew.
+fn trust(renews: bool) -> Trust {
+    Trust {
+        renews,
+        declared: "GridNetwork grid declares peerTrust.mode pin".to_owned(),
     }
 }
 
 #[test]
 fn rotation_enabled_under_pin_is_an_accepted_conflict_and_holds_renewal_back() {
-    let trust = Trust {
-        renews: false,
-        declared: "GridNetwork grid declares peerTrust.mode pin".to_owned(),
-    };
-    let refused = off_round(Off::UnsupportedUnderPin, Some(trust.refusal()));
+    let refused = accepted(&loaded(&signer("")), Some("east"), &trust(false));
     assert_eq!(
-        verdicts_of(&refused, local::ACCEPTED),
-        vec![("False", "RotationUnsupportedUnderPinTrust".to_owned())]
-    );
-    assert_eq!(
-        verdicts_of(&refused, local::ROTATION_ON_SCHEDULE),
-        vec![("True", "RotationDisabled".to_owned())],
-        "the rotation reason set stays closed; the conflict is on Accepted"
-    );
-    let (manager, message) = round_verdicts(&refused, &target(), true, None)
-        .into_iter()
-        .find(|(type_, ..)| *type_ == local::ACCEPTED)
-        .map(|(_, manager, verdict)| (manager, verdict.message))
-        .expect("Accepted");
-    assert_eq!(
-        manager,
-        local::ACCEPTED_FIELD_MANAGER,
-        "the same manager as the enrollment step"
+        (refused.status, refused.reason.as_ref()),
+        ("False", "RotationUnsupportedUnderPinTrust")
     );
     assert!(
-        message.contains("site.signerEndpoint.rotation is Enabled") && message.contains("peerTrust.mode pin"),
-        "{message}"
+        refused.message.contains("site.signerEndpoint.rotation is Enabled")
+            && refused.message.contains("peerTrust.mode pin"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(
+        verdicts_of(&off_round(Off::UnsupportedUnderPin), local::ROTATION_ON_SCHEDULE),
+        vec![("True", local::ROTATION_ON_SCHEDULE.to_owned())],
+        "the rotation reason set stays closed; the conflict is on Accepted"
+    );
+    let accepted_once = accepted(&loaded(&signer("")), Some("east"), &trust(true));
+    assert_eq!(
+        accepted_once.status, "True",
+        "spiffe trust renews, so nothing conflicts"
     );
 }
 
 #[test]
-fn disabled_rotation_and_no_signer_are_accepted() {
-    for why in [Off::Disabled, Off::NoSigner] {
+fn disabled_rotation_no_signer_and_no_config_are_accepted() {
+    for document in [signer("    rotation: Disabled\n"), String::new()] {
+        let verdict = accepted(&loaded(&document), Some("east"), &trust(false));
         assert_eq!(
-            verdicts_of(&off_round(why, None), local::ACCEPTED),
-            vec![("True", "Accepted".to_owned())],
-            "{why:?}"
+            (verdict.status, verdict.reason.as_ref()),
+            ("True", local::ACCEPTED),
+            "{document}"
         );
     }
+    let off = accepted(&Loaded::Absent, Some("east"), &trust(false));
+    assert_eq!(
+        (off.status, off.message.as_str()),
+        ("True", "no operator config, enrollment off")
+    );
 }
 
 #[test]
 fn a_refused_config_is_not_accepted_and_holds_renewal_back() {
-    for refusal in [
-        Verdict::config_invalid("site.signerEndpoint.url must be an https URL"),
-        Verdict::name_mismatch("west", "east"),
-    ] {
-        let reason = refusal.reason.clone().into_owned();
-        let round = off_round(Off::Refused, Some(refusal));
-        assert_eq!(verdicts_of(&round, local::ACCEPTED), vec![("False", reason)]);
-        assert_eq!(
-            verdicts_of(&round, local::ROTATION_ON_SCHEDULE),
-            vec![("Unknown", "NotEvaluated".to_owned())],
-            "renewal is held back, and not evaluated, until the config is fixed"
-        );
-    }
+    let invalid = accepted(
+        &Loaded::Invalid("site.name: bad".to_owned()),
+        Some("east"),
+        &trust(true),
+    );
+    assert_eq!(
+        (invalid.status, invalid.reason.as_ref()),
+        ("False", "OperatorConfigInvalid")
+    );
+    let mismatch = accepted(&loaded(""), Some("west"), &trust(true));
+    assert_eq!(
+        (mismatch.status, mismatch.reason.as_ref()),
+        ("False", "SiteNameMismatch")
+    );
+    assert_eq!(
+        verdicts_of(&off_round(Off::Refused), local::ROTATION_ON_SCHEDULE),
+        vec![("Unknown", "NotEvaluated".to_owned())],
+        "renewal is held back, and not evaluated, until the config is fixed"
+    );
 }
 
 #[test]
-fn an_enrolled_site_keeps_issued_while_the_identity_is_present() {
+fn a_round_that_never_read_the_identity_says_nothing_about_it() {
+    let failed = Round::failed(RenewError::Kube("apiserver unavailable".to_owned()));
+    let written: Vec<&str> = round_verdicts(
+        &failed,
+        &target(),
+        false,
+        (Verdict::own_site(), Some(Verdict::resolved())),
+    )
+    .into_iter()
+    .map(|(type_, ..)| type_)
+    .collect();
+    assert_eq!(
+        written,
+        [local::ACCEPTED, local::RESOLVED_REFS],
+        "no Enrolled, IdentityValid or RotationOnSchedule from a failed read"
+    );
+}
+
+#[test]
+fn an_identity_gone_reads_enrolled_false_and_one_written_outside_a_signer_names_its_renewer() {
+    let now = OffsetDateTime::now_utc();
+    let gone = Round {
+        identity: Some(Identity::Missing("Secret site-tls".to_owned())),
+        ..Round::failed(RenewError::Missing(String::new()))
+    };
+    assert_eq!(
+        verdicts_of(&gone, local::ENROLLED),
+        vec![("False", "IdentityMissing".to_owned())]
+    );
+    let outside = Round {
+        checked: Ok(Checked::Off {
+            why: Off::NoSigner,
+            due: Due::At(now),
+            renewer: Some("site-d-identity".to_owned()),
+        }),
+        signer: None,
+        identity: Some(Identity::Valid(now, String::new())),
+    };
+    let message = round_verdicts(&outside, &target(), true, (Verdict::own_site(), None))
+        .into_iter()
+        .find(|(type_, ..)| *type_ == local::ENROLLED)
+        .map(|(.., verdict)| verdict.message)
+        .expect("Enrolled says what renews it, even once enrolled");
+    assert_eq!(
+        message,
+        "identity provisioned outside the signer, renewed by cert-manager Certificate site-d-identity"
+    );
+}
+
+#[test]
+fn an_enrolled_site_keeps_its_issuance_message_while_the_identity_is_present() {
     let now = OffsetDateTime::now_utc();
     let round = Round {
         checked: Ok(Checked::Waiting(now)),
         signer: None,
         identity: Some(Identity::Valid(now, String::new())),
-        refused: None,
     };
     let written = |enrolled: bool| -> Vec<String> {
-        round_verdicts(&round, &target(), enrolled, None)
+        round_verdicts(&round, &target(), enrolled, (Verdict::own_site(), None))
             .into_iter()
             .filter(|(type_, ..)| *type_ == local::ENROLLED)
             .map(|(_, _, verdict)| verdict.reason.into_owned())
             .collect()
     };
-    assert!(written(true).is_empty(), "an enrolled site keeps Issued");
-    assert_eq!(written(false), vec!["IdentityPresent".to_owned()]);
+    assert!(written(true).is_empty(), "an enrolled site keeps its issuance message");
+    assert_eq!(written(false), vec![local::ENROLLED.to_owned()]);
 }

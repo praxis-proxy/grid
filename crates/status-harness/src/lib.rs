@@ -93,6 +93,8 @@ struct Inner {
     owners: BTreeMap<String, BTreeMap<String, String>>,
     /// The last resource version handed out.
     version: u64,
+    /// Reads of a path that answer 500, as a transient API failure, and how many are left.
+    failing: BTreeMap<String, usize>,
 }
 
 /// An in-memory Kubernetes API.
@@ -126,6 +128,11 @@ impl FakeApi {
         let version = inner.next_version();
         stamp(&mut object, &version);
         inner.objects.insert(path.to_owned(), object);
+    }
+
+    /// Answer the next `times` reads of `path`, an object or a list, with a 500.
+    pub fn fail_reads(&self, path: &str, times: usize) {
+        self.lock().failing.insert(path.to_owned(), times);
     }
 
     /// The object at `path`.
@@ -236,7 +243,9 @@ impl FakeApi {
             manager: write.manager.as_deref(),
             content_type: &write.content_type,
         };
+        let failed = parts.method == http::Method::GET && inner.scripted_failure(&write.path);
         let answer = match parts.method {
+            http::Method::GET if failed => (500, failure(500, "InternalError", "scripted failure")),
             http::Method::GET => inner.read(&write.path),
             http::Method::POST => inner.create(&write.path, write.body),
             http::Method::PUT => inner.replace(&write.path, write.status, write.body),
@@ -274,6 +283,15 @@ impl Write {
 }
 
 impl Inner {
+    /// Whether this read of `path` answers a scripted 500, counting it down.
+    fn scripted_failure(&mut self, path: &str) -> bool {
+        self.failing.get_mut(path).is_some_and(|left| {
+            let failing = *left > 0;
+            *left = left.saturating_sub(1);
+            failing
+        })
+    }
+
     /// The next resource version.
     fn next_version(&mut self) -> String {
         self.version = self.version.saturating_add(1);

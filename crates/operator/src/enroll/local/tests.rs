@@ -212,6 +212,7 @@ fn list(kind: &str, items: &Value) -> (u16, Value) {
 const NETWORKS: &str = "/apis/grid.praxis.fast/v1alpha1/gridnetworks";
 
 /// Answer one request against `world`.
+#[expect(clippy::too_many_lines, reason = "one arm per request the mock serves")]
 fn answer(world: &mut World, method: &http::Method, path: &str, query: &str, body: &[u8]) -> (u16, Value) {
     let secrets = format!("/api/v1/namespaces/{NAMESPACE}/secrets");
     let site_status = path
@@ -222,6 +223,16 @@ fn answer(world: &mut World, method: &http::Method, path: &str, query: &str, bod
             "GridNetworkList",
             &serde_json::to_value(&world.networks).unwrap_or_default(),
         ),
+        ("GET", p) if p.starts_with(&format!("{NETWORKS}/")) => {
+            let name = p.trim_start_matches(&format!("{NETWORKS}/"));
+            world
+                .networks
+                .iter()
+                .find(|network| network.metadata.name.as_deref() == Some(name))
+                .map_or_else(not_found, |network| {
+                    (200, serde_json::to_value(network).unwrap_or_default())
+                })
+        },
         ("GET", p) if p.starts_with(&format!("{secrets}/")) => {
             world.get_secret(p.trim_start_matches(&format!("{secrets}/")))
         },
@@ -280,7 +291,7 @@ fn own_network() -> GridNetwork {
         "apiVersion": "grid.praxis.fast/v1alpha1",
         "kind": "GridNetwork",
         "metadata": {"name": NETWORK, "uid": "uid-grid", "generation": 1},
-        "spec": {},
+        "spec": { "peerTrust": { "mode": "spiffe" } },
     }))
     .expect("network")
 }
@@ -330,6 +341,11 @@ fn verdicts(world: &Arc<Mutex<World>>) -> Vec<(String, String)> {
 }
 
 fn world(networks: Vec<GridNetwork>) -> Arc<Mutex<World>> {
+    world_of(networks)
+}
+
+/// [`world`], callable where a local shadows it.
+fn world_of(networks: Vec<GridNetwork>) -> Arc<Mutex<World>> {
     Arc::new(Mutex::new(World {
         networks,
         ..World::default()
@@ -467,12 +483,37 @@ fn every_enrollment_failure_has_its_own_reason() {
 }
 
 #[tokio::test]
-async fn without_an_operator_config_nothing_is_read_or_written() {
+async fn without_an_operator_config_the_network_says_enrollment_is_off() {
     let world = world(vec![own_network()]);
     let step = run_step(&mut Enrollment::default(), &world, None).await;
     assert_eq!(step, Step::NoLocalSite);
-    let world = world.lock().expect("lock").clone();
-    assert!(world.patches.is_empty() && world.reads.is_empty(), "{:?}", world.reads);
+    let held = world.lock().expect("lock").clone();
+    assert_eq!(
+        held.verdicts_of(NETWORK, ACCEPTED),
+        [("True".to_owned(), ACCEPTED.to_owned())]
+    );
+    assert_eq!(
+        held.messages_of(NETWORK, ACCEPTED),
+        ["no operator config, enrollment off".to_owned()]
+    );
+    assert_eq!(
+        held.verdicts_of(NETWORK, RESOLVED_REFS),
+        [("True".to_owned(), RESOLVED_REFS.to_owned())]
+    );
+    assert_eq!(
+        held.verdicts(NETWORK),
+        [("False".to_owned(), "EnrollmentOff".to_owned())]
+    );
+    assert!(!held.reads.contains(&TOKEN_SECRET.to_owned()), "no invite is read");
+    let bare = world_of(Vec::new());
+    assert_eq!(
+        run_step(&mut Enrollment::default(), &bare, None).await,
+        Step::NoLocalSite
+    );
+    assert!(
+        bare.lock().expect("lock").patches.is_empty(),
+        "nothing to write to without a GridNetwork"
+    );
 }
 
 #[tokio::test]
@@ -584,10 +625,7 @@ async fn with_an_identity_and_no_config_the_named_site_reads_enrolled() {
         held.verdicts_of(NETWORK, ACCEPTED),
         [("True".to_owned(), "Accepted".to_owned())]
     );
-    assert_eq!(
-        held.verdicts(NETWORK),
-        [("True".to_owned(), "IdentityPresent".to_owned())]
-    );
+    assert_eq!(held.verdicts(NETWORK), [("True".to_owned(), "Enrolled".to_owned())]);
 }
 
 #[tokio::test]
@@ -608,7 +646,7 @@ async fn an_existing_identity_is_enrolled_and_the_invite_is_never_read() {
     let world = world.lock().expect("lock").clone();
     assert_eq!(
         world.verdicts(NETWORK),
-        [("True".to_owned(), "IdentityPresent".to_owned())],
+        [("True".to_owned(), "Enrolled".to_owned())],
         "written once"
     );
     assert!(
@@ -635,7 +673,7 @@ async fn the_site_enrolls_through_the_operator_config() {
         world.verdicts(NETWORK),
         [
             ("Unknown".to_owned(), ENROLLING.to_owned()),
-            ("True".to_owned(), "Issued".to_owned())
+            ("True".to_owned(), "Enrolled".to_owned())
         ]
     );
     progressed_then_available(&world);
@@ -670,7 +708,10 @@ async fn before_its_grid_network_exists_nothing_is_sent_and_an_event_says_why_on
 
     world.lock().expect("lock").networks.push(own_network());
     assert_eq!(run_step(&mut enrollment, &world, None).await, Step::Enrolled);
-    assert_eq!(verdicts(&world).last(), Some(&("True".to_owned(), "Issued".to_owned())));
+    assert_eq!(
+        verdicts(&world).last(),
+        Some(&("True".to_owned(), "Enrolled".to_owned()))
+    );
 }
 
 /// `IdentityValid` waits for the renewal loop, so the controller's `Available` waits on it.
