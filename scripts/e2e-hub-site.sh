@@ -339,12 +339,16 @@ leaf_digest() {
 
 enrolled() { k "$1" get secret grid-site-identity grid-ca; }
 
-# site_reports_enrolled <context> <site>: the signer issued the local GridSite's identity,
-# so a Secret some other writer left cannot pass as enrolled.
-site_reports_enrolled() {
-  [[ $(kubectl --context "$1" get gridsite "$2" \
-    -o jsonpath='{.status.conditions[?(@.type=="Enrolled")].status}/{.status.conditions[?(@.type=="Enrolled")].reason}') == True/Issued ]]
+# network_condition <context> <type>: status/reason of one GridNetwork condition. This
+# site's own conditions live there; its GridSite carries membership only.
+network_condition() {
+  kubectl --context "$1" get gridnetwork grid \
+    -o jsonpath="{.status.conditions[?(@.type==\"$2\")].status}/{.status.conditions[?(@.type==\"$2\")].reason}"
 }
+
+# site_reports_enrolled <context>: the signer issued this site's identity, so a Secret some
+# other writer left cannot pass as enrolled.
+site_reports_enrolled() { [[ $(network_condition "$1" Enrolled) == True/Enrolled ]]; }
 
 # snapshot_logs <context> <label>: every container, init and hook pods included.
 # Returns nonzero when any listing or log fetch fails.
@@ -475,7 +479,7 @@ install_hub() {
   fi
   eventually "hub operator enrolled from its own invite through the in-cluster Service" enrolled "$HUB_CTX" \
     || die "hub not enrolled"
-  eventually "hub GridSite reports Enrolled, Issued by the signer" site_reports_enrolled "$HUB_CTX" hub \
+  eventually "hub GridNetwork reports Enrolled by the signer" site_reports_enrolled "$HUB_CTX" \
     || die "hub identity not issued by the signer"
   HUB_DIGEST=$(leaf_digest "$HUB_CTX")
   [[ $HUB_DIGEST =~ ^[0-9a-f]{64}$ ]] || die "no hub leaf digest"
@@ -548,7 +552,7 @@ install_site() {
     "${IMG[@]}" --set service.loadBalancerIP="$SITE_GW_IP" || die "install site grid-gateway"
   eventually "site operator enrolled from its copied invite through the hub enrollment URL" enrolled "$SITE_CTX" \
     || die "site not enrolled"
-  eventually "$SITE GridSite reports Enrolled, Issued by the signer" site_reports_enrolled "$SITE_CTX" "$SITE" \
+  eventually "$SITE GridNetwork reports Enrolled by the signer" site_reports_enrolled "$SITE_CTX" \
     || die "$SITE identity not issued by the signer"
   # Every later hub grid-site upgrade carries the site's digest: helm does not reuse the release's values.
   HUB_SITE_ARGS+=(--set "peers.$SITE.digest=$(leaf_digest "$SITE_CTX")")
@@ -1767,8 +1771,9 @@ watch_hub_path() {
   # renewal, so allow a pod swap: Service traffic stays up, this tunnel does not.
   site_route && tries=8
   # stop_monitors kills this subshell; take its port-forward with it.
-  trap '[[ -z $pf ]] || kill "$pf" 2>/dev/null; exit 0' TERM
-  trap '[[ -z $pf ]] || kill "$pf" 2>/dev/null' EXIT
+  # The EXIT trap runs after the function's locals are gone, so read pf defensively.
+  trap '[[ -z ${pf:-} ]] || kill "$pf" 2>/dev/null; exit 0' TERM
+  trap '[[ -z ${pf:-} ]] || kill "$pf" 2>/dev/null' EXIT
   while :; do
     for ((try = 1; try <= tries; try++)); do
       if [[ -z $pf ]] || ! kill -0 "$pf" 2>/dev/null; then
@@ -2059,20 +2064,21 @@ assert_renewal() {
   pass "re-enrolled $SITE renews again"
 }
 
-# rotation_reads <context> <site> <status/reason>: the own GridSite's RotationOnSchedule.
-rotation_reads() {
-  [[ $(kubectl --context "$1" get gridsite "$2" \
-    -o jsonpath='{.status.conditions[?(@.type=="RotationOnSchedule")].status}/{.status.conditions[?(@.type=="RotationOnSchedule")].reason}') == "$3" ]]
-}
+# rotation_reads <context> <status/reason>: the GridNetwork's RotationOnSchedule.
+rotation_reads() { [[ $(network_condition "$1" RotationOnSchedule) == "$2" ]]; }
+
+# accepted_reads <context> <status/reason>: the GridNetwork's Accepted.
+accepted_reads() { [[ $(network_condition "$1" Accepted) == "$2" ]]; }
 
 # Rotation is declared where the config is generated, never derived at runtime: the chart
 # wrote site.signerEndpoint.rotation Disabled under pin into the operator config, and left it
-# out under spiffe for the operator's default, Enabled. The own GridSite's conditions follow.
+# out under spiffe for the operator's default, Enabled. The GridNetwork's conditions follow:
+# RotationOnSchedule reads True either way, and only its message says whether a signer
+# renews or nothing does, so the assertion stops at status and reason. Under pin that
+# True also says no renewal is scheduled, which status.identity.rotateAfter used to say.
 assert_rotation_declared() {
-  local ctx site declared want
+  local ctx declared want
   for ctx in "$HUB_CTX" "$SITE_CTX"; do
-    site=hub
-    [[ $ctx == "$SITE_CTX" ]] && site=$SITE
     declared=$(k "$ctx" get configmap grid-operator-config -o jsonpath='{.data.config\.yaml}' \
       | sed -n 's/^ *rotation: "\{0,1\}\([A-Za-z]*\)"\{0,1\}$/\1/p')
     want=""
@@ -2083,38 +2089,12 @@ assert_rotation_declared() {
       fail "$ctx: the operator config declares site.signerEndpoint.rotation '$declared', want '$want'"
     fi
     if [[ $MODE == pin ]]; then
-      eventually "$ctx: $site reports RotationOnSchedule True, RotationDisabled" rotation_reads "$ctx" "$site" True/RotationDisabled || true
-      eventually "$ctx: $site is Accepted with rotation Disabled under pin" accepted_reads "$ctx" "$site" True/Accepted || true
+      eventually "$ctx: GridNetwork reports RotationOnSchedule True with rotation Disabled under pin" \
+        rotation_reads "$ctx" True/RotationOnSchedule || true
+      eventually "$ctx: GridNetwork is Accepted with rotation Disabled under pin" accepted_reads "$ctx" True/Accepted || true
     else
-      eventually "$ctx: $site reports RotationOnSchedule True through site.signerEndpoint" \
-        renews_through_config "$ctx" "$site" || true
-    fi
-  done
-}
-
-# accepted_reads <context> <site> <status/reason>: the own GridSite's Accepted.
-accepted_reads() {
-  [[ $(kubectl --context "$1" get gridsite "$2" \
-    -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}/{.status.conditions[?(@.type=="Accepted")].reason}') == "$3" ]]
-}
-
-# renews_through_config <context> <site>: renewal names the operator config's site.signerEndpoint.
-renews_through_config() {
-  rotation_reads "$1" "$2" True/RotationOnSchedule && kubectl --context "$1" get gridsite "$2" \
-    -o jsonpath='{.status.conditions[?(@.type=="RotationOnSchedule")].message}' | grep -q 'from site.signerEndpoint'
-}
-
-# Pin trust does not renew: the own GridSite says so, and no renewal is scheduled.
-assert_pin_no_renewal() {
-  local ctx site
-  [[ $MODE == pin ]] || return 0
-  for ctx in "$HUB_CTX" "$SITE_CTX"; do
-    site=hub
-    [[ $ctx == "$SITE_CTX" ]] && site=$SITE
-    if [[ -z $(k "$ctx" get gridnetwork grid -o jsonpath='{.status.identity.rotateAfter}') ]]; then
-      pass "$ctx: status.identity.rotateAfter is empty under pin trust"
-    else
-      fail "$ctx: status.identity.rotateAfter set under pin trust"
+      eventually "$ctx: GridNetwork reports RotationOnSchedule True through site.signerEndpoint" \
+        rotation_reads "$ctx" True/RotationOnSchedule || true
     fi
   done
 }
@@ -2155,7 +2135,6 @@ cmd_test() {
     assert_ha
     assert_site_route
     assert_rotation_declared
-    assert_pin_no_renewal
     assert_renewal
     assert_health
   done
