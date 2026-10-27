@@ -118,6 +118,8 @@ spec:
             {{- end }}
             - name: GRID_NETWORK
               value: {{ .Values.grid.network | quote }}
+            - name: GRID_OPERATOR_CONFIG
+              value: {{ include "grid-operator.operatorConfig.name" . | quote }}
             {{- /* The chart renders the records with grid.id, and an enrolling release may set it later. */}}
             {{- if or .Values.grid.id .Values.enrollment.enabled }}
             - name: GRID_CREATE_LOCAL_RECORDS
@@ -191,10 +193,7 @@ spec:
             {{- end }}
             - name: RUST_LOG
               value: {{ include "grid-operator.rustLog" . | quote }}
-            {{- with include "grid-operator.enrollment.env" . | trim }}
-            {{- . | nindent 12 }}
-            {{- end }}
-          {{- $mounts := list (include "grid-operator.enrollment.volumeMounts" . | trim) (include "grid-operator.metricsTls.volumeMount" . | trim) | compact }}
+          {{- $mounts := list (include "grid-operator.metricsTls.volumeMount" . | trim) | compact }}
           {{- with $mounts }}
           volumeMounts:
             {{- join "\n" . | nindent 12 }}
@@ -251,7 +250,7 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-      {{- $volumes := list (include "grid-operator.enrollment.volumes" . | trim) (include "grid-operator.metricsTls.volume" . | trim) | compact }}
+      {{- $volumes := list (include "grid-operator.metricsTls.volume" . | trim) | compact }}
       {{- with $volumes }}
       volumes:
         {{- join "\n" . | nindent 8 }}

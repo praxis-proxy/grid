@@ -78,6 +78,8 @@ spec:
               value: "grid-operator-swim"
             - name: GRID_NETWORK
               value: "grid"
+            - name: GRID_OPERATOR_CONFIG
+              value: "grid-operator-config"
             - name: GRID_GATEWAY_SERVICE_NAME
               value: "grid-gateway"
             - name: GRID_GATEWAY_NAMESPACE

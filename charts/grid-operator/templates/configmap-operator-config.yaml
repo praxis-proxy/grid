@@ -1,0 +1,16 @@
+{{- include "grid-operator.normalize" . }}
+{{- if (.Values.operatorConfig | default dict).create }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "grid-operator.operatorConfig.name" . | quote }}
+  labels:
+    {{- include "grid-operator.labels" . | nindent 4 }}
+data:
+  {{- with include "grid-operator.enrollment.site" . | trim }}
+  config.yaml: |
+    {{- . | nindent 4 }}
+  {{- else }}
+  config.yaml: ""
+  {{- end }}
+{{- end }}

@@ -20,17 +20,17 @@ rules:
       - {{ printf "%s-swim" (include "grid-operator.fullname" .) | quote }}
       - {{ printf "%s-signals" (include "grid-operator.fullname" .) | quote }}
     verbs: ["get"]
-{{- if include "grid-operator.enrollment.rotates" . }}
   # A rotation rolls the gateway, which loads its upstream client certificate only at start.
+  # Unconditional: any identified site renews once the operator config names a signer.
   - apiGroups: ["apps"]
     resources: ["deployments"]
     resourceNames: [{{ .Values.gateway.serviceName | default "provider-gateway" | quote }}]
     verbs: ["get", "patch"]
-{{- end }}
   - apiGroups: ["events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]
+  # The operator config is watched, so an edit applies without a restart.
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "create", "patch", "update"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
 {{- end }}

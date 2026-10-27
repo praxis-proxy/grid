@@ -1,0 +1,10 @@
+# Source: grid-operator/templates/configmap-operator-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: "grid-operator-config"
+  labels:
+    app.kubernetes.io/name: grid-operator
+    app.kubernetes.io/instance: grid-operator
+data:
+  config.yaml: ""

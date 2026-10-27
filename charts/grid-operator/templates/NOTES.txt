@@ -47,6 +47,8 @@ Resource access granted in additional namespaces:
 {{- end }}
 {{- if and (.Values.enrollment | default dict).enabled (not .Values.rbac.create) }}
 
-Auto-enroll is on with rbac.create=false: grant the operator ServiceAccount
-get, create, and patch on Secrets in {{ .Release.Namespace }}.
+Enrollment is on with rbac.create=false: grant the operator ServiceAccount
+get, create, and patch on Secrets, and get, list, and watch on ConfigMaps, in
+{{ .Release.Namespace }}. The site enrolls from the ConfigMap
+{{ include "grid-operator.operatorConfig.name" . }}.
 {{- end }}
