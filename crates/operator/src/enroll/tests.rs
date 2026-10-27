@@ -261,6 +261,9 @@ struct FakeStore {
     reads_fail: bool,
     /// Patches that write data fail transiently this many more times.
     data_patches_fail: Mutex<u32>,
+    /// A Secret another writer puts in place of the named one right after it is read, as a
+    /// replacement racing a write would.
+    replace_after_read: Mutex<Option<(String, Secret)>>,
 }
 
 impl FakeStore {
@@ -298,6 +301,15 @@ impl FakeStore {
             .labels
             .get_or_insert_default()
             .insert(key.to_owned(), value.to_owned());
+    }
+
+    /// Give the Secret `name` the resource version `version` and UID `uid`.
+    fn stamp(&self, name: &str, version: &str, uid: &str) {
+        let mut secrets = self.secrets.lock().expect("lock");
+        let metadata = &mut secrets.get_mut(name).expect("secret").metadata;
+        metadata.resource_version = Some(version.to_owned());
+        metadata.uid = Some(uid.to_owned());
+        drop(secrets);
     }
 
     /// Give the Secret `name` the type `type_`, keeping everything else.
@@ -348,7 +360,16 @@ impl Store for FakeStore {
             return Err(EnrollError::Kube(format!("reading Secret {name}: forbidden")));
         }
         self.reads.lock().expect("lock").push(name.to_owned());
-        Ok(self.secrets.lock().expect("lock").get(name).cloned())
+        let read = self.secrets.lock().expect("lock").get(name).cloned();
+        let racing = self
+            .replace_after_read
+            .lock()
+            .expect("lock")
+            .take_if(|(named, _)| named == name);
+        if let Some((_, replacement)) = racing {
+            self.secrets.lock().expect("lock").insert(name.to_owned(), replacement);
+        }
+        Ok(read)
     }
 
     async fn create(&self, secret: &Secret) -> Result<Created, EnrollError> {
@@ -420,8 +441,15 @@ fn merge_annotations(held: &mut Secret, from: Option<&Value>) {
     }
 }
 
-/// Merge `patch` into `held` as the API server does, `false` when the resource version it
-/// names is not `held`'s.
+/// Whether the resource version and UID `patch` names, if any, are `held`'s.
+fn preconditions_hold(held: &Secret, patch: &Value, version: &str) -> bool {
+    let named = |pointer: &str| patch.pointer(pointer).and_then(Value::as_str);
+    named("/metadata/resourceVersion").is_none_or(|rv| rv == version)
+        && named("/metadata/uid").is_none_or(|uid| Some(uid) == held.metadata.uid.as_deref())
+}
+
+/// Merge `patch` into `held` as the API server does, `false` when the resource version or
+/// UID it names is not `held`'s.
 pub(super) fn merge_patch(held: &mut Secret, patch: &Value) -> bool {
     let version: u64 = held
         .metadata
@@ -430,11 +458,7 @@ pub(super) fn merge_patch(held: &mut Secret, patch: &Value) -> bool {
         .unwrap_or("0")
         .parse()
         .unwrap_or(0);
-    if patch
-        .pointer("/metadata/resourceVersion")
-        .and_then(Value::as_str)
-        .is_some_and(|named| named != version.to_string())
-    {
+    if !preconditions_hold(held, patch, &version.to_string()) {
         return false;
     }
     merge_annotations(held, patch.pointer("/metadata/annotations"));
@@ -616,6 +640,53 @@ async fn an_enrolled_site_clears_only_a_pending_secret_that_is_wholly_its_own() 
         );
     }
     assert_eq!(signer.calls(), 0);
+}
+
+#[tokio::test]
+async fn a_pending_secret_replaced_between_the_read_and_the_write_keeps_its_keys() {
+    let (signer, settings) = serve(Reply::Sign).await;
+    let store = FakeStore::invited();
+    store.put("site-tls", "tls.crt", "enrolled");
+    store.put(&pending_name(), "csr.pem", "ours");
+    store.stamp(&pending_name(), "1", "uid-ours");
+    *store.replace_after_read.lock().expect("lock") = Some((pending_name(), another_controllers(&pending_name())));
+
+    let outcome = run_flow(&store, &settings).await;
+    assert!(matches!(outcome, Ok(Outcome::AlreadyEnrolled)), "{outcome:?}");
+    assert_eq!(signer.calls(), 0);
+    let left = store
+        .secrets
+        .lock()
+        .expect("lock")
+        .get(&pending_name())
+        .cloned()
+        .expect("their Secret");
+    assert_eq!(
+        left.metadata.resource_version.as_deref(),
+        Some("999"),
+        "the write named the object it judged, so the replacement was never written"
+    );
+    assert!(
+        left.data.as_ref().is_some_and(|data| data.contains_key("payload")),
+        "their keys are intact: {:?}",
+        left.data
+    );
+}
+
+/// An Opaque Secret `name` another controller owns, at resource version 999.
+fn another_controllers(name: &str) -> Secret {
+    let mut theirs = secret(
+        name,
+        "Opaque",
+        BTreeMap::from([("payload".to_owned(), ByteString(b"theirs".to_vec()))]),
+    );
+    theirs.metadata.resource_version = Some("999".to_owned());
+    theirs.metadata.uid = Some("uid-theirs".to_owned());
+    theirs.metadata.labels = Some(BTreeMap::from([(
+        "app.kubernetes.io/managed-by".to_owned(),
+        "another-controller".to_owned(),
+    )]));
+    theirs
 }
 
 /// A request kept for `settings` with the test invite, and its key.

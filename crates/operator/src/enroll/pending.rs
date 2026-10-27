@@ -377,28 +377,59 @@ pub(super) enum Swept {
     Foreign(String),
 }
 
+/// The patch clearing `secret`'s request, key and answer, conditioned on the version and
+/// UID of the object as read, so it applies to that object and no other.
+fn clearing(secret: &Secret) -> Value {
+    let mut metadata = serde_json::Map::new();
+    for (key, value) in [
+        ("resourceVersion", &secret.metadata.resource_version),
+        ("uid", &secret.metadata.uid),
+    ] {
+        if let Some(value) = value {
+            metadata.insert(key.to_owned(), json!(value));
+        }
+    }
+    metadata.insert(
+        "annotations".to_owned(),
+        json!({ UNANSWERED: Value::Null, SITE: Value::Null, ANCHOR: Value::Null, INVITE: Value::Null }),
+    );
+    json!({
+        "metadata": metadata,
+        "data": { CSR: Value::Null, KEY: Value::Null, CERT: Value::Null, CA: Value::Null },
+    })
+}
+
 /// Clear `target`'s enrollment in flight, leaving no key behind. Idempotent: a Secret already
 /// cleared is not written again. A Secret by the pending name that enrollment did not write is
-/// left alone.
+/// left alone. The write names the object it judged, so a Secret replaced or rewritten after
+/// the read is refused by the API server, read again and judged again rather than stripped.
 pub(super) async fn clear<S: Store + Sync>(store: &S, target: &Target, backoff: Backoff) -> Result<Swept, EnrollError> {
     let name = name(target);
-    let Some(secret) = store.get(&name).await? else {
-        return Ok(Swept::Nothing);
-    };
-    // The whole object decides, as it does before a request is kept there: a Secret of
-    // another type with enrollment's labels is not enrollment's either.
-    if let Err(why) = ours(&name, &secret.metadata, secret.type_.as_deref()) {
-        return Ok(Swept::Foreign(format!("{why}, left alone")));
-    }
-    if secret.data.as_ref().is_none_or(BTreeMap::is_empty) {
-        return Ok(Swept::Nothing);
-    }
-    let patch = json!({
-        "metadata": {
-            "annotations": { UNANSWERED: Value::Null, SITE: Value::Null, ANCHOR: Value::Null, INVITE: Value::Null },
+    let name = &name;
+    with_backoff(
+        backoff,
+        "clearing the enrollment kept",
+        EnrollError::Kube,
+        || async move {
+            let Some(secret) = store.get(name).await? else {
+                return Ok(Attempt::Done(Swept::Nothing));
+            };
+            // The whole object decides, as it does before a request is kept there: a Secret of
+            // another type with enrollment's labels is not enrollment's either.
+            if let Err(why) = ours(name, &secret.metadata, secret.type_.as_deref()) {
+                return Ok(Attempt::Done(Swept::Foreign(format!("{why}, left alone"))));
+            }
+            if secret.data.as_ref().is_none_or(BTreeMap::is_empty) {
+                return Ok(Attempt::Done(Swept::Nothing));
+            }
+            // A write the API server refuses for its version or UID, or for anything else it
+            // answers, is read again and judged again rather than forced.
+            Ok(match store.patch(name, &clearing(&secret)).await {
+                Ok(Attempt::Done(())) => Attempt::Done(Swept::Cleared),
+                Ok(Attempt::Retry(reason)) | Err(EnrollError::Kube(reason)) => Attempt::Retry(reason),
+                Err(error) => return Err(error),
+            })
         },
-        "data": { CSR: Value::Null, KEY: Value::Null, CERT: Value::Null, CA: Value::Null },
-    });
-    patched(store, &name, &patch, backoff).await?;
-    Ok(Swept::Cleared)
+    )
+    .await
 }
