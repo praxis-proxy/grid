@@ -323,6 +323,25 @@ mod tests {
     }
 
     #[test]
+    fn a_sec1_key_naming_no_curve_is_refused_rather_than_assumed() {
+        use x509_parser::asn1_rs::{Any, Class, Error, FromDer as _, Sequence, Tag, ToDer as _};
+        let block = pem::parse(P256_SEC1).expect("pem");
+        let (_rest, key) = Sequence::from_der(block.contents()).expect("sequence");
+        let mut without_parameters = Vec::new();
+        for field in key.der_iter::<Any<'_>, Error>().flatten() {
+            if !(field.class() == Class::ContextSpecific && field.tag() == Tag(0)) {
+                without_parameters.extend(field.to_der_vec().expect("field"));
+            }
+        }
+        let stripped = Sequence::new(without_parameters.into()).to_der_vec().expect("sequence");
+        assert!(backend::sec1_to_pkcs8(block.contents()).is_some(), "with its curve");
+        assert!(
+            backend::sec1_to_pkcs8(&stripped).is_none(),
+            "a key that names no curve is refused, not read as P-256"
+        );
+    }
+
+    #[test]
     fn a_key_matches_only_its_own_request() {
         let csr = crate::generate_csr("east").expect("csr");
         assert!(key_matches_csr(&csr.key_pem, &csr.csr_pem));
