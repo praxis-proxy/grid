@@ -38,8 +38,8 @@ use crate::{
         grid_network::{
             ClusterEndpointConfig, ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork,
             GridNetworkPhase, GridNetworkStatus, MountReconciliation, MountReconciliationPhase,
-            MountReconciliationStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode,
-            SiteIdentityStatus, SiteRouter, TenantBudgetStatus, TransportMode,
+            MountReconciliationStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode, SiteRouter,
+            TenantBudgetStatus, TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::{Condition, InferenceProvider, InferenceProviderStatus},
@@ -176,8 +176,6 @@ pub struct OperatorCtx {
     /// Where the declared peer trust goes, so site identity rotation follows it.
     declared_trust: Option<tokio::sync::watch::Sender<PeerTrustMode>>,
 
-    /// Set while the rotation loop has a signer to renew through.
-    rotation: Arc<std::sync::atomic::AtomicBool>,
     /// This operator's own settings, which say whether this site enrolls.
     operator_config: crate::operator_config::ConfigWatch,
 
@@ -318,7 +316,6 @@ impl OperatorCtx {
     /// This is the canonical constructor used by the operator binary so that
     /// the internal metrics cache type does not need to be exported from the
     /// library crate.
-    #[expect(clippy::too_many_lines, reason = "one line per field")]
     pub fn new(client: Client, swim: Option<Arc<SwimHandle>>, signal_mode: SignalMode) -> Self {
         Self {
             client,
@@ -345,19 +342,11 @@ impl OperatorCtx {
             peer_settings: PeerSettings::default(),
             membership_ready: std::sync::atomic::AtomicBool::new(true),
             declared_trust: None,
-            rotation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             operator_config: crate::operator_config::ConfigWatch::fixed(crate::operator_config::Snapshot::absent()),
             site_name: None,
             logged: ChangeLog::default(),
             started: Instant::now(),
         }
-    }
-
-    /// Report a rotation schedule only while the rotation loop has a signer.
-    #[must_use]
-    pub fn with_rotation(mut self, rotation: Arc<std::sync::atomic::AtomicBool>) -> Self {
-        self.rotation = rotation;
-        self
     }
 
     /// Read this operator's own settings from `config`.
@@ -1746,14 +1735,11 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     .await?;
 
     let grid_id = resolve_grid_id(&network);
-    let rotation = if ctx.rotation.load(std::sync::atomic::Ordering::Relaxed) {
-        Rotation::On
-    } else {
-        Rotation::Off
-    };
-    let identity = site_identity_status(&network, client, time::OffsetDateTime::now_utc(), rotation).await;
-    // An expired or unreadable identity degrades the network.
-    let identity_failed = identity.as_ref().is_some_and(|status| !status.reason.is_empty());
+    // An expired or unreadable identity, as IdentityValid reports it, degrades the network.
+    let identity_failed = network.status.as_ref().is_some_and(|status| {
+        held_condition(&status.conditions, crate::enroll::local::IDENTITY_VALID)
+            .is_some_and(|valid| matches!(valid.reason.as_str(), "CertificateExpired" | "CertificateUnreadable"))
+    });
     let phase = if swim_runtime_running && !identity_failed {
         determine_phase(&network, &grid_id, membership.as_ref())
     } else {
@@ -1799,7 +1785,6 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         mount_reconciliation_statuses,
         overlay_statuses,
         budget_statuses,
-        identity,
     )
     .await?;
     Box::pin(apply_rollup(client, &network)).await;
@@ -5666,7 +5651,6 @@ async fn update_status(
     mount_reconciliation_statuses: Vec<MountReconciliationStatus>,
     overlay_statuses: Vec<OverlayRevisionStatus>,
     budget_statuses: Vec<TenantBudgetStatus>,
-    identity: Option<SiteIdentityStatus>,
 ) -> Result<(), OperatorError> {
     let name = grid_network_name(network)?;
 
@@ -5685,7 +5669,6 @@ async fn update_status(
         mount_reconciliation_status: keep_mount_reconciliation_status_at(network, &mount_reconciliation_statuses),
         routing_map_status: keep_rendered_at(network.status.as_ref(), overlay_statuses),
         budget_status: budget_statuses,
-        identity,
     };
 
     if !grid_network_status_needs_update(network.status.as_ref(), &status) {
@@ -5702,101 +5685,6 @@ async fn update_status(
         .await?;
 
     Ok(())
-}
-
-/// Reason a site identity past its `notAfter` reports.
-pub const IDENTITY_EXPIRED: &str = "IdentityExpired";
-
-/// `status.identity.reason` when the identity Secret holds no readable certificate.
-pub const IDENTITY_UNREADABLE: &str = "IdentityUnreadable";
-
-/// This site's identity status from its certificate, `None` without one.
-async fn site_identity_status(
-    network: &GridNetwork,
-    client: &Client,
-    now: time::OffsetDateTime,
-    rotation: Rotation,
-) -> Option<SiteIdentityStatus> {
-    use crate::resources::endpoint_tls::TlsFailureReason;
-
-    let site = network.spec.tls.site_secret_ref.as_ref()?;
-    let read =
-        crate::resources::endpoint_tls::read_secret_bytes_for_tls(client, site, "tls.crt", "signals", "site identity")
-            .await;
-    let bytes = match read {
-        Ok(bytes) => bytes,
-        // Not written yet: enrollment or the self-signed path writes it.
-        Err((TlsFailureReason::SecretMissing, _)) => return None,
-        Err((TlsFailureReason::KeyMissing, message)) => return Some(unreadable_identity(&message)),
-        // A failed read says nothing new about the certificate, so the last status stands.
-        Err(_) => return network.status.as_ref().and_then(|status| status.identity.clone()),
-    };
-    let status = String::from_utf8(bytes)
-        .ok()
-        .and_then(|pem| identity_status(&pem, now, rotation));
-    Some(status.unwrap_or_else(|| unreadable_identity("tls.crt is not a certificate")))
-}
-
-/// The identity status of a Secret that holds no usable certificate.
-fn unreadable_identity(detail: &str) -> SiteIdentityStatus {
-    // Zero, not the last good notAfter, so an expiry alert fires on broken material.
-    crate::metrics::set_site_identity_expiry(0);
-    SiteIdentityStatus {
-        not_after: String::new(),
-        rotate_after: String::new(),
-        fingerprint: String::new(),
-        reason: IDENTITY_UNREADABLE.to_owned(),
-        message: format!("the site identity cannot be read ({detail}); restore the identity Secret or re-enroll"),
-    }
-}
-
-/// Whether this site's identity renews, for `status.identity`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Rotation {
-    /// The renewal loop has a signer that renews.
-    On,
-    /// Nothing renews: the own `GridSite`'s conditions say why.
-    Off,
-}
-
-impl Rotation {
-    /// What `status.identity.message` says while the identity is current.
-    const fn message(self) -> &'static str {
-        match self {
-            Self::On => "",
-            Self::Off => "rotation is off: see the RotationOnSchedule and Accepted conditions on this site's GridSite",
-        }
-    }
-}
-
-/// The identity status of `cert_pem` at `now`; without renewal, no renewal time.
-fn identity_status(cert_pem: &str, now: time::OffsetDateTime, rotation: Rotation) -> Option<SiteIdentityStatus> {
-    use time::format_description::well_known::Rfc3339;
-    let (not_before, not_after) = certs::cert_validity(cert_pem).ok()?;
-    crate::metrics::set_site_identity_expiry(not_after.unix_timestamp());
-    let renew_after = crate::enroll::renew::renew_after(not_before, not_after);
-    let expired = now >= not_after;
-    Some(SiteIdentityStatus {
-        not_after: not_after.format(&Rfc3339).ok()?,
-        rotate_after: if rotation == Rotation::On {
-            renew_after.format(&Rfc3339).ok()?
-        } else {
-            String::new()
-        },
-        fingerprint: certs::canonical_fingerprint(cert_pem).ok()?,
-        reason: if expired {
-            IDENTITY_EXPIRED.to_owned()
-        } else {
-            String::new()
-        },
-        message: if expired {
-            "the site identity expired and cannot renew: a grid-admin deletes this site's enrollment, mints a new \
-             site token, and the site re-enrolls"
-                .to_owned()
-        } else {
-            rotation.message().to_owned()
-        },
-    })
 }
 
 /// Return whether reconciliation-owned status differs from the desired status.
@@ -8615,58 +8503,6 @@ mod tests {
 
     /// The identity status reports expiry and the renewal window, and an expired identity says how to recover.
     #[test]
-    #[expect(clippy::expect_used, reason = "test")]
-    fn the_identity_status_reports_expiry_and_the_renewal_window() {
-        let ca = certs::generate_ca("grid-ca").expect("ca");
-        let csr = certs::generate_csr("east").expect("csr");
-        let start = time::OffsetDateTime::now_utc().saturating_sub(time::Duration::days(1));
-        let validity = certs::Validity {
-            not_before: start,
-            not_after: start.saturating_add(time::Duration::days(30)),
-        };
-        let leaf = certs::sign_csr(&ca, "east", &csr.csr_pem, validity).expect("leaf");
-
-        let current = identity_status(&leaf.cert_pem, time::OffsetDateTime::now_utc(), Rotation::On).expect("status");
-        assert!(current.reason.is_empty(), "a current identity reports no reason");
-        let (not_before, not_after) = certs::cert_validity(&leaf.cert_pem).expect("validity");
-        let renew_after = crate::enroll::renew::renew_after(not_before, not_after);
-        assert_eq!(
-            current.rotate_after,
-            renew_after
-                .format(&time::format_description::well_known::Rfc3339)
-                .expect("format")
-        );
-        assert_eq!(
-            current.fingerprint,
-            certs::canonical_fingerprint(&leaf.cert_pem).expect("fp")
-        );
-
-        let expired = identity_status(&leaf.cert_pem, not_after, Rotation::On).expect("status");
-        assert_eq!(expired.reason, IDENTITY_EXPIRED);
-        assert!(expired.message.contains("re-enrolls"), "names the recovery");
-
-        let off = identity_status(&leaf.cert_pem, time::OffsetDateTime::now_utc(), Rotation::Off).expect("status");
-        assert!(
-            off.rotate_after.is_empty() && off.reason.is_empty(),
-            "nothing renewing schedules no renewal and does not degrade a current identity"
-        );
-    }
-
-    #[test]
-    #[expect(clippy::expect_used, reason = "test")]
-    fn rotation_off_without_a_signer_does_not_blame_pin_trust() {
-        let ca = certs::generate_ca("grid-ca").expect("ca");
-        let leaf = certs::generate_site_cert(&ca, "east").expect("leaf");
-        let off = identity_status(&leaf.cert_pem, time::OffsetDateTime::now_utc(), Rotation::Off).expect("status");
-        assert!(off.rotate_after.is_empty());
-        assert!(
-            off.message.contains("RotationOnSchedule") && !off.message.contains("pin"),
-            "no signer is not pin trust: {}",
-            off.message
-        );
-    }
-
-    #[test]
     fn only_spiffe_trust_renews() {
         let modes = |trust| GridModes {
             signal: SignalMode::Gossip,
@@ -8681,14 +8517,6 @@ mod tests {
             GridModes::WITHOUT_NETWORK.renews(),
             "no GridNetwork trusts by SPIFFE ID"
         );
-    }
-
-    #[test]
-    fn an_unreadable_identity_degrades_with_its_recovery() {
-        let status = unreadable_identity("tls.crt is not a certificate");
-        assert_eq!(status.reason, IDENTITY_UNREADABLE);
-        assert!(status.message.contains("re-enroll"), "names the recovery");
-        assert!(status.not_after.is_empty() && status.fingerprint.is_empty());
     }
 
     #[test]
@@ -8732,7 +8560,6 @@ mod tests {
             praxis_config_status: Vec::new(),
             routing_map_status: Vec::new(),
             budget_status: Vec::new(),
-            identity: None,
             mount_reconciliation_status: Vec::new(),
         };
         assert!(!grid_network_status_needs_update(Some(&baseline), &baseline));

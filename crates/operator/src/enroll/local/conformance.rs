@@ -199,6 +199,14 @@ async fn invariant_1_own_site_with_an_identity_is_unchanged_across_five_rounds()
     let first = rounds.first().expect("five rounds");
     invariants::available_equals_rollup(first, &GATES).expect("invariant 7, Available");
     assert_eq!(available_of(first), ("True", "Available"));
+    let valid = first.condition(IDENTITY_VALID).expect("IdentityValid");
+    let message = valid["message"].as_str().unwrap_or_default();
+    let (expiry, rest) = message.split_once(' ').unwrap_or_default();
+    assert!(
+        time::OffsetDateTime::parse(expiry, &time::format_description::well_known::Rfc3339).is_ok()
+            && rest.starts_with("is the expiry; fingerprint sha256:"),
+        "IdentityValid leads with the RFC 3339 expiry and names the fingerprint: {message}"
+    );
 }
 
 /// Five rounds with an identity, deleted before the third.

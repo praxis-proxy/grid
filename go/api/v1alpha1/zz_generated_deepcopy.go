@@ -994,19 +994,6 @@ func (in *GridNetworkGatewayAgeReportsItem) DeepCopy() *GridNetworkGatewayAgeRep
 	return out
 }
 
-func (in *GridNetworkIdentity) DeepCopyInto(out *GridNetworkIdentity) {
-	*out = *in
-}
-
-func (in *GridNetworkIdentity) DeepCopy() *GridNetworkIdentity {
-	if in == nil {
-		return nil
-	}
-	out := new(GridNetworkIdentity)
-	in.DeepCopyInto(out)
-	return out
-}
-
 func (in *GridNetworkMountReconciliationItem) DeepCopyInto(out *GridNetworkMountReconciliationItem) {
 	*out = *in
 	if in.DeploymentName != nil {
@@ -1073,10 +1060,6 @@ func (in *GridNetworkStatus) DeepCopyInto(out *GridNetworkStatus) {
 		for i := range in.GatewayAgeReports {
 			in.GatewayAgeReports[i].DeepCopyInto(&out.GatewayAgeReports[i])
 		}
-	}
-	if in.Identity != nil {
-		out.Identity = new(GridNetworkIdentity)
-		in.Identity.DeepCopyInto(out.Identity)
 	}
 	if in.MountReconciliationStatus != nil {
 		out.MountReconciliationStatus = make([]GridNetworkMountReconciliationItem, len(in.MountReconciliationStatus))

@@ -47,6 +47,14 @@ spec:
           name: Phase
           priority: 1
           type: string
+        - jsonPath: .status.conditions[?(@.type=="Enrolled")].status
+          name: Enrolled
+          priority: 1
+          type: string
+        - jsonPath: .status.conditions[?(@.type=="IdentityValid")].status
+          name: Identity
+          priority: 1
+          type: string
       name: v1alpha1
       schema:
         openAPIV3Schema:
@@ -2340,35 +2348,6 @@ spec:
                   default: ""
                   description: The negotiated grid ID.
                   type: string
-                identity:
-                  description: 'This site''s identity certificate: when it expires and when rotation is due.'
-                  nullable: true
-                  properties:
-                    fingerprint:
-                      description: SHA-256 of the certificate DER, the digest peers pin.
-                      type: string
-                    message:
-                      description: How to recover.
-                      type: string
-                    notAfter:
-                      description: When the certificate expires, RFC 3339.
-                      type: string
-                    reason:
-                      description: |-
-                        `IdentityExpired` once the certificate has expired, `IdentityUnreadable` when the
-                        Secret holds no usable certificate.
-                      pattern: ^(IdentityExpired|IdentityUnreadable)$
-                      type: string
-                    rotateAfter:
-                      description: |-
-                        When rotation is due, a third of the lifetime before `notAfter`, RFC 3339. Empty
-                        under pin peer trust, or when this site's operator does not rotate.
-                      type: string
-                  required:
-                    - fingerprint
-                    - notAfter
-                    - rotateAfter
-                  type: object
                 mountReconciliationStatus:
                   description: |-
                     Per-gateway Secret requirements and optional mount reconciliation status.

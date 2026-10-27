@@ -2,10 +2,7 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -574,8 +571,6 @@ pub struct Settings {
     install: GridModes,
     /// The declared peer trust, sent by the `GridNetwork` reconcile when it changes.
     trust_changes: Option<tokio::sync::watch::Receiver<PeerTrustMode>>,
-    /// Set while a signer to renew through is named.
-    configured: Arc<AtomicBool>,
     /// The site the identity names, whose `GridSite` is this cluster's own.
     site: Option<String>,
     /// The operator config naming the signer.
@@ -597,7 +592,6 @@ impl Settings {
             gateway: None,
             install: GridModes::WITHOUT_NETWORK,
             trust_changes: None,
-            configured: Arc::new(AtomicBool::new(false)),
             site: None,
             config: ConfigWatch::fixed(Snapshot::absent()),
         }
@@ -614,13 +608,6 @@ impl Settings {
     #[must_use]
     pub fn with_site(mut self, site: Option<String>) -> Self {
         self.site = site;
-        self
-    }
-
-    /// Publish into `configured` whether a signer to renew through is named.
-    #[must_use]
-    pub fn with_configured(mut self, configured: Arc<AtomicBool>) -> Self {
-        self.configured = configured;
         self
     }
 
@@ -845,7 +832,6 @@ async fn tick(loop_: &Loop<'_>, settings: &Settings, target: &Result<Target, sup
         Err(error) => Round::failed(RenewError::Kube(error.to_string())),
         Ok(target) => Box::pin(check_round(loop_, target, settings.site.as_deref(), &declared)).await,
     };
-    settings.configured.store(round.signer.is_some(), Ordering::Relaxed);
     // A round given up for a stand-down says nothing new, and writing would hold the stand-down.
     if let (Ok(target), false) = (target, matches!(round.checked, Err(RenewError::StoodDown))) {
         let refs = match snapshot.loaded.site() {
@@ -889,8 +875,8 @@ enum Identity {
     NameMismatch(String),
     /// The key is not the certificate's: what to fix.
     KeyMismatch(String),
-    /// Usable until this instant.
-    Valid(OffsetDateTime),
+    /// Usable until this instant, with the fingerprint peers pin.
+    Valid(OffsetDateTime, String),
 }
 
 /// One round's check, the signer it went through, and the identity it read.
@@ -974,9 +960,13 @@ async fn read_identity(loop_: &Loop<'_>, target: &Target) -> Result<Read, Round>
         },
         Err(error) => return Err(Round::failed(error)),
     };
-    let (not_before, not_after) = validity(&held).map_err(|error| Round {
-        identity: Some(Identity::Unreadable(error.to_string())),
-        ..Round::failed(error)
+    let (not_before, not_after) = validity(&held).map_err(|error| {
+        // Zero, not the last good notAfter, so an expiry alert fires on broken material.
+        metrics::set_site_identity_expiry(0);
+        Round {
+            identity: Some(Identity::Unreadable(error.to_string())),
+            ..Round::failed(error)
+        }
     })?;
     metrics::set_site_identity_expiry(not_after.unix_timestamp());
     Ok(Read {
@@ -998,7 +988,8 @@ fn identity_of(read: &Read, target: &Target, site: Option<&str>, renews: bool) -
     if renews && !certs::has_svid_profile(&read.held.cert).unwrap_or(false) {
         return Identity::Unusable;
     }
-    Identity::Valid(read.not_after)
+    let fingerprint = certs::canonical_fingerprint(&read.held.cert).unwrap_or_default();
+    Identity::Valid(read.not_after, fingerprint)
 }
 
 /// Whether `held` is `site`'s identity from the grid CA it holds, with its own key.
@@ -1203,7 +1194,11 @@ fn identity_verdict(identity: &Identity) -> Verdict {
         Identity::Untrusted(why) => Verdict::new("False", "CertificateUntrusted", why.clone()),
         Identity::NameMismatch(why) => Verdict::new("False", "CertificateNameMismatch", why.clone()),
         Identity::KeyMismatch(why) => Verdict::new("False", "CertificateKeyMismatch", why.clone()),
-        Identity::Valid(at) => Verdict::new("True", local::IDENTITY_VALID, format!("valid until {at}")),
+        Identity::Valid(at, fingerprint) => Verdict::new(
+            "True",
+            local::IDENTITY_VALID,
+            format!("{} is the expiry; fingerprint sha256:{fingerprint}", rfc3339(*at)),
+        ),
     }
 }
 
@@ -1221,18 +1216,8 @@ fn rotation_verdict(checked: &Result<Checked, RenewError>, url: Option<&String>)
             Verdict::new("False", "RenewalNeedsPassthrough", error.to_string())
         },
         Err(error) => Verdict::new("False", "RenewalFailing", error.to_string()),
-        Ok(Checked::Waiting(_) | Checked::Renewed(_)) => match url {
-            Some(url) => Verdict::new(
-                "True",
-                local::ROTATION_ON_SCHEDULE,
-                format!("renews through {url}, from site.signerEndpoint"),
-            ),
-            None => Verdict::new(
-                "False",
-                "RenewalFailing",
-                "renewal went through no named signer".to_owned(),
-            ),
-        },
+        Ok(Checked::Waiting(at)) => on_schedule(url, Some(*at)),
+        Ok(Checked::Renewed(_)) => on_schedule(url, None),
         Ok(Checked::Expired(at)) => Verdict::new(
             "False",
             "RotationOverdue",
@@ -1240,6 +1225,23 @@ fn rotation_verdict(checked: &Result<Checked, RenewError>, url: Option<&String>)
         ),
         Ok(Checked::Off { why, due, renewer }) => off_verdict(*why, *due, renewer.as_deref()),
     }
+}
+
+/// What `RotationOnSchedule` says of a check through the signer at `url` that is renewing
+/// at `due`, or just renewed.
+fn on_schedule(url: Option<&String>, due: Option<OffsetDateTime>) -> Verdict {
+    let Some(url) = url else {
+        return Verdict::new(
+            "False",
+            "RenewalFailing",
+            "renewal went through no named signer".to_owned(),
+        );
+    };
+    let message = match due {
+        Some(at) => format!("renews at {} through {url}, from site.signerEndpoint", rfc3339(at)),
+        None => format!("renewed through {url}, from site.signerEndpoint"),
+    };
+    Verdict::new("True", local::ROTATION_ON_SCHEDULE, message)
 }
 
 /// What `RotationOnSchedule` says while the operator does not renew for `why`, with renewal
@@ -1440,6 +1442,12 @@ fn report(checked: &Result<Checked, RenewError>, changed: bool, wait: Duration) 
         },
         Ok(_) => {},
     }
+}
+
+/// `at` in RFC 3339, as conditions say it.
+fn rfc3339(at: OffsetDateTime) -> String {
+    at.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
 }
 
 /// Time from `now` to `at`, zero once passed.

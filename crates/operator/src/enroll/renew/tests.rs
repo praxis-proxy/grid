@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use reqwest::StatusCode;
 use time::Duration as Span;
@@ -930,7 +930,7 @@ fn identity_valid_follows_what_was_read() {
         ),
         (Identity::Expired(now), "False", "CertificateExpired"),
         (Identity::Unusable, "False", "CertificateUnusable"),
-        (Identity::Valid(now), "True", "IdentityValid"),
+        (Identity::Valid(now, String::new()), "True", "IdentityValid"),
     ] {
         let verdict = identity_verdict(&identity);
         assert_eq!(
@@ -973,7 +973,7 @@ fn off_round(why: Off, refused: Option<Verdict>) -> Round {
             renewer: None,
         }),
         signer: None,
-        identity: Some(Identity::Valid(now)),
+        identity: Some(Identity::Valid(now, String::new())),
         refused,
     }
 }
@@ -1044,7 +1044,7 @@ fn an_enrolled_site_keeps_issued_while_the_identity_is_present() {
     let round = Round {
         checked: Ok(Checked::Waiting(now)),
         signer: None,
-        identity: Some(Identity::Valid(now)),
+        identity: Some(Identity::Valid(now, String::new())),
         refused: None,
     };
     let written = |enrolled: bool| -> Vec<String> {

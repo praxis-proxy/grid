@@ -248,14 +248,12 @@ async fn main() {
     // The loop follows the declared peer trust, which may change after startup.
     let (declared_trust, trust_changes) = tokio::sync::watch::channel(trust);
     // Renews through the signer the operator config names; an unidentified site restarts once enrolled.
-    let rotation = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Released once the renewal loop has returned, after any write it had under way.
     let (renewal_done_tx, renewal_done) = operator::shutdown::Trigger::new();
     let mut renewal_done_tx = Some(renewal_done_tx);
     if has_identity {
         let settings = operator::enroll::renew::Settings::new()
             .with_config(operator_config.clone())
-            .with_configured(Arc::clone(&rotation))
             .with_site(config.swim.site_name.clone())
             .with_gateway(&config.gateway.namespace, &config.gateway.service_name)
             .with_declared_trust(install_modes, trust_changes);
@@ -292,7 +290,6 @@ async fn main() {
         OperatorCtx::new(client.clone(), None, signal_mode)
             .with_peer_settings(peer_settings)
             .with_declared_trust(declared_trust)
-            .with_rotation(rotation)
             .with_operator_config(operator_config.clone())
             .with_site_name(config.swim.site_name.clone())
             .with_scrape_interval(config.signals.scrape_interval())

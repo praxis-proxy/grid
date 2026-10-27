@@ -766,20 +766,6 @@ type GridNetworkGatewayAgeReportsItem struct {
 	Skew int64 `json:"skew"`
 }
 
-// GridNetworkIdentity This site's identity certificate: when it expires and when rotation is due.
-type GridNetworkIdentity struct {
-	// SHA-256 of the certificate DER, the digest peers pin.
-	Fingerprint string `json:"fingerprint"`
-	// How to recover.
-	Message string `json:"message,omitempty"`
-	// When the certificate expires, RFC 3339.
-	NotAfter string `json:"notAfter"`
-	// IdentityExpired once the certificate has expired, IdentityUnreadable when the Secret holds no usable certificate.
-	Reason string `json:"reason,omitempty"`
-	// When rotation is due, a third of the lifetime before notAfter, RFC 3339. Empty under pin peer trust, or when this site's operator does not rotate.
-	RotateAfter string `json:"rotateAfter"`
-}
-
 // GridNetworkMountReconciliationItem Per-gateway progress for Secret mount reconciliation and gateway readiness.
 type GridNetworkMountReconciliationItem struct {
 	// Digest last mounted and rolled out by Grid.
@@ -880,8 +866,6 @@ type GridNetworkStatus struct {
 	GatewayAgeReports []GridNetworkGatewayAgeReportsItem `json:"gatewayAgeReports,omitempty"`
 	// The negotiated grid ID.
 	GridID string `json:"gridId,omitempty"`
-	// This site's identity certificate: when it expires and when rotation is due.
-	Identity *GridNetworkIdentity `json:"identity,omitempty"`
 	// Per-gateway Secret requirements and optional mount reconciliation status.
 	// Populated for every gateway with praxisConfig.generate: true. Without explicit mount reconciliation, the phase remains RequirementsRendered.
 	MountReconciliationStatus []GridNetworkMountReconciliationItem `json:"mountReconciliationStatus,omitempty"`
