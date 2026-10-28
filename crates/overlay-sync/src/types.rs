@@ -165,6 +165,10 @@ pub(crate) struct RoutingCandidate {
     /// Whether the candidate is healthy.
     pub(crate) fresh: bool,
 
+    /// RFC 3339 UTC expiry deadline for a discovered model candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expires_at: Option<String>,
+
     /// Credential reference (Secret locator only, never the value).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) credential: Option<ProjectedCredential>,

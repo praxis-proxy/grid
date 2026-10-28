@@ -10,6 +10,7 @@ publish = false
 [features]
 default = ["ring-signing"]
 ring-signing = ["dep:ring"]
+# Use the host OpenSSL provider for model inventory digest verification.
 fips = ["dep:openssl"]
 
 [dependencies]
@@ -22,6 +23,7 @@ rand09 = { workspace = true }
 ring = { workspace = true, optional = true }
 openssl = { workspace = true, optional = true }
 serde = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }

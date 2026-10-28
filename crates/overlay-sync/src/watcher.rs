@@ -494,6 +494,7 @@ mod tests {
                 site: scope.local_site.clone(),
                 cluster: "cluster-a".to_owned(),
                 fresh: true,
+                expires_at: None,
                 credential: None,
                 stable_id: Some("abcd1234".to_owned()),
                 admission_state: None,

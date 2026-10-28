@@ -731,6 +731,10 @@ func (in *GridNetworkConsumerGatewaysItemProviderHopEndpointsItem) DeepCopy() *G
 
 func (in *GridNetworkConsumerGatewaysItem) DeepCopyInto(out *GridNetworkConsumerGatewaysItem) {
 	*out = *in
+	if in.ModelDiscoveryContractVersion != nil {
+		x := *in.ModelDiscoveryContractVersion
+		out.ModelDiscoveryContractVersion = &x
+	}
 	if in.PraxisConfig != nil {
 		out.PraxisConfig = new(GridNetworkConsumerGatewaysItemPraxisConfig)
 		in.PraxisConfig.DeepCopyInto(out.PraxisConfig)

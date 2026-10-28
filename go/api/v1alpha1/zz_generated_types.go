@@ -609,6 +609,9 @@ type GridNetworkConsumerGatewaysItemProviderHopEndpointsItem struct {
 
 // GridNetworkConsumerGatewaysItem Reference to a Praxis Gateway that participates in this grid.
 type GridNetworkConsumerGatewaysItem struct {
+	// Model-discovery contract version supported by the running gateway.
+	// Set this only after the gateway is running an image that understands the expires_at routing-candidate field and enforces its deadline. The operator includes discovered model candidates only when this is exactly v1; absent or other values keep dynamic candidates withheld.
+	ModelDiscoveryContractVersion *string `json:"modelDiscoveryContractVersion,omitempty"`
 	// Gateway name.
 	Name string `json:"name"`
 	// Gateway namespace.
@@ -1123,7 +1126,7 @@ type OpenAIModelsSource struct {
 }
 
 // ModelDiscoveryConfig Where to discover the models this provider serves.
-// When set, the operator polls the backend on a fixed cadence and holds the served-model set in memory, expiring it when polls stop succeeding. Until route and provider-record formats support inventory expiry, discovered names are withheld and do not fall back to spec.models. When absent, no discovery runs. Exactly one source field must be set (CRD oneOf).
+// When set, the operator polls the backend on a fixed cadence and holds the served-model set in memory, expiring it when polls stop succeeding. Discovered names may be routed locally to gateways that declare model-discovery contract v1. They are withheld from provider records, whose current wire format cannot carry expiry, and never fall back to spec.models. When absent, no discovery runs. Exactly one source field must be set (CRD oneOf).
 type ModelDiscoveryConfig struct {
 	// OpenAI-compatible GET /v1/models (vLLM, KServe, OpenAI).
 	// Reads data[].id from the response. The response is rejected as a whole when it is not valid JSON, has a blank, overlong, or duplicate id, or lists more models than the operator's cap. A rejected response never clears the previously discovered set.
@@ -1176,7 +1179,7 @@ type InferenceProviderSpec struct {
 	// [GridNetwork]: crate::crd::grid_network::GridNetwork
 	MetricsConfig *MetricsConfig `json:"metricsConfig,omitempty"`
 	// Where to discover the models this provider serves.
-	// When set, the operator polls the backend on a fixed cadence and holds the served-model set in memory, expiring it when polls stop succeeding. Until route and provider-record formats support inventory expiry, discovered names are withheld and do not fall back to spec.models. When absent, no discovery runs.
+	// When set, the operator polls the backend on a fixed cadence and holds the served-model set in memory, expiring it when polls stop succeeding. Discovered names may be routed locally to gateways that declare model-discovery contract v1. They are withheld from provider records, whose current wire format cannot carry expiry, and never fall back to spec.models. When absent, no discovery runs.
 	ModelDiscovery *ModelDiscoveryConfig `json:"modelDiscovery,omitempty"`
 	// Models served by this provider.
 	Models []ModelInfo `json:"models,omitempty"`

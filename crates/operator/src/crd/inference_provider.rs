@@ -114,8 +114,10 @@ pub struct InferenceProviderSpec {
     ///
     /// When set, the operator polls the backend on a fixed cadence and holds
     /// the served-model set in memory, expiring it when polls stop succeeding.
-    /// Until route and provider-record formats support inventory expiry,
-    /// discovered names are withheld and do not fall back to `spec.models`.
+    /// Discovered names may be routed locally to gateways that declare
+    /// model-discovery contract `v1`. They are withheld from provider records,
+    /// whose current wire format cannot carry expiry, and never fall back to
+    /// `spec.models`.
     /// When absent, no discovery runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_discovery: Option<ModelDiscoveryConfig>,

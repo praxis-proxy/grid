@@ -106,6 +106,7 @@ mod tests {
                     site: site.to_owned(),
                     cluster: cluster.to_owned(),
                     fresh: true,
+                    expires_at: None,
                     credential: None,
                     stable_id: None,
                     admission_state: None,

@@ -206,6 +206,13 @@ consumer of a gateway's overlay must therefore run an image with empty-snapshot
 support before this Grid version is deployed. The paired AI change and a
 compatible image release are prerequisites for the next Grid release.
 
+For discovered models, set `GatewayRef.modelDiscoveryContractVersion: v1`
+only after the running Praxis image implements the model-discovery contract. Without that
+declaration, Grid withholds discovered candidates from that gateway. The `v1`
+model-discovery contract carries `expires_at` as RFC 3339 UTC and expires the route
+when gateway UTC reaches the deadline minus 30 seconds, covering up to 30
+seconds of clock lag.
+
 The embedded gateway's filter chain and upstream cluster definitions remain in
 its startup Praxis configuration, but its changing candidate list is not a
 startup-only inline list: it comes from the watched Grid serving ConfigMap.

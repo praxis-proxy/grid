@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::crd::inference_provider::Condition;
 
+/// Gateway model-discovery contract version required for dynamic model routes.
+pub const MODEL_DISCOVERY_CONTRACT_VERSION: &str = "v1";
+
 // ---------------------------------------------------------------------------
 // Routing policy
 // ---------------------------------------------------------------------------
@@ -852,6 +855,15 @@ pub struct GatewayRef {
     #[serde(default, alias = "localSiteName")]
     pub site_name: Option<String>,
 
+    /// Model-discovery contract version supported by the running gateway.
+    ///
+    /// Set this only after the gateway is running an image that understands
+    /// the `expires_at` routing-candidate field and enforces its deadline.
+    /// The operator includes discovered model candidates only when this is
+    /// exactly `v1`; absent or other values keep dynamic candidates withheld.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_discovery_contract_version: Option<String>,
+
     /// Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
     /// serving config. With the default `praxisConfig.siteRouter`
     /// `intelligentRoute` this allowlist is independent of `praxisConfig`, so a
@@ -880,6 +892,14 @@ pub struct GatewayRef {
     /// compatible filter config is already running.
     #[serde(default, alias = "consumerConfig", skip_serializing_if = "Option::is_none")]
     pub praxis_config: Option<ConsumerConfig>,
+}
+
+impl GatewayRef {
+    /// Whether the declared running gateway supports model-discovery contract `v1`, including candidate expiry.
+    #[must_use]
+    pub fn supports_model_discovery_contract(&self) -> bool {
+        self.model_discovery_contract_version.as_deref() == Some(MODEL_DISCOVERY_CONTRACT_VERSION)
+    }
 }
 
 /// Opt-in configuration for operator-generated consumer Praxis config.
@@ -2253,6 +2273,33 @@ mod tests {
     }
 
     #[test]
+    fn model_discovery_contract_requires_exact_supported_version() {
+        let parse_gateway = |version: Option<&str>| {
+            let mut value = serde_json::json!({"name": "gw", "namespace": "ns"});
+            if let Some(version) = version {
+                let Some(object) = value.as_object_mut() else {
+                    std::process::abort();
+                };
+                object.insert("modelDiscoveryContractVersion".to_owned(), serde_json::json!(version));
+            }
+            serde_json::from_value::<GatewayRef>(value).unwrap_or_else(|_| std::process::abort())
+        };
+
+        assert!(
+            parse_gateway(Some("v1")).supports_model_discovery_contract(),
+            "known model discovery contract must enable discovered routes"
+        );
+        assert!(
+            !parse_gateway(None).supports_model_discovery_contract(),
+            "missing gateway contract must fail closed"
+        );
+        assert!(
+            !parse_gateway(Some("v2")).supports_model_discovery_contract(),
+            "unknown future contract must fail closed"
+        );
+    }
+
+    #[test]
     fn telemetry_config_rejects_embedded_headers() {
         let with_headers = serde_json::json!({
             "otlpEndpoint": "http://collector:4317",
@@ -2446,6 +2493,7 @@ mod tests {
             name: "gw".to_owned(),
             namespace: "ns".to_owned(),
             site_name: None,
+            model_discovery_contract_version: None,
             provider_hop_endpoints: Vec::new(),
             praxis_config: None,
         };
@@ -2472,6 +2520,10 @@ mod tests {
         assert!(
             gateway_ref_properties.contains_key("providerHopEndpoints"),
             "CRD schema must include independent providerHopEndpoints on GatewayRef"
+        );
+        assert!(
+            gateway_ref_properties.contains_key("modelDiscoveryContractVersion"),
+            "CRD schema must expose the gateway's model discovery contract version"
         );
         let consumer_config_properties = gateway_ref_properties
             .get("praxisConfig")

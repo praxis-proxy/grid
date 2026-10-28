@@ -153,6 +153,25 @@ impl ModelInventory {
     pub(crate) fn is_static(&self) -> bool {
         matches!(self, Self::Static(_))
     }
+
+    /// Expiry deadline for discovered names, absent for a static inventory.
+    #[must_use]
+    pub(crate) fn expires_at(&self) -> Option<&str> {
+        match self {
+            Self::Static(_) => None,
+            Self::Discovered(inventory) => Some(&inventory.expires_at),
+        }
+    }
+
+    /// Create a discovered inventory with its deadline and producing generation.
+    #[cfg(test)]
+    pub(crate) fn discovered(models: Arc<[String]>, expires_at: String, observed_generation: i64) -> Self {
+        Self::Discovered(DiscoveredModelInventory {
+            models,
+            expires_at,
+            observed_generation,
+        })
+    }
 }
 
 /// Identity of the provider and concrete endpoint used for discovery.
@@ -885,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_discovered_inventory_is_not_routed_or_gossiped() {
+    fn fresh_discovered_inventory_is_routed_but_not_gossiped() {
         let provider = discovery_provider("p", &serde_json::json!({}));
         let store = ServedModelStore::new();
         refresh(&store, round(&[("p", Some(&["discovered"]))]), TTL);
@@ -909,6 +928,8 @@ mod tests {
             std::slice::from_ref(&provider),
             &[],
             &[],
+            &[],
+            "test-id",
             "site-a",
             None,
             None,
@@ -916,14 +937,19 @@ mod tests {
             &scoring::ScoringWeights::default(),
             None,
             &store,
+            crate::resources::routing_overlay::CandidateExpirySupport::Supported,
         )
         .unwrap_or_else(|_| std::process::abort());
         let state = crate::controller::grid_network::provider_state_from_kube(&provider, "net", "site-a", None, &store)
             .unwrap_or_else(|| std::process::abort());
 
-        assert!(
-            overlay.candidates.is_empty(),
-            "fresh discovered models must not produce routing candidates"
+        assert_eq!(overlay.candidates.len(), 1, "fresh discovered model must route");
+        let candidate = overlay.candidates.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(candidate.name, "discovered", "candidate uses discovered model name");
+        assert_eq!(
+            candidate.expires_at.as_deref(),
+            inventory.expires_at(),
+            "candidate carries inventory expiry"
         );
         assert!(state.models.is_empty(), "fresh discovered models must not be gossiped");
     }

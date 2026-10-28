@@ -2550,6 +2550,7 @@ mod tests {
                 site: "api-site".to_owned(),
                 cluster: "api-cluster".to_owned(),
                 fresh: true,
+                expires_at: None,
                 credential: Some(ProjectedCredential {
                     strategy: "bearer_token".to_owned(),
                     secret_ref: ProjectedCredentialRef {

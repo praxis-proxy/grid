@@ -17,6 +17,10 @@ fingerprint hashing (peer identity and pin matching) through system openssl, so
 no identity crypto runs on ring or the sha2 crate. Keygen uses OpenSSL EVP, which
 a FIPS host refuses for a non-approved curve.
 
+The operator's `fips` feature propagates to `swim`, where model inventory
+digests are computed through system openssl before a completed inventory is
+accepted. Non-FIPS builds continue to compute those digests with `sha2`.
+
 The enrollment service is the production certificate signer. Its `fips` feature
 routes the same certs backend and, through system openssl, the server TLS
 listener, the Postgres transport, the one-time token RNG, and the site-token
