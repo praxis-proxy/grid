@@ -584,10 +584,6 @@ pub(crate) fn parse_server_name(server_name: &str) -> Result<ServerName, ()> {
 /// Returns [`MetricsScrapeError::TlsMaterial`] when PEM parsing fails or the
 /// material is structurally invalid.
 #[cfg(not(feature = "fips"))]
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential PEM parsing for CA, client cert, and client key with validation"
-)]
 pub(crate) fn build_tls_client_config(
     ca_pem: &[u8],
     client_cert_pem: Option<&[u8]>,
@@ -684,10 +680,6 @@ pub(crate) fn build_tls_client_config(
 /// Returns [`MetricsScrapeError::TlsMaterial`] when PEM parsing fails or the
 /// material is structurally invalid.
 #[cfg(feature = "fips")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential PEM parsing for CA, client cert, and client key with validation"
-)]
 pub(crate) fn build_tls_client_config(
     ca_pem: &[u8],
     client_cert_pem: Option<&[u8]>,

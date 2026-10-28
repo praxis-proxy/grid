@@ -277,10 +277,6 @@ fn handle_event(event: Event<ConfigMap>, config: &WatcherConfig, status: &Shared
 }
 
 /// Process a `ConfigMap`: extract, validate, and write the overlay.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the extraction, validation, and publication outcomes are clearer in one bounded pipeline"
-)]
 fn process_configmap(
     cm: &ConfigMap,
     config: &WatcherConfig,

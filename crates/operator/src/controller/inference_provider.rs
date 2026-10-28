@@ -552,10 +552,6 @@ pub(crate) fn requeue_interval_for_provider(spec: &InferenceProviderSpec) -> Dur
 /// [`Healthy`]: ProbeOutcome::Healthy
 /// [`Degraded`]: ProbeOutcome::Degraded
 /// [`Unavailable`]: ProbeOutcome::Unavailable
-#[expect(
-    clippy::too_many_lines,
-    reason = "scheme check + TLS branch + client build + request: sequential steps"
-)]
 pub(crate) async fn probe_endpoint(
     uri: Uri,
     timeout: Duration,
@@ -983,10 +979,6 @@ fn site_key(site: &GridSite) -> String {
 #[expect(
     clippy::too_many_arguments,
     reason = "all parameters are distinct reconcile outputs; no logical grouping reduces them"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "constructing and comparing reconcile-owned status fields belongs with the patch"
 )]
 async fn update_status(
     provider: &InferenceProvider,
@@ -3019,7 +3011,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "tests multiple TLS fields in one assertion block")]
     fn health_check_config_with_tls_and_client_cert_deserializes() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",

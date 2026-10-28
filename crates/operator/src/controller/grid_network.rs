@@ -354,7 +354,6 @@ impl OperatorCtx {
     /// This is the canonical constructor used by the operator binary so that
     /// the internal metrics cache type does not need to be exported from the
     /// library crate.
-    #[expect(clippy::too_many_lines, reason = "one initializer per field")]
     pub fn new(client: Client, swim: Option<Arc<SwimHandle>>, signal_mode: SignalMode) -> Self {
         Self {
             client,
@@ -1523,10 +1522,6 @@ fn persisted_grid_id(network: &GridNetwork) -> Option<&str> {
 
 /// Add or remove the SWIM-withdrawal finalizer without changing other finalizers.
 #[expect(
-    clippy::too_many_lines,
-    reason = "bounded conflict retry must keep its rebase invariants together"
-)]
-#[expect(
     clippy::large_stack_frames,
     reason = "async Kubernetes API calls carry large request and response values"
 )]
@@ -1600,10 +1595,6 @@ fn set_withdrawal_finalizer(finalizers: &mut Vec<String>, present: bool) -> bool
 }
 
 /// Complete a deleting network's local SWIM withdrawal before Kubernetes removes it.
-#[expect(
-    clippy::too_many_lines,
-    reason = "finalizer lifecycle keeps the retry and confirmation decisions adjacent"
-)]
 #[expect(
     clippy::cognitive_complexity,
     reason = "finalizer lifecycle has explicit branches for every safe deletion outcome"
@@ -2112,10 +2103,6 @@ fn held_condition<'held>(held: &'held [Condition], type_: &str) -> Option<&'held
 /// its local `GridSite` declaratively, this controller must still hand it to the
 /// `GridSite` controller for gateway probing. The status write is idempotent and
 /// only applies while the site is still pending.
-#[expect(
-    clippy::too_many_lines,
-    reason = "status patch keeps the local-site transition explicit"
-)]
 async fn reconcile_local_site(network_name: &str, local_site: &str, client: &Client) -> Result<(), OperatorError> {
     let api: Api<GridSite> = Api::all(client.clone());
     let Ok(site) = Box::pin(api.get(local_site)).await.map(Box::new) else {
@@ -2310,10 +2297,6 @@ pub(crate) fn diff_seed_sets(previous: &[SocketAddr], desired: &[SocketAddr]) ->
     clippy::cognitive_complexity,
     reason = "conditional logging paths for add/remove/announce; splitting would obscure the announce sequence"
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "linear announce sequence: resolve → diff → log → announce → update tracker"
-)]
 async fn announce_crd_seeds(
     network: &GridNetwork,
     swim: &SwimHandle,
@@ -2498,7 +2481,6 @@ fn config_enrolls(config: &crate::operator_config::Snapshot) -> bool {
 /// wrote is the grid's, and a new one would split it.
 #[expect(
     clippy::large_stack_frames,
-    clippy::too_many_lines,
     clippy::cognitive_complexity,
     reason = "decide, then create the CA and the identity it signs, as one step"
 )]
@@ -3225,10 +3207,6 @@ fn serving_provider_hop_sni_for_overlay(
 
 /// Resolve embedded-gateway provider hops from their dedicated `GatewayRef`
 /// contract, not from the optional generated consumer Praxis config.
-#[expect(
-    clippy::too_many_lines,
-    reason = "each provider-hop declaration is checked before routing"
-)]
 fn serving_provider_hop_clusters(gw_ref: &GatewayRef) -> Result<BTreeSet<String>, OperatorError> {
     let mut clusters = BTreeSet::new();
     for endpoint in &gw_ref.provider_hop_endpoints {
@@ -3290,10 +3268,6 @@ fn fold_serving_write(
 }
 
 /// Apply the serving config `ConfigMap` when changed, returning when to retry a deferred write.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the render, the write gate, and the apply are one serving write"
-)]
 async fn apply_serving_config(
     overlay: &routing_overlay::RoutingOverlay,
     source: &ServingSource<'_>,
@@ -3382,10 +3356,6 @@ fn keep_rendered_at(
 
 /// Keep last applied consumer status for gateways whose empty candidate set
 /// deliberately retained their previous working config.
-#[expect(
-    clippy::too_many_lines,
-    reason = "preserving last-good per-gateway status is one compact selection pass"
-)]
 fn keep_consumer_config_status_at(
     network: &GridNetwork,
     desired: &[ConsumerConfigStatus],
@@ -3683,10 +3653,6 @@ fn inactive_consumer_config_map_name(base: &str, active: &str) -> String {
     reason = "the exact GridNetwork/gateway inputs define this immutable render"
 )]
 #[expect(
-    clippy::too_many_lines,
-    reason = "render, publish requirements, and apply config as one gateway operation"
-)]
-#[expect(
     clippy::large_stack_frames,
     reason = "render result crosses the optional delegated async boundary"
 )]
@@ -3779,10 +3745,6 @@ fn mount_requirements_document(
 #[expect(
     clippy::too_many_arguments,
     reason = "the helper combines one render with its exact owner configuration"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "all delegated requirements must be canonicalized as one document"
 )]
 fn delegated_mount_requirements_document(
     rendered: &consumer_config::ConsumerRenderResult,
@@ -3883,10 +3845,6 @@ fn add_chart_serving_tls_item(
 }
 
 /// Confirm that the chart's read-only TLS mount supplies each serving file.
-#[expect(
-    clippy::too_many_lines,
-    reason = "validate every external TLS file against its mounted Secret source"
-)]
 fn validate_chart_managed_serving_tls(
     requirements: &consumer_config::MountRequirementsDocument,
     deployment: &Deployment,
@@ -4566,10 +4524,6 @@ async fn reconcile_delegated_gateway(
 
 /// Build a Grid-owned volume replacement or deletion patch after checking all
 /// consumers outside the target container.
-#[expect(
-    clippy::too_many_lines,
-    reason = "keep ownership checks and the matching mutation patch in one policy helper"
-)]
 fn owned_volume_mutation_patch(
     pod_spec: &k8s_openapi::api::core::v1::PodSpec,
     target_container_name: &str,
@@ -4613,10 +4567,6 @@ fn owned_volume_mutation_patch(
 }
 
 /// Confirm the Deployment's explicit opt-in and selected container identity.
-#[expect(
-    clippy::too_many_lines,
-    reason = "validate explicit owner annotations and selected container together"
-)]
 fn validate_deployment_delegation(
     deployment: &Deployment,
     network_name: &str,
@@ -4662,10 +4612,6 @@ fn validate_deployment_delegation(
 }
 
 /// Verify that the selected container receives Grid's generated praxis.yaml.
-#[expect(
-    clippy::too_many_lines,
-    reason = "mount path, volume source, and key projection form one fail-closed config-source check"
-)]
 fn validate_deployment_config_source(
     pod_spec: &k8s_openapi::api::core::v1::PodSpec,
     container: &k8s_openapi::api::core::v1::Container,
@@ -4731,10 +4677,6 @@ fn validate_deployment_config_source(
 }
 
 /// Read only Secret key presence and resource versions for a requirements document.
-#[expect(
-    clippy::too_many_lines,
-    reason = "validate same-namespace Secret references, keys, and versions in one pass"
-)]
 async fn validate_required_secrets(
     document: &consumer_config::MountRequirementsDocument,
     gateway_namespace: &str,
@@ -4873,10 +4815,6 @@ fn mount_failure(reason: &'static str, message: impl Into<String>) -> crate::err
 }
 
 /// Build a sanitized status entry after mount reconciliation failed.
-#[expect(
-    clippy::too_many_lines,
-    reason = "maps stable failure categories to the public mount lifecycle status"
-)]
 fn mount_reconciliation_status_error(
     gw_ref: &GatewayRef,
     delegation: Option<&MountReconciliation>,
@@ -5079,10 +5017,6 @@ fn legacy_overlay_payload_matches(existing: &ConfigMap, desired: &ConfigMap, rev
 ///
 /// Returns the Kubernetes `resourceVersion` of the (applied or pre-existing)
 /// `ConfigMap`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "fetch-guard, apply, and logging is a single cohesive sequence"
-)]
 #[expect(
     clippy::large_stack_frames,
     reason = "async future over Kubernetes API types with serde_json values"
@@ -5607,10 +5541,6 @@ fn retain_tool_catalogs_within_budget(
 /// least one tool fit. If the inference-only baseline already exceeds the
 /// transport budget, all tool providers remain omitted and the runtime reports
 /// the oversized inference snapshot.
-#[expect(
-    clippy::too_many_lines,
-    reason = "transport preflight, deterministic trimming, and its summary log form one bounded operation"
-)]
 fn fit_provider_tools_to_swim_budget(broadcast: &mut swim::StateBroadcast) {
     // The runtime's advertised address may be IPv6, so preflight against the
     // largest valid source identity for this site name. This cannot exceed the
@@ -6070,7 +6000,6 @@ pub(crate) fn consumer_config_status_disabled(
 /// `message` is derived from the `OperatorError` `Display` impl only.  That
 /// impl never includes credential token bytes; error messages describe
 /// structural failures (blank fields, JSON errors, Kubernetes API errors).
-#[expect(clippy::too_many_lines, reason = "one arm per status reason")]
 pub(crate) fn consumer_config_status_error(
     gw_ref: &GatewayRef,
     cc: &ConsumerConfig,
@@ -6693,10 +6622,6 @@ fn already_recorded_invalid(existing: Option<&GridSiteStatus>, message: &str) ->
     reason = "three sequential match arms, each a distinct security invariant (store/reject/security-log); splitting further would fragment cohesive I/O steps rather than reduce complexity"
 )]
 #[expect(
-    clippy::too_many_lines,
-    reason = "three JSON-patch-plus-log branches read clearer inline than split further"
-)]
-#[expect(
     clippy::large_stack_frames,
     reason = "async future over Kubernetes API types with serde_json values"
 )]
@@ -6800,10 +6725,6 @@ fn discovered_site_spec(site: &DiscoveredSite, network_name: &str, plaintext: bo
 /// - Discovered → Connecting: `GridSite` controller, based on data-plane gateway address presence.
 /// - Connecting → Active: only an identity-verified TLS probe can promote a site. Plaintext probes report reachability
 ///   but remain in Connecting.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential spec-apply + conditional status-patch per discovered site"
-)]
 #[expect(
     clippy::large_stack_frames,
     reason = "async future over Kubernetes API types with serde_json values"
@@ -7056,7 +6977,6 @@ mod tests {
     #[expect(
         clippy::expect_used,
         clippy::indexing_slicing,
-        clippy::too_many_lines,
         reason = "test assertions on a JSON patch"
     )]
     fn the_ready_condition_is_patched_only_on_a_change() {
@@ -7138,11 +7058,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::expect_used,
-        clippy::too_many_lines,
-        reason = "test: two Secrets, then three reads"
-    )]
+    #[expect(clippy::expect_used, reason = "test: two Secrets, then three reads")]
     async fn a_new_grid_ca_alone_changes_the_material_a_listener_was_built_from() {
         crate::init_process_crypto();
         let ca = certs::generate_ca("grid-ca").expect("ca");
@@ -7634,10 +7550,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one fenced pass must refresh collection, readiness and peer inventory"
-    )]
     async fn fenced_publication_keeps_scraping_readiness_and_refreshing_peers() -> Result<(), Box<dyn std::error::Error>>
     {
         let response = "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n"
@@ -8248,10 +8160,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "this table proves current and stale withdrawal behavior for every provider phase"
-    )]
     fn crdt_phase_from_provider_maps_all_variants() {
         assert_eq!(
             crdt_phase_from_provider(None, 1),
@@ -8590,10 +8498,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "two-provider membership fixture with inline vec construction"
-    )]
     fn staleness_override_multiple_providers_only_dead_site_degraded() {
         // Multi-provider recovery: west is Dead, east is Alive.
         // Only west's provider becomes Degraded; east's provider stays Available.
@@ -9032,7 +8936,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one network per gate state")]
     fn available_copies_the_first_failing_enrollment_gate_in_order() {
         use crate::enroll::local::{ACCEPTED, ENROLLED, IDENTITY_VALID, RESOLVED_REFS, ROTATION_ON_SCHEDULE};
         let pair = |status: &str, reason: &str| Some((status.to_owned(), reason.to_owned()));
@@ -9099,7 +9002,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "each peer condition both ways, then the order")]
     fn the_peer_conditions_degrade_the_network_after_its_own_and_never_gate_it() {
         use crate::{peer_membership::PEER_MEMBERSHIP, peer_reach};
         let pair = |status: &str, reason: &str| Some((status.to_owned(), reason.to_owned()));
@@ -10630,10 +10532,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the chart TLS fixture exercises every required projected file"
-    )]
     fn chart_managed_serving_tls_must_match_the_secret_refs_and_files() {
         let deployment: Deployment = serde_json::from_value(serde_json::json!({
             "apiVersion": "apps/v1",
@@ -10745,7 +10643,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "checks retention across an empty prior overlay")]
     fn retained_overlay_status_does_not_retain_an_error_without_revision() {
         let gw = make_gw_ref("gw", "grid-system");
         let mut network = base_network();
@@ -10893,10 +10790,6 @@ mod tests {
         );
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "test helper constructing deeply nested envelope struct"
-    )]
     fn make_render_result(revision: &str, candidate_count: u32) -> OverlayRenderResult {
         OverlayRenderResult {
             config_map_name: "grid-overlay-net-gw".to_owned(),
@@ -11133,7 +11026,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "each prerequisite is asserted in order")]
     fn site_route_prerequisites_fail_closed() {
         let gw = site_route_gateway(SiteRouter::GridSiteRoute);
         let cc = gw.praxis_config.clone().unwrap_or_else(|| std::process::abort());
@@ -11169,10 +11061,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "derived, declared, and withdrawn hops share one fixture"
-    )]
     fn site_route_serving_hops_are_the_rendered_mutual_tls_endpoints() {
         let mtls = |cluster: &str, sni: &str| ClusterEndpointConfig {
             cluster: cluster.to_owned(),
@@ -11362,7 +11250,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one real render per allowlist step")]
     fn narrowing_and_removing_the_allowlist_withdraws_the_revoked_endpoint_from_the_render() {
         let providers = vec![
             local_http_provider("prov-a", "prov-a.models.svc"),
@@ -11618,10 +11505,6 @@ mod tests {
 
     #[test]
     #[expect(
-        clippy::too_many_lines,
-        reason = "the rollout status transitions are exercised against one Deployment fixture"
-    )]
-    #[expect(
         clippy::expect_used,
         reason = "deserializing a fixed Deployment fixture must succeed"
     )]
@@ -11670,10 +11553,6 @@ mod tests {
         );
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the Deployment fixture keeps the config volume and target container together"
-    )]
     fn delegated_config_source_fixture() -> Value {
         json!({
             "apiVersion": "apps/v1",
@@ -11726,10 +11605,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "config source validation cases share one Deployment fixture"
-    )]
     fn delegated_config_source_requires_the_expected_config_map_and_projection() {
         let valid = delegated_config_source_fixture();
         assert!(matches!(delegated_config_source_check(valid.clone()), Ok(false)));
@@ -11772,10 +11647,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one patch must carry config, Secret volume, revision, and resourceVersion together"
-    )]
     fn config_and_secret_projection_switch_in_one_version_guarded_patch() {
         let mut fixture = delegated_config_source_fixture();
         let metadata = fixture
@@ -11842,10 +11713,6 @@ mod tests {
         );
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "keep the preserved Deployment and all of its consumers visible as one regression fixture"
-    )]
     fn mount_ownership_test_deployment_value() -> Value {
         json!({
             "apiVersion": "apps/v1",
@@ -12753,7 +12620,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "exhaustive rejection table")]
     fn metrics_refresh_duration_parser_rejects_unsupported_values() {
         assert!(
             parse_metrics_refresh_interval("").is_err(),
@@ -12990,10 +12856,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "constructs a mixed provider and verifies both capability classes"
-    )]
     fn upsert_mixed_provider_registers_models_but_not_tools_as_capabilities() {
         let mut snap = crdt::GridStateSnapshot::new("site-a".to_owned());
         let mut max_rev = 0_u64;
@@ -13033,10 +12895,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "constructs an oversized provider snapshot and verifies both transport and retention invariants"
-    )]
     fn tool_catalog_is_trimmed_to_the_serialized_swim_budget() {
         let mut snap = crdt::GridStateSnapshot::new("site-a".to_owned());
         let offered = 128_usize;
@@ -13082,10 +12940,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "constructs many tool providers and verifies inference survives whole-record trimming"
-    )]
     fn many_tool_provider_records_cannot_evict_inference_or_overfill_swim() {
         let mut snap = crdt::GridStateSnapshot::new("site-a".to_owned());
         snap.upsert_provider(crdt::ProviderState {

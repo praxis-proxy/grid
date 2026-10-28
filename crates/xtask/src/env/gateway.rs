@@ -178,7 +178,6 @@ fn apply_tls_secret(
 }
 
 /// Apply mock EPP Deployment + Service.
-#[expect(clippy::too_many_lines, reason = "K8s manifest generation")]
 fn apply_mock_epp(context: &str, site_name: &str, def: &ClusterDef) -> Result<(), Box<dyn std::error::Error>> {
     let route_args = mock_epp_route_args(def);
     let mock_epp_img = image_overrides::mock_epp_image();
@@ -237,10 +236,6 @@ fn apply_mock_epp(context: &str, site_name: &str, def: &ClusterDef) -> Result<()
 ///
 /// This is xtask validation infrastructure: the update is idempotent and
 /// `kubectl apply` leaves the mock-EPP Service unchanged.
-#[expect(
-    clippy::too_many_lines,
-    reason = "K8s Deployment YAML generation with per-route args"
-)]
 pub(crate) fn apply_mock_epp_with_extra_model(
     context: &str,
     site_name: &str,
@@ -353,7 +348,6 @@ fn apply_gateway_config(context: &str, _def: &ClusterDef) -> Result<(), Box<dyn 
 /// ```
 ///
 /// The `ext_proc` filter uses `StreamBuffer` body mode.
-#[expect(clippy::too_many_lines, reason = "provider Praxis config YAML generation")]
 fn provider_gateway_config() -> String {
     format!(
         "listeners:\n\
@@ -407,7 +401,6 @@ fn indent_yaml(yaml: &str, spaces: usize) -> String {
 }
 
 /// Apply the gateway Deployment + Service.
-#[expect(clippy::too_many_lines, reason = "K8s manifest generation")]
 fn apply_gateway_deployment(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     let gateway_img = image_overrides::gateway_image();
     let pull_policy = image_overrides::image_pull_policy();
@@ -809,10 +802,6 @@ pub(crate) fn send_responses_request(
 ///
 /// A Bearer token is always included.  The `mock-openai` backend requires it;
 /// the `inference-sim` backend ignores unknown headers.
-#[expect(
-    clippy::too_many_lines,
-    reason = "curl arg list for mTLS with optional spoofed header"
-)]
 pub(crate) fn curl_post_mtls(
     url: &str,
     body: &str,

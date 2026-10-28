@@ -85,10 +85,6 @@ fn preflight() -> Option<ExitCode> {
     None
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "gateway startup assembles dependent runtime stages"
-)]
 fn main() -> ExitCode {
     if let Some(exit) = preflight() {
         return exit;
@@ -302,7 +298,6 @@ struct BackendClientCert {
 }
 
 /// Resolve unique verified mutual-TLS backends across all chains.
-#[expect(clippy::too_many_lines, reason = "keeps the backend transport checks together")]
 fn provider_hop_backends(config: &Config) -> Result<BTreeMap<String, BackendTls>, praxis_filter::FilterError> {
     let mut backends = BTreeMap::new();
     let mut unverified = BTreeSet::new();

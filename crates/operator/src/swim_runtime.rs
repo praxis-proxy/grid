@@ -1250,10 +1250,6 @@ fn reconciliation_view(
 /// # Errors
 ///
 /// Returns [`SwimRuntimeError::Bind`] if the socket cannot be bound.
-#[expect(
-    clippy::too_many_lines,
-    reason = "channel setup, socket bind, runtime spawn: linear startup sequence"
-)]
 pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeError> {
     let revisions = RevisionClock::new(&config.revision_lease, config.revision_renewer.clone())?;
     if config.revision_lease.first_node_generation == 0
@@ -2101,7 +2097,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "case table")]
     fn a_stale_identity_never_downs_the_current_one() {
         let lb = "203.0.113.7:7946";
         let status = |events: Vec<MemberEvent>| {
@@ -2397,7 +2392,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "fills a site, then frees one slot")]
     fn identities_per_site_are_bounded() {
         let t0 = now();
         let mut tracked = HashMap::new();
@@ -2621,10 +2615,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one ordered test proves deduplication across membership, health, and provider-state changes"
-    )]
     async fn reconciliation_events_emit_only_for_semantic_changes() {
         let (handle, snapshot_tx, state_tx) = make_test_handle();
         let mut events = Box::pin(handle.reconciliation_events());
@@ -2938,10 +2928,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "ordered state-machine proof covers initial, duplicate, changed, and repair publications"
-    )]
     fn retained_state_deduplicates_updates_and_republishes_with_new_revision() {
         let original = provider_broadcast(0.1);
         let (retained, first) =
@@ -3047,10 +3033,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "eviction regression checks subscriber notification, provider withdrawal, and retained cumulative spend"
-    )]
     fn evicted_providers_disappear_from_subscribers_while_spend_survives() -> Result<(), Box<dyn std::error::Error>> {
         let identity = NodeId::with_generation("site-local".to_owned(), "127.0.0.1:7946".parse()?, 1);
         let mut node = SwimNode::new(identity);
@@ -3378,7 +3360,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "two real runtimes, a join, and a leave")]
     async fn a_leaving_runtime_stops_and_its_peer_sees_it_dead() {
         let addr1 = reserve_local_addr().await;
         let addr2 = reserve_local_addr().await;
@@ -3443,10 +3424,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "three-node real-UDP gossip proof: join, dual increment, convergence, late join, status tie-in"
-    )]
     async fn tenant_spend_converges_at_late_joining_site_after_partition_heals() {
         // grid#40 AC3, live network proof: sites A and B accumulate real per-request
         // spend for the same tenant *before* site C ever joins the mesh (a stand-in

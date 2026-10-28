@@ -255,7 +255,6 @@ async fn a_later_check_catches_up_a_missed_roll() {
 }
 
 #[test]
-#[expect(clippy::too_many_lines, reason = "one assertion per declared trust")]
 fn renewal_follows_the_declared_peer_trust() {
     let network = |trust: Option<&str>| -> GridNetwork {
         let spec = trust.map_or_else(
@@ -765,7 +764,6 @@ fn declared_signer() -> String {
 }
 
 #[test]
-#[expect(clippy::too_many_lines, reason = "one case per check")]
 fn rotation_on_schedule_follows_the_check() {
     let now = OffsetDateTime::now_utc();
     let named = declared_signer();
@@ -811,7 +809,6 @@ fn rotation_on_schedule_follows_the_check() {
 }
 
 #[test]
-#[expect(clippy::too_many_lines, reason = "both off reasons, both renewers")]
 fn a_cert_manager_certificate_on_the_secret_reads_as_renewed_until_due() {
     let now = OffsetDateTime::now_utc();
     let named = Some("site-d-identity");

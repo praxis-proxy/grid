@@ -235,10 +235,6 @@ pub(crate) fn validate_serving_candidates(raw: Vec<CandidateConfig>) -> Result<V
 
 /// Validate candidate fields while allowing emptiness only for versioned
 /// serving snapshots.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one validation pass keeps all candidate invariants adjacent"
-)]
 fn validate_candidates_with_empty(
     raw: Vec<CandidateConfig>,
     allow_empty: bool,

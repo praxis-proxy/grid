@@ -661,10 +661,6 @@ fn client_pod_overrides() -> String {
 }
 
 /// Create and wait for the persistent weighted-sampling client pod.
-#[expect(
-    clippy::too_many_lines,
-    reason = "client creation keeps security, readiness, and diagnostic errors together"
-)]
 fn ensure_client_pod(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     let existing = Command::new("kubectl")
         .args([
@@ -878,10 +874,6 @@ fn wait_for_environment_ready() -> Result<String, Box<dyn std::error::Error>> {
 // -----------------------------------------------------------------------------
 
 /// Assert exactly three provider clusters exist and are healthy.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The proof reports one bounded fact set per cluster."
-)]
 fn assert_cluster_health() -> AssertionResult {
     let start = Instant::now();
     let mut observed_facts = BTreeMap::new();
@@ -961,10 +953,6 @@ fn assert_cluster_health() -> AssertionResult {
 }
 
 /// Assert one provider stack per site and one consumer entrypoint.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The proof checks the required deployed components together."
-)]
 fn assert_component_deployment() -> AssertionResult {
     let start = Instant::now();
     let mut observed_facts = BTreeMap::new();
@@ -1066,7 +1054,6 @@ fn assert_component_deployment() -> AssertionResult {
 
 /// Assert every site's `GridNetwork` reports all three remote sites connected.
 #[expect(
-    clippy::too_many_lines,
     clippy::unnecessary_wraps,
     reason = "The assertion framework requires a fallible, named proof boundary."
 )]
@@ -1144,7 +1131,6 @@ fn assert_swim_convergence() -> AssertionResult {
 /// The locally declared placement site is not a remote SWIM discovery result
 /// and is excluded from this assertion.
 #[expect(
-    clippy::too_many_lines,
     clippy::unnecessary_wraps,
     reason = "The assertion framework requires a fallible, named proof boundary."
 )]
@@ -1463,10 +1449,6 @@ fn install_provider_boundary(certs_dir: &Path) -> Result<(), Box<dyn std::error:
 }
 
 /// Create a TLS secret from the generated cert, key, and CA files.
-#[expect(
-    clippy::too_many_lines,
-    reason = "TLS secret creation is one bounded setup operation."
-)]
 fn apply_tls_secret(
     context: &str,
     identity: &str,
@@ -1534,10 +1516,6 @@ fn apply_credential_secret(context: &str, secret_name: &str, token: &str) -> Res
 /// Captures both the Kubernetes `resourceVersion` (per-cluster) and the
 /// semantic revision from the `grid.praxis.fast/overlay-revision`
 /// annotation (content-addressed, safe to compare across clusters).
-#[expect(
-    clippy::too_many_lines,
-    reason = "The reader validates and parses one Kubernetes ConfigMap response."
-)]
 fn read_cluster_overlay(cluster: &str) -> Result<OverlayData, Box<dyn std::error::Error>> {
     let context = cluster_context(cluster);
     let overlay_name = overlay_configmap(cluster)?;
@@ -2020,10 +1998,6 @@ fn expected_candidates() -> BTreeSet<String> {
 /// Pre-SWIM, each operator only knows its local `InferenceProvider` resources.
 /// Global convergence (all candidates on every cluster) happens after SWIM
 /// seeding in a separate phase.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The readiness poll checks each local cluster's overlay."
-)]
 fn wait_for_local_overlays() -> Result<BTreeMap<String, OverlayData>, Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(180);
     let interval = Duration::from_secs(5);
@@ -2071,10 +2045,6 @@ fn wait_for_local_overlays() -> Result<BTreeMap<String, OverlayData>, Box<dyn st
 }
 
 /// Wait until every static-weighted cluster serves the same candidate set.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The convergence poll compares the bounded three-cluster overlay set."
-)]
 fn wait_for_global_overlay_convergence(
     expected: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, OverlayData>, Box<dyn std::error::Error>> {
@@ -2382,10 +2352,6 @@ fn collect_overlay_diagnostics() {
 /// - `CANDIDATE_ID_PLACEHOLDER` → stable ID from the overlay
 ///
 /// Creates the `provider-gateway-config` `ConfigMap` in each cluster.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Provider config materialization is one bounded setup phase."
-)]
 fn materialize_provider_config(
     overlays: &BTreeMap<String, OverlayData>,
     demo_root: &Path,
@@ -3063,10 +3029,6 @@ fn excluded_provider_selector(
 }
 
 /// Read a workload's `/metrics` endpoint through a bounded run-scoped port-forward.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the port-forward lifecycle and HTTP read form one bounded evidence operation"
-)]
 fn read_workload_metrics(
     context: &str,
     resource: &str,
@@ -3230,10 +3192,6 @@ fn parse_local_crdt_capacity(logs: &str, network: &str, provider: &str) -> Optio
 }
 
 /// Summarize bounded capacity-publication evidence without retaining raw logs.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The diagnostic reports each bounded publication matching boundary."
-)]
 fn capacity_publication_diagnostic(logs: &str, network: &str, provider: &str) -> String {
     let publication_lines = logs
         .lines()
@@ -3305,10 +3263,6 @@ fn read_local_crdt_capacity(site: &str) -> Result<u32, Box<dyn std::error::Error
 }
 
 /// Capture pod identity and restart count for the consumer gateway.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The identity query validates every restart invariant field."
-)]
 fn read_gateway_stability() -> Result<(String, u32), Box<dyn std::error::Error>> {
     let output = Command::new("kubectl")
         .args([
@@ -3368,10 +3322,6 @@ fn wait_for_stable_revision(revision: &str) -> Result<(String, String, u32), Box
 }
 
 /// Capture typed phase state from Grid, the converged remote overlay, and Praxis.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Phase evidence intentionally validates every required boundary."
-)]
 fn capture_phase_state(
     phase: &str,
     configured: [u32; 3],
@@ -3419,7 +3369,6 @@ fn capture_phase_state(
     })
 }
 
-#[expect(clippy::too_many_lines, reason = "A phase is an end-to-end qualification boundary.")]
 /// Execute one configured, converged, sampled static-weight phase.
 fn run_static_phase(
     phase: &str,
@@ -4156,10 +4105,6 @@ mod static_phase_policy_tests {
 }
 
 /// Run the setup checks, three weighted phases, and withdrawal/restoration proof.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The focused demo presents its qualification scenarios in order."
-)]
 fn run_static_weighted_scenarios() -> (BTreeMap<String, ProofResult>, Vec<StaticPhaseEvidence>) {
     let mut results = BTreeMap::new();
     let mut scenario_num: usize = 0;
@@ -4560,10 +4505,6 @@ fn read_swim_lb_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error>> 
 }
 
 /// Update a single operator's SWIM configuration with peer addresses.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The Helm upgrade carries the bounded SWIM configuration contract."
-)]
 fn update_operator_swim_config(
     cluster: &str,
     advertise_ip: &str,
@@ -4998,7 +4939,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "This test exercises the complete evidence schema.")]
     fn evidence_serialization() {
         let evidence = Evidence {
             schema_version: "test".to_owned(),
@@ -5203,7 +5143,6 @@ mod tests {
 
     #[test]
     #[expect(
-        clippy::too_many_lines,
         clippy::indexing_slicing,
         clippy::expect_used,
         reason = "This test exercises nested typed evidence fields."

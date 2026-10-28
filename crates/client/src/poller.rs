@@ -352,10 +352,6 @@ where
 /// caller can rebuild derived state (the routing snapshot) on one clock with no
 /// drift between "store updated" and "state rebuilt". It stays generic over the
 /// store: the poller never names the caller's derived type.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one cancellation-aware loop sequences fetch, commit, observation, refresh and reporting"
-)]
 async fn poll_loop<S, F>(
     store: Arc<LoadStore>,
     source: S,
@@ -476,10 +472,6 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "integration fixture coordinates cancellation during a blocked refresh"
-    )]
     async fn committed_skew_survives_cancellation_during_refresh() {
         drop(rustls::crypto::ring::default_provider().install_default());
         let reporter = Arc::new(crate::Reporter::new(certs::spiffe_id("east")).expect("reporter"));

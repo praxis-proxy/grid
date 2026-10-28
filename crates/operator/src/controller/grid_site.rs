@@ -81,7 +81,6 @@ pub struct SiteContext {
 /// Returns [`OperatorError`] on Kubernetes API failures.
 #[expect(
     clippy::large_stack_frames,
-    clippy::too_many_lines,
     reason = "TLS material loading + event recording requires intermediaries; \
               splitting hides the reconciliation flow"
 )]
@@ -202,10 +201,6 @@ pub(crate) fn site_phase_next(
 ///
 /// Returns `(next_phase, reason, message)`.  `reason` is machine-readable;
 /// `message` is human-readable and never contains private material.
-#[expect(
-    clippy::too_many_lines,
-    reason = "match arms are individually trivial; splitting would fragment the state machine"
-)]
 pub(crate) fn site_phase_under(
     current: &GridSitePhase,
     site: &GridSite,
@@ -380,10 +375,6 @@ fn advertised_leaf_der(site: &GridSite) -> Option<Vec<u8>> {
 /// Returns a `GatewayProbeOutcome` on failure so the caller can
 /// report the precise failure mode.
 #[expect(
-    clippy::too_many_lines,
-    reason = "linear secret-loading sequence; splitting would fragment error provenance"
-)]
-#[expect(
     clippy::large_stack_frames,
     reason = "TLS material parsing requires several Vec<u8> intermediaries"
 )]
@@ -550,10 +541,6 @@ async fn tcp_probe(addr: &str) -> bool {
 /// `public_cert_pem` are owned by SWIM reconciliation and are deliberately
 /// omitted. Updates `last_probe_time` when a probe was executed and
 /// `last_transition_time` when the phase changes.
-#[expect(
-    clippy::too_many_lines,
-    reason = "linear status-patching sequence; splitting would fragment field ownership"
-)]
 #[expect(
     clippy::too_many_arguments,
     clippy::large_stack_frames,

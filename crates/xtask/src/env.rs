@@ -1522,7 +1522,6 @@ fn env_verify_gateway_e2e(config: &Path) -> Result<(), Box<dyn std::error::Error
 ///    clusters for local providers.
 /// 5. Verify: `model-x` → local provider gateway (HTTP 200), `model-z` → mock API-provider (HTTP 200), unknown model →
 ///    404.
-#[expect(clippy::too_many_lines, reason = "multi-step E2E orchestration")]
 fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         API_FALLBACK_MODEL, API_PROVIDER_SECRET_KEY, API_PROVIDER_SECRET_NAME, API_PROVIDER_SECRET_NS,
@@ -2138,10 +2137,6 @@ fn env_install_grid_crds(config: &Path, site: Option<&str>) -> Result<(), Box<dy
 ///
 /// This is the shared core of both [`env_verify_operator_reconcile`] and
 /// [`env_validate_operator_routing`].
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential reconcile steps: CRD install, fixtures, operator spawn, poll, verify, export"
-)]
 fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     use operator::{
         API_PROVIDER_SECRET_KEY, API_PROVIDER_SECRET_NAME, API_PROVIDER_SECRET_NS, CONFIGMAP_POLL_TIMEOUT,
@@ -2306,10 +2301,6 @@ fn env_verify_operator_reconcile(config: &Path, site: Option<&str>) -> Result<()
 /// - `providers` must contain at least two entries (caller's responsibility).
 /// - Each `(site_name, models)` pair becomes one `InferenceProvider` with `clusterName = site_name` and the given model
 ///   list.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential reconcile steps: CRD install, fixtures, operator spawn, poll, verify, export"
-)]
 fn run_multi_provider_reconcile(
     context: &str,
     providers: &[(&str, &[String])],
@@ -2487,10 +2478,6 @@ fn env_verify_swim_membership(config: &Path, site: Option<&str>) -> Result<(), B
 ///
 /// SWIM gossip then converges and `GridNetwork.status.phase` becomes `Active`.
 /// The `GRID_SWIM_SEEDS` env var is empty for both operators throughout.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential CRD-seed kind steps: CRD install, two operator spawns, fixture apply with seeds, convergence wait, poll, cleanup"
-)]
 fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         CRD_SEEDS_TEST_NETWORK, SWIM_CONVERGENCE_WAIT, SWIM_NODE_PRIMARY_NAME, SWIM_NODE_SECONDARY_NAME,
@@ -2591,10 +2578,6 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
 ///
 /// Proves real `InferenceProvider`-derived CRDT state propagates over SWIM gossip.
 /// After convergence each operator's `remoteProviderCount` reflects remote provider records.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential SWIM state kind steps: CRD install, two operator spawns, fixture apply, convergence wait, poll, cleanup"
-)]
 fn env_verify_swim_state(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         SWIM_CONVERGENCE_WAIT, SWIM_NODE_PRIMARY_NAME, SWIM_NODE_SECONDARY_NAME, SWIM_STATUS_POLL_TIMEOUT,
@@ -2662,10 +2645,6 @@ fn env_verify_swim_state(config: &Path, site: Option<&str>) -> Result<(), Box<dy
 /// `localhost` is intentional: the two out-of-cluster operators bind to
 /// distinct loopback ports, so this exercises the production hostname resolver
 /// without depending on public DNS or cluster DNS from the host.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one bounded qualification keeps startup, convergence, propagation, evidence, and cleanup together"
-)]
 fn env_verify_swim_dns_hostnames(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         SWIM_NODE_PRIMARY_NAME, SWIM_NODE_SECONDARY_NAME, SWIM_STATUS_POLL_TIMEOUT, SWIM_TEST_NETWORK,
@@ -3089,10 +3068,6 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
 /// distributed state propagation, then reads the overlay `ConfigMap` and asserts
 /// that at least one candidate has a `site` value originating from the remote
 /// operator (not the primary site).
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential SWIM overlay steps: CRD install, two operator spawns, fixture apply, convergence wait, poll, overlay verify, cleanup"
-)]
 fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         CONFIGMAP_POLL_TIMEOUT, SWIM_CONVERGENCE_WAIT, SWIM_NODE_PRIMARY_NAME, SWIM_NODE_SECONDARY_NAME,
@@ -3219,10 +3194,6 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
 /// After SWIM gossip, the east operator's overlay includes model-west as a
 /// remote CRDT candidate.  A consumer gateway is deployed from that overlay
 /// and routes requests for both models.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential steps: CRDs, fixtures, operators, wait, overlay, consumer deploy, E2E verify, cleanup"
-)]
 fn env_verify_swim_routing(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         CONFIGMAP_POLL_TIMEOUT, SWIM_CONVERGENCE_WAIT, SWIM_ROUTING_GW, SWIM_ROUTING_NETWORK, SWIM_STATUS_POLL_TIMEOUT,
@@ -3411,11 +3382,6 @@ fn reserve_three_swim_bind_addrs() -> Result<(String, String, String), Box<dyn s
 /// 3. After `Active`, C's candidate appears in A's overlay.
 /// 4. A wrong-network `GridNetwork` and `InferenceProvider` are applied and their model is confirmed absent from A's
 ///    correct-network overlay.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential 11-step mesh proof: CRDs, three operators, CRDT convergence, \
-              eligibility before/after Active, wrong-network isolation, cleanup"
-)]
 #[expect(
     clippy::similar_names,
     reason = "op_a/op_b/op_c-style peer-pair naming is the clear, established idiom for the \
@@ -3771,10 +3737,6 @@ fn verify_llmd_compat_pod_restarts(
 /// 4. Deploy consumer gateway from overlay.
 /// 5. Verify consumer routing with model name checks.
 /// 6. Assert no unexpected pod restarts.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential demo proof steps: each step depends on the previous; splitting obscures the proof flow"
-)]
 fn env_verify_llmd_compat_routing(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
     let providers = provider_clusters_from_config(&cfg);
@@ -3973,10 +3935,6 @@ fn verify_responses_pod_restarts(
 /// 4. Verify `/v1/responses` routing: each model returns 200, unknown fails.
 /// 5. Verify response model fields match the requested model.
 /// 6. Assert no unexpected pod restarts.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential proof steps: each step depends on the previous; splitting obscures the proof flow"
-)]
 fn env_verify_responses_routing(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
     let providers = provider_clusters_from_config(&cfg);
@@ -5431,10 +5389,6 @@ fn env_verify_stale_gc_ttl(config: &Path) -> Result<(), Box<dyn std::error::Erro
 /// the current metrics values are applied.  The consumer config is generated solely
 /// from the metrics-routing overlay (which only advertises the shared model), so
 /// dedicated-model alive checks are not performed here.
-#[expect(
-    clippy::too_many_lines,
-    reason = "overlay check + port-forward + shared model + unknown model assertions"
-)]
 fn verify_metrics_routing_phase(
     consumer_site: &str,
     overlay: &operator_overlay::RoutingOverlay,
@@ -5604,10 +5558,6 @@ pub(crate) fn print_validate_all_table(results: &[StepResult]) {
 ///
 /// Continues past individual step failures so the full picture is visible.
 /// Exit code is non-zero when any step has `FAIL` status.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential step list: each step is one match arm; no abstraction saves lines without hiding intent"
-)]
 fn env_validate_all(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let mut results: Vec<StepResult> = Vec::new();
 
@@ -7111,7 +7061,6 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
 ///    configured tool list.
 /// 5. Apply a second `AgentToolProvider` pointed at a nonexistent Service and confirm it lands on `Unavailable` with a
 ///    populated `status.reason`.
-#[expect(clippy::too_many_lines, reason = "multi-step E2E orchestration")]
 fn env_verify_agenttoolprovider_convergence(
     config: &Path,
     site: Option<&str>,
@@ -7252,10 +7201,6 @@ fn env_verify_agenttoolprovider_convergence(
 /// 5. Bind TCP listener and apply plaintext egress to B's `GridSite`.
 /// 6. Wait for `IdentityVerificationRequired` while B remains `Connecting`.
 /// 7. Assert B's CRDT provider remains absent from the overlay.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential routing-eligibility proof: 7 steps covering SWIM → overlay"
-)]
 #[expect(
     clippy::similar_names,
     reason = "op_a/op_b-style peer-pair naming is the clear, established idiom for symmetric two-node \

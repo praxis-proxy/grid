@@ -1227,7 +1227,6 @@ mod tests {
     /// to preempt. Prompt length decides which limit binds, and nothing in the routing path
     /// sees a prompt, so the only reading that is right in both regimes is the larger of the
     /// two.
-    #[expect(clippy::too_many_lines, reason = "one sequence: short prompts, then long ones")]
     #[test]
     fn a_site_spent_on_long_contexts_reads_full_at_a_low_request_count() {
         let sites = EQUAL_CAPACITY;
@@ -1425,7 +1424,6 @@ mod tests {
     /// the larger pool keeps being ranked against what the smaller one could carry. The soft
     /// bound survives the same growth, because the most a smaller site carried is still a floor
     /// under what a larger one can.
-    #[expect(clippy::too_many_lines, reason = "one sequence: taught, bounded, grown")]
     #[test]
     fn a_site_that_gained_units_is_not_held_by_the_bound_the_smaller_one_taught() {
         let sites = EQUAL_CAPACITY;
@@ -1675,10 +1673,6 @@ mod tests {
 
     /// Missing concurrency cannot erase direct queue, held-work, or KV pressure.
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one matrix asserts signal state and dispatch together"
-    )]
     fn partial_signals_preserve_pressure_without_inventing_capacity() {
         for count in [2, 3] {
             let sites = &EQUAL_CAPACITY[..count];
@@ -1761,7 +1755,6 @@ mod tests {
 
     /// Neither a telemetry gap nor a fresh recovery is interpreted as a learned limit.
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one trace covers pressure, expiry, and recovery")]
     fn partial_pressure_expires_and_recovers_without_teaching_a_ceiling() {
         let sites = &EQUAL_CAPACITY[..2];
         for (queue, kv) in [(2.0, 0.3), (0.0, 1.0)] {
@@ -1907,7 +1900,6 @@ mod tests {
     /// `cargo test -p ai-grid-filters --lib timeline_bench -- --ignored --nocapture`.
     #[test]
     #[ignore = "a bench, not an invariant: prints which limit bound in each regime"]
-    #[expect(clippy::too_many_lines, reason = "one table, one row per regime")]
     #[expect(clippy::print_stdout, reason = "a bench reports its table on stdout")]
     fn timeline_bench() {
         let regimes: [Regime; 4] = [
@@ -2002,7 +1994,6 @@ mod tests {
         );
     }
 
-    #[expect(clippy::too_many_lines, reason = "one sequence: taught, shrunk, recovered")]
     #[test]
     fn a_shrunken_site_is_measured_against_what_it_queues_at_now() {
         let sites = EQUAL_CAPACITY;
@@ -2213,7 +2204,6 @@ mod tests {
         );
     }
 
-    #[expect(clippy::too_many_lines, reason = "one sequence: taught, reset, recovered")]
     #[test]
     fn a_reset_under_load_recovers_within_the_debounce() {
         let sites = HETEROGENEOUS_CAPACITY;

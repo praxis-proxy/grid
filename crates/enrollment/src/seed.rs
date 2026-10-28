@@ -66,7 +66,6 @@ pub fn verified(body: &str, signature_hex: &str, ca_cert_pem: &str) -> Result<Se
 }
 
 /// Parse the exact form [`text`] writes.
-#[expect(clippy::too_many_lines, reason = "one strict check per field")]
 fn parse(body: &str) -> Result<SeedRecord, SeedError> {
     let lines: Vec<&str> = body
         .strip_suffix('\n')
@@ -140,10 +139,6 @@ pub fn load_dir(dir: &Path, ca_cert_pem: &str) -> Vec<(String, Result<SeedRecord
 
 /// Apply every seed in `dir` the current CA signed for a reserved name, warning once per
 /// problem. Returns the problems newly warned about, by seed.
-#[expect(
-    clippy::too_many_lines,
-    reason = "verify, gate on the reserved list, apply, and report read as one pass"
-)]
 pub async fn apply(
     state: &crate::AppState,
     dir: &Path,

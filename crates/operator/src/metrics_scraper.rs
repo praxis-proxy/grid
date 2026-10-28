@@ -495,7 +495,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one table of failures and their classes")]
     fn a_scrape_failure_has_a_bounded_class() {
         use crate::readiness::ScrapeClass;
         let status = |status| MetricsScrapeError::NonOkStatus {
@@ -797,10 +796,6 @@ mod tests {
     /// `client_ca_pem`: when `Some`, the server requires client certificate
     /// authentication (mTLS).  When `None`, one-way TLS only.
     #[cfg(not(feature = "fips"))]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "TLS server setup: certs + verifier + acceptor + one-shot handler"
-    )]
     async fn start_tls_test_server(
         server_cert_pem: &str,
         server_key_pem: &str,
@@ -1123,7 +1118,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "server + client handshake round-trip setup")]
     async fn server_accept_verifies_the_client_and_exposes_its_leaf() {
         use crate::resources::tls_backend::{
             accept, build_server_config, connect, parse_server_name, server_peer_leaf_der,
@@ -1301,10 +1295,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "exhaustive PEM-leak check across multiple error paths"
-    )]
     fn error_messages_never_contain_pem_material() {
         let ca = certs::generate_ca("test-ca").unwrap();
         let client = certs::generate_dns_cert(&ca, "client", "localhost").unwrap();

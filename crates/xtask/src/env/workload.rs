@@ -125,7 +125,6 @@ fn create_request_body_configmap(context: &str, body: &str) -> Result<(), Box<dy
 /// Curl writes `STATUS:<code>` as a trailer after the body so the status
 /// can be parsed independently of content type (JSON error bodies are
 /// common for 4xx/5xx).
-#[expect(clippy::too_many_lines, reason = "JSON manifest literal with security context")]
 fn build_curl_job_manifest(job_name: &str, session_id: Option<&str>) -> String {
     let url = format!("http://{GATEWAY_SERVICE}/v1/chat/completions");
 

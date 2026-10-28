@@ -859,10 +859,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "checks duplicate rejection for every renamed provider field"
-    )]
     fn legacy_and_current_provider_field_names_are_rejected_together() {
         let gateway_json = serde_json::json!({
             "gridNetworkRef": "production",
@@ -1082,10 +1078,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "tests multiple signal_names fields in one assertion block"
-    )]
     fn metrics_config_with_path_and_signal_names_deserializes() {
         let json = serde_json::json!({
             "gridNetworkRef": "production",
@@ -1204,10 +1196,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "tests multiple schema paths in one assertion block"
-    )]
     fn crd_schema_enforces_min_length_on_tls_secret_fields() {
         let crd = crd_json();
         let tls_props = crd

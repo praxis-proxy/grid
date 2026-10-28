@@ -98,10 +98,6 @@ fn version_requested() -> bool {
 }
 
 #[tokio::main]
-#[expect(
-    clippy::too_many_lines,
-    reason = "startup wires config, TLS, store, authz, drain, and cert reload in one sequence"
-)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if version_requested() {
         use std::io::Write as _;

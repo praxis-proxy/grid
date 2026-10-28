@@ -532,10 +532,6 @@ fn generated_run_id(attempt: usize) -> Result<String, Box<dyn std::error::Error>
 }
 
 /// Return whether the exact physical resources already exist.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Collision preflight keeps cluster and network checks together for one atomic decision."
-)]
 fn physical_resources_exist(names: &RunIdentity) -> Result<bool, Box<dyn std::error::Error>> {
     let clusters = spawn_timed("kind", &["get", "clusters"], 30)?;
     if !clusters.status.success() {
@@ -744,10 +740,6 @@ fn probe(label: &str, gateway: &str, credential: Credential) -> Result<HttpResul
 
 /// Restricted long-lived curl pod used to remove pod scheduling from the
 /// concurrency measurement.
-#[expect(
-    clippy::too_many_lines,
-    reason = "pod creation, restricted security, and readiness form one lifecycle"
-)]
 fn create_concurrency_client(index: usize) -> Result<String, Box<dyn std::error::Error>> {
     let sequence = PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let pod = format!("quota-concurrent-{index}-{sequence}");
@@ -1520,10 +1512,6 @@ fn scenario_shared_budget(
 /// Fire `count` concurrent valid probes and sample the shared reservation
 /// ledger while they overlap. Every client pod is Running before the barrier
 /// releases its request, removing pod scheduling from the measurement.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the bounded concurrent probe lifecycle is kept together"
-)]
 fn concurrent_admitted(count: usize) -> Result<ConcurrentEvidence, Box<dyn std::error::Error>> {
     let mut clients = ConcurrencyClients(Vec::with_capacity(count));
     for index in 0..count {

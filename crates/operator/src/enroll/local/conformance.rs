@@ -514,7 +514,6 @@ async fn invariant_8_no_signer_reads_rotation_on_schedule_no_signer_and_never_bl
 }
 
 #[tokio::test]
-#[expect(clippy::too_many_lines, reason = "three writers across two objects")]
 async fn invariant_5_the_own_grid_site_carries_only_the_peer_rollup_and_the_network_one_writer_each() {
     let api = seeded();
     let client = api.client(NAMESPACE);
@@ -1010,7 +1009,6 @@ fn invited_through(api: &FakeApi, base: &str, ca_pem: &str) -> Snapshot {
 }
 
 #[tokio::test]
-#[expect(clippy::too_many_lines, reason = "three restarts and what each must read")]
 async fn invariant_8_a_restart_after_a_lost_answer_reads_invite_maybe_spent_when_the_token_is_refused() {
     let (mock, settings) = serve(Reply::Timeout).await;
     let api = seeded();

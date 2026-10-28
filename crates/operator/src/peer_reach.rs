@@ -663,7 +663,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "a reachable, a failing and a never reached peer")]
     fn a_peer_the_round_had_no_time_for_keeps_its_verdict_and_the_overrun_is_this_sites() {
         let mut misses = Misses::default();
         let mut reach = round(&PeerReach::default(), &mut misses, &[], &["east"]);

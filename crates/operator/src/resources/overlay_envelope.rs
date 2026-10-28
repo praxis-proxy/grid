@@ -216,7 +216,6 @@ pub fn compute_semantic_digest(overlay: &RoutingOverlay) -> Result<String, serde
     clippy::too_many_arguments,
     reason = "all arguments are distinct provenance/scope fields"
 )]
-#[expect(clippy::too_many_lines, reason = "flat struct construction with all fields")]
 pub fn build_overlay_envelope(
     overlay: &RoutingOverlay,
     gateway_name: &str,
@@ -323,10 +322,6 @@ mod tests {
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "two-candidate test fixture with full field coverage"
-    )]
     fn multi_candidate_overlay() -> RoutingOverlay {
         RoutingOverlay {
             network: "glb-demo".to_owned(),

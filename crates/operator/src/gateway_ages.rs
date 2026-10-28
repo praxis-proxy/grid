@@ -324,10 +324,6 @@ fn replace(held: &mut GatewayAgeReport, report: &IngestReport, now: &str) -> Res
 }
 
 /// Preserve transition time while updating diagnostic detail and observed generation.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one condition derives bounded detail and preserves transition metadata"
-)]
 fn condition(
     network: &GridNetwork,
     reports: &[GatewayAgeReport],
@@ -401,7 +397,6 @@ fn row(report: &IngestReport, rejected: bool, now: &str) -> GatewayAgeReport {
 #[expect(
     clippy::expect_used,
     clippy::indexing_slicing,
-    clippy::too_many_lines,
     reason = "tests and integration fixtures"
 )]
 mod tests {

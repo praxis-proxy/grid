@@ -82,10 +82,6 @@ impl SwimEndpoint {
 impl FromStr for SwimEndpoint {
     type Err = String;
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "endpoint parsing keeps all accepted and rejected forms together"
-    )]
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         if value.is_empty() || value.chars().any(char::is_whitespace) {
             return Err("endpoint must be non-empty and contain no whitespace".to_owned());
@@ -208,10 +204,6 @@ pub async fn resolve_endpoint_list_partial(raw: &[String], source: &str) -> Seed
 }
 
 /// Injectable implementation of the partial seed resolver.
-#[expect(
-    clippy::too_many_lines,
-    reason = "partial resolution keeps parse, bounded concurrency, diagnostics, and deterministic finalization together"
-)]
 pub async fn resolve_endpoint_list_partial_with<F, Fut>(
     raw: &[String],
     source: &str,

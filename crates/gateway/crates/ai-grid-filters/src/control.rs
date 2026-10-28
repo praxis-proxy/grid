@@ -830,7 +830,6 @@ fn report(result: &Result<Option<ReloadOutcome>, FilterError>, tally: &WatchCoun
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::min_ident_chars,
-    clippy::too_many_lines,
     clippy::disallowed_methods,
     reason = "tests; the pollers run on their own threads, so these sync tests wait with thread::sleep"
 )]

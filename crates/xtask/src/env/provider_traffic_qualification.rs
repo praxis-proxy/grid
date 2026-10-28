@@ -779,10 +779,6 @@ fn wait_for_environment_ready() -> Result<String, Box<dyn std::error::Error>> {
 // -----------------------------------------------------------------------------
 
 /// Assert exactly three provider clusters exist and are healthy.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The proof reports one bounded fact set per cluster."
-)]
 fn assert_cluster_health() -> AssertionResult {
     let start = Instant::now();
     let mut observed_facts = BTreeMap::new();
@@ -862,10 +858,6 @@ fn assert_cluster_health() -> AssertionResult {
 }
 
 /// Assert one provider stack per site and one consumer entrypoint.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The proof checks the required deployed components together."
-)]
 fn assert_component_deployment() -> AssertionResult {
     let start = Instant::now();
     let mut observed_facts = BTreeMap::new();
@@ -967,7 +959,6 @@ fn assert_component_deployment() -> AssertionResult {
 
 /// Assert every site's `GridNetwork` reports all three remote sites connected.
 #[expect(
-    clippy::too_many_lines,
     clippy::unnecessary_wraps,
     reason = "The assertion framework requires a fallible, named proof boundary."
 )]
@@ -1045,7 +1036,6 @@ fn assert_swim_convergence() -> AssertionResult {
 /// The locally declared placement site is not a remote SWIM discovery result
 /// and is excluded from this assertion.
 #[expect(
-    clippy::too_many_lines,
     clippy::unnecessary_wraps,
     reason = "The assertion framework requires a fallible, named proof boundary."
 )]
@@ -1380,10 +1370,6 @@ fn install_provider_boundary(certs_dir: &Path) -> Result<(), Box<dyn std::error:
 }
 
 /// Create a TLS secret from the generated cert, key, and CA files.
-#[expect(
-    clippy::too_many_lines,
-    reason = "TLS secret creation is one bounded setup operation."
-)]
 fn apply_tls_secret(
     context: &str,
     identity: &str,
@@ -1451,10 +1437,6 @@ fn apply_credential_secret(context: &str, secret_name: &str, token: &str) -> Res
 /// Captures both the Kubernetes `resourceVersion` (per-cluster) and the
 /// semantic revision from the `grid.praxis.fast/overlay-revision`
 /// annotation (content-addressed, safe to compare across clusters).
-#[expect(
-    clippy::too_many_lines,
-    reason = "The reader validates and parses one Kubernetes ConfigMap response."
-)]
 fn read_cluster_overlay(cluster: &str) -> Result<OverlayData, Box<dyn std::error::Error>> {
     let context = cluster_context(cluster);
 
@@ -1805,10 +1787,6 @@ fn expected_candidates() -> BTreeSet<String> {
 /// Pre-SWIM, each operator only knows its local `InferenceProvider` resources.
 /// Global convergence (all candidates on every cluster) happens after SWIM
 /// seeding in a separate phase.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The readiness poll checks each local cluster's overlay."
-)]
 fn wait_for_local_overlays() -> Result<BTreeMap<String, OverlayData>, Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(180);
     let interval = Duration::from_secs(5);
@@ -1856,10 +1834,6 @@ fn wait_for_local_overlays() -> Result<BTreeMap<String, OverlayData>, Box<dyn st
 }
 
 /// Wait until every provider-traffic cluster serves the same candidate set.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The convergence poll compares the bounded three-cluster overlay set."
-)]
 fn wait_for_global_overlay_convergence(
     expected: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, OverlayData>, Box<dyn std::error::Error>> {
@@ -2164,10 +2138,6 @@ fn collect_overlay_diagnostics() {
 /// - `CANDIDATE_ID_PLACEHOLDER` → stable ID from the overlay
 ///
 /// Creates the `provider-gateway-config` `ConfigMap` in each cluster.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Provider config materialization is one bounded setup phase."
-)]
 fn materialize_provider_config(
     overlays: &BTreeMap<String, OverlayData>,
     demo_root: &Path,
@@ -2792,10 +2762,6 @@ fn provider_gateway_endpoint_site<'endpoint>(
 }
 
 /// Opt the run-owned provider-a `GatewayRef` into the operator-generated config.
-#[expect(
-    clippy::too_many_lines,
-    reason = "this applies the opt-in only after reading and validating the run-owned gateway reference"
-)]
 fn enable_generated_consumer_config() -> Result<(), Box<dyn std::error::Error>> {
     let context = cluster_context("provider-a");
     let output = Command::new("kubectl")
@@ -2870,7 +2836,6 @@ fn enable_generated_consumer_config() -> Result<(), Box<dyn std::error::Error>> 
 }
 
 /// Change only the run-owned Provider A consumer endpoint transport and return its previous mode.
-#[expect(clippy::too_many_lines, reason = "reads and patches the run-owned consumer endpoint")]
 fn set_generated_consumer_provider_a_transport_mode(mode: &str) -> Result<String, Box<dyn std::error::Error>> {
     let context = cluster_context("provider-a");
     let output = Command::new("kubectl")
@@ -2946,10 +2911,6 @@ fn set_generated_consumer_provider_a_transport_mode(mode: &str) -> Result<String
 }
 
 /// Wait for a generation-current Rendered status and validate its live config.
-#[expect(
-    clippy::too_many_lines,
-    reason = "polling and validating the generated config is one bounded readiness gate"
-)]
 fn wait_for_generated_consumer_config() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     const TIMEOUT: Duration = Duration::from_secs(180);
     let context = cluster_context("provider-a");
@@ -3025,7 +2986,6 @@ fn wait_for_generated_consumer_config() -> Result<serde_json::Value, Box<dyn std
 }
 
 /// Wait for a generation-current consumer-config render error on the run-owned `GatewayRef`.
-#[expect(clippy::too_many_lines, reason = "polls status through the error transition")]
 fn wait_for_generated_consumer_config_error(
     expected_reason: &str,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -3087,10 +3047,6 @@ fn wait_for_generated_consumer_config_error(
 
 /// Check that generated YAML is dynamic, scoped, and contains the complete
 /// endpoint inventory rather than startup-only candidates.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the schema assertion checks the complete generated routing and endpoint contract"
-)]
 fn validate_generated_consumer_yaml(config_map: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
     let yaml = config_map
         .pointer("/data/praxis.yaml")
@@ -3175,10 +3131,6 @@ fn validate_generated_consumer_yaml(config_map: &serde_json::Value) -> Result<()
 }
 
 /// Configure and exercise the chart-managed embedded `grid-gateway` consumer.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the qualification provisions one isolated gateway and verifies its baseline request"
-)]
 fn activate_embedded_serving_gateway() -> AssertionResult {
     const TIMEOUT: Duration = Duration::from_secs(180);
     let started = Instant::now();
@@ -3352,7 +3304,6 @@ fn patch_embedded_provider_hop_endpoints(
 
 /// Wait for the controller's warning that invalid optional hop metadata was
 /// ignored while publishing an empty serving revision.
-#[expect(clippy::too_many_lines, reason = "polls controller logs for the scoped warning")]
 fn wait_for_empty_overlay_invalid_hop_warning(timeout: Duration) -> Result<String, Box<dyn std::error::Error>> {
     let context = cluster_context(CONSUMER_SITE);
     let deadline = Instant::now() + timeout;
@@ -3491,10 +3442,6 @@ fn restart_grid_operator(cluster: &str) -> Result<(), Box<dyn std::error::Error>
 }
 
 /// Install the chart-managed embedded consumer with its provider-hop endpoints.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Helm inputs and run-owned rollout verification form one bounded install operation"
-)]
 fn install_embedded_gateway(
     root: &Path,
     image: &str,
@@ -3642,10 +3589,6 @@ fn read_grid_serving_snapshot(context: &str) -> Result<serde_json::Value, Box<dy
 }
 
 /// Wait for the embedded gateway process to log acceptance of one exact serving digest.
-#[expect(
-    clippy::too_many_lines,
-    reason = "this bounded poll requires the exact digest and candidate count in runtime logs"
-)]
 fn wait_for_embedded_serving_log(
     snapshot: &serde_json::Value,
     context: &str,
@@ -3732,10 +3675,6 @@ fn embedded_serving_log_observation_count(
 }
 
 /// Send one request through the embedded `grid-gateway` Service and retain status plus provider attribution.
-#[expect(
-    clippy::too_many_lines,
-    reason = "request headers, response status, and attribution are captured as one probe"
-)]
 fn send_embedded_lifecycle_request(session_id: Option<&str>) -> Result<LifecycleRequest, Box<dyn std::error::Error>> {
     let mut args = vec![
         "curl".to_owned(),
@@ -4002,10 +3941,6 @@ fn verify_consumer_credential_request() -> Result<serde_json::Value, Box<dyn std
 
 /// Attest the projected-credential capability only after the generated filter
 /// and Secret volume have been confirmed in the rolled-out consumer Deployment.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one guarded read-patch-verify phase records a single readiness attestation"
-)]
 fn declare_projected_credentials_ready() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let context = cluster_context("provider-a");
     let output = Command::new("kubectl")
@@ -4088,10 +4023,6 @@ fn declare_projected_credentials_ready() -> Result<serde_json::Value, Box<dyn st
 
 /// Add one credential-bearing local candidate after the generated consumer
 /// filter is rolled out, then wait until Grid publishes its Secret reference.
-#[expect(
-    clippy::too_many_lines,
-    reason = "patch, bounded publication wait, and evidence form one ordered qualification phase"
-)]
 fn enable_provider_a_credential_candidate() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let previous = read_cluster_overlay("provider-a")?;
     let context = cluster_context("provider-a");
@@ -4163,10 +4094,6 @@ fn enable_provider_a_credential_candidate() -> Result<serde_json::Value, Box<dyn
 }
 
 /// Run the original six proofs and append lifecycle coverage in full mode.
-#[expect(
-    clippy::too_many_lines,
-    reason = "scenario order and the original six proofs remain explicit and auditable"
-)]
 fn run_provider_traffic_scenarios(mode: DemoMode, context: &ProviderTrafficContext) -> BTreeMap<String, ProofResult> {
     let mut results = BTreeMap::new();
     let mut scenario_num: usize = 0;
@@ -4473,10 +4400,6 @@ struct ProviderSelectorState {
 }
 
 /// Capture the selector contract from one topology-owned `InferenceProvider`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the helper validates identity and preserves every field needed for safe restoration"
-)]
 fn read_provider_selector(site: &str, resource: &str) -> Result<ProviderSelectorState, Box<dyn std::error::Error>> {
     let context = cluster_context(site);
     let output = Command::new("kubectl")
@@ -4525,10 +4448,6 @@ fn read_provider_selector(site: &str, resource: &str) -> Result<ProviderSelector
 }
 
 /// Change one topology-owned provider selector without touching its workload.
-#[expect(
-    clippy::too_many_lines,
-    reason = "selector mutation validates its target and applies only the narrowly owned label change"
-)]
 fn patch_provider_selector(
     state: &ProviderSelectorState,
     selector_value: &str,
@@ -4602,10 +4521,6 @@ fn wait_for_overlay_clusters(
 }
 
 /// Issue a request and retain only status plus provider attribution.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the lifecycle probe constructs a bounded request and parses only status/attribution"
-)]
 fn send_lifecycle_request(session_id: Option<&str>) -> Result<LifecycleRequest, Box<dyn std::error::Error>> {
     let mut args = vec![
         "curl".to_owned(),
@@ -4649,10 +4564,6 @@ fn send_lifecycle_request(session_id: Option<&str>) -> Result<LifecycleRequest, 
 }
 
 /// Read a workload's pod-local metrics through a scoped port-forward.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the scoped port-forward lifecycle and bounded HTTP read form one observation contract"
-)]
 fn read_workload_metrics(site: &str, resource: &str, remote_port: u16) -> Result<String, Box<dyn std::error::Error>> {
     let context = cluster_context(site);
     let local_port = find_local_tcp_port()?;
@@ -5417,10 +5328,6 @@ fn read_swim_lb_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error>> 
 }
 
 /// Update a single operator's SWIM configuration with peer addresses.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The Helm upgrade carries the bounded SWIM configuration contract."
-)]
 fn update_operator_swim_config(
     cluster: &str,
     advertise_ip: &str,
@@ -6349,7 +6256,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "This test exercises the complete evidence schema.")]
     fn evidence_serialization() {
         let evidence = Evidence {
             schema_version: "test".to_owned(),
@@ -6570,10 +6476,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "keeps the declaration and disabled consumer config assertions together"
-    )]
     fn embedded_gateway_declares_mtls_provider_hops_separately_from_disabled_consumer_config() {
         let endpoints = PROVIDER_RESOURCES
             .iter()

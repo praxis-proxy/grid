@@ -399,12 +399,6 @@ async fn probe_and_merge(
     clippy::large_stack_frames,
     reason = "async future with kube API types; mirrors grid_site.rs precedent"
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "status construction, patch-if-changed short-circuit, and the transition-telemetry call each need to \
-              stay inline for the flow to read top-to-bottom; the telemetry body itself is already split out into \
-              emit_transition_telemetry"
-)]
 async fn update_status(
     provider: &AgentToolProvider,
     client: &Client,
@@ -651,10 +645,6 @@ mod tests {
     /// Build a `kube::Client` backed by an in-memory `GridNetwork` map keyed
     /// by name, mirroring `mcp_probe::tests::mock_kube_client_with_secrets`'
     /// pattern for a different resource type.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "test mock builder: 404-vs-200 branches are the whole point"
-    )]
     fn mock_kube_client_with_grid_networks(networks: HashMap<&'static str, GridNetwork>) -> Client {
         let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
             let networks = networks.clone();
@@ -1139,10 +1129,6 @@ mod tests {
     /// publish by design (logged, not propagated; see `emit_transition_telemetry`),
     /// and the two scenarios below never reach `GridSite` listing at all,
     /// since both short-circuit inside `static_config_failure_reason`.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "test mock builder: PATCH-capture vs GridNetwork-GET vs catch-all-404 branches are the whole point"
-    )]
     fn mock_kube_client_capturing_status_patch(
         networks: HashMap<&'static str, GridNetwork>,
         captured: Arc<std::sync::Mutex<Option<serde_json::Value>>>,

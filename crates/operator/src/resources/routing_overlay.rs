@@ -1136,10 +1136,6 @@ struct GroupState {
 }
 
 /// Assign zero-based contiguous groups for each capability.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The two routing policies are explicit at this contract boundary."
-)]
 fn assign_selection_groups(candidates: &mut [RoutingCandidate], policy: crate::crd::grid_network::RoutingPolicy) {
     let mut last_by_capability: HashMap<(String, String), GroupState> = HashMap::new();
     for candidate in candidates {
@@ -1645,10 +1641,6 @@ fn collect_candidates(
 /// Mirrors [`collect_candidates`] for inference providers: filters by
 /// network, evaluates access policy, and delegates per-provider candidate
 /// generation to [`candidates_from_tool_provider`].
-#[expect(
-    clippy::too_many_lines,
-    reason = "three-arm access policy match mirrors the inference provider pattern and reads best unsplit"
-)]
 fn collect_tool_candidates(
     network_name: &str,
     sites: &[GridSite],
@@ -1750,10 +1742,6 @@ fn resolve_sites(provider: &InferenceProvider, network_sites: &[&GridSite], owni
 ///
 /// Returns an error if the provider has no metadata name or any model
 /// name is blank or whitespace-only.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential steps: name extraction, model validation, site resolution, credential projection, and candidate construction"
-)]
 fn candidates_from_provider(
     provider: &InferenceProvider,
     site_resolution: &SiteResolution,
@@ -1957,10 +1945,6 @@ pub(crate) fn is_candidate_fresh(provider: &InferenceProvider) -> bool {
 /// serialised.  In practice this cannot fail for the current type
 /// definition, but the caller must handle it to prevent silently
 /// applying an empty config.
-#[expect(
-    clippy::too_many_lines,
-    reason = "dual-key ConfigMap construction with optional envelope and annotations"
-)]
 pub fn build_overlay_configmap(
     overlay: &RoutingOverlay,
     envelope: Option<&super::overlay_envelope::OverlayEnvelope>,

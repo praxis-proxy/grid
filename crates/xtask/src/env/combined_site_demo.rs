@@ -4726,7 +4726,6 @@ fn materialize_external_provider_stack(
 
 /// Apply image overrides from environment variables to the Forge configuration.
 #[expect(
-    clippy::too_many_lines,
     clippy::collapsible_if,
     reason = "Image override application with structured YAML manipulation; nested ifs follow YAML structure hierarchy"
 )]
@@ -4861,10 +4860,6 @@ fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
 /// This is a global barrier: trust patching must not begin while another
 /// cluster is still waiting for its provider gateway endpoint to be
 /// advertised through SWIM.
-#[expect(
-    clippy::too_many_lines,
-    reason = "bounded polling loop reports each missing cluster/site pair"
-)]
 fn wait_for_all_discovered_sites(network: &str, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
     loop {

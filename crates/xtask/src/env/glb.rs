@@ -234,7 +234,6 @@ pub(crate) fn stage_provider_boundary_with_mode_and_external(
 /// When `external_key_file` is provided, the `OpenAI` API key Secret is created
 /// from that file on the east-provider cluster. The key file content is never
 /// read or logged by this process; `kubectl --from-file` handles the read.
-#[expect(clippy::too_many_lines, reason = "mode-branched sequential identity installation")]
 pub(crate) fn install_provider_boundary_with_mode_and_external(
     ingress_mode: IngressMode,
     external_key_file: Option<&Path>,
@@ -323,7 +322,6 @@ fn deployment_exists(context: &str, deployment: &str) -> Result<bool, Box<dyn st
 }
 
 /// Render provider gateway configs with the edge certificate digest.
-#[expect(clippy::too_many_lines, reason = "template rendering with token validation")]
 fn stage_provider_configs_with_external(
     east_edge_digest: &str,
     west_edge_digest: &str,
@@ -455,7 +453,6 @@ fn apply_configmap_key(
 }
 
 /// Append the `OpenAI` provider route, credential, and upstream to the east provider config.
-#[expect(clippy::too_many_lines, reason = "multi-section YAML insertion that reads linearly")]
 pub(crate) fn append_openai_provider_config(
     config: &str,
     ext: &ExternalProviderDescriptor,
@@ -537,7 +534,6 @@ pub(crate) fn append_openai_provider_config(
 }
 
 /// Append the `OpenAI` routing cluster to the edge gateway config.
-#[expect(clippy::too_many_lines, reason = "multi-section YAML insertion that reads linearly")]
 #[expect(
     clippy::string_slice,
     reason = "byte offset from str::find is always a char boundary"
@@ -645,7 +641,6 @@ pub(crate) fn apply_openai_credential_from_file(key_file: &Path) -> Result<(), B
 }
 
 /// Apply the `OpenAI` `InferenceProvider` CRD to the east-provider cluster.
-#[expect(clippy::too_many_lines, reason = "CRD manifest template that reads linearly")]
 pub(crate) fn apply_openai_inference_provider(
     ext: &ExternalProviderDescriptor,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -696,10 +691,6 @@ pub(crate) fn openai_candidate_id(model: &str) -> String {
 }
 
 /// Verify the exact external-provider candidate and accepted revision on one edge.
-#[expect(
-    clippy::too_many_lines,
-    reason = "keeps candidate, distributed revision, and serving revision proof atomic"
-)]
 pub(crate) fn verify_external_candidate(
     edge: &str,
     ext: &ExternalProviderDescriptor,
@@ -741,10 +732,6 @@ pub(crate) fn verify_external_candidate(
 }
 
 /// Prove a normal-mode deployment contains no OpenAI-specific runtime resources.
-#[expect(
-    clippy::too_many_lines,
-    reason = "checks every external-provider runtime surface in one fail-closed audit"
-)]
 pub(crate) fn verify_external_provider_absent() -> Result<String, Box<dyn std::error::Error>> {
     let east_provider = kubectl_context("east-provider");
     for (resource, name) in [
@@ -1263,7 +1250,6 @@ fn yaml_image_references(config_text: &str) -> Vec<(String, String)> {
 }
 
 /// Recursively collect image-like YAML fields.
-#[expect(clippy::too_many_lines, reason = "expanded wildcard match adds boilerplate")]
 fn collect_yaml_images(value: &serde_yaml::Value, path: &str, owner: &str, results: &mut Vec<(String, String)>) {
     match value {
         serde_yaml::Value::Mapping(mapping) => {
@@ -1936,10 +1922,6 @@ fn load_network_probe_image(provider: &str) -> Result<(), Box<dyn std::error::Er
 }
 
 /// Prove network and credential rejection behavior for one private backend.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential network probes for a single verification step"
-)]
 fn check_one_backend_network_boundary(
     provider: &str,
     context: &str,
@@ -2010,10 +1992,6 @@ struct NetworkPolicyProbe {
 }
 
 /// Capture bounded pod status and scheduling events for a non-terminal probe.
-#[expect(
-    clippy::too_many_lines,
-    reason = "pod status and event diagnostics are captured as one bounded evidence record"
-)]
 fn probe_diagnostics(context: &str, name: &str) -> String {
     let status = Command::new("timeout")
         .args([
@@ -2078,10 +2056,6 @@ fn delete_probe_pod(context: &str, name: &str) {
 }
 
 /// Run a bounded TCP probe pod and return its terminal phase and logs.
-#[expect(
-    clippy::too_many_lines,
-    reason = "kubectl pod lifecycle: create, poll, collect logs; splitting obscures the sequence"
-)]
 #[expect(
     clippy::disallowed_methods,
     reason = "xtask is synchronous; no async runtime available for tokio::time::sleep"
@@ -2263,10 +2237,6 @@ fn check_provider_peer_policy(addrs: &BTreeMap<String, String>) -> Result<String
 
 /// Prove unknown peer candidates and wrong paths are rejected
 /// by provider-local routing policy after successful peer authentication.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential network probes for a single verification step"
-)]
 fn check_provider_request_boundary(addrs: &BTreeMap<String, String>) -> Result<String, Box<dyn std::error::Error>> {
     let cert = format!("{GENERATED_CERTS_DIR}/east-edge-cert.pem");
     let key = format!("{GENERATED_CERTS_DIR}/east-edge-key.pem");
@@ -3342,10 +3312,6 @@ pub(crate) fn edge_overlay_revision_baselines() -> Result<BTreeMap<String, Strin
 /// The returned resource versions identify the marker writes. Readiness then
 /// requires each edge controller to restore the current generation and report
 /// the `ConfigMap` revision it actually published.
-#[expect(
-    clippy::too_many_lines,
-    reason = "each edge status marker must be validated, reset, and tied to its returned resource version"
-)]
 pub(crate) fn reset_edge_overlay_observation_markers() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     EDGE_CLUSTERS
         .iter()
@@ -3447,10 +3413,6 @@ pub(crate) fn reset_edge_overlay_observation_markers() -> Result<BTreeMap<String
 /// revision. This permits a restarted operator to confirm an unchanged
 /// semantic overlay without requiring its digest to change. For each edge,
 /// the status must name the current `ConfigMap` resource version and revision.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the bounded poll keeps post-restart readiness and its diagnostics together"
-)]
 pub(crate) fn wait_for_edge_overlays_ready_after_restart(
     restarted_cluster: &str,
     previous_network_resource_version: &str,
@@ -3564,10 +3526,6 @@ fn grid_network_json(cluster: &str) -> Result<serde_json::Value, Box<dyn std::er
 }
 
 /// Check that a restarted operator has published current mesh and overlay status.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the status fields and their recovery conditions form one validation"
-)]
 fn grid_network_recovered_after_restart(
     cluster: &str,
     network: &serde_json::Value,
@@ -3733,10 +3691,6 @@ fn edge_overlay_configmap_json(edge: &str) -> Result<serde_json::Value, Box<dyn 
 }
 
 /// Extract the semantic revision and resource version after validating candidate count.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the current payload, stable IDs, freshness, and revision are one validated snapshot"
-)]
 fn parse_current_edge_overlay(
     edge: &str,
     config_map: &serde_json::Value,
@@ -3842,10 +3796,6 @@ fn edge_overlay_status<'network>(
 }
 
 /// Require the status entry to describe the current `ConfigMap` and candidate set.
-#[expect(
-    clippy::too_many_lines,
-    reason = "all distribution status fields are checked together against the same overlay snapshot"
-)]
 fn validate_edge_overlay_status(
     edge: &str,
     overlay_status: &serde_json::Value,
@@ -3907,11 +3857,6 @@ fn validate_edge_overlay_mount(edge: &str) -> Result<(), Box<dyn std::error::Err
 }
 
 /// Validate one edge cluster's overlay content and volume projection.
-#[expect(
-    clippy::too_many_lines,
-    reason = "linear validation sequence, splitting hurts readability"
-)]
-
 fn verify_single_edge_overlay_with_count(
     edge: &str,
     expected_candidates: usize,
@@ -4015,10 +3960,6 @@ const EDGE_OVERLAY_PROJECTION_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Poll until the edge accepts and serves `revision` in two consecutive
 /// observations without a pod replacement or container restart.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the bounded serving barrier keeps polling, identity, and diagnostic state together"
-)]
 pub(crate) fn verify_edge_serving_revision(edge: &str, revision: &str) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + EDGE_SERVING_TIMEOUT;
     let initial = edge_pod_identity(edge)?;
@@ -4101,10 +4042,6 @@ pub(crate) fn verify_edge_serving_revision(edge: &str, revision: &str) -> Result
 /// edge's `ConfigMap` and require the same pair of revisions to be served in
 /// consecutive observations, rather than pinning a transient revision before
 /// convergence finishes.
-#[expect(
-    clippy::too_many_lines,
-    reason = "restart convergence checks keep revision, identity, and serving evidence together"
-)]
 pub(crate) fn wait_for_edge_overlays_serving_with_count(
     expected_candidates: usize,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -4169,10 +4106,6 @@ pub(crate) fn wait_for_edge_overlays_serving_with_count(
 }
 
 /// Wait for every edge to serve a stable map of its current distributed revisions.
-#[expect(
-    clippy::too_many_lines,
-    reason = "bounded multi-edge polling keeps stability and timeout diagnostics together"
-)]
 fn wait_for_stable_served_revisions(
     edges: &[&str],
     timeout: Duration,
@@ -4573,10 +4506,6 @@ fn get_edge_pod_json(edge: &str) -> Result<serde_json::Value, Box<dyn std::error
 }
 
 /// Read the revision from the mounted overlay in the selected ready edge pod.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one atomic observation ties mounted contents to the exact ready gateway pod"
-)]
 fn edge_mounted_overlay_observation(
     edge: &str,
     provider: &str,
@@ -4892,7 +4821,6 @@ fn check_edge_pod_stable(edge: &str, expected: &EdgePodIdentity) -> Result<Strin
 /// overwrite the deliberately corrupted `ConfigMap`.  This is not
 /// a production overlay-distribution path.
 #[expect(
-    clippy::too_many_lines,
     clippy::indexing_slicing,
     reason = "sequential end-to-end proof with known-shape JSON mutation"
 )]
@@ -5092,7 +5020,6 @@ fn count_invalid_reload_logs(edge: &str) -> Result<usize, Box<dyn std::error::Er
 /// startup content rather than becoming ready.
 #[expect(
     clippy::disallowed_methods,
-    clippy::too_many_lines,
     reason = "bounded polling in synchronous xtask validation"
 )]
 fn wait_for_cold_start_rejection(edge: &str, previous_uid: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -5202,10 +5129,6 @@ fn wait_for_candidate_admission(
 }
 
 /// Wait until the operator republishes the expected complete overlay after restoration.
-#[expect(
-    clippy::too_many_lines,
-    reason = "publication identity, status, stability, and timeout diagnostics are one barrier"
-)]
 fn wait_for_restored_overlay_publication(
     edge: &str,
     expected_revision: &str,
@@ -5273,7 +5196,6 @@ fn same_semantic_overlay(left: &CurrentEdgeOverlay, right: &CurrentEdgeOverlay) 
 /// Require a fresh operator publication of the exact complete restored revision.
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "the expected restored revision and both freshness markers define one publication predicate"
 )]
 fn restored_overlay_publication_evidence(
@@ -5320,7 +5242,6 @@ fn restored_overlay_publication_evidence(
 
 /// Wait until the restored `ConfigMap` revision is stably projected into the ready gateway pod.
 #[expect(
-    clippy::too_many_lines,
     clippy::too_many_arguments,
     reason = "the bounded projection barrier keeps revision and pod diagnostics together"
 )]
@@ -5391,10 +5312,6 @@ fn wait_for_withdrawal_overlay_projection(
 
 /// Require the same withdrawn overlay to be published and mounted twice in a
 /// row before the separate Praxis serving timeout starts.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the bounded poll keeps revision, provider presence, pod identity, and timeout diagnostics together"
-)]
 fn wait_for_stable_withdrawal_projection(
     edge: &str,
     provider: &str,
@@ -5594,11 +5511,7 @@ fn operator_replicas(edge: &str) -> Result<u32, Box<dyn std::error::Error>> {
 /// Used to prevent the operator from reconciling the overlay
 /// `ConfigMap` while the verifier holds it in an intentionally
 /// invalid state.
-#[expect(
-    clippy::disallowed_methods,
-    clippy::too_many_lines,
-    reason = "synchronous polling in xtask validation"
-)]
+#[expect(clippy::disallowed_methods, reason = "synchronous polling in xtask validation")]
 fn scale_operator(edge: &str, replicas: u32) -> Result<(), Box<dyn std::error::Error>> {
     let target = format!("--replicas={replicas}");
     let output = Command::new("kubectl")
@@ -6382,10 +6295,6 @@ clusters:
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "three-candidate overlay construction and differential assertion"
-    )]
     fn overlay_keeps_same_site_providers_as_distinct_candidates() {
         let candidate = |site: &str, cluster: &str, stable_id: String| {
             serde_json::json!({
@@ -7121,10 +7030,6 @@ clusters:
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the scenarios cover publication, projection, and pod replacement in sequence"
-    )]
     fn withdrawal_projection_waits_for_matching_stable_mount_and_pod() {
         let observations = [
             EdgeMountedOverlayObservation {
@@ -7201,10 +7106,6 @@ clusters:
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the convergence test covers multiple overlay revisions and a readiness gap"
-    )]
     fn restart_barrier_tracks_overlay_revisions_until_all_edges_are_stably_serving() {
         let west_observations = std::cell::Cell::new(0_u32);
         let result = wait_for_stable_served_revisions(
@@ -7265,10 +7166,6 @@ clusters:
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the assertions cover stale, pre-restart, and recovered status cases"
-    )]
     fn post_restart_publication_requires_fresh_active_gridnetwork_status() {
         let network = serde_json::json!({
             "metadata": { "resourceVersion": "42", "generation": 3 },
@@ -7337,10 +7234,6 @@ clusters:
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the assertions distinguish a valid restored publication from stale or incomplete state"
-    )]
     fn restored_publication_requires_new_exact_fresh_overlay_and_status() {
         let mut complete = CurrentEdgeOverlay {
             resource_version: "52".to_owned(),
@@ -7381,10 +7274,6 @@ clusters:
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the sequence proves stale projection is ignored until the exact stable revision is mounted"
-    )]
     fn restored_projection_waits_for_matching_revision_and_stable_gateway_pod() {
         let observations = [
             EdgeMountedOverlayObservation {

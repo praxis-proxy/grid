@@ -28,10 +28,6 @@ const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 /// [`FetchError::Unreachable`] on a non-success status, a body read past the time
 /// bound, or a non-UTF-8 body; [`FetchError::TooLarge`] past the ceiling;
 /// [`FetchError::NoDate`] when the response carries no usable `Date`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential status check, Date parse, and bounded body read"
-)]
 pub(crate) async fn read_scrape_response(
     response: http::Response<hyper::body::Incoming>,
     peer_identity: Arc<str>,

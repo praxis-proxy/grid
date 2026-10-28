@@ -1447,7 +1447,6 @@ fn revision_renewer(client: Client, site_name: String) -> swim_runtime::Revision
 
 /// Persist the lease `plan` makes from the held revision and generation marks, before any of it is used.
 #[expect(
-    clippy::too_many_lines,
     clippy::large_stack_frames,
     reason = "the Kubernetes read/create/replace CAS loop keeps each conflict and fail-closed path explicit"
 )]
@@ -1774,10 +1773,6 @@ async fn create_local_records(
 /// Metrics TLS rotation is detected by bounded requeue rather than a
 /// cluster-wide Secret watch; the operator only reads referenced
 /// Secrets by explicit namespace/name during reconciliation.
-#[expect(
-    clippy::too_many_lines,
-    reason = "controller builder chains three cross-resource watches plus SWIM event plumbing"
-)]
 async fn run_network_controller(
     client: Client,
     ctx: Arc<OperatorCtx>,
@@ -2421,10 +2416,6 @@ struct Serving {
 }
 
 /// Accept signals connections, deciding scope from the certificate presented.
-#[expect(
-    clippy::too_many_lines,
-    reason = "accept, admission, shutdown drain, and task ownership form one connection lifecycle"
-)]
 async fn serve_signals_tls(
     listener: tokio::net::TcpListener,
     serving: Serving,
@@ -2899,10 +2890,6 @@ async fn spoke_in_time(
 #[cfg_attr(
     not(feature = "fips"),
     expect(clippy::large_stack_frames, reason = "async future over a rustls handshake")
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "handshake shutdown, authenticated admission, and HTTP serving form one connection lifecycle"
 )]
 async fn serve_signals_connection(
     serving: Serving,
@@ -4570,7 +4557,6 @@ mod tests {
 
     /// The same callers under both trust modes.
     #[test]
-    #[expect(clippy::too_many_lines, reason = "case table")]
     fn signals_caller_by_trust_mode() {
         let addr = SocketAddr::from(([127, 0, 0, 1], 0));
         let (own, east, west, stranger) = (site_der("hub"), site_der("east"), site_der("west"), site_der("nowhere"));
@@ -4631,7 +4617,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[expect(clippy::too_many_lines, reason = "server TLS setup and a silent client")]
     async fn a_silent_client_is_dropped_before_its_handshake_is_waited_out() {
         let ca = certs::generate_ca("grid-ca").expect("fixture");
         let site = certs::generate_site_cert(&ca, "east").expect("fixture");
@@ -4958,7 +4943,6 @@ mod tests {
     /// request, not only when it reconnects.
     #[cfg(not(feature = "fips"))]
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "one connection, two requests, a removal between")]
     async fn a_removed_peer_is_refused_on_its_open_connection() {
         let mesh = Mesh::new();
         let identity = mesh.west_is_pinned();
@@ -5163,10 +5147,6 @@ mod tests {
     /// polling across it, and new connections see the renewed leaf.
     #[cfg(not(feature = "fips"))]
     #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "serve, poll, rotate, and poll again read as one scenario"
-    )]
     async fn a_renewal_rebinds_the_listener_without_dropping_a_peer_poll() {
         let mesh = Mesh::new();
         let renewed = certs::generate_site_cert(&mesh.ca, "east").expect("fixture");
@@ -5644,7 +5624,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one fixture walked through each kind of peer")]
     fn the_first_write_waits_for_every_live_named_peer_to_deliver() {
         let member = |site: &str, status| operator::swim::MemberRecord {
             site_id: site.to_owned(),
@@ -5864,7 +5843,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "every bind outcome against one fake binder")]
     async fn the_default_bind_falls_back_to_ipv4_without_ipv6() {
         let refuse_v6 = |kind: Option<std::io::ErrorKind>, raw: Option<i32>| {
             move |addr: SocketAddr| {
@@ -5904,7 +5882,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "membership and identities for both trust modes")]
     fn peers_are_polled_only_when_this_site_would_name_them() {
         let member = |site: &str, endpoint: &str| operator::swim::MemberRecord {
             site_id: site.to_owned(),
@@ -5983,7 +5960,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "declared, then gossiped, then nothing")]
     fn a_declared_endpoint_is_polled_without_gossip_and_over_a_gossiped_address() {
         let declared = |address: &str, server_name: Option<&str>, pins: Vec<String>| operator::signals::PeerRecord {
             labels: BTreeMap::new(),
@@ -6114,10 +6090,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "two declared and two gossiped members, then one round"
-    )]
     fn this_site_never_polls_itself_though_its_own_grid_site_declares_an_endpoint() {
         let declared = |host: &str| operator::signals::PeerRecord {
             labels: BTreeMap::new(),
@@ -6162,7 +6134,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "three rounds over one remembered set")]
     fn a_peer_swim_lost_is_still_polled_while_its_grid_site_names_it() {
         let member = |site: &str, endpoint: &str, status| operator::swim::MemberRecord {
             site_id: site.to_owned(),
@@ -6542,7 +6513,6 @@ mod tests {
     }
 
     /// An apiserver that routes one holder slice, then never answers again.
-    #[expect(clippy::too_many_lines, reason = "a scripted apiserver, one response per arm")]
     fn routes_then_hangs() -> Arc<operator::holder_route::HolderRoutes> {
         let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
@@ -6620,7 +6590,6 @@ mod tests {
     /// An identity renewal under way holds the lease until it finishes, whether the stand-down
     /// began on a signal or on a lost lease.
     #[tokio::test(start_paused = true)]
-    #[expect(clippy::too_many_lines, reason = "one stand-down per path, followed step by step")]
     async fn a_renewal_under_way_holds_the_lease_release_on_either_path() {
         for lost in [false, true] {
             let (trigger, shutdown) = operator::shutdown::Trigger::new();
