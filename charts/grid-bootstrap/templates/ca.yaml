@@ -1,0 +1,48 @@
+{{- include "grid-bootstrap.validate" . }}
+{{- if and .Values.enabled (eq .Values.ca.mode "Generate") }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ .Values.ca.bootstrapIssuerName | quote }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "grid-bootstrap.labels" . | nindent 4 }}
+  annotations:
+    {{- include "grid-bootstrap.retain" . | nindent 4 }}
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ .Values.ca.certificateName | quote }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "grid-bootstrap.labels" . | nindent 4 }}
+  annotations:
+    {{- include "grid-bootstrap.retain" . | nindent 4 }}
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  isCA: true
+  commonName: {{ .Values.ca.commonName | quote }}
+  secretName: {{ .Values.ca.secretName | quote }}
+  duration: {{ printf "%dh" (int .Values.ca.durationHours) | quote }}
+  renewBefore: {{ printf "%dh" (int .Values.ca.renewBeforeHours) | quote }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    encoding: PKCS8
+    # Replacing the signing key would split the grid's trust domain.
+    rotationPolicy: Never
+  usages:
+    - cert sign
+    - crl sign
+  secretTemplate:
+    annotations:
+      {{- include "grid-bootstrap.retain" . | nindent 6 }}
+  issuerRef:
+    name: {{ .Values.ca.bootstrapIssuerName | quote }}
+    kind: Issuer
+    group: cert-manager.io
+{{- end }}

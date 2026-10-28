@@ -1,0 +1,18 @@
+{{- if .Values.enabled }}
+Grid bootstrap references CA Secret {{ .Release.Namespace }}/{{ .Values.ca.secretName }}.
+The namespaced Issuer is {{ .Release.Namespace }}/{{ .Values.issuer.name }}.
+
+Wait for it before enrolling a site:
+  kubectl -n {{ .Release.Namespace }} wait issuer/{{ .Values.issuer.name }} --for=condition=Ready --timeout=120s
+
+Keep the CA private key on the hub. Distribute only its public certificate,
+and each site's own leaf certificate and private key, through the enroll flow.
+{{- if eq .Values.ca.mode "Existing" }}
+This release does not create, modify, or renew the existing CA Secret.
+{{- else }}
+The generated CA Certificate, Secret, and SelfSigned Issuer are retained on uninstall.
+CA certificate renewal reuses its signing key. CA replacement needs a separate migration.
+{{- end }}
+{{- else }}
+Grid bootstrap is disabled. Set enabled=true and choose ca.mode before installation.
+{{- end }}

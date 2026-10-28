@@ -1,0 +1,126 @@
+suite: bootstrap trust ownership
+release:
+  name: grid-bootstrap
+  namespace: grid-trust
+templates:
+  - templates/ca.yaml
+  - templates/issuer.yaml
+tests:
+  - it: renders nothing before bootstrap is enabled
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: adopts an existing CA through a namespaced issuer without writing the CA
+    set:
+      enabled: true
+      ca.secretName: existing-grid-ca
+      issuer.name: site-signer
+    asserts:
+      - hasDocuments:
+          count: 0
+        template: templates/ca.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/issuer.yaml
+      - isKind:
+          of: Issuer
+        template: templates/issuer.yaml
+      - equal:
+          path: metadata.namespace
+          value: grid-trust
+        template: templates/issuer.yaml
+      - equal:
+          path: metadata.name
+          value: site-signer
+        template: templates/issuer.yaml
+      - equal:
+          path: spec.ca.secretName
+          value: existing-grid-ca
+        template: templates/issuer.yaml
+
+  - it: generates a retained CA with a stable signing key only when requested
+    set:
+      enabled: true
+      ca.mode: Generate
+    asserts:
+      - hasDocuments:
+          count: 2
+        template: templates/ca.yaml
+      - isKind:
+          of: Issuer
+        template: templates/ca.yaml
+        documentIndex: 0
+      - equal:
+          path: spec.selfSigned
+          value: {}
+        template: templates/ca.yaml
+        documentIndex: 0
+      - isKind:
+          of: Certificate
+        template: templates/ca.yaml
+        documentIndex: 1
+      - equal:
+          path: spec.isCA
+          value: true
+        template: templates/ca.yaml
+        documentIndex: 1
+      - equal:
+          path: spec.privateKey.rotationPolicy
+          value: Never
+        template: templates/ca.yaml
+        documentIndex: 1
+      - equal:
+          path: spec.privateKey.encoding
+          value: PKCS8
+        template: templates/ca.yaml
+        documentIndex: 1
+      - equal:
+          path: spec.issuerRef.name
+          value: grid-root-selfsigned
+        template: templates/ca.yaml
+        documentIndex: 1
+      - equal:
+          path: spec.secretName
+          value: grid-ca-key
+        template: templates/ca.yaml
+        documentIndex: 1
+      - equal:
+          path: metadata.annotations["helm.sh/resource-policy"]
+          value: keep
+        template: templates/ca.yaml
+      - equal:
+          path: metadata.annotations["argocd.argoproj.io/sync-options"]
+          value: Prune=false,Delete=false
+        template: templates/ca.yaml
+      - equal:
+          path: spec.secretTemplate.annotations["helm.sh/resource-policy"]
+          value: keep
+        template: templates/ca.yaml
+        documentIndex: 1
+      - equal:
+          path: spec.secretTemplate.annotations["argocd.argoproj.io/sync-options"]
+          value: Prune=false,Delete=false
+        template: templates/ca.yaml
+        documentIndex: 1
+
+  - it: rejects a renewal window that cannot fit inside the CA lifetime
+    set:
+      enabled: true
+      ca.mode: Generate
+      ca.durationHours: 24
+      ca.renewBeforeHours: 24
+    asserts:
+      - failedTemplate:
+          errorMessage: ca.renewBeforeHours must be less than ca.durationHours
+        template: templates/issuer.yaml
+
+  - it: rejects two issuers with the same resource name
+    set:
+      enabled: true
+      ca.mode: Generate
+      issuer.name: grid-root-selfsigned
+    asserts:
+      - failedTemplate:
+          errorMessage: issuer.name and ca.bootstrapIssuerName must differ
+        template: templates/issuer.yaml

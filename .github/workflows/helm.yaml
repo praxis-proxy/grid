@@ -385,6 +385,9 @@ jobs:
         run: |
           KIND=1 GRID_IMAGE_TAG=ci ./scripts/verify-helm-chart.sh
 
+      - name: Verify bootstrap CA issuance and retention
+        run: bash charts/grid-bootstrap/tests/e2e.sh
+
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
