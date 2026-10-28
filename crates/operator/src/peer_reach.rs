@@ -34,8 +34,9 @@ pub const SIGNALS_REACHABLE: &str = "SignalsReachable";
 /// A peer `GridSite`'s catalog condition type.
 pub const CATALOG_ACCEPTED: &str = "CatalogAccepted";
 
-/// Reason for a peer with no signals endpoint to poll.
-pub const NO_SIGNALS_ENDPOINT: &str = "NoSignalsEndpoint";
+/// Reason for a peer with no signals endpoint to poll: it sends traffic out but this site
+/// reads nothing from it, which is a fact about the peer, not a failure.
+pub const EGRESS_ONLY: &str = "EgressOnly";
 
 /// Reason for a peer not yet checked.
 pub const AWAITING_FIRST_CHECK: &str = "AwaitingFirstCheck";
@@ -129,7 +130,7 @@ pub const CATALOGS: Kind = Kind {
 };
 
 /// What a peer's signals endpoint is told about when it does not answer.
-const NO_ENDPOINT: &str = "no signals endpoint: set spec.signalsEndpoint, or a dialable spec.gatewayEndpoint";
+const NO_ENDPOINT: &str = "no signals endpoint, so it is not polled: set spec.signalsEndpoint, or a dialable spec.gatewayEndpoint, to poll it";
 
 /// What one peer was judged this round.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,6 +141,8 @@ pub enum Judged {
     Noted(String),
     /// Not in the clear: the cause as a reason, and the detail.
     Failing(&'static str, String),
+    /// Declares no signals endpoint, so it is not polled; counted neither way.
+    EgressOnly,
     /// Not yet checked.
     Awaiting,
 }
@@ -193,10 +196,7 @@ impl PeerReach {
             peers.insert(peer.to_owned(), judged);
         }
         for peer in without_endpoint {
-            peers.insert(
-                peer.to_owned(),
-                Judged::Failing(NO_SIGNALS_ENDPOINT, NO_ENDPOINT.to_owned()),
-            );
+            peers.insert(peer.to_owned(), Judged::EgressOnly);
         }
         Self { kind: &REACH, peers }
     }
@@ -210,9 +210,9 @@ impl PeerReach {
         self.peers.iter_mut().for_each(|(peer, judged)| {
             let recent = misses.of(peer) < MISSES_BEFORE_UNREACHABLE;
             let excused = match judged {
-                Judged::Failing(reason, _) => *reason == deadline || (*reason != NO_SIGNALS_ENDPOINT && recent),
+                Judged::Failing(reason, _) => *reason == deadline || recent,
                 Judged::Awaiting => recent,
-                Judged::Clear | Judged::Noted(_) => false,
+                Judged::Clear | Judged::Noted(_) | Judged::EgressOnly => false,
             };
             if excused && previous.peers.get(peer) == Some(&Judged::Clear) {
                 *judged = Judged::Clear;
@@ -259,7 +259,7 @@ impl PeerReach {
         let checked = self
             .peers
             .values()
-            .filter(|judged| !matches!(judged, Judged::Awaiting))
+            .filter(|judged| !matches!(judged, Judged::Awaiting | Judged::EgressOnly))
             .count();
         let (status, reason, message) = if failing == 0 {
             ("True", self.kind.type_, self.kind.clear.to_owned())
@@ -284,6 +284,7 @@ impl PeerReach {
             Judged::Clear => ("True", self.kind.site_type, self.kind.site_clear.to_owned()),
             Judged::Noted(note) => ("True", self.kind.site_type, format!("{}; {note}", self.kind.site_clear)),
             Judged::Failing(reason, message) => ("False", *reason, message.clone()),
+            Judged::EgressOnly => ("False", EGRESS_ONLY, NO_ENDPOINT.to_owned()),
             Judged::Awaiting => (
                 "Unknown",
                 AWAITING_FIRST_CHECK,
@@ -383,9 +384,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        AWAITING_FIRST_CHECK, CATALOG_ACCEPTED, CATALOGS, CATALOGS_REFUSED, MISSES_BEFORE_UNREACHABLE, Misses,
-        NO_ENDPOINT, NO_SIGNALS_ENDPOINT, PEER_CATALOGS_ACCEPTED, PEER_SIGNALS_REACHABLE, PEERS_UNREACHABLE, PeerReach,
-        REACH, SIGNALS_REACHABLE,
+        AWAITING_FIRST_CHECK, CATALOG_ACCEPTED, CATALOGS, CATALOGS_REFUSED, EGRESS_ONLY, MISSES_BEFORE_UNREACHABLE,
+        Misses, NO_ENDPOINT, PEER_CATALOGS_ACCEPTED, PEER_SIGNALS_REACHABLE, PEERS_UNREACHABLE, PeerReach, REACH,
+        SIGNALS_REACHABLE,
     };
     use crate::{
         crd::{
@@ -445,7 +446,7 @@ mod tests {
             ("east", "False", "NotFound", "https://east:9443: answered 404"),
             ("west", "False", "Timeout", "https://west:9443: timed out"),
             ("north", "False", "TLSRefused", "TLS"),
-            ("south", "False", NO_SIGNALS_ENDPOINT, NO_ENDPOINT),
+            ("south", "False", EGRESS_ONLY, NO_ENDPOINT),
             ("fresh", "Unknown", AWAITING_FIRST_CHECK, "not yet"),
         ] {
             let written = applied(&reach, &site(peer, Vec::new())).unwrap_or_else(|| std::process::abort());
@@ -468,8 +469,8 @@ mod tests {
                 written.reason.as_str(),
                 written.message.as_str()
             ),
-            ("False", PEERS_UNREACHABLE, "4 of 5 peers unreachable"),
-            "the peer not yet checked is not counted"
+            ("False", PEERS_UNREACHABLE, "3 of 4 peers unreachable"),
+            "neither the peer not yet checked nor the egress-only one is counted"
         );
         let none = PeerReach::of(
             [],
@@ -478,8 +479,39 @@ mod tests {
         );
         assert_eq!(
             (condition(&none).reason.as_str(), condition(&none).message.as_str()),
-            (PEERS_UNREACHABLE, "2 of 2 peers unreachable")
+            (PEERS_UNREACHABLE, "1 of 1 peers unreachable")
         );
+    }
+
+    #[test]
+    fn an_egress_only_peer_is_named_on_its_grid_site_and_counted_neither_way() {
+        let reach = PeerReach::of(["up"], [], ["egress"]);
+        let written = condition(&reach);
+        assert_eq!(
+            (written.status.as_str(), written.reason.as_str()),
+            ("True", PEER_SIGNALS_REACHABLE),
+            "one egress-only member does not degrade every other site"
+        );
+        let site = applied(&reach, &site("egress", Vec::new())).unwrap_or_else(|| std::process::abort());
+        assert_eq!((site.status.as_str(), site.reason.as_str()), ("False", EGRESS_ONLY));
+    }
+
+    #[test]
+    fn this_site_is_never_judged_as_its_own_peer_when_its_grid_site_declares_no_endpoint() {
+        let identities = crate::signals::PeerIdentities::new();
+        identities.set(
+            ["hub", "east"]
+                .map(|site| (site.to_owned(), crate::signals::PeerRecord::default()))
+                .into(),
+        );
+        let without = identities.without_endpoint("hub");
+        assert_eq!(without, ["east"], "the own record is not a peer's");
+        let reach = PeerReach::of(["west"], [], without.iter().map(String::as_str));
+        assert!(
+            reach.site_patch(&site("hub", Vec::new()), "t").is_none(),
+            "the own GridSite carries no peer-reach condition"
+        );
+        assert_eq!(condition(&reach).status, "True", "and is not counted");
     }
 
     /// Each peer's reason after one round over `peers`, `answered` the ones that answered.

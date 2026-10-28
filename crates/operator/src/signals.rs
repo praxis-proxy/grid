@@ -673,14 +673,15 @@ impl PeerIdentities {
         held.get(site).is_none_or(|record| record.pins.is_empty())
     }
 
-    /// Each known peer with no signals endpoint to poll it at.
+    /// Each known peer with no signals endpoint to poll it at, never `local_site`, whose own
+    /// record this site is not a peer of.
     #[must_use]
-    pub fn without_endpoint(&self) -> Vec<String> {
+    pub fn without_endpoint(&self, local_site: &str) -> Vec<String> {
         let Ok(held) = self.inner.read() else {
             return Vec::new();
         };
         held.iter()
-            .filter(|(_, record)| record.signals.is_none())
+            .filter(|(site, record)| record.signals.is_none() && *site != local_site)
             .map(|(site, _)| site.clone())
             .collect()
     }

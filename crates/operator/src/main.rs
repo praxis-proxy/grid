@@ -3576,7 +3576,7 @@ impl PeerPoller {
     /// changed. Under Swim, remove what a Local run left on the `GridSite` objects, once.
     async fn report_reach(
         &mut self,
-        source: &operator::signals::PollPeers,
+        (source, local_site): (&operator::signals::PollPeers, &str),
         polled: &[String],
         answered: &BTreeMap<String, usize>,
         urls: &std::collections::HashMap<String, String>,
@@ -3589,7 +3589,7 @@ impl PeerPoller {
             }
             return;
         }
-        let (reach, catalogs) = self.judge(source, polled, answered, urls);
+        let (reach, catalogs) = self.judge((source, local_site), polled, answered, urls);
         let changed = reach != self.reach || catalogs != self.catalogs;
         if reach != self.reach {
             Box::pin(write_peer_reach(&self.client, &reach, &self.shutdown)).await;
@@ -3609,13 +3609,13 @@ impl PeerPoller {
     /// This round's signals and catalog verdicts on each peer.
     fn judge(
         &self,
-        source: &operator::signals::PollPeers,
+        (source, local_site): (&operator::signals::PollPeers, &str),
         polled: &[String],
         answered: &BTreeMap<String, usize>,
         urls: &std::collections::HashMap<String, String>,
     ) -> (operator::peer_reach::PeerReach, operator::peer_reach::PeerReach) {
         use operator::peer_reach::PeerReach;
-        let without_endpoint = self.ctx.peer_identities().without_endpoint();
+        let without_endpoint = self.ctx.peer_identities().without_endpoint(local_site);
         let reach = PeerReach::of(
             answered.keys().map(String::as_str),
             self.unanswered.iter().map(|peer| {
@@ -3650,6 +3650,7 @@ impl PeerPoller {
             .as_ref()
             .map(|swim| swim.site_name())
             .or_else(|| self.ctx.site_name())
+            .map(str::to_owned)
         else {
             tracing::debug!("peer polling waits for this site's name");
             return;
@@ -3658,7 +3659,7 @@ impl PeerPoller {
             identities: &self.ctx.peer_identities(),
             trust: source.trust,
             encrypted: self.swim.as_ref().is_some_and(|swim| swim.is_encrypted()),
-            local_site,
+            local_site: &local_site,
         })
         .targets(snapshot.as_ref(), &mut self.remembered) else {
             return;
@@ -3737,7 +3738,7 @@ impl PeerPoller {
             .filter(|site| !answered.contains_key(*site))
             .cloned()
             .collect();
-        Box::pin(self.report_reach(source, &polled, &answered, &urls)).await;
+        Box::pin(self.report_reach((source, &local_site), &polled, &answered, &urls)).await;
         if observe_peer_ages(membership_ready, &mut self.ages, &polled, &answered) {
             Box::pin(write_peer_ages(&self.client, &self.ages, &self.shutdown)).await;
         }

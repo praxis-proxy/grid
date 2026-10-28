@@ -892,7 +892,7 @@ answered the last poll. The message carries the polled address and the detail.
 | `False` | `TLSRefused` | The TLS handshake or the peer's identity was refused. |
 | `False` | `ConnectionRefused` | The connection was refused or never established. |
 | `False` | `RequestFailed` | Any other failure, named in the message. |
-| `False` | `NoSignalsEndpoint` | The peer has no signals endpoint to poll: set `spec.signalsEndpoint`, or a dialable `spec.gatewayEndpoint`. |
+| `False` | `EgressOnly` | The peer declares no signals endpoint, so it is not polled: set `spec.signalsEndpoint`, or a dialable `spec.gatewayEndpoint`, to poll it. It raises neither the peer's `Degraded` nor the `GridNetwork` count. |
 
 `CatalogAccepted` (`grid-operator-peer-catalogs`) says whether the peer's catalog was
 accepted in the last rendering. It is written once a catalog is held.

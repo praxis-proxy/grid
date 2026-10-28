@@ -705,15 +705,19 @@ fn connected_verdict<'step>(
 }
 
 /// What degrades a peer without gating it: this site's view of its signals, then of its
-/// catalog, as (reason, message) with the message naming the condition. `Unknown` or absent
-/// degrades nothing.
+/// catalog, as (reason, message) with the message naming the condition. `Unknown`, absent, or
+/// an egress-only peer, which declares no signals to read, degrades nothing.
 fn peer_concern(held: &[crate::crd::inference_provider::Condition]) -> Option<(String, String)> {
     [
         crate::peer_reach::SIGNALS_REACHABLE,
         crate::peer_reach::CATALOG_ACCEPTED,
     ]
     .iter()
-    .find_map(|type_| held.iter().find(|held| held.type_ == *type_ && held.status == "False"))
+    .find_map(|type_| {
+        held.iter().find(|held| {
+            held.type_ == *type_ && held.status == "False" && held.reason != crate::peer_reach::EGRESS_ONLY
+        })
+    })
     .map(|bad| (bad.reason.clone(), format!("{}: {}", bad.type_, bad.message)))
 }
 
@@ -839,6 +843,23 @@ fn rfc3339_now() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_egress_only_peer_is_not_degraded_but_a_refused_catalog_still_is() {
+        let held = |reason: &str| crate::crd::inference_provider::Condition {
+            type_: crate::peer_reach::SIGNALS_REACHABLE.to_owned(),
+            status: "False".to_owned(),
+            reason: reason.to_owned(),
+            message: "m".to_owned(),
+            last_transition_time: "t".to_owned(),
+            observed_generation: None,
+        };
+        assert_eq!(peer_concern(&[held(crate::peer_reach::EGRESS_ONLY)]), None);
+        assert_eq!(
+            peer_concern(&[held("Timeout")]).map(|(reason, _)| reason).as_deref(),
+            Some("Timeout")
+        );
+    }
 
     /// An apiserver status with `code`, as `error::tests` scripts one.
     fn api(code: u16) -> kube::Error {
