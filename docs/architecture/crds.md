@@ -227,8 +227,7 @@ endpoint did not answer, or that have none. A peer not yet checked is not counte
 
 | Status | Reason | When |
 |---|---|---|
-| `False` | `NoPeersReachable` | No checked peer's signals endpoint answered. The message reads, for example, `3 of 3 peers unreachable`. |
-| `False` | `SomePeersUnreachable` | Some checked peers' signals endpoints did not answer. The message reads, for example, `2 of 5 peers unreachable`. |
+| `False` | `PeersUnreachable` | A checked peer's signals endpoint did not answer. The message counts them, for example `2 of 5 peers unreachable`. |
 | `True` | `PeerSignalsReachable` | Every polled peer's signals endpoint answered. |
 
 `PeerCatalogsAccepted` (`grid-operator-peer-catalogs`) counts the peers whose catalog,
@@ -236,7 +235,7 @@ or part of it, was refused, out of the peers whose catalog is held.
 
 | Status | Reason | When |
 |---|---|---|
-| `False` | `SomeCatalogsRefused` | Some peers' catalogs were refused. The message reads, for example, `1 of 5 peers' catalogs refused`. |
+| `False` | `CatalogsRefused` | A peer's catalog was refused. The message counts them, for example `1 of 5 peers' catalogs refused`. |
 | `True` | `PeerCatalogsAccepted` | Every peer catalog read is accepted. |
 
 A `Swim` condition, under its own field manager (`grid-operator-swim`), reads `True`

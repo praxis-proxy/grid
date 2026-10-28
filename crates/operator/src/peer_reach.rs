@@ -16,11 +16,8 @@ use crate::{
 /// The condition's type.
 pub const PEER_SIGNALS_REACHABLE: &str = "PeerSignalsReachable";
 
-/// Reason while no peer's signals endpoint answered.
-pub const NO_PEERS_REACHABLE: &str = "NoPeersReachable";
-
-/// Reason while some peers' signals endpoints did not answer, or have none.
-pub const SOME_PEERS_UNREACHABLE: &str = "SomePeersUnreachable";
+/// Reason while any polled peer's signals endpoint did not answer.
+pub const PEERS_UNREACHABLE: &str = "PeersUnreachable";
 
 /// Server-side apply manager, apart from the other `GridNetwork` and `GridSite` writers.
 pub const FIELD_MANAGER: &str = "grid-operator-peer-reach";
@@ -28,8 +25,8 @@ pub const FIELD_MANAGER: &str = "grid-operator-peer-reach";
 /// The catalogs condition's type.
 pub const PEER_CATALOGS_ACCEPTED: &str = "PeerCatalogsAccepted";
 
-/// Reason while some peers' catalogs are refused.
-pub const SOME_CATALOGS_REFUSED: &str = "SomeCatalogsRefused";
+/// Reason while any peer's catalog is refused.
+pub const CATALOGS_REFUSED: &str = "CatalogsRefused";
 
 /// A peer `GridSite`'s signals condition type.
 pub const SIGNALS_REACHABLE: &str = "SignalsReachable";
@@ -95,10 +92,8 @@ impl Misses {
 pub struct Kind {
     /// The `GridNetwork` condition's type, and its True reason.
     pub type_: &'static str,
-    /// The False reason when no peer is in the clear.
-    pub none_reason: &'static str,
-    /// The False reason when some peers are.
-    pub some_reason: &'static str,
+    /// The False reason, whatever the count.
+    pub reason: &'static str,
     /// What the True `GridNetwork` condition says.
     pub clear: &'static str,
     /// What the False `GridNetwork` condition counts.
@@ -114,8 +109,7 @@ pub struct Kind {
 /// Peers' signals endpoints that did not answer.
 pub const REACH: Kind = Kind {
     type_: PEER_SIGNALS_REACHABLE,
-    none_reason: NO_PEERS_REACHABLE,
-    some_reason: SOME_PEERS_UNREACHABLE,
+    reason: PEERS_UNREACHABLE,
     clear: "every polled peer's signals endpoint answered",
     counted: "peers unreachable",
     site_type: SIGNALS_REACHABLE,
@@ -126,8 +120,7 @@ pub const REACH: Kind = Kind {
 /// Peers' catalogs refused for crowding the overlay or naming clusters they do not own.
 pub const CATALOGS: Kind = Kind {
     type_: PEER_CATALOGS_ACCEPTED,
-    none_reason: SOME_CATALOGS_REFUSED,
-    some_reason: SOME_CATALOGS_REFUSED,
+    reason: CATALOGS_REFUSED,
     clear: "every peer catalog read is accepted",
     counted: "peers' catalogs refused",
     site_type: CATALOG_ACCEPTED,
@@ -271,12 +264,11 @@ impl PeerReach {
         let (status, reason, message) = if failing == 0 {
             ("True", self.kind.type_, self.kind.clear.to_owned())
         } else {
-            let reason = if failing == checked {
-                self.kind.none_reason
-            } else {
-                self.kind.some_reason
-            };
-            ("False", reason, format!("{failing} of {checked} {}", self.kind.counted))
+            (
+                "False",
+                self.kind.reason,
+                format!("{failing} of {checked} {}", self.kind.counted),
+            )
         };
         stamp(
             current,
@@ -391,9 +383,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        AWAITING_FIRST_CHECK, CATALOG_ACCEPTED, CATALOGS, MISSES_BEFORE_UNREACHABLE, Misses, NO_ENDPOINT,
-        NO_PEERS_REACHABLE, NO_SIGNALS_ENDPOINT, PEER_CATALOGS_ACCEPTED, PEER_SIGNALS_REACHABLE, PeerReach, REACH,
-        SIGNALS_REACHABLE, SOME_CATALOGS_REFUSED, SOME_PEERS_UNREACHABLE,
+        AWAITING_FIRST_CHECK, CATALOG_ACCEPTED, CATALOGS, CATALOGS_REFUSED, MISSES_BEFORE_UNREACHABLE, Misses,
+        NO_ENDPOINT, NO_SIGNALS_ENDPOINT, PEER_CATALOGS_ACCEPTED, PEER_SIGNALS_REACHABLE, PEERS_UNREACHABLE, PeerReach,
+        REACH, SIGNALS_REACHABLE,
     };
     use crate::{
         crd::{
@@ -476,7 +468,7 @@ mod tests {
                 written.reason.as_str(),
                 written.message.as_str()
             ),
-            ("False", SOME_PEERS_UNREACHABLE, "4 of 5 peers unreachable"),
+            ("False", PEERS_UNREACHABLE, "4 of 5 peers unreachable"),
             "the peer not yet checked is not counted"
         );
         let none = PeerReach::of(
@@ -486,7 +478,7 @@ mod tests {
         );
         assert_eq!(
             (condition(&none).reason.as_str(), condition(&none).message.as_str()),
-            (NO_PEERS_REACHABLE, "2 of 2 peers unreachable")
+            (PEERS_UNREACHABLE, "2 of 2 peers unreachable")
         );
     }
 
@@ -676,7 +668,7 @@ mod tests {
             ),
             (
                 PEER_CATALOGS_ACCEPTED,
-                SOME_CATALOGS_REFUSED,
+                CATALOGS_REFUSED,
                 "1 of 2 peers' catalogs refused"
             )
         );
