@@ -560,7 +560,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one render over each kind of candidate")]
     fn publishes_load_is_written_only_for_a_candidate_whose_site_publishes_none() {
         let quiet = BTreeSet::from(["pool-a".to_owned()]);
         let heard = |site: &str, _: &str| site == "site-c";

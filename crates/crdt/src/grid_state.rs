@@ -706,7 +706,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "test needs comprehensive assertions")]
     fn snapshot_bincode_round_trip_with_restricted_access_policy() {
         // Test bincode round-trip with restricted access policy
         let mut snap = GridStateSnapshot::new("site-b".to_owned());

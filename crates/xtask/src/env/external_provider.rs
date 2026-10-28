@@ -104,10 +104,6 @@ impl ExternalProviderDescriptor {
 /// - not exceed [`MAX_KEY_FILE_BYTES`].
 ///
 /// This function never reads, prints, logs, or returns the file content.
-#[expect(
-    clippy::too_many_lines,
-    reason = "validation steps are sequential and would be less clear if split"
-)]
 pub(crate) fn validate_key_file(path: &Path, workspace_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let meta = path
         .symlink_metadata()

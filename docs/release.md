@@ -10,16 +10,22 @@ root workspace; root version changes do not update them. Package versions alone
 do not establish image compatibility: qualify the tagged source and intended
 consumer below.
 
-The five charts published by this release (`grid-operator`, `grid-site`,
-`praxis-gateway`, `grid-mock-providers`, and `grid-enrollment`) have versions
-matching the AGN release. The `appVersion` for AGN-owned workloads in the
-release charts also matches the AGN tag. The `praxis-gateway` chart is
-different: its `appVersion` identifies the default Praxis AI image and may
-advance independently of AGN.
+The six charts published by this release (`grid-operator`, `grid-site`,
+`praxis-gateway`, `grid-mock-providers`, `grid-enrollment`, and
+`grid-fleet-dashboard`) have versions matching the AGN release. The
+`appVersion` for AGN-owned workloads in the release charts also matches the
+AGN tag. The `praxis-gateway` chart is different: its `appVersion` identifies
+the default Praxis AI image and may advance independently of AGN.
 
 `grid-enrollment` joined the release line in 0.2.0. Before that it versioned
 independently and its image was published elsewhere, so a reader installing
 from chart defaults could not pull it.
+
+`grid-fleet-dashboard` joins the release line in 0.3.0. Its image was
+already published at every release tag from 0.2.0, but the chart stayed at
+0.1.4 and was not published, so its default image tag `v0.1.4` did not exist.
+Its chart lives at `crates/fleet-dashboard/charts/grid-fleet-dashboard`, not
+under `charts/`.
 
 The project-owned `grid-gateway` operand is versioned with AGN and must be
 built from the same tagged AGN source. It is distinct from the separately
@@ -36,8 +42,10 @@ An AGN release publishes:
 - `ghcr.io/praxis-proxy/grid-mock-providers`;
 - `ghcr.io/praxis-proxy/grid-overlay-sync`;
 - `ghcr.io/praxis-proxy/grid-enrollment`;
+- `ghcr.io/praxis-proxy/grid-fleet-dashboard`;
 - the `grid-operator`, `grid-site`, `praxis-gateway`,
-  `grid-mock-providers`, and `grid-enrollment` Helm charts; and
+  `grid-mock-providers`, `grid-enrollment`, and `grid-fleet-dashboard` Helm
+  charts; and
 - a GitHub Release containing generated notes and immutable artifact digests.
 
 Build `grid-gateway:v<version>` from the matching AGN release tag and record
@@ -64,7 +72,7 @@ Before opening a release preparation pull request:
 - [ ] Update the workspace version in `Cargo.toml` and regenerate `Cargo.lock`.
 - [ ] Update both `workspace.package.version` and `package.version` in
       `crates/gateway/Cargo.toml` and regenerate `crates/gateway/Cargo.lock`.
-- [ ] Update the five release-chart versions listed above.
+- [ ] Update the six release-chart versions listed above.
 - [ ] Update their AGN workload `appVersion` values to the AGN tag.
 - [ ] Verify the `praxis-gateway` `appVersion` and default image match the
       intended official Praxis AI release.
@@ -72,6 +80,9 @@ Before opening a release preparation pull request:
       `praxis-gateway` `overlay.sidecar.image.tag`. An empty tag there resolves
       to the chart `appVersion`, which is the Praxis AI version, so these are
       pinned by hand and the release workflow does not check them.
+- [ ] Run `UPDATE_GOLDEN=1 crates/fleet-dashboard/hack/helm-template-test.sh`
+      and commit the result. The fleet dashboard golden renders carry the
+      chart version and the default image tag.
 - [ ] Run `make generate-deploy` and commit the result. The manifests under
       `deploy/operator` and `deploy/overlays` render from `charts/grid-operator`,
       so they carry the operator image tag and the kind version label.
@@ -88,7 +99,7 @@ Before opening a release preparation pull request:
 - [ ] Run `make codegen-check`, `make crds-check`, and `make deploy-check`.
 - [ ] Run `git diff --check` and validate the release workflow with
       `actionlint`.
-- [ ] Lint and render the five release charts with their required values.
+- [ ] Lint and render the six release charts with their required values.
 - [ ] Validate affected Forge topologies.
 - [ ] Run the relevant integration qualifications when routing, overlay, or
       gateway compatibility changes.
@@ -279,7 +290,7 @@ Pushing a valid release tag triggers the **Release** workflow. The workflow:
 3. verifies the pinned official Praxis AI image and provenance;
 4. builds and publishes the version-tagged AGN container images, including
    `grid-gateway`, with SBOM and provenance attestations;
-5. validates, packages, and publishes the five release charts; and
+5. validates, packages, and publishes the six release charts; and
 6. creates the GitHub Release with generated notes and immutable digests.
 
 The workflow can also be dispatched for an existing immutable release tag. A

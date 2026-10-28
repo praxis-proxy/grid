@@ -13,10 +13,10 @@ the EPP.
 ## How it fits in Grid
 
 - **Opt-in.** Nothing in Grid builds, deploys, or depends on the dashboard. It is
-  a workspace crate like any other (so `cargo test --workspace` covers it), but
-  its Helm chart lives in this directory, not under `charts/`, so Grid's release
-  pipeline never packages or publishes it. You deploy it only by installing the
-  chart below.
+  a workspace crate like any other (so `cargo test --workspace` covers it). Its
+  Helm chart lives in this directory rather than under `charts/`, and is
+  packaged and published to `oci://ghcr.io/praxis-proxy/charts/grid-fleet-dashboard`
+  as part of every Grid release. You deploy it only by installing the chart below.
 - **Runs anywhere in the hub cluster.** The pod has no node selector, affinity,
   host path, host network, or persistent volume; it is stateless, non-root, and
   read-only-rootfs, and it needs only the API server (a namespaced `Role` to
@@ -92,7 +92,7 @@ What it does:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `image.repository` / `image.tag` / `image.pullPolicy` | `ghcr.io/praxis-proxy/grid-fleet-dashboard` / chart `appVersion` / `IfNotPresent` | Dashboard image |
+| `image.repository` / `image.tag` / `image.pullPolicy` | `ghcr.io/praxis-proxy/grid-fleet-dashboard` / chart `appVersion` (the Grid release tag) / `IfNotPresent` | Dashboard image |
 | `replicaCount` | `1` | Replicas (the collector is stateless; more than one only adds load on spokes) |
 | `serviceAccount.name` | `""` (release fullname) | ServiceAccount to create |
 | `registry.configMap` / `registry.key` | `epp-clusters` / `clusters.yaml` | Registry `ConfigMap` in the release namespace. Not created by the chart |

@@ -411,7 +411,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "end-to-end client pinning test setup")]
     async fn pinned_client_uses_original_address_after_dns_changes() {
         #[cfg(not(feature = "fips"))]
         drop(rustls::crypto::ring::default_provider().install_default());

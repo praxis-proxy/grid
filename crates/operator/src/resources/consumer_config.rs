@@ -337,10 +337,6 @@ pub(crate) fn generate_consumer_praxis_config(
 /// Returns [`ConsumerConfigError`] when the overlay, endpoint topology, or
 /// optional telemetry settings are invalid.
 #[expect(
-    clippy::too_many_lines,
-    reason = "sequential validation + three rendering passes; splitting would obscure the overall config shape"
-)]
-#[expect(
     clippy::too_many_arguments,
     reason = "preserves the renderer's established inputs and adds optional telemetry"
 )]
@@ -431,10 +427,6 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
 }
 
 /// Render validated exporter settings without secret material.
-#[expect(
-    clippy::too_many_lines,
-    reason = "serializes every optional telemetry value in a stable YAML order"
-)]
 fn render_telemetry(telemetry: &GatewayTelemetryConfig) -> Result<String, ConsumerConfigError> {
     if telemetry.otlp_endpoint.as_deref().is_none_or(str::is_empty)
         && telemetry.sampling_rate.is_none()
@@ -671,10 +663,6 @@ struct Pipeline<'input> {
 
 impl Pipeline<'_> {
     /// Render the pipeline around router `R`.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "validation and each pipeline section in filter order"
-    )]
     fn render<R: RouterRender>(&self) -> Result<String, ConsumerConfigError> {
         let overlay = self.overlay;
         if overlay.local_site.trim().is_empty() {
@@ -1026,10 +1014,6 @@ fn render_consumer_config(
 
 /// Add one validated file reference to the grouped requirements map.
 #[expect(
-    clippy::type_complexity,
-    reason = "the tuple provides deterministic grouping by purpose and Secret identity"
-)]
-#[expect(
     clippy::too_many_arguments,
     reason = "each argument identifies one projected Secret key and destination"
 )]
@@ -1264,10 +1248,6 @@ fn rendered_sni(ep: &ClusterEndpointConfig) -> Result<&str, ConsumerConfigError>
 }
 
 /// Render one `intelligent_route` candidate.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Candidate YAML fields are kept together to mirror the wire contract."
-)]
 #[cfg(test)]
 fn render_candidate(c: &RoutingCandidate, include_credential: bool) -> String {
     let mut lines = vec![
@@ -1336,10 +1316,6 @@ fn render_credential_reference(cred: &crate::resources::routing_overlay::Project
 /// unconditionally in explicit projected-credential mode. The latter keeps a
 /// filter present at empty-overlay startup so a later credential-bearing
 /// revision cannot bypass injection. Missing projected files fail closed.
-#[expect(
-    clippy::too_many_lines,
-    reason = "BTreeMap collection + format strings for each credential field"
-)]
 fn render_credential_inject(
     candidates: &[&RoutingCandidate],
     credential_mount_path: &str,
@@ -1454,10 +1430,6 @@ fn render_load_balancer(
 /// Validates that `transport` is present and, for `mutual_tls`, that `sni`
 /// is non-blank.  Missing transport fails closed with [`ConsumerConfigError::MissingTransport`];
 /// missing SNI on mTLS fails with [`ConsumerConfigError::MissingSni`].
-#[expect(
-    clippy::too_many_lines,
-    reason = "transport validation + two format branches; splitting would separate the match arms from their YAML templates"
-)]
 fn render_cluster_entry(
     quoted_name: &str,
     ep: &ClusterEndpointConfig,
@@ -1664,7 +1636,6 @@ mod tests {
     const SITE_ROUTE_SERVING: &str = include_str!("../../../gateway/tests/testdata/serving-config-site-route.json");
 
     /// A local model behind a bearer token and another site's gateway, its SNI written with stray spaces.
-    #[expect(clippy::too_many_lines, reason = "both endpoint declarations are spelled out")]
     fn site_route_topology() -> (RoutingOverlay, Vec<ClusterEndpointConfig>) {
         let local = credential_candidate(
             "inference_model",
@@ -1762,10 +1733,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "asserts the whole generated chain and cluster tables"
-    )]
     fn a_site_route_render_routes_with_grid_site_route_over_every_dialed_cluster() {
         let (overlay, endpoints) = site_route_topology();
         let yaml = render_site_route(&overlay, &endpoints).expect("render").config_yaml;
@@ -1893,10 +1860,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the praxis.yaml and serving sides of one credential"
-    )]
     fn a_site_route_render_injects_the_local_credential_its_router_selects() {
         let (mut overlay, endpoints) = site_route_topology();
         overlay.candidates[1] = credential_candidate(
@@ -1976,10 +1939,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one render per router, each assertion naming its contract"
-    )]
     fn an_intelligent_route_render_is_unchanged_by_the_router_choice() {
         let (overlay, endpoints) = site_route_topology();
         let render = |router| {
@@ -2100,10 +2059,6 @@ mod tests {
     const SENTINEL_TOKEN: &str = "sk-super-secret-bearer-token-do-not-emit";
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "covers local and remote candidates in one final-hop regression"
-    )]
     fn requirements_keep_backend_credentials_at_the_final_local_hop() {
         let overlay = simple_overlay(vec![
             credential_candidate(
@@ -2185,10 +2140,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "asserts both required Grid TLS Secret projections and file paths"
-    )]
     fn mutual_tls_requirements_project_grid_ca_and_site_identity_together() {
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
@@ -2297,10 +2248,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "asserts generated TLS config and its matching projected CA requirement"
-    )]
     fn server_tls_backend_ca_is_rendered_and_reported_as_a_file_requirement() -> Result<(), serde_yaml::Error> {
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
@@ -2437,10 +2384,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "asserts the generated filter chain and complete restoration endpoint inventory"
-    )]
     fn production_consumer_config_uses_scoped_reloadable_overlay_and_complete_endpoint_inventory() {
         let overlay = simple_overlay(vec![credential_candidate(
             "inference_model",
@@ -2512,10 +2455,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "checks the cold-start empty overlay contract with a configured endpoint"
-    )]
     fn empty_uncredentialed_consumer_config_does_not_require_new_praxis_filter() {
         let overlay = simple_overlay(Vec::new());
         let endpoints = [ClusterEndpointConfig {
@@ -2593,10 +2532,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "checks that projected credential references stay dynamic in rendered YAML"
-    )]
     fn projected_credential_mode_keeps_reference_dynamic_for_credential_route() {
         let overlay = simple_overlay(vec![credential_candidate(
             "inference_model",
@@ -2670,10 +2605,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "checks opt-in output, secret exclusion, and overlay separation"
-    )]
     fn telemetry_is_opt_in_and_rendered_outside_routing_filters() {
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
@@ -2737,10 +2668,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "covers environment fallback, sampling boundaries, and credential rejection"
-    )]
     fn telemetry_rejects_invalid_sampling_rates_and_credentials_in_endpoint() {
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
@@ -2864,10 +2791,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "test parses route and load-balancer sections and checks credential omission"
-    )]
     fn mixed_capability_overlay_projects_only_inference_pipeline() {
         let overlay = simple_overlay(vec![
             plain_candidate("inference_model", "model-a", "site-a", "model-cluster", true),
@@ -3050,10 +2973,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "test constructs duplicate credential candidates and asserts rendered dedupe behavior"
-    )]
     fn multiple_candidates_sharing_same_secret_ref_produce_one_credential_entry() {
         let overlay = simple_overlay(vec![
             credential_candidate(
@@ -3091,10 +3010,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "test constructs two credential references and asserts both rendered entries"
-    )]
     fn multiple_different_credentials_produce_multiple_entries() {
         let overlay = simple_overlay(vec![
             credential_candidate(
@@ -3609,7 +3524,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "checks every rendered mTLS property")]
     fn cluster_with_mtls_transport_renders_mtls_entry() {
         let endpoints = [mtls_ep("site-a", "172.18.0.4:30080", "site-a.grid.internal")];
         let overlay = simple_overlay(vec![plain_candidate(

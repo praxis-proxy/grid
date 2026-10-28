@@ -200,8 +200,8 @@ Validate praxisConfig: the source, and that each source gets only the settings i
 {{- if and (not $provider) (not $gridServing.enabled) (not (trim (toString $render.model))) }}
 {{- fail "praxisConfig.render.model is required for a consumer without praxisConfig.render.gridServing, and cannot be blank" }}
 {{- end }}
-{{- if not ($render.backends | default list) }}
-{{- fail "praxisConfig.render.backends needs at least one backend when praxisConfig.source is render" }}
+{{- if and (not ($render.backends | default list)) (not $gridServing.enabled) }}
+{{- fail "praxisConfig.render.backends needs at least one backend when praxisConfig.source is render without gridServing" }}
 {{- end }}
 {{- if and (not $auth.mode) (not $provider) }}
 {{- fail "praxisConfig.render.auth.mode is required when praxisConfig.source is render: api-key (needs an image with praxis-policy 0.4 or later) or none (only behind an authenticating front)" }}

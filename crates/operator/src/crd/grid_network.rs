@@ -1034,10 +1034,6 @@ impl GatewayTelemetryConfig {
     ///
     /// Returns an explanatory message for invalid strings, sampling rates, or
     /// batch settings outside their supported ranges.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "validates all telemetry settings before CRD rendering"
-    )]
     pub fn validate(&self) -> Result<(), String> {
         if self.otlp_endpoint.as_ref().is_some_and(|endpoint| {
             if endpoint.is_empty() {
@@ -2051,7 +2047,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "round-trip test covers all ConsumerConfig fields")]
     fn consumer_config_enabled_round_trips() {
         let json = serde_json::json!({
             "name": "gw",
@@ -2157,10 +2152,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "asserts every ConsumerConfig default as one contract"
-    )]
     fn consumer_config_defaults_when_subfields_absent() {
         let json = serde_json::json!({
             "name": "gw",
@@ -2402,10 +2393,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "asserts generated telemetry fields and all opt-in security boundaries"
-    )]
     fn grid_network_crd_has_consumer_config_field_on_gateway_ref() {
         let crd = crd_json();
         let gateway_ref_properties = crd
@@ -2760,7 +2747,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "full-field struct construction and assertion")]
     fn overlay_status_distributed_serialization() {
         let status = OverlayRevisionStatus {
             gateway_name: "gw".to_owned(),

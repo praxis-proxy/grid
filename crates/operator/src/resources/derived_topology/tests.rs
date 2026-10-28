@@ -523,7 +523,6 @@ fn a_discovered_site_is_found_by_the_id_it_speaks_for() {
 
 /// Every refusal names its reason.
 #[test]
-#[expect(clippy::too_many_lines, reason = "one row per refusal reason")]
 fn each_refusal_is_named() {
     let unavailable = {
         let mut p = provider("prov-down", "https://down.example.invalid", None);
@@ -1010,7 +1009,6 @@ fn derived_overlay() -> crate::resources::routing_overlay::RoutingOverlay {
 }
 
 #[test]
-#[expect(clippy::too_many_lines, reason = "the render takes every renderer input")]
 fn a_derived_tls_render_matches_the_fixture_praxis_loads() {
     let providers = derived_providers();
     let sites = derived_sites();

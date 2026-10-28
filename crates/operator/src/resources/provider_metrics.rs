@@ -941,7 +941,6 @@ mod tests {
 
     /// A `KServe` EPP exposition for pool `qwen3-kserve`, in the label sets the lab EPP emits:
     /// `served` streaming requests answered, about 104 usage reports each.
-    #[expect(clippy::too_many_lines, reason = "one exposition, line for line")]
     fn kserve_epp_exposition(served: f64, ready: f64) -> String {
         let l = r#"fairness_id="default-flow",model_name="qwen3",priority="0",target_model_name="qwen3""#;
         let (b01, b05, b1) = (served * 0.2, served * 0.6, served * 0.9);
@@ -981,7 +980,6 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "two scrapes and every published series")]
     fn a_kserve_epp_scrape_publishes_latency_and_republishes_gauges_only() {
         let readiness = crate::readiness::ReadinessStore::default();
         let mut mc = mc_with_queue("llm_d_epp_average_running_requests");
@@ -1708,7 +1706,6 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "cache seeding + assertion")]
     async fn stale_cache_used_within_ttl_on_scrape_failure() {
         // Seed the cache with a known good sample from T=0.
         let t0 = Instant::now();

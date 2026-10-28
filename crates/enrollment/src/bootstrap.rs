@@ -413,10 +413,6 @@ fn is_conflict(error: &(dyn Error + Send + Sync + 'static)) -> bool {
 ///
 /// Peers pin the leaf's digest, so an existing identity is kept, even an expired
 /// or unchained one, unless `--force-regenerate` is set.
-#[expect(
-    clippy::too_many_lines,
-    reason = "keep or issue the identity, then seed its key, read as one step"
-)]
 async fn ensure_site_identity(
     client: &kube::Client,
     ca: &certs::CaCert,
@@ -508,7 +504,6 @@ fn seed_is_current(held: Option<&enrollment::SeedRecord>, site: &str, leaf_key: 
 /// an older seed.
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "the seed's fields and where it goes, each used once"
 )]
 async fn ensure_seed(
@@ -817,10 +812,6 @@ fn hub_ca_write(view: Option<&SecretView>, ca_cert_pem: &str, force: bool) -> Hu
 ///
 /// Load when the Secret exists and no regenerate is forced, so re-runs keep the
 /// same CA. The signing key is written only to the CA-key Secret.
-#[expect(
-    clippy::too_many_lines,
-    reason = "load, refuse, or mint the CA reads as one decision"
-)]
 async fn resolve_ca(
     client: &kube::Client,
     secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
@@ -1304,7 +1295,6 @@ mod tests {
     /// The whole bootstrap order on a hub where the operator self-signed first: the
     /// CA, then the hub's CA Secret, then its identity, then a second run.
     #[test]
-    #[expect(clippy::too_many_lines, reason = "the whole bootstrap order, then a second run")]
     fn an_operator_placeholder_does_not_block_a_first_hub_install() {
         let placeholder = certs::generate_ca("grid-ca").expect("placeholder");
         let (hub_ca, hub_identity) = (view(None, &placeholder.cert_pem), identity(None, &placeholder));

@@ -811,7 +811,6 @@ mod tests {
     // ---- Safety: no secrets in reason strings or messages ----
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "exhaustive check of all 16 variants × 3 phases")]
     fn all_reasons_are_bounded_static_strings() {
         let all = [
             GatewayProbeOutcome::Verified,

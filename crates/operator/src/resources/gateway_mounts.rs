@@ -27,10 +27,6 @@ pub(crate) struct DesiredMount {
 /// Credential Secrets mount at their generated per-Secret parent directory.
 /// Grid CA and site identity keys use the parent of their rendered file paths,
 /// preserving the TLS directory configured for Praxis.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the reference-to-volume transformation validates and groups paths in one pass"
-)]
 pub(crate) fn desired_mounts(document: &MountRequirementsDocument) -> Result<Vec<DesiredMount>, GatewayMountFailure> {
     let mut projections = BTreeMap::<(String, String, String), BTreeMap<String, String>>::new();
     let mut destinations = BTreeMap::<String, (String, String, String)>::new();

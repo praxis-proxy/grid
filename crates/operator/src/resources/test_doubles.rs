@@ -74,10 +74,6 @@ fn kube_list_body(path: &str, providers: &[InferenceProvider]) -> Vec<u8> {
 }
 
 /// A `kube::Client` answering a GET by object name from `objects`, 404 otherwise.
-#[expect(
-    clippy::too_many_lines,
-    reason = "test mock builder: 404-vs-200 branches are the whole point"
-)]
 fn mock_kube_client_with_objects<T>(objects: HashMap<&'static str, T>) -> kube::Client
 where
     T: serde::Serialize + Clone + Send + Sync + 'static,

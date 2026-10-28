@@ -152,10 +152,6 @@ pub(crate) fn materialize_with_images(
 }
 
 /// Apply explicit image values to every Forge cluster property.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The bounded image-property rewrite is easiest to audit as one operation."
-)]
 pub(crate) fn apply_image_values(
     config: &mut serde_yaml::Value,
     images: &ImageOverrides,
@@ -226,10 +222,6 @@ mod tests {
 
     #[test]
     #[expect(clippy::expect_used, reason = "temporary Forge configuration fixture")]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one fixture checks every Forge state isolation property"
-    )]
     fn forge_commands_use_the_resolved_run_state_directory() {
         let temp = tempfile::tempdir().expect("create fixture directory");
         let combined_dir = temp.path().join("grid-combined-site");
@@ -358,7 +350,6 @@ mod tests {
     #[expect(
         clippy::expect_used,
         clippy::indexing_slicing,
-        clippy::too_many_lines,
         reason = "A test fixture should fail at the exact missing quota-contract field."
     )]
     fn quota_consumers_use_the_upstream_limiter_schema_and_shared_rule() {

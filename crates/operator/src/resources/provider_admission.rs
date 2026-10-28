@@ -79,10 +79,6 @@ pub(crate) struct Policy {
 
 impl Policy {
     /// Convert the CRD form into a validated evaluator policy.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "validation keeps all admission policy constraints together"
-    )]
     pub(crate) fn from_config(
         config: Option<&AdmissionPolicyConfig>,
         pressure_signal: PressureSignal,
@@ -451,7 +447,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "multi-phase state machine test")]
     fn recovery_requires_count_and_hold_down() {
         let start = Instant::now();
         let mut memory = AdmissionMemory::default();
@@ -541,7 +536,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "multi-phase state machine test")]
     fn repeated_recovery_sample_does_not_advance_recovery_counter() {
         let start = Instant::now();
         let mut memory = AdmissionMemory::default();
@@ -646,7 +640,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "multi-phase state machine test")]
     fn stable_idle_scrapes_satisfy_recovery_threshold() {
         let start = Instant::now();
         let mut memory = AdmissionMemory::default();

@@ -227,7 +227,6 @@ fn curl_post_mtls_args(
 /// Uses `--resolve` so `curl` reaches the server with the correct SNI,
 /// ensuring the test exercises `client_cert_mode: require` rather than an SNI
 /// mismatch.
-#[expect(clippy::too_many_lines, reason = "curl argument construction + result handling")]
 fn test_no_client_cert(cluster: &str, ctx: &str, port: u16, tally: &mut Tally) {
     let sni = format!("{cluster}.grid.internal");
     let resolve = format!("{sni}:{port}:127.0.0.1");
@@ -273,10 +272,6 @@ fn test_no_client_cert(cluster: &str, ctx: &str, port: u16, tally: &mut Tally) {
 /// Generates a fresh CA + site cert in the OS temp directory, then attempts
 /// an mTLS connection.  The provider only trusts the generated test CA, so
 /// rustls rejects the untrusted cert before any HTTP is exchanged.
-#[expect(
-    clippy::too_many_lines,
-    reason = "cert generation + temp file management + curl test"
-)]
 fn test_wrong_ca_cert(
     cluster: &str,
     ctx: &str,
@@ -350,10 +345,6 @@ fn test_wrong_ca_cert(
 /// tests may have reset the connection pool.  A connection error here is
 /// unexpected (same CA cert should succeed at TLS), so retrying once is
 /// appropriate.  A second failure is reported as a test failure.
-#[expect(
-    clippy::too_many_lines,
-    reason = "curl argument construction + retry + result handling"
-)]
 fn test_wrong_org_cert(cluster: &str, ctx: &str, port: u16, model: &str, tally: &mut Tally) {
     let cert_path = format!("{HOST_CERTS_DIR}/wrong-org-client-cert.pem");
     let key_path = format!("{HOST_CERTS_DIR}/wrong-org-client-key.pem");

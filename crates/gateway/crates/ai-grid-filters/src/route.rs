@@ -458,10 +458,6 @@ impl GridSiteRouteFilter {
     /// `None` for a request that names none. A site no longer in the grid gets
     /// 404, since the state lives only there. One that admits no new request now
     /// gets 503.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "pinned-state outcomes and hop context are handled together"
-    )]
     fn pin(&self, ctx: &mut HttpFilterContext<'_>, model: Option<&str>) -> Result<Option<FilterAction>, FilterError> {
         let snapshot = self.snapshot.load();
         let key = self.affinity.tag_key.load();
@@ -647,10 +643,6 @@ impl HttpFilter for GridSiteRouteFilter {
         Ok(FilterAction::Continue)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one snapshot decides withdrawal, pinned state, and normal selection"
-    )]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         self.health.observe(ctx.health_registry);
         for name in [
@@ -880,7 +872,6 @@ fn pinned_target<'snap>(snapshot: &'snap RouteSnapshot, holder: Option<&Holder>,
 }
 
 /// Count and answer a request no candidate took.
-#[expect(clippy::too_many_lines, reason = "each refusal maps to a distinct protocol response")]
 fn refuse(reason: Refused, model: &str, turn: usize) -> FilterAction {
     tracing::debug!(model = %model, reason = ?reason, "grid_site_route: no admitted candidate");
     reason.record();
@@ -2295,10 +2286,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "enumerate state pairs and compare actual draws with the tier oracle"
-    )]
     fn pressure_tiers_match_an_exhaustive_pairwise_oracle() {
         let states: Vec<_> = [None, Some(0.3), Some(1.0)]
             .into_iter()

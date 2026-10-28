@@ -3930,16 +3930,8 @@ fn apply_tls_secret(
 }
 
 /// Generate a random 32-byte hex provider credential.
-fn generate_provider_credential() -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("openssl").args(["rand", "-hex", "32"]).output()?;
-    if !output.status.success() {
-        return Err("openssl failed to generate provider credential".into());
-    }
-    let token = String::from_utf8(output.stdout)?.trim().to_owned();
-    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("openssl returned an invalid provider credential".into());
-    }
-    Ok(token)
+fn generate_provider_credential() -> String {
+    certs::generate_provider_credential()
 }
 
 /// Create an Opaque Secret with a `token` key.
@@ -4726,7 +4718,6 @@ fn materialize_external_provider_stack(
 
 /// Apply image overrides from environment variables to the Forge configuration.
 #[expect(
-    clippy::too_many_lines,
     clippy::collapsible_if,
     reason = "Image override application with structured YAML manipulation; nested ifs follow YAML structure hierarchy"
 )]
@@ -4861,10 +4852,6 @@ fn authorize_discovered_sites() -> Result<(), Box<dyn std::error::Error>> {
 /// This is a global barrier: trust patching must not begin while another
 /// cluster is still waiting for its provider gateway endpoint to be
 /// advertised through SWIM.
-#[expect(
-    clippy::too_many_lines,
-    reason = "bounded polling loop reports each missing cluster/site pair"
-)]
 fn wait_for_all_discovered_sites(network: &str, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -5030,7 +5017,7 @@ fn deploy_setup(context: &CombinedSiteContext) -> Result<OverlayState, Box<dyn s
 
     for cluster in CLUSTERS {
         let ctx = format!("kind-grid-combined-{cluster}");
-        let credential = generate_provider_credential()?;
+        let credential = generate_provider_credential();
         apply_credential_secret(&ctx, VCR_INFERENCE_CREDENTIAL, &credential)?;
         eprintln!("  [OK] {cluster}: vcr-inference-credential created");
         apply_stack(&context.forge_bin, &context.resolved_config, cluster, "vcr-backend")?;

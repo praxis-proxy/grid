@@ -541,10 +541,6 @@ impl StateBroadcast {
     /// # Errors
     ///
     /// Returns a bincode encode error if the snapshot cannot be serialized.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "base and trailing extension must be encoded as one atomic wire operation"
-    )]
     pub fn encode(&self) -> Result<Vec<u8>, bincode::error::EncodeError> {
         let v1 = StateBroadcastV1 {
             version: self.version,
@@ -631,10 +627,6 @@ impl StateBroadcast {
     ///
     /// Returns a bincode decode error if `bytes` is not a valid
     /// [`StateBroadcast`] payload.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "extension fields (capacity weights, tools) must be applied to providers in one decode pass"
-    )]
     pub fn decode(bytes: &[u8]) -> Result<Self, bincode::error::DecodeError> {
         let (mut v1, consumed): (StateBroadcastV1, usize) =
             bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
@@ -675,10 +667,6 @@ impl StateBroadcast {
     /// Decode the trailing extension bytes, falling back across every prior
     /// wire format in turn. See [`decode`](Self::decode) for why a naive
     /// single-shot struct decode is not enough during a rolling update.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "ordered decoding of every historical extension shape is one compatibility chain"
-    )]
     fn decode_extension(remaining: &[u8]) -> (BroadcastExtension, Option<String>, ProviderStateExtensionV1) {
         /// Decode `remaining` as one historical extension shape and the bytes it used.
         fn shape<T: serde::de::DeserializeOwned>(remaining: &[u8]) -> Option<(T, usize)> {
@@ -1505,10 +1493,6 @@ impl foca::BroadcastHandler<NodeId> for StateBroadcastHandler {
     type Error = StateBroadcastError;
     type Key = StateBroadcastKey;
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "decode, independent metadata lanes, and provider-state revision checks form one atomic receive path"
-    )]
     fn receive_item(&mut self, data: &[u8], _sender: Option<&NodeId>) -> Result<Option<Self::Key>, Self::Error> {
         let broadcast = StateBroadcast::decode(data)?;
         if broadcast.version != STATE_BROADCAST_VERSION {
@@ -2017,10 +2001,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "verifies acceptance under both the 'next' and 'current' pinned keys in one proof"
-    )]
     fn receive_item_accepts_a_broadcast_signed_by_either_key_in_a_rotated_pin_set() {
         // Bounded key rotation: an origin pinned to [current, next] must
         // verify against a signature made with *either* key, mirroring
@@ -2251,10 +2231,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "capacity regression exercises signed and unsigned admissions, every metadata lane, and existing replay guards"
-    )]
     fn full_pinned_capacity_refuses_unknown_state_without_mutating_any_lane() {
         let (mut handler, _control) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 2);
         let (signing_key, public_key) = generate_signing_key_and_pubkey();
@@ -2553,7 +2529,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "encodes the same broadcast in both wire shapes")]
     fn signals_address_rides_a_new_extension_older_peers_skip() {
         let base = StateBroadcast::new(
             "a".to_owned(),
@@ -2600,7 +2575,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "encodes every extension field in both layouts")]
     fn encoding_keeps_the_previous_layout_byte_for_byte() {
         let mut snap = snapshot("a", 3, 0.5);
         for provider in snap.providers.values_mut() {
@@ -2655,7 +2629,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "forged then real revisions on all three lanes")]
     fn a_metadata_revision_from_the_future_is_refused() {
         let (mut handler, _control) = StateBroadcastHandler::with_capacity("local".to_owned(), 8);
         let empty = || GridStateSnapshot::new("a".to_owned());
@@ -3820,10 +3793,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the eviction proof covers two GridNetwork scopes, metadata, and a lower-revision restart"
-    )]
     fn coordinated_eviction_removes_all_origin_state_before_next_item() {
         let (mut handler, origin_state) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 4);
         let cert = "public-cert";
@@ -3868,10 +3837,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one departure checked against every lane and both guards"
-    )]
     fn a_departed_origin_keeps_its_providers_signals_and_guards() {
         let (mut handler, origin_state) = StateBroadcastHandler::with_capacity("site-local".to_owned(), 4);
         let broadcast = |revision: u64, address: &str, cert: &str| {
@@ -4175,10 +4140,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "two scoped snapshots and one withdrawal form one cross-network regression proof"
-    )]
     fn authoritative_empty_snapshot_withdraws_only_its_grid_scope() {
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());
         let mut snapshot_a = GridStateSnapshot::new("site-a".to_owned());
@@ -4249,10 +4210,6 @@ mod tests {
     // Test Utilities
     // -----------------------------------------------------------------------
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the utility reproduces every field of the immutable pre-tools wire layout"
-    )]
     fn pre_tools_signable_bytes(broadcast: &StateBroadcast) -> Vec<u8> {
         let v1 = StateBroadcastV1 {
             version: broadcast.version,

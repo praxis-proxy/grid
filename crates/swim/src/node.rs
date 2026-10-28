@@ -162,7 +162,6 @@ impl SwimNode {
     }
 
     /// Create a node with an explicit hard bound for retained state origins.
-    #[expect(clippy::too_many_lines, reason = "seed + foca setup is one logical step")]
     pub fn with_origin_capacity(identity: NodeId, max_origins: usize) -> Self {
         let seed = {
             // Truncate nanoseconds to u64; we want spread, not precision.
@@ -595,10 +594,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "boundary proof finds both catalogs, exercises foca delivery, and checks the rejection"
-    )]
     fn publish_state_broadcast_accepts_the_largest_fitting_catalog_and_rejects_the_next() {
         let id = local_id("site-a", 7946);
         let byte_budget = state_broadcast_byte_budget(&id).unwrap_or_else(|_| std::process::abort());
@@ -728,10 +723,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "establishes membership, publishes unpinned state, then pins and re-checks purge in one proof"
-    )]
     fn pin_origin_purges_previously_unauthenticated_state_from_that_origin() {
         let id_a = local_id("site-a", 19_231);
         let id_b = local_id("site-b", 19_232);
@@ -776,10 +767,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "establishes membership, pins, signs+publishes, and re-pins with a rotated key set in one proof"
-    )]
     fn pin_origin_rotation_update_does_not_purge_already_authenticated_state() {
         let id_a = local_id("site-a", 19_233);
         let id_b = local_id("site-b", 19_234);
@@ -832,10 +819,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "establishes membership, publishes state, then unpins and re-checks retention in one proof"
-    )]
     fn unpin_origin_does_not_purge_existing_state() {
         let id_a = local_id("site-a", 19_235);
         let id_b = local_id("site-b", 19_236);
@@ -945,10 +928,6 @@ mod tests {
     /// 4. B processes the gossip message → `StateBroadcastHandler::receive_item` fires.
     /// 5. B's `state_snapshot()` reflects A's CRDT state.
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "multi-step gossip broadcast proof: membership + publish + gossip + receive"
-    )]
     fn crdt_state_propagates_to_peer_via_foca_gossip_broadcast() {
         let id_a = local_id("site-a", 19_201);
         let id_b = local_id("site-b", 19_202);
@@ -999,10 +978,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "three-node proof establishes membership, broadcasts once, and verifies both receivers"
-    )]
     fn dedicated_broadcast_reaches_all_available_peers() {
         let id_a = local_id("site-a", 19_210);
         let id_b = local_id("site-b", 19_211);
@@ -1052,10 +1027,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "sends two broadcasts (rev=2 then rev=1) and verifies stale rejection at receiver"
-    )]
     fn stale_broadcast_does_not_overwrite_newer_state_at_receiver() {
         let id_a = local_id("site-a", 19_203);
         let id_b = local_id("site-b", 19_204);
@@ -1207,10 +1178,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "establishes two independent memberships (A-C and B-C), gossips from each, verifies merged state"
-    )]
     fn two_independent_origins_merge_correctly_at_receiver() {
         let id_a = local_id("site-a", 19_207);
         let id_b = local_id("site-b", 19_208);
@@ -1292,10 +1259,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "two-origin gossip proof establishes membership, broadcasts twice, and verifies convergence"
-    )]
     fn tenant_spend_from_two_origin_sites_converges_at_third_via_gossip() {
         let id_a = local_id("site-a", 19_216);
         let id_b = local_id("site-b", 19_217);

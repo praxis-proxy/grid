@@ -322,10 +322,6 @@ pub(crate) fn setup(
 ///
 /// An explicit resolved config selects its run. A source config selects the
 /// only live run in its directory; ambiguity requires an explicit path.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the explicit and discovered run checks belong together"
-)]
 pub(crate) fn standalone_run_config(config: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if config
         .file_name()
@@ -942,10 +938,6 @@ fn demonstrate_global(
 }
 
 /// Workload-inference demonstration: in-cluster request path, no GTM.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential scenario narration is clearest in one function"
-)]
 fn demonstrate_workload(forge_config: &Path, mode: DemoMode, narrator: &mut Narrator) -> DemoOutcome {
     let mut capabilities = Vec::new();
 
@@ -1165,7 +1157,6 @@ fn print_credential_boundary_proof(narrator: &mut Narrator) {
 }
 
 /// Print explicit, mode-specific scope boundaries after all runtime proofs.
-#[expect(clippy::too_many_lines, reason = "mode-branched narration block")]
 fn print_boundaries(narrator: &mut Narrator, mode: DemoMode) {
     narrator.banner("DEMONSTRATED BOUNDARY");
     narrator.narrate("");
@@ -1332,7 +1323,6 @@ const EDGE_OVERLAY_CONFIGMAP: &str = "grid-overlay-glb-demo-edge-gateway";
 /// routes to a known west provider. Restoration is guarded: the provider
 /// gateway is always restored, overlay recovery verified, and local
 /// routing confirmed before returning.
-#[expect(clippy::too_many_lines, reason = "two-phase preference/fallback proof")]
 fn prove_workload_local_preference(narrator: &mut Narrator) -> Result<String, Box<dyn std::error::Error>> {
     narrator.narrate("  Phase 1: local preference");
     let mut local_hits = 0_usize;
@@ -1497,10 +1487,6 @@ fn wait_for_rollout(context: &str, name: &str) -> Result<(), Box<dyn std::error:
 /// withdrawn backend candidate. A sibling candidate in the same provider
 /// site remains valid; the assertion therefore uses backend attribution, not
 /// only the coarser provider-gateway site name.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the fallback proof keeps the serving barrier and bounded request assertion together"
-)]
 fn verify_drain_fallback(
     consumer_edge: &str,
     reload_before: usize,
@@ -1698,10 +1684,6 @@ fn prove_restart_recovery_and_soak(
 }
 
 /// Restart each Grid operator and prove overlay and request recovery.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the four sequential restart proofs share fixtures and ordered evidence"
-)]
 fn prove_operator_restarts(
     narrator: &mut Narrator,
     fixtures: &[&AffinityFixture],
@@ -2200,10 +2182,6 @@ fn render_config(
 /// Clone vcr-backend stack as vcr-backend-openai with required `OpenAI` credential mount.
 ///
 /// Creates east-only stack to prevent west-provider requiring credentials that only exist in east-provider.
-#[expect(
-    clippy::too_many_lines,
-    reason = "YAML path traversal and validation requires comprehensive error checking"
-)]
 fn add_openai_credential_mount(spec: &mut serde_yaml::Mapping) -> Result<(), Box<dyn std::error::Error>> {
     let stacks = spec
         .get_mut("stacks")
@@ -2687,7 +2665,6 @@ mod setup_tests {
         }
 
         #[test]
-        #[expect(clippy::too_many_lines, reason = "asserts Helm SWIM wiring for four identity stacks")]
         fn identity_stacks_use_helm_with_swim_config() -> Result<(), Box<dyn std::error::Error>> {
             let source = workspace_root().join("tests/e2e/topologies/grid-glb-demo/forge.yaml");
             let forge: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(source)?)?;
@@ -2896,7 +2873,6 @@ mod setup_tests {
             assert_eq!(options.ingress_mode(), IngressMode::Workload);
         }
 
-        #[expect(clippy::too_many_lines, reason = "complete serialized evidence fixture")]
         fn sample_report(mode: &'static str, status: &'static str) -> EvidenceReport {
             EvidenceReport {
                 schema_version: EVIDENCE_SCHEMA_VERSION,

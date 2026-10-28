@@ -1,12 +1,8 @@
 //! Certificate generation and distribution for the test environment.
 
-use std::{
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::path::{Path, PathBuf};
 
 use certs::{generate_ca, generate_cert_with_org, generate_dns_cert, generate_site_cert, load_ca};
-use sha2::{Digest as _, Sha256};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -196,20 +192,15 @@ pub(crate) fn certs_exist() -> bool {
 ///
 /// Returns a 64-character lowercase hex string: `hex(sha256(der_bytes))`.
 pub(crate) fn certificate_sha256(cert_path: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("openssl")
-        .args(["x509", "-in", &cert_path.display().to_string(), "-outform", "DER"])
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("failed to decode certificate: {}", stderr.trim()).into());
-    }
-    Ok(hex::encode(Sha256::digest(output.stdout)))
+    let pem =
+        std::fs::read_to_string(cert_path).map_err(|err| format!("could not read {}: {err}", cert_path.display()))?;
+    certs::canonical_fingerprint(&pem).map_err(|err| format!("could not parse {}: {err}", cert_path.display()).into())
 }
 
 /// Whether an existing certificate names its own site in the subject organization.
 ///
 /// An error rather than a false reading when the certificate cannot be read: a false here
-/// regenerates the identity, so a missing `openssl` would rotate every site's private key
+/// regenerates the identity, so a read failure would rotate every site's private key
 /// instead of saying why it could not tell.
 ///
 /// A certificates directory outlives the scheme that wrote it. One generated before the
@@ -223,31 +214,11 @@ fn names_its_site(dir: &Path, site: &str) -> Result<bool, Box<dyn std::error::Er
 
 /// Subject organization of a certificate on disk, `None` when absent or unreadable.
 fn certificate_organization(cert_path: &Path) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let output = Command::new("openssl")
-        .args([
-            "x509",
-            "-in",
-            &cert_path.display().to_string(),
-            "-noout",
-            "-subject",
-            "-nameopt",
-            "RFC2253",
-        ])
-        .output()
-        .map_err(|err| format!("could not run openssl to read {}: {err}", cert_path.display()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("could not read {}: {}", cert_path.display(), stderr.trim()).into());
-    }
-    // openssl prints `subject=O=west,CN=west`, so the label comes off before the split.
-    let printed = String::from_utf8_lossy(&output.stdout);
-    let subject = printed
-        .trim()
-        .strip_prefix("subject=")
-        .unwrap_or_else(|| printed.trim());
-    Ok(subject
-        .split(',')
-        .find_map(|part| part.trim().strip_prefix("O=").map(str::to_owned)))
+    let pem =
+        std::fs::read_to_string(cert_path).map_err(|err| format!("could not read {}: {err}", cert_path.display()))?;
+    let orgs =
+        certs::cert_organizations(&pem).map_err(|err| format!("could not parse {}: {err}", cert_path.display()))?;
+    Ok(orgs.into_iter().next())
 }
 
 /// Compute the canonical fingerprint for a generated site certificate.
@@ -267,14 +238,7 @@ pub(crate) fn site_certificate_fingerprint_in_dir(
 ///
 /// Used to compare a SWIM-advertised `publicCertPem` against a staged identity.
 pub(crate) fn pem_to_canonical_fingerprint(pem: &str) -> String {
-    let tmp = match tempfile::NamedTempFile::new() {
-        Ok(f) => f,
-        Err(_err) => return String::new(),
-    };
-    if std::fs::write(tmp.path(), pem.trim()).is_err() {
-        return String::new();
-    }
-    certificate_sha256(tmp.path()).unwrap_or_default()
+    certs::canonical_fingerprint(pem.trim()).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +321,11 @@ pub(crate) fn load_or_generate_ca(dir: &Path) -> Result<certs::CaCert, Box<dyn s
     }
 }
 
+/// Generate a random 32-byte hex provider credential.
+pub(crate) fn generate_provider_credential() -> String {
+    hex::encode(rand::random::<[u8; 32]>())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -408,7 +377,7 @@ mod tests {
 
     /// An identity it cannot read is an error, never a false reading.
     ///
-    /// False regenerates, so a missing `openssl` would rotate every private key rather
+    /// False regenerates, so a read failure would rotate every private key rather
     /// than saying why it could not tell.
     #[test]
     fn an_unreadable_identity_is_not_silently_rotated() {
@@ -472,6 +441,16 @@ mod tests {
         assert!(!identity_exists(test_dir.path(), "edge"));
         write_pem(&test_dir.path().join("edge-key.pem"), "KEY").unwrap_or_else(|_| std::process::abort());
         assert!(identity_exists(test_dir.path(), "edge"));
+    }
+
+    #[test]
+    fn provider_credential_is_64_lowercase_hex_characters() {
+        let token = generate_provider_credential();
+        assert_eq!(token.len(), 64, "32 bytes hex-encoded is 64 characters");
+        assert!(
+            token.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "must be lowercase hex, got {token}"
+        );
     }
 
     #[cfg(unix)]

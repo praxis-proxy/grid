@@ -437,7 +437,6 @@ pub(crate) fn mock_api_provider_deployment_yaml() -> String {
 }
 
 /// Generate the Deployment YAML with optional environment variables.
-#[expect(clippy::too_many_lines, reason = "readable multiline Kubernetes Deployment YAML")]
 pub(crate) fn mock_api_provider_deployment_yaml_with_env(envs: &[(&str, &str)]) -> String {
     let mock_provider_img = image_overrides::mock_provider_image();
     let pull_policy = image_overrides::image_pull_policy();
@@ -565,7 +564,6 @@ pub(crate) fn delete_mock_mcp_server(context: &str) {
 }
 
 /// Generate the Deployment YAML for the mock MCP server.
-#[expect(clippy::too_many_lines, reason = "readable multiline Kubernetes Deployment YAML")]
 fn mock_mcp_server_deployment_yaml(tools_csv: &str, required_bearer: Option<&str>) -> String {
     let mock_provider_img = image_overrides::mock_provider_image();
     let pull_policy = image_overrides::image_pull_policy();
@@ -703,7 +701,6 @@ pub(crate) fn delete_mock_cloud_provider(context: &str) {
 }
 
 /// Generate the Deployment YAML for the cloud-managed mock provider.
-#[expect(clippy::too_many_lines, reason = "readable multiline Kubernetes Deployment YAML")]
 pub(crate) fn mock_cloud_provider_deployment_yaml() -> String {
     let mock_provider_img = image_overrides::mock_provider_image();
     let pull_policy = image_overrides::image_pull_policy();
@@ -804,7 +801,6 @@ fn deploy_mock_openai(full_name: &str, site_name: &str) -> Result<(), Box<dyn st
 ///
 /// Deploys a single `grid-mock-providers` instance configured for the
 /// `openai` provider, serving all models in the cluster.
-#[expect(clippy::too_many_lines, reason = "Kubernetes manifest generation")]
 pub(crate) fn mock_openai_deployment_yaml(site_name: &str) -> String {
     let mock_provider_img = image_overrides::mock_provider_image();
     let pull_policy = image_overrides::image_pull_policy();

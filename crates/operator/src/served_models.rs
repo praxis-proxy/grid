@@ -885,10 +885,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one fixture verifies discovered inventory is excluded from routing and gossip"
-    )]
     fn fresh_discovered_inventory_is_not_routed_or_gossiped() {
         let provider = discovery_provider("p", &serde_json::json!({}));
         let store = ServedModelStore::new();

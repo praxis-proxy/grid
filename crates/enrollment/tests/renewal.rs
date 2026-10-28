@@ -302,7 +302,6 @@ async fn a_lost_response_retries_and_the_replaced_key_cannot_pick_another() {
 }
 
 #[tokio::test]
-#[expect(clippy::too_many_lines, reason = "a fork, the freeze it leaves, and the recovery")]
 async fn a_fork_freezes_the_site_until_a_grid_admin_deletes_its_enrollment() {
     let grid = grid(&[]);
     let first = enroll(&grid, "site-a").await;
@@ -609,7 +608,6 @@ async fn a_re_seed_of_the_held_key_is_not_applied_again_after_the_hub_renews() {
 }
 
 #[tokio::test]
-#[expect(clippy::too_many_lines, reason = "apply, roll back, and check the record held")]
 async fn a_rolled_back_seed_is_warned_once_and_changes_nothing() {
     let grid = grid(&["hub"]);
     let first = issue(&grid.ca, "hub", certs::Validity::default());
@@ -661,10 +659,6 @@ async fn a_rolled_back_seed_is_warned_once_and_changes_nothing() {
 }
 
 #[tokio::test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "exercise both routes across signer withholding and recovery"
-)]
 async fn a_withheld_signer_refuses_enrollment_and_rotation_then_recovers() {
     use enrollment::ca::{RecordedCa, anchor};
 
@@ -730,10 +724,6 @@ async fn a_withheld_signer_refuses_enrollment_and_rotation_then_recovers() {
 }
 
 #[tokio::test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "cover enrollment and rotation reuse through one key history"
-)]
 async fn rotation_to_any_key_ever_enrolled_is_refused() {
     let grid = grid(&["hub"]);
     let east = enroll(&grid, "east").await;

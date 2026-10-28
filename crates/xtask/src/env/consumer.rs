@@ -108,7 +108,6 @@ pub(crate) fn probe_network(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::E
 }
 
 /// Probe whether a provider cluster's gateway is reachable from the consumer.
-#[expect(clippy::too_many_lines, reason = "sequential probe steps with diagnostic output")]
 fn probe_provider_reachability(
     provider: &str,
     _def: &ClusterDef,
@@ -386,10 +385,6 @@ fn read_overlay_file(path: &Path) -> Result<RoutingOverlay, Box<dyn std::error::
 ///
 /// Returns an error when all candidates are filtered out, since no locally-routable
 /// route would remain, making the consumer gateway deployment useless.
-#[expect(
-    clippy::too_many_lines,
-    reason = "per-candidate filtering loop with diagnostic output for each excluded candidate"
-)]
 fn filter_overlay_for_local_providers(
     overlay: &RoutingOverlay,
     providers: &[ProviderEndpoint],
@@ -660,7 +655,6 @@ fn apply_consumer_responses_config(
 ///
 /// The `intelligent_route` cluster convention is `gateway-{site}`, which must match
 /// the names produced by [`build_clusters`].
-#[expect(clippy::too_many_lines, reason = "Praxis config YAML generation")]
 fn consumer_gateway_config(
     consumer_site: &str,
     providers: &[ProviderEndpoint],
@@ -709,7 +703,6 @@ fn consumer_gateway_config(
 ///
 /// `intelligent_route` reads the model from `X-Model` and selects from the Grid overlay
 /// exactly as in other routing modes.
-#[expect(clippy::too_many_lines, reason = "Praxis config YAML generation")]
 fn responses_consumer_gateway_config(
     consumer_site: &str,
     providers: &[ProviderEndpoint],
@@ -801,7 +794,6 @@ fn build_clusters(providers: &[ProviderEndpoint]) -> String {
 }
 
 /// Apply the consumer gateway Deployment and Service.
-#[expect(clippy::too_many_lines, reason = "K8s manifest generation")]
 fn apply_consumer_deployment(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     let gateway_img = image_overrides::gateway_image();
     let pull_policy = image_overrides::image_pull_policy();
@@ -868,10 +860,6 @@ fn apply_consumer_deployment(context: &str) -> Result<(), Box<dyn std::error::Er
 ///
 /// This allows `credential_inject` to use `file:` as its token source
 /// rather than an inline `value:`, keeping token bytes out of `ConfigMap`s.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Deployment + Service YAML with two volumes; mirrors apply_consumer_deployment"
-)]
 fn apply_consumer_deployment_with_credential_mount(
     context: &str,
     secret_name: &str,
@@ -973,10 +961,6 @@ fn apply_consumer_deployment_with_credential_mount(
 /// harness this is acceptable; production deployments should use mounted Secret
 /// volumes or a native Praxis secret-reference mechanism.
 #[expect(
-    clippy::too_many_lines,
-    reason = "Praxis YAML generation with mTLS and plain-HTTP clusters"
-)]
-#[expect(
     clippy::too_many_arguments,
     reason = "six distinct config parameters: site, providers, overlay, cluster name, endpoint, token"
 )]
@@ -1043,10 +1027,6 @@ shutdown_timeout_secs: 5
 /// the file at `{CREDENTIAL_MOUNT_BASE}/{secret_name}/{secret_key}` inside the pod.
 /// **The token does not appear in this `ConfigMap`**, in the operator overlay JSON,
 /// or in the `intelligent_route` candidates block.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Praxis YAML generation with mTLS + plain-HTTP clusters and native credential inject"
-)]
 #[expect(
     clippy::too_many_arguments,
     reason = "distinct argument per secretRef field; collapsing would obscure the security boundary"
@@ -1120,10 +1100,6 @@ shutdown_timeout_secs: 5
 #[expect(
     dead_code,
     reason = "live consumer uses operator-generated config; retained for xtask-generated config unit tests"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential deploy steps: tls secret, config, deployment with credential mount, rollout"
 )]
 #[expect(
     clippy::too_many_arguments,
@@ -1235,10 +1211,6 @@ pub(crate) fn deploy_consumer_from_operator_yaml(
 /// local providers; the API-provider candidate must survive into the generated
 /// Praxis config.  The `api_provider_endpoint` is the in-cluster address of the
 /// mock API-provider service (e.g. `mock-api-provider.default.svc:8080`).
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential deploy steps: secret, config, deployment, rollout"
-)]
 pub(crate) fn deploy_consumer_for_api_fallback(
     cfg: &EnvConfig,
     overlay: &RoutingOverlay,
@@ -1314,7 +1286,6 @@ pub(crate) fn deploy_consumer_for_api_fallback(
 /// xtask validation harness this is acceptable; production deployments should
 /// move to mounted Secret volumes or a native Praxis secret-reference
 /// mechanism when available rather than embedding credentials in a `ConfigMap`.
-#[expect(clippy::too_many_lines, reason = "Praxis YAML generation for all four cluster types")]
 #[expect(
     clippy::too_many_arguments,
     reason = "distinct argument per backend kind; grouping would obscure the intended topology"
@@ -1383,10 +1354,6 @@ shutdown_timeout_secs: 5
 /// Does **not** apply [`filter_overlay_for_local_providers`]; all four candidates
 /// (local, remote, cloud, `api_provider`) must survive into the Praxis config.
 #[expect(clippy::too_many_arguments, reason = "one endpoint per backend cluster type")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential deploy steps: secret, config, deployment, rollout"
-)]
 pub(crate) fn deploy_consumer_for_full_grid(
     cfg: &EnvConfig,
     overlay: &RoutingOverlay,
@@ -1446,7 +1413,6 @@ pub(crate) fn deploy_consumer_for_full_grid(
 /// verifies the response model field echoes the requested model name (proving
 /// the correct backend handled the request), and asserts an unknown model fails
 /// cleanly.
-#[expect(clippy::too_many_lines, reason = "multi-backend E2E assertion chain")]
 pub(crate) fn verify_full_grid_e2e(
     cfg: &EnvConfig,
     east_model: &str,
@@ -1504,7 +1470,6 @@ pub(crate) fn verify_full_grid_e2e(
 /// Assert one model returns HTTP 200, valid Chat Completions JSON, and that the
 /// response `model` field equals the requested model name.
 #[expect(clippy::too_many_arguments, reason = "all args are distinct per-backend identifiers")]
-#[expect(clippy::too_many_lines, reason = "JSON parse + model field check + tally chain")]
 fn verify_full_grid_model(
     context: &str,
     port: u16,
@@ -1587,7 +1552,6 @@ fn verify_full_grid_model(
 ///    Bearer`); the grid consumer gateway handles routing to the API endpoint.  The mock API-provider requires a Bearer
 ///    token, and the request succeeds, proving the infrastructure manages endpoint access, not the client.
 /// 5. **Unknown model fails cleanly**: a request for a non-existent model returns 404 or 503.
-#[expect(clippy::too_many_lines, reason = "multi-assertion E2E verification chain")]
 pub(crate) fn verify_api_fallback_e2e(
     cfg: &EnvConfig,
     local_model: &str,
@@ -1673,7 +1637,6 @@ pub(crate) fn verify_api_fallback_e2e(
 /// # Errors
 ///
 /// Returns an error if any assertion fails.
-#[expect(clippy::too_many_lines, reason = "multi-cluster E2E verification loop")]
 pub(crate) fn verify_e2e(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Error>> {
     let consumer_site = cfg
         .consumer_cluster_name()
@@ -1724,7 +1687,6 @@ pub(crate) fn verify_e2e(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Erro
 }
 
 /// Verify a single model routes correctly from the consumer to a provider.
-#[expect(clippy::too_many_lines, reason = "per-model assertion chain")]
 #[expect(
     clippy::too_many_arguments,
     reason = "all args are distinct non-groupable identifiers"
@@ -1867,10 +1829,6 @@ fn validate_responses_json(body: &str) -> Result<(), String> {
 /// - Consumer gateway is reachable via port-forward.
 /// - Each configured model returns HTTP 200 with a valid Responses body.
 /// - An unknown model fails cleanly (404 or 503).
-#[expect(
-    clippy::too_many_lines,
-    reason = "port-forward setup + per-model assertions + negative case"
-)]
 pub(crate) fn verify_responses_e2e(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Error>> {
     let consumer_site = cfg
         .consumer_cluster_name()
@@ -1921,7 +1879,6 @@ pub(crate) fn verify_responses_e2e(cfg: &EnvConfig) -> Result<(), Box<dyn std::e
 }
 
 /// Verify a single model routes correctly via the `/v1/responses` path.
-#[expect(clippy::too_many_lines, reason = "per-model assertion chain")]
 #[expect(
     clippy::too_many_arguments,
     reason = "all args are distinct non-groupable identifiers"
@@ -2019,10 +1976,6 @@ fn send_request_without_auth(port: u16, model: &str) -> Result<HttpResponse, Box
 ///
 /// Together these two assertions prove transparent provider credential injection:
 /// the client is unaware of the provider API key; the grid infrastructure manages it.
-#[expect(
-    clippy::too_many_lines,
-    reason = "two-phase credential injection proof: negative then positive"
-)]
 #[expect(
     clippy::too_many_arguments,
     reason = "six distinct parameters: context, two ports, model, secret name, tally"

@@ -71,7 +71,6 @@ fn an_unknown_key_inside_a_section_is_refused_with_its_path() {
 }
 
 #[test]
-#[expect(clippy::too_many_lines, reason = "one case per refused field")]
 fn a_refused_field_is_named_in_the_message() {
     let cases = [
         ("site: {}\n", "name"),

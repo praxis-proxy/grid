@@ -607,7 +607,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "checks the complete generated GridSite schema")]
     fn grid_site_crd_bounds_identity_fields() {
         let crd = crd_json();
         let pins = crd

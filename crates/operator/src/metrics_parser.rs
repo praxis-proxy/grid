@@ -218,10 +218,6 @@ impl PartialMetrics {
 /// matched a series carrying that pool name.  An unrelated metric with the
 /// right pool label does **not** count; at least one routing-relevant signal
 /// must match.
-#[expect(
-    clippy::too_many_lines,
-    reason = "six assign-and-match calls read as a table; extraction would obscure intent"
-)]
 pub fn parse_prometheus_text(text: &str, names: &MetricNames) -> Result<PartialMetrics, String> {
     let mut result = PartialMetrics::default();
     let mut pool_signal_matched = false;

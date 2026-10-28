@@ -215,7 +215,6 @@ fn list(kind: &str, items: &Value) -> (u16, Value) {
 }
 
 /// Answer one request against `world`.
-#[expect(clippy::too_many_lines, reason = "one arm per request the mock serves")]
 fn answer(world: &mut World, method: &http::Method, path: &str, query: &str, body: &[u8]) -> (u16, Value) {
     let secrets = format!("/api/v1/namespaces/{NAMESPACE}/secrets");
     let site_status = path
@@ -444,7 +443,6 @@ fn maybe_spent(refused: bool) -> EnrollError {
 }
 
 #[test]
-#[expect(clippy::too_many_lines, reason = "one case per enrollment error")]
 fn every_enrollment_failure_has_its_own_reason() {
     let errors = [
         EnrollError::Config(String::new()),
@@ -1001,7 +999,6 @@ async fn the_condition_is_applied_by_its_own_field_manager() {
 }
 
 #[tokio::test]
-#[expect(clippy::too_many_lines, reason = "owned and foreign, cleared and then left")]
 async fn an_existing_identity_clears_the_request_an_earlier_process_kept_and_leaves_a_foreign_one() {
     let pending = format!("{}-pending", crate::enroll::IDENTITY_SECRET);
     for (label, cleared) in [("grid-operator", true), ("someone-else", false)] {

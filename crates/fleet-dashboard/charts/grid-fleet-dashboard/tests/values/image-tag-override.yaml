@@ -1,0 +1,6 @@
+# Explicit image.tag wins over the chart appVersion.
+auth:
+  oauthProxy:
+    cookieSecret: golden-session-secret-0123456789ab
+image:
+  tag: v0.2.1

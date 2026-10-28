@@ -47,7 +47,6 @@ struct Spec {
 /// Drain or restore all providers assigned to one explicit gateway identity.
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "CLI dispatch keeps the selector and bounded operation controls explicit"
 )]
 pub(crate) fn run(
@@ -196,7 +195,6 @@ fn kubectl_owned(context: &str, args: &[String], timeout: Duration) -> Result<Ve
 
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "the convergence gate keeps all target and diagnostic state explicit"
 )]
 fn wait_for_convergence(
@@ -269,10 +267,6 @@ fn wait_for_convergence(
 }
 
 /// Read the projected overlay revision and candidate admission states.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the overlay parser validates the complete projected resource in one place"
-)]
 fn read_overlay(
     context: &str,
     network: &str,

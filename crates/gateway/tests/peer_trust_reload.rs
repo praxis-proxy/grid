@@ -6,7 +6,6 @@
     clippy::panic,
     clippy::arithmetic_side_effects,
     clippy::disallowed_methods,
-    clippy::too_many_lines,
     reason = "tests; waits poll a deadline with thread::sleep"
 )]
 mod tests {

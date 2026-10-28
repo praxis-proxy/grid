@@ -42,7 +42,6 @@ enum Shape {
 }
 
 /// `sites` candidates serving `llama` with the selected pressure pattern.
-#[expect(clippy::too_many_lines, reason = "one candidate literal spelled field by field")]
 fn snapshot(sites: u32, shape: Shape) -> RouteSnapshot {
     let candidates = (1..=sites)
         .map(|index| {
@@ -104,7 +103,6 @@ fn filter(snapshot: RouteSnapshot) -> Result<Box<dyn HttpFilter>, FilterError> {
 }
 
 /// A context as the pipeline hands it to the first selecting filter: nothing chosen yet.
-#[expect(clippy::too_many_lines, reason = "the context literal names every field")]
 fn context(request: &Request) -> HttpFilterContext<'_> {
     HttpFilterContext {
         buffered_request_body: None,

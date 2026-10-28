@@ -566,10 +566,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "multi-line JSON fixture with distinct security invariant per assert"
-    )]
     fn credential_bearing_candidate_parses_and_yaml_omits_credential() {
         // Regression guard: candidates_yaml() must strip credential data so that
         // intelligent_route filter YAML never contains secret references or token values.
@@ -649,7 +645,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "multi-line JSON fixture with per-field assertions")]
     fn credential_bearing_candidate_emits_secret_ref_in_native_mode() {
         let json = r#"{
             "network": "net",

@@ -1529,7 +1529,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one store across two scrapes")]
     fn provider_signals_drop_a_series_the_store_no_longer_holds() {
         use prometheus::core::Collector as _;
         let ready = crate::signals::Observation {
@@ -1573,7 +1572,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one scenario across both stores")]
     fn provider_signals_export_this_site_and_its_peers_and_omit_what_is_not_held() {
         use prometheus::core::Collector as _;
         let held = |site: &str, metric: &str, value: f64| crate::signals::Observation {
