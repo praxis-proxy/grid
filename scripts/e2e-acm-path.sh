@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
-# The ACM path end to end on kind: two clusters, cert-manager identities, Local membership,
-# no enrollment service anywhere.
+# Delivered membership records end to end on kind: two clusters, Local membership, no
+# enrollment service anywhere.
 #
-# Each cluster is a site. Its operator's config carries a site name and nothing else, its
-# identity comes from cert-manager through a CA both clusters trust, and its members are the
-# GridSites its own configuration declares. Neither site enrolls, neither runs SWIM, and
-# nothing installs grid-enrollment. What is under test is whether two sites built that way
-# poll each other's signals.
+# Each cluster is a site. Its operator's config carries a site name and nothing else, and its
+# members are the GridSites its own configuration declares, applied here the way an external
+# source of truth delivers them: the same records on every cluster, written by something
+# outside the grid. Open Cluster Management is the reference example; this leg applies the
+# records directly rather than running it, so what is under test is the grid's side of that
+# contract and not the delivery mechanism. Neither site enrolls, neither runs SWIM, and
+# nothing installs grid-enrollment.
 #
 # One cluster per site, because the operator reads every GridNetwork it can see and a second
 # site in another namespace would give it two grids to serve.
 #
-# This branch carries the Local membership half. The other half, identity.source CertManager
-# on the grid-operator chart, is on feat/site-identity-certmanager, so the leg runs only where
-# both are present. It refuses to start otherwise rather than failing in a helm schema error.
+# IDENTITY says where each site's identity comes from. secrets, the default, signs the two
+# leaves here with one CA and writes them, which needs nothing outside this branch.
+# certmanager installs cert-manager and has it issue them, which needs
+# identity.source CertManager on the grid-operator chart; the leg refuses by name when that
+# is absent rather than failing in a helm schema error.
 #
 # Env: IMAGE_REPO (default localhost/grid-operator), IMAGE_TAG (default ci),
-#      PREFIX (default grid-acm), GRID_ID (default dagobah),
+#      PREFIX (default grid-acm), GRID_ID (default dagobah), IDENTITY (secrets or certmanager),
 #      CERT_MANAGER_VERSION, KEEP=1 to keep the clusters, KIND_CREATE_PREFIX for rootless podman.
 set -euo pipefail
 
@@ -25,6 +29,7 @@ IMAGE_TAG="${IMAGE_TAG:-ci}"
 PREFIX="${PREFIX:-grid-acm}"
 GRID_ID="${GRID_ID:-dagobah}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.2}"
+IDENTITY="${IDENTITY:-secrets}"
 NS=grid
 NETWORK=grid
 SITES=(east west)
@@ -79,10 +84,16 @@ own_condition() {
   condition "$1" "gridnetwork/${NETWORK}" "$2" "$3" || condition "$1" "gridsite/$1" "$2" "$3"
 }
 
-# Refuse early and by name: without the cert-manager chart support, the install below fails
-# with "additional properties 'identity' not allowed", which says nothing about why.
-grep -q '"identity"' "${ROOT}/charts/grid-operator/values.schema.json" \
-  || die "this checkout has no identity.source: merge feat/site-identity-certmanager, which carries the cert-manager chart support this leg needs"
+case ${IDENTITY} in
+  secrets) ;;
+  certmanager)
+    # Refuse early and by name: without the cert-manager chart support, the install below
+    # fails with "additional properties 'identity' not allowed", which says nothing about why.
+    grep -q '"identity"' "${ROOT}/charts/grid-operator/values.schema.json" \
+      || die "IDENTITY=certmanager needs identity.source, which feat/site-identity-certmanager carries; this checkout has no such value"
+    ;;
+  *) die "IDENTITY must be secrets or certmanager, not ${IDENTITY}" ;;
+esac
 
 echo "== clusters =="
 clusters=$(kind get clusters 2>/dev/null || true)
@@ -97,26 +108,44 @@ for site in "${SITES[@]}"; do
   k "${site}" create namespace "${NS}"
 done
 
-echo "== cert-manager in each cluster =="
-for site in "${SITES[@]}"; do
-  k "${site}" apply -f \
-    "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml" \
-    || die "cannot install cert-manager in ${site}"
-done
-for site in "${SITES[@]}"; do
-  for d in cert-manager cert-manager-webhook cert-manager-cainjector; do
-    k "${site}" -n cert-manager rollout status "deployment/${d}" --timeout=300s \
-      || die "${site}: cert-manager ${d} not ready"
+if [[ ${IDENTITY} == certmanager ]]; then
+  echo "== cert-manager in each cluster =="
+  for site in "${SITES[@]}"; do
+    k "${site}" apply -f \
+      "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml" \
+      || die "cannot install cert-manager in ${site}"
   done
-done
+  for site in "${SITES[@]}"; do
+    for d in cert-manager cert-manager-webhook cert-manager-cainjector; do
+      k "${site}" -n cert-manager rollout status "deployment/${d}" --timeout=300s \
+        || die "${site}: cert-manager ${d} not ready"
+    done
+  done
+fi
 
-echo "== one CA, an Issuer in each cluster =="
-# One CA for the grid, held by the platform team in the real shape. Each site gets the key
-# only because this stands in for a CA neither cluster runs; a Vault issuer would hold it.
+echo "== one CA for the grid =="
+# One CA, held by the platform team in the real shape. The leg holds the key only because it
+# stands in for a CA neither cluster runs; a Vault issuer would hold it.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 \
   -subj "/CN=grid-ca/O=ai-grid" -addext "basicConstraints=critical,CA:TRUE" \
   -addext "keyUsage=critical,keyCertSign,cRLSign" \
   -keyout "${WORK}/ca.key" -out "${WORK}/ca.crt" 2>/dev/null || die "cannot make the grid CA"
+
+# site_leaf <site>: a leaf for <site> with the names a peer verifies, signed by that CA.
+site_leaf() {
+  local site=$1
+  openssl ecparam -name prime256v1 -genkey -noout -out "${WORK}/${site}.key" 2>/dev/null
+  openssl req -new -key "${WORK}/${site}.key" -subj "/CN=${site}/O=${site}" -out "${WORK}/${site}.csr" 2>/dev/null
+  cat > "${WORK}/${site}.ext" <<EOF
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=clientAuth,serverAuth
+subjectAltName=DNS:${site}.grid.internal,URI:spiffe://grid.internal/site/${site}
+EOF
+  openssl x509 -req -in "${WORK}/${site}.csr" -CA "${WORK}/ca.crt" -CAkey "${WORK}/ca.key" \
+    -extfile "${WORK}/${site}.ext" -days 7 -out "${WORK}/${site}.crt" 2>/dev/null
+}
+
 cat > "${WORK}/issuer.yaml" <<EOF
 apiVersion: cert-manager.io/v1
 kind: Issuer
@@ -127,18 +156,32 @@ spec:
     secretName: grid-ca-keypair
 EOF
 for site in "${SITES[@]}"; do
-  ns "${site}" create secret tls grid-ca-keypair --cert="${WORK}/ca.crt" --key="${WORK}/ca.key"
   ns "${site}" create secret generic grid-ca --from-file=ca.crt="${WORK}/ca.crt"
-  eventually 180 "${site}: cert-manager accepts an Issuer" ns "${site}" apply -f "${WORK}/issuer.yaml" \
-    || die "${site}: cert-manager never accepted the Issuer"
+  if [[ ${IDENTITY} == certmanager ]]; then
+    ns "${site}" create secret tls grid-ca-keypair --cert="${WORK}/ca.crt" --key="${WORK}/ca.key"
+    eventually 180 "${site}: cert-manager accepts an Issuer" ns "${site}" apply -f "${WORK}/issuer.yaml" \
+      || die "${site}: cert-manager never accepted the Issuer"
+  else
+    # The identity a delivered-records install gets from whatever its CA team runs. The leaf
+    # carries the names a peer verifies: the SPIFFE URI, the DNS name and the organization.
+    site_leaf "${site}" || die "cannot sign ${site}'s leaf"
+    ns "${site}" create secret tls grid-site-identity \
+      --cert="${WORK}/${site}.crt" --key="${WORK}/${site}.key" >/dev/null \
+      || die "cannot write ${site}'s identity"
+    pass "${site}: holds an identity from the grid CA"
+  fi
 done
 
 echo "== an operator per site, enrolling nothing =="
+CERTMANAGER_ARGS=()
+if [[ ${IDENTITY} == certmanager ]]; then
+  CERTMANAGER_ARGS=(--set identity.source=CertManager --set identity.issuerRef.name=grid-site)
+fi
 for site in "${SITES[@]}"; do
   helm --kube-context "$(ctx "${site}")" install grid-operator "${ROOT}/charts/grid-operator" -n "${NS}" \
     --set "image.repository=${IMAGE_REPO}" --set "image.tag=${IMAGE_TAG}" --set image.pullPolicy=Never \
     --set "site.name=${site}" --set grid.peerTrust=spiffe --set grid.membership.source=Local \
-    --set identity.source=CertManager --set identity.issuerRef.name=grid-site \
+    ${CERTMANAGER_ARGS[@]+"${CERTMANAGER_ARGS[@]}"} \
     --set signals.enabled=true --set signals.service.type=NodePort \
     || die "cannot install ${site}'s operator"
 done
@@ -204,7 +247,7 @@ done
 
 echo "== identities =="
 for site in "${SITES[@]}"; do
-  eventually 180 "${site}: cert-manager wrote the identity" ns "${site}" get secret grid-site-identity \
+  eventually 180 "${site}: the identity Secret is in place" ns "${site}" get secret grid-site-identity \
     || die "${site} never got an identity"
   ns "${site}" rollout status deployment/grid-operator --timeout=300s || die "${site}'s operator never came up"
   eventually 240 "${site}: IdentityValid is reported" own_condition "${site}" IdentityValid status
