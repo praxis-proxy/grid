@@ -158,6 +158,14 @@ pub enum Judged {
     Awaiting,
 }
 
+impl Judged {
+    /// Whether the peer is in the clear, with or without a note.
+    #[must_use]
+    pub const fn is_clear(&self) -> bool {
+        matches!(self, Self::Clear | Self::Noted(_))
+    }
+}
+
 /// Each peer a condition judged, as of the last round.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerReach {
@@ -272,6 +280,11 @@ impl PeerReach {
     #[must_use]
     pub const fn kind(&self) -> &'static Kind {
         self.kind
+    }
+
+    /// Each peer and what it was judged.
+    pub fn judged(&self) -> impl Iterator<Item = (&str, &Judged)> {
+        self.peers.iter().map(|(peer, judged)| (peer.as_str(), judged))
     }
 
     /// The `GridNetwork` condition to write over `current`, `None` when it already says this.

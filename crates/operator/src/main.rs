@@ -2433,7 +2433,6 @@ async fn serve_signals_tls(
     shutdown: operator::shutdown::Shutdown,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut changed = std::pin::pin!(changed);
-    let mut shed_warned: Option<std::time::Instant> = None;
     loop {
         let accepted = tokio::select! {
             biased;
@@ -2450,7 +2449,7 @@ async fn serve_signals_tls(
         let Some((stream, remote)) = accepted_or_backoff(accepted).await else {
             continue;
         };
-        let Some((slot, turn, source)) = admission.admit(remote, &mut shed_warned) else {
+        let Some((slot, turn, source)) = admission.admit(remote) else {
             continue;
         };
         let serve = Box::pin(serve_signals_connection(
@@ -2461,6 +2460,7 @@ async fn serve_signals_tls(
                 turn,
                 source,
                 peers: admission.peers.clone(),
+                warned: Arc::clone(&admission.warned),
             },
             shutdown.clone(),
         ));
@@ -2553,6 +2553,8 @@ struct Admission {
     per_peer: usize,
     /// The declared members the caps are sized for.
     members: operator::signals::PeerIdentities,
+    /// When a shed connection was last warned about, shared with every connection task.
+    warned: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl Admission {
@@ -2574,9 +2576,17 @@ impl Admission {
             ),
             per_peer: max_per_peer.max(1),
             members,
+            warned: Arc::default(),
         };
         admission.size_for_members();
         operator::metrics::set_signals_connection_cap(admission.capacity);
+        operator::metrics::set_signals_admission(operator::metrics::AdmissionHandles {
+            slots: Arc::clone(&admission.slots),
+            handshakes: Arc::clone(&admission.handshakes),
+            max_handshakes: SIGNALS_MAX_HANDSHAKES,
+            sources: Arc::clone(&admission.sources.pending),
+            source_cap: admission.sources.limit,
+        });
         admission
     }
 
@@ -2602,7 +2612,6 @@ impl Admission {
     fn admit(
         &mut self,
         remote: SocketAddr,
-        warned: &mut Option<std::time::Instant>,
     ) -> Option<(
         tokio::sync::OwnedSemaphorePermit,
         tokio::sync::OwnedSemaphorePermit,
@@ -2619,18 +2628,24 @@ impl Admission {
                 let source = self.sources.acquire(remote.ip()).ok_or("source")?;
                 Ok((slot, turn, source))
             });
-        held.inspect_err(|limit| shed(remote, limit, warned)).ok()
+        held.inspect_err(|limit| shed(remote, limit, &self.warned)).ok()
     }
 }
 
 /// Record a shed connection, warning at most once per [`SIGNALS_SHED_WARN_EVERY`].
-fn shed(remote: SocketAddr, limit: &str, warned: &mut Option<std::time::Instant>) {
+fn shed(remote: SocketAddr, limit: &str, warned: &std::sync::Mutex<Option<std::time::Instant>>) {
     operator::metrics::record_signals_shed(limit);
-    let quiet = warned.is_some_and(|at| at.elapsed() < SIGNALS_SHED_WARN_EVERY);
+    let quiet = {
+        let mut warned = warned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let quiet = warned.is_some_and(|at| at.elapsed() < SIGNALS_SHED_WARN_EVERY);
+        if !quiet {
+            *warned = Some(std::time::Instant::now());
+        }
+        quiet
+    };
     if quiet {
         tracing::debug!(%remote, limit, "signals connection shed");
     } else {
-        *warned = Some(std::time::Instant::now());
         tracing::warn!(%remote, limit, "signals connection limit reached; shedding");
     }
 }
@@ -2798,6 +2813,8 @@ struct Handshaking {
     source: SourceSlot,
     /// Where the authenticated connection is counted.
     peers: PeerSlots,
+    /// When a shed connection was last warned about, shared across the listener.
+    warned: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 /// Who a leaf speaks for and the site it counts against, `Local` only for this site's current leaf.
@@ -2874,7 +2891,7 @@ async fn serve_signals_connection(
         (Caller::Local, _) => None,
         (_, Some(site)) => {
             let Some(slot) = handshaking.peers.acquire(&site) else {
-                operator::metrics::record_signals_shed("peer");
+                shed(remote, "peer", &handshaking.warned);
                 tracing::debug!(%remote, site, "signals site at its connection cap; answering 503");
                 Box::pin(serve_http(
                     stream,
@@ -3594,6 +3611,12 @@ impl PeerPoller {
         }
         let (reach, catalogs, skipped) = self.judge((source, local_site), polled, answered, urls);
         Box::pin(self.write_network((&reach, &catalogs), (skipped, polled.len()))).await;
+        for (peer, judged) in reach.judged() {
+            operator::metrics::set_peer_signals_reachable(peer, judged.is_clear());
+        }
+        for (peer, judged) in catalogs.judged() {
+            operator::metrics::set_peer_catalog_refused(peer, !judged.is_clear());
+        }
         let changed = reach != self.reach || catalogs != self.catalogs;
         // Rechecked against the live objects on the catalog schedule, so a lost write heals.
         if changed || !self.sites_written || self.turn.is_multiple_of(CATALOG_ROUNDS) {
@@ -3748,6 +3771,7 @@ impl PeerPoller {
         self.ctx
             .peer_providers()
             .retain_sites(|site| polled.iter().any(|polled| polled == site));
+        operator::metrics::retain_peers(|site| polled.iter().any(|polled| polled == site));
         self.ctx
             .peer_catch_up()
             .record(&polled, |site| answered.contains_key(site), |site| catalogs.holds(site));
@@ -3792,10 +3816,13 @@ async fn read_catalogs(
     let read = std::sync::Mutex::new(Vec::new());
     let reads = futures::stream::iter(wanted).for_each_concurrent(concurrency, |site| async {
         if let Some((providers, version)) = source.fetch_providers(site).await {
+            operator::metrics::record_peer_catalog(&site.name, "replaced");
             catalogs.replace(&site.name, providers);
             read.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((site.name.clone(), version));
+        } else {
+            operator::metrics::record_peer_catalog(&site.name, "failed");
         }
     });
     let finished = tokio::select! {
@@ -4541,6 +4568,7 @@ mod tests {
     /// Fresh caps, and a handshake slot for loopback against them.
     fn handshaking(sources: &SourceSlots, peers: &PeerSlots) -> Handshaking {
         Handshaking {
+            warned: Arc::default(),
             turn: Arc::new(tokio::sync::Semaphore::new(1))
                 .try_acquire_owned()
                 .expect("a free turn"),
@@ -5222,10 +5250,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "floor, growth, no shrink and ceiling on one admission"
-    )]
     fn the_connection_cap_grows_with_the_declared_members_up_to_its_ceiling() {
         let members = operator::signals::PeerIdentities::new();
         let mut admission = Admission::new(4, 8, members.clone());
@@ -5238,10 +5262,7 @@ mod tests {
             );
         };
         declare(100);
-        let mut warned = None;
-        let held = admission
-            .admit(([127, 0, 0, 1], 1).into(), &mut warned)
-            .expect("admitted");
+        let held = admission.admit(([127, 0, 0, 1], 1).into()).expect("admitted");
         let wanted = 100 * 4 + SIGNALS_LOCAL_RESERVE + SIGNALS_MAX_HANDSHAKES;
         assert_eq!(admission.capacity, wanted, "every member's share fits");
         assert_eq!(
@@ -5264,9 +5285,8 @@ mod tests {
     #[test]
     fn handshakes_never_take_the_slots_authenticated_connections_need() {
         let mut admission = Admission::new(4, 64, operator::signals::PeerIdentities::new());
-        let mut warned = None;
         let held: Vec<_> = (0..=u8::MAX)
-            .filter_map(|n| admission.admit(([10, 0, 1, n], 1).into(), &mut warned))
+            .filter_map(|n| admission.admit(([10, 0, 1, n], 1).into()))
             .collect();
         assert_eq!(held.len(), SIGNALS_MAX_HANDSHAKES, "handshakes stop at their share");
         assert_eq!(
@@ -5276,7 +5296,7 @@ mod tests {
         );
         drop(held);
         let one_source: Vec<_> = (0..SIGNALS_MAX_HANDSHAKES)
-            .filter_map(|_| admission.admit(([10, 0, 2, 1], 1).into(), &mut warned))
+            .filter_map(|_| admission.admit(([10, 0, 2, 1], 1).into()))
             .collect();
         assert_eq!(
             one_source.len(),

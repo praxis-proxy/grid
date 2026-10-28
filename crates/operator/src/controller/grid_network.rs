@@ -1297,6 +1297,7 @@ pub async fn signals_server_config(network: &GridNetwork, client: &Client) -> Re
     let ca_pem = read_signals_pem(client, ca, "ca.crt").await?;
     let cert_pem = read_signals_pem(client, site, "tls.crt").await?;
     let key_pem = read_signals_pem(client, site, "tls.key").await?;
+    crate::metrics::set_signals_ca(&ca_pem, SystemTime::now());
     crate::resources::tls_backend::build_server_config(&ca_pem, &cert_pem, &key_pem).map(Some)
 }
 

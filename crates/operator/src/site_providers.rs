@@ -522,6 +522,9 @@ impl PeerProviders {
         let claims = claimants(in_network.iter().copied(), reserved, hops);
         let mut verdicts = HashMap::new();
         let (kept, short) = routed(&in_network, &shared, (reserved, hops, &claims), &mut verdicts);
+        for site in held.keys() {
+            crate::metrics::set_peer_catalog_cut(site, short.contains_key(site.as_str()));
+        }
         for (site, note) in notes(&shared, &short, &claims) {
             verdicts.entry(site).or_insert(Verdict::Noted(note));
         }
