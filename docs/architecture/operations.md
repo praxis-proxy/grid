@@ -482,13 +482,20 @@ probes and metrics endpoints are not used for this selection.
 
 The signals listener caps pending handshakes per client source address, eight by
 default, and gives each 2 seconds to finish before a client certificate proves
-who it is. At the cap the oldest pending handshake is cut, not the newest
-refused, so one slow or stalled handshake cannot shut a source's other peers
-out. The supported shape is a network load balancer whose Service carries
+who it is. At the cap the newest handshake is refused, so a flood from one
+source cannot cut that source's handshakes that are already in progress. The
+supported shape is a network load balancer whose Service carries
 `externalTrafficPolicy: Local`, so each peer arrives from its own address. With
 `Cluster`, node SNAT gives many clients one source address and they share its
-cap. Behind an OpenShift Route every peer arrives from the router's address,
-so raise `signals.maxHandshakesPerSource` to at least the number of peers.
+cap.
+
+Behind an OpenShift Route every peer arrives from the router's address, so the
+chart raises `signals.maxHandshakesPerSource` to 32, the listener's whole
+handshake share, whenever it renders a signals Route. A second cap covers the
+same source separately: connections that have sent nothing are held to 8, a
+quarter of the share, and one silent for 500 ms is dropped. Raising the first
+cap does not raise the second, so a peer set behind one router gets the share
+between them while a quiet source cannot hold it.
 
 `GRID_SWIM_ENCRYPT_KEY` is intentionally omitted from the
 `Deployment`.  Production SWIM encryption uses

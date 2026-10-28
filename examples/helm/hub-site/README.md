@@ -86,7 +86,7 @@ An invite expires after a day by default, and an unredeemed one stays in place. 
 
 - grid-enrollment: `host` joins the serving cert names, is the default Route host, and makes the enrollment Service a LoadBalancer when no Route renders. An invite's `network` defaults to `grid`.
 - grid-operator with `enrollment.enabled`: the operator config `grid-operator-config` names the site, its signer and its invite. The site name follows `swim.siteName`, the URL is the in-cluster grid-enrollment Service, the CA bundle is Secret `grid-ca-bundle`, the token is `grid-invite-<site>`, the SWIM Service is a LoadBalancer, the gateway Service is `grid-gateway`, and the render refuses Secret access in `grid-enrollment`.
-- grid-site: the network is `grid`. Listing `peers` turns on site discovery and the TLS Secrets the operator writes. A peer's probe name is `<name>.grid.internal`. A peer's GridSite is `<network>-<name>` under swim membership, the name SWIM discovery gives it, and `<name>` under declared.
+- grid-site: the network is `grid`. Listing `peers` turns on site discovery and the TLS Secrets the operator writes. A peer's probe name is `<name>.grid.internal`. A peer's GridSite is `<network>-<name>` under `Swim` membership, the name SWIM discovery gives it, and `<name>` under `Local`.
 - praxis-gateway: it renders its own config without a BYO ConfigMap. Set `gridIdentity.tlsSecretName` to `grid-site-identity` and `gridIdentity.caSecretName` to `grid-ca` for mTLS. A site backend uses mutual TLS to `<site>.grid.internal`. A provider's Service is a LoadBalancer, and `local` is its one plaintext backend.
 
 ## Credential Delivery
