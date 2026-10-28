@@ -7,6 +7,27 @@ argocd.argoproj.io/sync-options: Prune=false,Delete=false
 {{- define "grid-enrollment.external.validate" -}}
 {{- $ext := .Values.external -}}
 {{- $cm := .Values.external.certManager -}}
+{{- if .Values.managedClusters.enabled -}}
+{{- if ne .Values.mode "external" -}}
+{{- fail "managedClusters.enabled requires mode=external" -}}
+{{- end -}}
+{{- if ne .Values.grid.membership.source "Local" -}}
+{{- fail "managedClusters.enabled requires grid.membership.source=Local" -}}
+{{- end -}}
+{{- $_ := required "external.delivery.namespace is required for managed-cluster enrollment" $ext.delivery.namespace -}}
+{{- if $ext.delivery.enabled -}}
+{{- fail "managedClusters.enabled supplies identity delivery; leave external.delivery.enabled=false" -}}
+{{- end -}}
+{{- if gt (len (printf "%s.%s-identities" .Release.Namespace (include "grid-enrollment.membership.name" .))) 63 -}}
+{{- fail "managed-cluster policy names including the release namespace must fit within 63 characters; set fullnameOverride" -}}
+{{- end -}}
+{{- if or (hasPrefix .Values.managedClusters.identitySecretPrefix $cm.ca.secretName) (hasPrefix .Values.managedClusters.identitySecretPrefix $ext.trustBundleSecretRef) -}}
+{{- fail "managedClusters.identitySecretPrefix must not overlap shared CA or trust bundle names" -}}
+{{- end -}}
+{{- if $ext.sites -}}
+{{- fail "managedClusters.enabled discovers sites from cluster inventory; leave external.sites empty" -}}
+{{- end -}}
+{{- end -}}
 {{- if .Values.invites -}}
 {{- fail "mode=external uses external.sites, not invites" -}}
 {{- end -}}
@@ -27,7 +48,7 @@ argocd.argoproj.io/sync-options: Prune=false,Delete=false
 {{- if eq $cm.issuer.name $cm.ca.bootstrapIssuerName -}}
 {{- fail "external.certManager.issuer.name and external.certManager.ca.bootstrapIssuerName must differ" -}}
 {{- end -}}
-{{- if and $ext.sites (gt (int $cm.certificate.durationHours) (int $cm.ca.durationHours)) -}}
+{{- if and (or $ext.sites .Values.managedClusters.enabled) (gt (int $cm.certificate.durationHours) (int $cm.ca.durationHours)) -}}
 {{- fail "site certificate duration must not exceed the generated CA duration" -}}
 {{- end -}}
 {{- end -}}
@@ -35,7 +56,7 @@ argocd.argoproj.io/sync-options: Prune=false,Delete=false
 {{- fail "external.certManager.certificate.renewBeforeHours must be less than external.certManager.certificate.durationHours" -}}
 {{- end -}}
 {{- end -}}
-{{- if $ext.delivery.enabled -}}
+{{- if or $ext.delivery.enabled .Values.managedClusters.enabled -}}
 {{- $_ := required "external.delivery.namespace is required" $ext.delivery.namespace -}}
 {{- include "grid-enrollment.refuseDeliveryNamespace" (dict "key" "external.delivery.namespace" "ns" $ext.delivery.namespace "hint" (include "grid-enrollment.operatorNamespaceHint" .)) -}}
 {{- if eq $ext.delivery.identitySecretName $ext.delivery.caSecretName -}}

@@ -99,14 +99,83 @@ read them there. Each managed cluster receives one identity. The chart rejects p
 whose namespace-qualified form exceeds ACM's 63-character label limit. Removing a site
 from this map alone is not a complete decommission operation.
 
-This chart does not yet reconcile peer GridSites, their endpoints, or the
-operator's membership configuration. ACM/Argo must supply those consistently
-before a site can participate. For Local membership, configure the runtime
-and GridSites for that mode and disable service enrollment at the site.
+## Managed clusters
+
+Set `managedClusters.enabled: true` to bootstrap inventory-based enrollment and
+peer distribution. The chart can be deployed by Helm or a GitOps reconciler;
+there is no Argo-specific controller or ApplicationSet in this flow. This
+integration requires ACM/OCM Placement, governance policy, and ManifestWork APIs,
+including `ReadOnly` work with `feedbackScrapeType: Watch`. The hub must itself
+be registered with the governance policy add-on. All selected clusters need
+that add-on, the work agent, the Grid CRDs, and the Local-mode operator.
+
+```yaml
+mode: external
+fullnameOverride: grid-bootstrap
+grid:
+  membership:
+    source: Local
+managedClusters:
+  enabled: true
+  clusterSet: default
+  clusterLabel: grid.praxis.fast/member
+  clusterLabelValue: 'true'
+  hubClusterName: local-cluster
+external:
+  delivery:
+    namespace: grid-system
+  certManager:
+    enabled: true
+    issuer:
+      create: true
+      name: grid-ca
+    ca:
+      mode: Existing
+      secretName: grid-ca-key
+```
+
+Keep `external.sites` empty and `external.delivery.enabled: false` in this
+mode. The selected ManagedCluster name is also its Grid site identity. Use DNS
+label names of at most 51 characters. The hub reads the selected inventory,
+requests one identity per cluster, and creates a read-only observer of each
+cluster's own GridSite. Without cert-manager, your PKI must supply Secrets named
+`<managedClusters.identitySecretPrefix><cluster-name>` and a public trust bundle.
+The certificate profile includes both the gateway and signals DNS names in
+Local mode. Renewing at one third of the lifetime remaining matches the
+operator's external-renewal deadline.
+
+Each member owns its local GridSite, including its public gateway and signals
+endpoints. An observer watches changes and returns only selected public spec
+fields. The hub distributes remote records to the other selected members and
+supplies `grid-operator-config` with their site name. It never copies a record
+back to its source or replicates health/status. The Local operator then polls
+the peer's provider catalog and signals; no InferenceProvider copies or SWIM
+key distribution are needed.
+
+The template ServiceAccount can list cluster inventory and read only the named
+observer in each selected member namespace. It cannot read Secrets. Identity
+policies use encrypted `fromSecret` templates in the issuer namespace. Existing
+CA resources remain outside membership pruning.
+
+An endpoint change updates remote GridSites; removing optional fields clears
+them rather than retaining stale endpoints or trust pins. Removing a member's
+selection label or inventory entry withdraws its remote records and stops
+renewal by deleting the generated Certificate and observer. This is eventually
+consistent: policies can reconcile in either order. Check peer withdrawal
+before treating a removal as complete. An unavailable member retains its last
+observed public endpoints; disappearance of its source GridSite withdraws that
+record when the work agent reports missing feedback.
+
+See the [ManifestWork documentation] for feedback behavior and limits. A work
+agent can fall back to polling when its watch limit is reached.
+
+[ManifestWork documentation]: https://open-cluster-management.io/docs/concepts/work-distribution/manifestwork/
+
 
 ## Decommission
 
-The ordered decommission flow is a follow-up, not an implemented Helm hook:
+Managed-cluster policies implement inventory withdrawal and stopping renewal.
+The full ordered decommission flow still requires operator coordination:
 
 1. Withdraw the site's membership from every remaining peer and verify it has
    reconciled, so the site's existing certificate no longer grants access.
@@ -137,3 +206,9 @@ Validate locally with `helm unittest charts/grid-enrollment`. The disposable
 Kind test at `tests/cert-manager-e2e.sh` exercises issuance, renewal, external
 issuer ownership, and CA retention. Set `LEGACY_CHART` to the old bootstrap
 chart path to also verify migration preserves the existing Issuer UID and CA.
+
+`python3 charts/grid-enrollment/tests/managed_clusters_test.py` renders the chart
+and executes its hub templates against API fixtures for enrollment, endpoint
+changes, missing feedback, selection, identity delivery, and withdrawal. It
+requires Go and PyYAML. These tests and server-side dry runs do not replace a
+live ACM/OCM reconciliation test before the runtime cutover.

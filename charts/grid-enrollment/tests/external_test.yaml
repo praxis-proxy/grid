@@ -26,6 +26,49 @@ templates:
 - templates/enrollment/identity-policy.yaml
 - templates/external-validation.yaml
 tests:
+- it: issues Local identities for HTTPS signals before the operator renewal deadline
+  set:
+    mode: external
+    grid.membership.source: Local
+    external.certManager.enabled: true
+    external.sites.site-a.secretName: identity-a
+  asserts:
+  - equal:
+      path: spec.dnsNames
+      value: [site-a.grid.internal, site-a-signals.grid.internal]
+    template: templates/certs/site-certificates.yaml
+  - equal:
+      path: spec.renewBefore
+      value: 1440h
+    template: templates/certs/site-certificates.yaml
+- it: identifies the hub Certificate as the delivered identity renewer
+  set:
+    mode: external
+    external.certManager.enabled: true
+    external.sites.site-a.secretName: identity-a
+    external.sites.site-a.cluster: managed-a
+    external.trustBundleSecretRef: grid-trust
+    external.delivery.enabled: true
+    external.delivery.namespace: grid-system
+  asserts:
+  - equal:
+      path: spec.policy-templates[0].objectDefinition.spec.object-templates[1].objectDefinition.metadata.annotations["cert-manager.io/certificate-name"]
+      value: identity-a
+    template: templates/enrollment/identity-policy.yaml
+    documentIndex: 3
+- it: does not invent a Certificate renewer for externally supplied Secrets
+  set:
+    mode: external
+    external.sites.site-a.secretName: identity-a
+    external.sites.site-a.cluster: managed-a
+    external.trustBundleSecretRef: grid-trust
+    external.delivery.enabled: true
+    external.delivery.namespace: grid-system
+  asserts:
+  - notExists:
+      path: spec.policy-templates[0].objectDefinition.spec.object-templates[1].objectDefinition.metadata.annotations
+    template: templates/enrollment/identity-policy.yaml
+    documentIndex: 3
 - it: renders no service workloads, database, invite jobs, or service RBAC in external mode
   set:
     mode: external

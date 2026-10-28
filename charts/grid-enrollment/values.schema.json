@@ -89,6 +89,9 @@
             },
             "createClusterSetBinding": {
               "type": "boolean"
+            },
+            "includeLocalCluster": {
+              "type": "boolean"
             }
           }
         },
@@ -935,6 +938,57 @@
         "clusterSet": {
           "type": "string",
           "minLength": 1
+        }
+      }
+    },
+    "managedClusters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "networkName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 63,
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+        },
+        "clusterSet": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 63,
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+        },
+        "clusterLabel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253
+        },
+        "clusterLabelValue": {
+          "type": "string",
+          "maxLength": 63
+        },
+        "createClusterSetBinding": {
+          "type": "boolean"
+        },
+        "workName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 63,
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+        },
+        "hubClusterName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 63,
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+        },
+        "identitySecretPrefix": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 30,
+          "pattern": "^[a-z0-9][a-z0-9-]*-$"
         }
       }
     }

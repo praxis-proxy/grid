@@ -109,3 +109,43 @@ tests:
   - failedTemplate:
       errorMessage: ACM requires namespace.grid-identity-site to fit within 63 characters
     template: templates/external-validation.yaml
+- it: refuses managed membership while the chart selects SWIM
+  set:
+    mode: external
+    managedClusters.enabled: true
+  asserts:
+  - failedTemplate:
+      errorMessage: managedClusters.enabled requires grid.membership.source=Local
+    template: templates/external-validation.yaml
+- it: refuses a second source of inventory
+  set:
+    mode: external
+    grid.membership.source: Local
+    managedClusters.enabled: true
+    external.delivery.namespace: grid-system
+    external.sites.site-a.cluster: managed-a
+  asserts:
+  - failedTemplate:
+      errorMessage: managedClusters.enabled discovers sites from cluster inventory; leave external.sites empty
+    template: templates/external-validation.yaml
+- it: refuses a dynamic identity prefix that could overwrite the CA
+  set:
+    mode: external
+    grid.membership.source: Local
+    managedClusters.enabled: true
+    managedClusters.identitySecretPrefix: grid-
+    external.delivery.namespace: grid-system
+  asserts:
+  - failedTemplate:
+      errorMessage: managedClusters.identitySecretPrefix must not overlap shared CA or trust bundle names
+    template: templates/external-validation.yaml
+- it: requires public trust for a managed inventory with external PKI
+  set:
+    mode: external
+    grid.membership.source: Local
+    managedClusters.enabled: true
+    external.delivery.namespace: grid-system
+  asserts:
+  - failedTemplate:
+      errorMessage: external issuer delivery requires external.trustBundleSecretRef
+    template: templates/external-validation.yaml

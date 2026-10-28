@@ -130,6 +130,12 @@ jobs:
           mapfile -t charts < <(find charts -mindepth 2 -maxdepth 2 -name tests -type d -printf '%h\n' | sort)
           helm unittest "${charts[@]}"
 
+      - name: Managed-cluster lifecycle templates
+        run: |
+          python3 -m venv /tmp/grid-policy-tests
+          /tmp/grid-policy-tests/bin/pip install 'PyYAML==6.0.3'
+          /tmp/grid-policy-tests/bin/python charts/grid-enrollment/tests/managed_clusters_test.py
+
       - name: Validate charts (static)
         env:
           RENDER_DIR: ${{ runner.temp }}/helm-rendered

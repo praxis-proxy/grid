@@ -16,6 +16,8 @@ external:
     identitySecretName: grid-site-identity
     caSecretName: grid-ca
     createClusterSetBinding: true
+    # -- Permit delivery to OCM's local cluster, using the same flow as other members.
+    includeLocalCluster: false
   certManager:
     # -- Optional integration; cert-manager must already be installed.
     enabled: false
@@ -36,7 +38,23 @@ external:
       renewBeforeHours: 8760
     certificate:
       durationHours: 4320
-      renewBeforeHours: 720
+      # Renew when one third remains, matching the operator's rotation deadline.
+      renewBeforeHours: 1440
+
+# -- Bootstrap managed-cluster discovery, GridSite watches and peer distribution (ACM or OCM). Requires external mode.
+managedClusters:
+  enabled: false
+  networkName: grid
+  clusterSet: default
+  clusterLabel: grid.praxis.fast/member
+  clusterLabelValue: 'true'
+  # -- Bootstrap creates one shared binding unless another release owns it.
+  createClusterSetBinding: true
+  workName: grid-site-observer
+  # -- The hub must be registered with the policy add-on so it can reconcile
+  # dynamically generated Certificates, observers and their RBAC.
+  hubClusterName: local-cluster
+  identitySecretPrefix: grid-site-
 
 # Service mode: batteries included by default.
 # `helm install` with no overrides stands up a full grid site ready to enroll:

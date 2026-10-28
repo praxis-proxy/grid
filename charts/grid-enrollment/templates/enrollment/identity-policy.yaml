@@ -31,7 +31,9 @@ spec:
       labelSelector:
         matchExpressions:
         - {key: name, operator: In, values: [{{ $cluster | quote }}]}
+        {{- if not $ext.delivery.includeLocalCluster }}
         - {key: local-cluster, operator: DoesNotExist}
+        {{- end }}
 ---
 apiVersion: policy.open-cluster-management.io/v1
 kind: PlacementBinding
@@ -81,6 +83,12 @@ spec:
             metadata:
               name: {{ $ext.delivery.identitySecretName | quote }}
               namespace: {{ $ext.delivery.namespace | quote }}
+              {{- if $cm.enabled }}
+              annotations:
+                # The operator uses this to recognize external renewal. The
+                # Certificate remains on the hub beside the issuer.
+                cert-manager.io/certificate-name: {{ $secret | quote }}
+              {{- end }}
             data:
               tls.crt: '{{ printf "{{hub fromSecret %q %q \"tls.crt\" hub}}" $ns $secret }}'
               tls.key: '{{ printf "{{hub fromSecret %q %q \"tls.key\" hub}}" $ns $secret }}'
