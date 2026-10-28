@@ -506,6 +506,7 @@ jobs:
           ## Helm Chart
 
           \`\`\`text
+          oci://ghcr.io/praxis-proxy/charts/grid-bootstrap --version ${VERSION}
           oci://ghcr.io/praxis-proxy/charts/grid-operator --version ${VERSION}
           oci://ghcr.io/praxis-proxy/charts/grid-operator@${CHART_DIGEST}
           oci://ghcr.io/praxis-proxy/charts/praxis-gateway --version ${VERSION}

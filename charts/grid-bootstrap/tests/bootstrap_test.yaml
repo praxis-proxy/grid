@@ -124,3 +124,39 @@ tests:
       - failedTemplate:
           errorMessage: issuer.name and ca.bootstrapIssuerName must differ
         template: templates/issuer.yaml
+
+  - it: rejects an unsupported CA mode
+    set:
+      enabled: true
+      ca.mode: Adopt
+    asserts:
+      - failedTemplate:
+          errorPattern: 'ca[./]mode'
+        template: templates/issuer.yaml
+
+  - it: rejects an invalid issuer resource name
+    set:
+      enabled: true
+      issuer.name: Invalid_Name
+    asserts:
+      - failedTemplate:
+          errorPattern: 'issuer[./]name'
+        template: templates/issuer.yaml
+
+  - it: rejects a CA lifetime below the schema minimum
+    set:
+      enabled: true
+      ca.durationHours: 1
+    asserts:
+      - failedTemplate:
+          errorPattern: 'ca[./]durationHours'
+        template: templates/issuer.yaml
+
+  - it: rejects a renewal window below the schema minimum
+    set:
+      enabled: true
+      ca.renewBeforeHours: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: 'ca[./]renewBeforeHours'
+        template: templates/issuer.yaml
