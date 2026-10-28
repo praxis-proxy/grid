@@ -33,3 +33,4 @@ Kubernetes: `>=1.26.0-0`
 | ca.secretName | string | `"grid-ca-key"` | TLS Secret containing the CA certificate and private key, in the release namespace. |
 | enabled | bool | `false` | Enable bootstrap after cert-manager is installed in the cluster. |
 | issuer.name | string | `"grid-ca"` | Namespaced Issuer used by the enroll flow. Certificates must be in the release namespace. |
+
