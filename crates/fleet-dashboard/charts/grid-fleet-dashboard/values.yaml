@@ -4,7 +4,8 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/praxis-proxy/grid-fleet-dashboard
-  # Defaults to the chart appVersion when empty.
+  # Defaults to the chart appVersion when empty. The release workflow publishes
+  # this image at every Grid release tag and checks that appVersion matches it.
   tag: ""
   pullPolicy: IfNotPresent
 imagePullSecrets: []
