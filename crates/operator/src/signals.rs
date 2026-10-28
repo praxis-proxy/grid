@@ -3844,6 +3844,7 @@ mod tests {
         assert!(!client.is_retryable() && server.is_retryable());
     }
 
+    /// Peer polling separates retryable refusal from a non-retryable trust failure.
     #[test]
     fn a_refused_connection_is_told_apart_from_a_trust_failure() {
         let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);

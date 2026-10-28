@@ -131,9 +131,6 @@ fn transport_class(source: &(dyn std::error::Error + 'static)) -> crate::readine
     if tls {
         return ScrapeClass::Tls;
     }
-    if io_kind == Some(std::io::ErrorKind::TimedOut) {
-        return ScrapeClass::Timeout;
-    }
 
     let mut cause = Some(source);
     while let Some(error) = cause {
@@ -142,6 +139,9 @@ fn transport_class(source: &(dyn std::error::Error + 'static)) -> crate::readine
             return ScrapeClass::Dns;
         }
         cause = error.source();
+    }
+    if io_kind == Some(std::io::ErrorKind::TimedOut) {
+        return ScrapeClass::Timeout;
     }
     ScrapeClass::Connect
 }
@@ -481,6 +481,7 @@ mod tests {
         );
     }
 
+    /// Every scrape failure maps to one stable, bounded readiness class.
     #[test]
     #[expect(clippy::too_many_lines, reason = "one table of failures and their classes")]
     fn a_scrape_failure_has_a_bounded_class() {
@@ -503,6 +504,14 @@ mod tests {
             (
                 "dns",
                 transport("dns error: failed to lookup address information".into()),
+                ScrapeClass::Dns,
+            ),
+            (
+                "timed out dns",
+                transport(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "dns error: failed to lookup address information",
+                ))),
                 ScrapeClass::Dns,
             ),
             (
