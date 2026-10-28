@@ -3447,6 +3447,7 @@ async fn run_peer_poller(
         memberships: operator::peer_membership::PeerMemberships::default(),
         reach: operator::peer_reach::PeerReach::default(),
         misses: operator::peer_reach::Misses::default(),
+        polls: None,
         catalogs: operator::peer_reach::PeerReach::none(&operator::peer_reach::CATALOGS),
         sites_written: false,
         catalog_versions: std::collections::HashMap::new(),
@@ -3489,6 +3490,8 @@ struct PeerPoller {
     reach: operator::peer_reach::PeerReach,
     /// Rounds in a row each peer went unanswered, which a reachable peer outlasts.
     misses: operator::peer_reach::Misses,
+    /// Peers the last written round had no time for, of how many it polled.
+    polls: Option<(usize, usize)>,
     /// Under Local membership, which peers' catalogs were refused, as last written.
     catalogs: operator::peer_reach::PeerReach,
     /// Whether the peer `GridSite` conditions were last written in full.
@@ -3589,7 +3592,11 @@ impl PeerPoller {
             }
             return;
         }
-        let (reach, catalogs) = self.judge((source, local_site), polled, answered, urls);
+        let (reach, catalogs, skipped) = self.judge((source, local_site), polled, answered, urls);
+        let polls = (skipped, polled.len());
+        if self.polls != Some(polls) && Box::pin(write_peer_polls(&self.client, polls, &self.shutdown)).await {
+            self.polls = Some(polls);
+        }
         let changed = reach != self.reach || catalogs != self.catalogs;
         if reach != self.reach {
             Box::pin(write_peer_reach(&self.client, &reach, &self.shutdown)).await;
@@ -3606,14 +3613,15 @@ impl PeerPoller {
         self.catalogs = catalogs;
     }
 
-    /// This round's signals and catalog verdicts on each peer.
+    /// This round's signals and catalog verdicts on each peer, and how many peers it had no
+    /// time to poll.
     fn judge(
         &self,
         (source, local_site): (&operator::signals::PollPeers, &str),
         polled: &[String],
         answered: &BTreeMap<String, usize>,
         urls: &std::collections::HashMap<String, String>,
-    ) -> (operator::peer_reach::PeerReach, operator::peer_reach::PeerReach) {
+    ) -> (operator::peer_reach::PeerReach, operator::peer_reach::PeerReach, usize) {
         use operator::peer_reach::PeerReach;
         let without_endpoint = self.ctx.peer_identities().without_endpoint(local_site);
         let reach = PeerReach::of(
@@ -3626,14 +3634,15 @@ impl PeerPoller {
                 (peer.as_str(), failure)
             }),
             without_endpoint.iter().map(String::as_str),
-        )
-        .held_over(&self.reach, &self.misses);
+        );
+        let skipped = reach.skipped();
+        let reach = reach.held_over(&self.reach, &self.misses);
         let held = self.ctx.peer_providers();
         let catalogs = PeerReach::catalogs(
             polled.iter().map(String::as_str).filter(|site| held.holds(site)),
             &held.verdicts(),
         );
-        (reach, catalogs)
+        (reach, catalogs, skipped)
     }
 
     /// Collect from every known peer, replace what is published for them, and say
@@ -3890,31 +3899,70 @@ async fn write_peer_reach(
     reach: &operator::peer_reach::PeerReach,
     shutdown: &operator::shutdown::Shutdown,
 ) {
+    Box::pin(write_network_condition(
+        client,
+        reach.kind().field_manager,
+        |network, now| operator::peer_reach::patch(network, reach, now),
+        shutdown,
+    ))
+    .await;
+}
+
+/// Write `PeerPollsComplete` after a round that had no time for `skipped` of its `judged` peers,
+/// `true` once written.
+async fn write_peer_polls(
+    client: &Client,
+    (skipped, judged): (usize, usize),
+    shutdown: &operator::shutdown::Shutdown,
+) -> bool {
+    Box::pin(write_network_condition(
+        client,
+        operator::peer_reach::POLLS_FIELD_MANAGER,
+        |network, now| {
+            operator::peer_reach::network_patch(network, |current| {
+                operator::peer_reach::polls_condition(current, (skipped, judged), now)
+            })
+        },
+        shutdown,
+    ))
+    .await
+}
+
+/// Apply the condition `build` makes for the sole `GridNetwork` under `manager`, bounded and
+/// stood down by shutdown. `true` when it landed or the live status already says it.
+async fn write_network_condition<Build>(
+    client: &Client,
+    manager: &str,
+    build: Build,
+    shutdown: &operator::shutdown::Shutdown,
+) -> bool
+where
+    Build: for<'network> FnOnce(&'network GridNetwork, &str) -> Option<(&'network str, serde_json::Value)> + Send,
+{
     let apply = async {
         let Some(network) = Box::pin(sole_network(client)).await else {
-            return;
+            return false;
         };
         let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
-            return;
+            return false;
         };
-        let Some((name, patch)) = operator::peer_reach::patch(&network, reach, &now) else {
-            return;
+        let Some((name, patch)) = build(&network, &now) else {
+            return true;
         };
         let api: Api<GridNetwork> = Api::all(client.clone());
-        let params = PatchParams::apply(reach.kind().field_manager).force();
-        match Box::pin(api.patch_status(name, &params, &Patch::Apply(patch))).await {
-            Ok(_) => {},
-            Err(error) => tracing::warn!(%error, "peer reach condition not written; retrying next round"),
-        }
+        let params = PatchParams::apply(manager).force();
+        Box::pin(api.patch_status(name, &params, &Patch::Apply(patch)))
+            .await
+            .inspect_err(|error| tracing::warn!(%error, manager, "peer condition not written; retrying next round"))
+            .is_ok()
     };
     tokio::select! {
         biased;
-        () = shutdown.triggered() => {},
-        result = tokio::time::timeout(PEER_AGES_WRITE_TIMEOUT, apply) => {
-            if result.is_err() {
-                tracing::warn!("peer reach condition write timed out; retrying next round");
-            }
-        },
+        () = shutdown.triggered() => false,
+        result = tokio::time::timeout(PEER_AGES_WRITE_TIMEOUT, apply) => result.unwrap_or_else(|_elapsed| {
+            tracing::warn!(manager, "peer condition write timed out; retrying next round");
+            false
+        }),
     }
 }
 

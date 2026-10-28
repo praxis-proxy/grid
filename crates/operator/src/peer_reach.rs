@@ -41,6 +41,15 @@ pub const EGRESS_ONLY: &str = "EgressOnly";
 /// Reason for a peer not yet checked.
 pub const AWAITING_FIRST_CHECK: &str = "AwaitingFirstCheck";
 
+/// The `GridNetwork` condition saying whether each poll round had time for every peer.
+pub const PEER_POLLS_COMPLETE: &str = "PeerPollsComplete";
+
+/// Its False reason: this site's round ran out before it polled some peers.
+pub const POLL_ROUND_OVERRUN: &str = "PollRoundOverrun";
+
+/// Its server-side apply manager.
+pub const POLLS_FIELD_MANAGER: &str = "grid-operator-peer-polls";
+
 /// Rounds in a row a reachable peer goes unanswered before it reads unreachable.
 pub const MISSES_BEFORE_UNREACHABLE: u32 = 3;
 
@@ -143,6 +152,8 @@ pub enum Judged {
     Failing(&'static str, String),
     /// Declares no signals endpoint, so it is not polled; counted neither way.
     EgressOnly,
+    /// This site's round ran out before polling it: it keeps its last verdict.
+    Skipped,
     /// Not yet checked.
     Awaiting,
 }
@@ -190,9 +201,11 @@ impl PeerReach {
             .map(|peer| (peer.to_owned(), Judged::Clear))
             .collect();
         for (peer, failure) in unanswered {
-            let judged = failure.map_or(Judged::Awaiting, |(why, url)| {
-                Judged::Failing(why.reason(), format!("{url}: {}", why.describe()))
-            });
+            let judged = match failure {
+                None => Judged::Awaiting,
+                Some((Unreachable::RoundDeadline, _)) => Judged::Skipped,
+                Some((why, url)) => Judged::Failing(why.reason(), format!("{url}: {}", why.describe())),
+            };
             peers.insert(peer.to_owned(), judged);
         }
         for peer in without_endpoint {
@@ -202,23 +215,36 @@ impl PeerReach {
     }
 
     /// This round's verdicts, with a peer `previous` judged reachable kept so until it has gone
-    /// [`MISSES_BEFORE_UNREACHABLE`] rounds unanswered, or while only the round deadline kept it
-    /// from being polled. A peer that lost its endpoint reads so at once.
+    /// [`MISSES_BEFORE_UNREACHABLE`] rounds unanswered. A peer the round had no time for keeps
+    /// whatever `previous` said of it, else waits for its first check. A peer that lost its
+    /// endpoint reads so at once.
     #[must_use]
     pub fn held_over(mut self, previous: &Self, misses: &Misses) -> Self {
-        let deadline = Unreachable::RoundDeadline.reason();
         self.peers.iter_mut().for_each(|(peer, judged)| {
+            let before = previous.peers.get(peer);
+            if *judged == Judged::Skipped {
+                *judged = before
+                    .filter(|before| **before != Judged::Skipped)
+                    .cloned()
+                    .unwrap_or(Judged::Awaiting);
+                return;
+            }
             let recent = misses.of(peer) < MISSES_BEFORE_UNREACHABLE;
             let excused = match judged {
-                Judged::Failing(reason, _) => *reason == deadline || recent,
-                Judged::Awaiting => recent,
-                Judged::Clear | Judged::Noted(_) | Judged::EgressOnly => false,
+                Judged::Failing(..) | Judged::Awaiting => recent,
+                Judged::Clear | Judged::Noted(_) | Judged::EgressOnly | Judged::Skipped => false,
             };
-            if excused && previous.peers.get(peer) == Some(&Judged::Clear) {
+            if excused && before == Some(&Judged::Clear) {
                 *judged = Judged::Clear;
             }
         });
         self
+    }
+
+    /// How many peers this round had no time to poll, of how many it judged.
+    #[must_use]
+    pub fn skipped(&self) -> usize {
+        self.peers.values().filter(|judged| **judged == Judged::Skipped).count()
     }
 
     /// The catalogs of the `held` peers, as `verdicts` judged them in the last admission:
@@ -259,7 +285,7 @@ impl PeerReach {
         let checked = self
             .peers
             .values()
-            .filter(|judged| !matches!(judged, Judged::Awaiting | Judged::EgressOnly))
+            .filter(|judged| !matches!(judged, Judged::Awaiting | Judged::EgressOnly | Judged::Skipped))
             .count();
         let (status, reason, message) = if failing == 0 {
             ("True", self.kind.type_, self.kind.clear.to_owned())
@@ -285,7 +311,7 @@ impl PeerReach {
             Judged::Noted(note) => ("True", self.kind.site_type, format!("{}; {note}", self.kind.site_clear)),
             Judged::Failing(reason, message) => ("False", *reason, message.clone()),
             Judged::EgressOnly => ("False", EGRESS_ONLY, NO_ENDPOINT.to_owned()),
-            Judged::Awaiting => (
+            Judged::Awaiting | Judged::Skipped => (
                 "Unknown",
                 AWAITING_FIRST_CHECK,
                 "not yet answered or failed a poll".to_owned(),
@@ -362,12 +388,50 @@ pub fn patch<'network>(
     reach: &PeerReach,
     now_rfc3339: &str,
 ) -> Option<(&'network str, Value)> {
+    network_patch(network, |current| {
+        reach.condition(current, now_rfc3339, network.metadata.generation)
+    })
+}
+
+/// `PeerPollsComplete` after a round that had no time for `skipped` of its `judged` peers.
+#[must_use]
+pub fn polls_condition(
+    current: &[Condition],
+    (skipped, judged): (usize, usize),
+    now_rfc3339: &str,
+) -> Option<Condition> {
+    let (status, reason, message) = if skipped == 0 {
+        ("True", PEER_POLLS_COMPLETE, "each round polls every peer".to_owned())
+    } else {
+        (
+            "False",
+            POLL_ROUND_OVERRUN,
+            format!(
+                "{skipped} of {judged} peers not polled within the round: lengthen the round or raise the dial \
+                 concurrency"
+            ),
+        )
+    };
+    stamp(
+        current,
+        (PEER_POLLS_COMPLETE, status, reason, message),
+        now_rfc3339,
+        None,
+    )
+}
+
+/// The status apply on `network` carrying the condition `build` makes from its live ones, with
+/// its name; `None` when there is none to write.
+pub fn network_patch<Build>(network: &GridNetwork, build: Build) -> Option<(&str, Value)>
+where
+    Build: FnOnce(&[Condition]) -> Option<Condition>,
+{
     let name = network.metadata.name.as_deref()?;
     let current = network
         .status
         .as_ref()
         .map_or(&[][..], |status| status.conditions.as_slice());
-    let condition = reach.condition(current, now_rfc3339, network.metadata.generation)?;
+    let condition = build(current)?;
     Some((
         name,
         serde_json::json!({
@@ -385,8 +449,8 @@ mod tests {
 
     use super::{
         AWAITING_FIRST_CHECK, CATALOG_ACCEPTED, CATALOGS, CATALOGS_REFUSED, EGRESS_ONLY, MISSES_BEFORE_UNREACHABLE,
-        Misses, NO_ENDPOINT, PEER_CATALOGS_ACCEPTED, PEER_SIGNALS_REACHABLE, PEERS_UNREACHABLE, PeerReach, REACH,
-        SIGNALS_REACHABLE,
+        Misses, NO_ENDPOINT, PEER_CATALOGS_ACCEPTED, PEER_POLLS_COMPLETE, PEER_SIGNALS_REACHABLE, PEERS_UNREACHABLE,
+        POLL_ROUND_OVERRUN, PeerReach, REACH, SIGNALS_REACHABLE, polls_condition,
     };
     use crate::{
         crd::{
@@ -564,7 +628,8 @@ mod tests {
     }
 
     #[test]
-    fn a_round_with_no_time_left_for_a_peer_neither_counts_a_miss_nor_hides_its_cause() {
+    #[expect(clippy::too_many_lines, reason = "a reachable, a failing and a never reached peer")]
+    fn a_peer_the_round_had_no_time_for_keeps_its_verdict_and_the_overrun_is_this_sites() {
         let mut misses = Misses::default();
         let mut reach = round(&PeerReach::default(), &mut misses, &[], &["east"]);
         for _ in 0..MISSES_BEFORE_UNREACHABLE * 2 {
@@ -573,19 +638,53 @@ mod tests {
         assert_eq!(
             reason_of(&reach, "east"),
             SIGNALS_REACHABLE,
-            "this site's deadline is not the peer's miss"
+            "a reachable peer stays so"
         );
-        assert_eq!(misses.of("east"), 0, "and is not counted");
+        assert_eq!(misses.of("east"), 0, "and the skip is not a miss");
+        let mut failing = Misses::default();
+        let mut west = PeerReach::default();
+        for _ in 0..MISSES_BEFORE_UNREACHABLE {
+            west = round(&west, &mut failing, &[("west", Unreachable::Timeout)], &[]);
+        }
+        west = round(&west, &mut failing, &[("west", Unreachable::RoundDeadline)], &[]);
+        assert_eq!(
+            reason_of(&west, "west"),
+            "Timeout",
+            "a failing peer keeps its own cause"
+        );
         let never = round(
             &PeerReach::default(),
             &mut Misses::default(),
-            &[("west", Unreachable::RoundDeadline)],
+            &[("north", Unreachable::RoundDeadline)],
             &[],
         );
         assert_eq!(
-            reason_of(&never, "west"),
-            "RoundDeadline",
-            "a peer never reached names this site's round, not a stale cause"
+            reason_of(&never, "north"),
+            AWAITING_FIRST_CHECK,
+            "a peer never reached waits for its first check, and is never blamed for this site's round"
+        );
+    }
+
+    #[test]
+    fn an_overrun_round_reads_on_this_sites_grid_network_with_the_count() {
+        let skipped = PeerReach::of([], [("north", Some((Unreachable::RoundDeadline, "")))], []).skipped();
+        let overrun = polls_condition(&[], (skipped, 4), "t").unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            (
+                overrun.status.as_str(),
+                overrun.reason.as_str(),
+                overrun.message.as_str()
+            ),
+            (
+                "False",
+                POLL_ROUND_OVERRUN,
+                "1 of 4 peers not polled within the round: lengthen the round or raise the dial concurrency"
+            )
+        );
+        let complete = polls_condition(&[], (0, 4), "t").unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            (complete.status.as_str(), complete.reason.as_str()),
+            ("True", PEER_POLLS_COMPLETE)
         );
     }
 

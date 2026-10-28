@@ -218,12 +218,13 @@ means no polled peer has a rejected timestamp; `False` means at least one does.
 | `False` | `TimestampOutOfRange` | A polled peer's latest answer carried a row stamped more than a second past its `Date`, or more than a day before it. The message names those peers (the first ten, then a count): check their clocks. |
 | `True` | `PeerTimestampsValid` | No polled peer's latest answer was rejected for its age. |
 
-Under Local membership the poller also writes two counts, each under its own field
+Under Local membership the poller also writes three conditions, each under its own field
 manager. Which peers, and why, is on each peer's `GridSite`, as described in
 [Peer conditions under Local membership](#peer-conditions-under-local-membership).
 
 `PeerSignalsReachable` (`grid-operator-peer-reach`) counts the peers whose signals
-endpoint did not answer, or that have none. A peer not yet checked is not counted.
+endpoint did not answer. A peer not yet checked, an egress-only peer, and a peer the
+round had no time for are not counted.
 
 | Status | Reason | When |
 |---|---|---|
@@ -237,6 +238,15 @@ or part of it, was refused, out of the peers whose catalog is held.
 |---|---|---|
 | `False` | `CatalogsRefused` | A peer's catalog was refused. The message counts them, for example `1 of 5 peers' catalogs refused`. |
 | `True` | `PeerCatalogsAccepted` | Every peer catalog read is accepted. |
+
+`PeerPollsComplete` (`grid-operator-peer-polls`) says whether each round had time to poll
+every peer. A peer the round had no time for keeps its last `SignalsReachable` verdict, so
+the overrun is this site's, never the peer's.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `PollRoundOverrun` | The last round ran out before it polled some peers. The message counts them, for example `2 of 40 peers not polled within the round`. |
+| `True` | `PeerPollsComplete` | The last round polled every peer. |
 
 A `Swim` condition, under its own field manager (`grid-operator-swim`), reads `True`
 with reason `Swim` while SWIM runs, and `False` when it is configured but cannot start,
