@@ -72,7 +72,7 @@ spec:
               kind: Namespace
               metadata:
                 name: {{ .Release.Namespace | quote }}
-          {{ `{{hub range $cluster := (lookup "cluster.open-cluster-management.io/v1" "ManagedCluster" "" "").items hub}}` }}
+          {{- .Files.Get "files/managed-cluster-inventory.yaml" | nindent 10 }}
           {{ `{{hub if and (eq (index $cluster.metadata.labels $label) $labelValue) (or (eq $clusterSet "global") (eq (index $cluster.metadata.labels "cluster.open-cluster-management.io/clusterset") $clusterSet)) hub}}` }}
           {{ `{{hub $site := $cluster.metadata.name hub}}` }}
           {{ `{{hub $secret := printf "%s%s" $secretPrefix $site hub}}` }}
