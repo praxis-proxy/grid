@@ -92,15 +92,20 @@ spec:
               namespace: {{ $target | quote }}
             data:
               ca.crt: '{{ printf "{{hub fromSecret %q %q \"ca.crt\" hub}}" $ns $caBundle }}'
+        {{- /* normalize clears the name under Local membership, where no SWIM key exists to
+               deliver. Defaulting it here would put the name back and the policy would then
+               require a Secret the install never creates. */}}
+        {{- with $.Values.hubSite.swimKeySecretName }}
         - complianceType: musthave
           objectDefinition:
             apiVersion: v1
             kind: Secret
             type: Opaque
             metadata:
-              name: {{ $.Values.hubSite.swimKeySecretName | default "grid-swim-key" | quote }}
+              name: {{ . | quote }}
               namespace: {{ $target | quote }}
             data:
-              key: '{{ printf "{{hub fromSecret %q %q \"key\" hub}}" $ns ($.Values.hubSite.swimKeySecretName | default "grid-swim-key") }}'
+              key: '{{ printf "{{hub fromSecret %q %q \"key\" hub}}" $ns . }}'
+        {{- end }}
 {{- end }}
 {{- end }}
