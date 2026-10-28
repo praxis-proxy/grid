@@ -504,7 +504,8 @@ impl PeerProviders {
     /// record is dropped when its cluster is one of this site's own (`reserved`), when `hops`
     /// binds it to another site's gateway, when the cluster is named after another peer, or
     /// when peers contest it with nothing to settle who it is. A peer whose catalog would take
-    /// the overlay past its ceiling is dropped whole, once every peer has had its share.
+    /// the overlay past its ceiling is admitted up to its share and what is left of the
+    /// remainder, records in id order and models in name order.
     #[must_use]
     pub fn admit(&self, network: &str, reserved: &HashSet<String>, hops: &ClusterSites) -> Vec<crdt::ProviderState> {
         let held = self.0.held.read().unwrap_or_else(PoisonError::into_inner);
