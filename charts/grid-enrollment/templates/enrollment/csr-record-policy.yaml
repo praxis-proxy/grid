@@ -1,3 +1,4 @@
+{{- if eq .Values.mode "service" }}
 {{- include "grid-enrollment.normalize" . }}
 {{- if and (eq .Values.enrollment.authz "kube") .Values.enrollment.csrRecord.enabled }}
 {{- if not .Values.enrollment.csrRecord.policy.enabled }}
@@ -83,4 +84,5 @@ metadata:
 spec:
   policyName: {{ $name }}-confine
   validationActions: [Deny]
+{{- end }}
 {{- end }}

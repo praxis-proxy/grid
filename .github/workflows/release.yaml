@@ -372,7 +372,6 @@ jobs:
     env:
       # Release chart directories. The directory basename is the chart name.
       CHART_DIRS: >-
-        charts/grid-bootstrap
         charts/grid-operator
         charts/praxis-gateway
         charts/grid-site
@@ -415,7 +414,7 @@ jobs:
 
       - name: Lint charts
         run: |
-          for chart in grid-bootstrap grid-operator praxis-gateway grid-mock-providers grid-enrollment; do
+          for chart in grid-operator praxis-gateway grid-mock-providers grid-enrollment; do
             helm lint "charts/${chart}" --strict
           done
           helm lint charts/grid-site --strict \
@@ -506,7 +505,6 @@ jobs:
           ## Helm Chart
 
           \`\`\`text
-          oci://ghcr.io/praxis-proxy/charts/grid-bootstrap --version ${VERSION}
           oci://ghcr.io/praxis-proxy/charts/grid-operator --version ${VERSION}
           oci://ghcr.io/praxis-proxy/charts/grid-operator@${CHART_DIGEST}
           oci://ghcr.io/praxis-proxy/charts/praxis-gateway --version ${VERSION}

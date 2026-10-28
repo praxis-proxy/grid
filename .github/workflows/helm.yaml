@@ -385,8 +385,8 @@ jobs:
         run: |
           KIND=1 GRID_IMAGE_TAG=ci ./scripts/verify-helm-chart.sh
 
-      - name: Verify bootstrap CA issuance and retention
-        run: bash charts/grid-bootstrap/tests/e2e.sh
+      - name: Verify cert-manager enrollment and CA retention
+        run: bash charts/grid-enrollment/tests/cert-manager-e2e.sh
 
       - name: Upload test logs
         if: always()

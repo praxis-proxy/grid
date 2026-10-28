@@ -1,5 +1,9 @@
 # Grid Enrollment Helm Chart
 
+Choose `mode: service` (the default) or `mode: external` for identity issuance.
+See [External identities](EXTERNAL.md) for bootstrap, enrollment, optional PKI
+integrations, ACM delivery, and the planned decommission sequence.
+
 Helm chart for the grid enrollment service: the enrollment authority for a grid,
 its self-provisioned Grid CA, and a Postgres store. No values are required: given the
 namespaces under Prerequisites, an install stands up a site ready to enroll.

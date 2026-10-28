@@ -1,0 +1,3 @@
+{{- if eq .Values.mode "external" }}
+{{- include "grid-enrollment.external.validate" . }}
+{{- end }}

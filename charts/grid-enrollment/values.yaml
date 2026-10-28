@@ -1,4 +1,44 @@
-# grid-enrollment: batteries-included by default.
+# -- Identity lifecycle backend: service runs the enrollment API and bootstrap;
+# external consumes identity Secrets supplied by another issuer or PKI.
+mode: service
+
+# -- External identities and optional cert-manager issuance, with ACM delivery.
+external:
+  # -- Site names mapped to secretName, optional dnsNames, and optional ACM cluster.
+  sites: {}
+  # -- Public trust bundle for externally supplied identities; never a signing key.
+  trustBundleSecretRef: ''
+  trustBundleSecretKey: ca.crt
+  delivery:
+    enabled: false
+    namespace: ''
+    clusterSet: default
+    identitySecretName: grid-site-identity
+    caSecretName: grid-ca
+    createClusterSetBinding: true
+  certManager:
+    # -- Optional integration; cert-manager must already be installed.
+    enabled: false
+    issuer:
+      # -- False references an existing issuer; true creates a namespaced CA Issuer.
+      create: false
+      name: grid-ca
+      kind: Issuer
+      group: cert-manager.io
+    ca:
+      # -- Generate is only for a new grid; Existing never writes the CA Secret.
+      mode: Existing
+      secretName: grid-ca-key
+      certificateName: grid-root-ca
+      bootstrapIssuerName: grid-root-selfsigned
+      commonName: grid-root-ca
+      durationHours: 87600
+      renewBeforeHours: 8760
+    certificate:
+      durationHours: 4320
+      renewBeforeHours: 720
+
+# Service mode: batteries included by default.
 # `helm install` with no overrides stands up a full grid site ready to enroll:
 # it generates the Grid CA, issues the enrollment endpoint's serving cert,
 # deploys Postgres, generates a grid-admin token, and runs the enrollment

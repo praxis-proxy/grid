@@ -1,0 +1,35 @@
+{{- if and (eq .Values.mode "external") .Values.external.certManager.enabled }}
+{{- include "grid-enrollment.external.validate" . }}
+{{- $ext := .Values.external -}}
+{{- $cm := .Values.external.certManager }}
+{{- range $name, $site := $ext.sites }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $site.secretName | default (printf "grid-site-%s" $name) | quote }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "grid-enrollment.labels" $ | nindent 4 }}
+spec:
+  secretName: {{ $site.secretName | default (printf "grid-site-%s" $name) | quote }}
+  commonName: {{ $name | quote }}
+  subject:
+    organizations: [{{ $name | quote }}]
+  uris: [{{ printf "spiffe://grid.internal/site/%s" $name | quote }}]
+  dnsNames:
+    {{- toYaml (prepend ($site.dnsNames | default list) (printf "%s.grid.internal" $name) | uniq) | nindent 4 }}
+  duration: {{ printf "%dh" (int $cm.certificate.durationHours) | quote }}
+  renewBefore: {{ printf "%dh" (int $cm.certificate.renewBeforeHours) | quote }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    encoding: PKCS8
+    rotationPolicy: Always
+  usages: [digital signature, client auth, server auth]
+  issuerRef:
+    name: {{ $cm.issuer.name | quote }}
+    kind: {{ $cm.issuer.kind | quote }}
+    group: {{ $cm.issuer.group | quote }}
+{{- end }}
+{{- end }}

@@ -4,7 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 CHART=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-CLUSTER="${CLUSTER:-grid-bootstrap-test}"
+CLUSTER="${CLUSTER:-grid-enrollment-certmanager-test}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.21.3}"
 WORK=$(mktemp -d)
 CREATED=false
@@ -38,45 +38,25 @@ secret_digest() {
 
 issue_leaf() {
   local namespace=$1
-  kubectl -n "$namespace" apply -f - <<'YAML'
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata:
-  name: site-identity
-spec:
-  secretName: site-identity
-  commonName: site-a
-  subject:
-    organizations: [site-a]
-  uris: [spiffe://grid.internal/site/site-a]
-  dnsNames: [site-a.grid.internal]
-  duration: 168h
-  renewBefore: 72h
-  privateKey:
-    algorithm: ECDSA
-    size: 256
-    encoding: PKCS8
-    rotationPolicy: Always
-  usages: [digital signature, client auth, server auth]
-  issuerRef:
-    name: grid-ca
-    kind: Issuer
-    group: cert-manager.io
-YAML
+  local ca_mode=Existing
+  if [[ "$namespace" == fresh ]]; then ca_mode=Generate; fi
+  helm upgrade bootstrap "$CHART" -n "$namespace" \
+    --set mode=external,external.certManager.enabled=true,external.certManager.issuer.create=true,external.certManager.ca.mode="$ca_mode" \
+    --set external.sites.site-a.secretName=site-identity
   kubectl -n "$namespace" wait certificate/site-identity --for=condition=Ready --timeout=120s
   kubectl -n "$namespace" get secret site-identity -o jsonpath='{.data.tls\.crt}' | base64 -d > "$WORK/leaf.crt"
   openssl verify -CAfile "$WORK/ca.crt" -purpose sslclient "$WORK/leaf.crt"
   openssl verify -CAfile "$WORK/ca.crt" -purpose sslserver "$WORK/leaf.crt"
 }
 
-helm upgrade --install bootstrap "$CHART" -n fresh --set enabled=true,ca.mode=Generate
+helm upgrade --install bootstrap "$CHART" -n fresh --set mode=external,external.certManager.enabled=true,external.certManager.issuer.create=true,external.certManager.ca.mode=Generate
 kubectl -n fresh wait certificate/grid-root-ca --for=condition=Ready --timeout=120s
 kubectl -n fresh wait issuer/grid-ca --for=condition=Ready --timeout=120s
 kubectl -n fresh get secret grid-ca-key -o jsonpath='{.data.tls\.crt}' | base64 -d > "$WORK/ca.crt"
 before=$(secret_digest fresh)
 issue_leaf fresh
 
-helm upgrade bootstrap "$CHART" -n fresh --set enabled=true,ca.mode=Generate
+helm upgrade bootstrap "$CHART" -n fresh --reuse-values --set mode=external,external.certManager.enabled=true,external.certManager.issuer.create=true,external.certManager.ca.mode=Generate
 [[ "$(secret_digest fresh)" == "$before" ]]
 kubectl -n fresh patch certificate site-identity --type=merge \
   -p '{"spec":{"dnsNames":["site-a.grid.internal","site-a-signals.grid.internal"]}}'
@@ -89,11 +69,32 @@ kubectl -n fresh get secret grid-ca-key -o json | \
   jq '{apiVersion:"v1",kind:"Secret",metadata:{name:"grid-ca-key",namespace:"existing"},type:"kubernetes.io/tls",data:.data}' | \
   kubectl apply -f -
 existing_before=$(secret_digest existing)
-helm upgrade --install bootstrap "$CHART" -n existing --set enabled=true
+if [[ -n "${LEGACY_CHART:-}" ]]; then
+  helm install bootstrap "$LEGACY_CHART" -n existing --set enabled=true
+  issuer_uid=$(kubectl -n existing get issuer grid-ca -o jsonpath='{.metadata.uid}')
+fi
+helm upgrade --install bootstrap "$CHART" -n existing --set mode=external,external.certManager.enabled=true,external.certManager.issuer.create=true
+if [[ -n "${LEGACY_CHART:-}" ]]; then
+  [[ "$(kubectl -n existing get issuer grid-ca -o jsonpath='{.metadata.uid}')" == "$issuer_uid" ]]
+  [[ "$(secret_digest existing)" == "$existing_before" ]]
+  echo "PASS: chart migration preserves the Issuer UID and existing CA"
+fi
 kubectl -n existing wait issuer/grid-ca --for=condition=Ready --timeout=120s
 issue_leaf existing
-helm upgrade bootstrap "$CHART" -n existing --set enabled=true
+helm upgrade bootstrap "$CHART" -n existing --reuse-values --set mode=external,external.certManager.enabled=true,external.certManager.issuer.create=true
 [[ "$(secret_digest existing)" == "$existing_before" ]]
+helm upgrade --install external "$CHART" -n existing \
+  --set mode=external,external.certManager.enabled=true,external.certManager.issuer.name=grid-ca \
+  --set external.sites.site-b.secretName=external-site-identity
+kubectl -n existing wait certificate/external-site-identity --for=condition=Ready --timeout=120s
+kubectl -n existing get secret external-site-identity -o jsonpath='{.data.tls\.crt}' | base64 -d > "$WORK/external.crt"
+openssl verify -CAfile "$WORK/ca.crt" -purpose sslclient "$WORK/external.crt"
+openssl verify -CAfile "$WORK/ca.crt" -purpose sslserver "$WORK/external.crt"
+helm uninstall external -n existing
+kubectl -n existing get issuer/grid-ca >/dev/null
+[[ "$(secret_digest existing)" == "$existing_before" ]]
+echo "PASS: external issuer signs site identities and is not owned by the release"
+
 helm uninstall bootstrap -n existing
 [[ "$(secret_digest existing)" == "$existing_before" ]]
 echo "PASS: existing CA signs leaves and survives upgrades and uninstall unchanged"

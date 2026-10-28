@@ -1,3 +1,4 @@
+{{- if eq .Values.mode "service" }}
 {{- include "grid-enrollment.normalize" . }}
 {{- include "grid-enrollment.validateAuthz" . }}
 apiVersion: apps/v1
@@ -205,3 +206,4 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+{{- end }}

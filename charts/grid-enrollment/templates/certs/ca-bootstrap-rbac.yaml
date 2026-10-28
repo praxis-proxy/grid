@@ -1,3 +1,4 @@
+{{- if eq .Values.mode "service" }}
 {{- include "grid-enrollment.normalize" . }}
 {{- if include "grid-enrollment.bootstrapRuns" . }}
 {{- $ca := ne (include "grid-enrollment.caProvided" .) "true" }}
@@ -187,5 +188,6 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "grid-enrollment.bootstrapServiceAccountName" $ }}
     namespace: {{ $.Release.Namespace }}
+{{- end }}
 {{- end }}
 {{- end }}

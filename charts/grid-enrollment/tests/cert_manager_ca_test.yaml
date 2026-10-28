@@ -1,0 +1,178 @@
+suite: cert-manager trust ownership
+release:
+  name: grid-bootstrap
+  namespace: grid-trust
+templates:
+  - templates/certs/cert-manager-ca.yaml
+  - templates/certs/cert-manager-issuer.yaml
+tests:
+  - it: renders no cert-manager resources in service mode
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: adopts an existing CA through a namespaced issuer without writing the CA
+    set:
+      mode: external
+      external.certManager.enabled: true
+      external.certManager.issuer.create: true
+      external.certManager.ca.secretName: existing-grid-ca
+      external.certManager.issuer.name: site-signer
+    asserts:
+      - hasDocuments:
+          count: 0
+        template: templates/certs/cert-manager-ca.yaml
+      - hasDocuments:
+          count: 1
+        template: templates/certs/cert-manager-issuer.yaml
+      - isKind:
+          of: Issuer
+        template: templates/certs/cert-manager-issuer.yaml
+      - equal:
+          path: metadata.namespace
+          value: grid-trust
+        template: templates/certs/cert-manager-issuer.yaml
+      - equal:
+          path: metadata.name
+          value: site-signer
+        template: templates/certs/cert-manager-issuer.yaml
+      - equal:
+          path: spec.ca.secretName
+          value: existing-grid-ca
+        template: templates/certs/cert-manager-issuer.yaml
+
+  - it: generates a retained CA with a stable signing key only when requested
+    set:
+      mode: external
+      external.certManager.enabled: true
+      external.certManager.issuer.create: true
+      external.certManager.ca.mode: Generate
+    asserts:
+      - hasDocuments:
+          count: 2
+        template: templates/certs/cert-manager-ca.yaml
+      - isKind:
+          of: Issuer
+        template: templates/certs/cert-manager-ca.yaml
+        documentIndex: 0
+      - equal:
+          path: spec.selfSigned
+          value: {}
+        template: templates/certs/cert-manager-ca.yaml
+        documentIndex: 0
+      - isKind:
+          of: Certificate
+        template: templates/certs/cert-manager-ca.yaml
+        documentIndex: 1
+      - equal:
+          path: spec.isCA
+          value: true
+        template: templates/certs/cert-manager-ca.yaml
+        documentIndex: 1
+      - equal:
+          path: spec.privateKey.rotationPolicy
+          value: Never
+        template: templates/certs/cert-manager-ca.yaml
+        documentIndex: 1
+      - equal:
+          path: spec.privateKey.encoding
+          value: PKCS8
+        template: templates/certs/cert-manager-ca.yaml
+        documentIndex: 1
+      - equal:
+          path: spec.issuerRef.name
+          value: grid-root-selfsigned
+        template: templates/certs/cert-manager-ca.yaml
+        documentIndex: 1
+      - equal:
+          path: spec.secretName
+          value: grid-ca-key
+        template: templates/certs/cert-manager-ca.yaml
+        documentIndex: 1
+      - equal:
+          path: metadata.annotations["helm.sh/resource-policy"]
+          value: keep
+        template: templates/certs/cert-manager-ca.yaml
+      - equal:
+          path: metadata.annotations["argocd.argoproj.io/sync-options"]
+          value: Prune=false,Delete=false
+        template: templates/certs/cert-manager-ca.yaml
+      - equal:
+          path: spec.secretTemplate.annotations["helm.sh/resource-policy"]
+          value: keep
+        template: templates/certs/cert-manager-ca.yaml
+        documentIndex: 1
+      - equal:
+          path: spec.secretTemplate.annotations["argocd.argoproj.io/sync-options"]
+          value: Prune=false,Delete=false
+        template: templates/certs/cert-manager-ca.yaml
+        documentIndex: 1
+
+  - it: rejects a renewal window that cannot fit inside the CA lifetime
+    set:
+      mode: external
+      external.certManager.enabled: true
+      external.certManager.issuer.create: true
+      external.certManager.ca.mode: Generate
+      external.certManager.ca.durationHours: 24
+      external.certManager.ca.renewBeforeHours: 24
+    asserts:
+      - failedTemplate:
+          errorMessage: external.certManager.ca.renewBeforeHours must be less than external.certManager.ca.durationHours
+        template: templates/certs/cert-manager-issuer.yaml
+
+  - it: rejects two issuers with the same resource name
+    set:
+      mode: external
+      external.certManager.enabled: true
+      external.certManager.issuer.create: true
+      external.certManager.ca.mode: Generate
+      external.certManager.issuer.name: grid-root-selfsigned
+    asserts:
+      - failedTemplate:
+          errorMessage: external.certManager.issuer.name and external.certManager.ca.bootstrapIssuerName must differ
+        template: templates/certs/cert-manager-issuer.yaml
+
+  - it: rejects an unsupported CA mode
+    set:
+      mode: external
+      external.certManager.enabled: true
+      external.certManager.issuer.create: true
+      external.certManager.ca.mode: Adopt
+    asserts:
+      - failedTemplate:
+          errorPattern: 'external[./]certManager[./]ca[./]mode'
+        template: templates/certs/cert-manager-issuer.yaml
+
+  - it: rejects an invalid issuer resource name
+    set:
+      mode: external
+      external.certManager.enabled: true
+      external.certManager.issuer.create: true
+      external.certManager.issuer.name: Invalid_Name
+    asserts:
+      - failedTemplate:
+          errorPattern: 'external[./]certManager[./]issuer[./]name'
+        template: templates/certs/cert-manager-issuer.yaml
+
+  - it: rejects a CA lifetime below the schema minimum
+    set:
+      mode: external
+      external.certManager.enabled: true
+      external.certManager.issuer.create: true
+      external.certManager.ca.durationHours: 1
+    asserts:
+      - failedTemplate:
+          errorPattern: 'external[./]certManager[./]ca[./]durationHours'
+        template: templates/certs/cert-manager-issuer.yaml
+
+  - it: rejects a renewal window below the schema minimum
+    set:
+      mode: external
+      external.certManager.enabled: true
+      external.certManager.issuer.create: true
+      external.certManager.ca.renewBeforeHours: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: 'external[./]certManager[./]ca[./]renewBeforeHours'
+        template: templates/certs/cert-manager-issuer.yaml
