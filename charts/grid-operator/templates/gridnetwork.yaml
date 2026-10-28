@@ -8,7 +8,9 @@ metadata:
   name: {{ .network | quote }}
   labels:
     {{- include "grid-operator.labels" $ | nindent 4 }}
+    {{- if ne (dig "membership" "source" "Swim" .) "Local" }}
     grid.praxis.fast/auto-discover-sites: "true"
+    {{- end }}
   annotations:
     {{- include "grid-operator.afterCrds" $ | nindent 4 }}
 spec:
@@ -43,7 +45,7 @@ spec:
     caSecretRef:
       name: {{ $e.caSecretName | default "grid-ca" | quote }}
       namespace: {{ $.Release.Namespace | quote }}
-    {{- with .swimKeySecretName }}
+    {{- with and (ne (dig "membership" "source" "Swim" .) "Local") .swimKeySecretName }}
     swimKeySecretRef:
       name: {{ . | quote }}
       namespace: {{ $.Release.Namespace | quote }}

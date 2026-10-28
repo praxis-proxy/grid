@@ -263,6 +263,8 @@ Job reads, keys in sorted order.
 */}}
 {{- define "grid-enrollment.normalize" -}}
 {{- $v := .Values }}
+{{- /* Without SWIM there is no SWIM key to create or deliver. */}}
+{{- if eq (dig "membership" "source" "Swim" ($v.grid | default dict)) "Local" }}{{- $_ := set $v.hubSite "swimKeySecretName" "" }}{{- end }}
 {{- if not $v.enrollment.service.type }}
 {{- $lb := and $v.host (not (include "grid-enrollment.routeEnabled" .)) }}
 {{- $_ := set $v.enrollment.service "type" (ternary "LoadBalancer" "ClusterIP" (not (not $lb))) }}

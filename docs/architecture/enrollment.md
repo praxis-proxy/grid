@@ -54,10 +54,13 @@ sequenceDiagram
    name, with a lifetime of at most seven days. The service stores only the
    token's hash. Minting is the admission decision.
 2. Carry. The token and the grid CA bundle reach the joining site out of band,
-   as Secrets in the operator's namespace.
+   as Secrets in the operator's namespace. The operator config's `site` section
+   names them: `inviteSecretRef` the token, `signerEndpoint.caBundleRef` the CA
+   bundle, and `signerEndpoint.url` the service.
 3. Join. The operator generates a key that never leaves the cluster, builds a
    certificate request, and posts it with the token to the service over a
-   connection it verifies against the pinned CA bundle.
+   connection it verifies against the pinned CA bundle. The GridSite's
+   `Enrolled` condition reports the result.
 4. Check. The service checks the token before parsing the request: the token
    must hash to a live, unspent invite. The name must not be enrolled already
    and must not be reserved. The site receives a refusal immediately.
@@ -67,7 +70,10 @@ sequenceDiagram
    never the request's subject. The certificate carries the site's SPIFFE ID
    and lives 180 days by default.
 6. Renew. Once two thirds of the lifetime has passed, the operator requests a
-   new certificate, presenting its current one as proof. The service refuses a
+   new certificate from the signer the operator config names, presenting its
+   current one as proof, unless `site.signerEndpoint.rotation` is `Disabled`.
+   The grid-operator chart renders that config, on the hub as on a joining
+   site, and renewal reads nothing else. The service refuses a
    renewal that reuses a key already on the site's record, names an unknown
    site, or does not match the site's record, for example a certificate issued
    before the site's current enrollment.

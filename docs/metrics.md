@@ -72,8 +72,15 @@ is described in [Polling Cross-Site Load Signals](architecture/polling-metrics.m
 | `grid_peer_poll_slow_total` | counter | `peer` | Peer polls exceeding the slow threshold. |
 | `grid_peer_polls_in_flight` | gauge | | Peer polls currently in flight. |
 | `grid_peer_response_bytes_total` | counter | `peer` | Bytes read from peer signal endpoints. |
-| `grid_collection_up` | gauge | `peer` | Whether the last poll of this peer succeeded. |
+| `grid_collection_up` | gauge | `peer` | Whether the last poll of this peer succeeded. One missed poll reads 0 here while the condition still holds. |
+| `grid_peer_signals_reachable` | gauge | `peer` | 1 while the peer's `SignalsReachable` condition is True. It holds through three unanswered rounds, as the condition does, so alert on this one to agree with the status. |
 | `grid_peer_last_success_timestamp_seconds` | gauge | `peer` | Unix time of the last successful poll of this peer. |
+| `grid_peer_catalog_total` | counter | `peer`, `outcome` | Reads of the peer's providers catalog: `replaced` when a catalog landed, `failed` when the read did not. |
+| `grid_peer_catalog_refused` | gauge | `peer` | 1 while the peer's last admission refused its catalog, which its `CatalogAccepted` condition reads False. |
+| `grid_peer_catalog_cut` | gauge | `peer` | 1 while part of the peer's catalog waits past this site's share of the overlay ceiling. |
+
+Every series labelled `peer` is removed once the peer leaves the roster, so a renamed or
+deleted site does not keep stale series alive until restart.
 
 ## Operator: serving signals
 
@@ -83,8 +90,33 @@ relays every site's readings to its own gateway.
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `grid_peer_signals_refused_total` | counter | `peer`, `reason` | Peer observations refused at ingest. |
-| `grid_signals_connections_shed_total` | counter | `limit` | Signals connections shed at accept. |
+| `grid_signals_connections_shed_total` | counter | `limit` | Signals connections shed, by the cap that shed them: `total`, `handshake`, `source`, or `peer` for a site at its per-site cap. |
+| `grid_signals_connection_cap` | gauge | | Concurrent signals connections the listener admits, sized for the declared members. |
+| `grid_signals_connections_open` | gauge | | Signals connections the listener holds open, read at scrape time. |
+| `grid_signals_handshake_cap` | gauge | | Signals handshakes the listener admits at once. |
+| `grid_signals_handshakes_in_flight` | gauge | | Signals handshakes in progress, read at scrape time. |
+| `grid_signals_handshake_source_cap` | gauge | | Handshakes one source may hold at once: `signals.maxHandshakesPerSource`, raised behind a router that hides client addresses. |
+| `grid_signals_handshakes_busiest_source` | gauge | | Handshakes in progress from the busiest single source: an address or, for global IPv6, a /64 or its /48. Not labelled by address. |
+| `grid_signals_ca_loaded_timestamp_seconds` | gauge | | Unix time the listener last loaded its CA bundle. It moves when the listener restarts on rotated material. |
+| `grid_signals_ca_expiry_timestamp_seconds` | gauge | | Unix time the earliest loaded CA anchor expires, 0 while none is loaded. |
+| `grid_signals_ca_anchors` | gauge | | Certificates in the loaded CA bundle. A rotation that adds the new anchor before dropping the old one reads 2 for its overlap. |
 | `grid_signals_relay_truncated_total` | counter | `store`, `cut` | Targets dropped and lines cut from the relay served to the local gateway. |
+
+Alert before the listener sheds, not after; `grid_signals_connections_shed_total` says it
+already did. Both fire above four fifths of a cap for five minutes:
+
+```yaml
+- alert: GridSignalsSourceHandshakesNearCap
+  expr: grid_signals_handshakes_busiest_source / grid_signals_handshake_source_cap > 0.8
+  for: 5m
+  annotations:
+    summary: one source holds most of its signals handshake cap on {{ $labels.instance }}
+- alert: GridSignalsConnectionsNearCap
+  expr: grid_signals_connections_open / grid_signals_connection_cap > 0.8
+  for: 5m
+  annotations:
+    summary: the signals listener on {{ $labels.instance }} is near its connection cap
+```
 
 ## Operator: reconciliation and probing
 
@@ -97,14 +129,17 @@ relays every site's readings to its own gateway.
 | `grid_gateway_probe_duration_seconds` | histogram | | Gateway probe duration. |
 | `grid_mcp_probe_total` | counter | `outcome` | Total AgentToolProvider MCP tools/list probe attempts. |
 | `grid_mcp_probe_duration_seconds` | histogram | | AgentToolProvider MCP tools/list probe duration. |
+| `grid_gateway_feedback_events_total` | counter | `event` | Gateway status feedback events the operator could not apply as sent: `conflict`, `conflict_exhausted`, `overflow`, `unauthorized`, `write_failure`. |
 
 ## Operator: identity and gossip
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `grid_site_identity_expiry_timestamp_seconds` | gauge | | When the site identity certificate expires. |
+| `grid_swim_unavailable` | gauge | | 1 while SWIM is configured on this site but not running; the `GridNetwork` `Swim` condition reads `False` with the cause. |
 | `grid_site_identity_rotations_total` | counter | `result` | Site identity rotation attempts. |
 | `grid_swim_key_pending` | gauge | | 1 while SWIM holds traffic for its key. |
+| `grid_operator_config_ignored_sections` | gauge | | Top-level sections of the operator config that this operator does not read and ignores. |
 | `grid_operator_lease_held` | gauge | | 1 while this replica holds the operator lease. At most one replica reports 1, and none while no replica holds it. |
 | `grid_operator_routed` | gauge | | 1 while the signals and SWIM Services route to this replica. It drops before the lease is released. |
 | `grid_operator_lease_waiting` | gauge | `reason` | 1 for why this replica is not contending for the lease: `unelected_replica` while a replica of the operator Deployment runs without leader election, `replicas_unreadable` while the replicas cannot be listed. |
@@ -141,6 +176,7 @@ state, so two replicas agree only in steady state.
 | `grid_route_shedding` | gauge | `model` | 1 while the gateway sheds this model, 0 otherwise. |
 | `grid_route_prefix_affinity_total` | counter | `outcome` | Prefix-affinity decisions by outcome. |
 | `grid_serving_config_reload_total` | counter | `result` | Serving-config reloads by result. |
+| `grid_serving_unbound_provider_hops` | gauge | | Provider hops the applied serving config declares that no startup-verified backend binds. Their candidates take no traffic until a serving config names the verified SNI or the gateway restarts. |
 
 A `NaN` rho or weight means the gateway holds no reading for that site, which
 distinguishes an unmeasured site from one measured at zero. A `NaN` score means
@@ -159,6 +195,7 @@ described in [Site Selection](site-selection.md).
 | `grid_signals_last_success_timestamp_seconds` | gauge | | Unix time of the last successful poll. |
 | `grid_signals_response_bytes` | gauge | | Size of the last successful poll's response. |
 | `grid_signals_ingest_dropped_total` | counter | `reason` | Rows the operator served that the gateway refused, by reason. |
+| `grid_signals_feedback_failures_total` | counter | `reason` | Failed deliveries of gateway status feedback to the operator, by bounded reason. |
 
 ## Overlay-sync
 

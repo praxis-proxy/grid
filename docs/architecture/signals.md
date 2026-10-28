@@ -40,6 +40,11 @@ more than one rather than pick a mode for the process-global serve and poll
 paths. A reader treats a missing signal as neutral, not zero, per the signal
 mapping reference.
 
+Peers are dialled directly. The signals and providers path reads no
+`HTTP_PROXY`, `HTTPS_PROXY` or `NO_PROXY`, so a proxy between sites must pass
+TLS through untouched, and an egress proxy that terminates TLS breaks the
+mutual TLS the path depends on.
+
 ## Gateway ingest feedback
 
 The local gateway reports completed ingests with an empty-body
@@ -64,8 +69,14 @@ it cannot carry a clean report. Malformed, repeated, unsupported, or oversized
 metadata and nonempty bodies are refused. The entire server operation has a
 five-second budget, including body reading, admission, and Kubernetes writes.
 
-Local callers share the listener's 256-connection limit. Peers can hold at most
-248 slots, leaving eight for local traffic. The site's own certificate remains
+Local callers share the listener's connection limit. The limit fits every
+declared member's connections plus eight for local traffic and 64 for
+handshakes, at least 256 and at most 4096, and `grid_signals_connection_cap`
+reports it. It grows as members are declared and never shrinks while the
+listener runs. Peers can never hold the local or handshake slots. A source
+holds at most half of the handshake slots, and at its cap the newest handshake
+is refused. Past 4096 the listener sheds connections and counts them in
+`grid_signals_connections_shed_total{limit="total"}`. The site's own certificate remains
 the trust boundary; feedback has no separate local quota, and its single writer
 serializes publication within the same request budget.
 

@@ -1073,3 +1073,24 @@ fn the_overlay_shipped_with_the_derived_render_matches_the_fixture_praxis_loads(
     let json = serde_json::to_string_pretty(&envelope).expect("serialise");
     assert_eq!(json, DERIVED_OVERLAY_GOLDEN.trim_end(), "golden drifted");
 }
+
+#[test]
+fn a_remote_hop_naming_another_sites_server_name_derives_nothing() {
+    let sites = vec![
+        site("site-a", None),
+        site(
+            "site-b",
+            Some(mutual_egress(
+                "site-b.grid.example.invalid:8443",
+                "site-c.grid.internal",
+            )),
+        ),
+    ];
+    let candidates = vec![candidate("prov-b", "site-b")];
+    let resolution = resolve(&candidates, &[], &decl(&[], &sites, "site-a"));
+    assert!(resolution.get("prov-b").is_none(), "the hop would verify site-c's leaf");
+    assert_eq!(
+        resolution.refused.first().map(|refused| refused.reason),
+        Some(Refusal::ServerNameNotSite)
+    );
+}

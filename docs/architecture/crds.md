@@ -104,8 +104,21 @@ cluster-scoped CRD. The current AGN deployment supports only one
 `GridNetwork` in the cluster. The operator fails startup when it finds more
 than one; adding another after startup is not supported.
 
-Its roll-up is gated by `LocalSiteDeclared`. A `PeerTimeValid` of `False`, or a
-`GatewayAgesRejected` of `True`, sets `Degraded` with that condition's reason.
+It carries this cluster's own conditions. `Accepted`, `ResolvedRefs`, `Enrolled` and
+`IdentityValid` gate its roll-up, in that order. `RotationOnSchedule` `False`, a
+`PeerTimeValid` of `False`, or a `GatewayAgesRejected` of `True` sets `Degraded` with
+that condition's reason, and after them, under Local membership, a `False`
+`PeerSignalsReachable`, `PeerCatalogsAccepted`, `PeerMembership` or `PeerPollsComplete`.
+None of the peer conditions gates `Available`, and a site switched to Swim drops them. Each condition type has one writer, and the controller alone
+writes `Available`, `Progressing` and `Degraded`. Every reason is listed in
+[Site Enrollment](../installation/enrollment.md#3-enroll-the-site).
+
+`spec.gridId` is the grid the network belongs to, set once: a DNS label of at most 63
+characters, and a change is refused. `status.gridId` mirrors it. The operator mints an
+ID only while `spec.gridId` is empty and the operator config names no site, the
+standalone install. Beside a site section it mints nothing, holds the grid runtime, and
+`Accepted` reads `False` with `GridIdUnset` until `spec.gridId` is set. Moving a cluster
+to another grid means deleting and recreating its GridNetwork, and its identity with it.
 
 ```yaml
 apiVersion: grid.praxis.fast/v1alpha1
@@ -113,7 +126,7 @@ kind: GridNetwork
 metadata:
   name: production
 spec:
-  gridId: ""                    # auto-generated on first join
+  gridId: ""                    # the grid, set once; minted only without an operator config site section
   seeds:
     - "10.0.0.5:7946"
   consumerGateways:
@@ -206,6 +219,85 @@ means no polled peer has a rejected timestamp; `False` means at least one does.
 |---|---|---|
 | `False` | `TimestampOutOfRange` | A polled peer's latest answer carried a row stamped more than a second past its `Date`, or more than a day before it. The message names those peers (the first ten, then a count): check their clocks. |
 | `True` | `PeerTimestampsValid` | No polled peer's latest answer was rejected for its age. |
+
+Under Local membership the poller also writes three conditions, each under its own field
+manager. Which peers, and why, is on each peer's `GridSite`, as described in
+[Peer conditions under Local membership](#peer-conditions-under-local-membership).
+
+`PeerSignalsReachable` (`grid-operator-peer-reach`) counts the peers whose signals
+endpoint did not answer. A peer not yet checked, an egress-only peer, and a peer the
+round had no time for are not counted.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `PeersUnreachable` | A checked peer's signals endpoint did not answer. The message counts them, for example `2 of 5 peers unreachable`. |
+| `True` | `PeerSignalsReachable` | Every polled peer's signals endpoint answered. |
+
+`PeerCatalogsAccepted` (`grid-operator-peer-catalogs`) counts the peers whose catalog,
+or part of it, was refused, out of the peers whose catalog is held.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `CatalogsRefused` | A peer's catalog was refused. The message counts them, for example `1 of 5 peers' catalogs refused`. |
+| `True` | `PeerCatalogsAccepted` | Every peer catalog read is accepted. |
+
+`PeerPollsComplete` (`grid-operator-peer-polls`) says whether each round had time to poll
+every peer. A peer the round had no time for keeps its last `SignalsReachable` verdict, so
+the overrun is this site's, never the peer's.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `PollRoundOverrun` | The last round ran out before it polled some peers. The message counts them, for example `2 of 40 peers not polled within the round`. |
+| `True` | `PeerPollsComplete` | The last round polled every peer. |
+
+A `Swim` condition, under its own field manager (`grid-operator-swim`), reads `True`
+with reason `Swim` while SWIM runs, and `False` when it is configured but cannot start,
+with a reason naming the cause and the detail in the message. The operator
+keeps running without membership gossip, rather than exiting into a restart loop. It
+restarts itself once a late advertise address appears, and 300 s after a failure that
+may clear on another try: `AdvertiseAddressUnresolved`, `RevisionLeaseFailed` or
+`StartFailed`. A setting that is wrong waits for a rollout that fixes it. Under Local
+membership the operator removes the condition, since SWIM never runs there.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `AdvertiseAddressPending` | No advertise address within 180 s; the operator restarts once one appears. |
+| `False` | `AdvertiseAddressUnresolved` | The advertise address could not be resolved; retried after 300 s. |
+| `False` | `AdvertiseAddressUnspecified` | The address to advertise is unspecified; set `GRID_SWIM_ADVERTISE_ADDR`. |
+| `False` | `BindAddressInvalid` | `GRID_SWIM_BIND_ADDR` is not a socket address. |
+| `False` | `KeyInvalid` | `GRID_SWIM_ENCRYPT_KEY` does not parse. |
+| `False` | `RevisionLeaseFailed` | The signal revision lease could not be reserved; retried after 300 s. |
+| `False` | `StartFailed` | The runtime failed to start, binding its socket included; retried after 300 s. |
+| `True` | `Swim` | SWIM runs. |
+
+**Membership source:** the chart value `grid.membership.source`, the operator's
+`GRID_MEMBERSHIP_SOURCE`, says where a site learns its members. It is install
+configuration, not a `GridNetwork` field. `Swim`, the default, discovers members by SWIM
+gossip. `Local` means this site's configuration lists its peers as `GridSite` objects.
+Local needs poll signals: an unset transport starts in poll, and gossip fails the render
+and the operator's startup. Both are supported peer options.
+
+Local assumes something outside the grid delivers every site's `GridSite` records, the
+same set to every member. The operator discovers no peers in this mode. It polls the
+sites its own configuration lists, so a member missing from a site's records is a member
+that site never reaches.
+[Open Cluster Management](https://open-cluster-management.io/) is the reference example,
+placing the records on each cluster in a cluster set. Argo CD or plain GitOps deliver the
+same records just as well. Red Hat Advanced Cluster Management is the product built on
+Open Cluster Management.
+
+A `PeerMembership` condition, under its own field manager
+(`grid-operator-peer-membership`), compares the `X-Grid-Membership` header each
+polled peer answers with against this site's `GRID_MEMBERSHIP_SOURCE`. A peer that sends
+no header is an older release and is judged by nothing. A grid that mixes sources is
+not supported: polling goes on so the direction that works still routes, but a
+Swim site never reads a Local site's catalog, and the condition stays False
+until every site names one source.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `PeerMembershipMismatch` | A polled peer names a different membership source. The message names those peers and their sources: set `grid.membership.source` alike on every site. |
+| `True` | `PeerMembership` | Every polled peer that names a mode names this site's. |
 
 A relayed age survives a clock step on every hop, so a step alone never makes
 this condition false: it points at a peer whose clock or stamping is wrong.
@@ -544,8 +636,9 @@ embedded gateway's serving config is controlled separately by
 
 ## GridSite
 
-Represents another site in the grid. Created manually
-for seed peers or automatically by SWIM discovery.
+Represents a site in the grid. A peer is created manually for seed peers or
+automatically by SWIM discovery. This cluster's own site is the GridSite named
+after its identity, and before it has one, the GridSite named in the operator config.
 
 ```yaml
 apiVersion: grid.praxis.fast/v1alpha1
@@ -560,7 +653,7 @@ spec:
     address: egress.cluster-b.example.com:8443
     tls:
       mode: Mutual
-      serverName: egress.cluster-b.example.com
+      serverName: cluster-b.grid.internal
   trust:
     canonicalFingerprints:
       - "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -573,7 +666,68 @@ spec:
 
 **Status fields**: `conditions`, `phase`, `reason`, `message`, `observedGeneration`,
 `publicCertPem`, `capabilities` (inference, agentTools, agentToAgent),
-`lastProbeTime`, `lastTransitionTime`, `absentSince` (auto-discovered sites only)
+`lastProbeTime`, `lastTransitionTime`, `absentSince` (auto-discovered sites only).
+Status is membership only, each cluster's view of one site, this cluster's own site
+included. The own site's identity conditions live on the GridNetwork.
+
+### This cluster's own site
+
+This cluster's own GridSite is declared like any peer, by the grid-site chart, by
+`grid.id` on the grid-operator chart, by GitOps or by hand: named after the site the
+identity names and labelled `grid.praxis.fast/provider-site`. If nothing declares one,
+the operator creates it from the identity, as it does the GridNetwork, under
+`--grid-create-local-records`, on by default. It never overwrites a GridSite something
+else declared, and enrollment does not wait for it. The own GridSite carries no local
+config. How this site enrolls and renews lives in
+the operator config: the ConfigMap `grid-operator-config` in the operator namespace,
+key `config.yaml`, which the grid-operator chart renders from its `enrollment` values
+(`operatorConfig.name` renames it). The operator reads it through the API and watches
+it, so an edit applies without a restart. It holds only this operator's or this site's
+own settings. Grid-wide settings stay on the GridNetwork, and credentials stay in
+Secrets it names.
+
+```yaml
+site:
+  name: east2
+  signerEndpoint:
+    url: https://enrollment.apps.example.com
+    caBundleRef: {kind: Secret, name: grid-ca-bundle, key: ca.crt}
+    gridCaBundleRef: {kind: Secret, name: grid-ca-anchor, key: ca.crt}
+    rotation: Enabled
+  inviteSecretRef: {name: grid-invite-east2, key: token}
+```
+
+| Field | Meaning |
+|---|---|
+| `site` | This cluster's own site. Optional, like every section. Unset, the site does not enroll itself. |
+| `site.name` | The site name, and the name of its GridSite. Required. The invite label and the issued certificate must match it. |
+| `site.signerEndpoint.url` | The base URL of the signer the site enrolls and renews through. https, naming a host with an optional numeric port, without credentials, query or fragment, and not a host under `grid.internal`. |
+| `site.signerEndpoint.caBundleRef` | A `Secret` in the operator namespace pinning the signer to enroll, and by default the grid CA it returns. `kind` is required, and `Secret` is the only kind, so whoever can edit this config cannot pin a CA of their own. Required with `inviteSecretRef`. Renewal trusts the grid CA the site holds together with this bundle. Pin the issuing intermediate or the signer's serving certificate, never a public root. The object must carry `grid.praxis.fast/signer-bundle=true`, as must the `gridCaBundleRef` object. |
+| `site.signerEndpoint.gridCaBundleRef` | The grid CA the returned CA must match: a bootstrap override for a signer that cannot serve its own bundle, such as one behind a certificate from another CA. |
+| `site.signerEndpoint.rotation` | Whether this operator renews the identity through the signer. `Enabled` (default) renews when a third of its lifetime remains, and is refused under pin peer trust with `Accepted` `False` and `RotationUnsupportedUnderPinTrust`. `Disabled` uses the signer to enroll only. Enrollment runs whatever this says. |
+| `site.inviteSecretRef` | The Secret holding the one-time invite token, an opaque credential the signer issued, read once while the site has no identity. `key` defaults to `token`. The Secret must carry `grid.praxis.fast/site=<site.name>`. |
+
+An optional top-level `version` says which document this is. Absent reads as `1`, the
+only version this operator reads, and any other refuses the document. A top-level
+section the operator does not read is ignored and the rest applies, so an operator
+older than a new section keeps running through a rollout. It logs the section, records
+an `OperatorConfigSectionIgnored` Warning Event on the ConfigMap and counts it in
+`grid_operator_config_ignored_sections`. Inside a section it reads, the operator refuses
+the whole document: an unknown key, a bad URL or a missing field reports `Accepted`
+`False` with `OperatorConfigInvalid` on the GridNetwork, the message naming the field,
+and no section of it is acted on. A `site.name` other than the site the held identity
+names reports `SiteNameMismatch`. Before the GridNetwork exists, the operator sends
+nothing, logs why and records an `AwaitingGridNetwork` Event on the ConfigMap, once. Under pin peer trust,
+`rotation: Enabled` reports `Accepted` `False` with `RotationUnsupportedUnderPinTrust`
+and nothing renews. Every condition and reason is listed in
+[Site Enrollment](../installation/enrollment.md#3-enroll-the-site). A local site may
+exist before its GridNetwork, and the GridSite controller waits for the network
+without reporting an error.
+
+The operator self-signs a grid CA and site identity for a GridNetwork that names TLS
+Secrets neither of which exists. It never does while the operator config names this
+site, or is refused, since enrollment writes both. It waits 30 seconds after the
+GridNetwork is created, so an operator config applied with it is seen first.
 
 ### GridSite lifecycle
 
@@ -591,7 +745,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 |---|---|---|
 | `Pending` | Resource created (manually or by auto-discovery) | Initial default |
 | `Discovered` | SWIM peer observed as Alive | `GridNetwork` controller writes on first observation |
-| `Connecting` | Gateway address known (`spec.gatewayEndpoint.address` non-empty) | `GridSite` controller advances from Discovered; performs identity-aware probe |
+| `Connecting` | Gateway address known (`spec.gatewayEndpoint.address` non-empty) | `GridSite` controller advances from Discovered, or from Pending for a declared site with both endpoints; performs identity-aware probe |
 | `Active` | `TlsVerified` | `GridSite` controller promotes from Connecting only after identity-verified TLS succeeds |
 | `Unreachable` | Connectivity failure while Active | `GridSite` controller moves Active → Unreachable when the endpoint cannot be reached |
 | `Left` | Set on graceful site departure | Preserved by operator once set |
@@ -603,6 +757,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 | `AwaitingDiscovery` | Pending | Site record exists; SWIM has not yet observed the peer as Alive |
 | `SWIMDiscovered` | Discovered | Peer observed as Alive in SWIM membership; gateway address propagating |
 | `GatewayAddressKnown` | Connecting | Gateway address received; advancing to Connecting |
+| `EndpointsDeclared` | Connecting | Declared site names a dialable gateway endpoint, which also gives its signals endpoint; advancing without discovery |
 | `GatewayAddressMissing` | Discovered, Connecting, or Unreachable | No gateway address known (see `GRID_GATEWAY_ADDRESS`), or a previously probed site lost it |
 | `TlsVerified` | Active | TLS handshake succeeded; certificate chain, identity, and configured pin verified |
 | `IdentityVerificationRequired` | Connecting | TCP endpoint is reachable, but plaintext cannot establish the gateway identity |
@@ -622,6 +777,9 @@ A discovered SWIM peer is not automatically authorized for routing.
 - Pending → Discovered: the `GridNetwork` controller writes `Discovered` when a remote SWIM
   peer is first observed as Alive (requires `grid.praxis.fast/auto-discover-sites: "true"`
   label on the `GridNetwork`).
+- Pending → Connecting: the `GridSite` controller advances a declared site (one without
+  the `grid.praxis.fast/auto-discovered` label) that sets a dialable
+  `spec.gatewayEndpoint.address`, so it does not wait on SWIM.
 - Discovered → Connecting: the `GridSite` controller advances automatically when
   `spec.gatewayEndpoint.address` is non-empty. For auto-discovered sites, the egress address comes from
   the remote operator's `GRID_GATEWAY_ADDRESS` env var, propagated via SWIM state broadcast.
@@ -669,6 +827,26 @@ structural check passed.  It does **not** mean:
 Private keys, bearer tokens, provider credentials, and Kubernetes Secret contents must never
 be written to status.
 
+**Signals endpoint:** under Local membership a site serves its signals by default at its
+gateway endpoint's host, under the TLS server name `<site>-signals.grid.internal`, where `<site>` is
+the GridSite name. The port is the gateway's own, for a site whose one router selects the
+signals listener by server name, such as an OpenShift passthrough Route. The operator flag
+`GRID_SIGNALS_PEER_ENDPOINT_PORT` (chart `signals.peerEndpointPort`) sets one port for the
+grid instead, for sites whose one load balancer carries both. A site whose signals sit
+elsewhere sets the optional `spec.signalsEndpoint`, and each field it sets replaces the
+derived one. Loopback, link-local, and cloud metadata hosts are not dialled.
+
+**`spec.signalsEndpoint` fields**, all optional:
+
+| Field | Meaning |
+|---|---|
+| `address` | Signals listener `host:port`. Absent, the gateway endpoint's host |
+| `serverName` | TLS server name sent to the listener. Absent, `<site>-signals.grid.internal` |
+
+The address carries the port. Without one, the gateway endpoint's host is dialled at the
+operator's signals port setting, or at the gateway's own port. The poller verifies the peer
+by pin or SPIFFE ID, so the server name need not appear in the peer's certificate.
+
 **`spec.gatewayEndpoint.tls` fields:**
 
 | Field | Meaning |
@@ -714,6 +892,44 @@ and its mTLS gateway probe (`spec.gatewayEndpoint` + `spec.trust`) apply to reac
 
 See [Routing eligibility](routing.md#routing-eligibility) for the full gating rule.
 
+### Peer conditions under Local membership
+
+Under Local membership the lease holder writes two conditions on each peer's
+`GridSite`, each under its own field manager. They are this site's view of the peer.
+Neither gates the phase or `Available`. A `False` one raises the peer's `Degraded`,
+`SignalsReachable` first, then `CatalogAccepted`. `Degraded` copies its reason, and its
+message names the condition. The GridSite controller writes `Degraded` on the reconcile
+that the poller's write triggers.
+
+`SignalsReachable` (`grid-operator-peer-reach`) says whether the peer's signals endpoint
+answered the last poll. The message carries the polled address and the detail.
+
+| Status | Reason | When |
+|---|---|---|
+| `True` | `SignalsReachable` | The peer's signals endpoint answered. |
+| `Unknown` | `AwaitingFirstCheck` | The peer has not yet answered or failed a poll. |
+| `False` | `NotFound` | It answered 404: check its signals endpoint and port. |
+| `False` | `Timeout` | It did not answer in time. |
+| `False` | `TLSRefused` | The TLS handshake or the peer's identity was refused. |
+| `False` | `ConnectionRefused` | The connection was refused or never established. |
+| `False` | `RequestFailed` | Any other failure, named in the message. |
+| `False` | `EgressOnly` | The peer declares no signals endpoint, so it is not polled: set `spec.signalsEndpoint`, or a dialable `spec.gatewayEndpoint`, to poll it. It raises neither the peer's `Degraded` nor the `GridNetwork` count. |
+
+`CatalogAccepted` (`grid-operator-peer-catalogs`) says whether the peer's catalog was
+accepted in the last rendering. It is written once a catalog is held.
+
+| Status | Reason | When |
+|---|---|---|
+| `True` | `CatalogAccepted` | The peer's catalog is accepted, in full or up to what it may contribute. Each declared peer is owed the overlay's 1024-candidate ceiling divided by the peers, one candidate per model; what is left once every peer has its share goes to the peers over theirs in the order their catalogs first arrived. A peer is never refused for its size: past what it may contribute, the rest of its catalog waits, models in name order, and the message counts how many of its candidates wait and names who took the rest. The message also names what the peer holds that another peer also names, and the peers it leaves short by taking the remainder. |
+| `False` | `OwnCluster` | A record names one of this site's own clusters. |
+| `False` | `HopClaimed` | A record names a cluster bound to another site's gateway hop. The message names that site. |
+| `False` | `ClusterClaimed` | A record names a cluster another peer holds by declaration: the cluster is bound to that peer's gateway hop, or carries that peer's name. The message names the holder. |
+| `False` | `ClusterContested` | A record names a cluster another peer also names, and nothing declares whose it is, so no peer routes it until the names differ. The message names the other peers. |
+
+A peer that leaves the Local peer set loses both conditions on the next round, and an
+operator that starts under Swim removes them once. Either way the peer's `Degraded`
+returns to `False` on its next reconcile.
+
 Example status (Mutual TLS verified):
 
 ```yaml
@@ -749,7 +965,9 @@ status:
 ### Status conditions
 
 The operator writes `Connected` and the roll-up beside the phase, which stays for
-v1alpha1 readers. `Connected` is the only gate.
+v1alpha1 readers. On a peer, `Connected` is the only gate. Under Local membership, a
+`False` `SignalsReachable` or `CatalogAccepted` raises `Degraded`, as
+[Peer conditions under Local membership](#peer-conditions-under-local-membership) lists.
 
 A peer's `GridSite` is a local object, and its conditions record what this site
 observes of that peer. Status is never shared between sites, so two sites can
@@ -767,8 +985,14 @@ disagree about one peer during a partition. The peer's own health is in its own
 | `False` | `TLSProtocolError` | The TLS handshake failed or timed out at the protocol level. |
 | `False` | `UntrustedIssuer`, `IdentityMismatch`, `CertificateExpired`, `CertificateNotYetValid`, `PinMismatch`, `TrustMaterialMissing`, `TrustMaterialInvalid`, `IdentityVerificationRequired` | The probe's trust failure, named as the probe reports it. |
 
-`Connected` is applied by the field manager `grid-operator-probe`, and the roll-up
-by `grid-operator-site`. The phase stays a merge patch.
+`Connected` and the roll-up have separate writers. The phase stays a merge patch.
+
+This cluster's own site rolls up the same way, from a probe of its own gateway, and
+its GridSite says nothing about its identity. The identity conditions live on the
+GridNetwork, where `Accepted`, `ResolvedRefs`, `Enrolled` and `IdentityValid` gate the
+roll-up in that order. There `Degraded` is `True` while `RotationOnSchedule` is `False`,
+the early warning that the identity is about to expire, and `Progressing` is `True`
+while an enrollment is in flight or retried.
 
 ## InferenceProvider
 

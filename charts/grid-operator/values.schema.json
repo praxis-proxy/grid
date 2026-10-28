@@ -54,6 +54,20 @@
             "spiffe"
           ]
         },
+        "membership": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "source": {
+              "description": "Where this site learns its members: Swim, or Local, where this site's configuration lists its peers as GridSites polled at their derived signals endpoints.",
+              "type": "string",
+              "enum": [
+                "Swim",
+                "Local"
+              ]
+            }
+          }
+        },
         "signals": {
           "description": "Signal transport, gossip or poll. Empty keeps the GridNetwork default.",
           "type": "string",
@@ -551,6 +565,34 @@
             }
           }
         },
+        "maxHandshakesPerSource": {
+          "description": "Concurrent handshakes one source address may hold. Empty keeps the operator default.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            {
+              "type": "string",
+              "maxLength": 0
+            }
+          ]
+        },
+        "peerEndpointPort": {
+          "description": "Port each peer serves signals on, under Local membership, at its gateway endpoint's host. Empty dials the gateway's own port under <site>-signals.grid.internal.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            {
+              "type": "string",
+              "maxLength": 0
+            }
+          ]
+        },
         "peerIntervalSeconds": {
           "description": "Seconds between peer signal polls, 1 to 99999. Every site polls every other alive site, so a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator default.",
           "oneOf": [
@@ -578,6 +620,59 @@
               "pattern": "^$|^[1-9][0-9]{0,4}$"
             }
           ]
+        },
+        "route": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "An OpenShift Route in front of the signals Service.",
+          "properties": {
+            "enabled": {
+              "description": "auto renders the Route where the cluster serves route.openshift.io/v1; true or false forces it.",
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "string",
+                  "enum": [
+                    "auto",
+                    "true",
+                    "false"
+                  ]
+                }
+              ]
+            },
+            "host": {
+              "type": "string",
+              "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)?$",
+              "description": "External hostname peers dial, the name the router matches the SNI against. No wildcard."
+            },
+            "annotations": {
+              "type": "object",
+              "description": "Extra Route annotations. They override rateLimit's on a key clash."
+            },
+            "rateLimit": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Per-source-IP connection limits in the router.",
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "description": "Render the rate-limit annotations."
+                },
+                "concurrentTcp": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Concurrent TCP connections per source IP."
+                },
+                "rateTcp": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "TCP connection rate per source IP, in the router's rate window."
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -737,19 +832,59 @@
       "type": "string",
       "description": "Priority class for the operator pod."
     },
+    "operatorConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "This operator's own settings, a ConfigMap it watches.",
+      "properties": {
+        "create": {
+          "type": "boolean",
+          "description": "Render the ConfigMap."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$",
+          "description": "ConfigMap name, in the release namespace."
+        }
+      }
+    },
     "enrollment": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Site auto-enroll on startup.",
+      "description": "The operator config's site section: the site name, signerEndpoint with its rotation, and inviteSecretRef.",
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Enroll on startup when the site identity Secret is absent."
+          "description": "Name the signer and the invite, so the operator enrolls the site."
         },
         "url": {
           "type": "string",
           "pattern": "^(https://[^\\s]+)?$",
-          "description": "Enrollment service base URL (https)."
+          "description": "Signer base URL (https), site.signerEndpoint.url."
+        },
+        "hub": {
+          "type": "boolean",
+          "description": "The grid-enrollment release runs on this cluster, so url defaults to its in-cluster Service."
+        },
+        "hubService": {
+          "type": "string",
+          "pattern": "^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)?$",
+          "description": "With hub set and no url, the grid-enrollment release's full name."
+        },
+        "hubPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "With hub set and no url, the grid-enrollment Service's port."
+        },
+        "rotation": {
+          "enum": [
+            "",
+            "Enabled",
+            "Disabled"
+          ],
+          "description": "Whether the operator renews the site identity through the signer, site.signerEndpoint.rotation. Empty renders Disabled unless grid.peerTrust is spiffe."
         },
         "siteName": {
           "type": "string",
@@ -759,13 +894,8 @@
         "caBundle": {
           "type": "object",
           "additionalProperties": false,
-          "description": "CA bundle that pins the enrollment server, from at most one of configMap and secret.",
+          "description": "CA bundle that pins the signer to enroll, a Secret. ConfigMap bundles are refused.",
           "properties": {
-            "configMap": {
-              "type": "string",
-              "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
-              "description": "ConfigMap holding the bundle."
-            },
             "secret": {
               "type": "string",
               "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
@@ -775,33 +905,14 @@
               "type": "string",
               "minLength": 1,
               "description": "Key holding the PEM bundle."
-            }
-          },
-          "not": {
-            "required": [
-              "configMap",
-              "secret"
-            ],
-            "properties": {
-              "configMap": {
-                "minLength": 1
-              },
-              "secret": {
-                "minLength": 1
-              }
             }
           }
         },
         "gridCaBundle": {
           "type": "object",
           "additionalProperties": false,
-          "description": "Grid CA the returned CA must match, from at most one of configMap and secret.",
+          "description": "Grid CA the returned CA must match, a Secret.",
           "properties": {
-            "configMap": {
-              "type": "string",
-              "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
-              "description": "ConfigMap holding the bundle."
-            },
             "secret": {
               "type": "string",
               "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
@@ -812,42 +923,17 @@
               "minLength": 1,
               "description": "Key holding the PEM bundle."
             }
-          },
-          "not": {
-            "required": [
-              "configMap",
-              "secret"
-            ],
-            "properties": {
-              "configMap": {
-                "minLength": 1
-              },
-              "secret": {
-                "minLength": 1
-              }
-            }
           }
         },
         "identitySecretName": {
           "type": "string",
           "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
-          "description": "Secret the site identity is written to when no GridNetwork names one."
+          "description": "Identity Secret the rendered GridNetwork names."
         },
         "caSecretName": {
           "type": "string",
           "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$",
-          "description": "Secret the grid CA is written to when no GridNetwork names one."
-        },
-        "rotation": {
-          "type": "object",
-          "additionalProperties": false,
-          "description": "Rotating the site identity before it expires.",
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "description": "Rotate the site identity, presenting the current one."
-            }
-          }
+          "description": "Grid CA Secret the rendered GridNetwork names."
         },
         "tokenSecretRef": {
           "type": "object",
@@ -865,6 +951,15 @@
               "description": "Key holding the token."
             }
           }
+        },
+        "signerHosts": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\s,/]+$"
+          },
+          "description": "Signer hosts, host or host:port, the operator config may name. Empty defaults to the host and port of enrollment.url."
         }
       }
     },

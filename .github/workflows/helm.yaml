@@ -214,7 +214,7 @@ jobs:
   # ----------------------------------------------------------------------------
 
   publish:
-    needs: [images, kind, kind-enrollment, kind-hub-site, upgrade]
+    needs: [images, kind, kind-enrollment, kind-local-membership, kind-hub-site, upgrade]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -276,18 +276,26 @@ jobs:
           rm /tmp/kind
           kind version
 
-      - name: Download operator image
+      # Every image the kind path installs, as the hub-site legs download them. The operator
+      # alone was not enough: the enrollment chart then installed its published default, which
+      # on a release branch is a tag that does not exist yet, so its pods waited out a pull
+      # that could not succeed and the job hung on helm test.
+      - name: Download images
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: image-operator
+          pattern: image-*
           path: /tmp/images
+          merge-multiple: true
 
-      - name: Load operator image
-        run: docker load -i /tmp/images/grid-operator.tar
+      - name: Load images
+        run: |
+          for name in operator enrollment; do
+            docker load -i "/tmp/images/grid-${name}.tar"
+          done
 
       - name: Run Kind lifecycle tests
         run: |
-          KIND=1 GRID_OPERATOR_CI_TAG=ci ./scripts/verify-helm-chart.sh
+          KIND=1 GRID_IMAGE_TAG=ci ./scripts/verify-helm-chart.sh
 
       - name: Upload test logs
         if: always()
@@ -561,6 +569,66 @@ jobs:
   # installs the grid, then SWIM, mTLS serving, peer trust, and log health.
   # ----------------------------------------------------------------------------
 
+  # Local membership with its records delivered from outside the grid, which is what an Open
+  # Cluster Management hub does on a real fleet. The leg applies the records itself rather
+  # than running OCM, so this proves the grid's side of that contract and not the delivery
+  # mechanism. A leg that runs OCM is separate and much slower.
+  kind-local-membership:
+    needs: [changes, images]
+    if: needs.changes.outputs.runtime == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install Kind
+        run: |
+          curl -fsSL -o /tmp/kind \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54  /tmp/kind" | sha256sum -c
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          rm /tmp/kind
+          kind version
+
+      - name: Download operator image
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-operator
+          path: /tmp/images
+
+      - name: Load operator image
+        run: docker load -i /tmp/images/grid-operator.tar
+
+      - name: Run the delivered-records e2e (records applied as OCM would deliver them)
+        run: |
+          IMAGE_REPO=ghcr.io/praxis-proxy/grid-operator IMAGE_TAG=ci \
+            ./scripts/e2e-acm-path.sh
+
+      - name: Export cluster logs
+        if: failure()
+        run: |
+          for site in east west; do
+            kind export logs "/tmp/local-membership-logs/${site}" --name "grid-acm-${site}" || true
+          done
+
+      - name: Upload cluster logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: local-membership-logs
+          path: /tmp/local-membership-logs/
+          if-no-files-found: ignore
+          retention-days: 5
+
   kind-hub-site:
     name: kind-hub-site (${{ matrix.leg }})
     needs: [changes, images]
@@ -580,6 +648,8 @@ jobs:
           - peer-trust-mode: pin
             ha: "1"
             leg: pin, HA faults
+          - peer-trust-mode: local
+            leg: Local membership, no SWIM seed
     timeout-minutes: 60
     permissions:
       contents: read

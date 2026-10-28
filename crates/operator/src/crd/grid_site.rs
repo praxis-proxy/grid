@@ -1,9 +1,11 @@
 //! [`GridSite`] custom resource definition.
 //!
-//! Represents a remote site in the grid. Created manually for
-//! seed peers or automatically by SWIM discovery. The status
+//! Represents a site in the grid. A peer is created manually for
+//! seed peers or automatically by SWIM discovery, and its status
 //! tracks the site lifecycle from discovery through mTLS
-//! establishment to active connectivity.
+//! establishment to active connectivity. Status is membership only,
+//! each cluster's view of one site, this cluster's own site included:
+//! its enrollment and identity conditions live on the `GridNetwork`.
 
 use kube::CustomResource;
 use schemars::JsonSchema;
@@ -70,6 +72,36 @@ pub struct GridSiteSpec {
     /// material.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust: Option<GridSiteTrustPolicy>,
+
+    /// Where this site serves its signals, where its gateway endpoint does not say.
+    ///
+    /// Absent, signals are polled at the gateway endpoint's host under the server name
+    /// `<site>-signals.grid.internal`, at the operator's signals port setting or the gateway's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signals_endpoint: Option<GridSiteSignalsEndpoint>,
+}
+
+/// Where a site serves its signals. Each field left out falls back to the derived endpoint.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GridSiteSignalsEndpoint {
+    /// `host:port` of the signals listener: a DNS name, an IPv4 address, or a bracketed IPv6
+    /// address. Absent, the gateway endpoint's host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        length(min = 3, max = 263),
+        regex(pattern = r"^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):[0-9]{1,5}$")
+    )]
+    pub address: Option<String>,
+
+    /// TLS server name sent to the signals listener, which a router in front selects on.
+    /// Absent, `<site>-signals.grid.internal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        length(min = 1, max = 253),
+        regex(pattern = r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$")
+    )]
+    pub server_name: Option<String>,
 }
 
 /// Trust policy controlling when a [`GridSite`] can advance to `Active`.
@@ -123,6 +155,43 @@ pub struct EgressConfig {
     /// TLS mode for the connection.
     #[serde(default)]
     pub tls: EgressTls,
+}
+
+impl GridSite {
+    /// Where this site serves signals: `spec.signalsEndpoint` where it says, else the gateway
+    /// endpoint's host, at `port` (the operator's signals port setting) when set, else at the
+    /// gateway's own port behind the same router. `None` when that is not dialable.
+    #[must_use]
+    pub fn signals_endpoint(&self, port: Option<u16>) -> Option<crate::signals::SignalsEndpoint> {
+        let declared = self.spec.signals_endpoint.as_ref();
+        let address = declared
+            .and_then(|declared| declared.address.as_deref())
+            .map(str::trim)
+            .filter(|address| !address.is_empty());
+        let endpoint = if let Some(address) = address {
+            crate::signals::SignalsEndpoint::parse(address)?
+        } else {
+            let base = crate::signals::SignalsEndpoint::parse(self.spec.gateway_endpoint.as_ref()?.address.trim())?;
+            match port {
+                Some(port) => base.with_port(port),
+                None => base,
+            }
+        };
+        Some(endpoint).filter(crate::signals::SignalsEndpoint::is_dialable)
+    }
+
+    /// The TLS server name this site's signals are polled under: `spec.signalsEndpoint.serverName`
+    /// where set, else `<name>-signals.grid.internal`.
+    #[must_use]
+    pub fn signals_server_name(&self, name: &str) -> String {
+        self.spec
+            .signals_endpoint
+            .as_ref()
+            .and_then(|declared| declared.server_name.as_deref())
+            .map(str::trim)
+            .filter(|server_name| !server_name.is_empty())
+            .map_or_else(|| crate::signals::signals_server_name(name), str::to_ascii_lowercase)
+    }
 }
 
 /// TLS configuration for site egress.
@@ -180,7 +249,10 @@ pub struct GridSiteStatus {
     pub capabilities: SiteCapabilities,
 
     /// Observed conditions: `Connected`, and the `Available`, `Progressing` and `Degraded`
-    /// roll-up. The phase stays, kept for v1alpha1 readers.
+    /// roll-up, on every site, this cluster's own included. Its `Accepted`, `ResolvedRefs`,
+    /// `Enrolled`, `IdentityValid` and `RotationOnSchedule` live on the `GridNetwork`. Under
+    /// Local membership, a peer's also carries this site's `SignalsReachable` and
+    /// `CatalogAccepted` view of it. The phase stays, kept for v1alpha1 readers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(extend("x-kubernetes-list-type" = "map", "x-kubernetes-list-map-keys" = ["type"]))]
     pub conditions: Vec<Condition>,
@@ -582,5 +654,147 @@ mod tests {
             }),
             "CRD must reject both endpoint names"
         );
+    }
+
+    #[test]
+    fn the_own_site_carries_no_local_config() {
+        let crd = crd_json();
+        assert!(
+            crd.pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/local")
+                .is_none(),
+            "this site's own config lives in the operator ConfigMap"
+        );
+    }
+
+    fn site_at(address: &str) -> GridSite {
+        let mut site = GridSite::new(
+            "peer",
+            GridSiteSpec {
+                grid_network_ref: "net".to_owned(),
+                gateway_endpoint: Some(EgressConfig {
+                    address: address.to_owned(),
+                    tls: EgressTls::default(),
+                }),
+                region: None,
+                sovereignty_zone: None,
+                zone: None,
+                trust: None,
+                signals_endpoint: None,
+            },
+        );
+        site.status = None;
+        site
+    }
+
+    #[test]
+    fn the_signals_endpoint_is_the_gateway_host_at_the_signals_port_or_the_gateway_port() {
+        for (address, port, authority) in [
+            ("peer.example.com:443", None, "peer.example.com:443"),
+            ("Peer.Example.com:443", None, "peer.example.com:443"),
+            ("203.0.113.7:8443", Some(9091), "203.0.113.7:9091"),
+            ("[2001:db8::2]:8443", Some(9091), "[2001:db8::2]:9091"),
+        ] {
+            let endpoint = site_at(address).signals_endpoint(port);
+            assert_eq!(endpoint.map(|e| e.authority()).as_deref(), Some(authority), "{address}");
+        }
+    }
+
+    #[test]
+    fn no_signals_endpoint_is_derived_from_an_undialable_gateway_endpoint() {
+        for address in [
+            "",
+            "peer",
+            "peer:0",
+            "https://peer:443",
+            "127.0.0.1:443",
+            "169.254.169.254:80",
+            "[::1]:443",
+        ] {
+            assert!(
+                site_at(address).signals_endpoint(None).is_none(),
+                "{address:?} must not be dialled"
+            );
+        }
+        let mut site = site_at("peer:443");
+        site.spec.gateway_endpoint = None;
+        assert!(site.signals_endpoint(None).is_none(), "no gateway endpoint");
+    }
+
+    fn declared(address: Option<&str>, server_name: Option<&str>) -> GridSiteSignalsEndpoint {
+        GridSiteSignalsEndpoint {
+            address: address.map(str::to_owned),
+            server_name: server_name.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_declared_signals_endpoint_overrides_the_derived_one_field_by_field() {
+        for (signals, flag, authority) in [
+            (
+                declared(Some("signals.example.com:9443"), None),
+                Some(9091),
+                "signals.example.com:9443",
+            ),
+            (
+                declared(None, Some("east-signals.example.com")),
+                Some(9091),
+                "peer.example.com:9091",
+            ),
+            (declared(None, None), None, "peer.example.com:443"),
+        ] {
+            let mut site = site_at("peer.example.com:443");
+            site.spec.signals_endpoint = Some(signals.clone());
+            let endpoint = site.signals_endpoint(flag);
+            assert_eq!(
+                endpoint.map(|e| e.authority()).as_deref(),
+                Some(authority),
+                "{signals:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_address_needs_no_gateway_endpoint_and_must_be_dialable() {
+        let mut site = site_at("peer:443");
+        site.spec.gateway_endpoint = None;
+        site.spec.signals_endpoint = Some(declared(Some("signals.example.com:9443"), None));
+        assert!(site.signals_endpoint(None).is_some());
+        site.spec.signals_endpoint = Some(declared(Some("127.0.0.1:9443"), None));
+        assert!(
+            site.signals_endpoint(None).is_none(),
+            "a loopback address is not dialled"
+        );
+    }
+
+    #[test]
+    fn the_signals_server_name_is_declared_or_derived_from_the_site() {
+        let mut site = site_at("peer:443");
+        assert_eq!(site.signals_server_name("east"), "east-signals.grid.internal");
+        site.spec.signals_endpoint = Some(declared(None, Some("East-Signals.Example.com")));
+        assert_eq!(site.signals_server_name("east"), "east-signals.example.com");
+    }
+
+    #[test]
+    fn the_declared_signals_endpoint_is_optional_in_the_schema() {
+        let crd = crd_json();
+        let spec = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec")
+            .cloned()
+            .unwrap_or_default();
+        assert!(spec.pointer("/properties/signalsEndpoint/properties/address").is_some());
+        assert!(
+            spec.pointer("/properties/signalsEndpoint/properties/serverName")
+                .is_some()
+        );
+        assert!(
+            spec.pointer("/properties/signalsEndpoint/properties/port").is_none(),
+            "the address carries the port"
+        );
+        let required = spec
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(!required.iter().any(|field| field == "signalsEndpoint"));
     }
 }

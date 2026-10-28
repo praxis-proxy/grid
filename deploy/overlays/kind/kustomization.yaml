@@ -11,11 +11,14 @@ resources:
   - clusterrole-resources.yaml
   - clusterrolebinding-crd.yaml
   - clusterrolebinding-metrics-scraper.yaml
+  - configmap-config.yaml
   - deployment.yaml
   - role-leader-election.yaml
   - role-metrics-scraper-token.yaml
+  - role-operator-config.yaml
   - rolebinding-leader-election.yaml
   - rolebinding-metrics-scraper-token.yaml
+  - rolebinding-operator-config.yaml
   - rolebinding-resources-default.yaml
   - rolebinding-resources.yaml
   - service-metrics.yaml
@@ -27,4 +30,4 @@ labels:
   - pairs:
       app.kubernetes.io/name: grid-operator
       app.kubernetes.io/managed-by: kustomize
-      app.kubernetes.io/version: "v0.2.2"
+      app.kubernetes.io/version: "v0.3.0-rc.1"

@@ -1,6 +1,7 @@
 suite: enrolled site defaults
 templates:
   - templates/deployment.yaml
+  - templates/configmap-operator-config.yaml
   - templates/service-swim.yaml
   - templates/rolebindings-resources.yaml
 release:
@@ -12,31 +13,103 @@ tests:
     set:
       swim.siteName: hub
       enrollment.enabled: true
+      enrollment.hub: true
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
-          content: { name: GRID_ENROLL_URL, value: "https://grid-enrollment.grid-enrollment.svc:8443" }
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content: { name: GRID_ENROLL_SITE_NAME, value: hub }
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content: { name: GRID_ENROLL_TOKEN_SECRET, value: grid-invite-hub }
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content: { name: GRID_ENROLL_IDENTITY_SECRET, value: grid-site-identity }
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content: { name: GRID_ENROLL_CA_SECRET, value: grid-ca }
+          content: { name: GRID_SWIM_SITE_NAME, value: hub }
       - contains:
           path: spec.template.spec.containers[0].env
           content: { name: GRID_GATEWAY_SERVICE_NAME, value: grid-gateway }
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_ENROLL_URL, value: "https://grid-enrollment.grid-enrollment.svc:8443" }
+
+  - it: a hub's operator config enrolls through the in-cluster signer, rotation Disabled under pin
+    template: templates/configmap-operator-config.yaml
+    set:
+      swim.siteName: hub
+      enrollment.enabled: true
+      enrollment.hub: true
+    asserts:
+      - equal:
+          path: data["config.yaml"]
+          value: |
+            site:
+              name: "hub"
+              signerEndpoint:
+                url: "https://grid-enrollment.grid-enrollment.svc:8443"
+                caBundleRef:
+                  kind: Secret
+                  name: "grid-ca-bundle"
+                  key: "ca.crt"
+                rotation: "Disabled"
+              inviteSecretRef:
+                name: "grid-invite-hub"
+                key: "token"
+
+  - it: a hub whose bootstrap issued its identity names its signer with enrollment off
+    template: templates/configmap-operator-config.yaml
+    set:
+      swim.siteName: hub
+      enrollment.hub: true
+    asserts:
+      - equal:
+          path: data["config.yaml"]
+          value: |
+            site:
+              name: "hub"
+              signerEndpoint:
+                url: "https://grid-enrollment.grid-enrollment.svc:8443"
+                rotation: "Disabled"
+
+  - it: a hub with enrollment off allows its in-cluster signer host and guards its namespace
+    templates:
+      - templates/deployment.yaml
+      - templates/rolebindings-resources.yaml
+    set:
+      swim.siteName: hub
+      enrollment.hub: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_SIGNER_HOSTS, value: "grid-enrollment.grid-enrollment.svc:8443" }
+        template: templates/deployment.yaml
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_CREATE_LOCAL_RECORDS, value: "false" }
+        template: templates/deployment.yaml
+
+  - it: a hub with enrollment off and its own hubPort names that port
+    template: templates/configmap-operator-config.yaml
+    set:
+      swim.siteName: hub
+      enrollment.hub: true
+      enrollment.hubPort: 9443
+      rbac.enrollmentNamespace: signer
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'url: "https://grid-enrollment\.signer\.svc:9443"'
+
+  - it: a hub under spiffe leaves rotation to the operator default, Enabled
+    template: templates/configmap-operator-config.yaml
+    set:
+      swim.siteName: hub
+      grid.peerTrust: spiffe
+      enrollment.enabled: true
+      enrollment.hub: true
+    asserts:
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: rotation
 
   - it: enrollment brings a LoadBalancer SWIM Service
     template: templates/service-swim.yaml
     set:
       swim.siteName: hub
       enrollment.enabled: true
+      enrollment.hub: true
     asserts:
       - equal:
           path: spec.type
@@ -47,6 +120,7 @@ tests:
     set:
       swim.siteName: hub
       enrollment.enabled: true
+      enrollment.hub: true
       swim.service.enabled: false
     asserts:
       - hasDocuments:
@@ -74,55 +148,7 @@ tests:
     set:
       swim.siteName: hub
       enrollment.enabled: true
+      enrollment.hub: true
     asserts:
       - failedTemplate:
           errorPattern: must not get operator Secret access
-
-  - it: an enrolled site rotates its identity by default
-    template: templates/deployment.yaml
-    set:
-      swim.siteName: east
-      enrollment.enabled: true
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content: { name: GRID_ROTATION_ENABLED, value: "true" }
-
-  - it: a hub whose identity bootstrap issued rotates with only the enrollment URL
-    template: templates/deployment.yaml
-    set:
-      swim.siteName: hub
-      enrollment.url: https://grid-enrollment.grid-enrollment.svc:8443
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content: { name: GRID_ROTATION_ENABLED, value: "true" }
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content: { name: GRID_ENROLL_URL, value: "https://grid-enrollment.grid-enrollment.svc:8443" }
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content: { name: GRID_ENROLL_IDENTITY_SECRET, value: grid-site-identity }
-      - notContains:
-          path: spec.template.spec.containers[0].env
-          content: { name: GRID_ENROLL_ENABLED, value: "true" }
-
-  - it: rotation can be turned off
-    template: templates/deployment.yaml
-    set:
-      swim.siteName: east
-      enrollment.enabled: true
-      enrollment.rotation.enabled: false
-    asserts:
-      - notContains:
-          path: spec.template.spec.containers[0].env
-          content: { name: GRID_ROTATION_ENABLED, value: "true" }
-
-  - it: without an enrollment URL nothing rotates
-    template: templates/deployment.yaml
-    set:
-      swim.siteName: east
-    asserts:
-      - notContains:
-          path: spec.template.spec.containers[0].env
-          content: { name: GRID_ROTATION_ENABLED, value: "true" }

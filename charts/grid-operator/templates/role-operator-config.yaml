@@ -1,0 +1,33 @@
+{{- if .Values.rbac.create }}
+{{- $fullname := include "grid-operator.fullname" . }}
+# The operator config is watched, so an edit applies without a restart. Read only: the
+# watch names the ConfigMap, so list and watch are confined to it too.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-operator-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "grid-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: [{{ .Values.operatorConfig.name | quote }}]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-operator-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "grid-operator.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "grid-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ $fullname }}-operator-config
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

@@ -60,6 +60,8 @@ pub(crate) enum Refusal {
     ServerNameNeeded,
     /// The endpoint host is not a DNS hostname, so it cannot be the server name.
     ServerNameInvalid,
+    /// A remote hop's server name is not the site's own `{site}.grid.internal`.
+    ServerNameNotSite,
 }
 
 impl Refusal {
@@ -80,6 +82,7 @@ impl Refusal {
             Self::EndpointPort => "endpoint port",
             Self::ServerNameNeeded => "server name needed",
             Self::ServerNameInvalid => "server name invalid",
+            Self::ServerNameNotSite => "server name is not the site's",
         }
     }
 }
@@ -300,16 +303,21 @@ fn derive_local(
 }
 
 /// Derive a remote provider-hop entry from the provider site's `GridSite`.
-fn derive_remote(cluster: &str, site: &str, declarations: &Declarations<'_>) -> Result<Resolved, Refusal> {
-    let site = probed_site(site, declarations)?;
+fn derive_remote(cluster: &str, site_name: &str, declarations: &Declarations<'_>) -> Result<Resolved, Refusal> {
+    let site = probed_site(site_name, declarations)?;
     let egress = site.spec.gateway_endpoint.as_ref().ok_or(Refusal::NoEgress)?;
     let address = egress.address.trim();
     if address.is_empty() {
         return Err(Refusal::NoEgress);
     }
     let transport = hop_transport(&egress.tls);
-    if transport.mode == TransportMode::MutualTls && transport.sni.is_none() {
-        return Err(Refusal::NoServerName);
+    if transport.mode == TransportMode::MutualTls {
+        let expected = crate::signals::gateway_server_name(site_name);
+        match transport.sni.as_deref() {
+            None => return Err(Refusal::NoServerName),
+            Some(sni) if !sni.eq_ignore_ascii_case(&expected) => return Err(Refusal::ServerNameNotSite),
+            Some(_) => {},
+        }
     }
     Ok(Resolved {
         endpoint: ClusterEndpointConfig {

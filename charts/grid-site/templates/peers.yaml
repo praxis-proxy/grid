@@ -2,6 +2,10 @@
 {{- $network := .Values.gridNetwork.name }}
 {{- range $name := keys (.Values.peers | default dict) | sortAlpha }}
 {{- $p := get $.Values.peers $name | default dict }}
+{{- $gatewayName := $p.serverName | default (printf "%s.grid.internal" $name) }}
+{{- if ne (lower $gatewayName) (printf "%s.grid.internal" $name) }}
+{{- fail (printf "peers.%s.serverName must be %s.grid.internal, the only name the peer's certificate carries" $name $name) }}
+{{- end }}
 {{- if eq $name $.Values.gridSite.name }}
 {{- fail (printf "peers: %q is this site's own gridSite.name" $name) }}
 {{- end }}
@@ -9,8 +13,13 @@
 apiVersion: grid.praxis.fast/v1alpha1
 kind: GridSite
 metadata:
+  {{- if eq (dig "membership" "source" "Swim" $.Values.grid) "Local" }}
+  {{- /* Under Local membership nothing discovers a peer, so its object is named after the site. */}}
+  name: {{ $name }}
+  {{- else }}
   {{- /* The name the operator gives the peer it discovers over SWIM. */}}
   name: {{ printf "%s-%s" (regexReplaceAll "[^a-z0-9]" ($network | lower) "-" | trimAll "-") $name }}
+  {{- end }}
   labels:
     {{- include "grid-site.labels" $ | nindent 4 }}
     grid.praxis.fast/network: {{ $network | quote }}
@@ -27,7 +36,16 @@ spec:
     address: {{ . | quote }}
     tls:
       mode: Mutual
-      serverName: {{ $p.serverName | default (printf "%s.grid.internal" $name) | quote }}
+      serverName: {{ $gatewayName | quote }}
+  {{- end }}
+  {{- with $p.signalsEndpoint }}
+  signalsEndpoint:
+    {{- with .address }}
+    address: {{ . | quote }}
+    {{- end }}
+    {{- with .serverName }}
+    serverName: {{ . | quote }}
+    {{- end }}
   {{- end }}
   {{- with compact (list $p.digest $p.nextDigest) }}
   trust:

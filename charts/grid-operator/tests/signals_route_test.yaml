@@ -1,0 +1,168 @@
+suite: signals Route
+templates:
+  - templates/route-signals.yaml
+  - templates/deployment.yaml
+capabilities:
+  apiVersions:
+    - route.openshift.io/v1
+set:
+  site.name: east
+  grid.membership.source: Local
+  signals.enabled: true
+  signals.route.host: east-signals.grid.internal
+tests:
+  - it: passes peers through to the signals Service, keeping their client certificates
+    template: templates/route-signals.yaml
+    asserts:
+      - isKind:
+          of: Route
+      - isAPIVersion:
+          of: route.openshift.io/v1
+      - equal:
+          path: spec.host
+          value: east-signals.grid.internal
+      - equal:
+          path: spec.to
+          value:
+            kind: Service
+            name: RELEASE-NAME-grid-operator-signals
+            weight: 100
+      - equal:
+          path: spec.port.targetPort
+          value: signals
+      - equal:
+          path: spec.tls
+          value:
+            termination: passthrough
+            insecureEdgeTerminationPolicy: None
+      - equal:
+          path: spec.wildcardPolicy
+          value: None
+
+  - it: limits connections per source in the router
+    template: templates/route-signals.yaml
+    asserts:
+      - equal:
+          path: metadata.annotations["haproxy.router.openshift.io/rate-limit-connections"]
+          value: "true"
+      - equal:
+          path: metadata.annotations["haproxy.router.openshift.io/rate-limit-connections.concurrent-tcp"]
+          value: "10"
+      - equal:
+          path: metadata.annotations["haproxy.router.openshift.io/rate-limit-connections.rate-tcp"]
+          value: "20"
+
+  - it: takes the limits an install sets
+    template: templates/route-signals.yaml
+    set:
+      signals.route.rateLimit.concurrentTcp: 4
+      signals.route.rateLimit.rateTcp: 6
+    asserts:
+      - equal:
+          path: metadata.annotations["haproxy.router.openshift.io/rate-limit-connections.concurrent-tcp"]
+          value: "4"
+      - equal:
+          path: metadata.annotations["haproxy.router.openshift.io/rate-limit-connections.rate-tcp"]
+          value: "6"
+
+  - it: renders an unlimited Route only when the install says so
+    template: templates/route-signals.yaml
+    set:
+      signals.route.rateLimit.enabled: false
+    asserts:
+      - notExists:
+          path: metadata.annotations["haproxy.router.openshift.io/rate-limit-connections"]
+
+  - it: lets an install add its own annotations, which win on a clash
+    template: templates/route-signals.yaml
+    set:
+      signals.route.annotations:
+        haproxy.router.openshift.io/timeout: 30s
+        haproxy.router.openshift.io/rate-limit-connections.rate-tcp: "99"
+    asserts:
+      - equal:
+          path: metadata.annotations["haproxy.router.openshift.io/timeout"]
+          value: 30s
+      - equal:
+          path: metadata.annotations["haproxy.router.openshift.io/rate-limit-connections.rate-tcp"]
+          value: "99"
+
+  - it: renders no Route when the install turns it off
+    templates:
+      - templates/route-signals.yaml
+    set:
+      signals.route.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: defaults the host to this site's name under the grid trust domain
+    template: templates/route-signals.yaml
+    set:
+      signals.route.host: ""
+    asserts:
+      - equal:
+          path: spec.host
+          value: east-signals.grid.internal
+
+  - it: takes a host as given
+    template: templates/route-signals.yaml
+    set:
+      signals.route.host: east-signals.example.com
+    asserts:
+      - equal:
+          path: spec.host
+          value: east-signals.example.com
+
+  - it: needs a site to name, when neither the host nor site.name is set
+    template: templates/route-signals.yaml
+    set:
+      signals.route.host: ""
+      site.name: ""
+      swim.siteName: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: "signals.route.host needs site.name to default, or set it: peers dial the site's own name and the router picks this backend by it"
+
+  - it: refuses a LoadBalancer beside the Route
+    template: templates/route-signals.yaml
+    set:
+      signals.service.type: LoadBalancer
+    asserts:
+      - failedTemplate:
+          errorMessage: "signals.service.type LoadBalancer beside signals.route publishes the listener twice, on two addresses with different limits: pick the Route or the load balancer"
+
+  - it: raises the handshake cap to the listener's share behind the router
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_SIGNALS_MAX_HANDSHAKES_PER_SOURCE, value: "32" }
+
+  - it: takes a handshake cap an install sets
+    template: templates/deployment.yaml
+    set:
+      signals.maxHandshakesPerSource: 12
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_SIGNALS_MAX_HANDSHAKES_PER_SOURCE, value: "12" }
+
+  - it: refuses a Route to a site that serves no signals
+    template: templates/route-signals.yaml
+    set:
+      signals.enabled: false
+      grid.membership.source: Swim
+    asserts:
+      - failedTemplate:
+          errorMessage: "signals.route needs signals.enabled: a Route to a site that serves no signals answers nothing"
+
+  - it: refuses a Route with no Service behind it
+    template: templates/route-signals.yaml
+    set:
+      grid.membership.source: Swim
+      swim.service.enabled: true
+      signals.service.enabled: false
+    asserts:
+      - failedTemplate:
+          errorMessage: "signals.route needs signals.service.enabled: the Route sends traffic to that Service"

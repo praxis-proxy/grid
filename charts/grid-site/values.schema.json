@@ -214,6 +214,13 @@
         }
       }
     },
+    "grid": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "membership": { "type": "object", "additionalProperties": false, "properties": { "source": { "type": "string", "enum": ["Swim", "Local"], "description": "Where this site learns its members: Swim, or Local, where this site's configuration lists its peers as GridSites polled at their derived signals endpoints." } } }
+      }
+    },
     "gridSite": {
       "type": "object",
       "additionalProperties": false,
@@ -264,7 +271,16 @@
           "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "The peer's leaf certificate SHA-256 (DER)." },
           "nextDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "The next leaf digest during a rotation." },
           "region": { "type": "string" },
-          "zone": { "type": "string" }
+          "zone": { "type": "string" },
+          "signalsEndpoint": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Where the peer serves signals, where its gateway address does not say. Each field left out falls back to the derived endpoint.",
+            "properties": {
+              "address": { "type": "string", "pattern": "^\\S+:[0-9]+$", "description": "Signals listener host:port. Defaults to the gateway address's host." },
+              "serverName": { "type": "string", "minLength": 1, "maxLength": 253, "description": "TLS server name sent. Defaults to <name>-signals.grid.internal." }
+            }
+          }
         }
       }
     },

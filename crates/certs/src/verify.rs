@@ -288,6 +288,20 @@ pub fn cert_dns_sans(cert_pem: &str) -> Result<Vec<String>, VerifyError> {
     })
 }
 
+/// The subject organizations on a certificate, as encoded.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the certificate is oversized or unparseable.
+pub fn cert_organizations(cert_pem: &str) -> Result<Vec<String>, VerifyError> {
+    with_cert(cert_pem, |cert| {
+        cert.subject()
+            .iter_organization()
+            .filter_map(|organization| organization.as_str().ok().map(str::to_owned))
+            .collect()
+    })
+}
+
 /// The public key a certificate request carries, as `SubjectPublicKeyInfo` DER.
 ///
 /// An enrollee proves it is the one that made a request by signing with the key
@@ -452,6 +466,20 @@ pub fn leaf_spiffe_id(leaf_der: &[u8]) -> Option<String> {
     grid_spiffe_id(leaf_der, SPIFFE_TRUST_DOMAIN).ok()
 }
 
+/// Whether a DER leaf whose chain the caller verified names `site` alone: its one grid
+/// SPIFFE ID and its one subject organization both name it.
+#[must_use]
+pub fn leaf_names_site(leaf_der: &[u8], site: &str) -> bool {
+    let Ok((_, leaf)) = X509Certificate::from_der(leaf_der) else {
+        return false;
+    };
+    let mut organizations = leaf.subject().iter_organization();
+    let organization = organizations.next().and_then(|attribute| attribute.as_str().ok());
+    single_spiffe_name(&leaf).is_some_and(|name| name == spiffe_id(site))
+        && organization == Some(site)
+        && organizations.next().is_none()
+}
+
 /// The site a grid SPIFFE ID names, `None` for any other shape.
 #[must_use]
 pub fn site_of_spiffe_id(id: &str) -> Option<&str> {
@@ -495,10 +523,47 @@ mod tests {
         generate::{generate_ca, generate_expired_dns_cert, generate_site_cert},
     };
 
+    #[test]
+    fn a_site_certificate_names_its_site_as_organization_and_grid_dns_name() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let leaf = generate_site_cert(&ca, "east").expect("leaf");
+        assert_eq!(cert_organizations(&leaf.cert_pem).expect("parses"), ["east"]);
+        assert_eq!(cert_dns_sans(&leaf.cert_pem).expect("parses"), ["east.grid.internal"]);
+        assert!(
+            cert_organizations(&ca.cert_pem).expect("parses").is_empty(),
+            "a CA names no site"
+        );
+    }
+
     fn csr_for(_site: &str) -> String {
         let key = rcgen::KeyPair::generate().expect("key");
         let params = rcgen::CertificateParams::default();
         params.serialize_request(&key).expect("csr").pem().expect("pem")
+    }
+
+    fn der_of(pem: &str) -> Vec<u8> {
+        x509_parser::pem::parse_x509_pem(pem.as_bytes())
+            .expect("pem")
+            .1
+            .contents
+    }
+
+    #[test]
+    fn a_leaf_names_a_site_only_in_both_its_spiffe_id_and_its_organization() {
+        let ca = generate_ca("grid-ca").expect("ca");
+        let east = der_of(&generate_site_cert(&ca, "east").expect("east").cert_pem);
+        assert!(leaf_names_site(&east, "east"));
+        assert!(!leaf_names_site(&east, "west"), "another site's name");
+        let borrowed = crate::generate::generate_cert_with_org(&ca, "east", "west").expect("org cert");
+        assert!(
+            !leaf_names_site(&der_of(&borrowed.cert_pem), "east"),
+            "an organization naming another site"
+        );
+        let infra = crate::generate::generate_dns_only_cert(&ca, "east", &["east.svc".to_owned()]).expect("infra");
+        assert!(
+            !leaf_names_site(&der_of(&infra.cert_pem), "east"),
+            "no SPIFFE ID or organization"
+        );
     }
 
     #[test]

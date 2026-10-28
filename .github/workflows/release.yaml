@@ -51,6 +51,7 @@ jobs:
       source_sha: ${{ steps.version.outputs.source_sha }}
       short_sha: ${{ steps.version.outputs.short_sha }}
       build_date: ${{ steps.version.outputs.build_date }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -62,9 +63,15 @@ jobs:
         env:
           TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
-          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Release tag must use the form vMAJOR.MINOR.PATCH"
+          # A pre-release segment is allowed, so a release candidate can be tagged. Build
+          # metadata is not: an OCI tag cannot carry a plus.
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "::error::Release tag must use the form vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-PRERELEASE"
             exit 1
+          fi
+          PRERELEASE=false
+          if [[ "${TAG}" == *-* ]]; then
+            PRERELEASE=true
           fi
           TAG_VERSION="${TAG#v}"
           CARGO_VERSION="$(
@@ -103,6 +110,7 @@ jobs:
             echo "source_sha=${SOURCE_SHA}"
             echo "short_sha=${SOURCE_SHA::7}"
             echo "build_date=$(date -u +%Y%m%d)"
+            echo "prerelease=${PRERELEASE}"
           } >> "${GITHUB_OUTPUT}"
 
   # ----------------------------------------------------------------------------
@@ -523,3 +531,4 @@ jobs:
           --title "Grid $TAG"
           --generate-notes
           --notes-file release-images.md
+          ${{ needs.validate.outputs.prerelease == 'true' && '--prerelease' || '' }}

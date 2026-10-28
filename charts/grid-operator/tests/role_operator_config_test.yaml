@@ -1,0 +1,47 @@
+suite: operator config Role
+templates:
+  - templates/role-operator-config.yaml
+release:
+  name: grid-operator
+  namespace: grid-system
+tests:
+  - it: reads only the operator config, in the release namespace
+    documentIndex: 0
+    asserts:
+      - isKind:
+          of: Role
+      - equal:
+          path: metadata.namespace
+          value: grid-system
+      - equal:
+          path: rules
+          value:
+            - apiGroups: [""]
+              resources: ["configmaps"]
+              resourceNames: ["grid-operator-config"]
+              verbs: ["get", "list", "watch"]
+  - it: follows a renamed config
+    set:
+      operatorConfig.name: site-config
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: rules[0].resourceNames
+          value: ["site-config"]
+  - it: binds the operator's ServiceAccount
+    documentIndex: 1
+    asserts:
+      - isKind:
+          of: RoleBinding
+      - equal:
+          path: roleRef.name
+          value: grid-operator-operator-config
+      - equal:
+          path: subjects[0].name
+          value: grid-operator
+  - it: renders nothing without rbac.create
+    set:
+      rbac.create: false
+    asserts:
+      - hasDocuments:
+          count: 0

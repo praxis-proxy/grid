@@ -142,11 +142,20 @@ The invite tokens get a namespace of their own, `<release-namespace>-invites` un
 out of the release namespace because the enrollment service needs an unscopable `get` on
 Secrets where they live, and that namespace holds the Grid CA signing key.
 
-| Secret | From | To |
-|---|---|---|
-| `grid-invite-<site>` | release namespace | that site only |
-| `grid-ca-bundle` (`ca.crt`) | release namespace | every site |
-| `grid-swim-key` | release namespace | every cluster, hub included |
+| Secret | From | To | Label on the copy |
+|---|---|---|---|
+| `grid-invite-<site>` | release namespace | that site only | `grid.praxis.fast/site=<site>` |
+| `grid-ca-bundle` (`ca.crt`) | release namespace | every site | `grid.praxis.fast/signer-bundle=true` |
+| `grid-swim-key` | release namespace | every cluster, hub included | none |
+
+The operator reads an invite or a signer bundle only when the copy carries its label, so
+a Secret recreated from its data alone is refused. Label the copies in the operator
+namespace, or have the delivery method carry the labels across:
+
+```bash
+kubectl -n grid label secret grid-invite-site-1 grid.praxis.fast/site=site-1
+kubectl -n grid label secret grid-ca-bundle grid.praxis.fast/signer-bundle=true
+```
 
 A key that arrives late is picked up on the next reconcile, within about 30 seconds. No
 restart is needed.
@@ -169,7 +178,11 @@ helm install grid-operator charts/grid-operator -n grid --create-namespace \
   --set image.digest=sha256:<digest>
 ```
 
-The hub adds `--set enrollment.enabled=false`; its identity comes from the bootstrap Job.
+The `enrollment` values render the `site` section of the operator config, the ConfigMap
+`grid-operator-config`, and the operator enrolls from it once the GridNetwork, which
+`grid.id` renders, exists. The hub sets `--set enrollment.enabled=false`, since its identity
+comes from the bootstrap Job. To renew that identity, the hub sets `enrollment.url` to its
+in-cluster `grid-enrollment` Service, which renders a `site` section that renews only.
 
 A SWIM hostname exists only once that site's Service does, so seeding takes a second pass.
 Until then the site has no seeds and runs alone, which is harmless. Once every
@@ -256,4 +269,4 @@ traffic to the node it came from.
 | `no matches for kind "GridNetwork"` on a first install | The chart renders CRDs and their resources in one release. Apply the CRDs first, then install with `crds.enabled=false`. |
 | `cannot be imported into the current release: invalid ownership metadata` | CRDs applied by hand carry no Helm ownership. Install with `crds.enabled=false`. |
 | A site enrolls but the hub never starts SWIM | The hub takes `enrollment.enabled=false` and its identity from the bootstrap Job, a different path. Check the key is in its namespace and restart it. |
-| `rotation disabled: peerTrust pin needs re-enrollment` | Expected under pinned peer trust: identities do not auto-renew. Re-enroll before the certificate expires. |
+| `rotation disabled under pin peer trust` | Expected under pinned peer trust: identities do not auto-renew. Re-enroll before the certificate expires. |

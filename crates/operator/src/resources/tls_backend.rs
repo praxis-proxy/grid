@@ -14,7 +14,10 @@
 use std::sync::OnceLock;
 use std::{borrow::Cow, sync::Arc, time::Duration};
 
-use hyper_util::client::legacy::connect::{HttpConnector, dns::GaiResolver};
+use hyper_util::client::legacy::connect::{
+    HttpConnector,
+    dns::{GaiAddrs, GaiFuture, GaiResolver, Name},
+};
 #[cfg(feature = "fips")]
 use openssl::{
     pkey::{PKey, Private},
@@ -772,6 +775,10 @@ const TCP_KEEPALIVE: Duration = Duration::from_secs(15);
 /// Probes after [`TCP_KEEPALIVE`] before the connection is declared dead.
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
 
+/// How long one TCP connect may take. A peer that drops SYNs would otherwise hold each attempt
+/// until the request's own timeout, leaving nothing for a retry.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Build a TCP connector with the selected resolver and idle-connection probes.
 fn probing_connector_with_resolver<R>(resolver: R) -> HttpConnector<R> {
     let mut http = HttpConnector::new_with_resolver(resolver);
@@ -780,7 +787,56 @@ fn probing_connector_with_resolver<R>(resolver: R) -> HttpConnector<R> {
     http.set_keepalive(Some(TCP_KEEPALIVE));
     http.set_keepalive_interval(Some(TCP_KEEPALIVE));
     http.set_keepalive_retries(Some(TCP_KEEPALIVE_RETRIES));
+    http.set_connect_timeout(Some(CONNECT_TIMEOUT));
     http
+}
+
+/// A resolver that looks one name up as another host.
+///
+/// A peer behind a router that selects on TLS server name is dialled at the
+/// router's address while the URI carries the name, so the name resolves to the
+/// dial host here. Every other name resolves as itself.
+#[derive(Clone, Debug)]
+pub(crate) struct AliasResolver {
+    /// The server name and the host it stands for.
+    alias: Option<(Box<str>, Name)>,
+    /// What resolves the host.
+    inner: GaiResolver,
+}
+
+impl AliasResolver {
+    /// Resolve `server_name` as `host`, or every name as itself when `alias` is `None`.
+    pub(crate) fn new(alias: Option<(&str, &str)>) -> Self {
+        let alias = alias.and_then(|(server_name, host)| match host.parse() {
+            Ok(host) => Some((server_name.into(), host)),
+            Err(error) => {
+                tracing::warn!(server_name, host, %error, "dial host unusable; resolving the server name itself");
+                None
+            },
+        });
+        Self {
+            alias,
+            inner: GaiResolver::new(),
+        }
+    }
+}
+
+impl tower::Service<Name> for AliasResolver {
+    type Error = std::io::Error;
+    type Future = GaiFuture;
+    type Response = GaiAddrs;
+
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Name) -> Self::Future {
+        let name = match &self.alias {
+            Some((server_name, host)) if req.as_str() == &**server_name => host.clone(),
+            _ => req,
+        };
+        self.inner.call(name)
+    }
 }
 
 /// Build an HTTPS connector using native root certificates.
@@ -870,13 +926,7 @@ pub(crate) fn build_custom_tls_connector_with_resolver<R>(
 /// Returns [`MetricsScrapeError::Transport`] if the connector cannot be built.
 #[cfg(feature = "fips")]
 pub(crate) fn build_custom_tls_connector(config: &ClientTlsConfig) -> Result<HttpsConnector, MetricsScrapeError> {
-    config
-        .connector()
-        .map_err(|e| MetricsScrapeError::Transport(e.into()))?;
-    Ok(HttpsConnector::Custom {
-        http: probing_connector_with_resolver(GaiResolver::new()),
-        config: Arc::clone(config),
-    })
+    build_custom_tls_connector_with_resolver(config, GaiResolver::new())
 }
 
 /// Build an HTTPS-only connector using custom TLS material and an explicit DNS resolver.
@@ -901,35 +951,41 @@ pub(crate) fn build_custom_tls_connector_with_resolver<R>(
 /// What a peer's leaf must satisfy once it chains to the grid roots.
 #[derive(Clone, Debug)]
 pub(crate) enum LeafRule {
-    /// Leaf digest is one this site declared.
-    Pins(Vec<[u8; 32]>),
-    /// Leaf carries exactly this SPIFFE ID.
-    Spiffe(String),
+    /// Leaf digest is one this site declared, and the leaf names `site`.
+    Pins {
+        /// Declared leaf digests.
+        pins: Vec<[u8; 32]>,
+        /// The site the leaf must name.
+        site: String,
+    },
+    /// Leaf names exactly this site, in its SPIFFE ID and its organization.
+    Site(String),
 }
 
 impl LeafRule {
     /// Whether the DER leaf satisfies the rule.
     fn accepts(&self, leaf_der: &[u8]) -> bool {
         match self {
-            Self::Pins(pins) => pins.contains(&sha256(leaf_der)),
-            Self::Spiffe(id) => certs::leaf_spiffe_id(leaf_der).as_deref() == Some(id.as_str()),
+            Self::Pins { pins, site } => pins.contains(&sha256(leaf_der)) && certs::leaf_names_site(leaf_der, site),
+            Self::Site(site) => certs::leaf_names_site(leaf_der, site),
         }
     }
 
-    /// The pin rule from declared fingerprints, refusing the peer when empty.
-    fn from_pins(pins: &[String]) -> Result<Self, MetricsScrapeError> {
+    /// The pin rule from declared fingerprints for `site`, refusing the peer when empty.
+    fn from_pins(site: &str, pins: &[String]) -> Result<Self, MetricsScrapeError> {
         if pins.is_empty() {
             return Err(MetricsScrapeError::TlsMaterial(
                 "no declared fingerprints for this peer".to_owned(),
             ));
         }
-        Ok(Self::Pins(
-            pins.iter().map(|pin| decode_pin(pin)).collect::<Result<_, _>>()?,
-        ))
+        Ok(Self::Pins {
+            pins: pins.iter().map(|pin| decode_pin(pin)).collect::<Result<_, _>>()?,
+            site: site.to_owned(),
+        })
     }
 }
 
-/// Client config for a peer that must present `spiffe_id`, chained to the grid roots.
+/// Client config for a peer whose leaf must name `site`, chained to the grid roots.
 ///
 /// # Errors
 ///
@@ -938,17 +994,12 @@ pub(crate) fn build_spiffe_client_config(
     ca_pem: &[u8],
     client_cert_pem: Option<&[u8]>,
     client_key_pem: Option<&[u8]>,
-    spiffe_id: &str,
+    site: &str,
 ) -> Result<ClientTlsConfig, MetricsScrapeError> {
-    build_rule_client_config(
-        ca_pem,
-        client_cert_pem,
-        client_key_pem,
-        LeafRule::Spiffe(spiffe_id.to_owned()),
-    )
+    build_rule_client_config(ca_pem, client_cert_pem, client_key_pem, LeafRule::Site(site.to_owned()))
 }
 
-/// Build a client config that accepts only the leaf keys declared for one peer.
+/// Build a client config that accepts only the leaf keys declared for `site`, naming it.
 ///
 /// # Errors
 ///
@@ -958,9 +1009,15 @@ pub(crate) fn build_pinned_client_config(
     ca_pem: &[u8],
     client_cert_pem: Option<&[u8]>,
     client_key_pem: Option<&[u8]>,
+    site: &str,
     pins: &[String],
 ) -> Result<ClientTlsConfig, MetricsScrapeError> {
-    build_rule_client_config(ca_pem, client_cert_pem, client_key_pem, LeafRule::from_pins(pins)?)
+    build_rule_client_config(
+        ca_pem,
+        client_cert_pem,
+        client_key_pem,
+        LeafRule::from_pins(site, pins)?,
+    )
 }
 
 /// Decode a declared fingerprint into the 32 digest bytes it names.
@@ -1520,6 +1577,30 @@ pub(crate) fn transport_error_details(error: &(dyn std::error::Error + 'static))
     }
 
     (tls, io_kind)
+  
+/// Whether `err` is a server certificate refused only for its validity window, which the
+/// server can fix by rotating without anything on this side changing.
+#[cfg(not(feature = "fips"))]
+pub(crate) fn is_lapsed_certificate(err: &(dyn std::error::Error + 'static)) -> bool {
+    use rustls::{CertificateError, Error};
+    matches!(
+        err.downcast_ref::<Error>(),
+        Some(Error::InvalidCertificate(
+            CertificateError::Expired
+                | CertificateError::ExpiredContext { .. }
+                | CertificateError::NotValidYet
+                | CertificateError::NotValidYetContext { .. }
+        ))
+    )
+}
+
+/// Whether `err` is a server certificate refused only for its validity window, which the
+/// server can fix by rotating without anything on this side changing.
+// native-tls carries the verify result only in its message, as OpenSSL's fixed text.
+#[cfg(feature = "fips")]
+pub(crate) fn is_lapsed_certificate(err: &(dyn std::error::Error + 'static)) -> bool {
+    let text = err.to_string();
+    text.contains("certificate has expired") || text.contains("certificate is not yet valid")
 }
 
 /// Classify a TLS/handshake I/O error into a `GatewayProbeOutcome`.
@@ -1680,6 +1761,7 @@ mod tests {
             ca.cert_pem.as_bytes(),
             Some(client.cert_pem.as_bytes()),
             Some(client.key_pem.as_bytes()),
+            "east",
             &[certs::canonical_fingerprint(&server.cert_pem).expect("server pin")],
         )
         .expect("client TLS");
@@ -1713,17 +1795,48 @@ mod tests {
                 stream.shutdown().await.expect("close");
             }
         });
-        let transport = crate::metrics_scraper::PeerTransport::new(Some(&client_config), Some(Duration::from_secs(8)))
-            .expect("pooled transport");
+        let transport =
+            crate::metrics_scraper::PeerTransport::new(Some(&client_config), Some(Duration::from_secs(8)), None)
+                .expect("pooled transport");
         for connection in [0, 0, 1] {
-            let (body, _) = crate::metrics_scraper::scrape_peer(&url, Duration::from_secs(5), &transport)
-                .await
-                .expect("pooled request or fresh reconnect");
+            let (body, _) = crate::metrics_scraper::scrape_peer(
+                &url,
+                Duration::from_secs(5),
+                &transport,
+                crate::metrics_scraper::MAX_RESPONSE_BODY_BYTES,
+            )
+            .await
+            .expect("pooled request or fresh reconnect");
             assert_eq!(body, format!("connection {connection}\n"));
         }
         tokio::time::timeout(Duration::from_secs(5), serve)
             .await
             .expect("server finished")
             .expect("server task");
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use tower::Service as _;
+
+    use super::AliasResolver;
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "a name that does not parse or resolve fails the test")]
+    async fn an_alias_resolves_as_its_host_and_other_names_as_themselves() {
+        let mut resolver = AliasResolver::new(Some(("east-signals.grid.internal", "localhost")));
+        let aliased: Vec<_> = resolver
+            .call("east-signals.grid.internal".parse().expect("name"))
+            .await
+            .expect("resolved")
+            .collect();
+        assert!(!aliased.is_empty() && aliased.iter().all(|addr| addr.ip().is_loopback()));
+        let plain: Vec<_> = resolver
+            .call("localhost".parse().expect("name"))
+            .await
+            .expect("resolved")
+            .collect();
+        assert_eq!(plain, aliased, "a name outside the alias resolves as itself");
     }
 }

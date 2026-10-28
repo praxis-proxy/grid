@@ -44,6 +44,7 @@ tests:
     set:
       swim.siteName: hub
       enrollment.enabled: true
+      enrollment.hub: true
       grid.signals: poll
       signals.enabled: true
     asserts:

@@ -6,7 +6,7 @@ use clap::{Args, Parser};
 
 use crate::{
     crd::grid_network::{PeerTrustMode, SignalMode},
-    enroll, gateway,
+    gateway,
 };
 
 /// grid-operator command-line interface.
@@ -16,10 +16,6 @@ pub struct Cli {
     /// Gateway self-discovery options.
     #[command(flatten)]
     pub gateway: gateway::Config,
-
-    /// Site auto-enroll options.
-    #[command(flatten)]
-    pub enrollment: enroll::Config,
 
     /// SWIM runtime options.
     #[command(flatten)]
@@ -40,6 +36,19 @@ pub struct Cli {
     /// Leader election options.
     #[command(flatten)]
     pub leader: LeaderArgs,
+
+    /// The `ConfigMap` in the operator namespace holding this operator's own settings.
+    #[arg(
+        long = "operator-config",
+        env = "GRID_OPERATOR_CONFIG",
+        default_value = crate::operator_config::DEFAULT_CONFIG_MAP
+    )]
+    pub operator_config: String,
+
+    /// Signer hosts the operator config may name, comma-separated, each `host` or
+    /// `host:port`. Empty allows any.
+    #[arg(long = "signer-hosts", env = "GRID_SIGNER_HOSTS", default_value = "")]
+    pub signer_hosts: String,
 }
 
 /// Leader election options. With no lease, this replica writes unelected.
@@ -84,10 +93,52 @@ pub struct LeaderArgs {
     pub node_name: Option<String>,
 }
 
+/// Where this site learns its members from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Membership {
+    /// SWIM gossip discovers the members.
+    #[default]
+    #[value(name = "Swim")]
+    Swim,
+    /// This site's configuration lists its peers as `GridSite` objects, and their signals are
+    /// polled.
+    #[value(name = "Local")]
+    Local,
+}
+
+impl Membership {
+    /// The mode `name` names, ignoring case and surrounding space, `None` for any other value.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        let name = name.trim();
+        [Self::Swim, Self::Local]
+            .into_iter()
+            .find(|mode| mode.as_str().eq_ignore_ascii_case(name))
+    }
+
+    /// The name the chart and the signals response use.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Swim => "Swim",
+            Self::Local => "Local",
+        }
+    }
+}
+
 /// Grid-wide modes the install declares, used until its `GridNetwork` exists.
 #[derive(Args, Debug, Clone)]
 #[group(id = "grid")]
 pub struct GridArgs {
+    /// Where this site learns its members from, the chart's grid.membership.source.
+    #[arg(
+        long = "membership-source",
+        env = "GRID_MEMBERSHIP_SOURCE",
+        value_enum,
+        default_value_t = Membership::Swim
+    )]
+    pub membership: Membership,
+
     /// Signal transport to start in with no `GridNetwork`, the chart's grid.signals.
     #[arg(long = "grid-signals", env = "GRID_SIGNAL_TRANSPORT", value_enum)]
     pub signal_transport: Option<SignalMode>,
@@ -99,6 +150,10 @@ pub struct GridArgs {
     /// `GridNetwork` the operator creates for its site when none exists.
     #[arg(long = "grid-network", env = "GRID_NETWORK", default_value = "grid")]
     pub network: String,
+
+    /// This site's name, as `GRID_SWIM_SITE_NAME` gives it, for an install that runs no SWIM.
+    #[arg(id = "grid_site_name", long = "grid-site-name", env = "GRID_SITE_NAME")]
+    pub site_name: Option<String>,
 
     /// Namespace holding the site identity before a `GridNetwork` names it. Defaults to the operator's.
     #[arg(long = "grid-identity-namespace", env = "GRID_IDENTITY_NAMESPACE")]
@@ -121,6 +176,23 @@ pub struct GridArgs {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     pub create_local_records: bool,
+}
+
+impl GridArgs {
+    /// The signal transport to start in: poll under Local membership, which gossip contradicts.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the configured modes contradict each other.
+    pub fn startup_signal_transport(&self) -> Result<Option<SignalMode>, String> {
+        match (self.membership, self.signal_transport) {
+            (Membership::Local, Some(SignalMode::Gossip)) => {
+                Err("GRID_MEMBERSHIP_SOURCE Local polls signals, but GRID_SIGNAL_TRANSPORT is gossip".to_owned())
+            },
+            (Membership::Local, _) => Ok(Some(SignalMode::Poll)),
+            (Membership::Swim, mode) => Ok(mode),
+        }
+    }
 }
 
 /// Metrics and health listener options.
@@ -183,6 +255,27 @@ pub struct SignalsArgs {
     )]
     pub peer_port: u16,
 
+    /// Port a declared peer serves signals on at its gateway endpoint's host, for sites
+    /// whose one load balancer carries both. Unset, the gateway's own port, for sites
+    /// whose one router selects the signals listener by server name.
+    #[arg(
+        long = "signals-peer-endpoint-port",
+        env = "GRID_SIGNALS_PEER_ENDPOINT_PORT",
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
+    pub peer_endpoint_port: Option<u16>,
+
+    /// Concurrent handshakes one source address may hold. Behind a router or a load
+    /// balancer that does not keep the client address, every peer shares one source, so
+    /// raise it to the number of peers.
+    #[arg(
+        long = "signals-max-handshakes-per-source",
+        env = "GRID_SIGNALS_MAX_HANDSHAKES_PER_SOURCE",
+        default_value_t = 8,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=65_535)
+    )]
+    pub max_per_source: usize,
+
     /// Concurrent authenticated connections one peer site may hold.
     #[arg(
         long = "signals-max-per-peer",
@@ -227,11 +320,11 @@ pub struct SignalsArgs {
     )]
     pub peer_timeout_secs: u64,
 
-    /// Peers polled at once.
+    /// Peers polled at once, at most 32 and never more than there are peers.
     #[arg(
         long = "signals-peer-concurrency",
         env = "GRID_SIGNALS_PEER_CONCURRENCY",
-        default_value_t = 8
+        default_value_t = 32
     )]
     pub peer_concurrency: usize,
 
@@ -331,6 +424,15 @@ impl SignalsArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_membership_header_names_a_known_mode_or_nothing() {
+        assert_eq!(super::Membership::parse(" local "), Some(super::Membership::Local));
+        assert_eq!(super::Membership::parse("Swim"), Some(super::Membership::Swim));
+        for unknown in ["", "gossip", "declared", "local; drop table", "swim2"] {
+            assert_eq!(super::Membership::parse(unknown), None, "{unknown:?}");
+        }
+    }
+
     use std::collections::HashSet;
 
     use clap::{CommandFactory as _, Parser as _};
@@ -349,6 +451,58 @@ mod tests {
         let ids: Vec<String> = Cli::command().get_groups().map(|g| g.get_id().to_string()).collect();
         let unique: HashSet<&String> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "duplicate clap group ids: {ids:?}");
+    }
+
+    /// Local membership starts in poll, and refuses a gossip transport.
+    #[test]
+    fn local_membership_starts_in_poll() {
+        let transport = |args: &[&str]| {
+            Cli::try_parse_from([&["grid-operator"], args].concat())
+                .map_err(|e| e.to_string())
+                .and_then(|cli| cli.grid.startup_signal_transport())
+        };
+        assert_eq!(transport(&[]), Ok(None), "Swim keeps the GridNetwork default");
+        assert_eq!(
+            transport(&["--membership-source", "Local"]),
+            Ok(Some(crate::crd::grid_network::SignalMode::Poll))
+        );
+        assert_eq!(
+            transport(&["--membership-source", "Local", "--grid-signals", "poll"]),
+            Ok(Some(crate::crd::grid_network::SignalMode::Poll))
+        );
+        assert!(
+            transport(&["--membership-source", "Local", "--grid-signals", "gossip"]).is_err(),
+            "Local refuses gossip"
+        );
+        assert!(
+            transport(&["--membership-source", "MemberService"]).is_err(),
+            "a member service is not a source yet"
+        );
+    }
+
+    /// The per-source handshake cap defaults to 8 and refuses zero.
+    #[test]
+    fn signals_handshakes_per_source_defaults_and_refuses_zero() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from([&["grid-operator"], args].concat()).map(|cli| cli.signals.max_per_source)
+        };
+        assert_eq!(parse(&[]).ok(), Some(8));
+        assert_eq!(parse(&["--signals-max-handshakes-per-source", "64"]).ok(), Some(64));
+        assert!(
+            parse(&["--signals-max-handshakes-per-source", "0"]).is_err(),
+            "zero is refused"
+        );
+    }
+
+    /// The peer endpoint port is a real port.
+    #[test]
+    fn signals_peer_endpoint_port_refuses_zero() {
+        let parse = |value: &str| {
+            Cli::try_parse_from(["grid-operator", "--signals-peer-endpoint-port", value])
+                .map(|cli| cli.signals.peer_endpoint_port)
+        };
+        assert_eq!(parse("9091").ok().flatten(), Some(9091));
+        assert!(parse("0").is_err(), "port 0 is refused");
     }
 
     /// The advertised signals endpoint is parsed strictly and normalized.

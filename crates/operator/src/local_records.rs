@@ -95,6 +95,7 @@ pub fn grid_site(plan: &Plan, network: &str) -> GridSite {
         sovereignty_zone: None,
         zone: None,
         trust: None,
+        signals_endpoint: None,
     };
     let mut site = GridSite::new(&plan.site, spec);
     let mut labels = created_by();
@@ -188,7 +189,8 @@ fn created_by() -> BTreeMap<String, String> {
     BTreeMap::from([(CREATED_BY_LABEL.to_owned(), CREATED_BY.to_owned())])
 }
 
-/// The SWIM key Secret's name when it exists in the identity's namespace.
+/// The SWIM key Secret's name when it exists in the identity's namespace, `None` for an
+/// empty name.
 ///
 /// # Errors
 ///
@@ -198,6 +200,9 @@ pub async fn swim_key_secret_for_identity(
     identity: &Identity,
     name: &str,
 ) -> Result<Option<String>, OperatorError> {
+    if name.is_empty() {
+        return Ok(None);
+    }
     let found = Box::pin(Api::<Secret>::namespaced(client.clone(), &identity.namespace).get_opt(name)).await?;
     Ok(found.map(|_| name.to_owned()))
 }

@@ -96,21 +96,3 @@ pub(crate) fn reason_of(api: &FakeApi, path: &str, type_: &str) -> String {
         .unwrap_or_default()
         .to_owned()
 }
-
-/// Wait until `path` holds a condition of `type_`, or fail after a bounded wait.
-///
-/// The readiness pass writes from a spawned task, so a test polls for it. The bound is generous
-/// because slow builds (FIPS) took over two seconds; a passing run returns on the first hit.
-pub(crate) async fn until_condition(api: &FakeApi, path: &str, type_: &str) {
-    let held = async {
-        while observe(api, path).condition(type_).is_none() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    };
-    if tokio::time::timeout(std::time::Duration::from_secs(30), held)
-        .await
-        .is_err()
-    {
-        panic!("{path} never held a {type_} condition within 30 s");
-    }
-}

@@ -34,7 +34,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: operator
-          image: ghcr.io/praxis-proxy/grid-operator:v0.2.2
+          image: ghcr.io/praxis-proxy/grid-operator:v0.3.0-rc.1
           imagePullPolicy: "IfNotPresent"
           securityContext:
             runAsNonRoot: true
@@ -68,6 +68,8 @@ spec:
               value: "grid-operator-signals"
             - name: GRID_LEADER_SWIM_SERVICES
               value: "grid-operator-swim"
+            - name: GRID_MEMBERSHIP_SOURCE
+              value: "Swim"
             - name: GRID_SWIM_BIND_ADDR
               value: "0.0.0.0:7946"
             - name: GRID_SWIM_ADVERTISE_ADDR
@@ -78,6 +80,8 @@ spec:
               value: "grid-operator-swim"
             - name: GRID_NETWORK
               value: "grid"
+            - name: GRID_OPERATOR_CONFIG
+              value: "grid-operator-config"
             - name: GRID_GATEWAY_SERVICE_NAME
               value: "grid-gateway"
             - name: GRID_GATEWAY_NAMESPACE

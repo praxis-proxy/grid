@@ -612,6 +612,13 @@
         }
       ]
     },
+    "grid": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "membership": { "type": "object", "additionalProperties": false, "properties": { "source": { "type": "string", "enum": ["Swim", "Local"], "description": "Where sites learn their members, Swim or Local. Local creates and delivers no SWIM key." } } }
+      }
+    },
     "hubSite": {
       "description": "Issue the hub's own site identity straight from the grid CA, so the hub never enrolls.",
       "type": "object",

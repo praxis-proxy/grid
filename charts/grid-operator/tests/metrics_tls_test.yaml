@@ -21,6 +21,7 @@ tests:
     set:
       metrics.tls.enabled: false
       enrollment.enabled: true
+      enrollment.hub: true
       swim.siteName: site-d
     asserts:
       - notExists:
@@ -75,6 +76,7 @@ tests:
     template: templates/deployment.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       swim.siteName: site-d
     asserts:
       - contains:
@@ -147,6 +149,7 @@ tests:
     template: templates/servicemonitor.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       swim.siteName: site-d
       serviceMonitor.enabled: true
     asserts:
@@ -160,6 +163,7 @@ tests:
     template: templates/servicemonitor.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       enrollment.siteName: site-e
       serviceMonitor.enabled: true
     asserts:
@@ -171,6 +175,7 @@ tests:
     template: templates/servicemonitor.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       swim.siteName: site-d
       serviceMonitor.enabled: true
       serviceMonitor.namespace: monitoring
@@ -213,6 +218,7 @@ tests:
     template: templates/tests/operator-ready.yaml
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       swim.siteName: site-d
     asserts:
       - matchRegex:
@@ -237,6 +243,7 @@ tests:
     set:
       swim.siteName: hub
       enrollment.enabled: true
+      enrollment.hub: true
       grid.signals: poll
       signals.enabled: true
     asserts:

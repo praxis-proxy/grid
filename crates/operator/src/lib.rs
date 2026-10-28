@@ -39,7 +39,7 @@ pub mod latency;
 pub mod leader;
 /// Creates this site's `GridNetwork` and `GridSite` once its identity exists.
 pub mod local_records;
-/// The `LocalSiteDeclared` condition on the `GridNetwork`.
+/// The label providers select their site by.
 pub mod local_site;
 /// Prometheus metrics for gateway probe and phase-transition observability.
 pub mod metrics;
@@ -51,8 +51,13 @@ pub mod metrics_scraper;
 pub mod metrics_tls;
 /// Short-lived tokens for the metrics scraper ServiceAccount.
 pub(crate) mod metrics_token;
+/// This operator's own settings, from its `ConfigMap`.
+pub mod operator_config;
 /// The `GridNetwork` condition naming peers whose relayed signal ages are rejected.
 pub mod peer_ages;
+pub mod peer_membership;
+/// The `GridNetwork` condition naming peers whose signals endpoints did not answer.
+pub mod peer_reach;
 mod provider_revision;
 pub mod readiness;
 /// Kubernetes resource builders.
@@ -72,6 +77,8 @@ pub mod gateway_ages;
 pub mod shutdown;
 /// Provider signals, served as a multi-target exporter.
 pub mod signals;
+/// The providers a site serves to peers, and those polled from them.
+pub mod site_providers;
 /// SWIM membership data model and status summarization.
 ///
 /// Pure data layer for peer discovery; the live UDP runtime is implemented in

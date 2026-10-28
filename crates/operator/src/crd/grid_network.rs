@@ -596,18 +596,25 @@ fn add_tls_config_legacy_fields(schema: &mut schemars::Schema) {
     printcolumn = r#"{"name":"Degraded","type":"string","jsonPath":".status.conditions[?(@.type==\"Degraded\")].status"}"#,
     printcolumn = r#"{"name":"Since","type":"date","jsonPath":".status.conditions[?(@.type==\"Available\")].lastTransitionTime"}"#,
     printcolumn = r#"{"name":"Message","type":"string","jsonPath":".status.conditions[?(@.type==\"Available\")].message","priority":1}"#,
-    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase","priority":1}"#
+    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase","priority":1}"#,
+    printcolumn = r#"{"name":"Enrolled","type":"string","jsonPath":".status.conditions[?(@.type==\"Enrolled\")].status","priority":1}"#,
+    printcolumn = r#"{"name":"Identity","type":"string","jsonPath":".status.conditions[?(@.type==\"IdentityValid\")].status","priority":1}"#
 )]
 #[schemars(extend("x-kubernetes-validations" = [{
     "rule": "has(self.placementPolicy) == (has(self.selectionPolicy) && self.selectionPolicy.mode == 'weightedRandom')",
     "message": "placementPolicy must be set if and only if selectionPolicy.mode is weightedRandom"
+}, {
+    "rule": "!has(oldSelf.gridId) || oldSelf.gridId == '' || (has(self.gridId) && self.gridId == oldSelf.gridId)",
+    "message": "gridId cannot change once set"
 }]))]
 #[schemars(transform = add_grid_network_spec_legacy_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct GridNetworkSpec {
-    /// Grid ID for tenancy. Empty on creation; auto-generated
-    /// on first join with another site.
+    /// The grid this network belongs to, set once. Empty only while unset: an install with no
+    /// operator config site section then mints one, and one with a site section holds the
+    /// grid runtime until it is set. Moving to another grid means recreating the network.
     #[serde(default)]
+    #[schemars(length(max = 63), regex(pattern = "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"))]
     pub grid_id: String,
 
     /// Initial SWIM seed peer endpoints in host:port form. Literal IPv4, bracketed
@@ -1428,10 +1435,6 @@ pub struct GridNetworkStatus {
     /// Grid does not enforce budget limits itself (see [`BudgetPolicyConfig`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub budget_status: Vec<TenantBudgetStatus>,
-
-    /// This site's identity certificate: when it expires and when rotation is due.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<SiteIdentityStatus>,
 }
 
 /// Whether a separately owned status flag can be omitted from reconciliation.
@@ -1466,27 +1469,6 @@ pub struct GatewayAgeReport {
     /// Receipt time for inspection; freshness uses the operator's monotonic clock.
     #[schemars(extend("format" = "date-time"))]
     pub received_at: String,
-}
-
-/// This site's identity certificate.
-#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SiteIdentityStatus {
-    /// When the certificate expires, RFC 3339.
-    pub not_after: String,
-    /// When rotation is due, a third of the lifetime before `notAfter`, RFC 3339. Empty
-    /// under pin peer trust, or when this site's operator does not rotate.
-    pub rotate_after: String,
-    /// SHA-256 of the certificate DER, the digest peers pin.
-    pub fingerprint: String,
-    /// `IdentityExpired` once the certificate has expired, `IdentityUnreadable` when the
-    /// Secret holds no usable certificate.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    #[schemars(regex(pattern = "^(IdentityExpired|IdentityUnreadable)$"))]
-    pub reason: String,
-    /// How to recover.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub message: String,
 }
 
 /// Phase of an operator-generated consumer Praxis `ConfigMap` for one gateway.

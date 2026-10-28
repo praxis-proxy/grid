@@ -390,6 +390,36 @@ tests:
       - failedTemplate:
           errorPattern: hubSite.name "hub" is also invited
 
+  - it: creates and delivers no SWIM key under Local membership
+    template: templates/certs/ca-bootstrap-job.yaml
+    set:
+      hubSite.name: hub
+      hubSite.namespace: grid-system
+      grid.membership.source: Local
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --swim-key-secret
+
+  - it: grants no SWIM key access under Local membership
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    documentSelector:
+      path: kind
+      value: Role
+      matchMany: true
+    set:
+      hubSite.name: hub
+      hubSite.namespace: grid-system
+      grid.membership.source: Local
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            resourceNames: ["grid-swim-key"]
+            verbs: ["get"]
+
   - it: creates the SWIM key with the hub identity, unless its name is empty
     template: templates/certs/ca-bootstrap-job.yaml
     set:

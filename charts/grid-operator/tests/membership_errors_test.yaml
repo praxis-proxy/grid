@@ -1,0 +1,61 @@
+suite: membership mode contradictions
+templates:
+  - templates/deployment.yaml
+release:
+  name: grid
+  namespace: grid-system
+set:
+  site.name: east
+  grid.id: grid-a
+tests:
+  - it: Local refuses gossip signals
+    template: templates/deployment.yaml
+    set:
+      grid.membership.source: Local
+      grid.signals: gossip
+    asserts:
+      - failedTemplate:
+          errorPattern: grid.signals gossip contradicts it
+
+  - it: Local refuses a SWIM Service
+    template: templates/deployment.yaml
+    set:
+      grid.membership.source: Local
+      swim.service.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: unset swim.service.enabled
+
+  - it: Local refuses seeds
+    template: templates/deployment.yaml
+    set:
+      grid.membership.source: Local
+      grid.seeds: [10.0.0.1]
+    asserts:
+      - failedTemplate:
+          errorPattern: remove grid.seeds and swim.seeds
+
+  - it: Local refuses a SWIM advertise address
+    template: templates/deployment.yaml
+    set:
+      grid.membership.source: Local
+      swim.advertiseAddress: 10.0.0.1:7946
+    asserts:
+      - failedTemplate:
+          errorPattern: remove swim.advertiseAddress
+
+  - it: Local refuses turning off the signals Service
+    template: templates/deployment.yaml
+    set:
+      grid.membership.source: Local
+      signals.service.enabled: false
+    asserts:
+      - failedTemplate:
+          errorPattern: set signals.service.enabled
+
+  - it: refuses a source not yet supported, such as MemberService
+    template: templates/deployment.yaml
+    set:
+      grid.membership.source: MemberService
+    asserts:
+      - failedTemplate: {}

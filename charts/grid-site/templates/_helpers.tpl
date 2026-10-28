@@ -117,14 +117,24 @@ writes. inferenceProviders keyed by name become the list the template reads.
 {{- if kindIs "map" $site -}}
   {{- include "grid-site.rename-legacy-value" (dict "object" $site "old" "egress" "new" "gatewayEndpoint") -}}
 {{- end -}}
+{{- $local := eq (dig "membership" "source" "Swim" ($v.grid | default dict)) "Local" }}
+{{- if $local }}
+{{- if eq (($net.signalTransport | default dict).mode | default "poll") "gossip" }}{{- fail "grid.membership.source Local polls signals: gridNetwork.signalTransport.mode gossip contradicts it" }}{{- end }}
+{{- if $net.seeds }}{{- fail "grid.membership.source Local runs no SWIM: remove gridNetwork.seeds" }}{{- end }}
+{{- if eq (toString $net.autoDiscoverSites) "true" }}{{- fail "grid.membership.source Local discovers nothing: unset gridNetwork.autoDiscoverSites" }}{{- end }}
+{{- if (($net.tls | default dict).swimKeySecretRef) }}{{- fail "grid.membership.source Local runs no SWIM: remove gridNetwork.tls.swimKeySecretRef" }}{{- end }}
+{{- $_ := set $net "signalTransport" (dict "mode" "poll") }}
+{{- $_ := set $net "autoDiscoverSites" false }}
+{{- end }}
 {{- if $v.peers }}
 {{- if kindIs "invalid" $net.autoDiscoverSites }}{{- $_ := set $net "autoDiscoverSites" true }}{{- end }}
 {{- if not $net.tls }}
 {{- $ns := .Release.Namespace }}
-{{- $_ := set $net "tls" (dict
+{{- $refs := dict
   "siteSecretRef" (dict "name" "grid-site-identity" "namespace" $ns)
-  "caSecretRef" (dict "name" "grid-ca" "namespace" $ns)
-  "swimKeySecretRef" (dict "name" "grid-swim-key" "namespace" $ns)) }}
+  "caSecretRef" (dict "name" "grid-ca" "namespace" $ns) }}
+{{- if not $local }}{{- $_ := set $refs "swimKeySecretRef" (dict "name" "grid-swim-key" "namespace" $ns) }}{{- end }}
+{{- $_ := set $net "tls" $refs }}
 {{- end }}
 {{- end }}
 {{- if kindIs "map" $v.inferenceProviders }}

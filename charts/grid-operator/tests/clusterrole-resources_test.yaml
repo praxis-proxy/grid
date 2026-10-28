@@ -12,7 +12,7 @@ tests:
             apiGroups: [""]
             resources: ["secrets"]
             verbs: ["get", "create", "patch"]
-  - it: grants exactly the Secret, Service, Event, and ConfigMap rules by default
+  - it: grants exactly the Secret, Service, gateway roll, Event, and ConfigMap rules by default
     asserts:
       - equal:
           path: rules
@@ -24,6 +24,10 @@ tests:
               resources: ["services"]
               resourceNames: ["provider-gateway", "grid-operator-swim", "grid-operator-signals"]
               verbs: ["get"]
+            - apiGroups: ["apps"]
+              resources: ["deployments"]
+              resourceNames: ["provider-gateway"]
+              verbs: ["get", "patch"]
             - apiGroups: ["events.k8s.io"]
               resources: ["events"]
               verbs: ["create", "patch"]
@@ -41,6 +45,7 @@ tests:
   - it: lets rotation roll only the gateway Deployment
     set:
       enrollment.enabled: true
+      enrollment.hub: true
     asserts:
       - contains:
           path: rules
@@ -55,15 +60,32 @@ tests:
             apiGroups: ["apps"]
             resources: ["deployments"]
             verbs: ["get", "patch"]
-  - it: grants no Deployment access without rotation
-    set:
-      enrollment.enabled: true
-      enrollment.rotation.enabled: false
+  - it: grants the gateway roll without enrollment, since any identified site renews
     asserts:
-      - notContains:
+      - contains:
           path: rules
           content:
             apiGroups: ["apps"]
             resources: ["deployments"]
-            resourceNames: ["grid-gateway"]
+            resourceNames: ["provider-gateway"]
             verbs: ["get", "patch"]
+
+  - it: grants no SWIM Service read under Local membership, which renders none
+    set:
+      grid.membership.source: Local
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["services"]
+            resourceNames: ["provider-gateway", "grid-operator-swim", "grid-operator-signals"]
+            verbs: ["get"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["services"]
+            resourceNames: ["provider-gateway", "grid-operator-signals"]
+            verbs: ["get"]
+

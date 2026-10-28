@@ -77,7 +77,7 @@ pub(crate) const CANDIDATE_KIND: &str = "inference_model";
 const CANDIDATE_KIND_MCP_TOOL: &str = "mcp_tool";
 
 /// Maximum number of candidates accepted by the Grid/Praxis routing filters.
-const MAX_OVERLAY_CANDIDATES: usize = 1_024;
+pub(crate) const MAX_OVERLAY_CANDIDATES: usize = 1_024;
 
 /// Maximum identifier length accepted by the downstream routing filters.
 const MAX_CANDIDATE_IDENTIFIER_LEN: usize = 256;

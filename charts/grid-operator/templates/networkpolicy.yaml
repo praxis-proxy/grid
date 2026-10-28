@@ -18,8 +18,10 @@ spec:
   ingress:
     # Peer sites reach SWIM and signals as without the policy.
     - ports:
+        {{- if ne (dig "membership" "source" "Swim" .Values.grid) "Local" }}
         - port: swim-udp
           protocol: UDP
+        {{- end }}
         {{- if (.Values.signals).enabled }}
         - port: signals
           protocol: TCP

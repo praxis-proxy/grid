@@ -6,12 +6,14 @@ tests:
     set:
       rbac.create: false
       enrollment.enabled: true
+      enrollment.hub: true
     asserts:
       - matchRegexRaw:
           pattern: get, create, and patch on Secrets
   - it: says nothing extra with chart RBAC
     set:
       enrollment.enabled: true
+      enrollment.hub: true
     asserts:
       - notMatchRegexRaw:
           pattern: get, create, and patch on Secrets
@@ -32,6 +34,7 @@ tests:
   - it: says nothing when a grid site serves its identity
     set:
       enrollment.enabled: true
+      enrollment.hub: true
       swim.siteName: site-d
     asserts:
       - notMatchRegexRaw:

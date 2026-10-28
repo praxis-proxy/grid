@@ -15,6 +15,14 @@ grid:
   network: grid
   # -- Grid identifier. Empty renders no GridNetwork or GridSite.
   id: ""
+  membership:
+    # -- Where this site learns its members: Swim, from SWIM gossip, or Local, where this
+    # site's configuration lists its peers as GridSites and their signals are polled at the
+    # endpoint derived from each gateway. Local assumes something outside the grid delivers
+    # every site's GridSite records, the same set to every member, and discovers no peers. Local runs no SWIM: no SWIM Service, port or
+    # seeds, poll signals on the signals Service, and every contradicting value fails the
+    # render. An unset grid.signals renders poll under Local.
+    source: Swim
   # -- Peer trust, pin or spiffe. Empty keeps the GridNetwork default, pin. The operator
   # also starts in it before any GridNetwork exists, so set it to match the grid.
   peerTrust: ""
@@ -247,6 +255,40 @@ signals:
     externalTrafficPolicy: ""
   # -- Signals endpoint gossiped to peers (ip:port, [ipv6]:port, or dns-name:port). Set it when swim.advertiseAddress is set or the Service is not a LoadBalancer.
   advertiseAddress: ""
+  # -- An OpenShift Route in front of the signals Service, so peers reach this site through
+  # the cluster's router rather than a load balancer of its own. Required when signals are
+  # exposed through a Route: without the rate limits below, the listener is open to anyone
+  # who can reach the router.
+  route:
+    # -- auto renders the Route where the cluster serves route.openshift.io/v1; true or
+    # false forces it. An offline render without --api-versions renders auto as off.
+    enabled: auto
+    # -- External hostname peers dial, the name the router matches the SNI against. The
+    # convention is <site>-signals.<domain>. Required when a Route renders.
+    host: ""
+    # -- Extra Route annotations. They override rateLimit's on a key clash.
+    annotations: {}
+    # -- Per-source-IP connection limits in the router. The router sees each peer's own
+    # address, so these count one peer at a time; the operator's own
+    # signals.maxHandshakesPerSource sees them all as the router.
+    rateLimit:
+      enabled: true
+      # -- Concurrent TCP connections per source IP.
+      concurrentTcp: 10
+      # -- TCP connection rate per source IP, in the router's rate window.
+      rateTcp: 20
+
+
+  # -- Concurrent handshakes one source address may hold. Behind an OpenShift Route or a
+  # load balancer that does not keep the client address every peer arrives from one
+  # source, so set it to the number of peers. Empty keeps the operator's 8.
+  maxHandshakesPerSource: ""
+
+  # -- Port each peer serves signals on, under Local membership, at its gateway endpoint's host, for a
+  # grid whose sites each put the gateway and signals on one load balancer. Empty dials
+  # the gateway's own port with server name <site>-signals.grid.internal, for a grid whose
+  # sites each put both behind one router.
+  peerEndpointPort: ""
 
   # -- Seconds between peer signal polls. Every site polls every other alive site, so
   # a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator's 5s.
@@ -329,44 +371,69 @@ topologySpreadConstraints: []
 # -- Priority class for the operator pod.
 priorityClassName: ""
 
-# -- Site auto-enroll on startup.
+# -- This operator's own settings: a ConfigMap in the release namespace, watched, so an edit
+# applies without a restart. The enrollment values render its site section.
+operatorConfig:
+  # -- Render the ConfigMap. Set false to manage it yourself under name.
+  create: true
+  # -- ConfigMap name.
+  name: grid-operator-config
+
+# -- How this cluster's own site enrolls and renews its identity, rendered as the operator
+# config's site section.
 enrollment:
-  # -- Enroll when the site identity Secret is absent.
+  # -- Name the signer and the invite, so the operator enrolls the site while it has no
+  # identity, then renews through the same signer.
   enabled: false
-  # -- Enrollment service https base URL. Defaults to the in-cluster grid-enrollment
-  # Service in rbac.enrollmentNamespace, the hub's own.
+  # -- Signer https base URL, the config's site.signerEndpoint.url. Required unless hub is
+  # set, which defaults it to the in-cluster grid-enrollment Service in
+  # rbac.enrollmentNamespace.
   url: ""
-  # -- Site name the token pins, at most 51 characters. Defaults to swim.siteName.
+  # -- The grid-enrollment release runs on this cluster, so url defaults to its Service.
+  hub: false
+  # -- With hub set and no url, the grid-enrollment release's full name: its Service, and
+  # the in-cluster name its serving certificate carries. Must match that release.
+  hubService: grid-enrollment
+  # -- With hub set and no url, the grid-enrollment Service's port. Must match that release,
+  # whose Service port derives from its listenAddr.
+  hubPort: 8443
+  # -- Site name the token pins, at most 51 characters, and the GridSite's name: the config's
+  # site.name. Defaults to swim.siteName.
   siteName: ""
-  # -- CA pinning the enrollment server, and the grid CA by default. With neither set, Secret grid-ca-bundle.
+  # -- Signer hosts the operator config may name, each host or host:port, as the operator's
+  # GRID_SIGNER_HOSTS. Set where the operator is installed, so an edit to its config cannot
+  # point enrollment elsewhere. Empty defaults to the host and port of url when one renders.
+  signerHosts: []
+  # -- CA pinning the signer to enroll, and the grid CA by default:
+  # site.signerEndpoint.caBundleRef. A Secret only, since anyone who can edit a ConfigMap
+  # could pin a signer of their own. Unset, Secret grid-ca-bundle when enabled. Renewal
+  # trusts the grid CA the site holds together with this bundle. Pin the issuing intermediate or
+  # the signer's serving certificate, never a public root.
   caBundle:
-    # -- ConfigMap holding the bundle. Set this or secret.
-    configMap: ""
     # -- Secret holding the bundle.
     secret: ""
     # -- Key holding the PEM bundle.
     key: ca.crt
-  # -- Grid CA anchor, when it differs from caBundle.
+  # -- Grid CA anchor, when it differs from caBundle: site.signerEndpoint.gridCaBundleRef.
   gridCaBundle:
-    # -- ConfigMap holding the grid CA. Set this or secret.
-    configMap: ""
     # -- Secret holding the grid CA.
     secret: ""
     # -- Key holding the PEM bundle.
     key: ca.crt
-  # -- Secret the site identity is written to when no GridNetwork names one.
+  # -- Identity Secret the rendered GridNetwork names. Without grid.id it must stay the
+  # operator's default, grid-site-identity.
   identitySecretName: grid-site-identity
-  # -- Secret the grid CA is written to when no GridNetwork names one.
+  # -- Grid CA Secret the rendered GridNetwork names. Without grid.id it must stay the
+  # operator's default, grid-ca.
   caSecretName: grid-ca
-  rotation:
-    # -- Rotate the site identity before it expires, presenting the current one. Needs an
-    # enrollment URL: the default with enabled, or url set, as on a hub whose identity
-    # bootstrap issued. Without caBundle the grid CA in caSecretName pins the service.
-    # Off under pin peer trust whatever this says: a pinned peer refuses a rotated leaf.
-    enabled: true
-  # -- Secret holding the one-time site token.
+  # -- Secret holding the one-time site token: site.inviteSecretRef.
   tokenSecretRef:
     # -- Secret name. Defaults to grid-invite-<siteName>.
     name: ""
     # -- Key holding the token.
     key: token
+  # -- Whether the operator renews the site identity through the signer,
+  # site.signerEndpoint.rotation: Enabled or Disabled. Empty renders Disabled unless
+  # grid.peerTrust is spiffe, since pin peer trust refuses a renewed leaf. Under spiffe it is
+  # left out, and the operator's default is Enabled.
+  rotation: ""

@@ -1,4 +1,5 @@
 {{- include "grid-operator.normalize" . }}
+{{- $swim := ne (dig "membership" "source" "Swim" .Values.grid) "Local" }}
 {{- include "grid-operator.validateDigest" . }}
 {{- include "grid-operator.enrollment.validate" . }}
 {{- include "grid-operator.validateSignals" . }}
@@ -98,6 +99,9 @@ spec:
             - name: GRID_LEADER_SWIM_SERVICES
               value: {{ . | quote }}
             {{- end }}
+            - name: GRID_MEMBERSHIP_SOURCE
+              value: {{ dig "membership" "source" "Swim" .Values.grid | quote }}
+            {{- if $swim }}
             - name: GRID_SWIM_BIND_ADDR
               value: {{ .Values.swim.bindAddress | quote }}
             {{- if eq (toString .Values.swim.requireKey) "false" }}
@@ -116,19 +120,27 @@ spec:
               value: {{ printf "%s-swim" (include "grid-operator.fullname" .) | quote }}
             {{- end }}
             {{- end }}
+            {{- end }}
             - name: GRID_NETWORK
               value: {{ .Values.grid.network | quote }}
+            - name: GRID_OPERATOR_CONFIG
+              value: {{ include "grid-operator.operatorConfig.name" . | quote }}
+            {{- with include "grid-operator.enrollment.signerHosts" . }}
+            - name: GRID_SIGNER_HOSTS
+              value: {{ . | quote }}
+            {{- end }}
             {{- /* The chart renders the records with grid.id, and an enrolling release may set it later. */}}
             {{- if or .Values.grid.id .Values.enrollment.enabled }}
             - name: GRID_CREATE_LOCAL_RECORDS
               value: "false"
             {{- end }}
             {{- with .Values.swim.siteName | default (and .Values.enrollment.enabled .Values.enrollment.siteName) }}
-            - name: GRID_SWIM_SITE_NAME
+            {{- /* Local membership runs no SWIM, so its site name carries no SWIM prefix. */}}
+            - name: {{ ternary "GRID_SITE_NAME" "GRID_SWIM_SITE_NAME" (eq (dig "membership" "source" "Swim" $.Values.grid) "Local") }}
               value: {{ . | quote }}
             {{- end }}
             {{- $seeds := include "grid-operator.swimSeeds" . }}
-            {{- if $seeds }}
+            {{- if and $swim $seeds }}
             - name: GRID_SWIM_SEEDS
               value: {{ $seeds | quote }}
             {{- end }}
@@ -175,6 +187,16 @@ spec:
             - name: GRID_SIGNALS_ADVERTISE_ADDR
               value: {{ . | quote }}
             {{- end }}
+            {{- /* Behind a Route every peer arrives as the router, so one source holds the
+                   whole peer set's handshakes and the cap has to be sized for the set. */}}
+            {{- with (ternary (include "grid-operator.signalsRoute.handshakes" .) (.Values.signals.maxHandshakesPerSource | toString) (eq (include "grid-operator.signalsRoute.enabled" .) "true")) }}
+            - name: GRID_SIGNALS_MAX_HANDSHAKES_PER_SOURCE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.signals.peerEndpointPort }}
+            - name: GRID_SIGNALS_PEER_ENDPOINT_PORT
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.signals.peerIntervalSeconds }}
             - name: GRID_SIGNALS_PEER_INTERVAL_SECS
               value: {{ . | quote }}
@@ -191,18 +213,17 @@ spec:
             {{- end }}
             - name: RUST_LOG
               value: {{ include "grid-operator.rustLog" . | quote }}
-            {{- with include "grid-operator.enrollment.env" . | trim }}
-            {{- . | nindent 12 }}
-            {{- end }}
-          {{- $mounts := list (include "grid-operator.enrollment.volumeMounts" . | trim) (include "grid-operator.metricsTls.volumeMount" . | trim) | compact }}
+          {{- $mounts := list (include "grid-operator.metricsTls.volumeMount" . | trim) | compact }}
           {{- with $mounts }}
           volumeMounts:
             {{- join "\n" . | nindent 12 }}
           {{- end }}
           ports:
+            {{- if $swim }}
             - name: swim-udp
               containerPort: {{ splitList ":" .Values.swim.bindAddress | last }}
               protocol: UDP
+            {{- end }}
             - name: metrics
               containerPort: {{ splitList ":" .Values.metrics.bindAddress | last }}
               protocol: TCP
@@ -251,7 +272,7 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-      {{- $volumes := list (include "grid-operator.enrollment.volumes" . | trim) (include "grid-operator.metricsTls.volume" . | trim) | compact }}
+      {{- $volumes := list (include "grid-operator.metricsTls.volume" . | trim) | compact }}
       {{- with $volumes }}
       volumes:
         {{- join "\n" . | nindent 8 }}

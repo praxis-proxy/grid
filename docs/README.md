@@ -41,6 +41,8 @@
   workflow for in-cluster, existing-service, and external HTTPS providers.
 - [Metrics Reference](metrics.md): every metric the operator and the gateway
   export, with types, labels, and what each one means.
+- [Scaling the signals listener](architecture/signals-scaling.md): connections per peer, listener bounds,
+  polling cost, and the limits to size behind an OpenShift router.
 - [Operations](architecture/operations.md): local environment setup,
   validation commands, and operator workflows.
 - [CI Kind E2E](architecture/ci-kind-e2e.md): validation tiers, gate sequence,

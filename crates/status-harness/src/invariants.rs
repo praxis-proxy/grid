@@ -154,12 +154,12 @@ pub fn phase_transition_time_moves_only_with_phase(rounds: &[Observed]) -> Resul
 }
 
 /// Invariant 3: after every round, `status.observedGeneration` and each condition's
-/// `observedGeneration` equal `metadata.generation`.
+/// `observedGeneration` equal `metadata.generation`, a type in `unstamped` carrying none.
 ///
 /// # Errors
 ///
 /// Names the round and field that lags.
-pub fn observed_generation_tracks(rounds: &[Observed]) -> Result<(), Failure> {
+pub fn observed_generation_tracks(rounds: &[Observed], unstamped: &[&str]) -> Result<(), Failure> {
     for (index, round) in rounds.iter().enumerate() {
         let want = round.generation;
         if let Some(held) = round.status.get("observedGeneration").and_then(Value::as_i64)
@@ -170,11 +170,16 @@ pub fn observed_generation_tracks(rounds: &[Observed]) -> Result<(), Failure> {
             )));
         }
         for condition in &round.conditions {
+            let type_ = condition.get("type").and_then(Value::as_str).unwrap_or_default();
             let held = condition.get("observedGeneration").and_then(Value::as_i64);
-            if held != Some(want) {
+            let tracks = if unstamped.contains(&type_) {
+                held.is_none()
+            } else {
+                held == Some(want)
+            };
+            if !tracks {
                 return Err(Failure::from(format!(
-                    "round {index}: {} observedGeneration {held:?} lags generation {want}",
-                    condition.get("type").and_then(Value::as_str).unwrap_or_default()
+                    "round {index}: {type_} observedGeneration {held:?}, generation {want}"
                 )));
             }
         }

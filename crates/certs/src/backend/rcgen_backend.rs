@@ -146,10 +146,22 @@ pub(crate) fn sign_csr(ca: &CaMaterial, spec: &CertSpec<'_>, csr_pem: &str) -> R
     })
 }
 
+/// A key pair from PEM: PKCS#8, which rcgen reads, or SEC1 (`EC PRIVATE KEY`), the form
+/// cert-manager writes by default, wrapped into PKCS#8 first, so a key the openssl backend
+/// accepts is accepted here too.
+fn key_pair_from_pem(key_pem: &str) -> Result<KeyPair, rcgen::Error> {
+    let block = pem::parse(key_pem).map_err(|_bad| rcgen::Error::CouldNotParseKeyPair)?;
+    if block.tag() != super::SEC1_TAG {
+        return KeyPair::from_pem(key_pem);
+    }
+    let pkcs8 = super::sec1_to_pkcs8(block.contents()).ok_or(rcgen::Error::CouldNotParseKeyPair)?;
+    KeyPair::try_from(pkcs8.as_slice())
+}
+
 /// A private key's `SubjectPublicKeyInfo` DER, `None` when it does not parse.
 pub(crate) fn key_spki_der(key_pem: &str) -> Option<Vec<u8>> {
     use rcgen::PublicKeyData as _;
-    KeyPair::from_pem(key_pem).ok().map(|key| key.subject_public_key_info())
+    key_pair_from_pem(key_pem).ok().map(|key| key.subject_public_key_info())
 }
 
 /// Verify a request's self-signature and return its `SubjectPublicKeyInfo` DER.
@@ -162,7 +174,7 @@ pub(crate) fn csr_spki_der(csr_pem: &str) -> Result<Vec<u8>, BackendError> {
 /// The issuer name comes from the stored cert, not `_spec`, so leaves keep
 /// chaining to it when the configured common name changes.
 pub(crate) fn load_ca(_spec: &CertSpec<'_>, key_pem: &str, cert_pem: &str) -> Result<CaMaterial, BackendError> {
-    let key_pair = KeyPair::from_pem(key_pem).map_err(|err| BackendError::InvalidCaKey(err.to_string()))?;
+    let key_pair = key_pair_from_pem(key_pem).map_err(|err| BackendError::InvalidCaKey(err.to_string()))?;
 
     // Cert must certify this key: the point in its SPKI is the key pair's point.
     let cert_der = pem::parse(cert_pem).map_err(|_bad| BackendError::InvalidCaCert)?;

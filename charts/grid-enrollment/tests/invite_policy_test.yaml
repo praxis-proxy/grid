@@ -143,3 +143,43 @@ tests:
     asserts:
       - hasDocuments:
           count: 7
+
+  - it: delivers the SWIM key under Swim membership
+    set:
+      host: e.example.com
+      hubSite.name: hub
+      hubSite.namespace: grid-system
+      invitePolicy.enabled: true
+      invitePolicy.namespace: grid
+      invites.peer.cluster: peer
+    documentSelector:
+      path: kind
+      value: Policy
+    asserts:
+      - equal:
+          path: spec.policy-templates[0].objectDefinition.spec.object-templates[3].objectDefinition.metadata.name
+          value: grid-swim-key
+      - matchRegex:
+          path: spec.policy-templates[0].objectDefinition.spec.object-templates[3].objectDefinition.data.key
+          pattern: 'fromSecret "[^"]*" "grid-swim-key" "key"'
+
+  - it: delivers no SWIM key under Local membership, where none exists
+    set:
+      host: e.example.com
+      hubSite.name: hub
+      hubSite.namespace: grid-system
+      grid.membership.source: Local
+      invitePolicy.enabled: true
+      invitePolicy.namespace: grid
+      invites.peer.cluster: peer
+    documentSelector:
+      path: kind
+      value: Policy
+    asserts:
+      # Three templates, not four: the namespace, the invite and the CA bundle.
+      - notExists:
+          path: spec.policy-templates[0].objectDefinition.spec.object-templates[3]
+      # Both halves have to go. A fromSecret reading a Secret the install never creates
+      # would fail the policy just as surely as the projection would.
+      - notMatchRegexRaw:
+          pattern: swim

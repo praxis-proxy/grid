@@ -49,8 +49,10 @@ enrollment and its database. On upgrade it keeps the CA.
 The chart README and the chart values file cover the rest.
 
 If a `reencrypt` or publicly trusted Route must front enrollment, set
-`enrollment.rotation.enabled=false`, pin that Route's CA in the site's
-`enrollment.caBundle`, and set `enrollment.gridCaBundle` to the grid CA.
+`enrollment.rotation.enabled=false`, pin the intermediate that issued that Route's
+certificate, or the certificate itself, never a public root, in the site's
+`site.signerEndpoint.caBundleRef`, and set `site.signerEndpoint.gridCaBundleRef` to
+the grid CA, through the site's `enrollment.caBundle` and `enrollment.gridCaBundle`.
 
 ## 2. Invite a site
 
@@ -87,7 +89,53 @@ Treat invite Secrets as credentials:
 
 ## 3. Enroll the site
 
-1. Install the grid-operator chart with enrollment on:
+The site enrolls from the operator config: the ConfigMap `grid-operator-config` in the
+operator namespace, key `config.yaml`. Its `site` section names the site, the signer it
+enrolls and renews through, and the Secret holding the invite. The grid-operator chart
+renders it from the `enrollment` values. The operator reads it through the API and
+watches it, so an edit applies without a restart.
+
+```yaml
+site:
+  name: east2                      # the site name the invite pins, and its GridSite's
+  signerEndpoint:
+    url: https://enrollment.apps.example.com
+    caBundleRef:
+      kind: Secret
+      name: grid-ca-bundle         # key ca.crt by default
+  inviteSecretRef:
+    name: grid-invite-east2        # key token by default
+```
+
+| Field | Meaning |
+| --- | --- |
+| `site.name` | The site name. Required. The invite label and the issued certificate must match it, and the GridSite of this name is this cluster's own. |
+| `site.signerEndpoint.url` | The signer's base URL: https, a host with an optional numeric port, without credentials, query or fragment, and not a host under `grid.internal`, where site certificates live. Editable: renewal reads it each round. |
+| `site.signerEndpoint.caBundleRef` | `kind` (`Secret`, the only kind, required), `name`, `key`. Pins the signer's serving certificate to enroll and, by default, the grid CA it returns. Renewal trusts the grid CA the site holds together with this bundle. Required with `inviteSecretRef`. Pin the issuing intermediate or the signer's serving certificate, never a public root. The object must carry the label `grid.praxis.fast/signer-bundle=true`. |
+| `site.signerEndpoint.gridCaBundleRef` | The grid CA the returned CA must match: a bootstrap override for a signer that cannot serve its own bundle, such as one behind a certificate from another CA. Carries the same label. |
+| `site.signerEndpoint.rotation` | `Enabled`, the default, or `Disabled`: whether this operator renews through the signer. See [Rotation](#5-rotation). |
+| `site.inviteSecretRef` | `name`, `key`. The token is an opaque credential the signer issued. The operator presents it and never parses it, and reads it once, while the site has no identity. The Secret must carry the label `grid.praxis.fast/site=<site.name>`. |
+
+The document never holds a credential: it names Secrets. An unknown key inside the `site`
+section refuses the whole document, so a typo never passes as an unset field. An unknown
+top-level section is ignored with an `OperatorConfigSectionIgnored` Warning Event, so an
+operator older than a new section keeps working. An optional `version: 1` names the
+document, and any other version is refused. The operator
+config decides where the invite token goes and which CA the site trusts, so write access
+to it is operator-level access: grant it only to grid admins. `GRID_SIGNER_HOSTS`, the
+chart's `enrollment.signerHosts`, fixes the signer hosts the config may name, outside the
+config, and defaults to the host of `enrollment.url`. The two labels keep it from
+pinning a bundle that happens to be in the namespace, such as an injected service CA, or
+from sending an unrelated Secret as a token. Label a bundle or an invite only when it is
+one.
+
+```bash
+kubectl -n grid-system label secret grid-ca-bundle grid.praxis.fast/signer-bundle=true
+kubectl -n grid-system label secret grid-invite-east2 grid.praxis.fast/site=east2
+```
+
+1. Install the grid-operator chart with enrollment on. It renders the operator config,
+   and sets the SWIM Service, metrics TLS and namespace guard an enrolling site needs:
 
    ```bash
    helm install grid-operator ./charts/grid-operator \
@@ -97,31 +145,114 @@ Treat invite Secrets as credentials:
      --set enrollment.url=https://enrollment.apps.example.com
    ```
 
-2. Confirm the pod reports ready. On the hub itself, `enrollment.url` defaults
-   to the in-cluster `grid-enrollment` Service.
+   Off the hub `enrollment.url` is required, and the render fails without it. On the hub
+   itself, set `enrollment.hub=true` instead: the URL defaults to the in-cluster Service
+   `enrollment.hubService` (default `grid-enrollment`, the grid-enrollment release's full
+   name and the name its serving certificate carries) on `enrollment.hubPort` (default
+   `8443`) in `rbac.enrollmentNamespace`. Both must match the grid-enrollment release,
+   whose Service port derives from its `listenAddr`.
 
-Defaults:
+2. Create the GridNetwork with the grid-site chart or by hand, with `spec.gridId` naming
+   the grid, as the grid-site chart's `gridNetwork.gridId` and the grid-operator chart's
+   `grid.id` do. Beside a site section the operator mints no ID, so an empty
+   `spec.gridId` holds the grid runtime and `Accepted` reads `False` with `GridIdUnset`.
+   The operator sends nothing until the GridNetwork exists, and records an
+   `AwaitingGridNetwork` Event on the ConfigMap once meanwhile. The site's GridSite,
+   named `site.name`, is declared like any peer, with the grid-site chart, GitOps or by
+   hand; when nothing declares one the operator creates it from the identity. Enrollment
+   does not wait for it.
+3. Watch the GridNetwork's `Enrolled` condition:
+
+   ```bash
+   kubectl get gridnetwork grid -o jsonpath='{.status.conditions[?(@.type=="Enrolled")]}'
+   ```
 
 | Item | Default |
 | --- | --- |
 | Site name | `swim.siteName` |
 | CA bundle Secret | `grid-ca-bundle` |
 | Token Secret | `grid-invite-<siteName>` |
-| Identity Secret | `grid-site-identity` (`GRID_ENROLL_IDENTITY_SECRET`) |
-| CA Secret | `grid-ca` (`GRID_ENROLL_CA_SECRET`) |
+| Operator config | `grid-operator-config` (`operatorConfig.name`) |
 
-When a GridNetwork exists, the operator writes to the Secrets its
-`spec.tls.siteSecretRef` and `caSecretRef` name. All of these Secrets live in
-the operator namespace. Enrollment needs no GridNetwork, but until one exists
-the operator does no SWIM join and no overlay.
+The operator enrolls while it has no identity: at startup, every 15 seconds while it
+waits for one, and at once on an edit to the operator config. It writes the identity to
+`grid-site-identity` and the grid CA to `grid-ca` in its namespace, or to the Secrets a
+GridNetwork's `spec.tls.siteSecretRef` and `caSecretRef` name. An operator that enrolls
+while waiting exits 0 once and restarts under the identity. Enrollment waits for the
+GridNetwork, where it records its result. The grid-site chart renders one before
+enrollment, and `spec.gridId` names the grid, set once: a change is refused, and
+`status.gridId` mirrors it. The operator mints an ID only while `spec.gridId` is empty
+and the operator config names no site; beside a site section an empty `spec.gridId`
+holds the grid runtime and `Accepted` reads `False` with `GridIdUnset`. Until a
+GridNetwork exists nothing is sent, and the operator logs why and records an
+`AwaitingGridNetwork` Event on the operator config, once.
 
-A restart never spends a second token, because the operator skips enrollment
-when the identity Secret exists. If you create a GridNetwork afterward that
-names other Secrets, the operator refuses to enroll again. Point it at the
-enrolled Secrets. The operator retries retryable enrollment failures without an
-attempt limit or overall deadline. For `siteIdentity` installs, the startup probe
-restarts a pod still enrolling after about 16 minutes by default (96 checks, 10s
-apart); adjust `health.startup` to change that window.
+This site's conditions live on the GridNetwork, and they are the contract. Its GridSite
+carries membership only, each cluster's view of one site: `phase` and `Connected` follow
+the gateway probe, as on a peer, and say nothing about the identity. Each condition type
+has one writer. `Unknown` means only that a condition has not been
+evaluated yet. A wait an admin must end is `False`.
+
+| `Accepted` | Reason | Meaning |
+| --- | --- | --- |
+| `True` | `Accepted` | The operator config's `site` section applies to this site, the one the identity names. With no config, or no `site` section, the message reads `no operator config, enrollment off` or `the operator config names no site, enrollment off`. |
+| `False` | `OperatorConfigInvalid` | The operator config was refused whole: it does not parse, names a version other than `1`, carries an unknown key inside a section, or a field is invalid. The message names the field. Nothing in it is acted on, so nothing enrolls or renews. |
+| `False` | `SiteNameMismatch` | `site.name` differs from the site this cluster's identity names. Nothing renews through the config until they agree. |
+| `False` | `RotationUnsupportedUnderPinTrust` | `site.signerEndpoint.rotation` is `Enabled`, the default, but the GridNetwork declares `pin` peer trust, which does not renew. Renewal is held back and the rest of the config still acts. Set `rotation: Disabled`, or `peerTrust.mode: spiffe`. |
+| `False` | `GridIdUnset` | The GridNetwork has no `spec.gridId` while the operator config names a site, so no ID is minted and the grid runtime waits. Set `spec.gridId`, as the chart's `grid.id` does. The message names the GridNetwork. |
+
+| `ResolvedRefs` | Reason | Meaning |
+| --- | --- | --- |
+| `True` | `ResolvedRefs` | Every object the `site` section names resolves. |
+| `False` | `RefNotFound` | The invite or a bundle the `site` section names does not exist, or a bundle lacks `grid.praxis.fast/signer-bundle=true`. |
+
+| `Progressing` | Reason | Meaning |
+| --- | --- | --- |
+| `True` | `Enrolling` | The first request is out. A step retries a failure within its budget, about one poll, then returns, so an edit to the config is seen. |
+| `True` | `Retrying` | `Enrolled` holds a reason the next poll retries with the same inputs: `SignerLapsed`, `SignerUnreachable`, `InviteMaybeSpent`, `IdentityNotStored` or `StoreUnavailable`; `InviteRefusedAfterLostAnswer` is held, not retried. It holds across polls, so a resend does not move `lastTransitionTime`. |
+| `False` | `AsExpected` | Nothing is in flight. `Progressing` follows `Enrolled` alone. |
+
+| `Enrolled` | Reason | Meaning |
+| --- | --- | --- |
+| `True` | `Enrolled` | The signer issued this site's identity, or the identity Secret already existed and this process did not enroll it, so the invite is never read. It stays once written. For an identity written outside the signer the message reads `identity provisioned outside the signer, renewed by cert-manager Certificate <name>` when the Secret names one, else `identity provisioned outside the signer; nothing is known to renew it`. |
+| `Unknown` | `Enrolling` | The first request is out and no answer has returned. |
+| `False` | `EnrollmentOff` | No identity, and the config names no site to enroll: nothing is sent. Name the site and its invite in the operator config. |
+| `False` | `IdentityMissing` | An identity this process held is gone. Restore it, or name `site.inviteSecretRef` to enroll again. |
+| `False` | `AwaitingInvite` | No `site.inviteSecretRef` yet, or no `site.signerEndpoint` to send it to. |
+| `False` | `Misconfigured` | A setting cannot work, such as a missing `caBundleRef`, a bundle with no certificate, or a Secret enrollment would both write and read, such as a grid CA Secret named `<identity Secret>-pending`. The message names the field or the Secret. |
+| `False` | `SignerUntrusted` | The signer's serving certificate does not chain to `caBundleRef`. Nothing is sent. Pin the issuing intermediate or the signer's serving certificate, never a public root. |
+| `False` | `SignerLapsed` | The signer's serving certificate is expired or not yet valid. Nothing is sent, and the next poll retries: the signer must rotate its serving certificate. |
+| `False` | `SignerUnreachable` | The signer could not be reached within the step, so the request never left. The next poll retries, so a corrected `site.signerEndpoint.url` takes effect without a restart. |
+| `False` | `NameMismatch` | The invite Secret's `grid.praxis.fast/site` label is missing or names another site. Nothing is sent. |
+| `False` | `InviteInvalid` | The signer rejected the token: expired, revoked or spent. |
+| `False` | `NameTaken`, `NameDeleted` | The name is enrolled, or was deleted and the invite does not re-admit it. |
+| `False` | `Refused` | The signer refused the request. |
+| `False` | `InviteMaybeSpent` | The request was sent and no usable answer came back, or the signer answered 408. The next poll sends the same request again. A token refused after such a request reads `InviteRefusedAfterLostAnswer` instead. |
+| `False` | `InviteRefusedAfterLostAnswer` | The token was refused after an earlier request got no answer, which may have spent it. Not resent until the invite or the config changes, and a restart resends once; a new invite may be needed. |
+| `False` | `PendingSecretForeign` | A Secret named `<identity Secret>-pending` exists that enrollment did not write, so nothing is sent. Delete it: enrollment keeps its request there. A request kept there for another site name, grid CA or invite is discarded and a new one is made. |
+| `False` | `InvalidResponse` | The returned certificate failed the pin, name or key checks. The token is spent. |
+| `False` | `IdentityNotStored` | The certificate was issued but could not be written. The token is spent. |
+
+| `Available` | Reason | Meaning |
+| --- | --- | --- |
+| `True` | `Available` | `Accepted`, `ResolvedRefs`, `Enrolled` and `IdentityValid` are all `True`. |
+| `False` or `Unknown` | the first failing condition's | The roll-up copies the status, reason and message of the first of those that is not `True`, in that order. `RotationOnSchedule` does not gate it. It raises `Degraded`. |
+
+| `Degraded` | Reason | Meaning |
+| --- | --- | --- |
+| `False` | `AsExpected` | The identity renews before it expires, or renewal is not due yet. |
+| `True` | `RotationOnSchedule`'s | Copied from `RotationOnSchedule` while it is `False`: the early warning that the identity will expire. |
+
+A failure the same inputs cannot fix is not sent again until the operator config's
+`site` section, or the resource version of the invite or a bundle it names, changes.
+Replace the invite or edit the config to retry.
+`InviteMaybeSpent`, `IdentityNotStored` and `StoreUnavailable` retry on the next poll,
+and a spent token then answers as `InviteInvalid`. A restart never spends a second token, because
+the operator skips enrollment when the identity Secret exists. If you create a
+GridNetwork afterward that names other Secrets, the operator refuses to enroll
+again. Point it at the enrolled Secrets. For `siteIdentity` installs, the
+startup probe restarts a pod still enrolling after about 16 minutes by default
+(96 checks, 10s apart). Adjust `health.startup` to change that window.
 
 ## 3a. Read the enrollment record
 
@@ -173,18 +304,26 @@ does not rotate.
 
 Requirements:
 
-1. Set `grid.peerTrust` to `spiffe` or leave it unset. Under `pin` the operator
-   does not rotate and logs `rotation disabled`, because peers pin the leaf
-   digest and would refuse a new one. Before a pin site's certificate expires,
+1. Set `peerTrust.mode` to `spiffe` on the GridNetwork. Under `pin` peers pin the
+   leaf digest and would refuse a new one, so a site under `pin` sets
+   `site.signerEndpoint.rotation: Disabled`, which the chart renders by
+   default, and `Enabled` there reports `Accepted` `False` with
+   `RotationUnsupportedUnderPinTrust`. Before a pin site's certificate expires,
    re-enroll it as in step 7 and update the digest its peers pin.
 2. Keep the enrollment Route on passthrough. A reencrypt Route drops the client
    certificate.
 3. Do not put a proxy that presents a grid site certificate in front of
    enrollment.
-4. Leave `enrollment.rotation.enabled=true` on the grid-operator chart (default
-   whenever an enrollment URL is known). The chart then grants `get` and `patch`
-   on the gateway Deployment, because the gateway reads its client certificate
-   only at start and the operator rolls it after each rotation.
+4. Keep `site.signerEndpoint` in the operator config, with `rotation` at
+   `Enabled`, the default. The operator renews through the signer it names,
+   trusted through the grid CA the site holds together with `caBundleRef`, and rolls the gateway Deployment after each rotation, since the
+   gateway reads its client certificate only at start. The chart grants `get`
+   and `patch` on that Deployment. A hub declares its signer the same way: the
+   grid-operator chart renders `site.signerEndpoint` from `enrollment.url`,
+   which defaults to the in-cluster enrollment Service with `enrollment.hub`.
+   A hub installed without either does not renew: `RotationOnSchedule` reads `True`,
+   its message saying nothing is known to renew the identity, then `False` with
+   `RotationOverdue`.
 5. Keep clocks on the enrollment service and its database within five minutes of
    each other.
 6. Do not restore a site's identity Secret from backup, and do not manage it
@@ -195,20 +334,45 @@ Requirements:
    Both steps need `enrollment-admin`.
 
 Watch `grid_site_identity_expiry_timestamp_seconds` and
-`grid_site_identity_rotations_total` on the operator. `GridNetwork`
-`status.identity.notAfter` and `rotateAfter` show the dates, and
-`status.identity.reason` reads `IdentityExpired` when the certificate has
-expired.
+`grid_site_identity_rotations_total` on the operator. Alerting reads the gauge. The
+GridNetwork's `IdentityValid` message starts with the expiry, RFC 3339, and names the
+certificate fingerprint, and its reason is `CertificateExpired` once the certificate
+has expired. The GridNetwork carries two conditions the renewal loop writes each round:
+
+| `IdentityValid` | Reason | Meaning |
+| --- | --- | --- |
+| `True` | `IdentityValid` | The identity reads, is current, names this site, is issued by the grid CA the operator holds, and `tls.key` is its key. The message reads `<notAfter, RFC 3339> is the expiry; fingerprint sha256:<hex>`. |
+| `Unknown` | `AwaitingFirstAttempt` | No identity yet: the renewal loop evaluates it once one exists. |
+| `False` | `IdentityMissing` | The identity Secret, or a key in it, is absent. |
+| `False` | `CertificateUnreadable` | The Secret holds something that is not a certificate. |
+| `False` | `CertificateExpired` | The identity expired and cannot renew. Re-enroll with a new site token. |
+| `False` | `CertificateUnusable` | The certificate lacks the X.509-SVID profile peers under spiffe trust require. |
+| `False` | `CertificateUntrusted` | The grid CA in the CA Secret did not issue the certificate, or it is not yet valid. Replace it with one that CA issued, or re-enroll. |
+| `False` | `CertificateNameMismatch` | The certificate names another site, or no single site. Issue it for this site's SPIFFE ID, or set `site.name` to the site it names. |
+| `False` | `CertificateKeyMismatch` | `tls.key` is not the key of `tls.crt`. Write the certificate and its key together. |
+| `False` | `CertificateDnsNameMissing` | `tls.crt` lacks the DNS name `<site>.grid.internal`, which peers dial. Issue it with that name. Checked on every identity, signer-issued or external. |
+| `False` | `CertificateOrganizationMismatch` | The subject organization must name the site alone, `O=<site>`, which a gateway authorizes peers on. Issue it with that organization. Checked on every identity, signer-issued or external. |
+
+| `RotationOnSchedule` | Reason | Meaning |
+| --- | --- | --- |
+| `True` | `RotationOnSchedule` | Renewal is not due, and the message says what renews. The signer `site.signerEndpoint` names: the message carries the due time and the URL. The cert-manager Certificate the identity Secret's `cert-manager.io/certificate-name` annotation names: the operator reads only the annotation. Or nothing, so the identity is kept until it expires: `rotation` is `Disabled`, no signer is declared, or `Accepted` reports `RotationUnsupportedUnderPinTrust`. A newer leaf another writer puts in the identity Secret resets the clock. |
+| `Unknown` | `NotEvaluated` | The operator config is refused for this site, so renewal is held back and not evaluated. See `Accepted`. Once renewal falls due this reads `False` with `RotationOverdue`. |
+| `False` | `RotationOverdue` | Renewal is due or the identity expired, and nothing renewed it: the cases above, an annotated Certificate that has not replaced the identity within 15 minutes of its due time, the signer answering 503 `rotation_disabled`, or an expired identity. |
+| `False` | `RenewalFailing` | The last check or renewal failed and is retried with backoff. The message carries the error. |
+| `False` | `RenewalRefused` | The signer answered 401 or 403. Re-enroll this site with a new site token. |
+| `False` | `RenewalNeedsPassthrough` | The signer received no client certificate, so TLS ends before it. Renewal needs a passthrough Route, a load balancer, or the in-cluster Service. Retried with backoff. |
+| `False` | `SignerUntrusted` | Neither the grid CA this site holds nor the `caBundleRef` bundle trusts the signer's serving certificate. Pin the intermediate that issued it, or the certificate itself, never a public root, in `site.signerEndpoint.caBundleRef`, or serve a certificate the grid CA issued. Retried with backoff. |
+| `False` | `SignerLapsed` | The signer's serving certificate is expired or not yet valid. The signer must rotate its serving certificate. Retried with backoff. |
 
 ### Turn rotation off
 
 | Scope | Set | Effect |
 | --- | --- | --- |
 | Whole grid | `enrollment.rotation.enabled=false` on grid-enrollment | The service answers every rotation with 503 `rotation_disabled`. Enrollment still works. |
-| One site | `enrollment.rotation.enabled=false` on its grid-operator | The operator stops rotating and rolling the gateway. The chart drops the Deployment grant. |
+| One site | Set `enrollment.rotation=Disabled` on its grid-operator, which renders `site.signerEndpoint.rotation: Disabled` | The operator stops rotating and rolling the gateway, reports `RotationOnSchedule` `True`, its message saying nothing renews, until renewal is due and `False` with `RotationOverdue` after, which raises `Degraded`, and logs `rotation disabled`. The site stays this cluster's own and the signer still serves enrollment. |
 
-Either way, each site keeps its identity until `status.identity.notAfter`. Turn
-rotation back on before then, or the site must re-enroll.
+Either way, each site keeps its identity until the expiry its `IdentityValid` message
+names. Turn rotation back on before then, or the site must re-enroll.
 
 ### Frozen sites
 
@@ -230,7 +394,10 @@ and must re-enroll.
 
 ### Recover the hub identity
 
-The bootstrap Job issues the hub's identity. To re-issue it or clear a freeze:
+The bootstrap Job issues the hub's identity. The hub renews through the signer its
+operator config names, which the grid-operator chart renders from `enrollment.url`, the
+release's in-cluster Service by default. To re-issue the identity or clear a
+freeze:
 
 1. Delete the Secret named by `hubSite.identitySecretName` in
    `hubSite.namespace`.
@@ -276,8 +443,10 @@ Where to look:
 ```bash
 # Every operator replica; above one replica only the lease holder enrolls and rotates.
 kubectl -n grid-system logs -l app.kubernetes.io/name=grid-operator --all-containers --prefix --max-log-requests 10 | grep -i "enroll\|rotation"
+kubectl -n grid-system get configmap grid-operator-config -o yaml   # the site section
+kubectl get gridnetwork -o yaml   # status.conditions: Available first; IdentityValid names the expiry
+kubectl -n grid-system get events --field-selector involvedObject.name=grid-operator-config
 kubectl -n grid-enrollment logs deploy/grid-enrollment
-kubectl get gridnetwork -o yaml   # status.identity: notAfter, rotateAfter, reason
 ```
 
 Operator metrics: `grid_site_identity_expiry_timestamp_seconds` and
@@ -288,15 +457,19 @@ Operator metrics: `grid_site_identity_expiry_timestamp_seconds` and
 | --- | --- | --- |
 | `site token rejected (...)` | The token expired or was revoked. | Delete `grid-invite-<siteName>` on the hub, run `helm upgrade` with the site still in `invites`, and copy the new token. |
 | `site name already enrolled (...)` | An earlier attempt spent a token for this name. | An admin with `enrollment-admin` runs `DELETE /v1alpha1/enrollments/<siteName>`, then an admin with both `grid-admin` and `enrollment-admin` invites the site again with `allowDeletedName`. Without that access, enroll under a new site name. |
-| `reaching the enrollment service failed after 10 attempts` | `enrollment.url` from the site. | Make it reachable. |
-| `TLS to the enrollment service failed, check GRID_ENROLL_CA_FILE` | The CA that issued the enrollment serving certificate. | Set `enrollment.caBundle` to it. |
-| `returned CA is not the pinned grid CA` | The attempt spent the token. | Set `enrollment.gridCaBundle` to the grid CA and enroll under a new site name. |
+| `Progressing` stays `True` with `Enrolling` | `site.signerEndpoint.url` from the site. | Make it reachable. |
+| `TLS to the enrollment service failed, check site.signerEndpoint.caBundleRef` | The intermediate that issued the enrollment serving certificate. | Set `site.signerEndpoint.caBundleRef` to it, or to the certificate itself, never a public root. |
+| `returned CA is not the pinned grid CA` | The attempt spent the token. | Set `site.signerEndpoint.gridCaBundleRef` to the grid CA and enroll under a new site name. |
+| `Accepted` is `False` with `RotationUnsupportedUnderPinTrust` | The GridNetwork's `peerTrust.mode`. | Set `site.signerEndpoint.rotation: Disabled`, or move the grid to `spiffe`. |
+| `Accepted` is `False` with `OperatorConfigInvalid` | The field the message names in `grid-operator-config`. | Fix it. The operator picks the edit up without a restart. |
+| `Accepted` is `False` with `SiteNameMismatch` | Which site the identity names. | Set `site.name` to it, or re-enroll under the new name. |
+| An `AwaitingGridNetwork` Event on `grid-operator-config` | Whether a GridNetwork exists. | Create it, with the grid-site chart or by hand. |
 | `possible interception, contact the hub` | The certificate names another site or key. | Tell the hub admin before enrolling again. |
-| `rotation disabled: peerTrust pin needs re-enrollment and re-pinning at expiry` | `status.identity.notAfter`. | Expected under pin trust. Re-enroll before expiry and update the digest peers pin. |
+| `RotationOnSchedule` is `True` under pin trust and its message says nothing renews | The expiry the `IdentityValid` message names. | Expected. Re-enroll before expiry and update the digest peers pin. |
 | `site identity rotation failed` with `rotation_disabled` (503) | Whether `enrollment.rotation.enabled=false` on grid-enrollment. | Set it back to `true` before `notAfter`. |
-| `site identity rotation failed` with `rotation unauthenticated` and `identity_required` (401) | The Route must be passthrough. A reencrypt Route drops the client certificate. | Switch to passthrough. |
+| `RotationOnSchedule` `False` `RenewalNeedsPassthrough` (the signer answered 401 `identity_required`) | The signer never received the site's certificate. A reencrypt or edge Route, or a TLS-intercepting proxy, ends TLS before the signer. | Renewal needs TLS end to end: a passthrough Route, a load balancer, or the in-cluster Service. Put the signer host in `NO_PROXY`. |
 | `site identity rotation failed` with `rotation refused` and `identity_refused` (403) | Enrollment log for `rotation fork` or `rotation refused`. `GET /v1alpha1/enrollments/<siteName>` shows `state: frozen`. | Delete the site's enrollment with `enrollment-admin`, invite it again with `allowDeletedName` holding both `grid-admin` and `enrollment-admin`, and the site re-enrolls. For the hub, see Recover the hub identity. |
-| `site identity expired and cannot rotate; re-enroll this site with a new site token` | `status.identity.reason` is `IdentityExpired`. | Delete the site's enrollment with `enrollment-admin` and its identity Secret, invite it again with `allowDeletedName` holding both `grid-admin` and `enrollment-admin`, and restart the operator. |
+| `site identity expired and cannot rotate; re-enroll this site with a new site token` | `IdentityValid` is `False` with `CertificateExpired`. | Delete the site's enrollment with `enrollment-admin` and its identity Secret, invite it again with `allowDeletedName` holding both `grid-admin` and `enrollment-admin`, and restart the operator. |
 | CA bootstrap Job fails with `Restore Secret grid-ca-key from backup` | The message names why: a missing key Secret, a key for a different CA, or an unparsable distributed copy. | Restore the right `grid-ca-key` and run `helm upgrade`. To start a new grid on purpose, set `ca.forceRegenerate=true` and `ca.confirmRotation` to the old public-key `fingerprint` from the service's `grid CA checked against the database record` log line, not the bootstrap error's certificate fingerprint. Every site must re-enroll. |
 | Enrollment pod exits with `DB_CONNECTION_URL must set sslmode=verify-full` | The external database URL uses a lesser mode, or none. A shared database such as MaaS's may. | Set `sslmode=verify-full` and `sslrootcert` in the URL Secret, mounting the database's CA with `db.external.caConfigMapName`, then restart the pod. |
 | Enrollment pod exits with `the database records grid CA <old>, but the loaded CA is <new>` | A CA other than the one the database records was minted or restored. | Restore the CA with fingerprint `<old>` and run `helm upgrade`. To start a new grid on purpose, set `ca.confirmRotation=<old>`, and every site must re-enroll. |

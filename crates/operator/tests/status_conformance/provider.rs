@@ -47,15 +47,32 @@ async fn reconcile(api: &FakeApi, path: &str) {
 /// pass that finds it held skips its writes.
 static PASS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// One signals pass in Poll mode, the only writer of provider conditions, awaited.
+/// Run signals passes in Poll mode until the asynchronous readiness writer publishes `Ready`.
+///
+/// A pass can skip its status write while the process-wide write slot is occupied, so one pass
+/// is not enough to guarantee that this API receives the condition. Retry within the same bound
+/// used by the other readiness waits in this test suite.
 async fn signals_pass(api: &FakeApi, path: &str) {
     let _pass = PASS.lock().await;
     let client = api.client("default");
     let ctx = OperatorCtx::new(client.clone(), None, SignalMode::Poll);
-    grid_network::refresh_signals(&ctx, &client, NETWORK)
+    let publish = async {
+        loop {
+            grid_network::refresh_signals(&ctx, &client, NETWORK)
+                .await
+                .expect("signals pass succeeds");
+            if fixtures::observe(api, path).condition("Ready").is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(30), publish)
         .await
-        .expect("signals pass succeeds");
-    fixtures::until_condition(api, path, "Ready").await;
+        .is_err()
+    {
+        panic!("{path} never held a Ready condition within 30 s");
+    }
 }
 
 /// The field manager each provider condition type belongs to.
@@ -79,7 +96,7 @@ async fn invariant_1_available_provider_is_unchanged_across_five_rounds() {
     let rounds = fixtures::rounds(&api, &path, 5, |_round| reconcile(&api, &path)).await;
 
     invariants::unchanged_from(&rounds, 1).expect("invariant 1");
-    invariants::observed_generation_tracks(&rounds).expect("invariant 3");
+    invariants::observed_generation_tracks(&rounds, &[]).expect("invariant 3");
     invariants::changes_explained(&rounds, &[]).expect("invariant 6");
     let first = rounds.first().expect("five rounds");
     assert_eq!(first.field("phase"), "Available", "a resolved provider is Available");
@@ -122,7 +139,7 @@ async fn invariant_1_provider_conditions_are_unchanged_across_repeated_signals_p
 
     invariants::unchanged_from(&rounds, 1).expect("invariant 1");
     invariants::transition_time_moves_only_with_status(&rounds).expect("invariant 2");
-    invariants::observed_generation_tracks(&rounds).expect("invariant 3");
+    invariants::observed_generation_tracks(&rounds, &[]).expect("invariant 3");
     invariants::reasons_within(
         &rounds,
         &[

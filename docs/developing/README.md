@@ -48,8 +48,10 @@ kubectl --context kind-grid-hub-site-site -n grid get gridsites
 
 - The Helm commands the script runs are in
   [examples/helm/hub-site](../../examples/helm/hub-site/README.md).
-- Membership on `main` still uses SWIM. Declared membership with SWIM off is in
-  progress.
+- `grid.membership.source` picks where a site learns its members. `Swim`, the default,
+  discovers them by SWIM gossip. `Local` means this site's configuration lists its peers
+  as `GridSite` objects, polls their signals, and runs no SWIM. Both are supported peer
+  options.
 
 ## More
 

@@ -175,7 +175,8 @@ RBAC is split into two `ClusterRoles`:
 1. **`grid-operator-crd`**: cluster-scoped CRD access,
    bound via a `ClusterRoleBinding`.
 2. **`grid-operator-resources`**: namespaced `Secret` and
-   `ConfigMap` access, bound via per-namespace
+   `ConfigMap` access, plus `get` and `patch` on the named
+   gateway `Deployment`, bound via per-namespace
    `RoleBindings`.
 
 The default install includes a `RoleBinding` in the
@@ -210,7 +211,14 @@ granted for `secrets` and `configmaps`.  `delete` and
 | Resource | Verbs | Why |
 |---|---|---|
 | `secrets` | `get`, `create`, `patch` | Read TLS certs, SWIM key, credential refs; SSA-create CA and site cert `Secrets` |
-| `configmaps` | `get`, `create`, `patch`, `update` | Routing overlay, consumer config, and Secret requirements `ConfigMaps`; SWIM revision reservations |
+| `configmaps` | `get`, `create`, `patch`, `update` | Routing overlay, consumer config, and Secret requirements `ConfigMaps`, and SWIM revision reservations |
+| `deployments` | `get`, `patch` on the named gateway Deployment only | Roll the gateway after an identity rotation, as Deployment access describes |
+
+**Operator config (operator namespace, `grid-operator-operator-config`):**
+
+| Resource | Verbs | Why |
+|---|---|---|
+| `configmaps` | `get`, `list`, `watch` on the operator config only | Watch the operator config, so an edit applies without a restart. The watch selects the ConfigMap by name, so `resourceNames` confines `list` and `watch` too |
 
 The `grid-operator-resources` `ClusterRole` is never bound
 cluster-wide.  It takes effect only in namespaces where a
@@ -218,13 +226,16 @@ cluster-wide.  It takes effect only in namespaces where a
 
 ### Deployment access
 
-Neither `ClusterRole` grants unrestricted Deployment access. With rotation
-on, the resources `ClusterRole` grants `get` and `patch` on the named gateway
-Deployment. The operator reaches Deployments through two named grants only:
+Neither `ClusterRole` grants unrestricted Deployment access. The resources
+`ClusterRole` grants `get` and `patch` on the named gateway Deployment in
+every install path, whether or not rotation is on: the Helm chart names
+`gateway.serviceName`, the static operator manifests and the OpenShift overlay
+name `grid-gateway`, and the kind overlay names `provider-gateway`. The
+operator reaches Deployments through two named grants only:
 
 | Grant | Bound where | Why |
 |---|---|---|
-| `deployments` `get`, `patch` on `gateway.serviceName` (Helm chart only, with rotation on) | Release namespace, each `resourceNamespaces` entry, and `gateway.namespace` through the discovery Role | Roll the gateway after an identity rotation |
+| `deployments` `get`, `patch` on the named gateway Deployment | Helm: release namespace, each `resourceNamespaces` entry, and `gateway.namespace` through the discovery Role. Static manifests and overlays: the operator namespace through `grid-operator-resources` | Roll the gateway after an identity rotation |
 | `deployments` `get`, `patch` on one delegated gateway's Deployment | That gateway's namespace, through a Role its owner creates | Delegated Secret mount reconciliation |
 
 A gateway that delegates its mounts (`praxisConfig.mountReconciliation`
@@ -329,6 +340,7 @@ across namespaces or list `Secrets`.
 |---|---|---|
 | `spec.tls.siteSecretRef` | `tls.crt`, `tls.key` (client cert + private key for mTLS gateway probes; key bytes wrapped in `Zeroizing`) | `tls.crt`, `tls.key` (create-if-absent via SSA patch) |
 | `spec.tls.caSecretRef` | `ca.crt` (existence check) | `ca.crt`, `ca.key` (create-if-absent via SSA patch) |
+| `<siteSecretRef>-pending` | `csr.pem`, `tls.key`, `tls.crt`, `ca.crt` | Cleared once the identity is stored, and on any later step that finds the identity; one enrollment did not write is left in place and logged. The same keys, while an enrollment is in flight: the request and its key before it is sent, and the issued certificate before the identity is written. Cleared by patch once the identity is stored |
 | `spec.tls.swimKeySecretRef` | `key` (or custom key field) | None |
 | `spec.auth.secretRef` | existence + UTF-8 validation | None |
 
@@ -339,6 +351,37 @@ namespace.
 
 Credential token bytes are never written to `ConfigMaps`,
 overlays, status fields, or logs.
+
+The identity Secret keys are a contract any writer follows, the operator or another
+issuer: `tls.crt` holds the site leaf, `tls.key` its private key, and `ca.crt` the grid
+CA, in the site Secret or the CA Secret the GridNetwork names. A writer other than the
+operator sets `site.signerEndpoint.rotation: Disabled` in the operator config, or leaves
+the signer out, and the operator reads the new leaf on its next round.
+
+### Operator config write access
+
+The operator config decides where the invite token goes and which CA pins the signer, so
+write access to ConfigMaps in the operator namespace is operator-level access. Grant it
+only to grid admins. A role that edits the config should name `grid-operator-config` in
+`resourceNames`, and no other role should get `create`, `patch` or `update` on ConfigMaps
+in that namespace.
+
+Two guards limit what a ConfigMap editor can still do:
+
+- A signer bundle must be a Secret, so the editor cannot pin a CA of their own.
+- `GRID_SIGNER_HOSTS`, the chart's `enrollment.signerHosts`, fixes the signer hosts at
+  install time, outside the config. The chart defaults it to the host of
+  `enrollment.url`. Unset, any host is allowed and the operator logs a warning at startup.
+
+Renewal trusts the grid CA the site holds and the `caBundleRef` bundle, so a signer
+serving a certificate from another CA still renews. Both guards above apply to that
+bundle: it is a labelled Secret, and it is used only for a host the install allows.
+
+The operator reads its config through a Role that names it, with no write verb. Its
+ServiceAccount still keeps `create`, `patch` and `update` on ConfigMaps in the operator
+namespace for the records and reservations it writes there. It derives their names at
+runtime, so RBAC cannot exclude the config by name, and its write on Secrets is the larger
+grant in any case.
 
 ### ConfigMap write scope
 
@@ -416,6 +459,7 @@ unrelated address.
 | `GRID_SWIM_ADVERTISE_FALLBACK` | Marks a `GRID_SWIM_ADVERTISE_ADDR` equal to it as the Pod IP default. The operator then builds the Pod IP endpoint itself, bracketing IPv6, or discovers the LoadBalancer address when `GRID_SWIM_SERVICE_NAME` names a Service. An older operator ignores it and advertises the Pod IP |
 | `GRID_SWIM_REQUIRE_KEY` | Hold all SWIM traffic until the `GridNetwork` key loads or the network declares none. Defaults to `true`. With `false`, SWIM is plaintext while no network exists |
 | `GRID_SWIM_SITE_NAME` | Unique site identity for this operator instance |
+| `GRID_SITE_NAME` | The same, for an install under Local membership (`grid.membership.source` Local), which runs no SWIM; the chart sets it in place of `GRID_SWIM_SITE_NAME` |
 | `GRID_SWIM_SEEDS` | Comma-separated SWIM seed endpoints; accepts `ip:port`, `[ipv6]:port`, or `hostname:port` |
 | `GRID_SIGNALS_ADDR` | Signals listener address. Defaults to `[::]:9091`, or `0.0.0.0:9091` on a host without IPv6 |
 | `GRID_SIGNALS_ADVERTISE_ADDR` | Signals endpoint gossiped to peers, as `ip:port`, `[ipv6]:port`, or `hostname:port`. Without it, a site advertising the SWIM LoadBalancer gossips that address on the Service port named `signals`, and any other site gossips none. A LoadBalancer site needs one of the two, and the Service port needs a LoadBalancer that serves UDP and TCP on one Service |
@@ -436,10 +480,15 @@ unrelated address.
 Gateway port discovery reads only the gateway Service's `spec.ports`; Pod health
 probes and metrics endpoints are not used for this selection.
 
-The signals listener caps handshakes per client source address. Behind a
-LoadBalancer, set `externalTrafficPolicy: Local` on the Service that carries
-the signals port. With `Cluster`, node SNAT gives many clients one source
-address, and they share its cap.
+The signals listener caps pending handshakes per client source address, eight by
+default, and gives each 2 seconds to finish before a client certificate proves
+who it is. At the cap the oldest pending handshake is cut, not the newest
+refused, so one slow or stalled handshake cannot shut a source's other peers
+out. The supported shape is a network load balancer whose Service carries
+`externalTrafficPolicy: Local`, so each peer arrives from its own address. With
+`Cluster`, node SNAT gives many clients one source address and they share its
+cap. Behind an OpenShift Route every peer arrives from the router's address,
+so raise `signals.maxHandshakesPerSource` to at least the number of peers.
 
 `GRID_SWIM_ENCRYPT_KEY` is intentionally omitted from the
 `Deployment`.  Production SWIM encryption uses
@@ -1109,6 +1158,7 @@ kubectl get gridsite <name> -o jsonpath='{.status.phase}/{.status.reason}: {.sta
 |---|---|---|
 | (new) | Pending | Resource created |
 | Pending | Discovered | `GridNetwork` controller observes SWIM Alive member |
+| Pending | Connecting | `GridSite` controller: declared site sets a dialable `spec.gatewayEndpoint.address` |
 | Discovered | Connecting | `GridSite` controller: `spec.gatewayEndpoint.address` non-empty |
 | Connecting | Active | `GridSite` controller: configured Mutual TLS identity probe succeeds |
 | Active | Connecting | TLS identity or trust verification fails, or the endpoint is changed to plaintext |
@@ -1212,6 +1262,13 @@ The current operator does not delete the `GridSite`, garbage-collect the CRDT
 record, or automatically complete a `Left` transition on process shutdown.
 Departure therefore preserves control-plane evidence and requires explicit
 site lifecycle cleanup by the deployment owner.
+
+### Moving a cluster to another grid
+
+A cluster belongs to the grid its `GridNetwork` `spec.gridId` names, set once, and
+`status.gridId` mirrors it. To move it, delete the GridNetwork and the identity Secret,
+recreate the GridNetwork with the new grid's ID, then invite the cluster to that grid
+and enroll again. A `spec.gridId` cannot change in place.
 
 ## Adding a New Site to an Existing AI Grid Network
 

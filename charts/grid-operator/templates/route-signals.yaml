@@ -1,0 +1,40 @@
+{{- include "grid-operator.normalize" . }}
+{{- include "grid-operator.signalsRoute.validate" . }}
+{{- if include "grid-operator.signalsRoute.enabled" . }}
+{{- /*
+Peers poll this site's signals over mutual TLS. Passthrough is the only termination that
+works: the router would otherwise present its own certificate and the peer's client
+certificate would never reach the operator, so the grid's peer identity would be gone.
+*/ -}}
+{{- $rate := dig "route" "rateLimit" dict (.Values.signals | default dict) }}
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ include "grid-operator.fullname" . }}-signals
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "grid-operator.labels" . | nindent 4 }}
+  {{- $annotations := dict }}
+  {{- if $rate.enabled }}
+  {{- $_ := set $annotations "haproxy.router.openshift.io/rate-limit-connections" "true" }}
+  {{- $_ := set $annotations "haproxy.router.openshift.io/rate-limit-connections.concurrent-tcp" (toString $rate.concurrentTcp) }}
+  {{- $_ := set $annotations "haproxy.router.openshift.io/rate-limit-connections.rate-tcp" (toString $rate.rateTcp) }}
+  {{- end }}
+  {{- $annotations = mergeOverwrite $annotations (dig "route" "annotations" dict (.Values.signals | default dict)) }}
+  {{- with $annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  host: {{ include "grid-operator.signalsRoute.host" . | quote }}
+  to:
+    kind: Service
+    name: {{ include "grid-operator.fullname" . }}-signals
+    weight: 100
+  port:
+    targetPort: signals
+  tls:
+    termination: passthrough
+    insecureEdgeTerminationPolicy: None
+  wildcardPolicy: None
+{{- end }}

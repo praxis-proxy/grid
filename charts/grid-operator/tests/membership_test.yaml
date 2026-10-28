@@ -1,0 +1,128 @@
+suite: membership mode
+templates:
+  - templates/deployment.yaml
+  - templates/service-swim.yaml
+  - templates/service-signals.yaml
+  - templates/gridnetwork.yaml
+  - templates/networkpolicy.yaml
+release:
+  name: grid
+  namespace: grid-system
+set:
+  site.name: east
+  grid.id: grid-a
+tests:
+  - it: Swim is the default and runs SWIM
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_MEMBERSHIP_SOURCE, value: Swim }
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_SWIM_BIND_ADDR, value: "0.0.0.0:7946" }
+
+  - it: Local runs no SWIM and polls signals
+    template: templates/deployment.yaml
+    set:
+      grid.membership.source: Local
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_MEMBERSHIP_SOURCE, value: Local }
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_SIGNAL_TRANSPORT, value: poll }
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_SWIM_BIND_ADDR, value: "0.0.0.0:7946" }
+      - notContains:
+          path: spec.template.spec.containers[0].ports
+          content: { name: swim-udp, containerPort: 7946, protocol: UDP }
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content: { name: signals, containerPort: 9091, protocol: TCP }
+
+  - it: Local names the site without the SWIM prefix
+    template: templates/deployment.yaml
+    set:
+      grid.membership.source: Local
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_SITE_NAME, value: east }
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_SWIM_SITE_NAME, value: east }
+
+  - it: Swim keeps the SWIM site name, as on main
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_SWIM_SITE_NAME, value: east }
+
+  - it: Local renders no SWIM Service
+    template: templates/service-swim.yaml
+    set:
+      grid.membership.source: Local
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: Local renders the signals Service
+    template: templates/service-signals.yaml
+    set:
+      grid.membership.source: Local
+    asserts:
+      - equal:
+          path: metadata.name
+          value: grid-grid-operator-signals
+
+  - it: Local writes poll, no discovery, and no SWIM key to the GridNetwork
+    template: templates/gridnetwork.yaml
+    set:
+      grid.membership.source: Local
+    asserts:
+      - equal:
+          path: spec.signalTransport.mode
+          value: poll
+      - notExists:
+          path: metadata.labels["grid.praxis.fast/auto-discover-sites"]
+      - notExists:
+          path: spec.tls.swimKeySecretRef
+
+  - it: Local opens no SWIM port in the NetworkPolicy
+    template: templates/networkpolicy.yaml
+    set:
+      grid.membership.source: Local
+      networkPolicy.enabled: true
+      networkPolicy.metricsFrom:
+        - namespaceSelector: {}
+    asserts:
+      - notContains:
+          path: spec.ingress[0].ports
+          content: { port: swim-udp, protocol: UDP }
+
+  - it: refuses a Cluster policy on a Local site's signals LoadBalancer
+    template: templates/deployment.yaml
+    set:
+      grid.membership.source: Local
+      signals.service.type: LoadBalancer
+      signals.service.externalTrafficPolicy: Cluster
+    asserts:
+      - failedTemplate:
+          errorPattern: signals.service.externalTrafficPolicy Local, or signals.maxHandshakesPerSource raised
+
+  - it: accepts a Cluster policy on a Local site's signals LoadBalancer with the cap raised
+    template: templates/deployment.yaml
+    set:
+      grid.membership.source: Local
+      signals.service.type: LoadBalancer
+      signals.service.externalTrafficPolicy: Cluster
+      signals.maxHandshakesPerSource: 64
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_MEMBERSHIP_SOURCE, value: Local }
+

@@ -48,15 +48,15 @@ tests:
                 serverName: site-b.grid.internal
         documentIndex: 1
 
-  - it: keeps an explicit probe server name
+  - it: keeps an explicit probe server name that is the peer's own in another case
     template: templates/peers.yaml
     set:
       peers.site-b.address: 203.0.113.21:8080
-      peers.site-b.serverName: gw.site-b.example.com
+      peers.site-b.serverName: Site-B.grid.internal
     asserts:
       - equal:
           path: spec.gatewayEndpoint.tls.serverName
-          value: gw.site-b.example.com
+          value: Site-B.grid.internal
 
   - it: refuses a malformed pin
     template: templates/peers.yaml
@@ -82,6 +82,41 @@ tests:
       - equal:
           path: metadata.name
           value: prod-grid-hub
+
+  - it: names a peer's GridSite under Local membership after the peer, with nothing to discover it
+    template: templates/peers.yaml
+    set:
+      grid.membership.source: Local
+      gridNetwork.name: Prod.Grid
+      peers.hub.digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - equal:
+          path: metadata.name
+          value: hub
+
+  - it: refuses a peer serverName that is not the peer's own name
+    template: templates/peers.yaml
+    set:
+      peers.site-b.address: 203.0.113.21:8080
+      peers.site-b.serverName: site-c.grid.internal
+    asserts:
+      - failedTemplate:
+          errorPattern: peers.site-b.serverName must be site-b.grid.internal
+
+  - it: declares no signals endpoint, which the operator derives from the gateway
+    template: templates/peers.yaml
+    set:
+      peers.site-b.address: 203.0.113.21:8080
+    asserts:
+      - notExists:
+          path: spec.signalsEndpoint
+
+  - it: refuses the removed signals address
+    template: templates/peers.yaml
+    set:
+      peers.site-b.signalsAddress: 203.0.113.21:9091
+    asserts:
+      - failedTemplate: {}
 
   - it: listing peers turns on discovery and the operator's TLS Secrets
     template: templates/gridnetwork.yaml
@@ -119,3 +154,30 @@ tests:
           path: spec.tls
       - notExists:
           path: metadata.labels["grid.praxis.fast/auto-discover-sites"]
+
+  - it: renders a peer's declared signals endpoint
+    template: templates/peers.yaml
+    set:
+      peers:
+        east:
+          address: 203.0.113.20:8080
+          signalsEndpoint:
+            address: signals.east.example.com:9443
+            serverName: east-signals.example.com
+    asserts:
+      - equal:
+          path: spec.signalsEndpoint
+          value:
+            address: signals.east.example.com:9443
+            serverName: east-signals.example.com
+
+  - it: renders no signals endpoint when none is declared, so it is derived
+    template: templates/peers.yaml
+    set:
+      peers:
+        east:
+          address: 203.0.113.20:8080
+    asserts:
+      - notExists:
+          path: spec.signalsEndpoint
+

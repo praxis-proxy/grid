@@ -1,9 +1,15 @@
+use std::sync::{Arc, Mutex};
+
+use reqwest::StatusCode;
 use time::Duration as Span;
 
 use super::*;
 
 /// The identity Secret in memory, with a version a write must match.
-struct Memory(Mutex<(BTreeMap<String, String>, u64)>);
+struct Memory {
+    /// The Secret's data and its version.
+    held: Mutex<(BTreeMap<String, String>, u64)>,
+}
 
 impl Memory {
     fn holding(cert: &str, key: &str, ca: &str) -> Self {
@@ -12,21 +18,23 @@ impl Memory {
             ("tls.key".to_owned(), key.to_owned()),
             ("ca.crt".to_owned(), ca.to_owned()),
         ]);
-        Self(Mutex::new((data, 1)))
+        Self {
+            held: Mutex::new((data, 1)),
+        }
     }
 
     fn get(&self, key: &str) -> Option<String> {
-        self.0.lock().expect("lock").0.get(key).cloned()
+        self.held.lock().expect("lock").0.get(key).cloned()
     }
 
     fn version(&self) -> u64 {
-        self.0.lock().expect("lock").1
+        self.held.lock().expect("lock").1
     }
 }
 
 impl IdentityStore for Memory {
     async fn read(&self, _target: &Target) -> Result<Held, RenewError> {
-        let (data, version) = &*self.0.lock().expect("lock");
+        let (data, version) = &*self.held.lock().expect("lock");
         let get = |key: &str| data.get(key).cloned();
         Ok(Held {
             cert: get("tls.crt").expect("cert"),
@@ -35,6 +43,7 @@ impl IdentityStore for Memory {
             pending: get(PENDING_CSR).zip(get(PENDING_KEY).map(Zeroizing::new)),
             version: version.to_string(),
             rotated: data.contains_key(PREVIOUS_CERT),
+            renewer: None,
         })
     }
 
@@ -44,7 +53,7 @@ impl IdentityStore for Memory {
         version: &str,
         data: BTreeMap<&'static str, Option<Zeroizing<String>>>,
     ) -> Result<String, RenewError> {
-        let (held, current) = &mut *self.0.lock().expect("lock");
+        let (held, current) = &mut *self.held.lock().expect("lock");
         if version != current.to_string() {
             return Err(RenewError::Kube("409 conflict".to_owned()));
         }
@@ -95,11 +104,15 @@ impl Service {
     }
 }
 
-impl Renewer for Service {
-    async fn renew(&self, held: &Held, csr_pem: &str) -> Result<Enrollment, RenewError> {
-        let site = site_of(&held.cert)?;
+impl Signer for Service {
+    async fn enroll(&self, _credential: &str, _csr_pem: &str) -> Result<Issued, SignerError> {
+        Err(SignerError::Request("renewal tests never enroll".to_owned()))
+    }
+
+    async fn renew(&self, held: &Held, csr_pem: &str) -> Result<Issued, SignerError> {
+        let site = site_of(&held.cert).map_err(|e| SignerError::Request(e.to_string()))?;
         certs::verify_site_cert(&self.ca.cert_pem, &held.cert, &site)
-            .map_err(|e| RenewError::Unauthenticated(e.to_string()))?;
+            .map_err(|e| SignerError::Unauthenticated(e.to_string()))?;
         self.asked
             .lock()
             .expect("lock")
@@ -110,19 +123,26 @@ impl Renewer for Service {
         } else {
             site.as_str()
         };
-        match answer {
-            Answer::Refuse => return Err(RenewError::Refused("403".to_owned())),
-            Answer::Sign | Answer::Lose | Answer::Wrong => {},
+        if answer == Answer::Refuse {
+            return Err(forbidden());
         }
         let cert = certs::sign_csr(&self.ca, name, csr_pem, certs::Validity::default()).expect("sign");
         if answer == Answer::Lose {
-            return Err(RenewError::Transport("connection reset".to_owned()));
+            return Err(SignerError::Transport {
+                sent: true,
+                detail: "connection reset".to_owned(),
+            });
         }
-        Ok(Enrollment {
+        Ok(Issued {
             certificate: cert.cert_pem,
             ca_certificate: self.ca.cert_pem.clone(),
         })
     }
+}
+
+/// The signer's 403 for a refused identity.
+fn forbidden() -> SignerError {
+    SignerError::Forbidden("403 identity_refused".to_owned())
 }
 
 /// A gateway Deployment in memory: its identity annotation and how often it was patched.
@@ -275,7 +295,30 @@ fn renewal_follows_the_declared_peer_trust() {
         "several GridNetworks fail closed"
     );
     let (mut last, mut failures) = (None, 0);
-    assert_eq!(settle(&Ok(Checked::Off), &mut last, &mut failures), CHECK_EVERY);
+    let off = Checked::Off {
+        why: Off::UnsupportedUnderPin,
+        due: Due::At(OffsetDateTime::now_utc().saturating_add(Span::days(2))),
+        renewer: None,
+    };
+    assert_eq!(settle(&Ok(off), &mut last, &mut failures), CHECK_EVERY);
+
+    let pinned = declared_trust(&[network(Some("pin"))], spiffe);
+    assert!(!pinned.renews);
+    assert_eq!(pinned.declared, "GridNetwork grid declares peerTrust.mode pin");
+    let refusal = pinned.refusal();
+    assert!(
+        refusal.message.contains("site.signerEndpoint.rotation is Enabled")
+            && refusal.message.contains("peerTrust.mode pin"),
+        "names both fields: {}",
+        refusal.message
+    );
+    assert_eq!(refusal.reason, "RotationUnsupportedUnderPinTrust");
+    assert!(
+        declared_trust(&[], pin_install)
+            .declared
+            .contains("no GridNetwork exists yet"),
+        "the install is named while no GridNetwork exists"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -287,8 +330,9 @@ async fn a_declared_trust_change_wakes_the_loop_before_its_next_check() {
         declared.send_replace(PeerTrustMode::Pin);
         declared
     });
+    let mut config = ConfigWatch::fixed(Snapshot::absent());
     let started = tokio::time::Instant::now();
-    pause(CHECK_EVERY, &mut changes).await;
+    pause(CHECK_EVERY, &mut changes, &mut config).await;
     assert!(
         started.elapsed() < CHECK_EVERY,
         "woke on the change, not the hourly check"
@@ -296,8 +340,28 @@ async fn a_declared_trust_change_wakes_the_loop_before_its_next_check() {
     assert!(changes.is_some(), "still listening");
 
     drop(waker.await.expect("sender"));
-    pause(CHECK_EVERY, &mut changes).await;
+    pause(CHECK_EVERY, &mut changes, &mut config).await;
     assert!(changes.is_none(), "a closed channel leaves only the timer");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_operator_config_edit_wakes_the_loop_before_its_next_check() {
+    let (edits, watched) = tokio::sync::watch::channel(Arc::new(Snapshot::absent()));
+    let mut config = ConfigWatch::from_receiver(watched);
+    let editor = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        edits.send_replace(Arc::new(Snapshot::of_config(
+            crate::operator_config::OperatorConfig::default(),
+        )));
+        edits
+    });
+    let started = tokio::time::Instant::now();
+    pause(CHECK_EVERY, &mut None, &mut config).await;
+    assert!(
+        started.elapsed() < CHECK_EVERY,
+        "woke on the edit, not the hourly check"
+    );
+    drop(editor.await.expect("sender"));
 }
 
 #[test]
@@ -306,8 +370,43 @@ fn a_renewal_or_a_recheck_rolls_but_not_an_expiry_or_a_failure() {
     assert_eq!(rolls_after(&Ok(Checked::Renewed(now))), Some(true));
     assert_eq!(rolls_after(&Ok(Checked::Waiting(now))), Some(false));
     assert_eq!(rolls_after(&Ok(Checked::Expired(now))), None);
-    assert_eq!(rolls_after(&Ok(Checked::Off)), None, "pin trust never rolls");
+    let off = Checked::Off {
+        why: Off::UnsupportedUnderPin,
+        due: Due::At(now),
+        renewer: None,
+    };
+    assert_eq!(rolls_after(&Ok(off)), None, "pin trust never rolls");
     assert_eq!(rolls_after(&Err(RenewError::Transport("down".to_owned()))), None);
+}
+
+#[test]
+fn a_gateway_follows_an_identity_cert_manager_renews_and_a_reissue_is_owed_a_roll() {
+    let off = |why, renewer: Option<&str>| Checked::Off {
+        why,
+        due: Due::At(OffsetDateTime::now_utc()),
+        renewer: renewer.map(str::to_owned),
+    };
+    let cert_manager = Some("site-d-identity");
+    assert_eq!(rolls_after(&Ok(off(Off::NoSigner, cert_manager))), Some(false));
+    assert_eq!(rolls_after(&Ok(off(Off::Disabled, cert_manager))), Some(false));
+    assert_eq!(rolls_after(&Ok(off(Off::NoSigner, None))), None, "nothing renews it");
+    assert_eq!(
+        rolls_after(&Ok(off(Off::UnsupportedUnderPin, cert_manager))),
+        None,
+        "pin trust never rolls"
+    );
+    assert_eq!(rolls_after(&Ok(off(Off::Refused, cert_manager))), None);
+
+    let revision = |value: &str| kube::api::ObjectMeta {
+        annotations: Some(BTreeMap::from([(CERT_MANAGER_REVISION.to_owned(), value.to_owned())])),
+        ..kube::api::ObjectMeta::default()
+    };
+    assert!(
+        !reissued(&revision("1")),
+        "a first issuance leaves a fresh install running"
+    );
+    assert!(reissued(&revision("2")), "a reissue is owed a roll");
+    assert!(!reissued(&revision("x")) && !reissued(&kube::api::ObjectMeta::default()));
 }
 
 #[test]
@@ -424,6 +523,39 @@ async fn a_lost_response_retries_with_the_same_key() {
     assert_eq!(asked.first(), asked.last(), "the retry asks for the same key");
 }
 
+/// A signer that never answers.
+struct Silent;
+
+impl Signer for Silent {
+    async fn enroll(&self, _credential: &str, _csr_pem: &str) -> Result<Issued, SignerError> {
+        std::future::pending().await
+    }
+
+    async fn renew(&self, _held: &Held, _csr_pem: &str) -> Result<Issued, SignerError> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn a_stand_down_gives_up_the_request_and_keeps_the_identity_and_the_kept_key() {
+    let (_ca, store, now) = site(Span::days(25));
+    let before = store.get("tls.crt");
+    let (trigger, stop) = crate::shutdown::Trigger::new();
+    trigger.trigger();
+    let held = store.read(&target()).await.expect("held");
+    let given_up = check_held(&store, &Silent, &target(), held, (now, Some(&stop))).await;
+    assert!(matches!(given_up, Err(RenewError::StoodDown)), "{given_up:?}");
+    assert_eq!(
+        store.get("tls.crt"),
+        before,
+        "nothing is written once the request is given up"
+    );
+    assert!(
+        store.get(PENDING_KEY).is_some(),
+        "the kept key lets the next start resend it"
+    );
+}
+
 #[tokio::test]
 async fn a_refusal_or_a_bad_answer_leaves_the_identity_unchanged() {
     for answer in [Answer::Refuse, Answer::Wrong] {
@@ -487,65 +619,599 @@ fn retries_back_off_to_the_cap() {
     assert!(jittered >= wait && jittered <= wait.saturating_add(Duration::from_secs(60)));
 }
 
-#[test]
-fn renewal_refuses_an_enrollment_url_a_site_certificate_could_answer() {
-    let config = |url: &str| super::super::Config {
-        enabled: false,
-        url: Some(url.to_owned()),
-        ca_file: None,
-        grid_ca_file: None,
-        site_name: None,
-        token_secret: None,
-        token_secret_key: "token".to_owned(),
-        identity_secret: "grid-site-identity".to_owned(),
-        ca_secret: "grid-ca".to_owned(),
-        renew: true,
-    };
-    drop(Settings::from_config(&config("https://grid-enrollment.grid-enrollment.svc:8443")).expect("in-cluster URL"));
-    for url in [
-        "https://hub.grid.internal:8443",
-        "https://HUB.GRID.INTERNAL.:8443",
-        "https://grid.internal",
-        "http://grid-enrollment.svc",
-    ] {
-        assert!(Settings::from_config(&config(url)).is_err(), "{url}");
+/// The operator config `document` as loaded, naming site `east`.
+fn loaded(document: &str) -> Loaded {
+    match crate::operator_config::parse(&format!("site:\n  name: east\n{document}")) {
+        Ok(parsed) => Loaded::Valid(Box::new(parsed.config)),
+        Err(why) => Loaded::Invalid(why),
     }
 }
 
-/// A unique path under the temp dir, cleaned up by the caller.
-fn scratch_pem(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("grid-renew-{name}-{}.pem", std::process::id()))
+/// A signer at `https://enroll.example.com`, with `extra` lines under it.
+fn signer(extra: &str) -> String {
+    format!("  signerEndpoint:\n    url: https://enroll.example.com\n{extra}")
 }
 
 #[test]
-fn the_pin_is_cached_until_a_reload_rather_than_read_every_renewal() {
-    let path = scratch_pem("rotate");
-    std::fs::write(&path, "first").expect("write the pin");
-    let renewer = HttpsRenewer::new("https://enroll.example", Some(path.clone()));
-
-    assert_eq!(renewer.pin().expect("read").as_deref(), Some("first"));
-
-    // The enrollment CA rotates under a running pod.
-    std::fs::write(&path, "second").expect("rotate the pin");
+fn the_operator_config_says_whether_and_where_to_renew() {
+    assert_eq!(declared(&Loaded::Absent, Some("east")), Declared::NoSigner, "no config");
     assert_eq!(
-        renewer.pin().expect("read").as_deref(),
-        Some("first"),
-        "a renewal does no file work once the pin is held"
+        declared(&loaded(""), Some("east")),
+        Declared::NoSigner,
+        "a site without a signer"
     );
-
-    renewer.forget_pin();
+    assert!(
+        matches!(
+            declared(&loaded(&signer("")), Some("east")),
+            Declared::Renews(endpoint) if endpoint.url == "https://enroll.example.com"
+        ),
+        "a declared signer renews by default"
+    );
     assert_eq!(
-        renewer.pin().expect("read").as_deref(),
-        Some("second"),
-        "a reload picks up the rotated CA without a restart"
+        declared(&loaded(&signer("    rotation: Disabled\n")), Some("east")),
+        Declared::Disabled,
+        "a signer with rotation Disabled enrolls only"
     );
-    let _removed = std::fs::remove_file(&path);
 }
 
 #[test]
-fn without_a_configured_pin_the_held_grid_ca_is_used() {
-    let renewer = HttpsRenewer::new("https://enroll.example", None);
-    assert!(renewer.pin().expect("read").is_none());
-    renewer.forget_pin();
-    assert!(renewer.pin().expect("read").is_none());
+fn a_refused_operator_config_renews_through_nothing() {
+    assert!(
+        matches!(
+            declared(&Loaded::Invalid("site.name: bad".to_owned()), Some("east")),
+            Declared::Refused(refusal) if refusal.reason == "OperatorConfigInvalid"
+        ),
+        "a refused config renews through nothing"
+    );
+    assert!(
+        matches!(
+            declared(&loaded(&signer("")), Some("west")),
+            Declared::Refused(refusal) if refusal.reason == "SiteNameMismatch" && refusal.message.contains("west")
+        ),
+        "a config naming another site than the identity is refused"
+    );
+}
+
+/// Resolve the signer `loaded` names for site `east`.
+fn resolve(loaded: &Loaded) -> Resolved<'_> {
+    resolve_signer(&declared(loaded, Some("east"))).expect("resolved")
+}
+
+#[test]
+fn only_the_operator_config_names_the_signer() {
+    assert_eq!(
+        resolve(&Loaded::Absent),
+        Resolved::Off(Off::NoSigner),
+        "no config names no signer, whatever the identity Secret is annotated with"
+    );
+    assert_eq!(
+        resolve(&loaded("")),
+        Resolved::Off(Off::NoSigner),
+        "a site without a signer"
+    );
+    assert_eq!(
+        resolve(&loaded(&signer(""))),
+        Resolved::Signer(Endpoint {
+            base: SignerUrl::parse("https://enroll.example.com").expect("url"),
+            pin: None,
+        }),
+        "a signer renews trusted through the held grid CA"
+    );
+    assert_eq!(
+        resolve(&loaded(&signer("    rotation: Disabled\n"))),
+        Resolved::Off(Off::Disabled),
+        "Disabled keeps the signer for enrollment only"
+    );
+    assert_eq!(
+        resolve(&Loaded::Invalid("site.name: bad".to_owned())),
+        Resolved::Off(Off::Refused),
+        "a refused config is not acted on"
+    );
+}
+
+/// An identity for `east` from a fresh grid CA.
+fn held_identity() -> Held {
+    let ca = certs::generate_ca("grid-ca").expect("ca");
+    let leaf = certs::generate_site_cert(&ca, "east").expect("leaf");
+    Held {
+        cert: leaf.cert_pem,
+        key: Zeroizing::new(leaf.key_pem),
+        ca: ca.cert_pem,
+        pending: None,
+        version: "1".to_owned(),
+        rotated: false,
+        renewer: None,
+    }
+}
+
+#[tokio::test]
+async fn renewal_trusts_the_pin_beside_the_held_grid_ca() {
+    crate::init_process_crypto();
+    let held = held_identity();
+    let (base, pin) = super::super::tests::byo_serving_signer(&held.ca, axum::Router::new(), false).await;
+    let base = SignerUrl::parse(base.as_str()).expect("signer url");
+    let clients = Clients::default();
+
+    let unpinned = HttpsSigner::new(&base, None, &clients).renew(&held, "csr").await;
+    let unpinned = unpinned.err().map(renew_error);
+    assert!(
+        matches!(unpinned, Some(RenewError::Untrusted(_))),
+        "the held grid CA alone does not trust a serving certificate it did not issue: {unpinned:?}"
+    );
+    let reason = rotation_verdict(&Err(unpinned.expect("refused")), None).reason;
+    assert_eq!(
+        reason, "SignerUntrusted",
+        "an untrusted signer is not a transport failure"
+    );
+
+    let pinned = HttpsSigner::new(&base, Some(&pin), &clients).renew(&held, "csr").await;
+    assert!(
+        matches!(&pinned, Err(SignerError::Refused(detail)) if detail.starts_with("404")),
+        "the pin trusts the signer's serving certificate, so the request reaches it"
+    );
+}
+
+/// A check, the signer it went through, and the status and reason it earns.
+type Case<'signer> = (
+    Result<Checked, RenewError>,
+    Option<&'signer String>,
+    &'signer str,
+    &'signer str,
+);
+
+/// The renewal URL of the signer the operator config names.
+fn declared_signer() -> String {
+    "https://enroll.example.com/v1alpha1/rotations".to_owned()
+}
+
+#[test]
+#[expect(clippy::too_many_lines, reason = "one case per check")]
+fn rotation_on_schedule_follows_the_check() {
+    let now = OffsetDateTime::now_utc();
+    let named = declared_signer();
+    let off = |why: Off, due: Due| {
+        Ok(Checked::Off {
+            why,
+            due,
+            renewer: None,
+        })
+    };
+    let cases: [Case<'_>; 10] = [
+        (Ok(Checked::Waiting(now)), Some(&named), "True", "RotationOnSchedule"),
+        (Ok(Checked::Renewed(now)), Some(&named), "True", "RotationOnSchedule"),
+        (Ok(Checked::Waiting(now)), None, "False", "RenewalFailing"),
+        (Ok(Checked::Expired(now)), Some(&named), "False", "RotationOverdue"),
+        (
+            off(Off::UnsupportedUnderPin, Due::At(now)),
+            None,
+            "True",
+            "RotationOnSchedule",
+        ),
+        (off(Off::NoSigner, Due::Now), None, "False", "RotationOverdue"),
+        (off(Off::NoSigner, Due::At(now)), None, "True", "RotationOnSchedule"),
+        (off(Off::Disabled, Due::At(now)), None, "True", "RotationOnSchedule"),
+        (off(Off::Refused, Due::At(now)), None, "Unknown", "NotEvaluated"),
+        (off(Off::Refused, Due::Now), None, "False", "RotationOverdue"),
+    ];
+    for (checked, signer, status, reason) in cases {
+        let verdict = rotation_verdict(&checked, signer);
+        assert_eq!(
+            (verdict.status, verdict.reason.as_ref()),
+            (status, reason),
+            "{checked:?}"
+        );
+        let named_in_message =
+            verdict.message.contains("/v1alpha1/rotations") && verdict.message.contains("site.signerEndpoint");
+        assert!(
+            signer.is_none() || reason != "RotationOnSchedule" || named_in_message,
+            "{}",
+            verdict.message
+        );
+    }
+}
+
+#[test]
+#[expect(clippy::too_many_lines, reason = "both off reasons, both renewers")]
+fn a_cert_manager_certificate_on_the_secret_reads_as_renewed_until_due() {
+    let now = OffsetDateTime::now_utc();
+    let named = Some("site-d-identity");
+    for why in [Off::NoSigner, Off::Disabled] {
+        let held = off_verdict(why, Due::At(now), named);
+        assert_eq!(
+            (held.status, held.reason.as_ref(), held.message.as_str()),
+            (
+                "True",
+                "RotationOnSchedule",
+                "renewed by cert-manager Certificate site-d-identity"
+            ),
+            "{why:?}"
+        );
+        let unknown = off_verdict(why, Due::At(now), None);
+        assert_eq!(
+            (unknown.status, unknown.reason.as_ref()),
+            ("True", "RotationOnSchedule")
+        );
+        assert!(
+            unknown
+                .message
+                .ends_with("nothing is known to renew this identity; it is kept until it expires"),
+            "{}",
+            unknown.message
+        );
+    }
+    let held_back = off_verdict(Off::Refused, Due::At(now), named);
+    assert_eq!(
+        held_back.reason, "NotEvaluated",
+        "a refused config is never read as renewed"
+    );
+}
+
+#[test]
+fn a_due_identity_its_certificate_has_not_replaced_is_overdue() {
+    for why in [Off::NoSigner, Off::Disabled] {
+        for due in [Due::Now, Due::Expired] {
+            let overdue = off_verdict(why, due, Some("site-d-identity"));
+            assert_eq!((overdue.status, overdue.reason.as_ref()), ("False", "RotationOverdue"));
+            assert!(overdue.message.contains("site-d-identity"), "{}", overdue.message);
+            assert_eq!(off_verdict(why, due, None).reason, "RotationOverdue");
+        }
+    }
+}
+
+#[test]
+fn the_renewer_is_the_annotated_certificate() {
+    let annotated = |value: &str| kube::api::ObjectMeta {
+        annotations: Some(BTreeMap::from([(
+            CERT_MANAGER_CERTIFICATE.to_owned(),
+            value.to_owned(),
+        )])),
+        ..kube::api::ObjectMeta::default()
+    };
+    assert_eq!(
+        renewer_of(&annotated("site-d-identity")).as_deref(),
+        Some("site-d-identity")
+    );
+    assert_eq!(renewer_of(&annotated("")), None);
+    assert_eq!(renewer_of(&kube::api::ObjectMeta::default()), None);
+}
+
+#[test]
+fn a_401_for_a_missing_client_certificate_says_renewal_needs_passthrough() {
+    let body = br#"{"error":"identity_required","message":"rotation requires the site's current grid certificate over mutual TLS"}"#;
+    let refused = super::super::signer::classify(StatusCode::UNAUTHORIZED, body)
+        .err()
+        .map(renew_error);
+    assert!(matches!(refused, Some(RenewError::NeedsPassthrough(_))), "{refused:?}");
+    let verdict = rotation_verdict(&Err(refused.expect("refused")), None);
+    assert_eq!(verdict.reason, "RenewalNeedsPassthrough");
+    assert!(verdict.message.contains("passthrough Route"), "{}", verdict.message);
+    assert!(
+        !verdict.message.contains("re-enroll"),
+        "re-enrolling does not fix it: {}",
+        verdict.message
+    );
+    let invalid = br#"{"error":"invalid_token","message":"a valid site token is required"}"#;
+    assert!(matches!(
+        super::super::signer::classify(StatusCode::UNAUTHORIZED, invalid)
+            .err()
+            .map(renew_error),
+        Some(RenewError::Unauthenticated(_))
+    ));
+}
+
+#[test]
+fn why_nothing_renews_names_the_fix() {
+    assert!(Off::NoSigner.message().contains("names no site.signerEndpoint"));
+    assert!(Off::Refused.message().contains("see Accepted"));
+    assert!(Off::UnsupportedUnderPin.message().contains("see Accepted"));
+    assert!(Off::Disabled.message().contains("rotation is Disabled"));
+}
+
+#[test]
+fn a_signer_refusal_maps_to_what_renewal_reports() {
+    assert!(matches!(
+        renew_error(SignerError::Forbidden("403".to_owned())),
+        RenewError::Refused(_)
+    ));
+    assert!(
+        matches!(
+            renew_error(SignerError::Refused("409".to_owned())),
+            RenewError::Transport(_)
+        ),
+        "only a forbidden identity needs re-enrollment"
+    );
+    assert!(
+        matches!(
+            renew_error(SignerError::NameTaken("409".to_owned())),
+            RenewError::Transport(_)
+        ),
+        "an enrollment-only refusal is not a renewal verdict"
+    );
+    assert!(matches!(
+        renew_error(SignerError::Disabled("off".to_owned())),
+        RenewError::SignerDisabled(_)
+    ));
+    assert!(matches!(
+        renew_error(SignerError::Unauthenticated("401".to_owned())),
+        RenewError::Unauthenticated(_)
+    ));
+}
+
+#[test]
+fn a_failed_renewal_says_whether_to_retry_or_re_enroll() {
+    let named = declared_signer();
+    for (error, reason) in [
+        (RenewError::Transport("down".to_owned()), "RenewalFailing"),
+        (RenewError::Kube("409".to_owned()), "RenewalFailing"),
+        (RenewError::Unauthenticated("401".to_owned()), "RenewalRefused"),
+        (RenewError::Refused("frozen".to_owned()), "RenewalRefused"),
+        (RenewError::SignerDisabled("off".to_owned()), "RotationOverdue"),
+    ] {
+        let verdict = rotation_verdict(&Err(error), Some(&named));
+        assert_eq!((verdict.status, verdict.reason.as_ref()), ("False", reason));
+    }
+}
+
+#[test]
+fn identity_valid_follows_what_was_read() {
+    let now = OffsetDateTime::now_utc();
+    for (identity, status, reason) in [
+        (Identity::Missing("Secret x".to_owned()), "False", "IdentityMissing"),
+        (
+            Identity::Unreadable("junk".to_owned()),
+            "False",
+            "CertificateUnreadable",
+        ),
+        (Identity::Expired(now), "False", "CertificateExpired"),
+        (Identity::Unusable, "False", "CertificateUnusable"),
+        (Identity::Valid(now, String::new()), "True", "IdentityValid"),
+    ] {
+        let verdict = identity_verdict(&identity);
+        assert_eq!(
+            (verdict.status, verdict.reason.as_ref()),
+            (status, reason),
+            "{identity:?}"
+        );
+    }
+}
+
+#[test]
+fn disabled_rotation_neither_rolls_nor_retries() {
+    let disabled = || Checked::Off {
+        why: Off::Disabled,
+        due: Due::At(OffsetDateTime::now_utc().saturating_add(Span::days(2))),
+        renewer: None,
+    };
+    assert_eq!(rolls_after(&Ok(disabled())), None, "Disabled never rolls");
+    let (mut last, mut failures) = (None, 0);
+    assert_eq!(settle(&Ok(disabled()), &mut last, &mut failures), CHECK_EVERY);
+    let soon = Checked::Off {
+        why: Off::Disabled,
+        due: Due::At(OffsetDateTime::now_utc().saturating_add(Span::minutes(10))),
+        renewer: None,
+    };
+    let wait = settle(&Ok(soon), &mut last, &mut failures);
+    assert!(
+        wait <= Duration::from_secs(600) && wait > Duration::from_secs(590),
+        "checked again when renewal falls due, so an overdue identity is reported then: {wait:?}"
+    );
+    assert!(Off::Disabled.message().contains("Disabled"));
+}
+
+/// The verdicts of `round` for condition `type_`, as (status, reason).
+fn verdicts_of(round: &Round, type_: &str) -> Vec<(&'static str, String)> {
+    round_verdicts(round, &target(), true, (Verdict::own_site(), None))
+        .into_iter()
+        .filter(|(written, ..)| *written == type_)
+        .map(|(_, _, verdict)| (verdict.status, verdict.reason.into_owned()))
+        .collect()
+}
+
+/// A round in which nothing renews for `why`, with the identity valid.
+fn off_round(why: Off) -> Round {
+    let now = OffsetDateTime::now_utc();
+    Round {
+        checked: Ok(Checked::Off {
+            why,
+            due: Due::At(now),
+            renewer: None,
+        }),
+        signer: None,
+        identity: Some(Identity::Valid(now, String::new())),
+    }
+}
+
+/// Peer trust that does or does not renew.
+fn trust(renews: bool) -> Trust {
+    Trust {
+        renews,
+        declared: "GridNetwork grid declares peerTrust.mode pin".to_owned(),
+    }
+}
+
+#[test]
+fn rotation_enabled_under_pin_is_an_accepted_conflict_and_holds_renewal_back() {
+    let refused = accepted(&loaded(&signer("")), Some("east"), (&[], &trust(false)));
+    assert_eq!(
+        (refused.status, refused.reason.as_ref()),
+        ("False", "RotationUnsupportedUnderPinTrust")
+    );
+    assert!(
+        refused.message.contains("site.signerEndpoint.rotation is Enabled")
+            && refused.message.contains("peerTrust.mode pin"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(
+        verdicts_of(&off_round(Off::UnsupportedUnderPin), local::ROTATION_ON_SCHEDULE),
+        vec![("True", local::ROTATION_ON_SCHEDULE.to_owned())],
+        "the rotation reason set stays closed; the conflict is on Accepted"
+    );
+    let accepted_once = accepted(&loaded(&signer("")), Some("east"), (&[], &trust(true)));
+    assert_eq!(
+        accepted_once.status, "True",
+        "spiffe trust renews, so nothing conflicts"
+    );
+}
+
+#[test]
+fn disabled_rotation_no_signer_and_no_config_are_accepted() {
+    for document in [signer("    rotation: Disabled\n"), String::new()] {
+        let verdict = accepted(&loaded(&document), Some("east"), (&[], &trust(false)));
+        assert_eq!(
+            (verdict.status, verdict.reason.as_ref()),
+            ("True", local::ACCEPTED),
+            "{document}"
+        );
+    }
+    let off = accepted(&Loaded::Absent, Some("east"), (&[], &trust(false)));
+    assert_eq!(
+        (off.status, off.message.as_str()),
+        ("True", "no operator config, enrollment off")
+    );
+}
+
+#[test]
+fn a_site_section_without_a_grid_id_to_join_is_not_accepted() {
+    let unset: GridNetwork = serde_json::from_value(serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1", "kind": "GridNetwork",
+        "metadata": { "name": "grid" }, "spec": {}
+    }))
+    .expect("network");
+    let named = GridNetwork {
+        spec: crate::crd::grid_network::GridNetworkSpec {
+            grid_id: "dagobah".to_owned(),
+            ..unset.spec.clone()
+        },
+        ..unset.clone()
+    };
+    let verdict = accepted(&loaded(""), Some("east"), (std::slice::from_ref(&unset), &trust(true)));
+    assert_eq!((verdict.status, verdict.reason.as_ref()), ("False", "GridIdUnset"));
+    assert!(
+        verdict.message.contains("spec.gridId") && verdict.message.contains("GridNetwork grid"),
+        "{}",
+        verdict.message
+    );
+    let joined = accepted(&loaded(""), Some("east"), (std::slice::from_ref(&named), &trust(true)));
+    assert_eq!(joined.status, "True");
+    let standalone = accepted(&Loaded::Absent, None, (std::slice::from_ref(&unset), &trust(true)));
+    assert_eq!(
+        standalone.status, "True",
+        "with no site section the operator mints the grid ID"
+    );
+}
+
+#[test]
+fn a_refused_config_is_not_accepted_and_holds_renewal_back() {
+    let invalid = accepted(
+        &Loaded::Invalid("site.name: bad".to_owned()),
+        Some("east"),
+        (&[], &trust(true)),
+    );
+    assert_eq!(
+        (invalid.status, invalid.reason.as_ref()),
+        ("False", "OperatorConfigInvalid")
+    );
+    let mismatch = accepted(&loaded(""), Some("west"), (&[], &trust(true)));
+    assert_eq!(
+        (mismatch.status, mismatch.reason.as_ref()),
+        ("False", "SiteNameMismatch")
+    );
+    assert_eq!(
+        verdicts_of(&off_round(Off::Refused), local::ROTATION_ON_SCHEDULE),
+        vec![("Unknown", "NotEvaluated".to_owned())],
+        "renewal is held back, and not evaluated, until the config is fixed"
+    );
+}
+
+#[test]
+fn a_round_that_never_read_the_identity_says_nothing_about_it() {
+    let failed = Round::failed(RenewError::Kube("apiserver unavailable".to_owned()));
+    let written: Vec<&str> = round_verdicts(
+        &failed,
+        &target(),
+        false,
+        (Verdict::own_site(), Some(Verdict::resolved())),
+    )
+    .into_iter()
+    .map(|(type_, ..)| type_)
+    .collect();
+    assert_eq!(
+        written,
+        [local::ACCEPTED, local::RESOLVED_REFS],
+        "no Enrolled, IdentityValid or RotationOnSchedule from a failed read"
+    );
+}
+
+#[test]
+fn an_identity_gone_reads_enrolled_false_and_one_written_outside_a_signer_names_its_renewer() {
+    let now = OffsetDateTime::now_utc();
+    let gone = Round {
+        identity: Some(Identity::Missing("Secret site-tls".to_owned())),
+        ..Round::failed(RenewError::Missing(String::new()))
+    };
+    assert_eq!(
+        verdicts_of(&gone, local::ENROLLED),
+        vec![("False", "IdentityMissing".to_owned())]
+    );
+    let outside = Round {
+        checked: Ok(Checked::Off {
+            why: Off::NoSigner,
+            due: Due::At(now),
+            renewer: Some("site-d-identity".to_owned()),
+        }),
+        signer: None,
+        identity: Some(Identity::Valid(now, String::new())),
+    };
+    let message = round_verdicts(&outside, &target(), true, (Verdict::own_site(), None))
+        .into_iter()
+        .find(|(type_, ..)| *type_ == local::ENROLLED)
+        .map(|(.., verdict)| verdict.message)
+        .expect("Enrolled says what renews it, even once enrolled");
+    assert_eq!(
+        message,
+        "identity provisioned outside the signer, renewed by cert-manager Certificate site-d-identity"
+    );
+}
+
+#[test]
+fn an_enrolled_site_keeps_its_issuance_message_while_the_identity_is_present() {
+    let now = OffsetDateTime::now_utc();
+    let round = Round {
+        checked: Ok(Checked::Waiting(now)),
+        signer: None,
+        identity: Some(Identity::Valid(now, String::new())),
+    };
+    let written = |enrolled: bool| -> Vec<String> {
+        round_verdicts(&round, &target(), enrolled, (Verdict::own_site(), None))
+            .into_iter()
+            .filter(|(type_, ..)| *type_ == local::ENROLLED)
+            .map(|(_, _, verdict)| verdict.reason.into_owned())
+            .collect()
+    };
+    assert!(written(true).is_empty(), "an enrolled site keeps its issuance message");
+    assert_eq!(written(false), vec![local::ENROLLED.to_owned()]);
+}
+
+#[test]
+fn an_external_renewer_has_a_grace_past_due_before_it_reads_overdue() {
+    let renew_at = OffsetDateTime::now_utc();
+    let within = renew_at.saturating_add(Span::minutes(5));
+    let past = renew_at.saturating_add(EXTERNAL_GRACE).saturating_add(Span::minutes(1));
+    assert_eq!(
+        external_due(Due::Now, renew_at, true, within),
+        Due::At(renew_at.saturating_add(EXTERNAL_GRACE)),
+        "cert-manager renews at the same point, so it has the grace to replace the identity"
+    );
+    assert_eq!(
+        external_due(Due::Now, renew_at, true, past),
+        Due::Now,
+        "then it is overdue"
+    );
+    assert_eq!(
+        external_due(Due::Now, renew_at, false, within),
+        Due::Now,
+        "no renewer named, no grace"
+    );
+    assert_eq!(external_due(Due::Expired, renew_at, true, within), Due::Expired);
 }

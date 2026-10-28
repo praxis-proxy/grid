@@ -20,7 +20,7 @@ members = [
 exclude = ["crates/gateway"]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.3.0-rc.1"
 edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"

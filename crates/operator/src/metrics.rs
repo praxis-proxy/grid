@@ -21,6 +21,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SITE_IDENTITY_EXPIRY.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SWIM_UNAVAILABLE.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SITE_IDENTITY_RENEWALS.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PROBE_DURATION.clone()))
@@ -61,6 +63,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SWIM_KEY_PENDING.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(OPERATOR_CONFIG_IGNORED.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(LEASE_HELD.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(ROUTED.clone()))
@@ -71,11 +75,359 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SIGNALS_SHED.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SIGNALS_CONNECTION_CAP.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SIGNALS_RELAY_TRUNCATED.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(MODEL_DISCOVERY_TOTAL.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(PEER_CATALOG_TOTAL.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(PEER_CATALOG_REFUSED.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(PEER_CATALOG_CUT.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(PEER_SIGNALS_REACHABLE.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SIGNALS_CA_LOADED.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SIGNALS_CA_EXPIRY.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SIGNALS_CA_ANCHORS.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SignalsAdmission::gauges()))
+        .unwrap_or_else(|_| std::process::abort());
     r
+});
+
+/// Peer catalog reads by peer and outcome: `replaced` when a catalog landed, `failed` when
+/// the read did not.
+static PEER_CATALOG_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new("grid_peer_catalog_total", "Peer catalog reads by outcome"),
+        &["peer", "outcome"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// 1 while a peer's last admission refused its catalog, which its `CatalogAccepted` reads False.
+static PEER_CATALOG_REFUSED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "grid_peer_catalog_refused",
+            "1 while the peer's catalog is refused, 0 while it is accepted",
+        ),
+        &["peer"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// 1 while a peer's catalog is cut to what it may contribute of the overlay's ceiling.
+static PEER_CATALOG_CUT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "grid_peer_catalog_cut",
+            "1 while part of the peer's catalog waits past this site's share of the overlay ceiling",
+        ),
+        &["peer"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// 1 while a peer's `SignalsReachable` condition is True.
+///
+/// Distinct from [`PEER_COLLECTION_UP`], which follows the last poll: the condition holds
+/// through three unanswered rounds, so an alert on it sees what the status sees.
+static PEER_SIGNALS_REACHABLE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "grid_peer_signals_reachable",
+            "1 while the peer's SignalsReachable condition is True",
+        ),
+        &["peer"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// When the signals listener last loaded its CA bundle, Unix seconds.
+static SIGNALS_CA_LOADED: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "grid_signals_ca_loaded_timestamp_seconds",
+        "Unix time the signals CA bundle was last loaded",
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// The earliest expiry among the loaded CA anchors, Unix seconds.
+static SIGNALS_CA_EXPIRY: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "grid_signals_ca_expiry_timestamp_seconds",
+        "Unix time the earliest loaded signals CA anchor expires; 0 while none is loaded",
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// How many anchors the loaded CA bundle holds.
+static SIGNALS_CA_ANCHORS: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "grid_signals_ca_anchors",
+        "Certificates in the loaded signals CA bundle",
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// What the signals listener's admission holds, read at each scrape.
+#[derive(Clone)]
+pub struct AdmissionHandles {
+    /// Connection slots, one per open connection, grown with the cap.
+    pub slots: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Handshake turns, one per handshake in flight.
+    pub handshakes: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Handshake turns in all.
+    pub max_handshakes: usize,
+    /// Handshakes in flight by source key: an address, or a global IPv6 /64 and its /48.
+    pub sources: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+    /// Handshakes one source key may hold.
+    pub source_cap: usize,
+}
+
+impl AdmissionHandles {
+    /// Handshakes in flight from the busiest source key.
+    fn busiest_source(&self) -> usize {
+        self.sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// The current listener's admission, replaced each time the listener restarts.
+static SIGNALS_ADMISSION: std::sync::Mutex<Option<AdmissionHandles>> = std::sync::Mutex::new(None);
+
+/// What the signals listener holds, read from its admission at scrape time so a release is
+/// never missed.
+struct SignalsAdmission {
+    /// Each gauge, in exposition order: connections open, handshakes in flight, handshake cap,
+    /// per-source handshake cap, handshakes from the busiest source.
+    gauges: [IntGauge; 5],
+}
+
+impl SignalsAdmission {
+    /// The collector, with its gauges.
+    fn gauges() -> Self {
+        let gauge = |name, help| IntGauge::new(name, help).unwrap_or_else(|_| std::process::abort());
+        Self {
+            gauges: [
+                gauge(
+                    "grid_signals_connections_open",
+                    "Signals connections the listener holds open",
+                ),
+                gauge("grid_signals_handshakes_in_flight", "Signals handshakes in progress"),
+                gauge(
+                    "grid_signals_handshake_cap",
+                    "Signals handshakes the listener admits at once",
+                ),
+                gauge(
+                    "grid_signals_handshake_source_cap",
+                    "Signals handshakes one source may hold at once",
+                ),
+                gauge(
+                    "grid_signals_handshakes_busiest_source",
+                    "Signals handshakes in progress from the busiest single source",
+                ),
+            ],
+        }
+    }
+
+    /// The values to export, from `admission`; all 0 while no listener serves.
+    fn values(admission: Option<&AdmissionHandles>) -> [usize; 5] {
+        let Some(admission) = admission else {
+            return [0; 5];
+        };
+        let held = |all: usize, semaphore: &tokio::sync::Semaphore| all.saturating_sub(semaphore.available_permits());
+        let cap = usize::try_from(SIGNALS_CONNECTION_CAP.get()).unwrap_or(0);
+        [
+            held(cap, &admission.slots),
+            held(admission.max_handshakes, &admission.handshakes),
+            admission.max_handshakes,
+            admission.source_cap,
+            admission.busiest_source(),
+        ]
+    }
+}
+
+impl prometheus::core::Collector for SignalsAdmission {
+    fn desc(&self) -> Vec<&prometheus::core::Desc> {
+        self.gauges.iter().flat_map(IntGauge::desc).collect()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let handles = SIGNALS_ADMISSION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for (gauge, value) in self.gauges.iter().zip(Self::values(handles.as_ref())) {
+            gauge.set(i64::try_from(value).unwrap_or(i64::MAX));
+        }
+        self.gauges.iter().flat_map(IntGauge::collect).collect()
+    }
+}
+
+/// The two-label peer series, so a peer's label pairs can be remembered and removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PeerSeries {
+    /// [`PEER_POLL_TOTAL`], by outcome.
+    Poll,
+    /// [`PEER_POLL_RETRIES`], by reason.
+    Retry,
+    /// [`PEER_SIGNALS_REFUSED`], by reason.
+    Refused,
+    /// [`PEER_CATALOG_TOTAL`], by outcome.
+    Catalog,
+}
+
+impl PeerSeries {
+    /// The counter this names.
+    fn counter(self) -> &'static IntCounterVec {
+        match self {
+            Self::Poll => &PEER_POLL_TOTAL,
+            Self::Retry => &PEER_POLL_RETRIES,
+            Self::Refused => &PEER_SIGNALS_REFUSED,
+            Self::Catalog => &PEER_CATALOG_TOTAL,
+        }
+    }
+}
+
+/// The second label values recorded on a peer's two-label counters.
+type PeerLabels = std::collections::BTreeSet<(PeerSeries, String)>;
+
+/// Each peer with series, and the label values recorded on its two-label counters.
+static PEER_LABELS: LazyLock<std::sync::Mutex<std::collections::HashMap<String, PeerLabels>>> =
+    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Remember that `peer` has series, and `value` on `series` when given.
+fn note_peer(peer: &str, series: Option<(PeerSeries, &str)>) {
+    let mut labels = PEER_LABELS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let recorded = labels.entry(peer.to_owned()).or_default();
+    if let Some((series, value)) = series {
+        recorded.insert((series, value.to_owned()));
+    }
+    drop(labels);
+}
+
+/// Count one read of `peer`'s catalog: `replaced` when a catalog landed, `failed` when not.
+pub fn record_peer_catalog(peer: &str, outcome: &str) {
+    note_peer(peer, Some((PeerSeries::Catalog, outcome)));
+    PEER_CATALOG_TOTAL.with_label_values(&[peer, outcome]).inc();
+}
+
+/// Set whether `peer`'s last admission refused its catalog.
+pub fn set_peer_catalog_refused(peer: &str, refused: bool) {
+    note_peer(peer, None);
+    PEER_CATALOG_REFUSED.with_label_values(&[peer]).set(i64::from(refused));
+}
+
+/// Set whether `peer`'s catalog is cut to its share of the overlay ceiling.
+pub fn set_peer_catalog_cut(peer: &str, cut: bool) {
+    note_peer(peer, None);
+    PEER_CATALOG_CUT.with_label_values(&[peer]).set(i64::from(cut));
+}
+
+/// Set whether `peer`'s `SignalsReachable` condition is True.
+pub fn set_peer_signals_reachable(peer: &str, reachable: bool) {
+    note_peer(peer, None);
+    PEER_SIGNALS_REACHABLE
+        .with_label_values(&[peer])
+        .set(i64::from(reachable));
+}
+
+/// Drop every series of `peer` once it has left the roster, so they do not outlive it.
+pub fn forget_peer(peer: &str) {
+    let recorded = PEER_LABELS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(peer);
+    for (series, value) in recorded.unwrap_or_default() {
+        let _absent = series.counter().remove_label_values(&[peer, &value]);
+    }
+    let _absent_duration = PEER_POLL_DURATION.remove_label_values(&[peer]);
+    for gauge in [
+        &PEER_COLLECTION_UP,
+        &PEER_LAST_SUCCESS,
+        &PEER_SIGNALS_REACHABLE,
+        &PEER_CATALOG_REFUSED,
+        &PEER_CATALOG_CUT,
+    ] {
+        let _absent = gauge.remove_label_values(&[peer]);
+    }
+    for counter in [&PEER_POLL_SLOW, &PEER_RESPONSE_BYTES] {
+        let _absent = counter.remove_label_values(&[peer]);
+    }
+}
+
+/// Forget every peer with series that `keep` does not.
+pub fn retain_peers<Keep: Fn(&str) -> bool>(keep: Keep) {
+    let gone: Vec<String> = PEER_LABELS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys()
+        .filter(|peer| !keep(peer))
+        .cloned()
+        .collect();
+    for peer in gone {
+        forget_peer(&peer);
+    }
+}
+
+/// Record the signals listener's admission, read at each scrape until replaced.
+pub fn set_signals_admission(handles: AdmissionHandles) {
+    *SIGNALS_ADMISSION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handles);
+}
+
+/// Record the CA bundle the signals listener loaded at `at`: how many anchors it holds, and
+/// when the earliest of them expires. Material that is not a certificate is not counted.
+pub fn set_signals_ca(bundle_pem: &[u8], at: std::time::SystemTime) {
+    SIGNALS_CA_LOADED.set(unix_seconds(at));
+    let bundle = String::from_utf8_lossy(bundle_pem);
+    let expiries: Vec<i64> = pem_certificates(&bundle)
+        .filter_map(|cert| certs::cert_validity(cert).ok())
+        .map(|(_, not_after)| not_after.unix_timestamp())
+        .collect();
+    SIGNALS_CA_ANCHORS.set(i64::try_from(expiries.len()).unwrap_or(i64::MAX));
+    SIGNALS_CA_EXPIRY.set(expiries.into_iter().min().unwrap_or(0));
+}
+
+/// Each `CERTIFICATE` block of `bundle`, markers included.
+fn pem_certificates(bundle: &str) -> impl Iterator<Item = &str> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    bundle.match_indices(BEGIN).filter_map(move |(start, _)| {
+        let end = bundle.get(start..)?.find(END)?;
+        bundle.get(start..start + end + END.len())
+    })
+}
+
+/// `at` as Unix seconds, saturating.
+fn unix_seconds(at: std::time::SystemTime) -> i64 {
+    let secs = at
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    i64::try_from(secs).unwrap_or(i64::MAX)
+}
+
+/// The signals listener's connection cap.
+static SIGNALS_CONNECTION_CAP: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "grid_signals_connection_cap",
+        "Concurrent signals connections the listener admits, sized for the declared members",
+    )
+    .unwrap_or_else(|_| std::process::abort())
 });
 
 /// Signals connections shed at accept, by the limit that shed them.
@@ -158,6 +510,15 @@ pub fn record_relay_truncated(store: &str, rendered: &crate::signals::Rendered) 
     }
 }
 
+/// One while SWIM is configured but not running, zero otherwise.
+static SWIM_UNAVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "grid_swim_unavailable",
+        "Whether SWIM is configured on this site but not running",
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
 /// The site identity's `notAfter`, Unix seconds; zero when the identity cannot be read.
 static SITE_IDENTITY_EXPIRY: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new(
@@ -180,6 +541,15 @@ static SITE_IDENTITY_RENEWALS: LazyLock<IntCounterVec> = LazyLock::new(|| {
 static SWIM_KEY_PENDING: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new("grid_swim_key_pending", "1 while SWIM holds traffic for its key")
         .unwrap_or_else(|_| std::process::abort())
+});
+
+/// Top-level sections of the operator config this operator does not read.
+static OPERATOR_CONFIG_IGNORED: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "grid_operator_config_ignored_sections",
+        "Top-level sections of the operator config this operator does not read and ignored",
+    )
+    .unwrap_or_else(|_| std::process::abort())
 });
 
 /// 1 while this replica holds the operator lease.
@@ -557,6 +927,7 @@ pub(crate) fn record_model_discovery_failure(provider: &str, reason: &str) {
 /// two retries records one success here and two retries in
 /// [`record_peer_retry`]. Availability and cost are separate questions.
 pub(crate) fn record_peer_poll(peer: &str, outcome: &str, duration: Duration, bytes: usize, slow_after: Duration) {
+    note_peer(peer, Some((PeerSeries::Poll, outcome)));
     PEER_POLL_TOTAL.with_label_values(&[peer, outcome]).inc();
     PEER_POLL_DURATION
         .with_label_values(&[peer])
@@ -607,11 +978,13 @@ pub(crate) fn forget_provider_scrapes(provider: &str) {
 /// Count a peer observation this hub refused: `relayed_site`, `skew`, `name`, `provider`, `value`, or
 /// `provider_cap`.
 pub(crate) fn record_peer_signal_refused(peer: &str, reason: &str) {
+    note_peer(peer, Some((PeerSeries::Refused, reason)));
     PEER_SIGNALS_REFUSED.with_label_values(&[peer, reason]).inc();
 }
 
 /// Record an attempt that failed and will be tried again.
 pub(crate) fn record_peer_retry(peer: &str, reason: &str) {
+    note_peer(peer, Some((PeerSeries::Retry, reason)));
     PEER_POLL_RETRIES.with_label_values(&[peer, reason]).inc();
 }
 
@@ -620,6 +993,7 @@ pub(crate) fn record_peer_retry(peer: &str, reason: &str) {
 /// Called on every poll, including the ones that succeed, so the gauge tracks
 /// the current state rather than latching on the first failure.
 pub(crate) fn set_peer_collection_up(peer: &str, up: bool, at: std::time::SystemTime) {
+    note_peer(peer, None);
     PEER_COLLECTION_UP.with_label_values(&[peer]).set(i64::from(up));
     if up {
         let secs = at.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -663,9 +1037,30 @@ pub(crate) fn record_swim_pending_drop() {
     SWIM_PENDING_DROPS.inc();
 }
 
-/// Count a signals connection shed by `limit`, `total` or `source`.
+/// Count a signals connection shed by `limit`: `total`, `handshake`, `source` or `peer`.
 pub fn record_signals_shed(limit: &str) {
     SIGNALS_SHED.with_label_values(&[limit]).inc();
+}
+
+/// Set how many top-level sections of the operator config were ignored.
+pub fn set_operator_config_ignored_sections(count: usize) {
+    OPERATOR_CONFIG_IGNORED.set(i64::try_from(count).unwrap_or(i64::MAX));
+}
+
+/// How many top-level sections of the operator config were ignored, as last set.
+#[cfg(test)]
+pub(crate) fn operator_config_ignored_sections() -> i64 {
+    OPERATOR_CONFIG_IGNORED.get()
+}
+
+/// Record the signals listener's connection cap, sized for the declared members.
+pub fn set_signals_connection_cap(cap: usize) {
+    SIGNALS_CONNECTION_CAP.set(i64::try_from(cap).unwrap_or(i64::MAX));
+}
+
+/// Record whether SWIM is configured but not running.
+pub fn set_swim_unavailable(unavailable: bool) {
+    SWIM_UNAVAILABLE.set(i64::from(unavailable));
 }
 
 /// Set when the site identity expires, Unix seconds.
@@ -803,6 +1198,124 @@ pub fn encode_metrics() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scrape as text.
+    fn scrape() -> String {
+        String::from_utf8_lossy(&encode_metrics()).into_owned()
+    }
+
+    /// Every peer series, set once for `peer`.
+    fn record_every_peer_series(peer: &str) {
+        record_peer_poll(peer, "ok", Duration::from_millis(1), 10, Duration::from_secs(1));
+        record_peer_retry(peer, "timeout");
+        record_peer_signal_refused(peer, "skew");
+        record_peer_catalog(peer, "replaced");
+        set_peer_collection_up(peer, true, std::time::SystemTime::now());
+        set_peer_signals_reachable(peer, true);
+        set_peer_catalog_refused(peer, false);
+        set_peer_catalog_cut(peer, true);
+    }
+
+    #[test]
+    fn a_forgotten_peer_leaves_no_series_behind() {
+        record_every_peer_series("forget-gone");
+        record_every_peer_series("forget-kept");
+        let (gone, kept) = ("peer=\"forget-gone\"", "peer=\"forget-kept\"");
+        let before = scrape();
+        let series = before.matches(gone).count();
+        assert!(series > 0 && before.matches(kept).count() == series, "{before}");
+        forget_peer("forget-gone");
+        let after = scrape();
+        assert!(!after.contains(gone), "{after}");
+        assert_eq!(after.matches(kept).count(), series, "another peer keeps its series");
+        forget_peer("forget-kept");
+    }
+
+    #[test]
+    fn retaining_peers_forgets_the_rest() {
+        record_every_peer_series("retain-a");
+        record_every_peer_series("retain-b");
+        retain_peers(|peer| peer != "retain-b");
+        let after = scrape();
+        assert!(
+            after.contains("peer=\"retain-a\"") && !after.contains("peer=\"retain-b\""),
+            "{after}"
+        );
+        forget_peer("retain-a");
+    }
+
+    #[test]
+    fn the_signals_ca_signal_counts_anchors_and_names_the_earliest_expiry() {
+        let (Ok(first), Ok(second)) = (certs::generate_ca("first"), certs::generate_ca("second")) else {
+            std::process::abort()
+        };
+        let earliest = [&first.cert_pem, &second.cert_pem]
+            .into_iter()
+            .filter_map(|pem| certs::cert_validity(pem).ok())
+            .map(|(_, not_after)| not_after.unix_timestamp())
+            .min()
+            .unwrap_or_default();
+        let bundle = format!("{}\n# a comment\n{}", first.cert_pem, second.cert_pem);
+        let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        set_signals_ca(bundle.as_bytes(), at);
+        assert_eq!(
+            (
+                SIGNALS_CA_ANCHORS.get(),
+                SIGNALS_CA_EXPIRY.get(),
+                SIGNALS_CA_LOADED.get()
+            ),
+            (2, earliest, 1_700_000_000)
+        );
+        set_signals_ca(b"not a bundle", at);
+        assert_eq!(
+            (SIGNALS_CA_ANCHORS.get(), SIGNALS_CA_EXPIRY.get()),
+            (0, 0),
+            "nothing parsed"
+        );
+    }
+
+    /// An admission holding two of four slots, one of three handshakes, three from one source.
+    fn admission(
+        slots: &std::sync::Arc<tokio::sync::Semaphore>,
+        handshakes: &std::sync::Arc<tokio::sync::Semaphore>,
+    ) -> AdmissionHandles {
+        let source = |last: u8| std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, last));
+        AdmissionHandles {
+            slots: std::sync::Arc::clone(slots),
+            handshakes: std::sync::Arc::clone(handshakes),
+            max_handshakes: 3,
+            sources: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::from([
+                (source(1), 3),
+                (source(2), 1),
+            ]))),
+            source_cap: 8,
+        }
+    }
+
+    #[test]
+    fn the_admission_gauges_read_what_the_listener_holds() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+        let handshakes = std::sync::Arc::new(tokio::sync::Semaphore::new(3));
+        let held_slots = [slots.try_acquire(), slots.try_acquire()];
+        let held_turn = handshakes.try_acquire();
+        set_signals_connection_cap(4);
+        set_signals_admission(admission(&slots, &handshakes));
+        let text = scrape();
+        for expected in [
+            "grid_signals_connections_open 2\n",
+            "grid_signals_handshakes_in_flight 1\n",
+            "grid_signals_handshake_cap 3\n",
+            "grid_signals_handshake_source_cap 8\n",
+            "grid_signals_handshakes_busiest_source 3\n",
+        ] {
+            assert!(text.contains(expected), "{expected}: {text}");
+        }
+        drop((held_slots, held_turn));
+        assert!(
+            scrape().contains("grid_signals_connections_open 0\n"),
+            "a release is read at the next scrape"
+        );
+    }
 
     /// Every bounded event used by the feedback counter.
     const FEEDBACK_EVENTS: [GatewayFeedbackEvent; 5] = [

@@ -65,6 +65,15 @@ fn event_reference(site: &GridSite, namespace: &str) -> ObjectReference {
     }
 }
 
+/// What the `GridSite` controller reconciles with.
+#[derive(Clone)]
+pub struct SiteContext {
+    /// Kubernetes API client.
+    pub client: Arc<Client>,
+    /// How this site learns its members; declared sites leave `Pending` without discovery only under Local.
+    pub membership: crate::cli::Membership,
+}
+
 /// Reconcile a [`GridSite`] resource.
 ///
 /// # Errors
@@ -76,7 +85,8 @@ fn event_reference(site: &GridSite, namespace: &str) -> ObjectReference {
     reason = "TLS material loading + event recording requires intermediaries; \
               splitting hides the reconciliation flow"
 )]
-pub async fn reconcile(site: Arc<GridSite>, client: Arc<Client>) -> Result<Action, OperatorError> {
+pub async fn reconcile(site: Arc<GridSite>, ctx: Arc<SiteContext>) -> Result<Action, OperatorError> {
+    let client = Arc::clone(&ctx.client);
     let name = site.metadata.name.as_deref().unwrap_or_else(|| std::process::abort());
 
     let reporter = Reporter {
@@ -88,7 +98,15 @@ pub async fn reconcile(site: Arc<GridSite>, client: Arc<Client>) -> Result<Actio
 
     tracing::debug!(name, "reconciling GridSite");
 
-    let network = fetch_network(&site, client.as_ref()).await?;
+    let network = match fetch_network(&site, client.as_ref()).await {
+        Ok(network) => network,
+        // A declared site can precede its GridNetwork, as this cluster's own does while it enrolls.
+        Err(error @ OperatorError::NotFound(_)) => {
+            tracing::debug!(name, %error, "GridSite has no GridNetwork yet");
+            return Ok(Action::requeue(REQUEUE_INTERVAL));
+        },
+        Err(error) => return Err(error),
+    };
     let current_phase = site.status.as_ref().map_or(&GridSitePhase::Pending, |s| &s.phase);
 
     let outcome = if needs_probe(current_phase) {
@@ -106,7 +124,8 @@ pub async fn reconcile(site: Arc<GridSite>, client: Arc<Client>) -> Result<Actio
     };
 
     let probed = outcome.is_some();
-    let (next_phase, reason, message) = site_phase_next(current_phase, &site, outcome.as_ref());
+    let declared = ctx.membership == crate::cli::Membership::Local;
+    let (next_phase, reason, message) = site_phase_under(current_phase, &site, outcome.as_ref(), declared);
     Box::pin(update_status(
         &site,
         client.as_ref(),
@@ -124,7 +143,7 @@ pub async fn reconcile(site: Arc<GridSite>, client: Arc<Client>) -> Result<Actio
 }
 
 /// Error policy for the [`GridSite`] controller.
-pub fn error_policy(_site: Arc<GridSite>, error: &OperatorError, _ctx: Arc<Client>) -> Action {
+pub fn error_policy(_site: Arc<GridSite>, error: &OperatorError, _ctx: Arc<SiteContext>) -> Action {
     tracing::error!(%error, "GridSite reconciliation failed");
     Action::requeue(Duration::from_secs(30))
 }
@@ -137,10 +156,18 @@ pub fn error_policy(_site: Arc<GridSite>, error: &OperatorError, _ctx: Arc<Clien
 async fn fetch_network(site: &GridSite, client: &Client) -> Result<GridNetwork, OperatorError> {
     let api: Api<GridNetwork> = Api::all(client.clone());
     let network_name = &site.spec.grid_network_ref;
-    api.get(network_name).await.map_err(|e| {
-        tracing::warn!(error = %e, network = %network_name, "lookup failed");
-        OperatorError::NotFound(format!("GridNetwork {network_name}"))
-    })
+    api.get(network_name)
+        .await
+        .map_err(|error| network_fetch_error(network_name, error))
+}
+
+/// A 404 is `NotFound`, which a local site requeues on quietly. Anything else stays a kube
+/// error, so a denial or an apiserver fault is logged and retried as a failure.
+fn network_fetch_error(network_name: &str, error: kube::Error) -> OperatorError {
+    if matches!(&error, kube::Error::Api(status) if status.code == 404) {
+        return OperatorError::NotFound(format!("GridNetwork {network_name}: {error}"));
+    }
+    OperatorError::Kube(error)
 }
 
 /// Whether the current phase requires a gateway probe.
@@ -155,11 +182,23 @@ fn needs_probe(phase: &GridSitePhase) -> bool {
 // Phase Determination
 // ---------------------------------------------------------------------------
 
+/// The next lifecycle phase under Swim membership, as [`site_phase_under`] with `declared` false.
+#[cfg(test)]
+pub(crate) fn site_phase_next(
+    current: &GridSitePhase,
+    site: &GridSite,
+    outcome: Option<&GatewayProbeOutcome>,
+) -> (GridSitePhase, String, String) {
+    site_phase_under(current, site, outcome, false)
+}
+
 /// Determine the next lifecycle phase for a [`GridSite`].
 ///
 /// Pure function: the caller supplies the probe `outcome` (from
 /// [`evaluate_gateway`]) for phases that require it.  Phases that do
 /// not need a probe (`Pending`, `Discovered`, `Left`) ignore `outcome`.
+/// Under `declared` membership a declared site with a dialable gateway endpoint leaves
+/// `Pending` without discovery.
 ///
 /// Returns `(next_phase, reason, message)`.  `reason` is machine-readable;
 /// `message` is human-readable and never contains private material.
@@ -167,10 +206,11 @@ fn needs_probe(phase: &GridSitePhase) -> bool {
     clippy::too_many_lines,
     reason = "match arms are individually trivial; splitting would fragment the state machine"
 )]
-pub(crate) fn site_phase_next(
+pub(crate) fn site_phase_under(
     current: &GridSitePhase,
     site: &GridSite,
     outcome: Option<&GatewayProbeOutcome>,
+    declared: bool,
 ) -> (GridSitePhase, String, String) {
     let has_egress_address = site
         .spec
@@ -179,6 +219,15 @@ pub(crate) fn site_phase_next(
         .is_some_and(|e| !e.address.trim().is_empty());
 
     match current {
+        GridSitePhase::Pending
+            if declared && has_egress_address && is_declared(site) && site.signals_endpoint(None).is_some() =>
+        {
+            (
+                GridSitePhase::Connecting,
+                "EndpointsDeclared".to_owned(),
+                "gateway and signals endpoints declared; awaiting control-plane trust verification".to_owned(),
+            )
+        },
         GridSitePhase::Pending => (
             GridSitePhase::Pending,
             "AwaitingDiscovery".to_owned(),
@@ -232,6 +281,15 @@ pub(crate) fn site_phase_next(
             (t.phase, t.reason.to_owned(), t.message)
         },
     }
+}
+
+/// Whether `site` was declared rather than created by SWIM discovery.
+fn is_declared(site: &GridSite) -> bool {
+    site.metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(grid_network::LABEL_AUTO_DISCOVERED))
+        .is_none_or(|value| value != "true")
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +434,19 @@ async fn build_probe_config_from_secrets(
         .and_then(|e| e.tls.server_name.as_deref())
         .ok_or(O::TrustMaterialMissing)?;
     validate_server_name(server_name_str).map_err(|_err| O::TrustMaterialInvalid)?;
+    // The site's leaf carries only its own name, so any other would verify a different site.
+    if let Some((site_id, _)) = grid_network::peer_site_key(site)
+        && !server_name_str
+            .trim()
+            .eq_ignore_ascii_case(&crate::signals::gateway_server_name(&site_id))
+    {
+        tracing::warn!(
+            site = %site_id,
+            server_name = server_name_str,
+            "gateway serverName is not the site's own name; refusing to probe"
+        );
+        return Err(O::TrustMaterialInvalid);
+    }
     let server_name =
         crate::resources::tls_backend::parse_server_name(server_name_str).map_err(|_err| O::TrustMaterialInvalid)?;
 
@@ -633,6 +704,23 @@ fn connected_verdict<'step>(
     ((status, reason.to_owned(), message.to_owned()), moving)
 }
 
+/// What degrades a peer without gating it: this site's view of its signals, then of its
+/// catalog, as (reason, message) with the message naming the condition. `Unknown`, absent, or
+/// an egress-only peer, which declares no signals to read, degrades nothing.
+fn peer_concern(held: &[crate::crd::inference_provider::Condition]) -> Option<(String, String)> {
+    [
+        crate::peer_reach::SIGNALS_REACHABLE,
+        crate::peer_reach::CATALOG_ACCEPTED,
+    ]
+    .iter()
+    .find_map(|type_| {
+        held.iter().find(|held| {
+            held.type_ == *type_ && held.status == "False" && held.reason != crate::peer_reach::EGRESS_ONLY
+        })
+    })
+    .map(|bad| (bad.reason.clone(), format!("{}: {}", bad.type_, bad.message)))
+}
+
 /// Write `Connected` and the roll-up when either changed.
 async fn apply_conditions(site: &GridSite, client: &Client, reason: &str, message: &str) -> Result<(), OperatorError> {
     let name = site.metadata.name.as_deref().unwrap_or_else(|| std::process::abort());
@@ -647,7 +735,9 @@ async fn apply_conditions(site: &GridSite, client: &Client, reason: &str, messag
     let ((status, reason, message), moving) = connected_verdict(reason, message);
     let stamp = rollup::Stamp { generation, now: &now };
     let connected = rollup::condition(held, CONNECTED, (status, reason.as_str(), message), stamp);
-    let trio = rollup::trio(held, &[&connected], (None, moving), stamp);
+    let concern = peer_concern(held);
+    let degraded = concern.as_ref().map(|(why, detail)| (why.as_str(), detail.as_str()));
+    let trio = rollup::trio(held, &[&connected], (degraded, moving), stamp);
     let api: Api<GridSite> = Api::all(client.clone());
     for (manager, conditions) in [
         (PROBE_FIELD_MANAGER, std::slice::from_ref(&connected)),
@@ -753,6 +843,46 @@ fn rfc3339_now() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_egress_only_peer_is_not_degraded_but_a_refused_catalog_still_is() {
+        let held = |reason: &str| crate::crd::inference_provider::Condition {
+            type_: crate::peer_reach::SIGNALS_REACHABLE.to_owned(),
+            status: "False".to_owned(),
+            reason: reason.to_owned(),
+            message: "m".to_owned(),
+            last_transition_time: "t".to_owned(),
+            observed_generation: None,
+        };
+        assert_eq!(peer_concern(&[held(crate::peer_reach::EGRESS_ONLY)]), None);
+        assert_eq!(
+            peer_concern(&[held("Timeout")]).map(|(reason, _)| reason).as_deref(),
+            Some("Timeout")
+        );
+    }
+
+    /// An apiserver status with `code`, as `error::tests` scripts one.
+    fn api(code: u16) -> kube::Error {
+        kube::Error::Api(Box::new(kube::core::Status::failure("scripted", "r").with_code(code)))
+    }
+
+    /// Only a missing `GridNetwork` takes the local site's quiet requeue. A denial or an
+    /// apiserver fault must surface through the error policy.
+    #[test]
+    fn only_a_missing_grid_network_is_not_found() {
+        assert!(
+            matches!(network_fetch_error("net", api(404)), OperatorError::NotFound(_)),
+            "404 is a GridNetwork not yet applied"
+        );
+        assert!(
+            matches!(network_fetch_error("net", api(403)), OperatorError::Kube(_)),
+            "a denial is not a missing GridNetwork"
+        );
+        assert!(
+            matches!(network_fetch_error("net", api(503)), OperatorError::Kube(_)),
+            "an apiserver fault is not a missing GridNetwork"
+        );
+    }
 
     #[test]
     fn grid_site_status_update_is_skipped_when_semantically_unchanged() {
@@ -914,6 +1044,7 @@ mod tests {
                 sovereignty_zone: None,
                 zone: None,
                 trust: None,
+                signals_endpoint: None,
             },
             status: phase.map(|p| GridSiteStatus {
                 phase: p,
@@ -945,6 +1076,7 @@ mod tests {
                 sovereignty_zone: None,
                 zone: None,
                 trust: None,
+                signals_endpoint: None,
             },
             status: phase.map(|p| GridSiteStatus {
                 phase: p,
@@ -958,11 +1090,61 @@ mod tests {
     // site_phase_next: non-probe phases (outcome = None)
     // -----------------------------------------------------------------------
 
+    fn declared_at(address: &str) -> GridSite {
+        site_with_egress(Some(GridSitePhase::Pending), address)
+    }
+
     #[test]
-    fn pending_stays_pending_even_with_egress() {
-        let site = site_with_egress(Some(GridSitePhase::Pending), "10.0.0.1:8443");
+    fn under_swim_a_declared_site_still_waits_for_discovery() {
+        let site = declared_at("peer.example.com:443");
         let (next, reason, _msg) = site_phase_next(&GridSitePhase::Pending, &site, None);
-        assert_eq!(next, GridSitePhase::Pending);
+        assert_eq!(
+            next,
+            GridSitePhase::Pending,
+            "Swim keeps the discovery-driven lifecycle"
+        );
+        assert_eq!(reason, "AwaitingDiscovery");
+    }
+
+    #[test]
+    fn pending_declared_with_both_endpoints_advances_to_connecting() {
+        let site = declared_at("peer.example.com:443");
+        let (next, reason, _msg) = site_phase_under(&GridSitePhase::Pending, &site, None, true);
+        assert_eq!(next, GridSitePhase::Connecting, "declared endpoints need no discovery");
+        assert_eq!(reason, "EndpointsDeclared");
+    }
+
+    #[test]
+    fn pending_declared_without_a_gateway_stays_pending() {
+        let mut site = declared_at("peer.example.com:443");
+        site.spec.gateway_endpoint = None;
+        let (next, reason, _msg) = site_phase_under(&GridSitePhase::Pending, &site, None, true);
+        assert_eq!(next, GridSitePhase::Pending, "no gateway, no endpoints");
+        assert_eq!(reason, "AwaitingDiscovery");
+    }
+
+    #[test]
+    fn pending_declared_with_an_undialable_gateway_endpoint_stays_pending() {
+        for address in ["127.0.0.1:443", "169.254.169.254:80", "https://peer:443", "peer"] {
+            let site = declared_at(address);
+            let (next, ..) = site_phase_under(&GridSitePhase::Pending, &site, None, true);
+            assert_eq!(
+                next,
+                GridSitePhase::Pending,
+                "{address} derives no signals endpoint to advance on"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_auto_discovered_stub_waits_for_discovery_despite_endpoints() {
+        let mut site = declared_at("peer.example.com:443");
+        site.metadata.labels = Some(std::collections::BTreeMap::from([(
+            grid_network::LABEL_AUTO_DISCOVERED.to_owned(),
+            "true".to_owned(),
+        )]));
+        let (next, reason, _msg) = site_phase_under(&GridSitePhase::Pending, &site, None, true);
+        assert_eq!(next, GridSitePhase::Pending, "discovery owns a stub's lifecycle");
         assert_eq!(reason, "AwaitingDiscovery");
     }
 
@@ -1365,6 +1547,7 @@ mod tests {
                 sovereignty_zone: None,
                 zone: None,
                 trust: None,
+                signals_endpoint: None,
             },
             status: phase.map(|p| GridSiteStatus {
                 phase: p,
@@ -1578,6 +1761,7 @@ mod tests {
                 sovereignty_zone: None,
                 zone: None,
                 trust,
+                signals_endpoint: None,
             },
             status: phase.map(|p| GridSiteStatus {
                 phase: p,

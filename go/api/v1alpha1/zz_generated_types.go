@@ -689,7 +689,7 @@ type GridNetworkSpec struct {
 	BudgetPolicy *GridNetworkBudgetPolicy `json:"budgetPolicy,omitempty"`
 	// References to Praxis Gateways that participate in this grid.
 	ConsumerGateways []GridNetworkConsumerGatewaysItem `json:"consumerGateways,omitempty"`
-	// Grid ID for tenancy. Empty on creation; auto-generated on first join with another site.
+	// The grid this network belongs to, set once. Empty only while unset: an install with no operator config site section then mints one, and one with a site section holds the grid runtime until it is set. Moving to another grid means recreating the network.
 	GridID string `json:"gridId,omitempty"`
 	// Maximum time between metric refreshes and score/ranking recalculation.
 	// This controls the GridNetwork reconcile cadence for provider metrics; it does not change request-path routing or the overlay watch latency. Use a duration of at least one second, such as "10s" or "1500ms". The default cadence is 300 seconds. TLS-protected provider metrics cap the cadence at 60 seconds for bounded certificate-rotation detection.
@@ -764,20 +764,6 @@ type GridNetworkGatewayAgeReportsItem struct {
 	Sequence int64 `json:"sequence"`
 	// Cumulative skew rejection count.
 	Skew int64 `json:"skew"`
-}
-
-// GridNetworkIdentity This site's identity certificate: when it expires and when rotation is due.
-type GridNetworkIdentity struct {
-	// SHA-256 of the certificate DER, the digest peers pin.
-	Fingerprint string `json:"fingerprint"`
-	// How to recover.
-	Message string `json:"message,omitempty"`
-	// When the certificate expires, RFC 3339.
-	NotAfter string `json:"notAfter"`
-	// IdentityExpired once the certificate has expired, IdentityUnreadable when the Secret holds no usable certificate.
-	Reason string `json:"reason,omitempty"`
-	// When rotation is due, a third of the lifetime before notAfter, RFC 3339. Empty under pin peer trust, or when this site's operator does not rotate.
-	RotateAfter string `json:"rotateAfter"`
 }
 
 // GridNetworkMountReconciliationItem Per-gateway progress for Secret mount reconciliation and gateway readiness.
@@ -880,8 +866,6 @@ type GridNetworkStatus struct {
 	GatewayAgeReports []GridNetworkGatewayAgeReportsItem `json:"gatewayAgeReports,omitempty"`
 	// The negotiated grid ID.
 	GridID string `json:"gridId,omitempty"`
-	// This site's identity certificate: when it expires and when rotation is due.
-	Identity *GridNetworkIdentity `json:"identity,omitempty"`
 	// Per-gateway Secret requirements and optional mount reconciliation status.
 	// Populated for every gateway with praxisConfig.generate: true. Without explicit mount reconciliation, the phase remains RequirementsRendered.
 	MountReconciliationStatus []GridNetworkMountReconciliationItem `json:"mountReconciliationStatus,omitempty"`
@@ -918,6 +902,15 @@ type GridSiteGatewayEndpoint struct {
 	TLS *GridSiteGatewayEndpointTLS `json:"tls,omitempty"`
 }
 
+// GridSiteSignalsEndpoint Where this site serves its signals, where its gateway endpoint does not say.
+// Absent, signals are polled at the gateway endpoint's host under the server name <site>-signals.grid.internal, at the operator's signals port setting or the gateway's.
+type GridSiteSignalsEndpoint struct {
+	// host:port of the signals listener: a DNS name, an IPv4 address, or a bracketed IPv6 address. Absent, the gateway endpoint's host.
+	Address *string `json:"address,omitempty"`
+	// TLS server name sent to the signals listener, which a router in front selects on. Absent, <site>-signals.grid.internal.
+	ServerName *string `json:"serverName,omitempty"`
+}
+
 // GridSiteTrust Trust policy for this site.
 // When configured, the operator verifies the received public certificate against this policy before promoting the site to Active. If absent, the site remains Connecting with reason TrustMaterialMissing regardless of certificate material.
 type GridSiteTrust struct {
@@ -941,6 +934,9 @@ type GridSiteSpec struct {
 	GridNetworkRef string `json:"gridNetworkRef"`
 	// Deployment region.
 	Region *string `json:"region,omitempty"`
+	// Where this site serves its signals, where its gateway endpoint does not say.
+	// Absent, signals are polled at the gateway endpoint's host under the server name <site>-signals.grid.internal, at the operator's signals port setting or the gateway's.
+	SignalsEndpoint *GridSiteSignalsEndpoint `json:"signalsEndpoint,omitempty"`
 	// Sovereignty zone for data residency constraints.
 	SovereigntyZone *string `json:"sovereigntyZone,omitempty"`
 	// Trust policy for this site.
@@ -969,7 +965,7 @@ type GridSiteStatus struct {
 	AbsentSince *string `json:"absentSince,omitempty"`
 	// Capabilities offered by this site.
 	Capabilities *GridSiteCapabilities `json:"capabilities,omitempty"`
-	// Observed conditions: Connected, and the Available, Progressing and Degraded roll-up. The phase stays, kept for v1alpha1 readers.
+	// Observed conditions: Connected, and the Available, Progressing and Degraded roll-up, on every site, this cluster's own included. Its Accepted, ResolvedRefs, Enrolled, IdentityValid and RotationOnSchedule live on the GridNetwork. Under Local membership, a peer's also carries this site's SignalsReachable and CatalogAccepted view of it. The phase stays, kept for v1alpha1 readers.
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 	// Timestamp of the last probe whose resulting status was persisted.
 	// This is not a liveness heartbeat; it may remain unchanged when a probe produces no status changes.

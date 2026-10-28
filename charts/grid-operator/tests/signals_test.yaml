@@ -470,3 +470,16 @@ tests:
           count: 1
       - notExists:
           path: spec.externalTrafficPolicy
+
+  - it: passes the per-source handshake cap for a site behind a router
+    template: templates/deployment.yaml
+    set:
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.maxHandshakesPerSource: 64
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SIGNALS_MAX_HANDSHAKES_PER_SOURCE
+            value: "64"

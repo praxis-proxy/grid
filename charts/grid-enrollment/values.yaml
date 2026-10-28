@@ -315,6 +315,13 @@ invitePolicy:
 # -- The hub's own site identity, issued by the bootstrap Job straight from the grid
 # CA, so the hub never enrolls or needs an invite. It rotates like an enrolled site.
 # Delete the Secret and upgrade to re-issue it.
+# -- Grid-wide settings shared with the other grid charts.
+grid:
+  membership:
+    # -- Where sites learn their members, Swim or Local, as the grid-operator chart's
+    # grid.membership.source. Local creates and delivers no SWIM key.
+    source: Swim
+
 hubSite:
   # -- Hub site name. Empty disables it. Must not also be invited.
   name: ""

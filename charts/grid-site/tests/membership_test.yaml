@@ -1,0 +1,59 @@
+suite: membership mode
+templates:
+  - templates/gridnetwork.yaml
+release:
+  namespace: grid
+set:
+  gridSite.name: site-a
+  gridNetwork.gridId: grid-a
+tests:
+  - it: Local writes poll signals and no discovery or SWIM key
+    set:
+      grid.membership.source: Local
+      peers.hub.address: 203.0.113.10:443
+    asserts:
+      - equal:
+          path: spec.signalTransport.mode
+          value: poll
+      - notExists:
+          path: metadata.labels["grid.praxis.fast/auto-discover-sites"]
+      - notExists:
+          path: spec.tls.swimKeySecretRef
+      - equal:
+          path: spec.tls.siteSecretRef.name
+          value: grid-site-identity
+
+  - it: Swim keeps discovery and the SWIM key for listed peers
+    set:
+      peers.hub.address: 203.0.113.10:443
+    asserts:
+      - equal:
+          path: metadata.labels["grid.praxis.fast/auto-discover-sites"]
+          value: "true"
+      - equal:
+          path: spec.tls.swimKeySecretRef.name
+          value: grid-swim-key
+
+  - it: Local refuses gossip signals
+    set:
+      grid.membership.source: Local
+      gridNetwork.signalTransport.mode: gossip
+    asserts:
+      - failedTemplate:
+          errorPattern: signalTransport.mode gossip contradicts it
+
+  - it: Local refuses seeds
+    set:
+      grid.membership.source: Local
+      gridNetwork.seeds: [10.0.0.1:7946]
+    asserts:
+      - failedTemplate:
+          errorPattern: remove gridNetwork.seeds
+
+  - it: Local refuses site discovery
+    set:
+      grid.membership.source: Local
+      gridNetwork.autoDiscoverSites: true
+    asserts:
+      - failedTemplate:
+          errorPattern: unset gridNetwork.autoDiscoverSites

@@ -31,12 +31,13 @@ The commands run from the repository root. Enrollment runs in its own namespace,
 helm upgrade --install grid-enrollment charts/grid-enrollment -n grid-enrollment --create-namespace \
   --set host=enroll.grid.example.com --set invites.hub.network=grid --set invites.site-a.network=grid
 helm upgrade --install grid-operator charts/grid-operator -n grid --create-namespace \
-  --set swim.siteName=hub --set enrollment.enabled=true
+  --set swim.siteName=hub --set enrollment.enabled=true --set enrollment.hub=true
 kubectl -n grid-enrollment get secret grid-ca-bundle -o jsonpath='{.data.ca\.crt}' | base64 -d \
   | kubectl -n grid create secret generic grid-ca-bundle --from-file=ca.crt=/dev/stdin
 kubectl -n grid-enrollment get secret grid-invite-hub -o jsonpath='{.data.token}' | base64 -d \
   | kubectl -n grid create secret generic grid-invite-hub --from-file=token=/dev/stdin
 kubectl -n grid label secret grid-invite-hub grid.praxis.fast/site=hub
+kubectl -n grid label secret grid-ca-bundle grid.praxis.fast/signer-bundle=true
 head -c 32 /dev/urandom | kubectl -n grid create secret generic grid-swim-key --from-file=key=/dev/stdin
 helm upgrade --install grid-site charts/grid-site -n grid \
   --set gridNetwork.gridId=grid-1 --set gridSite.name=hub --set peers.site-a.address=203.0.113.20:8080
@@ -62,6 +63,7 @@ kubectl --context hub -n grid-enrollment get secret grid-ca-bundle -o jsonpath='
 kubectl --context hub -n grid-enrollment get secret grid-invite-site-a -o jsonpath='{.data.token}' | base64 -d \
   | kubectl -n grid create secret generic grid-invite-site-a --from-file=token=/dev/stdin
 kubectl -n grid label secret grid-invite-site-a grid.praxis.fast/site=site-a
+kubectl -n grid label secret grid-ca-bundle grid.praxis.fast/signer-bundle=true
 kubectl --context hub -n grid get secret grid-swim-key -o jsonpath='{.data.key}' | base64 -d \
   | kubectl -n grid create secret generic grid-swim-key --from-file=key=/dev/stdin
 helm upgrade --install grid-site charts/grid-site -n grid \
@@ -74,7 +76,7 @@ helm upgrade --install grid-gateway charts/praxis-gateway -n grid \
   --set praxisConfig.render.peerTrust.digest="$HUB_DIGEST" --set praxisConfig.render.backends.local.endpoint=10.96.0.20:8000
 ```
 
-The site needs three Secrets from the hub: the Grid CA bundle, its invite token with its site label, and the SWIM key. The commands above copy them one at a time. A fleet delivers them with ACM or External Secrets instead. The site operator redeems the token on its first start and writes the site identity. Then pin the site on the hub by rerunning the hub `grid-site` command with `--set peers.site-a.digest=<site-a leaf digest>` added.
+The site needs three Secrets from the hub: the Grid CA bundle, its invite token with its site label, and the SWIM key. The commands above copy them one at a time. A fleet delivers them with ACM or External Secrets instead. The grid-operator chart renders the operator config, the ConfigMap `grid-operator-config`, naming the signer and the invite. The site operator redeems the token once its GridSite exists, writes the site identity, and restarts under it. The GridSite's `Enrolled` condition reports the result. Then pin the site on the hub by rerunning the hub `grid-site` command with `--set peers.site-a.digest=<site-a leaf digest>` added.
 
 A later change returns the SWIM key and the CA bundle from enrollment, so you copy only the invite token (design-1s3). In the longer term, the grid-operator chart alone installs a site, and the operator bootstraps the rest. That design is in progress.
 
@@ -83,8 +85,8 @@ An invite expires after a day by default, and an unredeemed one stays in place. 
 ## Defaults These Commands Rely On
 
 - grid-enrollment: `host` joins the serving cert names, is the default Route host, and makes the enrollment Service a LoadBalancer when no Route renders. An invite's `network` defaults to `grid`.
-- grid-operator with `enrollment.enabled`: the site name follows `swim.siteName`, the URL is the in-cluster grid-enrollment Service, the CA bundle is Secret `grid-ca-bundle`, the token is `grid-invite-<site>`, the SWIM Service is a LoadBalancer, the gateway Service is `grid-gateway`, and the render refuses Secret access in `grid-enrollment`.
-- grid-site: the network is `grid`. Listing `peers` turns on site discovery and the TLS Secrets the operator writes. A peer's probe name is `<name>.grid.internal`.
+- grid-operator with `enrollment.enabled`: the operator config `grid-operator-config` names the site, its signer and its invite. The site name follows `swim.siteName`, the URL is the in-cluster grid-enrollment Service, the CA bundle is Secret `grid-ca-bundle`, the token is `grid-invite-<site>`, the SWIM Service is a LoadBalancer, the gateway Service is `grid-gateway`, and the render refuses Secret access in `grid-enrollment`.
+- grid-site: the network is `grid`. Listing `peers` turns on site discovery and the TLS Secrets the operator writes. A peer's probe name is `<name>.grid.internal`. A peer's GridSite is `<network>-<name>` under swim membership, the name SWIM discovery gives it, and `<name>` under declared.
 - praxis-gateway: it renders its own config without a BYO ConfigMap. Set `gridIdentity.tlsSecretName` to `grid-site-identity` and `gridIdentity.caSecretName` to `grid-ca` for mTLS. A site backend uses mutual TLS to `<site>.grid.internal`. A provider's Service is a LoadBalancer, and `local` is its one plaintext backend.
 
 ## Credential Delivery
@@ -103,7 +105,9 @@ In a fleet, deliver the three Secrets over one protected channel:
 
 The grid-site `gridNetwork.peerTrust.mode` is the source of truth for the grid. Each provider gateway's `praxisConfig.render.peerTrust.mode` must match it.
 
-Each operator routes to a peer only once a probe of its gateway, at the peer `address`, finds a leaf that matches the peer `digest`, which makes the peer Active. Declare a peer before it joins, since the operator creates a GridSite for any peer it meets and Helm does not adopt it. To rotate a pin, set `nextDigest` to the new digest, then move it to `digest` once the peer is Active.
+Each operator routes to a peer only once a probe of its gateway, at the peer `address`, finds a leaf that matches the peer `digest`, which makes the peer Active. A listed peer's `digest` is the pin the signals poller uses. With `address` set, the site's signals are polled at the same host under `<name>-signals.grid.internal`, without waiting on gossip, so each site puts its gateway and signals behind one router or one load balancer. To rotate a pin, set `nextDigest` to the new digest, then move it to `digest` once the peer is Active.
+
+`grid.membership.source` picks where a site learns its peers. `Swim`, the default, discovers them over SWIM. `Local` means this site's configuration lists its peers, and runs no SWIM: set `--set grid.membership.source=Local` on grid-enrollment, grid-operator and grid-site alike, and the charts derive poll signals, no SWIM Service, port, seeds or key, and refuse any value that contradicts it.
 
 `peerTrust.mode` picks how the signals listener and the provider gateway admit peers. In `pin` mode, the default, they admit the pinned digests. In `spiffe` mode, add `--set gridNetwork.peerTrust.mode=spiffe` to both grid-site commands, and on the site gateway replace the digest with `--set praxisConfig.render.peerTrust.mode=spiffe --set praxisConfig.render.peerTrust.spiffeId=spiffe://grid.internal/site/hub`. It needs the grid-gateway image built with the praxis `spiffe` feature, which praxis marks experimental.
 
