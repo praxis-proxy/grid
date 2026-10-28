@@ -95,7 +95,8 @@ explicit public trust bundle is required, including with an external issuer.
 
 Leave `cluster` empty for an identity issued locally on the hub. Certificate
 Secrets always live in the release namespace; local identity consumers must
-read them there. Each managed cluster receives one identity. Removing a site
+read them there. Each managed cluster receives one identity. The chart rejects policy names
+whose namespace-qualified form exceeds ACM's 63-character label limit. Removing a site
 from this map alone is not a complete decommission operation.
 
 This chart does not yet reconcile peer GridSites, their endpoints, or the
