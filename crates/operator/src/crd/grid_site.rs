@@ -102,12 +102,6 @@ pub struct GridSiteSignalsEndpoint {
         regex(pattern = r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$")
     )]
     pub server_name: Option<String>,
-
-    /// Port, replacing the address's. Absent, the address's port, or for an address taken from
-    /// the gateway endpoint, the operator's signals port setting or the gateway's port.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1, max = 65535))]
-    pub port: Option<u16>,
 }
 
 /// Trust policy controlling when a [`GridSite`] can advance to `Active`.
@@ -174,18 +168,16 @@ impl GridSite {
             .and_then(|declared| declared.address.as_deref())
             .map(str::trim)
             .filter(|address| !address.is_empty());
-        let (base, port) = match address {
-            Some(address) => (crate::signals::SignalsEndpoint::parse(address)?, None),
-            None => (
-                crate::signals::SignalsEndpoint::parse(self.spec.gateway_endpoint.as_ref()?.address.trim())?,
-                port,
-            ),
+        let endpoint = if let Some(address) = address {
+            crate::signals::SignalsEndpoint::parse(address)?
+        } else {
+            let base = crate::signals::SignalsEndpoint::parse(self.spec.gateway_endpoint.as_ref()?.address.trim())?;
+            match port {
+                Some(port) => base.with_port(port),
+                None => base,
+            }
         };
-        Some(match declared.and_then(|declared| declared.port).or(port) {
-            Some(port) => base.with_port(port),
-            None => base,
-        })
-        .filter(crate::signals::SignalsEndpoint::is_dialable)
+        Some(endpoint).filter(crate::signals::SignalsEndpoint::is_dialable)
     }
 
     /// The TLS server name this site's signals are polled under: `spec.signalsEndpoint.serverName`
@@ -728,11 +720,10 @@ mod tests {
         assert!(site.signals_endpoint(None).is_none(), "no gateway endpoint");
     }
 
-    fn declared(address: Option<&str>, server_name: Option<&str>, port: Option<u16>) -> GridSiteSignalsEndpoint {
+    fn declared(address: Option<&str>, server_name: Option<&str>) -> GridSiteSignalsEndpoint {
         GridSiteSignalsEndpoint {
             address: address.map(str::to_owned),
             server_name: server_name.map(str::to_owned),
-            port,
         }
     }
 
@@ -740,22 +731,16 @@ mod tests {
     fn a_declared_signals_endpoint_overrides_the_derived_one_field_by_field() {
         for (signals, flag, authority) in [
             (
-                declared(Some("signals.example.com:9443"), None, None),
+                declared(Some("signals.example.com:9443"), None),
                 Some(9091),
                 "signals.example.com:9443",
             ),
             (
-                declared(Some("signals.example.com:9443"), None, Some(10443)),
-                Some(9091),
-                "signals.example.com:10443",
-            ),
-            (declared(None, None, Some(10443)), Some(9091), "peer.example.com:10443"),
-            (
-                declared(None, Some("east-signals.example.com"), None),
+                declared(None, Some("east-signals.example.com")),
                 Some(9091),
                 "peer.example.com:9091",
             ),
-            (declared(None, None, None), None, "peer.example.com:443"),
+            (declared(None, None), None, "peer.example.com:443"),
         ] {
             let mut site = site_at("peer.example.com:443");
             site.spec.signals_endpoint = Some(signals.clone());
@@ -772,9 +757,9 @@ mod tests {
     fn a_declared_address_needs_no_gateway_endpoint_and_must_be_dialable() {
         let mut site = site_at("peer:443");
         site.spec.gateway_endpoint = None;
-        site.spec.signals_endpoint = Some(declared(Some("signals.example.com:9443"), None, None));
+        site.spec.signals_endpoint = Some(declared(Some("signals.example.com:9443"), None));
         assert!(site.signals_endpoint(None).is_some());
-        site.spec.signals_endpoint = Some(declared(Some("127.0.0.1:9443"), None, None));
+        site.spec.signals_endpoint = Some(declared(Some("127.0.0.1:9443"), None));
         assert!(
             site.signals_endpoint(None).is_none(),
             "a loopback address is not dialled"
@@ -785,7 +770,7 @@ mod tests {
     fn the_signals_server_name_is_declared_or_derived_from_the_site() {
         let mut site = site_at("peer:443");
         assert_eq!(site.signals_server_name("east"), "east-signals.grid.internal");
-        site.spec.signals_endpoint = Some(declared(None, Some("East-Signals.Example.com"), None));
+        site.spec.signals_endpoint = Some(declared(None, Some("East-Signals.Example.com")));
         assert_eq!(site.signals_server_name("east"), "east-signals.example.com");
     }
 
@@ -801,7 +786,10 @@ mod tests {
             spec.pointer("/properties/signalsEndpoint/properties/serverName")
                 .is_some()
         );
-        assert!(spec.pointer("/properties/signalsEndpoint/properties/port").is_some());
+        assert!(
+            spec.pointer("/properties/signalsEndpoint/properties/port").is_none(),
+            "the address carries the port"
+        );
         let required = spec
             .get("required")
             .and_then(serde_json::Value::as_array)

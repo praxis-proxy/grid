@@ -907,8 +907,6 @@ type GridSiteGatewayEndpoint struct {
 type GridSiteSignalsEndpoint struct {
 	// host:port of the signals listener: a DNS name, an IPv4 address, or a bracketed IPv6 address. Absent, the gateway endpoint's host.
 	Address *string `json:"address,omitempty"`
-	// Port, replacing the address's. Absent, the address's port, or for an address taken from the gateway endpoint, the operator's signals port setting or the gateway's port.
-	Port *int64 `json:"port,omitempty"`
 	// TLS server name sent to the signals listener, which a router in front selects on. Absent, <site>-signals.grid.internal.
 	ServerName *string `json:"serverName,omitempty"`
 }

@@ -157,15 +157,6 @@ spec:
                       nullable: true
                       pattern: ^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):[0-9]{1,5}$
                       type: string
-                    port:
-                      description: |-
-                        Port, replacing the address's. Absent, the address's port, or for an address taken from
-                        the gateway endpoint, the operator's signals port setting or the gateway's port.
-                      format: uint16
-                      maximum: 65535.0
-                      minimum: 1.0
-                      nullable: true
-                      type: integer
                     serverName:
                       description: |-
                         TLS server name sent to the signals listener, which a router in front selects on.

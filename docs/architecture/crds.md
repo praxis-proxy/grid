@@ -822,8 +822,10 @@ derived one. Loopback, link-local, and cloud metadata hosts are not dialled.
 |---|---|
 | `address` | Signals listener `host:port`. Absent, the gateway endpoint's host |
 | `serverName` | TLS server name sent to the listener. Absent, `<site>-signals.grid.internal` |
-| `port` | Port, replacing the address's. Absent, the address's port, or for an address taken from the gateway endpoint the operator's signals port setting or the gateway's | The poller verifies the peer by pin or SPIFFE ID, so the
-server name need not appear in the peer's certificate.
+
+The address carries the port. Without one, the gateway endpoint's host is dialled at the
+operator's signals port setting, or at the gateway's own port. The poller verifies the peer
+by pin or SPIFFE ID, so the server name need not appear in the peer's certificate.
 
 **`spec.gatewayEndpoint.tls` fields:**
 

@@ -1130,10 +1130,6 @@ func (in *GridSiteSignalsEndpoint) DeepCopyInto(out *GridSiteSignalsEndpoint) {
 		x := *in.Address
 		out.Address = &x
 	}
-	if in.Port != nil {
-		x := *in.Port
-		out.Port = &x
-	}
 	if in.ServerName != nil {
 		x := *in.ServerName
 		out.ServerName = &x

@@ -164,14 +164,12 @@ tests:
           signalsEndpoint:
             address: signals.east.example.com:9443
             serverName: east-signals.example.com
-            port: 10443
     asserts:
       - equal:
           path: spec.signalsEndpoint
           value:
             address: signals.east.example.com:9443
             serverName: east-signals.example.com
-            port: 10443
 
   - it: renders no signals endpoint when none is declared, so it is derived
     template: templates/peers.yaml

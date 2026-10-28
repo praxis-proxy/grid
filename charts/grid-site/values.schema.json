@@ -278,8 +278,7 @@
             "description": "Where the peer serves signals, where its gateway address does not say. Each field left out falls back to the derived endpoint.",
             "properties": {
               "address": { "type": "string", "pattern": "^\\S+:[0-9]+$", "description": "Signals listener host:port. Defaults to the gateway address's host." },
-              "serverName": { "type": "string", "minLength": 1, "maxLength": 253, "description": "TLS server name sent. Defaults to <name>-signals.grid.internal." },
-              "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "Port, replacing the address's." }
+              "serverName": { "type": "string", "minLength": 1, "maxLength": 253, "description": "TLS server name sent. Defaults to <name>-signals.grid.internal." }
             }
           }
         }

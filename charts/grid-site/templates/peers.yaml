@@ -46,9 +46,6 @@ spec:
     {{- with .serverName }}
     serverName: {{ . | quote }}
     {{- end }}
-    {{- with .port }}
-    port: {{ . }}
-    {{- end }}
   {{- end }}
   {{- with compact (list $p.digest $p.nextDigest) }}
   trust:
