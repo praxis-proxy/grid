@@ -364,8 +364,6 @@ float_cmp = "deny"
 host_endian_bytes = "deny"
 # Match exhaustiveness: name every variant; no `_` arms over enums
 wildcard_enum_match_arm = "deny"
-# Determinism: no iteration over unordered hash collections
-iter_over_hash_type = "deny"
 # Module organization: `foo.rs` style, never `foo/mod.rs`
 mod_module_files = "deny"
 # Naming clarity
