@@ -185,10 +185,32 @@ pub enum Reader<'labels> {
 ///
 /// In network order, so the version and a truncated body are the same each render.
 #[derive(Clone, Debug, Default)]
-pub struct LocalProviders(
-    Arc<RwLock<BTreeMap<String, Vec<WireProvider>>>>,
-    Arc<RwLock<Option<String>>>,
-);
+pub struct LocalProviders(Arc<RwLock<Catalog>>, Arc<RwLock<Option<String>>>);
+
+/// What [`LocalProviders`] holds: the records by network, and each reader's body as rendered
+/// from them, emptied whenever they change.
+#[derive(Debug, Default)]
+pub struct Catalog {
+    /// The records, by network.
+    networks: BTreeMap<String, Vec<WireProvider>>,
+    /// Each reader's body and its version, by the labels it reads under, `None` for this site.
+    rendered: std::sync::Mutex<RenderedByReader>,
+}
+
+/// Rendered bodies by the labels their reader reads under, `None` for this site.
+type RenderedByReader = HashMap<Option<BTreeMap<String, String>>, Rendered>;
+
+/// One reader's body and the version naming it, rendered together so they always agree.
+#[derive(Clone, Debug)]
+pub struct Rendered {
+    /// The JSON body.
+    pub body: bytes::Bytes,
+    /// A digest of exactly `body`.
+    pub version: String,
+}
+
+/// Readers whose bodies are kept rendered; past it the kept ones are dropped and rendered again.
+const MAX_RENDERED: usize = 1024;
 
 impl LocalProviders {
     /// Replace what `network` serves, ordered by provider so a capped body keeps the same records.
@@ -196,8 +218,12 @@ impl LocalProviders {
         providers.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
         let serialized = {
             let mut held = self.0.write().unwrap_or_else(PoisonError::into_inner);
-            held.insert(network.to_owned(), providers);
-            serde_json::to_vec(&*held).ok()
+            if held.networks.get(network) == Some(&providers) {
+                return;
+            }
+            held.networks.insert(network.to_owned(), providers);
+            held.rendered.get_mut().unwrap_or_else(PoisonError::into_inner).clear();
+            serde_json::to_vec(&held.networks).ok()
         };
         let version = serialized.map(|bytes| digest(&bytes));
         *self.1.write().unwrap_or_else(PoisonError::into_inner) = version;
@@ -208,12 +234,15 @@ impl LocalProviders {
     pub fn retain_networks<Keep: Fn(&str) -> bool>(&self, keep: Keep) {
         let serialized = {
             let mut held = self.0.write().unwrap_or_else(PoisonError::into_inner);
-            let before = held.len();
-            held.retain(|network, _| keep(network));
-            if held.len() == before {
+            let before = held.networks.len();
+            held.networks.retain(|network, _| keep(network));
+            if held.networks.len() == before {
                 return;
             }
-            (!held.is_empty()).then(|| serde_json::to_vec(&*held).ok()).flatten()
+            held.rendered.get_mut().unwrap_or_else(PoisonError::into_inner).clear();
+            (!held.networks.is_empty())
+                .then(|| serde_json::to_vec(&held.networks).ok())
+                .flatten()
         };
         *self.1.write().unwrap_or_else(PoisonError::into_inner) = serialized.map(|bytes| digest(&bytes));
     }
@@ -223,7 +252,36 @@ impl LocalProviders {
     /// records outside its scope.
     #[must_use]
     pub fn version_for(&self, reader: Reader<'_>) -> Option<String> {
-        self.render(reader).map(|body| digest(body.as_bytes()))
+        self.rendered(reader).map(|rendered| rendered.version)
+    }
+
+    /// `reader`'s body and its version from one read of the catalog, rendered once per change
+    /// and reader; `None` until published.
+    #[must_use]
+    pub fn rendered(&self, reader: Reader<'_>) -> Option<Rendered> {
+        let key = match reader {
+            Reader::Local => None,
+            Reader::Peer(labels) => Some(labels.clone()),
+        };
+        let held = self.0.read().unwrap_or_else(PoisonError::into_inner);
+        let mut kept = held.rendered.lock().unwrap_or_else(PoisonError::into_inner);
+        let rendered = if let Some(rendered) = kept.get(&key) {
+            rendered.clone()
+        } else {
+            let body = render_from(&held.networks, reader)?;
+            let rendered = Rendered {
+                version: digest(body.as_bytes()),
+                body: bytes::Bytes::from(body),
+            };
+            if kept.len() >= MAX_RENDERED {
+                kept.clear();
+            }
+            kept.insert(key, rendered.clone());
+            rendered
+        };
+        drop(kept);
+        drop(held);
+        Some(rendered)
     }
 
     /// A digest of everything served, `None` until published.
@@ -239,37 +297,42 @@ impl LocalProviders {
     /// provider is not a wider right than routing to it.
     #[must_use]
     pub fn render(&self, reader: Reader<'_>) -> Option<String> {
-        let mut body = String::from(r#"{"providers":["#);
-        let held = self.0.read().unwrap_or_else(PoisonError::into_inner);
-        if held.is_empty() {
-            return None;
-        }
-        let visible = interleaved(&held).filter(|provider| match reader {
-            Reader::Local => true,
-            Reader::Peer(labels) => crate::signals::labels_satisfy(&provider.match_labels, labels),
-        });
-        let mut count = 0;
-        let mut truncated = false;
-        for provider in visible {
-            let Ok(record) = serde_json::to_string(provider) else {
-                continue;
-            };
-            // The truncated close is counted with each record, so the cap holds for the whole body.
-            let full = body.len() + record.len() + usize::from(count > 0) + TRUNCATED_CLOSE.len() > MAX_BODY_BYTES;
-            if count == MAX_PROVIDERS || full {
-                truncated = true;
-                break;
-            }
-            if count > 0 {
-                body.push(',');
-            }
-            body.push_str(&record);
-            count += 1;
-        }
-        drop(held);
-        body.push_str(if truncated { TRUNCATED_CLOSE } else { "]}" });
-        Some(body)
+        let rendered = self.rendered(reader)?;
+        String::from_utf8(rendered.body.to_vec()).ok()
     }
+}
+
+/// The JSON body `reader` is served from `held`, within [`MAX_PROVIDERS`] and
+/// [`MAX_BODY_BYTES`], `None` when nothing is published.
+fn render_from(held: &BTreeMap<String, Vec<WireProvider>>, reader: Reader<'_>) -> Option<String> {
+    let mut body = String::from(r#"{"providers":["#);
+    if held.is_empty() {
+        return None;
+    }
+    let visible = interleaved(held).filter(|provider| match reader {
+        Reader::Local => true,
+        Reader::Peer(labels) => crate::signals::labels_satisfy(&provider.match_labels, labels),
+    });
+    let mut count = 0;
+    let mut truncated = false;
+    for provider in visible {
+        let Ok(record) = serde_json::to_string(provider) else {
+            continue;
+        };
+        // The truncated close is counted with each record, so the cap holds for the whole body.
+        let full = body.len() + record.len() + usize::from(count > 0) + TRUNCATED_CLOSE.len() > MAX_BODY_BYTES;
+        if count == MAX_PROVIDERS || full {
+            truncated = true;
+            break;
+        }
+        if count > 0 {
+            body.push(',');
+        }
+        body.push_str(&record);
+        count += 1;
+    }
+    body.push_str(if truncated { TRUNCATED_CLOSE } else { "]}" });
+    Some(body)
 }
 
 /// Every network's providers, one from each in turn, so a body cut at its bound keeps a share
@@ -815,6 +878,34 @@ fn refusal(
 #[expect(clippy::indexing_slicing, reason = "tests index verdicts by the peer they set up")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_version_always_names_the_very_body_served_across_a_publish() {
+        let local = LocalProviders::default();
+        local.replace("net", vec![wire("a", &[])]);
+        let gold = BTreeMap::from([("tier".to_owned(), "gold".to_owned())]);
+        for reader in [Reader::Local, Reader::Peer(&gold)] {
+            let first = local.rendered(reader).unwrap_or_else(|| std::process::abort());
+            assert_eq!(first.version, digest(&first.body), "rendered together");
+            let again = local.rendered(reader).unwrap_or_else(|| std::process::abort());
+            assert_eq!(
+                (again.body, again.version),
+                (first.body.clone(), first.version.clone()),
+                "kept"
+            );
+        }
+        let before = local.rendered(Reader::Local).unwrap_or_else(|| std::process::abort());
+        local.replace("net", vec![wire("a", &[]), wire("b", &[])]);
+        let after = local.rendered(Reader::Local).unwrap_or_else(|| std::process::abort());
+        assert_ne!(after.version, before.version, "a publish drops what was kept");
+        assert_eq!(after.version, digest(&after.body));
+        local.replace("net", vec![wire("b", &[]), wire("a", &[])]);
+        assert_eq!(
+            local.rendered(Reader::Local).map(|rendered| rendered.version),
+            Some(after.version),
+            "an unchanged catalog keeps its body"
+        );
+    }
 
     fn wire(id: &str, labels: &[(&str, &str)]) -> WireProvider {
         WireProvider {

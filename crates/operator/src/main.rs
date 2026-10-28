@@ -3140,19 +3140,18 @@ async fn providers_handler(
         Caller::Peer(None) => return refused(),
     };
     // Before the first publish an answer would read as no providers, so a peer keeps what it holds.
-    let Some(body) = published.providers.render(reader) else {
+    let Some(rendered) = published.providers.rendered(reader) else {
         return http::StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let contract = operator::site_providers::CONTRACT_VERSION.to_string();
-    // The version of this very body, so the reader records what it read.
-    let version = published.providers.version_for(reader).unwrap_or_default();
+    // The version and the body come from one render, so the reader records what it read.
     (
         [
             (http::header::CONTENT_TYPE.as_str(), "application/json"),
             (operator::site_providers::CONTRACT_HEADER, contract.as_str()),
-            (operator::site_providers::VERSION_HEADER, version.as_str()),
+            (operator::site_providers::VERSION_HEADER, rendered.version.as_str()),
         ],
-        body,
+        rendered.body,
     )
         .into_response()
 }
