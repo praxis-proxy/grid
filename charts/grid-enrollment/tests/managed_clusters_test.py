@@ -130,9 +130,33 @@ class ManagedClusterTemplates(unittest.TestCase):
             self.assertEqual(cfg['feedbackScrapeType'], 'Watch')
             self.assertTrue(all(p['path'].startswith(('.spec.', '.metadata.'))
                                 for p in cfg['feedbackRules'][0]['jsonPaths']))
-        roles = [o for o in objects if o['kind'] == 'Role']
-        self.assertEqual(roles[0]['rules'][0]['resourceNames'], ['grid-site-observer'])
         self.assertFalse(any(o['kind'] == 'Secret' for o in objects))
+
+    def test_observer_access_does_not_wait_for_hub_policy(self):
+        for work_name in ('grid-site-observer', 'custom-observer'):
+            with self.subTest(work_name=work_name):
+                values = copy.deepcopy(self.values)
+                values['managedClusters']['workName'] = work_name
+                docs = self.render_chart(values)
+                policy = next(d for d in docs if d['kind'] == 'Policy' and
+                              d['metadata']['name'] == 'grid-bootstrap-membership')
+                account = policy['spec']['hubTemplateOptions']['serviceAccountName']
+                binding, = [d for d in docs if d['kind'] == 'ClusterRoleBinding' and
+                            {'kind': 'ServiceAccount', 'name': account,
+                             'namespace': policy['metadata']['namespace']} in d['subjects']]
+                role, = [d for d in docs if d['kind'] == binding['roleRef']['kind'] and
+                         d['metadata']['name'] == binding['roleRef']['name']]
+                observer_rules = [r for r in role['rules'] if
+                                  'manifestworks' in r['resources']]
+                self.assertEqual(len(observer_rules), 1,
+                                 'observer watches must be authorized before hub policy enforcement')
+                rule, = observer_rules
+                self.assertEqual(rule['apiGroups'], ['work.open-cluster-management.io'])
+                self.assertEqual(rule['resources'], ['manifestworks'])
+                self.assertEqual(rule['resourceNames'], [work_name])
+                self.assertEqual(set(rule['verbs']), {'get', 'list', 'watch'})
+                self.assertTrue(all(r['resources'] in (['managedclusters'], ['manifestworks'])
+                                    for r in role['rules']))
 
     def test_decommission_stops_renewal_without_owning_ca(self):
         objects = self.render('-hub')

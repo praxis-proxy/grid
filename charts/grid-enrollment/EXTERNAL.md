@@ -153,9 +153,12 @@ the peer's provider catalog and signals; no InferenceProvider copies or SWIM
 key distribution are needed.
 
 The template ServiceAccount can list cluster inventory and read only the named
-observer in each selected member namespace. It cannot read Secrets. Identity
-policies use encrypted `fromSecret` templates in the issuer namespace. Existing
-CA resources remain outside membership pruning.
+observer across namespaces. The chart installs this permission in its ClusterRole
+so template resolution does not depend on the hub policy first creating per-member
+RBAC. The templates still select members by label and cluster set. The account
+cannot read Secrets or modify ManifestWorks. Identity policies use encrypted
+`fromSecret` templates in the issuer namespace. Existing CA resources remain
+outside membership pruning.
 
 An endpoint change updates remote GridSites; removing optional fields clears
 them rather than retaining stale endpoints or trust pins. Removing a member's

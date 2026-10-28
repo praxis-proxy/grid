@@ -64,7 +64,6 @@ spec:
           {{ printf "{{hub $clusterSet := %q hub}}" $cfg.clusterSet }}
           {{ printf "{{hub $workName := %q hub}}" $cfg.workName }}
           {{ printf "{{hub $namespace := %q hub}}" .Release.Namespace }}
-          {{ printf "{{hub $account := %q hub}}" $name }}
           {{ printf "{{hub $secretPrefix := %q hub}}" $cfg.identitySecretPrefix }}
           - complianceType: musthave
             objectDefinition:
