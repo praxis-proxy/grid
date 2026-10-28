@@ -160,6 +160,11 @@ cannot read Secrets or modify ManifestWorks. Identity policies use encrypted
 `fromSecret` templates in the issuer namespace. Existing CA resources remain
 outside membership pruning.
 
+The inventory and membership policies carry a `policy.open-cluster-management.io/trigger-update`
+annotation derived from the lookup permissions. A chart update that changes those
+permissions also requests hub-template reprocessing, including when an earlier
+permission error prevented the dependency watch from starting.
+
 An endpoint change updates remote GridSites; removing optional fields clears
 them rather than retaining stale endpoints or trust pins. Removing a member's
 selection label or inventory entry withdraws its remote records and stops

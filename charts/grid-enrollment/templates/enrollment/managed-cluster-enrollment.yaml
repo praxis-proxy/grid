@@ -38,6 +38,8 @@ kind: Policy
 metadata:
   name: {{ $name }}-hub
   namespace: {{ .Release.Namespace }}
+  annotations:
+    policy.open-cluster-management.io/trigger-update: {{ include "grid-enrollment.membership.lookupRules" . | sha256sum | quote }}
 spec:
   remediationAction: enforce
   disabled: false

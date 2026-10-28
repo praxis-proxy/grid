@@ -6,6 +6,7 @@ Requires Helm, Go and PyYAML. This does not exercise live policy reconciliation.
 import copy
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -55,8 +56,8 @@ class ManagedClusterTemplates(unittest.TestCase):
                         for d in cls.docs if d['kind'] == 'Policy'}
 
     @classmethod
-    def render_chart(cls, values):
-        result = subprocess.run(['helm', 'template', 'grid-bootstrap', str(CHART),
+    def render_chart(cls, values, chart=CHART):
+        result = subprocess.run(['helm', 'template', 'grid-bootstrap', str(chart),
                                  '-n', 'grid-system', '-f', '-'],
                                 input=yaml.safe_dump(values), text=True,
                                 capture_output=True, check=True)
@@ -157,6 +158,31 @@ class ManagedClusterTemplates(unittest.TestCase):
                 self.assertEqual(set(rule['verbs']), {'get', 'list', 'watch'})
                 self.assertTrue(all(r['resources'] in (['managedclusters'], ['manifestworks'])
                                     for r in role['rules']))
+
+    def test_permission_changes_refresh_hub_templates_without_spec_changes(self):
+        def triggers(docs):
+            return {d['metadata']['name']: d['metadata']['annotations'][
+                    'policy.open-cluster-management.io/trigger-update']
+                    for d in docs if d['kind'] == 'Policy' and
+                    'hubTemplateOptions' in d['spec']}
+
+        original = triggers(self.docs)
+        self.assertEqual(len(original), 2)
+        self.assertEqual(original, triggers(self.render_chart(self.values)))
+        values = copy.deepcopy(self.values)
+        values['managedClusters']['identitySecretPrefix'] = 'another-site-'
+        self.assertEqual(original, triggers(self.render_chart(values)))
+        with tempfile.TemporaryDirectory(prefix='grid-rbac-refresh-test-') as temp:
+            chart = Path(temp) / 'chart'
+            shutil.copytree(CHART, chart)
+            helper = chart / 'templates/_managed-clusters.tpl'
+            helper.write_text(helper.read_text().replace(
+                'verbs: [get, list, watch]', 'verbs: [get, list]', 1))
+            changed = self.render_chart(self.values, chart)
+        for name, trigger in triggers(changed).items():
+            self.assertNotEqual(original[name], trigger)
+        self.assertEqual([d['spec'] for d in self.docs if d['kind'] == 'Policy'],
+                         [d['spec'] for d in changed if d['kind'] == 'Policy'])
 
     def test_decommission_stops_renewal_without_owning_ca(self):
         objects = self.render('-hub')
