@@ -44,6 +44,7 @@
       name: {{hub printf "%q" $site hub}}
       labels:
         grid.praxis.fast/membership: declared
+        grid.praxis.fast/auto-discovered: "false"
     spec:
       gridNetworkRef: {{hub printf "%q" $network hub}}
       gatewayEndpoint:

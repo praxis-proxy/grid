@@ -89,6 +89,7 @@ class ManagedClusterTemplates(unittest.TestCase):
         self.assertEqual(peer['metadata']['name'], 'east')
         self.assertEqual(peer['spec']['gatewayEndpoint']['tls']['serverName'], 'east.grid.internal')
         self.assertNotIn('status', peer)
+        self.assertEqual(peer['metadata']['labels']['grid.praxis.fast/auto-discovered'], 'false')
 
     def test_endpoint_update_and_optional_field_removal(self):
         resources = self.inventory()
