@@ -3855,7 +3855,11 @@ mod tests {
         #[cfg(feature = "fips")]
         let tls_err = openssl::error::ErrorStack::get();
         let wrapped = std::io::Error::new(std::io::ErrorKind::InvalidData, tls_err);
-        assert_eq!(classify_transport(&wrapped), RequestOutcome::Tls);
+        assert_eq!(
+            classify_transport(&wrapped),
+            RequestOutcome::Tls,
+            "the wrapped TLS failure should remain distinguishable from transport I/O"
+        );
     }
 
     /// Peer TLS material from a throwaway CA, for the config cache tests.
