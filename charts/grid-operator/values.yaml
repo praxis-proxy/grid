@@ -18,7 +18,8 @@ grid:
   membership:
     # -- Where this site learns its members: Swim, from SWIM gossip, or Local, where this
     # site's configuration lists its peers as GridSites and their signals are polled at the
-    # endpoint derived from each gateway. Local runs no SWIM: no SWIM Service, port or
+    # endpoint derived from each gateway. Local assumes something outside the grid delivers
+    # every site's GridSite records, the same set to every member, and discovers no peers. Local runs no SWIM: no SWIM Service, port or
     # seeds, poll signals on the signals Service, and every contradicting value fails the
     # render. An unset grid.signals renders poll under Local.
     source: Swim

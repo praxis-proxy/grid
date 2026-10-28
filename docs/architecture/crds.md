@@ -277,6 +277,15 @@ gossip. `Local` means this site's configuration lists its peers as `GridSite` ob
 Local needs poll signals: an unset transport starts in poll, and gossip fails the render
 and the operator's startup. Both are supported peer options.
 
+Local assumes something outside the grid delivers every site's `GridSite` records, the
+same set to every member. The operator discovers no peers in this mode. It polls the
+sites its own configuration lists, so a member missing from a site's records is a member
+that site never reaches.
+[Open Cluster Management](https://open-cluster-management.io/) is the reference example,
+placing the records on each cluster in a cluster set. Argo CD or plain GitOps deliver the
+same records just as well. Red Hat Advanced Cluster Management is the product built on
+Open Cluster Management.
+
 A `PeerMembership` condition, under its own field manager
 (`grid-operator-peer-membership`), compares the `X-Grid-Membership` header each
 polled peer answers with against this site's `GRID_MEMBERSHIP_SOURCE`. A peer that sends

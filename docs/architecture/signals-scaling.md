@@ -9,7 +9,9 @@ Each site keeps one pooled connection to each peer and polls it every 5 seconds.
 | Total connections | members x 8 + 72, from 256 to 4096 |
 | Connections per peer site | 8 (`GRID_SIGNALS_MAX_PER_PEER`) |
 | Handshakes in progress | 64, refusing the newest past that |
-| Handshakes from one source address | 8 (`signals.maxHandshakesPerSource`) |
+| Handshakes from one source address | 8, or 32 behind a Route (`signals.maxHandshakesPerSource`) |
+| Handshakes from one source that have sent nothing | 8, a quarter of the share |
+| Silence before a connection is dropped | 500 ms |
 
 Catalogs are read again only when a peer's version changes, and status is written only when a verdict changes, after 3 missed rounds.
 
@@ -17,12 +19,22 @@ Catalogs are read again only when a peer's version changes, and status is writte
 
 Through a passthrough Route the operator sees every peer at the router's address, and the router applies its per-client limits to each peer's egress address. Sites behind one egress address share it, so the defaults of 10 concurrent connections and 20 a second fit about 5 to 10 such sites.
 
-Raise the operator's per-source cap toward the handshake share:
+The chart raises the per-source cap to 32, the whole handshake share, whenever it renders a
+signals Route. That is deliberate: with every peer at one address, a cap sized for one peer
+sheds the rest. An install that sets `signals.maxHandshakesPerSource` keeps its own value,
+and without a Route the default stays 8.
 
 ```sh
 helm upgrade grid-operator charts/grid-operator --reuse-values \
-  --set signals.maxHandshakesPerSource=32
+  --set signals.maxHandshakesPerSource=48
 ```
+
+Two limits cover one source and they are separate. The cap above counts handshakes in
+progress and is loose behind a router by design. A second cap counts only connections from
+that source which have sent nothing yet, at 8, a quarter of the share. The listener drops a
+connection that sends nothing for 500 ms. A peer set behind one router therefore gets the
+whole share between them, while one source cannot hold the share by opening connections and
+staying quiet. Raising `signals.maxHandshakesPerSource` does not raise the quiet cap.
 
 Size the router limits for the peers sharing one egress address, and allow only the peers' egress ranges:
 

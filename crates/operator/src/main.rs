@@ -2449,7 +2449,7 @@ async fn serve_signals_tls(
         let Some((stream, remote)) = accepted_or_backoff(accepted).await else {
             continue;
         };
-        let Some((slot, turn, source)) = admission.admit(remote) else {
+        let Some((slot, turn, source, silent)) = admission.admit(remote) else {
             continue;
         };
         let serve = Box::pin(serve_signals_connection(
@@ -2459,6 +2459,7 @@ async fn serve_signals_tls(
             Handshaking {
                 turn,
                 source,
+                silent,
                 peers: admission.peers.clone(),
                 warned: Arc::clone(&admission.warned),
             },
@@ -2513,6 +2514,11 @@ const SIGNALS_SHED_WARN_EVERY: std::time::Duration = std::time::Duration::from_s
 /// Bound on the TLS handshake.
 const SIGNALS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long an accepted connection may send nothing before it is dropped. A connection that
+/// has not begun its handshake costs a slot and proves nothing, and a source that opens many
+/// of them is the cheapest way to hold the share.
+const SIGNALS_SILENT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Bound on reading request headers, including between keep-alive requests.
 const SIGNALS_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -2547,6 +2553,10 @@ struct Admission {
     handshakes: Arc<tokio::sync::Semaphore>,
     /// Handshakes in progress, per source.
     sources: SourceSlots,
+    /// Accepted connections that have sent nothing yet, per source. Separate from `sources`
+    /// and much tighter: behind a router every peer is one source, so the handshake cap has
+    /// to cover the whole peer set, while a source that sends nothing earns a quarter of it.
+    silent: SourceSlots,
     /// Authenticated peer connections, per site.
     peers: PeerSlots,
     /// Connections one peer may hold.
@@ -2570,6 +2580,7 @@ impl Admission {
                 max_per_source.min(share),
                 max_per_source.max(SIGNALS_MAX_PER_SOURCE_48).min(share),
             ),
+            silent: SourceSlots::new((share / 4).max(1), (share / 4).max(1)),
             peers: PeerSlots::new(
                 max_per_peer,
                 SIGNALS_MAX_CONNECTIONS.saturating_sub(SIGNALS_LOCAL_RESERVE + SIGNALS_MAX_HANDSHAKES),
@@ -2616,6 +2627,7 @@ impl Admission {
         tokio::sync::OwnedSemaphorePermit,
         tokio::sync::OwnedSemaphorePermit,
         SourceSlot,
+        SourceSlot,
     )> {
         self.size_for_members();
         let held = Arc::clone(&self.slots)
@@ -2626,7 +2638,8 @@ impl Admission {
                     .try_acquire_owned()
                     .map_err(|_full| "handshake")?;
                 let source = self.sources.acquire(remote.ip()).ok_or("source")?;
-                Ok((slot, turn, source))
+                let silent = self.silent.acquire(remote.ip()).ok_or("silent")?;
+                Ok((slot, turn, source, silent))
             });
         held.inspect_err(|limit| shed(remote, limit, &self.warned)).ok()
     }
@@ -2811,6 +2824,9 @@ struct Handshaking {
     turn: tokio::sync::OwnedSemaphorePermit,
     /// Released once the handshake ends.
     source: SourceSlot,
+    /// Released as soon as the connection sends anything, or when it is dropped for sending
+    /// nothing. It covers only the window before the first byte.
+    silent: SourceSlot,
     /// Where the authenticated connection is counted.
     peers: PeerSlots,
     /// When a shed connection was last warned about, shared across the listener.
@@ -2872,6 +2888,20 @@ async fn serve_signals_connection(
     shutdown: operator::shutdown::Shutdown,
 ) {
     let handshake = (handshaking.turn, handshaking.source);
+    // Nothing read yet, so a connection that never speaks costs only this wait. readable()
+    // does not consume, so the handshake below still sees the ClientHello.
+    let spoke = tokio::select! {
+        biased;
+        () = shutdown.triggered() => return,
+        ready = tokio::time::timeout(SIGNALS_SILENT_TIMEOUT, tcp.readable()) => ready,
+    };
+    if !matches!(spoke, Ok(Ok(()))) {
+        operator::metrics::record_signals_shed("silent");
+        tracing::debug!(%remote, "signals connection sent nothing; dropping");
+        return;
+    }
+    // It has spoken, so it no longer counts against the silent cap; the handshake caps take over.
+    drop(handshaking.silent);
     let accepted = tokio::select! {
         biased;
         () = shutdown.triggered() => return,
@@ -4565,23 +4595,29 @@ mod tests {
         }
     }
 
-    /// Fresh caps, and a handshake slot for loopback against them.
+    /// Fresh caps, and a handshake slot for loopback against them. `silent` is its own
+    /// tracker, as in the listener, so a test can watch either cap on its own.
     fn handshaking(sources: &SourceSlots, peers: &PeerSlots) -> Handshaking {
+        handshaking_with(sources, &SourceSlots::new(1, 1), peers)
+    }
+
+    /// As [`handshaking`], with the quiet tracker named.
+    fn handshaking_with(sources: &SourceSlots, silent: &SourceSlots, peers: &PeerSlots) -> Handshaking {
+        let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
         Handshaking {
             warned: Arc::default(),
             turn: Arc::new(tokio::sync::Semaphore::new(1))
                 .try_acquire_owned()
                 .expect("a free turn"),
-            source: sources
-                .acquire(std::net::IpAddr::from([127, 0, 0, 1]))
-                .expect("a free slot"),
+            source: sources.acquire(loopback).expect("a free slot"),
+            silent: silent.acquire(loopback).expect("a free quiet slot"),
             peers: peers.clone(),
         }
     }
 
     #[tokio::test(start_paused = true)]
     #[expect(clippy::too_many_lines, reason = "server TLS setup and a silent client")]
-    async fn a_silent_client_is_dropped_at_the_handshake_timeout() {
+    async fn a_silent_client_is_dropped_before_its_handshake_is_waited_out() {
         let ca = certs::generate_ca("grid-ca").expect("fixture");
         let site = certs::generate_site_cert(&ca, "east").expect("fixture");
         let tls = tls_backend::build_server_config(
@@ -4614,15 +4650,51 @@ mod tests {
             handshaking(&sources, &PeerSlots::new(1, 8)),
             operator::shutdown::Shutdown::never(),
         ));
+        let silent = SourceSlots::new(1, 1);
         tokio::time::timeout(SIGNALS_HANDSHAKE_TIMEOUT * 2, serve)
             .await
-            .expect("released by the handshake bound");
+            .expect("released by the silence bound");
         assert_eq!(
             started.elapsed(),
-            SIGNALS_HANDSHAKE_TIMEOUT,
-            "released exactly at the bound"
+            SIGNALS_SILENT_TIMEOUT,
+            "a connection that sends nothing goes at the silence bound, not the handshake one"
         );
-        assert_eq!(sources.held(remote.ip()), 0, "a failed handshake frees its source slot");
+        assert!(
+            SIGNALS_SILENT_TIMEOUT < SIGNALS_HANDSHAKE_TIMEOUT,
+            "silence is the tighter of the two, or this proves nothing"
+        );
+        assert_eq!(
+            sources.held(remote.ip()),
+            0,
+            "a dropped connection frees its source slot"
+        );
+        assert_eq!(silent.held(remote.ip()), 0, "and holds no quiet slot once it is gone");
+    }
+
+    #[test]
+    fn the_quiet_cap_is_a_quarter_of_the_handshake_share() {
+        let share = SIGNALS_MAX_HANDSHAKES / 2;
+        let admission = Admission::new(8, share, operator::signals::PeerIdentities::new());
+        let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
+        // The handshake cap is the whole share, which is what a peer set behind one router
+        // needs; the quiet cap is a quarter of it, which is what one slow source gets.
+        let mut held = Vec::new();
+        for _ in 0..share {
+            held.push(admission.sources.acquire(loopback).expect("the share is available"));
+        }
+        assert!(
+            admission.sources.acquire(loopback).is_none(),
+            "the handshake cap stops at the share"
+        );
+        let mut quiet = Vec::new();
+        for _ in 0..(share / 4) {
+            quiet.push(admission.silent.acquire(loopback).expect("a quarter is available"));
+        }
+        assert!(
+            admission.silent.acquire(loopback).is_none(),
+            "the quiet cap stops at a quarter of the share"
+        );
+        assert_eq!(quiet.len() * 4, held.len(), "a quarter, whatever the share is");
     }
 
     /// A rustls client presenting `client` (a Grid-CA site cert) to a server named `east`.
@@ -5295,11 +5367,24 @@ mod tests {
             "the rest stay free for authenticated connections"
         );
         drop(held);
+        // Through admit the quiet cap binds first, because a connection has not spoken yet
+        // when it is admitted: one source gets a quarter of the share while it stays quiet.
         let one_source: Vec<_> = (0..SIGNALS_MAX_HANDSHAKES)
             .filter_map(|_| admission.admit(([10, 0, 2, 1], 1).into()))
             .collect();
         assert_eq!(
             one_source.len(),
+            SIGNALS_MAX_HANDSHAKES / 8,
+            "a source that has not spoken holds a quarter of the share, whatever its configured cap"
+        );
+        drop(one_source);
+        // The handshake cap itself is still the whole share, which is what a peer set behind
+        // one router needs once its connections speak and give their quiet slots back.
+        let speaking: Vec<_> = (0..SIGNALS_MAX_HANDSHAKES)
+            .filter_map(|_| admission.sources.acquire(std::net::IpAddr::from([10, 0, 2, 1])))
+            .collect();
+        assert_eq!(
+            speaking.len(),
             SIGNALS_MAX_HANDSHAKES / 2,
             "one source holds at most half the handshakes, whatever its configured cap"
         );
