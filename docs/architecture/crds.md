@@ -106,8 +106,10 @@ than one; adding another after startup is not supported.
 
 It carries this cluster's own conditions. `Accepted`, `ResolvedRefs`, `Enrolled` and
 `IdentityValid` gate its roll-up, in that order. `RotationOnSchedule` `False`, a
-`PeerTimeValid` of `False`, or a `GatewayAgesRejected` of `True`, sets `Degraded` with
-that condition's reason. Each condition type has one writer, and the controller alone
+`PeerTimeValid` of `False`, or a `GatewayAgesRejected` of `True` sets `Degraded` with
+that condition's reason, and after them, under Local membership, a `False`
+`PeerSignalsReachable`, `PeerCatalogsAccepted`, `PeerMembership` or `PeerPollsComplete`.
+None of the peer conditions gates `Available`, and a site switched to Swim drops them. Each condition type has one writer, and the controller alone
 writes `Available`, `Progressing` and `Degraded`. Every reason is listed in
 [Site Enrollment](../installation/enrollment.md#3-enroll-the-site).
 

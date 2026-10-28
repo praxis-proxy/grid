@@ -420,6 +420,28 @@ pub fn polls_condition(
     )
 }
 
+/// The status apply withdrawing `type_`, which the caller's manager owns alone, from
+/// `network`, with its name; `None` when `network` holds none.
+#[must_use]
+pub fn withdrawal<'network>(network: &'network GridNetwork, type_: &str) -> Option<(&'network str, Value)> {
+    let name = network.metadata.name.as_deref()?;
+    network
+        .status
+        .as_ref()
+        .is_some_and(|status| status.conditions.iter().any(|held| held.type_ == type_))
+        .then(|| {
+            (
+                name,
+                serde_json::json!({
+                    "apiVersion": "grid.praxis.fast/v1alpha1",
+                    "kind": "GridNetwork",
+                    "metadata": { "name": name },
+                    "status": { "conditions": [] }
+                }),
+            )
+        })
+}
+
 /// The status apply on `network` carrying the condition `build` makes from its live ones, with
 /// its name; `None` when there is none to write.
 pub fn network_patch<Build>(network: &GridNetwork, build: Build) -> Option<(&str, Value)>
@@ -663,6 +685,29 @@ mod tests {
             AWAITING_FIRST_CHECK,
             "a peer never reached waits for its first check, and is never blamed for this site's round"
         );
+    }
+
+    #[test]
+    fn a_withdrawal_empties_only_a_network_that_holds_the_condition() {
+        let mut network: crate::crd::grid_network::GridNetwork = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": "grid" },
+            "spec": {},
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            super::withdrawal(&network, PEER_SIGNALS_REACHABLE).is_none(),
+            "nothing to withdraw"
+        );
+        network.status = Some(crate::crd::grid_network::GridNetworkStatus {
+            conditions: vec![condition(&PeerReach::of(["up"], [], []))],
+            ..Default::default()
+        });
+        let (name, patch) =
+            super::withdrawal(&network, PEER_SIGNALS_REACHABLE).unwrap_or_else(|| std::process::abort());
+        assert_eq!(name, "grid");
+        assert_eq!(patch.pointer("/status/conditions"), Some(&serde_json::json!([])));
     }
 
     #[test]

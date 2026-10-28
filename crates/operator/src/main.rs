@@ -3588,7 +3588,9 @@ impl PeerPoller {
         if self.ctx.membership() != Membership::Local {
             if !self.sites_written {
                 let none = [PeerReach::none(&REACH), PeerReach::none(&CATALOGS)];
-                self.sites_written = Box::pin(write_site_conditions(&self.client, &none, &self.shutdown)).await;
+                let sites = Box::pin(write_site_conditions(&self.client, &none, &self.shutdown)).await;
+                let network = Box::pin(withdraw_network_conditions(&self.client, &self.shutdown)).await;
+                self.sites_written = sites && network;
             }
             return;
         }
@@ -3906,6 +3908,27 @@ async fn write_peer_reach(
         shutdown,
     ))
     .await;
+}
+
+/// Withdraw what a Local run left on the `GridNetwork`, so a site now under Swim is not
+/// degraded by it. `true` once every one is gone.
+async fn withdraw_network_conditions(client: &Client, shutdown: &operator::shutdown::Shutdown) -> bool {
+    use operator::peer_reach::{CATALOGS, PEER_POLLS_COMPLETE, POLLS_FIELD_MANAGER, REACH};
+    let mut withdrawn = true;
+    for (manager, type_) in [
+        (REACH.field_manager, REACH.type_),
+        (CATALOGS.field_manager, CATALOGS.type_),
+        (POLLS_FIELD_MANAGER, PEER_POLLS_COMPLETE),
+    ] {
+        withdrawn &= Box::pin(write_network_condition(
+            client,
+            manager,
+            |network, _| operator::peer_reach::withdrawal(network, type_),
+            shutdown,
+        ))
+        .await;
+    }
+    withdrawn
 }
 
 /// Write `PeerPollsComplete` after a round that had no time for `skipped` of its `judged` peers,

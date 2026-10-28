@@ -2022,8 +2022,21 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 /// Manager for the `GridNetwork`'s `Available`, `Progressing` and `Degraded`, written only here.
 pub const ROLLUP_FIELD_MANAGER: &str = "grid-operator-rollup";
 
+/// What raises the `GridNetwork`'s `Degraded`, each with the status that does, the first held
+/// read: this site's own identity and clocks first, then its view of its peers. None gates
+/// `Available`, since peers being down leaves this site available.
+const DEGRADED_BY: [(&str, &str); 7] = [
+    (crate::enroll::local::ROTATION_ON_SCHEDULE, "False"),
+    (crate::peer_ages::PEER_TIME_VALID, "False"),
+    (crate::gateway_ages::GATEWAY_AGES_REJECTED, "True"),
+    (crate::peer_reach::PEER_SIGNALS_REACHABLE, "False"),
+    (crate::peer_reach::PEER_CATALOGS_ACCEPTED, "False"),
+    (crate::peer_membership::PEER_MEMBERSHIP, "False"),
+    (crate::peer_reach::PEER_POLLS_COMPLETE, "False"),
+];
+
 /// The network's roll-up: the enrollment step's and the renewal loop's conditions gate it, and
-/// an off-schedule rotation or rejected peer or gateway signal ages degrade it.
+/// whatever [`DEGRADED_BY`] holds degrades it.
 pub(crate) fn network_rollup(network: &GridNetwork) -> Vec<Condition> {
     let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
         return Vec::new();
@@ -2038,15 +2051,9 @@ pub(crate) fn network_rollup(network: &GridNetwork) -> Vec<Condition> {
     };
     let enrollment = enrollment_gates(held, stamp);
     let gates: Vec<&Condition> = enrollment.iter().collect();
-    let degraded = held_condition(held, crate::enroll::local::ROTATION_ON_SCHEDULE)
-        .filter(|condition| condition.status == "False")
-        .or_else(|| {
-            held_condition(held, crate::peer_ages::PEER_TIME_VALID).filter(|condition| condition.status == "False")
-        })
-        .or_else(|| {
-            held_condition(held, crate::gateway_ages::GATEWAY_AGES_REJECTED)
-                .filter(|condition| condition.status == "True")
-        })
+    let degraded = DEGRADED_BY
+        .iter()
+        .find_map(|(type_, bad)| held_condition(held, type_).filter(|condition| condition.status == *bad))
         .map(|condition| (condition.reason.as_str(), condition.message.as_str()));
     rollup::trio(held, &gates, (degraded, crate::enroll::local::in_flight(held)), stamp).into()
 }
@@ -9088,6 +9095,57 @@ mod tests {
                 "{reason} is nothing in flight"
             );
         }
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "each peer condition both ways, then the order")]
+    fn the_peer_conditions_degrade_the_network_after_its_own_and_never_gate_it() {
+        use crate::{peer_membership::PEER_MEMBERSHIP, peer_reach};
+        let pair = |status: &str, reason: &str| Some((status.to_owned(), reason.to_owned()));
+        for (type_, reason) in [
+            (peer_reach::PEER_SIGNALS_REACHABLE, peer_reach::PEERS_UNREACHABLE),
+            (peer_reach::PEER_CATALOGS_ACCEPTED, peer_reach::CATALOGS_REFUSED),
+            (PEER_MEMBERSHIP, crate::peer_membership::PEER_MEMBERSHIP_MISMATCH),
+            (peer_reach::PEER_POLLS_COMPLETE, peer_reach::POLL_ROUND_OVERRUN),
+        ] {
+            let failing = network_holding(&[(type_, "False", reason)]);
+            assert_eq!(
+                rolled_up(&failing, "Degraded"),
+                pair("True", reason),
+                "{type_} degrades"
+            );
+            assert_ne!(
+                rolled_up(&failing, "Available").map(|(_, gate)| gate).as_deref(),
+                Some(reason),
+                "{type_} never gates Available"
+            );
+            let clear = network_holding(&[(type_, "True", type_)]);
+            assert_eq!(
+                rolled_up(&clear, "Degraded").map(|(status, _)| status).as_deref(),
+                Some("False"),
+                "{type_} True clears it"
+            );
+        }
+        let both = network_holding(&[
+            (
+                peer_reach::PEER_SIGNALS_REACHABLE,
+                "False",
+                peer_reach::PEERS_UNREACHABLE,
+            ),
+            (crate::peer_ages::PEER_TIME_VALID, "False", "TimestampOutOfRange"),
+        ]);
+        assert_eq!(
+            rolled_up(&both, "Degraded"),
+            pair("True", "TimestampOutOfRange"),
+            "this site's own inputs read first"
+        );
+        assert_eq!(
+            rolled_up(&network_holding(&[]), "Degraded")
+                .map(|(status, _)| status)
+                .as_deref(),
+            Some("False"),
+            "removed, as under Swim, they degrade nothing"
+        );
     }
 
     #[test]
