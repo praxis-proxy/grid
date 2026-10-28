@@ -1,12 +1,20 @@
 suite: signals Route off a cluster that serves no Routes
 templates:
   - templates/route-signals.yaml
+  - templates/deployment.yaml
 set:
   site.name: east
   grid.membership.source: Local
   signals.enabled: true
   signals.route.host: east-signals.grid.internal
 tests:
+  - it: leaves the handshake cap alone without a Route
+    template: templates/deployment.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_SIGNALS_MAX_HANDSHAKES_PER_SOURCE, value: "32" }
+
   - it: renders no Route where the Route API is absent
     template: templates/route-signals.yaml
     asserts:

@@ -187,7 +187,9 @@ spec:
             - name: GRID_SIGNALS_ADVERTISE_ADDR
               value: {{ . | quote }}
             {{- end }}
-            {{- with .Values.signals.maxHandshakesPerSource }}
+            {{- /* Behind a Route every peer arrives as the router, so one source holds the
+                   whole peer set's handshakes and the cap has to be sized for the set. */}}
+            {{- with (ternary (include "grid-operator.signalsRoute.handshakes" .) (.Values.signals.maxHandshakesPerSource | toString) (eq (include "grid-operator.signalsRoute.enabled" .) "true")) }}
             - name: GRID_SIGNALS_MAX_HANDSHAKES_PER_SOURCE
               value: {{ . | quote }}
             {{- end }}

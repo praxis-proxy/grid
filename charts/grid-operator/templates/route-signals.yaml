@@ -26,7 +26,7 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  host: {{ dig "route" "host" "" (.Values.signals | default dict) | quote }}
+  host: {{ include "grid-operator.signalsRoute.host" . | quote }}
   to:
     kind: Service
     name: {{ include "grid-operator.fullname" . }}-signals

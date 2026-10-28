@@ -1,6 +1,7 @@
 suite: signals Route
 templates:
   - templates/route-signals.yaml
+  - templates/deployment.yaml
 capabilities:
   apiVersions:
     - route.openshift.io/v1
@@ -95,13 +96,57 @@ tests:
       - hasDocuments:
           count: 0
 
-  - it: needs a host, which is the name the router matches
+  - it: defaults the host to this site's name under the grid trust domain
     template: templates/route-signals.yaml
     set:
       signals.route.host: ""
     asserts:
+      - equal:
+          path: spec.host
+          value: east-signals.grid.internal
+
+  - it: takes a host as given
+    template: templates/route-signals.yaml
+    set:
+      signals.route.host: east-signals.example.com
+    asserts:
+      - equal:
+          path: spec.host
+          value: east-signals.example.com
+
+  - it: needs a site to name, when neither the host nor site.name is set
+    template: templates/route-signals.yaml
+    set:
+      signals.route.host: ""
+      site.name: ""
+      swim.siteName: ""
+    asserts:
       - failedTemplate:
-          errorMessage: "signals.route.host is required: peers dial the site's own name and the router picks this backend by it"
+          errorMessage: "signals.route.host needs site.name to default, or set it: peers dial the site's own name and the router picks this backend by it"
+
+  - it: refuses a LoadBalancer beside the Route
+    template: templates/route-signals.yaml
+    set:
+      signals.service.type: LoadBalancer
+    asserts:
+      - failedTemplate:
+          errorMessage: "signals.service.type LoadBalancer beside signals.route publishes the listener twice, on two addresses with different limits: pick the Route or the load balancer"
+
+  - it: raises the handshake cap to the listener's share behind the router
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_SIGNALS_MAX_HANDSHAKES_PER_SOURCE, value: "32" }
+
+  - it: takes a handshake cap an install sets
+    template: templates/deployment.yaml
+    set:
+      signals.maxHandshakesPerSource: 12
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_SIGNALS_MAX_HANDSHAKES_PER_SOURCE, value: "12" }
 
   - it: refuses a Route to a site that serves no signals
     template: templates/route-signals.yaml
