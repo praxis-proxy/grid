@@ -3437,7 +3437,7 @@ async fn run_peer_poller(
     if swim.is_none() {
         tracing::info!("peer signals poller polls declared endpoints only: SWIM is not running");
     }
-    PeerPoller {
+    let poller = PeerPoller {
         ctx,
         swim,
         client,
@@ -3447,16 +3447,15 @@ async fn run_peer_poller(
         memberships: operator::peer_membership::PeerMemberships::default(),
         reach: operator::peer_reach::PeerReach::default(),
         misses: operator::peer_reach::Misses::default(),
-        polls: None,
+        written: NetworkWritten::default(),
         catalogs: operator::peer_reach::PeerReach::none(&operator::peer_reach::CATALOGS),
         sites_written: false,
         catalog_versions: std::collections::HashMap::new(),
         remembered: BTreeMap::new(),
         unanswered: BTreeSet::new(),
         turn: 0,
-    }
-    .run()
-    .await;
+    };
+    Box::pin(poller.run()).await;
     Ok(())
 }
 
@@ -3490,8 +3489,8 @@ struct PeerPoller {
     reach: operator::peer_reach::PeerReach,
     /// Rounds in a row each peer went unanswered, which a reachable peer outlasts.
     misses: operator::peer_reach::Misses,
-    /// Peers the last written round had no time for, of how many it polled.
-    polls: Option<(usize, usize)>,
+    /// What the `GridNetwork`'s peer conditions were last written from.
+    written: NetworkWritten,
     /// Under Local membership, which peers' catalogs were refused, as last written.
     catalogs: operator::peer_reach::PeerReach,
     /// Whether the peer `GridSite` conditions were last written in full.
@@ -3595,17 +3594,8 @@ impl PeerPoller {
             return;
         }
         let (reach, catalogs, skipped) = self.judge((source, local_site), polled, answered, urls);
-        let polls = (skipped, polled.len());
-        if self.polls != Some(polls) && Box::pin(write_peer_polls(&self.client, polls, &self.shutdown)).await {
-            self.polls = Some(polls);
-        }
+        Box::pin(self.write_network((&reach, &catalogs), (skipped, polled.len()))).await;
         let changed = reach != self.reach || catalogs != self.catalogs;
-        if reach != self.reach {
-            Box::pin(write_peer_reach(&self.client, &reach, &self.shutdown)).await;
-        }
-        if catalogs != self.catalogs {
-            Box::pin(write_peer_reach(&self.client, &catalogs, &self.shutdown)).await;
-        }
         // Rechecked against the live objects on the catalog schedule, so a lost write heals.
         if changed || !self.sites_written || self.turn.is_multiple_of(CATALOG_ROUNDS) {
             let judged = [reach.clone(), catalogs.clone()];
@@ -3613,6 +3603,26 @@ impl PeerPoller {
         }
         self.reach = reach;
         self.catalogs = catalogs;
+    }
+
+    /// Write each `GridNetwork` peer condition this round changed, or whose last write failed.
+    async fn write_network(
+        &mut self,
+        (reach, catalogs): (&operator::peer_reach::PeerReach, &operator::peer_reach::PeerReach),
+        polls: (usize, usize),
+    ) {
+        if write_due(self.written.polls.as_ref(), &polls) {
+            let landed = Box::pin(write_peer_polls(&self.client, polls, &self.shutdown)).await;
+            self.written.polls = landed.then_some(polls);
+        }
+        if write_due(self.written.reach.as_ref(), reach) {
+            let landed = Box::pin(write_peer_reach(&self.client, reach, &self.shutdown)).await;
+            self.written.reach = landed.then(|| reach.clone());
+        }
+        if write_due(self.written.catalogs.as_ref(), catalogs) {
+            let landed = Box::pin(write_peer_reach(&self.client, catalogs, &self.shutdown)).await;
+            self.written.catalogs = landed.then(|| catalogs.clone());
+        }
     }
 
     /// This round's signals and catalog verdicts on each peer, and how many peers it had no
@@ -3666,13 +3676,18 @@ impl PeerPoller {
             tracing::debug!("peer polling waits for this site's name");
             return;
         };
-        let Some(mut sites) = (Targeting {
-            identities: &self.ctx.peer_identities(),
+        let identities = self.ctx.peer_identities();
+        let targets = Targeting {
+            identities: &identities,
             trust: source.trust,
             encrypted: self.swim.as_ref().is_some_and(|swim| swim.is_encrypted()),
             local_site: &local_site,
-        })
-        .targets(snapshot.as_ref(), &mut self.remembered) else {
+        }
+        .targets(snapshot.as_ref(), &mut self.remembered);
+        // A Local site whose peers are all endpoint-less still reports on them, and clears what
+        // the last pollable one left.
+        let idle = idle_round(self.ctx.membership(), identities.loaded());
+        let Some(mut sites) = targets.or_else(|| idle.then(Vec::new)) else {
             return;
         };
         self.turn = self.turn.wrapping_add(1);
@@ -3683,7 +3698,6 @@ impl PeerPoller {
         // Each peer lands as it answers, so one slow peer cannot age out the rest.
         let peers = self.ctx.peers();
         let heard = self.ctx.load_heard();
-        let identities = self.ctx.peer_identities();
         heard.retain_sites(|site| identities.knows(site));
         let ttl = self.settings.peer_ttl();
         let mut answered = BTreeMap::new();
@@ -3900,14 +3914,39 @@ async fn write_peer_reach(
     client: &Client,
     reach: &operator::peer_reach::PeerReach,
     shutdown: &operator::shutdown::Shutdown,
-) {
+) -> bool {
     Box::pin(write_network_condition(
         client,
         reach.kind().field_manager,
         |network, now| operator::peer_reach::patch(network, reach, now),
         shutdown,
     ))
-    .await;
+    .await
+}
+
+/// Whether a `GridNetwork` condition judged as `next` is to be written: it differs from what
+/// was `written` last, `None` when that write did not land.
+fn write_due<T: PartialEq>(written: Option<&T>, next: &T) -> bool {
+    written != Some(next)
+}
+
+/// What the `GridNetwork`'s peer conditions were last written from, each `None` until a write
+/// lands, so one that failed is written again however the next round judges.
+#[derive(Default)]
+struct NetworkWritten {
+    /// Peers a round had no time for, of how many it polled.
+    polls: Option<(usize, usize)>,
+    /// `PeerSignalsReachable`'s verdicts.
+    reach: Option<operator::peer_reach::PeerReach>,
+    /// `PeerCatalogsAccepted`'s verdicts.
+    catalogs: Option<operator::peer_reach::PeerReach>,
+}
+
+/// Whether a round with nothing to poll still runs: under Local once the peers are read, so
+/// endpoint-less peers are reported and a last endpoint's removal is seen. Without that input
+/// the round waits.
+fn idle_round(membership: Membership, peers_read: bool) -> bool {
+    membership == Membership::Local && peers_read
 }
 
 /// Withdraw what a Local run left on the `GridNetwork`, so a site now under Swim is not
@@ -5916,6 +5955,42 @@ mod tests {
         assert!(
             round(None, &mut remembered).is_none(),
             "nothing declared and no gossip is nothing to poll"
+        );
+    }
+
+    #[test]
+    fn a_failed_network_write_is_retried_though_the_next_round_judges_the_same() {
+        assert!(write_due(None, &1), "the last write did not land");
+        assert!(write_due(Some(&1), &2), "the verdict changed");
+        assert!(!write_due(Some(&1), &1), "unchanged and written");
+    }
+
+    #[test]
+    fn a_local_round_with_only_endpoint_less_peers_still_reports_them() {
+        let identities = operator::signals::PeerIdentities::new();
+        identities.set(BTreeMap::from([(
+            "east".to_owned(),
+            operator::signals::PeerRecord::default(),
+        )]));
+        let targets = Targeting {
+            identities: &identities,
+            trust: operator::signals::PeerTrustMode::Spiffe,
+            encrypted: true,
+            local_site: "hub",
+        }
+        .targets(None, &mut BTreeMap::new());
+        assert!(targets.is_none(), "nothing to poll");
+        assert!(
+            idle_round(Membership::Local, identities.loaded()),
+            "yet the round runs, so east reads EgressOnly and a removed endpoint is cleared"
+        );
+        assert!(
+            !idle_round(Membership::Local, operator::signals::PeerIdentities::new().loaded()),
+            "before the peers are read, the round waits for them"
+        );
+        assert!(
+            !idle_round(Membership::Swim, true),
+            "under Swim gossip drives the round"
         );
     }
 
