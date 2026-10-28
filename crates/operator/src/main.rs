@@ -2871,6 +2871,30 @@ fn site_by_spiffe(leaf: &[u8], identity: &SignalsIdentity) -> Option<(String, BT
     identity.peers.labels_for(site).map(|labels| (site.to_owned(), labels))
 }
 
+/// Whether `tcp` sent anything within [`SIGNALS_SILENT_TIMEOUT`].
+///
+/// A connection that never speaks costs a slot and proves nothing, and opening many of them
+/// is the cheapest way to hold the handshake share. `readable()` does not consume, so the
+/// handshake that follows still sees the `ClientHello`. False also covers shutdown, where the
+/// caller stops for its own reasons.
+async fn spoke_in_time(
+    tcp: &tokio::net::TcpStream,
+    remote: SocketAddr,
+    shutdown: &operator::shutdown::Shutdown,
+) -> bool {
+    let ready = tokio::select! {
+        biased;
+        () = shutdown.triggered() => return false,
+        ready = tokio::time::timeout(SIGNALS_SILENT_TIMEOUT, tcp.readable()) => ready,
+    };
+    if matches!(ready, Ok(Ok(()))) {
+        return true;
+    }
+    operator::metrics::record_signals_shed("silent");
+    tracing::debug!(%remote, "signals connection sent nothing; dropping");
+    false
+}
+
 /// Handshake one connection, then serve it with the scope its certificate earns.
 #[cfg_attr(
     not(feature = "fips"),
@@ -2888,16 +2912,7 @@ async fn serve_signals_connection(
     shutdown: operator::shutdown::Shutdown,
 ) {
     let handshake = (handshaking.turn, handshaking.source);
-    // Nothing read yet, so a connection that never speaks costs only this wait. readable()
-    // does not consume, so the handshake below still sees the ClientHello.
-    let spoke = tokio::select! {
-        biased;
-        () = shutdown.triggered() => return,
-        ready = tokio::time::timeout(SIGNALS_SILENT_TIMEOUT, tcp.readable()) => ready,
-    };
-    if !matches!(spoke, Ok(Ok(()))) {
-        operator::metrics::record_signals_shed("silent");
-        tracing::debug!(%remote, "signals connection sent nothing; dropping");
+    if !spoke_in_time(&tcp, remote, &shutdown).await {
         return;
     }
     // It has spoken, so it no longer counts against the silent cap; the handshake caps take over.
