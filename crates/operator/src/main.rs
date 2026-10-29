@@ -107,13 +107,7 @@ async fn main() {
     if let Some(site_name) = config.grid.site_name.take() {
         config.swim.site_name.get_or_insert(site_name);
     }
-    config.grid.signal_transport = match config.grid.startup_signal_transport() {
-        Ok(mode) => mode,
-        Err(error) => {
-            tracing::error!(%error, "contradictory grid modes");
-            std::process::exit(1);
-        },
-    };
+    config.grid.signal_transport = config.grid.startup_signal_transport();
 
     let client = match Client::try_default().await {
         Ok(c) => c,
@@ -256,10 +250,6 @@ async fn main() {
         },
     };
     config.grid.membership = modes.membership;
-    if modes.membership == Membership::Local && modes.signal != SignalMode::Poll {
-        tracing::error!("Local membership requires signalTransport.mode poll");
-        std::process::exit(1);
-    }
     let signal_mode = modes.signal;
     let trust = modes.trust;
     // The loop follows the declared peer trust, which may change after startup.
@@ -765,23 +755,29 @@ async fn resolve_grid_modes(
         .await
         .map_err(|e| format!("listing GridNetworks: {e}"))?
         .items;
-    match items.as_slice() {
+    let (modes, declared) = match items.as_slice() {
         [] => {
             let identity = if enrolled { " (enrolled identity)" } else { "" };
             tracing::info!(modes = ?without_network, "no GridNetwork yet; starting in the install's modes{identity}");
-            Ok((without_network, false))
+            (without_network, false)
         },
         [network] => {
             let modes = GridModes::of(network, without_network.membership);
             tracing::info!(?modes, "resolved grid-wide modes");
-            Ok((modes, network.spec.membership.is_some()))
+            (modes, network.spec.membership.is_some())
         },
-        many => Err(format!(
-            "multiple GridNetworks unsupported: found {}; a process-global signals serve/poll path \
+        many => {
+            return Err(format!(
+                "multiple GridNetworks unsupported: found {}; a process-global signals serve/poll path \
              cannot serve more than one grid mode",
-            many.len()
-        )),
+                many.len()
+            ));
+        },
+    };
+    if modes.membership == Membership::Local && modes.signal != SignalMode::Poll {
+        return Err("Local membership requires signalTransport.mode poll".to_owned());
     }
+    Ok((modes, declared))
 }
 
 // ---------------------------------------------------------------------------
@@ -4347,36 +4343,88 @@ mod tests {
                 true,
             ),
         ] {
-            let items: Vec<_> = spec
-                .into_iter()
-                .map(|spec| {
-                    serde_json::json!({
-                        "apiVersion": "grid.praxis.fast/v1alpha1", "kind": "GridNetwork",
-                        "metadata": {"name": "grid"}, "spec": spec
-                    })
-                })
-                .collect();
-            let body = serde_json::json!({
-                "apiVersion": "grid.praxis.fast/v1alpha1", "kind": "GridNetworkList",
-                "metadata": {}, "items": items
-            })
-            .to_string();
-            let client = Client::new(
-                tower::service_fn(move |_request: http::Request<kube::client::Body>| {
-                    let body = body.clone();
-                    async move { Ok::<_, std::convert::Infallible>(http::Response::new(axum::body::Body::from(body))) }
-                }),
-                "default",
-            );
+            let client = network_modes_client(spec.clone());
             let (modes, membership_declared) = resolve_grid_modes(&client, true, install).await?;
-            assert_eq!(modes.membership, expected);
-            assert_eq!(membership_declared, declared);
+            assert_eq!(modes.membership, expected, "spec={spec:?}, modes={modes:?}");
+            assert_eq!(membership_declared, declared, "spec={spec:?}, modes={modes:?}");
+            let swim = swim_requested(modes.membership, membership_declared, true);
             assert!(
-                swim_requested(modes.membership, membership_declared, true)
-                    .is_ok_and(|enabled| enabled == (expected == Membership::Swim))
+                swim.as_ref()
+                    .is_ok_and(|enabled| *enabled == (expected == Membership::Swim)),
+                "spec={spec:?}, modes={modes:?}, membership_declared={membership_declared}, swim={swim:?}"
             );
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_validates_transport_after_network_overrides() -> Result<(), String> {
+        let cli = Cli::try_parse_from(["operator", "--membership-source", "Local", "--grid-signals", "gossip"])
+            .map_err(|error| error.to_string())?;
+        let install = GridModes::without_network(cli.grid.startup_signal_transport(), cli.grid.peer_trust)
+            .with_membership(cli.grid.membership);
+        for (spec, expected) in [
+            (
+                Some(serde_json::json!({"membership": {"mode": "Swim"}, "signalTransport": {"mode": "gossip"}})),
+                Some((Membership::Swim, SignalMode::Gossip)),
+            ),
+            (
+                Some(serde_json::json!({"membership": {"mode": "Local"}, "signalTransport": {"mode": "poll"}})),
+                Some((Membership::Local, SignalMode::Poll)),
+            ),
+            (
+                Some(serde_json::json!({"membership": {"mode": "Local"}, "signalTransport": {"mode": "gossip"}})),
+                None,
+            ),
+            (None, None),
+        ] {
+            let resolved = resolve_grid_modes(&network_modes_client(spec.clone()), true, install).await;
+            if let Some((membership, signal)) = expected {
+                let (modes, declared) = resolved?;
+                assert_eq!(
+                    (modes.membership, modes.signal),
+                    (membership, signal),
+                    "spec={spec:?}, modes={modes:?}"
+                );
+                assert!(
+                    declared,
+                    "spec={spec:?} must override the install's contradictory modes"
+                );
+            } else {
+                assert!(
+                    resolved
+                        .as_ref()
+                        .is_err_and(|error| error.contains("Local membership requires")),
+                    "spec={spec:?} leaves Local/gossip invalid: {resolved:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// An API serving the optional network used to resolve startup modes.
+    fn network_modes_client(spec: Option<serde_json::Value>) -> Client {
+        let items: Vec<_> = spec
+            .into_iter()
+            .map(|spec| {
+                serde_json::json!({
+                    "apiVersion": "grid.praxis.fast/v1alpha1", "kind": "GridNetwork",
+                    "metadata": {"name": "grid"}, "spec": spec
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1", "kind": "GridNetworkList",
+            "metadata": {}, "items": items
+        })
+        .to_string();
+        Client::new(
+            tower::service_fn(move |_request: http::Request<kube::client::Body>| {
+                let body = body.clone();
+                async move { Ok::<_, std::convert::Infallible>(http::Response::new(axum::body::Body::from(body))) }
+            }),
+            "default",
+        )
     }
 
     #[test]

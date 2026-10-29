@@ -6,6 +6,15 @@ umask 077
 CHART=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CLUSTER="${CLUSTER:-grid-enrollment-certmanager-test}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.21.3}"
+if [[ "$CERT_MANAGER_VERSION" == v1.21.3 ]]; then
+  CERT_MANAGER_SHA256="${CERT_MANAGER_SHA256:-c04a51295adda2b1a775146751f973e787190778c7f35180861d9678876e5c74}"
+else
+  : "${CERT_MANAGER_SHA256:?set CERT_MANAGER_SHA256 when overriding CERT_MANAGER_VERSION}"
+fi
+if [[ ! "$CERT_MANAGER_SHA256" =~ ^[a-fA-F0-9]{64}$ ]]; then
+  echo "CERT_MANAGER_SHA256 must contain 64 hexadecimal characters" >&2
+  exit 1
+fi
 WORK=$(mktemp -d)
 CREATED=false
 export KUBECONFIG="$WORK/kubeconfig"
@@ -18,14 +27,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+curl -fsSL --retry 3 -o "$WORK/cert-manager.yaml" \
+  "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml"
+printf '%s  %s\n' "$CERT_MANAGER_SHA256" "$WORK/cert-manager.yaml" | sha256sum --check
+
 if kind get clusters | grep -Fx "$CLUSTER" >/dev/null; then
   echo "Refusing to reuse existing cluster $CLUSTER" >&2
   exit 1
 fi
 CREATED=true
 kind create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG" --wait 120s
-kubectl apply --server-side -f \
-  "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml"
+kubectl apply --server-side -f "$WORK/cert-manager.yaml"
 for deployment in cert-manager cert-manager-cainjector cert-manager-webhook; do
   kubectl -n cert-manager rollout status "deployment/$deployment" --timeout=180s
 done

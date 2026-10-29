@@ -147,18 +147,11 @@ pub struct GridArgs {
 }
 
 impl GridArgs {
-    /// The signal transport to start in: poll under Local membership, which gossip contradicts.
-    ///
-    /// # Errors
-    ///
-    /// Returns why the configured modes contradict each other.
-    pub fn startup_signal_transport(&self) -> Result<Option<SignalMode>, String> {
+    /// Default an unset Local transport to poll; validate after resolving network overrides.
+    pub fn startup_signal_transport(&self) -> Option<SignalMode> {
         match (self.membership, self.signal_transport) {
-            (Membership::Local, Some(SignalMode::Gossip)) => {
-                Err("GRID_MEMBERSHIP_SOURCE Local polls signals, but GRID_SIGNAL_TRANSPORT is gossip".to_owned())
-            },
-            (Membership::Local, _) => Ok(Some(SignalMode::Poll)),
-            (Membership::Swim, mode) => Ok(mode),
+            (Membership::Local, None) => Some(SignalMode::Poll),
+            (_, mode) => mode,
         }
     }
 }
@@ -421,13 +414,13 @@ mod tests {
         assert_eq!(unique.len(), ids.len(), "duplicate clap group ids: {ids:?}");
     }
 
-    /// Local membership starts in poll, and refuses a gossip transport.
+    /// Local defaults to poll while explicit transport waits for network mode resolution.
     #[test]
     fn local_membership_starts_in_poll() {
         let transport = |args: &[&str]| {
             Cli::try_parse_from([&["grid-operator"], args].concat())
                 .map_err(|e| e.to_string())
-                .and_then(|cli| cli.grid.startup_signal_transport())
+                .map(|cli| cli.grid.startup_signal_transport())
         };
         assert_eq!(transport(&[]), Ok(None), "Swim keeps the GridNetwork default");
         assert_eq!(
@@ -438,9 +431,10 @@ mod tests {
             transport(&["--membership-source", "Local", "--grid-signals", "poll"]),
             Ok(Some(crate::crd::grid_network::SignalMode::Poll))
         );
-        assert!(
-            transport(&["--membership-source", "Local", "--grid-signals", "gossip"]).is_err(),
-            "Local refuses gossip"
+        assert_eq!(
+            transport(&["--membership-source", "Local", "--grid-signals", "gossip"]),
+            Ok(Some(crate::crd::grid_network::SignalMode::Gossip)),
+            "a network override can select Swim, so CLI defaults must not reject gossip"
         );
         assert!(
             transport(&["--membership-source", "MemberService"]).is_err(),
