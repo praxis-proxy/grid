@@ -22,6 +22,9 @@ const MAX_CANDIDATES: usize = 1024;
 /// Maximum length for identifier strings.
 const MAX_NAME_LEN: usize = 256;
 
+/// Stop serving before an inventory deadline to cover the mesh's 30-second clock-skew allowance.
+const CANDIDATE_EXPIRY_SKEW_MARGIN_MS: i128 = 30_000;
+
 /// Header prefixes reserved for internal gateway/protocol metadata.
 pub(crate) const RESERVED_HEADER_PREFIXES: &[&str] = &["x-praxis-", "x-mcp-"];
 
@@ -92,6 +95,10 @@ impl AdmissionState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateConfig {
+    /// Unix-millisecond deadline for a discovered model; absent for static candidates.
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
+
     /// Whether it takes new requests, as the operator resolved it. Absent means it does.
     #[serde(default)]
     pub admission: AdmissionState,
@@ -146,6 +153,9 @@ fn default_fresh() -> bool {
     reason = "each flag is an independent fact the operator or the snapshot resolves"
 )]
 pub struct RouteCandidate {
+    /// Unix-millisecond deadline for a discovered model; absent for static candidates.
+    pub expires_at_ms: Option<u64>,
+
     /// Grid-operator admission state.
     pub admission_state: AdmissionState,
 
@@ -207,6 +217,15 @@ pub struct RouteCandidate {
 
     /// Remote site's gateway, dialed directly instead of a `load_balancer` cluster.
     pub upstream: Option<Upstream>,
+}
+
+impl RouteCandidate {
+    /// Whether this candidate is past its deadline after applying the mesh clock-skew margin.
+    pub(crate) fn expired_at(&self, now_ms: i64) -> bool {
+        self.expires_at_ms.is_some_and(|deadline| {
+            i128::from(now_ms).saturating_add(CANDIDATE_EXPIRY_SKEW_MARGIN_MS) >= i128::from(deadline)
+        })
+    }
 }
 
 /// Build a deterministic stable ID from candidate identity fields.
@@ -275,6 +294,7 @@ fn validate_candidates_with_empty(
             Arc::from,
         );
         candidates.push(RouteCandidate {
+            expires_at_ms: cand.expires_at_ms,
             admission_state: cand.admission,
             capacity: None,
             rho: None,
@@ -429,6 +449,7 @@ mod tests {
     fn candidate(kind_str: &str, name: &str, site: &str, cluster: &str) -> CandidateConfig {
         let kind: CapabilityKind = serde_yaml::from_str(&format!("\"{kind_str}\"")).unwrap();
         CandidateConfig {
+            expires_at_ms: None,
             admission: AdmissionState::default(),
             cluster: cluster.to_owned(),
             credential: None,
@@ -459,6 +480,20 @@ mod tests {
         c.fresh = false;
         let candidates = validate_candidates(vec![c]).unwrap();
         assert!(!candidates[0].fresh);
+    }
+
+    #[test]
+    fn serving_expiry_is_parsed_and_applies_the_mesh_clock_skew_margin() {
+        let config: CandidateConfig = serde_yaml::from_str(
+            "admission: new_and_existing\ncluster: c\nexpires_at_ms: 100000\nfresh: true\nkind: inference_model\nname: m\npublishes_load: true\nsite: s\nstable_id: null\n",
+        )
+        .unwrap();
+        let candidates = validate_candidates(vec![config]).unwrap();
+        let parsed = candidates.first().unwrap();
+
+        assert_eq!(parsed.expires_at_ms, Some(100_000));
+        assert!(!parsed.expired_at(69_999));
+        assert!(parsed.expired_at(70_000));
     }
 
     #[test]

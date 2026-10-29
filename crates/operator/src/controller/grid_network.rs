@@ -5905,6 +5905,26 @@ fn retain_tool_catalogs_within_budget(
 /// Maximum DER-encoded ECDSA P-256 signature size.
 const MAX_P256_DER_SIGNATURE_BYTES: usize = 72;
 
+/// Retain whole provider UID records only while the inference snapshot remains transport-safe.
+///
+/// UID values are identity tokens and are never truncated. Providers whose UID metadata does not
+/// fit still remain in the provider snapshot; their discovered inventories will be ignored until
+/// a later snapshot can carry the matching UID.
+fn fit_provider_uids_to_swim_budget(broadcast: &mut swim::StateBroadcast, byte_budget: usize) -> usize {
+    let mut offered = std::mem::take(&mut broadcast.provider_uids);
+    offered.sort_by(|left, right| left.identity.cmp(&right.identity));
+    let mut dropped = 0_usize;
+    for provider_uid in offered {
+        broadcast.provider_uids.push(provider_uid);
+        if !broadcast.encode().is_ok_and(|encoded| encoded.len() <= byte_budget) {
+            if broadcast.provider_uids.pop().is_some() {
+                dropped = dropped.saturating_add(1);
+            }
+        }
+    }
+    dropped
+}
+
 /// Deterministically trim tool catalogs until the encoded state fits SWIM.
 ///
 /// Inference provider records and capabilities are never removed. Tool
@@ -5920,6 +5940,7 @@ fn fit_provider_tools_to_swim_budget(broadcast: &mut swim::StateBroadcast) {
     let catalogs = detach_tool_catalogs(broadcast);
     let providers_offered = catalogs.len();
     let offered = catalogs.iter().map(|catalog| catalog.tools.len()).sum::<usize>();
+    let provider_uids_dropped = fit_provider_uids_to_swim_budget(broadcast, byte_budget);
     let baseline_fits = broadcast.encode().is_ok_and(|encoded| encoded.len() <= byte_budget);
     let retained = if baseline_fits {
         retain_tool_catalogs_within_budget(broadcast, &catalogs, byte_budget)
@@ -5944,8 +5965,9 @@ fn fit_provider_tools_to_swim_budget(broadcast: &mut swim::StateBroadcast) {
         offered,
         retained,
         dropped = offered.saturating_sub(retained),
+        provider_uids_dropped,
         byte_budget,
-        "trimmed MCP tool providers and catalogs to fit the SWIM broadcast budget"
+        "trimmed provider UID metadata and MCP tool catalogs to fit the SWIM broadcast budget"
     );
 }
 
@@ -13858,6 +13880,61 @@ mod tests {
                 .values()
                 .any(|provider| !provider.tools.is_empty()),
             "the fair fit should retain at least one reachable tool provider"
+        );
+    }
+
+    #[test]
+    fn uid_metadata_cannot_overflow_an_otherwise_fitting_inference_snapshot() {
+        let local_id = worst_case_swim_identity("site-a");
+        let budget = swim::node::state_broadcast_byte_budget(&local_id).unwrap_or_else(|_| std::process::abort());
+        let uid = swim::ProviderUid {
+            identity: swim::ProviderIdentity {
+                network: "net".to_owned(),
+                site: "site-a".to_owned(),
+                provider: "inference".to_owned(),
+            },
+            uid: "uid-entire-and-never-truncated".to_owned(),
+        };
+        let make_broadcast = |model: &str| {
+            let mut snapshot = crdt::GridStateSnapshot::new("site-a".to_owned());
+            let mut state = provider_state("site-a", "inference");
+            state.models = vec![model.to_owned()];
+            let mut max_revision = 0;
+            upsert_provider_with_capabilities(&mut snapshot, &mut max_revision, state);
+            provider_state_broadcast("site-a", "grid", max_revision, snapshot, None)
+        };
+        let mut model = String::new();
+        let mut baseline = None;
+        for _ in 0..budget {
+            let candidate = make_broadcast(&model);
+            let candidate_fits = candidate.encode().is_ok_and(|encoded| encoded.len() <= budget);
+            let with_uid_fits = candidate
+                .clone()
+                .with_provider_uids(vec![uid.clone()])
+                .encode()
+                .is_ok_and(|encoded| encoded.len() <= budget);
+            if candidate_fits && !with_uid_fits {
+                baseline = Some(candidate);
+                break;
+            }
+            model.push('x');
+        }
+        let mut broadcast = baseline
+            .unwrap_or_else(|| std::process::abort())
+            .with_provider_uids(vec![uid]);
+
+        assert!(
+            !broadcast.encode().is_ok_and(|encoded| encoded.len() <= budget),
+            "the UID metadata pushes this inference snapshot past the transport budget"
+        );
+        fit_provider_tools_to_swim_budget(&mut broadcast);
+
+        let encoded = broadcast.encode().unwrap_or_else(|_| std::process::abort());
+        assert!(encoded.len() <= budget);
+        assert!(broadcast.snapshot.providers.contains_key("net/site-a/inference"));
+        assert!(
+            broadcast.provider_uids.is_empty(),
+            "the complete UID is omitted rather than truncated"
         );
     }
 }

@@ -950,6 +950,7 @@ mod tests {
 
     fn candidate(site: &str) -> CandidateConfig {
         CandidateConfig {
+            expires_at_ms: None,
             admission: crate::descriptor::AdmissionState::default(),
             cluster: format!("pool-{site}"),
             credential: None,

@@ -1464,6 +1464,11 @@ the operator; a gateway with a clock ahead may withdraw the route early. The
 gateway must never extend the deadline or apply a grace period after it.
 Gateways without the declaration receive no discovered candidates.
 
+The embedded gateway carries the same deadline in its watched serving config as
+`expires_at_ms`. It checks the deadline during route selection and pinned
+requests, using the same 30-second allowance; expiry therefore remains enforced
+even when operator reconciliation or config delivery stops.
+
 The bearer token comes from `spec.auth`. A model-discovery URL must use HTTPS
 when a bearer token is configured. With `auth.credentialsManagedExternally`, requests carry no
 credentials, so plain HTTP remains available.

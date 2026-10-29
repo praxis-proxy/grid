@@ -120,6 +120,9 @@ pub(crate) struct ServingConfig {
 /// One routable `(model, site, cluster)`, `cluster` naming a `load_balancer` cluster.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct ServingCandidate {
+    /// Unix-millisecond deadline for a discovered model, absent for static candidates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) expires_at_ms: Option<u64>,
     /// Overlay-assigned stable identity used by authenticated provider hops.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stable_id: Option<String>,
@@ -248,6 +251,8 @@ struct Folded {
     stable_id: Option<String>,
     /// The first credential locator any duplicate carries.
     credential: Option<ProjectedCredential>,
+    /// The latest expiry, or `None` when any duplicate is static.
+    expires_at_ms: Option<u64>,
 }
 
 /// Each routable candidate once, folded.
@@ -266,6 +271,7 @@ fn dedup<'overlay>(
             candidate.cluster.as_str(),
         );
         let admission = candidate.admission_state.unwrap_or(AdmissionState::NewAndExisting);
+        let expires_at_ms = candidate_expiry_ms(candidate.expires_at.as_deref());
         // Seeded with the identities of both folds, so the first candidate and every
         // duplicate after it take the same path: fresh only if all are, admission as
         // restricted as the most restricted.
@@ -274,6 +280,7 @@ fn dedup<'overlay>(
             admission: AdmissionState::NewAndExisting,
             stable_id: None,
             credential: None,
+            expires_at_ms,
         });
         folded.fresh &= candidate.fresh;
         folded.admission = folded.admission.max(admission);
@@ -283,6 +290,10 @@ fn dedup<'overlay>(
         if folded.credential.is_none() {
             folded.credential.clone_from(&candidate.credential);
         }
+        folded.expires_at_ms = match (folded.expires_at_ms, expires_at_ms) {
+            (Some(held), Some(incoming)) => Some(held.max(incoming)),
+            _ => None,
+        };
     }
     unique
 }
@@ -320,8 +331,21 @@ fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<Servi
             credential: folded.credential.filter(|_| {
                 inputs.inject_local_credentials && !remote && !inputs.provider_hop_clusters.contains(cluster)
             }),
+            expires_at_ms: folded.expires_at_ms,
         })
         .collect()
+}
+
+/// Parse the overlay's RFC 3339 deadline to epoch milliseconds for the gateway.
+///
+/// An invalid present deadline becomes zero so the gateway fails closed.
+fn candidate_expiry_ms(expires_at: Option<&str>) -> Option<u64> {
+    expires_at.map(|timestamp| {
+        time::OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339)
+            .ok()
+            .and_then(|parsed| u64::try_from(parsed.unix_timestamp_nanos() / 1_000_000).ok())
+            .unwrap_or_default()
+    })
 }
 
 /// Whether `site` publishes load for `cluster`: a peer's once heard, this site's when it has metrics.
@@ -734,6 +758,30 @@ mod tests {
         assert_eq!(pool_b["admission"], "none");
         let wire = serde_json::to_string(&source).expect("overlay json");
         assert!(!wire.contains("pool-b"), "the overlay wire is unchanged: {wire}");
+    }
+
+    #[test]
+    fn discovered_model_expiry_is_carried_into_gateway_serving_config() {
+        let mut discovered = cand("llama", "site-b", "pool-b", None);
+        discovered.expires_at = Some("2030-01-01T00:00:00Z".to_owned());
+        let rendered = render(
+            &overlay(vec![discovered, cand("static", "site-a", "pool-a", None)]),
+            &INPUTS,
+        );
+        let text = to_text(&rendered).expect("text");
+        let config: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let candidates = config["candidates"].as_array().expect("candidates");
+        let discovered = candidates
+            .iter()
+            .find(|candidate| candidate["name"] == "llama")
+            .expect("discovered candidate");
+        let static_candidate = candidates
+            .iter()
+            .find(|candidate| candidate["name"] == "static")
+            .expect("static candidate");
+
+        assert_eq!(discovered["expires_at_ms"], 1_893_456_000_000_u64);
+        assert!(static_candidate.get("expires_at_ms").is_none());
     }
 
     #[test]

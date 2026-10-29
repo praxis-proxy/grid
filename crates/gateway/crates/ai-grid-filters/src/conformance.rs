@@ -226,6 +226,7 @@ fn publish(store: &LoadStore, spec: &SiteSpec, run: &Run, phase: Phase) {
 /// One site's candidate entry, as the serving config would declare it.
 fn config(spec: &SiteSpec) -> CandidateConfig {
     CandidateConfig {
+        expires_at_ms: None,
         admission: AdmissionState::NewAndExisting,
         cluster: format!("pool-{}", spec.site),
         credential: None,

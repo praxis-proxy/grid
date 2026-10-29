@@ -47,6 +47,7 @@ fn snapshot(sites: u32, shape: Shape) -> RouteSnapshot {
         .map(|index| {
             let site: Arc<str> = Arc::from(format!("site-{index}"));
             RouteCandidate {
+                expires_at_ms: None,
                 admission_state: AdmissionState::NewAndExisting,
                 capacity: (!matches!(shape, Shape::PressureOnly) && (!matches!(shape, Shape::Mixed) || index == 1))
                     .then_some(8.0),

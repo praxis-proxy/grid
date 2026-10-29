@@ -1208,6 +1208,7 @@ mod tests {
     /// A validated candidate for model `name` served by `site`/`cluster`.
     fn cand(name: &str, site: &str, cluster: &str) -> CandidateConfig {
         CandidateConfig {
+            expires_at_ms: None,
             admission: AdmissionState::default(),
             cluster: cluster.to_owned(),
             credential: None,

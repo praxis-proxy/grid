@@ -395,7 +395,9 @@ impl GridSiteRouteFilter {
         if snapshot.shedding.contains(model) {
             return Err(refuse(Refused::Shed, model, turn));
         }
-        let routable = |candidate: &RouteCandidate| has_route(candidate, self.clusters.as_ref());
+        let now_ms = grid_signals::now_ms();
+        let routable =
+            |candidate: &RouteCandidate| !candidate.expired_at(now_ms) && has_route(candidate, self.clusters.as_ref());
         let settings = self.affinity.settings.load();
         let pick = if settings.enabled {
             let sticky = Sticky {
@@ -460,8 +462,9 @@ impl GridSiteRouteFilter {
     /// gets 503.
     fn pin(&self, ctx: &mut HttpFilterContext<'_>, model: Option<&str>) -> Result<Option<FilterAction>, FilterError> {
         let snapshot = self.snapshot.load();
+        let now_ms = grid_signals::now_ms();
         let key = self.affinity.tag_key.load();
-        let Some(pinned) = pinned_site(ctx, &snapshot, key.as_deref()) else {
+        let Some(pinned) = pinned_site(ctx, &snapshot, key.as_deref(), now_ms) else {
             return Ok(None);
         };
         let (holder, rewrite) = match pinned {
@@ -474,7 +477,7 @@ impl GridSiteRouteFilter {
             return Ok(Some(refuse(Refused::Shed, model, turn)));
         }
         let site = holder.as_ref().map(|holder| &holder.site);
-        let candidate = match pinned_target(&snapshot, holder.as_ref(), model) {
+        let candidate = match pinned_target(&snapshot, holder.as_ref(), model, now_ms) {
             Target::Found(candidate) => candidate,
             Target::Gone => {
                 tracing::debug!(site = ?site, "grid_site_route: the cluster holding the state left the grid");
@@ -797,6 +800,7 @@ fn pinned_site(
     ctx: &HttpFilterContext<'_>,
     snapshot: &RouteSnapshot,
     key: Option<&TagKey>,
+    now_ms: i64,
 ) -> Option<Result<(Option<Holder>, Option<String>), FilterAction>> {
     match pin::state_path(ctx.request.uri.path()) {
         Some(StatePath::Stored { collection, id, rest }) => Some(pin::untag(id, key).map_or_else(
@@ -819,7 +823,7 @@ fn pinned_site(
                 site: Arc::clone(&snapshot.local_site),
                 mark: None,
             };
-            let admits = pinned_target(snapshot, Some(&local), None).found().is_some();
+            let admits = pinned_target(snapshot, Some(&local), None, now_ms).found().is_some();
             Some(Ok((admits.then_some(local), None)))
         },
         _ => Some(Ok((Some(ctx.get_filter_state::<RouteState>()?.pinned.clone()?), None))),
@@ -848,7 +852,12 @@ impl<'snap> Target<'snap> {
 
 /// The front candidate at `holder`, anywhere when `None`, that admits a pinned
 /// request, for `model` when named.
-fn pinned_target<'snap>(snapshot: &'snap RouteSnapshot, holder: Option<&Holder>, model: Option<&str>) -> Target<'snap> {
+fn pinned_target<'snap>(
+    snapshot: &'snap RouteSnapshot,
+    holder: Option<&Holder>,
+    model: Option<&str>,
+    now_ms: i64,
+) -> Target<'snap> {
     let mut at_site = snapshot
         .candidates
         .iter()
@@ -861,6 +870,7 @@ fn pinned_target<'snap>(snapshot: &'snap RouteSnapshot, holder: Option<&Holder>,
                         .is_none_or(|mark| pin::cluster_mark(&candidate.cluster) == mark)
             }) && candidate.kind == CapabilityKind::InferenceModel
                 && model.is_none_or(|model| &*candidate.name == model)
+                && !candidate.expired_at(now_ms)
         })
         .peekable();
     if at_site.peek().is_none() {
@@ -1362,6 +1372,9 @@ mod tests {
         snapshot::{Inputs, Learned, decisions_for},
     };
 
+    /// Fixed wall-clock instant used by routing tests.
+    const TEST_NOW_MS: i64 = 1_000;
+
     /// The pick for `kind` and `name` over `candidates` in their given order.
     fn front(candidates: Vec<RouteCandidate>, kind: CapabilityKind, name: &str) -> Option<String> {
         let snapshot = RouteSnapshot::from_static(candidates, Arc::from("east"));
@@ -1371,6 +1384,7 @@ mod tests {
     /// A validated one-candidate list for `model` at `site`/`cluster`.
     fn one(model: &str, site: &str, cluster: &str, admission: AdmissionState) -> Vec<RouteCandidate> {
         let mut candidates = validate_candidates(vec![CandidateConfig {
+            expires_at_ms: None,
             admission: AdmissionState::default(),
             cluster: cluster.to_owned(),
             credential: None,
@@ -1408,6 +1422,7 @@ mod tests {
             sorted
                 .iter()
                 .map(|(site, ..)| CandidateConfig {
+                    expires_at_ms: None,
                     stable_id: None,
                     cluster: format!("pool-{site}"),
                     credential: None,
@@ -1508,28 +1523,78 @@ mod tests {
     fn a_pinned_site_that_left_is_gone_and_one_that_admits_nothing_is_unavailable() {
         let snapshot = queued(&[("a", 0.0, OPEN), ("b", 0.0, AdmissionState::Excluded)]);
         assert!(matches!(
-            pinned_target(&snapshot, Some(&holder("a", Some("pool-a"))), Some("llama")),
+            pinned_target(&snapshot, Some(&holder("a", Some("pool-a"))), Some("llama"), TEST_NOW_MS),
             Target::Found(candidate) if &*candidate.site == "a"
         ));
         assert!(matches!(
-            pinned_target(&snapshot, Some(&holder("b", Some("pool-b"))), Some("llama")),
+            pinned_target(
+                &snapshot,
+                Some(&holder("b", Some("pool-b"))),
+                Some("llama"),
+                TEST_NOW_MS
+            ),
             Target::Unavailable
         ));
         assert!(matches!(
-            pinned_target(&snapshot, Some(&holder("gone", None)), None),
+            pinned_target(&snapshot, Some(&holder("gone", None)), None, TEST_NOW_MS),
             Target::Gone
         ));
         assert!(matches!(
-            pinned_target(&snapshot, Some(&holder("a", Some("pool-a"))), Some("granite")),
+            pinned_target(
+                &snapshot,
+                Some(&holder("a", Some("pool-a"))),
+                Some("granite"),
+                TEST_NOW_MS
+            ),
             Target::Gone
         ));
         assert!(
             matches!(
-                pinned_target(&snapshot, Some(&holder("a", Some("pool-left"))), None),
+                pinned_target(&snapshot, Some(&holder("a", Some("pool-left"))), None, TEST_NOW_MS),
                 Target::Gone
             ),
             "the cluster that stored it left, though the site did not"
         );
+    }
+
+    #[test]
+    fn discovered_candidates_stop_routing_before_expiry_with_clock_skew_margin() {
+        let mut candidates = one("llama", "a", "pool-a", AdmissionState::NewAndExisting);
+        if let Some(candidate) = candidates.first_mut() {
+            candidate.expires_at_ms = Some(100_000);
+        }
+        let snapshot = RouteSnapshot::from_static(candidates, Arc::from("a"));
+        let routable_before = |candidate: &RouteCandidate| !candidate.expired_at(69_999);
+        let routable_after = |candidate: &RouteCandidate| !candidate.expired_at(70_000);
+
+        assert!(
+            select_spread(
+                &snapshot,
+                CapabilityKind::InferenceModel,
+                "llama",
+                0,
+                routable_before,
+                &KeepAll,
+            )
+            .is_some(),
+            "the route remains active before the skew-adjusted deadline"
+        );
+        assert!(
+            select_spread(
+                &snapshot,
+                CapabilityKind::InferenceModel,
+                "llama",
+                0,
+                routable_after,
+                &KeepAll,
+            )
+            .is_none(),
+            "the route is withdrawn at the deadline minus the 30-second skew margin"
+        );
+        assert!(matches!(
+            pinned_target(&snapshot, Some(&holder("a", Some("pool-a"))), Some("llama"), 70_000),
+            Target::Gone
+        ));
     }
 
     #[test]
@@ -1538,6 +1603,7 @@ mod tests {
             [("llama", "pool-llama"), ("granite", "pool-granite")]
                 .into_iter()
                 .map(|(name, cluster)| CandidateConfig {
+                    expires_at_ms: None,
                     stable_id: None,
                     cluster: cluster.to_owned(),
                     credential: None,
@@ -1557,7 +1623,7 @@ mod tests {
         let snapshot = RouteSnapshot::from_static(candidates, Arc::from("a"));
         let stored = holder("a", Some("pool-granite"));
         assert!(matches!(
-            pinned_target(&snapshot, Some(&stored), None),
+            pinned_target(&snapshot, Some(&stored), None, TEST_NOW_MS),
             Target::Found(candidate) if &*candidate.cluster == "pool-granite"
         ));
     }

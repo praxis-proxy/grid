@@ -171,6 +171,7 @@ fn candidates(model: &str, sites: &[(&str, &str)]) -> Vec<RouteCandidate> {
     let raw = sites
         .iter()
         .map(|(site, cluster)| CandidateConfig {
+            expires_at_ms: None,
             admission: crate::descriptor::AdmissionState::default(),
             cluster: (*cluster).to_owned(),
             credential: None,
