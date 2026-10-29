@@ -255,7 +255,7 @@ does not count as a passed external-provider qualification.
 ## Tagging A Release
 
 Tags use `v<MAJOR>.<MINOR>.<PATCH>`, with an optional pre-release segment for a
-release candidate, as in `v0.3.0-rc.1`. Build metadata is refused, because an OCI
+release candidate, as in `v0.3.0-rc.2`. Build metadata is refused, because an OCI
 tag cannot carry a plus. Create the tag only from the reviewed commit after its
 pull request and CI checks pass. Sign the tag using the project's normal Git
 signing configuration:
@@ -273,11 +273,11 @@ for corrections.
 A pre-release tag publishes the same artifacts as any other, under its own
 version. The workflow marks its GitHub release as a pre-release, so it does not
 become the repository's latest release. Every image and chart carries the full
-version, `0.3.0-rc.1`, and nothing floating moves onto it.
+version, `0.3.0-rc.2`, and nothing floating moves onto it.
 
-Tell consumers which way a candidate sorts. SemVer orders `0.3.0-rc.1` above
+Tell consumers which way a candidate sorts. SemVer orders `0.3.0-rc.2` above
 `0.2.2` and below `0.3.0`. A Helm range such as `^0.2` leaves a candidate alone,
-because ranges exclude pre-releases. An exact `--version 0.3.0-rc.1`, or a tag
+because ranges exclude pre-releases. An exact `--version 0.3.0-rc.2`, or a tag
 read straight from the registry, lands on it. A reader tracking the charts needs
 to know which of those they are doing.
 

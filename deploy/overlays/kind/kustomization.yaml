@@ -30,4 +30,4 @@ labels:
   - pairs:
       app.kubernetes.io/name: grid-operator
       app.kubernetes.io/managed-by: kustomize
-      app.kubernetes.io/version: "v0.3.0-rc.1"
+      app.kubernetes.io/version: "v0.3.0-rc.2"

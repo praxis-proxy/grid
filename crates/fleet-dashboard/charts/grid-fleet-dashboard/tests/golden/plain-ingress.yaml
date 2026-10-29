@@ -6,10 +6,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.1
+    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.2
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.0-rc.1"
+    app.kubernetes.io/version: "v0.3.0-rc.2"
     app.kubernetes.io/managed-by: Helm
 ---
 # Source: grid-fleet-dashboard/templates/configmap.yaml
@@ -19,10 +19,10 @@ metadata:
   name: fleet-config
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.1
+    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.2
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.0-rc.1"
+    app.kubernetes.io/version: "v0.3.0-rc.2"
     app.kubernetes.io/managed-by: Helm
 data:
   config.yaml: |
@@ -56,10 +56,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.1
+    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.2
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.0-rc.1"
+    app.kubernetes.io/version: "v0.3.0-rc.2"
     app.kubernetes.io/managed-by: Helm
 rules:
   - apiGroups: [""]
@@ -73,10 +73,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.1
+    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.2
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.0-rc.1"
+    app.kubernetes.io/version: "v0.3.0-rc.2"
     app.kubernetes.io/managed-by: Helm
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -94,10 +94,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.1
+    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.2
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.0-rc.1"
+    app.kubernetes.io/version: "v0.3.0-rc.2"
     app.kubernetes.io/managed-by: Helm
 spec:
   type: ClusterIP
@@ -117,10 +117,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.1
+    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.2
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.0-rc.1"
+    app.kubernetes.io/version: "v0.3.0-rc.2"
     app.kubernetes.io/managed-by: Helm
 spec:
   replicas: 1
@@ -134,7 +134,7 @@ spec:
         app.kubernetes.io/name: grid-fleet-dashboard
         app.kubernetes.io/instance: grid-fleet-dashboard
       annotations:
-        checksum/config: 878c1441ab22e99312a0d3797fedbf51191b274d294cf46f1baf35474a059f12
+        checksum/config: 1fd6e86a4ac0cd0f22b1a70e5ae4570391a706ecfaa93a481db8370d409513e5
     spec:
       serviceAccountName: grid-fleet-dashboard
       securityContext:
@@ -143,7 +143,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: dashboard
-          image: "ghcr.io/praxis-proxy/grid-fleet-dashboard:v0.3.0-rc.1"
+          image: "ghcr.io/praxis-proxy/grid-fleet-dashboard:v0.3.0-rc.2"
           imagePullPolicy: IfNotPresent
           args:
             - --listen=:8080
@@ -203,10 +203,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.1
+    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.2
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.0-rc.1"
+    app.kubernetes.io/version: "v0.3.0-rc.2"
     app.kubernetes.io/managed-by: Helm
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt
