@@ -106,8 +106,8 @@ spec:
           {{ printf "{{hub $workName := %q hub}}" $cfg.workName }}
           {{ printf "{{hub $namespace := %q hub}}" .Values.external.delivery.namespace }}
           {{ printf "{{hub $clusterSet := %q hub}}" $cfg.clusterSet }}
-          {{- .Files.Get "files/managed-cluster-ready.yaml" | nindent 10 }}
-          {{- .Files.Get "files/managed-cluster-peers.yaml" | nindent 10 }}
+          {{- .Files.Get "files/managed-cluster-ready.yaml" | trim | nindent 10 }}
+          {{- .Files.Get "files/managed-cluster-peers.yaml" | trim | nindent 10 }}
 {{- if .Values.gridIdentity.enabled }}
   - objectDefinition:
       apiVersion: policy.open-cluster-management.io/v1
@@ -130,7 +130,7 @@ spec:
           {{ printf "{{hub $identity := %q hub}}" .Values.external.delivery.identitySecretName }}
           {{ printf "{{hub $ca := %q hub}}" .Values.external.delivery.caSecretName }}
           {{ printf "{{hub $gateway := %q hub}}" $cfg.gatewayName }}
-          {{- .Files.Get "files/managed-cluster-ready.yaml" | nindent 10 }}
-          {{- .Files.Get "files/managed-cluster-network.yaml" | nindent 10 }}
+          {{- .Files.Get "files/managed-cluster-ready.yaml" | trim | nindent 10 }}
+          {{- .Files.Get "files/managed-cluster-network.yaml" | trim | nindent 10 }}
 {{- end }}
 {{- end }}
