@@ -762,16 +762,16 @@ mod tests {
 
     #[test]
     fn discovered_model_expiry_is_carried_into_gateway_serving_config() {
-        let mut discovered = cand("llama", "site-b", "pool-b", None);
-        discovered.expires_at = Some("2030-01-01T00:00:00Z".to_owned());
+        let mut discovered_config = cand("llama", "site-b", "pool-b", None);
+        discovered_config.expires_at = Some("2030-01-01T00:00:00Z".to_owned());
         let rendered = render(
-            &overlay(vec![discovered, cand("static", "site-a", "pool-a", None)]),
+            &overlay(vec![discovered_config, cand("static", "site-a", "pool-a", None)]),
             &INPUTS,
         );
         let text = to_text(&rendered).expect("text");
         let config: serde_json::Value = serde_json::from_str(&text).expect("json");
         let candidates = config["candidates"].as_array().expect("candidates");
-        let discovered = candidates
+        let discovered_candidate = candidates
             .iter()
             .find(|candidate| candidate["name"] == "llama")
             .expect("discovered candidate");
@@ -780,7 +780,7 @@ mod tests {
             .find(|candidate| candidate["name"] == "static")
             .expect("static candidate");
 
-        assert_eq!(discovered["expires_at_ms"], 1_893_456_000_000_u64);
+        assert_eq!(discovered_candidate["expires_at_ms"], 1_893_456_000_000_u64);
         assert!(static_candidate.get("expires_at_ms").is_none());
     }
 

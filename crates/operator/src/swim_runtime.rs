@@ -1315,6 +1315,7 @@ impl SwimHandle {
         self.trust_update_tx
             .send(GridTrustUpdate::AllowStateAdmission)
             .map_err(|_error| BroadcastError::ChannelClosed)
+    }
 
     /// Queue a signed model inventory frame for delivery to SWIM peers.
     ///
@@ -2253,8 +2254,8 @@ impl EnforcedGrid {
 /// Current Unix time in milliseconds, saturating at the wire type's limit.
 fn wall_clock_millis() -> u64 {
     u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_millis(),
     )

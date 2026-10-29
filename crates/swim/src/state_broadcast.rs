@@ -1931,7 +1931,7 @@ impl StateBroadcastHandler {
         let keys = self
             .trust_store_rx
             .borrow()
-            .get(&broadcast.origin_site)
+            .pin(&PinKey::grid(&broadcast.grid_id, &broadcast.origin_site))
             .cloned()
             .filter(|keys| !keys.is_empty())
             .ok_or_else(|| StateBroadcastError::UntrustedInventoryOrigin {
@@ -2438,7 +2438,7 @@ mod tests {
         let (handler, _control) = StateBroadcastHandler::with_capacity("local".to_owned(), 8);
         let inventories = handler.subscribe_model_inventories();
         handler.trust_store_tx.send_modify(|store| {
-            store.insert("site-p".to_owned(), vec![raw_public_key]);
+            store.set_pin(PinKey::grid("grid-p", "site-p"), vec![raw_public_key]);
         });
         (handler, inventories)
     }

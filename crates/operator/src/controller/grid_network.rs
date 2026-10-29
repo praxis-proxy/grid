@@ -2201,7 +2201,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         memory.retain_network_keys(name, admission_keys.iter().cloned());
     }
 
-    let grid_id = resolve_grid_id(&network);
+    let grid_id = network.spec.grid_id.clone();
     let remote_crdt_providers: Vec<crdt::ProviderState> = if reads_polled_catalogs(ctx.membership()) {
         ctx.peer_providers()
             .admit(name, &reserved_clusters(&network, &providers), &hop_sites(&network))
@@ -5916,10 +5916,10 @@ fn fit_provider_uids_to_swim_budget(broadcast: &mut swim::StateBroadcast, byte_b
     let mut dropped = 0_usize;
     for provider_uid in offered {
         broadcast.provider_uids.push(provider_uid);
-        if !broadcast.encode().is_ok_and(|encoded| encoded.len() <= byte_budget) {
-            if broadcast.provider_uids.pop().is_some() {
-                dropped = dropped.saturating_add(1);
-            }
+        if !broadcast.encode().is_ok_and(|encoded| encoded.len() <= byte_budget)
+            && broadcast.provider_uids.pop().is_some()
+        {
+            dropped = dropped.saturating_add(1);
         }
     }
     dropped
