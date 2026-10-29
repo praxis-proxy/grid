@@ -1569,28 +1569,17 @@ async fn apply_signed_state(
 }
 
 /// Apply this grid's signed-state mode, then publish the certificate bootstrap it allows.
-///
-/// Returns `true` when this pass persisted a generated grid ID and must be requeued.
 async fn sign_grid_state(
     network: &GridNetwork,
     ctx: &OperatorCtx,
     swim: &SwimHandle,
     name: &str,
-) -> Result<bool, OperatorError> {
+) -> Result<(), OperatorError> {
     let signed_state = signed_state_mode(network);
-    // Persist the scope before the membership hold so the next reconcile can install trust.
     let Some(grid_id) = persisted_grid_id(network) else {
-        if signed_state == SignedStateMode::Enforce {
-            let grid_id = resolve_grid_id(network);
-            Box::pin(persist_grid_id(network, &ctx.client, &grid_id)).await?;
-            return Ok(true);
-        }
-        if signed_state == SignedStateMode::Off {
-            swim.allow_state_admission()
-                .map_err(|error| OperatorError::InvalidResource(error.to_string()))?;
-            Box::pin(publish_site_cert(network, &ctx.client, swim, name)).await;
-        }
-        return Ok(false);
+        // Enrollment owns grid IDs. Reconciliation waits for `spec.grid_id`
+        // rather than minting a local fallback.
+        return Ok(());
     };
     let signing_ready = Box::pin(apply_signed_state(network, ctx, swim, grid_id, signed_state)).await?;
 
@@ -1602,16 +1591,6 @@ async fn sign_grid_state(
         // An unusable local identity cannot sign; stay silent rather than send unsigned.
         SignedStateMode::Enforce => {},
     }
-    Ok(false)
-}
-
-/// Persist a generated grid ID without releasing SWIM state admission.
-async fn persist_grid_id(network: &GridNetwork, client: &Client, grid_id: &str) -> Result<(), OperatorError> {
-    let name = grid_network_name(network)?;
-    let api: Api<GridNetwork> = Api::all(client.clone());
-    let patch = json!({ "status": { "gridId": grid_id } });
-    api.patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
-        .await?;
     Ok(())
 }
 
@@ -1676,7 +1655,7 @@ async fn collect_gossip_peer_pins(
         .map_err(|_error| OperatorError::InvalidResource("Grid CA certificate is not UTF-8".to_owned()))?;
     let network_name = network.metadata.name.as_deref().unwrap_or_default();
     // The declared mode, not the startup one: a trust change under gossip does not restart.
-    let trust = GridModes::of(network).trust;
+    let trust = GridModes::of(network, MembershipMode::Swim).trust;
     let mut verified = PeerPins::new();
     for site in list_all_grid_sites(client)
         .await?
@@ -2085,9 +2064,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         // diff_seed_sets tracks additions/removals for diagnostic logging.
         announce_crd_seeds(&network, swim, &ctx.last_seeds).await;
 
-        if Box::pin(sign_grid_state(&network, &ctx, swim, name)).await? {
-            return Ok(Action::requeue(MEMBERSHIP_HOLD_REQUEUE));
-        }
+        Box::pin(sign_grid_state(&network, &ctx, swim, name)).await?;
     }
 
     // List providers and tools once; shared between the catalog, the overlay and CRDT publishing.
@@ -9300,7 +9277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unpersisted_grid_id_installs_no_signed_state() {
+    async fn an_unpersisted_grid_id_waits_without_installing_signed_state() {
         let mut network = network_with_endpoint_transport("plaintext", None);
         network.spec.grid_id = String::new();
         network.spec.peer_trust = Some(crate::crd::grid_network::PeerTrustConfig {
@@ -9314,16 +9291,16 @@ mod tests {
         let ctx = OperatorCtx::new(client, None, SignalMode::default());
         let (swim, mut runtime) = SwimHandle::detached("site-a");
 
-        let persisted = sign_grid_state(&network, &ctx, &swim, "glb-demo").await;
+        let result = sign_grid_state(&network, &ctx, &swim, "glb-demo").await;
 
         assert!(
-            matches!(persisted, Ok(true)),
-            "generated grid ID was persisted: {persisted:?}"
+            result.is_ok(),
+            "missing enrollment-owned grid ID waits without failing: {result:?}"
         );
         assert_eq!(
             runtime.grids_enforced(),
             Vec::<String>::new(),
-            "a generated grid ID changes each reconcile until persisted"
+            "signed state is not enabled before enrollment provides a grid ID"
         );
     }
 
