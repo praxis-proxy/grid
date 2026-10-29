@@ -17,11 +17,24 @@ cluster. The hub needs the governance policy add-on and any optional PKI
 integration.
 
 Enable `gridIdentity.enabled` to create the grid ID once in the immutable
-`grid-bootstrap-state` ConfigMap. Bootstrap adopts the named GridNetwork's
-declared ID, or its legacy status ID, when one exists; otherwise it generates
-a UUID v4. Retries reuse the saved value, including concurrent bootstrap runs.
-A malformed existing ConfigMap is an error, never a reason to mint another ID.
-Back up this ConfigMap with the CA and retain it through CA rotation.
+`grid-bootstrap-state` ConfigMap. Bootstrap reads and writes only that
+ConfigMap: when it is absent, bootstrap generates a UUID v4 and saves it.
+Retries reuse the saved value, including concurrent bootstrap runs. A malformed
+existing ConfigMap is an error, never a reason to mint another ID. Bootstrap
+reads no Grid object, so the hub needs no Grid CRD. Back up this ConfigMap with
+the CA and retain it through CA rotation.
+
+To keep an existing grid's ID, create the ConfigMap before installing, with
+that ID under `gridId`:
+
+```bash
+kubectl -n <release-namespace> create configmap grid-bootstrap-state \
+  --from-literal=gridId=<existing-grid-id>
+```
+
+Bootstrap uses a pre-created ConfigMap unchanged. The existing ID is the
+`spec.gridId` of the grid's GridNetwork on any member, or `status.gridId` on
+releases that predate the spec field.
 
 In external mode the existing bootstrap Job uses `--skip-ca` and has no Secret
 permissions. In service mode that same Job also handles CA and credentials.

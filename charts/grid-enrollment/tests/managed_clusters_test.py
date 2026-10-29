@@ -195,6 +195,21 @@ class ManagedClusterTemplates(unittest.TestCase):
         self.assertEqual(members['requiredClusterSelector']['labelSelector']['matchLabels'],
                          {'grid.praxis.fast/member': 'true'})
 
+    def test_hub_needs_no_grid_api(self):
+        def grid_refs(objects):
+            for obj in objects:
+                if obj.get('apiVersion', '').startswith('grid.praxis.fast/'):
+                    yield f"{obj['kind']}/{obj['metadata']['name']}"
+                for rule in obj.get('rules') or []:
+                    if 'grid.praxis.fast' in rule.get('apiGroups', []):
+                        yield f"{obj['kind']}/{obj['metadata']['name']} rule"
+        values = copy.deepcopy(self.values)
+        values['gridIdentity'] = {'enabled': True}
+        release = [d for d in self.render_chart(values) if d['kind'] != 'Policy']
+        self.assertEqual(list(grid_refs(release)), [])
+        hub = {MC_KEY: {'items': [member('local-cluster', False), member('east')]}}
+        self.assertEqual(list(grid_refs(self.render('-hub', hub))), [])
+
     def test_observer_access_does_not_wait_for_hub_policy(self):
         for work_name in ('grid-site-observer', 'custom-observer'):
             with self.subTest(work_name=work_name):

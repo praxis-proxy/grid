@@ -95,6 +95,8 @@ struct Inner {
     version: u64,
     /// Reads of a path that answer 500, as a transient API failure, and how many are left.
     failing: BTreeMap<String, usize>,
+    /// API group prefixes the server does not serve, which answer a plain-text 404.
+    unserved: Vec<String>,
 }
 
 /// An in-memory Kubernetes API.
@@ -133,6 +135,11 @@ impl FakeApi {
     /// Answer the next `times` reads of `path`, an object or a list, with a 500.
     pub fn fail_reads(&self, path: &str, times: usize) {
         self.lock().failing.insert(path.to_owned(), times);
+    }
+
+    /// Serve no API under `prefix`, as a cluster without its CRD: a bare 404 with no Status body.
+    pub fn unserve(&self, prefix: &str) {
+        self.lock().unserved.push(prefix.to_owned());
     }
 
     /// The object at `path`.
@@ -204,6 +211,19 @@ impl FakeApi {
             let api = api.clone();
             async move {
                 let (parts, body) = request.into_parts();
+                if api
+                    .lock()
+                    .unserved
+                    .iter()
+                    .any(|prefix| parts.uri.path().starts_with(prefix.as_str()))
+                {
+                    let mut response = http::Response::new(kube::client::Body::from(b"404 page not found\n".to_vec()));
+                    *response.status_mut() = http::StatusCode::NOT_FOUND;
+                    response
+                        .headers_mut()
+                        .insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("text/plain"));
+                    return Ok::<_, std::convert::Infallible>(response);
+                }
                 let bytes = http_body_util::BodyExt::collect(body)
                     .await
                     .map(http_body_util::Collected::to_bytes)

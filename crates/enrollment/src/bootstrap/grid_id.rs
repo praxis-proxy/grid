@@ -5,28 +5,20 @@ use std::collections::BTreeMap;
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
     Api, Client,
-    api::{ApiResource, DynamicObject, GroupVersionKind, ObjectMeta, PostParams},
+    api::{ObjectMeta, PostParams},
 };
 
 use super::BoxError;
 
-/// Load bootstrap's persisted ID, or adopt the existing grid's ID before minting one.
+/// Load bootstrap's persisted ID, or mint and persist one. It reads no Grid kind, so the
+/// hub needs no Grid CRD; a migrating grid pre-creates the `ConfigMap` with its ID.
 /// Creation is atomic: concurrent bootstrap Jobs read the winning object on conflict.
-#[expect(
-    clippy::large_stack_frames,
-    reason = "one-shot bootstrap holds Kubernetes objects off the request path"
-)]
-pub(super) async fn ensure(client: &Client, namespace: &str, name: &str, network: &str) -> Result<String, BoxError> {
+pub(super) async fn ensure(client: &Client, namespace: &str, name: &str) -> Result<String, BoxError> {
     let states: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
     if let Some(state) = Box::pin(states.get_opt(name)).await? {
         return stored_id(&state);
     }
-    let resource = ApiResource::from_gvk(&GroupVersionKind::gvk("grid.praxis.fast", "v1alpha1", "GridNetwork"));
-    let networks: Api<DynamicObject> = Api::all_with(client.clone(), &resource);
-    let existing = Box::pin(networks.get_opt(network)).await?;
-    let adopted = existing.as_ref().and_then(network_id);
-    let id = adopted.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
-    validate(&id)?;
+    let id = uuid::Uuid::new_v4().to_string();
     let state = ConfigMap {
         metadata: ObjectMeta {
             name: Some(name.to_owned()),
@@ -48,25 +40,11 @@ pub(super) async fn ensure(client: &Client, namespace: &str, name: &str, network
         immutable: Some(true),
         ..ConfigMap::default()
     };
-    let persisted = match Box::pin(states.create(&PostParams::default(), &state)).await {
-        Ok(created) => stored_id(&created)?,
-        Err(kube::Error::Api(error)) if error.code == 409 => stored_id(&Box::pin(states.get(name)).await?)?,
-        Err(error) => return Err(error.into()),
-    };
-    if adopted.is_some_and(|previous| previous != persisted) {
-        return Err(
-            "bootstrap state conflicts with the existing GridNetwork ID; refusing to change grid identity".into(),
-        );
+    match Box::pin(states.create(&PostParams::default(), &state)).await {
+        Ok(created) => stored_id(&created),
+        Err(kube::Error::Api(error)) if error.code == 409 => stored_id(&Box::pin(states.get(name)).await?),
+        Err(error) => Err(error.into()),
     }
-    Ok(persisted)
-}
-
-/// Prefer the declared ID, retaining legacy status-only IDs during migration.
-fn network_id(network: &DynamicObject) -> Option<&str> {
-    ["/spec/gridId", "/status/gridId"]
-        .into_iter()
-        .filter_map(|path| network.data.pointer(path).and_then(serde_json::Value::as_str))
-        .find(|id| !id.is_empty())
 }
 
 /// Refuse damaged bootstrap state instead of generating a replacement identity.
@@ -105,9 +83,9 @@ mod tests {
     async fn a_new_grid_gets_one_persisted_id_and_retries_only_read_it() -> Result<(), BoxError> {
         let api = FakeApi::new();
         let client = api.client("grid");
-        let first = ensure(&client, "grid", "grid-state", "grid").await?;
+        let first = ensure(&client, "grid", "grid-state").await?;
         assert_eq!(uuid::Uuid::parse_str(&first)?.get_version_num(), 4);
-        assert_eq!(ensure(&client, "grid", "grid-state", "grid").await?, first);
+        assert_eq!(ensure(&client, "grid", "grid-state").await?, first);
         let writes = api.writes();
         assert_eq!(writes.len(), 1);
         let write = writes.first().ok_or("bootstrap did not write its state")?;
@@ -118,26 +96,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_adopts_declared_or_legacy_ids_without_touching_the_network() -> Result<(), BoxError> {
-        for (spec, status, expected) in [("declared", "old", "declared"), ("", "legacy", "legacy")] {
-            let api = FakeApi::new();
-            api.put(
-                "/apis/grid.praxis.fast/v1alpha1/gridnetworks/grid",
-                json!({
-                    "apiVersion": "grid.praxis.fast/v1alpha1", "kind": "GridNetwork",
-                    "metadata": {"name": "grid"}, "spec": {"gridId": spec}, "status": {"gridId": status}
-                }),
-            );
-            assert_eq!(
-                ensure(&api.client("grid"), "grid", "grid-state", "grid").await?,
-                expected
-            );
-            assert!(
-                api.writes()
-                    .iter()
-                    .all(|write| write.method == "POST" && write.path == "/api/v1/namespaces/grid/configmaps")
-            );
-        }
+    async fn a_precreated_state_keeps_its_id_and_mints_none() -> Result<(), BoxError> {
+        let api = FakeApi::new();
+        api.put(
+            "/api/v1/namespaces/grid/configmaps/grid-state",
+            json!({
+                "apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "grid-state"},
+                "data": {"gridId": "existing-grid"}
+            }),
+        );
+        assert_eq!(
+            ensure(&api.client("grid"), "grid", "grid-state").await?,
+            "existing-grid"
+        );
+        assert!(api.writes().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_hub_without_the_grid_api_mints_an_id() -> Result<(), BoxError> {
+        let api = FakeApi::new();
+        api.unserve("/apis/grid.praxis.fast/");
+        let id = ensure(&api.client("grid"), "grid", "grid-state").await?;
+        assert_eq!(uuid::Uuid::parse_str(&id)?.get_version_num(), 4);
+        assert_eq!(api.writes().len(), 1);
         Ok(())
     }
 
@@ -151,13 +133,13 @@ mod tests {
                     "apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "grid-state"}, "data": data
                 }),
             );
-            let result = ensure(&api.client("grid"), "grid", "grid-state", "grid").await;
+            let result = ensure(&api.client("grid"), "grid", "grid-state").await;
             assert!(matches!(result, Err(error) if error.to_string().contains("gridId")));
             assert!(api.writes().is_empty());
         }
         let api = FakeApi::new();
         api.fail_reads("/api/v1/namespaces/grid/configmaps/grid-state", 1);
-        let result = ensure(&api.client("grid"), "grid", "grid-state", "grid").await;
+        let result = ensure(&api.client("grid"), "grid", "grid-state").await;
         assert!(matches!(result, Err(error) if !error.to_string().is_empty()));
         assert!(api.writes().is_empty());
     }
