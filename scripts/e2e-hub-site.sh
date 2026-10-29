@@ -1924,7 +1924,10 @@ assert_signed_state() {
     else
       pass "$ctx: operator signs its state"
     fi
-    if grep -q 'failed to encode address broadcast' <<<"$logs"; then
+    # The runtime holds state admission until the first GridNetwork trust snapshot arrives.
+    # An address discovered during that startup window is retried after trust is initialized.
+    if grep 'failed to encode address broadcast' <<<"$logs" \
+      | grep -v 'arrived before GridNetwork trust was initialized' >/dev/null; then
       fail "$ctx: operator could not publish its addresses under signed state"
     else
       pass "$ctx: operator publishes its addresses under signed state"
