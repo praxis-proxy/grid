@@ -114,6 +114,33 @@ This chart version has no upgrade path from earlier ones; reinstall it. What cha
 - Under `siteIdentity` the port listens only after enrollment writes the identity, so the
   scrape target is down until then. Do not alert on it during enrollment.
 
+### Operator config
+
+The chart renders `operatorConfig.name` only when the `enrollment` values give it a site
+section. An upgrade from an earlier chart without them removes the ConfigMap from the
+release, and Helm deletes it. If another writer has written a site section into it, keep
+it before upgrading:
+
+```bash
+kubectl -n grid-system annotate configmap grid-operator-config helm.sh/resource-policy=keep
+```
+
+Helm then leaves it in place. A GitOps tool that applies the rendered manifests prunes it
+the same way unless the ConfigMap tells it not to, for example Argo CD's
+`argocd.argoproj.io/sync-options: Prune=false`.
+
+When another writer owns the ConfigMap, keep `operatorConfig.create: false`. To hand it
+back to the chart before setting `enrollment` values, delete it or give it the release's
+ownership metadata, else the upgrade fails on an object the release does not own:
+
+```bash
+kubectl -n grid-system label configmap grid-operator-config app.kubernetes.io/managed-by=Helm
+kubectl -n grid-system annotate configmap grid-operator-config \
+  meta.helm.sh/release-name=grid-operator meta.helm.sh/release-namespace=grid-system
+```
+
+The chart's render then replaces its `config.yaml`.
+
 ### Gateway namespace
 
 The operator looks for the gateway Service in the release namespace unless
