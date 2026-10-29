@@ -11,6 +11,18 @@
         version: 1
         site:
           name: {{hub printf "%q" .ManagedClusterName hub}}
+- complianceType: musthave
+  objectDefinition:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      name: {{hub printf "%q" (printf "%s-reader" $workName) hub}}
+      labels:
+        open-cluster-management.io/aggregate-to-work: "true"
+    rules:
+    - apiGroups: [grid.praxis.fast]
+      resources: [gridsites]
+      verbs: [get, list, watch]
 {{hub range $cluster := $members hub}}
 {{hub if and (eq (index $cluster.metadata.labels $label) $labelValue) (or (eq $clusterSet "global") (eq (index $cluster.metadata.labels "cluster.open-cluster-management.io/clusterset") $clusterSet)) (ne $cluster.metadata.name $.ManagedClusterName) hub}}
 {{hub $work := lookup "work.open-cluster-management.io/v1" "ManifestWork" $cluster.metadata.name $workName hub}}

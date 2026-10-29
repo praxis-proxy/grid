@@ -96,8 +96,8 @@ spec:
         evaluationInterval:
           compliant: watch
           noncompliant: watch
-        # Only remote peer records are managed here. The local GridSite remains
-        # authoritative and is never copied back onto its source cluster.
+        # Withdraw peer records and observer permissions on membership removal.
+        # The local GridSite remains authoritative and is never copied back.
         pruneObjectBehavior: DeleteAll
         object-templates-raw: |
           {{ printf "{{hub $network := %q hub}}" $cfg.networkName }}

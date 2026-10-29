@@ -91,9 +91,19 @@ class ManagedClusterTemplates(unittest.TestCase):
         return [o for o in self.render(resources=resources) if o['kind'] == 'GridSite']
 
     def test_empty_inventory_keeps_site_config_without_peers(self):
-        config, = self.render()
+        config, = [o for o in self.render() if o['kind'] == 'ConfigMap']
         self.assertEqual(yaml.safe_load(config['data']['config.yaml']),
                          {'version': 1, 'site': {'name': 'west'}})
+
+    def test_work_agent_can_observe_sites_without_write_permissions(self):
+        role, = [o for o in self.render() if o['kind'] == 'ClusterRole']
+        self.assertEqual(role['metadata']['name'], 'grid-site-observer-reader')
+        self.assertEqual(role['metadata']['labels'],
+                         {'open-cluster-management.io/aggregate-to-work': 'true'})
+        self.assertEqual(role['rules'], [{'apiGroups': ['grid.praxis.fast'],
+                                         'resources': ['gridsites'],
+                                         'verbs': ['get', 'list', 'watch']}])
+        self.assertEqual(self.policies['']['pruneObjectBehavior'], 'DeleteAll')
 
     def test_peer_delivery_waits_for_crds_before_emitting_any_objects(self):
         raw = self.policies['']['object-templates-raw']
