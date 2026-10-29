@@ -12,7 +12,10 @@ use serde_json::Value;
 
 use super::{EnrollError, KubeStore, Outcome, Settings, Store as _, Target};
 use crate::{
-    crd::{grid_network::GridNetwork, inference_provider::Condition},
+    crd::{
+        grid_network::GridNetwork,
+        inference_provider::{Condition, ConditionStatus},
+    },
     operator_config::{
         BundleKind, BundleRef, ConfigWatch, InviteSecretRef, Section, SignerEndpoint, SiteConfig, Snapshot,
     },
@@ -104,8 +107,8 @@ pub(crate) fn in_flight(held: &[Condition]) -> Option<rollup::Cause<'_>> {
 /// What a condition says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Verdict {
-    /// `True`, `False`, or `Unknown`.
-    pub(crate) status: &'static str,
+    /// The condition status.
+    pub(crate) status: ConditionStatus,
     /// CamelCase reason.
     pub(crate) reason: Cow<'static, str>,
     /// Detail, never holding token bytes.
@@ -114,7 +117,7 @@ pub(crate) struct Verdict {
 
 impl Verdict {
     /// A verdict.
-    pub(crate) fn new(status: &'static str, reason: impl Into<Cow<'static, str>>, message: String) -> Self {
+    pub(crate) fn new(status: ConditionStatus, reason: impl Into<Cow<'static, str>>, message: String) -> Self {
         Self {
             status,
             reason: reason.into(),
@@ -124,13 +127,13 @@ impl Verdict {
 
     /// `Accepted`: the site section applies to this cluster's own site, with nothing conflicting.
     pub(crate) fn own_site() -> Self {
-        Self::new("True", ACCEPTED, "this cluster's own site".to_owned())
+        Self::new(ConditionStatus::True, ACCEPTED, "this cluster's own site".to_owned())
     }
 
     /// `Accepted`: a `GridNetwork` naming no grid to join.
     pub(crate) fn grid_id_unset(network: &str) -> Self {
         Self::new(
-            "False",
+            ConditionStatus::False,
             "GridIdUnset",
             format!(
                 "GridNetwork {network} sets no spec.gridId: bootstrap must supply this grid's persisted ID, \
@@ -146,7 +149,7 @@ impl Verdict {
         } else {
             "the operator config names no site, enrollment off"
         };
-        Self::new("True", ACCEPTED, message.to_owned())
+        Self::new(ConditionStatus::True, ACCEPTED, message.to_owned())
     }
 
     /// `Enrolled`: an identity written outside a signer, with what renews it.
@@ -157,13 +160,13 @@ impl Verdict {
             },
             None => "identity provisioned outside the signer; nothing is known to renew it".to_owned(),
         };
-        Self::new("True", ENROLLED, message)
+        Self::new(ConditionStatus::True, ENROLLED, message)
     }
 
     /// `Enrolled`: the identity this site held is gone.
     pub(crate) fn identity_lost(secret: &str) -> Self {
         Self::new(
-            "False",
+            ConditionStatus::False,
             "IdentityMissing",
             format!("site identity Secret {secret} is gone: restore it, or name site.inviteSecretRef to enroll again"),
         )
@@ -172,7 +175,7 @@ impl Verdict {
     /// `Enrolled`: no identity, and nothing to enroll with.
     fn enrollment_off(secret: &str) -> Self {
         Self::new(
-            "False",
+            ConditionStatus::False,
             "EnrollmentOff",
             format!(
                 "no site identity: Secret {secret} does not exist, and the operator config names no site to enroll"
@@ -182,13 +185,13 @@ impl Verdict {
 
     /// `Accepted`: the operator config was refused as a whole, so no section of it is acted on.
     pub(crate) fn config_invalid(why: &str) -> Self {
-        Self::new("False", "OperatorConfigInvalid", why.to_owned())
+        Self::new(ConditionStatus::False, "OperatorConfigInvalid", why.to_owned())
     }
 
     /// `Accepted`: the config names another site than the identity this cluster holds.
     pub(crate) fn name_mismatch(configured: &str, identity: &str) -> Self {
         Self::new(
-            "False",
+            ConditionStatus::False,
             "SiteNameMismatch",
             format!("site.name is {configured} but this cluster's identity names site {identity}"),
         )
@@ -197,7 +200,7 @@ impl Verdict {
     /// No `GridNetwork` yet, so nothing is enrolled or reported there.
     fn awaiting_grid_network(name: &str) -> Self {
         Self::new(
-            "False",
+            ConditionStatus::False,
             "AwaitingGridNetwork",
             format!("no GridNetwork yet: declare this cluster's GridNetwork, and site {name} enrolls"),
         )
@@ -206,7 +209,7 @@ impl Verdict {
     /// More than one `GridNetwork`, so none is this cluster's.
     fn many_networks(count: usize) -> Self {
         Self::new(
-            "False",
+            ConditionStatus::False,
             "MoreThanOneGridNetwork",
             format!("{count} GridNetworks found, but one operator serves one grid: delete all but one"),
         )
@@ -215,7 +218,7 @@ impl Verdict {
     /// The first request is out.
     fn enrolling() -> Self {
         Self::new(
-            "Unknown",
+            ConditionStatus::Unknown,
             ENROLLING,
             "sending the enrollment request to the signer".to_owned(),
         )
@@ -224,7 +227,7 @@ impl Verdict {
     /// No invite to enroll with: an admin must act.
     fn awaiting_invite() -> Self {
         Self::new(
-            "False",
+            ConditionStatus::False,
             "AwaitingInvite",
             "set site.inviteSecretRef in the operator config to the Secret holding this site's invite, beside \
              site.signerEndpoint"
@@ -234,13 +237,13 @@ impl Verdict {
 
     /// `ResolvedRefs`: every object the site section names resolves.
     pub(crate) fn resolved() -> Self {
-        Self::new("True", RESOLVED_REFS, String::new())
+        Self::new(ConditionStatus::True, RESOLVED_REFS, String::new())
     }
 
     /// The signer issued `spiffe_id`.
     fn issued(spiffe_id: &str) -> Self {
         Self::new(
-            "True",
+            ConditionStatus::True,
             ENROLLED,
             format!("enrolled as {spiffe_id}, issued by the signer"),
         )
@@ -248,12 +251,16 @@ impl Verdict {
 
     /// The identity Secret already exists.
     pub(crate) fn present(secret: &str) -> Self {
-        Self::new("True", ENROLLED, format!("site identity Secret {secret} exists"))
+        Self::new(
+            ConditionStatus::True,
+            ENROLLED,
+            format!("site identity Secret {secret} exists"),
+        )
     }
 
     /// Enrollment ended without an identity.
     fn failed(error: &EnrollError) -> Self {
-        Self::new("False", reason(error), error.to_string())
+        Self::new(ConditionStatus::False, reason(error), error.to_string())
     }
 }
 
@@ -336,7 +343,7 @@ pub(crate) fn condition(site: &GridNetwork, type_: &str, verdict: &Verdict, now_
         .map_or_else(|| now_rfc3339.to_owned(), |held| held.last_transition_time.clone());
     Some(Condition {
         type_: type_.to_owned(),
-        status: verdict.status.to_owned(),
+        status: verdict.status,
         reason: verdict.reason.clone().into_owned(),
         message: verdict.message.clone(),
         last_transition_time,
@@ -356,7 +363,7 @@ fn patch(name: &str, condition: &Condition) -> Value {
 
 /// Whether the live `Enrolled` condition is already `True`.
 pub(crate) fn enrolled(site: &GridNetwork) -> bool {
-    held(site, ENROLLED).is_some_and(|held| held.status == "True")
+    held(site, ENROLLED).is_some_and(|held| held.status == ConditionStatus::True)
 }
 
 /// Write `verdict` as `Enrolled` on `site`.
@@ -420,7 +427,7 @@ pub(crate) async fn report_many(
 async fn identity_not_evaluated(client: &Client, site: &GridNetwork, secret: &str) {
     // Written whenever it differs, so a verdict on an identity since deleted never stands.
     let waiting = Verdict::new(
-        "Unknown",
+        ConditionStatus::Unknown,
         "AwaitingFirstAttempt",
         format!("waiting for a site identity: Secret {secret} does not exist yet, see Enrolled"),
     );
@@ -742,7 +749,7 @@ async fn record(client: &Client, object: &ObjectReference, verdict: &Verdict) {
         instance: None,
     };
     let event = Event {
-        type_: if verdict.status == "False" {
+        type_: if verdict.status == ConditionStatus::False {
             EventType::Warning
         } else {
             EventType::Normal
@@ -866,7 +873,13 @@ pub(crate) async fn named_refs(client: &Client, config: Option<&SiteConfig>) -> 
         ),
     ] {
         match Box::pin(bundles.read(reference)).await {
-            Read::Missing(why) => return Some(Verdict::new("False", "RefNotFound", format!("{field}: {why}"))),
+            Read::Missing(why) => {
+                return Some(Verdict::new(
+                    ConditionStatus::False,
+                    "RefNotFound",
+                    format!("{field}: {why}"),
+                ));
+            },
             Read::Unavailable(why) => {
                 tracing::warn!(field, error = %why, "reading a bundle failed; ResolvedRefs keeps its last verdict");
                 return None;

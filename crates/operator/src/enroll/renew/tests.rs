@@ -794,7 +794,7 @@ fn rotation_on_schedule_follows_the_check() {
     for (checked, signer, status, reason) in cases {
         let verdict = rotation_verdict(&checked, signer);
         assert_eq!(
-            (verdict.status, verdict.reason.as_ref()),
+            (verdict.status.as_str(), verdict.reason.as_ref()),
             (status, reason),
             "{checked:?}"
         );
@@ -815,7 +815,7 @@ fn a_cert_manager_certificate_on_the_secret_reads_as_renewed_until_due() {
     for why in [Off::NoSigner, Off::Disabled] {
         let held = off_verdict(why, Due::At(now), named);
         assert_eq!(
-            (held.status, held.reason.as_ref(), held.message.as_str()),
+            (held.status.as_str(), held.reason.as_ref(), held.message.as_str()),
             (
                 "True",
                 "RotationOnSchedule",
@@ -825,7 +825,7 @@ fn a_cert_manager_certificate_on_the_secret_reads_as_renewed_until_due() {
         );
         let unknown = off_verdict(why, Due::At(now), None);
         assert_eq!(
-            (unknown.status, unknown.reason.as_ref()),
+            (unknown.status.as_str(), unknown.reason.as_ref()),
             ("True", "RotationOnSchedule")
         );
         assert!(
@@ -848,9 +848,17 @@ fn a_due_identity_its_certificate_has_not_replaced_is_overdue() {
     for why in [Off::NoSigner, Off::Disabled] {
         for due in [Due::Now, Due::Expired] {
             let overdue = off_verdict(why, due, Some("site-d-identity"));
-            assert_eq!((overdue.status, overdue.reason.as_ref()), ("False", "RotationOverdue"));
+            assert_eq!(
+                (overdue.status.as_str(), overdue.reason.as_ref()),
+                ("False", "RotationOverdue"),
+                "{why:?}/{due:?} with a renewer names the certificate"
+            );
             assert!(overdue.message.contains("site-d-identity"), "{}", overdue.message);
-            assert_eq!(off_verdict(why, due, None).reason, "RotationOverdue");
+            assert_eq!(
+                off_verdict(why, due, None).reason,
+                "RotationOverdue",
+                "{why:?}/{due:?} without a renewer is still overdue"
+            );
         }
     }
 }
@@ -945,7 +953,11 @@ fn a_failed_renewal_says_whether_to_retry_or_re_enroll() {
         (RenewError::SignerDisabled("off".to_owned()), "RotationOverdue"),
     ] {
         let verdict = rotation_verdict(&Err(error), Some(&named));
-        assert_eq!((verdict.status, verdict.reason.as_ref()), ("False", reason));
+        assert_eq!(
+            (verdict.status.as_str(), verdict.reason.as_ref()),
+            ("False", reason),
+            "expected reason {reason}"
+        );
     }
 }
 
@@ -965,7 +977,7 @@ fn identity_valid_follows_what_was_read() {
     ] {
         let verdict = identity_verdict(&identity);
         assert_eq!(
-            (verdict.status, verdict.reason.as_ref()),
+            (verdict.status.as_str(), verdict.reason.as_ref()),
             (status, reason),
             "{identity:?}"
         );
@@ -1000,7 +1012,7 @@ fn verdicts_of(round: &Round, type_: &str) -> Vec<(&'static str, String)> {
     round_verdicts(round, &target(), true, (Verdict::own_site(), None))
         .into_iter()
         .filter(|(written, ..)| *written == type_)
-        .map(|(_, _, verdict)| (verdict.status, verdict.reason.into_owned()))
+        .map(|(_, _, verdict)| (verdict.status.as_str(), verdict.reason.into_owned()))
         .collect()
 }
 
@@ -1030,7 +1042,7 @@ fn trust(renews: bool) -> Trust {
 fn rotation_enabled_under_pin_is_an_accepted_conflict_and_holds_renewal_back() {
     let refused = accepted(&loaded(&signer("")), Some("east"), (&[], &trust(false)));
     assert_eq!(
-        (refused.status, refused.reason.as_ref()),
+        (refused.status.as_str(), refused.reason.as_ref()),
         ("False", "RotationUnsupportedUnderPinTrust")
     );
     assert!(
@@ -1046,7 +1058,8 @@ fn rotation_enabled_under_pin_is_an_accepted_conflict_and_holds_renewal_back() {
     );
     let accepted_once = accepted(&loaded(&signer("")), Some("east"), (&[], &trust(true)));
     assert_eq!(
-        accepted_once.status, "True",
+        accepted_once.status.as_str(),
+        "True",
         "spiffe trust renews, so nothing conflicts"
     );
 }
@@ -1056,14 +1069,14 @@ fn disabled_rotation_no_signer_and_no_config_are_accepted() {
     for document in [signer("    rotation: Disabled\n"), String::new()] {
         let verdict = accepted(&loaded(&document), Some("east"), (&[], &trust(false)));
         assert_eq!(
-            (verdict.status, verdict.reason.as_ref()),
+            (verdict.status.as_str(), verdict.reason.as_ref()),
             ("True", local::ACCEPTED),
             "{document}"
         );
     }
     let off = accepted(&Loaded::Absent, Some("east"), (&[], &trust(false)));
     assert_eq!(
-        (off.status, off.message.as_str()),
+        (off.status.as_str(), off.message.as_str()),
         ("True", "no operator config, enrollment off")
     );
 }
@@ -1083,18 +1096,21 @@ fn every_install_waits_for_a_declared_grid_id() {
         ..unset.clone()
     };
     let verdict = accepted(&loaded(""), Some("east"), (std::slice::from_ref(&unset), &trust(true)));
-    assert_eq!((verdict.status, verdict.reason.as_ref()), ("False", "GridIdUnset"));
+    assert_eq!(
+        (verdict.status.as_str(), verdict.reason.as_ref()),
+        ("False", "GridIdUnset")
+    );
     assert!(
         verdict.message.contains("spec.gridId") && verdict.message.contains("GridNetwork grid"),
         "{}",
         verdict.message
     );
     let joined = accepted(&loaded(""), Some("east"), (std::slice::from_ref(&named), &trust(true)));
-    assert_eq!(joined.status, "True");
+    assert_eq!(joined.status.as_str(), "True");
     let standalone = accepted(&Loaded::Absent, None, (std::slice::from_ref(&unset), &trust(true)));
     assert_eq!(
         (standalone.status, standalone.reason.as_ref()),
-        ("False", "GridIdUnset"),
+        (ConditionStatus::False, "GridIdUnset"),
         "a standalone operator also waits for bootstrap"
     );
 }
@@ -1107,12 +1123,12 @@ fn a_refused_config_is_not_accepted_and_holds_renewal_back() {
         (&[], &trust(true)),
     );
     assert_eq!(
-        (invalid.status, invalid.reason.as_ref()),
+        (invalid.status.as_str(), invalid.reason.as_ref()),
         ("False", "OperatorConfigInvalid")
     );
     let mismatch = accepted(&loaded(""), Some("west"), (&[], &trust(true)));
     assert_eq!(
-        (mismatch.status, mismatch.reason.as_ref()),
+        (mismatch.status.as_str(), mismatch.reason.as_ref()),
         ("False", "SiteNameMismatch")
     );
     assert_eq!(

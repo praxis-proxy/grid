@@ -42,7 +42,7 @@ use crate::{
             TenantBudgetStatus, TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
-        inference_provider::{Condition, InferenceProvider, InferenceProviderStatus},
+        inference_provider::{Condition, ConditionStatus, InferenceProvider, InferenceProviderStatus},
     },
     error::OperatorError,
     readiness,
@@ -988,7 +988,7 @@ async fn apply_ready_condition(
     if verdict.reason.excludes() {
         tracing::warn!(
             provider = name,
-            status = verdict.reason.status(),
+            status = %verdict.reason.status(),
             reason = verdict.reason.as_str(),
             message = %verdict.message,
             "provider readiness changed"
@@ -996,7 +996,7 @@ async fn apply_ready_condition(
     } else {
         tracing::info!(
             provider = name,
-            status = verdict.reason.status(),
+            status = %verdict.reason.status(),
             reason = verdict.reason.as_str(),
             message = %verdict.message,
             "provider readiness changed"
@@ -2054,14 +2054,14 @@ pub const ROLLUP_FIELD_MANAGER: &str = "grid-operator-rollup";
 /// What raises the `GridNetwork`'s `Degraded`, each with the status that does, the first held
 /// read: this site's own identity and clocks first, then its view of its peers. None gates
 /// `Available`, since peers being down leaves this site available.
-const DEGRADED_BY: [(&str, &str); 7] = [
-    (crate::enroll::local::ROTATION_ON_SCHEDULE, "False"),
-    (crate::peer_ages::PEER_TIME_VALID, "False"),
-    (crate::gateway_ages::GATEWAY_AGES_REJECTED, "True"),
-    (crate::peer_reach::PEER_SIGNALS_REACHABLE, "False"),
-    (crate::peer_reach::PEER_CATALOGS_ACCEPTED, "False"),
-    (crate::peer_membership::PEER_MEMBERSHIP, "False"),
-    (crate::peer_reach::PEER_POLLS_COMPLETE, "False"),
+const DEGRADED_BY: [(&str, ConditionStatus); 7] = [
+    (crate::enroll::local::ROTATION_ON_SCHEDULE, ConditionStatus::False),
+    (crate::peer_ages::PEER_TIME_VALID, ConditionStatus::False),
+    (crate::gateway_ages::GATEWAY_AGES_REJECTED, ConditionStatus::True),
+    (crate::peer_reach::PEER_SIGNALS_REACHABLE, ConditionStatus::False),
+    (crate::peer_reach::PEER_CATALOGS_ACCEPTED, ConditionStatus::False),
+    (crate::peer_membership::PEER_MEMBERSHIP, ConditionStatus::False),
+    (crate::peer_reach::PEER_POLLS_COMPLETE, ConditionStatus::False),
 ];
 
 /// The network's roll-up: the enrollment step's and the renewal loop's conditions gate it, and
@@ -2094,7 +2094,11 @@ fn enrollment_gates(held: &[Condition], stamp: rollup::Stamp<'_>) -> Vec<Conditi
         .iter()
         .map(|type_| {
             held_condition(held, type_).cloned().unwrap_or_else(|| {
-                let unwritten = ("Unknown", "AwaitingFirstCheck", "not evaluated yet".to_owned());
+                let unwritten = (
+                    ConditionStatus::Unknown,
+                    "AwaitingFirstCheck",
+                    "not evaluated yet".to_owned(),
+                );
                 rollup::condition(&[], type_, unwritten, stamp)
             })
         })
@@ -8958,7 +8962,7 @@ mod tests {
         let mut independently_owned = baseline.clone();
         independently_owned.conditions = vec![Condition {
             type_: crate::peer_ages::PEER_TIME_VALID.to_owned(),
-            status: "False".to_owned(),
+            status: ConditionStatus::False,
             reason: "TimestampOutOfRange".to_owned(),
             ..Default::default()
         }];
@@ -8987,14 +8991,14 @@ mod tests {
     }
 
     /// A network holding `conditions` as `(type, status, reason)`.
-    fn network_holding(conditions: &[(&str, &str, &str)]) -> GridNetwork {
+    fn network_holding(conditions: &[(&str, ConditionStatus, &str)]) -> GridNetwork {
         let mut network = base_network();
         network.status = Some(GridNetworkStatus {
             conditions: conditions
                 .iter()
                 .map(|(type_, status, reason)| Condition {
                     type_: (*type_).to_owned(),
-                    status: (*status).to_owned(),
+                    status: *status,
                     reason: (*reason).to_owned(),
                     ..Condition::default()
                 })
@@ -9009,7 +9013,7 @@ mod tests {
         network_rollup(network)
             .into_iter()
             .find(|condition| condition.type_ == type_)
-            .map(|condition| (condition.status, condition.reason))
+            .map(|condition| (condition.status.to_string(), condition.reason))
     }
 
     #[test]
@@ -9017,10 +9021,14 @@ mod tests {
         let network = network_holding(&[
             (
                 crate::gateway_ages::GATEWAY_AGES_REJECTED,
-                "True",
+                ConditionStatus::True,
                 "GatewayAgesRejected",
             ),
-            (crate::peer_ages::PEER_TIME_VALID, "False", "TimestampOutOfRange"),
+            (
+                crate::peer_ages::PEER_TIME_VALID,
+                ConditionStatus::False,
+                "TimestampOutOfRange",
+            ),
         ]);
         let pair = |status: &str, reason: &str| Some((status.to_owned(), reason.to_owned()));
         assert_eq!(
@@ -9035,26 +9043,26 @@ mod tests {
     fn available_copies_the_first_failing_enrollment_gate_in_order() {
         use crate::enroll::local::{ACCEPTED, ENROLLED, IDENTITY_VALID, RESOLVED_REFS, ROTATION_ON_SCHEDULE};
         let pair = |status: &str, reason: &str| Some((status.to_owned(), reason.to_owned()));
-        let gates = |identity: (&'static str, &'static str)| {
+        let gates = |identity: (ConditionStatus, &'static str)| {
             network_holding(&[
-                (ROTATION_ON_SCHEDULE, "False", "RenewalFailing"),
-                (ENROLLED, "True", "Issued"),
-                (ACCEPTED, "True", ACCEPTED),
-                (RESOLVED_REFS, "False", "RefNotFound"),
+                (ROTATION_ON_SCHEDULE, ConditionStatus::False, "RenewalFailing"),
+                (ENROLLED, ConditionStatus::True, "Issued"),
+                (ACCEPTED, ConditionStatus::True, ACCEPTED),
+                (RESOLVED_REFS, ConditionStatus::False, "RefNotFound"),
                 (IDENTITY_VALID, identity.0, identity.1),
             ])
         };
-        let held = gates(("Unknown", "AwaitingFirstAttempt"));
+        let held = gates((ConditionStatus::Unknown, "AwaitingFirstAttempt"));
         assert_eq!(
             rolled_up(&held, "Available"),
             pair("False", "RefNotFound"),
             "ResolvedRefs comes first"
         );
-        let mut valid = gates(("True", IDENTITY_VALID));
+        let mut valid = gates((ConditionStatus::True, IDENTITY_VALID));
         if let Some(status) = valid.status.as_mut() {
             for condition in &mut status.conditions {
                 if condition.type_ == RESOLVED_REFS {
-                    condition.status = "True".to_owned();
+                    condition.status = ConditionStatus::True;
                     condition.reason = RESOLVED_REFS.to_owned();
                 }
             }
@@ -9077,17 +9085,17 @@ mod tests {
         let pair = |status: &str, reason: &str| Some((status.to_owned(), reason.to_owned()));
         let enrolled = |status, reason| network_holding(&[(ENROLLED, status, reason)]);
         assert_eq!(
-            rolled_up(&enrolled("Unknown", ENROLLING), "Progressing"),
+            rolled_up(&enrolled(ConditionStatus::Unknown, ENROLLING), "Progressing"),
             pair("True", ENROLLING)
         );
         assert_eq!(
-            rolled_up(&enrolled("False", "InviteMaybeSpent"), "Progressing"),
+            rolled_up(&enrolled(ConditionStatus::False, "InviteMaybeSpent"), "Progressing"),
             pair("True", RETRYING)
         );
         for (status, reason) in [
-            ("False", "AwaitingInvite"),
-            ("False", "InviteInvalid"),
-            ("True", "Issued"),
+            (ConditionStatus::False, "AwaitingInvite"),
+            (ConditionStatus::False, "InviteInvalid"),
+            (ConditionStatus::True, "Issued"),
         ] {
             assert_eq!(
                 rolled_up(&enrolled(status, reason), "Progressing").map(|(status, _)| status),
@@ -9107,7 +9115,7 @@ mod tests {
             (PEER_MEMBERSHIP, crate::peer_membership::PEER_MEMBERSHIP_MISMATCH),
             (peer_reach::PEER_POLLS_COMPLETE, peer_reach::POLL_ROUND_OVERRUN),
         ] {
-            let failing = network_holding(&[(type_, "False", reason)]);
+            let failing = network_holding(&[(type_, ConditionStatus::False, reason)]);
             assert_eq!(
                 rolled_up(&failing, "Degraded"),
                 pair("True", reason),
@@ -9118,7 +9126,7 @@ mod tests {
                 Some(reason),
                 "{type_} never gates Available"
             );
-            let clear = network_holding(&[(type_, "True", type_)]);
+            let clear = network_holding(&[(type_, ConditionStatus::True, type_)]);
             assert_eq!(
                 rolled_up(&clear, "Degraded").map(|(status, _)| status).as_deref(),
                 Some("False"),
@@ -9128,10 +9136,14 @@ mod tests {
         let both = network_holding(&[
             (
                 peer_reach::PEER_SIGNALS_REACHABLE,
-                "False",
+                ConditionStatus::False,
                 peer_reach::PEERS_UNREACHABLE,
             ),
-            (crate::peer_ages::PEER_TIME_VALID, "False", "TimestampOutOfRange"),
+            (
+                crate::peer_ages::PEER_TIME_VALID,
+                ConditionStatus::False,
+                "TimestampOutOfRange",
+            ),
         ]);
         assert_eq!(
             rolled_up(&both, "Degraded"),
@@ -9151,7 +9163,7 @@ mod tests {
     fn rejected_gateway_ages_degrade() {
         let network = network_holding(&[(
             crate::gateway_ages::GATEWAY_AGES_REJECTED,
-            "True",
+            ConditionStatus::True,
             "GatewayAgesRejected",
         )]);
         let degraded = rolled_up(&network, "Degraded");
@@ -9168,7 +9180,7 @@ mod tests {
         let with_condition = GridNetworkStatus {
             conditions: vec![Condition {
                 type_: crate::peer_ages::PEER_TIME_VALID.to_owned(),
-                status: "True".to_owned(),
+                status: ConditionStatus::True,
                 ..Condition::default()
             }],
             ..baseline.clone()

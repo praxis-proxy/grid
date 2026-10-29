@@ -20,7 +20,7 @@ use kube::{
 use crate::{
     crd::{
         grid_network::{GatewayAgeReport, GridNetwork},
-        inference_provider::Condition,
+        inference_provider::{Condition, ConditionStatus},
     },
     metrics::{GatewayFeedbackEvent, record_gateway_feedback},
     shutdown::Shutdown,
@@ -333,11 +333,11 @@ fn condition(
 ) -> Condition {
     let rejecting = reports.iter().filter(|held| held.rejected).collect::<Vec<_>>();
     let (standing, reason) = if rejecting.iter().any(|held| freshness.contains(held)) {
-        ("True", "GatewayAgesRejected")
+        (ConditionStatus::True, "GatewayAgesRejected")
     } else if uncertain || !rejecting.is_empty() {
-        ("Unknown", "GatewayEvidenceStale")
+        (ConditionStatus::Unknown, "GatewayEvidenceStale")
     } else {
-        ("False", "GatewayAgesAccepted")
+        (ConditionStatus::False, "GatewayAgesAccepted")
     };
     let labels = rejecting
         .iter()
@@ -357,7 +357,7 @@ fn condition(
     });
     Condition {
         type_: GATEWAY_AGES_REJECTED.to_owned(),
-        status: standing.to_owned(),
+        status: standing,
         reason: reason.to_owned(),
         message,
         last_transition_time: held

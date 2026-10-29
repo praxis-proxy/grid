@@ -276,6 +276,11 @@ func checkEnumValuesInGenerated(t *testing.T, crdFile string, schema map[string]
 	if schema == nil {
 		return
 	}
+	// A metav1.Condition-shaped schema is generated as metav1.Condition, whose
+	// status enum constants live in apimachinery, not in zz_generated_types.go.
+	if isConditionSchema(schema) {
+		return
+	}
 	if st, _ := schema["type"].(string); st == "string" {
 		if enum, _ := schema["enum"].([]interface{}); len(enum) > 0 {
 			for _, v := range enum {
@@ -299,6 +304,21 @@ func checkEnumValuesInGenerated(t *testing.T, crdFile string, schema map[string]
 	if items, ok := schema["items"].(map[string]interface{}); ok {
 		checkEnumValuesInGenerated(t, crdFile, items, generated)
 	}
+}
+
+// isConditionSchema reports whether schema has exactly the metav1.Condition
+// properties, the shape gen-types maps to metav1.Condition.
+func isConditionSchema(schema map[string]interface{}) bool {
+	props, _ := schema["properties"].(map[string]interface{})
+	if len(props) != 6 {
+		return false
+	}
+	for _, want := range []string{"lastTransitionTime", "message", "observedGeneration", "reason", "status", "type"} {
+		if _, ok := props[want]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func dig(m map[string]interface{}, keys ...string) interface{} {

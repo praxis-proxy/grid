@@ -77,8 +77,8 @@ use crate::{
         grid_network::GridNetwork,
         grid_site::GridSite,
         inference_provider::{
-            Condition, HealthCheckConfig, InferenceProvider, InferenceProviderSpec, InferenceProviderStatus,
-            ModelDiscoveryConfig, ProviderPhase,
+            Condition, ConditionStatus, HealthCheckConfig, InferenceProvider, InferenceProviderSpec,
+            InferenceProviderStatus, ModelDiscoveryConfig, ProviderPhase,
         },
     },
     error::OperatorError,
@@ -176,7 +176,7 @@ fn provider_conditions(provider: &InferenceProvider, refs: Refs, phase_reason: O
     let resolved = rollup::condition(held, RESOLVED_REFS, resolved, stamp);
     let live = endpoint_live_gate(held, stamp);
     let degraded = find(readiness::METRICS_REACHABLE_CONDITION)
-        .filter(|condition| condition.status == "False")
+        .filter(|condition| condition.status == ConditionStatus::False)
         .map(|condition| (condition.reason.as_str(), condition.message.as_str()));
     let trio = rollup::trio(held, &[&accepted, &resolved, &live], (degraded, None), stamp);
     [accepted, resolved].into_iter().chain(trio).collect()
@@ -189,7 +189,7 @@ fn endpoint_live_gate(held: &[Condition], stamp: rollup::Stamp<'_>) -> Condition
         .cloned()
         .unwrap_or_else(|| {
             let awaiting = (
-                "Unknown",
+                ConditionStatus::Unknown,
                 "AwaitingFirstCheck",
                 "awaiting the first readiness pass".to_owned(),
             );
@@ -198,13 +198,13 @@ fn endpoint_live_gate(held: &[Condition], stamp: rollup::Stamp<'_>) -> Condition
 }
 
 /// `Accepted` as `(status, reason, message)`.
-fn accepted_verdict(provider: &InferenceProvider) -> (&'static str, &'static str, String) {
+fn accepted_verdict(provider: &InferenceProvider) -> (ConditionStatus, &'static str, String) {
     if let Some(why) = validate_provider_config(provider) {
-        ("False", "Invalid", format!("the spec has a {why}"))
+        (ConditionStatus::False, "Invalid", format!("the spec has a {why}"))
     } else if let Err(error) = credentials::credential_plan_from_auth(provider.spec.auth.as_ref()) {
-        ("False", "Invalid", format!("spec.auth: {error}"))
+        (ConditionStatus::False, "Invalid", format!("spec.auth: {error}"))
     } else {
-        ("True", ACCEPTED, String::new())
+        (ConditionStatus::True, ACCEPTED, String::new())
     }
 }
 
@@ -213,21 +213,21 @@ fn resolved_verdict(
     provider: &InferenceProvider,
     refs: Refs,
     phase_reason: Option<&str>,
-) -> (&'static str, &'static str, String) {
+) -> (ConditionStatus, &'static str, String) {
     match refs {
-        Refs::Resolved => ("True", RESOLVED_REFS, String::new()),
+        Refs::Resolved => (ConditionStatus::True, RESOLVED_REFS, String::new()),
         Refs::NetworkMissing => (
-            "False",
+            ConditionStatus::False,
             "BackendNotFound",
             format!("GridNetwork {:?} does not exist", provider.spec.grid_network_ref),
         ),
         Refs::NoSitesMatched => (
-            "False",
+            ConditionStatus::False,
             "NoSitesMatched",
             "siteSelector matches no site in the network".to_owned(),
         ),
         Refs::NotChecked => (
-            "Unknown",
+            ConditionStatus::Unknown,
             "NotEvaluated",
             format!("not resolved while {}", phase_reason.unwrap_or("the spec is invalid")),
         ),
@@ -1107,7 +1107,7 @@ mod tests {
         let changed_conditions = InferenceProviderStatus {
             conditions: vec![Condition {
                 type_: "Ready".to_owned(),
-                status: "False".to_owned(),
+                status: ConditionStatus::False,
                 ..Default::default()
             }],
             ..baseline.clone()
@@ -1262,9 +1262,9 @@ mod tests {
     #[test]
     fn endpoint_live_gates_available_and_a_metrics_failure_degrades() {
         let mut provider = test_provider("p", "grid", &["m"]);
-        let held = |type_: &str, status: &str, reason: &str| Condition {
+        let held = |type_: &str, status: ConditionStatus, reason: &str| Condition {
             type_: type_.to_owned(),
-            status: status.to_owned(),
+            status,
             reason: reason.to_owned(),
             ..Condition::default()
         };
@@ -1275,8 +1275,16 @@ mod tests {
         );
         provider.status = Some(InferenceProviderStatus {
             conditions: vec![
-                held(readiness::ENDPOINT_LIVE_CONDITION, "True", "EndpointLive"),
-                held(readiness::METRICS_REACHABLE_CONDITION, "False", "ScrapeFailed"),
+                held(
+                    readiness::ENDPOINT_LIVE_CONDITION,
+                    ConditionStatus::True,
+                    "EndpointLive",
+                ),
+                held(
+                    readiness::METRICS_REACHABLE_CONDITION,
+                    ConditionStatus::False,
+                    "ScrapeFailed",
+                ),
             ],
             ..InferenceProviderStatus::default()
         });

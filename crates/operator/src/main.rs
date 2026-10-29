@@ -74,7 +74,7 @@ use operator::{
         agent_tool_provider::AgentToolProvider,
         grid_network::{GridNetwork, SignalMode},
         grid_site::GridSite,
-        inference_provider::InferenceProvider,
+        inference_provider::{Condition, ConditionStatus, InferenceProvider},
     },
     error::OperatorError,
     gateway,
@@ -1097,22 +1097,22 @@ fn swim_cleared(name: &str) -> serde_json::Value {
 }
 
 /// The [`SWIM_CONDITION`] condition: `True` while SWIM runs, `False` with the cause when it cannot.
-fn swim_condition(
-    unavailable: Option<&SwimFailure>,
-    now: &str,
-    generation: Option<i64>,
-) -> operator::crd::inference_provider::Condition {
+fn swim_condition(unavailable: Option<&SwimFailure>, now: &str, generation: Option<i64>) -> Condition {
     let (status, reason, message) = match unavailable {
         Some(failure) => (
-            "False",
+            ConditionStatus::False,
             failure.reason,
             format!("SWIM is not running: {}", failure.cause),
         ),
-        None => ("True", SWIM_CONDITION, "SWIM membership gossip is running".to_owned()),
+        None => (
+            ConditionStatus::True,
+            SWIM_CONDITION,
+            "SWIM membership gossip is running".to_owned(),
+        ),
     };
-    operator::crd::inference_provider::Condition {
+    Condition {
         type_: SWIM_CONDITION.to_owned(),
-        status: status.to_owned(),
+        status,
         reason: reason.to_owned(),
         message,
         last_transition_time: now.to_owned(),
@@ -4496,7 +4496,7 @@ mod tests {
         assert_eq!(
             ages.condition(std::slice::from_ref(&live), "t1", Some(1))
                 .map(|condition| condition.status),
-            Some("True".to_owned()),
+            Some(ConditionStatus::True),
             "a genuinely empty snapshot after convergence clears rejection"
         );
     }
@@ -7336,14 +7336,22 @@ mod tests {
                 .iter()
                 .find(|held| held.type_ == "PeerTimeValid")
                 .expect("peer condition preserved");
-            assert_eq!(peer.status, "False", "gateway publication cannot recover the peer");
+            assert_eq!(
+                peer.status,
+                ConditionStatus::False,
+                "gateway publication cannot recover the peer"
+            );
             assert_eq!(peer.reason, "TimestampOutOfRange", "peer reason preserved");
             let gateway = status
                 .conditions
                 .iter()
                 .find(|held| held.type_ == "GatewayAgesRejected")
                 .expect("gateway condition persisted");
-            assert_eq!(gateway.status, "True", "fresh gateway rejection persisted");
+            assert_eq!(
+                gateway.status,
+                ConditionStatus::True,
+                "fresh gateway rejection persisted"
+            );
             assert_eq!(status.gateway_age_reports.len(), 1, "one durable reporter");
             assert!(
                 status

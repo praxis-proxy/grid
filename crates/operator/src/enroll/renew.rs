@@ -24,7 +24,10 @@ use super::{
 };
 use crate::{
     controller::grid_network::GridModes,
-    crd::grid_network::{GridNetwork, PeerTrustMode},
+    crd::{
+        grid_network::{GridNetwork, PeerTrustMode},
+        inference_provider::ConditionStatus,
+    },
     metrics,
     operator_config::{BundleRef, ConfigWatch, Loaded, Rotation, Section, SignerEndpoint, Snapshot},
     shutdown::Shutdown,
@@ -985,7 +988,7 @@ impl Trust {
     /// What `Accepted` says when the signer's rotation is Enabled under this trust.
     fn refusal(&self) -> Verdict {
         Verdict::new(
-            "False",
+            ConditionStatus::False,
             "RotationUnsupportedUnderPinTrust",
             format!(
                 "site.signerEndpoint.rotation is Enabled but {}, which does not renew; set rotation Disabled or \
@@ -1305,26 +1308,30 @@ fn enrolled_verdict(round: &Round, identity: &Identity, target: &Target, enrolle
 /// What `IdentityValid` says about `identity`.
 fn identity_verdict(identity: &Identity) -> Verdict {
     match identity {
-        Identity::Missing(what) => Verdict::new("False", "IdentityMissing", format!("site identity absent: {what}")),
-        Identity::Unreadable(why) => Verdict::new("False", "CertificateUnreadable", why.clone()),
+        Identity::Missing(what) => Verdict::new(
+            ConditionStatus::False,
+            "IdentityMissing",
+            format!("site identity absent: {what}"),
+        ),
+        Identity::Unreadable(why) => Verdict::new(ConditionStatus::False, "CertificateUnreadable", why.clone()),
         Identity::Expired(at) => Verdict::new(
-            "False",
+            ConditionStatus::False,
             "CertificateExpired",
             format!("the site identity expired at {at}; re-enroll this site with a new site token"),
         ),
         Identity::Unusable => Verdict::new(
-            "False",
+            ConditionStatus::False,
             "CertificateUnusable",
             "the certificate lacks the X.509-SVID profile peers under spiffe trust require; re-enroll through a \
              current signer"
                 .to_owned(),
         ),
-        Identity::Untrusted(why) => Verdict::new("False", "CertificateUntrusted", why.clone()),
-        Identity::NameMismatch(why) => Verdict::new("False", "CertificateNameMismatch", why.clone()),
-        Identity::KeyMismatch(why) => Verdict::new("False", "CertificateKeyMismatch", why.clone()),
-        Identity::Unservable(reason, why) => Verdict::new("False", *reason, why.clone()),
+        Identity::Untrusted(why) => Verdict::new(ConditionStatus::False, "CertificateUntrusted", why.clone()),
+        Identity::NameMismatch(why) => Verdict::new(ConditionStatus::False, "CertificateNameMismatch", why.clone()),
+        Identity::KeyMismatch(why) => Verdict::new(ConditionStatus::False, "CertificateKeyMismatch", why.clone()),
+        Identity::Unservable(reason, why) => Verdict::new(ConditionStatus::False, *reason, why.clone()),
         Identity::Valid(at, fingerprint) => Verdict::new(
-            "True",
+            ConditionStatus::True,
             local::IDENTITY_VALID,
             format!("{} is the expiry; fingerprint sha256:{fingerprint}", rfc3339(*at)),
         ),
@@ -1336,19 +1343,25 @@ fn identity_verdict(identity: &Identity) -> Verdict {
 fn rotation_verdict(checked: &Result<Checked, RenewError>, url: Option<&String>) -> Verdict {
     match checked {
         Err(error @ (RenewError::Unauthenticated(_) | RenewError::Refused(_))) => {
-            Verdict::new("False", "RenewalRefused", error.to_string())
+            Verdict::new(ConditionStatus::False, "RenewalRefused", error.to_string())
         },
-        Err(error @ RenewError::SignerDisabled(_)) => Verdict::new("False", "RotationOverdue", error.to_string()),
-        Err(error @ RenewError::Untrusted(_)) => Verdict::new("False", "SignerUntrusted", error.to_string()),
-        Err(error @ RenewError::SignerLapsed(_)) => Verdict::new("False", "SignerLapsed", error.to_string()),
+        Err(error @ RenewError::SignerDisabled(_)) => {
+            Verdict::new(ConditionStatus::False, "RotationOverdue", error.to_string())
+        },
+        Err(error @ RenewError::Untrusted(_)) => {
+            Verdict::new(ConditionStatus::False, "SignerUntrusted", error.to_string())
+        },
+        Err(error @ RenewError::SignerLapsed(_)) => {
+            Verdict::new(ConditionStatus::False, "SignerLapsed", error.to_string())
+        },
         Err(error @ RenewError::NeedsPassthrough(_)) => {
-            Verdict::new("False", "RenewalNeedsPassthrough", error.to_string())
+            Verdict::new(ConditionStatus::False, "RenewalNeedsPassthrough", error.to_string())
         },
-        Err(error) => Verdict::new("False", "RenewalFailing", error.to_string()),
+        Err(error) => Verdict::new(ConditionStatus::False, "RenewalFailing", error.to_string()),
         Ok(Checked::Waiting(at)) => on_schedule(url, Some(*at)),
         Ok(Checked::Renewed(_)) => on_schedule(url, None),
         Ok(Checked::Expired(at)) => Verdict::new(
-            "False",
+            ConditionStatus::False,
             "RotationOverdue",
             format!("the site identity expired at {at} and cannot renew; re-enroll this site with a new site token"),
         ),
@@ -1361,7 +1374,7 @@ fn rotation_verdict(checked: &Result<Checked, RenewError>, url: Option<&String>)
 fn on_schedule(url: Option<&String>, due: Option<OffsetDateTime>) -> Verdict {
     let Some(url) = url else {
         return Verdict::new(
-            "False",
+            ConditionStatus::False,
             "RenewalFailing",
             "renewal went through no named signer".to_owned(),
         );
@@ -1370,29 +1383,33 @@ fn on_schedule(url: Option<&String>, due: Option<OffsetDateTime>) -> Verdict {
         Some(at) => format!("renews at {} through {url}, from site.signerEndpoint", rfc3339(at)),
         None => format!("renewed through {url}, from site.signerEndpoint"),
     };
-    Verdict::new("True", local::ROTATION_ON_SCHEDULE, message)
+    Verdict::new(ConditionStatus::True, local::ROTATION_ON_SCHEDULE, message)
 }
 
 /// What `RotationOnSchedule` says while the operator does not renew for `why`, with renewal
 /// `due` and `renewer` the cert-manager Certificate the Secret names, if any. A refused config
 /// is not evaluated until renewal falls due, so it never reads as a choice.
 fn off_verdict(why: Off, due: Due, renewer: Option<&str>) -> Verdict {
-    let overdue = |message: String| Verdict::new("False", "RotationOverdue", message);
+    let overdue = |message: String| Verdict::new(ConditionStatus::False, "RotationOverdue", message);
     match (why, due, renewer) {
-        (Off::Refused, Due::At(_), _) => Verdict::new("Unknown", "NotEvaluated", why.message().to_owned()),
+        (Off::Refused, Due::At(_), _) => {
+            Verdict::new(ConditionStatus::Unknown, "NotEvaluated", why.message().to_owned())
+        },
         (Off::Refused, Due::Now | Due::Expired, _) => overdue(
             "renewal is overdue and held back: the operator config is refused for this site, see Accepted".to_owned(),
         ),
-        (Off::UnsupportedUnderPin, Due::At(_), _) => {
-            Verdict::new("True", local::ROTATION_ON_SCHEDULE, why.message().to_owned())
-        },
+        (Off::UnsupportedUnderPin, Due::At(_), _) => Verdict::new(
+            ConditionStatus::True,
+            local::ROTATION_ON_SCHEDULE,
+            why.message().to_owned(),
+        ),
         (Off::NoSigner | Off::Disabled, Due::At(_), Some(certificate)) => Verdict::new(
-            "True",
+            ConditionStatus::True,
             local::ROTATION_ON_SCHEDULE,
             format!("renewed by cert-manager Certificate {certificate}"),
         ),
         (Off::NoSigner | Off::Disabled, Due::At(_), None) => Verdict::new(
-            "True",
+            ConditionStatus::True,
             local::ROTATION_ON_SCHEDULE,
             format!(
                 "{}: nothing is known to renew this identity; it is kept until it expires",

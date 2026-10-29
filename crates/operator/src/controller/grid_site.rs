@@ -25,6 +25,7 @@ use crate::{
     crd::{
         grid_network::{GridNetwork, PeerTrustMode},
         grid_site::{EgressTlsMode, GridSite, GridSitePhase, GridSiteStatus},
+        inference_provider::ConditionStatus,
     },
     error::OperatorError,
     resources::{
@@ -675,18 +676,20 @@ pub(crate) const CONNECTED: &str = "Connected";
 fn connected_verdict<'step>(
     reason: &str,
     message: &'step str,
-) -> ((&'static str, String, String), Option<rollup::Cause<'step>>) {
+) -> ((ConditionStatus, String, String), Option<rollup::Cause<'step>>) {
     let probing = Some(("Probing", message));
     let (status, reason, moving) = match reason {
-        "TlsVerified" | "AdvertisedCertMismatch" => return (("True", CONNECTED.to_owned(), String::new()), None),
-        "GatewayAddressKnown" => ("Unknown", "AwaitingFirstCheck", probing),
+        "TlsVerified" | "AdvertisedCertMismatch" => {
+            return ((ConditionStatus::True, CONNECTED.to_owned(), String::new()), None);
+        },
+        "GatewayAddressKnown" => (ConditionStatus::Unknown, "AwaitingFirstCheck", probing),
         // The probe on the edited address failed to connect, and the next probe retries it.
-        "SpecUnverified" => ("False", "Unreachable", probing),
-        "GatewayAddressMissing" => ("False", "AddressMissing", None),
-        "GossipedAddressRefused" => ("False", "AddressRefused", None),
-        "ConnectTimeout" | "ConnectionFailed" | "PlaintextUnreachable" => ("False", "Unreachable", None),
-        "HandshakeTimeout" | "TlsProtocolError" => ("False", "TLSProtocolError", None),
-        other => ("False", other, None),
+        "SpecUnverified" => (ConditionStatus::False, "Unreachable", probing),
+        "GatewayAddressMissing" => (ConditionStatus::False, "AddressMissing", None),
+        "GossipedAddressRefused" => (ConditionStatus::False, "AddressRefused", None),
+        "ConnectTimeout" | "ConnectionFailed" | "PlaintextUnreachable" => (ConditionStatus::False, "Unreachable", None),
+        "HandshakeTimeout" | "TlsProtocolError" => (ConditionStatus::False, "TLSProtocolError", None),
+        other => (ConditionStatus::False, other, None),
     };
     ((status, reason.to_owned(), message.to_owned()), moving)
 }
@@ -702,7 +705,9 @@ fn peer_concern(held: &[crate::crd::inference_provider::Condition]) -> Option<(S
     .iter()
     .find_map(|type_| {
         held.iter().find(|held| {
-            held.type_ == *type_ && held.status == "False" && held.reason != crate::peer_reach::EGRESS_ONLY
+            held.type_ == *type_
+                && held.status == ConditionStatus::False
+                && held.reason != crate::peer_reach::EGRESS_ONLY
         })
     })
     .map(|bad| (bad.reason.clone(), format!("{}: {}", bad.type_, bad.message)))
@@ -835,7 +840,7 @@ mod tests {
     fn an_egress_only_peer_is_not_degraded_but_a_refused_catalog_still_is() {
         let held = |reason: &str| crate::crd::inference_provider::Condition {
             type_: crate::peer_reach::SIGNALS_REACHABLE.to_owned(),
-            status: "False".to_owned(),
+            status: ConditionStatus::False,
             reason: reason.to_owned(),
             message: "m".to_owned(),
             last_transition_time: "t".to_owned(),
@@ -938,7 +943,7 @@ mod tests {
     fn connected_for(reason: &str) -> (&'static str, String, Option<&'static str>) {
         let ((status, connected, _), moving) = connected_verdict(reason, "detail");
         (
-            status,
+            status.as_str(),
             connected,
             moving.map(|(probing, _)| if probing == "Probing" { "Probing" } else { "other" }),
         )

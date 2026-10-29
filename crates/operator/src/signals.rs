@@ -2436,6 +2436,7 @@ fn relay_age(date_ms: i64, stamp_ms: i64) -> Option<Duration> {
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+    use crate::crd::inference_provider::ConditionStatus;
 
     #[test]
     fn a_restarted_site_catches_up_once_every_peer_is_held_or_long_silent() {
@@ -3156,7 +3157,7 @@ mod tests {
             &answered,
         );
         let condition = ages.condition(&[], "t0", Some(1)).expect("raised");
-        assert_eq!(condition.status, "False", "{condition:?}");
+        assert_eq!(condition.status, ConditionStatus::False, "{condition:?}");
         assert!(
             condition.message.contains("from ahead, ancient:"),
             "the peers stamping past their Date and a day behind it are named, the clean one is not: {}",

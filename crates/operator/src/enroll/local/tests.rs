@@ -361,7 +361,7 @@ fn rolled_up(world: &Arc<Mutex<World>>, type_: &str) -> (String, String) {
     rolled
         .into_iter()
         .find(|condition| condition.type_ == type_)
-        .map(|condition| (condition.status, condition.reason))
+        .map(|condition| (condition.status.to_string(), condition.reason))
         .expect("rolled up")
 }
 

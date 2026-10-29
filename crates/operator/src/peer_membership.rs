@@ -10,7 +10,10 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::crd::{grid_network::GridNetwork, inference_provider::Condition};
+use crate::crd::{
+    grid_network::GridNetwork,
+    inference_provider::{Condition, ConditionStatus},
+};
 
 /// The condition's type.
 pub const PEER_MEMBERSHIP: &str = "PeerMembership";
@@ -72,9 +75,9 @@ impl PeerMemberships {
     ) -> Option<Condition> {
         let held = current.iter().find(|held| held.type_ == PEER_MEMBERSHIP);
         let (status, reason) = if self.mismatched.is_empty() {
-            ("True", PEER_MEMBERSHIP_MATCHES)
+            (ConditionStatus::True, PEER_MEMBERSHIP_MATCHES)
         } else {
-            ("False", PEER_MEMBERSHIP_MISMATCH)
+            (ConditionStatus::False, PEER_MEMBERSHIP_MISMATCH)
         };
         let message = self.message(ours);
         if held.is_some_and(|held| {
@@ -90,7 +93,7 @@ impl PeerMemberships {
             .map_or_else(|| now_rfc3339.to_owned(), |held| held.last_transition_time.clone());
         Some(Condition {
             type_: PEER_MEMBERSHIP.to_owned(),
-            status: status.to_owned(),
+            status,
             reason: reason.to_owned(),
             message,
             last_transition_time,

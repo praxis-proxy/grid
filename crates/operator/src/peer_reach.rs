@@ -8,7 +8,11 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::{
-    crd::{grid_network::GridNetwork, grid_site::GridSite, inference_provider::Condition},
+    crd::{
+        grid_network::GridNetwork,
+        grid_site::GridSite,
+        inference_provider::{Condition, ConditionStatus},
+    },
     signals::Unreachable,
     site_providers::Verdict,
 };
@@ -301,10 +305,10 @@ impl PeerReach {
             .filter(|judged| !matches!(judged, Judged::Awaiting | Judged::EgressOnly | Judged::Skipped))
             .count();
         let (status, reason, message) = if failing == 0 {
-            ("True", self.kind.type_, self.kind.clear.to_owned())
+            (ConditionStatus::True, self.kind.type_, self.kind.clear.to_owned())
         } else {
             (
-                "False",
+                ConditionStatus::False,
                 self.kind.reason,
                 format!("{failing} of {checked} {}", self.kind.counted),
             )
@@ -318,14 +322,22 @@ impl PeerReach {
     }
 
     /// The condition `site` should carry: `None` when this round did not judge it.
-    fn site_condition(&self, site: &str) -> Option<(&'static str, &'static str, String)> {
+    fn site_condition(&self, site: &str) -> Option<(ConditionStatus, &'static str, String)> {
         Some(match self.peers.get(site)? {
-            Judged::Clear => ("True", self.kind.site_type, self.kind.site_clear.to_owned()),
-            Judged::Noted(note) => ("True", self.kind.site_type, format!("{}; {note}", self.kind.site_clear)),
-            Judged::Failing(reason, message) => ("False", *reason, message.clone()),
-            Judged::EgressOnly => ("False", EGRESS_ONLY, NO_ENDPOINT.to_owned()),
+            Judged::Clear => (
+                ConditionStatus::True,
+                self.kind.site_type,
+                self.kind.site_clear.to_owned(),
+            ),
+            Judged::Noted(note) => (
+                ConditionStatus::True,
+                self.kind.site_type,
+                format!("{}; {note}", self.kind.site_clear),
+            ),
+            Judged::Failing(reason, message) => (ConditionStatus::False, *reason, message.clone()),
+            Judged::EgressOnly => (ConditionStatus::False, EGRESS_ONLY, NO_ENDPOINT.to_owned()),
             Judged::Awaiting | Judged::Skipped => (
-                "Unknown",
+                ConditionStatus::Unknown,
                 AWAITING_FIRST_CHECK,
                 "not yet answered or failed a poll".to_owned(),
             ),
@@ -367,7 +379,7 @@ impl PeerReach {
 /// `type_` as `status`, `reason` and `message` over `current`, `None` when it already says this.
 fn stamp(
     current: &[Condition],
-    (type_, status, reason, message): (&str, &str, &str, String),
+    (type_, status, reason, message): (&str, ConditionStatus, &str, String),
     now_rfc3339: &str,
     generation: Option<i64>,
 ) -> Option<Condition> {
@@ -385,7 +397,7 @@ fn stamp(
         .map_or_else(|| now_rfc3339.to_owned(), |held| held.last_transition_time.clone());
     Some(Condition {
         type_: type_.to_owned(),
-        status: status.to_owned(),
+        status,
         reason: reason.to_owned(),
         message,
         last_transition_time,
@@ -414,10 +426,14 @@ pub fn polls_condition(
     now_rfc3339: &str,
 ) -> Option<Condition> {
     let (status, reason, message) = if skipped == 0 {
-        ("True", PEER_POLLS_COMPLETE, "each round polls every peer".to_owned())
+        (
+            ConditionStatus::True,
+            PEER_POLLS_COMPLETE,
+            "each round polls every peer".to_owned(),
+        )
     } else {
         (
-            "False",
+            ConditionStatus::False,
             POLL_ROUND_OVERRUN,
             format!(
                 "{skipped} of {judged} peers not polled within the round: lengthen the round or raise the dial \
@@ -483,9 +499,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        AWAITING_FIRST_CHECK, CATALOG_ACCEPTED, CATALOGS, CATALOGS_REFUSED, EGRESS_ONLY, MISSES_BEFORE_UNREACHABLE,
-        Misses, NO_ENDPOINT, PEER_CATALOGS_ACCEPTED, PEER_POLLS_COMPLETE, PEER_SIGNALS_REACHABLE, PEERS_UNREACHABLE,
-        POLL_ROUND_OVERRUN, PeerReach, REACH, SIGNALS_REACHABLE, polls_condition,
+        AWAITING_FIRST_CHECK, CATALOG_ACCEPTED, CATALOGS, CATALOGS_REFUSED, ConditionStatus, EGRESS_ONLY,
+        MISSES_BEFORE_UNREACHABLE, Misses, NO_ENDPOINT, PEER_CATALOGS_ACCEPTED, PEER_POLLS_COMPLETE,
+        PEER_SIGNALS_REACHABLE, PEERS_UNREACHABLE, POLL_ROUND_OVERRUN, PeerReach, REACH, SIGNALS_REACHABLE,
+        polls_condition,
     };
     use crate::{
         crd::{
@@ -610,7 +627,7 @@ mod tests {
             reach.site_patch(&site("hub", Vec::new()), "t").is_none(),
             "the own GridSite carries no peer-reach condition"
         );
-        assert_eq!(condition(&reach).status, "True", "and is not counted");
+        assert_eq!(condition(&reach).status, ConditionStatus::True, "and is not counted");
     }
 
     /// Each peer's reason after one round over `peers`, `answered` the ones that answered.
