@@ -860,7 +860,8 @@ async fn publish_pending_withdrawals(
                 tracing::info!(%grid_id, revision, "published GridNetwork withdrawal");
             },
             Err(error) => {
-                tracing::warn!(%grid_id, %error, "GridNetwork withdrawal completed locally, unpublished");
+                tracing::warn!(%grid_id, %error, "GridNetwork withdrawal remains pending until it can be signed");
+                continue;
             },
         }
         publish_state(state_tx, node);

@@ -79,8 +79,23 @@ key also clears retained state for that origin so previously accepted data
 cannot remain associated with a newly rejected identity.
 
 Deleting a `GridNetwork` publishes a signed withdrawal, then drops that grid's
-signer and peer keys. A site with no usable signer cannot sign the withdrawal:
-it completes the deletion locally, and peers keep its state until it ages out.
+signer and peer keys. If the signer is unavailable or withdrawal signing fails,
+the withdrawal remains pending and the deletion finalizer stays in place until
+the runtime can publish the signed empty state. The runtime stops republishing
+the prior provider state while the withdrawal is pending.
+
+## Known provider-scope limitation
+
+The signature authenticates the origin site and `grid_id`, but provider records
+also carry a `network_id`. The receiver currently does not verify that each
+provider `network_id` is authorized for the authenticated `grid_id`. A trusted
+site in one grid can therefore sign a provider record labeled with another
+network name, and that record can enter shared state under that name. Routing
+still requires the site's `GridSite` in that network to pass the normal
+routing-eligibility checks, but signed gossip does not yet provide isolation
+between those provider-network scopes. Do not rely on it for cross-grid provider
+isolation; binding each grid identity to its allowed provider-network IDs needs
+a follow-up change.
 
 ## Routing remains a separate decision
 
