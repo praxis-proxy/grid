@@ -764,6 +764,19 @@ func (in *GridNetworkConsumerGatewaysItem) DeepCopy() *GridNetworkConsumerGatewa
 	return out
 }
 
+func (in *GridNetworkMembership) DeepCopyInto(out *GridNetworkMembership) {
+	*out = *in
+}
+
+func (in *GridNetworkMembership) DeepCopy() *GridNetworkMembership {
+	if in == nil {
+		return nil
+	}
+	out := new(GridNetworkMembership)
+	in.DeepCopyInto(out)
+	return out
+}
+
 func (in *GridNetworkPeerTrust) DeepCopyInto(out *GridNetworkPeerTrust) {
 	*out = *in
 }
@@ -898,6 +911,10 @@ func (in *GridNetworkSpec) DeepCopyInto(out *GridNetworkSpec) {
 		for i := range in.ConsumerGateways {
 			in.ConsumerGateways[i].DeepCopyInto(&out.ConsumerGateways[i])
 		}
+	}
+	if in.Membership != nil {
+		out.Membership = new(GridNetworkMembership)
+		in.Membership.DeepCopyInto(out.Membership)
 	}
 	if in.MetricsRefreshInterval != nil {
 		x := *in.MetricsRefreshInterval

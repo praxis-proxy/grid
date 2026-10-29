@@ -1466,11 +1466,11 @@ fn declared_trust(networks: &[GridNetwork], install: GridModes) -> Trust {
             ),
         },
         [network] => Trust {
-            renews: GridModes::of(network).renews(),
+            renews: GridModes::of(network, install.membership).renews(),
             declared: format!(
                 "GridNetwork {} declares peerTrust.mode {}",
                 network.metadata.name.as_deref().unwrap_or_default(),
-                mode(GridModes::of(network))
+                mode(GridModes::of(network, install.membership))
             ),
         },
         // One operator serves one grid: with several declared, renew under none of them.

@@ -4,6 +4,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use clap::{Args, Parser};
 
+pub use crate::crd::grid_network::MembershipMode as Membership;
 use crate::{
     crd::grid_network::{PeerTrustMode, SignalMode},
     gateway,
@@ -93,44 +94,11 @@ pub struct LeaderArgs {
     pub node_name: Option<String>,
 }
 
-/// Where this site learns its members from.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
-pub enum Membership {
-    /// SWIM gossip discovers the members.
-    #[default]
-    #[value(name = "Swim")]
-    Swim,
-    /// This site's configuration lists its peers as `GridSite` objects, and their signals are
-    /// polled.
-    #[value(name = "Local")]
-    Local,
-}
-
-impl Membership {
-    /// The mode `name` names, ignoring case and surrounding space, `None` for any other value.
-    #[must_use]
-    pub fn parse(name: &str) -> Option<Self> {
-        let name = name.trim();
-        [Self::Swim, Self::Local]
-            .into_iter()
-            .find(|mode| mode.as_str().eq_ignore_ascii_case(name))
-    }
-
-    /// The name the chart and the signals response use.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Swim => "Swim",
-            Self::Local => "Local",
-        }
-    }
-}
-
 /// Grid-wide modes the install declares, used until its `GridNetwork` exists.
 #[derive(Args, Debug, Clone)]
 #[group(id = "grid")]
 pub struct GridArgs {
-    /// Where this site learns its members from, the chart's grid.membership.source.
+    /// Membership fallback when `GridNetwork.spec.membership` is absent.
     #[arg(
         long = "membership-source",
         env = "GRID_MEMBERSHIP_SOURCE",

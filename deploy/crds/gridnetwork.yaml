@@ -1890,6 +1890,21 @@ spec:
                   maxLength: 63
                   pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$
                   type: string
+                membership:
+                  description: |-
+                    Grid-wide membership source. When absent, the install's startup setting applies.
+                    A change causes the operator to restart gracefully into the declared mode.
+                  nullable: true
+                  properties:
+                    mode:
+                      description: 'Membership source. Local requires `signalTransport.mode: poll`.'
+                      enum:
+                        - Swim
+                        - Local
+                      type: string
+                  required:
+                    - mode
+                  type: object
                 metricsRefreshInterval:
                   description: |-
                     Maximum time between metric refreshes and score/ranking recalculation.
@@ -2197,6 +2212,8 @@ spec:
                   rule: has(self.placementPolicy) == (has(self.selectionPolicy) && self.selectionPolicy.mode == 'weightedRandom')
                 - message: gridId cannot change once set
                   rule: '!has(oldSelf.gridId) || oldSelf.gridId == '''' || (has(self.gridId) && self.gridId == oldSelf.gridId)'
+                - message: membership.mode Local requires signalTransport.mode poll
+                  rule: '!has(self.membership) || self.membership.mode != ''Local'' || (has(self.signalTransport) && self.signalTransport.mode == ''poll'')'
                 - message: set only `gatewayRefs` or `consumerGateways`, not both
                   rule: '!(has(self.gatewayRefs) && has(self.consumerGateways))'
             status:

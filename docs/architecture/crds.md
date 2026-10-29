@@ -270,12 +270,30 @@ membership the operator removes the condition, since SWIM never runs there.
 | `False` | `StartFailed` | The runtime failed to start, binding its socket included; retried after 300 s. |
 | `True` | `Swim` | SWIM runs. |
 
-**Membership source:** the chart value `grid.membership.source`, the operator's
-`GRID_MEMBERSHIP_SOURCE`, says where a site learns its members. It is install
-configuration, not a `GridNetwork` field. `Swim`, the default, discovers members by SWIM
-gossip. `Local` means this site's configuration lists its peers as `GridSite` objects.
-Local needs poll signals: an unset transport starts in poll, and gossip fails the render
-and the operator's startup. Both are supported peer options.
+**Membership mode:** `spec.membership.mode` selects how a site learns its
+members. `Swim` discovers members by SWIM gossip. `Local` uses the site's
+declared `GridSite` objects and requires `spec.signalTransport.mode: poll`:
+
+```yaml
+spec:
+  membership:
+    mode: Local
+  signalTransport:
+    mode: poll
+```
+
+An explicit mode overrides the install's `GRID_MEMBERSHIP_SOURCE`. When the
+field is absent, the install setting applies, defaulting to `Swim`. Changing
+the mode, including removing an override, gracefully restarts the operator
+to apply the new selection. A declared `Local` mode disables SWIM even when
+the platform Deployment still sets `GRID_SWIM_BIND_ADDR`; the Deployment
+does not need to change. Local requires reachable peer signals endpoints
+and matching identities, independently of how those resources are delivered.
+
+The `grid-operator` and `grid-site` charts write this field from their existing
+`grid.membership.source` value. Under `Local` they also default signals to
+poll and reject contradictory gossip settings. Install-only Local mode
+continues to reject an explicitly configured SWIM bind address.
 
 Local assumes something outside the grid delivers every site's `GridSite` records, the
 same set to every member. The operator discovers no peers in this mode. It polls the

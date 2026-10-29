@@ -176,6 +176,14 @@ const (
 	GridNetworkConsumerGatewaysItemPraxisConfigSiteRouterGridSiteRoute    GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter = "gridSiteRoute"
 )
 
+// GridNetworkMembershipMode is a string enumeration.
+type GridNetworkMembershipMode string
+
+const (
+	GridNetworkMembershipModeSWIM  GridNetworkMembershipMode = "Swim"
+	GridNetworkMembershipModeLocal GridNetworkMembershipMode = "Local"
+)
+
 // PeerTrustMode is a string enumeration.
 type PeerTrustMode string
 
@@ -619,6 +627,12 @@ type GridNetworkConsumerGatewaysItem struct {
 	LocalSiteName *string `json:"localSiteName,omitempty"`
 }
 
+// GridNetworkMembership Grid-wide membership source. When absent, the install's startup setting applies. A change causes the operator to restart gracefully into the declared mode.
+type GridNetworkMembership struct {
+	// Membership source. Local requires signalTransport.mode: poll.
+	Mode GridNetworkMembershipMode `json:"mode"`
+}
+
 // GridNetworkPeerTrust Grid-wide peer trust on the signals path, pin when absent, read at operator start.
 type GridNetworkPeerTrust struct {
 	// Peer trust mode.
@@ -691,6 +705,8 @@ type GridNetworkSpec struct {
 	ConsumerGateways []GridNetworkConsumerGatewaysItem `json:"consumerGateways,omitempty"`
 	// The grid this network belongs to, set once. Empty only while unset: an install with no operator config site section then mints one, and one with a site section holds the grid runtime until it is set. Moving to another grid means recreating the network.
 	GridID string `json:"gridId,omitempty"`
+	// Grid-wide membership source. When absent, the install's startup setting applies. A change causes the operator to restart gracefully into the declared mode.
+	Membership *GridNetworkMembership `json:"membership,omitempty"`
 	// Maximum time between metric refreshes and score/ranking recalculation.
 	// This controls the GridNetwork reconcile cadence for provider metrics; it does not change request-path routing or the overlay watch latency. Use a duration of at least one second, such as "10s" or "1500ms". The default cadence is 300 seconds. TLS-protected provider metrics cap the cadence at 60 seconds for bounded certificate-rotation detection.
 	MetricsRefreshInterval *string `json:"metricsRefreshInterval,omitempty"`

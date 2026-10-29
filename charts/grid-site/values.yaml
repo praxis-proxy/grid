@@ -40,7 +40,7 @@ gridNetwork:
 grid:
   membership:
     # -- Where this site learns its members, Swim or Local, as the grid-operator chart's
-    # grid.membership.source. Local writes poll signals and no discovery or SWIM key to the
+    # grid.membership.source. Writes GridNetwork.spec.membership.mode. Local writes poll signals and no discovery or SWIM key to the
     # GridNetwork, and every peer is polled at the endpoint derived from its address.
     source: Swim
 

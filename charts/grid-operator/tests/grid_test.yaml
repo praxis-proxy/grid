@@ -35,6 +35,7 @@ tests:
           path: spec
           value:
             gridId: lab
+            membership: {mode: Swim}
             seeds: ["192.0.2.10:7946"]
             signalTransport: {mode: poll}
             peerTrust: {mode: spiffe}

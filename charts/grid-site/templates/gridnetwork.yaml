@@ -18,6 +18,8 @@ spec:
   with "spec: Required value" on both create and update.
   */}}
   gridId: {{ .Values.gridNetwork.gridId | quote }}
+  membership:
+    mode: {{ .Values.grid.membership.source | quote }}
   {{- with .Values.gridNetwork.region }}
   region: {{ . | quote }}
   {{- end }}

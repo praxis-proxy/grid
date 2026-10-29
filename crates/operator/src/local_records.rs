@@ -11,7 +11,10 @@ use kube::{
 use crate::{
     controller::grid_network::GridModes,
     crd::{
-        grid_network::{GridNetwork, GridNetworkSpec, PeerTrustConfig, SecretRef, SignalTransportConfig, TlsConfig},
+        grid_network::{
+            GridNetwork, GridNetworkSpec, MembershipConfig, PeerTrustConfig, SecretRef, SignalTransportConfig,
+            TlsConfig,
+        },
         grid_site::{GridSite, GridSiteSpec},
     },
     error::OperatorError,
@@ -80,6 +83,9 @@ pub fn grid_network(plan: &Plan) -> Result<GridNetwork, OperatorError> {
         mode: plan.modes.signal,
     });
     spec.peer_trust = Some(PeerTrustConfig { mode: plan.modes.trust });
+    spec.membership = Some(MembershipConfig {
+        mode: plan.modes.membership,
+    });
     let mut network = GridNetwork::new(&plan.network, spec);
     network.metadata.labels = Some(created_by());
     Ok(network)
@@ -216,7 +222,7 @@ mod tests {
 
     use crate::{
         controller::grid_network::GridModes,
-        crd::grid_network::{PeerTrustMode, SignalMode},
+        crd::grid_network::{MembershipMode, PeerTrustMode, SignalMode},
         local_records::{CREATED_BY_LABEL, MARKER, Outcome, Plan, create, grid_network, grid_site},
         local_site::PROVIDER_SITE_LABEL,
         site_name::Identity,
@@ -286,9 +292,14 @@ mod tests {
 
     #[test]
     fn the_network_declares_the_install_modes() {
-        let network = grid_network(&plan(None)).expect("network");
-        assert_eq!(network.spec.signal_transport.map(|t| t.mode), Some(SignalMode::Poll));
-        assert_eq!(network.spec.peer_trust.map(|t| t.mode), Some(PeerTrustMode::Pin));
+        for membership in [MembershipMode::Swim, MembershipMode::Local] {
+            let mut plan = plan(None);
+            plan.modes = plan.modes.with_membership(membership);
+            let network = grid_network(&plan).expect("network");
+            assert_eq!(network.spec.membership.map(|m| m.mode), Some(membership));
+            assert_eq!(network.spec.signal_transport.map(|t| t.mode), Some(SignalMode::Poll));
+            assert_eq!(network.spec.peer_trust.map(|t| t.mode), Some(PeerTrustMode::Pin));
+        }
     }
 
     #[test]

@@ -21,7 +21,7 @@ grid:
     # endpoint derived from each gateway. Local assumes something outside the grid delivers
     # every site's GridSite records, the same set to every member, and discovers no peers. Local runs no SWIM: no SWIM Service, port or
     # seeds, poll signals on the signals Service, and every contradicting value fails the
-    # render. An unset grid.signals renders poll under Local.
+    # render. An unset grid.signals renders poll under Local. Also writes GridNetwork.spec.membership.mode when grid.id is set.
     source: Swim
   # -- Peer trust, pin or spiffe. Empty keeps the GridNetwork default, pin. The operator
   # also starts in it before any GridNetwork exists, so set it to match the grid.

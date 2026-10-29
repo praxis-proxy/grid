@@ -169,10 +169,50 @@ pub struct SelectionPolicyConfig {
     pub mode: SelectionMode,
 }
 
+/// Where a site learns its members from.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize, clap::ValueEnum)]
+pub enum MembershipMode {
+    /// SWIM gossip discovers the members.
+    #[default]
+    #[value(name = "Swim")]
+    Swim,
+    /// Declared `GridSite` objects supply peers, whose catalogs and signals are polled over HTTPS.
+    #[value(name = "Local")]
+    Local,
+}
+
+impl MembershipMode {
+    /// The mode `name` names, ignoring case and surrounding space, `None` for any other value.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        let name = name.trim();
+        [Self::Swim, Self::Local]
+            .into_iter()
+            .find(|mode| mode.as_str().eq_ignore_ascii_case(name))
+    }
+
+    /// The name the API, charts, and signals response use.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Swim => "Swim",
+            Self::Local => "Local",
+        }
+    }
+}
+
+/// Grid-wide membership selection, overriding the install's startup setting when present.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct MembershipConfig {
+    /// Membership source. Local requires `signalTransport.mode: poll`.
+    pub mode: MembershipMode,
+}
+
 /// How signals propagate across the sites of a grid.
 ///
-/// The mode names the dissemination path, not the transport: SWIM membership
-/// runs in both modes. Only where the load signal travels changes.
+/// SWIM membership can use either path; Local membership requires polling.
 #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "camelCase")]
 pub enum SignalMode {
@@ -606,6 +646,9 @@ fn add_tls_config_legacy_fields(schema: &mut schemars::Schema) {
 }, {
     "rule": "!has(oldSelf.gridId) || oldSelf.gridId == '' || (has(self.gridId) && self.gridId == oldSelf.gridId)",
     "message": "gridId cannot change once set"
+}, {
+    "rule": "!has(self.membership) || self.membership.mode != 'Local' || (has(self.signalTransport) && self.signalTransport.mode == 'poll')",
+    "message": "membership.mode Local requires signalTransport.mode poll"
 }]))]
 #[schemars(transform = add_grid_network_spec_legacy_fields)]
 #[serde(rename_all = "camelCase")]
@@ -687,6 +730,11 @@ pub struct GridNetworkSpec {
     /// selection override and Praxis uses deterministic selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_policy: Option<SelectionPolicyConfig>,
+
+    /// Grid-wide membership source. When absent, the install's startup setting applies.
+    /// A change causes the operator to restart gracefully into the declared mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership: Option<MembershipConfig>,
 
     /// Grid-wide signal transport.
     ///
@@ -3084,6 +3132,35 @@ mod tests {
             std::process::abort();
         };
         assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn membership_round_trips_without_defaulting_absent_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let bare: GridNetworkSpec = serde_json::from_value(serde_json::json!({}))?;
+        assert!(bare.membership.is_none(), "legacy networks retain the install setting");
+        assert!(serde_json::to_value(bare)?.get("membership").is_none());
+        for (value, mode) in [("Local", MembershipMode::Local), ("Swim", MembershipMode::Swim)] {
+            let spec: GridNetworkSpec = serde_json::from_value(serde_json::json!({
+                "membership": {"mode": value}, "signalTransport": {"mode": "poll"}
+            }))?;
+            assert_eq!(spec.membership.as_ref().map(|policy| policy.mode), Some(mode));
+            assert_eq!(
+                serde_json::to_value(spec)?.pointer("/membership/mode"),
+                Some(&serde_json::json!(value))
+            );
+        }
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"mode": "local"}),
+            serde_json::json!({"mode": "Other"}),
+            serde_json::json!({"mode": "Local", "extra": true}),
+        ] {
+            let error = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({"membership": invalid}))
+                .err()
+                .ok_or("invalid membership was accepted")?;
+            assert!(error.is_data());
+        }
+        Ok(())
     }
 
     #[test]

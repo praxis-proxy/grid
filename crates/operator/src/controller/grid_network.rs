@@ -37,7 +37,7 @@ use crate::{
         agent_tool_provider::AgentToolProvider,
         grid_network::{
             ClusterEndpointConfig, ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork,
-            GridNetworkPhase, GridNetworkStatus, MountReconciliation, MountReconciliationPhase,
+            GridNetworkPhase, GridNetworkStatus, MembershipMode, MountReconciliation, MountReconciliationPhase,
             MountReconciliationStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode, SiteRouter,
             TenantBudgetStatus, TransportMode,
         },
@@ -196,6 +196,9 @@ pub struct OperatorCtx {
     /// How this site learns its members.
     membership: crate::cli::Membership,
 
+    /// Membership selected by the install when the network omits its override.
+    membership_fallback: MembershipMode,
+
     /// The last value logged per state, so a pass logs at INFO only what changed.
     pub(crate) logged: ChangeLog,
 
@@ -237,6 +240,8 @@ fn send_declared_trust(sender: &tokio::sync::watch::Sender<PeerTrustMode>, decla
 /// Grid-wide modes, fixed for the life of the process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridModes {
+    /// Membership discovery.
+    pub membership: MembershipMode,
     /// Signal propagation.
     pub signal: SignalMode,
     /// Peer authorization on the signals path.
@@ -246,6 +251,7 @@ pub struct GridModes {
 impl GridModes {
     /// Without a `GridNetwork`: SPIFFE trust in the Grid CA identity, never an implicit pin.
     pub const WITHOUT_NETWORK: Self = Self {
+        membership: MembershipMode::Swim,
         signal: SignalMode::Gossip,
         trust: PeerTrustMode::Spiffe,
     };
@@ -256,15 +262,28 @@ impl GridModes {
     #[must_use]
     pub fn without_network(signal: Option<SignalMode>, trust: Option<PeerTrustMode>) -> Self {
         Self {
+            membership: Self::WITHOUT_NETWORK.membership,
             signal: signal.unwrap_or(Self::WITHOUT_NETWORK.signal),
             trust: trust.unwrap_or(Self::WITHOUT_NETWORK.trust),
         }
     }
 
-    /// The modes `network` declares, defaults for absent fields.
+    /// Select the install's membership before a network overrides it.
     #[must_use]
-    pub fn of(network: &GridNetwork) -> Self {
+    pub const fn with_membership(mut self, membership: MembershipMode) -> Self {
+        self.membership = membership;
+        self
+    }
+
+    /// The modes `network` declares, using `membership` when its override is absent.
+    #[must_use]
+    pub fn of(network: &GridNetwork, membership: MembershipMode) -> Self {
         Self {
+            membership: network
+                .spec
+                .membership
+                .as_ref()
+                .map_or(membership, |policy| policy.mode),
             signal: network
                 .spec
                 .signal_transport
@@ -283,11 +302,15 @@ impl GridModes {
 
     /// The modes to restart into when `network` declares other than `self`, the running modes.
     #[must_use]
-    pub fn restart_for(self, network: Option<&GridNetwork>) -> Option<Self> {
+    pub fn restart_for(self, network: Option<&GridNetwork>, membership_fallback: MembershipMode) -> Option<Self> {
         // Only the poll path reads trust, so a trust change under gossip needs no restart.
-        network.map(Self::of).filter(|declared| {
-            declared.signal != self.signal || (declared.signal == SignalMode::Poll && declared.trust != self.trust)
-        })
+        network
+            .map(|network| Self::of(network, membership_fallback))
+            .filter(|declared| {
+                declared.membership != self.membership
+                    || declared.signal != self.signal
+                    || (declared.signal == SignalMode::Poll && declared.trust != self.trust)
+            })
     }
 }
 
@@ -391,6 +414,7 @@ impl OperatorCtx {
             mode_restart: None,
             site_name: None,
             membership: crate::cli::Membership::Swim,
+            membership_fallback: MembershipMode::Swim,
             logged: ChangeLog::default(),
             started: Instant::now(),
         }
@@ -429,7 +453,7 @@ impl OperatorCtx {
     /// Publish the trust `network` declares, waking its watchers only on a change.
     fn publish_declared_trust(&self, network: &GridNetwork) {
         if let Some(sender) = &self.declared_trust {
-            send_declared_trust(sender, GridModes::of(network).trust);
+            send_declared_trust(sender, GridModes::of(network, self.membership_fallback).trust);
         }
     }
 
@@ -531,6 +555,14 @@ impl OperatorCtx {
     #[must_use]
     pub const fn with_membership(mut self, membership: crate::cli::Membership) -> Self {
         self.membership = membership;
+        self.membership_fallback = membership;
+        self
+    }
+
+    /// Restore the install's membership if the network override is removed.
+    #[must_use]
+    pub const fn with_membership_fallback(mut self, membership: MembershipMode) -> Self {
+        self.membership_fallback = membership;
         self
     }
 
@@ -1704,16 +1736,23 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // Modes are fixed at startup, so a change stands the process down and its restart applies it,
     // and nothing here runs under the old modes meanwhile.
     let running = GridModes {
+        membership: ctx.membership(),
         signal: ctx.signal_mode,
         trust: ctx.peer_settings.trust,
     };
-    if let Some(next) = running.restart_for(Some(&network)) {
+    let declared = GridModes::of(&network, ctx.membership_fallback);
+    if declared.membership == MembershipMode::Local && declared.signal != SignalMode::Poll {
+        return Err(OperatorError::InvalidResource(
+            "Local membership requires signalTransport.mode poll".to_owned(),
+        ));
+    }
+    if let Some(next) = running.restart_for(Some(&network), ctx.membership_fallback) {
         tracing::info!(
-            "GridNetwork {name} sets signalTransport={:?} peerTrust={:?}; running {:?}/{:?}; restarting to apply",
+            "GridNetwork {name} sets membership={:?} signalTransport={:?} peerTrust={:?}; running {:?}; restarting to apply",
+            next.membership,
             next.signal,
             next.trust,
-            running.signal,
-            running.trust
+            running
         );
         ctx.owe_restart(next);
         return Ok(Action::await_change());
@@ -2675,7 +2714,7 @@ async fn reconcile_routing_overlay_inner(
     owning_site: Option<&str>,
 ) -> Result<OverlayOutcome, OperatorError> {
     let network_name = grid_network_name(network)?;
-    let signal = GridModes::of(network).signal;
+    let signal = GridModes::of(network, MembershipMode::Swim).signal;
 
     // Every reconcile lists the sites, so the phase gauge follows each status change and deletion.
     let sites = list_all_grid_sites(client)
@@ -5755,7 +5794,7 @@ fn membership_staleness(
     providers: Vec<crdt::ProviderState>,
     membership: Option<&MembershipSnapshot>,
 ) -> Vec<crdt::ProviderState> {
-    if GridModes::of(network).signal == SignalMode::Poll {
+    if GridModes::of(network, MembershipMode::Swim).signal == SignalMode::Poll {
         return providers;
     }
     // Dead or Suspect members' providers go Degraded, so their candidates render fresh=false.
@@ -7109,24 +7148,33 @@ mod tests {
     #[test]
     fn modes_restart_only_when_a_grid_network_declares_others() {
         let running = GridModes::WITHOUT_NETWORK;
-        assert_eq!(running.restart_for(None), None, "no GridNetwork, no restart");
+        assert_eq!(
+            running.restart_for(None, MembershipMode::Swim),
+            None,
+            "no GridNetwork, no restart"
+        );
 
         let same = network_with_modes(&serde_json::json!({"peerTrust": {"mode": "spiffe"}}));
-        assert_eq!(running.restart_for(Some(&same)), None, "same modes, no restart");
+        assert_eq!(
+            running.restart_for(Some(&same), MembershipMode::Swim),
+            None,
+            "same modes, no restart"
+        );
 
         let poll = network_with_modes(&serde_json::json!({
             "peerTrust": {"mode": "spiffe"},
             "signalTransport": {"mode": "poll"},
         }));
         assert_eq!(
-            running.restart_for(Some(&poll)),
+            running.restart_for(Some(&poll), MembershipMode::Swim),
             Some(GridModes {
+                membership: MembershipMode::Swim,
                 signal: SignalMode::Poll,
                 trust: PeerTrustMode::Spiffe,
             })
         );
         assert_eq!(
-            GridModes::of(&poll).restart_for(Some(&poll)),
+            GridModes::of(&poll, MembershipMode::Swim).restart_for(Some(&poll), MembershipMode::Swim),
             None,
             "the restarted process runs what it declares, so it never loops"
         );
@@ -7136,7 +7184,7 @@ mod tests {
     fn a_trust_change_restarts_only_under_poll() {
         let pin = network_with_modes(&serde_json::json!({"peerTrust": {"mode": "pin"}}));
         assert_eq!(
-            GridModes::WITHOUT_NETWORK.restart_for(Some(&pin)),
+            GridModes::WITHOUT_NETWORK.restart_for(Some(&pin), MembershipMode::Swim),
             None,
             "gossip reads no trust, so a fresh install declaring pin does not restart"
         );
@@ -7149,9 +7197,72 @@ mod tests {
             "signalTransport": {"mode": "poll"},
         }));
         assert_eq!(
-            GridModes::of(&poll).restart_for(Some(&poll_pin)),
-            Some(GridModes::of(&poll_pin)),
+            GridModes::of(&poll, MembershipMode::Swim).restart_for(Some(&poll_pin), MembershipMode::Swim),
+            Some(GridModes::of(&poll_pin, MembershipMode::Swim)),
             "under poll a trust change restarts"
+        );
+    }
+
+    #[test]
+    fn membership_override_and_removal_resolve_against_the_install() {
+        let legacy = network_with_modes(&serde_json::json!({"signalTransport": {"mode": "poll"}}));
+        for mode in [MembershipMode::Swim, MembershipMode::Local] {
+            assert_eq!(GridModes::of(&legacy, mode).membership, mode);
+            assert_eq!(GridModes::of(&legacy, mode).restart_for(Some(&legacy), mode), None);
+        }
+        let declared = network_with_modes(&serde_json::json!({
+            "membership": {"mode": "Local"}, "signalTransport": {"mode": "poll"}
+        }));
+        let running = GridModes::of(&declared, MembershipMode::Swim);
+        assert_eq!(running.membership, MembershipMode::Local);
+        assert_eq!(running.restart_for(Some(&declared), MembershipMode::Swim), None);
+        assert_eq!(
+            running
+                .restart_for(Some(&legacy), MembershipMode::Swim)
+                .map(|next| next.membership),
+            Some(MembershipMode::Swim),
+            "removing the override restores the install setting"
+        );
+        assert_eq!(running.restart_for(Some(&legacy), MembershipMode::Local), None);
+    }
+
+    #[tokio::test]
+    async fn membership_changes_restart_before_reconciling_other_resources() -> Result<(), OperatorError> {
+        for (running, wanted) in [
+            (MembershipMode::Swim, MembershipMode::Local),
+            (MembershipMode::Local, MembershipMode::Swim),
+        ] {
+            let client = crate::resources::test_doubles::mock_kube_client_with_secrets(HashMap::new());
+            let (owed, mut restart) = tokio::sync::watch::channel(None);
+            let ctx = Arc::new(
+                OperatorCtx::new(client, None, SignalMode::Poll)
+                    .with_membership(running)
+                    .with_mode_restart(owed),
+            );
+            let network = network_with_modes(&serde_json::json!({
+                "membership": {"mode": wanted.as_str()},
+                "signalTransport": {"mode": "poll"}, "peerTrust": {"mode": "pin"}
+            }));
+            assert_eq!(
+                Box::pin(reconcile(Arc::new(network), ctx)).await?,
+                Action::await_change()
+            );
+            assert_eq!(restart.borrow_and_update().map(|next| next.membership), Some(wanted));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_membership_rejects_gossip_before_requesting_restart() {
+        let client = crate::resources::test_doubles::mock_kube_client_with_secrets(HashMap::new());
+        let (owed, restart) = tokio::sync::watch::channel(None);
+        let ctx = Arc::new(OperatorCtx::new(client, None, SignalMode::Gossip).with_mode_restart(owed));
+        let network = network_with_modes(&serde_json::json!({"membership": {"mode": "Local"}}));
+        assert!(matches!(Box::pin(reconcile(Arc::new(network), ctx)).await,
+                         Err(OperatorError::InvalidResource(message)) if message.contains("requires signalTransport.mode poll")));
+        assert!(
+            restart.borrow().is_none(),
+            "invalid modes must not cause a restart loop"
         );
     }
 
@@ -7164,12 +7275,14 @@ mod tests {
             "signalTransport": {"mode": "poll"},
         }));
         assert_eq!(
-            startup.restart_for(Some(&poll_pin)),
+            startup.restart_for(Some(&poll_pin), MembershipMode::Swim),
             None,
             "the network it declared needs no restart"
         );
         assert!(
-            GridModes::WITHOUT_NETWORK.restart_for(Some(&poll_pin)).is_some(),
+            GridModes::WITHOUT_NETWORK
+                .restart_for(Some(&poll_pin), MembershipMode::Swim)
+                .is_some(),
             "without the declared modes the same install restarts"
         );
         assert_eq!(
@@ -8789,6 +8902,7 @@ mod tests {
     #[test]
     fn only_spiffe_trust_renews() {
         let modes = |trust| GridModes {
+            membership: MembershipMode::Swim,
             signal: SignalMode::Gossip,
             trust,
         };

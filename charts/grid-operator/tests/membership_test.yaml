@@ -12,6 +12,13 @@ set:
   site.name: east
   grid.id: grid-a
 tests:
+  - it: Swim is declared on the GridNetwork by default
+    template: templates/gridnetwork.yaml
+    asserts:
+      - equal:
+          path: spec.membership.mode
+          value: Swim
+
   - it: Swim is the default and runs SWIM
     template: templates/deployment.yaml
     asserts:
@@ -84,6 +91,9 @@ tests:
     set:
       grid.membership.source: Local
     asserts:
+      - equal:
+          path: spec.membership.mode
+          value: Local
       - equal:
           path: spec.signalTransport.mode
           value: poll
