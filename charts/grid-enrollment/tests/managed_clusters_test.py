@@ -70,7 +70,7 @@ class ManagedClusterTemplates(unittest.TestCase):
                                 capture_output=True, check=True)
         return [d for d in yaml.safe_load_all(result.stdout) if d]
 
-    def render(self, suffix='', resources=None, cluster='west'):
+    def render(self, suffix='', resources=None, cluster='west', definitions_only=True):
         policy = self.policies[suffix]
         raw = policy.get('object-templates-raw') or yaml.safe_dump(policy['object-templates'])
         result = subprocess.run([self.renderer], input=json.dumps({
@@ -80,7 +80,8 @@ class ManagedClusterTemplates(unittest.TestCase):
         managed = subprocess.run([self.renderer], input=json.dumps({
             'Template': result.stdout, 'Managed': True,
             'Resources': ready_crds()}), text=True, capture_output=True, check=True)
-        return [obj['objectDefinition'] for obj in yaml.safe_load(managed.stdout)]
+        objects = yaml.safe_load(managed.stdout)
+        return [obj['objectDefinition'] for obj in objects] if definitions_only else objects
 
     def inventory(self):
         return {MC_KEY: {'items': [member('west'), member('east'), member('unselected', False),
@@ -123,6 +124,20 @@ class ManagedClusterTemplates(unittest.TestCase):
         self.assertEqual(peer['spec']['gatewayEndpoint']['tls']['serverName'], 'east.grid.internal')
         self.assertNotIn('status', peer)
         self.assertEqual(peer['metadata']['labels']['grid.praxis.fast/auto-discovered'], 'false')
+
+    def test_peer_spec_removes_legacy_alias_without_removing_controller_metadata(self):
+        objects = self.render(resources=self.inventory(), definitions_only=False)
+        peer, = [o for o in objects if o['objectDefinition']['kind'] == 'GridSite']
+        self.assertEqual(peer['complianceType'], 'mustonlyhave',
+                         'omitting egress from a musthave template retains its old value')
+        self.assertEqual(peer['metadataComplianceType'], 'musthave',
+                         'other controllers retain ownership of labels and annotations')
+        self.assertNotIn('egress', peer['objectDefinition']['spec'],
+                         'even egress:null conflicts with the gatewayEndpoint alias')
+        self.assertIn('gatewayEndpoint', peer['objectDefinition']['spec'])
+        self.assertNotIn('status', peer['objectDefinition'])
+        self.assertTrue(all(o['complianceType'] == 'musthave' for o in objects
+                            if o['objectDefinition']['kind'] != 'GridSite'))
 
     def test_endpoint_update_and_optional_field_removal(self):
         resources = self.inventory()

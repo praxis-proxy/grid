@@ -48,7 +48,8 @@
 {{hub if eq $field.name "sovereigntyZone" hub}}{{hub $sovereigntyZone = $field.fieldValue.string hub}}{{hub end hub}}
 {{hub end hub}}
 {{hub if and (eq $site $cluster.metadata.name) (eq $siteNetwork $network) (ne $gatewayAddress "") hub}}
-- complianceType: musthave
+- complianceType: mustonlyhave
+  metadataComplianceType: musthave
   objectDefinition:
     apiVersion: grid.praxis.fast/v1alpha1
     kind: GridSite
@@ -64,9 +65,8 @@
         tls:
           mode: Mutual
           serverName: {{hub if ne $gatewayServerName "" hub}}{{hub printf "%q" $gatewayServerName hub}}{{hub else hub}}{{hub printf "%q" (printf "%s.grid.internal" $site) hub}}{{hub end hub}}
-      # Clear fields that disappeared from the source instead of retaining an
-      # old endpoint or a certificate pin from a previous discovery mode.
-      egress: null
+      # Replace the peer spec to remove legacy aliases, including explicit nulls.
+      # Preserve controller-owned labels, annotations, and status.
       trust: null
       {{hub if or (ne $signalsAddress "") (ne $signalsServerName "") hub}}
       signalsEndpoint:
