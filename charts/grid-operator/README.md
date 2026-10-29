@@ -241,7 +241,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `tolerations` | list | `[]` | Pod tolerations. |
 | `topologySpreadConstraints` | list | `[]` | Topology spread constraints. |
 | `priorityClassName` | string | `""` | Pod priority class. |
-| `operatorConfig.create` | bool | `true` | Render the ConfigMap holding this operator's own settings. Set `false` to manage it yourself under `operatorConfig.name`. |
+| `operatorConfig.create` | bool | `true` | Render the ConfigMap holding this operator's own settings, when the `enrollment` values give it a site section. Without one nothing renders, the operator runs on defaults, and another writer may own the ConfigMap. Set `false` to manage it yourself under `operatorConfig.name`. |
 | `operatorConfig.name` | string | `grid-operator-config` | ConfigMap name, in the release namespace. The operator watches it, so an edit applies without a restart. |
 | `enrollment.enabled` | bool | `false` | This site enrolls: turns on the SWIM LoadBalancer Service, site-identity metrics TLS and the enrollment namespace guard, and renders the signer and the invite into the operator config's `site` section. |
 | `enrollment.url` | string | `""` | Signer base URL (https), `site.signerEndpoint.url`. Required unless `enrollment.hub` is set. Set alone on a hub whose identity bootstrap issued, it renders a `site` section that renews only. |

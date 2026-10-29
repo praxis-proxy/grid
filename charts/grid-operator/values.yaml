@@ -378,7 +378,7 @@ priorityClassName: ""
 # -- This operator's own settings: a ConfigMap in the release namespace, watched, so an edit
 # applies without a restart. The enrollment values render its site section.
 operatorConfig:
-  # -- Render the ConfigMap. Set false to manage it yourself under name.
+  # -- Render the ConfigMap when the enrollment values give it a site section. Set false to manage it yourself under name.
   create: true
   # -- ConfigMap name.
   name: grid-operator-config
