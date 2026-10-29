@@ -3838,20 +3838,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn withdrawal_completes_for_a_strict_grid_without_a_signer() {
+    async fn withdrawal_stays_pending_for_a_strict_grid_without_a_signer() {
         let addr = reserve_local_addr().await;
         let handle = start_test_runtime("site-a", addr, Vec::new(), 45_000).await;
         handle
+            .publish_state_broadcast(provider_broadcast(0.1).with_grid_id(Some("grid-delete".to_owned())))
+            .unwrap_or_else(|_| std::process::abort());
+        wait_until_provider_presence(&handle, "site-a", true).await;
+        handle
             .set_grid_trust_snapshot("grid-delete".to_owned(), None, Some(PeerPins::new()))
             .unwrap_or_else(|_| std::process::abort());
+        wait_until_provider_presence(&handle, "site-a", false).await;
 
         let receipt = handle
             .withdraw_scope("grid-delete".to_owned())
             .unwrap_or_else(|_| std::process::abort());
 
+        let outcome = tokio::time::timeout(Duration::from_millis(100), receipt).await;
         assert!(
-            matches!(tokio::time::timeout(Duration::from_secs(5), receipt).await, Ok(Ok(()))),
-            "an unsignable withdrawal must not hold the GridNetwork finalizer forever"
+            outcome.is_err(),
+            "an unsigned withdrawal must not acknowledge publication: {outcome:?}"
         );
         handle.leave(Duration::from_secs(1)).await;
     }
