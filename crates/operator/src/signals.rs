@@ -1310,26 +1310,22 @@ fn classify(error: &MetricsScrapeError) -> RequestOutcome {
 /// is worth retrying and the other will fail identically until a certificate is
 /// replaced. The chain is walked rather than the message matched, because an
 /// error string is not an interface.
-#[expect(clippy::wildcard_enum_match_arm, reason = "std::io::ErrorKind is non_exhaustive")]
 fn classify_transport(error: &(dyn std::error::Error + 'static)) -> RequestOutcome {
-    let mut current = Some(error);
-    while let Some(err) = current {
-        if tls_backend::is_tls_error(err) {
-            return RequestOutcome::Tls;
-        }
-        if let Some(io) = err.downcast_ref::<std::io::Error>() {
-            return match io.kind() {
-                std::io::ErrorKind::ConnectionRefused
-                | std::io::ErrorKind::HostUnreachable
-                | std::io::ErrorKind::NetworkUnreachable
-                | std::io::ErrorKind::ConnectionReset => RequestOutcome::Refused,
-                std::io::ErrorKind::TimedOut => RequestOutcome::Timeout,
-                _ => RequestOutcome::Transport,
-            };
-        }
-        current = err.source();
+    let (tls, io_kind) = tls_backend::transport_error_details(error);
+    if tls {
+        return RequestOutcome::Tls;
     }
-    RequestOutcome::Transport
+
+    match io_kind {
+        Some(
+            std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::ConnectionReset,
+        ) => RequestOutcome::Refused,
+        Some(std::io::ErrorKind::TimedOut) => RequestOutcome::Timeout,
+        Some(_) | None => RequestOutcome::Transport,
+    }
 }
 
 /// Delay before attempt `attempt`, counting the first retry as zero.
@@ -3816,10 +3812,9 @@ mod tests {
         assert!(!client.is_retryable() && server.is_retryable());
     }
 
+    /// Peer polling separates retryable refusal from a non-retryable trust failure.
     #[test]
     fn a_refused_connection_is_told_apart_from_a_trust_failure() {
-        // Both arrive as transport errors and call for opposite responses, so
-        // the chain is walked rather than the message matched.
         let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
         assert_eq!(classify_transport(&refused), RequestOutcome::Refused);
 
@@ -3827,7 +3822,12 @@ mod tests {
         let tls_err = rustls::Error::DecryptError;
         #[cfg(feature = "fips")]
         let tls_err = openssl::error::ErrorStack::get();
-        assert_eq!(classify_transport(&tls_err), RequestOutcome::Tls);
+        let wrapped = std::io::Error::new(std::io::ErrorKind::InvalidData, tls_err);
+        assert_eq!(
+            classify_transport(&wrapped),
+            RequestOutcome::Tls,
+            "the wrapped TLS failure should remain distinguishable from transport I/O"
+        );
     }
 
     /// Peer TLS material from a throwaway CA, for the config cache tests.

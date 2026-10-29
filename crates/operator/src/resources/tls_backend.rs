@@ -1547,6 +1547,34 @@ pub(crate) fn is_tls_error(err: &(dyn std::error::Error + 'static)) -> bool {
     err.downcast_ref::<openssl::ssl::Error>().is_some() || err.downcast_ref::<openssl::error::ErrorStack>().is_some()
 }
 
+/// Find the TLS marker and first meaningful I/O kind in a transport error chain.
+///
+/// An [`std::io::Error`] does not expose its wrapped error through the same
+/// path as every other error, so its inner value is followed explicitly. An
+/// outer kind is retained unless it is [`std::io::ErrorKind::Other`], in which
+/// case a more specific inner kind replaces it.
+pub(crate) fn transport_error_details(error: &(dyn std::error::Error + 'static)) -> (bool, Option<std::io::ErrorKind>) {
+    let mut current = Some(error);
+    let mut io_kind = None;
+    let mut tls = false;
+
+    while let Some(current_error) = current {
+        tls |= is_tls_error(current_error);
+        if let Some(io) = current_error.downcast_ref::<std::io::Error>() {
+            if io_kind.is_none() || io_kind == Some(std::io::ErrorKind::Other) {
+                io_kind = Some(io.kind());
+            }
+            current = io
+                .get_ref()
+                .map(|inner| -> &(dyn std::error::Error + 'static) { inner });
+        } else {
+            current = current_error.source();
+        }
+    }
+
+    (tls, io_kind)
+}
+
 /// Whether `err` is a server certificate refused only for its validity window, which the
 /// server can fix by rotating without anything on this side changing.
 #[cfg(not(feature = "fips"))]
@@ -1782,6 +1810,31 @@ mod tests {
             .await
             .expect("server finished")
             .expect("server task");
+    }
+}
+
+#[cfg(test)]
+mod transport_error_tests {
+    use std::io::{Error, ErrorKind};
+
+    use super::transport_error_details;
+
+    /// A specific outer I/O kind wins over an inner fallback kind.
+    #[test]
+    fn a_meaningful_outer_io_kind_is_preserved() {
+        for kind in [ErrorKind::TimedOut, ErrorKind::ConnectionRefused] {
+            let error = Error::new(kind, Error::other("inner"));
+            assert_eq!(transport_error_details(&error).1, Some(kind));
+        }
+    }
+
+    /// A specific inner I/O kind replaces an outer fallback kind.
+    #[test]
+    fn a_meaningful_inner_io_kind_replaces_outer_other() {
+        for kind in [ErrorKind::TimedOut, ErrorKind::ConnectionRefused] {
+            let error = Error::other(Error::new(kind, "inner"));
+            assert_eq!(transport_error_details(&error).1, Some(kind));
+        }
     }
 }
 
