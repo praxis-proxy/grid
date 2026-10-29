@@ -28,7 +28,7 @@ spec:
             name: {{ .serviceMonitor.caConfigMap.name | quote }}
             key: {{ .serviceMonitor.caConfigMap.key | quote }}
       metricRelabelings:
-        # Praxis names the upstream cluster "cluster", which ACM sets to the managed cluster.
+        # Reserve "cluster" for the managed cluster; Praxis uses it for the backend.
         - sourceLabels: [cluster]
           regex: "(.+)"
           targetLabel: backend

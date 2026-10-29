@@ -16,6 +16,13 @@ import yaml
 CHART = Path(__file__).resolve().parents[1]
 MC_KEY = 'cluster.open-cluster-management.io/v1/ManagedCluster//'
 WORK_PREFIX = 'work.open-cluster-management.io/v1/ManifestWork/'
+CRD_PREFIX = 'apiextensions.k8s.io/v1/CustomResourceDefinition//'
+
+
+def ready_crds():
+    return {CRD_PREFIX + name: {'status': {'conditions': [
+        {'type': 'Established', 'status': 'True'}]}}
+        for name in ('gridnetworks.grid.praxis.fast', 'gridsites.grid.praxis.fast')}
 
 
 def member(name, selected=True, cluster_set='default'):
@@ -70,7 +77,10 @@ class ManagedClusterTemplates(unittest.TestCase):
             'Template': raw, 'Cluster': cluster,
             'Resources': resources or {MC_KEY: {'items': []}}}),
             text=True, capture_output=True, check=True)
-        return [obj['objectDefinition'] for obj in yaml.safe_load(result.stdout)]
+        managed = subprocess.run([self.renderer], input=json.dumps({
+            'Template': result.stdout, 'Managed': True,
+            'Resources': ready_crds()}), text=True, capture_output=True, check=True)
+        return [obj['objectDefinition'] for obj in yaml.safe_load(managed.stdout)]
 
     def inventory(self):
         return {MC_KEY: {'items': [member('west'), member('east'), member('unselected', False),
@@ -84,6 +94,18 @@ class ManagedClusterTemplates(unittest.TestCase):
         config, = self.render()
         self.assertEqual(yaml.safe_load(config['data']['config.yaml']),
                          {'version': 1, 'site': {'name': 'west'}})
+
+    def test_peer_delivery_waits_for_crds_before_emitting_any_objects(self):
+        raw = self.policies['']['object-templates-raw']
+        hub = subprocess.run([self.renderer], input=json.dumps({
+            'Template': raw, 'Cluster': 'west', 'Resources': self.inventory()}),
+            text=True, capture_output=True, check=True)
+        managed = subprocess.run([self.renderer], input=json.dumps({
+            'Template': hub.stdout, 'Managed': True, 'Resources': {}}),
+            text=True, capture_output=True)
+        self.assertNotEqual(managed.returncode, 0)
+        self.assertEqual(managed.stdout, '')
+        self.assertIn('waiting for CRD gridnetworks.grid.praxis.fast', managed.stderr)
 
     def test_remote_only_selected_members(self):
         peer, = self.peers(self.inventory())
@@ -132,6 +154,21 @@ class ManagedClusterTemplates(unittest.TestCase):
             self.assertTrue(all(p['path'].startswith(('.spec.', '.metadata.'))
                                 for p in cfg['feedbackRules'][0]['jsonPaths']))
         self.assertFalse(any(o['kind'] == 'Secret' for o in objects))
+
+    def test_management_only_hub_is_separate_from_grid_membership(self):
+        resources = {MC_KEY: {'items': [member('local-cluster', False), member('east')]}}
+        objects = self.render('-hub', resources)
+        certs = [o for o in objects if o['kind'] == 'Certificate']
+        self.assertEqual([c['metadata']['name'] for c in certs], ['grid-site-east'])
+        observers = [o for o in objects if o['kind'] == 'ManifestWork']
+        self.assertEqual([o['metadata']['namespace'] for o in observers], ['east'])
+        placements = {d['metadata']['name']: d['spec'] for d in self.docs if d['kind'] == 'Placement'}
+        hub = placements['grid-bootstrap-membership-hub']['predicates'][0]
+        members = placements['grid-bootstrap-membership']['predicates'][0]
+        self.assertEqual(hub['requiredClusterSelector']['labelSelector']['matchLabels'],
+                         {'name': 'local-cluster'})
+        self.assertEqual(members['requiredClusterSelector']['labelSelector']['matchLabels'],
+                         {'grid.praxis.fast/member': 'true'})
 
     def test_observer_access_does_not_wait_for_hub_policy(self):
         for work_name in ('grid-site-observer', 'custom-observer'):
@@ -236,7 +273,7 @@ class ManagedClusterTemplates(unittest.TestCase):
         identities = {'v1/Secret/grid-system/grid-site-identity':
                       {'metadata': {'name': 'grid-site-identity'}},
                       'v1/Secret/grid-system/grid-ca': {'metadata': {'name': 'grid-ca'}}}
-        managed = execute(hub.stdout, identities, managed=True)
+        managed = execute(hub.stdout, {**ready_crds(), **identities}, managed=True)
         self.assertEqual(managed.returncode, 0, managed.stderr)
         objects = yaml.safe_load(managed.stdout)
         self.assertEqual(objects[0]['objectDefinition']['spec'], {
@@ -248,10 +285,21 @@ class ManagedClusterTemplates(unittest.TestCase):
                     'caSecretRef': {'name': 'grid-ca', 'namespace': 'grid-system'}},
             'consumerGateways': [{'name': 'grid-gateway', 'namespace': 'grid-system', 'siteName': 'west'}]})
         self.assertEqual(len(objects), 1)
-        missing = execute(hub.stdout, {}, managed=True)
+        for name in ('gridnetworks.grid.praxis.fast', 'gridsites.grid.praxis.fast'):
+            for conditions in (None, [], [{'type': 'Established', 'status': 'False'}]):
+                resources = {**ready_crds(), **identities}
+                if conditions is None:
+                    del resources[CRD_PREFIX + name]
+                else:
+                    resources[CRD_PREFIX + name] = {'status': {'conditions': conditions}}
+                blocked = execute(hub.stdout, resources, managed=True)
+                self.assertNotEqual(blocked.returncode, 0)
+                self.assertEqual(blocked.stdout, '', 'waiting must emit no objects to write')
+                self.assertIn('waiting for CRD ' + name, blocked.stderr)
+        missing = execute(hub.stdout, ready_crds(), managed=True)
         self.assertNotEqual(missing.returncode, 0)
         self.assertIn('waiting for the enrolled site identity', missing.stderr)
-        missing_ca = execute(hub.stdout, {'v1/Secret/grid-system/grid-site-identity':
+        missing_ca = execute(hub.stdout, {**ready_crds(), 'v1/Secret/grid-system/grid-site-identity':
                                          identities['v1/Secret/grid-system/grid-site-identity']}, managed=True)
         self.assertNotEqual(missing_ca.returncode, 0)
         self.assertIn('waiting for the grid trust bundle', missing_ca.stderr)

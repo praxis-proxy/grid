@@ -29,6 +29,7 @@ func main() {
 		},
 		"fromSecret": func(ns, name, key string) string { return ns + "/" + name + "/" + key },
 		"fail":       func(message string) (string, error) { return "", fmt.Errorf("%s", message) },
+		"list":       func(values ...any) []any { return values },
 	}
 	left, right := "{{hub", "hub}}"
 	if input.Managed {

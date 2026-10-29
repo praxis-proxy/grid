@@ -79,7 +79,7 @@ argocd.argoproj.io/sync-options: Prune=false,Delete=false
 {{- $_ := set $secrets $secret true -}}
 {{- if and $ext.delivery.enabled $site.cluster -}}
 {{- if gt (len (printf "%s.grid-identity-%s" $.Release.Namespace $name)) 63 -}}
-{{- fail "ACM requires namespace.grid-identity-site to fit within 63 characters" -}}
+{{- fail "Policy propagation requires namespace.grid-identity-site to fit within 63 characters" -}}
 {{- end -}}
 {{- if hasKey $clusters $site.cluster -}}
 {{- fail "external.delivery supports one site identity per managed cluster" -}}

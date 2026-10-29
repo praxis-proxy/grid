@@ -8,6 +8,14 @@ same lifecycle: bootstrap, enroll, and decommission.
 
 ## Bootstrap
 
+A management-only hub can host bootstrap and enrollment policies without local
+Grid workloads. The hub policy targets `managedClusters.hubClusterName`;
+grid membership uses the separate member-label selector. Leave that label off
+the hub to enroll only spokes. If the hub also hosts Grid workloads, select it
+as a member and it receives the same identity and GridNetwork as any other
+cluster. The hub needs the governance policy add-on and any optional PKI
+integration.
+
 Enable `gridIdentity.enabled` to create the grid ID once in the immutable
 `grid-bootstrap-state` ConfigMap. Bootstrap adopts the named GridNetwork's
 declared ID, or its legacy status ID, when one exists; otherwise it generates
@@ -15,23 +23,23 @@ a UUID v4. Retries reuse the saved value, including concurrent bootstrap runs.
 A malformed existing ConfigMap is an error, never a reason to mint another ID.
 Back up this ConfigMap with the CA and retain it through CA rotation.
 
-This bootstrap Job uses the enrollment image's `bootstrap` command with
-`--skip-ca` and has no Secret permissions. It works with either identity
-backend. Use an image that supports `--grid-id-config-map` before enabling it.
+In external mode the existing bootstrap Job uses `--skip-ca` and has no Secret
+permissions. In service mode that same Job also handles CA and credentials.
+Use an image that supports `--grid-id-config-map` before enabling it.
 For managed clusters, the enrollment policy creates a complete GridNetwork
 with the saved ID, Local membership, polling, SPIFFE trust, and references to
 the delivered identity and CA Secrets. It waits for those Secrets before
 creating the network. `managedClusters.gatewayName` defaults to `grid-gateway`;
 the gateway reference uses each cluster's name as its site name. Enrollment
-retains the network on decommission. Other delivery systems
-must copy the saved value into each member's GridNetwork (or the chart's
+retains the network on decommission. Other delivery systems must copy the saved
+value into each member's GridNetwork (or the chart's
 `grid.id` value). The ID is independent of the CA and is immutable once declared.
 
 For externally supplied identities, provision the shared trust bundle and the
 site identity Secrets through your PKI integration. The chart reads references;
-private keys never belong in values or Git. ACM delivery expects each identity
-Secret to contain `tls.crt` and `tls.key`, and the public trust Secret to contain
-`ca.crt` (or the configured `external.trustBundleSecretKey`).
+private keys never belong in values or Git. Managed-cluster delivery expects
+each identity Secret to contain `tls.crt` and `tls.key`, and the trust Secret
+to contain `ca.crt` (or the configured `external.trustBundleSecretKey`).
 
 Cert-manager is an optional integration, installed separately. An existing
 Issuer, ClusterIssuer, or external issuer can be referenced without the chart
@@ -105,7 +113,7 @@ usages. The optional integration creates ECDSA keys and renews them with the
 certificates. External issuers must permit this profile. Additional listener
 DNS names belong in `dnsNames`; they do not change the site's identity.
 
-ACM delivers the identity and public trust bundle only to the named managed
+The policy delivers the identity and public trust bundle only to the named managed
 cluster. Hub `fromSecret` templates encrypt Secret values; the CA signing key
 is never included in the delivery policy. Policies follow Secret updates, so
 renewal does not require a Helm hook. When the chart creates a CA Issuer, the
@@ -115,7 +123,7 @@ explicit public trust bundle is required, including with an external issuer.
 Leave `cluster` empty for an identity issued locally on the hub. Certificate
 Secrets always live in the release namespace; local identity consumers must
 read them there. Each managed cluster receives one identity. The chart rejects policy names
-whose namespace-qualified form exceeds ACM's 63-character label limit. Removing a site
+whose namespace-qualified form exceeds the 63-character policy label limit. Removing a site
 from this map alone is not a complete decommission operation.
 
 ## Managed clusters
@@ -123,14 +131,23 @@ from this map alone is not a complete decommission operation.
 Set `managedClusters.enabled: true` to bootstrap inventory-based enrollment and
 peer distribution. The chart can be deployed by Helm or a GitOps reconciler;
 there is no Argo-specific controller or ApplicationSet in this flow. This
-integration requires ACM/OCM Placement, governance policy, and ManifestWork APIs,
+integration requires Placement, governance policy, and ManifestWork APIs,
 including `ReadOnly` work with `feedbackScrapeType: Watch`. The hub must itself
 be registered with the governance policy add-on. All selected clusters need
 that add-on, the work agent, the Grid CRDs, and the Local-mode operator.
 
+The supported onboarding flow starts when a newly registered cluster is
+selected for membership. Platform deployment supplies its operator and CRDs.
+Before writing Grid custom resources, the enrollment policy waits for both
+the GridNetwork and GridSite CRDs to report `Established=True`. The watched
+lookups resume delivery when those CRDs become ready; identity delivery can
+proceed independently because it uses core Kubernetes resources.
+
 ```yaml
 mode: external
 fullnameOverride: grid-bootstrap
+gridIdentity:
+  enabled: true
 grid:
   membership:
     source: Local
@@ -208,10 +225,11 @@ The full ordered decommission flow still requires operator coordination:
    reconciled, so the site's existing certificate no longer grants access.
 2. Stop issuance/renewal and delivery for that site. Remove its Certificate or
    revoke renewal through the external PKI integration.
-3. Remove the site's identity Secrets and configuration, then detach it from ACM.
+3. Remove the site's identity Secrets and configuration, then remove its
+   managed-cluster registration.
 
 Deleting a Certificate stops renewal but does not cryptographically revoke an
-issued certificate. Cert-manager normally retains its Secret, and ACM policy
+issued certificate. Cert-manager normally retains its Secret, and governance policy
 removal is not a guarantee of remote object deletion. Shared CA resources
 remain outside the site's lifecycle.
 
@@ -238,4 +256,4 @@ chart path to also verify migration preserves the existing Issuer UID and CA.
 and executes its hub templates against API fixtures for enrollment, endpoint
 changes, missing feedback, selection, identity delivery, and withdrawal. It
 requires Go and PyYAML. These tests and server-side dry runs do not replace a
-live ACM/OCM reconciliation test before the runtime cutover.
+live managed-cluster reconciliation test before the runtime cutover.
