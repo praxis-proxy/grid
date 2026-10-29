@@ -1440,8 +1440,8 @@ mod tests {
         let (mut node_b, _) = make_node("site-b", 19_251);
         establish_membership(&mut node_a, &mut node_b, &id_a, &id_b);
         let (private_key, public_key) = generate_signing_key_and_pubkey();
-        node_a.pin_origin("site-a".to_owned(), vec![public_key.clone()])?;
-        node_b.pin_origin("site-a".to_owned(), vec![public_key])?;
+        node_a.pin_origin_for_grid("grid-a", "site-a".to_owned(), vec![public_key.clone()])?;
+        node_b.pin_origin_for_grid("grid-a", "site-a".to_owned(), vec![public_key])?;
         let mut snapshot = provider_snap("site-a", 0.2);
         for provider in snapshot.providers.values_mut() {
             provider.models.clear();

@@ -23,6 +23,22 @@ fn init_crypto() {
     drop(rustls::crypto::ring::default_provider().install_default());
 }
 
+/// Build an enrollment client whose `localhost` address uses the test listener's IPv4 socket.
+fn loopback_http_client(ca_pem: &[u8], port: u16) -> reqwest::Client {
+    let roots = grid_client::roots_from_pem(ca_pem, "the enrollment CA bundle").expect("roots");
+    let timeouts = grid_client::Timeouts::ENROLLMENT;
+    reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .connect_timeout(timeouts.connect)
+        .timeout(timeouts.request)
+        .tls_certs_only(roots)
+        .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+        .build()
+        .expect("client")
+}
+
 /// A temp file holding a grid-admin token, removed on drop.
 struct AdminFile(PathBuf);
 
@@ -71,6 +87,13 @@ impl ClosedPort {
         self.socket.listen(128).expect("listen");
         self.socket.set_nonblocking(true).expect("nonblocking");
         self.socket.into()
+    }
+
+    /// Release the reserved port so connection attempts are refused until it is rebound.
+    fn release(self) -> u16 {
+        let port = self.port;
+        drop(self.socket);
+        port
     }
 }
 
@@ -172,7 +195,7 @@ mod live {
 
     use enrollment::{AppState, GridAdmins, SharedCa, Store, authz::Authorizer, router};
 
-    use super::{super::*, AdminFile, FAST, closed_port, init_crypto, invite};
+    use super::{super::*, AdminFile, FAST, closed_port, init_crypto, invite, loopback_http_client};
 
     /// What the fake does on create.
     #[derive(Clone, Copy)]
@@ -319,15 +342,17 @@ mod live {
 
     /// Serve `app` on the reserved `port` once `after` passes. Until then it refuses connections.
     async fn listen_after(port: super::ClosedPort, after: Duration, cert: certs::SiteCertOutput, app: axum::Router) {
-        let start = async move {
-            tokio::time::sleep(after).await;
-            spawn_tls(port.listen(), cert, app).await;
-        };
         if after.is_zero() {
-            start.await;
-        } else {
-            tokio::spawn(start);
+            spawn_tls(port.listen(), cert, app).await;
+            return;
         }
+        let port = port.release();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("listen");
+            listener.set_nonblocking(true).expect("nonblocking");
+            spawn_tls(listener, cert, app).await;
+        });
     }
 
     /// Serve the enrollment router over TLS with a pinned minter.
@@ -343,7 +368,7 @@ mod live {
         let port = closed_port();
         let admin = AdminFile::new(admin);
         let minter = Minter {
-            http: http_client(ca.cert_pem.as_bytes()).expect("client"),
+            http: loopback_http_client(ca.cert_pem.as_bytes(), port.port),
             base: format!("https://localhost:{}", port.port),
             admin_token_file: admin.0.clone(),
             retry: Retry::new(FAST),
