@@ -43,9 +43,8 @@ async fn reconcile(api: &FakeApi, path: &str) {
         .expect("provider reconcile succeeds");
 }
 
-/// Serializes the signals passes: the readiness write slot is one per process, and a
-/// pass that finds it held skips its writes.
-static PASS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Serializes the signals passes in this test module.
+static PASS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 /// Run signals passes in Poll mode until the asynchronous readiness writer publishes `Ready`.
 ///
@@ -57,7 +56,7 @@ async fn signals_pass(api: &FakeApi, path: &str) {
     let publish = async {
         loop {
             {
-                let _pass = PASS.lock().await;
+                let _pass = PASS.acquire().await.expect("signals pass semaphore is open");
                 let client = api.client("default");
                 let ctx = OperatorCtx::new(client.clone(), None, SignalMode::Poll);
                 grid_network::refresh_signals(&ctx, &client, NETWORK)
@@ -187,7 +186,7 @@ fn seeded_with_metrics() -> (FakeApi, String) {
 async fn signals_pass_until(api: &FakeApi, path: &str, mode: SignalMode, type_: &str, reason: &str) {
     for _attempt in 0..50 {
         {
-            let _pass = PASS.lock().await;
+            let _pass = PASS.acquire().await.expect("signals pass semaphore is open");
             let client = api.client("default");
             let ctx = OperatorCtx::new(client.clone(), None, mode);
             grid_network::refresh_signals(&ctx, &client, NETWORK)

@@ -1,5 +1,10 @@
 //! A request the grid router cannot route is answered by the router and logged below WARN.
 
+#[path = "support/logs.rs"]
+mod logs;
+#[path = "support/ports.rs"]
+mod ports;
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
@@ -13,7 +18,7 @@
 mod tests {
     use std::{
         io::{BufRead as _, BufReader, Read as _, Write as _},
-        net::{TcpListener, TcpStream},
+        net::TcpStream,
         path::PathBuf,
         process::{Child, Command, Stdio},
         sync::{Arc, Mutex},
@@ -21,16 +26,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use super::ports::free_port;
+
     /// How long the gateway may take to start listening.
     const DEADLINE: Duration = Duration::from_secs(20);
-
-    fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0")
-            .expect("bind")
-            .local_addr()
-            .expect("addr")
-            .port()
-    }
 
     /// Collect `pipe`'s lines into `lines` on a background thread.
     fn drain(pipe: impl std::io::Read + Send + 'static, lines: Arc<Mutex<Vec<String>>>) {
@@ -142,6 +141,7 @@ mod tests {
 
     impl Drop for Gateway {
         fn drop(&mut self) {
+            super::logs::gateway_output_on_failure(&self.output);
             let _killed = self.child.kill();
             let _reaped = self.child.wait();
         }

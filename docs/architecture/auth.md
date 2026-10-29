@@ -420,9 +420,14 @@ SPIFFE URI SAN, and the site's DNS SAN. A provider gateway in SPIFFE mode refuse
 those extensions. Certificates issued before this profile lack them, so
 re-enroll those sites before switching a provider to SPIFFE mode.
 
-SPIFFE mode, `spec.peerTrust.mode: spiffe` on the `GridNetwork`, reads no pins.
-It admits any site the Grid CA signed, auto-discovered sites included, and it
-cannot revoke one short of rotating the Grid CA and the SWIM key.
+SPIFFE mode, `spec.peerTrust.mode: spiffe` on the `GridNetwork`, reads no
+certificate fingerprint pins; it relies on the Grid CA and the site's SPIFFE
+identity instead. Signed gossip still installs the verified public signing
+key against the `(grid ID, site)` origin in either mode. See [Signed Gossip
+Trust](signed-gossip-trust.md). SPIFFE mode admits CA-issued sites with the
+expected identity, auto-discovered sites included, without requiring a
+per-certificate fingerprint update. It cannot revoke one short of rotating the
+Grid CA and the SWIM key.
 
 On the signals listener, only this site's current leaf, matched by digest,
 reads unscoped as the co-located gateway, in either mode. The listener refuses

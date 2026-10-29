@@ -13,7 +13,7 @@ bash e2e-hub-site.sh test      # install and assert on existing clusters
 bash e2e-hub-site.sh down      # delete the clusters
 ```
 
-`MODES=pin` or `MODES=spiffe` runs one peer trust mode. `SKIP_BUILD=1` uses prebuilt images named by `IMAGE_PREFIX` and `IMAGE_TAG`. `KEEP=1` keeps the clusters. The script header lists every variable.
+`MODES=pin` or `MODES=spiffe` runs one peer trust mode. `SIGNED_STATE=enforce` adds the signed state checks. `SKIP_BUILD=1` uses prebuilt images named by `IMAGE_PREFIX` and `IMAGE_TAG`. `KEEP=1` keeps the clusters. The script header lists every variable.
 
 The script pins each LoadBalancer address from the MetalLB pool, so it knows the enrollment URL and SWIM seeds before install. The site gateway dials the mock model at its ClusterIP. A selectorless `grid-enrollment` Service in the site's `grid-enrollment` namespace forwards to the hub enrollment LoadBalancer, so the site operator enrolls by the Service name on the enrollment certificate.
 
@@ -26,6 +26,7 @@ For each mode in `MODES`, after it resets the `grid` and `grid-enrollment` names
 - The hub consumer gateway serves a chat completion over its static site backend, with `x-grid-provider-site: site-a`.
 - With the hub identity, the site gateway serves the same completion over mTLS. Without a client certificate the handshake fails with a TLS alert. `/health`, which the backend serves, a `../` traversal, an encoded traversal, and `/v1/modelsX` get a 404 with no provider header, and `DELETE` gets a 405.
 - The site gateway refuses `rogue`, an identity enrolled from its own invite: 403 in pin mode, a TLS alert in spiffe mode.
+- With `SIGNED_STATE=enforce`, both operators sign their state, so the remote candidate above came from verified state. Once the site's GridNetwork turns signed state off, the hub refuses the site's unsigned state. Certificate rotation is excluded: a renewed key is locked out under enforce.
 - No container in either namespace restarted, and no grid container log, init and hook containers included, matches ` ERROR`, `panic`, or `fatal`. WARN lines print for review.
 
 Logs land in `ARTIFACTS` (default `/tmp/grid-hub-site-e2e`). Poll signal transport is not covered.

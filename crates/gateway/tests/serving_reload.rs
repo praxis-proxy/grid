@@ -1,5 +1,12 @@
 //! The gateway binary reloads its serving config and site identity from kubelet-style mounts.
 
+#[path = "support/http.rs"]
+mod http;
+#[path = "support/logs.rs"]
+mod logs;
+#[path = "support/ports.rs"]
+mod ports;
+
 #[cfg(test)]
 #[expect(
     clippy::expect_used,
@@ -12,7 +19,7 @@
 mod tests {
     use std::{
         io::{BufRead as _, BufReader, Read as _, Write as _},
-        net::{TcpListener, TcpStream},
+        net::TcpStream,
         path::{Path, PathBuf},
         process::{Child, Command, Stdio},
         sync::{
@@ -27,6 +34,11 @@ mod tests {
     use rustls::{
         ServerConfig, ServerConnection, StreamOwned,
         pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _},
+    };
+
+    use super::{
+        http::read_request,
+        ports::{bound_listener, free_port},
     };
 
     /// How long any one expected change may take: the watch re-reads every 5s.
@@ -107,7 +119,7 @@ mod tests {
                     .with_single_cert(chain, key)
                     .expect("server config"),
             );
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer");
+            let listener = bound_listener();
             let addr = listener.local_addr().expect("peer addr").to_string();
             let seen = Arc::new(Mutex::new(Vec::new()));
             let hop_requests = Arc::new(AtomicUsize::new(0));
@@ -133,16 +145,10 @@ mod tests {
                         continue;
                     };
                     let mut tls = StreamOwned::new(conn, stream);
-                    let mut request = Vec::new();
-                    let mut buf = [0_u8; 1024];
-                    // Read the request head. A refused handshake ends the read early.
-                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                        match tls.read(&mut buf) {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => request.extend_from_slice(&buf[..n]),
-                        }
-                    }
-                    let head = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    let Ok((head, _body)) = read_request(&mut tls) else {
+                        continue;
+                    };
+                    let head = head.to_ascii_lowercase();
                     if head.contains("x-ai-routing-candidate: candidate-east") {
                         recorded_hops.fetch_add(1, Ordering::SeqCst);
                     }
@@ -231,14 +237,6 @@ mod tests {
             .expect("a leaf")
             .expect("parse leaf");
         certs::sha256(leaf.as_ref())
-    }
-
-    fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0")
-            .expect("bind")
-            .local_addr()
-            .expect("addr")
-            .port()
     }
 
     /// Collect `pipe`'s lines into `lines` on a background thread.
@@ -367,6 +365,7 @@ mod tests {
 
     impl Drop for Gateway {
         fn drop(&mut self) {
+            super::logs::gateway_output_on_failure(&self.output);
             let _killed = self.child.kill();
             let _reaped = self.child.wait();
         }
@@ -524,28 +523,27 @@ mod tests {
         requests: Arc<AtomicUsize>,
         hops: Arc<AtomicUsize>,
         heads: Arc<Mutex<Vec<String>>>,
+        request_body_bytes_read: Arc<AtomicUsize>,
     }
 
     impl Plain {
         fn start() -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind plaintext");
+            let listener = bound_listener();
             let addr = listener.local_addr().expect("plaintext addr").to_string();
             let (requests, hops) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
             let (counted, hopped) = (Arc::clone(&requests), Arc::clone(&hops));
             let heads = Arc::new(Mutex::new(Vec::new()));
             let recorded = Arc::clone(&heads);
+            let request_body_bytes_read = Arc::new(AtomicUsize::new(0));
+            let measured_body_bytes = Arc::clone(&request_body_bytes_read);
             thread::spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { continue };
-                    let mut request = Vec::new();
-                    let mut buf = [0_u8; 1024];
-                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                        match stream.read(&mut buf) {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => request.extend_from_slice(&buf[..n]),
-                        }
-                    }
-                    let head = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    let Ok((head, body)) = read_request(&mut stream) else {
+                        continue;
+                    };
+                    measured_body_bytes.store(body.len(), Ordering::SeqCst);
+                    let head = head.to_ascii_lowercase();
                     if head.contains("/v1/chat/completions") {
                         counted.fetch_add(1, Ordering::SeqCst);
                         recorded.lock().expect("heads").push(head.clone());
@@ -561,6 +559,7 @@ mod tests {
                 requests,
                 hops,
                 heads,
+                request_body_bytes_read,
             }
         }
     }
@@ -1139,6 +1138,44 @@ mod tests {
             "the credential never leaves this site: {head}"
         );
         assert!(line.contains("trace=1"), "an ordinary parameter still arrives: {line}");
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn the_gateway_stub_reads_the_complete_post_body_before_responding() {
+        let work = fresh_work("backend-unread-body");
+        let backend = Plain::start();
+        let mut serving = Mount::new(work.join("serving"));
+        serving.write(&[(
+            "serving-config.json",
+            br#"{"local_site":"local","window_secs":60,"load_window_ms":30000,"candidates":[{"kind":"inference_model","name":"llama","site":"east","cluster":"pool-east"}],"peers":[]}"#,
+        )]);
+        let (listen, admin) = (free_port(), free_port());
+        let praxis = routed_praxis(listen, admin, &backend.addr, "");
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
+        gateway.eventually("the gateway listens", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok()
+        });
+        let body = format!(
+            r#"{{"model":"llama","messages":[],"padding":"{}"}}"#,
+            "x".repeat(8 * 1024)
+        );
+        assert_eq!(
+            post(listen, &body, CALLER_CREDENTIALS),
+            200,
+            "a backend response survives closing with unread request bytes"
+        );
+        assert_eq!(
+            backend.requests.load(Ordering::SeqCst),
+            1,
+            "the request reached the backend"
+        );
+        assert_eq!(
+            backend.request_body_bytes_read.load(Ordering::SeqCst),
+            body.len(),
+            "the backend consumed the full body before answering; a head-only read can reset the response on Linux"
+        );
         drop(gateway);
         let _cleaned = std::fs::remove_dir_all(&work);
     }

@@ -1,5 +1,10 @@
 //! A provider listener's `peer_identity_trust` allowlist changes on a config reload, with no restart.
 
+#[path = "support/logs.rs"]
+mod logs;
+#[path = "support/ports.rs"]
+mod ports;
+
 #[cfg(test)]
 #[expect(
     clippy::expect_used,
@@ -11,7 +16,7 @@
 mod tests {
     use std::{
         io::{BufRead as _, BufReader, Read as _, Write as _},
-        net::{TcpListener, TcpStream},
+        net::TcpStream,
         path::{Path, PathBuf},
         process::{Child, Command, Stdio},
         sync::{Arc, Mutex},
@@ -25,16 +30,10 @@ mod tests {
         pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _},
     };
 
+    use super::ports::{bound_listener, free_port};
+
     /// How long one expected change may take.
     const DEADLINE: Duration = Duration::from_secs(20);
-
-    fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0")
-            .expect("bind")
-            .local_addr()
-            .expect("addr")
-            .port()
-    }
 
     /// Collect `pipe`'s lines into `lines` on a background thread.
     fn drain(pipe: impl std::io::Read + Send + 'static, lines: Arc<Mutex<Vec<String>>>) {
@@ -47,7 +46,7 @@ mod tests {
 
     /// A plaintext backend that answers every request on a connection it keeps open.
     fn keepalive_backend() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+        let listener = bound_listener();
         let addr = listener.local_addr().expect("backend addr").to_string();
         thread::spawn(move || {
             for stream in listener.incoming() {
@@ -138,6 +137,7 @@ mod tests {
 
     impl Drop for Gateway {
         fn drop(&mut self) {
+            super::logs::gateway_output_on_failure(&self.output);
             let _killed = self.child.kill();
             let _reaped = self.child.wait();
         }

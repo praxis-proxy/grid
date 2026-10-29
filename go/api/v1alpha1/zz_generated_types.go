@@ -192,6 +192,14 @@ const (
 	PeerTrustModeSpiffe PeerTrustMode = "spiffe"
 )
 
+// GridNetworkPeerTrustSignedState is a string enumeration.
+type GridNetworkPeerTrustSignedState string
+
+const (
+	GridNetworkPeerTrustSignedStateOff     GridNetworkPeerTrustSignedState = "off"
+	GridNetworkPeerTrustSignedStateEnforce GridNetworkPeerTrustSignedState = "enforce"
+)
+
 // PlacementStrategy is a string enumeration.
 type PlacementStrategy string
 
@@ -633,10 +641,12 @@ type GridNetworkMembership struct {
 	Mode GridNetworkMembershipMode `json:"mode"`
 }
 
-// GridNetworkPeerTrust Grid-wide peer trust on the signals path, pin when absent, read at operator start.
+// GridNetworkPeerTrust Grid-wide peer trust: signals-path mode, pin when absent, read at operator start; signed state, read each reconcile.
 type GridNetworkPeerTrust struct {
 	// Peer trust mode.
 	Mode PeerTrustMode `json:"mode"`
+	// Signed state, off when absent. Switch every site together: an enforcing site refuses unsigned peers.
+	SignedState GridNetworkPeerTrustSignedState `json:"signedState,omitempty"`
 }
 
 // GridNetworkPlacementPolicy Optional static capacity-placement policy.
@@ -710,7 +720,7 @@ type GridNetworkSpec struct {
 	// Maximum time between metric refreshes and score/ranking recalculation.
 	// This controls the GridNetwork reconcile cadence for provider metrics; it does not change request-path routing or the overlay watch latency. Use a duration of at least one second, such as "10s" or "1500ms". The default cadence is 300 seconds. TLS-protected provider metrics cap the cadence at 60 seconds for bounded certificate-rotation detection.
 	MetricsRefreshInterval *string `json:"metricsRefreshInterval,omitempty"`
-	// Grid-wide peer trust on the signals path, pin when absent, read at operator start.
+	// Grid-wide peer trust: signals-path mode, pin when absent, read at operator start; signed state, read each reconcile.
 	PeerTrust *GridNetworkPeerTrust `json:"peerTrust,omitempty"`
 	// Optional static capacity-placement policy.
 	PlacementPolicy *GridNetworkPlacementPolicy `json:"placementPolicy,omitempty"`

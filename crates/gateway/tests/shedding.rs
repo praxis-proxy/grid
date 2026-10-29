@@ -5,6 +5,13 @@
 //! gateway learns each site's ceiling from the in-flight count the operators publish, so the
 //! test first teaches every site a ceiling, then fills them all, then drains one.
 
+#[path = "support/http.rs"]
+mod http;
+#[path = "support/logs.rs"]
+mod logs;
+#[path = "support/ports.rs"]
+mod ports;
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
@@ -21,8 +28,8 @@
 mod tests {
     use std::{
         collections::BTreeMap,
-        io::{BufRead as _, BufReader, ErrorKind, Read as _, Write as _},
-        net::{TcpListener, TcpStream},
+        io::{BufRead as _, BufReader, Read as _, Write as _},
+        net::TcpStream,
         path::{Path, PathBuf},
         process::{Child, Command, Stdio},
         sync::{
@@ -37,6 +44,11 @@ mod tests {
     use rustls::{
         ServerConfig, ServerConnection, StreamOwned,
         pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _},
+    };
+
+    use super::{
+        http::read_request,
+        ports::{bound_listener, free_port},
     };
 
     /// How often the gateway polls each peer.
@@ -92,7 +104,7 @@ mod tests {
                     .with_single_cert(chain, key)
                     .expect("server config"),
             );
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer");
+            let listener = bound_listener();
             let addr = listener.local_addr().expect("peer addr").to_string();
             let mode = Arc::new(AtomicU8::new(TEACH));
             let stop = Arc::new(AtomicBool::new(false));
@@ -161,22 +173,15 @@ mod tests {
 
     /// A plain HTTP backend answering 200 with its site name.
     fn backend(site: &'static str) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+        let listener = bound_listener();
         let port = listener.local_addr().expect("backend addr").port();
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 thread::spawn(move || {
-                    let mut head = Vec::new();
-                    let mut buf = [0_u8; 1024];
-                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                        match stream.read(&mut buf) {
-                            Ok(0) => return,
-                            Ok(n) => head.extend_from_slice(&buf[..n]),
-                            Err(e) if e.kind() == ErrorKind::Interrupted => {},
-                            Err(_) => return,
-                        }
-                    }
+                    let Ok((_head, _body)) = read_request(&mut stream) else {
+                        return;
+                    };
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{site}",
                         site.len()
@@ -186,14 +191,6 @@ mod tests {
             }
         });
         port
-    }
-
-    fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0")
-            .expect("bind")
-            .local_addr()
-            .expect("addr")
-            .port()
     }
 
     fn drain(pipe: impl std::io::Read + Send + 'static, lines: Arc<Mutex<Vec<String>>>) {
@@ -339,6 +336,7 @@ mod tests {
 
     impl Drop for Gateway {
         fn drop(&mut self) {
+            super::logs::gateway_output_on_failure(&self.output);
             let _killed = self.child.kill();
             let _reaped = self.child.wait();
         }

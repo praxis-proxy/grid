@@ -27,6 +27,18 @@ pub(crate) fn mock_kube_client_with_config_maps(
     mock_kube_client_with_objects(config_maps)
 }
 
+/// Like [`mock_kube_client_with_secrets`], for raw JSON bodies keyed by the last path segment.
+pub(crate) fn mock_kube_client_with_json(objects: HashMap<&'static str, serde_json::Value>) -> kube::Client {
+    mock_kube_client_with_objects(objects)
+}
+
+/// Like [`mock_kube_client_with_secrets`], for `GridNetworks`, including status patches.
+pub(crate) fn mock_kube_client_with_grid_networks(
+    networks: HashMap<&'static str, crate::crd::grid_network::GridNetwork>,
+) -> kube::Client {
+    mock_kube_client_with_objects(networks)
+}
+
 /// Build a `kube::Client` that lists the given `InferenceProvider` objects and no `GridSite` objects.
 pub(crate) fn mock_kube_client_with_providers(providers: Vec<InferenceProvider>) -> kube::Client {
     let providers = Arc::new(providers);
@@ -73,16 +85,22 @@ fn kube_list_body(path: &str, providers: &[InferenceProvider]) -> Vec<u8> {
     serde_json::to_vec(&list).unwrap_or_else(|_| std::process::abort())
 }
 
-/// A `kube::Client` answering a GET by object name from `objects`, 404 otherwise.
+/// A `kube::Client` answering requests by object name from `objects`, 404 otherwise.
+/// Status patches are matched by their parent object's name.
 fn mock_kube_client_with_objects<T>(objects: HashMap<&'static str, T>) -> kube::Client
 where
     T: serde::Serialize + Clone + Send + Sync + 'static,
 {
     let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
-        let secrets = objects.clone();
+        let objects = objects.clone();
         async move {
-            let name = req.uri().path().rsplit('/').next().unwrap_or_default().to_owned();
-            let response = secrets.get(name.as_str()).map_or_else(
+            let path = req.uri().path();
+            let name = if req.method() == http::Method::PATCH && path.ends_with("/status") {
+                path.rsplit('/').nth(1).unwrap_or_default()
+            } else {
+                path.rsplit('/').next().unwrap_or_default()
+            };
+            let response = objects.get(name).map_or_else(
                 || {
                     let not_found = serde_json::json!({
                         "kind": "Status",

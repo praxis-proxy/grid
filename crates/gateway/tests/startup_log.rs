@@ -1,17 +1,21 @@
 //! Startup must install a log subscriber, or reload results and errors are dropped.
 
+#[path = "support/ports.rs"]
+mod ports;
+
 #[cfg(test)]
 mod tests {
     use std::{
         error::Error,
         io::{self, BufRead as _, BufReader, Read},
-        net::TcpListener,
         path::PathBuf,
         process::{Child, Command, Stdio},
         sync::mpsc,
         thread,
         time::{Duration, Instant},
     };
+
+    use super::ports::free_port;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -23,7 +27,7 @@ mod tests {
 
     /// Write a minimal config, named `name`, listening on a free loopback port.
     fn write_config(name: &str) -> io::Result<PathBuf> {
-        let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let port = free_port();
         let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
         let yaml = format!(
             "listeners:\n  - name: default\n    address: \"127.0.0.1:{port}\"\n    filter_chains: [main]\n\

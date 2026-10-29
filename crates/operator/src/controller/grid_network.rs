@@ -38,8 +38,8 @@ use crate::{
         grid_network::{
             ClusterEndpointConfig, ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork,
             GridNetworkPhase, GridNetworkStatus, MembershipMode, MountReconciliation, MountReconciliationPhase,
-            MountReconciliationStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode, SiteRouter,
-            TenantBudgetStatus, TransportMode,
+            MountReconciliationStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode, SignedStateMode,
+            SiteRouter, TenantBudgetStatus, TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::{Condition, ConditionStatus, InferenceProvider, InferenceProviderStatus},
@@ -57,7 +57,7 @@ use crate::{
     rollup, served_models, signals, site_providers,
     swim::{MemberStatus, MembershipSnapshot},
     swim_endpoint::{SeedResolution, resolve_endpoint_list_partial},
-    swim_runtime::SwimHandle,
+    swim_runtime::{PeerPins, SwimHandle},
 };
 
 
@@ -1402,6 +1402,286 @@ async fn read_signals_pem(
         .map_err(|(_, message)| message)
 }
 
+/// Load the local join-issued leaf and return its validated P-256 signing key.
+async fn load_gossip_signing_key(
+    network: &GridNetwork,
+    client: &Client,
+    site: &str,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    let ca_ref = network
+        .spec
+        .tls
+        .ca_secret_ref
+        .as_ref()
+        .ok_or_else(|| "Grid CA Secret is not configured".to_owned())?;
+    let site_ref = network
+        .spec
+        .tls
+        .site_secret_ref
+        .as_ref()
+        .ok_or_else(|| "site identity Secret is not configured".to_owned())?;
+    let ca = read_signals_pem(client, ca_ref, "ca.crt").await?;
+    let cert = read_signals_pem(client, site_ref, "tls.crt").await?;
+    let key = zeroize::Zeroizing::new(read_signals_pem(client, site_ref, "tls.key").await?);
+    validated_gossip_key(&ca, &cert, &key, site)
+}
+
+/// PEM tag of a PKCS8 private key.
+const PKCS8_PEM_TAG: &str = "PRIVATE KEY";
+
+/// Length of an uncompressed SEC1 P-256 point: a tag, then two 32-byte coordinates.
+const P256_POINT_LEN: usize = 65;
+
+/// SEC1 tag of an uncompressed point.
+const SEC1_UNCOMPRESSED_TAG: u8 = 0x04;
+
+/// Whether `public_key` has the shape of an uncompressed P-256 point.
+///
+/// The curve itself is enforced when a signature verifies against it.
+fn is_p256_point(public_key: &[u8]) -> bool {
+    public_key.len() == P256_POINT_LEN && public_key.first() == Some(&SEC1_UNCOMPRESSED_TAG)
+}
+
+/// Validate the site-bound leaf and its matching P-256 PKCS8 key, returning the key DER.
+fn validated_gossip_key(ca: &[u8], cert: &[u8], key: &[u8], site: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    let ca = std::str::from_utf8(ca).map_err(|_error| "Grid CA certificate is not UTF-8".to_owned())?;
+    let cert = std::str::from_utf8(cert).map_err(|_error| "site certificate is not UTF-8".to_owned())?;
+    if trust_bundle::check_cert_pem(cert) != CertPemStatus::ValidStructure {
+        return Err("site certificate is not public certificate PEM".to_owned());
+    }
+    let key_pem = std::str::from_utf8(key).map_err(|_error| "site private key is not UTF-8".to_owned())?;
+    let public_key = certs::verify_site_cert(ca, cert, site).map_err(|error| error.to_string())?;
+
+    let block = pem::parse(key_pem).map_err(|_error| "site private key is not PEM".to_owned())?;
+    if block.tag() != PKCS8_PEM_TAG {
+        return Err("site private key is not PKCS8".to_owned());
+    }
+    let der = zeroize::Zeroizing::new(block.into_contents());
+
+    // Loading the key as the runtime will checks its curve and proves it matches the leaf.
+    let derived = swim::signing::public_key_ecdsa_p256(&der)
+        .map_err(|_error| "site private key is not a P-256 PKCS8 key".to_owned())?;
+    if derived != public_key {
+        return Err("site private key does not match its certificate".to_owned());
+    }
+    Ok(der)
+}
+
+/// Load and validate this site's signed-gossip identity.
+async fn load_gossip_signing_identity(
+    network: &GridNetwork,
+    client: &Client,
+    site: &str,
+) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+    match load_gossip_signing_key(network, client, site).await {
+        Ok(key) => Some(key),
+        Err(reason) => {
+            tracing::warn!(%reason, "signed gossip disabled: local site identity is unusable");
+            None
+        },
+    }
+}
+
+/// Validate one peer certificate against this `GridNetwork`'s CA and trust mode.
+fn verified_peer_gossip_key(site: &GridSite, ca_pem: &str, trust: PeerTrustMode) -> Result<Option<Vec<u8>>, String> {
+    let Some((site_name, _)) = peer_site_key(site) else {
+        return Ok(None);
+    };
+    let Some(cert_pem) = site
+        .status
+        .as_ref()
+        .and_then(|status| status.public_cert_pem.as_deref())
+    else {
+        return Ok(None);
+    };
+    if trust_bundle::check_cert_pem(cert_pem) != CertPemStatus::ValidStructure {
+        return Err("peer certificate is not public certificate PEM".to_owned());
+    }
+    let public_key = certs::verify_site_cert(ca_pem, cert_pem, &site_name).map_err(|error| error.to_string())?;
+    if !is_p256_point(&public_key) {
+        return Err("peer certificate does not carry an uncompressed P-256 key".to_owned());
+    }
+    if trust == PeerTrustMode::Pin
+        && !peer_has_declared_fingerprint(
+            site,
+            &certs::canonical_fingerprint(cert_pem).map_err(|error| error.to_string())?,
+        )
+    {
+        return Err("peer certificate does not match a declared canonical fingerprint".to_owned());
+    }
+    Ok(Some(public_key))
+}
+
+/// Whether `site` declares this certificate's canonical SHA-256 fingerprint.
+fn peer_has_declared_fingerprint(site: &GridSite, fingerprint: &str) -> bool {
+    site.spec
+        .trust
+        .as_ref()
+        .and_then(|policy| policy.canonical_fingerprints.as_ref())
+        .is_some_and(|pins| {
+            pins.iter()
+                .any(|pin| signals::canonical_fingerprint(pin) == fingerprint)
+        })
+}
+
+/// This grid's signed-state mode, `off` when `peerTrust` is absent.
+fn signed_state_mode(network: &GridNetwork) -> SignedStateMode {
+    network
+        .spec
+        .peer_trust
+        .as_ref()
+        .map_or_else(SignedStateMode::default, |trust| trust.signed_state)
+}
+
+/// Apply this grid's signed-state mode to the SWIM runtime.
+///
+/// `off` drops any trust installed while enforcing, so state flows unsigned
+/// again. `enforce` installs the local signer and verified peer pins.
+/// Returns whether this site can sign its grid-scoped state.
+async fn apply_signed_state(
+    network: &GridNetwork,
+    ctx: &OperatorCtx,
+    swim: &SwimHandle,
+    grid_id: &str,
+    signed_state: SignedStateMode,
+) -> Result<bool, OperatorError> {
+    if signed_state == SignedStateMode::Off {
+        swim.relax_grid_trust(grid_id.to_owned())
+            .map_err(|error| OperatorError::InvalidResource(error.to_string()))?;
+        return Ok(false);
+    }
+
+    let client = &ctx.client;
+
+    // Peers that cannot be re-verified keep their pins: a transient read failure must not drop all state.
+    let peer_pins = match collect_gossip_peer_pins(network, client, swim.site_name()).await {
+        Ok(peer_pins) => Some(peer_pins),
+        Err(error) => {
+            tracing::warn!(%grid_id, %error, "keeping installed SWIM peer pins: peers could not be re-verified");
+            None
+        },
+    };
+    let local_signing_key = load_gossip_signing_identity(network, client, swim.site_name()).await;
+    let signing_ready = local_signing_key.is_some();
+    swim.set_grid_trust_snapshot(grid_id.to_owned(), local_signing_key, peer_pins)
+        .map_err(|error| OperatorError::InvalidResource(error.to_string()))?;
+    Ok(signing_ready)
+}
+
+/// Apply this grid's signed-state mode, then publish the certificate bootstrap it allows.
+async fn sign_grid_state(
+    network: &GridNetwork,
+    ctx: &OperatorCtx,
+    swim: &SwimHandle,
+    name: &str,
+) -> Result<(), OperatorError> {
+    let signed_state = signed_state_mode(network);
+    let Some(grid_id) = persisted_grid_id(network) else {
+        // Enrollment owns grid IDs. Reconciliation waits for `spec.grid_id`
+        // rather than minting a local fallback.
+        return Ok(());
+    };
+    let signing_ready = Box::pin(apply_signed_state(network, ctx, swim, grid_id, signed_state)).await?;
+
+    match signed_state {
+        SignedStateMode::Off => Box::pin(publish_site_cert(network, &ctx.client, swim, name)).await,
+        SignedStateMode::Enforce if signing_ready => {
+            Box::pin(publish_signed_site_cert(network, &ctx.client, swim, grid_id, name)).await;
+        },
+        // An unusable local identity cannot sign; stay silent rather than send unsigned.
+        SignedStateMode::Enforce => {},
+    }
+    Ok(())
+}
+
+/// Empty-state broadcast carrying this site's public certificate PEM.
+fn site_cert_broadcast(swim: &SwimHandle, cert_pem: String) -> swim::StateBroadcast {
+    swim::StateBroadcast::new(
+        swim.site_name().to_owned(),
+        cert_broadcast_revision(),
+        crdt::GridStateSnapshot::new(swim.site_name().to_owned()),
+        None,
+    )
+    .with_cert(Some(cert_pem))
+}
+
+/// Broadcast this site's public certificate, unsigned, on every reconcile.
+///
+/// Remote peers populate `GridSite.status.publicCertPem` from it. Only the
+/// public cert is read; the private key (`tls.key`) is never accessed here.
+async fn publish_site_cert(network: &GridNetwork, client: &Client, swim: &SwimHandle, name: &str) {
+    let Ok(Some(cert_pem)) = secret::read_site_cert_pem(client, network.spec.tls.site_secret_ref.as_ref()).await else {
+        return;
+    };
+    if let Err(error) = swim.publish_state_broadcast(site_cert_broadcast(swim, cert_pem)) {
+        tracing::warn!(network = name, %error, "failed to publish site cert broadcast");
+    }
+}
+
+/// Publish this site's grid-scoped certificate bootstrap on every reconcile.
+///
+/// The runtime signs it; peers validate the certificate, then pin its key.
+/// Republishing reaches peers that joined, restarted, or evicted it since.
+async fn publish_signed_site_cert(
+    network: &GridNetwork,
+    client: &Client,
+    swim: &SwimHandle,
+    grid_id: &str,
+    name: &str,
+) {
+    let Ok(Some(cert_pem)) = secret::read_site_cert_pem(client, network.spec.tls.site_secret_ref.as_ref()).await else {
+        return;
+    };
+    let broadcast = site_cert_broadcast(swim, cert_pem).with_grid_id(Some(grid_id.to_owned()));
+    if let Err(error) = swim.publish_state_broadcast(broadcast) {
+        tracing::warn!(network = name, %error, "failed to publish site cert broadcast");
+    }
+}
+
+
+/// Collect the currently verified peer certificates as a complete trust snapshot.
+async fn collect_gossip_peer_pins(
+    network: &GridNetwork,
+    client: &Client,
+    local_site_name: &str,
+) -> Result<PeerPins, OperatorError> {
+    let Some(ca_ref) = network.spec.tls.ca_secret_ref.as_ref() else {
+        return Ok(BTreeMap::new());
+    };
+    let ca = read_signals_pem(client, ca_ref, "ca.crt")
+        .await
+        .map_err(OperatorError::InvalidResource)?;
+    let ca = std::str::from_utf8(&ca)
+        .map_err(|_error| OperatorError::InvalidResource("Grid CA certificate is not UTF-8".to_owned()))?;
+    let network_name = network.metadata.name.as_deref().unwrap_or_default();
+    // The declared mode, not the startup one: a trust change under gossip does not restart.
+    let trust = GridModes::of(network, MembershipMode::Swim).trust;
+    let mut verified = PeerPins::new();
+    for site in list_all_grid_sites(client)
+        .await?
+        .iter()
+        .filter(|site| site.spec.grid_network_ref == network_name)
+    {
+        let Some((site_name, _)) = peer_site_key(site) else {
+            continue;
+        };
+        if site_name == local_site_name {
+            continue;
+        }
+        match verified_peer_gossip_key(site, ca, trust) {
+            Ok(Some(key)) => {
+                let keys = verified.entry(site_name).or_default();
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            },
+            Ok(None) => {},
+            Err(reason) => tracing::warn!(site = %site_name, %reason, "peer gossip signing pin refused"),
+        }
+    }
+    Ok(verified)
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -1664,6 +1944,10 @@ async fn reconcile_deleting_grid_network(
     };
     match timeout(WITHDRAWAL_PUBLICATION_TIMEOUT, receipt).await {
         Ok(Ok(())) => {
+            // The withdrawal was the grid's last signed message; drop its signer and pins.
+            if let Err(error) = swim.relax_grid_trust(grid_id.to_owned()) {
+                tracing::warn!(network = name, %grid_id, %error, "failed to drop deleted GridNetwork's gossip trust");
+            }
             patch_withdrawal_finalizer(network, &ctx.client, false).await?;
             tracing::info!(network = name, %grid_id, "published GridNetwork SWIM withdrawal; removed finalizer");
             Ok(Action::await_change())
@@ -1780,22 +2064,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         // diff_seed_sets tracks additions/removals for diagnostic logging.
         announce_crd_seeds(&network, swim, &ctx.last_seeds).await;
 
-        // Broadcast the local site's public certificate PEM so remote peers can
-        // populate GridSite.status.publicCertPem.  Only the public cert is read;
-        // the private key (tls.key) is never accessed by this code path.
-        if let Ok(Some(cert_pem)) = secret::read_site_cert_pem(client, network.spec.tls.site_secret_ref.as_ref()).await
-        {
-            let cert_broadcast = swim::StateBroadcast::new(
-                swim.site_name().to_owned(),
-                cert_broadcast_revision(),
-                crdt::GridStateSnapshot::new(swim.site_name().to_owned()),
-                None,
-            )
-            .with_cert(Some(cert_pem));
-            if let Err(e) = swim.publish_state_broadcast(cert_broadcast) {
-                tracing::warn!(network = name, error = %e, "failed to publish site cert broadcast");
-            }
-        }
+        Box::pin(sign_grid_state(&network, &ctx, swim, name)).await?;
     }
 
     // List providers and tools once; shared between the catalog, the overlay and CRDT publishing.
@@ -5566,6 +5835,9 @@ fn retain_tool_catalogs_within_budget(
     retained
 }
 
+/// Maximum DER-encoded ECDSA P-256 signature size.
+const MAX_P256_DER_SIGNATURE_BYTES: usize = 72;
+
 /// Deterministically trim tool catalogs until the encoded state fits SWIM.
 ///
 /// Inference provider records and capabilities are never removed. Tool
@@ -5574,22 +5846,9 @@ fn retain_tool_catalogs_within_budget(
 /// transport budget, all tool providers remain omitted and the runtime reports
 /// the oversized inference snapshot.
 fn fit_provider_tools_to_swim_budget(broadcast: &mut swim::StateBroadcast) {
-    // The runtime's advertised address may be IPv6, so preflight against the
-    // largest valid source identity for this site name. This cannot exceed the
-    // runtime's real transport budget.
-    let local_id = worst_case_swim_identity(&broadcast.origin_site);
-    let Ok(byte_budget) = swim::node::state_broadcast_byte_budget(&local_id) else {
-        tracing::warn!("failed to calculate SWIM state-broadcast byte budget");
+    let Some(byte_budget) = provider_tool_byte_budget(broadcast) else {
         return;
     };
-    // The runtime replaces the CRD-derived revision with a leased transport
-    // revision. Fit against the largest bincode representation so that rewrite
-    // cannot push an edge-sized snapshot over the node's byte limit.
-    let original_revision = std::mem::replace(&mut broadcast.revision, u64::MAX);
-    if broadcast.encode().is_ok_and(|encoded| encoded.len() <= byte_budget) {
-        broadcast.revision = original_revision;
-        return;
-    }
 
     let catalogs = detach_tool_catalogs(broadcast);
     let providers_offered = catalogs.len();
@@ -5611,7 +5870,6 @@ fn fit_provider_tools_to_swim_budget(broadcast: &mut swim::StateBroadcast) {
         .iter()
         .filter(|catalog| broadcast.snapshot.providers.contains_key(&catalog.key))
         .count();
-    broadcast.revision = original_revision;
     tracing::warn!(
         providers_offered,
         providers_retained,
@@ -5622,6 +5880,42 @@ fn fit_provider_tools_to_swim_budget(broadcast: &mut swim::StateBroadcast) {
         byte_budget,
         "trimmed MCP tool providers and catalogs to fit the SWIM broadcast budget"
     );
+}
+
+/// Returns the payload budget when this broadcast needs its provider tools trimmed.
+fn provider_tool_byte_budget(broadcast: &swim::StateBroadcast) -> Option<usize> {
+    // The runtime's advertised address may be IPv6, so preflight against the
+    // largest valid source identity for this site name. This cannot exceed the
+    // runtime's real transport budget.
+    let local_id = worst_case_swim_identity(&broadcast.origin_site);
+    let Ok(maximum_bytes) = swim::node::state_broadcast_byte_budget(&local_id) else {
+        tracing::warn!("failed to calculate SWIM state-broadcast byte budget");
+        return None;
+    };
+    // The runtime replaces the CRD-derived revision with a leased transport
+    // revision. Fit against the largest bincode representation so that rewrite
+    // cannot push an edge-sized snapshot over the node's byte limit.
+    // P-256 ECDSA signatures use DER encoding, whose largest valid signature is
+    // 72 bytes. Include the maximum signature and timestamp representation when
+    // measuring so the runtime's later signing step cannot exceed foca's limit.
+    let mut maximum_signed = broadcast.clone();
+    maximum_signed.revision = u64::MAX;
+    maximum_signed.signature = Some(vec![0; MAX_P256_DER_SIGNATURE_BYTES]);
+    maximum_signed.signed_at_ms = Some(u64::MAX);
+    let Ok(current_len) = broadcast.encode().map(|encoded| encoded.len()) else {
+        tracing::warn!("failed to encode SWIM state broadcast for size preflight");
+        return None;
+    };
+    let Ok(signed_maximum_len) = maximum_signed.encode().map(|encoded| encoded.len()) else {
+        tracing::warn!("failed to encode maximum signed SWIM state broadcast for size preflight");
+        return None;
+    };
+    if signed_maximum_len <= maximum_bytes {
+        return None;
+    }
+    // Covers both leased-revision growth and the signature fields.
+    let signing_overhead = signed_maximum_len.saturating_sub(current_len);
+    Some(maximum_bytes.saturating_sub(signing_overhead))
 }
 
 /// Return the largest valid local SWIM identity for `site_name`.
@@ -8884,7 +9178,322 @@ mod tests {
         assert!(!note_inconsistent(network(), false) && !note_inconsistent(other(), false));
     }
 
-    /// The identity status reports expiry and the renewal window, and an expired identity says how to recover.
+    #[test]
+    #[expect(clippy::expect_used, reason = "certificate trust boundary test fixture")]
+    fn validated_gossip_key_requires_grid_ca_site_identity_and_matching_private_key() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let leaf = certs::generate_site_cert(&ca, "site-east").expect("leaf");
+        let der = pem::parse(&leaf.key_pem).expect("key pem").into_contents();
+        let validated = validated_gossip_key(
+            ca.cert_pem.as_bytes(),
+            leaf.cert_pem.as_bytes(),
+            leaf.key_pem.as_bytes(),
+            "site-east",
+        )
+        .expect("valid local identity");
+        let wrong_name = validated_gossip_key(
+            ca.cert_pem.as_bytes(),
+            leaf.cert_pem.as_bytes(),
+            leaf.key_pem.as_bytes(),
+            "site-west",
+        );
+        let other_ca = certs::generate_ca("other-ca").expect("other ca");
+        let wrong_ca = validated_gossip_key(
+            other_ca.cert_pem.as_bytes(),
+            leaf.cert_pem.as_bytes(),
+            leaf.key_pem.as_bytes(),
+            "site-east",
+        );
+        let other_leaf = certs::generate_site_cert(&ca, "site-east").expect("other leaf");
+        let mismatched_key = validated_gossip_key(
+            ca.cert_pem.as_bytes(),
+            leaf.cert_pem.as_bytes(),
+            other_leaf.key_pem.as_bytes(),
+            "site-east",
+        );
+
+        assert_eq!(
+            validated.as_slice(),
+            der.as_slice(),
+            "the installed signer is the validated PKCS8 key"
+        );
+        assert!(wrong_name.is_err(), "another site's leaf must not identify this site");
+        assert!(wrong_ca.is_err(), "a leaf outside this grid CA must not be trusted");
+        assert!(
+            mismatched_key.is_err(),
+            "the private signer must match the existing site certificate"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "peer certificate trust test fixture")]
+    fn peer_gossip_pin_obeys_grid_ca_and_declared_fingerprint_policy() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let leaf = certs::generate_site_cert(&ca, "site-peer").expect("leaf");
+        let fingerprint = certs::canonical_fingerprint(&leaf.cert_pem).expect("fingerprint");
+        let peer = |fingerprints: Vec<String>| {
+            serde_json::from_value::<GridSite>(serde_json::json!({
+                "apiVersion": "grid.praxis.fast/v1alpha1",
+                "kind": "GridSite",
+                "metadata": { "name": "site-peer" },
+                "spec": {
+                    "gridNetworkRef": "grid-a",
+                    "trust": { "canonicalFingerprints": fingerprints }
+                },
+                "status": { "publicCertPem": leaf.cert_pem.clone() }
+            }))
+            .expect("GridSite")
+        };
+        let formatted_fingerprint: String = fingerprint
+            .char_indices()
+            .flat_map(|(index, character)| {
+                let character = character.to_ascii_uppercase();
+                if index > 0 && index.is_multiple_of(2) {
+                    vec![':', character]
+                } else {
+                    vec![character]
+                }
+            })
+            .collect();
+        let pinned = peer(vec![fingerprint]);
+        let unpinned = peer(Vec::new());
+        let other_ca = certs::generate_ca("other-ca").expect("other ca");
+        assert!(
+            verified_peer_gossip_key(&pinned, &ca.cert_pem, PeerTrustMode::Pin)
+                .expect("verified certificate")
+                .is_some(),
+            "matching CA and declared fingerprint yield a peer pin"
+        );
+        assert!(
+            verified_peer_gossip_key(&peer(vec![formatted_fingerprint]), &ca.cert_pem, PeerTrustMode::Pin)
+                .expect("non-canonical declared fingerprint")
+                .is_some(),
+            "uppercase colon-separated pins authorize the same certificate"
+        );
+        assert!(
+            verified_peer_gossip_key(&unpinned, &ca.cert_pem, PeerTrustMode::Pin).is_err(),
+            "pin trust refuses a certificate with no declared fingerprint"
+        );
+        assert!(
+            verified_peer_gossip_key(&pinned, &other_ca.cert_pem, PeerTrustMode::Spiffe).is_err(),
+            "SPIFFE trust still requires the Grid CA"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unpersisted_grid_id_waits_without_installing_signed_state() {
+        let mut network = network_with_endpoint_transport("plaintext", None);
+        network.spec.grid_id = String::new();
+        network.spec.peer_trust = Some(crate::crd::grid_network::PeerTrustConfig {
+            mode: PeerTrustMode::Pin,
+            signed_state: SignedStateMode::Enforce,
+        });
+        let client = crate::resources::test_doubles::mock_kube_client_with_grid_networks(HashMap::from([(
+            "glb-demo",
+            network.clone(),
+        )]));
+        let ctx = OperatorCtx::new(client, None, SignalMode::default());
+        let (swim, mut runtime) = SwimHandle::detached("site-a");
+
+        let result = sign_grid_state(&network, &ctx, &swim, "glb-demo").await;
+
+        assert!(
+            result.is_ok(),
+            "missing enrollment-owned grid ID waits without failing: {result:?}"
+        );
+        assert_eq!(
+            runtime.grids_enforced(),
+            Vec::<String>::new(),
+            "signed state is not enabled before enrollment provides a grid ID"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "certificate and API server fixture")]
+    async fn peer_pins_follow_the_declared_trust_not_the_startup_one() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let leaf = certs::generate_site_cert(&ca, "site-peer").expect("leaf");
+        let sites = serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridSiteList",
+            "metadata": { "resourceVersion": "1" },
+            "items": [{
+                "apiVersion": "grid.praxis.fast/v1alpha1",
+                "kind": "GridSite",
+                "metadata": { "name": "site-peer" },
+                "spec": { "gridNetworkRef": "glb-demo" },
+                "status": { "publicCertPem": leaf.cert_pem }
+            }]
+        });
+        let ca_secret = serde_json::to_value(crate::resources::test_doubles::secret_with_key(
+            "ca.crt",
+            ca.cert_pem.as_bytes(),
+        ))
+        .expect("Secret");
+        let client = crate::resources::test_doubles::mock_kube_client_with_json(HashMap::from([
+            ("ca", ca_secret),
+            ("gridsites", sites),
+        ]));
+        let mut network = network_with_endpoint_transport("plaintext", None);
+        network.spec.peer_trust = Some(crate::crd::grid_network::PeerTrustConfig {
+            mode: PeerTrustMode::Pin,
+            signed_state: SignedStateMode::Enforce,
+        });
+
+        let pins = collect_gossip_peer_pins(&network, &client, "site-local")
+            .await
+            .expect("pins");
+
+        assert!(
+            pins.is_empty(),
+            "declared pin trust refuses a peer with no declared fingerprint: {pins:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::expect_used,
+        reason = "multiple certificate fixtures verify key accumulation and deduplication"
+    )]
+    async fn peer_gossip_pins_accumulate_distinct_keys_for_one_site() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let first = certs::generate_site_cert(&ca, "site-peer").expect("first leaf");
+        let second = certs::generate_site_cert(&ca, "site-peer").expect("second leaf");
+        let first_fingerprint = certs::canonical_fingerprint(&first.cert_pem).expect("first fingerprint");
+        let second_fingerprint = certs::canonical_fingerprint(&second.cert_pem).expect("second fingerprint");
+        let discovered = |name: &str, cert_pem: &str, fingerprint: &str| {
+            serde_json::json!({
+                "apiVersion": "grid.praxis.fast/v1alpha1",
+                "kind": "GridSite",
+                "metadata": {
+                    "name": name,
+                    "labels": { "grid.praxis.fast/auto-discovered": "true" },
+                    "annotations": { "grid.praxis.fast/site-id": "site-peer" }
+                },
+                "spec": {
+                    "gridNetworkRef": "glb-demo",
+                    "trust": { "canonicalFingerprints": [fingerprint] }
+                },
+                "status": { "publicCertPem": cert_pem }
+            })
+        };
+        let enrolled = serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridSite",
+            "metadata": { "name": "site-peer" },
+            "spec": {
+                "gridNetworkRef": "glb-demo",
+                "trust": { "canonicalFingerprints": [first_fingerprint] }
+            },
+            "status": { "publicCertPem": first.cert_pem }
+        });
+        let sites = serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridSiteList",
+            "metadata": { "resourceVersion": "1" },
+            "items": [
+                enrolled,
+                discovered("glb-demo-site-peer", &second.cert_pem, &second_fingerprint),
+                discovered("glb-demo-site-peer-copy", &second.cert_pem, &second_fingerprint)
+            ]
+        });
+        let ca_secret = serde_json::to_value(crate::resources::test_doubles::secret_with_key(
+            "ca.crt",
+            ca.cert_pem.as_bytes(),
+        ))
+        .expect("Secret");
+        let client = crate::resources::test_doubles::mock_kube_client_with_json(HashMap::from([
+            ("ca", ca_secret),
+            ("gridsites", sites),
+        ]));
+        let network = network_with_endpoint_transport("plaintext", None);
+        let pins = collect_gossip_peer_pins(&network, &client, "site-local")
+            .await
+            .expect("pins");
+        let first_key = certs::verify_site_cert(&ca.cert_pem, &first.cert_pem, "site-peer").expect("first key");
+        let second_key = certs::verify_site_cert(&ca.cert_pem, &second.cert_pem, "site-peer").expect("second key");
+
+        assert!(
+            matches!(pins.get("site-peer"), Some(keys) if keys.len() == 2
+                && keys.contains(&first_key) && keys.contains(&second_key)),
+            "both distinct certificates are retained once: {pins:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "certificate fixture")]
+    async fn signed_cert_bootstrap_republishes_on_every_reconcile() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let leaf = certs::generate_site_cert(&ca, "site-a").expect("leaf");
+        let site = crate::resources::test_doubles::secret_with_key("tls.crt", leaf.cert_pem.as_bytes());
+        let client = crate::resources::test_doubles::mock_kube_client_with_secrets(HashMap::from([("site", site)]));
+        let ctx = OperatorCtx::new(client, None, SignalMode::default());
+        let (swim, mut runtime) = SwimHandle::detached("site-a");
+        let network = network_with_endpoint_transport("plaintext", None);
+
+        publish_signed_site_cert(&network, &ctx.client, &swim, "grid-a", "net").await;
+        publish_signed_site_cert(&network, &ctx.client, &swim, "grid-a", "net").await;
+
+        for reconcile in ["first", "second"] {
+            let bootstrap = runtime.broadcasts.try_recv().expect(reconcile);
+            assert_eq!(
+                bootstrap.grid_id.as_deref(),
+                Some("grid-a"),
+                "{reconcile} reconcile publishes a grid-scoped bootstrap"
+            );
+            assert_eq!(
+                bootstrap.site_cert_pem.as_deref(),
+                Some(leaf.cert_pem.as_str()),
+                "{reconcile} reconcile carries the site certificate for late joiners"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_grid_ca_keeps_installed_pins_and_reconciles() {
+        let client = crate::resources::test_doubles::mock_kube_client_with_secrets(HashMap::new());
+        let ctx = OperatorCtx::new(client, None, SignalMode::default());
+        let (swim, mut runtime) = SwimHandle::detached("site-a");
+        let network = network_with_endpoint_transport("plaintext", None);
+
+        let ready = apply_signed_state(&network, &ctx, &swim, "grid-a", SignedStateMode::Enforce).await;
+
+        assert!(
+            matches!(ready, Ok(false)),
+            "a missing Grid CA must not fail the reconcile, nor yield a signer"
+        );
+        assert_eq!(
+            runtime.peer_pins_sent("grid-a"),
+            vec![None],
+            "the grid still enforces, keeping the pins it has"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_network_relaxes_its_trust_once_withdrawn() {
+        let mut network = network_with_endpoint_transport("plaintext", None);
+        network.metadata.finalizers = Some(vec![GRID_NETWORK_WITHDRAWAL_FINALIZER.to_owned()]);
+        let client = crate::resources::test_doubles::mock_kube_client_with_grid_networks(HashMap::from([(
+            "glb-demo",
+            network.clone(),
+        )]));
+        let (swim, mut runtime) = SwimHandle::detached("site-a");
+        let ctx = OperatorCtx::new(client, Some(Arc::new(swim)), SignalMode::default());
+
+        let (action, withdrawn) = tokio::join!(
+            reconcile_deleting_grid_network(&network, &ctx, "glb-demo"),
+            runtime.publish_withdrawal()
+        );
+
+        assert!(action.is_ok(), "the finalizer is removed: {action:?}");
+        assert_eq!(withdrawn.as_deref(), Some("id"));
+        assert_eq!(
+            runtime.grids_relaxed(),
+            vec!["id".to_owned()],
+            "a withdrawn grid keeps no signer or pins"
+        );
+    }
+
     #[test]
     fn only_spiffe_trust_renews() {
         let modes = |trust| GridModes {

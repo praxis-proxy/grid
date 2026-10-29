@@ -25,9 +25,12 @@ spec:
   signalTransport:
     mode: {{ . | quote }}
   {{- end }}
-  {{- with .peerTrust }}
+  {{- if or .peerTrust .signedState }}
   peerTrust:
-    mode: {{ . | quote }}
+    mode: {{ .peerTrust | default "pin" | quote }}
+    {{- with .signedState }}
+    signedState: {{ . | quote }}
+    {{- end }}
   {{- end }}
   {{- with $.Values.gateway.serviceName }}
   consumerGateways:

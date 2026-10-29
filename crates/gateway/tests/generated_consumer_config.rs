@@ -1,17 +1,22 @@
 //! The operator's generated consumer config must build filter pipelines in this binary,
 //! so a praxis-ai filter schema the render emits and the pinned crate rejects fails here.
+#[path = "support/ports.rs"]
+mod ports;
+
 #[cfg(test)]
 mod tests {
     use std::{
         error::Error,
         io::{self, BufRead as _, BufReader, Read},
-        net::{TcpListener, TcpStream},
+        net::TcpStream,
         path::PathBuf,
         process::{Child, Command, Stdio},
         sync::mpsc,
         thread,
         time::{Duration, Instant},
     };
+
+    use super::ports::free_port;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -99,7 +104,7 @@ filter_chains:
 
     #[test]
     fn the_generated_consumer_filters_build() -> TestResult {
-        let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let port = free_port();
         let mount_base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("grid-credentials");
         std::fs::create_dir_all(&mount_base)?;
         let (mut child, lines) = spawn(write_config(port, &mount_base.display().to_string())?)?;

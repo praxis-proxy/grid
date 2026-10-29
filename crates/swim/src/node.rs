@@ -22,7 +22,7 @@ use crate::{
     AccumulatedOutput, GridRuntime, NodeId,
     runtime::TimerEvent,
     state_broadcast::{
-        DEFAULT_MAX_RETAINED_ORIGINS, MAX_PINNED_KEYS_PER_ORIGIN, OriginStateHandle, StateBroadcast,
+        DEFAULT_MAX_RETAINED_ORIGINS, MAX_PINNED_KEYS_PER_ORIGIN, OriginStateHandle, PinKey, StateBroadcast,
         StateBroadcastHandler, TooManyPinnedKeys, TrustStore,
     },
 };
@@ -252,14 +252,109 @@ impl SwimNode {
                 supplied: keys.len(),
             });
         }
-        let was_unpinned = self.trust_store_tx.borrow().get(&origin).is_none_or(Vec::is_empty);
+        let was_unpinned = self
+            .trust_store_tx
+            .borrow()
+            .pin(&PinKey::Site(origin.clone()))
+            .is_none_or(Vec::is_empty);
         if was_unpinned {
             self.evict_origin(&origin);
         }
         self.trust_store_tx.send_modify(|store| {
-            store.insert(origin, keys);
+            store.set_pin(PinKey::Site(origin), keys);
         });
         Ok(())
+    }
+
+    /// Pin a site's signing key within one `GridNetwork` trust domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TooManyPinnedKeys`] when more than
+    /// [`MAX_PINNED_KEYS_PER_ORIGIN`] keys are supplied.
+    pub fn pin_origin_for_grid(
+        &self,
+        grid_id: &str,
+        origin: String,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<(), TooManyPinnedKeys> {
+        if keys.len() > MAX_PINNED_KEYS_PER_ORIGIN {
+            return Err(TooManyPinnedKeys {
+                origin,
+                supplied: keys.len(),
+            });
+        }
+        let key = PinKey::grid(grid_id, &origin);
+        let previous = self.trust_store_tx.borrow().pin(&key).cloned();
+        let purge = previous.as_ref().is_none_or(Vec::is_empty)
+            || previous
+                .as_ref()
+                .is_some_and(|previous| previous.iter().any(|old| !keys.contains(old)));
+        if purge || keys.is_empty() {
+            self.evict_origin(&origin);
+        }
+        self.trust_store_tx.send_modify(|store| {
+            store.set_pin(key, keys);
+        });
+        Ok(())
+    }
+
+    /// Require a verified pin before accepting state in `grid_id`.
+    pub fn enforce_signed_grid(&self, grid_id: &str) {
+        let store = self.trust_store_tx.borrow();
+        if store.is_strict(grid_id) {
+            return;
+        }
+        let unpinned = self
+            .origin_state
+            .known_origins()
+            .into_iter()
+            .filter(|origin| store.pin(&PinKey::grid(grid_id, origin)).is_none_or(Vec::is_empty))
+            .collect::<Vec<_>>();
+        drop(store);
+        for origin in unpinned {
+            self.evict_origin(&origin);
+        }
+        self.trust_store_tx.send_modify(|pins| {
+            pins.enforce(grid_id);
+        });
+    }
+
+    /// Hold inbound state broadcasts until the controller applies `GridNetwork` trust.
+    pub fn hold_state_admission(&self) {
+        self.trust_store_tx.send_modify(TrustStore::hold_state_admission);
+    }
+
+    /// Resume inbound state broadcasts after the controller applies `GridNetwork` trust.
+    pub fn open_state_admission(&self) {
+        self.trust_store_tx.send_modify(TrustStore::open_state_admission);
+    }
+
+    /// Stop requiring signed state in `grid_id`, dropping its strictness and pins.
+    ///
+    /// Retained state is kept: it was verified when it merged.
+    pub fn relax_signed_grid(&self, grid_id: &str) {
+        self.trust_store_tx.send_modify(|store| store.forget_grid(grid_id));
+    }
+
+    /// Revoke a site identity in one `GridNetwork` and purge its retained state.
+    pub fn unpin_origin_for_grid(&self, grid_id: &str, origin: &str) {
+        self.evict_origin(origin);
+        self.trust_store_tx.send_modify(|store| {
+            store.set_pin(PinKey::grid(grid_id, origin), Vec::new());
+        });
+    }
+
+    /// Clear a site's current pin and allow only certificate bootstrap in a strict grid.
+    ///
+    /// This is used when a peer certificate is absent or no longer satisfies
+    /// the declared trust policy. Ordinary grid state remains blocked until a
+    /// newly validated pin is installed.
+    pub fn clear_origin_pin_for_grid(&self, grid_id: &str, origin: &str) {
+        self.evict_origin(origin);
+        self.trust_store_tx.send_modify(|store| {
+            store.remove_pin(&PinKey::grid(grid_id, origin));
+        });
     }
 
     /// Remove `origin`'s pin, returning it to unenforced (pass-through) status.
@@ -269,7 +364,7 @@ impl SwimNode {
     /// already accepted under whatever enforcement applied when it arrived.
     pub fn unpin_origin(&self, origin: &str) {
         self.trust_store_tx.send_modify(|store| {
-            store.remove(origin);
+            store.remove_pin(&PinKey::Site(origin.to_owned()));
         });
     }
 
@@ -711,6 +806,107 @@ mod tests {
     }
 
     #[test]
+    fn relaxing_a_grid_drops_only_that_grids_policy_and_pins() {
+        let (node, _) = make_node("site-local", 19_232);
+        for grid in ["grid-a", "grid-b"] {
+            node.enforce_signed_grid(grid);
+            node.pin_origin_for_grid(grid, "site-peer".to_owned(), vec![vec![1]])
+                .unwrap_or_else(|_| std::process::abort());
+        }
+
+        node.relax_signed_grid("grid-a");
+
+        let pins = node.trust_store_tx.borrow().clone();
+        assert!(!pins.is_strict("grid-a"), "a relaxed grid stops requiring signed state");
+        assert!(
+            pins.pin(&PinKey::grid("grid-a", "site-peer")).is_none(),
+            "a relaxed grid keeps no peer pins"
+        );
+        assert!(
+            pins.is_strict("grid-b") && pins.pin(&PinKey::grid("grid-b", "site-peer")).is_some(),
+            "other grids keep enforcing"
+        );
+    }
+
+    #[test]
+    fn empty_certificate_bootstrap_establishes_grid_scoped_signed_gossip() {
+        let id_a = local_id("site-a", 19_229);
+        let id_b = local_id("site-b", 19_230);
+        let (mut node_a, _) = make_node("site-a", 19_229);
+        let (mut node_b, _) = make_node("site-b", 19_230);
+        establish_membership(&mut node_a, &mut node_b, &id_a, &id_b);
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        node_a
+            .pin_origin_for_grid("grid-a", "site-a".to_owned(), vec![public_key.clone()])
+            .unwrap_or_else(|_| std::process::abort());
+        node_b.enforce_signed_grid("grid-a");
+
+        let unsigned_bootstrap = StateBroadcast::new(
+            "site-a".to_owned(),
+            1,
+            GridStateSnapshot::new("site-a".to_owned()),
+            None,
+        )
+        .with_cert(Some("public certificate".to_owned()))
+        .with_grid_id(Some("grid-a".to_owned()))
+        .with_signed_at(Some(now_ms()));
+        let bootstrap_signature = crate::signing::sign_ecdsa_p256(
+            &private_key,
+            &unsigned_bootstrap
+                .signable_bytes()
+                .unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        node_a
+            .publish_state_broadcast(&unsigned_bootstrap.with_signature(Some(bootstrap_signature)))
+            .unwrap_or_else(|_| std::process::abort());
+        for message in &node_a.broadcast().messages {
+            if message.addr == id_b.socket_addr() {
+                drop(node_b.handle_data(&message.data));
+            }
+        }
+        assert_eq!(
+            node_b.cert_pems().get("site-a").map(String::as_str),
+            Some("public certificate"),
+            "strict grid accepts the empty certificate bootstrap for operator CA validation"
+        );
+
+        node_b
+            .pin_origin_for_grid("grid-a", "site-a".to_owned(), vec![public_key])
+            .unwrap_or_else(|_| std::process::abort());
+        let unsigned_metadata = StateBroadcast::new(
+            "site-a".to_owned(),
+            2,
+            GridStateSnapshot::new("site-a".to_owned()),
+            None,
+        )
+        .with_signals_address(Some("site-a:9443".to_owned()))
+        .with_grid_id(Some("grid-a".to_owned()))
+        .with_signed_at(Some(now_ms()));
+        let metadata_signature = crate::signing::sign_ecdsa_p256(
+            &private_key,
+            &unsigned_metadata
+                .signable_bytes()
+                .unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        node_a
+            .publish_state_broadcast(&unsigned_metadata.with_signature(Some(metadata_signature)))
+            .unwrap_or_else(|_| std::process::abort());
+        for message in &node_a.broadcast().messages {
+            if message.addr == id_b.socket_addr() {
+                drop(node_b.handle_data(&message.data));
+            }
+        }
+
+        assert_eq!(
+            node_b.signals_addrs().get("site-a").map(String::as_str),
+            Some("site-a:9443"),
+            "after pinning, the same grid-scoped identity authenticates later empty metadata"
+        );
+    }
+
+    #[test]
     fn pin_origin_rejects_more_than_the_max_pinned_keys() {
         let (node, _) = make_node("site-b", 19_230);
 
@@ -719,6 +915,26 @@ mod tests {
         assert!(
             matches!(&result, Err(TooManyPinnedKeys { origin, supplied }) if origin == "site-p" && *supplied == 3),
             "pinning 3 keys (over MAX_PINNED_KEYS_PER_ORIGIN=2) must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn clearing_a_grid_pin_leaves_strict_bootstrap_policy_enabled() {
+        let (node, _) = make_node("site-local", 19_231);
+        node.enforce_signed_grid("grid-a");
+        node.pin_origin_for_grid("grid-a", "site-peer".to_owned(), vec![vec![1]])
+            .unwrap_or_else(|_| std::process::abort());
+
+        node.clear_origin_pin_for_grid("grid-a", "site-peer");
+
+        let pins = node.trust_store_tx.borrow().clone();
+        assert!(
+            pins.pin(&PinKey::grid("grid-a", "site-peer")).is_none(),
+            "a cleared peer returns to the certificate-bootstrap state"
+        );
+        assert!(
+            pins.is_strict("grid-a"),
+            "clearing a peer pin must not disable the grid's strict policy"
         );
     }
 

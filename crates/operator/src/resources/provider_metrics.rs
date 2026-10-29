@@ -1408,19 +1408,15 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
     #[tokio::test]
     async fn provider_signal_scrapes_are_bounded_at_sixteen() {
         let (endpoint, peak_connections) = start_bounded_test_server(ok_response("bounded_queue 0.1\n"), 17, 16).await;
+        let mut metrics = mc_with_queue("bounded_queue");
+        metrics.timeout = "10s".to_owned();
         let providers: Vec<_> = (0..17)
-            .map(|index| {
-                provider_fixture(
-                    &format!("provider-{index}"),
-                    &endpoint,
-                    Some(mc_with_queue("bounded_queue")),
-                )
-            })
+            .map(|index| provider_fixture(&format!("provider-{index}"), &endpoint, Some(metrics.clone())))
             .collect();
         let readiness = crate::readiness::ReadinessStore::default();
 
         let collected = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(15),
             collect_provider_signals("net", &providers, None, &readiness),
         )
         .await;

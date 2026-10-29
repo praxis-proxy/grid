@@ -14,6 +14,14 @@ tests:
       - hasDocuments:
           count: 0
 
+  - it: refuses signed gossip without a rendered GridNetwork
+    template: templates/gridnetwork.yaml
+    set:
+      grid.signedState: enforce
+    asserts:
+      - failedTemplate:
+          errorPattern: "grid.signedState enforce requires grid.id"
+
   - it: renders the GridNetwork from the flat grid values, after the CRDs
     template: templates/gridnetwork.yaml
     set:
@@ -45,6 +53,17 @@ tests:
               siteSecretRef: {name: grid-site-identity, namespace: grid}
               caSecretRef: {name: grid-ca, namespace: grid}
               swimKeySecretRef: {name: grid-swim-key, namespace: grid}
+
+  - it: enforces signed gossip under the default peer trust
+    template: templates/gridnetwork.yaml
+    set:
+      site.name: east
+      grid.id: lab
+      grid.signedState: enforce
+    asserts:
+      - equal:
+          path: spec.peerTrust
+          value: {mode: pin, signedState: enforce}
 
   - it: passes gateway.praxisConfig through to the site gateway reference
     template: templates/gridnetwork.yaml

@@ -249,6 +249,17 @@ pub enum PeerTrustMode {
     Spiffe,
 }
 
+/// Whether grid-scoped SWIM state must carry a verified signature.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SignedStateMode {
+    /// State is neither signed nor verified.
+    #[default]
+    Off,
+    /// State is signed with the site identity, and unverified peer state is refused.
+    Enforce,
+}
+
 /// Grid-wide peer trust, the same at every site.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -256,6 +267,10 @@ pub enum PeerTrustMode {
 pub struct PeerTrustConfig {
     /// Peer trust mode.
     pub mode: PeerTrustMode,
+
+    /// Signed state, `off` when absent. Switch every site together: an enforcing site refuses unsigned peers.
+    #[serde(default)]
+    pub signed_state: SignedStateMode,
 }
 
 /// Explicit static provider-capacity placement strategy.
@@ -745,7 +760,8 @@ pub struct GridNetworkSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal_transport: Option<SignalTransportConfig>,
 
-    /// Grid-wide peer trust on the signals path, `pin` when absent, read at operator start.
+    /// Grid-wide peer trust: signals-path mode, `pin` when absent, read at operator start; signed state, read each
+    /// reconcile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_trust: Option<PeerTrustConfig>,
 
@@ -3178,6 +3194,31 @@ mod tests {
         else {
             std::process::abort();
         };
+    }
+
+    #[test]
+    fn signed_state_is_off_unless_enforced() {
+        let parse = |peer_trust: serde_json::Value| {
+            serde_json::from_value::<GridNetworkSpec>(serde_json::json!({"seeds": [], "peerTrust": peer_trust}))
+                .map(|spec| spec.peer_trust.map(|trust| trust.signed_state))
+        };
+
+        assert_eq!(
+            parse(serde_json::json!({"mode": "pin"})).ok().flatten(),
+            Some(SignedStateMode::Off),
+            "absent signedState keeps state unsigned"
+        );
+        assert_eq!(
+            parse(serde_json::json!({"mode": "pin", "signedState": "enforce"}))
+                .ok()
+                .flatten(),
+            Some(SignedStateMode::Enforce),
+            "enforce parses"
+        );
+        assert!(
+            parse(serde_json::json!({"mode": "pin", "signedState": "sign"})).is_err(),
+            "unknown signedState is rejected"
+        );
     }
 
     #[test]

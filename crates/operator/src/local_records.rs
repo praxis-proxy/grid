@@ -13,7 +13,7 @@ use crate::{
     crd::{
         grid_network::{
             GridNetwork, GridNetworkSpec, MembershipConfig, PeerTrustConfig, SecretRef, SignalTransportConfig,
-            TlsConfig,
+            SignedStateMode, TlsConfig,
         },
         grid_site::{GridSite, GridSiteSpec},
     },
@@ -82,7 +82,10 @@ pub fn grid_network(plan: &Plan) -> Result<GridNetwork, OperatorError> {
     spec.signal_transport = Some(SignalTransportConfig {
         mode: plan.modes.signal,
     });
-    spec.peer_trust = Some(PeerTrustConfig { mode: plan.modes.trust });
+    spec.peer_trust = Some(PeerTrustConfig {
+        mode: plan.modes.trust,
+        signed_state: SignedStateMode::default(),
+    });
     spec.membership = Some(MembershipConfig {
         mode: plan.modes.membership,
     });

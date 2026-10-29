@@ -1926,7 +1926,9 @@ spec:
                   pattern: ^([1-9][0-9]*s|[1-9][0-9]{3,}ms)$
                   type: string
                 peerTrust:
-                  description: Grid-wide peer trust on the signals path, `pin` when absent, read at operator start.
+                  description: |-
+                    Grid-wide peer trust: signals-path mode, `pin` when absent, read at operator start; signed state, read each
+                    reconcile.
                   nullable: true
                   properties:
                     mode:
@@ -1934,6 +1936,13 @@ spec:
                       enum:
                         - pin
                         - spiffe
+                      type: string
+                    signedState:
+                      default: "off"
+                      description: 'Signed state, `off` when absent. Switch every site together: an enforcing site refuses unsigned peers.'
+                      enum:
+                        - "off"
+                        - enforce
                       type: string
                   required:
                     - mode
