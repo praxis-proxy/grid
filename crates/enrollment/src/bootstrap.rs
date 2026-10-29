@@ -17,6 +17,8 @@ use std::error::Error;
 
 use clap::Parser;
 
+mod grid_id;
+
 /// Boxed error that is `Send + Sync` so the async command future stays `Send`.
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -29,6 +31,12 @@ struct BootstrapArgs {
     /// `default`.
     #[arg(long)]
     namespace: Option<String>,
+    /// Persist the grid ID once in this `ConfigMap`, independently of CA rotation.
+    #[arg(long)]
+    grid_id_config_map: Option<String>,
+    /// Existing `GridNetwork` whose ID bootstrap adopts when creating its state.
+    #[arg(long, default_value = "grid")]
+    grid_network: String,
     /// Common name recorded on the CA certificate.
     #[arg(long, default_value = "grid-ca")]
     common_name: String,
@@ -133,6 +141,10 @@ async fn bootstrap(args: &BootstrapArgs) -> Result<(), BoxError> {
     let namespace = resolve_namespace(args);
     check_site_args(args)?;
     let client = kube::Client::try_default().await?;
+    if let Some(name) = &args.grid_id_config_map {
+        let id = grid_id::ensure(&client, &namespace, name, &args.grid_network).await?;
+        tracing::info!(grid_id = %id, "bootstrap grid identity is persisted");
+    }
     let secrets: Api<Secret> = Api::namespaced(client.clone(), &namespace);
 
     Box::pin(await_secret_confinement(&secrets, args)).await?;

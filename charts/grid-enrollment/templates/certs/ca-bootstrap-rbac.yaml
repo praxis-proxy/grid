@@ -1,4 +1,4 @@
-{{- if eq .Values.mode "service" }}
+{{- if or (eq .Values.mode "service") .Values.gridIdentity.enabled }}
 {{- include "grid-enrollment.normalize" . }}
 {{- if include "grid-enrollment.bootstrapRuns" . }}
 {{- $ca := ne (include "grid-enrollment.caProvided" .) "true" }}
@@ -44,6 +44,16 @@ metadata:
     helm.sh/hook-weight: "-10"
     helm.sh/hook-delete-policy: before-hook-creation
 rules:
+  {{- if .Values.gridIdentity.enabled }}
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [{{ .Values.gridIdentity.configMapName | quote }}]
+    verbs: [get]
+  {{- end }}
+  {{- if eq .Values.mode "service" }}
   # create cannot be resourceName-scoped (the object does not exist yet).
   - apiGroups: [""]
     resources: ["secrets"]
@@ -107,6 +117,7 @@ rules:
       - {{ include "grid-enrollment.dbHost" . | quote }}
     verbs: ["get", "patch"]
   {{- end }}
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -127,6 +138,41 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "grid-enrollment.bootstrapServiceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- if .Values.gridIdentity.enabled }}
+{{- $name := printf "%s-%s" .Release.Namespace (include "grid-enrollment.bootstrapServiceAccountName" .) }}
+{{- $role := printf "%s-%s" ($name | trunc 54 | trimSuffix "-") ($name | sha256sum | trunc 8) }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $role }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+rules:
+  - apiGroups: [grid.praxis.fast]
+    resources: [gridnetworks]
+    resourceNames: [{{ .Values.gridIdentity.networkName | quote }}]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $role }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $role }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "grid-enrollment.bootstrapServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- with .Values.hubSite.name }}
 {{- $name := printf "%s-hub-site" (include "grid-enrollment.bootstrapServiceAccountName" $) }}
 ---

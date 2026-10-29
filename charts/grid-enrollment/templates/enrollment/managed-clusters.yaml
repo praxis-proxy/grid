@@ -107,4 +107,28 @@ spec:
           {{ printf "{{hub $namespace := %q hub}}" .Values.external.delivery.namespace }}
           {{ printf "{{hub $clusterSet := %q hub}}" $cfg.clusterSet }}
           {{- .Files.Get "files/managed-cluster-peers.yaml" | nindent 10 }}
+{{- if .Values.gridIdentity.enabled }}
+  - objectDefinition:
+      apiVersion: policy.open-cluster-management.io/v1
+      kind: ConfigurationPolicy
+      metadata:
+        name: {{ $name }}-network
+      spec:
+        remediationAction: enforce
+        severity: high
+        evaluationInterval:
+          compliant: watch
+          noncompliant: watch
+        # A membership removal must not delete the grid or reset its identity.
+        pruneObjectBehavior: None
+        object-templates-raw: |
+          {{ printf "{{hub $stateNamespace := %q hub}}" .Release.Namespace }}
+          {{ printf "{{hub $stateName := %q hub}}" .Values.gridIdentity.configMapName }}
+          {{ printf "{{hub $network := %q hub}}" $cfg.networkName }}
+          {{ printf "{{hub $namespace := %q hub}}" .Values.external.delivery.namespace }}
+          {{ printf "{{hub $identity := %q hub}}" .Values.external.delivery.identitySecretName }}
+          {{ printf "{{hub $ca := %q hub}}" .Values.external.delivery.caSecretName }}
+          {{ printf "{{hub $gateway := %q hub}}" $cfg.gatewayName }}
+          {{- .Files.Get "files/managed-cluster-network.yaml" | nindent 10 }}
+{{- end }}
 {{- end }}

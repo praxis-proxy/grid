@@ -653,9 +653,9 @@ fn add_tls_config_legacy_fields(schema: &mut schemars::Schema) {
 #[schemars(transform = add_grid_network_spec_legacy_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct GridNetworkSpec {
-    /// The grid this network belongs to, set once. Empty only while unset: an install with no
-    /// operator config site section then mints one, and one with a site section holds the
-    /// grid runtime until it is set. Moving to another grid means recreating the network.
+    /// The grid this network belongs to, set once by bootstrap or its delivery automation.
+    /// The operator waits until this is declared and never generates a grid ID.
+    /// Moving to another grid means recreating the network.
     #[serde(default)]
     #[schemars(length(max = 63), regex(pattern = "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"))]
     pub grid_id: String,

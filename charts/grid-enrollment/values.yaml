@@ -2,6 +2,13 @@
 # external consumes identity Secrets supplied by another issuer or PKI.
 mode: service
 
+# -- Persist grid identity once during bootstrap, separately from CA issuance.
+gridIdentity:
+  enabled: false
+  configMapName: grid-bootstrap-state
+  # -- Existing GridNetwork to adopt during migration; otherwise bootstrap generates an ID.
+  networkName: grid
+
 # -- External identities and optional cert-manager issuance, with ACM delivery.
 external:
   # -- Site names mapped to secretName, optional dnsNames, and optional ACM cluster.
@@ -45,6 +52,8 @@ external:
 managedClusters:
   enabled: false
   networkName: grid
+  # -- Per-cluster gateway referenced by the enrolled GridNetwork; empty omits it.
+  gatewayName: grid-gateway
   clusterSet: default
   clusterLabel: grid.praxis.fast/member
   clusterLabelValue: 'true'

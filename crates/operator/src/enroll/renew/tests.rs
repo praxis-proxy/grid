@@ -1069,7 +1069,7 @@ fn disabled_rotation_no_signer_and_no_config_are_accepted() {
 }
 
 #[test]
-fn a_site_section_without_a_grid_id_to_join_is_not_accepted() {
+fn every_install_waits_for_a_declared_grid_id() {
     let unset: GridNetwork = serde_json::from_value(serde_json::json!({
         "apiVersion": "grid.praxis.fast/v1alpha1", "kind": "GridNetwork",
         "metadata": { "name": "grid" }, "spec": {}
@@ -1093,8 +1093,9 @@ fn a_site_section_without_a_grid_id_to_join_is_not_accepted() {
     assert_eq!(joined.status, "True");
     let standalone = accepted(&Loaded::Absent, None, (std::slice::from_ref(&unset), &trust(true)));
     assert_eq!(
-        standalone.status, "True",
-        "with no site section the operator mints the grid ID"
+        (standalone.status, standalone.reason.as_ref()),
+        ("False", "GridIdUnset"),
+        "a standalone operator also waits for bootstrap"
     );
 }
 

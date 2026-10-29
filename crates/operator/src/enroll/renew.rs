@@ -688,7 +688,7 @@ fn declared<'config>(loaded: &'config Loaded, identity: Option<&str>) -> Declare
 /// What `Accepted` says of `loaded` for the site `identity` names, under `trust`: the one
 /// verdict the enrollment step and the renewal loop both write.
 fn accepted(loaded: &Loaded, identity: Option<&str>, (networks, trust): (&[GridNetwork], &Trust)) -> Verdict {
-    if let ([network], Section::Site(_)) = (networks, loaded.site())
+    if let [network] = networks
         && network.spec.grid_id.is_empty()
     {
         return Verdict::grid_id_unset(network.metadata.name.as_deref().unwrap_or_default());

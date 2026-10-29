@@ -1537,9 +1537,7 @@ fn has_withdrawal_finalizer(network: &GridNetwork) -> bool {
 
 /// The persisted grid ID used to scope state that may have reached SWIM peers.
 ///
-/// Unlike [`resolve_grid_id`], this never generates a fallback UUID: an
-/// unpersisted UUID cannot identify a scope that another reconciliation may
-/// have published.
+/// Legacy status-only IDs remain valid for withdrawing state published before migration.
 fn persisted_grid_id(network: &GridNetwork) -> Option<&str> {
     (!network.spec.grid_id.is_empty())
         .then_some(network.spec.grid_id.as_str())
@@ -1760,7 +1758,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     ctx.publish_declared_trust(&network);
 
     let client = &ctx.client;
-    if holds_for_grid_id(&network, &ctx.operator_config.current()) {
+    if network.spec.grid_id.is_empty() {
         tracing::info!(name, "spec.gridId is not set; the grid runtime waits until it is");
         Box::pin(apply_rollup(client, &network)).await;
         return Ok(Action::await_change());
@@ -1974,7 +1972,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     ))
     .await?;
 
-    let grid_id = resolve_grid_id(&network);
+    let grid_id = network.spec.grid_id.clone();
     // An expired or unreadable identity, as IdentityValid reports it, degrades the network.
     let identity_failed = network.status.as_ref().is_some_and(|status| {
         held_condition(&status.conditions, crate::enroll::local::IDENTITY_VALID)
@@ -5113,28 +5111,6 @@ async fn distribute_overlay_configmap(
 // Grid ID
 // ---------------------------------------------------------------------------
 
-/// Resolve the grid ID: use spec if set, or status if
-/// previously generated, or generate a new one.
-/// Whether `network` must wait for `spec.gridId`: unset, while the operator config names a
-/// site, which joins a grid an admin names rather than one this operator would mint.
-fn holds_for_grid_id(network: &GridNetwork, config: &crate::operator_config::Snapshot) -> bool {
-    network.spec.grid_id.is_empty() && !matches!(config.loaded.site(), crate::operator_config::Section::Unset)
-}
-
-/// The grid ID: `spec.gridId` whenever set, else the one minted earlier, else a new one. Only
-/// an install whose operator config names no site gets here without `spec.gridId`.
-fn resolve_grid_id(network: &GridNetwork) -> String {
-    if !network.spec.grid_id.is_empty() {
-        return network.spec.grid_id.clone();
-    }
-    if let Some(status) = &network.status
-        && !status.grid_id.is_empty()
-    {
-        return status.grid_id.clone();
-    }
-    uuid::Uuid::new_v4().to_string()
-}
-
 /// Determine the lifecycle phase.
 ///
 /// When a [`MembershipSnapshot`] is provided, the live membership state takes
@@ -5464,7 +5440,7 @@ pub(crate) fn tool_names_from_agent_tool_provider(provider: &AgentToolProvider) 
 /// ones.  The routing overlay layer already filters `Unavailable` providers
 /// from local routing decisions.
 ///
-/// `grid_id` (the caller's already-[`resolve_grid_id`]d value) is attached to
+/// `grid_id` (the caller's declared grid identity) is attached to
 /// the broadcast so a signature over this `GridNetwork`'s state cannot be
 /// replayed as valid for a different `GridNetwork` sharing the same
 /// cluster's `SwimHandle`; see [`swim::StateBroadcast::grid_id`].
@@ -8657,36 +8633,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // resolve_grid_id: pure ID resolution (three branches)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn resolve_grid_id_prefers_spec_grid_id() {
-        let network = base_network();
-        let id = resolve_grid_id(&network);
-        assert_eq!(
-            id, "test-id",
-            "spec.gridId must be returned verbatim when non-empty, with no status lookup or UUID generation"
-        );
-    }
-
-    #[test]
-    fn resolve_grid_id_falls_back_to_status_grid_id_when_spec_is_empty() {
-        let mut network = base_network();
-        network.spec.grid_id = String::new();
-        network.status = Some(GridNetworkStatus {
-            grid_id: "persisted-id".to_owned(),
-            ..Default::default()
-        });
-        let id = resolve_grid_id(&network);
-        assert_eq!(
-            id, "persisted-id",
-            "status.gridId must be returned when spec.gridId is empty, \
-             preserving a previously negotiated ID across operator restarts"
-        );
-    }
-
     #[test]
     fn persisted_grid_id_uses_spec_without_generating_a_fallback() {
         let network = base_network();
@@ -9201,17 +9147,32 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_grid_id_generates_uuid_when_both_spec_and_status_are_empty() {
-        let mut network = base_network();
-        network.spec.grid_id = String::new();
-        network.status = None;
-        let id = resolve_grid_id(&network);
-        assert!(!id.is_empty(), "a freshly generated grid ID must not be empty");
-        assert!(
-            uuid::Uuid::parse_str(&id).is_ok(),
-            "generated grid ID must be a valid UUID, got: {id}"
-        );
+    #[tokio::test]
+    async fn an_unconfigured_operator_waits_for_bootstrap_instead_of_minting_a_grid_id() -> Result<(), OperatorError> {
+        for previous in [None, Some("legacy-grid")] {
+            let api = status_harness::FakeApi::new();
+            let mut network = base_network();
+            network.spec.grid_id.clear();
+            network.status = previous.map(|id| GridNetworkStatus {
+                grid_id: id.to_owned(),
+                ..GridNetworkStatus::default()
+            });
+            let name = network.metadata.name.as_deref().unwrap_or_default();
+            let path = format!("/apis/grid.praxis.fast/v1alpha1/gridnetworks/{name}");
+            api.put(&path, serde_json::to_value(&network)?);
+            let ctx = Arc::new(OperatorCtx::new(api.client("grid"), None, SignalMode::Gossip));
+            assert_eq!(
+                Box::pin(reconcile(Arc::new(network), ctx)).await?,
+                Action::await_change()
+            );
+            let writes = api.writes();
+            assert!(
+                writes
+                    .iter()
+                    .all(|write| write.status && write.body.pointer("/status/gridId").is_none())
+            );
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

@@ -14,6 +14,7 @@ func main() {
 		Template  string
 		Cluster   string
 		Resources map[string]any
+		Managed   bool
 	}
 	if err := json.NewDecoder(os.Stdin).Decode(&input); err != nil {
 		panic(err)
@@ -27,8 +28,13 @@ func main() {
 			return value
 		},
 		"fromSecret": func(ns, name, key string) string { return ns + "/" + name + "/" + key },
+		"fail":       func(message string) (string, error) { return "", fmt.Errorf("%s", message) },
 	}
-	t, err := template.New("hub").Delims("{{hub", "hub}}").Funcs(funcs).Parse(input.Template)
+	left, right := "{{hub", "hub}}"
+	if input.Managed {
+		left, right = "{{", "}}"
+	}
+	t, err := template.New("hub").Delims(left, right).Funcs(funcs).Parse(input.Template)
 	if err != nil {
 		panic(err)
 	}

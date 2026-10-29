@@ -15,4 +15,10 @@
   resources: [manifestworks]
   resourceNames: [{{ .Values.managedClusters.workName | quote }}]
   verbs: [get, list, watch]
+{{- if .Values.gridIdentity.enabled }}
+- apiGroups: [""]
+  resources: [configmaps]
+  resourceNames: [{{ .Values.gridIdentity.configMapName | quote }}]
+  verbs: [get, list, watch]
+{{- end }}
 {{- end -}}

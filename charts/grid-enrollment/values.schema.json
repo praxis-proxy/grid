@@ -9,6 +9,26 @@
         "external"
       ]
     },
+    "gridIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "configMapName", "networkName"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "configMapName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 63,
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+        },
+        "networkName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 63,
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+        }
+      }
+    },
     "external": {
       "type": "object",
       "additionalProperties": false,
@@ -945,6 +965,11 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "gatewayName": {
+          "type": "string",
+          "maxLength": 63,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+        },
         "enabled": {
           "type": "boolean"
         },

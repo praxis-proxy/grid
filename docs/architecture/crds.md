@@ -114,10 +114,11 @@ writes `Available`, `Progressing` and `Degraded`. Every reason is listed in
 [Site Enrollment](../installation/enrollment.md#3-enroll-the-site).
 
 `spec.gridId` is the grid the network belongs to, set once: a DNS label of at most 63
-characters, and a change is refused. `status.gridId` mirrors it. The operator mints an
-ID only while `spec.gridId` is empty and the operator config names no site, the
-standalone install. Beside a site section it mints nothing, holds the grid runtime, and
-`Accepted` reads `False` with `GridIdUnset` until `spec.gridId` is set. Moving a cluster
+characters, and a change is refused. `status.gridId` mirrors it. Bootstrap owns
+ID generation and persists it independently of the CA; the operator never mints
+an ID. Every installation waits with `Accepted=False`, reason `GridIdUnset`,
+until `spec.gridId` is set. During migration, bootstrap adopts an existing
+declared or legacy status ID rather than creating another one. Moving a cluster
 to another grid means deleting and recreating its GridNetwork, and its identity with it.
 
 ```yaml
@@ -126,7 +127,7 @@ kind: GridNetwork
 metadata:
   name: production
 spec:
-  gridId: ""                    # the grid, set once; minted only without an operator config site section
+  gridId: "production-grid"     # the stable ID supplied by bootstrap
   seeds:
     - "10.0.0.5:7946"
   consumerGateways:

@@ -1,0 +1,37 @@
+{{hub $state := lookup "v1" "ConfigMap" $stateNamespace $stateName hub}}
+{{hub $id := index $state.data "gridId" hub}}
+{{hub if not $id hub}}{{hub fail "waiting for bootstrap grid identity" hub}}{{hub end hub}}
+{{ $namespace := {{hub printf "%q" $namespace hub}} }}
+{{ $identity := {{hub printf "%q" $identity hub}} }}
+{{ $ca := {{hub printf "%q" $ca hub}} }}
+{{ if not (lookup "v1" "Secret" $namespace $identity).metadata.name }}
+{{ fail "waiting for the enrolled site identity" }}{{ end }}
+{{ if not (lookup "v1" "Secret" $namespace $ca).metadata.name }}
+{{ fail "waiting for the grid trust bundle" }}{{ end }}
+- complianceType: musthave
+  objectDefinition:
+    apiVersion: grid.praxis.fast/v1alpha1
+    kind: GridNetwork
+    metadata:
+      name: {{hub printf "%q" $network hub}}
+    spec:
+      gridId: {{hub printf "%q" $id hub}}
+      membership:
+        mode: Local
+      signalTransport:
+        mode: poll
+      peerTrust:
+        mode: spiffe
+      tls:
+        siteSecretRef:
+          name: {{hub printf "%q" $identity hub}}
+          namespace: {{hub printf "%q" $namespace hub}}
+        caSecretRef:
+          name: {{hub printf "%q" $ca hub}}
+          namespace: {{hub printf "%q" $namespace hub}}
+      {{hub if $gateway hub}}
+      consumerGateways:
+      - name: {{hub printf "%q" $gateway hub}}
+        namespace: {{hub printf "%q" $namespace hub}}
+        siteName: {{hub printf "%q" .ManagedClusterName hub}}
+      {{hub end hub}}

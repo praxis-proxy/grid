@@ -215,6 +215,52 @@ class ManagedClusterTemplates(unittest.TestCase):
         self.assertNotIn('cert-manager.io/certificate-name', rendered)
         self.assertIn('public-grid-ca', rendered)
 
+    def test_enrollment_creates_complete_network_after_identity_delivery(self):
+        values = copy.deepcopy(self.values)
+        values['gridIdentity'] = {'enabled': True}
+        docs = self.render_chart(values)
+        policy, = [d for d in docs if d['kind'] == 'Policy' and
+                   d['metadata']['name'] == 'grid-bootstrap-membership']
+        spec = policy['spec']['policy-templates'][1]['objectDefinition']['spec']
+        self.assertEqual(spec['pruneObjectBehavior'], 'None')
+
+        def execute(raw, resources, managed=False):
+            return subprocess.run([self.renderer], input=json.dumps({
+                'Template': raw, 'Cluster': 'west', 'Managed': managed,
+                'Resources': resources}), text=True, capture_output=True)
+
+        state = {'v1/ConfigMap/grid-system/grid-bootstrap-state':
+                 {'data': {'gridId': 'persisted-grid'}}}
+        hub = execute(spec['object-templates-raw'], state)
+        self.assertEqual(hub.returncode, 0, hub.stderr)
+        identities = {'v1/Secret/grid-system/grid-site-identity':
+                      {'metadata': {'name': 'grid-site-identity'}},
+                      'v1/Secret/grid-system/grid-ca': {'metadata': {'name': 'grid-ca'}}}
+        managed = execute(hub.stdout, identities, managed=True)
+        self.assertEqual(managed.returncode, 0, managed.stderr)
+        objects = yaml.safe_load(managed.stdout)
+        self.assertEqual(objects[0]['objectDefinition']['spec'], {
+            'gridId': 'persisted-grid',
+            'membership': {'mode': 'Local'},
+            'signalTransport': {'mode': 'poll'},
+            'peerTrust': {'mode': 'spiffe'},
+            'tls': {'siteSecretRef': {'name': 'grid-site-identity', 'namespace': 'grid-system'},
+                    'caSecretRef': {'name': 'grid-ca', 'namespace': 'grid-system'}},
+            'consumerGateways': [{'name': 'grid-gateway', 'namespace': 'grid-system', 'siteName': 'west'}]})
+        self.assertEqual(len(objects), 1)
+        missing = execute(hub.stdout, {}, managed=True)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn('waiting for the enrolled site identity', missing.stderr)
+        missing_ca = execute(hub.stdout, {'v1/Secret/grid-system/grid-site-identity':
+                                         identities['v1/Secret/grid-system/grid-site-identity']}, managed=True)
+        self.assertNotEqual(missing_ca.returncode, 0)
+        self.assertIn('waiting for the grid trust bundle', missing_ca.stderr)
+        self.assertNotEqual(execute(spec['object-templates-raw'], {}).returncode, 0)
+        state['v1/ConfigMap/grid-system/grid-bootstrap-state']['data']['gridId'] = ''
+        empty = execute(spec['object-templates-raw'], state)
+        self.assertNotEqual(empty.returncode, 0)
+        self.assertIn('waiting for bootstrap grid identity', empty.stderr)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

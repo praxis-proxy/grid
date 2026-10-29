@@ -8,6 +8,25 @@ same lifecycle: bootstrap, enroll, and decommission.
 
 ## Bootstrap
 
+Enable `gridIdentity.enabled` to create the grid ID once in the immutable
+`grid-bootstrap-state` ConfigMap. Bootstrap adopts the named GridNetwork's
+declared ID, or its legacy status ID, when one exists; otherwise it generates
+a UUID v4. Retries reuse the saved value, including concurrent bootstrap runs.
+A malformed existing ConfigMap is an error, never a reason to mint another ID.
+Back up this ConfigMap with the CA and retain it through CA rotation.
+
+This bootstrap Job uses the enrollment image's `bootstrap` command with
+`--skip-ca` and has no Secret permissions. It works with either identity
+backend. Use an image that supports `--grid-id-config-map` before enabling it.
+For managed clusters, the enrollment policy creates a complete GridNetwork
+with the saved ID, Local membership, polling, SPIFFE trust, and references to
+the delivered identity and CA Secrets. It waits for those Secrets before
+creating the network. `managedClusters.gatewayName` defaults to `grid-gateway`;
+the gateway reference uses each cluster's name as its site name. Enrollment
+retains the network on decommission. Other delivery systems
+must copy the saved value into each member's GridNetwork (or the chart's
+`grid.id` value). The ID is independent of the CA and is immutable once declared.
+
 For externally supplied identities, provision the shared trust bundle and the
 site identity Secrets through your PKI integration. The chart reads references;
 private keys never belong in values or Git. ACM delivery expects each identity

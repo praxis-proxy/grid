@@ -1,0 +1,87 @@
+suite: bootstrap grid identity
+templates:
+  - templates/certs/ca-bootstrap-job.yaml
+  - templates/certs/ca-bootstrap-rbac.yaml
+  - templates/enrollment/managed-clusters.yaml
+release:
+  name: grid-bootstrap
+  namespace: grid
+tests:
+  - it: leaves external releases unchanged until grid identity bootstrap is enabled
+    template: templates/certs/ca-bootstrap-job.yaml
+    set:
+      mode: external
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: reuses the bootstrap Job with CA issuance disabled for external identities
+    template: templates/certs/ca-bootstrap-job.yaml
+    set:
+      mode: external
+      gridIdentity.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --skip-ca
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --grid-id-config-map
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --db-credentials-secret
+  - it: grants external bootstrap no access to signing keys
+    template: templates/certs/ca-bootstrap-rbac.yaml
+    set:
+      mode: external
+      gridIdentity.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 5
+      - equal:
+          path: rules
+          value:
+            - apiGroups: [""]
+              resources: [configmaps]
+              verbs: [create]
+            - apiGroups: [""]
+              resources: [configmaps]
+              resourceNames: [grid-bootstrap-state]
+              verbs: [get]
+        documentIndex: 1
+  - it: uses one Job for service credentials and grid identity
+    template: templates/certs/ca-bootstrap-job.yaml
+    set:
+      gridIdentity.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --grid-id-config-map
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --ca-key-secret
+  - it: adds network delivery to the membership policy without owning network deletion
+    template: templates/enrollment/managed-clusters.yaml
+    set:
+      mode: external
+      gridIdentity.enabled: true
+      managedClusters.enabled: true
+      grid.membership.source: Local
+      external.delivery.namespace: grid
+      external.trustBundleSecretRef: public-grid-ca
+    documentSelector:
+      path: kind
+      value: Policy
+    asserts:
+      - lengthEqual:
+          path: spec.policy-templates
+          count: 2
+      - equal:
+          path: spec.policy-templates[1].objectDefinition.spec.pruneObjectBehavior
+          value: None
+      - matchRegex:
+          path: spec.policy-templates[1].objectDefinition.spec.object-templates-raw
+          pattern: waiting for the enrolled site identity

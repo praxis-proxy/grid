@@ -703,7 +703,7 @@ type GridNetworkSpec struct {
 	BudgetPolicy *GridNetworkBudgetPolicy `json:"budgetPolicy,omitempty"`
 	// References to Praxis Gateways that participate in this grid.
 	ConsumerGateways []GridNetworkConsumerGatewaysItem `json:"consumerGateways,omitempty"`
-	// The grid this network belongs to, set once. Empty only while unset: an install with no operator config site section then mints one, and one with a site section holds the grid runtime until it is set. Moving to another grid means recreating the network.
+	// The grid this network belongs to, set once by bootstrap or its delivery automation. The operator waits until this is declared and never generates a grid ID. Moving to another grid means recreating the network.
 	GridID string `json:"gridId,omitempty"`
 	// Grid-wide membership source. When absent, the install's startup setting applies. A change causes the operator to restart gracefully into the declared mode.
 	Membership *GridNetworkMembership `json:"membership,omitempty"`
