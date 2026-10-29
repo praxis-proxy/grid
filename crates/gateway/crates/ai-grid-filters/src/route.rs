@@ -392,10 +392,10 @@ impl GridSiteRouteFilter {
         keys: Option<&PrefixKeys>,
     ) -> Result<Pick<'snap>, FilterAction> {
         let turn = self.turn.fetch_add(1, Ordering::Relaxed);
-        if snapshot.shedding.contains(model) {
+        let now_ms = grid_signals::now_ms();
+        if snapshot.is_shedding(model, now_ms) {
             return Err(refuse(Refused::Shed, model, turn));
         }
-        let now_ms = grid_signals::now_ms();
         let routable =
             |candidate: &RouteCandidate| !candidate.expired_at(now_ms) && has_route(candidate, self.clusters.as_ref());
         let settings = self.affinity.settings.load();
@@ -472,7 +472,7 @@ impl GridSiteRouteFilter {
             Err(answer) => return Ok(Some(answer)),
         };
         // A pin names where the state lives; it does not exempt the request from shedding.
-        if let Some(model) = model.filter(|model| snapshot.shedding.contains(*model)) {
+        if let Some(model) = model.filter(|model| snapshot.is_shedding(model, now_ms)) {
             let turn = self.turn.fetch_add(1, Ordering::Relaxed);
             return Ok(Some(refuse(Refused::Shed, model, turn)));
         }

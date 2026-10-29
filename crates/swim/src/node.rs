@@ -559,12 +559,22 @@ impl SwimNode {
                 .as_millis(),
         )
         .unwrap_or(u64::MAX);
-        self.model_inventories_rx
-            .borrow()
-            .iter()
-            .filter(|inventory| inventory.expires_at_ms > now_ms)
-            .cloned()
-            .collect()
+        self.with_model_inventories(|inventories| {
+            inventories
+                .iter()
+                .filter(|inventory| inventory.expires_at_ms > now_ms)
+                .cloned()
+                .collect()
+        })
+    }
+
+    /// Read the retained model inventories without cloning them.
+    pub fn with_model_inventories<R, Read>(&self, read: Read) -> R
+    where
+        Read: FnOnce(&[ModelInventory]) -> R,
+    {
+        let inventories = self.model_inventories_rx.borrow();
+        read(&inventories)
     }
 
     /// Return the current gateway address map from all received broadcasts.

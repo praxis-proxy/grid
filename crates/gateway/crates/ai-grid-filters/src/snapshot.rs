@@ -95,6 +95,14 @@ impl RouteSnapshot {
         }
     }
 
+    /// Whether `model` is still shed after expiring candidates are removed at request time.
+    pub(crate) fn is_shedding(&self, model: &str, now_ms: i64) -> bool {
+        self.shedding.contains(model)
+            && self.candidates.iter().zip(&self.scores).any(|(candidate, score)| {
+                candidate.name.as_ref() == model && !candidate.expired_at(now_ms) && sheds_on(candidate, *score)
+            })
+    }
+
     /// Order candidates least-loaded-first from the live store, then wrap them.
     ///
     /// For each candidate the store is read at its `site/cluster` key over the
@@ -2506,6 +2514,26 @@ mod tests {
         let previous = BTreeSet::from([Arc::from("m")]);
         let shed = snapshot.shed(&previous, &availability);
         assert!(shed.shedding.is_empty(), "off releases a latch too");
+    }
+
+    #[test]
+    fn an_expired_candidate_does_not_keep_a_model_shed() {
+        let mut candidates = one("a");
+        let Some(candidate) = candidates.first_mut() else {
+            std::process::abort();
+        };
+        candidate.expires_at_ms = Some(100_000);
+        let mut snapshot = RouteSnapshot::from_static(candidates, Arc::from("hub"));
+        snapshot.shedding.insert(Arc::from("m"));
+
+        assert!(
+            snapshot.is_shedding("m", 69_999),
+            "the unexpired candidate remains shed"
+        );
+        assert!(
+            !snapshot.is_shedding("m", 70_000),
+            "the expiry margin releases stale shedding"
+        );
     }
 
     #[test]

@@ -2352,6 +2352,22 @@ fn wait_until_deadline(deadline: time::OffsetDateTime, now: time::OffsetDateTime
     Duration::from_millis(u64::try_from(wait_millis).unwrap_or(u64::MAX))
 }
 
+/// Wake well before the gateway's 30-second expiry cutoff, retrying briefly when inside the lead.
+fn inventory_expiry_retry(deadline: time::OffsetDateTime, now: time::OffsetDateTime) -> Duration {
+    const RECONCILE_LEAD: Duration = Duration::from_secs(60);
+    const LATE_RETRY_MAX: Duration = Duration::from_secs(10);
+
+    if deadline <= now {
+        return Duration::from_secs(1);
+    }
+    let until_deadline = wait_until_deadline(deadline, now);
+    if until_deadline > RECONCILE_LEAD {
+        return until_deadline.saturating_sub(RECONCILE_LEAD);
+    }
+    let half_wait = Duration::from_nanos(u64::try_from(until_deadline.as_nanos() / 2).unwrap_or(0));
+    half_wait.min(LATE_RETRY_MAX).max(Duration::from_nanos(1))
+}
+
 /// Choose the earliest normal, deferred-write, or discovered-inventory requeue.
 fn soonest_reconcile_retry(
     normal_retry: Duration,
@@ -2359,8 +2375,8 @@ fn soonest_reconcile_retry(
     inventory_expiry_deadline: Option<time::OffsetDateTime>,
     now: time::OffsetDateTime,
 ) -> Duration {
-    let inventory_expiry_retry = inventory_expiry_deadline.map(|deadline| wait_until_deadline(deadline, now));
-    [Some(normal_retry), serving_retry, inventory_expiry_retry]
+    let expiry_retry = inventory_expiry_deadline.map(|deadline| inventory_expiry_retry(deadline, now));
+    [Some(normal_retry), serving_retry, expiry_retry]
         .into_iter()
         .flatten()
         .min()
@@ -13382,7 +13398,7 @@ mod tests {
     }
 
     #[test]
-    fn discovered_model_expiry_shortens_reconcile_retry_and_past_deadline_stays_positive() {
+    fn discovered_model_expiry_retries_before_gateway_cutoff() {
         let now = time::OffsetDateTime::parse("2030-01-01T00:00:00Z", &time::format_description::well_known::Rfc3339)
             .unwrap_or_else(|_| std::process::abort());
         let normal_retry = Duration::from_secs(300);
@@ -13390,13 +13406,23 @@ mod tests {
 
         assert_eq!(
             soonest_reconcile_retry(normal_retry, serving_retry, Some(now + time::Duration::seconds(5)), now,),
-            Duration::from_secs(5),
-            "inventory expiry must wake reconciliation before the normal and deferred-write retries"
+            Duration::from_secs(2) + Duration::from_millis(500),
+            "a deadline inside the lead window must retry before the deadline"
         );
         assert_eq!(
             soonest_reconcile_retry(normal_retry, serving_retry, Some(now - time::Duration::seconds(1)), now,),
-            Duration::from_millis(1),
-            "a deadline reached during reconciliation must still schedule a positive retry"
+            Duration::from_secs(1),
+            "a deadline reached during reconciliation must still schedule a bounded short retry"
+        );
+        assert_eq!(
+            inventory_expiry_retry(now + time::Duration::seconds(120), now),
+            Duration::from_secs(60),
+            "a deadline 120 seconds away must requeue no later than 60 seconds"
+        );
+        let inside_lead = inventory_expiry_retry(now + time::Duration::seconds(20), now);
+        assert!(
+            inside_lead < Duration::from_secs(20),
+            "a deadline inside the lead window must requeue before the deadline"
         );
     }
 

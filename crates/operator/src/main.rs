@@ -3444,7 +3444,7 @@ fn bounded_model_discovery_ttl(
 ) -> std::time::Duration {
     let requested_ttl =
         std::time::Duration::from_secs(parse_env_or("GRID_MODEL_DISCOVERY_TTL_SECS", default.as_secs()).max(1));
-    let minimum_ttl = interval.saturating_add(timeout);
+    let minimum_ttl = minimum_model_discovery_ttl(interval, timeout);
     let unclamped_ttl = requested_ttl.max(minimum_ttl);
     let ttl = unclamped_ttl.min(MAX_MODEL_DISCOVERY_TTL);
     if unclamped_ttl > MAX_MODEL_DISCOVERY_TTL {
@@ -3457,6 +3457,15 @@ fn bounded_model_discovery_ttl(
         );
     }
     ttl
+}
+
+/// Keep a discovered model alive through a poll round and the gateway's expiry margin.
+fn minimum_model_discovery_ttl(interval: std::time::Duration, timeout: std::time::Duration) -> std::time::Duration {
+    interval
+        .saturating_add(timeout)
+        .saturating_add(std::time::Duration::from_millis(
+            grid_signals::CANDIDATE_EXPIRY_SKEW_MARGIN_MS,
+        ))
 }
 
 /// Parse one discovery duration, enforcing a positive value and maximum.
@@ -4325,6 +4334,18 @@ async fn peer_tls(client: &Client) -> Option<Arc<operator::signals::PeerTlsMater
 #[allow(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_ttl_covers_poll_round_and_gateway_expiry_margin() {
+        let minimum =
+            minimum_model_discovery_ttl(std::time::Duration::from_secs(60), std::time::Duration::from_secs(5));
+
+        assert_eq!(minimum, std::time::Duration::from_secs(95));
+        assert!(
+            minimum > std::time::Duration::from_millis(grid_signals::CANDIDATE_EXPIRY_SKEW_MARGIN_MS),
+            "the TTL must remain valid when received by the gateway"
+        );
+    }
 
     #[tokio::test]
     async fn startup_reads_network_membership_before_selecting_the_swim_listener() -> Result<(), String> {

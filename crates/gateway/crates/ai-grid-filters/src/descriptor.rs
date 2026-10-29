@@ -22,9 +22,6 @@ const MAX_CANDIDATES: usize = 1024;
 /// Maximum length for identifier strings.
 const MAX_NAME_LEN: usize = 256;
 
-/// Stop serving before an inventory deadline to cover the mesh's 30-second clock-skew allowance.
-const CANDIDATE_EXPIRY_SKEW_MARGIN_MS: i128 = 30_000;
-
 /// Header prefixes reserved for internal gateway/protocol metadata.
 pub(crate) const RESERVED_HEADER_PREFIXES: &[&str] = &["x-praxis-", "x-mcp-"];
 
@@ -223,7 +220,8 @@ impl RouteCandidate {
     /// Whether this candidate is past its deadline after applying the mesh clock-skew margin.
     pub(crate) fn expired_at(&self, now_ms: i64) -> bool {
         self.expires_at_ms.is_some_and(|deadline| {
-            i128::from(now_ms).saturating_add(CANDIDATE_EXPIRY_SKEW_MARGIN_MS) >= i128::from(deadline)
+            i128::from(now_ms).saturating_add(i128::from(grid_signals::CANDIDATE_EXPIRY_SKEW_MARGIN_MS))
+                >= i128::from(deadline)
         })
     }
 }

@@ -461,13 +461,16 @@ fn publish_state(state_tx: &watch::Sender<GridStateSnapshot>, node: &SwimNode) {
 
 /// Publish complete, verified, unexpired model inventories from the SWIM node.
 fn publish_model_inventories(inventories_tx: &watch::Sender<Vec<swim::ModelInventory>>, node: &SwimNode) {
-    let inventories = node.model_inventories();
-    inventories_tx.send_if_modified(|current| {
-        if *current == inventories {
-            return false;
-        }
-        *current = inventories;
-        true
+    let now_ms = wall_clock_millis();
+    node.with_model_inventories(|held| {
+        inventories_tx.send_if_modified(|current| {
+            let fresh = held.iter().filter(|inventory| inventory.expires_at_ms > now_ms);
+            if current.iter().eq(fresh.clone()) {
+                return false;
+            }
+            *current = fresh.cloned().collect();
+            true
+        })
     });
 }
 

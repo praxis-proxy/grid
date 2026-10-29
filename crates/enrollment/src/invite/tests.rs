@@ -29,9 +29,10 @@ fn loopback_http_client(ca_pem: &[u8], port: u16) -> reqwest::Client {
     let timeouts = grid_client::Timeouts::ENROLLMENT;
     reqwest::Client::builder()
         .https_only(true)
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .min_tls_version(reqwest::tls::Version::TLS_1_2)
-        .connect_timeout(timeouts.connect)
+        .connect_timeout(Duration::from_millis(100))
         .timeout(timeouts.request)
         .tls_certs_only(roots)
         .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], port)))
@@ -87,13 +88,6 @@ impl ClosedPort {
         self.socket.listen(128).expect("listen");
         self.socket.set_nonblocking(true).expect("nonblocking");
         self.socket.into()
-    }
-
-    /// Release the reserved port so connection attempts are refused until it is rebound.
-    fn release(self) -> u16 {
-        let port = self.port;
-        drop(self.socket);
-        port
     }
 }
 
@@ -346,12 +340,9 @@ mod live {
             spawn_tls(port.listen(), cert, app).await;
             return;
         }
-        let port = port.release();
         tokio::spawn(async move {
             tokio::time::sleep(after).await;
-            let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("listen");
-            listener.set_nonblocking(true).expect("nonblocking");
-            spawn_tls(listener, cert, app).await;
+            spawn_tls(port.listen(), cert, app).await;
         });
     }
 
@@ -564,7 +555,7 @@ mod live {
 
     #[tokio::test]
     async fn a_blip_is_retried_and_later_sites_start_at_the_initial_delay() {
-        let (state, mut minter, _admin) = serve_after("good-admin", Duration::from_millis(50)).await;
+        let (state, mut minter, _admin) = serve_after("good-admin", Duration::from_millis(500)).await;
         let budget = Backoff {
             attempts: 100,
             initial: Duration::from_millis(5),
