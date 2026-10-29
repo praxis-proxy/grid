@@ -202,6 +202,9 @@ Service. Without enrollment nothing changes.
 Refuse a grid the chart cannot render.
 */}}
 {{- define "grid-operator.validateGrid" -}}
+{{- if and (not .Values.grid.id) (eq .Values.grid.signedState "enforce") }}
+{{- fail "grid.signedState enforce requires grid.id; otherwise set peerTrust.signedState: enforce on the GridNetwork you manage" }}
+{{- end }}
 {{- if and .Values.grid.id (not .Values.swim.siteName) }}
 {{- fail "grid.id needs site.name: the GridSite and the SWIM identity are named after this site" }}
 {{- end }}

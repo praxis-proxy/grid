@@ -28,6 +28,8 @@
 #   TIMEOUT             seconds to wait for each converging condition (default 180)
 #   ROTATION_LIFETIME    site certificate lifetime in seconds for the spiffe leg, which
 #                       then polls signals and asserts renewal, a fork, and re-enrollment
+#   SIGNED_STATE        peerTrust.signedState, off or enforce (default off). enforce also
+#                       asserts that the hub refuses the site's state once it stops signing
 #   NET_PREFIX          command prefix for calls to LoadBalancer addresses, e.g. under
 #                       rootless podman: podman unshare --rootless-netns
 #   TOPOLOGY            topology under tests/e2e/topologies (default grid-hub-site, or
@@ -49,6 +51,7 @@ TOPOLOGY=${TOPOLOGY:-$([[ ${HA:-0} == 1 ]] && echo grid-hub-site-ha || echo grid
 TOPO="$ROOT/tests/e2e/topologies/$TOPOLOGY"
 MODES=${MODES:-pin spiffe}
 HUB_ROUTER=${HUB_ROUTER:-render}
+SIGNED_STATE=${SIGNED_STATE:-off}
 IMAGE_PREFIX=${IMAGE_PREFIX:-localhost/grid-}
 IMAGE_TAG=${IMAGE_TAG:-e2e}
 CONTAINER_TOOL=${CONTAINER_TOOL:-docker}
@@ -79,6 +82,10 @@ CORDONED=""
 FRONTDOOR_PID=""
 CATALOG_PID=""
 DRAIN_PID=""
+
+# When signed state was turned on, for the signing log check.
+SIGNED_FROM=""
+
 FAILED=0
 # Start of the deliberate-refusal checks; assert_health allows gateway handshake rejections after it.
 REFUSALS_FROM=""
@@ -212,6 +219,7 @@ plan_addresses() {
   SITE_GW_IP=$(ip_add "$site" 2)
   SITE_SIG_IP=$(ip_add "$site" 3)
   MODEL_LB_IP=$(ip_add "$site" 4)
+  HUB_GW_IP=$(ip_add "$hub" 4)
   MODEL_IP=$(kubectl --context "$SITE_CTX" -n model get service vcr-inference-site -o jsonpath='{.spec.clusterIP}')
   [[ -n $MODEL_IP ]] || die "no vcr-inference-site Service on the site"
   # Two Services asking MetalLB for one address leaves the loser pending forever,
@@ -333,6 +341,17 @@ site_route_providers() {
   done
 }
 
+# signed_args: under enforce, signedState and the identity Secrets that sign, into SA.
+# Applied only after enrollment: naming absent Secrets makes the operator self-sign them,
+# and enrollment then finds an identity and never runs.
+signed_args() {
+  SA=()
+  [[ $SIGNED_STATE == enforce ]] || return 0
+  SA=(--set gridNetwork.peerTrust.signedState=enforce
+    --set gridNetwork.tls.siteSecretRef.name=grid-site-identity --set "gridNetwork.tls.siteSecretRef.namespace=$NS"
+    --set gridNetwork.tls.caSecretRef.name=grid-ca --set "gridNetwork.tls.caSecretRef.namespace=$NS")
+}
+
 # images <component>: this run's image for a chart, into IMG.
 images() { IMG=(--set-string "image.repository=$IMAGE_PREFIX$1" --set-string "image.tag=$IMAGE_TAG"); }
 
@@ -445,6 +464,7 @@ copy_key() {
 # Test-only overrides: this run's images, fixed LoadBalancer addresses, the mock model,
 # the trust mode, a rogue invite, and the hub gateway ref the overlay assert reads.
 install_hub() {
+  local -a hub_gateway_args=()
   images enrollment
   renewal_args grid-enrollment
   helm_on "$HUB_CTX" "$ENS" grid-enrollment grid-enrollment "${RA[@]}" \
@@ -478,19 +498,30 @@ install_hub() {
   images gateway
   ha_gateway_args
   if site_route; then
+    if [[ $SIGNED_STATE == enforce ]]; then
+      hub_gateway_args+=(--set service.type=LoadBalancer --set "service.loadBalancerIP=$HUB_GW_IP"
+        --set praxisConfig.operator.allowUnauthenticatedExposure=true)
+    fi
     helm_on "$HUB_CTX" "$NS" grid-gateway praxis-gateway \
       --set fullnameOverride=grid-gateway --set praxisConfig.source=operator --set image.flavor=grid-gateway \
       --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca \
       --set praxisConfig.operator.gridServing.enabled=true --set mountReconciliation.enabled=true \
       --set mountReconciliation.network=grid --set mountReconciliation.gatewayRef=grid-gateway \
-      --set "mountReconciliation.operator.namespace=$NS" "${IMG[@]}" "${GA[@]}" || die "install hub grid-gateway"
+      --set "mountReconciliation.operator.namespace=$NS" "${IMG[@]}" \
+      "${hub_gateway_args[@]}" "${GA[@]}" || die "install hub grid-gateway"
   else
+    if [[ $SIGNED_STATE == enforce ]]; then
+      # The site probes the discovered gateway with Grid CA trust.
+      hub_gateway_args+=(--set service.type=LoadBalancer --set "service.loadBalancerIP=$HUB_GW_IP"
+        --set praxisConfig.render.auth.allowUnauthenticatedExposure=true
+        --set listenerTls.secretName=grid-site-identity)
+    fi
     helm_on "$HUB_CTX" "$NS" grid-gateway praxis-gateway \
       --set fullnameOverride=grid-gateway --set praxisConfig.source=render --set grid.siteName=hub \
       --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca \
       --set praxisConfig.render.model="$MODEL" --set praxisConfig.render.auth.mode=none \
-      --set "praxisConfig.render.backends.$SITE.endpoint=$SITE_GW_IP:8080" "${IMG[@]}" "${GA[@]}" \
-      || die "install hub grid-gateway"
+      --set "praxisConfig.render.backends.$SITE.endpoint=$SITE_GW_IP:8080" "${IMG[@]}" \
+      "${hub_gateway_args[@]}" "${GA[@]}" || die "install hub grid-gateway"
   fi
   eventually "hub operator enrolled from its own invite through the in-cluster Service" enrolled "$HUB_CTX" \
     || die "hub not enrolled"
@@ -563,10 +594,15 @@ install_site() {
     fail "copied invite lacks its grid.praxis.fast/site label"
   fi
   renewal_args grid-site
-  helm_on "$SITE_CTX" "$NS" grid-site grid-site "${RA[@]}" \
-    --set gridNetwork.gridId="$PREFIX-e2e" --set "gridSite.name=$SITE" --set "peers.hub.digest=$HUB_DIGEST" \
-    --set "inferenceProviders.vcr.endpoint=http://$MODEL_IP:8000" \
-    --set "inferenceProviders.vcr.model=$MODEL" --set gridNetwork.peerTrust.mode="$TRUST" || die "install site grid-site"
+  SITE_SITE_ARGS=("${RA[@]}" --set gridNetwork.gridId="$PREFIX-e2e" --set "gridSite.name=$SITE"
+    --set "peers.hub.digest=$HUB_DIGEST" --set "inferenceProviders.vcr.endpoint=http://$MODEL_IP:8000"
+    --set "inferenceProviders.vcr.model=$MODEL" --set gridNetwork.peerTrust.mode="$TRUST")
+  if [[ $SIGNED_STATE == enforce ]]; then
+    SITE_SITE_ARGS+=(--set "gridNetwork.consumerGateways[0].name=grid-gateway"
+      --set "gridNetwork.consumerGateways[0].namespace=$NS"
+      --set "gridNetwork.consumerGateways[0].siteName=$SITE")
+  fi
+  helm_on "$SITE_CTX" "$NS" grid-site grid-site "${SITE_SITE_ARGS[@]}" || die "install site grid-site"
   trust=(--set "praxisConfig.render.peerTrust.digest=$HUB_DIGEST")
   [[ $TRUST == pin ]] || trust=(--set praxisConfig.render.peerTrust.mode=spiffe
     --set praxisConfig.render.peerTrust.spiffeId=spiffe://grid.internal/site/hub)
@@ -582,6 +618,12 @@ install_site() {
     || die "site not enrolled"
   eventually "$SITE GridNetwork reports Enrolled by the signer" site_reports_enrolled "$SITE_CTX" \
     || die "$SITE identity not issued by the signer"
+  signed_args
+  SIGNED_FROM=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  HUB_SITE_ARGS+=("${SA[@]}")
+  SITE_SITE_ARGS+=("${SA[@]}")
+  ((${#SA[@]} == 0)) || helm_on "$SITE_CTX" "$NS" grid-site grid-site "${SITE_SITE_ARGS[@]}" \
+    || die "sign the site's state"
   # Every later hub grid-site upgrade carries the site's digest: helm does not reuse the release's values.
   HUB_SITE_ARGS+=(--set "peers.$SITE.digest=$(leaf_digest "$SITE_CTX")")
   helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "pin the site on the hub"
@@ -658,8 +700,12 @@ assert_membership() {
       fi
     done
   else
-    # The hub gateway is ClusterIP, so the hub gossips no gateway address and stays Discovered on the site.
-    eventually "site GridSite grid-hub Discovered over SWIM" site_phase_in "$SITE_CTX" grid-hub Discovered || true
+    if [[ $SIGNED_STATE == enforce ]]; then
+      eventually "site GridSite grid-hub Active over SWIM" site_phase_in "$SITE_CTX" grid-hub Active || true
+    else
+      # The hub gateway is ClusterIP, so the hub gossips no gateway address and stays Discovered on the site.
+      eventually "site GridSite grid-hub Discovered over SWIM" site_phase_in "$SITE_CTX" grid-hub Discovered || true
+    fi
     eventually "hub GridNetwork Active with >=1 connected site" network_active "$HUB_CTX" || true
   fi
   # Operator state only: the hub gateway routes on its static backends, not this overlay.
@@ -732,7 +778,12 @@ enroll_rogue() {
 
 # hub_chat <out prefix>: one chat completion through the hub gateway, succeeding on HTTP 200.
 hub_chat() {
-  local out=$1
+  local out=$1 url=http://127.0.0.1:18080/v1/chat/completions
+  local -a tls_args=()
+  if [[ $SIGNED_STATE == enforce && $HUB_ROUTER == render ]]; then
+    url=https://hub.grid.internal:18080/v1/chat/completions
+    tls_args=(--cacert "$WORK/id/ca.crt" --resolve hub.grid.internal:18080:127.0.0.1)
+  fi
   # A gateway rollout ends the port-forward's pod, so start another.
   if [[ -z $PF_PID ]] || ! kill -0 "$PF_PID" 2>/dev/null; then
     k "$HUB_CTX" port-forward service/grid-gateway 18080:8080 >"$WORK/pf.log" 2>&1 &
@@ -740,7 +791,7 @@ hub_chat() {
     sleep 2
   fi
   [[ $(chat_body | curl -sS -o "$out.body" -D "$out.hdr" -w '%{http_code}' --max-time 15 \
-    -H 'Content-Type: application/json' -d @- http://127.0.0.1:18080/v1/chat/completions) == 200 ]]
+    -H 'Content-Type: application/json' -d @- "${tls_args[@]}" "$url") == 200 ]]
 }
 
 consumer_served() { hub_chat "$WORK/consumer" && served "$WORK/consumer"; }
@@ -966,9 +1017,10 @@ ha_gateway_args() {
 }
 
 # front_door_lb: a LoadBalancer beside the gateway's own Service, so load reaches the pods
-# through kube-proxy rather than a port-forward. The chart's Service keeps its type, because
-# the operator advertises that address to peers and a peer dials it over mTLS.
+# through kube-proxy rather than a port-forward. Signed-state gateways already have the
+# front door address on their Service, so reuse that Service instead of sharing its IP.
 front_door_lb() {
+  [[ $SIGNED_STATE != enforce ]] || return 0
   k "$HUB_CTX" get service grid-gateway -o json \
     | jq --arg ip "$HUB_GW_IP" '{apiVersion: "v1", kind: "Service",
         metadata: {name: "grid-gateway-frontdoor", namespace: .metadata.namespace},
@@ -978,16 +1030,23 @@ front_door_lb() {
 }
 
 front_door_lb_ready() {
-  [[ $(k "$HUB_CTX" get service grid-gateway-frontdoor \
+  local service=grid-gateway-frontdoor
+  [[ $SIGNED_STATE != enforce ]] || service=grid-gateway
+  [[ $(k "$HUB_CTX" get service "$service" \
     -o jsonpath='{.status.loadBalancer.ingress[0].ip}') == "$HUB_GW_IP" ]]
 }
 
 # front_door <out prefix>: one chat completion through the hub gateway Service. Prints
 # "<code> <provider site>", 000 for a call that never got a response.
 front_door() {
-  local out=$1 code site
+  local out=$1 code site url="http://$HUB_GW_IP:8080/v1/chat/completions"
+  local -a tls_args=()
+  if [[ $SIGNED_STATE == enforce && $HUB_ROUTER == render ]]; then
+    url=https://hub.grid.internal:8080/v1/chat/completions
+    tls_args=(--cacert "$WORK/id/ca.crt" --resolve "hub.grid.internal:8080:$HUB_GW_IP")
+  fi
   code=$(chat_body | lb_curl -sS -o "$out.body" -D "$out.hdr" -w '%{http_code}' --max-time 10 \
-    -H 'Content-Type: application/json' -d @- "http://$HUB_GW_IP:8080/v1/chat/completions" 2>/dev/null) || true
+    -H 'Content-Type: application/json' -d @- "${tls_args[@]}" "$url" 2>/dev/null) || true
   site=$(grep -i '^x-grid-provider-site:' "$out.hdr" 2>/dev/null | head -1 | cut -d: -f2- | tr -d ' \r')
   printf '%s %s\n' "${code:-000}" "${site:--}"
 }
@@ -1062,27 +1121,93 @@ measure_ttr() {
   measure "$1" "$2" "$v"
 }
 
-# watch_drain <context> <pod> <service>: every 200ms, whether that pod is still a ready
-# endpoint of the Service and whether its containers are still running. The pair is the drain
-# order: readiness has to go first, or traffic lands on a socket already closing.
+# watch_drain <context> <pod> <service>: watch EndpointSlice changes and whether the pod's
+# containers are still running. Watching changes catches a short handoff between holders.
 watch_drain() {
-  local ctx=$1 pod=$2 svc=$3 ip=$4 ready running
+  local ctx=$1 pod=$2 svc=$3 ip=$4 selector endpoint_json resource_version target_slice event_pid event_fd event event_type event_slice ready running
   trap 'exit 0' TERM
+  selector="kubernetes.io/service-name=$svc"
+  endpoint_json=$(k "$ctx" get endpointslices -l "$selector" -o json 2>/dev/null) || endpoint_json='{"items":[]}'
+  resource_version=$(jq -r '.metadata.resourceVersion // empty' <<<"$endpoint_json")
+  target_slice=$(endpoint_slice_for_ip "$ip" "$endpoint_json")
+  ready=$(endpoint_status "$ip" "$endpoint_json")
+  running=$(pod_running_status "$ctx" "$pod")
+  printf '%s %s %s\n' "$(date -u +%s)" "$ready" "$running" >>"$WORK/drain.log"
+
+  if [[ -n $resource_version ]]; then
+    coproc DRAIN_EVENTS {
+      k "$ctx" get endpointslices -l "$selector" --watch-only --resource-version="$resource_version" \
+        --output-watch-events -o json 2>/dev/null | jq --unbuffered -c .
+    }
+  else
+    coproc DRAIN_EVENTS {
+      k "$ctx" get endpointslices -l "$selector" --watch-only --output-watch-events -o json 2>/dev/null \
+        | jq --unbuffered -c .
+    }
+  fi
+  event_pid=$DRAIN_EVENTS_PID
+  event_fd=${DRAIN_EVENTS[0]}
+  trap 'kill "$event_pid" 2>/dev/null || true; exit 0' TERM
   while :; do
-    # A terminating endpoint keeps conditions.ready true in this API, and kube-proxy stops
-    # giving it new connections on conditions.terminating, so terminating counts as out.
-    ready=$(k "$ctx" get endpointslices -l "kubernetes.io/service-name=$svc" -o json 2>/dev/null \
-      | jq -r --arg ip "$ip" '[.items[].endpoints[]? | select((.addresses // []) | index($ip))
-          | (if (.conditions.terminating // false) then false else (.conditions.ready // true) end)]
-          | if length == 0 then "gone" elif any then "true" else "false" end') || ready=gone
-    if running=$(k "$ctx" get pod "$pod" -o jsonpath='{.status.containerStatuses[*].state.running.startedAt}' 2>/dev/null); then
-      [[ -n $running ]] && running=true || running=false
+    if IFS= read -r -t 0.2 -u "$event_fd" event; then
+      event_type=$(jq -r '.type // empty' <<<"$event")
+      event_slice=$(jq -r '.object.metadata.name // empty' <<<"$event")
+      if jq -e --arg ip "$ip" '(.object.endpoints[]? | select((.addresses // []) | index($ip))) != null' \
+        <<<"$event" >/dev/null; then
+        target_slice=$event_slice
+        ready=$(endpoint_event_status "$ip" "$event")
+      elif [[ -n $target_slice && $event_slice == "$target_slice" ]]; then
+        ready=$(endpoint_event_status "$ip" "$event")
+      else
+        continue
+      fi
+      [[ $event_type != DELETED ]] || target_slice=""
+      running=$(pod_running_status "$ctx" "$pod")
+      printf '%s %s %s\n' "$(date -u +%s)" "$ready" "$running" >>"$WORK/drain.log"
     else
-      running=gone
+      running=$(pod_running_status "$ctx" "$pod")
+      if [[ $running != true ]]; then
+        endpoint_json=$(k "$ctx" get endpointslices -l "$selector" -o json 2>/dev/null) || endpoint_json='{"items":[]}'
+        ready=$(endpoint_status "$ip" "$endpoint_json")
+        printf '%s %s %s\n' "$(date -u +%s)" "$ready" "$running" >>"$WORK/drain.log"
+        break
+      fi
+      if ! kill -0 "$event_pid" 2>/dev/null; then
+        endpoint_json=$(k "$ctx" get endpointslices -l "$selector" -o json 2>/dev/null) || endpoint_json='{"items":[]}'
+        ready=$(endpoint_status "$ip" "$endpoint_json")
+        printf '%s %s %s\n' "$(date -u +%s)" "$ready" "$running" >>"$WORK/drain.log"
+      fi
     fi
-    printf '%s %s %s\n' "$(date -u +%s)" "${ready:-gone}" "$running" >>"$WORK/drain.log"
-    sleep 0.2
   done
+}
+
+endpoint_slice_for_ip() {
+  jq -r --arg ip "$1" '[.items[] | select(any(.endpoints[]?; (.addresses // []) | index($ip))) | .metadata.name][0] // empty' \
+    <<<"$2"
+}
+
+endpoint_status() {
+  jq -r --arg ip "$1" '[.items[].endpoints[]? | select((.addresses // []) | index($ip))
+      | (if (.conditions.terminating // false) then false else (if .conditions.ready == null then true else .conditions.ready end) end)]
+      | if length == 0 then "gone" elif any then "true" else "false" end' <<<"$2"
+}
+
+endpoint_event_status() {
+  jq -r --arg ip "$1" '
+    if .type == "DELETED" then "gone"
+    else [(.object.endpoints // [])[] | select((.addresses // []) | index($ip))
+      | (if (.conditions.terminating // false) then false else (if .conditions.ready == null then true else .conditions.ready end) end)]
+      | if length == 0 then "gone" elif any then "true" else "false" end
+    end' <<<"$2"
+}
+
+pod_running_status() {
+  local running
+  if running=$(k "$1" get pod "$2" -o jsonpath='{.status.containerStatuses[*].state.running.startedAt}' 2>/dev/null); then
+    [[ -n $running ]] && printf 'true' || printf 'false'
+  else
+    printf 'gone'
+  fi
 }
 
 # start_drain_watch <context> <pod> <service>
@@ -1095,7 +1220,10 @@ start_drain_watch() {
 }
 
 stop_drain_watch() {
-  [[ -z $DRAIN_PID ]] || kill "$DRAIN_PID" 2>/dev/null || true
+  if [[ -n $DRAIN_PID ]]; then
+    kill "$DRAIN_PID" 2>/dev/null || true
+    wait "$DRAIN_PID" 2>/dev/null || true
+  fi
   DRAIN_PID=""
 }
 
@@ -1729,6 +1857,13 @@ cmd_selftest() {
 
   printf '%s\n' "100 true true" "101 false true" "102 gone gone" >"$WORK/drain.log"
   assert_drain_order "selftest drain order"
+  want "a ready EndpointSlice endpoint" true "$(endpoint_status 10.0.0.1 '{"items":[{"endpoints":[{"addresses":["10.0.0.1"],"conditions":{"ready":true,"terminating":false}}]}]}')"
+  want "an unready EndpointSlice endpoint" false "$(endpoint_status 10.0.0.1 '{"items":[{"endpoints":[{"addresses":["10.0.0.1"],"conditions":{"ready":false,"terminating":false}}]}]}')"
+  want "an unready EndpointSlice event" false "$(endpoint_event_status 10.0.0.1 '{"type":"MODIFIED","object":{"endpoints":[{"addresses":["10.0.0.1"],"conditions":{"ready":false,"terminating":false}}]}}')"
+  want "an EndpointSlice endpoint with missing readiness" true "$(endpoint_status 10.0.0.1 '{"items":[{"endpoints":[{"addresses":["10.0.0.1"],"conditions":{}}]}]}')"
+  want "a terminating EndpointSlice endpoint" false "$(endpoint_status 10.0.0.1 '{"items":[{"endpoints":[{"addresses":["10.0.0.1"],"conditions":{"ready":true,"terminating":true}}]}]}')"
+  want "an empty EndpointSlice endpoint set" gone "$(endpoint_status 10.0.0.1 '{"items":[]}')"
+  want "a deleted EndpointSlice event" gone "$(endpoint_event_status 10.0.0.1 '{"type":"DELETED","object":{"endpoints":[{"addresses":["10.0.0.1"]}]}}')"
   printf '%s\n' "100 true true" "101 true false" "102 gone gone" >"$WORK/drain.log"
   refutes "a ready endpoint that outlived its container" assert_drain_order "selftest late endpoint"
   : >"$WORK/drain.log"
@@ -1751,6 +1886,62 @@ cmd_selftest() {
     return 1
   fi
   printf 'RESULT: PASS (selftest)\n'
+}
+
+# Signed state
+# ---------------------------------------------------------------------------
+
+# signed_operator_logs <context> [kubectl logs args...]: every operator pod, ANSI stripped.
+signed_operator_logs() {
+  local ctx=$1
+  shift
+  operator_logs "$ctx" "$@" | strip_ansi
+}
+
+# unsigned_refused <since>: the hub rejected the site's unsigned state after <since>.
+unsigned_refused() {
+  local logs
+  # Capture first so a matching line cannot cut off the log-fetch pipeline under pipefail.
+  logs=$(signed_operator_logs "$HUB_CTX" --since-time="$1")
+  grep 'rejecting pinned-origin state broadcast' <<<"$logs" | grep "origin_site=$SITE" | grep missing_signature >/dev/null
+}
+
+site_received_signed_probe() {
+  k "$SITE_CTX" get configmap grid-overlay-grid-grid-gateway -o json \
+    | jq -e '.data["routing-config.json"] | fromjson | any(.candidates[]; .name == "signed-state-probe" and .site == "hub")'
+}
+
+# assert_signed_state: under enforce, both operators sign, so the remote candidate
+# assert_membership saw came from verified state. Once the site stops signing, the hub
+# refuses its state.
+assert_signed_state() {
+  local ctx logs since
+  [[ $SIGNED_STATE == enforce ]] || return 0
+  for ctx in "$HUB_CTX" "$SITE_CTX"; do
+    logs=$(signed_operator_logs "$ctx" --since-time="$SIGNED_FROM")
+    if grep -q 'signed gossip disabled' <<<"$logs"; then
+      fail "$ctx: operator has no usable signing identity"
+    else
+      pass "$ctx: operator signs its state"
+    fi
+    if grep -q 'failed to encode address broadcast' <<<"$logs"; then
+      fail "$ctx: operator could not publish its addresses under signed state"
+    else
+      pass "$ctx: operator publishes its addresses under signed state"
+    fi
+  done
+  eventually "site verifies the hub gateway identity" site_phase_in "$SITE_CTX" grid-hub Active \
+    || die "hub gateway identity is not Active on the site"
+  helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" \
+    --set inferenceProviders.signed-state-probe.endpoint=http://127.0.0.1:8000 \
+    || die "publish a fresh hub provider under signed state"
+  eventually "site accepts the named signed provider update from the hub" site_received_signed_probe
+  since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  helm_on "$SITE_CTX" "$NS" grid-site grid-site "${SITE_SITE_ARGS[@]}" \
+    --set gridNetwork.peerTrust.signedState=off || die "turn signed state off on the site"
+  eventually "hub refuses the site's unsigned state" unsigned_refused "$since" || true
+  helm_on "$SITE_CTX" "$NS" grid-site grid-site "${SITE_SITE_ARGS[@]}" || die "turn signed state back on"
+
 }
 
 # ---------------------------------------------------------------------------
@@ -1902,11 +2093,13 @@ poll_counts() {
   return "$rc"
 }
 
-# operator_logs <context>: every operator pod. `logs deployment/x` reads one pod, which is a
-# coin flip once the operator runs a holder beside a candidate.
+# operator_logs <context> [kubectl logs args...]: every operator pod. `logs deployment/x` reads
+# one pod, which is a coin flip once the operator runs a holder beside a candidate.
 operator_logs() {
-  k "$1" logs -l app.kubernetes.io/instance=grid-operator --all-containers --prefix \
-    --max-log-requests 10 --tail -1 2>/dev/null
+  local ctx=$1
+  shift
+  k "$ctx" logs -l app.kubernetes.io/instance=grid-operator --all-containers --prefix \
+    --max-log-requests 10 --tail=-1 "$@" 2>/dev/null
 }
 
 # renewals_logged <context>: INFO "site identity rotated" lines across this operator's pods.
@@ -2153,6 +2346,10 @@ cmd_test() {
     case $m in pin | spiffe | local) ;; *) die "MODES entry $m is not pin, spiffe or local" ;; esac
   done
   case $HUB_ROUTER in render | operator) ;; *) die "HUB_ROUTER $HUB_ROUTER is not render or operator" ;; esac
+  case $SIGNED_STATE in off | enforce) ;; *) die "SIGNED_STATE $SIGNED_STATE is not off or enforce" ;; esac
+  # A renewed key is locked out under enforce: see docs/architecture/signed-gossip-trust.md.
+  [[ $SIGNED_STATE == off || -z ${ROTATION_LIFETIME:-} || $MODES != *spiffe* ]] \
+    || die "SIGNED_STATE=enforce cannot rotate"
   for tool in kubectl helm jq openssl curl; do
     command -v "$tool" >/dev/null || die "$tool is required"
   done
@@ -2186,6 +2383,7 @@ cmd_test() {
     assert_site_route
     assert_rotation_declared
     assert_renewal
+    assert_signed_state
     assert_health
   done
   if ((FAILED)); then

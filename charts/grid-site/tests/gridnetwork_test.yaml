@@ -145,6 +145,18 @@ tests:
       - equal:
           path: spec.peerTrust.mode
           value: spiffe
+      - notExists:
+          path: spec.peerTrust.signedState
+
+  - it: renders peerTrust signedState
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridNetwork.peerTrust: {mode: pin, signedState: enforce}
+    asserts:
+      - equal:
+          path: spec.peerTrust
+          value: {mode: pin, signedState: enforce}
 
   - it: opts the network into site discovery
     set:

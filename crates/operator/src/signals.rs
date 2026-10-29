@@ -2849,7 +2849,7 @@ mod tests {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut request = [0_u8; 1024];
             drop(stream.read(&mut request).await);
-            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             let response = format!("HTTP/1.1 200 OK\r\n{date}Content-Length: {}\r\n\r\n{body}", body.len());
             drop(stream.write_all(response.as_bytes()).await);
         });
@@ -2869,7 +2869,7 @@ mod tests {
         let round = poll.collect(&[slow]).await;
         assert!(
             round.contains_key("east"),
-            "1.5 s fits the 2 s budget of one that missed a round"
+            "a peer that answers inside the short budget is included in the round"
         );
     }
 

@@ -747,6 +747,9 @@ jobs:
             leg: pin, HA faults
           - peer-trust-mode: local
             leg: Local membership, no SWIM seed
+          - peer-trust-mode: pin
+            signed-state: enforce
+            leg: pin, signed state
     timeout-minutes: 60
     permissions:
       contents: read
@@ -809,6 +812,7 @@ jobs:
           MODES: ${{ matrix.peer-trust-mode }}
           HUB_ROUTER: ${{ matrix.hub-router || 'render' }}
           HA: ${{ matrix.ha || '0' }}
+          SIGNED_STATE: ${{ matrix.signed-state || 'off' }}
           GRID_FEEDBACK_CONTRACT_TEST: ${{ matrix.peer-trust-mode == 'pin' && '1' || '0' }}
           # The spiffe leg rotates 8 minute identities; pin trust does not rotate.
           ROTATION_LIFETIME: "480"
@@ -822,7 +826,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: hub-site-e2e-logs-${{ matrix.peer-trust-mode }}${{ matrix.hub-router && format('-{0}', matrix.hub-router) || '' }}${{ matrix.ha && '-ha' || '' }}
+          name: hub-site-e2e-logs-${{ matrix.peer-trust-mode }}${{ matrix.hub-router && format('-{0}', matrix.hub-router) || '' }}${{ matrix.ha && '-ha' || '' }}-${{ matrix.signed-state || 'off' }}
           path: /tmp/grid-hub-site-e2e/
           if-no-files-found: ignore
           retention-days: 5

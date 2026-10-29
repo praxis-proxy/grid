@@ -701,7 +701,7 @@ mod tests {
     async fn fleet_with_spoke1_down() -> (Collector, watch::Sender<SiteList>, String) {
         let queries = QuerySet::defaults().unwrap();
         let healthy = fake_for(&queries, &healthy_answers()).serve().await;
-        let down = spoke("spoke1", "Ohio", "us-east-2", &refused_base());
+        let down = spoke("spoke1", "Ohio", "us-east-2", &FakePrometheus::new().serve().await);
         let spoke2 = spoke("spoke2", "Oregon", "us-west-2", &healthy);
         let (collector, sites) = fleet(vec![down, spoke2], queries, INTERVAL, TIMEOUT);
         (collector, sites, healthy)

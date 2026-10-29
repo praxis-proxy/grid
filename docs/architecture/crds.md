@@ -165,6 +165,9 @@ spec:
     probeInterval: 5s           # WAN probe interval
     suspicionTimeout: 10s       # before declaring dead
     gossipNodes: 3              # indirect probe fanout
+  peerTrust:
+    mode: pin                    # pin (default) or spiffe
+    signedState: "off"           # off (default) or enforce
   tls:
     caSecretRef:
       name: grid-ca
@@ -182,6 +185,21 @@ spec:
       - tenantId: tenant-b
         capUsd: 250.0
 ```
+
+`peerTrust.mode` controls how this grid accepts peer signing identities for
+SWIM state gossip. `pin` (the default) requires the peer certificate's
+canonical DER SHA-256 fingerprint to appear in that peer's
+`GridSite.spec.trust.canonicalFingerprints`. It still verifies the certificate
+against this grid's CA and expected site identity. `spiffe` also verifies the
+grid CA and site identity, requires the site's SPIFFE URI, and does not read
+fingerprints. See [Signed gossip trust](signed-gossip-trust.md) for how those
+identities gate signed CRDT state and how the certificate bootstrap works.
+
+`peerTrust.signedState` gates that signing. `off` (the default) gossips state
+unsigned, as before. `enforce` signs this site's state and refuses peer state
+without a verified signature. Switch every site together: an enforcing site
+drops state from peers still at `off`. Setting `off` again removes the signer
+and pins on the next reconcile.
 
 ### Routing policy fields
 
@@ -879,6 +897,11 @@ by pin or SPIFFE ID, so the server name need not appear in the peer's certificat
 |---|---|
 | `canonicalFingerprints` | Required DER-certificate SHA-256 pins (`hex(sha256(der_bytes))`), one or two entries for bounded rotation overlap |
 | `certFingerprint` | **Deprecated.** Legacy PEM-based fingerprint; rejected at runtime with `TrustMaterialInvalid`; migrate to `canonicalFingerprints` |
+
+The same `GridSite.spec.trust.canonicalFingerprints` policy is used by
+`peerTrust.mode: pin` to verify a site's signing identity for SWIM/CRDT state.
+The certificate must also chain to the grid CA and identify the expected site;
+the fingerprint is an additional exact-certificate check.
 
 **Routing eligibility:** `GridSite.status.phase == Active` is the control-plane eligibility
 gate for remote CRDT provider records. Active means the control plane has

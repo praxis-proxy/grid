@@ -32,9 +32,11 @@ gridNetwork:
   # signalTransport:
   #   mode: poll
   # -- Grid-wide peer trust: pin (default) or spiffe. The operator applies it at
-  # startup and, under poll, restarts itself when it changes.
+  # startup and, under poll, restarts itself when it changes. signedState: enforce
+  # signs state; set it at every site together.
   # peerTrust:
   #   mode: spiffe
+  #   signedState: enforce
 
 # -- Grid-wide settings shared with the other grid charts.
 grid:

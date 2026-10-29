@@ -306,6 +306,10 @@ first install, so set `grid.id` on an upgrade after it, or install the grid-site
 `grid.signals` and `grid.peerTrust` also set the modes the operator starts in before any
 GridNetwork exists, with or without `grid.id`. Set them to match the grid's GridNetwork,
 wherever it comes from, and the operator never restarts when that network appears.
+`grid.signedState: enforce` signs state on the rendered GridNetwork and requires
+`grid.id`; set it at every site together. Without `grid.id`, set
+`peerTrust.signedState: enforce` on the GridNetwork you manage. See
+[Signed Gossip Trust](../../docs/architecture/signed-gossip-trust.md).
 
 When enrollment is enabled or `grid.id` is set, an empty
 `gateway.serviceName` becomes `grid-gateway`. A consumer-only site without a

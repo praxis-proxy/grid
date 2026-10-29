@@ -26,6 +26,10 @@ grid:
   # -- Peer trust, pin or spiffe. Empty keeps the GridNetwork default, pin. The operator
   # also starts in it before any GridNetwork exists, so set it to match the grid.
   peerTrust: ""
+  # -- Signed state, off or enforce. Applies to the rendered GridNetwork when grid.id is
+  # set. Empty keeps its default, off. Set enforce at every site together; an enforcing
+  # site refuses unsigned peers.
+  signedState: ""
   # -- Signal transport, gossip or poll. poll also serves signals on the SWIM Service.
   # Empty keeps the GridNetwork default, gossip. The operator also starts in it before any
   # GridNetwork exists, so a poll install never restarts once its network appears.

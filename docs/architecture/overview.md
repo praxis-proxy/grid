@@ -293,10 +293,16 @@ Neither SWIM nor CRDT is an authorization engine.  Discovery alone does not make
 a site routable.  A provider still has to pass lifecycle, trust, freshness,
 placement, and access-policy checks before it enters a gateway overlay.
 
-Important current limitation: SWIM encryption proves membership in the shared
-key group, but stronger sender/origin binding is still hardening work.  Do not
-treat distributed CRDT state as fully security-sensitive routing input until
-that work is complete.
+With `peerTrust.signedState: enforce` and a valid site identity, an operator
+signs grid-scoped state broadcasts with its P-256 identity key. Receivers validate the peer certificate
+against the Grid CA and configured peer trust mode, then verify the signature
+and freshness before merging normal state. A certificate-only, empty-state
+bootstrap is allowed so a receiver can obtain the public certificate it needs
+to validate and install the peer key. That bootstrap does not authorize
+provider state; if the local signing identity is unusable, normal gossip fails
+closed. Signed origin identity still does not replace routing eligibility or
+policy checks. See [Signed Gossip Trust](signed-gossip-trust.md) for the trust
+modes and full exchange.
 
 ## Single-Site and Combined Deployments
 

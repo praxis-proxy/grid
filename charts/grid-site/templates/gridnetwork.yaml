@@ -59,9 +59,12 @@ spec:
     mode: {{ .mode | quote }}
   {{- end }}
   {{- end }}
-  {{- with (.Values.gridNetwork.peerTrust).mode }}
+  {{- with .Values.gridNetwork.peerTrust }}
   peerTrust:
-    mode: {{ . | quote }}
+    mode: {{ .mode | quote }}
+    {{- with .signedState }}
+    signedState: {{ . | quote }}
+    {{- end }}
   {{- end }}
   {{- with .Values.gridNetwork.metricsRefreshInterval }}
   {{- if . }}
