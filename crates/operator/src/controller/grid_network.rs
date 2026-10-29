@@ -70,8 +70,8 @@ use crate::{
 /// Bundles the Kubernetes client with an optional live SWIM handle.
 /// When `swim` is `Some`, each reconcile obtains a fresh
 /// [`MembershipSnapshot`] to feed into `determine_phase` and
-/// `update_status`.  When `swim` is `None`, the controller falls back
-/// to its existing static phase logic.
+/// `update_status`. When `swim` is `None`, phase follows the configured
+/// membership mode and local identity prerequisites.
 #[expect(
     clippy::partial_pub_fields,
     reason = "client is public API; the SWIM handle and caches are reached through methods"
@@ -1979,7 +1979,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
             .is_some_and(|valid| matches!(valid.reason.as_str(), "CertificateExpired" | "CertificateUnreadable"))
     });
     let phase = if swim_runtime_running && !identity_failed {
-        determine_phase(&network, &grid_id, membership.as_ref())
+        determine_phase(&network, &grid_id, membership.as_ref(), ctx.membership())
     } else {
         GridNetworkPhase::Degraded
     };
@@ -5119,17 +5119,31 @@ async fn distribute_overlay_configmap(
 /// - Members present but all [`Suspect`]/[`Dead`] → [`Degraded`].
 /// - Empty snapshot → falls through to the existing TLS-based logic.
 ///
-/// When `membership` is `None` (no SWIM runtime wired yet), the existing
-/// `Pending`/`Initializing` logic is unchanged.
+/// Local membership needs a grid identity and TLS trust, but no SWIM runtime.
+/// Peer reachability is reported by the polling conditions independently.
+/// In Swim mode, an absent runtime retains the `Pending`/`Initializing` logic.
 ///
 /// [`Alive`]: MemberStatus::Alive
 /// [`Suspect`]: MemberStatus::Suspect
 /// [`Dead`]: MemberStatus::Dead
 /// [`Active`]: GridNetworkPhase::Active
 /// [`Degraded`]: GridNetworkPhase::Degraded
-fn determine_phase(network: &GridNetwork, grid_id: &str, membership: Option<&MembershipSnapshot>) -> GridNetworkPhase {
+fn determine_phase(
+    network: &GridNetwork,
+    grid_id: &str,
+    membership: Option<&MembershipSnapshot>,
+    mode: MembershipMode,
+) -> GridNetworkPhase {
     if grid_id.is_empty() {
         return GridNetworkPhase::Pending;
+    }
+    let has_tls = network.spec.tls.ca_secret_ref.is_some();
+    if mode == MembershipMode::Local {
+        return if has_tls {
+            GridNetworkPhase::Active
+        } else {
+            GridNetworkPhase::Pending
+        };
     }
     // Live membership takes precedence when available and non-empty.
     if let Some(snap) = membership
@@ -5141,7 +5155,6 @@ fn determine_phase(network: &GridNetwork, grid_id: &str, membership: Option<&Mem
     // Alive/Degraded peer exists, so we reach here when the network has no peers
     // yet: either the SWIM runtime is not up (`membership` is `None`) or it is
     // up but no peers have joined (`Some`, empty snapshot).
-    let has_tls = network.spec.tls.ca_secret_ref.is_some();
     if !has_tls {
         return GridNetworkPhase::Pending;
     }
@@ -7834,10 +7847,33 @@ mod tests {
     }
 
     #[test]
+    fn determine_phase_local_does_not_wait_for_swim() {
+        for (grid_id, trust, mode, expected) in [
+            ("some-id", true, MembershipMode::Local, GridNetworkPhase::Active),
+            ("", true, MembershipMode::Local, GridNetworkPhase::Pending),
+            ("some-id", false, MembershipMode::Local, GridNetworkPhase::Pending),
+            ("some-id", true, MembershipMode::Swim, GridNetworkPhase::Initializing),
+        ] {
+            let mut network = base_network();
+            network.spec.seeds = vec!["legacy-peer:7946".to_owned()];
+            network.spec.tls.ca_secret_ref = trust.then(|| crate::crd::grid_network::SecretRef {
+                name: "ca".to_owned(),
+                namespace: "default".to_owned(),
+                key: None,
+            });
+            assert_eq!(
+                determine_phase(&network, grid_id, None, mode),
+                expected,
+                "mode={mode:?}, grid_id={grid_id:?}, trust={trust} without a SWIM runtime"
+            );
+        }
+    }
+
+    #[test]
     fn determine_phase_none_membership_preserves_tls_logic() {
         let network = base_network();
         // Without TLS config, phase is Pending regardless of grid_id.
-        let phase = determine_phase(&network, "some-id", None);
+        let phase = determine_phase(&network, "some-id", None, MembershipMode::Swim);
         assert_eq!(
             phase,
             GridNetworkPhase::Pending,
@@ -7849,7 +7885,7 @@ mod tests {
     fn determine_phase_empty_snapshot_preserves_tls_logic() {
         let network = base_network();
         let empty = MembershipSnapshot::default();
-        let phase = determine_phase(&network, "some-id", Some(&empty));
+        let phase = determine_phase(&network, "some-id", Some(&empty), MembershipMode::Swim);
         assert_eq!(
             phase,
             GridNetworkPhase::Pending,
@@ -7861,7 +7897,7 @@ mod tests {
     fn determine_phase_with_alive_member_is_active() {
         let network = base_network();
         let snap = alive_snapshot(2);
-        let phase = determine_phase(&network, "some-id", Some(&snap));
+        let phase = determine_phase(&network, "some-id", Some(&snap), MembershipMode::Swim);
         assert_eq!(
             phase,
             GridNetworkPhase::Active,
@@ -7873,7 +7909,7 @@ mod tests {
     fn determine_phase_with_suspect_only_is_degraded() {
         let network = base_network();
         let snap = suspect_snapshot();
-        let phase = determine_phase(&network, "some-id", Some(&snap));
+        let phase = determine_phase(&network, "some-id", Some(&snap), MembershipMode::Swim);
         assert_eq!(
             phase,
             GridNetworkPhase::Degraded,
@@ -7892,7 +7928,7 @@ mod tests {
             key: None,
         });
         let snap = alive_snapshot(1);
-        let phase = determine_phase(&network, "some-id", Some(&snap));
+        let phase = determine_phase(&network, "some-id", Some(&snap), MembershipMode::Swim);
         assert_eq!(
             phase,
             GridNetworkPhase::Active,
@@ -7914,7 +7950,7 @@ mod tests {
         });
         network.spec.seeds.clear();
         let empty = MembershipSnapshot::default();
-        let phase = determine_phase(&network, "some-id", Some(&empty));
+        let phase = determine_phase(&network, "some-id", Some(&empty), MembershipMode::Swim);
         assert_eq!(
             phase,
             GridNetworkPhase::Active,
@@ -7934,7 +7970,7 @@ mod tests {
         });
         network.spec.seeds = vec!["grid.peer:7946".to_owned()];
         let empty = MembershipSnapshot::default();
-        let phase = determine_phase(&network, "some-id", Some(&empty));
+        let phase = determine_phase(&network, "some-id", Some(&empty), MembershipMode::Swim);
         assert_eq!(
             phase,
             GridNetworkPhase::Initializing,
