@@ -36,6 +36,16 @@ Bootstrap uses a pre-created ConfigMap unchanged. The existing ID is the
 `spec.gridId` of the grid's GridNetwork on any member, or `status.gridId` on
 releases that predate the spec field.
 
+Earlier releases also created a hook ClusterRole and ClusterRoleBinding that
+let bootstrap read the GridNetwork. Helm does not delete a hook resource that a
+chart stops rendering, so remove that pair after the upgrade:
+
+```bash
+name=<release-namespace>-<bootstrap-service-account>
+role=$(printf %s "${name:0:54}" | sed 's/-$//')-$(printf %s "$name" | sha256sum | cut -c1-8)
+kubectl delete clusterrole/"$role" clusterrolebinding/"$role" --ignore-not-found
+```
+
 In external mode the existing bootstrap Job uses `--skip-ca` and has no Secret
 permissions. In service mode that same Job also handles CA and credentials.
 Use an image that supports `--grid-id-config-map` before enabling it.

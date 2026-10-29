@@ -1308,7 +1308,10 @@ mod tests {
     fn an_older_chart_passing_grid_network_still_parses() {
         let args =
             BootstrapArgs::try_parse_from(["bootstrap", "--grid-id-config-map", "state", "--grid-network", "grid"]);
-        assert!(args.is_ok_and(|args| args.grid_id_config_map.as_deref() == Some("state")));
+        assert!(
+            args.is_ok_and(|args| args.grid_id_config_map.as_deref() == Some("state")),
+            "an older chart's --grid-network must parse and be ignored"
+        );
     }
 
     /// The whole bootstrap order on a hub where the operator self-signed first: the

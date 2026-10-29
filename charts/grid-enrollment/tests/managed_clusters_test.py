@@ -58,9 +58,13 @@ class ManagedClusterTemplates(unittest.TestCase):
                                    'certManager': {'enabled': True,
                                                    'issuer': {'create': True}}}}
         cls.docs = cls.render_chart(cls.values)
-        cls.policies = {d['metadata']['name'].removeprefix('grid-bootstrap-membership'):
-                        d['spec']['policy-templates'][0]['objectDefinition']['spec']
-                        for d in cls.docs if d['kind'] == 'Policy'}
+        cls.policies = cls.policy_specs(cls.docs)
+
+    @staticmethod
+    def policy_specs(docs):
+        return {d['metadata']['name'].removeprefix('grid-bootstrap-membership'):
+                d['spec']['policy-templates'][0]['objectDefinition']['spec']
+                for d in docs if d['kind'] == 'Policy'}
 
     @classmethod
     def render_chart(cls, values, chart=CHART):
@@ -70,8 +74,9 @@ class ManagedClusterTemplates(unittest.TestCase):
                                 capture_output=True, check=True)
         return [d for d in yaml.safe_load_all(result.stdout) if d]
 
-    def render(self, suffix='', resources=None, cluster='west', definitions_only=True):
-        policy = self.policies[suffix]
+    def render(self, suffix='', resources=None, cluster='west', definitions_only=True,
+               policies=None):
+        policy = (policies or self.policies)[suffix]
         raw = policy.get('object-templates-raw') or yaml.safe_dump(policy['object-templates'])
         result = subprocess.run([self.renderer], input=json.dumps({
             'Template': raw, 'Cluster': cluster,
@@ -205,10 +210,12 @@ class ManagedClusterTemplates(unittest.TestCase):
                         yield f"{obj['kind']}/{obj['metadata']['name']} rule"
         values = copy.deepcopy(self.values)
         values['gridIdentity'] = {'enabled': True}
-        release = [d for d in self.render_chart(values) if d['kind'] != 'Policy']
+        docs = self.render_chart(values)
+        release = [d for d in docs if d['kind'] != 'Policy']
         self.assertEqual(list(grid_refs(release)), [])
         hub = {MC_KEY: {'items': [member('local-cluster', False), member('east')]}}
-        self.assertEqual(list(grid_refs(self.render('-hub', hub))), [])
+        rendered = self.render('-hub', hub, policies=self.policy_specs(docs))
+        self.assertEqual(list(grid_refs(rendered)), [])
 
     def test_observer_access_does_not_wait_for_hub_policy(self):
         for work_name in ('grid-site-observer', 'custom-observer'):

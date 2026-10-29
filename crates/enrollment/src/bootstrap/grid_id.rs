@@ -85,9 +85,13 @@ mod tests {
         let client = api.client("grid");
         let first = ensure(&client, "grid", "grid-state").await?;
         assert_eq!(uuid::Uuid::parse_str(&first)?.get_version_num(), 4);
-        assert_eq!(ensure(&client, "grid", "grid-state").await?, first);
+        assert_eq!(
+            ensure(&client, "grid", "grid-state").await?,
+            first,
+            "a retry must reuse the saved id"
+        );
         let writes = api.writes();
-        assert_eq!(writes.len(), 1);
+        assert_eq!(writes.len(), 1, "only the first run writes the state");
         let write = writes.first().ok_or("bootstrap did not write its state")?;
         assert_eq!(write.method, "POST");
         assert_eq!(write.body.get("immutable"), Some(&json!(true)));
@@ -107,9 +111,10 @@ mod tests {
         );
         assert_eq!(
             ensure(&api.client("grid"), "grid", "grid-state").await?,
-            "existing-grid"
+            "existing-grid",
+            "a pre-created state keeps its id"
         );
-        assert!(api.writes().is_empty());
+        assert!(api.writes().is_empty(), "a pre-created state is never rewritten");
         Ok(())
     }
 
@@ -118,8 +123,16 @@ mod tests {
         let api = FakeApi::new();
         api.unserve("/apis/grid.praxis.fast/");
         let id = ensure(&api.client("grid"), "grid", "grid-state").await?;
-        assert_eq!(uuid::Uuid::parse_str(&id)?.get_version_num(), 4);
-        assert_eq!(api.writes().len(), 1);
+        assert_eq!(
+            uuid::Uuid::parse_str(&id)?.get_version_num(),
+            4,
+            "the minted id is a UUID v4"
+        );
+        assert_eq!(
+            api.writes().len(),
+            1,
+            "a hub without the Grid API still saves one state"
+        );
         Ok(())
     }
 
