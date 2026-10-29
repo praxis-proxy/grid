@@ -1131,20 +1131,24 @@ impl prometheus::core::Collector for ProviderSignals {
             gauge.reset();
         }
         let mut seen = std::collections::BTreeSet::new();
-        for sample in self.stores.iter().flat_map(crate::signals::SignalStore::current) {
-            let (Some(site), Some(provider)) = (sample.labels.get("grid_site"), sample.labels.get("grid_provider"))
-            else {
-                continue;
-            };
-            let Some((_, gauge)) = self.gauges.iter().find(|(name, _)| *name == sample.metric) else {
-                continue;
-            };
-            // The first store holding a series wins: this site's own before a peer's.
-            if seen.insert((sample.metric.clone(), site.clone(), provider.clone())) {
-                gauge
-                    .with_label_values(&[site.as_str(), provider.as_str()])
-                    .set(sample.value);
-            }
+        for store in &self.stores {
+            // Borrowed under the store's read lock: only an exported series is copied, never
+            // the samples dropped here.
+            store.for_each_current(|sample| {
+                let Some((name, gauge)) = self.gauges.iter().find(|(name, _)| *name == sample.metric) else {
+                    return;
+                };
+                let (Some(site), Some(provider)) = (sample.labels.get("grid_site"), sample.labels.get("grid_provider"))
+                else {
+                    return;
+                };
+                // The first store holding a series wins: this site's own before a peer's.
+                if seen.insert((*name, site.clone(), provider.clone())) {
+                    gauge
+                        .with_label_values(&[site.as_str(), provider.as_str()])
+                        .set(sample.value);
+                }
+            });
         }
         self.gauges
             .iter()
@@ -1638,6 +1642,100 @@ mod tests {
                 .iter()
                 .all(|family| family.name() != "llm_d_epp_average_queue_size"),
             "only provider series"
+        );
+    }
+
+    #[test]
+    fn provider_signals_over_large_stores_export_what_a_cloning_scrape_would() {
+        use prometheus::core::Collector as _;
+        let observation = |metric: &str, site: &str, provider: Option<&str>, value: f64| crate::signals::Observation {
+            metric: metric.to_owned(),
+            labels: std::iter::once(("grid_site", site))
+                .chain(provider.map(|p| ("grid_provider", p)))
+                .chain(std::iter::once(("inference_pool", "pool")))
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+            value,
+            timestamp_ms: None,
+            age: Duration::ZERO,
+        };
+        let samples = |site: &str, value: f64| -> Vec<crate::signals::Observation> {
+            (0..40_u32)
+                .flat_map(|index| {
+                    let provider = format!("p{index}");
+                    let exported = PROVIDER_SIGNALS
+                        .iter()
+                        .map(|(name, _)| observation(name, site, Some(&provider), value + f64::from(index)))
+                        .collect::<Vec<_>>();
+                    let unrelated = (0..25_u32)
+                        .map(|gauge| observation(&format!("llm_d_epp_gauge_{gauge}"), site, Some(&provider), 1.0))
+                        .collect::<Vec<_>>();
+                    let unlabelled = observation(PROVIDER_SIGNALS[0].0, site, None, 1.0);
+                    exported.into_iter().chain(unrelated).chain(std::iter::once(unlabelled))
+                })
+                .collect()
+        };
+        let local = crate::signals::SignalStore::new();
+        local.refresh(
+            std::collections::BTreeMap::from([("pool".to_owned(), samples("hq", 100.0))]),
+            Duration::from_secs(60),
+        );
+        let peers = crate::signals::SignalStore::new();
+        peers.refresh(
+            ["hq", "s0", "s1", "s2", "s3", "s4"]
+                .iter()
+                .map(|site| ((*site).to_owned(), samples(site, -100.0)))
+                .collect(),
+            Duration::from_secs(60),
+        );
+        let mut expected = std::collections::BTreeMap::new();
+        for sample in [&local, &peers].iter().flat_map(|store| store.current()) {
+            let (Some(site), Some(provider)) = (sample.labels.get("grid_site"), sample.labels.get("grid_provider"))
+            else {
+                continue;
+            };
+            if PROVIDER_SIGNALS.iter().any(|(name, _)| *name == sample.metric) {
+                expected
+                    .entry((sample.metric.clone(), site.clone(), provider.clone()))
+                    .or_insert(sample.value);
+            }
+        }
+        let label = |metric: &prometheus::proto::Metric, name: &str| -> String {
+            metric
+                .get_label()
+                .iter()
+                .find(|label| label.name() == name)
+                .map(|label| label.value().to_owned())
+                .unwrap_or_default()
+        };
+        let exported: std::collections::BTreeMap<_, _> = provider_signals(vec![local, peers])
+            .collect()
+            .iter()
+            .flat_map(|family| {
+                family.get_metric().iter().map(|metric| {
+                    (
+                        (
+                            family.name().to_owned(),
+                            label(metric, "grid_site"),
+                            label(metric, "grid_provider"),
+                        ),
+                        metric.get_gauge().value(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            exported.len(),
+            6 * 40 * PROVIDER_SIGNALS.len(),
+            "every site's provider series"
+        );
+        assert_eq!(exported, expected, "the same series and values as cloning every sample");
+        assert!(
+            exported
+                .iter()
+                .filter(|((_, site, _), _)| site == "hq")
+                .all(|(_, value)| *value >= 100.0),
+            "this site's own values win over a peer's"
         );
     }
 }
