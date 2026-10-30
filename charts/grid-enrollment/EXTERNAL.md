@@ -68,8 +68,17 @@ chart stops rendering, so remove that pair after the upgrade:
 
 ```bash
 name=<release-namespace>-<bootstrap-service-account>
-role=$(printf %s "${name:0:54}" | sed 's/-$//')-$(printf %s "$name" | sha256sum | cut -c1-8)
-kubectl delete clusterrole/"$role" clusterrolebinding/"$role" --ignore-not-found
+prefix=$(printf %s "${name:0:54}" | sed -e 's/-$//' -e 's/\./\\./g')
+kubectl get clusterrole,clusterrolebinding -o name | grep -E "/${prefix}-[0-9a-f]{8}$"
+```
+
+That lists the pair the earlier chart named after the release. Check it, then
+delete each object it printed:
+
+```bash
+for object in $(kubectl get clusterrole,clusterrolebinding -o name | grep -E "/${prefix}-[0-9a-f]{8}$"); do
+  kubectl delete "$object"
+done
 ```
 
 In external mode the existing bootstrap Job uses `--skip-ca` and has no Secret
