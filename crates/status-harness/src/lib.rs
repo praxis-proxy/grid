@@ -99,6 +99,8 @@ struct Inner {
     racing: BTreeMap<String, Value>,
     /// Objects a concurrent writer stores just before the next patch of their path.
     racing_patches: BTreeMap<String, Value>,
+    /// Paths whose next patch answers 422, with what a concurrent writer stores right after.
+    invalid_patches: BTreeMap<String, Option<Value>>,
 }
 
 /// An in-memory Kubernetes API.
@@ -148,6 +150,12 @@ impl FakeApi {
     /// resource version answers 409.
     pub fn win_patch_race(&self, path: &str, object: Value) {
         self.lock().racing_patches.insert(path.to_owned(), object);
+    }
+
+    /// Answer the next patch of `path` with 422, then store `after`, when given, as a concurrent
+    /// writer's object.
+    pub fn reject_next_patch(&self, path: &str, after: Option<Value>) {
+        self.lock().invalid_patches.insert(path.to_owned(), after);
     }
 
     /// The object at `path`.
@@ -384,6 +392,14 @@ impl Inner {
             let version = self.next_version();
             stamp(&mut winner, &version);
             self.objects.insert(path.to_owned(), winner);
+        }
+        if let Some(after) = self.invalid_patches.remove(path) {
+            if let Some(mut winner) = after {
+                let version = self.next_version();
+                stamp(&mut winner, &version);
+                self.objects.insert(path.to_owned(), winner);
+            }
+            return (422, failure(422, "Invalid", &format!("{path} failed validation")));
         }
         let Some(held) = self.objects.get(path).cloned() else {
             return (404, failure(404, "NotFound", &format!("{path} not found")));

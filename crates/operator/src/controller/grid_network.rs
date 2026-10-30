@@ -1836,9 +1836,14 @@ const GRID_ID_FIELD_MANAGER: &str = "grid-operator-grid-id";
 /// Tries at copying a status-only grid ID into spec before the reconcile reports the conflict.
 const GRID_ID_PATCH_ATTEMPTS: usize = 3;
 
-/// Copy a legacy status-only grid ID into an empty `spec.gridId`, never replacing a set one.
+/// Copy a status-only grid ID into an empty `spec.gridId`, never replacing a set one.
 ///
+/// Operators before #474 minted the ID into status only; rc.2 then stopped running such members.
 /// Returns whether spec now holds a grid ID, the copied one or one another writer set first.
+///
+/// # Errors
+///
+/// [`OperatorError::InvalidResource`] when the API refuses the status ID as `spec.gridId`.
 #[expect(
     clippy::large_stack_frames,
     reason = "async Kubernetes API calls carry large request and response values"
@@ -1882,7 +1887,11 @@ async fn adopt_status_grid_id(network: &GridNetwork, client: &Client) -> Result<
             Err(kube::Error::Api(error)) if error.code == 422 => {
                 return match api.get_opt(name).await? {
                     Some(current) if !current.spec.grid_id.is_empty() => Ok(true),
-                    _ => Err(kube::Error::Api(error).into()),
+                    _ => Err(OperatorError::InvalidResource(format!(
+                        "GridNetwork {name} status.gridId {grid_id:?} cannot become spec.gridId: {}; set spec.gridId \
+                         by hand",
+                        error.message
+                    ))),
                 };
             },
             Err(error) => return Err(error.into()),
@@ -2073,6 +2082,13 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         return Ok(Action::await_change());
     }
 
+    // Ahead of every spec check, so an unrelated invalid field cannot keep a member status-only.
+    let client = &ctx.client;
+    if network.spec.grid_id.is_empty() && Box::pin(adopt_status_grid_id(&network, client)).await? {
+        // The spec write triggers the next reconcile, which runs with spec as the only source.
+        return Ok(Action::await_change());
+    }
+
     reject_invalid_budget_policy(&network)?;
 
     tracing::debug!(name, "reconciling GridNetwork");
@@ -2103,12 +2119,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     }
     ctx.publish_declared_trust(&network);
 
-    let client = &ctx.client;
     if network.spec.grid_id.is_empty() {
-        // The spec write triggers the next reconcile, which runs with spec as the only source.
-        if Box::pin(adopt_status_grid_id(&network, client)).await? {
-            return Ok(Action::await_change());
-        }
         tracing::info!(name, "spec.gridId is not set; the grid runtime waits until it is");
         Box::pin(apply_rollup(client, &network)).await;
         return Ok(Action::await_change());
@@ -10041,11 +10052,99 @@ mod tests {
             Box::pin(reconcile(Arc::new(network), ctx)).await?,
             Action::await_change()
         );
+        let writes = api.writes();
         assert!(
-            api.writes()
+            !writes.is_empty(),
+            "the waiting reconcile still applies its status rollup"
+        );
+        assert!(
+            writes
                 .iter()
                 .all(|write| write.status && write.body.pointer("/status/gridId").is_none()),
             "neither spec nor status gains a minted grid ID"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refused_status_grid_id_is_a_terminal_invalid_resource() -> Result<(), OperatorError> {
+        let (api, network) = stored_grid_id_network("", "legacy-grid")?;
+        api.reject_next_patch(GRID_ID_PATH, None);
+        let result = Box::pin(adopt_status_grid_id(&network, &api.client("grid"))).await;
+        assert!(
+            matches!(&result, Err(OperatorError::InvalidResource(message)) if message.contains("\"legacy-grid\"")),
+            "a 422 names the status grid ID and does not retry: {result:?}"
+        );
+        assert_eq!(grid_id_spec_writes(&api).len(), 1, "a 422 is never retried");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refused_copy_adopts_a_spec_another_writer_set_meanwhile() -> Result<(), OperatorError> {
+        let (api, network) = stored_grid_id_network("", "legacy-grid")?;
+        let mut winner = api.get(GRID_ID_PATH).unwrap_or_default();
+        if let Some(spec) = winner.get_mut("spec") {
+            spec["gridId"] = serde_json::json!("bootstrap-grid");
+        }
+        api.reject_next_patch(GRID_ID_PATH, Some(winner));
+        assert!(Box::pin(adopt_status_grid_id(&network, &api.client("grid"))).await?);
+        assert_eq!(
+            grid_id_spec_writes(&api).len(),
+            1,
+            "the refused patch is the only write"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_invalid_budget_policy_does_not_keep_a_member_status_only() -> Result<(), OperatorError> {
+        let (api, mut network) = stored_grid_id_network("", "legacy-grid")?;
+        network.spec.budget_policy = Some(BudgetPolicyConfig {
+            tenants: vec![tenant("", 100.0)],
+        });
+        let ctx = Arc::new(OperatorCtx::new(api.client("grid"), None, SignalMode::Gossip));
+        assert_eq!(
+            Box::pin(reconcile(Arc::new(network), ctx)).await?,
+            Action::await_change()
+        );
+        assert_eq!(
+            api.get(GRID_ID_PATH)
+                .and_then(|stored| stored.pointer("/spec/gridId").cloned()),
+            Some(serde_json::json!("legacy-grid")),
+            "the copy runs before spec validation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_reconcile_after_the_copy_runs_with_the_copied_spec() -> Result<(), OperatorError> {
+        let (api, mut declared) = stored_grid_id_network("", "legacy-grid")?;
+        // A mode the operator is not running, so reaching the mode check is observable.
+        declared.spec.signal_transport = Some(serde_json::from_value(serde_json::json!({ "mode": "poll" }))?);
+        api.put(GRID_ID_PATH, serde_json::to_value(&declared)?);
+        let network: GridNetwork = serde_json::from_value(api.get(GRID_ID_PATH).unwrap_or_default())?;
+        let (restart, restarts) = tokio::sync::watch::channel(None);
+        let ctx = Arc::new(OperatorCtx::new(api.client("grid"), None, SignalMode::Gossip).with_mode_restart(restart));
+        assert_eq!(
+            Box::pin(reconcile(Arc::new(network), Arc::clone(&ctx))).await?,
+            Action::await_change()
+        );
+        assert!(restarts.borrow().is_none(), "the copy returns before the mode check");
+        let copied: GridNetwork = serde_json::from_value(api.get(GRID_ID_PATH).unwrap_or_default())?;
+        assert_eq!(copied.spec.grid_id, "legacy-grid");
+        assert_eq!(
+            Box::pin(reconcile(Arc::new(copied), ctx)).await?,
+            Action::await_change()
+        );
+        assert_eq!(
+            grid_id_spec_writes(&api).len(),
+            1,
+            "a set spec.gridId is not written again"
+        );
+        assert_eq!(
+            restarts.borrow().map(|next| next.signal),
+            Some(SignalMode::Poll),
+            "the next reconcile reaches the mode check"
         );
         Ok(())
     }
