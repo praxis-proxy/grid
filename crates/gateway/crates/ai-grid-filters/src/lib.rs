@@ -17,6 +17,7 @@ mod health;
 mod metadata;
 mod pin;
 mod prefix;
+mod provider;
 mod route;
 mod serving;
 mod signals;
@@ -36,6 +37,10 @@ pub use health::ClusterHealth;
 pub use metadata::{CandidateCredential, CredentialRef};
 use praxis_filter::{FilterError, FilterFactory, FilterRegistry, HttpFilter};
 pub use prefix::{AffinitySettings, PrefixAffinity};
+pub use provider::{
+    PROVIDER_FILE, ProviderCandidate, ProviderConfig, ProviderCounts, ProviderRuntime, ProviderSnapshot,
+    spawn_provider, validate_provider,
+};
 pub use serving::{
     AvailabilitySettings, CredentialStrategy, DIAL_FILE, DialConfig, DialCredential, DialSpec, DialTransport,
     DialVersion, GridRuntime, GridServingConfig, PeerServingConfig, dial_config_path, load_dial_config,
@@ -45,7 +50,7 @@ pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;
 
 /// Grid counters the gateway emits, with the help text a scrape shows.
-const COUNTER_HELP: [(&str, &str); 9] = [
+const COUNTER_HELP: [(&str, &str); 11] = [
     (
         "grid_route_decisions_total",
         "Requests the gateway decided, by outcome. A refusal records an empty site and cluster.",
@@ -75,6 +80,14 @@ const COUNTER_HELP: [(&str, &str); 9] = [
     (
         "grid_dial_failures_total",
         "Dialed requests that got no response, or a gateway error no grid gateway attributed, by cluster.",
+    ),
+    (
+        "grid_provider_requests_total",
+        "Peer requests a provider gateway served or refused, by result.",
+    ),
+    (
+        "grid_provider_config_reload_total",
+        "Provider-file reloads by result. A refused file keeps the last good one.",
     ),
 ];
 
@@ -223,4 +236,19 @@ pub fn register_grid_filters(
         )
     };
     registry.register("grid_site_route", FilterFactory::Http(Arc::new(factory)))
+}
+
+/// Register `grid_provider` into `registry` over the snapshot `spawn_provider` keeps current.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if the filter name is already registered.
+pub fn register_provider_filter(
+    registry: &mut FilterRegistry,
+    snapshot: Arc<ArcSwap<ProviderSnapshot>>,
+) -> Result<(), FilterError> {
+    let factory = move |config: &serde_yaml::Value| -> Result<Box<dyn HttpFilter>, FilterError> {
+        provider::GridProviderFilter::from_config(config, Arc::clone(&snapshot))
+    };
+    registry.register("grid_provider", FilterFactory::Http(Arc::new(factory)))
 }

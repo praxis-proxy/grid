@@ -7,7 +7,7 @@
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     /// Names `describe_metrics` documents, which a scrape must explain.
-    const DOCUMENTED: [&str; 31] = [
+    const DOCUMENTED: [&str; 33] = [
         "grid_route_decisions_total",
         "grid_route_selections_total",
         "grid_route_prefix_affinity_total",
@@ -39,6 +39,8 @@ mod tests {
         "grid_signals_feedback_failures_total",
         "grid_signals_last_success_timestamp_seconds",
         "grid_signals_response_bytes",
+        "grid_provider_requests_total",
+        "grid_provider_config_reload_total",
     ];
 
     /// The per-site gauges, set once each so their help text renders.
@@ -88,6 +90,8 @@ mod tests {
         }
         metrics::gauge!("grid_dial_down", "cluster" => "east").set(0.0);
         metrics::counter!("grid_dial_failures_total", "cluster" => "east").increment(1);
+        metrics::counter!("grid_provider_requests_total", "result" => "served").increment(1);
+        metrics::counter!("grid_provider_config_reload_total", "result" => "applied").increment(1);
 
         let text = praxis_protocol::http::pingora::metrics::render_prometheus().expect("recorder installed");
         for name in DOCUMENTED {

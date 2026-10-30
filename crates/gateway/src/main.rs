@@ -23,6 +23,7 @@ use serde::Deserialize;
 use tracing::info;
 
 mod metrics_listener;
+mod provider_preflight;
 
 /// Log line emitted once tracing is up; the startup test waits for it.
 const STARTUP_MESSAGE: &str = "starting grid-gateway";
@@ -105,6 +106,14 @@ fn main() -> ExitCode {
         return praxis::report_fatal(&err, log_output);
     }
 
+    // A provider never dials another site, so it must not also hold the consumer's dials.
+    if std::env::var_os("GRID_PROVIDER_CONFIG").is_some() && std::env::var_os("GRID_SERVING_CONFIG").is_some() {
+        return praxis::report_fatal(
+            &"grid: GRID_PROVIDER_CONFIG and GRID_SERVING_CONFIG cannot both be set",
+            log_output,
+        );
+    }
+
     let mut registry = praxis_filter::FilterRegistry::with_builtins();
     praxis_ai_filters::register_ai_filters(&mut registry, None);
 
@@ -134,6 +143,15 @@ fn main() -> ExitCode {
         None => (None, None),
     };
 
+    let provider = match std::env::var("GRID_PROVIDER_CONFIG")
+        .ok()
+        .map(|path| start_provider(&path, &config, &mut registry))
+    {
+        Some(Err(err)) => return praxis::report_fatal(&err, log_output),
+        Some(Ok(runtime)) => Some(runtime),
+        None => None,
+    };
+
     // Use the returning server path so both the routing runtime and tracing
     // provider can shut down cleanly after the listeners stop.
     let mut composition = praxis::ServerComposition::with_registry(registry);
@@ -143,8 +161,15 @@ fn main() -> ExitCode {
                 .map_err(|error| praxis::CompositionError::new(error.to_string()))
         });
     }
+    if provider.is_some() {
+        // A reload must keep the same guarantees the startup config was checked for.
+        composition = composition.add_pipeline_validator(|ctx| {
+            provider_preflight::check(ctx.config()).map_err(praxis::CompositionError::new)
+        });
+    }
     let result = praxis::try_run_server_with_composition(config, composition, config_file, log_level);
     drop(grid_runtime);
+    drop(provider);
     let exit_code = result.map_or_else(|err| praxis::report_fatal(&err, log_output), |()| ExitCode::SUCCESS);
     // The Praxis guard shuts down the OTLP provider and flushes queued spans.
     drop(tracing_guard);
@@ -267,6 +292,29 @@ fn start_grid_routing(
     runtime
         .watch(path, SERVING_RELOAD_INTERVAL)
         .map_err(|err| -> praxis_filter::FilterError { format!("grid: watching {path}: {err}").into() })?;
+    Ok(runtime)
+}
+
+/// Check the config serves peers safely, then start the provider watcher and register
+/// `grid_provider` over its snapshot.
+///
+/// # Errors
+///
+/// Returns the preflight refusal, or the error starting the watcher or registering the filter.
+fn start_provider(
+    path: &str,
+    config: &Config,
+    registry: &mut praxis_filter::FilterRegistry,
+) -> Result<ai_grid_filters::ProviderRuntime, praxis_filter::FilterError> {
+    provider_preflight::check(config)?;
+    let binding = ai_grid_filters::Binding {
+        // Captured once: praxis applies insecure options only at startup.
+        insecure: config.insecure_options.clone(),
+        ..ai_grid_filters::Binding::default()
+    };
+    let runtime = ai_grid_filters::spawn_provider(path.into(), binding, SERVING_RELOAD_INTERVAL)
+        .map_err(|err| -> praxis_filter::FilterError { format!("grid: watching {path}: {err}").into() })?;
+    ai_grid_filters::register_provider_filter(registry, runtime.snapshot())?;
     Ok(runtime)
 }
 

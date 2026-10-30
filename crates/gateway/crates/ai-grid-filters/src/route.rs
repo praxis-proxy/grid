@@ -44,14 +44,14 @@ use crate::{
 };
 
 /// Internal request header carrying the selected candidate's stable ID.
-const SELECTED_CANDIDATE_HEADER: &str = "x-ai-routing-candidate";
+pub(crate) const SELECTED_CANDIDATE_HEADER: &str = "x-ai-routing-candidate";
 /// Internal request header carrying the provider-hop request correlation ID.
 const PROVIDER_HOP_REQUEST_ID_HEADER: &str = "x-ai-routing-request-id";
 /// Internal request header carrying the serving overlay revision.
-const OVERLAY_REVISION_HEADER: &str = "x-ai-routing-revision";
+pub(crate) const OVERLAY_REVISION_HEADER: &str = "x-ai-routing-revision";
 /// The caller's credentials, which never leave this site: another site authorizes the hop by
 /// its mutual TLS peer and candidate, so a caller's token would only leak.
-const CALLER_CREDENTIAL_HEADERS: [http::header::HeaderName; 10] = [
+pub(crate) const CALLER_CREDENTIAL_HEADERS: [http::header::HeaderName; 10] = [
     http::header::AUTHORIZATION,
     http::header::PROXY_AUTHORIZATION,
     http::header::COOKIE,
@@ -120,7 +120,7 @@ const CREDENTIAL_METADATA: [&str; 4] = [
 ///
 /// Names are matched percent-decoded and case-folded, as `url_rewrite` matches them; the
 /// remaining parameters keep their order and encoding.
-fn strip_credential_query(path_and_query: &str) -> Option<String> {
+pub(crate) fn strip_credential_query(path_and_query: &str) -> Option<String> {
     let (path, query) = path_and_query.split_once('?')?;
     // Some backends split pairs on `;` as well as `&`, so both count as a separator.
     let separator = |byte: char| byte == '&' || byte == ';';
@@ -597,7 +597,7 @@ fn select_upstream(ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate) 
 /// kind, so a missing head counts only while it could still be a connect, DNS, TLS or
 /// private-address failure; past the connect budget the connection was made, so a read timeout
 /// is not counted. A reset right after connecting still counts.
-fn dial_outcome(answered: bool, reached: bool, elapsed: Duration, budget: Duration) -> Option<bool> {
+pub(crate) fn dial_outcome(answered: bool, reached: bool, elapsed: Duration, budget: Duration) -> Option<bool> {
     if !reached {
         return None;
     }
@@ -1468,7 +1468,7 @@ fn is_admitted_for_new_request(state: AdmissionState) -> bool {
     clippy::float_arithmetic,
     reason = "tests"
 )]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
@@ -3006,7 +3006,7 @@ mod tests {
     static IDS: LazyLock<praxis_core::id::IdGenerator> = LazyLock::new(|| praxis_core::id::IdGenerator::with_seed(0));
 
     /// A context as the pipeline hands it to the first selecting filter.
-    fn context(request: &praxis_filter::Request) -> HttpFilterContext<'_> {
+    pub(crate) fn context(request: &praxis_filter::Request) -> HttpFilterContext<'_> {
         HttpFilterContext {
             buffered_request_body: None,
             body_done_indices: Vec::new(),
