@@ -749,6 +749,9 @@ jobs:
           - peer-trust-mode: pin
             ha: "1"
             leg: pin, HA faults
+          - peer-trust-mode: spiffe
+            ha: "1"
+            leg: spiffe, HA faults
           - peer-trust-mode: local
             leg: Local membership, no SWIM seed
           - peer-trust-mode: pin
