@@ -363,7 +363,8 @@ class ManagedClusterTemplates(unittest.TestCase):
                               {'v1/ConfigMap/grid-system/grid-bootstrap-state': config_map})
             self.assertNotEqual(refused.returncode, 0)
             self.assertEqual(refused.stdout, '', 'a refused state must emit nothing')
-            self.assertIn('bootstrap grid identity is not immutable', refused.stderr)
+            self.assertIn('bootstrap grid identity is not immutable; patch grid-bootstrap-state '
+                          'in place with {"immutable":true}', refused.stderr)
         state['v1/ConfigMap/grid-system/grid-bootstrap-state']['data']['gridId'] = ''
         empty = execute(spec['object-templates-raw'], state)
         self.assertNotEqual(empty.returncode, 0)
@@ -385,10 +386,12 @@ class ManagedClusterTemplates(unittest.TestCase):
                 'v1/Secret/grid-system/grid-site-identity': {'metadata': {'name': 'x'}},
                 'v1/Secret/grid-system/grid-ca': {'metadata': {'name': 'x'}}}
 
-        def managed(network):
+        def managed(network, others=()):
             resources = dict(base)
-            if network is not None:
-                resources['grid.praxis.fast/v1alpha1/GridNetwork//grid'] = network
+            for name, obj in ((('grid', network),) if network is not None else ()) + tuple(others):
+                obj = copy.deepcopy(obj)
+                obj.setdefault('metadata', {}).setdefault('name', name)
+                resources['grid.praxis.fast/v1alpha1/GridNetwork//' + name] = obj
             return subprocess.run([self.renderer], input=json.dumps({
                 'Template': hub.stdout, 'Managed': True, 'Resources': resources}),
                 text=True, capture_output=True)
@@ -421,8 +424,24 @@ class ManagedClusterTemplates(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, '', 'a refusal must emit no objects to write')
                 self.assertIn('existing grid ID old-grid differs from bootstrap state '
-                              'bootstrap-grid; pre-create grid-bootstrap-state with old-grid',
-                              result.stderr)
+                              'bootstrap-grid; delete and recreate grid-bootstrap-state with '
+                              'old-grid (immutable), or recreate this GridNetwork to join '
+                              'bootstrap-grid', result.stderr)
+        # A by-name lookup would miss these; the guard lists every GridNetwork.
+        another = {
+            'another network with no ID': (None, [('legacy', {})]),
+            'another network with the same ID':
+                (None, [('legacy', {'spec': {'gridId': 'bootstrap-grid'}})]),
+            'another network beside a matching one':
+                ({'spec': {'gridId': 'bootstrap-grid'}}, [('legacy', {'status': {'gridId': 'old-grid'}})]),
+        }
+        for case, (network, others) in another.items():
+            with self.subTest(case=case):
+                result = managed(network, others)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '', 'a refusal must emit no objects to write')
+                self.assertIn('GridNetwork legacy already exists on this site; enrollment '
+                              'manages only GridNetwork grid', result.stderr)
 
 
 if __name__ == '__main__':
