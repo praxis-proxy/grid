@@ -618,9 +618,25 @@ and timeouts. A typed `clusterEndpoints` entry is never written there, so it sta
 that reads it builds the upstream itself; an older one never opens the key. The
 operator leaves out a cluster the gateway would refuse to dial: a site known only
 from discovery, whose address came from gossip; a mutual TLS hop whose server name
-is not exactly `{site}.grid.internal`; plaintext to another site; and a
-credential-bearing cluster, since nothing on the dialed path injects the credential.
-A refused cluster is logged when the refused set for a gateway changes.
+is not exactly `{site}.grid.internal`; plaintext to another site; a credential-bearing
+cluster at another site; and a local one whose credential the gateway cannot read.
+A refused cluster is logged, with why, when the refused set for a gateway changes.
+
+A local dial carries the path of its provider's endpoint URL as `base_path`, which
+the gateway prepends to every request, so a serving gateway that routes by path
+still sees the provider's path. An endpoint path with a query, a fragment, an empty
+segment or a `..` segment is refused. When the local cluster's candidates name a
+`bearer_token` credential, the dial carries
+`credential: {strategy: bearer_token, path}` pointing at
+`/run/secrets/grid-credentials/<secret>/<key>`, the file `credential_inject` reads.
+The operator writes it only for a Secret in the gateway's namespace and only when
+`credentialMountPath` is that default; mount the Secret with `providerCredentials`
+or mount reconciliation. The gateway reads the token when it builds the dial, so a
+rotated file rebuilds it, and an unreadable token takes only that cluster out of
+routing. A routed request drops the caller's credential headers and query
+parameters and sends `Authorization: Bearer <token>`. The gateway refuses a
+credential on a dial to another site or over grid mutual TLS, and one outside the
+credential mount.
 
 A `mutual_tls` dial carries only its `sni`. The gateway presents the grid identity
 it fixed at startup, the `ca.crt`, `tls.crt` and `tls.key` its signals peers use,

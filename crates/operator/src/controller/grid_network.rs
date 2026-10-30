@@ -3620,8 +3620,8 @@ fn site_route_unmet(gw_ref: &GatewayRef, cc: &ConsumerConfig, polling: bool) -> 
 ///
 /// Produced for any gateway with `gridServing` whose derivation admits clusters, whether or
 /// not it generates its praxis config. Only derived clusters: a typed `clusterEndpoints`
-/// entry stays a praxis cluster and no derived dial shadows it. A credential-bearing cluster
-/// is left out, since nothing on the dialed path injects its credential.
+/// entry stays a praxis cluster and no derived dial shadows it. A local dial carries its
+/// provider endpoint's path and the bearer token its candidates name.
 fn gateway_dials(
     gw_ref: &GatewayRef,
     overlay: &routing_overlay::RoutingOverlay,
@@ -3654,27 +3654,87 @@ fn gateway_dials(
         })
         .map(|refused| format!("{}: {}", refused.cluster, refused.reason.as_str()))
         .collect();
-    let credentialed: BTreeSet<&str> = overlay
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.credential.is_some())
-        .map(|candidate| candidate.cluster.as_str())
-        .collect();
-    let endpoints: Vec<ClusterEndpointConfig> = resolution
+    let paths: BTreeMap<String, Option<String>> = resolution
         .resolved
-        .into_values()
-        .filter(|entry| !credentialed.contains(entry.endpoint.cluster.as_str()))
-        .map(|entry| entry.endpoint)
+        .iter()
+        .map(|(cluster, entry)| (cluster.clone(), entry.endpoint_path.clone()))
         .collect();
+    let endpoints: Vec<ClusterEndpointConfig> = resolution.resolved.into_values().map(|entry| entry.endpoint).collect();
     let sites: BTreeMap<&str, &str> = overlay
         .candidates
         .iter()
         .filter(|candidate| candidate.kind == routing_overlay::CANDIDATE_KIND)
         .map(|candidate| (candidate.cluster.as_str(), candidate.site.as_str()))
         .collect();
-    let (dials, unrendered) = consumer_config::dial_specs(&endpoints, &sites, &overlay.local_site);
+    let (mut dials, unrendered) = consumer_config::dial_specs(&endpoints, &sites, &overlay.local_site);
     refused.extend(unrendered.iter().map(|(cluster, error)| format!("{cluster}: {error}")));
+    dials.retain(|cluster, dial| {
+        let path = paths.get(cluster).and_then(Option::as_deref);
+        match dial_request_shape(cluster, dial, path, overlay, gw_ref) {
+            Ok((base_path, credential)) => {
+                dial.base_path = base_path;
+                dial.credential = credential;
+                true
+            },
+            Err(reason) => {
+                refused.insert(format!("{cluster}: {reason}"));
+                false
+            },
+        }
+    });
     (dials, refused)
+}
+
+/// The base path and credential `dial` sends for `cluster`, or why it cannot be dialed.
+fn dial_request_shape(
+    cluster: &str,
+    dial: &serving_config::DialSpec,
+    endpoint_path: Option<&str>,
+    overlay: &routing_overlay::RoutingOverlay,
+    gw_ref: &GatewayRef,
+) -> Result<(Option<String>, Option<serving_config::DialCredential>), &'static str> {
+    let credential_mount = gw_ref
+        .praxis_config
+        .as_ref()
+        .map_or(serving_config::DIAL_CREDENTIAL_BASE, |cc| {
+            cc.credential_mount_path.as_str()
+        });
+    let base_path = endpoint_path.map(serving_config::dial_base_path).transpose()?.flatten();
+    let mut credentials = overlay
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.cluster == cluster)
+        .filter_map(|candidate| candidate.credential.as_ref());
+    let Some(credential) = credentials.next() else {
+        return Ok((base_path, None));
+    };
+    if dial.site != overlay.local_site || matches!(dial.transport, serving_config::DialTransport::MutualTls { .. }) {
+        return Err("a credential is never sent off this site");
+    }
+    if credentials.any(|other| other != credential) {
+        return Err("its candidates name different credentials");
+    }
+    if credential.strategy != "bearer_token" {
+        return Err("only a bearer_token credential is dialed");
+    }
+    if credential.secret_ref.namespace != gw_ref.namespace {
+        return Err("the credential Secret is not in the gateway's namespace");
+    }
+    if credential_mount != serving_config::DIAL_CREDENTIAL_BASE {
+        return Err("credentialMountPath is not the gateway's credential mount");
+    }
+    let path = consumer_config::credential_file_path(
+        credential_mount,
+        &credential.secret_ref.name,
+        &credential.secret_ref.key,
+    );
+    Ok((
+        base_path,
+        Some(serving_config::DialCredential {
+            path,
+            strategy: "bearer_token",
+        }),
+    ))
 }
 
 /// Render the serving config for one gateway, including authoritative no-route state.
@@ -12386,8 +12446,11 @@ mod tests {
         );
         assert_eq!(
             refused,
-            BTreeSet::from(["prov-c: site not enrolled".to_owned()]),
-            "the stub is refused, with why"
+            BTreeSet::from([
+                "prov-c: site not enrolled".to_owned(),
+                "site-d: a credential is never sent off this site".to_owned(),
+            ]),
+            "the stub and the off-site credential are refused, with why"
         );
         let generating = gw.praxis_config.as_ref().is_some_and(|cc| cc.generate);
         if let Some(cc) = gw.praxis_config.as_mut() {
@@ -12403,6 +12466,57 @@ mod tests {
         assert!(
             gateway_dials(&unconfigured, &overlay, &declarations).0.is_empty(),
             "nothing admitted, no entries"
+        );
+    }
+
+    #[test]
+    fn a_local_dial_carries_its_endpoint_path_and_its_candidates_token() {
+        let mut local = topology_candidate("prov-a", "site-a");
+        local.credential = serde_json::from_value(json!({
+            "strategy": "bearer_token",
+            "secretRef": {"namespace": "praxis-system", "name": "grid-model-client-token", "key": "token"}
+        }))
+        .ok();
+        let overlay = dial_overlay(vec![local]);
+        let plain = serving_config::DialSpec {
+            address: "model.svc:80".to_owned(),
+            base_path: None,
+            connect_retries: None,
+            connect_timeout_ms: None,
+            credential: None,
+            read_timeout_ms: None,
+            site: "site-a".to_owned(),
+            total_connect_timeout_ms: None,
+            transport: serving_config::DialTransport::Plaintext,
+            trusted_private: true,
+            write_timeout_ms: None,
+        };
+        let shape = |dial: &serving_config::DialSpec, path: Option<&str>, namespace: &str| {
+            dial_request_shape("prov-a", dial, path, &overlay, &make_gw_ref("inference-gw", namespace))
+        };
+        let (base_path, credential) =
+            shape(&plain, Some("/publishers/p/models/m/"), "praxis-system").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(base_path.as_deref(), Some("/publishers/p/models/m"));
+        assert_eq!(
+            credential.map(|credential| credential.path),
+            Some("/run/secrets/grid-credentials/grid-model-client-token/token".to_owned()),
+            "the token file credential_inject reads"
+        );
+        let remote = serving_config::DialSpec {
+            site: "site-b".to_owned(),
+            ..plain.clone()
+        };
+        assert_eq!(
+            shape(&remote, None, "praxis-system").err(),
+            Some("a credential is never sent off this site")
+        );
+        assert_eq!(
+            shape(&plain, None, "other").err(),
+            Some("the credential Secret is not in the gateway's namespace")
+        );
+        assert_eq!(
+            shape(&plain, Some("/p?x=1"), "praxis-system").err(),
+            Some("the endpoint path carries a query or fragment")
         );
     }
 

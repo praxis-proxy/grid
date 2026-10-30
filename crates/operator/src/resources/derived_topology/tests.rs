@@ -103,6 +103,20 @@ fn resolve_local(endpoint: &str, tls: Option<serde_json::Value>) -> Resolved {
 }
 
 #[test]
+fn a_local_endpoint_keeps_its_path_for_the_dial() {
+    let got = resolve_local(
+        "https://inference.openshift-ingress.svc.cluster.local/publishers/p/models/m",
+        None,
+    );
+    assert_eq!(got.endpoint_path.as_deref(), Some("/publishers/p/models/m"));
+    assert_eq!(
+        resolve_local("http://model.svc/", None).endpoint_path,
+        None,
+        "the root is no path"
+    );
+}
+
+#[test]
 fn an_https_endpoint_derives_server_authenticated_tls_against_its_own_host() {
     let got = resolve_local("https://model-gateway.models.svc.cluster.local", None);
     let transport = got.endpoint.transport.expect("transport");

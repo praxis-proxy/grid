@@ -143,6 +143,8 @@ pub(crate) struct Resolved {
     pub(crate) origin: Origin,
     /// The site its candidates name.
     pub(crate) site: String,
+    /// A derived local endpoint's path and query, `None` at the root.
+    pub(crate) endpoint_path: Option<String>,
 }
 
 /// The declarations resolution reads.
@@ -281,6 +283,7 @@ fn resolve_one(
             endpoint: (*entry).clone(),
             origin: Origin::Explicit,
             site: site.to_owned(),
+            endpoint_path: None,
         });
     }
     if site == declarations.local_site {
@@ -365,6 +368,11 @@ fn derive_local(
         },
         origin: Origin::DerivedLocal,
         site: site.to_owned(),
+        endpoint_path: uri
+            .path_and_query()
+            .map(http::uri::PathAndQuery::as_str)
+            .filter(|path| !path.is_empty() && *path != "/")
+            .map(str::to_owned),
     })
 }
 
@@ -393,6 +401,7 @@ fn derive_remote(cluster: &str, site_name: &str, declarations: &Declarations<'_>
         },
         origin: Origin::DerivedRemote,
         site: site_name.to_owned(),
+        endpoint_path: None,
     })
 }
 

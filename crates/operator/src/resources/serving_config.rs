@@ -117,6 +117,22 @@ pub(crate) struct ServingConfig {
     pub(crate) peers: Vec<ServingPeer>,
 }
 
+/// Where the gateway reads a local dial's token, the provider credential mount `credential_inject` reads.
+pub(crate) const DIAL_CREDENTIAL_BASE: &str = "/run/secrets/grid-credentials";
+
+/// The base path an endpoint's path and query give a dial, `None` at the root, refusing what
+/// the gateway refuses: a query, a fragment, an empty segment or a dot segment.
+pub(crate) fn dial_base_path(path: &str) -> Result<Option<String>, &'static str> {
+    if path.contains(['?', '#']) {
+        return Err("the endpoint path carries a query or fragment");
+    }
+    if path.contains("//") || path.split('/').any(|segment| segment == ".." || segment == ".") {
+        return Err("the endpoint path has an empty or dot segment");
+    }
+    let trimmed = path.trim_end_matches('/');
+    Ok((!trimmed.is_empty()).then(|| trimmed.to_owned()))
+}
+
 /// `ConfigMap` data key holding the dial file, beside the serving config.
 pub(crate) const DIAL_KEY: &str = "dial.json";
 
@@ -135,12 +151,18 @@ pub(crate) struct DialFile {
 pub(crate) struct DialSpec {
     /// `host:port` dialed.
     pub(crate) address: String,
+    /// The path every request is sent under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) base_path: Option<String>,
     /// Connect retries on a connect failure, to the same address.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) connect_retries: Option<u32>,
     /// Connect timeout before TLS, milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) connect_timeout_ms: Option<u64>,
+    /// The token a local dial sends in place of the caller's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) credential: Option<DialCredential>,
     /// Per-read timeout, milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) read_timeout_ms: Option<u64>,
@@ -157,6 +179,15 @@ pub(crate) struct DialSpec {
     /// Per-write timeout, milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) write_timeout_ms: Option<u64>,
+}
+
+/// The bearer token file a local dial sends, field for field the gateway's `DialCredential`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct DialCredential {
+    /// The token file, under the provider credential mount.
+    pub(crate) path: String,
+    /// Always `bearer_token`.
+    pub(crate) strategy: &'static str,
 }
 
 /// How a dial is secured; verification is always on.
@@ -336,11 +367,13 @@ pub(crate) fn render_dials(config: &ServingConfig, dials: &BTreeMap<String, Dial
         .filter_map(|(cluster, served)| {
             let dial = dials.get(cluster)?;
             let mutual = matches!(dial.transport, DialTransport::MutualTls { .. });
+            let local = dial.site == config.local_site && !mutual;
             let accepted = served.iter().all(|candidate| {
                 candidate.site == dial.site
-                    && candidate.credential.is_none()
+                    && (candidate.credential.is_none() || (local && dial.credential.is_some()))
                     && (!mutual || candidate.stable_id.is_some())
             }) && (mutual || dial.site == config.local_site)
+                && (dial.credential.is_none() || local)
                 && dial.transport.ca_path().is_none_or(within_backend_ca)
                 && config
                     .provider_hop_sni
@@ -1095,8 +1128,10 @@ mod tests {
     fn dial(site: &str, transport: DialTransport) -> DialSpec {
         DialSpec {
             address: "peer.example:8443".to_owned(),
+            base_path: None,
             connect_retries: None,
             connect_timeout_ms: None,
+            credential: None,
             read_timeout_ms: None,
             site: site.to_owned(),
             total_connect_timeout_ms: None,

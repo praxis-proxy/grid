@@ -1580,8 +1580,10 @@ pub(crate) fn dial_specs(
                 |duration: std::time::Duration| peer.then(|| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
             let spec = DialSpec {
                 address: ep.address.clone(),
+                base_path: None,
                 connect_retries: peer.then_some(hop.connect_retries),
                 connect_timeout_ms: ms(hop.connect),
+                credential: None,
                 read_timeout_ms: ms(hop.read),
                 site: site.to_owned(),
                 total_connect_timeout_ms: ms(hop.total_connect),
@@ -1648,7 +1650,7 @@ fn private_trust_host(address: &str) -> Option<&str> {
 ///
 /// Uses `{credential_mount_path}/{secret-name}/{secret-key}`.
 /// The secret name is sanitized to be DNS-label-safe before use.
-fn credential_file_path(mount_base: &str, secret_name: &str, secret_key: &str) -> String {
+pub(crate) fn credential_file_path(mount_base: &str, secret_name: &str, secret_key: &str) -> String {
     let safe_name = dns_safe(secret_name);
     format!("{mount_base}/{safe_name}/{secret_key}")
 }
