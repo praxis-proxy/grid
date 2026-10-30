@@ -212,10 +212,13 @@ class ManagedClusterTemplates(unittest.TestCase):
         values['gridIdentity'] = {'enabled': True}
         docs = self.render_chart(values)
         release = [d for d in docs if d['kind'] != 'Policy']
-        self.assertEqual(list(grid_refs(release)), [])
+        self.assertEqual(list(grid_refs(release)), [],
+                         'bootstrap must not need Grid RBAC or objects on the hub')
+        # Standing guard only: the hub policy has never targeted Grid kinds.
         hub = {MC_KEY: {'items': [member('local-cluster', False), member('east')]}}
         rendered = self.render('-hub', hub, policies=self.policy_specs(docs))
-        self.assertEqual(list(grid_refs(rendered)), [])
+        self.assertEqual(list(grid_refs(rendered)), [],
+                         'the hub policy must keep delivering no Grid object to the hub')
 
     def test_observer_access_does_not_wait_for_hub_policy(self):
         for work_name in ('grid-site-observer', 'custom-observer'):

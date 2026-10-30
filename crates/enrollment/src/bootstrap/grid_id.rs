@@ -119,19 +119,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hub_without_the_grid_api_mints_an_id() -> Result<(), BoxError> {
+    async fn a_lost_create_race_returns_the_winning_id() -> Result<(), BoxError> {
         let api = FakeApi::new();
-        api.unserve("/apis/grid.praxis.fast/");
-        let id = ensure(&api.client("grid"), "grid", "grid-state").await?;
-        assert_eq!(
-            uuid::Uuid::parse_str(&id)?.get_version_num(),
-            4,
-            "the minted id is a UUID v4"
+        api.win_create_race(
+            "/api/v1/namespaces/grid/configmaps/grid-state",
+            json!({
+                "apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "grid-state"},
+                "data": {"gridId": "winning-grid"}
+            }),
         );
         assert_eq!(
-            api.writes().len(),
-            1,
-            "a hub without the Grid API still saves one state"
+            ensure(&api.client("grid"), "grid", "grid-state").await?,
+            "winning-grid",
+            "the loser of a create race adopts the winner's id"
+        );
+        let writes = api.writes();
+        assert_eq!(writes.len(), 1, "the loser posts once and then only reads");
+        assert!(writes.iter().all(|write| write.method == "POST"));
+        assert_eq!(
+            api.get("/api/v1/namespaces/grid/configmaps/grid-state")
+                .and_then(|state| state.pointer("/data/gridId").cloned()),
+            Some(json!("winning-grid")),
+            "the winner's state is never overwritten"
         );
         Ok(())
     }
