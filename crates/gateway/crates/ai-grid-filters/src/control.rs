@@ -2501,7 +2501,7 @@ mod tests {
         let (config, dial) = dialed_east();
         let config = with_hop(config, "east", "east.grid.internal");
         let binding = Binding {
-            backend_tls: verified(&[("pool-east", "stale.grid.internal")]),
+            backend_tls: verified(&[("pool-east", "east.grid.internal")]),
             lb_clusters: BTreeSet::from(["pool-east".to_owned()]),
             ..bound_at(&dir)
         };
@@ -2510,7 +2510,7 @@ mod tests {
         let snapshot = control.snapshot().load_full();
         assert!(
             presented(&snapshot, "pool-east").is_some(),
-            "the dial, not the stale load_balancer backend, binds the hop"
+            "the dial at the verified name binds the hop"
         );
         assert!(
             snapshot.provider_hop_clusters.contains("pool-east"),

@@ -360,9 +360,11 @@ pub(crate) fn validate_dials(
             )
             .into());
         }
-        if binding.backend_tls.contains_key(cluster) && !matches!(dial.transport, DialTransport::MutualTls { .. }) {
+        if let Some(verified) = binding.backend_tls.get(cluster)
+            && !matches!(&dial.transport, DialTransport::MutualTls { sni } if sni == verified)
+        {
             return Err(format!(
-                "grid: dial for cluster '{cluster}' is weaker than the verified mutual TLS cluster it replaces"
+                "grid: dial for cluster '{cluster}' does not verify '{verified}', as the mutual TLS cluster it replaces does"
             )
             .into());
         }
@@ -545,24 +547,22 @@ mod tests {
     }
 
     #[test]
-    fn a_dial_never_weakens_the_verified_cluster_it_replaces() {
-        let binding = Binding {
-            backend_tls: BTreeMap::from([("east".to_owned(), "east.grid.internal".to_owned())]),
-            ..Binding::default()
-        };
-        let mut local = spec("local", tls("east.models.svc"), true);
-        local.site = "local".to_owned();
-        for (transport, allowed) in [
-            (mutual_tls("local"), true),
-            (tls("east.models.svc"), false),
-            (DialTransport::Plaintext, false),
+    fn a_dial_replaces_a_verified_cluster_only_under_its_verified_name() {
+        for (verified, transport, allowed) in [
+            ("local.grid.internal", mutual_tls("local"), true),
+            ("stale.grid.internal", mutual_tls("local"), false),
+            ("local.grid.internal", tls("local.grid.internal"), false),
+            ("local.grid.internal", DialTransport::Plaintext, false),
         ] {
-            let mut config = config(&[("east", spec("local", transport.clone(), true))]);
-            config.serving.candidates[0].stable_id = Some("candidate-east".to_owned());
+            let binding = Binding {
+                backend_tls: BTreeMap::from([("east".to_owned(), verified.to_owned())]),
+                ..Binding::default()
+            };
+            let config = config(&[("east", spec("local", transport.clone(), true))]);
             assert_eq!(
                 validate_dials(&config.serving, &config.dial, &binding).is_ok(),
                 allowed,
-                "{transport:?} over a verified mutual TLS cluster"
+                "{transport:?} over a mutual TLS cluster verified at {verified}"
             );
         }
     }
