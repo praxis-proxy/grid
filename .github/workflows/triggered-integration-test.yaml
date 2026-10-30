@@ -56,7 +56,7 @@ on:
       timezone: America/New_York
 
 concurrency:
-  group: grid-triggered-integration-${{ inputs.release_qualification || 'glb-quick' }}-${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.branch != '' && format('branch-{0}', inputs.branch) || 'main' }}-${{ github.event_name }}
+  group: grid-triggered-integration-${{ github.workflow }}-${{ inputs.release_qualification || 'glb-quick' }}-${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.branch != '' && format('branch-{0}', inputs.branch) || 'main' }}-${{ github.event_name }}
   cancel-in-progress: true
 
 permissions: {}

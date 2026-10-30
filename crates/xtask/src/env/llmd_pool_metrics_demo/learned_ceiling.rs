@@ -1448,6 +1448,17 @@ fn endpoint_kv_cache_for_deployment(
     }
 }
 
+/// Return simulator Pods that are not already terminating.
+fn non_terminating_simulator_pods(pods: &[Value]) -> Vec<&Value> {
+    pods.iter()
+        .filter(|pod| {
+            pod.pointer("/metadata/deletionTimestamp")
+                .and_then(Value::as_str)
+                .is_none()
+        })
+        .collect()
+}
+
 /// Identify the single Ready simulator pod behind a run-owned Deployment.
 fn simulator_pod_uid(context: &str, deployment: &str) -> Result<String, Box<dyn std::error::Error>> {
     let selector = format!("app=vllm-vcr,pool={SITE},instance={deployment}");
@@ -1477,10 +1488,12 @@ fn simulator_pod_uid(context: &str, deployment: &str) -> Result<String, Box<dyn 
         .get("items")
         .and_then(Value::as_array)
         .ok_or("kubectl simulator pod list omitted items")?;
-    let [pod] = items.as_slice() else {
+    let active_pods = non_terminating_simulator_pods(items);
+    let [pod] = active_pods.as_slice() else {
         return Err(format!(
-            "expected exactly one pod for deployment/{deployment}, found {}",
-            items.len()
+            "expected exactly one non-terminating pod for deployment/{deployment}, found {} active among {} total",
+            active_pods.len(),
+            items.len(),
         )
         .into());
     };
@@ -4845,9 +4858,9 @@ mod tests {
         hard_bound_without_soft_is_valid, hard_only_epp_in_flight, idle_ceiling_is_retained,
         kv_cache_hard_bound_is_valid, kv_cache_reported_only_route_share_shift, kv_cache_route_share_shift,
         lifecycle_ceiling_sequence_valid, local_relay_matches, metric_values, no_waiting_or_held_work,
-        parse_epp_readings, policy_with_run_exclusion, probe_failure_value, qualification_succeeded,
-        reported_only_kv_cache_is_valid, restored_revision_is_observed, returned_ceiling_is_valid,
-        validate_response_attribution,
+        non_terminating_simulator_pods, parse_epp_readings, policy_with_run_exclusion, probe_failure_value,
+        qualification_succeeded, reported_only_kv_cache_is_valid, restored_revision_is_observed,
+        returned_ceiling_is_valid, validate_response_attribution,
     };
 
     fn route_distribution(pool_a: usize, pool_b: usize) -> RouteDistribution {
@@ -4859,37 +4872,73 @@ mod tests {
 
     #[test]
     fn live_simulator_stimulus_keeps_distinct_endpoint_cache_values() {
-        assert_eq!(endpoint_kv_cache_for_deployment("vcr-1", 1.0, 0.0).ok(), Some(1.0));
-        assert_eq!(endpoint_kv_cache_for_deployment("vcr-2", 1.0, 0.0).ok(), Some(0.0));
+        assert_eq!(
+            endpoint_kv_cache_for_deployment("vcr-1", 1.0, 0.0).ok(),
+            Some(1.0),
+            "the first simulator endpoint must receive its configured KV-cache stimulus"
+        );
+        assert_eq!(
+            endpoint_kv_cache_for_deployment("vcr-2", 1.0, 0.0).ok(),
+            Some(0.0),
+            "the second simulator endpoint must receive its independent KV-cache stimulus"
+        );
         assert_eq!(
             endpoint_kv_cache_for_deployment("other", 1.0, 0.0),
-            Err("no per-endpoint KV-cache stimulus was specified for this simulator deployment")
+            Err("no per-endpoint KV-cache stimulus was specified for this simulator deployment"),
+            "an unconfigured simulator endpoint must not inherit another endpoint's cache value"
+        );
+    }
+
+    #[test]
+    fn simulator_pod_selection_ignores_pods_during_rollout_termination() {
+        let pods = vec![
+            serde_json::json!({"metadata":{"name":"old","deletionTimestamp":"2026-10-30T00:00:00Z"}}),
+            serde_json::json!({"metadata":{"name":"new","deletionTimestamp":null}}),
+        ];
+
+        let active = non_terminating_simulator_pods(&pods);
+
+        assert_eq!(
+            active.len(),
+            1,
+            "a terminating old ReplicaSet Pod must not make a single-active-Pod rollout ambiguous"
+        );
+        assert_eq!(
+            active
+                .first()
+                .and_then(|pod| pod.pointer("/metadata/name"))
+                .and_then(serde_json::Value::as_str),
+            Some("new"),
+            "the surviving non-terminating simulator Pod must be selected"
         );
     }
 
     #[test]
     fn restoration_accepts_an_original_revision_that_never_left_the_gateway() {
-        assert!(restored_revision_is_observed(
-            "original",
-            "original",
-            3.0,
-            "original",
-            Some(("unserved-intermediate", 3.0)),
-        ));
-        assert!(restored_revision_is_observed(
-            "original",
-            "original",
-            4.0,
-            "original",
-            Some(("served-intermediate", 3.0)),
-        ));
-        assert!(!restored_revision_is_observed(
-            "new",
-            "new",
-            3.0,
-            "original",
-            Some(("unserved-intermediate", 3.0)),
-        ));
+        assert!(
+            restored_revision_is_observed(
+                "original",
+                "original",
+                3.0,
+                "original",
+                Some(("unserved-intermediate", 3.0)),
+            ),
+            "an unchanged original revision may remain serving while a newer revision is observed"
+        );
+        assert!(
+            restored_revision_is_observed(
+                "original",
+                "original",
+                4.0,
+                "original",
+                Some(("served-intermediate", 3.0)),
+            ),
+            "the original revision must be accepted after a previously served intermediate revision"
+        );
+        assert!(
+            !restored_revision_is_observed("new", "new", 3.0, "original", Some(("unserved-intermediate", 3.0)),),
+            "a different current revision must not be mistaken for successful restoration"
+        );
     }
 
     #[test]

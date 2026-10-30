@@ -39,8 +39,6 @@ const TWO_SITE_SHARE_RANGE: (f64, f64) = (0.1, 0.9);
 const CROSS_SITE_HIGHER_WAITING_REQUESTS: u32 = 2;
 /// The test Gateway keeps the moderate queue above its default backlog threshold but below EPP capacity.
 const CROSS_SITE_QUEUE_FULL_THRESHOLD: u32 = 3;
-/// The normal Gateway threshold is restored before the learned-ceiling proof runs.
-const DEFAULT_GATEWAY_QUEUE_FULL_THRESHOLD: u32 = 1;
 /// A reported load signal gives the embedded Gateway a nonzero rho while both sites remain eligible.
 const CROSS_SITE_HIGHER_KV_CACHE: f64 = 0.95;
 /// A lighter local signal than the peer's trusted baseline for the wrong-pin check.
@@ -726,7 +724,13 @@ fn run(
         context.scoring_flavor,
         mtls,
     )?;
-    let _restored_pressure_order = wait_for_pressure_order(operator_metrics_port, "pool-a", Duration::from_secs(120))?;
+    wait_for_pressure_order_recorded(
+        operator_metrics_port,
+        "pool-a",
+        Duration::from_secs(120),
+        observations,
+        "pool-a operator observed the restored pressure order",
+    )?;
     let pre_pin_route = verify_weighted_site_distribution(
         gateway_http_port,
         gateway_metrics_port,
@@ -967,7 +971,13 @@ fn run(
         pool_b_before_bad_pin,
         Duration::from_secs(90),
     )?;
-    let _recovered_pressure_order = wait_for_pressure_order(operator_metrics_port, "pool-b", Duration::from_secs(90))?;
+    wait_for_pressure_order_recorded(
+        operator_metrics_port,
+        "pool-b",
+        Duration::from_secs(90),
+        observations,
+        "pool-a operator observed the recovered pressure order",
+    )?;
     verify_weighted_site_distribution(
         gateway_http_port,
         gateway_metrics_port,
@@ -1033,12 +1043,12 @@ fn prepare_poll_gateway(image: &str) -> Result<(), Box<dyn std::error::Error>> {
     for cluster in CLUSTERS {
         restart_operator(cluster)?;
     }
-    install_grid_gateway(image, &endpoints, CROSS_SITE_QUEUE_FULL_THRESHOLD)?;
+    install_grid_gateway(image, &endpoints, Some(CROSS_SITE_QUEUE_FULL_THRESHOLD))?;
     wait_for_grid_serving_snapshot(Duration::from_secs(120))?;
     Ok(())
 }
 
-/// Restore the chart's normal queue threshold before the learned-ceiling proof uses backlog evidence.
+/// Restore the chart's configured queue threshold before the learned-ceiling proof uses backlog evidence.
 fn restore_gateway_default_queue_threshold(image: &str) -> Result<(), Box<dyn std::error::Error>> {
     let context = kind_context(GRID_SERVING_SITE);
     let status = Command::new("helm")
@@ -1066,7 +1076,7 @@ fn restore_gateway_default_queue_threshold(image: &str) -> Result<(), Box<dyn st
         provider_gateway_endpoint("pool-a")?,
         provider_gateway_endpoint("pool-b")?,
     ];
-    install_grid_gateway(image, &endpoints, DEFAULT_GATEWAY_QUEUE_FULL_THRESHOLD)
+    install_grid_gateway(image, &endpoints, None)
 }
 
 /// Apply EPP queue pressure plus a reported fullness signal so the embedded Gateway can weight both sites.
@@ -1136,7 +1146,13 @@ fn prove_network_partition(
         mtls,
     )?;
     set_cross_site_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
-    let _partition_pressure_order = wait_for_pressure_order(operator_port, "pool-b", Duration::from_secs(120))?;
+    wait_for_pressure_order_recorded(
+        operator_port,
+        "pool-b",
+        Duration::from_secs(120),
+        observations,
+        "pool-a operator observed the pre-partition pressure order",
+    )?;
     verify_weighted_site_distribution(
         gateway_port,
         gateway_metrics_port,
@@ -1250,6 +1266,7 @@ fn wait_for_partition_degradation(
     let mut last_request_observation = None;
     let mut last_membership_observation = None;
     let mut last_state = String::from("partition active; waiting for SWIM and overlay updates");
+    let remote_site = "pool-b";
 
     while Instant::now() < deadline {
         attempts += 1;
@@ -1282,11 +1299,11 @@ fn wait_for_partition_degradation(
         let gateway_metrics = read_gateway_metrics(gateway_metrics_port);
         let (signal_silent, last_sample_age) = gateway_metrics.as_ref().map_or((None, None), |metrics| {
             (
-                gateway_site_signal_silent(metrics, GRID_SERVING_SITE, remote_cluster),
+                gateway_site_signal_silent(metrics, remote_site, remote_cluster),
                 sample_value(
                     metrics,
                     "grid_route_site_last_sample_age_seconds",
-                    &[("site", GRID_SERVING_SITE), ("cluster", remote_cluster)],
+                    &[("site", remote_site), ("cluster", remote_cluster)],
                 ),
             )
         });
@@ -1475,7 +1492,7 @@ fn patch_network_for_poll(cluster: &str, endpoints: &[serde_json::Value]) -> Res
 fn install_grid_gateway(
     image: &str,
     endpoints: &[serde_json::Value],
-    queue_full_threshold: u32,
+    queue_full_threshold: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (repository, tag) = split_image_reference(image)?;
     let chart = crate::workspace_root().join("charts/praxis-gateway");
@@ -1547,12 +1564,16 @@ fn install_grid_gateway(
         "--set",
         "praxisConfig.render.gridServing.enabled=true",
         "--set",
-        &format!("praxisConfig.render.gridServing.siteRoute.availability.queue_full={queue_full_threshold}"),
-        "--set",
         "networkPolicy.enabled=true",
         "--set",
         "metricsListener.enabled=true",
     ]);
+    if let Some(queue_full_threshold) = queue_full_threshold {
+        command.args([
+            "--set",
+            &format!("praxisConfig.render.gridServing.siteRoute.availability.queue_full={queue_full_threshold}"),
+        ]);
+    }
     let output = command.output()?;
     if !output.status.success() {
         return Err(format!(
@@ -3156,16 +3177,32 @@ mod tests {
     #[test]
     fn cross_site_pressure_keeps_queue_depth_and_gateway_saturation_explicit() {
         let queue_pressure = cross_site_simulator_metrics(2, super::super::ScoringFlavor::QueueDepth);
-        assert_eq!(queue_pressure, (2, CROSS_SITE_HIGHER_KV_CACHE));
+        assert_eq!(
+            queue_pressure,
+            (2, CROSS_SITE_HIGHER_KV_CACHE),
+            "queue-depth pressure must preserve queue count and use the paired saturation signal"
+        );
 
         let queue_clear = cross_site_simulator_metrics(0, super::super::ScoringFlavor::QueueDepth);
-        assert_eq!(queue_clear, (0, 0.0));
+        assert_eq!(
+            queue_clear,
+            (0, 0.0),
+            "clearing queue-depth pressure must clear both simulator signals"
+        );
 
         let kv_pressure = cross_site_simulator_metrics(2, super::super::ScoringFlavor::KvCachePressure);
-        assert_eq!(kv_pressure, (0, CROSS_SITE_HIGHER_KV_CACHE));
+        assert_eq!(
+            kv_pressure,
+            (0, CROSS_SITE_HIGHER_KV_CACHE),
+            "KV-cache pressure must use saturation without introducing queue depth"
+        );
 
         let kv_clear = cross_site_simulator_metrics(0, super::super::ScoringFlavor::KvCachePressure);
-        assert_eq!(kv_clear, (0, 0.0));
+        assert_eq!(
+            kv_clear,
+            (0, 0.0),
+            "clearing KV-cache pressure must clear both simulator signals"
+        );
     }
 
     #[test]
@@ -3272,8 +3309,14 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0.5
             ..jittered
         };
 
-        assert!(weighted_route_metrics_stable(stable, jittered));
-        assert!(!weighted_route_metrics_stable(stable, changed));
+        assert!(
+            weighted_route_metrics_stable(stable, jittered),
+            "small scrape jitter must preserve a stable weighted-route observation"
+        );
+        assert!(
+            !weighted_route_metrics_stable(stable, changed),
+            "a meaningful route-metric change must not be classified as scrape jitter"
+        );
     }
 
     #[test]
@@ -3541,17 +3584,24 @@ grid_route_site_silent{site="pool-c",cluster="llmd-pool-c-provider"} NaN
 
         assert_eq!(
             gateway_site_signal_silent(exposition, "pool-b", "llmd-pool-b-provider"),
-            Some(true)
+            Some(true),
+            "the exact remote site/provider series must report a silent signal"
         );
         assert_eq!(
             gateway_site_signal_silent(exposition, "pool-a", "llmd-pool-a-provider"),
-            Some(false)
+            Some(false),
+            "the exact local site/provider series must report a live signal"
         );
         assert_eq!(
             gateway_site_signal_silent(exposition, "pool-c", "llmd-pool-c-provider"),
-            None
+            None,
+            "a non-finite silence gauge must not be interpreted as a valid signal"
         );
-        assert_eq!(gateway_site_signal_silent(exposition, "pool-b", "wrong-provider"), None);
+        assert_eq!(
+            gateway_site_signal_silent(exposition, "pool-b", "wrong-provider"),
+            None,
+            "a silence gauge for another provider must not match the requested series"
+        );
     }
 
     #[test]

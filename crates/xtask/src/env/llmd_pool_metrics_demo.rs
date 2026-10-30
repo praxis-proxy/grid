@@ -2381,7 +2381,7 @@ fn parse_curl_probe_output(raw: &str) -> Result<CurlProbeOutput, Box<dyn std::er
         .split_once("\nCURL_STDERR_END")
         .ok_or_else(|| std::io::Error::other("curl probe output omitted the stderr terminator"))?;
     let trailing_output = trailing_output.trim();
-    if !trailing_output.is_empty() && !is_kubectl_curl_probe_cleanup_notice(trailing_output) {
+    if !trailing_output.is_empty() {
         return Err(std::io::Error::other("curl probe output had unexpected trailing data").into());
     }
 
@@ -2413,16 +2413,6 @@ fn parse_curl_probe_output(raw: &str) -> Result<CurlProbeOutput, Box<dyn std::er
             .ok_or_else(|| std::io::Error::other("curl probe output omitted the curl exit code"))?,
         curl_stderr: curl_stderr.to_owned(),
     })
-}
-
-/// Recognize the line kubectl prints after deleting a successful `run --rm` pod.
-fn is_kubectl_curl_probe_cleanup_notice(line: &str) -> bool {
-    const PREFIX: &str = "pod \"curl-probe-";
-    const SUFFIXES: [&str; 2] = ["\" deleted", "\" deleted from grid-system namespace"];
-
-    line.strip_prefix(PREFIX)
-        .and_then(|name| SUFFIXES.iter().find_map(|suffix| name.strip_suffix(suffix)))
-        .is_some_and(|name| !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Fetch EPP metrics.
@@ -4869,28 +4859,44 @@ mod tests {
     #[test]
     fn curl_probe_waits_for_a_terminal_pod_before_reading_logs() -> Result<(), Box<dyn std::error::Error>> {
         let running: serde_json::Value = serde_json::from_str(r#"{"status":{"phase":"Running"}}"#)?;
-        assert_eq!(curl_probe_pod_exit_code(&running), None);
+        assert_eq!(
+            curl_probe_pod_exit_code(&running),
+            None,
+            "a running probe Pod must not be treated as ready for log collection"
+        );
 
         let succeeded: serde_json::Value = serde_json::from_str(
             r#"{"status":{"phase":"Succeeded","containerStatuses":[{"state":{"terminated":{"exitCode":0}}}]}}"#,
         )?;
-        assert_eq!(curl_probe_pod_exit_code(&succeeded), Some(0));
+        assert_eq!(
+            curl_probe_pod_exit_code(&succeeded),
+            Some(0),
+            "a succeeded probe Pod must report a successful container exit"
+        );
 
         let failed: serde_json::Value = serde_json::from_str(
             r#"{"status":{"phase":"Failed","containerStatuses":[{"state":{"terminated":{"exitCode":22}}}]}}"#,
         )?;
-        assert_eq!(curl_probe_pod_exit_code(&failed), Some(22));
+        assert_eq!(
+            curl_probe_pod_exit_code(&failed),
+            Some(22),
+            "a failed probe Pod must preserve curl's nonzero container exit"
+        );
 
         let failed_before_container_start: serde_json::Value =
             serde_json::from_str(r#"{"status":{"phase":"Failed","reason":"ImagePullBackOff"}}"#)?;
-        assert_eq!(curl_probe_pod_exit_code(&failed_before_container_start), None);
+        assert_eq!(
+            curl_probe_pod_exit_code(&failed_before_container_start),
+            None,
+            "a Pod that failed before its container started has no curl exit code"
+        );
         Ok(())
     }
 
     #[test]
     fn curl_probe_output_preserves_no_response_transport_diagnostics() -> Result<(), Box<dyn std::error::Error>> {
         let output = parse_curl_probe_output(
-            "STATUS:000\nPROVIDER_GW:\nDEMO_ATTRIB:\nCURL_EXIT:28\nCURL_STDERR_BEGIN\ncurl: (28) timed out\nCURL_STDERR_END\npod \"curl-probe-050906\" deleted\n",
+            "STATUS:000\nPROVIDER_GW:\nDEMO_ATTRIB:\nCURL_EXIT:28\nCURL_STDERR_BEGIN\ncurl: (28) timed out\nCURL_STDERR_END\n",
         )?;
 
         assert_eq!(output.status, 0);
@@ -4902,28 +4908,14 @@ mod tests {
     }
 
     #[test]
-    fn curl_probe_output_accepts_kubectl_cleanup_notice_with_namespace_detail() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let output = parse_curl_probe_output(
-            "STATUS:200\nPROVIDER_GW:pool-a\nDEMO_ATTRIB:pool-a\nCURL_EXIT:0\nCURL_STDERR_BEGIN\n\nCURL_STDERR_END\npod \"curl-probe-050906\" deleted from grid-system namespace\n",
-        )?;
-
-        assert_eq!(output.status, 200);
-        assert_eq!(output.provider_gateway, "pool-a");
-        assert_eq!(output.demo_attribution, "pool-a");
-        assert_eq!(output.curl_exit_code, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn curl_probe_output_rejects_unrecognized_trailing_data() {
+    fn curl_probe_output_rejects_cleanup_notice_from_obsolete_attached_pod_flow() {
         assert!(
             parse_curl_probe_output(
-                "STATUS:000\nPROVIDER_GW:\nDEMO_ATTRIB:\nCURL_EXIT:28\nCURL_STDERR_BEGIN\ncurl: (28) timed out\nCURL_STDERR_END\nunexpected output\n",
+                "STATUS:200\nPROVIDER_GW:pool-a\nDEMO_ATTRIB:pool-a\nCURL_EXIT:0\nCURL_STDERR_BEGIN\n\nCURL_STDERR_END\npod \"curl-probe-050906\" deleted\n",
             )
             .err()
             .is_some_and(|error| error.to_string().contains("unexpected trailing data")),
-            "unrecognized kubectl output must not be accepted as curl data"
+            "kubectl's obsolete attached-Pod cleanup notice must not be accepted as probe output"
         );
     }
 
