@@ -20,6 +20,7 @@ use std::{
         Arc, LazyLock,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
@@ -35,7 +36,7 @@ use crate::{
     control::Tuning,
     decisions::{Refused, SiteDecisions},
     descriptor::{AdmissionState, CapabilityKind, RouteCandidate, validate_model_header},
-    health::ClusterHealth,
+    health::{Admission, ClusterHealth},
     pin::{self, Collection, Pushed, StatePath, TagKey, Tagger},
     prefix::{self, Affinity, AffinitySettings, Api, PrefixAffinity, PrefixKeys, QueueGate, Queued},
     serving::AvailabilitySettings,
@@ -390,14 +391,18 @@ impl GridSiteRouteFilter {
         snapshot: &'snap RouteSnapshot,
         model: &str,
         keys: Option<&PrefixKeys>,
+        skip: Option<&str>,
     ) -> Result<Pick<'snap>, FilterAction> {
         let turn = self.turn.fetch_add(1, Ordering::Relaxed);
         let now_ms = grid_signals::now_ms();
         if snapshot.is_shedding(model, now_ms) {
             return Err(refuse(Refused::Shed, model, turn));
         }
-        let routable =
-            |candidate: &RouteCandidate| !candidate.expired_at(now_ms) && has_route(candidate, self.clusters.as_ref());
+        let routable = |candidate: &RouteCandidate| {
+            !candidate.expired_at(now_ms)
+                && has_route(candidate, self.clusters.as_ref())
+                && skip.is_none_or(|skip| *candidate.cluster != *skip)
+        };
         let settings = self.affinity.settings.load();
         let pick = if settings.enabled {
             let sticky = Sticky {
@@ -440,7 +445,7 @@ impl GridSiteRouteFilter {
         with_state(ctx, |state| {
             responses = state.responses;
             state.served = Some((Arc::clone(&candidate.site), Arc::clone(&candidate.cluster)));
-            state.dialed = candidate.dial.as_ref().map(|dial| Arc::clone(dial.health()));
+            state.dialed = InFlight::of(candidate, false);
             if let Some(keys) = keys {
                 self.affinity.index.record(&keys, &candidate.cluster);
                 state.recorded = Some((keys, Arc::clone(&candidate.cluster)));
@@ -494,7 +499,7 @@ impl GridSiteRouteFilter {
         with_state(ctx, |state| {
             state.responses = true;
             state.served = Some((Arc::clone(&candidate.site), Arc::clone(&candidate.cluster)));
-            state.dialed = candidate.dial.as_ref().map(|dial| Arc::clone(dial.health()));
+            state.dialed = InFlight::of(candidate, false);
         });
         select_upstream(ctx, candidate);
         write_provider_context(ctx, candidate, &snapshot)?;
@@ -530,12 +535,17 @@ impl GridSiteRouteFilter {
                 .get(http::header::CONTENT_ENCODING)
                 .is_none_or(|encoding| encoding.as_bytes().eq_ignore_ascii_case(b"identity"))
         });
-        let dial_outcome = dial_outcome(head, ctx.upstream_reached);
+        let (answered, reached) = (head.is_some(), ctx.upstream_reached);
         let Some(state) = ctx.get_filter_state_mut::<RouteState>() else {
             return Ok(());
         };
-        if let (Some(dialed), Some(reached)) = (state.dialed.take(), dial_outcome) {
-            dialed.record(reached, crate::health::monotonic_ms());
+        if let Some(dialed) = state.dialed.take() {
+            if let Some(working) = dial_outcome(answered, reached, dialed.sent.elapsed(), dialed.budget) {
+                dialed.state.record(working, crate::health::monotonic_ms());
+            }
+            if dialed.probe {
+                dialed.state.release_probe();
+            }
         }
         // Keep the selected route after releasing the mutable borrow of filter state in `ctx`.
         let served = state.served.clone();
@@ -569,16 +579,53 @@ fn select_upstream(ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate) 
     }
 }
 
-/// Whether a dialed request reached a working site: `None` when the site never owned the
-/// outcome. No response from a reached upstream is a failure, as is a gateway error no grid
-/// gateway attributed; praxis cannot tell a connect failure from a read timeout.
-fn dial_outcome(head: Option<&praxis_filter::Response>, upstream_reached: bool) -> Option<bool> {
-    let Some(response) = head else {
-        return upstream_reached.then_some(false);
-    };
-    let gateway_error =
-        matches!(response.status.as_u16(), 502..=504) && !response.headers.contains_key(ROUTE_SITE_HEADER);
-    Some(!gateway_error)
+/// Whether a dialed request reached a working site: `None` when the dial never owned the outcome.
+///
+/// Any response head proves the connect and handshake. Praxis 0.7.5 hands a filter no error
+/// kind, so a missing head counts only while it could still be a connect, DNS, TLS or
+/// private-address failure; past the connect budget the connection was made, so a read timeout
+/// is not counted. A reset right after connecting still counts.
+fn dial_outcome(answered: bool, reached: bool, elapsed: Duration, budget: Duration) -> Option<bool> {
+    if !reached {
+        return None;
+    }
+    if answered {
+        return Some(true);
+    }
+    (elapsed <= budget).then_some(false)
+}
+
+/// A request sent over a dial, whose outcome its response records.
+#[derive(Debug)]
+struct InFlight {
+    /// The longest the dial's connect attempts can take.
+    budget: Duration,
+    /// Whether this request holds the down dial's one probe.
+    probe: bool,
+    /// When the request was routed.
+    sent: Instant,
+    /// The dial's health.
+    state: Arc<crate::health::DialState>,
+}
+
+impl InFlight {
+    /// The request routed to `candidate`, `None` when it is not dialed.
+    fn of(candidate: &RouteCandidate, probe: bool) -> Option<Self> {
+        candidate.dial.as_ref().map(|dial| Self {
+            budget: dial.connect_budget(),
+            probe,
+            sent: Instant::now(),
+            state: Arc::clone(dial.health()),
+        })
+    }
+}
+
+/// Whether a request may take `candidate`'s dial.
+fn admission(candidate: &RouteCandidate) -> Admission {
+    candidate
+        .dial
+        .as_ref()
+        .map_or(Admission::Open, |dial| dial.health().admit())
 }
 
 /// Apply attribution and body-tagging header changes to the routed response.
@@ -711,13 +758,30 @@ impl HttpFilter for GridSiteRouteFilter {
             .get_filter_state_mut::<RouteState>()
             .and_then(|state| state.keys.take())
             .map(|keys| keys.for_model(model));
-        match self.choose(&snapshot, model, keys.as_ref()) {
-            Ok(pick) => {
-                self.route(ctx, &snapshot, &pick, keys)?;
-                Ok(FilterAction::Continue)
+        let pick = match self.choose(&snapshot, model, keys.as_ref(), None) {
+            Ok(pick) => pick,
+            Err(answer) => return Ok(answer),
+        };
+        let (pick, admitted) = match admission(pick.candidate) {
+            // Another request probes this down dial: pick elsewhere when anywhere else routes.
+            Admission::Busy => match self.choose(&snapshot, model, keys.as_ref(), Some(&pick.candidate.cluster)) {
+                Ok(other) => {
+                    let admitted = admission(other.candidate);
+                    (other, admitted)
+                },
+                Err(_) => (pick, Admission::Busy),
             },
-            Err(answer) => Ok(answer),
+            admitted @ (Admission::Open | Admission::Probe) => (pick, admitted),
+        };
+        self.route(ctx, &snapshot, &pick, keys)?;
+        if admitted == Admission::Probe {
+            with_state(ctx, |state| {
+                if let Some(dialed) = state.dialed.as_mut() {
+                    dialed.probe = true;
+                }
+            });
         }
+        Ok(FilterAction::Continue)
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -798,7 +862,7 @@ struct RouteState {
     /// Tags the answer's ids with the site that served it.
     tagger: Option<Tagger>,
     /// The health of the dial the request was sent over, recorded once its outcome is known.
-    dialed: Option<Arc<crate::health::DialState>>,
+    dialed: Option<InFlight>,
 }
 
 /// Run `change` on this request's state, created on first use.
@@ -1492,7 +1556,7 @@ mod tests {
         filter.affinity.index.confirm(&keys, &Arc::from("pool-a"));
         let snapshot = filter.snapshot.load();
         filter
-            .choose(&snapshot, "llama", Some(&keys))
+            .choose(&snapshot, "llama", Some(&keys), None)
             .ok()
             .map(|pick| pick.candidate.site.to_string())
     }
@@ -1929,7 +1993,7 @@ mod tests {
 
     /// A snapshot of `llama` on east and west, with the given queue depths.
     fn two_sites(east: Option<f64>, west: Option<f64>) -> RouteSnapshot {
-        let store = grid_signals::LoadStore::new(std::time::Duration::from_secs(60));
+        let store = grid_signals::LoadStore::new(Duration::from_secs(60));
         for (site, cluster, load) in [("east", "pool-a", east), ("west", "pool-b", west)] {
             if let Some(value) = load {
                 let line = format!(
@@ -2012,7 +2076,7 @@ mod tests {
 
     /// Sites publishing (in flight, capacity), each `None` to publish nothing, as one snapshot.
     fn loaded(sites: &[(&str, Option<f64>, Option<f64>)]) -> RouteSnapshot {
-        let store = grid_signals::LoadStore::new(std::time::Duration::from_secs(60));
+        let store = grid_signals::LoadStore::new(Duration::from_secs(60));
         let mut candidates = Vec::new();
         for (site, in_flight, capacity) in sites {
             let cluster = format!("pool-{site}");
@@ -2776,42 +2840,89 @@ mod tests {
     }
 
     #[test]
-    fn a_dial_outcome_counts_only_what_the_site_owned() {
-        let response = |status: u16, attributed: bool| {
-            let mut headers = http::HeaderMap::new();
-            if attributed {
-                headers.insert(ROUTE_SITE_HEADER, http::HeaderValue::from_static("east"));
-            }
-            praxis_filter::Response {
-                headers,
-                status: http::StatusCode::from_u16(status).expect("status"),
-            }
-        };
+    fn a_dial_outcome_counts_only_a_failure_to_connect() {
+        let budget = Duration::from_secs(9);
+        let (within, past) = (Duration::from_secs(1), Duration::from_secs(120));
         assert_eq!(
-            dial_outcome(None, true),
+            dial_outcome(false, true, within, budget),
             Some(false),
-            "a reached site that never answered"
+            "no head within the connect budget: connect, DNS, TLS or private refusal"
         );
-        assert_eq!(dial_outcome(None, false), None, "the site never owned the outcome");
-        for status in [502, 503, 504] {
+        assert_eq!(
+            dial_outcome(false, true, past, budget),
+            None,
+            "no head past the connect budget: a read timeout on an established connection"
+        );
+        for elapsed in [within, past] {
             assert_eq!(
-                dial_outcome(Some(&response(status, false)), true),
-                Some(false),
-                "{status} from no grid gateway"
+                dial_outcome(true, true, elapsed, budget),
+                Some(true),
+                "any head proves the dial"
             );
             assert_eq!(
-                dial_outcome(Some(&response(status, true)), true),
-                Some(true),
-                "{status} the far gateway attributed is its backend's, not the dial's"
+                dial_outcome(true, false, elapsed, budget),
+                None,
+                "a local answer never reached the dial"
+            );
+            assert_eq!(
+                dial_outcome(false, false, elapsed, budget),
+                None,
+                "the dial never owned the outcome"
             );
         }
-        for status in [200, 429, 500] {
+    }
+
+    #[tokio::test]
+    async fn a_down_dial_probed_by_another_request_sends_the_rest_elsewhere() {
+        let mut candidates = dialed("east", "east", Some("10.0.0.9:8443"));
+        candidates.extend(dialed("west", "west", Some("10.0.0.10:8443")));
+        let east = Arc::clone(candidates[0].dial.as_ref().expect("dialed").health());
+        east.record(false, 0);
+        east.record(false, 0);
+        assert_eq!(
+            east.admit_at(crate::health::monotonic_ms()),
+            Admission::Probe,
+            "another request holds the probe"
+        );
+        let filter = dial_filter(candidates, "local", Some(&[]));
+        let request = llama_request("/v1/chat/completions");
+        for sent in 1..=8 {
+            let mut ctx = context(&request);
+            let action = filter.on_request(&mut ctx).await.expect("routes");
+            assert!(matches!(action, FilterAction::Continue), "routes");
             assert_eq!(
-                dial_outcome(Some(&response(status, false)), true),
-                Some(true),
-                "{status} proves the dial works"
+                ctx.cluster.as_deref(),
+                Some("west"),
+                "request {sent} avoids the probed dial"
             );
         }
+
+        let only = dial_filter(dialed("east", "east", Some("10.0.0.9:8443")), "local", Some(&[]));
+        let probed = Arc::clone(
+            only.snapshot.load().candidates[0]
+                .dial
+                .as_ref()
+                .expect("dialed")
+                .health(),
+        );
+        probed.record(false, 0);
+        probed.record(false, 0);
+        let mut first = context(&request);
+        drop(only.on_request(&mut first).await.expect("routes"));
+        let mut second = context(&request);
+        drop(only.on_request(&mut second).await.expect("routes"));
+        assert_eq!(
+            second.cluster.as_deref(),
+            Some("east"),
+            "a probed dial still routes when it is the only one"
+        );
+        first.upstream_reached = true;
+        drop(only.on_response(&mut first).await.expect("settles"));
+        assert_eq!(
+            probed.admit_at(crate::health::monotonic_ms()),
+            Admission::Probe,
+            "the settled probe is handed back"
+        );
     }
 
     #[tokio::test]
@@ -2887,7 +2998,7 @@ mod tests {
             request,
             request_body_bytes: 0,
             request_body_mode: BodyMode::Stream,
-            request_start: std::time::Instant::now(),
+            request_start: Instant::now(),
             response_body_bytes: 0,
             response_body_mode: BodyMode::Stream,
             response_header: None,

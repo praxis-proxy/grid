@@ -135,6 +135,9 @@ impl Default for GridIdentity {
 /// A built dial: the upstream a routed request is sent to, and its retry policy.
 #[derive(Debug)]
 pub struct Dialed {
+    /// The longest a request can take to fail every connect attempt.
+    connect_budget: std::time::Duration,
+
     /// The dial's passive health, which each routed response records into.
     health: Arc<DialState>,
 
@@ -155,11 +158,26 @@ impl Dialed {
 
     /// A dial recording its outcomes into `health`.
     pub(crate) fn with_health(upstream: Upstream, retry: Arc<RetryPolicy>, health: Arc<DialState>) -> Self {
+        let per_attempt = upstream
+            .connection
+            .total_connection_timeout
+            .or(upstream.connection.connection_timeout)
+            .unwrap_or(std::time::Duration::from_millis(TOTAL_CONNECT_TIMEOUT_MS));
+        // Every attempt, plus slack for retry backoff and scheduling.
+        let connect_budget = per_attempt
+            .saturating_mul(retry.effective_max_retries().saturating_add(1))
+            .saturating_add(std::time::Duration::from_secs(1));
         Self {
+            connect_budget,
             health,
             retry,
             upstream,
         }
+    }
+
+    /// The longest a request can take to fail every connect attempt.
+    pub(crate) fn connect_budget(&self) -> std::time::Duration {
+        self.connect_budget
     }
 
     /// The dial's passive health.

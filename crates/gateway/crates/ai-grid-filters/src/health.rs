@@ -94,11 +94,22 @@ impl ClusterHealth {
     }
 }
 
+/// Whether a routed request may take a dial.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Admission {
+    /// The dial is up.
+    Open,
+    /// The dial is down and this request holds its one probe.
+    Probe,
+    /// The dial is down and another request holds its probe.
+    Busy,
+}
+
 /// One dial's passive health, recorded on the response path with atomics only.
 ///
 /// Down after [`DOWN_AFTER`] consecutive failures, up after [`UP_AFTER`] consecutive successes.
-/// A down dial is ordered last, never excluded, for [`COOLDOWN_MS`]; then it is half open: the
-/// next request may take it, and one more failure orders it last again.
+/// A down dial is ordered last, never excluded, for [`COOLDOWN_MS`]; then it is half open: one
+/// request at a time may probe it, and one more failure orders it last again.
 #[derive(Debug)]
 pub(crate) struct DialState {
     /// The address dialed, so a moved cluster starts healthy.
@@ -109,6 +120,9 @@ pub(crate) struct DialState {
 
     /// Consecutive failures.
     failures: AtomicU32,
+
+    /// When the probe of a down dial was taken, plus one; 0 while none is held.
+    probe_since: AtomicU64,
 
     /// The cluster's failure counter, resolved once.
     failures_total: metrics::Counter,
@@ -125,8 +139,37 @@ impl DialState {
             address,
             down_since: AtomicU64::new(0),
             failures: AtomicU32::new(0),
+            probe_since: AtomicU64::new(0),
             successes: AtomicU32::new(0),
         }
+    }
+
+    /// Whether a request may take the dial now: always while up, else only as its one probe.
+    pub(crate) fn admit(&self) -> Admission {
+        if !self.down() {
+            return Admission::Open;
+        }
+        self.admit_at(monotonic_ms())
+    }
+
+    /// [`Self::admit`] for a down dial at `now_ms`. A probe that never settles lapses after a cooldown.
+    pub(crate) fn admit_at(&self, now_ms: u64) -> Admission {
+        let held = self.probe_since.load(Ordering::Acquire);
+        if held != 0 && now_ms.saturating_add(1).saturating_sub(held) < COOLDOWN_MS {
+            return Admission::Busy;
+        }
+        match self
+            .probe_since
+            .compare_exchange(held, now_ms.saturating_add(1), Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => Admission::Probe,
+            Err(_) => Admission::Busy,
+        }
+    }
+
+    /// Hand back the probe once its request settled.
+    pub(crate) fn release_probe(&self) {
+        self.probe_since.store(0, Ordering::Release);
     }
 
     /// Record one request's outcome at `now_ms`.
@@ -318,6 +361,41 @@ mod tests {
         dial.record(false, 20_000);
         assert!(dial.demoted(20_000), "one failure while half open orders it last again");
         assert!(!dial.demoted(20_000 + COOLDOWN_MS), "for another cooldown");
+    }
+
+    #[test]
+    fn a_down_dial_admits_one_probe_at_a_time() {
+        let dial = Arc::new(DialState::new("east", Arc::from("east:8443")));
+        assert_eq!(dial.admit(), Admission::Open, "an up dial admits every request");
+        dial.record(false, 1_000);
+        dial.record(false, 1_000);
+        let now = 1_000 + COOLDOWN_MS;
+        let admitted: Vec<Admission> = std::thread::scope(|scope| {
+            let racers: Vec<_> = std::iter::repeat_with(|| scope.spawn(|| dial.admit_at(now)))
+                .take(16)
+                .collect();
+            racers.into_iter().map(|racer| racer.join().expect("racer")).collect()
+        });
+        assert_eq!(
+            admitted
+                .iter()
+                .filter(|admission| **admission == Admission::Probe)
+                .count(),
+            1,
+            "exactly one concurrent request probes: {admitted:?}"
+        );
+        assert_eq!(dial.admit_at(now + 1), Admission::Busy, "the rest wait for its outcome");
+        dial.release_probe();
+        assert_eq!(
+            dial.admit_at(now + 2),
+            Admission::Probe,
+            "a settled probe frees the next one"
+        );
+        assert_eq!(
+            dial.admit_at(now + 2 + COOLDOWN_MS),
+            Admission::Probe,
+            "a probe that never settles lapses"
+        );
     }
 
     #[test]
