@@ -494,6 +494,11 @@ impl HttpFilter for GridProviderFilter {
             return Ok(refuse("candidate", 503));
         };
         forward_only_allowed(ctx);
+        // A credentialed backend gets the dial's own token, never anything a peer sent.
+        if let Some(token) = dialed.credential() {
+            ctx.request_headers_to_set
+                .push((http::header::AUTHORIZATION, token.clone()));
+        }
         let probe = match dialed.health().admit() {
             Admission::Probe => true,
             // A provider has one backend per ID, so a down dial is still tried rather than refused.
@@ -554,9 +559,14 @@ fn as_serving(config: &ProviderConfig) -> GridServingConfig {
     }
 }
 
-/// A change detector over the CA files `dial` reads.
+/// A change detector over the CA and token files `dial` reads.
 fn ca_digest(dial: &DialConfig) -> [u8; 32] {
-    files_digest(dial.dial.values().filter_map(|spec| spec.transport.ca_path()).collect())
+    let cas = dial.dial.values().filter_map(|spec| spec.transport.ca_path());
+    let tokens = dial
+        .dial
+        .values()
+        .filter_map(|spec| spec.credential.as_ref().map(|credential| credential.path.as_str()));
+    files_digest(cas.chain(tokens).collect())
 }
 
 /// Read the provider file at `path` from the mount's current revision into `builder`, keeping
@@ -950,6 +960,71 @@ mod tests {
             Some("/v1/chat/completions?stream=true"),
             "credential query parameters are stripped"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_credentialed_backend_gets_the_dials_token_not_the_peers() -> Result<(), FilterError> {
+        let base = std::env::temp_dir().join(format!("provider-token-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("model-token")).expect("token dir");
+        std::fs::write(base.join("model-token/token"), "s3cret\n").expect("token");
+        let mut config = minimal();
+        dial_mut(&mut config).credential = Some(crate::serving::DialCredential {
+            path: base.join("model-token/token").display().to_string(),
+            strategy: crate::serving::CredentialStrategy::BearerToken,
+        });
+        let mut builder = Builder::new(Binding {
+            credential_base: base.clone(),
+            insecure: loopback(),
+            ..Binding::default()
+        });
+        let dial = config.dials();
+        validate_provider(&config, &dial, &builder.binding)?;
+        builder.publish(config, dial);
+        let filter = GridProviderFilter {
+            allowed_paths: BTreeSet::from(["/v1/chat/completions".to_owned()]),
+            snapshot: Arc::clone(&builder.snapshot),
+        };
+        let mut request = request(http::Method::POST, "/v1/chat/completions");
+        request
+            .headers
+            .insert(CANDIDATE_HEADER, http::HeaderValue::from_static("ccac628c"));
+        request.headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer peer"),
+        );
+        let mut ctx = context(&request);
+        ctx.peer_identity = Some(peer("site-b"));
+        assert!(
+            matches!(filter.on_request(&mut ctx).await?, FilterAction::Continue),
+            "served"
+        );
+        assert!(
+            ctx.request_headers_to_remove.contains(&http::header::AUTHORIZATION),
+            "the peer's Authorization is dropped"
+        );
+        let sent: Vec<&http::HeaderValue> = ctx
+            .request_headers_to_set
+            .iter()
+            .filter(|(name, _)| *name == http::header::AUTHORIZATION)
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(
+            sent,
+            [&http::HeaderValue::from_static("Bearer s3cret")],
+            "only the dial's token is sent"
+        );
+
+        let mut outside = minimal();
+        dial_mut(&mut outside).credential = Some(crate::serving::DialCredential {
+            path: "/etc/praxis/tls/tls.key".to_owned(),
+            strategy: crate::serving::CredentialStrategy::BearerToken,
+        });
+        assert!(
+            validate_provider(&outside, &outside.dials(), &builder.binding).is_err(),
+            "a token outside the credential mount is refused"
+        );
+        let _cleaned = std::fs::remove_dir_all(&base);
         Ok(())
     }
 

@@ -14,7 +14,9 @@ use crate::{
     resources::{
         consumer_config::BACKEND_CA_MOUNT_BASE,
         routing_overlay::{CANDIDATE_KIND, RoutingOverlay, overlay_labels},
-        serving_config::{DialSpec, DialTransport, RefusedSites, configmap_name, refusal_changed},
+        serving_config::{
+            DIAL_CREDENTIAL_BASE, DialSpec, DialTransport, RefusedSites, configmap_name, refusal_changed,
+        },
     },
 };
 
@@ -79,10 +81,11 @@ pub(crate) fn admitted_sites(sites: &[GridSite], network_name: &str, local_site:
 
 /// The provider file for `overlay`'s local backends over `dials`, admitting `admitted`.
 ///
-/// A candidate is kept only when it is this site's inference model, carries a stable ID, no
-/// credential and no site restriction, and its cluster has a local dial other than mutual
-/// TLS. A stable ID two backends share is dropped with both, since a peer's request could
-/// mean either. `restricted` names clusters whose provider limits which sites may route to it.
+/// A candidate is kept only when it is this site's inference model, carries a stable ID and no
+/// site restriction, and its cluster has a local dial other than mutual TLS. A credentialed
+/// candidate's dial must send its own token, which replaces anything a peer sends. A stable ID two backends share is
+/// dropped with both, since a peer's request could mean either. `restricted` names clusters whose provider limits which
+/// sites may route to it.
 pub(crate) fn render_provider(
     overlay: &RoutingOverlay,
     dials: &BTreeMap<String, DialSpec>,
@@ -96,11 +99,10 @@ pub(crate) fn render_provider(
         .filter(|candidate| {
             candidate.kind == CANDIDATE_KIND
                 && candidate.site == local
-                && candidate.credential.is_none()
                 && !restricted.contains(candidate.cluster.as_str())
-                && dials
-                    .get(&candidate.cluster)
-                    .is_some_and(|dial| local_dial(dial, local))
+                && dials.get(&candidate.cluster).is_some_and(|dial| {
+                    local_dial(dial, local) && (candidate.credential.is_none() || dial.credential.is_some())
+                })
         })
         .filter_map(|candidate| {
             let stable_id = candidate.stable_id.as_ref().filter(|id| certs::is_stable_id(id))?;
@@ -220,17 +222,28 @@ pub(crate) fn build_configmap(text: &str, network_name: &str, gateway_name: &str
 /// whole file over any other, so it is left out here with its candidates.
 fn local_dial(dial: &DialSpec, local_site: &str) -> bool {
     let grid_name = |name: &str| certs::is_grid_name(name);
-    let ca_within = dial.transport.ca_path().is_none_or(|path| {
-        let path = std::path::Path::new(path);
-        path.starts_with(BACKEND_CA_MOUNT_BASE)
-            && path != std::path::Path::new(BACKEND_CA_MOUNT_BASE)
-            && !path.components().any(|part| part == std::path::Component::ParentDir)
-    });
+    let ca_within = dial
+        .transport
+        .ca_path()
+        .is_none_or(|path| within(path, BACKEND_CA_MOUNT_BASE));
+    let credential_within = dial
+        .credential
+        .as_ref()
+        .is_none_or(|credential| within(&credential.path, DIAL_CREDENTIAL_BASE));
     dial.site == local_site
+        && credential_within
         && !matches!(dial.transport, DialTransport::MutualTls { .. })
         && !dial.transport.sni().is_some_and(grid_name)
         && !grid_name(grid_client::address_host(&dial.address))
         && ca_within
+}
+
+/// Whether `path` names a file below `base`, with no `..` to climb out.
+fn within(path: &str, base: &str) -> bool {
+    let path = std::path::Path::new(path);
+    path.starts_with(base)
+        && path != std::path::Path::new(base)
+        && !path.components().any(|part| part == std::path::Component::ParentDir)
 }
 
 #[cfg(test)]
@@ -251,7 +264,7 @@ mod tests {
     fn renders_the_contract_the_gateway_loads() {
         let text = serving_config::to_text(&golden()).expect("json");
         assert_eq!(text, GOLDEN.trim_end(), "golden drifted");
-        assert!(!text.contains("credential"), "the schema has no credential field");
+        assert!(!text.contains("credential"), "the golden backends carry no credential");
     }
 
     #[test]
@@ -289,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn only_local_uncredentialed_unrestricted_locally_dialed_backends_are_emitted() {
+    fn only_local_unrestricted_locally_dialed_backends_are_emitted() {
         let mut credentialed = local("secret", "pool-secret");
         credentialed.credential = Some(crate::resources::routing_overlay::ProjectedCredential {
             strategy: "bearer_token".to_owned(),
@@ -299,6 +312,14 @@ mod tests {
                 key: "token".to_owned(),
             },
         });
+        let mut token = credentialed.clone();
+        token.name = "token".to_owned();
+        token.cluster = "pool-token".to_owned();
+        token.stable_id = Some(compute_stable_id(CANDIDATE_KIND, "token", "site-a", "pool-token"));
+        let mut leaked = token.clone();
+        leaked.name = "leaked".to_owned();
+        leaked.cluster = "pool-leaked".to_owned();
+        leaked.stable_id = Some(compute_stable_id(CANDIDATE_KIND, "leaked", "site-a", "pool-leaked"));
         let mut no_id = local("anon", "pool-anon");
         no_id.stable_id = None;
         let mut bad_id = local("bad", "pool-bad");
@@ -309,6 +330,8 @@ mod tests {
         let overlay = overlay(vec![
             local("llama", "pool-llama"),
             credentialed,
+            token,
+            leaked,
             no_id,
             bad_id,
             tool,
@@ -321,6 +344,11 @@ mod tests {
         let dials = BTreeMap::from([
             ("pool-llama".to_owned(), plaintext("site-a")),
             ("pool-secret".to_owned(), plaintext("site-a")),
+            (
+                "pool-token".to_owned(),
+                with_token("/run/secrets/grid-credentials/key/token"),
+            ),
+            ("pool-leaked".to_owned(), with_token("/etc/praxis/tls/tls.key")),
             ("pool-anon".to_owned(), plaintext("site-a")),
             ("pool-bad".to_owned(), plaintext("site-a")),
             ("pool-tool".to_owned(), plaintext("site-a")),
@@ -335,20 +363,33 @@ mod tests {
             vec!["site-b".to_owned()],
             &BTreeSet::from(["pool-restricted"]),
         );
-        let clusters: Vec<&str> = provider
+        let clusters: BTreeSet<&str> = provider
             .candidates
             .iter()
             .map(|candidate| candidate.cluster.as_str())
             .collect();
-        assert_eq!(clusters, ["pool-llama"], "only the plain local backend is servable");
+        assert_eq!(
+            clusters,
+            BTreeSet::from(["pool-llama", "pool-token"]),
+            "a plain local backend, and a credentialed one whose dial sends its own token"
+        );
         assert_eq!(
             provider.dial.keys().collect::<Vec<_>>(),
-            ["pool-llama"],
-            "a remote, mutual TLS or unused dial is never written"
+            ["pool-llama", "pool-token"],
+            "a remote, mutual TLS, tokenless-for-a-credential or unused dial is never written"
+        );
+        let sent = provider.dial.get("pool-token").expect("token dial");
+        assert_eq!(
+            (
+                sent.base_path.as_deref(),
+                sent.credential.as_ref().map(|credential| credential.path.as_str())
+            ),
+            (Some("/v1"), Some("/run/secrets/grid-credentials/key/token")),
+            "the dial's base path and token ride along"
         );
         assert_eq!(
             dropped(&overlay, &provider).len(),
-            7,
+            8,
             "every other local inference cluster is reported as left out"
         );
     }
@@ -544,6 +585,17 @@ mod tests {
             transport: DialTransport::Plaintext,
             trusted_private: true,
             write_timeout_ms: None,
+        }
+    }
+
+    fn with_token(path: &str) -> DialSpec {
+        DialSpec {
+            base_path: Some("/v1".to_owned()),
+            credential: Some(serving_config::DialCredential {
+                path: path.to_owned(),
+                strategy: "bearer_token",
+            }),
+            ..plaintext("site-a")
         }
     }
 

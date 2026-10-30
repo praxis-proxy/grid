@@ -172,3 +172,16 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "set gatewayRefName to that gateway's name, or configMapName"
+
+  - it: mounts providerCredentials where a credentialed dial reads its token
+    template: templates/deployment.yaml
+    set:
+      providerCredentials:
+        - secretName: grid-model-client-token
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: credential-0
+            mountPath: /run/secrets/grid-credentials/grid-model-client-token
+            readOnly: true

@@ -642,7 +642,9 @@ refuses `backends`, `spiffeIds`, `allowAnyGridSite` and `certDigests`. The liste
 requires a Grid-CA SVID with no list, and `grid_provider` checks the peer's organization
 against the file on every request, so a removed site is refused without a restart. The
 ConfigMap mount is optional: until the operator writes the file, every peer gets 403. A
-Route with no `route.host` takes `<grid.siteName>.grid.internal`.
+Route with no `route.host` takes `<grid.siteName>.grid.internal`. A credentialed local backend is
+served with its dial's own token: list its Secret in `providerCredentials`, which mounts it
+under `/run/secrets/grid-credentials`, and any token a peer sends is dropped.
 
 A `grid-gateway` built from the current source re-reads `serving-config.json`
 every five seconds after the kubelet updates the mounted ConfigMap. It applies
