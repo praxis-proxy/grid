@@ -117,26 +117,33 @@ This chart version has no upgrade path from earlier ones; reinstall it. What cha
 ### Operator config
 
 The chart renders `operatorConfig.name` only when the `enrollment` values give it a site
-section. An upgrade from an earlier chart without them removes the ConfigMap from the
-release, and Helm deletes it. If another writer has written a site section into it, keep
-it before upgrading:
+section. Another writer may own the ConfigMap otherwise; it must set the `config.yaml` key,
+since a ConfigMap without it reads as an invalid config.
+
+Upgrading from an earlier chart without `enrollment` values removes the ConfigMap from the
+release, and Helm deletes it; `helm uninstall` does too. If another writer has written a site
+section into it, keep it first:
 
 ```bash
 kubectl -n grid-system annotate configmap grid-operator-config helm.sh/resource-policy=keep
 ```
 
-Helm then leaves it in place. A GitOps tool that applies the rendered manifests prunes it
-the same way unless the ConfigMap tells it not to, for example Argo CD's
-`argocd.argoproj.io/sync-options: Prune=false`.
+A GitOps tool that applies the rendered manifests prunes it the same way unless the
+ConfigMap tells it not to, for example Argo CD's `argocd.argoproj.io/sync-options: Prune=false`.
 
-When another writer owns the ConfigMap, keep `operatorConfig.create: false`. To hand it
-back to the chart before setting `enrollment` values, delete it or give it the release's
-ownership metadata, else the upgrade fails on an object the release does not own:
+To set `enrollment` values while another writer owns the ConfigMap, set
+`operatorConfig.create: false`. To hand it back to the chart instead:
+
+1. Stop the other writer, or it rewrites `config.yaml` after the chart does.
+2. Delete the ConfigMap, or give it the release's ownership metadata and drop the keep
+   annotation. Otherwise the upgrade fails on an object the release does not own, and so
+   does a rollback to an earlier chart, which always renders it:
 
 ```bash
 kubectl -n grid-system label configmap grid-operator-config app.kubernetes.io/managed-by=Helm
 kubectl -n grid-system annotate configmap grid-operator-config \
-  meta.helm.sh/release-name=grid-operator meta.helm.sh/release-namespace=grid-system
+  meta.helm.sh/release-name=grid-operator meta.helm.sh/release-namespace=grid-system \
+  helm.sh/resource-policy-
 ```
 
 The chart's render then replaces its `config.yaml`.
