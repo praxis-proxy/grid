@@ -362,7 +362,11 @@ fn mutual_tls_dial() -> Result<(Arc<Dialed>, Arc<praxis_tls::CachedClientCert>),
         connection: Arc::default(),
         tls: Some(cached),
     };
-    let dial = Dialed::new(upstream, Arc::new(praxis_core::config::RetryPolicy::legacy_default()));
+    let dial = Dialed::new(
+        "site-2",
+        upstream,
+        Arc::new(praxis_core::config::RetryPolicy::legacy_default()),
+    );
     Ok((Arc::new(dial), read))
 }
 

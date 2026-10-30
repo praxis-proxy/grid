@@ -7,7 +7,7 @@
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     /// Names `describe_metrics` documents, which a scrape must explain.
-    const DOCUMENTED: [&str; 29] = [
+    const DOCUMENTED: [&str; 31] = [
         "grid_route_decisions_total",
         "grid_route_selections_total",
         "grid_route_prefix_affinity_total",
@@ -16,6 +16,8 @@ mod tests {
         "grid_serving_undialable_clusters",
         "grid_serving_refused_dial_clusters",
         "grid_serving_dial_shadowed_clusters",
+        "grid_dial_down",
+        "grid_dial_failures_total",
         "grid_route_site_silent_transitions_total",
         "grid_route_site_rho",
         "grid_route_site_rho_reported",
@@ -84,6 +86,8 @@ mod tests {
         ] {
             metrics::gauge!(name).set(0.0);
         }
+        metrics::gauge!("grid_dial_down", "cluster" => "east").set(0.0);
+        metrics::counter!("grid_dial_failures_total", "cluster" => "east").increment(1);
 
         let text = praxis_protocol::http::pingora::metrics::render_prometheus().expect("recorder installed");
         for name in DOCUMENTED {
@@ -101,12 +105,13 @@ mod tests {
     /// emit sites out of the source instead.
     #[test]
     fn every_emitted_grid_metric_is_documented() {
-        const SOURCES: [&str; 5] = [
+        const SOURCES: [&str; 6] = [
             include_str!("../crates/ai-grid-filters/src/snapshot.rs"),
             include_str!("../crates/ai-grid-filters/src/signals.rs"),
             include_str!("../crates/ai-grid-filters/src/decisions.rs"),
             include_str!("../crates/ai-grid-filters/src/control.rs"),
             include_str!("../crates/ai-grid-filters/src/dial.rs"),
+            include_str!("../crates/ai-grid-filters/src/health.rs"),
         ];
 
         let mut emitted: Vec<&str> = SOURCES

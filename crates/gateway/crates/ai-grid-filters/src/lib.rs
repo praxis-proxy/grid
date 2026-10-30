@@ -44,7 +44,7 @@ pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;
 
 /// Grid counters the gateway emits, with the help text a scrape shows.
-const COUNTER_HELP: [(&str, &str); 8] = [
+const COUNTER_HELP: [(&str, &str); 9] = [
     (
         "grid_route_decisions_total",
         "Requests the gateway decided, by outcome. A refusal records an empty site and cluster.",
@@ -71,10 +71,14 @@ const COUNTER_HELP: [(&str, &str); 8] = [
         "grid_signals_feedback_failures_total",
         "Failed gateway feedback delivery attempts, by bounded reason.",
     ),
+    (
+        "grid_dial_failures_total",
+        "Dialed requests that got no response, or a gateway error no grid gateway attributed, by cluster.",
+    ),
 ];
 
 /// Grid gauges the gateway emits.
-const GAUGE_HELP: [(&str, &str); 21] = [
+const GAUGE_HELP: [(&str, &str); 22] = [
     (
         "grid_serving_unbound_provider_hops",
         "Provider hops the applied serving config declares that no startup-verified backend binds. Their candidates take no traffic until a serving config names the SNI that backend verified at startup, or, for a backend not verified at startup, until the gateway restarts.",
@@ -90,6 +94,10 @@ const GAUGE_HELP: [(&str, &str); 21] = [
     (
         "grid_serving_dial_shadowed_clusters",
         "Dials that replace a load_balancer cluster of the same name.",
+    ),
+    (
+        "grid_dial_down",
+        "1 while a dial is down after consecutive failures, 0 otherwise. A down dial is ordered last, never excluded.",
     ),
     (
         "grid_route_site_rho",

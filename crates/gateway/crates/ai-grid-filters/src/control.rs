@@ -205,13 +205,8 @@ impl Topology {
             &mut inputs,
         );
         ordered.provider_hop_clusters = Arc::clone(&self.provider_hop_clusters);
-        // Praxis demotes a cluster only once it has reported health. Without a registry the
-        // gateway knows nothing about backends, so it demotes nothing rather than guessing.
-        let ordered = if health.observed() {
-            ordered.demote(&health.down())
-        } else {
-            ordered
-        };
+        // Without a registry only a failing dial is down: the gateway demotes no backend by guessing.
+        let ordered = ordered.demote(&health.down());
         ordered.shed(shedding, availability).published(gauged)
     }
 }
@@ -454,7 +449,12 @@ impl Control {
         report_shadowed(dial, &self.binding.lb_clusters);
         let bound = routed_view_with(raw, dial, &self.binding.backend_tls)?;
         validate_config(bound.as_ref(), dial, &self.binding.backend_ca_base)?;
-        let dials = Dials::build(dial, &self.binding.insecure, &self.binding.grid_identity);
+        let dials = Dials::build(
+            dial,
+            &self.binding.insecure,
+            &self.binding.grid_identity,
+            self.health.dials(),
+        );
         let dialable = without_unroutable(bound, &dials);
         let config = dialable.as_ref();
         let topology = Arc::new(Topology::with_dials(config, &dials)?);
@@ -479,6 +479,7 @@ impl Control {
         // The reload stands and its topology is published: only now may the new pollers write,
         // so their first refresh orders the new topology. Committing a kept poller is a no-op.
         self.peers.values().for_each(|running| running.handle.commit());
+        self.health.dials().adopt(dials.states());
         self.adopt(config, identity, tag_key, generation);
         // The file as written, so re-reading it settles.
         self.applied = Some(raw.clone());
@@ -2547,6 +2548,39 @@ mod tests {
             Some("local.grid.internal"),
             "bound at the name the dial verifies"
         );
+    }
+
+    #[test]
+    fn a_failing_dial_is_ordered_last_but_never_excluded() {
+        let dir = temp_dir("demoted");
+        write_identity(&dir, &certs::generate_ca("grid-ca").expect("ca"));
+        let (mut config, mut dial) = dialed_east();
+        let mut west = candidate("west");
+        west.stable_id = Some("candidate-west".to_owned());
+        config.candidates.insert(0, west);
+        dial.dial
+            .insert("pool-west".to_owned(), dial_spec("west", mutual_tls("west")));
+        let mut control = dial_control(&config, &dir);
+        control.apply_joined(&config, &dial).expect("applies");
+        let east = control.health().dials().state("pool-east", "east.example.com:8443");
+        east.record(false, crate::health::monotonic_ms());
+        east.record(false, crate::health::monotonic_ms());
+        assert!(control.health().update(), "the down dial is news");
+        control.refresh()(&control.store());
+        let snapshot = control.snapshot().load_full();
+        assert_eq!(sites(&snapshot), ["west", "east"], "east is ordered last, not removed");
+        let mut reloaded = config.clone();
+        reloaded.load_window_ms = 31_000;
+        control.apply_joined(&reloaded, &dial).expect("a rewrite applies");
+        assert!(
+            control
+                .health()
+                .dials()
+                .state("pool-east", "east.example.com:8443")
+                .down(),
+            "a reload keeps the down dial"
+        );
+        let _cleaned = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

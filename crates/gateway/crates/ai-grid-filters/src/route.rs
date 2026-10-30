@@ -440,6 +440,7 @@ impl GridSiteRouteFilter {
         with_state(ctx, |state| {
             responses = state.responses;
             state.served = Some((Arc::clone(&candidate.site), Arc::clone(&candidate.cluster)));
+            state.dialed = candidate.dial.as_ref().map(|dial| Arc::clone(dial.health()));
             if let Some(keys) = keys {
                 self.affinity.index.record(&keys, &candidate.cluster);
                 state.recorded = Some((keys, Arc::clone(&candidate.cluster)));
@@ -493,6 +494,7 @@ impl GridSiteRouteFilter {
         with_state(ctx, |state| {
             state.responses = true;
             state.served = Some((Arc::clone(&candidate.site), Arc::clone(&candidate.cluster)));
+            state.dialed = candidate.dial.as_ref().map(|dial| Arc::clone(dial.health()));
         });
         select_upstream(ctx, candidate);
         write_provider_context(ctx, candidate, &snapshot)?;
@@ -528,9 +530,13 @@ impl GridSiteRouteFilter {
                 .get(http::header::CONTENT_ENCODING)
                 .is_none_or(|encoding| encoding.as_bytes().eq_ignore_ascii_case(b"identity"))
         });
+        let dial_outcome = dial_outcome(head, ctx.upstream_reached);
         let Some(state) = ctx.get_filter_state_mut::<RouteState>() else {
             return Ok(());
         };
+        if let (Some(dialed), Some(reached)) = (state.dialed.take(), dial_outcome) {
+            dialed.record(reached, crate::health::monotonic_ms());
+        }
         // Keep the selected route after releasing the mutable borrow of filter state in `ctx`.
         let served = state.served.clone();
         // A success means the site took the request, not that it cached the prompt yet:
@@ -561,6 +567,18 @@ fn select_upstream(ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate) 
         ctx.upstream = Some(dial.upstream().clone());
         ctx.retry_policy = Some(Arc::clone(dial.retry()));
     }
+}
+
+/// Whether a dialed request reached a working site: `None` when the site never owned the
+/// outcome. No response from a reached upstream is a failure, as is a gateway error no grid
+/// gateway attributed; praxis cannot tell a connect failure from a read timeout.
+fn dial_outcome(head: Option<&praxis_filter::Response>, upstream_reached: bool) -> Option<bool> {
+    let Some(response) = head else {
+        return upstream_reached.then_some(false);
+    };
+    let gateway_error =
+        matches!(response.status.as_u16(), 502..=504) && !response.headers.contains_key(ROUTE_SITE_HEADER);
+    Some(!gateway_error)
 }
 
 /// Apply attribution and body-tagging header changes to the routed response.
@@ -779,6 +797,8 @@ struct RouteState {
     responses: bool,
     /// Tags the answer's ids with the site that served it.
     tagger: Option<Tagger>,
+    /// The health of the dial the request was sent over, recorded once its outcome is known.
+    dialed: Option<Arc<crate::health::DialState>>,
 }
 
 /// Run `change` on this request's state, created on first use.
@@ -2590,8 +2610,8 @@ mod tests {
         );
     }
 
-    /// A plaintext dial to `address` retried `retries` times.
-    fn dial_to(address: &str, retries: u32) -> Arc<crate::dial::Dialed> {
+    /// A plaintext dial for `cluster` to `address` retried `retries` times.
+    fn dial_to(cluster: &str, address: &str, retries: u32) -> Arc<crate::dial::Dialed> {
         let upstream = praxis_core::connectivity::Upstream {
             address: Arc::from(address),
             authority: None,
@@ -2603,13 +2623,13 @@ mod tests {
             max_retries: Some(retries),
             ..praxis_core::config::RetryPolicy::legacy_default()
         };
-        Arc::new(crate::dial::Dialed::new(upstream, Arc::new(retry)))
+        Arc::new(crate::dial::Dialed::new(cluster, upstream, Arc::new(retry)))
     }
 
     /// `llama` at `site` on `cluster`, dialed at `address` when given.
     fn dialed(site: &str, cluster: &str, address: Option<&str>) -> Vec<RouteCandidate> {
         let mut candidates = one("llama", site, cluster, OPEN);
-        candidates[0].dial = address.map(|address| dial_to(address, 1));
+        candidates[0].dial = address.map(|address| dial_to(cluster, address, 1));
         candidates
     }
 
@@ -2753,6 +2773,76 @@ mod tests {
             "the pin sends to the built upstream"
         );
         assert!(ctx.retry_policy.is_some(), "with its retry policy");
+    }
+
+    #[test]
+    fn a_dial_outcome_counts_only_what_the_site_owned() {
+        let response = |status: u16, attributed: bool| {
+            let mut headers = http::HeaderMap::new();
+            if attributed {
+                headers.insert(ROUTE_SITE_HEADER, http::HeaderValue::from_static("east"));
+            }
+            praxis_filter::Response {
+                headers,
+                status: http::StatusCode::from_u16(status).expect("status"),
+            }
+        };
+        assert_eq!(
+            dial_outcome(None, true),
+            Some(false),
+            "a reached site that never answered"
+        );
+        assert_eq!(dial_outcome(None, false), None, "the site never owned the outcome");
+        for status in [502, 503, 504] {
+            assert_eq!(
+                dial_outcome(Some(&response(status, false)), true),
+                Some(false),
+                "{status} from no grid gateway"
+            );
+            assert_eq!(
+                dial_outcome(Some(&response(status, true)), true),
+                Some(true),
+                "{status} the far gateway attributed is its backend's, not the dial's"
+            );
+        }
+        for status in [200, 429, 500] {
+            assert_eq!(
+                dial_outcome(Some(&response(status, false)), true),
+                Some(true),
+                "{status} proves the dial works"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn two_unanswered_dialed_requests_take_the_dial_down() {
+        let candidates = dialed("east", "east", Some("10.0.0.9:8443"));
+        let health = Arc::clone(candidates[0].dial.as_ref().expect("dialed").health());
+        let filter = dial_filter(candidates, "local", Some(&[]));
+        let request = llama_request("/v1/chat/completions");
+        for sent in 1..=2 {
+            assert!(!health.down(), "up before request {sent} fails");
+            let mut ctx = context(&request);
+            let action = filter.on_request(&mut ctx).await.expect("routes");
+            assert!(matches!(action, FilterAction::Continue), "routes");
+            ctx.upstream_reached = true;
+            let settled = filter.on_response(&mut ctx).await.expect("settles");
+            assert!(matches!(settled, FilterAction::Continue), "settles");
+        }
+        assert!(health.down(), "two unanswered requests take it down");
+
+        let mut ctx = context(&request);
+        let action = filter.on_request(&mut ctx).await.expect("routes");
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "a down dial still routes when it is the only one"
+        );
+        let settled = filter.on_response(&mut ctx).await.expect("settles");
+        assert!(matches!(settled, FilterAction::Continue), "settles");
+        assert!(
+            health.down(),
+            "a client that left before the upstream answered proves nothing"
+        );
     }
 
     // ---------------------------------------------------------------------------

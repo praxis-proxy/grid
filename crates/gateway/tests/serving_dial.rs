@@ -219,6 +219,73 @@ mod tests {
         let _cleaned = std::fs::remove_dir_all(&work);
     }
 
+    #[test]
+    fn a_killed_site_is_demoted_and_the_live_one_takes_the_traffic() {
+        let work = fresh_work("dial-killed");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca, "local");
+        let (east, west) = (Site::start(&ca, "east"), Site::start(&ca, "west"));
+        let mut serving = Mount::new(work.join("serving"));
+        dial_serving(&[("east", &east), ("west", &west)], &identity).write(&mut serving);
+
+        let gateway = Gateway::start(&work, &serving);
+        gateway.eventually("both sites take traffic", || {
+            gateway.chat();
+            !east.heads().is_empty() && !west.heads().is_empty()
+        });
+        drop(east);
+        gateway.eventually("east is down", || {
+            gateway.chat();
+            gateway.metric(r#"grid_dial_down{cluster="east"}"#) == Some(1.0)
+        });
+        for sent in 1..=10 {
+            let (status, head) = gateway.chat();
+            assert_eq!(status, 200, "request {sent} avoids the dead site");
+            assert!(head.contains("x-grid-site: west"), "to the live site: {head}");
+        }
+        assert!(
+            gateway
+                .metric(r#"grid_dial_failures_total{cluster="east"}"#)
+                .is_some_and(|failures| failures >= 2.0),
+            "the failures that took east down are counted"
+        );
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_client_that_leaves_after_the_site_took_its_request_never_demotes_the_site() {
+        let work = fresh_work("dial-client-abort");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca, "local");
+        let east = Site::holding(&ca, "east");
+        let mut serving = Mount::new(work.join("serving"));
+        dial_serving(&[("east", &east)], &identity).write(&mut serving);
+
+        let gateway = Gateway::start(&work, &serving);
+        for sent in 1..=3 {
+            let stream = gateway.send_chat();
+            gateway.eventually("east took the request", || east.heads().len() == sent);
+            drop(stream);
+        }
+        gateway.eventually("every abandoned request ran to its end", || {
+            gateway.metric("praxis_http_active_requests") == Some(0.0)
+        });
+        assert_ne!(
+            gateway.metric(r#"grid_dial_down{cluster="east"}"#),
+            Some(1.0),
+            "a client leaving says nothing about east"
+        );
+        assert!(
+            gateway
+                .metric(r#"grid_dial_failures_total{cluster="east"}"#)
+                .is_none_or(|failures| failures == 0.0),
+            "no dial failure is counted"
+        );
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
     // ---------------------------------------------------------------------------
     // Test Utilities
     // ---------------------------------------------------------------------------
@@ -295,6 +362,15 @@ mod tests {
 
     impl Site {
         fn start(ca: &CaCert, site: &str) -> Self {
+            Self::start_with(ca, site, true)
+        }
+
+        /// A site that takes each request and never answers, holding the connection open.
+        fn holding(ca: &CaCert, site: &str) -> Self {
+            Self::start_with(ca, site, false)
+        }
+
+        fn start_with(ca: &CaCert, site: &str, answer: bool) -> Self {
             let identity = generate_site_cert(ca, site).expect("site cert");
             let chain = CertificateDer::pem_slice_iter(identity.cert_pem.as_bytes())
                 .collect::<Result<Vec<_>, _>>()
@@ -339,6 +415,14 @@ mod tests {
                         recorded_leaves.lock().expect("seen").push(certs::sha256(leaf.as_ref()));
                     }
                     recorded_heads.lock().expect("heads").push(head.to_ascii_lowercase());
+                    if !answer {
+                        // Held open until the gateway hangs up.
+                        thread::spawn(move || {
+                            let mut sink = [0_u8; 1];
+                            while tls.read(&mut sink).is_ok_and(|read| read > 0) {}
+                        });
+                        continue;
+                    }
                     let _sent = tls
                         .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
                         .and_then(|()| tls.flush());
@@ -488,12 +572,18 @@ mod tests {
             gateway
         }
 
-        /// One chat request carrying a caller credential: its status and lowercased response head.
-        fn chat(&self) -> (u16, String) {
+        /// Send one chat request carrying a caller credential, returning the open connection.
+        fn send_chat(&self) -> TcpStream {
             let mut stream = TcpStream::connect(("127.0.0.1", self.listen)).expect("connect gateway");
             stream
                 .write_all(b"GET /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nX-Model: llama\r\nAuthorization: Bearer caller-secret\r\nConnection: close\r\n\r\n")
                 .expect("send request");
+            stream
+        }
+
+        /// One chat request carrying a caller credential: its status and lowercased response head.
+        fn chat(&self) -> (u16, String) {
+            let mut stream = self.send_chat();
             let mut response = String::new();
             stream.read_to_string(&mut response).expect("read response");
             let status = response
@@ -525,6 +615,18 @@ mod tests {
                 .and_then(|line| line.rsplit(' ').next())
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0)
+        }
+
+        /// The value of the admin metrics series that starts with `series`, if it exists.
+        fn metric(&self, series: &str) -> Option<f64> {
+            let mut stream = TcpStream::connect(("127.0.0.1", self.admin)).ok()?;
+            let _sent = stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            let mut body = String::new();
+            let _read = stream.read_to_string(&mut body);
+            body.lines()
+                .find(|line| line.starts_with(series))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
         }
 
         /// Swap in `revision` and wait until it is applied.

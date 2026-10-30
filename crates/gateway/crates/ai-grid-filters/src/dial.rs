@@ -17,7 +17,10 @@ use praxis_core::{
 use praxis_filter::FilterError;
 use praxis_tls::{CaConfig, CachedClusterTls, CertKeyPair, ClusterTls};
 
-use crate::serving::{DialConfig, DialSpec, DialTransport, GridServingConfig};
+use crate::{
+    health::{DialHealth, DialState},
+    serving::{DialConfig, DialSpec, DialTransport, GridServingConfig},
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -94,6 +97,9 @@ impl Default for GridIdentity {
 /// A built dial: the upstream a routed request is sent to, and its retry policy.
 #[derive(Debug)]
 pub struct Dialed {
+    /// The dial's passive health, which each routed response records into.
+    health: Arc<DialState>,
+
     /// The connect-failure retry policy, shared by every request.
     retry: Arc<RetryPolicy>,
 
@@ -102,10 +108,25 @@ pub struct Dialed {
 }
 
 impl Dialed {
-    /// A dial to `upstream`, retried under `retry`.
+    /// A dial to `cluster` through `upstream`, retried under `retry`.
     #[must_use]
-    pub fn new(upstream: Upstream, retry: Arc<RetryPolicy>) -> Self {
-        Self { retry, upstream }
+    pub fn new(cluster: &str, upstream: Upstream, retry: Arc<RetryPolicy>) -> Self {
+        let health = Arc::new(DialState::new(cluster, Arc::clone(&upstream.address)));
+        Self::with_health(upstream, retry, health)
+    }
+
+    /// A dial recording its outcomes into `health`.
+    pub(crate) fn with_health(upstream: Upstream, retry: Arc<RetryPolicy>, health: Arc<DialState>) -> Self {
+        Self {
+            health,
+            retry,
+            upstream,
+        }
+    }
+
+    /// The dial's passive health.
+    pub(crate) fn health(&self) -> &Arc<DialState> {
+        &self.health
     }
 
     /// The retry policy a routed request carries.
@@ -137,7 +158,12 @@ impl Dials {
     ///
     /// A dial praxis refuses, or whose TLS files cannot be read mid-rotation, only takes its
     /// own cluster out of routing.
-    pub(crate) fn build(dial: &DialConfig, insecure: &InsecureOptions, identity: &GridIdentity) -> Self {
+    pub(crate) fn build(
+        dial: &DialConfig,
+        insecure: &InsecureOptions,
+        identity: &GridIdentity,
+        health: &DialHealth,
+    ) -> Self {
         let mut dials = Self::default();
         for (name, spec) in &dial.dial {
             let cluster = cluster(name, spec, identity);
@@ -146,7 +172,7 @@ impl Dials {
                 dials.refused.insert(name.clone());
                 continue;
             }
-            match dialed(&cluster) {
+            match dialed(&cluster, health.state(name, &spec.address)) {
                 Ok(built) => {
                     dials.built.insert(name.clone(), Arc::new(built));
                 },
@@ -165,6 +191,14 @@ impl Dials {
     /// The built dial for `cluster`.
     pub(crate) fn get(&self, cluster: &str) -> Option<&Arc<Dialed>> {
         self.built.get(cluster)
+    }
+
+    /// Each built dial's health, by cluster.
+    pub(crate) fn states(&self) -> BTreeMap<Arc<str>, Arc<DialState>> {
+        self.built
+            .iter()
+            .map(|(cluster, dial)| (Arc::from(cluster.as_str()), Arc::clone(dial.health())))
+            .collect()
     }
 
     /// Whether `cluster` has a dial that was refused or could not be read.
@@ -327,8 +361,8 @@ fn validate(cluster: &Cluster, insecure: &InsecureOptions) -> Result<(), FilterE
         .map_err(|error| refused(error.to_string()))
 }
 
-/// Read `cluster`'s TLS material and build its upstream.
-fn dialed(cluster: &Cluster) -> Result<Dialed, String> {
+/// Read `cluster`'s TLS material and build its upstream, recording into `health`.
+fn dialed(cluster: &Cluster, health: Arc<DialState>) -> Result<Dialed, String> {
     let tls = cluster
         .tls
         .as_ref()
@@ -341,7 +375,7 @@ fn dialed(cluster: &Cluster) -> Result<Dialed, String> {
         .first()
         .map(|endpoint| Arc::from(endpoint.address()))
         .ok_or_else(|| "no address".to_owned())?;
-    Ok(Dialed::new(
+    Ok(Dialed::with_health(
         Upstream {
             address,
             authority: None,
@@ -350,6 +384,7 @@ fn dialed(cluster: &Cluster) -> Result<Dialed, String> {
             tls,
         },
         retry,
+        health,
     ))
 }
 
@@ -520,7 +555,12 @@ mod tests {
             ("local-plain", spec("local", DialTransport::Plaintext, true)),
         ]);
         validate_dials(&config.serving, &config.dial, Path::new(BACKEND_CA_BASE)).expect("no trust rule is broken");
-        let dials = Dials::build(&config.dial, &InsecureOptions::default(), &dir.identity());
+        let dials = Dials::build(
+            &config.dial,
+            &InsecureOptions::default(),
+            &dir.identity(),
+            &DialHealth::default(),
+        );
         assert!(
             dials.refused.contains("east"),
             "praxis refuses an untrusted .internal name"
@@ -554,6 +594,7 @@ mod tests {
             &config(&[("east", dial)]).dial,
             &InsecureOptions::default(),
             &dir.identity(),
+            &DialHealth::default(),
         );
         let built = dials.get("east").expect("east is built");
         let upstream = built.upstream();
@@ -694,7 +735,12 @@ mod tests {
 
     /// Build `dial` under `insecure` with an identity that does not exist.
     fn build(dial: &DialConfig, insecure: &InsecureOptions) -> Dials {
-        Dials::build(dial, insecure, &GridIdentity::under("/nonexistent"))
+        Dials::build(
+            dial,
+            insecure,
+            &GridIdentity::under("/nonexistent"),
+            &DialHealth::default(),
+        )
     }
 
     /// A dial to `site` over `transport` at a hostname address.
