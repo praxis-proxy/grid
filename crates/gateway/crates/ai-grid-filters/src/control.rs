@@ -820,8 +820,6 @@ where
 /// A change detector over every identity file `config` names, the grid CA, client
 /// certificate, and key of each peer, the files `dial` reads, and the tag key `affinity` names.
 /// Not a security function.
-///
-/// Each file is hashed on its own, so no buffer holds the concatenated key.
 fn identity_digest(
     config: &GridServingConfig,
     dial: &DialConfig,
@@ -848,6 +846,14 @@ fn identity_digest(
         // A rotated tag key re-applies the config like a renewed certificate.
         .chain(affinity.tag_key_path.as_deref())
         .collect();
+    files_digest(paths)
+}
+
+/// A change detector over the content of each of `paths`, an unreadable one included. Not a
+/// security function.
+///
+/// Each file is hashed on its own, so no buffer holds the concatenated key.
+pub(crate) fn files_digest(paths: BTreeSet<&str>) -> [u8; 32] {
     let mut material = Vec::new();
     for path in paths {
         material.extend_from_slice(&path.len().to_be_bytes());
@@ -887,6 +893,16 @@ pub(crate) struct WatchCounts {
 }
 
 impl WatchCounts {
+    /// Count one applied file.
+    pub(crate) fn count_applied(&self) {
+        self.applied.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Count one rejected file.
+    pub(crate) fn count_rejected(&self) {
+        self.rejected.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Files applied so far.
     #[cfg(test)]
     pub(crate) fn applied(&self) -> usize {
@@ -958,7 +974,7 @@ pub(crate) fn watch(control: Arc<Mutex<Control>>, path: PathBuf, every: Duration
 }
 
 /// The dial file's bytes, `None` when it does not exist.
-fn read_dial(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+pub(crate) fn read_dial(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),

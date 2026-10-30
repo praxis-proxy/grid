@@ -44,14 +44,14 @@ use crate::{
 };
 
 /// Internal request header carrying the selected candidate's stable ID.
-pub(crate) const SELECTED_CANDIDATE_HEADER: &str = "x-ai-routing-candidate";
+const SELECTED_CANDIDATE_HEADER: &str = "x-ai-routing-candidate";
 /// Internal request header carrying the provider-hop request correlation ID.
 const PROVIDER_HOP_REQUEST_ID_HEADER: &str = "x-ai-routing-request-id";
 /// Internal request header carrying the serving overlay revision.
-pub(crate) const OVERLAY_REVISION_HEADER: &str = "x-ai-routing-revision";
+const OVERLAY_REVISION_HEADER: &str = "x-ai-routing-revision";
 /// The caller's credentials, which never leave this site: another site authorizes the hop by
 /// its mutual TLS peer and candidate, so a caller's token would only leak.
-pub(crate) const CALLER_CREDENTIAL_HEADERS: [http::header::HeaderName; 10] = [
+const CALLER_CREDENTIAL_HEADERS: [http::header::HeaderName; 10] = [
     http::header::AUTHORIZATION,
     http::header::PROXY_AUTHORIZATION,
     http::header::COOKIE,
@@ -552,12 +552,7 @@ impl GridSiteRouteFilter {
             return Ok(());
         };
         if let Some(dialed) = state.dialed.take() {
-            if let Some(working) = dial_outcome(answered, reached, dialed.sent.elapsed(), dialed.budget) {
-                dialed.state.record(working, crate::health::monotonic_ms());
-            }
-            if dialed.probe {
-                dialed.state.release_probe();
-            }
+            dialed.settle(answered, reached);
         }
         // Keep the selected route after releasing the mutable borrow of filter state in `ctx`.
         let served = state.served.clone();
@@ -597,7 +592,7 @@ fn select_upstream(ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate) 
 /// kind, so a missing head counts only while it could still be a connect, DNS, TLS or
 /// private-address failure; past the connect budget the connection was made, so a read timeout
 /// is not counted. A reset right after connecting still counts.
-pub(crate) fn dial_outcome(answered: bool, reached: bool, elapsed: Duration, budget: Duration) -> Option<bool> {
+fn dial_outcome(answered: bool, reached: bool, elapsed: Duration, budget: Duration) -> Option<bool> {
     if !reached {
         return None;
     }
@@ -609,7 +604,7 @@ pub(crate) fn dial_outcome(answered: bool, reached: bool, elapsed: Duration, bud
 
 /// A request sent over a dial, whose outcome its response records.
 #[derive(Debug)]
-struct InFlight {
+pub(crate) struct InFlight {
     /// The longest the dial's connect attempts can take.
     budget: Duration,
     /// Whether this request holds the down dial's one probe.
@@ -623,12 +618,28 @@ struct InFlight {
 impl InFlight {
     /// The request routed to `candidate`, `None` when it is not dialed.
     fn of(candidate: &RouteCandidate, probe: bool) -> Option<Self> {
-        candidate.dial.as_ref().map(|dial| Self {
+        candidate.dial.as_deref().map(|dial| Self::over(dial, probe))
+    }
+
+    /// A request sent over `dial` now, holding its probe when `probe`.
+    pub(crate) fn over(dial: &crate::dial::Dialed, probe: bool) -> Self {
+        Self {
             budget: dial.connect_budget(),
             probe,
             sent: Instant::now(),
             state: Arc::clone(dial.health()),
-        })
+        }
+    }
+
+    /// Record the request's outcome, `answered` with a head after `reached` the upstream, and
+    /// hand back the probe it holds.
+    pub(crate) fn settle(self, answered: bool, reached: bool) {
+        if let Some(working) = dial_outcome(answered, reached, self.sent.elapsed(), self.budget) {
+            self.state.record(working, crate::health::monotonic_ms());
+        }
+        if self.probe {
+            self.state.release_probe();
+        }
     }
 }
 

@@ -191,6 +191,36 @@ pub fn site_dns_name(site_name: &str) -> String {
     format!("{site_name}.{SPIFFE_TRUST_DOMAIN}")
 }
 
+/// Whether `host` is the grid's own name or a name under it, the names grid gateways answer to.
+///
+/// Case and a trailing dot are ignored, as DNS ignores them.
+///
+/// ```
+/// assert!(certs::is_grid_name("East.Grid.Internal."));
+/// assert!(certs::is_grid_name("grid.internal"));
+/// assert!(!certs::is_grid_name("notgrid.internal"));
+/// ```
+#[must_use]
+pub fn is_grid_name(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let Some(prefix) = host.len().checked_sub(SPIFFE_TRUST_DOMAIN.len()) else {
+        return false;
+    };
+    let (head, tail) = host.split_at_checked(prefix).unwrap_or_default();
+    tail.eq_ignore_ascii_case(SPIFFE_TRUST_DOMAIN) && (head.is_empty() || head.ends_with('.'))
+}
+
+/// Whether `id` is a routing candidate's stable ID: eight lowercase hex digits.
+///
+/// ```
+/// assert!(certs::is_stable_id("ccac628c"));
+/// assert!(!certs::is_stable_id("CCAC628C"));
+/// ```
+#[must_use]
+pub fn is_stable_id(id: &str) -> bool {
+    id.len() == 8 && id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Generate a site certificate carrying extra DNS names.
 ///
 /// A site is reached by more than one name. Peers dial it by its grid identity,

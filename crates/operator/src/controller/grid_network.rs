@@ -3168,6 +3168,11 @@ async fn reconcile_routing_overlay_inner(
         // Each gateway identifies its own local site.  Fall back to the
         // network name for single-site deployments where the two are equal.
         let local_site = gw_ref.site_name.as_deref().unwrap_or(network_name);
+        let admitted = provider_config::admitted_sites(&sites, network_name, local_site);
+        // Before anything that can skip this gateway, so a removed site never outlives a failed render.
+        if serving.is_some() {
+            revoke_provider_admission(network_name, gw_ref, &admitted, client).await;
+        }
 
         // Filter remote CRDT providers to those whose source GridSite is Active.
         // Providers from sites in any other phase (Discovered, Connecting, Pending,
@@ -3263,14 +3268,13 @@ async fn reconcile_routing_overlay_inner(
             }
             dials
         });
-        let provider = serving.as_ref().map(|source| {
-            let restricted = restricted_clusters(providers);
-            let admitted = provider_config::admitted_sites(&sites, network_name, local_site);
-            let provider = provider_config::render_provider(&overlay, &dials, admitted, &restricted);
+        if let Some(source) = serving.as_ref() {
+            let provider =
+                provider_config::render_provider(&overlay, &dials, admitted.clone(), &restricted_clusters(providers));
             let key = format!("provider:{network_name}/{}/{}", gw_ref.namespace, gw_ref.name);
             provider_config::warn_dropped(&overlay, &provider, &key, source.refused_dials);
-            provider
-        });
+            apply_provider_file(network_name, gw_ref, &provider, client).await;
+        }
         let site_route = gw_ref
             .praxis_config
             .as_ref()
@@ -3401,14 +3405,11 @@ async fn reconcile_routing_overlay_inner(
             if !delegated_mount_reconciled {
                 // A serving file no pod has started on serves nothing, and the gateway cannot
                 // start, nor its rollout finish, without one, so a missing one is written now.
-                if let Some(source) = serving.filter(|_| awaiting_rollout)
-                    && let Some(provider) = provider.as_ref()
-                {
+                if let Some(source) = serving.filter(|_| awaiting_rollout) {
                     let target = ServingTarget {
                         gw_ref,
                         hops,
                         dials: &dials,
-                        provider,
                         bootstrap: true,
                     };
                     let written = apply_serving_config(&overlay, source, network_name, target, client).await;
@@ -3482,14 +3483,11 @@ async fn reconcile_routing_overlay_inner(
         });
 
         // The embedded gateway watches valid serving revisions independently.
-        if let Some(source) = serving
-            && let Some(provider) = provider.as_ref()
-        {
+        if let Some(source) = serving {
             let target = ServingTarget {
                 gw_ref,
                 hops,
                 dials: &dials,
-                provider,
                 bootstrap: false,
             };
             let written = apply_serving_config(&overlay, source, network_name, target, client).await;
@@ -3761,6 +3759,78 @@ fn restricted_clusters(providers: &[InferenceProvider]) -> BTreeSet<&str> {
         .collect()
 }
 
+/// Rewrite `gw_ref`'s stored provider file at once when it admits a site `admitted` does not.
+async fn revoke_provider_admission(network_name: &str, gw_ref: &GatewayRef, admitted: &[String], client: &Client) {
+    let (api, name) = provider_api(network_name, gw_ref, client);
+    let stored = match api.get_opt(&name).await {
+        Ok(existing) => stored_provider(existing),
+        Err(error) => {
+            tracing::warn!(network = network_name, gateway = %gw_ref.name, %error, "provider file: cannot read the stored admission");
+            return;
+        },
+    };
+    if let Some(revoked) = stored
+        .as_deref()
+        .and_then(|stored| provider_config::revoked(stored, admitted))
+    {
+        apply_provider_text(&api, network_name, gw_ref, &revoked).await;
+    }
+}
+
+/// Apply `provider` as `gw_ref`'s provider file when it differs from what is stored.
+///
+/// Its own field manager and key, so it is written whatever happens to the serving config.
+async fn apply_provider_file(
+    network_name: &str,
+    gw_ref: &GatewayRef,
+    provider: &provider_config::ProviderConfig,
+    client: &Client,
+) {
+    let Ok(text) = serving_config::to_text(provider) else {
+        tracing::warn!(network = network_name, gateway = %gw_ref.name, "provider file: render failed");
+        return;
+    };
+    let (api, name) = provider_api(network_name, gw_ref, client);
+    let stored = api.get_opt(&name).await.ok().flatten();
+    if stored_provider(stored).as_deref() != Some(text.as_str()) {
+        apply_provider_text(&api, network_name, gw_ref, &text).await;
+    }
+}
+
+/// The `ConfigMap` API and name `gw_ref`'s provider file lives in.
+fn provider_api(network_name: &str, gw_ref: &GatewayRef, client: &Client) -> (Api<ConfigMap>, String) {
+    (
+        Api::namespaced(client.clone(), &gw_ref.namespace),
+        serving_config::configmap_name(network_name, &gw_ref.name),
+    )
+}
+
+/// The provider file `existing` holds.
+fn stored_provider(existing: Option<ConfigMap>) -> Option<String> {
+    existing
+        .and_then(|cm| cm.data)
+        .and_then(|mut data| data.remove(provider_config::PROVIDER_KEY))
+}
+
+/// Apply `text` as the provider file under its own field manager, logging the outcome.
+async fn apply_provider_text(api: &Api<ConfigMap>, network_name: &str, gw_ref: &GatewayRef, text: &str) {
+    let cm = provider_config::build_configmap(text, network_name, &gw_ref.name, &gw_ref.namespace);
+    let name = serving_config::configmap_name(network_name, &gw_ref.name);
+    match api
+        .patch(
+            &name,
+            &PatchParams::apply(provider_config::FIELD_MANAGER).force(),
+            &Patch::Apply(&cm),
+        )
+        .await
+    {
+        Ok(_) => info!(cm_name = %name, digest = %serving_config::digest(text), "applied provider file"),
+        Err(error) => {
+            tracing::warn!(network = network_name, gateway = %gw_ref.name, %error, "provider file apply failed");
+        },
+    }
+}
+
 /// Render the serving config for one gateway, including authoritative no-route state.
 fn render_serving_config(
     overlay: &routing_overlay::RoutingOverlay,
@@ -3889,10 +3959,7 @@ struct ServingTarget<'target> {
     hops: HopSource<'target>,
     /// What the dial file may carry, before the gateway's own checks.
     dials: &'target BTreeMap<String, serving_config::DialSpec>,
-    /// The local backends and admitted sites a provider gateway serves.
-    provider: &'target provider_config::ProviderConfig,
-    /// Write only a missing one, for a gateway whose first pod needs it to start, or a shrunk
-    /// admitted set, which never waits.
+    /// Write only a missing one, for a gateway whose first pod needs it to start.
     bootstrap: bool,
 }
 
@@ -3926,63 +3993,41 @@ async fn apply_serving_config(
         gw_ref,
         hops,
         dials,
-        provider,
         bootstrap,
     } = target;
     serving_config::warn_refused_sites(overlay, network_name, source.refused);
     let config = render_serving_config(overlay, source, gw_ref, hops)?;
-    let mut text = serving_config::to_text(&config).map_err(OperatorError::Json)?;
-    let mut dial =
-        serving_config::to_text(&serving_config::render_dials(&config, dials)).map_err(OperatorError::Json)?;
-    let provider_text = serving_config::to_text(provider).map_err(OperatorError::Json)?;
+    let text = serving_config::to_text(&config).map_err(OperatorError::Json)?;
+    let dial = serving_config::to_text(&serving_config::render_dials(&config, dials)).map_err(OperatorError::Json)?;
     let name = serving_config::configmap_name(network_name, &gw_ref.name);
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
     let existing = api.get_opt(&name).await?;
     let data = existing.as_ref().and_then(|cm| cm.data.as_ref());
-    let stored_key = |key: &str| data.and_then(|data| data.get(key)).map_or("", String::as_str);
-    // One decision for every key, so a dial or provider change alone is written too.
+    // One decision for both keys, so a dial change alone is written too.
     let stored = data
         .and_then(|data| data.get(serving_config::SERVING_CONFIG_KEY))
         .map(|stored_text| {
-            format!(
-                "{stored_text}\0{}\0{}",
-                stored_key(serving_config::DIAL_KEY),
-                stored_key(provider_config::PROVIDER_KEY)
-            )
+            let stored_dial = data.and_then(|data| data.get(serving_config::DIAL_KEY));
+            format!("{stored_text}\0{}", stored_dial.map_or("", String::as_str))
         });
     let stored = stored.as_deref();
-    let desired = format!("{text}\0{dial}\0{provider_text}");
-    let stored_provider = data
-        .and_then(|data| data.get(provider_config::PROVIDER_KEY))
-        .map(String::as_str);
+    let desired = format!("{text}\0{dial}");
     let key = format!("{}/{name}", gw_ref.namespace);
     let now = Instant::now();
-    let held = bootstrap && existing.is_some();
-    let decision = provider_config::decide(stored_provider, provider, || {
-        if held {
-            WriteDecision::Unchanged
-        } else if overlay.candidates.is_empty() {
-            serving_config::decide_empty_withdrawal(stored, &desired)
-        } else {
-            serving_config::decide_write(stored, &desired, source.gate.last(&key), now)
-        }
-    });
-    if held && let Some(stored_text) = data.and_then(|data| data.get(serving_config::SERVING_CONFIG_KEY)) {
-        // Only the shrunk provider file is written: the held serving config stays as it was.
-        text.clone_from(stored_text);
-        dial = stored_key(serving_config::DIAL_KEY).to_owned();
-    }
+    // The provider file may have created the ConfigMap, so only a stored serving config holds.
+    let decision = if bootstrap && stored.is_some() {
+        WriteDecision::Unchanged
+    } else if overlay.candidates.is_empty() {
+        serving_config::decide_empty_withdrawal(stored, &desired)
+    } else {
+        serving_config::decide_write(stored, &desired, source.gate.last(&key), now)
+    };
     match decision {
         WriteDecision::Unchanged => return Ok(None),
         WriteDecision::Deferred(wait) => return Ok(Some(wait)),
         WriteDecision::Write => {},
     }
-    let files = serving_config::ServingFiles {
-        dial: &dial,
-        provider: &provider_text,
-        text: &text,
-    };
-    let cm = serving_config::build_configmap(&files, network_name, &gw_ref.name, &gw_ref.namespace);
+    let cm = serving_config::build_configmap(&text, &dial, network_name, &gw_ref.name, &gw_ref.namespace);
     api.patch(&name, &PatchParams::apply(FIELD_MANAGER).force(), &Patch::Apply(&cm))
         .await?;
     source.gate.record(&key, now);
@@ -12516,6 +12561,194 @@ mod tests {
         assert!(
             gateway_dials(&unconfigured, &overlay, &declarations).0.is_empty(),
             "nothing admitted, no entries"
+        );
+    }
+
+    /// A client serving one serving `ConfigMap` holding `stored` as its provider file, recording
+    /// every apply's body.
+    #[expect(clippy::indexing_slicing, reason = "tests")]
+    fn provider_store(stored: Option<&str>) -> (Client, Arc<std::sync::Mutex<Vec<Value>>>) {
+        let patches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&patches);
+        let data = stored.map_or_else(
+            || serde_json::json!({"serving-config.json": "{}"}),
+            |stored| serde_json::json!({"serving-config.json": "{}", provider_config::PROVIDER_KEY: stored}),
+        );
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": serving_config::configmap_name("net", "gw"), "namespace": "ns"},
+            "data": data,
+        });
+        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let (seen, cm) = (Arc::clone(&seen), cm.clone());
+            async move {
+                let manager = req.uri().query().unwrap_or_default().to_owned();
+                if req.method() == http::Method::PATCH {
+                    let bytes = http_body_util::BodyExt::collect(req.into_body())
+                        .await
+                        .map(http_body_util::Collected::to_bytes)
+                        .unwrap_or_default();
+                    let mut body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                    body["fieldManager"] = Value::from(manager);
+                    seen.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(body);
+                }
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(200)
+                        .body(kube::client::Body::from(serde_json::to_vec(&cm).unwrap_or_default()))
+                        .unwrap_or_else(|_| std::process::abort()),
+                )
+            }
+        });
+        (Client::new(service, "ns"), patches)
+    }
+
+    #[tokio::test]
+    #[expect(clippy::indexing_slicing, reason = "tests")]
+    async fn a_removed_site_is_revoked_without_the_serving_path() {
+        let stored = "{\n  \"admitted_sites\": [\"site-b\", \"site-c\"],\n  \"candidates\": [],\n  \"dial\": {},\n  \"local_site\": \"site-a\",\n  \"version\": \"v1\"\n}";
+        let gw = make_gw_ref("gw", "ns");
+        let (client, patches) = provider_store(Some(stored));
+        revoke_provider_admission("net", &gw, &["site-b".to_owned(), "site-c".to_owned()], &client).await;
+        assert!(
+            patches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "nothing removed, nothing written"
+        );
+
+        revoke_provider_admission("net", &gw, &["site-b".to_owned()], &client).await;
+        let written = patches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(written.len(), 1, "the removal is written at once");
+        let patch = written.first().cloned().unwrap_or_default();
+        assert!(
+            patch["fieldManager"]
+                .as_str()
+                .is_some_and(|query| query.contains(provider_config::FIELD_MANAGER)),
+            "under the provider's own field manager: {patch}"
+        );
+        let data = patch["data"].as_object().cloned().unwrap_or_default();
+        assert_eq!(
+            data.keys().collect::<Vec<_>>(),
+            [provider_config::PROVIDER_KEY],
+            "only the provider file, so the serving config is untouched"
+        );
+        let provider: Value =
+            serde_json::from_str(data[provider_config::PROVIDER_KEY].as_str().unwrap_or_default()).unwrap_or_default();
+        assert_eq!(
+            provider["admitted_sites"],
+            serde_json::json!(["site-b"]),
+            "site-c revoked"
+        );
+
+        let (missing, untouched) = provider_store(None);
+        revoke_provider_admission("net", &gw, &[], &missing).await;
+        assert!(
+            untouched
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "no stored file admits no one, so there is nothing to revoke"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_provider_file_is_applied_only_when_it_changes() {
+        let gw = make_gw_ref("gw", "ns");
+        let provider = provider_config::ProviderConfig {
+            admitted_sites: vec!["site-b".to_owned()],
+            candidates: Vec::new(),
+            dial: BTreeMap::new(),
+            local_site: "site-a".to_owned(),
+            version: "v1",
+        };
+        let text = serving_config::to_text(&provider).unwrap_or_default();
+        let (same, unchanged) = provider_store(Some(&text));
+        apply_provider_file("net", &gw, &provider, &same).await;
+        assert!(
+            unchanged
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "an equal file is not rewritten"
+        );
+        let (stale, changed) = provider_store(Some("{}"));
+        apply_provider_file("net", &gw, &provider, &stale).await;
+        assert_eq!(
+            changed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(),
+            1,
+            "a changed file is written"
+        );
+    }
+
+    #[test]
+    fn a_site_restricted_provider_is_never_served_to_peers() {
+        let provider = |name: &str, cluster: Option<&str>, restricted: bool| -> InferenceProvider {
+            let mut provider = cluster.map_or_else(
+                || make_inference_provider(name, "net"),
+                |cluster| make_provider_with_routing_ref(name, "net", cluster),
+            );
+            if restricted {
+                provider.spec.access_policy.site_selector.match_labels =
+                    BTreeMap::from([("tier".to_owned(), "gold".to_owned())]);
+            }
+            provider
+        };
+        let providers = vec![
+            provider("open", None, false),
+            provider("gold-by-name", None, true),
+            provider("gold", Some("pool-gold"), true),
+        ];
+        let restricted = restricted_clusters(&providers);
+        assert_eq!(
+            restricted.iter().copied().collect::<Vec<_>>(),
+            ["gold-by-name", "pool-gold"],
+            "the routing identity, clusterName or else the name, of each restricted provider"
+        );
+        let local = |cluster: &str| {
+            let mut local = topology_candidate(cluster, "site-a");
+            local.stable_id = Some(crate::resources::geography::compute_stable_id(
+                routing_overlay::CANDIDATE_KIND,
+                "model-x",
+                "site-a",
+                cluster,
+            ));
+            local
+        };
+        let mut overlay = dial_overlay(vec![local("open"), local("gold-by-name"), local("pool-gold")]);
+        overlay.local_site = "site-a".to_owned();
+        let dial = |site: &str| serving_config::DialSpec {
+            address: "m.models.svc:8000".to_owned(),
+            base_path: None,
+            connect_retries: None,
+            connect_timeout_ms: None,
+            credential: None,
+            read_timeout_ms: None,
+            site: site.to_owned(),
+            total_connect_timeout_ms: None,
+            transport: serving_config::DialTransport::Plaintext,
+            trusted_private: true,
+            write_timeout_ms: None,
+        };
+        let dials = ["open", "gold-by-name", "pool-gold"]
+            .map(|cluster| (cluster.to_owned(), dial("site-a")))
+            .into();
+        let rendered = provider_config::render_provider(&overlay, &dials, Vec::new(), &restricted);
+        assert_eq!(
+            rendered
+                .candidates
+                .iter()
+                .map(|candidate| candidate.cluster.as_str())
+                .collect::<Vec<_>>(),
+            ["open"],
+            "only the unrestricted provider is served to peers"
         );
     }
 

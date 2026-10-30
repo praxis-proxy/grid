@@ -143,9 +143,8 @@ fn main() -> ExitCode {
         None => (None, None),
     };
 
-    let provider = match std::env::var("GRID_PROVIDER_CONFIG")
-        .ok()
-        .map(|path| start_provider(&path, &config, &mut registry))
+    let provider = match std::env::var_os("GRID_PROVIDER_CONFIG")
+        .map(|path| start_provider(std::path::Path::new(&path), &config, &mut registry))
     {
         Some(Err(err)) => return praxis::report_fatal(&err, log_output),
         Some(Ok(runtime)) => Some(runtime),
@@ -161,10 +160,11 @@ fn main() -> ExitCode {
                 .map_err(|error| praxis::CompositionError::new(error.to_string()))
         });
     }
-    if provider.is_some() {
+    if let Some((_, grid_ca)) = provider.as_ref() {
+        let grid_ca = grid_ca.clone();
         // A reload must keep the same guarantees the startup config was checked for.
-        composition = composition.add_pipeline_validator(|ctx| {
-            provider_preflight::check(ctx.config()).map_err(praxis::CompositionError::new)
+        composition = composition.add_pipeline_validator(move |ctx| {
+            provider_preflight::check(ctx.config(), &grid_ca).map_err(praxis::CompositionError::new)
         });
     }
     let result = praxis::try_run_server_with_composition(config, composition, config_file, log_level);
@@ -272,12 +272,9 @@ fn start_grid_routing(
             ai_grid_filters::DialConfig::default()
         });
     // The grid TLS mount, never the serving config: a dial presents only the identity mounted for it.
-    let tls_dir = std::env::var("GRID_TLS_DIR").unwrap_or_else(|_| ai_grid_filters::GRID_TLS_MOUNT.to_owned());
-    let credential_dir =
-        std::env::var("GRID_CREDENTIAL_DIR").unwrap_or_else(|_| ai_grid_filters::CREDENTIAL_BASE.to_owned());
     let binding = ai_grid_filters::Binding {
-        credential_base: credential_dir.into(),
-        grid_identity: ai_grid_filters::GridIdentity::under(&tls_dir),
+        credential_base: credential_base(),
+        grid_identity: grid_identity(),
         ..binding
     };
     let mut runtime = ai_grid_filters::spawn_grid_routing(&config, &dial, binding)?;
@@ -302,20 +299,34 @@ fn start_grid_routing(
 ///
 /// Returns the preflight refusal, or the error starting the watcher or registering the filter.
 fn start_provider(
-    path: &str,
+    path: &std::path::Path,
     config: &Config,
     registry: &mut praxis_filter::FilterRegistry,
-) -> Result<ai_grid_filters::ProviderRuntime, praxis_filter::FilterError> {
-    provider_preflight::check(config)?;
+) -> Result<(ai_grid_filters::ProviderRuntime, String), praxis_filter::FilterError> {
     let binding = ai_grid_filters::Binding {
+        credential_base: credential_base(),
+        grid_identity: grid_identity(),
         // Captured once: praxis applies insecure options only at startup.
         insecure: config.insecure_options.clone(),
         ..ai_grid_filters::Binding::default()
     };
-    let runtime = ai_grid_filters::spawn_provider(path.into(), binding, SERVING_RELOAD_INTERVAL)
-        .map_err(|err| -> praxis_filter::FilterError { format!("grid: watching {path}: {err}").into() })?;
+    let grid_ca = binding.grid_identity.ca.clone();
+    provider_preflight::check(config, &grid_ca)?;
+    let runtime = ai_grid_filters::spawn_provider(path.to_path_buf(), binding, SERVING_RELOAD_INTERVAL)
+        .map_err(|err| -> praxis_filter::FilterError { format!("grid: watching {}: {err}", path.display()).into() })?;
     ai_grid_filters::register_provider_filter(registry, runtime.snapshot())?;
-    Ok(runtime)
+    Ok((runtime, grid_ca))
+}
+
+/// Where dial credentials are mounted: `GRID_CREDENTIAL_DIR`, else the default mount.
+fn credential_base() -> std::path::PathBuf {
+    std::env::var_os("GRID_CREDENTIAL_DIR").map_or_else(|| ai_grid_filters::CREDENTIAL_BASE.into(), Into::into)
+}
+
+/// The grid identity under `GRID_TLS_DIR`, else the default mount.
+fn grid_identity() -> ai_grid_filters::GridIdentity {
+    let dir = std::env::var("GRID_TLS_DIR").unwrap_or_else(|_| ai_grid_filters::GRID_TLS_MOUNT.to_owned());
+    ai_grid_filters::GridIdentity::under(&dir)
 }
 
 /// How often the grid serving config file is re-read.

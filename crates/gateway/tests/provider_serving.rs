@@ -134,7 +134,10 @@ mod tests {
             head.starts_with("post /v1/chat/completions?"),
             "the path is kept: {head}"
         );
-        assert_eq!(remote.connections(), 0, "nothing reached another site");
+        assert!(
+            !head.contains("x-peer-extra:"),
+            "an unlisted header never reaches the backend: {head}"
+        );
 
         let mut open_west = Client::connect(&ca, &west, gateway.listen).expect("open site-b connection");
         assert_eq!(
@@ -151,6 +154,7 @@ mod tests {
                 "\"mode\": \"mutual_tls\", \"sni\": \"site-a.grid.internal\"",
             ),
             provider_file(&["site-b"], &remote).replace("\"site\": \"site-a\"", "\"site\": \"site-d\""),
+            provider_file(&["site-b", "site-a"], &backend),
         ] {
             let before = gateway.lines("provider file refused");
             mount.write(&[("provider.json", bad.as_bytes())]);
@@ -160,13 +164,39 @@ mod tests {
                 Some(200),
                 "a refused file keeps the last good one"
             );
+            assert_eq!(
+                gateway.chat(&ca, &local, SERVED),
+                Some(403),
+                "this site is never admitted"
+            );
         }
         assert_eq!(
             gateway.lines("provider file refused"),
-            refusals + 3,
+            refusals + 4,
             "each bad file refused"
         );
         assert_eq!(remote.connections(), 0, "a refused remote dial never connects");
+
+        let refused_and_shrunk =
+            provider_file(&["site-c"], &backend).replace("\"site\": \"site-a\"", "\"site\": \"site-d\"");
+        mount.write(&[("provider.json", refused_and_shrunk.as_bytes())]);
+        eventually("a refused file that drops site-b refusing it", || {
+            gateway.chat(&ca, &west, SERVED) == Some(403)
+        });
+        assert_eq!(
+            gateway.chat(&ca, &north, SERVED),
+            Some(403),
+            "a refused file never adds a site"
+        );
+        mount.write(&[("provider.json", provider_file(&["site-b"], &backend).as_bytes())]);
+        eventually("site-b admitted again", || {
+            gateway.chat(&ca, &west, SERVED) == Some(200)
+        });
+        assert_eq!(
+            open_west.chat(SERVED),
+            Some(200),
+            "site-b's open connection is admitted again"
+        );
 
         mount.write(&[("provider.json", provider_file(&["site-c"], &backend).as_bytes())]);
         eventually("site-c admitted", || gateway.chat(&ca, &north, SERVED) == Some(200));
@@ -212,6 +242,16 @@ mod tests {
             (
                 "a listener that only requests a client certificate",
                 good.replace("client_cert_mode: require_named", "client_cert_mode: request"),
+                &[],
+            ),
+            (
+                "a listener that requires a certificate but not a grid SVID",
+                good.replace("client_cert_mode: require_named", "client_cert_mode: require"),
+                &[],
+            ),
+            (
+                "a static_response after grid_provider",
+                format!("{good}      - filter: static_response\n        status: 200\n"),
                 &[],
             ),
             (
@@ -396,8 +436,9 @@ mod tests {
             if entry.symlink_metadata().is_err() {
                 std::os::unix::fs::symlink(Path::new("..data").join("provider.json"), &entry).expect("key link");
             }
-            if self.generation > 1 {
-                std::fs::remove_dir_all(self.dir.join(format!("..gen_{}", self.generation - 1)))
+            // Kept one write longer, so a read that resolved the old revision still finds it.
+            if self.generation > 2 {
+                std::fs::remove_dir_all(self.dir.join(format!("..gen_{}", self.generation - 2)))
                     .expect("old generation");
             }
         }
@@ -478,7 +519,7 @@ mod tests {
     }
 
     impl Gateway {
-        fn start(work: &Path, _tls: &Path, yaml: &str, mount: Option<&Mount>, env: &[(&str, &str)]) -> Self {
+        fn start(work: &Path, tls: &Path, yaml: &str, mount: Option<&Mount>, env: &[(&str, &str)]) -> Self {
             let config = work.join("praxis.yaml");
             std::fs::write(&config, yaml).expect("praxis config");
             let ports = std::fs::read_to_string(work.join("ports")).expect("ports");
@@ -497,6 +538,7 @@ mod tests {
             if let Some(mount) = mount {
                 command.env("GRID_PROVIDER_CONFIG", mount.path("provider.json"));
             }
+            command.env("GRID_TLS_DIR", tls);
             command.envs(env.iter().copied());
             let mut child = command.spawn().expect("spawn gateway");
             let output = Arc::new(Mutex::new(Vec::new()));
@@ -577,7 +619,7 @@ mod tests {
         fn chat(&mut self, candidate: &str) -> Option<u16> {
             let body = r#"{"model":"llama"}"#;
             let request = format!(
-                "POST /v1/chat/completions?api_key=s3cret&stream=true&token=t HTTP/1.1\r\nHost: site-a.grid.internal\r\nAuthorization: Bearer caller\r\nProxy-Authorization: Basic x\r\nCookie: session=1\r\nX-Api-Key: k\r\nX-Goog-Api-Key: g\r\nx-ai-routing-candidate: {candidate}\r\nx-ai-routing-revision: 7\r\nx-ai-routing-request-id: req-1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                "POST /v1/chat/completions?api_key=s3cret&stream=true&token=t HTTP/1.1\r\nHost: site-a.grid.internal\r\nAuthorization: Bearer caller\r\nProxy-Authorization: Basic x\r\nCookie: session=1\r\nX-Api-Key: k\r\nX-Goog-Api-Key: g\r\nx-ai-routing-candidate: {candidate}\r\nx-ai-routing-revision: 7\r\nx-ai-routing-request-id: req-1\r\nX-Peer-Extra: 1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             );
             self.stream.write_all(request.as_bytes()).ok()?;

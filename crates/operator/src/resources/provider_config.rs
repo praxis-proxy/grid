@@ -6,13 +6,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use k8s_openapi::api::core::v1::ConfigMap;
 use serde::Serialize;
 
 use crate::{
     crd::grid_site::GridSite,
     resources::{
-        routing_overlay::{CANDIDATE_KIND, RoutingOverlay},
-        serving_config::{DialSpec, DialTransport, RefusedSites, WriteDecision, refusal_changed},
+        consumer_config::BACKEND_CA_MOUNT_BASE,
+        routing_overlay::{CANDIDATE_KIND, RoutingOverlay, overlay_labels},
+        serving_config::{DialSpec, DialTransport, RefusedSites, configmap_name, refusal_changed},
     },
 };
 
@@ -23,8 +25,9 @@ use crate::{
 /// `ConfigMap` data key holding the provider file, beside the serving config.
 pub(crate) const PROVIDER_KEY: &str = "provider.json";
 
-/// Length of a candidate stable ID, `fnv1a_hex8`.
-const STABLE_ID_LEN: usize = 8;
+/// The field manager the provider file is applied under, apart from the serving config's, so
+/// either is written without taking the other's keys away.
+pub(crate) const FIELD_MANAGER: &str = "grid-operator-provider";
 
 // ---------------------------------------------------------------------------
 // Provider File
@@ -100,7 +103,7 @@ pub(crate) fn render_provider(
                     .is_some_and(|dial| local_dial(dial, local))
         })
         .filter_map(|candidate| {
-            let stable_id = candidate.stable_id.as_ref().filter(|id| valid_stable_id(id))?;
+            let stable_id = candidate.stable_id.as_ref().filter(|id| certs::is_stable_id(id))?;
             Some(ProviderCandidate {
                 stable_id: stable_id.clone(),
                 name: candidate.name.clone(),
@@ -163,38 +166,49 @@ pub(crate) fn warn_dropped(overlay: &RoutingOverlay, provider: &ProviderConfig, 
     }
 }
 
-/// Whether `stored`, a provider file this operator wrote, admits a site `desired` does not.
+/// `stored` with every admitted site not in `admitted` removed, `None` when it removes none.
 ///
-/// A file that does not parse counts as shrinking, so it is replaced at once.
-pub(crate) fn admission_shrinks(stored: Option<&str>, desired: &ProviderConfig) -> bool {
-    let Some(stored) = stored else {
-        return false;
+/// It needs nothing but the site list, so it runs before anything that can fail for a gateway:
+/// until the file is rewritten, a removed site still reaches this site's backends. A file that
+/// does not parse, or has no list, is replaced by one admitting no one.
+pub(crate) fn revoked(stored: &str, admitted: &[String]) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(stored).unwrap_or_else(|_| serde_json::json!({}));
+    let listed: Vec<serde_json::Value> = value
+        .get("admitted_sites")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let kept: Vec<serde_json::Value> = listed
+        .iter()
+        .filter(|site| {
+            site.as_str()
+                .is_some_and(|site| admitted.iter().any(|kept| kept == site))
+        })
+        .cloned()
+        .collect();
+    if kept.len() == listed.len() && value.get("admitted_sites").is_some() {
+        return None;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return Some("{\n  \"admitted_sites\": []\n}".to_owned());
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(stored) else {
-        return true;
-    };
-    let Some(sites) = value.get("admitted_sites").and_then(serde_json::Value::as_array) else {
-        return true;
-    };
-    sites.iter().any(|site| {
-        site.as_str()
-            .is_none_or(|site| !desired.admitted_sites.iter().any(|kept| kept == site))
-    })
+    object.insert("admitted_sites".to_owned(), serde_json::Value::Array(kept));
+    serde_json::to_string_pretty(&value).ok()
 }
 
-/// `Write` when `stored` admits a site `desired` does not, else what `otherwise` decides.
-///
-/// A shrink bypasses write spacing and empty-withdrawal coalescing: until the file is
-/// rewritten, the removed site still reaches this site's backends.
-pub(crate) fn decide(
-    stored: Option<&str>,
-    desired: &ProviderConfig,
-    otherwise: impl FnOnce() -> WriteDecision,
-) -> WriteDecision {
-    if admission_shrinks(stored, desired) {
-        WriteDecision::Write
-    } else {
-        otherwise()
+/// The patch that sets only the provider file in `{network}`'s serving `ConfigMap` for `gateway`.
+pub(crate) fn build_configmap(text: &str, network_name: &str, gateway_name: &str, namespace: &str) -> ConfigMap {
+    let mut labels = overlay_labels(network_name, gateway_name);
+    labels.insert("app.kubernetes.io/component".to_owned(), "serving".to_owned());
+    ConfigMap {
+        metadata: kube::api::ObjectMeta {
+            labels: Some(labels),
+            name: Some(configmap_name(network_name, gateway_name)),
+            namespace: Some(namespace.to_owned()),
+            ..Default::default()
+        },
+        data: Some(BTreeMap::from([(PROVIDER_KEY.to_owned(), text.to_owned())])),
+        ..Default::default()
     }
 }
 
@@ -202,18 +216,30 @@ pub(crate) fn decide(
 // Utility Functions
 // ---------------------------------------------------------------------------
 
-/// A dial to this site that the gateway may hand a peer's request to.
+/// A dial to this site that the gateway may hand a peer's request to: the gateway refuses the
+/// whole file over any other, so it is left out here with its candidates.
 fn local_dial(dial: &DialSpec, local_site: &str) -> bool {
-    dial.site == local_site && !matches!(dial.transport, DialTransport::MutualTls { .. })
-}
-
-/// Eight lowercase hex digits, the shape the gateway accepts.
-fn valid_stable_id(id: &str) -> bool {
-    id.len() == STABLE_ID_LEN && id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    let grid_name = |name: &str| certs::is_grid_name(name);
+    let ca_within = dial.transport.ca_path().is_none_or(|path| {
+        let path = std::path::Path::new(path);
+        path.starts_with(BACKEND_CA_MOUNT_BASE)
+            && path != std::path::Path::new(BACKEND_CA_MOUNT_BASE)
+            && !path.components().any(|part| part == std::path::Component::ParentDir)
+    });
+    dial.site == local_site
+        && !matches!(dial.transport, DialTransport::MutualTls { .. })
+        && !dial.transport.sni().is_some_and(grid_name)
+        && !grid_name(grid_client::address_host(&dial.address))
+        && ca_within
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "tests")]
+#[expect(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::type_complexity,
+    reason = "tests"
+)]
 mod tests {
     use super::*;
     use crate::resources::{geography::compute_stable_id, routing_overlay::RoutingCandidate, serving_config};
@@ -354,57 +380,102 @@ mod tests {
     }
 
     #[test]
-    fn a_shrinking_admitted_set_is_detected_against_what_is_stored() {
+    fn a_removed_site_is_revoked_from_what_is_stored() {
         let stored = serving_config::to_text(&golden()).expect("json");
-        let mut desired = golden();
-        assert!(
-            !admission_shrinks(Some(&stored), &desired),
-            "the same set does not shrink"
+        let both = ["site-b".to_owned(), "site-c".to_owned()];
+        assert_eq!(revoked(&stored, &both), None, "the same set needs no rewrite");
+        let grown = ["site-b".to_owned(), "site-c".to_owned(), "site-z".to_owned()];
+        assert_eq!(
+            revoked(&stored, &grown),
+            None,
+            "a growing set waits for the full render"
         );
-        desired.admitted_sites.push("site-z".to_owned());
-        assert!(
-            !admission_shrinks(Some(&stored), &desired),
-            "a growing set does not shrink"
+        let rewritten = revoked(&stored, &["site-c".to_owned()]).expect("a removed site is revoked");
+        let value: serde_json::Value = serde_json::from_str(&rewritten).expect("json");
+        assert_eq!(
+            value["admitted_sites"],
+            serde_json::json!(["site-c"]),
+            "only the remaining site"
         );
-        desired.admitted_sites.retain(|site| site != "site-c");
-        assert!(admission_shrinks(Some(&stored), &desired), "a removed site shrinks");
-        assert!(!admission_shrinks(None, &desired), "nothing stored admits nobody");
-        assert!(admission_shrinks(Some("{"), &desired), "an unreadable file is replaced");
-        assert!(
-            admission_shrinks(Some("{\"admitted_sites\": [1]}"), &desired),
-            "a malformed entry is replaced"
+        assert_eq!(
+            value["candidates"],
+            serde_json::to_value(golden().candidates).expect("json"),
+            "backends kept"
         );
-        assert!(
-            admission_shrinks(Some("{}"), &desired),
-            "a file without the list is replaced"
-        );
+        for broken in ["{", "{\"admitted_sites\": [1]}", "{}", "[]"] {
+            let replaced = revoked(broken, &both).expect("a malformed file is replaced");
+            let parsed: serde_json::Value = serde_json::from_str(&replaced).expect("json");
+            assert_eq!(
+                parsed["admitted_sites"],
+                serde_json::json!([]),
+                "{broken}: admits no one"
+            );
+        }
     }
 
     #[test]
-    fn a_shrinking_admitted_set_writes_inside_the_gate_window() {
-        let stored = serving_config::to_text(&golden()).expect("json");
-        let now = std::time::Instant::now();
-        let gated = || serving_config::decide_write(Some("old"), "new", Some(now), now);
-        assert!(
-            matches!(gated(), WriteDecision::Deferred(_)),
-            "the fixture is inside the write window"
-        );
-        assert!(
-            matches!(decide(Some(&stored), &golden(), gated), WriteDecision::Deferred(_)),
-            "an unchanged admitted set waits like any other change"
-        );
-        let mut shrunk = golden();
-        shrunk.admitted_sites.retain(|site| site != "site-b");
+    fn the_provider_patch_carries_only_its_key() {
+        let cm = build_configmap("{}", "grid", "gw", "ns");
         assert_eq!(
-            decide(Some(&stored), &shrunk, gated),
-            WriteDecision::Write,
-            "a removed site is written at once"
+            cm.metadata.name.as_deref(),
+            Some("grid-serving-grid-gw"),
+            "the serving ConfigMap"
         );
         assert_eq!(
-            decide(Some(&stored), &shrunk, || WriteDecision::Unchanged),
-            WriteDecision::Write,
-            "a shrink is written even where the serving config would not be"
+            cm.data.expect("data").keys().collect::<Vec<_>>(),
+            [PROVIDER_KEY],
+            "the serving config and dial file are another manager's"
         );
+        assert!(cm.metadata.annotations.is_none(), "no rollout digest");
+    }
+
+    #[test]
+    fn a_dial_the_gateway_would_refuse_drops_its_backend() {
+        let overlay = overlay(vec![local("llama", "pool-llama")]);
+        let refused: [(&str, fn(&mut DialSpec)); 5] = [
+            ("a grid SNI", |dial| {
+                dial.transport = DialTransport::Tls {
+                    ca_path: None,
+                    sni: "site-b.Grid.Internal.".to_owned(),
+                };
+            }),
+            ("a grid address", |dial| {
+                dial.address = "site-b.grid.internal:8443".to_owned();
+            }),
+            ("the grid apex", |dial| {
+                dial.address = "grid.internal:8443".to_owned();
+            }),
+            ("a CA outside the mount", |dial| {
+                dial.transport = DialTransport::Tls {
+                    ca_path: Some("/etc/praxis/tls/ca.crt".to_owned()),
+                    sni: "llama.models.svc".to_owned(),
+                };
+            }),
+            ("a CA climbing out of the mount", |dial| {
+                dial.transport = DialTransport::Tls {
+                    ca_path: Some("/run/secrets/grid-backend-ca/../x/ca.crt".to_owned()),
+                    sni: "llama.models.svc".to_owned(),
+                };
+            }),
+        ];
+        let kept = BTreeMap::from([("pool-llama".to_owned(), plaintext("site-a"))]);
+        assert_eq!(
+            render_provider(&overlay, &kept, Vec::new(), &BTreeSet::new())
+                .candidates
+                .len(),
+            1,
+            "the fixture is servable"
+        );
+        for (what, break_it) in refused {
+            let mut dial = plaintext("site-a");
+            break_it(&mut dial);
+            let dials = BTreeMap::from([("pool-llama".to_owned(), dial)]);
+            let provider = render_provider(&overlay, &dials, Vec::new(), &BTreeSet::new());
+            assert!(
+                provider.candidates.is_empty() && provider.dial.is_empty(),
+                "{what}: dropped"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

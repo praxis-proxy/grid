@@ -38,8 +38,8 @@ pub use metadata::{CandidateCredential, CredentialRef};
 use praxis_filter::{FilterError, FilterFactory, FilterRegistry, HttpFilter};
 pub use prefix::{AffinitySettings, PrefixAffinity};
 pub use provider::{
-    PROVIDER_FILE, ProviderCandidate, ProviderConfig, ProviderCounts, ProviderRuntime, ProviderSnapshot,
-    spawn_provider, validate_provider,
+    PROVIDER_FILE, ProviderCandidate, ProviderConfig, ProviderRuntime, ProviderSnapshot, spawn_provider,
+    validate_provider,
 };
 pub use serving::{
     AvailabilitySettings, CredentialStrategy, DIAL_FILE, DialConfig, DialCredential, DialSpec, DialTransport,
