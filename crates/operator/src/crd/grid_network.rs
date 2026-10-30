@@ -673,6 +673,7 @@ fn add_tls_config_legacy_fields(schema: &mut schemars::Schema) {
 pub struct GridNetworkSpec {
     /// The grid this network belongs to, set once by bootstrap or its delivery automation.
     /// The operator waits until this is declared and never generates a grid ID.
+    /// A legacy grid ID held only in status is copied here once, and status then mirrors spec.
     /// Moving to another grid means recreating the network.
     #[serde(default)]
     #[schemars(length(max = 63), regex(pattern = "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"))]

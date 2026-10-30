@@ -97,6 +97,8 @@ struct Inner {
     failing: BTreeMap<String, usize>,
     /// Objects a concurrent writer stores just before the first create of their path.
     racing: BTreeMap<String, Value>,
+    /// Objects a concurrent writer stores just before the next patch of their path.
+    racing_patches: BTreeMap<String, Value>,
 }
 
 /// An in-memory Kubernetes API.
@@ -140,6 +142,12 @@ impl FakeApi {
     /// Store `object` at `path` just before its next create, so that create answers 409.
     pub fn win_create_race(&self, path: &str, object: Value) {
         self.lock().racing.insert(path.to_owned(), object);
+    }
+
+    /// Store `object` at `path` just before its next patch, so a patch that carries the old
+    /// resource version answers 409.
+    pub fn win_patch_race(&self, path: &str, object: Value) {
+        self.lock().racing_patches.insert(path.to_owned(), object);
     }
 
     /// The object at `path`.
@@ -372,9 +380,20 @@ impl Inner {
 
     /// PATCH an object or its status.
     fn patch(&mut self, path: &str, target: PatchTarget<'_>, body: &Value) -> (u16, Value) {
+        if let Some(mut winner) = self.racing_patches.remove(path) {
+            let version = self.next_version();
+            stamp(&mut winner, &version);
+            self.objects.insert(path.to_owned(), winner);
+        }
         let Some(held) = self.objects.get(path).cloned() else {
             return (404, failure(404, "NotFound", &format!("{path} not found")));
         };
+        // A resource version in the patch is a precondition, as the API server treats it.
+        let expected = body.pointer("/metadata/resourceVersion").and_then(Value::as_str);
+        let current = held.pointer("/metadata/resourceVersion").and_then(Value::as_str);
+        if expected.is_some_and(|expected| Some(expected) != current) {
+            return (409, failure(409, "Conflict", &format!("{path} has been modified")));
+        }
         let mut object = held.clone();
         let scope = if target.status { "/status" } else { "" };
         let content_type = target.content_type;

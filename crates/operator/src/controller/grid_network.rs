@@ -1830,6 +1830,68 @@ fn persisted_grid_id(network: &GridNetwork) -> Option<&str> {
         })
 }
 
+/// Field manager for the operator's one write to `spec.gridId`.
+const GRID_ID_FIELD_MANAGER: &str = "grid-operator-grid-id";
+
+/// Tries at copying a status-only grid ID into spec before the reconcile reports the conflict.
+const GRID_ID_PATCH_ATTEMPTS: usize = 3;
+
+/// Copy a legacy status-only grid ID into an empty `spec.gridId`, never replacing a set one.
+///
+/// Returns whether spec now holds a grid ID, the copied one or one another writer set first.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "async Kubernetes API calls carry large request and response values"
+)]
+async fn adopt_status_grid_id(network: &GridNetwork, client: &Client) -> Result<bool, OperatorError> {
+    let name = grid_network_name(network)?;
+    let api: Api<GridNetwork> = Api::all(client.clone());
+    let mut latest = network.clone();
+    for attempt in 0..GRID_ID_PATCH_ATTEMPTS {
+        if !latest.spec.grid_id.is_empty() {
+            return Ok(true);
+        }
+        // Spec is empty here, so this is the status ID.
+        let Some(grid_id) = persisted_grid_id(&latest) else {
+            return Ok(false);
+        };
+        let Some(resource_version) = latest.metadata.resource_version.as_deref() else {
+            return Ok(false);
+        };
+        // The resource version makes this a compare-and-swap against a writer that sets spec first.
+        let patch = serde_json::json!({
+            "metadata": { "resourceVersion": resource_version },
+            "spec": { "gridId": grid_id },
+        });
+        let params = PatchParams {
+            field_manager: Some(GRID_ID_FIELD_MANAGER.to_owned()),
+            ..PatchParams::default()
+        };
+        match api.patch(name, &params, &Patch::Merge(&patch)).await {
+            Ok(_) => {
+                tracing::info!(network = name, %grid_id, "copied the status grid ID into spec.gridId");
+                return Ok(true);
+            },
+            Err(kube::Error::Api(error)) if error.code == 409 && attempt + 1 < GRID_ID_PATCH_ATTEMPTS => {
+                let Some(current) = api.get_opt(name).await? else {
+                    return Ok(false);
+                };
+                latest = current;
+            },
+            // The same patch cannot pass again, so only adopt a spec another writer set meanwhile.
+            Err(kube::Error::Api(error)) if error.code == 422 => {
+                return match api.get_opt(name).await? {
+                    Some(current) if !current.spec.grid_id.is_empty() => Ok(true),
+                    _ => Err(kube::Error::Api(error).into()),
+                };
+            },
+            Err(error) => return Err(error.into()),
+        }
+    }
+    // Not reached: the last attempt returns from its match.
+    Ok(false)
+}
+
 /// Add or remove the SWIM-withdrawal finalizer without changing other finalizers.
 #[expect(
     clippy::large_stack_frames,
@@ -2043,6 +2105,10 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     let client = &ctx.client;
     if network.spec.grid_id.is_empty() {
+        // The spec write triggers the next reconcile, which runs with spec as the only source.
+        if Box::pin(adopt_status_grid_id(&network, client)).await? {
+            return Ok(Action::await_change());
+        }
         tracing::info!(name, "spec.gridId is not set; the grid runtime waits until it is");
         Box::pin(apply_rollup(client, &network)).await;
         return Ok(Action::await_change());
@@ -7932,6 +7998,34 @@ mod tests {
     // determine_phase with membership seam
     // -----------------------------------------------------------------------
 
+    /// API path of [`stored_grid_id_network`]'s network.
+    const GRID_ID_PATH: &str = "/apis/grid.praxis.fast/v1alpha1/gridnetworks/net";
+
+    /// A fake API holding a network with these spec and status grid IDs, and the network as read back.
+    fn stored_grid_id_network(
+        spec: &str,
+        status: &str,
+    ) -> Result<(status_harness::FakeApi, GridNetwork), OperatorError> {
+        let api = status_harness::FakeApi::new();
+        let mut network = base_network();
+        spec.clone_into(&mut network.spec.grid_id);
+        network.status = (!status.is_empty()).then(|| GridNetworkStatus {
+            grid_id: status.to_owned(),
+            ..GridNetworkStatus::default()
+        });
+        api.put(GRID_ID_PATH, serde_json::to_value(&network)?);
+        let stored = serde_json::from_value(api.get(GRID_ID_PATH).unwrap_or_default())?;
+        Ok((api, stored))
+    }
+
+    /// Writes to the network's main resource, which is where `spec.gridId` lives.
+    fn grid_id_spec_writes(api: &status_harness::FakeApi) -> Vec<status_harness::Write> {
+        api.writes()
+            .into_iter()
+            .filter(|write| write.path == GRID_ID_PATH && !write.status)
+            .collect()
+    }
+
     fn base_network() -> GridNetwork {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis.fast/v1alpha1",
@@ -9941,29 +10035,76 @@ mod tests {
 
     #[tokio::test]
     async fn an_unconfigured_operator_waits_for_bootstrap_instead_of_minting_a_grid_id() -> Result<(), OperatorError> {
-        for previous in [None, Some("legacy-grid")] {
-            let api = status_harness::FakeApi::new();
-            let mut network = base_network();
-            network.spec.grid_id.clear();
-            network.status = previous.map(|id| GridNetworkStatus {
-                grid_id: id.to_owned(),
-                ..GridNetworkStatus::default()
-            });
-            let name = network.metadata.name.as_deref().unwrap_or_default();
-            let path = format!("/apis/grid.praxis.fast/v1alpha1/gridnetworks/{name}");
-            api.put(&path, serde_json::to_value(&network)?);
-            let ctx = Arc::new(OperatorCtx::new(api.client("grid"), None, SignalMode::Gossip));
-            assert_eq!(
-                Box::pin(reconcile(Arc::new(network), ctx)).await?,
-                Action::await_change()
-            );
-            let writes = api.writes();
-            assert!(
-                writes
-                    .iter()
-                    .all(|write| write.status && write.body.pointer("/status/gridId").is_none())
-            );
+        let (api, network) = stored_grid_id_network("", "")?;
+        let ctx = Arc::new(OperatorCtx::new(api.client("grid"), None, SignalMode::Gossip));
+        assert_eq!(
+            Box::pin(reconcile(Arc::new(network), ctx)).await?,
+            Action::await_change()
+        );
+        assert!(
+            api.writes()
+                .iter()
+                .all(|write| write.status && write.body.pointer("/status/gridId").is_none()),
+            "neither spec nor status gains a minted grid ID"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_status_only_grid_id_is_copied_into_spec() -> Result<(), OperatorError> {
+        let (api, network) = stored_grid_id_network("", "legacy-grid")?;
+        let ctx = Arc::new(OperatorCtx::new(api.client("grid"), None, SignalMode::Gossip));
+        assert_eq!(
+            Box::pin(reconcile(Arc::new(network), ctx)).await?,
+            Action::await_change()
+        );
+        let spec_writes = grid_id_spec_writes(&api);
+        assert_eq!(spec_writes.len(), 1, "one spec write: {spec_writes:?}");
+        assert!(
+            spec_writes.iter().all(|write| {
+                write.manager.as_deref() == Some(GRID_ID_FIELD_MANAGER)
+                    && write.body.get("spec") == Some(&serde_json::json!({ "gridId": "legacy-grid" }))
+            }),
+            "the write carries spec.gridId alone under its own manager: {spec_writes:?}"
+        );
+        let stored = api.get(GRID_ID_PATH).unwrap_or_default();
+        assert_eq!(stored.pointer("/spec/gridId"), Some(&serde_json::json!("legacy-grid")));
+        assert_eq!(
+            stored.pointer("/status/gridId"),
+            Some(&serde_json::json!("legacy-grid")),
+            "status keeps the ID it already mirrored"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_set_spec_grid_id_is_never_patched() -> Result<(), OperatorError> {
+        let (api, network) = stored_grid_id_network("declared", "legacy-grid")?;
+        assert!(Box::pin(adopt_status_grid_id(&network, &api.client("grid"))).await?);
+        assert!(api.writes().is_empty(), "a set spec.gridId is never written");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_grid_id_another_writer_sets_first_is_adopted_without_a_second_write() -> Result<(), OperatorError> {
+        let (api, network) = stored_grid_id_network("", "legacy-grid")?;
+        let mut winner = api.get(GRID_ID_PATH).unwrap_or_default();
+        if let Some(spec) = winner.get_mut("spec") {
+            spec["gridId"] = serde_json::json!("bootstrap-grid");
         }
+        api.win_patch_race(GRID_ID_PATH, winner);
+        assert!(Box::pin(adopt_status_grid_id(&network, &api.client("grid"))).await?);
+        assert_eq!(
+            grid_id_spec_writes(&api).len(),
+            1,
+            "the losing patch is the only write; the re-read adopts what is there"
+        );
+        assert_eq!(
+            api.get(GRID_ID_PATH)
+                .and_then(|stored| stored.pointer("/spec/gridId").cloned()),
+            Some(serde_json::json!("bootstrap-grid")),
+            "the other writer's ID stands"
+        );
         Ok(())
     }
 
