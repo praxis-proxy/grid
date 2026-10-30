@@ -1,0 +1,40 @@
+{
+  "admitted_sites": [
+    "site-b",
+    "site-c"
+  ],
+  "candidates": [
+    {
+      "stable_id": "67b6bb1e",
+      "name": "granite",
+      "cluster": "local-granite"
+    },
+    {
+      "stable_id": "ccac628c",
+      "name": "llama",
+      "cluster": "local-llama"
+    }
+  ],
+  "dial": {
+    "local-granite": {
+      "address": "granite.models.svc.cluster.local:8443",
+      "site": "site-a",
+      "transport": {
+        "mode": "tls",
+        "ca_path": "/run/secrets/grid-backend-ca/models-ca/ca.crt",
+        "sni": "granite.models.svc"
+      },
+      "trusted_private": true
+    },
+    "local-llama": {
+      "address": "llama.models.svc.cluster.local:8000",
+      "site": "site-a",
+      "transport": {
+        "mode": "plaintext"
+      },
+      "trusted_private": true
+    }
+  },
+  "local_site": "site-a",
+  "version": "v1"
+}

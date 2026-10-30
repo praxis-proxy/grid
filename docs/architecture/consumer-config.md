@@ -646,6 +646,15 @@ refused whole and the last good one stays. At startup the gateway serves without
 dials until a good one lands. A single dial praxis refuses, such as an untrusted
 `.internal` or loopback host, takes only its own cluster out of routing.
 
+It also carries `provider.json`, which a provider gateway on the same site serves
+peers from. It lists the enrolled sites other than this one as `admitted_sites`,
+each local inference backend by the stable ID a consumer sends in
+`x-ai-routing-candidate`, and the local dial that reaches it. A backend is left
+out when it carries a credential, its provider sets `accessPolicy.siteSelector`,
+it has no local dial other than mutual TLS, or another backend shares its stable
+ID. A deleting or discovered `GridSite` is never admitted. When the admitted set
+shrinks, the operator rewrites the file at once, past the write interval.
+
 [praxis-reload]: https://github.com/praxis-proxy/praxis/blob/main/docs/operating/configuration.md#dynamic-configuration-reload
 
 ## Security

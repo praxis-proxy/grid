@@ -604,15 +604,25 @@ pub(crate) fn configmap_name(network_name: &str, gateway_name: &str) -> String {
     scoped_configmap_name("grid-serving", network_name, gateway_name)
 }
 
+/// The rendered texts one serving `ConfigMap` carries.
+pub(crate) struct ServingFiles<'text> {
+    /// The dial file.
+    pub(crate) dial: &'text str,
+    /// The provider file.
+    pub(crate) provider: &'text str,
+    /// The serving config.
+    pub(crate) text: &'text str,
+}
+
 /// The `ConfigMap` the gateway mounts. The digest covers the serving config alone: the
-/// gateway re-reads the dial file in place, so a dial change needs no rollout.
+/// gateway re-reads the dial and provider files in place, so a change to either needs no rollout.
 pub(crate) fn build_configmap(
-    text: &str,
-    dial: &str,
+    files: &ServingFiles<'_>,
     network_name: &str,
     gateway_name: &str,
     namespace: &str,
 ) -> ConfigMap {
+    let ServingFiles { dial, provider, text } = files;
     ConfigMap {
         metadata: kube::api::ObjectMeta {
             annotations: Some(BTreeMap::from([(ANNOTATION_DIGEST.to_owned(), digest(text))])),
@@ -622,8 +632,12 @@ pub(crate) fn build_configmap(
             ..Default::default()
         },
         data: Some(BTreeMap::from([
-            (SERVING_CONFIG_KEY.to_owned(), text.to_owned()),
-            (DIAL_KEY.to_owned(), dial.to_owned()),
+            (SERVING_CONFIG_KEY.to_owned(), (*text).to_owned()),
+            (DIAL_KEY.to_owned(), (*dial).to_owned()),
+            (
+                crate::resources::provider_config::PROVIDER_KEY.to_owned(),
+                (*provider).to_owned(),
+            ),
         ])),
         ..Default::default()
     }
@@ -1278,15 +1292,29 @@ mod tests {
 
     #[test]
     fn configmap_carries_name_labels_and_digest() {
-        let cm = build_configmap("{}", "{\"dial\":{}}", "grid", "gw", "ns");
+        let files = ServingFiles {
+            dial: "{\"dial\":{}}",
+            provider: "{\"version\":\"v1\"}",
+            text: "{}",
+        };
+        let cm = build_configmap(&files, "grid", "gw", "ns");
         assert_eq!(cm.metadata.name.as_deref(), Some("grid-serving-grid-gw"));
         let annotations = cm.metadata.annotations.expect("annotations");
-        assert_eq!(annotations[ANNOTATION_DIGEST], digest("{}"));
+        assert_eq!(
+            annotations[ANNOTATION_DIGEST],
+            digest("{}"),
+            "only the serving config rolls the gateway"
+        );
         let data = cm.data.expect("data");
         assert_eq!(data[SERVING_CONFIG_KEY], "{}");
         assert_eq!(
             data[DIAL_KEY], "{\"dial\":{}}",
             "the dial file rides in the same ConfigMap"
+        );
+        assert_eq!(
+            data[crate::resources::provider_config::PROVIDER_KEY],
+            "{\"version\":\"v1\"}",
+            "the provider file rides in the same ConfigMap"
         );
         assert_eq!(
             cm.metadata.labels.expect("labels")[COMPONENT_LABEL],

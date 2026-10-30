@@ -48,8 +48,8 @@ use crate::{
     readiness,
     resources::{
         consumer_config::{self, ConsumerConfigError, SiteRoutePrerequisite},
-        derived_topology, gateway_mounts, overlay_envelope, provider_admission, provider_metrics, routing_overlay,
-        secret,
+        derived_topology, gateway_mounts, overlay_envelope, provider_admission, provider_config, provider_metrics,
+        routing_overlay, secret,
         serving_config::{self, ServingInputs, WriteDecision, WriteGate},
         tls_backend::ServerTlsConfig,
         trust_bundle::{self, CertPemStatus},
@@ -3263,6 +3263,14 @@ async fn reconcile_routing_overlay_inner(
             }
             dials
         });
+        let provider = serving.as_ref().map(|source| {
+            let restricted = restricted_clusters(providers);
+            let admitted = provider_config::admitted_sites(&sites, network_name, local_site);
+            let provider = provider_config::render_provider(&overlay, &dials, admitted, &restricted);
+            let key = format!("provider:{network_name}/{}/{}", gw_ref.namespace, gw_ref.name);
+            provider_config::warn_dropped(&overlay, &provider, &key, source.refused_dials);
+            provider
+        });
         let site_route = gw_ref
             .praxis_config
             .as_ref()
@@ -3393,11 +3401,14 @@ async fn reconcile_routing_overlay_inner(
             if !delegated_mount_reconciled {
                 // A serving file no pod has started on serves nothing, and the gateway cannot
                 // start, nor its rollout finish, without one, so a missing one is written now.
-                if let Some(source) = serving.filter(|_| awaiting_rollout) {
+                if let Some(source) = serving.filter(|_| awaiting_rollout)
+                    && let Some(provider) = provider.as_ref()
+                {
                     let target = ServingTarget {
                         gw_ref,
                         hops,
                         dials: &dials,
+                        provider,
                         bootstrap: true,
                     };
                     let written = apply_serving_config(&overlay, source, network_name, target, client).await;
@@ -3471,11 +3482,14 @@ async fn reconcile_routing_overlay_inner(
         });
 
         // The embedded gateway watches valid serving revisions independently.
-        if let Some(source) = serving {
+        if let Some(source) = serving
+            && let Some(provider) = provider.as_ref()
+        {
             let target = ServingTarget {
                 gw_ref,
                 hops,
                 dials: &dials,
+                provider,
                 bootstrap: false,
             };
             let written = apply_serving_config(&overlay, source, network_name, target, client).await;
@@ -3737,6 +3751,16 @@ fn dial_request_shape(
     ))
 }
 
+/// Clusters whose local provider limits which sites may route to it, which a provider file
+/// never serves to an admitted peer.
+fn restricted_clusters(providers: &[InferenceProvider]) -> BTreeSet<&str> {
+    providers
+        .iter()
+        .filter(|provider| !provider.spec.access_policy.site_selector.match_labels.is_empty())
+        .filter_map(routing_overlay::routing_identity)
+        .collect()
+}
+
 /// Render the serving config for one gateway, including authoritative no-route state.
 fn render_serving_config(
     overlay: &routing_overlay::RoutingOverlay,
@@ -3865,7 +3889,10 @@ struct ServingTarget<'target> {
     hops: HopSource<'target>,
     /// What the dial file may carry, before the gateway's own checks.
     dials: &'target BTreeMap<String, serving_config::DialSpec>,
-    /// Write only a missing one, for a gateway whose first pod needs it to start.
+    /// The local backends and admitted sites a provider gateway serves.
+    provider: &'target provider_config::ProviderConfig,
+    /// Write only a missing one, for a gateway whose first pod needs it to start, or a shrunk
+    /// admitted set, which never waits.
     bootstrap: bool,
 }
 
@@ -3899,40 +3926,63 @@ async fn apply_serving_config(
         gw_ref,
         hops,
         dials,
+        provider,
         bootstrap,
     } = target;
     serving_config::warn_refused_sites(overlay, network_name, source.refused);
     let config = render_serving_config(overlay, source, gw_ref, hops)?;
-    let text = serving_config::to_text(&config).map_err(OperatorError::Json)?;
-    let dial = serving_config::to_text(&serving_config::render_dials(&config, dials)).map_err(OperatorError::Json)?;
+    let mut text = serving_config::to_text(&config).map_err(OperatorError::Json)?;
+    let mut dial =
+        serving_config::to_text(&serving_config::render_dials(&config, dials)).map_err(OperatorError::Json)?;
+    let provider_text = serving_config::to_text(provider).map_err(OperatorError::Json)?;
     let name = serving_config::configmap_name(network_name, &gw_ref.name);
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
     let existing = api.get_opt(&name).await?;
     let data = existing.as_ref().and_then(|cm| cm.data.as_ref());
-    // One decision for both keys, so a dial change alone is written too.
+    let stored_key = |key: &str| data.and_then(|data| data.get(key)).map_or("", String::as_str);
+    // One decision for every key, so a dial or provider change alone is written too.
     let stored = data
         .and_then(|data| data.get(serving_config::SERVING_CONFIG_KEY))
         .map(|stored_text| {
-            let stored_dial = data.and_then(|data| data.get(serving_config::DIAL_KEY));
-            format!("{stored_text}\0{}", stored_dial.map_or("", String::as_str))
+            format!(
+                "{stored_text}\0{}\0{}",
+                stored_key(serving_config::DIAL_KEY),
+                stored_key(provider_config::PROVIDER_KEY)
+            )
         });
     let stored = stored.as_deref();
-    let desired = format!("{text}\0{dial}");
+    let desired = format!("{text}\0{dial}\0{provider_text}");
+    let stored_provider = data
+        .and_then(|data| data.get(provider_config::PROVIDER_KEY))
+        .map(String::as_str);
     let key = format!("{}/{name}", gw_ref.namespace);
     let now = Instant::now();
-    let decision = if bootstrap && existing.is_some() {
-        WriteDecision::Unchanged
-    } else if overlay.candidates.is_empty() {
-        serving_config::decide_empty_withdrawal(stored, &desired)
-    } else {
-        serving_config::decide_write(stored, &desired, source.gate.last(&key), now)
-    };
+    let held = bootstrap && existing.is_some();
+    let decision = provider_config::decide(stored_provider, provider, || {
+        if held {
+            WriteDecision::Unchanged
+        } else if overlay.candidates.is_empty() {
+            serving_config::decide_empty_withdrawal(stored, &desired)
+        } else {
+            serving_config::decide_write(stored, &desired, source.gate.last(&key), now)
+        }
+    });
+    if held && let Some(stored_text) = data.and_then(|data| data.get(serving_config::SERVING_CONFIG_KEY)) {
+        // Only the shrunk provider file is written: the held serving config stays as it was.
+        text.clone_from(stored_text);
+        dial = stored_key(serving_config::DIAL_KEY).to_owned();
+    }
     match decision {
         WriteDecision::Unchanged => return Ok(None),
         WriteDecision::Deferred(wait) => return Ok(Some(wait)),
         WriteDecision::Write => {},
     }
-    let cm = serving_config::build_configmap(&text, &dial, network_name, &gw_ref.name, &gw_ref.namespace);
+    let files = serving_config::ServingFiles {
+        dial: &dial,
+        provider: &provider_text,
+        text: &text,
+    };
+    let cm = serving_config::build_configmap(&files, network_name, &gw_ref.name, &gw_ref.namespace);
     api.patch(&name, &PatchParams::apply(FIELD_MANAGER).force(), &Patch::Apply(&cm))
         .await?;
     source.gate.record(&key, now);
