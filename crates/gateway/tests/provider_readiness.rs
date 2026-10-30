@@ -418,6 +418,13 @@ mod tests {
                 "grid_route_site_score_unavailable{site=\"site-b\",cluster=\"pool-site-b\",reason=\"unreadable\"} 1",
             )
         });
+        site_b.mode.store(PARTITIONED, Ordering::SeqCst);
+        thread::sleep(WINDOW * 3);
+        gateway.eventually("stale score metric", || {
+            gateway.metrics().contains(
+                "grid_route_site_score_unavailable{site=\"site-b\",cluster=\"pool-site-b\",reason=\"stale\"} 1",
+            )
+        });
         site_b.mode.store(READY, Ordering::SeqCst);
         gateway.eventually("every site serving after readable scores", || {
             let counts = split(&gateway, 9);
@@ -458,10 +465,13 @@ mod tests {
             "a silent peer is not readmitted: {partitioned:?}"
         );
         assert_eq!(partitioned.get("error"), None, "{partitioned:?}");
-        gateway.eventually("stale score metric", || {
-            gateway.metrics().contains(
-                "grid_route_site_score_unavailable{site=\"site-b\",cluster=\"pool-site-b\",reason=\"stale\"} 1",
-            )
+        gateway.eventually("no unavailable-score reason for an unready site", || {
+            let metrics = gateway.metrics();
+            ["absent", "unreadable", "stale"].iter().all(|reason| {
+                metrics.contains(&format!(
+                    "grid_route_site_score_unavailable{{site=\"site-b\",cluster=\"pool-site-b\",reason=\"{reason}\"}} 0"
+                ))
+            })
         });
 
         // It heals with an operator that no longer publishes readiness: absent reads as ready.

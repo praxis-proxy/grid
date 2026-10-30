@@ -148,7 +148,7 @@ impl RouteSnapshot {
         local: bool,
         inputs: &mut Inputs<'_, S>,
         reset_pairs: &mut BTreeSet<SitePair>,
-    ) -> (f64, RouteCandidate, bool, Option<ScoreUnavailable>) {
+    ) -> ResolvedCandidate {
         let readings = observed(&mut candidate, local, inputs);
         let score_unavailable = ScoreUnavailable::for_candidate(&candidate, &readings, inputs);
         let reading = &readings.horizon;
@@ -184,7 +184,12 @@ impl RouteSnapshot {
         } else {
             UNHEALTHY
         };
-        (load, candidate, measured.is_some(), score_unavailable)
+        ResolvedCandidate {
+            candidate,
+            load,
+            measured: measured.is_some(),
+            score_unavailable,
+        }
     }
 
     /// The site over the horizon, and over the settling time alone: `room_after_ms`. Both are
@@ -231,18 +236,24 @@ impl RouteSnapshot {
     /// The floor as a device follows Brent Salisbury's pressure-weighted placement, where it keeps
     /// a saturated site eligible; here it keeps an unproven one exploring.
     fn explore_floor(
-        ranked: Vec<(f64, RouteCandidate, bool, Option<ScoreUnavailable>)>,
+        ranked: Vec<ResolvedCandidate>,
         share: f64,
     ) -> Vec<(f64, RouteCandidate, Option<ScoreUnavailable>)> {
         let largest = ranked
             .iter()
-            .filter(|(_, _, measured, _)| *measured)
-            .filter_map(|(_, candidate, ..)| candidate.capacity)
+            .filter(|resolved| resolved.measured)
+            .filter_map(|resolved| resolved.candidate.capacity)
             .fold(0.0_f64, f64::max);
         let floor = largest * share;
         ranked
             .into_iter()
-            .map(|(load, mut candidate, measured, score_unavailable)| {
+            .map(|resolved| {
+                let ResolvedCandidate {
+                    mut candidate,
+                    load,
+                    measured,
+                    score_unavailable,
+                } = resolved;
                 if measured {
                     candidate.capacity = candidate.capacity.map(|ceiling| ceiling.max(floor));
                 }
@@ -400,7 +411,7 @@ impl RouteSnapshot {
             // The front entry for a pair is its best; later ones are other models.
             if current.insert(key.clone()) {
                 site_score(&key, *score);
-                publish_score_unavailable(&key, *score_unavailable);
+                publish_score_unavailable(&key, |reason| f64::from(u8::from(*score_unavailable == Some(reason))));
                 site_gauge("grid_route_site_rho", &key, candidate.rho.unwrap_or(f64::NAN));
                 site_gauge("grid_route_site_weight", &key, candidate.capacity.unwrap_or(f64::NAN));
                 // The limits are set where they are learned; an unmeasured site must not keep
@@ -413,7 +424,7 @@ impl RouteSnapshot {
         }
         for gone in published.difference(&current) {
             site_score(gone, f64::NAN);
-            publish_score_unavailable_value(gone, f64::NAN);
+            publish_score_unavailable(gone, |_| f64::NAN);
             site_gauge("grid_route_site_silent", gone, f64::NAN);
             site_gauge("grid_route_site_last_sample_age_seconds", gone, f64::NAN);
             site_gauge("grid_route_site_round_age_seconds", gone, f64::NAN);
@@ -464,6 +475,18 @@ pub(crate) fn decisions_for(candidates: &[RouteCandidate]) -> Vec<SiteDecisions>
 /// A candidate's site and cluster, the labels of its score gauge.
 type SitePair = (Arc<str>, Arc<str>);
 
+/// A candidate resolved against one consistent set of signal readings.
+struct ResolvedCandidate {
+    /// Candidate after applying the readings.
+    candidate: RouteCandidate,
+    /// Queue-derived ordering score.
+    load: f64,
+    /// Whether the readings produced learned capacity and saturation.
+    measured: bool,
+    /// Why the candidate lacks a queue score, when applicable.
+    score_unavailable: Option<ScoreUnavailable>,
+}
+
 /// Why an otherwise routable load-publishing candidate has no queue score.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScoreUnavailable {
@@ -489,6 +512,7 @@ impl ScoreUnavailable {
             || !candidate.publishes_load
             || !readings.coherent
             || readings.horizon.queued.is_some()
+            || readings.horizon.unready
         {
             return None;
         }
@@ -1098,22 +1122,11 @@ fn site_score(key: &SitePair, score: f64) {
     site_gauge("grid_route_site_score", key, score);
 }
 
-/// Publish the one-hot reason that a candidate has no queue score.
-fn publish_score_unavailable(key: &SitePair, unavailable: Option<ScoreUnavailable>) {
-    for reason in ScoreUnavailable::ALL {
-        let value = f64::from(u8::from(unavailable == Some(reason)));
-        metrics::gauge!(
-            "grid_route_site_score_unavailable",
-            "site" => Arc::clone(&key.0),
-            "cluster" => Arc::clone(&key.1),
-            "reason" => reason.as_str()
-        )
-        .set(value);
-    }
-}
-
-/// Set every unavailable-reason series for `key` to `value`.
-fn publish_score_unavailable_value(key: &SitePair, value: f64) {
+/// Publish each unavailable-reason series with its value for this candidate.
+fn publish_score_unavailable<F>(key: &SitePair, value_for: F)
+where
+    F: Fn(ScoreUnavailable) -> f64,
+{
     for reason in ScoreUnavailable::ALL {
         metrics::gauge!(
             "grid_route_site_score_unavailable",
@@ -1121,7 +1134,7 @@ fn publish_score_unavailable_value(key: &SitePair, value: f64) {
             "cluster" => Arc::clone(&key.1),
             "reason" => reason.as_str()
         )
-        .set(value);
+        .set(value_for(reason));
     }
 }
 
@@ -2361,6 +2374,31 @@ mod tests {
         );
         let sites: BTreeSet<Arc<str>> = picks(&snapshot).into_iter().map(|(site, _)| site).collect();
         assert_eq!(sites.len(), 2, "both stay in the draw, as when nothing is published");
+    }
+
+    #[test]
+    fn unready_site_does_not_publish_score_unavailable_reason() {
+        let recorder = Captured::default();
+        metrics::with_local_recorder(&recorder, || {
+            let store = LoadStore::new(Duration::from_secs(600));
+            let availability = AvailabilitySettings::default();
+            let mut gauged = Gauged::new();
+            with_series(&store, "a", "vendor_queue_depth", 4.0, 1_000);
+            store.ingest_at(&ready("a", "pool-a", 0.0, 1_000), 1_000, 1_000, "a");
+
+            drop(
+                RouteSnapshot::from_store(
+                    one("a"),
+                    Arc::from("hub"),
+                    &mut at(&store, &availability, &mut gauged.learned, 1_000, 500),
+                )
+                .published(&mut gauged),
+            );
+
+            for reason in ["absent", "unreadable", "stale"] {
+                recorder.assert_gauge(&format!("grid_route_site_score_unavailable:{reason}"), 0.0);
+            }
+        });
     }
 
     #[test]
