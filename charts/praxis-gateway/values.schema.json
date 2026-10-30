@@ -111,6 +111,23 @@
                   "role": {
                     "const": "provider"
                   }
+                },
+                "not": {
+                  "required": [
+                    "gridServing"
+                  ],
+                  "properties": {
+                    "gridServing": {
+                      "required": [
+                        "enabled"
+                      ],
+                      "properties": {
+                        "enabled": {
+                          "const": true
+                        }
+                      }
+                    }
+                  }
                 }
               },
               "then": {
@@ -189,6 +206,46 @@
                         ]
                       }
                     ]
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "required": [
+                  "role",
+                  "gridServing"
+                ],
+                "properties": {
+                  "role": {
+                    "const": "provider"
+                  },
+                  "gridServing": {
+                    "required": [
+                      "enabled"
+                    ],
+                    "properties": {
+                      "enabled": {
+                        "const": true
+                      }
+                    }
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "peerTrust"
+                ],
+                "properties": {
+                  "peerTrust": {
+                    "required": [
+                      "mode"
+                    ],
+                    "properties": {
+                      "mode": {
+                        "const": "spiffe"
+                      }
+                    }
                   }
                 }
               }

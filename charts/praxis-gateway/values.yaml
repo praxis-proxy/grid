@@ -327,7 +327,8 @@ praxisConfig:
     # -- Operator-rendered serving data for grid_site_route. This does not select the operator
     # source: praxisConfig.source remains render and the chart still renders praxis.yaml.
     gridServing:
-      # -- Mount the serving data, set GRID_SERVING_CONFIG, and use grid_site_route.
+      # -- Mount the serving data, set GRID_SERVING_CONFIG, and use grid_site_route. On a provider,
+      # read provider.json from the consumer gatewayRefName's ConfigMap and serve with grid_provider.
       enabled: false
       # -- GridNetwork name, which with gatewayRefName names the operator's ConfigMap. Empty uses grid.networkName.
       networkName: ""

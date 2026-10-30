@@ -11,6 +11,8 @@ mod ports;
 #[cfg(test)]
 #[expect(
     clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
     clippy::disallowed_methods,
     clippy::too_many_lines,
@@ -234,6 +236,45 @@ mod tests {
         let _cleaned = std::fs::remove_dir_all(&work);
     }
 
+    #[test]
+    fn the_chart_render_serves_admitted_peers_only() {
+        let work = fresh_work("provider-chart");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let tls = write_identity(&work, &ca, "site-a");
+        let Some(yaml) = chart_render(&work, &tls) else {
+            return;
+        };
+        let (west, north) = (
+            generate_site_cert(&ca, "site-b").expect("west"),
+            generate_site_cert(&ca, "site-c").expect("north"),
+        );
+        let backend = Backend::start();
+        let mut mount = Mount::new(work.join("serving"));
+        mount.write(&[("provider.json", provider_file(&["site-b"], &backend).as_bytes())]);
+        let mut gateway = Gateway::start(&work, &tls, &yaml, Some(&mount), &[]);
+        eventually("site-b admitted", || gateway.chat(&ca, &west, SERVED) == Some(200));
+        assert_eq!(
+            gateway.chat(&ca, &north, SERVED),
+            Some(403),
+            "an unlisted site is refused"
+        );
+        assert_eq!(
+            gateway.chat(&ca, &west, ELSEWHERE),
+            Some(503),
+            "an unserved stable ID has no upstream"
+        );
+        mount.write(&[("provider.json", provider_file(&["site-c"], &backend).as_bytes())]);
+        eventually("site-b removed", || gateway.chat(&ca, &west, SERVED) == Some(403));
+        assert_eq!(
+            gateway.chat(&ca, &north, SERVED),
+            Some(200),
+            "the listed site is admitted"
+        );
+        gateway.assert_running();
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
     // ---------------------------------------------------------------------------
     // Test Utilities
     // ---------------------------------------------------------------------------
@@ -245,6 +286,50 @@ mod tests {
         let tls = tls.display();
         format!(
             "insecure_options:\n  allow_private_endpoints: true\nadmin:\n  metrics_address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: gateway\n    address: \"127.0.0.1:{listen}\"\n    tls:\n      certificates:\n        - cert_path: \"{tls}/tls.crt\"\n          key_path: \"{tls}/tls.key\"\n      client_ca:\n        ca_path: \"{tls}/ca.crt\"\n      client_cert_mode: require_named\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: grid_provider\n        allowed_paths: [/v1/chat/completions, /v1/models]\n"
+        )
+    }
+
+    /// The chart's provider render, moved to this test's identity and free ports, or `None`
+    /// when helm is absent and skipping is asked for.
+    fn chart_render(work: &Path, tls: &Path) -> Option<String> {
+        let chart = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../charts/praxis-gateway");
+        let output = match Command::new("helm")
+            .args(["template", "render"])
+            .arg(&chart)
+            .args([
+                "--set=praxisConfig.source=render",
+                "--set=grid.siteName=site-a",
+                "--set=grid.networkName=grid",
+                "--set=image.flavor=grid-gateway",
+                "--set=praxisConfig.render.role=provider",
+                "--set=gridIdentity.tlsSecretName=grid-site-identity",
+                "--set=praxisConfig.render.peerTrust.mode=spiffe",
+                "--set=praxisConfig.render.gridServing.enabled=true",
+                "--set=praxisConfig.render.gridServing.gatewayRefName=grid-gateway",
+                "--set=praxisConfig.render.provider.allowedPaths[0]=/v1/chat/completions",
+            ])
+            .args(["--show-only", "templates/gateway-config.yaml"])
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) if std::env::var("GRID_SKIP_CHART_RENDER").is_ok_and(|skip| skip == "1") => return None,
+            Err(error) => panic!("helm is needed to render the chart ({error}); set GRID_SKIP_CHART_RENDER=1 to skip"),
+        };
+        assert!(
+            output.status.success(),
+            "helm template: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let config_map: serde_yaml::Value = serde_yaml::from_slice(&output.stdout).expect("a ConfigMap");
+        let yaml = config_map["data"]["praxis.yaml"].as_str().expect("praxis.yaml");
+        let (listen, admin) = (free_port(), free_port());
+        std::fs::write(work.join("ports"), format!("{listen} {admin}")).expect("ports");
+        // The backend is on loopback, which praxis refuses without the test-only opt-in.
+        Some(
+            format!("insecure_options:\n  allow_private_endpoints: true\n{yaml}")
+                .replace("/etc/praxis/tls/", &format!("{}/", tls.display()))
+                .replace("0.0.0.0:8080", &format!("127.0.0.1:{listen}"))
+                .replace("127.0.0.1:9901", &format!("127.0.0.1:{admin}")),
         )
     }
 

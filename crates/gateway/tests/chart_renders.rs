@@ -106,6 +106,26 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_serving_from_the_provider_file_loads() {
+        let Some(yaml) = render(&[
+            "--set=image.flavor=grid-gateway",
+            "--set=grid.networkName=grid",
+            "--set=praxisConfig.render.role=provider",
+            "--set=gridIdentity.tlsSecretName=grid-site-identity",
+            "--set=praxisConfig.render.peerTrust.mode=spiffe",
+            "--set=praxisConfig.render.gridServing.enabled=true",
+            "--set=praxisConfig.render.gridServing.gatewayRefName=grid-gateway",
+        ]) else {
+            return;
+        };
+        assert!(
+            yaml.contains("- filter: grid_provider"),
+            "the provider file render:\n{yaml}"
+        );
+        load(&yaml).unwrap_or_else(|error| panic!("provider file render: {error}"));
+    }
+
+    #[test]
     fn every_default_render_loads() {
         for (name, values) in CASES {
             let Some(yaml) = render(values) else { return };

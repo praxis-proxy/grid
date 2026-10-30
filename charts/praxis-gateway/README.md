@@ -333,7 +333,7 @@ Praxis AI image; these values may advance independently.
 | `overlay.sidecar.image.pullPolicy` | string | `IfNotPresent` | Overlay-sync image pull policy. |
 | `overlay.sidecar.dataKey` | string | `routing-overlay.json` | Content-addressed envelope key in the overlay ConfigMap. |
 | `overlay.sidecar.resources` | object | small requests and limits | Resources for both the one-shot init container and continuous sidecar. |
-| `praxisConfig.render.gridServing.enabled` | bool | `false` | Mount the operator's serving config, set `GRID_SERVING_CONFIG`, and route with `grid_site_route`. Consumer role and `image.flavor: grid-gateway` only. Needs `gridIdentity.tlsSecretName`; its CA defaults to that Secret. |
+| `praxisConfig.render.gridServing.enabled` | bool | `false` | Mount the operator's serving config, set `GRID_SERVING_CONFIG`, and route with `grid_site_route`. On a provider, mount it optionally, set `GRID_PROVIDER_CONFIG` and serve peers with `grid_provider` (see [Providers from the provider file](#providers-from-the-provider-file)). Needs `image.flavor: grid-gateway` and `gridIdentity.tlsSecretName`; its CA defaults to that Secret. |
 | `praxisConfig.render.gridServing.networkName` | string | `""` | GridNetwork name, which with `gatewayRefName` names the operator's ConfigMap. |
 | `praxisConfig.render.gridServing.gatewayRefName` | string | release fullname | This gateway's name in the GridNetwork `gatewayRefs`. |
 | `praxisConfig.render.gridServing.configMapName` | string | `""` | Overrides `grid-serving-<networkName>-<gatewayRefName>`. Needed when that name passes 63 characters. |
@@ -630,6 +630,19 @@ With `praxisConfig.render.gridServing.enabled` and no `praxisConfig.render.backe
 chart renders no clusters: every upstream comes from the operator's dial file beside the
 serving config. List the CAs those dials verify against in
 `praxisConfig.render.gridServing.backendCAs`, unless `mountReconciliation` mounts them.
+
+### Providers from the provider file
+
+On a combined site, a provider with `praxisConfig.render.gridServing.enabled` needs no
+backends or site list in values. It reads `provider.json` from the consumer gateway's
+serving ConfigMap, so set `gridServing.gatewayRefName` to that gateway's name (or
+`configMapName`). The operator lists there the enrolled sites admitted to reach this site
+and each local backend with its dial. The chart requires `peerTrust.mode: spiffe` and
+refuses `backends`, `spiffeIds`, `allowAnyGridSite` and `certDigests`. The listener
+requires a Grid-CA SVID with no list, and `grid_provider` checks the peer's organization
+against the file on every request, so a removed site is refused without a restart. The
+ConfigMap mount is optional: until the operator writes the file, every peer gets 403. A
+Route with no `route.host` takes `<grid.siteName>.grid.internal`.
 
 A `grid-gateway` built from the current source re-reads `serving-config.json`
 every five seconds after the kubelet updates the mounted ConfigMap. It applies

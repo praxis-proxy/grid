@@ -217,13 +217,24 @@ Validate praxisConfig: the source, and that each source gets only the settings i
 {{- if not .Values.gridIdentity.tlsSecretName }}
 {{- fail "praxisConfig.render.role provider needs gridIdentity.tlsSecretName for its client identity and Grid CA" }}
 {{- end }}
-{{- if ne (len $render.backends) 1 }}
+{{- if $gridServing.enabled }}
+{{- /* The operator's provider file names the backends and the admitted sites, so the chart names neither. */}}
+{{- if $render.backends }}
+{{- fail "praxisConfig.render.role provider with gridServing serves the backends the operator's provider file names; unset praxisConfig.render.backends" }}
+{{- end }}
+{{- if ne ($peerTrust.mode | default "pin") "spiffe" }}
+{{- fail "praxisConfig.render.role provider with gridServing admits peers by their Grid-CA SVID: set praxisConfig.render.peerTrust.mode spiffe" }}
+{{- end }}
+{{- if or $peerTrust.spiffeIds $peerTrust.allowAnyGridSite $peerTrust.certDigests }}
+{{- fail "praxisConfig.render.role provider with gridServing admits the sites the operator's provider file lists; unset peerTrust spiffeIds, allowAnyGridSite and certDigests" }}
+{{- end }}
+{{- else if ne (len $render.backends) 1 }}
 {{- fail "praxisConfig.render.role provider routes to exactly one local backend" }}
 {{- end }}
 {{- if .Values.listenerTls.secretName }}
 {{- fail "praxisConfig.render.role provider serves the grid identity; unset listenerTls" }}
 {{- end }}
-{{- if eq ($peerTrust.mode | default "pin") "spiffe" }}
+{{- if and (eq ($peerTrust.mode | default "pin") "spiffe") (not $gridServing.enabled) }}
 {{- if and (not $peerTrust.spiffeIds) (not $peerTrust.allowAnyGridSite) }}
 {{- fail "praxisConfig.render.peerTrust spiffe mode needs spiffeIds, or allowAnyGridSite true to admit every Grid-CA site" }}
 {{- end }}
@@ -231,7 +242,7 @@ Validate praxisConfig: the source, and that each source gets only the settings i
 {{- fail "praxisConfig.render.peerTrust.allowAnyGridSite admits every Grid-CA site, so it cannot be set beside spiffeIds" }}
 {{- end }}
 {{- $_ := include "praxis-gateway.peerSites" ($peerTrust.spiffeIds | default list) }}
-{{- else if not $peerTrust.certDigests }}
+{{- else if and (not $gridServing.enabled) (not $peerTrust.certDigests) }}
 {{- fail "praxisConfig.render.peerTrust pin mode needs certDigests" }}
 {{- end }}
 {{- else if $peerTrust.certDigests }}
@@ -463,8 +474,8 @@ Validate enabled mounts have a non-empty resource name.
 {{- if not .Values.gridIdentity.tlsSecretName }}
 {{- fail (printf "%s polls peers with the grid identity: set gridIdentity.tlsSecretName" $key) }}
 {{- end }}
-{{- if eq (.Values.praxisConfig.render.role | default "consumer") "provider" }}
-{{- fail (printf "%s routes callers across sites; it applies to the consumer role only" $key) }}
+{{- if and (eq (.Values.praxisConfig.render.role | default "consumer") "provider") (not (or $serving.gatewayRefName $serving.configMapName)) }}
+{{- fail (printf "%s on a provider reads the consumer gateway's serving ConfigMap: set gatewayRefName to that gateway's name, or configMapName" $key) }}
 {{- end }}
 {{- if ne .Values.image.flavor "grid-gateway" }}
 {{- fail (printf "%s needs image.flavor grid-gateway" $key) }}
