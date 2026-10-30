@@ -109,13 +109,14 @@ mod tests {
     /// emit sites out of the source instead.
     #[test]
     fn every_emitted_grid_metric_is_documented() {
-        const SOURCES: [&str; 6] = [
+        const SOURCES: [&str; 7] = [
             include_str!("../crates/ai-grid-filters/src/snapshot.rs"),
             include_str!("../crates/ai-grid-filters/src/signals.rs"),
             include_str!("../crates/ai-grid-filters/src/decisions.rs"),
             include_str!("../crates/ai-grid-filters/src/control.rs"),
             include_str!("../crates/ai-grid-filters/src/dial.rs"),
             include_str!("../crates/ai-grid-filters/src/health.rs"),
+            include_str!("../crates/ai-grid-filters/src/provider.rs"),
         ];
 
         let mut emitted: Vec<&str> = SOURCES
@@ -125,6 +126,8 @@ mod tests {
                 name.bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte == b'_' || byte.is_ascii_digit())
             })
+            // The provider filter registers under its own name, which is not a metric.
+            .filter(|name| *name != "grid_provider")
             .collect();
         emitted.sort_unstable();
         emitted.dedup();
