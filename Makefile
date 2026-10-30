@@ -14,10 +14,10 @@ ifneq ($(V),)
 endif
 
 .PHONY: all build release check clean \
-	test test-unit lint gateway-lint lint-extra fmt doc audit \
-	generate-api-types codegen-check generate-crds crds-check generate-deploy deploy-check \
+		test test-unit lint gateway-lint lint-extra fmt doc audit \
+	generate-api-types codegen-check generate-crds crds-check generate-crds-experimental crds-check-experimental generate-deploy deploy-check \
 	generate-go-types go-types-check \
-	coverage coverage-check \
+		coverage coverage-check \
 	mutants semver publish-dry-run \
 	require-container-engine \
 	images container operator-image gateway-image \
@@ -121,6 +121,13 @@ go-types-check:
 	git diff --exit-code go/api/v1alpha1/zz_generated_types.go go/api/v1alpha1/zz_generated_deepcopy.go
 	cd go && $(GO) test ./...
 	cd go && $(GO) build -o /dev/null ./_example
+
+# Generate or verify the opt-in A2A CRD using the experimental operator feature.
+generate-crds-experimental:
+	./scripts/generate-deployment-crds.sh --experimental
+
+crds-check-experimental:
+	./scripts/generate-deployment-crds.sh --experimental --check
 
 # Regenerate the operator install manifests in deploy/operator (platform base) and
 # deploy/overlays/kind from charts/grid-operator and the values.yaml in each directory.

@@ -55,6 +55,13 @@ crds:
   # -- Keep the CRDs on helm uninstall and an Argo CD delete or prune.
   keep: true
 
+# -- Experimental features. These are disabled by default and require an
+# operator image built with the matching Cargo feature.
+experimental:
+  a2a:
+    # -- Render the experimental AgentToAgentProvider CRD and RBAC.
+    enabled: false
+
 # -- Number of operator replicas. Every replica is ready and elects: one holds the operator
 # lease and runs everything that writes, and the signals and SWIM Services route to it alone
 # through an EndpointSlice it writes. An in-place upgrade from a release before leader

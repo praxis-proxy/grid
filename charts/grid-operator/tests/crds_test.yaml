@@ -1,11 +1,14 @@
 suite: CRDs
 templates:
+  - templates/crds/agenttoagentprovider.yaml
   - templates/crds/agenttoolprovider.yaml
   - templates/crds/gridnetwork.yaml
   - templates/crds/gridsite.yaml
   - templates/crds/inferenceprovider.yaml
 tests:
   - it: installs every CRD, kept on uninstall and never pruned by Argo CD
+    set:
+      experimental.a2a.enabled: true
     asserts:
       - isKind:
           of: CustomResourceDefinition
@@ -25,6 +28,7 @@ tests:
 
   - it: lets helm uninstall and Argo CD remove them when keep is false
     set:
+      experimental.a2a.enabled: true
       crds.keep: false
     asserts:
       - notExists:
@@ -32,3 +36,25 @@ tests:
       - equal:
           path: metadata.annotations["argocd.argoproj.io/sync-options"]
           value: ServerSideApply=true
+
+  - it: does not render the A2A CRD by default
+    template: templates/crds/agenttoagentprovider.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: does not render the A2A CRD when the experimental profile is null
+    template: templates/crds/agenttoagentprovider.yaml
+    set:
+      experimental: null
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders the A2A CRD only when the experimental profile is enabled
+    template: templates/crds/agenttoagentprovider.yaml
+    set:
+      experimental.a2a.enabled: true
+    asserts:
+      - isKind:
+          of: CustomResourceDefinition
