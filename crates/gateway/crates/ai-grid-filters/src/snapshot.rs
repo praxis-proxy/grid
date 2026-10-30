@@ -403,15 +403,22 @@ impl RouteSnapshot {
     #[must_use]
     pub(crate) fn published(self, gauged: &mut Gauged) -> Self {
         let Gauged { published, learned } = gauged;
+        let unavailable_by_pair: BTreeMap<SitePair, ScoreUnavailable> = self
+            .candidates
+            .iter()
+            .zip(&self.score_unavailable)
+            .filter_map(|(candidate, unavailable)| {
+                unavailable.map(|reason| ((Arc::clone(&candidate.site), Arc::clone(&candidate.cluster)), reason))
+            })
+            .collect();
         let mut current = BTreeSet::new();
-        for ((candidate, score), score_unavailable) in
-            self.candidates.iter().zip(&self.scores).zip(&self.score_unavailable)
-        {
+        for (candidate, score) in self.candidates.iter().zip(&self.scores) {
             let key = (Arc::clone(&candidate.site), Arc::clone(&candidate.cluster));
             // The front entry for a pair is its best; later ones are other models.
             if current.insert(key.clone()) {
                 site_score(&key, *score);
-                publish_score_unavailable(&key, |reason| f64::from(u8::from(*score_unavailable == Some(reason))));
+                let unavailable = unavailable_by_pair.get(&key).copied();
+                publish_score_unavailable(&key, |reason| f64::from(u8::from(unavailable == Some(reason))));
                 site_gauge("grid_route_site_rho", &key, candidate.rho.unwrap_or(f64::NAN));
                 site_gauge("grid_route_site_weight", &key, candidate.capacity.unwrap_or(f64::NAN));
                 // The limits are set where they are learned; an unmeasured site must not keep
@@ -2397,6 +2404,35 @@ mod tests {
 
             for reason in ["absent", "unreadable", "stale"] {
                 recorder.assert_gauge(&format!("grid_route_site_score_unavailable:{reason}"), 0.0);
+            }
+        });
+    }
+
+    #[test]
+    fn unavailable_score_reason_uses_eligible_candidate_for_pair_in_either_order() {
+        let recorder = Captured::default();
+        metrics::with_local_recorder(&recorder, || {
+            let store = LoadStore::new(Duration::from_secs(600));
+            let availability = AvailabilitySettings::default();
+            let mut without_load = cand("without-load", "a", "pool-a");
+            without_load.publishes_load = false;
+            let with_load = cand("with-load", "a", "pool-a");
+
+            for candidates in [
+                vec![without_load.clone(), with_load.clone()],
+                vec![with_load, without_load],
+            ] {
+                let mut gauged = Gauged::new();
+                drop(
+                    RouteSnapshot::from_store(
+                        validate_candidates(candidates).unwrap(),
+                        Arc::from("hub"),
+                        &mut at(&store, &availability, &mut gauged.learned, 1_000, 500),
+                    )
+                    .published(&mut gauged),
+                );
+
+                recorder.assert_gauge("grid_route_site_score_unavailable:absent", 1.0);
             }
         });
     }
