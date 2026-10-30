@@ -30,6 +30,13 @@ func main() {
 		"fromSecret": func(ns, name, key string) string { return ns + "/" + name + "/" + key },
 		"fail":       func(message string) (string, error) { return "", fmt.Errorf("%s", message) },
 		"list":       func(values ...any) []any { return values },
+		// Sprig's default for the scalar values these templates pass.
+		"default": func(fallback any, given ...any) any {
+			if len(given) == 0 || given[0] == nil || given[0] == "" {
+				return fallback
+			}
+			return given[0]
+		},
 	}
 	left, right := "{{hub", "hub}}"
 	if input.Managed {

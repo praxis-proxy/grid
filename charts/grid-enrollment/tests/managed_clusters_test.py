@@ -356,6 +356,61 @@ class ManagedClusterTemplates(unittest.TestCase):
         self.assertNotEqual(empty.returncode, 0)
         self.assertIn('waiting for bootstrap grid identity', empty.stderr)
 
+    def test_member_with_another_grid_id_refuses_instead_of_moving(self):
+        values = copy.deepcopy(self.values)
+        values['gridIdentity'] = {'enabled': True}
+        policy, = [d for d in self.render_chart(values) if d['kind'] == 'Policy' and
+                   d['metadata']['name'] == 'grid-bootstrap-membership']
+        raw = policy['spec']['policy-templates'][1]['objectDefinition']['spec'][
+            'object-templates-raw']
+        hub = subprocess.run([self.renderer], input=json.dumps({
+            'Template': raw, 'Cluster': 'west', 'Resources': {
+                'v1/ConfigMap/grid-system/grid-bootstrap-state':
+                {'data': {'gridId': 'bootstrap-grid'}}}}),
+            text=True, capture_output=True, check=True)
+        base = {**ready_crds(),
+                'v1/Secret/grid-system/grid-site-identity': {'metadata': {'name': 'x'}},
+                'v1/Secret/grid-system/grid-ca': {'metadata': {'name': 'x'}}}
+
+        def managed(network):
+            resources = dict(base)
+            if network is not None:
+                resources['grid.praxis.fast/v1alpha1/GridNetwork//grid'] = network
+            return subprocess.run([self.renderer], input=json.dumps({
+                'Template': hub.stdout, 'Managed': True, 'Resources': resources}),
+                text=True, capture_output=True)
+
+        adoptable = {
+            'no network': None,
+            'no spec or status': {'metadata': {'name': 'grid'}},
+            'no gridId keys': {'spec': {}, 'status': {}},
+            'empty ids': {'spec': {'gridId': ''}, 'status': {'gridId': ''}},
+            'matching status-only': {'status': {'gridId': 'bootstrap-grid'}},
+            'matching spec': {'spec': {'gridId': 'bootstrap-grid'}},
+            'spec wins over stale status': {'spec': {'gridId': 'bootstrap-grid'},
+                                            'status': {'gridId': 'old-grid'}},
+        }
+        for case, network in adoptable.items():
+            with self.subTest(case=case):
+                result = managed(network)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                obj, = yaml.safe_load(result.stdout)
+                self.assertEqual(obj['objectDefinition']['spec']['gridId'], 'bootstrap-grid')
+        conflicting = {
+            'differing status-only': {'spec': {'gridId': ''}, 'status': {'gridId': 'old-grid'}},
+            'differing spec': {'spec': {'gridId': 'old-grid'}, 'status': {'gridId': 'old-grid'}},
+            'differing spec over matching status': {'spec': {'gridId': 'old-grid'},
+                                                    'status': {'gridId': 'bootstrap-grid'}},
+        }
+        for case, network in conflicting.items():
+            with self.subTest(case=case):
+                result = managed(network)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '', 'a refusal must emit no objects to write')
+                self.assertIn('existing grid ID old-grid differs from bootstrap state '
+                              'bootstrap-grid; pre-create grid-bootstrap-state with old-grid',
+                              result.stderr)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
