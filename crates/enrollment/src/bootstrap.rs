@@ -34,9 +34,9 @@ struct BootstrapArgs {
     /// Persist the grid ID once in this `ConfigMap`, independently of CA rotation.
     #[arg(long)]
     grid_id_config_map: Option<String>,
-    /// Existing `GridNetwork` whose ID bootstrap adopts when creating its state.
-    #[arg(long, default_value = "grid")]
-    grid_network: String,
+    /// Ignored. Accepted so callers that still pass it keep working; bootstrap reads no `GridNetwork`.
+    #[arg(long = "grid-network", hide = true)]
+    _grid_network: Option<String>,
     /// Common name recorded on the CA certificate.
     #[arg(long, default_value = "grid-ca")]
     common_name: String,
@@ -142,7 +142,7 @@ async fn bootstrap(args: &BootstrapArgs) -> Result<(), BoxError> {
     check_site_args(args)?;
     let client = kube::Client::try_default().await?;
     if let Some(name) = &args.grid_id_config_map {
-        let id = grid_id::ensure(&client, &namespace, name, &args.grid_network).await?;
+        let id = grid_id::ensure(&client, &namespace, name).await?;
         tracing::info!(grid_id = %id, "bootstrap grid identity is persisted");
     }
     let secrets: Api<Secret> = Api::namespaced(client.clone(), &namespace);
@@ -1302,6 +1302,16 @@ mod tests {
 
     fn hub_args(extra: &[&str]) -> BootstrapArgs {
         BootstrapArgs::parse_from(["bootstrap", "--site-name", "hub"].iter().chain(extra))
+    }
+
+    #[test]
+    fn an_older_chart_passing_grid_network_still_parses() {
+        let args =
+            BootstrapArgs::try_parse_from(["bootstrap", "--grid-id-config-map", "state", "--grid-network", "grid"]);
+        assert!(
+            args.is_ok_and(|args| args.grid_id_config_map.as_deref() == Some("state")),
+            "an older chart's --grid-network must parse and be ignored"
+        );
     }
 
     /// The whole bootstrap order on a hub where the operator self-signed first: the

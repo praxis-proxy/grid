@@ -504,9 +504,9 @@ type GridNetworkConsumerGatewaysItemPraxisConfigClusterEndpointsItem struct {
 	Transport *EndpointTransport `json:"transport,omitempty"`
 }
 
-// GridNetworkConsumerGatewaysItemPraxisConfigDeriveTopology Derive the endpoint topology from the declarations of named providers, instead of requiring a clusterEndpoints entry per candidate.
+// GridNetworkConsumerGatewaysItemPraxisConfigDeriveTopology Settings for the endpoint topology the operator derives for each candidate with no clusterEndpoints entry. Absent still derives.
 type GridNetworkConsumerGatewaysItemPraxisConfigDeriveTopology struct {
-	// Routing identities whose declarations this gateway derives from.
+	// Remote routing identities this gateway derives a hop for without a member catalog, as under SWIM membership.
 	// Each entry is a provider's clusterName, or its metadata.name when that is unset. At most 64 entries, each named once.
 	FromProviders []string `json:"fromProviders,omitempty"`
 	// TLS for derived local https backends. Omitted uses the endpoint host and the process trust store.
@@ -561,7 +561,7 @@ type GridNetworkConsumerGatewaysItemPraxisConfig struct {
 	// In projected-credential mode, mount each Secret at {credentialMountPath}/{secret-namespace}/{secret-name} with its data keys as files. Static file: entries continue to use their explicit paths and are not constrained by this directory layout.
 	// Default: /run/secrets/grid-credentials.
 	CredentialMountPath string `json:"credentialMountPath,omitempty"`
-	// Derive the endpoint topology from the declarations of named providers, instead of requiring a clusterEndpoints entry per candidate.
+	// Settings for the endpoint topology the operator derives for each candidate with no clusterEndpoints entry. Absent still derives.
 	DeriveTopology *GridNetworkConsumerGatewaysItemPraxisConfigDeriveTopology `json:"deriveTopology,omitempty"`
 	// Generate the dynamic credential_inject filter and projected mount root, including when the current overlay has no credentials. Enable this first, then roll out the generated config before asserting readiness with supportsProjectedCredentials.
 	// Default: false.
@@ -716,7 +716,7 @@ type GridNetworkSpec struct {
 	BudgetPolicy *GridNetworkBudgetPolicy `json:"budgetPolicy,omitempty"`
 	// References to Praxis Gateways that participate in this grid.
 	ConsumerGateways []GridNetworkConsumerGatewaysItem `json:"consumerGateways,omitempty"`
-	// The grid this network belongs to, set once by bootstrap or its delivery automation. The operator waits until this is declared and never generates a grid ID. Moving to another grid means recreating the network.
+	// The grid this network belongs to, set once by bootstrap or its delivery automation. The operator waits until this is declared and never generates a grid ID. A grid ID that operators before #474 kept only in status is copied here once, and status then mirrors spec. Moving to another grid means recreating the network.
 	GridID string `json:"gridId,omitempty"`
 	// Grid-wide membership source. When absent, the install's startup setting applies. A change causes the operator to restart gracefully into the declared mode.
 	Membership *GridNetworkMembership `json:"membership,omitempty"`

@@ -1,6 +1,6 @@
 //! Derive consumer endpoint topology from provider and `GridSite` declarations.
 //!
-//! Works out, for allowlisted [`InferenceProvider`]s, the endpoint topology a
+//! Works out, for [`InferenceProvider`]s and member catalogs, the endpoint topology a
 //! human otherwise types into `consumerConfig.clusterEndpoints`, emitting the
 //! same [`ClusterEndpointConfig`] type so the renderer is unchanged.
 //!
@@ -15,8 +15,11 @@ use crate::{
         grid_site::{EgressTls, EgressTlsMode, GridSite},
         inference_provider::InferenceProvider,
     },
-    resources::routing_overlay::{CANDIDATE_KIND, RoutingCandidate, routing_identity},
+    resources::routing_overlay::{CANDIDATE_KIND, RoutingCandidate, is_explicitly_unavailable, routing_identity},
 };
+
+/// Clusters each member site's catalog offers, by site.
+pub(crate) type PeerCatalog<'records> = BTreeMap<&'records str, BTreeSet<&'records str>>;
 
 /// Where a resolved entry came from, for status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +65,12 @@ pub(crate) enum Refusal {
     ServerNameInvalid,
     /// A remote hop's server name is not the site's own `{site}.grid.internal`.
     ServerNameNotSite,
+    /// No member catalog offers the cluster at the candidate's site.
+    NotOffered,
+    /// More than one `GridSite` of the network keys to the candidate's site.
+    SiteKeyAmbiguous,
+    /// A member hop whose egress is not mutual TLS, so the peer is not verified.
+    MemberHopNotMutual,
 }
 
 impl Refusal {
@@ -83,6 +92,9 @@ impl Refusal {
             Self::ServerNameNeeded => "server name needed",
             Self::ServerNameInvalid => "server name invalid",
             Self::ServerNameNotSite => "server name is not the site's",
+            Self::NotOffered => "not offered by the member",
+            Self::SiteKeyAmbiguous => "site key is ambiguous",
+            Self::MemberHopNotMutual => "member hop is not mutual TLS",
         }
     }
 }
@@ -136,12 +148,28 @@ pub(crate) struct Declarations<'decl> {
     pub(crate) local_site: &'decl str,
     /// The network both are scoped to.
     pub(crate) network_name: &'decl str,
-    /// Allowlisted routing identities.
+    /// Remote routing identities that derive without a member catalog.
     pub(crate) from_providers: &'decl [String],
     /// TLS for derived local `https` backends.
     pub(crate) transport: Option<&'decl EndpointTransport>,
     /// The grid's signal transport, which decides whether an unreachable site keeps its hop.
     pub(crate) signal: SignalMode,
+    /// What authenticated peer catalogs offer. `None` unless membership is Local.
+    pub(crate) peer_catalog: Option<&'decl PeerCatalog<'decl>>,
+}
+
+/// What `providers` offer, by the site the record names.
+pub(crate) fn peer_catalog<'records>(
+    providers: impl IntoIterator<Item = &'records crdt::ProviderState>,
+) -> PeerCatalog<'records> {
+    let mut catalog = PeerCatalog::new();
+    for provider in providers {
+        catalog
+            .entry(provider.site_id.as_str())
+            .or_default()
+            .insert(provider.routing_cluster.as_str());
+    }
+    catalog
 }
 
 /// Explicit entries win whole.
@@ -194,7 +222,7 @@ fn clusters_at_two_sites<'cluster>(clusters: &BTreeSet<(&'cluster str, &'cluster
     twice
 }
 
-/// Allowlisted, available, unambiguous providers in this network, by routing identity.
+/// Admitted, available, unambiguous providers in this network, by routing identity.
 fn local_providers<'decl>(declarations: &Declarations<'decl>) -> BTreeMap<&'decl str, &'decl InferenceProvider> {
     let mut local: BTreeMap<&str, &InferenceProvider> = BTreeMap::new();
     let mut ambiguous: BTreeSet<&str> = BTreeSet::new();
@@ -202,10 +230,7 @@ fn local_providers<'decl>(declarations: &Declarations<'decl>) -> BTreeMap<&'decl
         let Some(identity) = routing_identity(provider) else {
             continue;
         };
-        if !declarations.from_providers.iter().any(|named| named == identity)
-            || provider.spec.grid_network_ref != declarations.network_name
-            || crate::resources::routing_overlay::is_explicitly_unavailable(provider)
-        {
+        if provider.spec.grid_network_ref != declarations.network_name || is_explicitly_unavailable(provider) {
             continue;
         }
         // Otherwise iteration order would pick one endpoint silently.
@@ -217,6 +242,22 @@ fn local_providers<'decl>(declarations: &Declarations<'decl>) -> BTreeMap<&'decl
         local.remove(identity);
     }
     local
+}
+
+/// Whether `fromProviders` names `cluster`.
+fn is_named(cluster: &str, declarations: &Declarations<'_>) -> bool {
+    declarations.from_providers.iter().any(|name| name == cluster)
+}
+
+/// Admit an unnamed remote candidate only as a member site's catalog offers it.
+fn admits_member(cluster: &str, site: &str, declarations: &Declarations<'_>) -> Result<(), Refusal> {
+    // Only Local membership reads catalogs off identity-verified peers; SWIM keeps the name gate.
+    let catalog = declarations.peer_catalog.ok_or(Refusal::NotAllowlisted)?;
+    // A local provider's selector can place a candidate at a peer; the peer never offered it.
+    if !catalog.get(site).is_some_and(|clusters| clusters.contains(cluster)) {
+        return Err(Refusal::NotOffered);
+    }
+    Ok(())
 }
 
 /// Resolve one cluster: its explicit entry, else a derived local or remote one.
@@ -233,10 +274,6 @@ fn resolve_one(
             origin: Origin::Explicit,
         });
     }
-    // The allowlist gates remote candidates too.
-    if !declarations.from_providers.iter().any(|named| named == cluster) {
-        return Err(Refusal::NotAllowlisted);
-    }
     if site == declarations.local_site {
         // Own site egress would hairpin through our own provider gateway.
         return match local.get(cluster) {
@@ -244,7 +281,25 @@ fn resolve_one(
             None => Err(local_refusal(cluster, declarations)),
         };
     }
-    derive_remote(cluster, site, declarations)
+    // The allowlist gates remote candidates too.
+    if is_named(cluster, declarations) {
+        return derive_remote(cluster, site, declarations);
+    }
+    admits_member(cluster, site, declarations)?;
+    if site_key_ambiguous(site, declarations) {
+        return Err(Refusal::SiteKeyAmbiguous);
+    }
+    let resolved = derive_remote(cluster, site, declarations)?;
+    // Only a mutual TLS hop verifies the peer it reaches.
+    if !resolved
+        .endpoint
+        .transport
+        .as_ref()
+        .is_some_and(|transport| transport.mode == TransportMode::MutualTls)
+    {
+        return Err(Refusal::MemberHopNotMutual);
+    }
+    Ok(resolved)
 }
 
 /// Why no admitted provider carries `cluster` at this site: nobody does, every
@@ -259,7 +314,7 @@ fn local_refusal(cluster: &str, declarations: &Declarations<'_>) -> Refusal {
         .collect();
     let available = carriers
         .iter()
-        .filter(|provider| !crate::resources::routing_overlay::is_explicitly_unavailable(provider))
+        .filter(|provider| !is_explicitly_unavailable(provider))
         .count();
     if carriers.is_empty() {
         Refusal::NoProvider
@@ -327,6 +382,19 @@ fn derive_remote(cluster: &str, site_name: &str, declarations: &Declarations<'_>
         },
         origin: Origin::DerivedRemote,
     })
+}
+
+/// Whether more than one `GridSite` of this network keys to `site`.
+fn site_key_ambiguous(site: &str, declarations: &Declarations<'_>) -> bool {
+    declarations
+        .sites
+        .iter()
+        .filter(|known| {
+            known.spec.grid_network_ref == declarations.network_name
+                && crate::controller::grid_network::peer_site_key(known).is_some_and(|(key, _)| key == site)
+        })
+        .nth(1)
+        .is_some()
 }
 
 /// The site named `site` in this network, if a probe verified its current spec.

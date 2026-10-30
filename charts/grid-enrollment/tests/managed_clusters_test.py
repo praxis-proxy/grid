@@ -58,9 +58,13 @@ class ManagedClusterTemplates(unittest.TestCase):
                                    'certManager': {'enabled': True,
                                                    'issuer': {'create': True}}}}
         cls.docs = cls.render_chart(cls.values)
-        cls.policies = {d['metadata']['name'].removeprefix('grid-bootstrap-membership'):
-                        d['spec']['policy-templates'][0]['objectDefinition']['spec']
-                        for d in cls.docs if d['kind'] == 'Policy'}
+        cls.policies = cls.policy_specs(cls.docs)
+
+    @staticmethod
+    def policy_specs(docs):
+        return {d['metadata']['name'].removeprefix('grid-bootstrap-membership'):
+                d['spec']['policy-templates'][0]['objectDefinition']['spec']
+                for d in docs if d['kind'] == 'Policy'}
 
     @classmethod
     def render_chart(cls, values, chart=CHART):
@@ -70,8 +74,9 @@ class ManagedClusterTemplates(unittest.TestCase):
                                 capture_output=True, check=True)
         return [d for d in yaml.safe_load_all(result.stdout) if d]
 
-    def render(self, suffix='', resources=None, cluster='west', definitions_only=True):
-        policy = self.policies[suffix]
+    def render(self, suffix='', resources=None, cluster='west', definitions_only=True,
+               policies=None):
+        policy = (policies or self.policies)[suffix]
         raw = policy.get('object-templates-raw') or yaml.safe_dump(policy['object-templates'])
         result = subprocess.run([self.renderer], input=json.dumps({
             'Template': raw, 'Cluster': cluster,
@@ -195,6 +200,26 @@ class ManagedClusterTemplates(unittest.TestCase):
         self.assertEqual(members['requiredClusterSelector']['labelSelector']['matchLabels'],
                          {'grid.praxis.fast/member': 'true'})
 
+    def test_hub_needs_no_grid_api(self):
+        def grid_refs(objects):
+            for obj in objects:
+                if obj.get('apiVersion', '').startswith('grid.praxis.fast/'):
+                    yield f"{obj['kind']}/{obj['metadata']['name']}"
+                for rule in obj.get('rules') or []:
+                    if 'grid.praxis.fast' in rule.get('apiGroups', []):
+                        yield f"{obj['kind']}/{obj['metadata']['name']} rule"
+        values = copy.deepcopy(self.values)
+        values['gridIdentity'] = {'enabled': True}
+        docs = self.render_chart(values)
+        release = [d for d in docs if d['kind'] != 'Policy']
+        self.assertEqual(list(grid_refs(release)), [],
+                         'bootstrap must not need Grid RBAC or objects on the hub')
+        # Standing guard only: the hub policy has never targeted Grid kinds.
+        hub = {MC_KEY: {'items': [member('local-cluster', False), member('east')]}}
+        rendered = self.render('-hub', hub, policies=self.policy_specs(docs))
+        self.assertEqual(list(grid_refs(rendered)), [],
+                         'the hub policy must keep delivering no Grid object to the hub')
+
     def test_observer_access_does_not_wait_for_hub_policy(self):
         for work_name in ('grid-site-observer', 'custom-observer'):
             with self.subTest(work_name=work_name):
@@ -292,7 +317,7 @@ class ManagedClusterTemplates(unittest.TestCase):
                 'Resources': resources}), text=True, capture_output=True)
 
         state = {'v1/ConfigMap/grid-system/grid-bootstrap-state':
-                 {'data': {'gridId': 'persisted-grid'}}}
+                 {'data': {'gridId': 'persisted-grid'}, 'immutable': True}}
         hub = execute(spec['object-templates-raw'], state)
         self.assertEqual(hub.returncode, 0, hub.stderr)
         identities = {'v1/Secret/grid-system/grid-site-identity':
@@ -329,10 +354,94 @@ class ManagedClusterTemplates(unittest.TestCase):
         self.assertNotEqual(missing_ca.returncode, 0)
         self.assertIn('waiting for the grid trust bundle', missing_ca.stderr)
         self.assertNotEqual(execute(spec['object-templates-raw'], {}).returncode, 0)
+        # Bootstrap refuses a mutable state, so members must not get its ID either.
+        for mutable in (None, False):
+            config_map = {'data': {'gridId': 'persisted-grid'}}
+            if mutable is not None:
+                config_map['immutable'] = mutable
+            refused = execute(spec['object-templates-raw'],
+                              {'v1/ConfigMap/grid-system/grid-bootstrap-state': config_map})
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertEqual(refused.stdout, '', 'a refused state must emit nothing')
+            self.assertIn('bootstrap grid identity is not immutable; patch grid-bootstrap-state '
+                          'in place with {"immutable":true}', refused.stderr)
         state['v1/ConfigMap/grid-system/grid-bootstrap-state']['data']['gridId'] = ''
         empty = execute(spec['object-templates-raw'], state)
         self.assertNotEqual(empty.returncode, 0)
         self.assertIn('waiting for bootstrap grid identity', empty.stderr)
+
+    def test_member_with_another_grid_id_refuses_instead_of_moving(self):
+        values = copy.deepcopy(self.values)
+        values['gridIdentity'] = {'enabled': True}
+        policy, = [d for d in self.render_chart(values) if d['kind'] == 'Policy' and
+                   d['metadata']['name'] == 'grid-bootstrap-membership']
+        raw = policy['spec']['policy-templates'][1]['objectDefinition']['spec'][
+            'object-templates-raw']
+        hub = subprocess.run([self.renderer], input=json.dumps({
+            'Template': raw, 'Cluster': 'west', 'Resources': {
+                'v1/ConfigMap/grid-system/grid-bootstrap-state':
+                {'data': {'gridId': 'bootstrap-grid'}, 'immutable': True}}}),
+            text=True, capture_output=True, check=True)
+        base = {**ready_crds(),
+                'v1/Secret/grid-system/grid-site-identity': {'metadata': {'name': 'x'}},
+                'v1/Secret/grid-system/grid-ca': {'metadata': {'name': 'x'}}}
+
+        def managed(network, others=()):
+            resources = dict(base)
+            for name, obj in ((('grid', network),) if network is not None else ()) + tuple(others):
+                obj = copy.deepcopy(obj)
+                obj.setdefault('metadata', {}).setdefault('name', name)
+                resources['grid.praxis.fast/v1alpha1/GridNetwork//' + name] = obj
+            return subprocess.run([self.renderer], input=json.dumps({
+                'Template': hub.stdout, 'Managed': True, 'Resources': resources}),
+                text=True, capture_output=True)
+
+        adoptable = {
+            'no network': None,
+            'no spec or status': {'metadata': {'name': 'grid'}},
+            'no gridId keys': {'spec': {}, 'status': {}},
+            'empty ids': {'spec': {'gridId': ''}, 'status': {'gridId': ''}},
+            'matching status-only': {'status': {'gridId': 'bootstrap-grid'}},
+            'matching spec': {'spec': {'gridId': 'bootstrap-grid'}},
+            'spec wins over stale status': {'spec': {'gridId': 'bootstrap-grid'},
+                                            'status': {'gridId': 'old-grid'}},
+        }
+        for case, network in adoptable.items():
+            with self.subTest(case=case):
+                result = managed(network)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                obj, = yaml.safe_load(result.stdout)
+                self.assertEqual(obj['objectDefinition']['spec']['gridId'], 'bootstrap-grid')
+        conflicting = {
+            'differing status-only': {'spec': {'gridId': ''}, 'status': {'gridId': 'old-grid'}},
+            'differing spec': {'spec': {'gridId': 'old-grid'}, 'status': {'gridId': 'old-grid'}},
+            'differing spec over matching status': {'spec': {'gridId': 'old-grid'},
+                                                    'status': {'gridId': 'bootstrap-grid'}},
+        }
+        for case, network in conflicting.items():
+            with self.subTest(case=case):
+                result = managed(network)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '', 'a refusal must emit no objects to write')
+                self.assertIn('existing grid ID old-grid differs from bootstrap state '
+                              'bootstrap-grid; delete and recreate grid-bootstrap-state with '
+                              'old-grid (immutable), or recreate this GridNetwork to join '
+                              'bootstrap-grid', result.stderr)
+        # A by-name lookup would miss these; the guard lists every GridNetwork.
+        another = {
+            'another network with no ID': (None, [('legacy', {})]),
+            'another network with the same ID':
+                (None, [('legacy', {'spec': {'gridId': 'bootstrap-grid'}})]),
+            'another network beside a matching one':
+                ({'spec': {'gridId': 'bootstrap-grid'}}, [('legacy', {'status': {'gridId': 'old-grid'}})]),
+        }
+        for case, (network, others) in another.items():
+            with self.subTest(case=case):
+                result = managed(network, others)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '', 'a refusal must emit no objects to write')
+                self.assertIn('GridNetwork legacy already exists on this site; enrollment '
+                              'manages only GridNetwork grid', result.stderr)
 
 
 if __name__ == '__main__':

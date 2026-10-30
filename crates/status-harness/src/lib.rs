@@ -95,6 +95,12 @@ struct Inner {
     version: u64,
     /// Reads of a path that answer 500, as a transient API failure, and how many are left.
     failing: BTreeMap<String, usize>,
+    /// Objects a concurrent writer stores just before the first create of their path.
+    racing: BTreeMap<String, Value>,
+    /// Objects a concurrent writer stores just before the next patch of their path.
+    racing_patches: BTreeMap<String, Value>,
+    /// Paths whose next patch answers 422, with what a concurrent writer stores right after.
+    invalid_patches: BTreeMap<String, Option<Value>>,
 }
 
 /// An in-memory Kubernetes API.
@@ -133,6 +139,23 @@ impl FakeApi {
     /// Answer the next `times` reads of `path`, an object or a list, with a 500.
     pub fn fail_reads(&self, path: &str, times: usize) {
         self.lock().failing.insert(path.to_owned(), times);
+    }
+
+    /// Store `object` at `path` just before its next create, so that create answers 409.
+    pub fn win_create_race(&self, path: &str, object: Value) {
+        self.lock().racing.insert(path.to_owned(), object);
+    }
+
+    /// Store `object` at `path` just before its next patch, so a patch that carries the old
+    /// resource version answers 409.
+    pub fn win_patch_race(&self, path: &str, object: Value) {
+        self.lock().racing_patches.insert(path.to_owned(), object);
+    }
+
+    /// Answer the next patch of `path` with 422, then store `after`, when given, as a concurrent
+    /// writer's object.
+    pub fn reject_next_patch(&self, path: &str, after: Option<Value>) {
+        self.lock().invalid_patches.insert(path.to_owned(), after);
     }
 
     /// The object at `path`.
@@ -326,6 +349,11 @@ impl Inner {
             return (422, failure(422, "Invalid", "metadata.name is required"));
         };
         let path = format!("{collection}/{name}");
+        if let Some(mut winner) = self.racing.remove(&path) {
+            let version = self.next_version();
+            stamp(&mut winner, &version);
+            self.objects.insert(path.clone(), winner);
+        }
         if self.objects.contains_key(&path) {
             return (409, failure(409, "AlreadyExists", &format!("{path} already exists")));
         }
@@ -360,9 +388,28 @@ impl Inner {
 
     /// PATCH an object or its status.
     fn patch(&mut self, path: &str, target: PatchTarget<'_>, body: &Value) -> (u16, Value) {
+        if let Some(mut winner) = self.racing_patches.remove(path) {
+            let version = self.next_version();
+            stamp(&mut winner, &version);
+            self.objects.insert(path.to_owned(), winner);
+        }
+        if let Some(after) = self.invalid_patches.remove(path) {
+            if let Some(mut winner) = after {
+                let version = self.next_version();
+                stamp(&mut winner, &version);
+                self.objects.insert(path.to_owned(), winner);
+            }
+            return (422, failure(422, "Invalid", &format!("{path} failed validation")));
+        }
         let Some(held) = self.objects.get(path).cloned() else {
             return (404, failure(404, "NotFound", &format!("{path} not found")));
         };
+        // A resource version in the patch is a precondition, as the API server treats it.
+        let expected = body.pointer("/metadata/resourceVersion").and_then(Value::as_str);
+        let current = held.pointer("/metadata/resourceVersion").and_then(Value::as_str);
+        if expected.is_some_and(|expected| Some(expected) != current) {
+            return (409, failure(409, "Conflict", &format!("{path} has been modified")));
+        }
         let mut object = held.clone();
         let scope = if target.status { "/status" } else { "" };
         let content_type = target.content_type;

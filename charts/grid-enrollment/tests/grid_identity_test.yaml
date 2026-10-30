@@ -30,15 +30,18 @@ tests:
           content: --grid-id-config-map
       - notContains:
           path: spec.template.spec.containers[0].args
+          content: --grid-network
+      - notContains:
+          path: spec.template.spec.containers[0].args
           content: --db-credentials-secret
-  - it: grants external bootstrap no access to signing keys
+  - it: grants external bootstrap no access to signing keys or Grid objects
     template: templates/certs/ca-bootstrap-rbac.yaml
     set:
       mode: external
       gridIdentity.enabled: true
     asserts:
       - hasDocuments:
-          count: 5
+          count: 3
       - equal:
           path: rules
           value:

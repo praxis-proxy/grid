@@ -114,6 +114,40 @@ This chart version has no upgrade path from earlier ones; reinstall it. What cha
 - Under `siteIdentity` the port listens only after enrollment writes the identity, so the
   scrape target is down until then. Do not alert on it during enrollment.
 
+### Operator config
+
+The chart renders `operatorConfig.name` only when the `enrollment` values give it a site
+section. Another writer may own the ConfigMap otherwise; it must set the `config.yaml` key,
+since a ConfigMap without it reads as an invalid config.
+
+Upgrading from an earlier chart without `enrollment` values removes the ConfigMap from the
+release, and Helm deletes it; `helm uninstall` does too. If another writer has written a site
+section into it, keep it first:
+
+```bash
+kubectl -n grid-system annotate configmap grid-operator-config helm.sh/resource-policy=keep
+```
+
+A GitOps tool that applies the rendered manifests prunes it the same way unless the
+ConfigMap tells it not to, for example Argo CD's `argocd.argoproj.io/sync-options: Prune=false`.
+
+To set `enrollment` values while another writer owns the ConfigMap, set
+`operatorConfig.create: false`. To hand it back to the chart instead:
+
+1. Stop the other writer, or it rewrites `config.yaml` after the chart does.
+2. Delete the ConfigMap, or give it the release's ownership metadata and drop the keep
+   annotation. Otherwise the upgrade fails on an object the release does not own, and so
+   does a rollback to an earlier chart, which always renders it:
+
+```bash
+kubectl -n grid-system label configmap grid-operator-config app.kubernetes.io/managed-by=Helm
+kubectl -n grid-system annotate configmap grid-operator-config \
+  meta.helm.sh/release-name=grid-operator meta.helm.sh/release-namespace=grid-system \
+  helm.sh/resource-policy-
+```
+
+The chart's render then replaces its `config.yaml`.
+
 ### Gateway namespace
 
 The operator looks for the gateway Service in the release namespace unless
@@ -241,7 +275,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `tolerations` | list | `[]` | Pod tolerations. |
 | `topologySpreadConstraints` | list | `[]` | Topology spread constraints. |
 | `priorityClassName` | string | `""` | Pod priority class. |
-| `operatorConfig.create` | bool | `true` | Render the ConfigMap holding this operator's own settings. Set `false` to manage it yourself under `operatorConfig.name`. |
+| `operatorConfig.create` | bool | `true` | Render the ConfigMap holding this operator's own settings, when the `enrollment` values give it a site section. Without one nothing renders, the operator runs on defaults, and another writer may own the ConfigMap. Set `false` to manage it yourself under `operatorConfig.name`. |
 | `operatorConfig.name` | string | `grid-operator-config` | ConfigMap name, in the release namespace. The operator watches it, so an edit applies without a restart. |
 | `enrollment.enabled` | bool | `false` | This site enrolls: turns on the SWIM LoadBalancer Service, site-identity metrics TLS and the enrollment namespace guard, and renders the signer and the invite into the operator config's `site` section. |
 | `enrollment.url` | string | `""` | Signer base URL (https), `site.signerEndpoint.url`. Required unless `enrollment.hub` is set. Set alone on a hub whose identity bootstrap issued, it renders a `site` section that renews only. |

@@ -234,19 +234,27 @@ static Praxis configuration.
 
 ## Derived endpoint topology
 
-`praxisConfig.deriveTopology.fromProviders` lists the routing identities (a
-provider's `clusterName`, else its `metadata.name`) whose declarations the
-operator may use to fill `clusterEndpoints[]` for candidates that have no
-entry. An empty list derives nothing. An `InferenceProvider` is cluster scoped
-and its `gridNetworkRef` is self asserted, so only the allowlist decides where a
-gateway dials.
+The operator fills `clusterEndpoints[]` for every candidate that has no entry,
+from what already decides who may serve:
+
+- A local candidate derives from the `InferenceProvider` of the network on this
+  cluster that carries its routing identity (`clusterName`, else
+  `metadata.name`). Creating a cluster-scoped `InferenceProvider` takes cluster
+  RBAC; on RHOAI the model controller writes one only for a namespace an admin
+  labelled `grid.opendatahub.io/allowed=true`, with the serving Gateway's own
+  address.
+- Under Local membership, a remote candidate derives when that member's own
+  catalog offers it. The operator reads each catalog from the peer over mutual
+  TLS and stamps its records with that peer's site, and the hop address and
+  server name come from the `GridSite` an admin declared.
+- Under SWIM membership no catalog is read from a verified peer, so a remote
+  candidate derives only when `deriveTopology.fromProviders` names it.
 
 An explicit entry wins whole, never field by field. A candidate with no
 explicit entry that cannot be derived is withdrawn from this gateway's routes
-and named in the `praxisConfigStatus` message with a reason. With the list
-empty or `deriveTopology` absent, that is every candidate with no explicit
-entry, so removing a provider from the list withdraws its derived endpoint on
-the next render.
+and named in the `praxisConfigStatus` message with a reason. Deleting a
+provider, or marking it unavailable, withdraws its derived endpoint on the next
+render.
 
 | Candidate | Field | Source |
 |---|---|---|
@@ -268,13 +276,22 @@ different trust takes an explicit entry.
 ```yaml
 praxisConfig:
   deriveTopology:
-    fromProviders: [qwen2-7b, llama-3-8b]
     transport:
       mode: tls
       sni: inference-gateway.infra.svc.cluster.local
       caSecretRef:
         name: serving-gateway-ca
 ```
+
+A member hop derived from a catalog takes the existing remote checks, the
+site's `GridSite` probed at its current generation, and adds three refusals. A
+name in `fromProviders` keeps the existing checks only.
+
+| Reason | Cause |
+|---|---|
+| `not offered by the member` | The candidate's site did not offer the cluster, as when a local provider's `siteSelector` places it at a peer |
+| `site key is ambiguous` | More than one `GridSite` of the network keys to the candidate's site |
+| `member hop is not mutual TLS` | The site's egress is plaintext, so the hop does not verify the peer |
 
 ## Operational diagnostics
 
@@ -478,7 +495,7 @@ that all provider `clusterName` values are non-empty.
 A route candidate references a cluster with no `praxisConfig.clusterEndpoints[]`
 entry that could not be derived, so the operator withdrew it from this gateway.
 The message names the cluster and the reason. Add an endpoint entry for it, or
-allowlist its provider in `deriveTopology.fromProviders`.
+under SWIM membership name a remote cluster in `deriveTopology.fromProviders`.
 
 **Phase is `Error` / reason `MissingClusterEndpoint`**
 

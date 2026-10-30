@@ -181,3 +181,17 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "caConfigMap.name is required"
+
+  - it: adds the labels a collector selects ServiceMonitors by
+    template: templates/servicemonitor.yaml
+    set:
+      metricsListener.serviceMonitor.enabled: true
+      metricsListener.serviceMonitor.caConfigMap: {name: openshift-service-ca.crt, key: service-ca.crt}
+      metricsListener.serviceMonitor.labels: {example.com/scrape: "true", app.kubernetes.io/name: other}
+    asserts:
+      - equal:
+          path: metadata.labels["example.com/scrape"]
+          value: "true"
+      - equal:
+          path: metadata.labels["app.kubernetes.io/name"]
+          value: praxis-gateway

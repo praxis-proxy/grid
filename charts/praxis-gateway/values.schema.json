@@ -1002,6 +1002,13 @@
                   "type": "string"
                 }
               }
+            },
+            "labels": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Additional labels on the ServiceMonitor, for a collector that selects by label."
             }
           }
         }
