@@ -1554,9 +1554,9 @@ fn peer_limits() -> String {
 /// The dial for each cluster in `sites`, with the transport, timeouts and trust its rendered
 /// `load_balancer` entry carries, and the clusters refused the same way, with why.
 ///
-/// One refused cluster leaves the others' dials standing. Only a local dial may trust a
-/// private address, and only for a hostname: an IP literal is never resolved, and praxis
-/// refuses trusting one.
+/// One refused cluster leaves the others' dials standing. A local dial, or another site's over
+/// grid mutual TLS, may trust a private address, and only for a hostname: an IP literal is never
+/// resolved, and praxis refuses trusting one.
 pub(crate) fn dial_specs(
     cluster_endpoints: &[ClusterEndpointConfig],
     sites: &BTreeMap<&str, &str>,
@@ -1586,7 +1586,8 @@ pub(crate) fn dial_specs(
                 site: site.to_owned(),
                 total_connect_timeout_ms: ms(hop.total_connect),
                 transport,
-                trusted_private: site == local_site && private_trust_host(&ep.address).is_some(),
+                // Off this site only behind grid mutual TLS: nothing is sent before the handshake verifies the site.
+                trusted_private: (site == local_site || peer) && private_trust_host(&ep.address).is_some(),
                 write_timeout_ms: ms(hop.write),
             };
             Some((ep.cluster.clone(), spec))
@@ -1639,10 +1640,7 @@ fn render_trusted_private(address: &str) -> String {
 
 /// The hostname of `address` praxis may trust as private, `None` for an IP literal.
 fn private_trust_host(address: &str) -> Option<&str> {
-    let host = address
-        .rsplit_once(':')
-        .map_or(address, |(host, _port)| host)
-        .trim_matches(|c| c == '[' || c == ']');
+    let host = grid_client::address_host(address);
     (!host.is_empty() && host.parse::<std::net::IpAddr>().is_err()).then_some(host)
 }
 
@@ -1879,7 +1877,10 @@ mod tests {
             "the same bounds the rendered load_balancer entry carries"
         );
         assert_eq!(peer.connect_retries, Some(hop.connect_retries));
-        assert!(!peer.trusted_private, "another site's address is never trusted private");
+        assert!(
+            peer.trusted_private,
+            "a peer hostname behind grid mutual TLS may resolve privately"
+        );
         for local in ["local-llama", "local-granite"] {
             let dial = &dials[local];
             assert_eq!(
@@ -1899,18 +1900,22 @@ mod tests {
     }
 
     #[test]
-    fn only_a_local_hostname_dial_trusts_a_private_address() {
+    fn a_hostname_dial_trusts_a_private_address_locally_or_behind_grid_mutual_tls() {
         let endpoints = vec![
             plain_ep("by-ip", "10.96.0.20:8000"),
             plain_ep("by-v6", "[fd00::1]:8000"),
             plain_ep("by-name", "llama.models.svc:8000"),
-            mtls_ep("remote", "peer.internal:8443", "site-b.grid.internal"),
+            mtls_ep("remote", "site-b.ec2.internal:8443", "site-b.grid.internal"),
+            mtls_ep("remote-ip", "10.1.0.9:8443", "site-b.grid.internal"),
+            plain_ep("remote-plain", "llama.site-b.internal:8000"),
         ];
         let sites = BTreeMap::from([
             ("by-ip", "site-a"),
             ("by-v6", "site-a"),
             ("by-name", "site-a"),
             ("remote", "site-b"),
+            ("remote-ip", "site-b"),
+            ("remote-plain", "site-b"),
         ]);
         let (dials, _) = dial_specs(&endpoints, &sites, "site-a");
         let trusted: Vec<&str> = dials
@@ -1918,7 +1923,11 @@ mod tests {
             .filter(|(_, dial)| dial.trusted_private)
             .map(|(cluster, _)| cluster.as_str())
             .collect();
-        assert_eq!(trusted, ["by-name"], "praxis refuses trusting an IP literal");
+        assert_eq!(
+            trusted,
+            ["by-name", "remote"],
+            "praxis refuses trusting an IP literal; off this site only behind grid mutual TLS"
+        );
     }
 
     #[test]

@@ -181,6 +181,14 @@ pub(crate) enum DialTransport {
 }
 
 impl DialTransport {
+    /// The CA file a server-only TLS dial names.
+    fn ca_path(&self) -> Option<&str> {
+        match self {
+            Self::Tls { ca_path, .. } => ca_path.as_deref(),
+            Self::MutualTls { .. } | Self::Plaintext => None,
+        }
+    }
+
     /// The verified server name, `None` for plaintext.
     fn sni(&self) -> Option<&str> {
         match self {
@@ -328,9 +336,12 @@ pub(crate) fn render_dials(config: &ServingConfig, dials: &BTreeMap<String, Dial
         .filter_map(|(cluster, served)| {
             let dial = dials.get(cluster)?;
             let mutual = matches!(dial.transport, DialTransport::MutualTls { .. });
-            let accepted = served
-                .iter()
-                .all(|candidate| candidate.site == dial.site && (!mutual || candidate.stable_id.is_some()))
+            let accepted = served.iter().all(|candidate| {
+                candidate.site == dial.site
+                    && candidate.credential.is_none()
+                    && (!mutual || candidate.stable_id.is_some())
+            }) && (mutual || dial.site == config.local_site)
+                && dial.transport.ca_path().is_none_or(within_backend_ca)
                 && config
                     .provider_hop_sni
                     .get(cluster)
@@ -342,6 +353,15 @@ pub(crate) fn render_dials(config: &ServingConfig, dials: &BTreeMap<String, Dial
         })
         .collect();
     DialFile { dial, version: "v1" }
+}
+
+/// Whether `path` names a file below the backend CA mount, with no `..` to climb out, as the gateway requires.
+fn within_backend_ca(path: &str) -> bool {
+    let (path, base) = (
+        std::path::Path::new(path),
+        std::path::Path::new(crate::resources::consumer_config::BACKEND_CA_MOUNT_BASE),
+    );
+    path != base && path.starts_with(base) && !path.components().any(|part| part == std::path::Component::ParentDir)
 }
 
 /// A candidate's identity: remote after local, then site, name, cluster.
@@ -1112,7 +1132,16 @@ mod tests {
         unnamed.stable_id = None;
         let mut misnamed = cand("llama", "site-e", "pool-e", None);
         misnamed.stable_id = Some("id-e".to_owned());
+        let mut server_only = cand("llama", "site-g", "pool-g", None);
+        server_only.stable_id = Some("id-g".to_owned());
+        let tls = |ca: &str| DialTransport::Tls {
+            ca_path: Some(ca.to_owned()),
+            sni: "models.svc".to_owned(),
+        };
         let source = overlay(vec![
+            server_only,
+            cand("llama", "site-a", "pool-h", None),
+            cand("llama", "site-a", "pool-i", None),
             cand("llama", "site-a", "pool-a", None),
             remote,
             unnamed,
@@ -1128,6 +1157,18 @@ mod tests {
             ("pool-e".to_owned(), dial("site-e", mutual("site-e.grid.internal"))),
             ("pool-f".to_owned(), dial("site-a", DialTransport::Plaintext)),
             ("pool-z".to_owned(), dial("site-a", DialTransport::Plaintext)),
+            (
+                "pool-g".to_owned(),
+                dial("site-g", tls("/run/secrets/grid-backend-ca/ca/ca.crt")),
+            ),
+            (
+                "pool-h".to_owned(),
+                dial("site-a", tls("/run/secrets/grid-backend-ca/ca/../../x")),
+            ),
+            (
+                "pool-i".to_owned(),
+                dial("site-a", tls("/run/secrets/grid-backend-ca/ca/ca.crt")),
+            ),
         ]);
         let hops = BTreeSet::from(["pool-b".to_owned(), "pool-e".to_owned(), "pool-f".to_owned()]);
         let hop_sni = BTreeMap::from([
@@ -1145,11 +1186,12 @@ mod tests {
         let kept: Vec<&str> = file.dial.keys().map(String::as_str).collect();
         assert_eq!(
             kept,
-            ["pool-a", "pool-b"],
+            ["pool-a", "pool-b", "pool-i"],
             "pool-c has no stable id, pool-d names another site, pool-e another hop SNI, pool-f a hop it does not \
-             verify, pool-z no candidate"
+             verify, pool-g leaves the site without mutual TLS, pool-h reads a CA outside the mount, pool-z no \
+             candidate"
         );
-        assert_eq!(rendered.candidates.len(), 6, "every candidate stays, only the dials go");
+        assert_eq!(rendered.candidates.len(), 9, "every candidate stays, only the dials go");
     }
 
     #[test]

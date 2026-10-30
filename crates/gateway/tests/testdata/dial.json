@@ -29,6 +29,7 @@
         "mode": "mutual_tls",
         "sni": "site-b.grid.internal"
       },
+      "trusted_private": true,
       "write_timeout_ms": 30000
     }
   },
