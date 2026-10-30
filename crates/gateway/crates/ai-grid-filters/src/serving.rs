@@ -114,9 +114,17 @@ pub struct DialSpec {
     /// `host:port` dialed. A retry reconnects to the same address.
     pub address: String,
 
+    /// The path every request is sent under, from the provider's endpoint URL.
+    #[serde(default)]
+    pub base_path: Option<String>,
+
     /// Connect retries on a connect failure, to the same address.
     #[serde(default)]
     pub connect_retries: Option<u32>,
+
+    /// The token a local dial sends in place of the caller's credential.
+    #[serde(default)]
+    pub credential: Option<DialCredential>,
 
     /// The connect timeout before TLS, milliseconds.
     #[serde(default)]
@@ -143,6 +151,25 @@ pub struct DialSpec {
     /// The per-write timeout, milliseconds.
     #[serde(default)]
     pub write_timeout_ms: Option<u64>,
+}
+
+/// The credential a local dial presents, read from a mounted file.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DialCredential {
+    /// The file holding the token, under the credential mount.
+    pub path: String,
+
+    /// How the token is sent.
+    pub strategy: CredentialStrategy,
+}
+
+/// How a dial's token is sent.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialStrategy {
+    /// `Authorization: Bearer <token>`.
+    BearerToken,
 }
 
 /// How a dial is secured.

@@ -248,7 +248,10 @@ fn start_grid_routing(
         });
     // The grid TLS mount, never the serving config: a dial presents only the identity mounted for it.
     let tls_dir = std::env::var("GRID_TLS_DIR").unwrap_or_else(|_| ai_grid_filters::GRID_TLS_MOUNT.to_owned());
+    let credential_dir =
+        std::env::var("GRID_CREDENTIAL_DIR").unwrap_or_else(|_| ai_grid_filters::CREDENTIAL_BASE.to_owned());
     let binding = ai_grid_filters::Binding {
+        credential_base: credential_dir.into(),
         grid_identity: ai_grid_filters::GridIdentity::under(&tls_dir),
         ..binding
     };

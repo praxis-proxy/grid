@@ -47,6 +47,9 @@ pub struct Binding {
     /// The directory every server-only TLS dial's CA must be under.
     pub backend_ca_base: PathBuf,
 
+    /// The directory every local dial's credential must be under.
+    pub credential_base: PathBuf,
+
     /// The verified SNI of each mutual TLS `load_balancer` cluster, by cluster.
     pub backend_tls: BTreeMap<String, String>,
 
@@ -65,6 +68,7 @@ impl Default for Binding {
         Self {
             backend_ca_base: PathBuf::from(BACKEND_CA_BASE),
             backend_tls: BTreeMap::new(),
+            credential_base: PathBuf::from(crate::dial::CREDENTIAL_BASE),
             grid_identity: GridIdentity::default(),
             insecure: InsecureOptions::default(),
             lb_clusters: BTreeSet::new(),
@@ -835,6 +839,11 @@ fn identity_digest(
         .map(String::as_str)
         // A dial's TLS material is read once per apply, so a rotated file re-applies the config.
         .chain(dial.dial.values().filter_map(|dial| dial.transport.ca_path()))
+        .chain(
+            dial.dial
+                .values()
+                .filter_map(|dial| dial.credential.as_ref().map(|credential| credential.path.as_str())),
+        )
         .chain(mutual.then(|| identity.paths()).into_iter().flatten())
         // A rotated tag key re-applies the config like a renewed certificate.
         .chain(affinity.tag_key_path.as_deref())
@@ -2271,8 +2280,10 @@ mod tests {
     fn dial_spec(site: &str, transport: DialTransport) -> crate::serving::DialSpec {
         crate::serving::DialSpec {
             address: format!("{site}.example.com:8443"),
+            base_path: None,
             connect_retries: None,
             connect_timeout_ms: None,
+            credential: None,
             read_timeout_ms: None,
             site: site.to_owned(),
             total_connect_timeout_ms: None,

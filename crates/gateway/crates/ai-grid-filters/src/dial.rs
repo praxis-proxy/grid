@@ -21,7 +21,7 @@ use praxis_tls::{CaConfig, CachedClusterTls, CertKeyPair, ClusterTls};
 use crate::{
     control::Binding,
     health::{DialHealth, DialState},
-    serving::{DialConfig, DialSpec, DialTransport, GridServingConfig, mount_revision},
+    serving::{CredentialStrategy, DialConfig, DialSpec, DialTransport, GridServingConfig, mount_revision},
 };
 
 // ---------------------------------------------------------------------------
@@ -33,6 +33,9 @@ const DIAL_CHAIN: &str = "serving-config-dial";
 
 /// Where the CA bundles server-only TLS dials verify against are mounted.
 pub const BACKEND_CA_BASE: &str = "/run/secrets/grid-backend-ca";
+
+/// Where the provider credentials a local dial sends are mounted, as `credential_inject` reads them.
+pub const CREDENTIAL_BASE: &str = "/run/secrets/grid-credentials";
 
 /// Where the grid identity is mounted; the chart enforces this path.
 pub const GRID_TLS_MOUNT: &str = "/etc/praxis/tls";
@@ -138,6 +141,9 @@ pub struct Dialed {
     /// The longest a request can take to fail every connect attempt.
     connect_budget: std::time::Duration,
 
+    /// The `Authorization` value a local dial sends in place of the caller's.
+    credential: Option<http::HeaderValue>,
+
     /// The dial's passive health, which each routed response records into.
     health: Arc<DialState>,
 
@@ -169,15 +175,27 @@ impl Dialed {
             .saturating_add(std::time::Duration::from_secs(1));
         Self {
             connect_budget,
+            credential: None,
             health,
             retry,
             upstream,
         }
     }
 
+    /// This dial sending `credential` in place of the caller's.
+    #[must_use]
+    pub(crate) fn with_credential(self, credential: Option<http::HeaderValue>) -> Self {
+        Self { credential, ..self }
+    }
+
     /// The longest a request can take to fail every connect attempt.
     pub(crate) fn connect_budget(&self) -> std::time::Duration {
         self.connect_budget
+    }
+
+    /// The `Authorization` value this dial sends in place of the caller's.
+    pub(crate) fn credential(&self) -> Option<&http::HeaderValue> {
+        self.credential.as_ref()
     }
 
     /// The dial's passive health.
@@ -228,7 +246,7 @@ impl Dials {
                 dials.refused.insert(name.clone());
                 continue;
             }
-            match dialed(&cluster, health.state(name, &spec.address)) {
+            match dialed(&cluster, spec, health.state(name, &spec.address)) {
                 Ok(built) => {
                     dials.built.insert(name.clone(), Arc::new(built));
                 },
@@ -288,10 +306,11 @@ pub(crate) fn validate_dials(
             )
             .into());
         }
-        // Nothing on a dialed path injects a credential, so a dial would drop it silently.
-        if candidate.credential.is_some() {
+        // Only a local dial carries a credential, and only one it sends itself.
+        let local = dial.site == config.local_site && !matches!(dial.transport, DialTransport::MutualTls { .. });
+        if candidate.credential.is_some() && !(local && dial.credential.is_some()) {
             return Err(format!(
-                "grid: dial for cluster '{}' serves candidate '{}', which carries a credential",
+                "grid: dial for cluster '{}' serves candidate '{}', whose credential it does not send",
                 candidate.cluster, candidate.name
             )
             .into());
@@ -343,6 +362,7 @@ pub(crate) fn validate_dials(
         if !local && dial.trusted_private && grid_client::address_host(&dial.address).parse::<IpAddr>().is_ok() {
             return Err(format!("grid: dial for cluster '{cluster}' trusts a private IP literal off this site").into());
         }
+        validate_request_shape(cluster, dial, local, binding)?;
         if let Some(ca_path) = dial.transport.ca_path()
             && !within(Path::new(ca_path), &binding.backend_ca_base)
         {
@@ -376,6 +396,37 @@ pub(crate) fn validate_dials(
 // Utility Functions
 // ---------------------------------------------------------------------------
 
+/// Refuse a credential on a dial that is off this site or grid mutual TLS, or read outside the
+/// credential mount, and a base path that is not clean.
+fn validate_request_shape(cluster: &str, dial: &DialSpec, local: bool, binding: &Binding) -> Result<(), FilterError> {
+    if let Some(credential) = &dial.credential {
+        if !local || matches!(dial.transport, DialTransport::MutualTls { .. }) {
+            return Err(format!("grid: dial for cluster '{cluster}' would send a credential off this site").into());
+        }
+        if !within(Path::new(&credential.path), &binding.credential_base) {
+            return Err(format!(
+                "grid: dial for cluster '{cluster}' reads its credential outside {}",
+                binding.credential_base.display()
+            )
+            .into());
+        }
+    }
+    if let Some(base_path) = &dial.base_path
+        && !clean_base_path(base_path)
+    {
+        return Err(format!("grid: dial for cluster '{cluster}' has an unusable base path '{base_path}'").into());
+    }
+    Ok(())
+}
+
+/// Whether `path` is an absolute path with no query, fragment, empty segment or `..` segment.
+pub(crate) fn clean_base_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.contains(['?', '#'])
+        && !path.contains("//")
+        && !path.split('/').any(|segment| segment == ".." || segment == ".")
+}
+
 /// Whether `path` names a file below `base`, with no `..` to climb out.
 fn within(path: &Path, base: &Path) -> bool {
     path != base && path.starts_with(base) && !path.components().any(|part| part == Component::ParentDir)
@@ -400,6 +451,7 @@ fn cluster(name: &str, spec: &DialSpec, identity: &GridIdentity) -> Cluster {
     if spec.trusted_private {
         cluster.trusted_private_endpoints = vec![grid_client::address_host(&spec.address).to_owned()];
     }
+    cluster.http.base_path = spec.base_path.as_deref().map(Arc::from);
     cluster.tls = tls(&spec.transport, identity);
     cluster
 }
@@ -449,8 +501,9 @@ fn validate(cluster: &Cluster, insecure: &InsecureOptions) -> Result<(), FilterE
         .map_err(|error| refused(error.to_string()))
 }
 
-/// Read `cluster`'s TLS material and build its upstream, recording into `health`.
-fn dialed(cluster: &Cluster, health: Arc<DialState>) -> Result<Dialed, String> {
+/// Read `cluster`'s TLS material and `spec`'s credential and build its upstream, recording into `health`.
+fn dialed(cluster: &Cluster, spec: &DialSpec, health: Arc<DialState>) -> Result<Dialed, String> {
+    let credential = spec.credential.as_ref().map(bearer).transpose()?;
     let tls = cluster
         .tls
         .as_ref()
@@ -467,13 +520,36 @@ fn dialed(cluster: &Cluster, health: Arc<DialState>) -> Result<Dialed, String> {
         Upstream {
             address,
             authority: None,
-            base_path: None,
+            base_path: cluster.http.normalized_base_path().map(Arc::from),
             connection: Arc::new(ConnectionOptions::from(cluster)),
             tls,
         },
         retry,
         health,
-    ))
+    )
+    .with_credential(credential))
+}
+
+/// The `Authorization` value `credential` sends, read now so a rotated file rebuilds the dial.
+fn bearer(credential: &crate::serving::DialCredential) -> Result<http::HeaderValue, String> {
+    match credential.strategy {
+        CredentialStrategy::BearerToken => {},
+    }
+    let path = &credential.path;
+    let token = std::fs::read(path)
+        .map(zeroize::Zeroizing::new)
+        .map_err(|error| format!("reading the dial credential {path}: {error}"))?;
+    let token = token.trim_ascii();
+    if token.is_empty() {
+        return Err(format!("the dial credential {path} is empty"));
+    }
+    let mut value = zeroize::Zeroizing::new(Vec::with_capacity(token.len().saturating_add(7)));
+    value.extend_from_slice(b"Bearer ");
+    value.extend_from_slice(token);
+    let mut header = http::HeaderValue::from_bytes(&value)
+        .map_err(|_invalid| format!("the dial credential {path} is not a header value"))?;
+    header.set_sensitive(true);
+    Ok(header)
 }
 
 #[cfg(test)]
@@ -530,6 +606,43 @@ mod tests {
     }
 
     #[test]
+    fn a_credential_rides_only_a_local_dial_and_a_base_path_must_be_clean() {
+        let credential = |path: &str| {
+            Some(crate::serving::DialCredential {
+                path: path.to_owned(),
+                strategy: CredentialStrategy::BearerToken,
+            })
+        };
+        let token = format!("{CREDENTIAL_BASE}/grid-model-client-token/token");
+        let mut local = spec("local", DialTransport::Plaintext, true);
+        local.credential = credential(&token);
+        local.base_path = Some("/publishers/p/models/m".to_owned());
+        let ok = config(&[("local-plain", local.clone())]);
+        validate_dials(&ok.serving, &ok.dial, &Binding::default()).expect("a local dial sends its own token");
+        let mut off_site = spec("east", mutual_tls("east"), false);
+        off_site.credential = credential(&token);
+        let mut local_mutual = spec("local", mutual_tls("local"), true);
+        local_mutual.credential = credential(&token);
+        for dial in [off_site, local_mutual] {
+            assert!(
+                refused(&config(&[("east", dial)])).contains("would send a credential off this site"),
+                "a token never rides grid mutual TLS or leaves this site"
+            );
+        }
+        let mut outside = local.clone();
+        outside.credential = credential("/etc/praxis/tls/tls.key");
+        assert!(refused(&config(&[("local-plain", outside)])).contains("reads its credential outside"));
+        for bad in ["/a?b=1", "/a#f", "/a//b", "/a/../b", "relative"] {
+            let mut path = local.clone();
+            path.base_path = Some(bad.to_owned());
+            assert!(
+                refused(&config(&[("local-plain", path)])).contains("unusable base path"),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn a_credentialed_candidate_is_never_dialed() {
         let mut config = config(&[("local-plain", spec("local", DialTransport::Plaintext, true))]);
         config.serving.candidates[0].credential = Some(crate::metadata::CandidateCredential {
@@ -541,7 +654,7 @@ mod tests {
             },
         });
         assert!(
-            refused(&config).contains("carries a credential"),
+            refused(&config).contains("whose credential it does not send"),
             "nothing on a dial injects it"
         );
     }
@@ -979,8 +1092,10 @@ mod tests {
         };
         DialSpec {
             address: format!("{host}:8443"),
+            base_path: None,
             connect_retries: None,
             connect_timeout_ms: None,
+            credential: None,
             read_timeout_ms: None,
             site: site.to_owned(),
             total_connect_timeout_ms: None,

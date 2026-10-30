@@ -31,14 +31,15 @@ pub use decisions::SiteDecisions;
 // the gateway's refresh step orders candidates by live load and swaps the
 // snapshot. The request path only reads a snapshot.
 pub use descriptor::{AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate};
-pub use dial::{BACKEND_CA_BASE, Dialed, GRID_TLS_MOUNT, GridIdentity};
+pub use dial::{BACKEND_CA_BASE, CREDENTIAL_BASE, Dialed, GRID_TLS_MOUNT, GridIdentity};
 pub use health::ClusterHealth;
 pub use metadata::{CandidateCredential, CredentialRef};
 use praxis_filter::{FilterError, FilterFactory, FilterRegistry, HttpFilter};
 pub use prefix::{AffinitySettings, PrefixAffinity};
 pub use serving::{
-    AvailabilitySettings, DIAL_FILE, DialConfig, DialSpec, DialTransport, DialVersion, GridRuntime, GridServingConfig,
-    PeerServingConfig, dial_config_path, load_dial_config, load_serving_config, spawn_grid_routing,
+    AvailabilitySettings, CredentialStrategy, DIAL_FILE, DialConfig, DialCredential, DialSpec, DialTransport,
+    DialVersion, GridRuntime, GridServingConfig, PeerServingConfig, dial_config_path, load_dial_config,
+    load_serving_config, spawn_grid_routing,
 };
 pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;

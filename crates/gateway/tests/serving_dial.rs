@@ -254,6 +254,59 @@ mod tests {
     }
 
     #[test]
+    fn a_local_dial_sends_its_token_under_the_providers_base_path() {
+        let work = fresh_work("dial-local-token");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca, "local");
+        let secret = work.join("credentials/grid-model-client-token");
+        std::fs::create_dir_all(&secret).expect("credential dir");
+        std::fs::write(secret.join("token"), "site-token\n").expect("token");
+        let listener = bound_listener();
+        let addr = listener.local_addr().expect("backend addr").to_string();
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&heads);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Ok((head, _body)) = read_request(&mut stream) else {
+                    continue;
+                };
+                recorded.lock().expect("heads").push(head);
+                let _sent = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            }
+        });
+        let mut serving = Mount::new(work.join("serving"));
+        Revision {
+            dial: format!(
+                r#"{{"version":"v1","dial":{{"local-model":{{"address":"{addr}","site":"local","transport":{{"mode":"plaintext"}},"base_path":"/publishers/x/models/y","credential":{{"strategy":"bearer_token","path":"{token}"}}}}}}}}"#,
+                token = secret.join("token").display(),
+            ),
+            serving: format!(
+                r#"{{"local_site":"local","window_secs":60,"load_window_ms":30000,"candidates":[{{"kind":"inference_model","name":"llama","site":"local","cluster":"local-model","credential":{{"strategy":"bearer_token","secretRef":{{"name":"grid-model-client-token","namespace":"grid","key":"token"}}}}}}],"peers":[{}]}}"#,
+                local_peer(&identity),
+            ),
+        }
+        .write(&mut serving);
+
+        let gateway = Gateway::start(&work, &serving);
+        let (status, head) = gateway.chat();
+        assert_eq!(status, 200, "the local dial routes: {head}");
+        let heads = heads.lock().expect("heads").clone();
+        let sent = heads.first().expect("the backend saw the request").to_ascii_lowercase();
+        assert!(
+            sent.starts_with("get /publishers/x/models/y/v1/chat/completions "),
+            "sent under the provider's base path: {sent}"
+        );
+        assert!(
+            sent.contains("authorization: bearer site-token"),
+            "with the dial's token: {sent}"
+        );
+        assert!(!sent.contains("caller-secret"), "never the caller's: {sent}");
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
     fn a_post_whose_first_connect_fails_is_retried_on_the_dial() {
         let work = fresh_work("dial-retry-post");
         let ca = generate_ca("grid-ca").expect("ca");
@@ -580,6 +633,7 @@ mod tests {
                 .arg(&config)
                 .env("GRID_SERVING_CONFIG", serving.path("serving-config.json"))
                 .env("GRID_TLS_DIR", work.join("identity"))
+                .env("GRID_CREDENTIAL_DIR", work.join("credentials"))
                 .env("RUST_LOG", "info")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())

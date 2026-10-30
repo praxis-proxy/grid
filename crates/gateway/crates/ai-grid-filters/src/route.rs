@@ -153,16 +153,14 @@ fn write_credentials(ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate
         ctx.filter_metadata.remove(key);
     }
     if candidate.site != snapshot.local_site || snapshot.provider_hop_clusters.contains(candidate.cluster.as_ref()) {
-        ctx.request_headers_to_remove.extend(CALLER_CREDENTIAL_HEADERS);
-        let sent = ctx.rewritten_path.as_deref().unwrap_or_else(|| {
-            ctx.request
-                .uri
-                .path_and_query()
-                .map_or("/", http::uri::PathAndQuery::as_str)
-        });
-        if let Some(stripped) = strip_credential_query(sent) {
-            ctx.rewritten_path = Some(stripped);
-        }
+        strip_caller_credentials(ctx);
+        return;
+    }
+    // A local dial sends its own token, never the caller's.
+    if let Some(token) = candidate.dial.as_deref().and_then(crate::dial::Dialed::credential) {
+        strip_caller_credentials(ctx);
+        ctx.request_headers_to_set
+            .push((http::header::AUTHORIZATION, token.clone()));
         return;
     }
     let Some(credential) = candidate.credential.as_ref() else {
@@ -176,6 +174,20 @@ fn write_credentials(ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate
     ];
     for (key, value) in CREDENTIAL_METADATA.into_iter().zip(values) {
         ctx.filter_metadata.insert(key.to_owned(), value.clone());
+    }
+}
+
+/// Drop every caller credential header and credential query parameter from the request.
+fn strip_caller_credentials(ctx: &mut HttpFilterContext<'_>) {
+    ctx.request_headers_to_remove.extend(CALLER_CREDENTIAL_HEADERS);
+    let sent = ctx.rewritten_path.as_deref().unwrap_or_else(|| {
+        ctx.request
+            .uri
+            .path_and_query()
+            .map_or("/", http::uri::PathAndQuery::as_str)
+    });
+    if let Some(stripped) = strip_credential_query(sent) {
+        ctx.rewritten_path = Some(stripped);
     }
 }
 
@@ -2818,6 +2830,36 @@ mod tests {
             "this site's credential is never selected for another site"
         );
         assert_eq!(ctx.rewritten_path.as_deref(), Some("/v1/chat/completions?trace=1"));
+    }
+
+    #[tokio::test]
+    async fn a_local_dial_replaces_the_callers_authorization_with_its_token() {
+        let mut candidates = dialed("local", "local-pool", Some("10.0.0.7:8000"));
+        let token = http::HeaderValue::from_static("Bearer site-token");
+        let dial = candidates[0].dial.take().expect("dialed");
+        let dial = Arc::try_unwrap(dial)
+            .expect("one owner")
+            .with_credential(Some(token.clone()));
+        candidates[0].dial = Some(Arc::new(dial));
+        let filter = dial_filter(candidates, "local", Some(&[]));
+        let request = llama_request("/v1/chat/completions?key=caller");
+        let mut ctx = context(&request);
+        let action = filter.on_request(&mut ctx).await.expect("routes");
+        assert!(matches!(action, FilterAction::Continue), "routes");
+        assert!(
+            ctx.request_headers_to_remove.contains(&http::header::AUTHORIZATION),
+            "the caller's credential is never forwarded"
+        );
+        assert_eq!(
+            ctx.request_headers_to_set
+                .iter()
+                .filter(|(name, _)| name == http::header::AUTHORIZATION)
+                .map(|(_, value)| value)
+                .collect::<Vec<_>>(),
+            [&token],
+            "the dial's own token replaces it"
+        );
+        assert_eq!(ctx.rewritten_path.as_deref(), Some("/v1/chat/completions"));
     }
 
     #[tokio::test]
