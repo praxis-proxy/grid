@@ -71,7 +71,7 @@ const COUNTER_HELP: [(&str, &str); 8] = [
 ];
 
 /// Grid gauges the gateway emits.
-const GAUGE_HELP: [(&str, &str); 18] = [
+const GAUGE_HELP: [(&str, &str); 19] = [
     (
         "grid_serving_unbound_provider_hops",
         "Provider hops the applied serving config declares that no startup-verified backend binds. Their candidates take no traffic until a serving config names the SNI that backend verified at startup, or, for a backend not verified at startup, until the gateway restarts.",
@@ -131,6 +131,10 @@ const GAUGE_HELP: [(&str, &str); 18] = [
     (
         "grid_route_site_score",
         "Score the site ranks by in the current snapshot. NaN when excluded or demoted.",
+    ),
+    (
+        "grid_route_site_score_unavailable",
+        "1 when an otherwise routable load-publishing site has no queue score, by bounded reason: absent, stale, or unreadable. 0 otherwise.",
     ),
     (
         "grid_route_shedding",
