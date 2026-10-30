@@ -86,6 +86,44 @@ values only after the older CRDs and charts are ready.
 | `ConsumerConfigDisabled` | `PraxisConfigDisabled` |
 | `EgressMissing` | `GatewayAddressMissing` |
 
+### Grid ID on GitOps-managed members
+
+The operator copies a status-only grid ID into an empty `spec.gridId` once,
+and a CEL rule then refuses any change to it. The `grid-site` chart always
+renders `gridId`, empty unless `gridNetwork.gridId` is set. Argo CD, with
+client-side or server-side apply, then tries to reset the copied ID to the
+empty value, the CEL rule refuses it, and self-heal fails on every retry.
+Leaving the field out does not help, because removing a previously applied
+value is also a change.
+
+Set `gridNetwork.gridId` to the member's current `status.gridId` in the same
+change that upgrades the operator:
+
+```bash
+kubectl get gridnetwork <name> -o jsonpath='{.status.gridId}{"\n"}'
+```
+
+Alternatively, have the Application ignore the field:
+
+```yaml
+spec:
+  ignoreDifferences:
+    - group: grid.praxis.fast
+      kind: GridNetwork
+      jsonPointers:
+        - /spec/gridId
+  syncPolicy:
+    syncOptions:
+      - RespectIgnoreDifferences=true
+```
+
+`RespectIgnoreDifferences` keeps a sync from writing the ignored field.
+
+A plain `helm upgrade` is unaffected. Helm 3 patches only what changed between
+the previous and the new manifest, and an empty `gridId` in both leaves the
+copied ID in place. `helm upgrade --force` replaces the object and fails the
+same way as Argo CD.
+
 ## Before upgrading after the compatibility window
 
 1. Back up the affected custom resources and Helm values.

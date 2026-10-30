@@ -1,5 +1,7 @@
 gridNetwork:
   name: grid
+  # -- Set once. Under Argo CD, set this to status.gridId before the operator copies it into
+  # spec, or the empty value fights the copy; see docs/installation/migration-0.3.x.md.
   gridId: ""
   # -- Create a GridSite for each SWIM peer and route to them. Unset, it is on when peers
   # are listed, else off, which keeps the clusterName overlay of existing networks.
