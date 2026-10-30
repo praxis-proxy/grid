@@ -1,6 +1,7 @@
 {{hub $state := lookup "v1" "ConfigMap" $stateNamespace $stateName hub}}
 {{hub $id := index $state.data "gridId" hub}}
 {{hub if not $id hub}}{{hub fail "waiting for bootstrap grid identity" hub}}{{hub end hub}}
+{{hub if not $state.immutable hub}}{{hub fail "bootstrap grid identity is not immutable" hub}}{{hub end hub}}
 {{ $namespace := {{hub printf "%q" $namespace hub}} }}
 {{ $identity := {{hub printf "%q" $identity hub}} }}
 {{ $ca := {{hub printf "%q" $ca hub}} }}

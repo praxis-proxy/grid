@@ -57,7 +57,8 @@ fn stored_id(state: &ConfigMap) -> Result<String, BoxError> {
     validate(id)?;
     // A mutable state could be edited into another grid ID after members adopted this one.
     if state.immutable != Some(true) {
-        return Err("bootstrap ConfigMap must set immutable: true; recreate it with the same gridId".into());
+        // Patch in place: recreating it opens a window in which bootstrap mints a new ID.
+        return Err("bootstrap ConfigMap must set immutable: true; patch it in place with {\"immutable\":true}, do not recreate it".into());
     }
     Ok(id.clone())
 }

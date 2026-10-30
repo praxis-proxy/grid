@@ -317,7 +317,7 @@ class ManagedClusterTemplates(unittest.TestCase):
                 'Resources': resources}), text=True, capture_output=True)
 
         state = {'v1/ConfigMap/grid-system/grid-bootstrap-state':
-                 {'data': {'gridId': 'persisted-grid'}}}
+                 {'data': {'gridId': 'persisted-grid'}, 'immutable': True}}
         hub = execute(spec['object-templates-raw'], state)
         self.assertEqual(hub.returncode, 0, hub.stderr)
         identities = {'v1/Secret/grid-system/grid-site-identity':
@@ -354,6 +354,16 @@ class ManagedClusterTemplates(unittest.TestCase):
         self.assertNotEqual(missing_ca.returncode, 0)
         self.assertIn('waiting for the grid trust bundle', missing_ca.stderr)
         self.assertNotEqual(execute(spec['object-templates-raw'], {}).returncode, 0)
+        # Bootstrap refuses a mutable state, so members must not get its ID either.
+        for mutable in (None, False):
+            config_map = {'data': {'gridId': 'persisted-grid'}}
+            if mutable is not None:
+                config_map['immutable'] = mutable
+            refused = execute(spec['object-templates-raw'],
+                              {'v1/ConfigMap/grid-system/grid-bootstrap-state': config_map})
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertEqual(refused.stdout, '', 'a refused state must emit nothing')
+            self.assertIn('bootstrap grid identity is not immutable', refused.stderr)
         state['v1/ConfigMap/grid-system/grid-bootstrap-state']['data']['gridId'] = ''
         empty = execute(spec['object-templates-raw'], state)
         self.assertNotEqual(empty.returncode, 0)
@@ -369,7 +379,7 @@ class ManagedClusterTemplates(unittest.TestCase):
         hub = subprocess.run([self.renderer], input=json.dumps({
             'Template': raw, 'Cluster': 'west', 'Resources': {
                 'v1/ConfigMap/grid-system/grid-bootstrap-state':
-                {'data': {'gridId': 'bootstrap-grid'}}}}),
+                {'data': {'gridId': 'bootstrap-grid'}, 'immutable': True}}}),
             text=True, capture_output=True, check=True)
         base = {**ready_crds(),
                 'v1/Secret/grid-system/grid-site-identity': {'metadata': {'name': 'x'}},

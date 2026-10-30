@@ -46,7 +46,16 @@ data:
 ```
 
 Bootstrap uses a pre-created ConfigMap unchanged, and refuses one without
-`immutable: true`. The existing ID is each
+`immutable: true`. A ConfigMap created by an earlier release's
+`kubectl create configmap` instructions is mutable, so make it immutable in
+place before upgrading. Do not delete and recreate it: bootstrap could mint a
+new ID in between.
+
+```bash
+kubectl -n <release-namespace> patch configmap grid-bootstrap-state --type merge -p '{"immutable":true}'
+```
+
+The existing ID is each
 member GridNetwork's `spec.gridId` when set, otherwise its `status.gridId`.
 Every member must report the same ID. The member policy refuses to touch a
 GridNetwork whose ID differs from the saved one and reports `existing grid ID
