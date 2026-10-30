@@ -264,7 +264,8 @@ for site in "${SITES[@]}"; do
   else
     pass "${site}: no grid-enrollment Deployment in the cluster"
   fi
-  config=$(ns "${site}" get configmap grid-operator-config -o jsonpath='{.data.config\.yaml}')
+  # Without enrollment values the chart renders no operator config, which names no signer either.
+  config=$(ns "${site}" get configmap grid-operator-config -o jsonpath='{.data.config\.yaml}' 2>/dev/null || true)
   grep -q signerEndpoint <<<"${config}" && fail "${site}: the operator config names a signer" \
     || pass "${site}: the operator config names no signer"
   if ns "${site}" get svc grid-operator-swim >/dev/null 2>&1; then
