@@ -45,7 +45,8 @@ data:
   gridId: <existing-grid-id>
 ```
 
-Bootstrap uses a pre-created ConfigMap unchanged. The existing ID is each
+Bootstrap uses a pre-created ConfigMap unchanged, and refuses one without
+`immutable: true`. The existing ID is each
 member GridNetwork's `spec.gridId` when set, otherwise its `status.gridId`.
 Every member must report the same ID. The member policy refuses to touch a
 GridNetwork whose ID differs from the saved one and reports `existing grid ID

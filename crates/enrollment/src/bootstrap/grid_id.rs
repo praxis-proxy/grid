@@ -47,7 +47,7 @@ pub(super) async fn ensure(client: &Client, namespace: &str, name: &str) -> Resu
     }
 }
 
-/// Refuse damaged bootstrap state instead of generating a replacement identity.
+/// Refuse damaged or mutable bootstrap state instead of generating a replacement identity.
 fn stored_id(state: &ConfigMap) -> Result<String, BoxError> {
     let id = state
         .data
@@ -55,6 +55,10 @@ fn stored_id(state: &ConfigMap) -> Result<String, BoxError> {
         .and_then(|data| data.get("gridId"))
         .ok_or("bootstrap ConfigMap has no gridId; restore its original value")?;
     validate(id)?;
+    // A mutable state could be edited into another grid ID after members adopted this one.
+    if state.immutable != Some(true) {
+        return Err("bootstrap ConfigMap must set immutable: true; recreate it with the same gridId".into());
+    }
     Ok(id.clone())
 }
 
@@ -106,7 +110,7 @@ mod tests {
             "/api/v1/namespaces/grid/configmaps/grid-state",
             json!({
                 "apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "grid-state"},
-                "data": {"gridId": "existing-grid"}
+                "data": {"gridId": "existing-grid"}, "immutable": true
             }),
         );
         assert_eq!(
@@ -119,13 +123,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mutable_precreated_state_is_refused() {
+        for immutable in [json!(null), json!(false)] {
+            let api = FakeApi::new();
+            api.put(
+                "/api/v1/namespaces/grid/configmaps/grid-state",
+                json!({
+                    "apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "grid-state"},
+                    "data": {"gridId": "existing-grid"}, "immutable": immutable
+                }),
+            );
+            let result = ensure(&api.client("grid"), "grid", "grid-state").await;
+            assert!(
+                matches!(&result, Err(error) if error.to_string().contains("immutable: true")),
+                "immutable={immutable}: {result:?}"
+            );
+            assert!(api.writes().is_empty(), "a refused state is never rewritten");
+        }
+    }
+
+    #[tokio::test]
     async fn a_lost_create_race_returns_the_winning_id() -> Result<(), BoxError> {
         let api = FakeApi::new();
         api.win_create_race(
             "/api/v1/namespaces/grid/configmaps/grid-state",
             json!({
                 "apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "grid-state"},
-                "data": {"gridId": "winning-grid"}
+                "data": {"gridId": "winning-grid"}, "immutable": true
             }),
         );
         assert_eq!(
@@ -152,7 +176,8 @@ mod tests {
             api.put(
                 "/api/v1/namespaces/grid/configmaps/grid-state",
                 json!({
-                    "apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "grid-state"}, "data": data
+                    "apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "grid-state"}, "data": data,
+                    "immutable": true
                 }),
             );
             let result = ensure(&api.client("grid"), "grid", "grid-state").await;
