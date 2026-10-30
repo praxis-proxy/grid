@@ -131,6 +131,10 @@ pub struct CandidateConfig {
     /// gateways. Older/static configs may omit it and retain the derived ID.
     #[serde(default)]
     pub stable_id: Option<String>,
+
+    /// Declared capacity weight from the provider's `capacityWeight` CRD field.
+    #[serde(default)]
+    pub weight: Option<u32>,
 }
 
 /// Default freshness state for candidates.
@@ -217,6 +221,9 @@ pub struct RouteCandidate {
     /// The upstream the gateway built for this cluster from the serving config, sent to
     /// directly instead of a `load_balancer` cluster.
     pub dial: Option<Arc<Dialed>>,
+
+    /// Declared capacity weight from the provider CRD, defaulting to 1.
+    pub weight: u32,
 }
 
 impl RouteCandidate {
@@ -275,6 +282,9 @@ fn validate_candidates_with_empty(
         validate_name(&format!("candidates[{index}].cluster"), &cand.cluster)?;
         validate_header_value(&format!("candidates[{index}].cluster"), &cand.cluster)?;
         validate_credential(index, cand.credential.as_ref())?;
+        if cand.weight == Some(0) {
+            return Err(format!("grid: candidates[{index}].weight must not be zero").into());
+        }
 
         if !seen.insert((cand.kind, cand.name.clone(), cand.site.clone(), cand.cluster.clone())) {
             return Err(format!(
@@ -314,6 +324,7 @@ fn validate_candidates_with_empty(
             site: Arc::from(cand.site.as_str()),
             stable_id,
             dial: None,
+            weight: cand.weight.unwrap_or(1),
         });
     }
 
@@ -460,6 +471,7 @@ mod tests {
             publishes_load: true,
             site: site.to_owned(),
             stable_id: None,
+            weight: None,
         }
     }
 
@@ -628,5 +640,18 @@ mod tests {
         let base = r#""kind":"inference_model","name":"m","site":"s","cluster":"c""#;
         assert!(parse(&format!("{{{base}}}")).unwrap());
         assert!(!parse(&format!(r#"{{{base},"publishes_load":false}}"#)).unwrap());
+    }
+
+    #[test]
+    fn zero_weight_is_rejected() {
+        let raw = vec![CandidateConfig {
+            weight: Some(0),
+            ..candidate("inference_model", "m", "s", "c")
+        }];
+        let err = validate_candidates(raw).expect_err("zero weight must be rejected");
+        assert!(
+            err.to_string().contains("weight must not be zero"),
+            "unexpected error: {err}"
+        );
     }
 }

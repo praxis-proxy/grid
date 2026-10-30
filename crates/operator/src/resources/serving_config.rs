@@ -259,6 +259,11 @@ pub(crate) struct ServingCandidate {
     /// A local candidate's credential locator, which `grid_site_route` selects for `credential_inject`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) credential: Option<ProjectedCredential>,
+    /// Declared capacity weight from the provider's `capacityWeight`, carried from the overlay's
+    /// `traffic_weight`. Omitted when absent; a gateway that predates this field rejects the config
+    /// via `deny_unknown_fields`, so the gateway must accept the field before the operator emits it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) weight: Option<u32>,
 }
 
 /// Whether `publishes_load` is the default, which the gateway assumes when absent.
@@ -412,6 +417,8 @@ struct Folded {
     credential: Option<ProjectedCredential>,
     /// The latest expiry, or `None` when any duplicate is static.
     expires_at_ms: Option<u64>,
+    /// The largest declared weight across duplicates.
+    weight: Option<u32>,
 }
 
 /// Each routable candidate once, folded.
@@ -440,6 +447,7 @@ fn dedup<'overlay>(
             stable_id: None,
             credential: None,
             expires_at_ms,
+            weight: None,
         });
         folded.fresh &= candidate.fresh;
         folded.admission = folded.admission.max(admission);
@@ -453,6 +461,11 @@ fn dedup<'overlay>(
             (Some(held), Some(incoming)) => Some(held.max(incoming)),
             _ => None,
         };
+        match (folded.weight, candidate.traffic_weight) {
+            (None, w) => folded.weight = w,
+            (Some(existing), Some(new)) if new > existing => folded.weight = Some(new),
+            _ => {},
+        }
     }
     unique
 }
@@ -491,6 +504,7 @@ fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<Servi
                 inputs.inject_local_credentials && !remote && !inputs.provider_hop_clusters.contains(cluster)
             }),
             expires_at_ms: folded.expires_at_ms,
+            weight: folded.weight,
         })
         .collect()
 }
@@ -1295,5 +1309,44 @@ mod tests {
         );
         let long = configmap_name(&"n".repeat(60), &"g".repeat(60));
         assert!(long.len() <= 63 && long.starts_with("grid-serving-"), "{long}");
+    }
+
+    #[test]
+    fn traffic_weight_reaches_serving_candidate() {
+        let mut c = cand("llama", "site-a", "pool-a", None);
+        c.traffic_weight = Some(3);
+        let config = render(&overlay(vec![c]), &INPUTS);
+        assert_eq!(
+            config.candidates[0].weight,
+            Some(3),
+            "traffic_weight must flow to the gateway's weight field"
+        );
+        let json = to_text(&config).expect("json");
+        assert!(json.contains("\"weight\": 3"), "weight serializes into the config JSON");
+    }
+
+    #[test]
+    fn absent_weight_is_omitted_from_json() {
+        let config = render(&two_site(), &INPUTS);
+        let json = to_text(&config).expect("json");
+        assert!(
+            !json.contains("\"weight\""),
+            "absent weight must not appear in JSON so older gateways with deny_unknown_fields accept it"
+        );
+    }
+
+    #[test]
+    fn duplicate_candidates_fold_to_the_largest_weight() {
+        let mut c1 = cand("llama", "site-a", "pool-a", None);
+        c1.traffic_weight = Some(2);
+        let mut c2 = cand("llama", "site-a", "pool-a", None);
+        c2.traffic_weight = Some(5);
+        let config = render(&overlay(vec![c1, c2]), &INPUTS);
+        assert_eq!(config.candidates.len(), 1, "dedup should merge duplicates");
+        assert_eq!(
+            config.candidates[0].weight,
+            Some(5),
+            "the larger weight survives the fold"
+        );
     }
 }

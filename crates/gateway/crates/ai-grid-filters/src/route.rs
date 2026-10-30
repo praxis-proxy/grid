@@ -1340,7 +1340,7 @@ fn select<'snap>(sites: &Sites<'snap>, spread: bool, turn: usize) -> Option<Site
     let unpublished = mean_capacity(sites);
     match arm {
         0 => weighted(sites, unit(turn, SALTS.0), None, |candidate| {
-            candidate.capacity.unwrap_or(unpublished)
+            candidate.capacity.unwrap_or(unpublished) * f64::from(candidate.weight)
         }),
         1 => sites.get(0),
         2 => Some(between_two(sites.get(0)?, sites.get(1)?, turn, unpublished)),
@@ -1387,17 +1387,20 @@ fn mean_capacity(sites: &Sites<'_>) -> f64 {
     if count > 0.0 { sum / count } else { 1.0 }
 }
 
-/// A pick between two sites by capacity over 1 + rho, each share clamped to 0.1..0.9.
+/// A pick between two sites by capacity over 1 + rho, with the exploration clamp applied before weights.
 fn between_two<'snap>(first: Site<'snap>, second: Site<'snap>, turn: usize, unpublished: f64) -> Site<'snap> {
     let rate =
         |candidate: &RouteCandidate| candidate.capacity.unwrap_or(unpublished) / (1.0 + candidate.rho.unwrap_or(0.0));
-    let share = (rate(first.0) / (rate(first.0) + rate(second.0))).clamp(TWO_SITE_SHARE.0, TWO_SITE_SHARE.1);
+    let base_share = (rate(first.0) / (rate(first.0) + rate(second.0))).clamp(TWO_SITE_SHARE.0, TWO_SITE_SHARE.1);
+    let first_weighted = base_share * f64::from(first.0.weight);
+    let second_weighted = (1.0 - base_share) * f64::from(second.0.weight);
+    let share = first_weighted / (first_weighted + second_weighted);
     if unit(turn, SALTS.0) < share { first } else { second }
 }
 
 /// Two distinct picks from `sites` by capacity, taking the lower rho; exact ties go to the first.
 fn two_choices<'snap>(sites: &Sites<'snap>, turn: usize, unpublished: f64) -> Option<Site<'snap>> {
-    let capacity = |candidate: &RouteCandidate| candidate.capacity.unwrap_or(unpublished);
+    let capacity = |candidate: &RouteCandidate| candidate.capacity.unwrap_or(unpublished) * f64::from(candidate.weight);
     let first = weighted(sites, unit(turn, SALTS.0), None, capacity)?;
     let second = weighted(sites, unit(turn, SALTS.1), Some(first.0), capacity).unwrap_or(first);
     Some(if second.0.rho < first.0.rho { second } else { first })
@@ -1510,6 +1513,7 @@ pub(crate) mod tests {
             publishes_load: true,
             site: site.to_owned(),
             stable_id: None,
+            weight: None,
         }])
         .unwrap();
         candidates[0].admission_state = admission;
@@ -1548,6 +1552,7 @@ pub(crate) mod tests {
                     name: "llama".to_owned(),
                     publishes_load: true,
                     site: (*site).to_owned(),
+                    weight: None,
                 })
                 .collect(),
         )
@@ -1729,6 +1734,7 @@ pub(crate) mod tests {
                     name: name.to_owned(),
                     publishes_load: true,
                     site: "a".to_owned(),
+                    weight: None,
                 })
                 .collect(),
         )
@@ -2420,6 +2426,69 @@ pub(crate) mod tests {
             snapshot.scores.rotate_left(1);
             snapshot.decisions.rotate_left(1);
         }
+    }
+
+    #[test]
+    fn declared_weight_scales_draw_share() {
+        let mut snapshot = two_sites(Some(5.0), Some(5.0));
+        snapshot.candidates[0].weight = 3;
+        snapshot.candidates[1].weight = 1;
+        let east = (0..4_000)
+            .filter(|&turn| {
+                select_spread(
+                    &snapshot,
+                    CapabilityKind::InferenceModel,
+                    "llama",
+                    turn,
+                    |_| true,
+                    &KeepAll,
+                )
+                .unwrap()
+                .candidate
+                .site
+                .as_ref()
+                    == "east"
+            })
+            .count();
+        assert!(
+            (2_700..=3_300).contains(&east),
+            "weight 3 vs 1 should give ~75% to east, got {east}/4000"
+        );
+    }
+
+    #[test]
+    fn declared_weight_scales_between_two_with_pressure() {
+        let mut snapshot = loaded(&[("a", Some(3.0), Some(10.0)), ("b", Some(3.0), Some(10.0))]);
+        for candidate in &mut snapshot.candidates {
+            candidate.backlog = Some(false);
+        }
+        snapshot.candidates[0].weight = 3;
+        snapshot.candidates[1].weight = 1;
+        let taken = shares(&snapshot, 4_000, &KeepAll);
+        assert!(
+            (2_700..=3_300).contains(&taken["a"]),
+            "weight 3 vs 1 with equal pressure should give ~75% to a, got {taken:?}"
+        );
+    }
+
+    #[test]
+    fn declared_weight_scales_two_choices_with_pressure() {
+        let mut snapshot = loaded(&[
+            ("a", Some(2.0), Some(10.0)),
+            ("b", Some(2.0), Some(10.0)),
+            ("c", Some(2.0), Some(10.0)),
+        ]);
+        for candidate in &mut snapshot.candidates {
+            candidate.backlog = Some(false);
+        }
+        snapshot.candidates[0].weight = 3;
+        snapshot.candidates[1].weight = 1;
+        snapshot.candidates[2].weight = 1;
+        let taken = shares(&snapshot, 10_000, &KeepAll);
+        let a = taken["a"];
+        let b = taken["b"];
+        let c = taken["c"];
+        assert!(a > b && a > c, "the heavier site takes the most: a={a}, b={b}, c={c}");
     }
 
     #[test]

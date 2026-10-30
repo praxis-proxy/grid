@@ -236,6 +236,7 @@ fn config(spec: &SiteSpec) -> CandidateConfig {
         publishes_load: true,
         site: spec.site.to_owned(),
         stable_id: None,
+        weight: None,
     }
 }
 
