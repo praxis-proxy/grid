@@ -1,0 +1,16 @@
+name: Scheduled llm-d Pool-Metrics Quick Qualification
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+
+permissions:
+  contents: read
+  packages: read
+  pull-requests: read
+
+jobs:
+  qualify:
+    uses: ./.github/workflows/triggered-integration-test.yaml
+    with:
+      release_qualification: llmd-pool-metrics-quick
