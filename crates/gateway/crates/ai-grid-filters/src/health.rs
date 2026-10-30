@@ -87,10 +87,11 @@ impl ClusterHealth {
         let dialed = self.dials.states.load();
         now.retain(|cluster| !dialed.contains_key(cluster));
         now.extend(self.dials.demoted(now_ms));
+        // Every tick: a dial that recovers from half open changes no down set.
+        self.dials.export();
         if **self.down.load() == now {
             return false;
         }
-        self.dials.export();
         tracing::info!(down = ?now, "grid: backend clusters with no healthy endpoint changed");
         self.down.store(Arc::new(now));
         true
@@ -280,6 +281,8 @@ fn down_clusters(registry: &HashMap<Arc<str>, ClusterHealthState>) -> BTreeSet<A
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
+    use std::sync::Mutex;
+
     use praxis_core::health::{ClusterHealthEntry, EndpointHealth};
 
     use super::*;
@@ -330,6 +333,74 @@ mod tests {
         health.observe(Some(&registry(&[("site-a", &[true])])));
         assert!(health.update(), "the recovered cluster leaves the down set");
         assert!(health.down().is_empty());
+    }
+
+    /// Gauges by name and cluster, so a test reads `grid_dial_down` back.
+    #[derive(Default)]
+    struct Gauges(Mutex<BTreeMap<String, Arc<AtomicU64>>>);
+
+    impl Gauges {
+        /// `grid_dial_down` for `cluster`, if ever set.
+        fn down(&self, cluster: &str) -> Option<bool> {
+            let value = self
+                .0
+                .lock()
+                .unwrap()
+                .get(&format!("grid_dial_down:{cluster}"))
+                .map(|value| value.load(Ordering::Relaxed))?;
+            Some(value == 1.0_f64.to_bits())
+        }
+    }
+
+    impl metrics::Recorder for Gauges {
+        fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn register_counter(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+
+        fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            let cluster = key
+                .labels()
+                .find(|label| label.key() == "cluster")
+                .map_or("", |label| label.value());
+            let name = format!("{}:{cluster}", key.name());
+            metrics::Gauge::from_arc(Arc::clone(self.0.lock().unwrap().entry(name).or_default()))
+        }
+
+        fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn the_down_gauge_clears_when_a_half_open_dial_recovers() {
+        let gauges = Gauges::default();
+        metrics::with_local_recorder(&gauges, || {
+            let health = ClusterHealth::default();
+            let dial = health.dials().state("east", "east:8443");
+            health
+                .dials()
+                .adopt(BTreeMap::from([(Arc::from("east"), Arc::clone(&dial))]));
+            dial.record(false, 1_000);
+            dial.record(false, 2_000);
+            assert!(health.update_at(2_000), "two failures demote the dial");
+            assert_eq!(gauges.down("east"), Some(true));
+            let half_open = 2_000 + COOLDOWN_MS;
+            assert!(
+                health.update_at(half_open),
+                "the cooldown ends and the down set changes"
+            );
+            assert_eq!(gauges.down("east"), Some(true), "half open is still down");
+            dial.record(true, half_open + 100);
+            dial.record(true, half_open + 200);
+            assert!(!health.update_at(half_open + 200), "recovery changes no down set");
+            assert_eq!(gauges.down("east"), Some(false), "but the gauge still clears");
+        });
     }
 
     #[test]
