@@ -434,6 +434,8 @@ metricsListener:
     caConfigMap:
       name: ""
       key: "ca.crt"
+    # -- Additional labels on the ServiceMonitor, for a collector that selects by label.
+    labels: {}
 
 # -- Gateway Service configuration.
 service:

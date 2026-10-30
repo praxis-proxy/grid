@@ -12,7 +12,6 @@ resources:
   - clusterrole-resources.yaml
   - clusterrolebinding-crd.yaml
   - clusterrolebinding-metrics-scraper.yaml
-  - configmap-config.yaml
   - deployment.yaml
   - networkpolicy.yaml
   - role-leader-election.yaml

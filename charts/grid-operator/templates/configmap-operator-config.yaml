@@ -1,16 +1,15 @@
 {{- include "grid-operator.normalize" . }}
 {{- if (.Values.operatorConfig | default dict).create }}
+{{- with include "grid-operator.enrollment.site" . | trim }}
+{{- /* With no site section the operator runs on defaults, and another writer may own the ConfigMap. */}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "grid-operator.operatorConfig.name" . | quote }}
+  name: {{ include "grid-operator.operatorConfig.name" $ | quote }}
   labels:
-    {{- include "grid-operator.labels" . | nindent 4 }}
+    {{- include "grid-operator.labels" $ | nindent 4 }}
 data:
-  {{- with include "grid-operator.enrollment.site" . | trim }}
   config.yaml: |
     {{- . | nindent 4 }}
-  {{- else }}
-  config.yaml: ""
-  {{- end }}
+{{- end }}
 {{- end }}

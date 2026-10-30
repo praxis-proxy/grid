@@ -127,16 +127,15 @@ tests:
                 url: "https://enroll.example.com"
                 rotation: "Disabled"
 
-  - it: renders an empty document without enrollment or a URL
+  - it: renders no ConfigMap without a site section, so another writer can own it
     template: templates/configmap-operator-config.yaml
     set:
       enrollment.url: ""
       enrollment.caBundle.secret: ""
       enrollment.tokenSecretRef.name: ""
     asserts:
-      - equal:
-          path: data["config.yaml"]
-          value: ""
+      - hasDocuments:
+          count: 0
 
   - it: defaults the URL to the in-cluster grid-enrollment Service
     template: templates/configmap-operator-config.yaml
