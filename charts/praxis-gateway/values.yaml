@@ -337,6 +337,11 @@ praxisConfig:
       configMapName: ""
       # -- Mount directory for the serving ConfigMap.
       mountPath: "/etc/praxis/grid-serving"
+      # -- CA bundles the operator's tls dials verify against, each { secretName or
+      # configMapName, key (default ca.crt) }, mounted read-only at
+      # /run/secrets/grid-backend-ca/<name>/<key>. One entry per Secret or ConfigMap.
+      # Leave empty when mountReconciliation lets the operator mount them.
+      backendCAs: []
       # -- Tuning for the grid_site_route filter block: availability and prefixAffinity, keys as
       # the filter reads them. Fields and defaults in examples/gateway/grid-site-route.yaml.
       siteRoute:

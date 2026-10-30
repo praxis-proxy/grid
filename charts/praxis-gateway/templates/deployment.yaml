@@ -316,6 +316,11 @@ spec:
             {{- end }}
             {{- end }}
             {{- end }}
+            {{- range $i, $ca := $gridServing.backendCAs }}
+            - name: grid-backend-ca-{{ $i }}
+              mountPath: {{ printf "/run/secrets/grid-backend-ca/%s" (include "praxis-gateway.backendCADir" $ca) | quote }}
+              readOnly: true
+            {{- end }}
             {{- if .Values.listenerTls.secretName }}
             - name: listener-tls
               mountPath: {{ .Values.listenerTls.mountPath | quote }}
@@ -421,6 +426,20 @@ spec:
           {{- end }}
         {{- end }}
         {{- end }}
+        {{- end }}
+        {{- range $i, $ca := $gridServing.backendCAs }}
+        {{- $key := $ca.key | default "ca.crt" }}
+        - name: grid-backend-ca-{{ $i }}
+          {{- if $ca.configMapName }}
+          configMap:
+            name: {{ $ca.configMapName | quote }}
+          {{- else }}
+          secret:
+            secretName: {{ $ca.secretName | quote }}
+          {{- end }}
+            items:
+              - key: {{ $key | quote }}
+                path: {{ $key | quote }}
         {{- end }}
         {{- $validateCA := .Values.praxisConfig.render.auth.validateCA }}
         {{- $apiKeyRender := and (eq .Values.praxisConfig.source "render") (eq .Values.praxisConfig.render.auth.mode "api-key") }}

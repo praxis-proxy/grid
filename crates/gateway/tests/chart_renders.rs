@@ -141,4 +141,25 @@ mod tests {
         );
         load(&yaml).unwrap_or_else(|error| panic!("grid serving with site route tuning: {error}"));
     }
+
+    #[test]
+    fn a_grid_serving_render_without_backends_loads() {
+        let Some(yaml) = render(&[
+            "--set=image.flavor=grid-gateway",
+            "--set=praxisConfig.render.gridServing.enabled=true",
+            "--set=praxisConfig.render.gridServing.networkName=grid",
+            "--set=praxisConfig.render.gridServing.backendCAs[0].secretName=kserve-ca",
+            "--set=gridIdentity.tlsSecretName=grid-site-identity",
+            "--set=gridIdentity.caSecretName=grid-ca",
+        ]) else {
+            return;
+        };
+        assert!(
+            yaml.contains("clusters: []") && !yaml.contains("load_balancer"),
+            "grid_site_route declares no clusters and no load_balancer is rendered:\n{yaml}"
+        );
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("praxis.yaml");
+        assert!(parsed.get("clusters").is_none(), "no top-level clusters:\n{yaml}");
+        load(&yaml).unwrap_or_else(|error| panic!("grid serving without backends: {error}"));
+    }
 }

@@ -176,7 +176,7 @@ Validate praxisConfig: the source, and that each source gets only the settings i
 {{- fail (printf "praxisConfig.render.%s is set but praxisConfig.source is %s, which ignores it: set praxisConfig.source to render, or unset it" $key $source) }}
 {{- end }}
 {{- end }}
-{{- if or $render.backends $auth.mode $telemetry.enabled $provider $gridServing.enabled $peerTrust.certDigests $auth.validateUrl $validateCA.configMapName $validateCA.secretName }}
+{{- if or $render.backends $auth.mode $telemetry.enabled $provider $gridServing.enabled $gridServing.backendCAs $peerTrust.certDigests $auth.validateUrl $validateCA.configMapName $validateCA.secretName }}
 {{- fail (printf "praxisConfig.render settings are set but praxisConfig.source is %s, which ignores them: set praxisConfig.source to render, or unset them" $source) }}
 {{- end }}
 {{- end }}
@@ -203,6 +203,7 @@ Validate praxisConfig: the source, and that each source gets only the settings i
 {{- if and (not ($render.backends | default list)) (not $gridServing.enabled) }}
 {{- fail "praxisConfig.render.backends needs at least one backend when praxisConfig.source is render without gridServing" }}
 {{- end }}
+{{- include "praxis-gateway.validateBackendCAs" . }}
 {{- if and (not $auth.mode) (not $provider) }}
 {{- fail "praxisConfig.render.auth.mode is required when praxisConfig.source is render: api-key (needs an image with praxis-policy 0.4 or later) or none (only behind an authenticating front)" }}
 {{- end }}
@@ -472,6 +473,39 @@ Validate enabled mounts have a non-empty resource name.
 {{- fail "praxisConfig.operator.gridServing needs mountReconciliation.enabled: every operator praxis.yaml revision must roll the pod so it re-reads its provider-hop backends" }}
 {{- end }}
 {{- end }}
+{{- end }}
+
+{{/*
+Validate praxisConfig.render.gridServing.backendCAs.
+*/}}
+{{- define "praxis-gateway.validateBackendCAs" -}}
+{{- $serving := .Values.praxisConfig.render.gridServing | default dict }}
+{{- if $serving.backendCAs }}
+{{- if not $serving.enabled }}
+{{- fail "praxisConfig.render.gridServing.backendCAs needs praxisConfig.render.gridServing.enabled: the CAs are for the operator's dials" }}
+{{- end }}
+{{- if .Values.mountReconciliation.enabled }}
+{{- fail "praxisConfig.render.gridServing.backendCAs and mountReconciliation both mount /run/secrets/grid-backend-ca: let the operator mount the CAs, or disable mountReconciliation" }}
+{{- end }}
+{{- end }}
+{{- $dirs := dict }}
+{{- range $serving.backendCAs }}
+{{- if eq (empty .secretName) (empty .configMapName) }}
+{{- fail "praxisConfig.render.gridServing.backendCAs: set secretName or configMapName on each entry, not both" }}
+{{- end }}
+{{- $dir := include "praxis-gateway.backendCADir" . }}
+{{- if hasKey $dirs $dir }}
+{{- fail (printf "praxisConfig.render.gridServing.backendCAs: %s is listed twice; one entry per Secret or ConfigMap" $dir) }}
+{{- end }}
+{{- $_ := set $dirs $dir true }}
+{{- end }}
+{{- end }}
+
+{{/*
+A backendCAs entry's directory under /run/secrets/grid-backend-ca, named as the operator's dns_safe names it.
+*/}}
+{{- define "praxis-gateway.backendCADir" -}}
+{{- regexReplaceAll "[^a-z0-9]+" (lower (.secretName | default .configMapName)) "-" | trimAll "-" | trunc 63 | trimSuffix "-" -}}
 {{- end }}
 
 {{/*
