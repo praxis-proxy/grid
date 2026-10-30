@@ -1,0 +1,187 @@
+suite: provider from the operator's provider file
+templates:
+  - templates/gateway-config.yaml
+  - templates/deployment.yaml
+  - templates/route.yaml
+release:
+  name: gw
+  namespace: redhat-ai-grid
+set:
+  image.flavor: grid-gateway
+  praxisConfig.source: render
+  grid.siteName: site-a
+  grid.networkName: grid
+  gridIdentity.tlsSecretName: grid-site-identity
+  praxisConfig.render.role: provider
+  praxisConfig.render.peerTrust.mode: spiffe
+  praxisConfig.render.gridServing.enabled: true
+  praxisConfig.render.gridServing.gatewayRefName: grid-gateway
+tests:
+  - it: requires an SVID at the handshake and holds no site list
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'client_ca:\s+ca_path: "/etc/praxis/tls/ca.crt"\s+client_cert_mode: require_named\n'
+      - notMatchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'trusted_spiffe_ids|peer_identity_trust'
+
+  - it: runs grid_provider first, then the response header, with nothing that routes
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: '(?s)filters:\s+- filter: grid_provider\s+allowed_paths:\s+- "/v1/chat/completions"\s+- "/v1/completions"\s+- "/v1/models"\s+- "/v1/embeddings"\s+- filter: headers\s+response_set:\s+- name: X-Grid-Provider-Site\s+value: "site-a"'
+      - notMatchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'load_balancer|router|grid_site_route|intelligent_route|provider_route|static_response|clusters:'
+
+  - it: keeps trace_context ahead and a static rate limit behind grid_provider
+    template: templates/gateway-config.yaml
+    set:
+      praxisConfig.render.telemetry.enabled: true
+      praxisConfig.render.peerTrust.rateLimit: { rate: 20, burst: 40 }
+      praxisConfig.render.provider.allowedPaths: ["/v1/models"]
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: '(?s)filters:\s+- filter: trace_context\s+- filter: grid_provider\s+allowed_paths:\s+- "/v1/models"\s+- filter: rate_limit\s+mode: global\s+rate: 20\s+burst: 40\s+- filter: headers'
+
+  - it: points the gateway at the provider file in the consumer's serving ConfigMap, optional
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_PROVIDER_CONFIG
+            value: /etc/praxis/grid-serving/provider.json
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SERVING_CONFIG
+            value: /etc/praxis/grid-serving/serving-config.json
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: grid-serving
+            configMap:
+              name: grid-serving-grid-grid-gateway
+              optional: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: grid-serving
+            mountPath: /etc/praxis/grid-serving
+            readOnly: true
+
+  - it: mounts the backend CAs the provider file's tls dials verify against
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.render.gridServing.backendCAs:
+        - secretName: models-ca
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: grid-backend-ca-0
+            mountPath: /run/secrets/grid-backend-ca/models-ca
+            readOnly: true
+
+  - it: a consumer's serving ConfigMap stays required
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.render.role: consumer
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.peerTrust: null
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SERVING_CONFIG
+            value: /etc/praxis/grid-serving/serving-config.json
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: grid-serving
+            configMap:
+              name: grid-serving-grid-grid-gateway
+              optional: false
+
+  - it: defaults the Route host to the site's grid name
+    template: templates/route.yaml
+    set:
+      route.enabled: true
+    asserts:
+      - equal:
+          path: spec.host
+          value: site-a.grid.internal
+      - equal:
+          path: spec.tls.termination
+          value: passthrough
+
+  - it: keeps an explicit Route host
+    template: templates/route.yaml
+    set:
+      route.enabled: true
+      route.host: site-a.apps.example.com
+    asserts:
+      - equal:
+          path: spec.host
+          value: site-a.apps.example.com
+
+  - it: refuses chart backends beside the provider file
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.render.backends:
+        - cluster: local
+          endpoints: ["10.96.0.20:8000"]
+          transport: { mode: plaintext }
+    asserts:
+      - failedTemplate:
+          errorPattern: "unset praxisConfig.render.backends"
+
+  - it: refuses a chart site list beside the provider file
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.render.peerTrust.spiffeIds: ["spiffe://grid.internal/site/site-b"]
+    asserts:
+      - failedTemplate:
+          errorPattern: "unset peerTrust spiffeIds, allowAnyGridSite and certDigests"
+
+  - it: refuses admitting any Grid-CA site beside the provider file
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.render.peerTrust.allowAnyGridSite: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "unset peerTrust spiffeIds, allowAnyGridSite and certDigests"
+
+  - it: refuses pin trust beside the provider file
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.render.peerTrust.mode: pin
+      praxisConfig.render.peerTrust.certDigests: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+    asserts:
+      - failedTemplate: {}
+
+  - it: refuses a provider that would read its own serving ConfigMap
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.render.gridServing.gatewayRefName: ""
+    asserts:
+      - failedTemplate:
+          errorPattern: "set gatewayRefName to that gateway's name, or configMapName"
+
+  - it: mounts providerCredentials where a credentialed dial reads its token
+    template: templates/deployment.yaml
+    set:
+      providerCredentials:
+        - secretName: grid-model-client-token
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: credential-0
+            mountPath: /run/secrets/grid-credentials/grid-model-client-token
+            readOnly: true

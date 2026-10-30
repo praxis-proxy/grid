@@ -1086,8 +1086,20 @@ fi
 try_reject_msg "$GW_DIR" "gridServing without the Grid identity (gw)" "praxisConfig.render.gridServing polls peers with the grid identity" "${SERVING[@]}" \
   --set gridIdentity.tlsSecretName="" --set gridIdentity.caSecretName="" \
   --set praxisConfig.render.backends[0].transport.mode=tls
-try_reject_msg "$GW_DIR" "gridServing on the provider role (gw)" "consumer role only" "${SERVING[@]}" --set praxisConfig.render.role=provider \
+try_reject_msg "$GW_DIR" "gridServing on a pin-trust provider (gw)" "peerTrust" "${SERVING[@]}" --set praxisConfig.render.role=provider \
   --set-json "praxisConfig.render.peerTrust.certDigests=[\"$DIGEST\"]"
+try_reject_msg "$GW_DIR" "gridServing provider with chart backends (gw)" "unset praxisConfig.render.backends" "${SERVING[@]}" \
+  --set praxisConfig.render.role=provider --set praxisConfig.render.peerTrust.mode=spiffe
+if helm template v-prov "$GW_DIR" --set praxisConfig.source=render --set grid.siteName=hub --set grid.networkName=grid \
+  --set image.repository=quay.io/example/grid-gateway --set image.tag=t --set image.flavor=grid-gateway \
+  --set gridIdentity.tlsSecretName=grid-site-identity --set praxisConfig.render.role=provider \
+  --set praxisConfig.render.peerTrust.mode=spiffe --set praxisConfig.render.gridServing.enabled=true \
+  --set praxisConfig.render.gridServing.gatewayRefName=grid-gateway 2>&1 \
+  | matches 'filter: grid_provider'; then
+  pass "gridServing provider: renders grid_provider from the provider file"
+else
+  fail "gridServing provider: grid_provider not rendered"
+fi
 try_reject_msg "$GW_DIR" "gridServing on the ai image flavor (gw)" "praxisConfig.render.gridServing needs image.flavor grid-gateway" "${SERVING[@]}" \
   --set image.repository=quay.io/example/ai --set image.flavor=ai
 # --reuse-values from a release predating these keys leaves them absent.

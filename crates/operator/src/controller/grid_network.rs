@@ -48,8 +48,8 @@ use crate::{
     readiness,
     resources::{
         consumer_config::{self, ConsumerConfigError, SiteRoutePrerequisite},
-        derived_topology, gateway_mounts, overlay_envelope, provider_admission, provider_metrics, routing_overlay,
-        secret,
+        derived_topology, gateway_mounts, overlay_envelope, provider_admission, provider_config, provider_metrics,
+        routing_overlay, secret,
         serving_config::{self, ServingInputs, WriteDecision, WriteGate},
         tls_backend::ServerTlsConfig,
         trust_bundle::{self, CertPemStatus},
@@ -125,6 +125,9 @@ pub struct OperatorCtx {
 
     /// Sites each `GridNetwork`'s serving config last refused, for warning on change.
     pub(crate) refused_sites: serving_config::RefusedSites,
+
+    /// Clusters each gateway's dial file last refused, for warning on change.
+    pub(crate) refused_dials: serving_config::RefusedSites,
 
     /// Who may read the signals endpoint, keyed by presented-cert fingerprint.
     /// Set by reconcile from each `GridSite`'s trust pins.
@@ -393,6 +396,7 @@ impl OperatorCtx {
             admission_memory: Mutex::new(provider_admission::AdmissionMemory::default()),
             last_seeds: std::sync::Mutex::new(HashMap::new()),
             refused_sites: std::sync::Mutex::new(HashMap::new()),
+            refused_dials: std::sync::Mutex::new(HashMap::new()),
             peer_identities: signals::PeerIdentities::new(),
             peers: signals::SignalStore::new(),
             peer_rounds: signals::PeerRounds::default(),
@@ -1227,11 +1231,7 @@ fn declared_signals(site: &GridSite, name: &str, signals_port: Option<u16>) -> O
 /// The bare `site_id` a peer is keyed by, and whether the object is enrolled
 /// rather than a discovered stub carrying [`ANNOTATION_SITE_ID`].
 pub(crate) fn peer_site_key(site: &GridSite) -> Option<(String, bool)> {
-    let discovered = site
-        .metadata
-        .labels
-        .as_ref()
-        .is_some_and(|labels| labels.get(LABEL_AUTO_DISCOVERED).is_some_and(|v| v == "true"));
+    let discovered = !crate::controller::grid_site::is_declared(site);
     // Only discovery's own stubs speak for another id; any other object is its name.
     site.metadata
         .annotations
@@ -3168,6 +3168,11 @@ async fn reconcile_routing_overlay_inner(
         // Each gateway identifies its own local site.  Fall back to the
         // network name for single-site deployments where the two are equal.
         let local_site = gw_ref.site_name.as_deref().unwrap_or(network_name);
+        let admitted = provider_config::admitted_sites(&sites, network_name, local_site);
+        // Before anything that can skip this gateway, so a removed site never outlives a failed render.
+        if serving.is_some() {
+            revoke_provider_admission(network_name, gw_ref, &admitted, client).await;
+        }
 
         // Filter remote CRDT providers to those whose source GridSite is Active.
         // Providers from sites in any other phase (Discovered, Connecting, Pending,
@@ -3234,20 +3239,18 @@ async fn reconcile_routing_overlay_inner(
             inventory_expiry_deadline =
                 Some(inventory_expiry_deadline.map_or(deadline, |current| current.min(deadline)));
         }
-        let (cluster_endpoints, derived_summary, refused) = gateway_cluster_endpoints(
-            gw_ref,
-            &overlay.candidates,
-            &derived_topology::Declarations {
-                providers,
-                sites: &sites,
-                local_site,
-                network_name,
-                from_providers: &[],
-                transport: None,
-                signal,
-                peer_catalog: peer_catalog.as_ref(),
-            },
-        );
+        let declarations = derived_topology::Declarations {
+            providers,
+            sites: &sites,
+            local_site,
+            network_name,
+            from_providers: &[],
+            transport: None,
+            signal,
+            peer_catalog: peer_catalog.as_ref(),
+        };
+        let (cluster_endpoints, derived_summary, refused) =
+            gateway_cluster_endpoints(gw_ref, &overlay.candidates, &declarations);
         if !refused.is_empty() {
             tracing::warn!(
                 network = network_name,
@@ -3257,6 +3260,21 @@ async fn reconcile_routing_overlay_inner(
             );
         }
         withdraw_refused(&mut overlay, &refused);
+        let dials = serving.as_ref().map_or_else(BTreeMap::new, |source| {
+            let (dials, undialable) = gateway_dials(gw_ref, &overlay, &declarations);
+            let key = format!("{network_name}/{}/{}", gw_ref.namespace, gw_ref.name);
+            if serving_config::refusal_changed(&key, &undialable, source.refused_dials) && !undialable.is_empty() {
+                tracing::warn!(network = network_name, gateway = %gw_ref.name, refused = ?undialable, "dial file: refusing clusters the gateway must not dial");
+            }
+            dials
+        });
+        if let Some(source) = serving.as_ref() {
+            let provider =
+                provider_config::render_provider(&overlay, &dials, admitted.clone(), &restricted_clusters(providers));
+            let key = format!("provider:{network_name}/{}/{}", gw_ref.namespace, gw_ref.name);
+            provider_config::warn_dropped(&overlay, &provider, &key, source.refused_dials);
+            apply_provider_file(network_name, gw_ref, &provider, client).await;
+        }
         let site_route = gw_ref
             .praxis_config
             .as_ref()
@@ -3391,6 +3409,7 @@ async fn reconcile_routing_overlay_inner(
                     let target = ServingTarget {
                         gw_ref,
                         hops,
+                        dials: &dials,
                         bootstrap: true,
                     };
                     let written = apply_serving_config(&overlay, source, network_name, target, client).await;
@@ -3468,6 +3487,7 @@ async fn reconcile_routing_overlay_inner(
             let target = ServingTarget {
                 gw_ref,
                 hops,
+                dials: &dials,
                 bootstrap: false,
             };
             let written = apply_serving_config(&overlay, source, network_name, target, client).await;
@@ -3564,6 +3584,8 @@ struct ServingSource<'src> {
     scrape_interval: Duration,
     /// Sites each network's serving config last refused.
     refused: &'src serving_config::RefusedSites,
+    /// Clusters each gateway's dial file last refused.
+    refused_dials: &'src serving_config::RefusedSites,
     /// Peer providers the poller has heard load for.
     load_heard: &'src signals::LoadHeard,
     /// This site's provider clusters with no metrics to scrape.
@@ -3587,6 +3609,7 @@ fn serving_source<'ctx>(ctx: &'ctx OperatorCtx, providers: &[InferenceProvider])
         settings: &ctx.peer_settings,
         scrape_interval: ctx.scrape_interval,
         refused: &ctx.refused_sites,
+        refused_dials: &ctx.refused_dials,
         load_heard: &ctx.load_heard,
         quiet_local,
     })
@@ -3605,13 +3628,216 @@ fn site_route_unmet(gw_ref: &GatewayRef, cc: &ConsumerConfig, polling: bool) -> 
     }
 }
 
-/// Render the serving config text for one gateway, including authoritative no-route state.
-fn render_serving_text(
+/// The dials derivation admits for one gateway, and each cluster refused, with why.
+///
+/// Produced for any gateway with `gridServing` whose derivation admits clusters, whether or
+/// not it generates its praxis config. Only derived clusters: a typed `clusterEndpoints`
+/// entry stays a praxis cluster and no derived dial shadows it. A local dial carries its
+/// provider endpoint's path and the bearer token its candidates name.
+fn gateway_dials(
+    gw_ref: &GatewayRef,
+    overlay: &routing_overlay::RoutingOverlay,
+    declarations: &derived_topology::Declarations<'_>,
+) -> (BTreeMap<String, serving_config::DialSpec>, BTreeSet<String>) {
+    let cc = gw_ref.praxis_config.as_ref();
+    let derive = cc.and_then(|cc| cc.derive_topology.as_ref());
+    let resolve_with = derived_topology::Declarations {
+        from_providers: derive.map_or(&[][..], |derive| derive.from_providers.as_slice()),
+        transport: derive.and_then(|derive| derive.transport.as_ref()),
+        ..*declarations
+    };
+    let typed = cc.map_or(&[][..], |cc| cc.cluster_endpoints.as_slice());
+    let mut resolution = derived_topology::resolve(&overlay.candidates, typed, &resolve_with);
+    resolution
+        .resolved
+        .retain(|_, entry| entry.origin != derived_topology::Origin::Explicit);
+    derived_topology::refuse_undialable(&mut resolution, &resolve_with);
+    let mut refused: BTreeSet<String> = resolution
+        .refused
+        .iter()
+        .filter(|refused| {
+            matches!(
+                refused.reason,
+                derived_topology::Refusal::SiteNotEnrolled
+                    | derived_topology::Refusal::PlaintextOffSite
+                    | derived_topology::Refusal::ServerNameNotSite
+                    | derived_topology::Refusal::NoServerName
+            )
+        })
+        .map(|refused| format!("{}: {}", refused.cluster, refused.reason.as_str()))
+        .collect();
+    let paths: BTreeMap<String, Option<String>> = resolution
+        .resolved
+        .iter()
+        .map(|(cluster, entry)| (cluster.clone(), entry.endpoint_path.clone()))
+        .collect();
+    let endpoints: Vec<ClusterEndpointConfig> = resolution.resolved.into_values().map(|entry| entry.endpoint).collect();
+    let sites: BTreeMap<&str, &str> = overlay
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.kind == routing_overlay::CANDIDATE_KIND)
+        .map(|candidate| (candidate.cluster.as_str(), candidate.site.as_str()))
+        .collect();
+    let (mut dials, unrendered) = consumer_config::dial_specs(&endpoints, &sites, &overlay.local_site);
+    refused.extend(unrendered.iter().map(|(cluster, error)| format!("{cluster}: {error}")));
+    dials.retain(|cluster, dial| {
+        let path = paths.get(cluster).and_then(Option::as_deref);
+        match dial_request_shape(cluster, dial, path, overlay, gw_ref) {
+            Ok((base_path, credential)) => {
+                dial.base_path = base_path;
+                dial.credential = credential;
+                true
+            },
+            Err(reason) => {
+                refused.insert(format!("{cluster}: {reason}"));
+                false
+            },
+        }
+    });
+    (dials, refused)
+}
+
+/// The base path and credential `dial` sends for `cluster`, or why it cannot be dialed.
+fn dial_request_shape(
+    cluster: &str,
+    dial: &serving_config::DialSpec,
+    endpoint_path: Option<&str>,
+    overlay: &routing_overlay::RoutingOverlay,
+    gw_ref: &GatewayRef,
+) -> Result<(Option<String>, Option<serving_config::DialCredential>), &'static str> {
+    let credential_mount = gw_ref
+        .praxis_config
+        .as_ref()
+        .map_or(serving_config::DIAL_CREDENTIAL_BASE, |cc| {
+            cc.credential_mount_path.as_str()
+        });
+    let base_path = endpoint_path.map(serving_config::dial_base_path).transpose()?.flatten();
+    let mut credentials = overlay
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.cluster == cluster)
+        .filter_map(|candidate| candidate.credential.as_ref());
+    let Some(credential) = credentials.next() else {
+        return Ok((base_path, None));
+    };
+    if dial.site != overlay.local_site || matches!(dial.transport, serving_config::DialTransport::MutualTls { .. }) {
+        return Err("a credential is never sent off this site");
+    }
+    if credentials.any(|other| other != credential) {
+        return Err("its candidates name different credentials");
+    }
+    if credential.strategy != "bearer_token" {
+        return Err("only a bearer_token credential is dialed");
+    }
+    if credential.secret_ref.namespace != gw_ref.namespace {
+        return Err("the credential Secret is not in the gateway's namespace");
+    }
+    if credential_mount != serving_config::DIAL_CREDENTIAL_BASE {
+        return Err("credentialMountPath is not the gateway's credential mount");
+    }
+    let path = consumer_config::credential_file_path(
+        credential_mount,
+        &credential.secret_ref.name,
+        &credential.secret_ref.key,
+    );
+    Ok((
+        base_path,
+        Some(serving_config::DialCredential {
+            path,
+            strategy: "bearer_token",
+        }),
+    ))
+}
+
+/// Clusters whose local provider limits which sites may route to it, which a provider file
+/// never serves to an admitted peer.
+fn restricted_clusters(providers: &[InferenceProvider]) -> BTreeSet<&str> {
+    providers
+        .iter()
+        .filter(|provider| !provider.spec.access_policy.site_selector.match_labels.is_empty())
+        .filter_map(routing_overlay::routing_identity)
+        .collect()
+}
+
+/// Rewrite `gw_ref`'s stored provider file at once when it admits a site `admitted` does not.
+async fn revoke_provider_admission(network_name: &str, gw_ref: &GatewayRef, admitted: &[String], client: &Client) {
+    let (api, name) = provider_api(network_name, gw_ref, client);
+    let stored = match api.get_opt(&name).await {
+        Ok(existing) => stored_provider(existing),
+        Err(error) => {
+            tracing::warn!(network = network_name, gateway = %gw_ref.name, %error, "provider file: cannot read the stored admission");
+            return;
+        },
+    };
+    if let Some(revoked) = stored
+        .as_deref()
+        .and_then(|stored| provider_config::revoked(stored, admitted))
+    {
+        apply_provider_text(&api, network_name, gw_ref, &revoked).await;
+    }
+}
+
+/// Apply `provider` as `gw_ref`'s provider file when it differs from what is stored.
+///
+/// Its own field manager and key, so it is written whatever happens to the serving config.
+async fn apply_provider_file(
+    network_name: &str,
+    gw_ref: &GatewayRef,
+    provider: &provider_config::ProviderConfig,
+    client: &Client,
+) {
+    let Ok(text) = serving_config::to_text(provider) else {
+        tracing::warn!(network = network_name, gateway = %gw_ref.name, "provider file: render failed");
+        return;
+    };
+    let (api, name) = provider_api(network_name, gw_ref, client);
+    let stored = api.get_opt(&name).await.ok().flatten();
+    if stored_provider(stored).as_deref() != Some(text.as_str()) {
+        apply_provider_text(&api, network_name, gw_ref, &text).await;
+    }
+}
+
+/// The `ConfigMap` API and name `gw_ref`'s provider file lives in.
+fn provider_api(network_name: &str, gw_ref: &GatewayRef, client: &Client) -> (Api<ConfigMap>, String) {
+    (
+        Api::namespaced(client.clone(), &gw_ref.namespace),
+        serving_config::configmap_name(network_name, &gw_ref.name),
+    )
+}
+
+/// The provider file `existing` holds.
+fn stored_provider(existing: Option<ConfigMap>) -> Option<String> {
+    existing
+        .and_then(|cm| cm.data)
+        .and_then(|mut data| data.remove(provider_config::PROVIDER_KEY))
+}
+
+/// Apply `text` as the provider file under its own field manager, logging the outcome.
+async fn apply_provider_text(api: &Api<ConfigMap>, network_name: &str, gw_ref: &GatewayRef, text: &str) {
+    let cm = provider_config::build_configmap(text, network_name, &gw_ref.name, &gw_ref.namespace);
+    let name = serving_config::configmap_name(network_name, &gw_ref.name);
+    match api
+        .patch(
+            &name,
+            &PatchParams::apply(provider_config::FIELD_MANAGER).force(),
+            &Patch::Apply(&cm),
+        )
+        .await
+    {
+        Ok(_) => info!(cm_name = %name, digest = %serving_config::digest(text), "applied provider file"),
+        Err(error) => {
+            tracing::warn!(network = network_name, gateway = %gw_ref.name, %error, "provider file apply failed");
+        },
+    }
+}
+
+/// Render the serving config for one gateway, including authoritative no-route state.
+fn render_serving_config(
     overlay: &routing_overlay::RoutingOverlay,
     source: &ServingSource<'_>,
     gw_ref: &GatewayRef,
     hops: HopSource<'_>,
-) -> Result<String, OperatorError> {
+) -> Result<serving_config::ServingConfig, OperatorError> {
     let tls_mount = gw_ref
         .praxis_config
         .as_ref()
@@ -3633,7 +3859,7 @@ fn render_serving_text(
         quiet_local: &source.quiet_local,
         inject_local_credentials: matches!(hops, HopSource::Rendered(_)),
     };
-    serving_config::to_text(&serving_config::render(overlay, &inputs)).map_err(OperatorError::Json)
+    Ok(serving_config::render(overlay, &inputs))
 }
 
 /// Where a gateway's serving config takes its provider hops from.
@@ -3731,6 +3957,8 @@ struct ServingTarget<'target> {
     gw_ref: &'target GatewayRef,
     /// Where its provider hops come from.
     hops: HopSource<'target>,
+    /// What the dial file may carry, before the gateway's own checks.
+    dials: &'target BTreeMap<String, serving_config::DialSpec>,
     /// Write only a missing one, for a gateway whose first pod needs it to start.
     bootstrap: bool,
 }
@@ -3750,6 +3978,10 @@ fn fold_serving_write(
 }
 
 /// Apply the serving config `ConfigMap` when changed, returning when to retry a deferred write.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the rendered config and dial file cross the ConfigMap API calls"
+)]
 async fn apply_serving_config(
     overlay: &routing_overlay::RoutingOverlay,
     source: &ServingSource<'_>,
@@ -3760,33 +3992,42 @@ async fn apply_serving_config(
     let ServingTarget {
         gw_ref,
         hops,
+        dials,
         bootstrap,
     } = target;
     serving_config::warn_refused_sites(overlay, network_name, source.refused);
-    let text = render_serving_text(overlay, source, gw_ref, hops)?;
+    let config = render_serving_config(overlay, source, gw_ref, hops)?;
+    let text = serving_config::to_text(&config).map_err(OperatorError::Json)?;
+    let dial = serving_config::to_text(&serving_config::render_dials(&config, dials)).map_err(OperatorError::Json)?;
     let name = serving_config::configmap_name(network_name, &gw_ref.name);
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
     let existing = api.get_opt(&name).await?;
-    let stored = existing
-        .as_ref()
-        .and_then(|cm| cm.data.as_ref())
+    let data = existing.as_ref().and_then(|cm| cm.data.as_ref());
+    // One decision for both keys, so a dial change alone is written too.
+    let stored = data
         .and_then(|data| data.get(serving_config::SERVING_CONFIG_KEY))
-        .map(String::as_str);
+        .map(|stored_text| {
+            let stored_dial = data.and_then(|data| data.get(serving_config::DIAL_KEY));
+            format!("{stored_text}\0{}", stored_dial.map_or("", String::as_str))
+        });
+    let stored = stored.as_deref();
+    let desired = format!("{text}\0{dial}");
     let key = format!("{}/{name}", gw_ref.namespace);
     let now = Instant::now();
-    let decision = if bootstrap && existing.is_some() {
+    // The provider file may have created the ConfigMap, so only a stored serving config holds.
+    let decision = if bootstrap && stored.is_some() {
         WriteDecision::Unchanged
     } else if overlay.candidates.is_empty() {
-        serving_config::decide_empty_withdrawal(stored, &text)
+        serving_config::decide_empty_withdrawal(stored, &desired)
     } else {
-        serving_config::decide_write(stored, &text, source.gate.last(&key), now)
+        serving_config::decide_write(stored, &desired, source.gate.last(&key), now)
     };
     match decision {
         WriteDecision::Unchanged => return Ok(None),
         WriteDecision::Deferred(wait) => return Ok(Some(wait)),
         WriteDecision::Write => {},
     }
-    let cm = serving_config::build_configmap(&text, network_name, &gw_ref.name, &gw_ref.namespace);
+    let cm = serving_config::build_configmap(&text, &dial, network_name, &gw_ref.name, &gw_ref.namespace);
     api.patch(&name, &PatchParams::apply(FIELD_MANAGER).force(), &Patch::Apply(&cm))
         .await?;
     source.gate.record(&key, now);
@@ -12222,6 +12463,369 @@ mod tests {
                 .is_empty(),
             "no candidate receives hop context after an authoritative withdrawal"
         );
+    }
+
+    /// An `Active` site egressing over mutual TLS, discovered by gossip when `stub`.
+    fn dial_site(name: &str, site_id: &str, stub: bool) -> GridSite {
+        let mut site = make_active_grid_site(name, "net");
+        site.spec.gateway_endpoint = Some(crate::crd::grid_site::EgressConfig {
+            address: format!("{site_id}.example.invalid:8443"),
+            tls: crate::crd::grid_site::EgressTls {
+                server_name: Some(format!("{site_id}.grid.internal")),
+                ..Default::default()
+            },
+        });
+        if stub {
+            site.metadata.labels = Some(BTreeMap::from([(LABEL_AUTO_DISCOVERED.to_owned(), "true".to_owned())]));
+            site.metadata.annotations = Some(BTreeMap::from([(ANNOTATION_SITE_ID.to_owned(), site_id.to_owned())]));
+        }
+        site
+    }
+
+    fn dial_overlay(candidates: Vec<routing_overlay::RoutingCandidate>) -> routing_overlay::RoutingOverlay {
+        routing_overlay::RoutingOverlay {
+            network: "net".to_owned(),
+            local_site: "site-a".to_owned(),
+            candidates,
+            excluded: Vec::new(),
+            selection_policy: None,
+            generated_at: None,
+        }
+    }
+
+    #[test]
+    fn the_dial_file_carries_only_derived_enrolled_uncredentialed_clusters() {
+        let sites = vec![
+            dial_site("site-b", "site-b", false),
+            dial_site("net-site-c-1", "site-c", true),
+        ];
+        let mut credentialed = topology_candidate("site-d", "site-b");
+        credentialed.credential = serde_json::from_value(json!({
+            "strategy": "bearer_token",
+            "secretRef": {"namespace": "models", "name": "token", "key": "token"}
+        }))
+        .ok();
+        assert!(credentialed.credential.is_some(), "fixture carries a credential");
+        let overlay = dial_overlay(vec![
+            topology_candidate("prov-b", "site-b"),
+            topology_candidate("prov-c", "site-c"),
+            topology_candidate("typed", "site-b"),
+            credentialed,
+        ]);
+        let mut gw = make_gw_ref("inference-gw", "praxis-system");
+        gw.praxis_config = Some(ConsumerConfig {
+            derive_topology: Some(crate::crd::grid_network::DeriveTopology {
+                from_providers: vec!["prov-b".to_owned(), "prov-c".to_owned(), "site-d".to_owned()],
+                transport: None,
+            }),
+            cluster_endpoints: vec![typed_endpoint("typed", "typed.example.invalid:8080")],
+            ..make_consumer_config("praxis-consumer-config")
+        });
+        let declarations = derived_topology::Declarations {
+            sites: &sites,
+            ..empty_declarations()
+        };
+        assert!(
+            sites.iter().all(|site| site.metadata.generation.is_none()),
+            "fixture sites are probed at their generation"
+        );
+        let (dials, refused) = gateway_dials(&gw, &overlay, &declarations);
+        assert_eq!(
+            dials.keys().collect::<Vec<_>>(),
+            ["prov-b"],
+            "a stub's gossiped address, a typed entry and a credential-bearing cluster are never dialed"
+        );
+        assert_eq!(
+            dials.get("prov-b").map(|dial| dial.address.as_str()),
+            Some("site-b.example.invalid:8443")
+        );
+        assert_eq!(
+            refused,
+            BTreeSet::from([
+                "prov-c: site not enrolled".to_owned(),
+                "site-d: a credential is never sent off this site".to_owned(),
+            ]),
+            "the stub and the off-site credential are refused, with why"
+        );
+        let generating = gw.praxis_config.as_ref().is_some_and(|cc| cc.generate);
+        if let Some(cc) = gw.praxis_config.as_mut() {
+            cc.generate = !generating;
+        }
+        assert_eq!(
+            gateway_dials(&gw, &overlay, &declarations).0.keys().collect::<Vec<_>>(),
+            ["prov-b"],
+            "dials do not depend on generating the praxis config"
+        );
+
+        let unconfigured = make_gw_ref("other-gw", "praxis-system");
+        assert!(
+            gateway_dials(&unconfigured, &overlay, &declarations).0.is_empty(),
+            "nothing admitted, no entries"
+        );
+    }
+
+    /// A client serving one serving `ConfigMap` holding `stored` as its provider file, recording
+    /// every apply's body.
+    #[expect(clippy::indexing_slicing, reason = "tests")]
+    fn provider_store(stored: Option<&str>) -> (Client, Arc<std::sync::Mutex<Vec<Value>>>) {
+        let patches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&patches);
+        let data = stored.map_or_else(
+            || serde_json::json!({"serving-config.json": "{}"}),
+            |stored| serde_json::json!({"serving-config.json": "{}", provider_config::PROVIDER_KEY: stored}),
+        );
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": serving_config::configmap_name("net", "gw"), "namespace": "ns"},
+            "data": data,
+        });
+        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let (seen, cm) = (Arc::clone(&seen), cm.clone());
+            async move {
+                let manager = req.uri().query().unwrap_or_default().to_owned();
+                if req.method() == http::Method::PATCH {
+                    let bytes = http_body_util::BodyExt::collect(req.into_body())
+                        .await
+                        .map(http_body_util::Collected::to_bytes)
+                        .unwrap_or_default();
+                    let mut body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                    body["fieldManager"] = Value::from(manager);
+                    seen.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(body);
+                }
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(200)
+                        .body(kube::client::Body::from(serde_json::to_vec(&cm).unwrap_or_default()))
+                        .unwrap_or_else(|_| std::process::abort()),
+                )
+            }
+        });
+        (Client::new(service, "ns"), patches)
+    }
+
+    #[tokio::test]
+    #[expect(clippy::indexing_slicing, reason = "tests")]
+    async fn a_removed_site_is_revoked_without_the_serving_path() {
+        let stored = "{\n  \"admitted_sites\": [\"site-b\", \"site-c\"],\n  \"candidates\": [],\n  \"dial\": {},\n  \"local_site\": \"site-a\",\n  \"version\": \"v1\"\n}";
+        let gw = make_gw_ref("gw", "ns");
+        let (client, patches) = provider_store(Some(stored));
+        revoke_provider_admission("net", &gw, &["site-b".to_owned(), "site-c".to_owned()], &client).await;
+        assert!(
+            patches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "nothing removed, nothing written"
+        );
+
+        revoke_provider_admission("net", &gw, &["site-b".to_owned()], &client).await;
+        let written = patches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(written.len(), 1, "the removal is written at once");
+        let patch = written.first().cloned().unwrap_or_default();
+        assert!(
+            patch["fieldManager"]
+                .as_str()
+                .is_some_and(|query| query.contains(provider_config::FIELD_MANAGER)),
+            "under the provider's own field manager: {patch}"
+        );
+        let data = patch["data"].as_object().cloned().unwrap_or_default();
+        assert_eq!(
+            data.keys().collect::<Vec<_>>(),
+            [provider_config::PROVIDER_KEY],
+            "only the provider file, so the serving config is untouched"
+        );
+        let provider: Value =
+            serde_json::from_str(data[provider_config::PROVIDER_KEY].as_str().unwrap_or_default()).unwrap_or_default();
+        assert_eq!(
+            provider["admitted_sites"],
+            serde_json::json!(["site-b"]),
+            "site-c revoked"
+        );
+
+        let (missing, untouched) = provider_store(None);
+        revoke_provider_admission("net", &gw, &[], &missing).await;
+        assert!(
+            untouched
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "no stored file admits no one, so there is nothing to revoke"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_provider_file_is_applied_only_when_it_changes() {
+        let gw = make_gw_ref("gw", "ns");
+        let provider = provider_config::ProviderConfig {
+            admitted_sites: vec!["site-b".to_owned()],
+            candidates: Vec::new(),
+            dial: BTreeMap::new(),
+            local_site: "site-a".to_owned(),
+            version: "v1",
+        };
+        let text = serving_config::to_text(&provider).unwrap_or_default();
+        let (same, unchanged) = provider_store(Some(&text));
+        apply_provider_file("net", &gw, &provider, &same).await;
+        assert!(
+            unchanged
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "an equal file is not rewritten"
+        );
+        let (stale, changed) = provider_store(Some("{}"));
+        apply_provider_file("net", &gw, &provider, &stale).await;
+        assert_eq!(
+            changed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(),
+            1,
+            "a changed file is written"
+        );
+    }
+
+    #[test]
+    fn a_site_restricted_provider_is_never_served_to_peers() {
+        let provider = |name: &str, cluster: Option<&str>, restricted: bool| -> InferenceProvider {
+            let mut provider = cluster.map_or_else(
+                || make_inference_provider(name, "net"),
+                |cluster| make_provider_with_routing_ref(name, "net", cluster),
+            );
+            if restricted {
+                provider.spec.access_policy.site_selector.match_labels =
+                    BTreeMap::from([("tier".to_owned(), "gold".to_owned())]);
+            }
+            provider
+        };
+        let providers = vec![
+            provider("open", None, false),
+            provider("gold-by-name", None, true),
+            provider("gold", Some("pool-gold"), true),
+        ];
+        let restricted = restricted_clusters(&providers);
+        assert_eq!(
+            restricted.iter().copied().collect::<Vec<_>>(),
+            ["gold-by-name", "pool-gold"],
+            "the routing identity, clusterName or else the name, of each restricted provider"
+        );
+        let local = |cluster: &str| {
+            let mut local = topology_candidate(cluster, "site-a");
+            local.stable_id = Some(crate::resources::geography::compute_stable_id(
+                routing_overlay::CANDIDATE_KIND,
+                "model-x",
+                "site-a",
+                cluster,
+            ));
+            local
+        };
+        let mut overlay = dial_overlay(vec![local("open"), local("gold-by-name"), local("pool-gold")]);
+        overlay.local_site = "site-a".to_owned();
+        let dial = |site: &str| serving_config::DialSpec {
+            address: "m.models.svc:8000".to_owned(),
+            base_path: None,
+            connect_retries: None,
+            connect_timeout_ms: None,
+            credential: None,
+            read_timeout_ms: None,
+            site: site.to_owned(),
+            total_connect_timeout_ms: None,
+            transport: serving_config::DialTransport::Plaintext,
+            trusted_private: true,
+            write_timeout_ms: None,
+        };
+        let dials = ["open", "gold-by-name", "pool-gold"]
+            .map(|cluster| (cluster.to_owned(), dial("site-a")))
+            .into();
+        let rendered = provider_config::render_provider(&overlay, &dials, Vec::new(), &restricted);
+        assert_eq!(
+            rendered
+                .candidates
+                .iter()
+                .map(|candidate| candidate.cluster.as_str())
+                .collect::<Vec<_>>(),
+            ["open"],
+            "only the unrestricted provider is served to peers"
+        );
+    }
+
+    #[test]
+    fn a_local_dial_carries_its_endpoint_path_and_its_candidates_token() {
+        let mut local = topology_candidate("prov-a", "site-a");
+        local.credential = serde_json::from_value(json!({
+            "strategy": "bearer_token",
+            "secretRef": {"namespace": "praxis-system", "name": "grid-model-client-token", "key": "token"}
+        }))
+        .ok();
+        let overlay = dial_overlay(vec![local]);
+        let plain = serving_config::DialSpec {
+            address: "model.svc:80".to_owned(),
+            base_path: None,
+            connect_retries: None,
+            connect_timeout_ms: None,
+            credential: None,
+            read_timeout_ms: None,
+            site: "site-a".to_owned(),
+            total_connect_timeout_ms: None,
+            transport: serving_config::DialTransport::Plaintext,
+            trusted_private: true,
+            write_timeout_ms: None,
+        };
+        let shape = |dial: &serving_config::DialSpec, path: Option<&str>, namespace: &str| {
+            dial_request_shape("prov-a", dial, path, &overlay, &make_gw_ref("inference-gw", namespace))
+        };
+        let (base_path, credential) =
+            shape(&plain, Some("/publishers/p/models/m/"), "praxis-system").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(base_path.as_deref(), Some("/publishers/p/models/m"));
+        assert_eq!(
+            credential.map(|credential| credential.path),
+            Some("/run/secrets/grid-credentials/grid-model-client-token/token".to_owned()),
+            "the token file credential_inject reads"
+        );
+        let remote = serving_config::DialSpec {
+            site: "site-b".to_owned(),
+            ..plain.clone()
+        };
+        assert_eq!(
+            shape(&remote, None, "praxis-system").err(),
+            Some("a credential is never sent off this site")
+        );
+        assert_eq!(
+            shape(&plain, None, "other").err(),
+            Some("the credential Secret is not in the gateway's namespace")
+        );
+        assert_eq!(
+            shape(&plain, Some("/p?x=1"), "praxis-system").err(),
+            Some("the endpoint path carries a query or fragment")
+        );
+    }
+
+    #[test]
+    fn a_typed_entry_is_never_shadowed_by_a_dial_for_the_same_cluster() {
+        let sites = vec![dial_site("site-b", "site-b", false)];
+        let overlay = dial_overlay(vec![topology_candidate("prov-b", "site-b")]);
+        let mut gw = make_gw_ref("inference-gw", "praxis-system");
+        gw.praxis_config = Some(ConsumerConfig {
+            derive_topology: Some(crate::crd::grid_network::DeriveTopology {
+                from_providers: vec!["prov-b".to_owned()],
+                transport: None,
+            }),
+            cluster_endpoints: vec![typed_endpoint("prov-b", "typed.example.invalid:8080")],
+            ..make_consumer_config("praxis-consumer-config")
+        });
+        let declarations = derived_topology::Declarations {
+            sites: &sites,
+            ..empty_declarations()
+        };
+        let (dials, refused) = gateway_dials(&gw, &overlay, &declarations);
+        assert!(
+            dials.is_empty(),
+            "the typed entry stays a praxis cluster, not a derived dial: {dials:?}"
+        );
+        assert!(refused.is_empty(), "nothing refused: {refused:?}");
     }
 
     #[test]

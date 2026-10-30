@@ -611,6 +611,51 @@ can still restart signals pollers using those accepted settings. The watcher
 does not update listener settings or add load-balancer clusters to `praxis.yaml`.
 See the [gateway chart serving guide](../../charts/praxis-gateway/README.md#cross-site-routing-in-agn).
 
+The same `ConfigMap` carries `dial.json` beside the serving config: one entry
+per cluster that derivation admits for this gateway, with its address, transport
+and timeouts. A typed `clusterEndpoints` entry is never written there, so it stays a
+`praxis.yaml` cluster. With nothing admitted, the file has no entries. A gateway
+that reads it builds the upstream itself; an older one never opens the key. The
+operator leaves out a cluster the gateway would refuse to dial: a site known only
+from discovery, whose address came from gossip; a mutual TLS hop whose server name
+is not exactly `{site}.grid.internal`; plaintext to another site; a credential-bearing
+cluster at another site; and a local one whose credential the gateway cannot read.
+A refused cluster is logged, with why, when the refused set for a gateway changes.
+
+A local dial carries the path of its provider's endpoint URL as `base_path`, which
+the gateway prepends to every request, so a serving gateway that routes by path
+still sees the provider's path. An endpoint path with a query, a fragment, an empty
+segment or a `..` segment is refused. When the local cluster's candidates name a
+`bearer_token` credential, the dial carries
+`credential: {strategy: bearer_token, path}` pointing at
+`/run/secrets/grid-credentials/<secret>/<key>`, the file `credential_inject` reads.
+The operator writes it only for a Secret in the gateway's namespace and only when
+`credentialMountPath` is that default; mount the Secret with `providerCredentials`
+or mount reconciliation. The gateway reads the token when it builds the dial, so a
+rotated file rebuilds it, and an unreadable token takes only that cluster out of
+routing. A routed request drops the caller's credential headers and query
+parameters and sends `Authorization: Bearer <token>`. The gateway refuses a
+credential on a dial to another site or over grid mutual TLS, and one outside the
+credential mount.
+
+A `mutual_tls` dial carries only its `sni`. The gateway presents the grid identity
+it fixed at startup, the `ca.crt`, `tls.crt` and `tls.key` its signals peers use,
+and re-reads those files on rotation. A `tls` dial may name a `ca_path`, which must
+be under `/run/secrets/grid-backend-ca`. A dial file that breaks a trust rule is
+refused whole and the last good one stays. At startup the gateway serves without
+dials until a good one lands. A single dial praxis refuses, such as an untrusted
+`.internal` or loopback host, takes only its own cluster out of routing.
+
+It also carries `provider.json`, which a provider gateway on the same site serves
+peers from. It lists the enrolled sites other than this one as `admitted_sites`,
+each local inference backend by the stable ID a consumer sends in
+`x-ai-routing-candidate`, and the local dial that reaches it. A credentialed
+backend is served with its dial's own token in place of the peer's. A backend is
+left out when it carries a credential its dial does not, its provider sets
+`accessPolicy.siteSelector`, it has no local dial other than mutual TLS, or
+another backend shares its stable ID. A deleting or discovered `GridSite` is never admitted. When the admitted set
+shrinks, the operator rewrites the file at once, past the write interval.
+
 [praxis-reload]: https://github.com/praxis-proxy/praxis/blob/main/docs/operating/configuration.md#dynamic-configuration-reload
 
 ## Security

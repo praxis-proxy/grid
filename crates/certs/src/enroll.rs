@@ -153,7 +153,7 @@ pub fn sign_csr(ca: &CaCert, site_name: &str, csr_pem: &str, validity: Validity)
     }
 
     // The request's names are dropped, keeping only its public key.
-    let primary = format!("{site_name}.{}", crate::SPIFFE_TRUST_DOMAIN);
+    let primary = crate::site_dns_name(site_name);
     // Exhaustive, so a new GenerateError variant is a compile error here rather than a
     // signing failure reported to an enrollee as an invalid name.
     let id = site_identity(site_name, &primary).map_err(|err| match err {

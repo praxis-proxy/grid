@@ -280,7 +280,7 @@ pub(crate) fn site_phase_under(
 }
 
 /// Whether `site` was declared rather than created by SWIM discovery.
-fn is_declared(site: &GridSite) -> bool {
+pub(crate) fn is_declared(site: &GridSite) -> bool {
     site.metadata
         .labels
         .as_ref()

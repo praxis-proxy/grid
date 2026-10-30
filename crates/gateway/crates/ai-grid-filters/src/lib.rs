@@ -10,12 +10,14 @@ mod conformance;
 mod control;
 mod decisions;
 mod descriptor;
+mod dial;
 #[cfg(test)]
 mod flow;
 mod health;
 mod metadata;
 mod pin;
 mod prefix;
+mod provider;
 mod route;
 mod serving;
 mod signals;
@@ -24,24 +26,31 @@ mod snapshot;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-pub use control::{ReloadOutcome, Tuning};
+pub use control::{Binding, ReloadOutcome, Tuning};
 pub use decisions::SiteDecisions;
 // The routing model and the snapshot builder are the crate's control-plane API:
 // the gateway's refresh step orders candidates by live load and swaps the
 // snapshot. The request path only reads a snapshot.
 pub use descriptor::{AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate};
+pub use dial::{BACKEND_CA_BASE, CREDENTIAL_BASE, Dialed, GRID_TLS_MOUNT, GridIdentity};
 pub use health::ClusterHealth;
 pub use metadata::{CandidateCredential, CredentialRef};
 use praxis_filter::{FilterError, FilterFactory, FilterRegistry, HttpFilter};
 pub use prefix::{AffinitySettings, PrefixAffinity};
+pub use provider::{
+    PROVIDER_FILE, ProviderCandidate, ProviderConfig, ProviderRuntime, ProviderSnapshot, spawn_provider,
+    validate_provider,
+};
 pub use serving::{
-    AvailabilitySettings, GridRuntime, GridServingConfig, PeerServingConfig, load_serving_config, spawn_grid_routing,
+    AvailabilitySettings, CredentialStrategy, DIAL_FILE, DialConfig, DialCredential, DialSpec, DialTransport,
+    DialVersion, GridRuntime, GridServingConfig, PeerServingConfig, dial_config_path, load_dial_config,
+    load_serving_config, spawn_grid_routing,
 };
 pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;
 
 /// Grid counters the gateway emits, with the help text a scrape shows.
-const COUNTER_HELP: [(&str, &str); 8] = [
+const COUNTER_HELP: [(&str, &str); 11] = [
     (
         "grid_route_decisions_total",
         "Requests the gateway decided, by outcome. A refusal records an empty site and cluster.",
@@ -68,13 +77,41 @@ const COUNTER_HELP: [(&str, &str); 8] = [
         "grid_signals_feedback_failures_total",
         "Failed gateway feedback delivery attempts, by bounded reason.",
     ),
+    (
+        "grid_dial_failures_total",
+        "Dialed requests that got no response, or a gateway error no grid gateway attributed, by cluster.",
+    ),
+    (
+        "grid_provider_requests_total",
+        "Peer requests a provider gateway served or refused, by result.",
+    ),
+    (
+        "grid_provider_config_reload_total",
+        "Provider-file reloads by result. A refused file keeps the last good one.",
+    ),
 ];
 
 /// Grid gauges the gateway emits.
-const GAUGE_HELP: [(&str, &str); 18] = [
+const GAUGE_HELP: [(&str, &str); 22] = [
     (
         "grid_serving_unbound_provider_hops",
         "Provider hops the applied serving config declares that no startup-verified backend binds. Their candidates take no traffic until a serving config names the SNI that backend verified at startup, or, for a backend not verified at startup, until the gateway restarts.",
+    ),
+    (
+        "grid_serving_undialable_clusters",
+        "Dials in the applied dial file whose TLS files could not be read. Their candidates take no traffic until the files read.",
+    ),
+    (
+        "grid_serving_refused_dial_clusters",
+        "Dials in the applied dial file praxis refused, such as a private or metadata host not trusted. Their candidates take no traffic.",
+    ),
+    (
+        "grid_serving_dial_shadowed_clusters",
+        "Dials that replace a load_balancer cluster of the same name.",
+    ),
+    (
+        "grid_dial_down",
+        "1 while a dial is down after consecutive failures, 0 otherwise. A down dial is ordered last, never excluded.",
     ),
     (
         "grid_route_site_rho",
@@ -199,4 +236,19 @@ pub fn register_grid_filters(
         )
     };
     registry.register("grid_site_route", FilterFactory::Http(Arc::new(factory)))
+}
+
+/// Register `grid_provider` into `registry` over the snapshot `spawn_provider` keeps current.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if the filter name is already registered.
+pub fn register_provider_filter(
+    registry: &mut FilterRegistry,
+    snapshot: Arc<ArcSwap<ProviderSnapshot>>,
+) -> Result<(), FilterError> {
+    let factory = move |config: &serde_yaml::Value| -> Result<Box<dyn HttpFilter>, FilterError> {
+        provider::GridProviderFilter::from_config(config, Arc::clone(&snapshot))
+    };
+    registry.register("grid_provider", FilterFactory::Http(Arc::new(factory)))
 }

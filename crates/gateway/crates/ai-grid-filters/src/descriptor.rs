@@ -10,11 +10,13 @@ use std::{
     sync::Arc,
 };
 
-use praxis_core::connectivity::Upstream;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
-use crate::metadata::{CandidateCredential, STRATEGY_BEARER_TOKEN};
+use crate::{
+    dial::Dialed,
+    metadata::{CandidateCredential, STRATEGY_BEARER_TOKEN},
+};
 
 /// Maximum number of route candidates.
 const MAX_CANDIDATES: usize = 1024;
@@ -212,8 +214,9 @@ pub struct RouteCandidate {
     /// Deterministic identifier for session affinity binding.
     pub stable_id: Arc<str>,
 
-    /// Remote site's gateway, dialed directly instead of a `load_balancer` cluster.
-    pub upstream: Option<Upstream>,
+    /// The upstream the gateway built for this cluster from the serving config, sent to
+    /// directly instead of a `load_balancer` cluster.
+    pub dial: Option<Arc<Dialed>>,
 }
 
 impl RouteCandidate {
@@ -310,7 +313,7 @@ fn validate_candidates_with_empty(
             selection_tier: None,
             site: Arc::from(cand.site.as_str()),
             stable_id,
-            upstream: None,
+            dial: None,
         });
     }
 
@@ -397,7 +400,7 @@ pub(crate) fn validate_local_site(value: &str) -> Result<(), FilterError> {
 ///
 /// Site names go into stored-state ids and request paths, so a `.`, `/`, quote
 /// or backslash in one would break them.
-fn validate_site(field: &str, value: &str) -> Result<(), FilterError> {
+pub(crate) fn validate_site(field: &str, value: &str) -> Result<(), FilterError> {
     let bytes = value.as_bytes();
     let edge = |byte: Option<&u8>| byte.is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
     let label = (1..=63).contains(&bytes.len())
