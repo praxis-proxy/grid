@@ -611,6 +611,25 @@ can still restart signals pollers using those accepted settings. The watcher
 does not update listener settings or add load-balancer clusters to `praxis.yaml`.
 See the [gateway chart serving guide](../../charts/praxis-gateway/README.md#cross-site-routing-in-agn).
 
+The same `ConfigMap` carries `dial.json` beside the serving config: one entry
+per cluster that derivation admits for this gateway, with its address, transport
+and timeouts. A typed `clusterEndpoints` entry is never written there, so it stays a
+`praxis.yaml` cluster. With nothing admitted, the file has no entries. A gateway
+that reads it builds the upstream itself; an older one never opens the key. The
+operator leaves out a cluster the gateway would refuse to dial: a site known only
+from discovery, whose address came from gossip; a mutual TLS hop whose server name
+is not exactly `{site}.grid.internal`; plaintext to another site; and a
+credential-bearing cluster, since nothing on the dialed path injects the credential.
+A refused cluster is logged when the refused set for a gateway changes.
+
+A `mutual_tls` dial carries only its `sni`. The gateway presents the grid identity
+it fixed at startup, the `ca.crt`, `tls.crt` and `tls.key` its signals peers use,
+and re-reads those files on rotation. A `tls` dial may name a `ca_path`, which must
+be under `/run/secrets/grid-backend-ca`. A dial file that breaks a trust rule is
+refused whole and the last good one stays. At startup the gateway serves without
+dials until a good one lands. A single dial praxis refuses, such as an untrusted
+`.internal` or loopback host, takes only its own cluster out of routing.
+
 [praxis-reload]: https://github.com/praxis-proxy/praxis/blob/main/docs/operating/configuration.md#dynamic-configuration-reload
 
 ## Security

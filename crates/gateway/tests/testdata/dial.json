@@ -1,12 +1,8 @@
 {
-  "version": "v1",
   "dial": {
     "local-granite": {
       "address": "granite.models.svc.cluster.local:8443",
-      "connect_timeout_ms": 2000,
-      "read_timeout_ms": 300000,
       "site": "site-a",
-      "total_connect_timeout_ms": 4000,
       "transport": {
         "mode": "tls",
         "ca_path": "/run/secrets/grid-backend-ca/models-ca/ca.crt",
@@ -16,8 +12,6 @@
     },
     "local-llama": {
       "address": "llama.models.svc.cluster.local:8000",
-      "connect_timeout_ms": 2000,
-      "read_timeout_ms": 300000,
       "site": "site-a",
       "transport": {
         "mode": "plaintext"
@@ -28,14 +22,15 @@
       "address": "site-b-gateway.grid.example.com:8443",
       "connect_retries": 1,
       "connect_timeout_ms": 2000,
-      "read_timeout_ms": 300000,
+      "read_timeout_ms": 120000,
       "site": "site-b",
       "total_connect_timeout_ms": 4000,
       "transport": {
         "mode": "mutual_tls",
         "sni": "site-b.grid.internal"
       },
-      "write_timeout_ms": 300000
+      "write_timeout_ms": 30000
     }
-  }
+  },
+  "version": "v1"
 }
