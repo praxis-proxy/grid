@@ -198,6 +198,8 @@ pub struct OperatorCtx {
 
     /// How this site learns its members.
     membership: crate::cli::Membership,
+    /// What the declared signals listener's task reports, `None` when the install declares none.
+    signals_listener: Option<crate::signals_listener::Report>,
 
     /// Membership selected by the install when the network omits its override.
     membership_fallback: MembershipMode,
@@ -418,6 +420,7 @@ impl OperatorCtx {
             mode_restart: None,
             site_name: None,
             membership: crate::cli::Membership::Swim,
+            signals_listener: None,
             membership_fallback: MembershipMode::Swim,
             logged: ChangeLog::default(),
             started: Instant::now(),
@@ -586,6 +589,14 @@ impl OperatorCtx {
                 false
             },
         });
+        self
+    }
+
+    /// The declared signals listener's report, which the `SignalsListener` condition reads;
+    /// `None` when the install declares none.
+    #[must_use]
+    pub fn with_signals_listener(mut self, report: Option<crate::signals_listener::Report>) -> Self {
+        self.signals_listener = report;
         self
     }
 
@@ -2100,6 +2111,10 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         signal: ctx.signal_mode,
         trust: ctx.peer_settings.trust,
     };
+    // Before any step that can fail, so a failing listener never keeps an old True.
+    let served = ctx.signals_listener.as_ref().map(|report| report.borrow().clone());
+    let listener = crate::signals_listener::Listener::of(served.as_ref(), ctx.signal_mode);
+    Box::pin(apply_signals_listener_condition(client, &network, listener.as_ref())).await;
     let declared = GridModes::of(&network, ctx.membership_fallback);
     if declared.membership == MembershipMode::Local && declared.signal != SignalMode::Poll {
         return Err(OperatorError::InvalidResource(
@@ -2548,6 +2563,26 @@ pub async fn apply_rollup(client: &Client, network: &GridNetwork) {
 /// The condition of `type_` in `held`.
 fn held_condition<'held>(held: &'held [Condition], type_: &str) -> Option<&'held Condition> {
     held.iter().find(|condition| condition.type_ == type_)
+}
+
+/// Write the `SignalsListener` condition when it changed, removing it once none is declared.
+async fn apply_signals_listener_condition(
+    client: &Client,
+    network: &GridNetwork,
+    listener: Option<&crate::signals_listener::Listener>,
+) {
+    let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
+        return;
+    };
+    let Some((name, patch)) = crate::signals_listener::patch(network, listener, &now) else {
+        return;
+    };
+    let params = PatchParams::apply(crate::signals_listener::FIELD_MANAGER).force();
+    let api: Api<GridNetwork> = Api::all(client.clone());
+    match Box::pin(api.patch_status(name, &params, &Patch::Apply(patch))).await {
+        Ok(_) => tracing::info!(?listener, network = name, "signals listener condition written"),
+        Err(error) => tracing::warn!(%error, "signals listener condition not written; retrying next reconcile"),
+    }
 }
 
 /// Advance the explicitly configured local [`GridSite`] into discovery.

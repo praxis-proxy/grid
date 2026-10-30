@@ -483,3 +483,24 @@ tests:
           content:
             name: GRID_SIGNALS_MAX_HANDSHAKES_PER_SOURCE
             value: "64"
+
+  - it: refuses a signals listener under an explicit gossip transport
+    template: templates/deployment.yaml
+    set:
+      signals.enabled: true
+      swim.service.enabled: true
+      grid.signals: gossip
+    asserts:
+      - failedTemplate:
+          errorPattern: signals.enabled needs grid.signals poll
+
+  - it: accepts a signals listener under poll
+    template: templates/deployment.yaml
+    set:
+      signals.enabled: true
+      swim.service.enabled: true
+      grid.signals: poll
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_SIGNAL_TRANSPORT, value: poll }

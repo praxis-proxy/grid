@@ -79,7 +79,9 @@ use operator::{
     error::OperatorError,
     gateway,
     resources::tls_backend::{self, ServerTlsConfig},
-    served_models, swim_advertise,
+    served_models,
+    signals_listener::Served,
+    swim_advertise,
     swim_endpoint::{SwimEndpoint, resolve_endpoint, resolve_endpoint_list_partial},
     swim_runtime::{self, RevisionLease, SwimConfig},
 };
@@ -286,6 +288,8 @@ async fn main() {
     }
     drop(renewal_done_tx);
     let signals_enabled = matches!(signal_mode, SignalMode::Poll);
+    // The listener task reports what it serves; the SignalsListener condition reads it.
+    let (listener_report, listener_reported) = operator::signals_listener::report();
     let peer_settings = grid_network::PeerSettings {
         local_signals_addr: config.signals.local_addr(),
         trust,
@@ -311,6 +315,7 @@ async fn main() {
             .with_mode_restart(mode_restart)
             .with_site_name(config.swim.site_name.clone())
             .with_membership(config.grid.membership)
+            .with_signals_listener(config.signals.local_addr().is_some().then(|| listener_reported.clone()))
             .with_membership_fallback(install_modes.membership)
             .with_scrape_interval(config.signals.scrape_interval())
             .hold_membership(),
@@ -330,12 +335,18 @@ async fn main() {
     let writer_client = client.clone();
     let writer_ctx = Arc::clone(&ctx);
     let writer_swim = swim_rx.clone();
+    let writer_listener = listener_reported;
     let writer_site_name = ctx.site_name().map(str::to_owned);
     // Every mode scrapes for readiness; only Poll mode publishes what it scrapes.
     let writer_scrape_interval = config.signals.scrape_interval();
     let writer_group = async move {
         tokio::try_join!(
-            run_network_controller(writer_client.clone(), Arc::clone(&writer_ctx), writer_swim),
+            run_network_controller(
+                writer_client.clone(),
+                Arc::clone(&writer_ctx),
+                writer_swim,
+                writer_listener,
+            ),
             run_site_controller(writer_client.clone(), writer_ctx.membership()),
             run_provider_controller(writer_client.clone(), writer_site_name),
             run_agent_tool_provider_controller(writer_client.clone()),
@@ -389,6 +400,7 @@ async fn main() {
                     trust,
                     max_per_peer: config.signals.max_per_peer,
                     max_per_source: config.signals.max_per_source,
+                    report: listener_report,
                 }),
                 swim_rx.clone(),
                 shutdown.clone(),
@@ -1796,6 +1808,7 @@ async fn run_network_controller(
     client: Client,
     ctx: Arc<OperatorCtx>,
     swim: SwimStartup,
+    listener: operator::signals_listener::Report,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api = Api::<GridNetwork>::all(client.clone());
     let provider_api = Api::<InferenceProvider>::all(client.clone());
@@ -1822,10 +1835,16 @@ async fn run_network_controller(
     let swim_events = futures::stream::once(swim_settled(swim))
         .filter_map(std::future::ready)
         .flat_map(|handle| futures::stream::once(std::future::ready(())).chain(handle.reconciliation_events()));
-    // And whenever a polled peer's catalog changes, which no watched object reflects.
+    // And whenever a polled peer's catalog changes, which no watched object reflects, or the
+    // signals listener's report changes, so its condition follows at once.
     let catalog_events = ctx.peer_providers().changes();
+    let listener_events = futures::stream::unfold(listener, |mut listener| async move {
+        listener.changed().await.ok()?;
+        Some(((), listener))
+    });
     controller
         .reconcile_all_on(futures::stream::select(swim_events, catalog_events))
+        .reconcile_all_on(listener_events)
         .run(grid_network::reconcile, grid_network::error_policy, ctx)
         .for_each(|result| async {
             match result {
@@ -2266,6 +2285,8 @@ struct SignalsListener {
     max_per_peer: usize,
     /// Concurrent handshakes one source address may hold.
     max_per_source: usize,
+    /// Where this task reports what it serves.
+    report: operator::signals_listener::Reporter,
 }
 
 /// Serve the coarse signal rollup on the single mTLS wire path, fail closed.
@@ -2317,6 +2338,7 @@ impl SignalsListener {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (tls, own) = Box::pin(signals_identity(&self.client)).await;
         let Some(tls) = tls else {
+            self.report(Served::AwaitingTls);
             tracing::warn!("signals: TLS material unavailable; not serving the rollup (fail closed)");
             tokio::time::sleep(SIGNALS_TLS_POLL).await;
             return Ok(());
@@ -2326,7 +2348,7 @@ impl SignalsListener {
             own: own.clone(),
             trust: self.trust,
         };
-        let listener = bind_signals(self.bind).await?;
+        let listener = self.bind().await?;
         let bound = listener
             .local_addr()
             .map_or_else(|_| "unknown".to_owned(), |a| a.to_string());
@@ -2338,7 +2360,28 @@ impl SignalsListener {
             app: app.clone(),
             identity,
         };
-        serve_signals_tls(listener, serving, admission, changed, shutdown).await
+        self.report(Served::Serving);
+        let served = serve_signals_tls(listener, serving, admission, changed, shutdown).await;
+        self.report(Served::Starting);
+        served
+    }
+
+    /// Bind the listener, reporting a failure as what it serves.
+    async fn bind(&self) -> std::io::Result<tokio::net::TcpListener> {
+        bind_signals(self.bind).await.inspect_err(|error| {
+            self.report(Served::BindFailed(error.to_string()));
+        })
+    }
+
+    /// Report `served` when it changed, so each change wakes reconciliation once.
+    fn report(&self, served: Served) {
+        self.report.send_if_modified(|held| {
+            if *held == served {
+                return false;
+            }
+            *held = served;
+            true
+        });
     }
 }
 
@@ -4490,6 +4533,64 @@ mod tests {
                 "neither authorized peers nor absent identities can publish gateway status"
             );
         }
+    }
+
+    /// A listener whose kube client answers every request with `status`.
+    fn listener_answered_with(status: http::StatusCode) -> (SignalsListener, operator::signals_listener::Report) {
+        let client = Client::new(
+            tower::service_fn(move |_request: http::Request<kube::client::Body>| async move {
+                let response = http::Response::builder()
+                    .status(status)
+                    .body(axum::body::Body::empty())
+                    .expect("response");
+                Ok::<_, std::convert::Infallible>(response)
+            }),
+            "default",
+        );
+        let (report, reported) = operator::signals_listener::report();
+        let listener = SignalsListener {
+            bind: None,
+            client: client.clone(),
+            published: Published {
+                site: operator::signals::SignalStore::new(),
+                peers: operator::signals::SignalStore::new(),
+                rounds: operator::signals::PeerRounds::default(),
+                providers: operator::site_providers::LocalProviders::default(),
+                membership: "Swim",
+                feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
+            },
+            peer_identities: operator::signals::PeerIdentities::new(),
+            trust: operator::signals::PeerTrustMode::Pin,
+            max_per_peer: 1,
+            max_per_source: 1,
+            report,
+        };
+        (listener, reported)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_listener_reports_waiting_for_tls_material_instead_of_serving() {
+        let (listener, reported) = listener_answered_with(http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            *reported.borrow(),
+            Served::Starting,
+            "nothing reported before the first attempt"
+        );
+        let app = signals_app(listener.published.clone());
+        Box::pin(listener.serve_once(&app, None, operator::shutdown::Shutdown::never()))
+            .await
+            .expect("waiting for material is not an error");
+        assert_eq!(*reported.borrow(), Served::AwaitingTls);
+    }
+
+    #[tokio::test]
+    async fn the_listener_reports_a_failed_bind_with_its_error() {
+        let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        let (mut listener, reported) = listener_answered_with(http::StatusCode::OK);
+        listener.bind = Some(taken.local_addr().expect("bound"));
+        let error = listener.bind().await.expect_err("the port is taken");
+        assert_eq!(*reported.borrow(), Served::BindFailed(error.to_string()));
+        drop(taken);
     }
 
     #[tokio::test]

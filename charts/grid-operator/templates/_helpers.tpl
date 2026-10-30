@@ -81,6 +81,9 @@ repository@digest and ignores tag. Otherwise renders repository:tag
 Signals are reached through the SWIM Service.
 */}}
 {{- define "grid-operator.validateSignals" -}}
+{{- if and (.Values.signals).enabled (eq (toString ((.Values.grid).signals)) "gossip") }}
+{{- fail "signals.enabled needs grid.signals poll: under gossip the operator runs no signals listener, so the signals Service would have nothing behind it" }}
+{{- end }}
 {{- /* Local membership serves signals on its own Service, which normalize requires. */}}
 {{- if eq (dig "membership" "source" "Swim" .Values.grid) "Local" }}
 {{- else if and (.Values.signals).enabled (not .Values.swim.service.enabled) }}

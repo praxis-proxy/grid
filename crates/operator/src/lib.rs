@@ -77,6 +77,8 @@ pub mod gateway_ages;
 pub mod shutdown;
 /// Provider signals, served as a multi-target exporter.
 pub mod signals;
+/// The `SignalsListener` condition: whether the declared signals endpoint is served.
+pub mod signals_listener;
 /// The providers a site serves to peers, and those polled from them.
 pub mod site_providers;
 /// SWIM membership data model and status summarization.
