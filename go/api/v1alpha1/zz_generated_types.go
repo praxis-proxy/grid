@@ -504,9 +504,9 @@ type GridNetworkConsumerGatewaysItemPraxisConfigClusterEndpointsItem struct {
 	Transport *EndpointTransport `json:"transport,omitempty"`
 }
 
-// GridNetworkConsumerGatewaysItemPraxisConfigDeriveTopology Derive the endpoint topology from the declarations of named providers, instead of requiring a clusterEndpoints entry per candidate.
+// GridNetworkConsumerGatewaysItemPraxisConfigDeriveTopology Settings for the endpoint topology the operator derives for each candidate with no clusterEndpoints entry. Absent still derives.
 type GridNetworkConsumerGatewaysItemPraxisConfigDeriveTopology struct {
-	// Routing identities whose declarations this gateway derives from.
+	// Remote routing identities this gateway derives a hop for without a member catalog, as under SWIM membership.
 	// Each entry is a provider's clusterName, or its metadata.name when that is unset. At most 64 entries, each named once.
 	FromProviders []string `json:"fromProviders,omitempty"`
 	// TLS for derived local https backends. Omitted uses the endpoint host and the process trust store.
@@ -561,7 +561,7 @@ type GridNetworkConsumerGatewaysItemPraxisConfig struct {
 	// In projected-credential mode, mount each Secret at {credentialMountPath}/{secret-namespace}/{secret-name} with its data keys as files. Static file: entries continue to use their explicit paths and are not constrained by this directory layout.
 	// Default: /run/secrets/grid-credentials.
 	CredentialMountPath string `json:"credentialMountPath,omitempty"`
-	// Derive the endpoint topology from the declarations of named providers, instead of requiring a clusterEndpoints entry per candidate.
+	// Settings for the endpoint topology the operator derives for each candidate with no clusterEndpoints entry. Absent still derives.
 	DeriveTopology *GridNetworkConsumerGatewaysItemPraxisConfigDeriveTopology `json:"deriveTopology,omitempty"`
 	// Generate the dynamic credential_inject filter and projected mount root, including when the current overlay has no credentials. Enable this first, then roll out the generated config before asserting readiness with supportsProjectedCredentials.
 	// Default: false.

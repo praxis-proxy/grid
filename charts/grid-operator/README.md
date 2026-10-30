@@ -243,8 +243,6 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `priorityClassName` | string | `""` | Pod priority class. |
 | `operatorConfig.create` | bool | `true` | Render the ConfigMap holding this operator's own settings. Set `false` to manage it yourself under `operatorConfig.name`. |
 | `operatorConfig.name` | string | `grid-operator-config` | ConfigMap name, in the release namespace. The operator watches it, so an edit applies without a restart. |
-| `operatorConfig.serving.localProviders` | string | `""` | The config's `serving.localProviders`: `Named`, the operator's default, derives only providers `deriveTopology.fromProviders` names, and `Published` also every provider of the network on this cluster. Empty renders nothing. |
-| `operatorConfig.serving.remote` | string | `""` | The config's `serving.remote`: `None`, the operator's default, or `Members`, which also derives a hop for every candidate a member site's catalog offers and needs `grid.membership.source` `Local`. Empty renders nothing. |
 | `enrollment.enabled` | bool | `false` | This site enrolls: turns on the SWIM LoadBalancer Service, site-identity metrics TLS and the enrollment namespace guard, and renders the signer and the invite into the operator config's `site` section. |
 | `enrollment.url` | string | `""` | Signer base URL (https), `site.signerEndpoint.url`. Required unless `enrollment.hub` is set. Set alone on a hub whose identity bootstrap issued, it renders a `site` section that renews only. |
 | `enrollment.hub` | bool | `false` | The grid-enrollment release runs on this cluster, so `enrollment.url` defaults to its Service in `rbac.enrollmentNamespace`. |
@@ -334,8 +332,6 @@ site:
   inviteSecretRef:
     name: grid-invite-site-a
 ```
-
-`operatorConfig.serving` renders the top-level `serving` section, what this site's generated consumer gateways derive without `deriveTopology.fromProviders` naming each provider. See [Site serving](../../docs/architecture/consumer-config.md#site-serving).
 
 Credentials never go in the ConfigMap. It names Secrets, which keep their labels: a bundle carries `grid.praxis.fast/signer-bundle: "true"`, and the invite carries `grid.praxis.fast/site: <site.name>`. Grid-wide settings stay on the GridNetwork.
 

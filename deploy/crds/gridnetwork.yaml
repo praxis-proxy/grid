@@ -319,14 +319,15 @@ spec:
                             type: string
                           deriveTopology:
                             description: |-
-                              Derive the endpoint topology from the declarations of named providers,
-                              instead of requiring a `clusterEndpoints` entry per candidate.
+                              Settings for the endpoint topology the operator derives for each candidate
+                              with no `clusterEndpoints` entry. Absent still derives.
                             nullable: true
                             properties:
                               fromProviders:
                                 default: []
                                 description: |-
-                                  Routing identities whose declarations this gateway derives from.
+                                  Remote routing identities this gateway derives a hop for without a member catalog,
+                                  as under SWIM membership.
 
                                   Each entry is a provider's `clusterName`, or its `metadata.name`
                                   when that is unset. At most 64 entries, each named once.
@@ -718,14 +719,15 @@ spec:
                             type: string
                           deriveTopology:
                             description: |-
-                              Derive the endpoint topology from the declarations of named providers,
-                              instead of requiring a `clusterEndpoints` entry per candidate.
+                              Settings for the endpoint topology the operator derives for each candidate
+                              with no `clusterEndpoints` entry. Absent still derives.
                             nullable: true
                             properties:
                               fromProviders:
                                 default: []
                                 description: |-
-                                  Routing identities whose declarations this gateway derives from.
+                                  Remote routing identities this gateway derives a hop for without a member catalog,
+                                  as under SWIM membership.
 
                                   Each entry is a provider's `clusterName`, or its `metadata.name`
                                   when that is unset. At most 64 entries, each named once.
@@ -1192,14 +1194,15 @@ spec:
                             type: string
                           deriveTopology:
                             description: |-
-                              Derive the endpoint topology from the declarations of named providers,
-                              instead of requiring a `clusterEndpoints` entry per candidate.
+                              Settings for the endpoint topology the operator derives for each candidate
+                              with no `clusterEndpoints` entry. Absent still derives.
                             nullable: true
                             properties:
                               fromProviders:
                                 default: []
                                 description: |-
-                                  Routing identities whose declarations this gateway derives from.
+                                  Remote routing identities this gateway derives a hop for without a member catalog,
+                                  as under SWIM membership.
 
                                   Each entry is a provider's `clusterName`, or its `metadata.name`
                                   when that is unset. At most 64 entries, each named once.
@@ -1586,14 +1589,15 @@ spec:
                             type: string
                           deriveTopology:
                             description: |-
-                              Derive the endpoint topology from the declarations of named providers,
-                              instead of requiring a `clusterEndpoints` entry per candidate.
+                              Settings for the endpoint topology the operator derives for each candidate
+                              with no `clusterEndpoints` entry. Absent still derives.
                             nullable: true
                             properties:
                               fromProviders:
                                 default: []
                                 description: |-
-                                  Routing identities whose declarations this gateway derives from.
+                                  Remote routing identities this gateway derives a hop for without a member catalog,
+                                  as under SWIM membership.
 
                                   Each entry is a provider's `clusterName`, or its `metadata.name`
                                   when that is unset. At most 64 entries, each named once.

@@ -1824,13 +1824,8 @@ async fn run_network_controller(
         .flat_map(|handle| futures::stream::once(std::future::ready(())).chain(handle.reconciliation_events()));
     // And whenever a polled peer's catalog changes, which no watched object reflects.
     let catalog_events = ctx.peer_providers().changes();
-    // And whenever the operator config changes, so a serving knob applies without a requeue.
-    let config_events = ctx.operator_config_changes();
     controller
-        .reconcile_all_on(futures::stream::select(
-            swim_events,
-            futures::stream::select(catalog_events, config_events),
-        ))
+        .reconcile_all_on(futures::stream::select(swim_events, catalog_events))
         .run(grid_network::reconcile, grid_network::error_policy, ctx)
         .for_each(|result| async {
             match result {

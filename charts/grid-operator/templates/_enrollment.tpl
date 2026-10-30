@@ -92,20 +92,6 @@ site:
 {{- end }}
 {{- end }}
 
-{{/* The operator config's top-level serving section, with the knobs that are set, or nothing. */}}
-{{- define "grid-operator.operatorConfig.serving" -}}
-{{- $s := (.Values.operatorConfig | default dict).serving | default dict }}
-{{- if or $s.localProviders $s.remote }}
-serving:
-  {{- with $s.localProviders }}
-  localProviders: {{ . | quote }}
-  {{- end }}
-  {{- with $s.remote }}
-  remote: {{ . | quote }}
-  {{- end }}
-{{- end }}
-{{- end }}
-
 {{/* The operator config ConfigMap's name. */}}
 {{- define "grid-operator.operatorConfig.name" -}}
 {{- (.Values.operatorConfig | default dict).name | default "grid-operator-config" }}

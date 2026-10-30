@@ -603,11 +603,6 @@ impl OperatorCtx {
         self.local_providers.clone()
     }
 
-    /// One item after each change to the operator config, so a serving knob applies at once.
-    pub fn operator_config_changes(&self) -> impl futures::Stream<Item = ()> + Send + 'static {
-        self.operator_config.changes()
-    }
-
     /// A handle to the providers polled from peers, for the poller and reconcile.
     #[must_use]
     pub fn peer_providers(&self) -> site_providers::PeerProviders {
@@ -2248,7 +2243,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         &admission_states,
         serving.as_ref(),
         ctx.site_name(),
-        site_serving(&ctx.operator_config.current().loaded, ctx.membership()),
+        reads_polled_catalogs(ctx.membership()),
     ))
     .await?;
 
@@ -3003,45 +2998,6 @@ fn site_phases(sites: &[GridSite]) -> impl Iterator<Item = (&str, &'static str)>
     })
 }
 
-/// This site's serving knobs, and whether remote records come from authenticated peer catalogs.
-#[derive(Clone, Copy, Debug)]
-struct SiteServing {
-    /// The operator config's `serving`, the defaults when the document is refused.
-    knobs: crate::operator_config::Serving,
-    /// Whether membership is Local, so remote records were read from identity-verified peers.
-    catalogs: bool,
-    /// Whether the operator config was refused, so the knobs fell back to the defaults.
-    refused: bool,
-}
-
-/// The serving knobs `loaded` sets under `membership`, logging a refused document.
-fn site_serving(loaded: &crate::operator_config::Loaded, membership: crate::cli::Membership) -> SiteServing {
-    let (knobs, refused) = match loaded.serving() {
-        Ok(knobs) => (knobs, false),
-        Err(why) => {
-            tracing::warn!(error = %why, "operator config refused; serving reads the defaults");
-            (crate::operator_config::Serving::default(), true)
-        },
-    };
-    SiteServing {
-        knobs,
-        catalogs: reads_polled_catalogs(membership),
-        refused,
-    }
-}
-
-/// A refused operator config's note on the derived summary, so status explains a withdrawal.
-fn with_config_refusal(summary: String, refused: bool) -> String {
-    match (refused, summary.is_empty()) {
-        (false, _) => summary,
-        (true, true) => CONFIG_REFUSED.to_owned(),
-        (true, false) => format!("{summary}; {CONFIG_REFUSED}"),
-    }
-}
-
-/// What a derived summary says while the operator config is refused.
-const CONFIG_REFUSED: &str = "operator config refused, so serving reads the defaults";
-
 /// Reconcile routing overlay `ConfigMap`s for a [`GridNetwork`].
 ///
 /// Lists all [`InferenceProvider`]s and [`GridSite`]s cluster-wide, then
@@ -3096,7 +3052,7 @@ async fn reconcile_routing_overlay_inner(
     admission_states: &HashMap<String, crate::resources::geography::AdmissionState>,
     serving: Option<&ServingSource<'_>>,
     owning_site: Option<&str>,
-    site_serving: SiteServing,
+    member_catalogs: bool,
 ) -> Result<OverlayOutcome, OperatorError> {
     let network_name = grid_network_name(network)?;
     let signal = GridModes::of(network, MembershipMode::Swim).signal;
@@ -3122,7 +3078,7 @@ async fn reconcile_routing_overlay_inner(
     let mut serving_retry: Option<Duration> = None;
     let mut inventory_expiry_deadline: Option<time::OffsetDateTime> = None;
     // Peer records are the same for every gateway; only Local reads them from verified peers.
-    let peer_catalog = site_serving.catalogs.then(|| {
+    let peer_catalog = member_catalogs.then(|| {
         derived_topology::peer_catalog(filter_eligible_remote_crdt_providers(
             network_name,
             &sites,
@@ -3212,12 +3168,9 @@ async fn reconcile_routing_overlay_inner(
                 from_providers: &[],
                 transport: None,
                 signal,
-                serving: site_serving.knobs,
                 peer_catalog: peer_catalog.as_ref(),
             },
         );
-        let generates = gw_ref.praxis_config.as_ref().is_some_and(|cc| cc.generate);
-        let derived_summary = with_config_refusal(derived_summary, site_serving.refused && generates);
         if !refused.is_empty() {
             tracing::warn!(
                 network = network_name,
@@ -9277,31 +9230,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_serving_only_config_leaves_the_site_to_self_sign() {
-        let enrolls = crate::operator_config::parse("serving:\n  localProviders: Published\n  remote: Members\n")
-            .map(|parsed| config_enrolls(&crate::operator_config::Snapshot::of_config(parsed.config)));
-        assert_eq!(enrolls, Ok(false), "serving knobs are not a site that enrolls");
-    }
-
-    #[test]
-    fn a_refused_operator_config_reads_the_defaults_and_says_so() {
-        let refused = site_serving(
-            &crate::operator_config::Loaded::Invalid("serving.remote: unknown variant".to_owned()),
-            crate::cli::Membership::Local,
-        );
-        assert_eq!(refused.knobs, crate::operator_config::Serving::default());
-        assert!(refused.refused && refused.catalogs);
-        assert_eq!(with_config_refusal(String::new(), true), CONFIG_REFUSED);
-        assert_eq!(
-            with_config_refusal("withdrew 1 (x: not allowlisted)".to_owned(), true),
-            format!("withdrew 1 (x: not allowlisted); {CONFIG_REFUSED}")
-        );
-        assert_eq!(with_config_refusal("derived".to_owned(), false), "derived");
-        let read = site_serving(&crate::operator_config::Loaded::Absent, crate::cli::Membership::Swim);
-        assert!(!read.refused && !read.catalogs);
-    }
-
     /// What `ensure_tls_secrets` writes, after a restart that lost the config, beside a
     /// pending Secret labelled `labels`.
     async fn writes_beside_pending(labels: &Value) -> Vec<status_harness::Write> {
@@ -11909,7 +11837,6 @@ mod tests {
             from_providers: &[],
             transport: None,
             signal: SignalMode::Gossip,
-            serving: crate::operator_config::Serving::default(),
             peer_catalog: None,
         }
     }
@@ -12192,57 +12119,21 @@ mod tests {
     }
 
     #[test]
-    fn published_serving_derives_an_unnamed_local_provider_without_derive_topology() {
-        let providers = vec![local_http_provider("a1b2c3d4", "pool.models.svc")];
-        let mut gw = make_gw_ref("inference-gw", "praxis-system");
-        gw.site_name = Some("site-a".to_owned());
-        gw.praxis_config = Some(make_consumer_config("praxis-consumer-config"));
-        let candidates = vec![topology_candidate("a1b2c3d4", "site-a")];
-        let declarations = derived_topology::Declarations {
-            providers: &providers,
-            serving: crate::operator_config::Serving {
-                local_providers: crate::operator_config::LocalProviders::Published,
-                remote: crate::operator_config::RemoteServing::None,
-            },
-            ..empty_declarations()
-        };
-        let (endpoints, _summary, refused) = gateway_cluster_endpoints(&gw, &candidates, &declarations);
-        assert!(refused.is_empty(), "{refused:?}");
-        assert_eq!(
-            endpoints.iter().map(|entry| entry.cluster.as_str()).collect::<Vec<_>>(),
-            ["a1b2c3d4"],
-            "the site knob reaches derivation through the gateway's declarations"
-        );
-    }
-
-    #[test]
-    fn narrowing_and_removing_the_allowlist_withdraws_the_revoked_endpoint_from_the_render() {
-        let providers = vec![
-            local_http_provider("prov-a", "prov-a.models.svc"),
-            local_http_provider("prov-b", "prov-b.models.svc"),
-        ];
-        let declarations = derived_topology::Declarations {
-            providers: &providers,
-            ..empty_declarations()
-        };
-        let allow = |names: &[&str]| {
-            Some(crate::crd::grid_network::DeriveTopology {
-                from_providers: names.iter().map(|name| (*name).to_owned()).collect(),
-                transport: None,
-            })
-        };
-        // The typed entry keeps the inventory non-empty once every derivation is revoked.
-        let steps = [
-            (allow(&["prov-a", "prov-b"]), &["prov-a", "prov-b"][..]),
-            (allow(&["prov-a"]), &["prov-a"][..]),
-            (allow(&[]), &[][..]),
-            (None, &[][..]),
-        ];
-        for (derive_topology, live) in steps {
+    fn removing_a_provider_withdraws_its_derived_endpoint_from_the_render() {
+        // The typed entry keeps the inventory non-empty once every provider is gone.
+        let steps: [&[&str]; 3] = [&["prov-a", "prov-b"], &["prov-a"], &[]];
+        for live in steps {
+            let providers: Vec<InferenceProvider> = live
+                .iter()
+                .map(|name| local_http_provider(name, &format!("{name}.models.svc")))
+                .collect();
+            let declarations = derived_topology::Declarations {
+                providers: &providers,
+                ..empty_declarations()
+            };
             let mut gw = make_gw_ref("inference-gw", "praxis-system");
             gw.site_name = Some("site-a".to_owned());
             let cc = ConsumerConfig {
-                derive_topology,
                 cluster_endpoints: vec![typed_endpoint("typed-c", "typed-c.models.svc:8000")],
                 ..make_consumer_config("praxis-consumer-config")
             };
@@ -12282,15 +12173,15 @@ mod tests {
                 assert_eq!(
                     rendered.config_yaml.contains(&address),
                     live.contains(&cluster),
-                    "{live:?}: {address} is live only while allowlisted"
+                    "{live:?}: {address} is live only while its provider exists"
                 );
                 assert_eq!(
                     overlay.candidates.iter().any(|c| c.cluster == cluster),
                     live.contains(&cluster),
-                    "{live:?}: {cluster} routes only while allowlisted"
+                    "{live:?}: {cluster} routes only while its provider exists"
                 );
                 assert_eq!(
-                    summary.contains(&format!("{cluster}: not allowlisted")),
+                    summary.contains(&format!("{cluster}: no provider")),
                     !live.contains(&cluster),
                     "{live:?}: the status names {cluster} once withdrawn: {summary}"
                 );

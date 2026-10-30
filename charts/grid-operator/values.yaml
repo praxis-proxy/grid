@@ -382,15 +382,6 @@ operatorConfig:
   create: true
   # -- ConfigMap name.
   name: grid-operator-config
-  # -- What this site's generated consumer gateways derive beyond the providers
-  # deriveTopology.fromProviders names: the config's serving section. Empty keeps the
-  # operator's default. Renders a top-level serving section, apart from site.
-  serving:
-    # -- Named (default) or Published: also every provider of the network on this cluster.
-    localProviders: ""
-    # -- None (default) or Members: also every candidate a member site's catalog offers.
-    # Needs grid.membership.source Local.
-    remote: ""
 
 # -- How this cluster's own site enrolls and renews its identity, rendered as the operator
 # config's site section.

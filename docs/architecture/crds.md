@@ -740,9 +740,6 @@ site:
     gridCaBundleRef: {kind: Secret, name: grid-ca-anchor, key: ca.crt}
     rotation: Enabled
   inviteSecretRef: {name: grid-invite-east2, key: token}
-serving:
-  localProviders: Named
-  remote: None
 ```
 
 | Field | Meaning |
@@ -754,9 +751,6 @@ serving:
 | `site.signerEndpoint.gridCaBundleRef` | The grid CA the returned CA must match: a bootstrap override for a signer that cannot serve its own bundle, such as one behind a certificate from another CA. |
 | `site.signerEndpoint.rotation` | Whether this operator renews the identity through the signer. `Enabled` (default) renews when a third of its lifetime remains, and is refused under pin peer trust with `Accepted` `False` and `RotationUnsupportedUnderPinTrust`. `Disabled` uses the signer to enroll only. Enrollment runs whatever this says. |
 | `site.inviteSecretRef` | The Secret holding the one-time invite token, an opaque credential the signer issued, read once while the site has no identity. `key` defaults to `token`. The Secret must carry `grid.praxis.fast/site=<site.name>`. |
-| `serving` | What this site's generated consumer gateways derive beyond `deriveTopology.fromProviders`. Optional, and apart from `site`, so setting it never makes the site enroll itself. |
-| `serving.localProviders` | Which of this cluster's providers a generated consumer gateway derives an upstream for. `Named` (default) derives only what `deriveTopology.fromProviders` names. `Published` also derives every provider of the network on this cluster, so a site needs no per-site name list. See [Derived endpoint topology](consumer-config.md#derived-endpoint-topology). |
-| `serving.remote` | Which remote candidates a generated consumer gateway derives a provider hop for. `None` (default) derives only what `fromProviders` names. `Members` also derives every candidate a member site's catalog offers, through that site's gateway. It needs Local membership. |
 
 An optional top-level `version` says which document this is. Absent reads as `1`, the
 only version this operator reads, and any other refuses the document. A top-level

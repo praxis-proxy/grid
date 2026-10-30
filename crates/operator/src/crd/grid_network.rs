@@ -1000,8 +1000,8 @@ pub struct ConsumerConfig {
     #[serde(default = "default_tls_cert_mount_path")]
     pub tls_cert_mount_path: String,
 
-    /// Derive the endpoint topology from the declarations of named providers,
-    /// instead of requiring a `clusterEndpoints` entry per candidate.
+    /// Settings for the endpoint topology the operator derives for each candidate
+    /// with no `clusterEndpoints` entry. Absent still derives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derive_topology: Option<DeriveTopology>,
 
@@ -1190,7 +1190,8 @@ impl Default for ConsumerConfig {
     }
 }
 
-/// Providers a gateway derives its endpoint topology from. Empty derives nothing.
+/// How a gateway derives its endpoint topology. Every local provider of the network
+/// derives, and so does every candidate a member's catalog offers under Local membership.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -1199,7 +1200,8 @@ impl Default for ConsumerConfig {
     "message": "deriveTopology.transport mode must be tls"
 }]))]
 pub struct DeriveTopology {
-    /// Routing identities whose declarations this gateway derives from.
+    /// Remote routing identities this gateway derives a hop for without a member catalog,
+    /// as under SWIM membership.
     ///
     /// Each entry is a provider's `clusterName`, or its `metadata.name`
     /// when that is unset. At most 64 entries, each named once.

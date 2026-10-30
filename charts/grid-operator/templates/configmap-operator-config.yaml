@@ -7,8 +7,7 @@ metadata:
   labels:
     {{- include "grid-operator.labels" . | nindent 4 }}
 data:
-  {{- $document := list (include "grid-operator.enrollment.site" . | trim) (include "grid-operator.operatorConfig.serving" . | trim) | compact | join "\n" }}
-  {{- with $document }}
+  {{- with include "grid-operator.enrollment.site" . | trim }}
   config.yaml: |
     {{- . | nindent 4 }}
   {{- else }}

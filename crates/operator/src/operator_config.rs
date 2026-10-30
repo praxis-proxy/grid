@@ -30,11 +30,6 @@ pub struct OperatorConfig {
     /// This cluster's own site: how it enrolls and renews its identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub site: Option<SiteConfig>,
-
-    /// What this site's generated gateways serve beyond the providers they name. Apart from
-    /// `site`, so setting it never reads as a site that enrolls.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub serving: Option<Serving>,
 }
 
 /// This cluster's own site.
@@ -54,40 +49,6 @@ pub struct SiteConfig {
     /// the operator presents it and never parses it. Read only while the site has no identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invite_secret_ref: Option<InviteSecretRef>,
-}
-
-/// What a generated consumer gateway at this site derives an upstream for without
-/// `deriveTopology.fromProviders` naming it. Private to the site, unlike the `GridNetwork`.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct Serving {
-    /// Which of this cluster's providers a gateway derives a local upstream for.
-    #[serde(default)]
-    pub local_providers: LocalProviders,
-    /// Which remote candidates a gateway derives a provider hop for.
-    #[serde(default)]
-    pub remote: RemoteServing,
-}
-
-/// Which local providers a gateway derives an upstream for.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub enum LocalProviders {
-    /// Only those `deriveTopology.fromProviders` names.
-    #[default]
-    Named,
-    /// Also every provider of the network on this cluster that is not disabled.
-    Published,
-}
-
-/// Which remote candidates a gateway derives a provider hop for.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub enum RemoteServing {
-    /// Only those `deriveTopology.fromProviders` names.
-    #[default]
-    None,
-    /// Also every candidate a member site's catalog offers, through that site's gateway.
-    /// Needs Local membership, where catalogs are read from identity-verified peers.
-    Members,
 }
 
 /// Whether this operator renews the site identity through the signer.
@@ -341,7 +302,7 @@ impl SiteConfig {
 pub const VERSION: u64 = 1;
 
 /// The top-level sections this operator reads, beside `version`.
-const SECTIONS: [&str; 2] = ["site", "serving"];
+const SECTIONS: [&str; 1] = ["site"];
 
 /// A parsed document, and the top-level sections this operator does not know and ignored.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -471,19 +432,6 @@ impl<'config> Section<'config> {
 }
 
 impl Loaded {
-    /// The serving knobs, the defaults when unset, or why the document was refused.
-    ///
-    /// # Errors
-    ///
-    /// Why the document was refused, whose knobs then read as the defaults.
-    pub fn serving(&self) -> Result<Serving, &str> {
-        match self {
-            Self::Unread | Self::Absent => Ok(Serving::default()),
-            Self::Invalid(why) => Err(why),
-            Self::Valid(config) => Ok(config.serving.unwrap_or_default()),
-        }
-    }
-
     /// Whether the document names this site, or was refused and may: either holds off
     /// self-signing until it is read clean.
     #[must_use]
@@ -643,14 +591,6 @@ impl ConfigWatch {
         if self.0.changed().await.is_err() {
             std::future::pending::<()>().await;
         }
-    }
-
-    /// One item after each change to the document.
-    pub fn changes(&self) -> impl Stream<Item = ()> + Send + 'static {
-        futures::stream::unfold(self.clone(), |mut watch| async move {
-            watch.changed().await;
-            Some(((), watch))
-        })
     }
 }
 

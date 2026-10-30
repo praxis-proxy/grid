@@ -54,6 +54,13 @@ and dashboards that read them during the 0.3.x upgrade, including
 `praxisConfigStatus`. Status is operator-owned; do not migrate it by hand.
 The compatibility window covers spec fields and chart values only.
 
+A generated consumer gateway derives an endpoint for every local
+`InferenceProvider` of its network, and under Local membership for every
+candidate a member's catalog offers, without `deriveTopology.fromProviders`
+naming it. Under SWIM membership `fromProviders` still gates remote candidates.
+Delete or disable a provider that must not be served before upgrading. See
+[Derived endpoint topology](../architecture/consumer-config.md#derived-endpoint-topology).
+
 Upgrade in this order:
 
 1. Apply the 0.3.x CRDs first. When the platform owns the CRDs, apply the

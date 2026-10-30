@@ -199,71 +199,6 @@ fn the_site_section_reads_unset_invalid_or_the_site() {
     assert!(matches!(valid.site(), Section::Site(site) if site.name == SITE));
 }
 
-#[test]
-fn serving_is_its_own_section_and_defaults_to_named_and_none() {
-    let set = parse("serving:\n  localProviders: Published\n  remote: Members\n").expect("parses");
-    assert!(set.ignored.is_empty(), "serving is a section this operator reads");
-    assert_eq!(set.config.site, None, "serving alone names no site");
-    assert_eq!(
-        set.config.serving,
-        Some(Serving {
-            local_providers: LocalProviders::Published,
-            remote: RemoteServing::Members,
-        })
-    );
-    let empty = parse("serving: {}\n").expect("parses");
-    assert_eq!(empty.config.serving, Some(Serving::default()), "each knob is optional");
-    assert_eq!(
-        Serving::default(),
-        Serving {
-            local_providers: LocalProviders::Named,
-            remote: RemoteServing::None,
-        }
-    );
-    for loaded in [Loaded::Absent, Loaded::Unread, Snapshot::of(&map(Some(FULL))).loaded] {
-        assert_eq!(
-            loaded.serving(),
-            Ok(Serving::default()),
-            "{loaded:?}: unset reads the defaults"
-        );
-    }
-    assert_eq!(
-        Loaded::Invalid("bad".to_owned()).serving(),
-        Err("bad"),
-        "a refusal is reported"
-    );
-    let beside = Snapshot::of(&map(Some(&format!("{FULL}serving:\n  localProviders: Published\n")))).loaded;
-    assert_eq!(
-        beside.serving(),
-        Ok(Serving {
-            local_providers: LocalProviders::Published,
-            remote: RemoteServing::None,
-        })
-    );
-}
-
-#[test]
-fn a_serving_only_document_names_no_site() {
-    let snapshot = Snapshot::of(&map(Some("serving:\n  remote: Members\n")));
-    assert_eq!(snapshot.loaded.site(), Section::Unset);
-    assert!(!snapshot.loaded.names_site(), "serving must not hold off self-signing");
-    assert!(!snapshot.site_seen);
-}
-
-#[test]
-fn serving_refuses_an_unknown_value_or_key() {
-    for (text, names) in [
-        ("serving:\n  localProviders: All\n", "localProviders"),
-        ("serving:\n  remote: Everyone\n", "remote"),
-        ("serving:\n  remote: members\n", "remote"),
-        ("serving:\n  selector: {}\n", "selector"),
-        ("site:\n  name: site-d\n  serving: {}\n", "serving"),
-    ] {
-        let why = refused(text);
-        assert!(why.contains(names), "{text:?}: {why}");
-    }
-}
-
 /// Where a test sends watch events.
 type Events = futures::channel::mpsc::UnboundedSender<Result<watcher::Event<ConfigMap>, watcher::Error>>;
 
@@ -383,29 +318,6 @@ async fn the_watch_picks_up_an_edit() {
         (pin.kind, pin.name.as_str()),
         (BundleKind::Secret, "grid-ca"),
         "the edit applies"
-    );
-}
-
-#[tokio::test]
-async fn changes_yields_once_per_edit() {
-    let _watch = WATCH.lock().await;
-    let (events, mut config) = watching();
-    send(&events, watcher::Event::Init);
-    send(&events, watcher::Event::InitApply(map(Some(FULL))));
-    send(&events, watcher::Event::InitDone);
-    drop(config.read().await);
-    let mut changes = std::pin::pin!(config.changes());
-    send(
-        &events,
-        watcher::Event::Apply(map(Some(&format!("{FULL}serving:\n  localProviders: Published\n")))),
-    );
-    tokio::time::timeout(std::time::Duration::from_secs(5), changes.next())
-        .await
-        .expect("an edit yields")
-        .expect("the stream stays open");
-    assert_eq!(
-        config.current().loaded.serving().map(|knobs| knobs.local_providers),
-        Ok(LocalProviders::Published)
     );
 }
 
