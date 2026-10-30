@@ -131,7 +131,7 @@ tests:
           configMapName: b
     asserts:
       - failedTemplate:
-          errorPattern: "backendCAs/0/(secretName|configMapName)': maxLength"
+          errorPattern: "backendCAs[./]0.*(oneOf|maxLength|less than or equal to 0)"
 
   - it: refuses backendCAs without gridServing
     template: templates/deployment.yaml
