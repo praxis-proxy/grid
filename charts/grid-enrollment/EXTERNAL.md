@@ -24,17 +24,33 @@ existing ConfigMap is an error, never a reason to mint another ID. Bootstrap
 reads no Grid object, so the hub needs no Grid CRD. Back up this ConfigMap with
 the CA and retain it through CA rotation.
 
-To keep an existing grid's ID, create the ConfigMap before installing, with
-that ID under `gridId`:
+To keep an existing grid's ID, create the ConfigMap before the first
+`gridIdentity.enabled` run, with that ID under `gridId`. Bootstrap mints a new
+ID when the ConfigMap is absent, and creating it afterwards cannot replace one
+already saved. Apply the same object bootstrap writes:
 
-```bash
-kubectl -n <release-namespace> create configmap grid-bootstrap-state \
-  --from-literal=gridId=<existing-grid-id>
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grid-bootstrap-state
+  namespace: <release-namespace>
+  labels:
+    app.kubernetes.io/managed-by: grid-enrollment-bootstrap
+  annotations:
+    helm.sh/resource-policy: keep
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+immutable: true
+data:
+  gridId: <existing-grid-id>
 ```
 
-Bootstrap uses a pre-created ConfigMap unchanged. The existing ID is the
-`spec.gridId` of the grid's GridNetwork on any member, or `status.gridId` on
-releases that predate the spec field.
+Bootstrap uses a pre-created ConfigMap unchanged. The existing ID is each
+member GridNetwork's `spec.gridId` when set, otherwise its `status.gridId`.
+Every member must report the same ID. The member policy refuses to touch a
+GridNetwork whose ID differs from the saved one and reports `existing grid ID
+<old> differs from bootstrap state <new>` until the ConfigMap holds the
+existing ID.
 
 Earlier releases also created a hook ClusterRole and ClusterRoleBinding that
 let bootstrap read the GridNetwork. Helm does not delete a hook resource that a
@@ -49,6 +65,9 @@ kubectl delete clusterrole/"$role" clusterrolebinding/"$role" --ignore-not-found
 In external mode the existing bootstrap Job uses `--skip-ca` and has no Secret
 permissions. In service mode that same Job also handles CA and credentials.
 Use an image that supports `--grid-id-config-map` before enabling it.
+Upgrade the chart and the bootstrap image together. This chart no longer grants
+GridNetwork read access or passes `--grid-network`, so a v0.3.0-rc.2 or earlier
+image, which reads the GridNetwork named by its `grid` default, fails with 403.
 For managed clusters, the enrollment policy creates a complete GridNetwork
 with the saved ID, Local membership, polling, SPIFFE trust, and references to
 the delivered identity and CA Secrets. It waits for those Secrets before
