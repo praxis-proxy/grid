@@ -177,6 +177,9 @@ state, so two replicas agree only in steady state.
 | `grid_route_prefix_affinity_total` | counter | `outcome` | Prefix-affinity decisions by outcome. |
 | `grid_serving_config_reload_total` | counter | `result` | Serving-config reloads by result. |
 | `grid_serving_unbound_provider_hops` | gauge | | Provider hops the applied serving config declares that no startup-verified backend binds. Their candidates take no traffic until a serving config names the verified SNI or the gateway restarts. |
+| `grid_serving_undialable_clusters` | gauge | | Dials in the applied dial file whose TLS files could not be read. Their candidates take no traffic until the files read, which re-applies the config. |
+| `grid_serving_refused_dial_clusters` | gauge | | Dials in the applied dial file praxis refused, such as a private, loopback, or metadata host the dial does not trust. Their candidates take no traffic, and the rest of the file applies. |
+| `grid_serving_dial_shadowed_clusters` | gauge | | Dials that replace a `load_balancer` cluster of the same name. |
 
 A `NaN` rho or weight means the gateway holds no reading for that site, which
 distinguishes an unmeasured site from one measured at zero. A `NaN` score means

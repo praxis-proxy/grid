@@ -569,7 +569,7 @@ pub struct PeerRecord {
 /// The server name `site`'s gateway is reached and verified under, the DNS name its leaf carries.
 #[must_use]
 pub fn gateway_server_name(site: &str) -> String {
-    format!("{site}.{}", certs::SPIFFE_TRUST_DOMAIN)
+    certs::site_dns_name(site)
 }
 
 /// The server name `site`'s signals listener is reached under, beside its gateway's own.

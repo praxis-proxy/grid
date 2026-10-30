@@ -114,13 +114,20 @@ fn main() -> ExitCode {
     // the pollers refresh. Dropping the runtime stops the pollers, so it is
     // bound until the server returns.
     let (grid_runtime, backend_tls) = match std::env::var("GRID_SERVING_CONFIG").ok().map(|path| {
-        let backend_tls = provider_hop_backends(&config)?;
-        let backend_sni = backend_tls
-            .iter()
-            .map(|(name, tls)| (name.clone(), tls.sni.clone()))
-            .collect();
-        let runtime = start_grid_routing(&path, backend_sni, &mut registry)?;
-        Ok::<_, praxis_filter::FilterError>((runtime, backend_tls))
+        let backends = load_balancer_backends(&config)?;
+        let binding = ai_grid_filters::Binding {
+            backend_tls: backends
+                .verified
+                .iter()
+                .map(|(name, tls)| (name.clone(), tls.sni.clone()))
+                .collect(),
+            // Captured once: praxis applies insecure options only at startup.
+            insecure: config.insecure_options.clone(),
+            lb_clusters: backends.names,
+            ..ai_grid_filters::Binding::default()
+        };
+        let runtime = start_grid_routing(&path, binding, &mut registry)?;
+        Ok::<_, praxis_filter::FilterError>((runtime, backends.verified))
     }) {
         Some(Err(err)) => return praxis::report_fatal(&err, log_output),
         Some(Ok((runtime, backend_tls))) => (Some(runtime), Some(backend_tls)),
@@ -230,11 +237,21 @@ fn start_metrics_listener(config: &Config) -> Result<(), String> {
 /// registering the filters.
 fn start_grid_routing(
     path: &str,
-    backend_tls: BTreeMap<String, String>,
+    binding: ai_grid_filters::Binding,
     registry: &mut praxis_filter::FilterRegistry,
 ) -> Result<ai_grid_filters::GridRuntime, praxis_filter::FilterError> {
     let config = ai_grid_filters::load_serving_config(path)?;
-    let mut runtime = ai_grid_filters::spawn_grid_routing(&config, backend_tls)?;
+    let dial = ai_grid_filters::load_dial_config(&ai_grid_filters::dial_config_path(std::path::Path::new(path)))
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "grid: dial file unreadable at startup; serving without dials");
+            ai_grid_filters::DialConfig::default()
+        });
+    let binding = ai_grid_filters::Binding {
+        // Fixed at startup: dials present the identity the peers already present.
+        grid_identity: ai_grid_filters::GridIdentity::of(&config),
+        ..binding
+    };
+    let mut runtime = ai_grid_filters::spawn_grid_routing(&config, &dial, binding)?;
     ai_grid_filters::register_grid_filters(
         registry,
         runtime.snapshot(),
@@ -297,8 +314,21 @@ struct BackendClientCert {
     key_path: String,
 }
 
+/// The `load_balancer` clusters of a praxis config.
+struct LoadBalancerClusters {
+    /// Every cluster name.
+    names: BTreeSet<String>,
+    /// The verified mutual TLS clusters.
+    verified: BTreeMap<String, BackendTls>,
+}
+
 /// Resolve unique verified mutual-TLS backends across all chains.
 fn provider_hop_backends(config: &Config) -> Result<BTreeMap<String, BackendTls>, praxis_filter::FilterError> {
+    load_balancer_backends(config).map(|clusters| clusters.verified)
+}
+
+/// Every `load_balancer` cluster, and the verified mutual-TLS ones, across all chains.
+fn load_balancer_backends(config: &Config) -> Result<LoadBalancerClusters, praxis_filter::FilterError> {
     let mut backends = BTreeMap::new();
     let mut unverified = BTreeSet::new();
     for chain in &config.filter_chains {
@@ -334,7 +364,11 @@ fn provider_hop_backends(config: &Config) -> Result<BTreeMap<String, BackendTls>
             }
         }
     }
-    Ok(backends)
+    let names = backends.keys().cloned().chain(unverified).collect();
+    Ok(LoadBalancerClusters {
+        names,
+        verified: backends,
+    })
 }
 
 /// Reject a Praxis config reload that changes a backend identity trusted by the Grid runtime.
@@ -385,7 +419,7 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::{
-        USAGE, backend_tls_unchanged, config_arg, otlp_headers_present, provider_hop_backends,
+        USAGE, backend_tls_unchanged, config_arg, load_balancer_backends, otlp_headers_present, provider_hop_backends,
         validate_otlp_endpoint_transport_values,
     };
 
@@ -435,6 +469,22 @@ mod tests {
                 "rejection must leave the original identity trusted"
             );
         }
+    }
+
+    #[test]
+    fn every_load_balancer_cluster_is_named_and_only_verified_ones_bind() {
+        let verified = "        tls:\n          sni: provider-a.grid.internal\n          verify: true\n          ca: { ca_path: /tls/ca.crt }\n          client_cert: { cert_path: /tls/tls.crt, key_path: /tls/tls.key }\n        endpoints: [provider-a:8443]\n      - name: local-model\n        endpoints: [model:80]\n";
+        let clusters = load_balancer_backends(&config_with_backend(verified)).expect("backends");
+        assert_eq!(
+            clusters.names.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["local-model", "provider-a"],
+            "a dial of either name shadows it"
+        );
+        assert_eq!(
+            clusters.verified.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["provider-a"],
+            "only the verified cluster binds a hop"
+        );
     }
 
     fn parse(args: &[&str]) -> Result<Option<String>, String> {

@@ -10,6 +10,7 @@ mod conformance;
 mod control;
 mod decisions;
 mod descriptor;
+mod dial;
 #[cfg(test)]
 mod flow;
 mod health;
@@ -24,18 +25,20 @@ mod snapshot;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-pub use control::{ReloadOutcome, Tuning};
+pub use control::{Binding, ReloadOutcome, Tuning};
 pub use decisions::SiteDecisions;
 // The routing model and the snapshot builder are the crate's control-plane API:
 // the gateway's refresh step orders candidates by live load and swaps the
 // snapshot. The request path only reads a snapshot.
 pub use descriptor::{AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate};
+pub use dial::{BACKEND_CA_BASE, Dialed, GRID_TLS_MOUNT, GridIdentity};
 pub use health::ClusterHealth;
 pub use metadata::{CandidateCredential, CredentialRef};
 use praxis_filter::{FilterError, FilterFactory, FilterRegistry, HttpFilter};
 pub use prefix::{AffinitySettings, PrefixAffinity};
 pub use serving::{
-    AvailabilitySettings, GridRuntime, GridServingConfig, PeerServingConfig, load_serving_config, spawn_grid_routing,
+    AvailabilitySettings, DIAL_FILE, DialConfig, DialSpec, DialTransport, DialVersion, GridRuntime, GridServingConfig,
+    PeerServingConfig, dial_config_path, load_dial_config, load_serving_config, spawn_grid_routing,
 };
 pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;
@@ -71,10 +74,22 @@ const COUNTER_HELP: [(&str, &str); 8] = [
 ];
 
 /// Grid gauges the gateway emits.
-const GAUGE_HELP: [(&str, &str); 18] = [
+const GAUGE_HELP: [(&str, &str); 21] = [
     (
         "grid_serving_unbound_provider_hops",
         "Provider hops the applied serving config declares that no startup-verified backend binds. Their candidates take no traffic until a serving config names the SNI that backend verified at startup, or, for a backend not verified at startup, until the gateway restarts.",
+    ),
+    (
+        "grid_serving_undialable_clusters",
+        "Dials in the applied dial file whose TLS files could not be read. Their candidates take no traffic until the files read.",
+    ),
+    (
+        "grid_serving_refused_dial_clusters",
+        "Dials in the applied dial file praxis refused, such as a private or metadata host not trusted. Their candidates take no traffic.",
+    ),
+    (
+        "grid_serving_dial_shadowed_clusters",
+        "Dials that replace a load_balancer cluster of the same name.",
     ),
     (
         "grid_route_site_rho",

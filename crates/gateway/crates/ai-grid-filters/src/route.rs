@@ -449,7 +449,7 @@ impl GridSiteRouteFilter {
             // Ids are tagged in the body, so it must come back uncompressed.
             ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         }
-        ctx.cluster = Some(Arc::clone(&candidate.cluster));
+        select_upstream(ctx, candidate);
         write_provider_context(ctx, candidate, snapshot)?;
         write_credentials(ctx, candidate, snapshot);
         Ok(())
@@ -490,12 +490,11 @@ impl GridSiteRouteFilter {
                 )));
             },
         };
-        let cluster = Arc::clone(&candidate.cluster);
         with_state(ctx, |state| {
             state.responses = true;
             state.served = Some((Arc::clone(&candidate.site), Arc::clone(&candidate.cluster)));
         });
-        ctx.cluster = Some(cluster);
+        select_upstream(ctx, candidate);
         write_provider_context(ctx, candidate, &snapshot)?;
         // The pinned path is rewritten first so a credential in its query is stripped too.
         ctx.rewritten_path = rewrite.or_else(|| ctx.rewritten_path.take());
@@ -551,6 +550,16 @@ impl GridSiteRouteFilter {
         let tagging = tag.is_some();
         state.tagger = tag;
         finish_route_response_headers(ctx, served.as_ref(), tagging)
+    }
+}
+
+/// Select `candidate`'s cluster, and its built upstream when it has one. The cluster stays set
+/// for metrics and affinity.
+fn select_upstream(ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate) {
+    ctx.cluster = Some(Arc::clone(&candidate.cluster));
+    if let Some(dial) = candidate.dial.as_deref() {
+        ctx.upstream = Some(dial.upstream().clone());
+        ctx.retry_policy = Some(Arc::clone(dial.retry()));
     }
 }
 
@@ -999,10 +1008,10 @@ fn error_response(
     ))
 }
 
-/// Whether a request routed to `candidate` has somewhere to go: a declared cluster.
-/// With no declared list, every cluster is assumed to exist.
+/// Whether a request routed to `candidate` has somewhere to go: a built dial or a declared
+/// cluster. With no declared list, every cluster is assumed to exist.
 fn has_route(candidate: &RouteCandidate, clusters: Option<&HashSet<Arc<str>>>) -> bool {
-    clusters.is_none_or(|clusters| clusters.contains(&candidate.cluster))
+    candidate.dial.is_some() || clusters.is_none_or(|clusters| clusters.contains(&candidate.cluster))
 }
 
 /// One site selection may choose, as a [`Narrow`] stage sees it.
@@ -2579,5 +2588,232 @@ mod tests {
             Some("/v1/models"),
             "a query of only credentials is dropped whichever separator it used"
         );
+    }
+
+    /// A plaintext dial to `address` retried `retries` times.
+    fn dial_to(address: &str, retries: u32) -> Arc<crate::dial::Dialed> {
+        let upstream = praxis_core::connectivity::Upstream {
+            address: Arc::from(address),
+            authority: None,
+            base_path: None,
+            connection: Arc::default(),
+            tls: None,
+        };
+        let retry = praxis_core::config::RetryPolicy {
+            max_retries: Some(retries),
+            ..praxis_core::config::RetryPolicy::legacy_default()
+        };
+        Arc::new(crate::dial::Dialed::new(upstream, Arc::new(retry)))
+    }
+
+    /// `llama` at `site` on `cluster`, dialed at `address` when given.
+    fn dialed(site: &str, cluster: &str, address: Option<&str>) -> Vec<RouteCandidate> {
+        let mut candidates = one("llama", site, cluster, OPEN);
+        candidates[0].dial = address.map(|address| dial_to(address, 1));
+        candidates
+    }
+
+    /// The filter over `candidates` at local site `local`, affinity off, declaring `clusters`.
+    fn dial_filter(candidates: Vec<RouteCandidate>, local: &str, clusters: Option<&[&str]>) -> GridSiteRouteFilter {
+        let mut filter = filter(
+            RouteSnapshot::from_static(candidates, Arc::from(local)),
+            AffinitySettings {
+                enabled: false,
+                ..AffinitySettings::default()
+            },
+        );
+        filter.clusters = clusters.map(|clusters| clusters.iter().map(|cluster| Arc::from(*cluster)).collect());
+        filter
+    }
+
+    /// One request for `llama` at `path` carrying a caller credential.
+    fn llama_request(path: &'static str) -> praxis_filter::Request {
+        praxis_filter::Request {
+            headers: [
+                (
+                    http::header::HeaderName::from_static("x-model"),
+                    http::HeaderValue::from_static("llama"),
+                ),
+                (
+                    http::header::AUTHORIZATION,
+                    http::HeaderValue::from_static("Bearer caller"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            method: http::Method::POST,
+            uri: http::Uri::from_static(path),
+        }
+    }
+
+    #[test]
+    fn a_candidate_has_a_route_through_a_dial_or_a_declared_cluster() {
+        let declared: HashSet<Arc<str>> = HashSet::from([Arc::from("pool-a")]);
+        for (dial, clusters, cluster, expected) in [
+            (true, None, "pool-a", true),
+            (true, Some(&declared), "pool-a", true),
+            (true, Some(&declared), "pool-b", true),
+            (false, None, "pool-b", true),
+            (false, Some(&declared), "pool-a", true),
+            (false, Some(&declared), "pool-b", false),
+        ] {
+            let candidate = &dialed("a", cluster, dial.then_some("10.0.0.1:8080"))[0];
+            assert_eq!(
+                has_route(candidate, clusters),
+                expected,
+                "dial {dial}, declared {}, cluster {cluster}",
+                clusters.is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dialed_pick_sends_to_its_upstream_and_keeps_the_cluster() {
+        let filter = dial_filter(dialed("east", "east", Some("10.0.0.9:8443")), "local", Some(&[]));
+        let request = llama_request("/v1/chat/completions");
+        let mut ctx = context(&request);
+        let action = filter.on_request(&mut ctx).await.expect("routes");
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "an undeclared dialed cluster routes"
+        );
+        assert_eq!(
+            ctx.cluster.as_deref(),
+            Some("east"),
+            "the cluster stays for metrics and affinity"
+        );
+        assert_eq!(
+            ctx.upstream.as_ref().map(|upstream| &*upstream.address),
+            Some("10.0.0.9:8443"),
+            "sent to the built upstream"
+        );
+        assert_eq!(
+            ctx.retry_policy.as_ref().map(|policy| policy.effective_max_retries()),
+            Some(1),
+            "with the dial's retry policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pick_without_a_dial_leaves_the_upstream_to_the_load_balancer() {
+        let filter = dial_filter(dialed("east", "pool-east", None), "local", None);
+        let request = llama_request("/v1/chat/completions");
+        let mut ctx = context(&request);
+        let action = filter.on_request(&mut ctx).await.expect("routes");
+        assert!(matches!(action, FilterAction::Continue), "routes");
+        assert_eq!(ctx.cluster.as_deref(), Some("pool-east"));
+        assert!(ctx.upstream.is_none(), "the load_balancer picks the endpoint");
+        assert!(ctx.retry_policy.is_none(), "and the retry policy");
+    }
+
+    #[tokio::test]
+    async fn a_remote_dial_carries_no_credential() {
+        let mut candidates = dialed("east", "east", Some("10.0.0.9:8443"));
+        candidates[0].credential = Some(crate::metadata::CandidateCredential {
+            strategy: "bearer_token".to_owned(),
+            secret_ref: crate::metadata::CredentialRef {
+                key: "token".to_owned(),
+                name: "grid-model-client".to_owned(),
+                namespace: "models".to_owned(),
+            },
+        });
+        let filter = dial_filter(candidates, "local", Some(&[]));
+        let request = llama_request("/v1/chat/completions?key=caller&trace=1");
+        let mut ctx = context(&request);
+        let action = filter.on_request(&mut ctx).await.expect("routes");
+        assert!(matches!(action, FilterAction::Continue), "routes");
+        assert!(ctx.upstream.is_some(), "dialed");
+        assert!(
+            ctx.request_headers_to_remove.contains(&http::header::AUTHORIZATION),
+            "the caller's credential never leaves this site"
+        );
+        assert!(
+            CREDENTIAL_METADATA
+                .iter()
+                .all(|key| !ctx.filter_metadata.contains_key(*key)),
+            "this site's credential is never selected for another site"
+        );
+        assert_eq!(ctx.rewritten_path.as_deref(), Some("/v1/chat/completions?trace=1"));
+    }
+
+    #[tokio::test]
+    async fn a_pinned_request_is_sent_to_the_dial_that_holds_its_state() {
+        let filter = dial_filter(dialed("local", "local-pool", Some("10.0.0.7:8000")), "local", Some(&[]));
+        let request = llama_request("/v1/conversations");
+        let mut ctx = context(&request);
+        let action = filter.on_request(&mut ctx).await.expect("routes");
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "the new conversation pins locally"
+        );
+        assert_eq!(ctx.cluster.as_deref(), Some("local-pool"));
+        assert_eq!(
+            ctx.upstream.as_ref().map(|upstream| &*upstream.address),
+            Some("10.0.0.7:8000"),
+            "the pin sends to the built upstream"
+        );
+        assert!(ctx.retry_policy.is_some(), "with its retry policy");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test Utilities
+    // ---------------------------------------------------------------------------
+
+    /// The request id source every test context shares.
+    static IDS: LazyLock<praxis_core::id::IdGenerator> = LazyLock::new(|| praxis_core::id::IdGenerator::with_seed(0));
+
+    /// A context as the pipeline hands it to the first selecting filter.
+    fn context(request: &praxis_filter::Request) -> HttpFilterContext<'_> {
+        HttpFilterContext {
+            buffered_request_body: None,
+            body_done_indices: Vec::new(),
+            branch_iterations: std::collections::HashMap::new(),
+            client_addr: None,
+            cluster: None,
+            current_filter_id: Some(0),
+            downstream_tls: false,
+            metrics_route: None,
+            peer_identity: None,
+            extensions: praxis_filter::RequestExtensions::default(),
+            executed_branch_filters: Vec::new(),
+            executed_filter_indices: Vec::new(),
+            extra_request_headers: Vec::new(),
+            request_headers_to_remove: Vec::new(),
+            request_headers_to_set: Vec::new(),
+            filter_metadata: std::collections::HashMap::new(),
+            grpc_completion: None,
+            prior_pre_read_mutations: Vec::new(),
+            pre_read_mutations: Vec::new(),
+            structured_metadata: std::collections::HashMap::new(),
+            filter_results: std::collections::HashMap::new(),
+            filter_state: std::collections::HashMap::new(),
+            health_registry: None,
+            hedge_policy: None,
+            id_generator: &IDS,
+            kv_stores: None,
+            session_stores: None,
+            subrequest_client: None,
+            subrequest_response_mode: praxis_filter::SubRequestResponseMode::Buffered,
+            request,
+            request_body_bytes: 0,
+            request_body_mode: BodyMode::Stream,
+            request_start: std::time::Instant::now(),
+            response_body_bytes: 0,
+            response_body_mode: BodyMode::Stream,
+            response_header: None,
+            response_headers_modified: false,
+            upstream_reached: false,
+            selected_endpoint_index: None,
+            attempted_endpoints: Vec::new(),
+            retry_policy: None,
+            route_retry_policy: None,
+            cluster_retry_state: None,
+            cluster_retry_state_released: false,
+            endpoint_reselector: None,
+            pinned_endpoint_address: None,
+            time_source: &praxis_core::time::SystemTimeSource,
+            rewritten_path: None,
+            upstream: None,
+        }
     }
 }

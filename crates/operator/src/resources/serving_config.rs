@@ -404,7 +404,7 @@ fn valid_id(value: &str) -> bool {
 
 /// The local operator entry, presenting this site's own identity from `tls_mount`.
 fn peer(site: String, addr: String, tls_mount: &str) -> ServingPeer {
-    let name = format!("{site}.{}", certs::SPIFFE_TRUST_DOMAIN);
+    let name = certs::site_dns_name(&site);
     ServingPeer {
         site,
         addr,

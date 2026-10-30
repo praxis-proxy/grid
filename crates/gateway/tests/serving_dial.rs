@@ -1,0 +1,559 @@
+//! The gateway dials sites the serving config alone describes, with no praxis cluster for them.
+
+#[path = "support/http.rs"]
+mod http;
+#[path = "support/logs.rs"]
+mod logs;
+#[path = "support/ports.rs"]
+mod ports;
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_methods,
+    reason = "tests; waits poll a deadline with thread::sleep"
+)]
+mod tests {
+    use std::{
+        io::{BufRead as _, BufReader, Read as _, Write as _},
+        net::TcpStream,
+        path::{Path, PathBuf},
+        process::{Child, Command, Stdio},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use ai_grid_filters::{Binding, DialConfig, GridIdentity, GridServingConfig};
+    use certs::{CaCert, DEFAULT_TRUST_DOMAIN, GridSpiffeClientVerifier, generate_ca, generate_site_cert};
+    use rustls::{
+        ServerConfig, ServerConnection, StreamOwned,
+        pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _},
+    };
+
+    use super::{
+        http::read_request,
+        ports::{bound_listener, free_port},
+    };
+
+    /// How long any one expected change may take: the watch re-reads every 5s.
+    const DEADLINE: Duration = Duration::from_secs(20);
+
+    /// The serving config the operator renders beside its dial file.
+    const DIAL_SERVING: &str = include_str!("testdata/serving-config-dial.json");
+
+    /// The dial file the operator renders beside the serving config.
+    const DIAL_FILE: &str = include_str!("testdata/dial.json");
+
+    #[test]
+    fn the_operator_dial_render_loads_and_builds_every_dial() {
+        let work = fresh_work("dial-golden");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca, "site-a");
+        let tls = identity.dir.to_string_lossy().into_owned();
+        let backend_ca_base = work.join("backend-ca");
+        std::fs::create_dir_all(backend_ca_base.join("models-ca")).expect("backend CA dir");
+        std::fs::write(backend_ca_base.join("models-ca/ca.crt"), &ca.cert_pem).expect("backend CA");
+        let backend_ca_base_text = backend_ca_base.to_string_lossy().into_owned();
+        let render = DIAL_FILE.replace(ai_grid_filters::BACKEND_CA_BASE, &backend_ca_base_text);
+        let mut config: GridServingConfig = serde_yaml::from_str(DIAL_SERVING).expect("the serving render parses");
+        let identity_of = GridIdentity::of(&config);
+        assert_eq!(
+            identity_of,
+            GridIdentity::under("/etc/praxis/tls"),
+            "the rendered peer presents the grid TLS mount"
+        );
+        config.peers.clear();
+        let binding = Binding {
+            backend_ca_base,
+            grid_identity: GridIdentity::under(&tls),
+            ..Binding::default()
+        };
+        let load = |text: &str| {
+            let dial: DialConfig = serde_yaml::from_str(text).expect("the dial render parses");
+            ai_grid_filters::spawn_grid_routing(&config, &dial, binding.clone())
+        };
+
+        let runtime = load(&render).expect("the render loads");
+        let snapshot = runtime.snapshot().load_full();
+        let mut dialed: Vec<&str> = snapshot
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.dial.is_some())
+            .map(|candidate| &*candidate.cluster)
+            .collect();
+        dialed.sort_unstable();
+        assert_eq!(
+            dialed,
+            ["local-granite", "local-llama", "site-b"],
+            "every rendered dial is built"
+        );
+        assert!(
+            snapshot.provider_hop_clusters.contains("site-b"),
+            "the remote dial carries hop context"
+        );
+        drop(runtime);
+
+        for (from, to) in [
+            ("\"sni\": \"site-b.grid.internal\"", "\"sni\": \"site-c.grid.internal\""),
+            ("\"mode\": \"mutual_tls\"", "\"mode\": \"plaintext\""),
+            (&*backend_ca_base_text, "/etc/praxis/tls"),
+        ] {
+            assert!(render.contains(from), "the fixture still carries {from}");
+            let refused = load(&render.replace(from, to)).expect("a refused dial file never stops startup");
+            assert!(
+                refused
+                    .snapshot()
+                    .load()
+                    .candidates
+                    .iter()
+                    .all(|candidate| candidate.dial.is_none()),
+                "{to} builds a dial, so the trust rule guards nothing"
+            );
+        }
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_dialed_site_gets_hop_context_and_never_the_callers_credential() {
+        let work = fresh_work("dial-hop");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca, "local");
+        let east = Site::start(&ca, "east");
+        let mut serving = Mount::new(work.join("serving"));
+        dial_serving(&[("east", &east)], &identity).write(&mut serving);
+
+        let gateway = Gateway::start(&work, &serving);
+        for sent in 1..=3 {
+            let (status, head) = gateway.chat();
+            assert_eq!(status, 200, "request {sent} reaches east over its dial");
+            assert!(head.contains("x-grid-site: east"), "attributed to east: {head}");
+        }
+        let heads = east.heads();
+        assert_eq!(heads.len(), 3, "every request reached east");
+        for head in &heads {
+            assert!(
+                head.contains("x-ai-routing-candidate: candidate-east"),
+                "hop context names the candidate: {head}"
+            );
+            assert!(
+                !head.contains("authorization:"),
+                "the caller's credential stays on this site: {head}"
+            );
+        }
+        assert!(
+            east.saw(&leaf_fingerprint(&identity.leaf)),
+            "east saw this site's identity"
+        );
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_site_presenting_another_sites_name_is_never_sent_a_request() {
+        let work = fresh_work("dial-wrong-name");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca, "local");
+        let west = Site::start(&ca, "west");
+        let mut serving = Mount::new(work.join("serving"));
+        dial_serving(&[("east", &west)], &identity).write(&mut serving);
+
+        let gateway = Gateway::start(&work, &serving);
+        let (status, _) = gateway.chat();
+        assert_eq!(status, 502, "west's certificate does not name east");
+        assert!(west.heads().is_empty(), "no request reached the wrong site");
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_site_added_through_the_serving_mount_alone_routes() {
+        let work = fresh_work("dial-hot-add");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca, "local");
+        let (east, west) = (Site::start(&ca, "east"), Site::start(&ca, "west"));
+        let mut serving = Mount::new(work.join("serving"));
+        dial_serving(&[("east", &east)], &identity).write(&mut serving);
+
+        let gateway = Gateway::start(&work, &serving);
+        assert_eq!(gateway.chat().0, 200, "east routes");
+        gateway.serve(&mut serving, &dial_serving(&[("west", &west)], &identity));
+        for sent in 1..=3 {
+            let (status, head) = gateway.chat();
+            assert_eq!(status, 200, "request {sent} routes");
+            assert!(head.contains("x-grid-site: west"), "to the added site: {head}");
+        }
+        assert_eq!(west.heads().len(), 3, "west took every request after the rewrite");
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_rotated_identity_keeps_routing_with_the_renewed_leaf() {
+        let work = fresh_work("dial-rotate");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let mut identity = site_identity(&work, &ca, "local");
+        let east = Site::start(&ca, "east");
+        let mut serving = Mount::new(work.join("serving"));
+        dial_serving(&[("east", &east)], &identity).write(&mut serving);
+
+        let gateway = Gateway::start(&work, &serving);
+        assert_eq!(gateway.chat().0, 200, "east routes on the first identity");
+        let renewed = generate_site_cert(&ca, "local").expect("renewed cert");
+        identity.mount.write(&[
+            ("ca.crt", ca.cert_pem.as_bytes()),
+            ("tls.crt", renewed.cert_pem.as_bytes()),
+            ("tls.key", renewed.key_pem.as_bytes()),
+        ]);
+        let renewed_leaf = leaf_fingerprint(&renewed.cert_pem);
+        gateway.eventually("east sees the renewed leaf on a routed request", || {
+            gateway.chat().0 == 200 && east.saw(&renewed_leaf)
+        });
+        assert_eq!(gateway.chat().0, 200, "routing continues on the renewed identity");
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test Utilities
+    // ---------------------------------------------------------------------------
+
+    /// A directory laid out like a kubelet `ConfigMap` or `Secret` volume.
+    struct Mount {
+        dir: PathBuf,
+        generation: u32,
+    }
+
+    impl Mount {
+        fn new(dir: PathBuf) -> Self {
+            std::fs::create_dir_all(&dir).expect("mount dir");
+            Self { dir, generation: 0 }
+        }
+
+        fn path(&self, key: &str) -> String {
+            self.dir.join(key).to_string_lossy().into_owned()
+        }
+
+        fn write(&mut self, files: &[(&str, &[u8])]) {
+            self.generation += 1;
+            let generation = format!("..gen_{}", self.generation);
+            let staged = self.dir.join(&generation);
+            std::fs::create_dir(&staged).expect("generation dir");
+            for (key, content) in files {
+                std::fs::write(staged.join(key), content).expect("write key");
+            }
+            let link = self.dir.join("..data_tmp");
+            std::os::unix::fs::symlink(&generation, &link).expect("data link");
+            std::fs::rename(&link, self.dir.join("..data")).expect("swap ..data");
+            for (key, _) in files {
+                let entry = self.dir.join(key);
+                if entry.symlink_metadata().is_err() {
+                    std::os::unix::fs::symlink(Path::new("..data").join(key), &entry).expect("key link");
+                }
+            }
+            if self.generation > 1 {
+                std::fs::remove_dir_all(self.dir.join(format!("..gen_{}", self.generation - 1)))
+                    .expect("old generation");
+            }
+        }
+    }
+
+    /// This site's identity mount and the leaf it started with.
+    struct Identity {
+        dir: PathBuf,
+        leaf: String,
+        mount: Mount,
+    }
+
+    fn site_identity(work: &Path, ca: &CaCert, site: &str) -> Identity {
+        let cert = generate_site_cert(ca, site).expect("site cert");
+        let mut mount = Mount::new(work.join("identity"));
+        mount.write(&[
+            ("ca.crt", ca.cert_pem.as_bytes()),
+            ("tls.crt", cert.cert_pem.as_bytes()),
+            ("tls.key", cert.key_pem.as_bytes()),
+        ]);
+        Identity {
+            dir: mount.dir.clone(),
+            leaf: cert.cert_pem,
+            mount,
+        }
+    }
+
+    /// A site's gateway over grid mutual TLS, recording each request head and client leaf.
+    struct Site {
+        addr: String,
+        heads: Arc<Mutex<Vec<String>>>,
+        seen: Arc<Mutex<Vec<[u8; 32]>>>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl Site {
+        fn start(ca: &CaCert, site: &str) -> Self {
+            let identity = generate_site_cert(ca, site).expect("site cert");
+            let chain = CertificateDer::pem_slice_iter(identity.cert_pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .expect("site chain");
+            let key = PrivateKeyDer::from_pem_slice(identity.key_pem.as_bytes()).expect("site key");
+            let provider = rustls::crypto::ring::default_provider();
+            let verifier = GridSpiffeClientVerifier::new(
+                ca.cert_pem.as_bytes(),
+                DEFAULT_TRUST_DOMAIN,
+                provider.signature_verification_algorithms,
+            )
+            .expect("client verifier");
+            let config = Arc::new(
+                ServerConfig::builder_with_provider(Arc::new(provider))
+                    .with_safe_default_protocol_versions()
+                    .expect("versions")
+                    .with_client_cert_verifier(verifier)
+                    .with_single_cert(chain, key)
+                    .expect("server config"),
+            );
+            let listener = bound_listener();
+            let addr = listener.local_addr().expect("site addr").to_string();
+            let heads = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (recorded_heads, recorded_leaves, stopping) =
+                (Arc::clone(&heads), Arc::clone(&seen), Arc::clone(&stop));
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if stopping.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let Ok(stream) = stream else { continue };
+                    let Ok(conn) = ServerConnection::new(Arc::clone(&config)) else {
+                        continue;
+                    };
+                    let mut tls = StreamOwned::new(conn, stream);
+                    let Ok((head, _body)) = read_request(&mut tls) else {
+                        continue;
+                    };
+                    if let Some(leaf) = tls.conn.peer_certificates().and_then(<[_]>::first) {
+                        recorded_leaves.lock().expect("seen").push(certs::sha256(leaf.as_ref()));
+                    }
+                    recorded_heads.lock().expect("heads").push(head.to_ascii_lowercase());
+                    let _sent = tls
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                        .and_then(|()| tls.flush());
+                }
+            });
+            Self {
+                addr,
+                heads,
+                seen,
+                stop,
+            }
+        }
+
+        fn heads(&self) -> Vec<String> {
+            self.heads.lock().expect("heads").clone()
+        }
+
+        fn saw(&self, fingerprint: &[u8; 32]) -> bool {
+            self.seen.lock().expect("seen").contains(fingerprint)
+        }
+    }
+
+    impl Drop for Site {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _woken = TcpStream::connect(&self.addr);
+        }
+    }
+
+    /// A serving config routing `llama` to each `(site, server)` over a mutual TLS dial, polling nothing.
+    fn dial_serving(sites: &[(&str, &Site)], identity: &Identity) -> Revision {
+        let candidates: Vec<String> = sites
+            .iter()
+            .map(|(site, _)| {
+                format!(
+                    r#"{{"kind":"inference_model","name":"llama","site":"{site}","cluster":"{site}","stable_id":"candidate-{site}"}}"#
+                )
+            })
+            .collect();
+        let dials: Vec<String> = sites
+            .iter()
+            .map(|(site, server)| {
+                format!(
+                    r#""{site}":{{"address":"{addr}","connect_timeout_ms":1000,"site":"{site}","transport":{{"mode":"mutual_tls","sni":"{site}.grid.internal"}}}}"#,
+                    addr = server.addr,
+                )
+            })
+            .collect();
+        Revision {
+            dial: format!(r#"{{"version":"v1","dial":{{{}}}}}"#, dials.join(",")),
+            serving: format!(
+                r#"{{"local_site":"local","window_secs":60,"load_window_ms":30000,"candidates":[{}],"peers":[{}]}}"#,
+                candidates.join(","),
+                local_peer(identity),
+            ),
+        }
+    }
+
+    /// The local operator entry presenting `identity`, polling a port nothing listens on.
+    fn local_peer(identity: &Identity) -> String {
+        format!(
+            r#"{{"site":"local","addr":"127.0.0.1:{port}","server_name":"local.grid.internal","authority":"local.grid.internal","interval_ms":60000,"connect_timeout_ms":100,"request_timeout_ms":100,"grid_ca_path":"{ca}","client_cert_path":"{cert}","client_key_path":"{key}"}}"#,
+            port = free_port(),
+            ca = identity.mount.path("ca.crt"),
+            cert = identity.mount.path("tls.crt"),
+            key = identity.mount.path("tls.key"),
+        )
+    }
+
+    /// One revision of the serving mount: the serving config and the dial file beside it.
+    struct Revision {
+        dial: String,
+        serving: String,
+    }
+
+    impl Revision {
+        /// Swap both files in at once, as the kubelet swaps one `ConfigMap`.
+        fn write(&self, mount: &mut Mount) {
+            mount.write(&[
+                ("serving-config.json", self.serving.as_bytes()),
+                (ai_grid_filters::DIAL_FILE, self.dial.as_bytes()),
+            ]);
+        }
+    }
+
+    /// The SHA-256 of the leaf a PEM chain starts with.
+    fn leaf_fingerprint(cert_pem: &str) -> [u8; 32] {
+        let leaf = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .next()
+            .expect("a leaf")
+            .expect("parse leaf");
+        certs::sha256(leaf.as_ref())
+    }
+
+    fn fresh_work(name: &str) -> PathBuf {
+        let work = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
+        let _cleared = std::fs::remove_dir_all(&work);
+        work
+    }
+
+    /// Collect `pipe`'s lines into `lines` on a background thread.
+    fn drain(pipe: impl std::io::Read + Send + 'static, lines: Arc<Mutex<Vec<String>>>) {
+        thread::spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                lines.lock().expect("output").push(line);
+            }
+        });
+    }
+
+    /// The gateway with no praxis cluster: `grid_site_route` declares none and nothing balances.
+    struct Gateway {
+        child: Child,
+        output: Arc<Mutex<Vec<String>>>,
+        listen: u16,
+        admin: u16,
+    }
+
+    impl Gateway {
+        fn start(work: &Path, serving: &Mount) -> Self {
+            let (listen, admin) = (free_port(), free_port());
+            let yaml = format!(
+                "insecure_options:\n  allow_private_endpoints: true\nadmin:\n  metrics_address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: grid_site_route\n        model_header: X-Model\n        clusters: []\n"
+            );
+            let config = work.join("praxis.yaml");
+            std::fs::write(&config, yaml).expect("praxis config");
+            let mut child = Command::new(env!("CARGO_BIN_EXE_grid-gateway"))
+                .arg("--config")
+                .arg(&config)
+                .env("GRID_SERVING_CONFIG", serving.path("serving-config.json"))
+                .env("RUST_LOG", "info")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn gateway");
+            let output = Arc::new(Mutex::new(Vec::new()));
+            drain(child.stdout.take().expect("stdout"), Arc::clone(&output));
+            drain(child.stderr.take().expect("stderr"), Arc::clone(&output));
+            let gateway = Self {
+                child,
+                output,
+                listen,
+                admin,
+            };
+            gateway.eventually("the gateway listens", || {
+                TcpStream::connect(("127.0.0.1", listen)).is_ok()
+            });
+            gateway
+        }
+
+        /// One chat request carrying a caller credential: its status and lowercased response head.
+        fn chat(&self) -> (u16, String) {
+            let mut stream = TcpStream::connect(("127.0.0.1", self.listen)).expect("connect gateway");
+            stream
+                .write_all(b"GET /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nX-Model: llama\r\nAuthorization: Bearer caller-secret\r\nConnection: close\r\n\r\n")
+                .expect("send request");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("read response");
+            let status = response
+                .split_whitespace()
+                .nth(1)
+                .and_then(|status| status.parse().ok())
+                .expect("numeric HTTP status");
+            let head = response
+                .split("\r\n\r\n")
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            (status, head)
+        }
+
+        /// The serving reloads that ended in `result`, zero until the series exists.
+        fn reloads(&self, result: &str) -> u64 {
+            let Ok(mut stream) = TcpStream::connect(("127.0.0.1", self.admin)) else {
+                return 0;
+            };
+            let _sent = stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            let mut body = String::new();
+            let _read = stream.read_to_string(&mut body);
+            body.lines()
+                .find(|line| {
+                    line.starts_with("grid_serving_config_reload_total")
+                        && line.contains(&format!(r#"result="{result}""#))
+                })
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0)
+        }
+
+        /// Swap in `revision` and wait until it is applied.
+        fn serve(&self, serving: &mut Mount, revision: &Revision) {
+            let applied = self.reloads("applied");
+            revision.write(serving);
+            self.eventually("the rewritten serving file is applied", || {
+                self.reloads("applied") > applied
+            });
+        }
+
+        /// Wait for `done`, failing with the gateway's output after the deadline.
+        fn eventually(&self, what: &str, done: impl Fn() -> bool) {
+            let deadline = Instant::now() + DEADLINE;
+            while !done() {
+                if Instant::now() > deadline {
+                    let output = self.output.lock().expect("output").join("\n");
+                    panic!("timed out waiting for {what}; gateway output:\n{output}");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    impl Drop for Gateway {
+        fn drop(&mut self) {
+            super::logs::gateway_output_on_failure(&self.output);
+            let _killed = self.child.kill();
+            let _reaped = self.child.wait();
+        }
+    }
+}
