@@ -41,10 +41,10 @@ const HOST_CERTS_DIR: &str = "tests/env/certs";
 ///
 /// For each provider cluster, exercises four trust cases:
 ///
-/// 1. Positive: valid client cert → model request returns 200.
-/// 2. Negative (TLS layer): no client cert → `curl` exits non-zero.
-/// 3. Negative (TLS layer): client cert from an untrusted CA → `curl` exits non-zero.
-/// 4. Negative (filter layer): same trusted CA but wrong organization → HTTP 403 from `peer_identity_trust`.
+/// 1. Positive: valid client cert -> model request returns 200.
+/// 2. Negative (TLS layer): no client cert -> `curl` exits non-zero.
+/// 3. Negative (TLS layer): client cert from an untrusted CA -> `curl` exits non-zero.
+/// 4. Negative (filter layer): same trusted CA but wrong organization -> HTTP 403 from `peer_identity_trust`.
 ///
 /// Cases 2 and 3 confirm that the gateway enforces `client_cert_mode:
 /// require` and that only certs from the generated test CA are accepted.
@@ -133,7 +133,7 @@ fn verify_provider_trust(
 // Individual tests
 // ---------------------------------------------------------------------------
 
-/// Positive: valid consumer client cert → model returns 200.
+/// Positive: valid consumer client cert -> model returns 200.
 #[expect(
     clippy::too_many_arguments,
     reason = "cluster, context, port, consumer_site, model, tally all distinct"
@@ -222,7 +222,7 @@ fn curl_post_mtls_args(
     ])
 }
 
-/// Negative: no client cert → TLS handshake failure (`curl` exits non-zero).
+/// Negative: no client cert -> TLS handshake failure (`curl` exits non-zero).
 ///
 /// Uses `--resolve` so `curl` reaches the server with the correct SNI,
 /// ensuring the test exercises `client_cert_mode: require` rather than an SNI
@@ -266,7 +266,7 @@ fn test_no_client_cert(cluster: &str, ctx: &str, port: u16, tally: &mut Tally) {
     }
 }
 
-/// Negative: client cert from an ephemeral untrusted CA → TLS handshake
+/// Negative: client cert from an ephemeral untrusted CA -> TLS handshake
 /// failure.
 ///
 /// Generates a fresh CA + site cert in the OS temp directory, then attempts
@@ -332,7 +332,7 @@ fn test_wrong_ca_cert(
 }
 
 /// Negative: client cert from the same trusted CA but with a different
-/// organization → HTTP 403 from `peer_identity_trust`.
+/// organization -> HTTP 403 from `peer_identity_trust`.
 ///
 /// This specifically tests filter-level enforcement, not the TLS/PKI layer.
 /// The cert passes `client_cert_mode: require` because it is CA-valid;

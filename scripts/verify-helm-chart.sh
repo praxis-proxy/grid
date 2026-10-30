@@ -1935,7 +1935,7 @@ INSTALL_ORDER=$(grep -n 'helm upgrade --install' "$SCRIPT_DIR/install.sh" \
 if echo "$INSTALL_ORDER" | matches "grid-operator.*grid-mock-providers.*grid-site"; then
   pass "install order: operator before mock-providers before grid-site"
 else
-  fail "install order: expected operator → mock → site, got: $INSTALL_ORDER"
+  fail "install order: expected operator -> mock -> site, got: $INSTALL_ORDER"
 fi
 
 # Provider must come after overlay wait, consumer after provider.
@@ -1945,9 +1945,9 @@ OVERLAY_WAIT_LINE=$(grep -n 'wait_for_overlay' "$SCRIPT_DIR/install.sh" | grep -
 if [[ -n "$OVERLAY_WAIT_LINE" && -n "$PROVIDER_LINE" && -n "$CONSUMER_LINE" ]] \
    && (( OVERLAY_WAIT_LINE < PROVIDER_LINE )) \
    && (( PROVIDER_LINE < CONSUMER_LINE )); then
-  pass "install order: overlay wait → provider → consumer"
+  pass "install order: overlay wait -> provider -> consumer"
 else
-  fail "install order: overlay wait ($OVERLAY_WAIT_LINE) → provider ($PROVIDER_LINE) → consumer ($CONSUMER_LINE)"
+  fail "install order: overlay wait ($OVERLAY_WAIT_LINE) -> provider ($PROVIDER_LINE) -> consumer ($CONSUMER_LINE)"
 fi
 
 # Mock opt-in/out
@@ -2020,9 +2020,9 @@ echo "=== Uninstall reverse order ==="
 UNINSTALL_ORDER=$(grep -n 'helm uninstall' "$SCRIPT_DIR/uninstall.sh" \
   | sed 's/.*uninstall \([^ ]*\).*/\1/' | tr '\n' ' ')
 if echo "$UNINSTALL_ORDER" | matches "grid-mock-providers.*grid-site.*grid-operator"; then
-  pass "uninstall order: mock → site → operator (reverse of install)"
+  pass "uninstall order: mock -> site -> operator (reverse of install)"
 else
-  fail "uninstall order: expected mock → site → operator, got: $UNINSTALL_ORDER"
+  fail "uninstall order: expected mock -> site -> operator, got: $UNINSTALL_ORDER"
 fi
 
 # ConfigMap cleanup in uninstall

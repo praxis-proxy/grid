@@ -33,7 +33,7 @@
 //!
 //! # ConfigMap contract
 //!
-//! - Name: `grid-overlay-{network}-{gateway}` (≤ 63 chars). Long names receive a deterministic FNV-1a hash suffix to
+//! - Name: `grid-overlay-{network}-{gateway}` (<= 63 chars). Long names receive a deterministic FNV-1a hash suffix to
 //!   avoid collisions.
 //! - Data keys: `routing-config.json` (legacy) + `routing-overlay.json` (versioned envelope)
 //! - Serialization failures are returned as errors, not silently defaulted.
@@ -144,7 +144,7 @@ pub(crate) fn routing_identity(provider: &InferenceProvider) -> Option<&str> {
 /// - `spec.backendKind` does not match any [`scoring::BackendKind`] variant (locality is the primary scoring signal;
 ///   unknown kinds cannot be ranked).
 ///
-/// The `BackendConfig` name is [`routing_identity`] — `spec.clusterName`
+/// The `BackendConfig` name is [`routing_identity`] -- `spec.clusterName`
 /// if set, otherwise `metadata.name`.  Using the routing identity here ensures
 /// that score lookups in `render_routing_overlay` (which key on
 /// `candidate.cluster`, not `metadata.name`) resolve correctly.
@@ -214,7 +214,7 @@ pub(crate) fn crdt_phase_to_fresh(phase: &crdt::ProviderPhase) -> Option<bool> {
 ///
 /// | Field | Missing default | Rationale |
 /// |---|---|---|
-/// | `error_rate` | `0.0` | No evidence of errors → do not penalise |
+/// | `error_rate` | `0.0` | No evidence of errors -> do not penalise |
 /// | `healthy` | `true` | Assume reachable until evidence of failure |
 /// | `kv_cache_utilization` | `0.5` | Neutral (no signal) |
 /// | `latency_p99_ms` | `2500.0` | Neutral: `1.0 - 2500/5000 = 0.5` latency score |
@@ -231,7 +231,7 @@ pub(crate) fn crdt_phase_to_fresh(phase: &crdt::ProviderPhase) -> Option<bool> {
 /// CRDT values are produced by remote operators which may run a different
 /// software version.  Non-finite values fall back to the same defaults as
 /// absent values, ratio signals are clamped to `[0.0, 1.0]`, and latency is
-/// clamped to `≥ 0.0` so that a misbehaving or outdated remote site cannot
+/// clamped to `>= 0.0` so that a misbehaving or outdated remote site cannot
 /// corrupt overlay scoring through invalid or out-of-range values.
 pub(crate) fn crdt_metrics_to_backend(m: &crdt::ProviderMetricsSnapshot) -> scoring::BackendMetrics {
     scoring::BackendMetrics {
@@ -246,7 +246,7 @@ pub(crate) fn crdt_metrics_to_backend(m: &crdt::ProviderMetricsSnapshot) -> scor
 
 /// Return `value` if it is `Some` and finite, otherwise return `default`.
 ///
-/// Drops NaN and ±Inf so they cannot corrupt downstream scoring.
+/// Drops NaN and +/-Inf so they cannot corrupt downstream scoring.
 fn finite_or(value: Option<f64>, default: f64) -> f64 {
     value.filter(|v| v.is_finite()).unwrap_or(default)
 }
@@ -486,7 +486,7 @@ pub(crate) fn remote_crdt_provider_to_backend_config(provider: &crdt::ProviderSt
     };
     Some(scoring::BackendConfig::new(
         provider.routing_cluster.clone(),
-        0.0, // cost unknown; treated as free → max cost score
+        0.0, // cost unknown; treated as free -> max cost score
         0.0,
         String::new(), // endpoint not used for scoring
         kind,
@@ -588,16 +588,16 @@ pub(crate) fn stale_policy_from_spec(ttl_seconds: Option<u32>) -> StaleCandidate
 /// 1. **Fresh candidates** (`fresh = true`) are **always retained** regardless of age or policy.  Local candidates and
 ///    healthy remote candidates must never be evicted by a stale-peer GC policy.
 ///
-/// 2. **No TTL configured** (`policy.dead_member_ttl_secs = None`) → retain. The conservative default until a product
+/// 2. **No TTL configured** (`policy.dead_member_ttl_secs = None`) -> retain. The conservative default until a product
 ///    TTL setting is added.
 ///
-/// 3. **No age data** (`dead_age_secs = None`) → retain. This includes `age_secs = 0` for Dead/Suspect members, which
+/// 3. **No age data** (`dead_age_secs = None`) -> retain. This includes `age_secs = 0` for Dead/Suspect members, which
 ///    means the transition happened less than one second ago or the caller provided a synthetic snapshot without age.
 ///
-/// 4. **Age below TTL** (`dead_age_secs < ttl`) → retain. The peer has been dead for less than the configured window.
+/// 4. **Age below TTL** (`dead_age_secs < ttl`) -> retain. The peer has been dead for less than the configured window.
 ///    The `fresh=false` signal is enough to deprioritise it.
 ///
-/// 5. **Age at or above TTL** (`dead_age_secs >= ttl`) → evict. The peer has been dead long enough that its overlay
+/// 5. **Age at or above TTL** (`dead_age_secs >= ttl`) -> evict. The peer has been dead long enough that its overlay
 ///    entries add noise without adding observability value.
 ///
 /// # Honest boundaries
@@ -611,10 +611,10 @@ pub(crate) fn should_retain_candidate(fresh: bool, dead_age_secs: Option<u64>, p
         return true; // Rule 1: fresh candidates are never evicted.
     }
     let Some(ttl) = policy.dead_member_ttl_secs else {
-        return true; // Rule 2: no TTL configured → retain.
+        return true; // Rule 2: no TTL configured -> retain.
     };
     let Some(age) = dead_age_secs else {
-        return true; // Rule 3: no age data → retain conservatively.
+        return true; // Rule 3: no age data -> retain conservatively.
     };
     age < ttl // Rules 4 & 5: retain below TTL, evict at or above.
 }
@@ -677,7 +677,7 @@ pub(crate) fn apply_stale_gc_filter(
 /// would assign to a provider whose `backend_kind` cannot be parsed.
 ///
 /// Applies the given weights with neutral runtime signals (0.5, the scoring
-/// crate's default for missing metrics) and no cost (treated as free → cost
+/// crate's default for missing metrics) and no cost (treated as free -> cost
 /// signal = 1.0).  This places unmapped providers on the same numeric scale
 /// as scored providers so they can be sorted in a single pass.
 fn unmapped_provider_breakdown(backend_kind: &str, weights: &scoring::ScoringWeights) -> scoring::ScoreBreakdown {
@@ -1930,10 +1930,10 @@ fn candidates_from_inventory(
     }
 
     let sites: Vec<&str> = match &site_resolution {
-        // No site inventory at all → Phase 1 fallback.
+        // No site inventory at all -> Phase 1 fallback.
         // Use routing identity so the site field matches the cluster reference.
         SiteResolution::Unavailable => vec![cluster],
-        // Inventory exists but selector matched nothing → emit no candidates.
+        // Inventory exists but selector matched nothing -> emit no candidates.
         SiteResolution::Known(names) if names.is_empty() => return Ok(Vec::new()),
         // Inventory exists and selector matched these sites.
         SiteResolution::Known(names) => names.iter().map(String::as_str).collect(),
@@ -2081,7 +2081,7 @@ pub(crate) fn is_candidate_fresh(provider: &InferenceProvider) -> bool {
 /// This prevents applying an empty or invalid config to the cluster.
 ///
 /// The `ConfigMap` name is computed by `overlay_configmap_name` which
-/// ensures names are ≤ 63 characters and collision-safe.
+/// ensures names are <= 63 characters and collision-safe.
 ///
 /// # Errors
 ///
@@ -2146,7 +2146,7 @@ pub fn build_overlay_configmap(
 /// (20) characters and `hash8` is 8 lowercase hex digits derived from a
 /// FNV-1a 32-bit hash of `"{network}/{gateway}"`.
 ///
-/// The total of the hash-suffixed form is always ≤ 63 characters:
+/// The total of the hash-suffixed form is always <= 63 characters:
 /// `"grid-overlay-"` (13) + 20 + `"-"` + 20 + `"-"` + 8 = 63.
 pub(crate) fn overlay_configmap_name(network_name: &str, gateway_name: &str) -> String {
     scoped_configmap_name("grid-overlay", network_name, gateway_name)
@@ -2852,7 +2852,7 @@ mod tests {
     fn score_ordered_cost_differentiates_equal_locality_providers() {
         // Two local providers with different costs: lower cost must rank first.
         // Score difference: cost_score(0.0) - cost_score(0.001) = 1.0 - 0.99 = 0.01;
-        // multiplied by weight 1.0 → free provider wins.
+        // multiplied by weight 1.0 -> free provider wins.
         let network = test_network("net");
         let free_prov = test_provider_with_cost("free-prov", "net", 0.0);
         let costly_prov = test_provider_with_cost("costly-prov", "net", 50.0); // 50/million = 0.05/1k
@@ -2877,7 +2877,7 @@ mod tests {
 
     #[test]
     fn score_ordered_deterministic_for_equal_scores() {
-        // Two identical providers (same kind, same cost) → alphabetical tiebreak.
+        // Two identical providers (same kind, same cost) -> alphabetical tiebreak.
         let network = test_network("net");
         let p_z = test_provider_with_backend_kind("z-local", "net", "local");
         let p_a = test_provider_with_backend_kind("a-local", "net", "local");
@@ -2904,8 +2904,8 @@ mod tests {
     fn score_ordered_unknown_backend_kind_uses_same_scale_fallback() {
         // Providers with unknown backend_kind fall back to unmapped_provider_score,
         // which is on the same numeric scale as score_backends output.
-        // unknown kind → locality 0.5 → same scale score ≈ 7.0
-        // cloud_managed → locality 0.2 → score ≈ 6.1
+        // unknown kind -> locality 0.5 -> same scale score ~ 7.0
+        // cloud_managed -> locality 0.2 -> score ~ 6.1
         // unknown (7.0) must rank before cloud_managed (6.1).
         let network = test_network("net");
         let cloud = test_provider_with_backend_kind("cloud-prov", "net", "cloud_managed");
@@ -2925,7 +2925,7 @@ mod tests {
         assert_eq!(
             overlay.candidates.first().map(|c| c.cluster.as_str()),
             Some("unknown-prov"),
-            "unmapped-kind provider (same scale as remote, ≈7.0) must rank before cloud_managed (≈6.1)"
+            "unmapped-kind provider (same scale as remote, ~7.0) must rank before cloud_managed (~6.1)"
         );
     }
 
@@ -3156,7 +3156,7 @@ mod tests {
         // provider is also unavailable, but its fresh=false signals that its
         // metrics are stale.
         //
-        // Default GeographyFirst sort: admission → locality → fresh → score → tiebreak.
+        // Default GeographyFirst sort: admission -> locality -> fresh -> score -> tiebreak.
         // Freshness is evaluated before score after locality, so a fresh remote
         // candidate can precede a degraded local candidate.
         let network = test_network("fallback-net");
@@ -3389,7 +3389,7 @@ mod tests {
 
     #[test]
     fn remote_backend_kind_scores_half() {
-        // No region context → remote falls back to 0.5.
+        // No region context -> remote falls back to 0.5.
         let score = backend_locality_score("remote");
         assert!(
             (score - 0.5).abs() < f64::EPSILON,
@@ -3499,7 +3499,7 @@ mod tests {
         )
         .unwrap_or_else(|_| std::process::abort());
         let clusters: Vec<&str> = overlay.candidates.iter().map(|c| c.cluster.as_str()).collect();
-        // local (1.0) → remote (0.5) → cloud_managed (0.2) → api_provider (0.1)
+        // local (1.0) -> remote (0.5) -> cloud_managed (0.2) -> api_provider (0.1)
         assert_eq!(
             clusters,
             ["z-local", "z-remote", "z-cloud", "z-api"],
@@ -3892,7 +3892,7 @@ mod tests {
         assert_eq!(
             overlay.candidates.len(),
             1,
-            "no sites in this network → Unavailable → provider-name fallback"
+            "no sites in this network -> Unavailable -> provider-name fallback"
         );
         assert_eq!(
             overlay.candidates[0].site, "prov",
@@ -3903,8 +3903,8 @@ mod tests {
     #[test]
     fn known_sites_with_selector_no_match_emits_no_candidates() {
         // Site inventory IS present (one site), but the provider's selector
-        // requires hw=gpu and only hw=cpu exists.  Selector matched nothing →
-        // SiteResolution::Known([]) → no candidates.  Must NOT fall back to
+        // requires hw=gpu and only hw=cpu exists.  Selector matched nothing ->
+        // SiteResolution::Known([]) -> no candidates.  Must NOT fall back to
         // provider name.
         let network = test_network("net");
         let site_cpu = test_site_with_labels("cpu-site", "net", &[("hw", "cpu")]);
@@ -3930,7 +3930,7 @@ mod tests {
     #[test]
     fn two_providers_same_model_same_site_different_cluster_both_survive() {
         // Two providers on the same site serving the same model.
-        // Dedup is on (kind, name, site, cluster); different cluster → both kept.
+        // Dedup is on (kind, name, site, cluster); different cluster -> both kept.
         let network = test_network("net");
         let site = test_site("site-a", "net");
         let p1 = test_provider("prov-a", "net", &["shared-model"]);
@@ -4294,7 +4294,7 @@ mod tests {
 
     #[test]
     fn degraded_fresh_false_appears_in_json_output() {
-        // End-to-end: Degraded → fresh=false must survive JSON serialisation
+        // End-to-end: Degraded -> fresh=false must survive JSON serialisation
         // in the ConfigMap and be readable by the overlay consumer.
         let network = test_network("net");
         let provider = test_provider_with_phase("prov", "net", &["model-1"], "Degraded");
@@ -4363,7 +4363,7 @@ mod tests {
         // serving the same model, one healthy (Available), one stale (Degraded).
         // The fresh=true candidate must appear before the fresh=false one.
         let network = test_network("net");
-        // test_provider uses backendKind=local for both → equal locality scores.
+        // test_provider uses backendKind=local for both -> equal locality scores.
         // Stale provider is given Degraded status so is_candidate_fresh returns false.
         let healthy = test_provider("healthy-prov", "net", &["shared-model"]);
         let stale = test_provider_with_phase("stale-prov", "net", &["shared-model"], "Degraded");
@@ -4457,7 +4457,7 @@ mod tests {
     #[test]
     fn stale_fresh_sort_order_input_order_independent() {
         // Ordering must be deterministic regardless of input order.
-        // Stale candidate submitted first → healthy candidate still wins.
+        // Stale candidate submitted first -> healthy candidate still wins.
         let network = test_network("net");
         let healthy = test_provider("healthy-prov", "net", &["shared-model"]);
         let stale = test_provider_with_phase("stale-prov", "net", &["shared-model"], "Degraded");
@@ -4620,7 +4620,11 @@ mod tests {
         let net = "a".repeat(50);
         let gw = "b".repeat(50);
         let name = overlay_configmap_name(&net, &gw);
-        assert!(name.len() <= MAX_K8S_NAME, "name must be ≤63 chars, got {}", name.len());
+        assert!(
+            name.len() <= MAX_K8S_NAME,
+            "name must be <=63 chars, got {}",
+            name.len()
+        );
     }
 
     #[test]
@@ -5266,7 +5270,7 @@ mod tests {
 
     #[test]
     fn parse_pipeline_does_not_panic_on_malformed_scrape_data() {
-        // Proves the full pipeline: malformed scrape text → parse → BackendMetrics →
+        // Proves the full pipeline: malformed scrape text -> parse -> BackendMetrics ->
         // passed to render_routing_overlay.  None of these must panic or error.
         let malformed_inputs: &[&str] = &[
             "",
@@ -5581,7 +5585,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // cluster_name — overlay identity override
+    // cluster_name -- overlay identity override
     // -----------------------------------------------------------------------
 
     fn test_provider_with_routing_cluster_ref(
@@ -6140,7 +6144,7 @@ mod tests {
     fn crdt_metrics_absent_latency_defaults_to_neutral_ms() {
         // Missing latency must use NEUTRAL_LATENCY_MS (2500.0) so that a remote
         // provider with no latency observation scores neutrally (0.5) on the latency
-        // signal, not optimally (≈1.0 if 0.5ms were used).
+        // signal, not optimally (~1.0 if 0.5ms were used).
         let m = crdt::ProviderMetricsSnapshot::default(); // all None
         let bm = crdt_metrics_to_backend(&m);
         assert!(
@@ -6158,7 +6162,7 @@ mod tests {
         let m = crdt::ProviderMetricsSnapshot {
             queue_depth: Some(1.5),
             kv_cache_utilization: Some(2.0),
-            latency_p99_ms: Some(-100.0), // negative latency → clamp to 0.0
+            latency_p99_ms: Some(-100.0), // negative latency -> clamp to 0.0
             prefix_cache_hit_ratio: Some(1.1),
             error_rate: Some(1.3),
             healthy: Some(false),
@@ -6605,7 +6609,7 @@ mod tests {
     #[test]
     fn dead_or_suspect_age_returns_none_for_zero_age_dead() {
         // age_secs=0 on a Dead member means sub-second age or synthetic
-        // snapshot without age. Conservatively treat as unknown → retain.
+        // snapshot without age. Conservatively treat as unknown -> retain.
         let snap = make_snapshot(vec![make_member("site-a", MemberStatus::Dead, 0)]);
         let age = dead_or_suspect_age_secs("site-a", Some(&snap));
         assert!(
@@ -6707,7 +6711,7 @@ mod tests {
 
     #[test]
     fn gc_filter_retains_stale_with_zero_age_conservatively() {
-        // age_secs=0 → sub-second age or synthetic snapshot without age.
+        // age_secs=0 -> sub-second age or synthetic snapshot without age.
         // Retain conservatively.
         let policy = StaleCandidatePolicy {
             dead_member_ttl_secs: Some(60),
@@ -6749,7 +6753,7 @@ mod tests {
 
     #[test]
     fn retain_stale_candidate_when_no_ttl_configured() {
-        // Rule 2: no TTL → retain indefinitely regardless of age.
+        // Rule 2: no TTL -> retain indefinitely regardless of age.
         let policy = StaleCandidatePolicy {
             dead_member_ttl_secs: None,
         };
@@ -6761,7 +6765,7 @@ mod tests {
 
     #[test]
     fn retain_stale_candidate_when_age_unknown() {
-        // Rule 3: no age data (age_secs always 0 in current runtime) → retain conservatively.
+        // Rule 3: no age data (age_secs always 0 in current runtime) -> retain conservatively.
         let policy = StaleCandidatePolicy {
             dead_member_ttl_secs: Some(300),
         };
@@ -6773,7 +6777,7 @@ mod tests {
 
     #[test]
     fn retain_stale_candidate_when_age_below_ttl() {
-        // Rule 4: age < TTL → retain (candidate is stale but within the window).
+        // Rule 4: age < TTL -> retain (candidate is stale but within the window).
         let policy = StaleCandidatePolicy {
             dead_member_ttl_secs: Some(300),
         };
@@ -6785,7 +6789,7 @@ mod tests {
 
     #[test]
     fn evict_stale_candidate_when_age_meets_ttl() {
-        // Rule 5 (boundary): age == TTL → evict.
+        // Rule 5 (boundary): age == TTL -> evict.
         let policy = StaleCandidatePolicy {
             dead_member_ttl_secs: Some(300),
         };
@@ -6797,7 +6801,7 @@ mod tests {
 
     #[test]
     fn evict_stale_candidate_when_age_exceeds_ttl() {
-        // Rule 5: age > TTL → evict.
+        // Rule 5: age > TTL -> evict.
         let policy = StaleCandidatePolicy {
             dead_member_ttl_secs: Some(300),
         };
@@ -6809,7 +6813,7 @@ mod tests {
 
     #[test]
     fn default_policy_retains_all_stale_candidates() {
-        // Current default: None TTL → retain everything.
+        // Current default: None TTL -> retain everything.
         // This ensures that until real age data is available, no candidate
         // is silently evicted at runtime.
         let policy = StaleCandidatePolicy::default();
@@ -7306,7 +7310,7 @@ mod tests {
             &scoring::ScoringWeights::default(),
         )
         .unwrap_or_else(|_| std::process::abort());
-        // With 2 sites and 3 providers, we expect 6 candidates (3 providers × 2 sites each)
+        // With 2 sites and 3 providers, we expect 6 candidates (3 providers * 2 sites each)
         assert_eq!(
             overlay.candidates.len(),
             6,

@@ -3,7 +3,7 @@
 //! Generates the `praxis.yaml` content for a consumer gateway `ConfigMap` from
 //! a [`RoutingOverlay`].  The generated config includes:
 //!
-//! - `json_body_field` filter (model field → `X-Model` header)
+//! - `json_body_field` filter (model field -> `X-Model` header)
 //! - `intelligent_route` filter with inference candidates from the overlay
 //! - `credential_inject` filter (only when credential-bearing candidates exist)
 //! - `load_balancer` filter with one cluster entry per unique inference cluster
@@ -1325,7 +1325,7 @@ fn render_credential_inject(
     local_site: &str,
     enable_projected_credentials: bool,
 ) -> String {
-    // Collect unique (strategy, name, namespace, key) → rendered entry.
+    // Collect unique (strategy, name, namespace, key) -> rendered entry.
     // BTreeMap provides deterministic sorted order by key.
     let mut entries: BTreeMap<(String, String, String, String), String> = BTreeMap::new();
 
@@ -1401,7 +1401,7 @@ fn render_load_balancer(
     cluster_endpoints: &[ClusterEndpointConfig],
     tls_cert_mount_path: &str,
 ) -> Result<String, ConsumerConfigError> {
-    // Build a lookup map: cluster name → endpoint config.
+    // Build a lookup map: cluster name -> endpoint config.
     let endpoint_map: BTreeMap<&str, &ClusterEndpointConfig> =
         cluster_endpoints.iter().map(|ep| (ep.cluster.as_str(), ep)).collect();
 

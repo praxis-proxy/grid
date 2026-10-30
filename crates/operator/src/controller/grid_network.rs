@@ -1718,7 +1718,7 @@ const WITHDRAWAL_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// When this label is present with value `"true"`, the `GridNetwork` controller
 /// creates `GridSite` resources for remote Alive SWIM members automatically.
-/// Networks without this label are unaffected — their overlay generation uses
+/// Networks without this label are unaffected -- their overlay generation uses
 /// the existing `clusterName`-based (Phase 1) fallback.
 ///
 /// This opt-in gate prevents auto-discovery from changing the overlay generation
@@ -2702,7 +2702,7 @@ pub fn error_policy(_network: Arc<GridNetwork>, error: &OperatorError, _ctx: Arc
 /// # Removal semantics
 ///
 /// A seed appearing in `removed` will **not** be actively disconnected from the
-/// SWIM runtime.  The SWIM protocol's own failure detection (probe → Suspect →
+/// SWIM runtime.  The SWIM protocol's own failure detection (probe -> Suspect ->
 /// Dead) handles peers that stop responding.  Use the `removed` list only for
 /// diagnostics and logging.
 pub(crate) fn diff_seed_sets(previous: &[SocketAddr], desired: &[SocketAddr]) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
@@ -3079,7 +3079,7 @@ fn site_phases(sites: &[GridSite]) -> impl Iterator<Item = (&str, &'static str)>
 ///
 /// Lists all [`InferenceProvider`]s and [`GridSite`]s cluster-wide, then
 /// renders one overlay `ConfigMap` per `consumerGateways` entry.  Each gateway may
-/// declare its own `siteName` — the `local_site` in the overlay for
+/// declare its own `siteName` -- the `local_site` in the overlay for
 /// gateway G is `G.siteName ?? network_name`.  This ensures that in a
 /// multi-gateway network each gateway's overlay identifies the correct local
 /// site.  A network with no `consumerGateways` is a no-op.
@@ -5801,9 +5801,9 @@ async fn distribute_overlay_configmap(
 ///
 /// When a [`MembershipSnapshot`] is provided, the live membership state takes
 /// precedence:
-/// - ≥1 [`Alive`] member → [`Active`].
-/// - Members present but all [`Suspect`]/[`Dead`] → [`Degraded`].
-/// - Empty snapshot → falls through to the existing TLS-based logic.
+/// - >=1 [`Alive`] member -> [`Active`].
+/// - Members present but all [`Suspect`]/[`Dead`] -> [`Degraded`].
+/// - Empty snapshot -> falls through to the existing TLS-based logic.
 ///
 /// Local membership needs a grid identity and TLS trust, but no SWIM runtime.
 /// Peer reachability is reported by the polling conditions independently.
@@ -5868,7 +5868,7 @@ fn determine_phase(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Provider → CRDT state mapping
+// Provider -> CRDT state mapping
 // ---------------------------------------------------------------------------
 
 /// Map a Kubernetes `ProviderPhase` to the CRDT `ProviderPhase`.
@@ -6842,7 +6842,7 @@ fn network_site_name(network: &GridNetwork) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Routing eligibility: CRDT provider → GridSite phase
+// Routing eligibility: CRDT provider -> GridSite phase
 // ---------------------------------------------------------------------------
 
 /// Filter remote CRDT provider records to those whose source `GridSite` is
@@ -7500,9 +7500,9 @@ fn discovered_site_spec(site: &DiscoveredSite, network_name: &str, plaintext: bo
 /// has already advanced to `Connecting` or beyond.
 ///
 /// Phase ownership:
-/// - Pending → Discovered: this function (`GridNetwork` controller), based on SWIM Alive
-/// - Discovered → Connecting: `GridSite` controller, based on data-plane gateway address presence.
-/// - Connecting → Active: only an identity-verified TLS probe can promote a site. Plaintext probes report reachability
+/// - Pending -> Discovered: this function (`GridNetwork` controller), based on SWIM Alive
+/// - Discovered -> Connecting: `GridSite` controller, based on data-plane gateway address presence.
+/// - Connecting -> Active: only an identity-verified TLS probe can promote a site. Plaintext probes report reachability
 ///   but remain in Connecting.
 #[expect(
     clippy::large_stack_frames,
@@ -8759,7 +8759,7 @@ mod tests {
 
     #[test]
     fn connected_sites_is_zero_without_membership() {
-        // Verify the update_status path: no membership → connected_sites = 0.
+        // Verify the update_status path: no membership -> connected_sites = 0.
         let count = None::<MembershipSnapshot>
             .as_ref()
             .map_or(0, MembershipSnapshot::connected_count);
@@ -8928,7 +8928,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // InferenceProvider → crdt::ProviderState mapping
+    // InferenceProvider -> crdt::ProviderState mapping
     // -----------------------------------------------------------------------
 
     fn make_provider(name: &str, network: &str, backend_kind: &str, generation: i64) -> InferenceProvider {
@@ -9068,7 +9068,7 @@ mod tests {
         assert_eq!(
             crdt_phase_from_provider(None, 1),
             crdt::ProviderPhase::Pending,
-            "absent status → Pending"
+            "absent status -> Pending"
         );
         let pending: InferenceProviderStatus = serde_json::from_value(serde_json::json!({
             "phase": "Pending", "observedGeneration": 3
@@ -9157,9 +9157,9 @@ mod tests {
     #[test]
     fn metrics_to_crdt_returns_all_none_when_no_metrics() {
         let m = metrics_to_crdt(None);
-        assert!(m.error_rate.is_none(), "no metrics → error_rate=None");
-        assert!(m.queue_depth.is_none(), "no metrics → queue_depth=None");
-        assert!(m.healthy.is_none(), "no metrics → healthy=None");
+        assert!(m.error_rate.is_none(), "no metrics -> error_rate=None");
+        assert!(m.queue_depth.is_none(), "no metrics -> queue_depth=None");
+        assert!(m.healthy.is_none(), "no metrics -> healthy=None");
     }
 
     #[test]
@@ -9362,7 +9362,7 @@ mod tests {
         // This is the pure-function equivalent of the rejoin recovery proof.
         let provider = make_crdt_provider("site-west", crdt::ProviderPhase::Available);
 
-        // Partition: Dead → Degraded
+        // Partition: Dead -> Degraded
         let dead_membership = make_swim_membership("site-west", MemberStatus::Dead);
         let degraded = apply_swim_staleness_override(std::slice::from_ref(&provider), Some(&dead_membership));
         assert_eq!(
@@ -9371,7 +9371,7 @@ mod tests {
             "Dead peer must produce Degraded phase (partition)"
         );
 
-        // Recovery: Alive → Available (override lifted)
+        // Recovery: Alive -> Available (override lifted)
         let alive_membership = make_swim_membership("site-west", MemberStatus::Alive);
         let recovered = apply_swim_staleness_override(std::slice::from_ref(&provider), Some(&alive_membership));
         assert_eq!(
@@ -11684,8 +11684,8 @@ mod tests {
     #[test]
     fn diff_seed_sets_empty_to_empty_is_no_op() {
         let (added, removed) = diff_seed_sets(&[], &[]);
-        assert!(added.is_empty(), "empty→empty must produce no additions");
-        assert!(removed.is_empty(), "empty→empty must produce no removals");
+        assert!(added.is_empty(), "empty->empty must produce no additions");
+        assert!(removed.is_empty(), "empty->empty must produce no removals");
     }
 
     #[test]
@@ -14092,9 +14092,9 @@ mod tests {
             make_phase_grid_site("site-b", "net", "Connecting"),
         ];
         let providers = vec![
-            make_eligible_crdt_provider("net", "site-a"), // Active → eligible
-            make_eligible_crdt_provider("net", "site-b"), // Connecting → ineligible
-            make_eligible_crdt_provider("net", "site-c"), // Missing → ineligible
+            make_eligible_crdt_provider("net", "site-a"), // Active -> eligible
+            make_eligible_crdt_provider("net", "site-b"), // Connecting -> ineligible
+            make_eligible_crdt_provider("net", "site-c"), // Missing -> ineligible
         ];
         let eligible = filter_eligible_remote_crdt_providers("net", &sites, &providers, SignalMode::Gossip);
         assert_eq!(eligible.len(), 1, "only Active site provider must pass filter");
