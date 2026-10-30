@@ -83,6 +83,9 @@ impl ClusterHealth {
     /// [`Self::update`] at `now_ms`.
     pub(crate) fn update_at(&self, now_ms: u64) -> bool {
         let mut now = self.registry.load().as_deref().map(down_clusters).unwrap_or_default();
+        // A dial replaces a declared cluster of its name, so only the dial's own health speaks for it.
+        let dialed = self.dials.states.load();
+        now.retain(|cluster| !dialed.contains_key(cluster));
         now.extend(self.dials.demoted(now_ms));
         if **self.down.load() == now {
             return false;
@@ -412,6 +415,30 @@ mod tests {
         assert_eq!(*health.down(), BTreeSet::from([Arc::from("east")]));
         assert!(health.update_at(1_000 + COOLDOWN_MS), "half open leaves the down set");
         assert!(health.down().is_empty(), "so the next request may try it");
+    }
+
+    #[test]
+    fn a_dial_replacing_a_declared_cluster_takes_only_its_own_health() {
+        let health = ClusterHealth::default();
+        health.observe(Some(&registry(&[("east", &[false]), ("west", &[false])])));
+        let east = health.dials().state("east", "east:8443");
+        health
+            .dials()
+            .adopt(BTreeMap::from([(Arc::from("east"), Arc::clone(&east))]));
+        assert!(health.update_at(1_000), "west's registry health is news");
+        assert_eq!(
+            *health.down(),
+            BTreeSet::from([Arc::from("west")]),
+            "a healthy dial is not down for its declared cluster's endpoints; a non-dialed cluster still is"
+        );
+        east.record(false, 1_000);
+        east.record(false, 1_000);
+        assert!(health.update_at(1_000), "the failing dial is news");
+        assert_eq!(
+            *health.down(),
+            BTreeSet::from([Arc::from("east"), Arc::from("west")]),
+            "two connect failures take the dial down"
+        );
     }
 
     #[test]
