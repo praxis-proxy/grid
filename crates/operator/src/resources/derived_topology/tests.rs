@@ -103,6 +103,20 @@ fn resolve_local(endpoint: &str, tls: Option<serde_json::Value>) -> Resolved {
 }
 
 #[test]
+fn a_local_endpoint_keeps_its_path_for_the_dial() {
+    let got = resolve_local(
+        "https://inference.openshift-ingress.svc.cluster.local/publishers/p/models/m",
+        None,
+    );
+    assert_eq!(got.endpoint_path.as_deref(), Some("/publishers/p/models/m"));
+    assert_eq!(
+        resolve_local("http://model.svc/", None).endpoint_path,
+        None,
+        "the root is no path"
+    );
+}
+
+#[test]
 fn an_https_endpoint_derives_server_authenticated_tls_against_its_own_host() {
     let got = resolve_local("https://model-gateway.models.svc.cluster.local", None);
     let transport = got.endpoint.transport.expect("transport");
@@ -1280,4 +1294,137 @@ fn the_peer_catalog_keys_clusters_by_the_site_the_record_names() {
             ("site-c", BTreeSet::from(["x"]))
         ])
     );
+}
+
+/// Resolve `candidates` for a gateway that dials them from the serving config.
+fn resolve_dialed(
+    candidates: &[RoutingCandidate],
+    explicit: &[ClusterEndpointConfig],
+    sites: &[GridSite],
+    allowed: &[String],
+) -> Resolution {
+    let declarations = decl_allowing(&[], sites, allowed);
+    let mut resolution = resolve(candidates, explicit, &declarations);
+    refuse_undialable(&mut resolution, &declarations);
+    resolution
+}
+
+/// An explicit entry with `mode` and `sni`.
+fn explicit(cluster: &str, mode: TransportMode, sni: Option<&str>) -> ClusterEndpointConfig {
+    ClusterEndpointConfig {
+        cluster: cluster.to_owned(),
+        address: "peer.example.invalid:8443".to_owned(),
+        transport: Some(EndpointTransport {
+            mode,
+            sni: sni.map(str::to_owned),
+            ca_secret_ref: None,
+        }),
+    }
+}
+
+/// What a dialed resolution refused, by cluster.
+fn dial_refusals(resolution: &Resolution) -> Vec<(&str, Refusal)> {
+    resolution
+        .refused
+        .iter()
+        .map(|refused| (refused.cluster.as_str(), refused.reason))
+        .collect()
+}
+
+#[test]
+fn a_dialed_gateway_refuses_a_site_only_gossip_vouches_for() {
+    let egress = mutual_egress("site-b.grid.example.invalid:8443", "site-b.grid.internal");
+    let allowed = vec!["prov-b".to_owned()];
+    let candidates = vec![candidate("prov-b", "site-b")];
+    let stub = vec![discovered_site("net-site-b-7f3a", "site-b", &egress)];
+    let resolution = resolve_dialed(&candidates, &[], &stub, &allowed);
+    assert_eq!(
+        dial_refusals(&resolution),
+        [("prov-b", Refusal::SiteNotEnrolled)],
+        "a stub's address came from gossip"
+    );
+    assert!(resolution.resolved.is_empty(), "refused, so not dialed");
+
+    let mut unannotated = discovered_site("site-b", "site-b", &egress);
+    unannotated.metadata.annotations = None;
+    let unannotated_resolution = resolve_dialed(&candidates, &[], &[unannotated], &allowed);
+    assert_eq!(
+        dial_refusals(&unannotated_resolution),
+        [("prov-b", Refusal::SiteNotEnrolled)],
+        "a stub that lost its id annotation is still a stub"
+    );
+
+    let enrolled = vec![site("site-b", Some(egress))];
+    let enrolled_resolution = resolve_dialed(&candidates, &[], &enrolled, &allowed);
+    assert!(
+        enrolled_resolution.refused.is_empty(),
+        "{:?}",
+        enrolled_resolution.refused
+    );
+    assert_eq!(enrolled_resolution.resolved["prov-b"].site, "site-b");
+}
+
+#[test]
+fn a_dialed_mutual_tls_entry_must_verify_its_own_site_exactly() {
+    let candidates = vec![candidate("peer", "site-b")];
+    let cases = [
+        (Some("site-b.grid.internal"), None),
+        (Some(" site-b.grid.internal "), None),
+        (Some("site-c.grid.internal"), Some(Refusal::ServerNameNotSite)),
+        (Some("Site-B.grid.internal"), Some(Refusal::ServerNameNotSite)),
+        (Some("peer.example.invalid"), Some(Refusal::ServerNameNotSite)),
+        (Some(" "), Some(Refusal::NoServerName)),
+        (None, Some(Refusal::NoServerName)),
+    ];
+    for (sni, want) in cases {
+        let entry = explicit("peer", TransportMode::MutualTls, sni);
+        let resolution = resolve_dialed(&candidates, &[entry], &[], &[]);
+        let got: Vec<Refusal> = resolution.refused.iter().map(|refused| refused.reason).collect();
+        assert_eq!(got, want.into_iter().collect::<Vec<_>>(), "sni {sni:?}");
+    }
+}
+
+#[test]
+fn a_dialed_gateway_never_sends_plaintext_off_its_site() {
+    let entries = [
+        explicit("remote", TransportMode::Plaintext, None),
+        explicit("local", TransportMode::Plaintext, None),
+        explicit("remote-tls", TransportMode::Tls, Some("peer.example.invalid")),
+    ];
+    let candidates = vec![
+        candidate("remote", "site-b"),
+        candidate("local", "site-a"),
+        candidate("remote-tls", "site-b"),
+    ];
+    let resolution = resolve_dialed(&candidates, &entries, &[], &[]);
+    assert_eq!(dial_refusals(&resolution), [("remote", Refusal::PlaintextOffSite)]);
+    assert!(
+        resolution.resolved.contains_key("local"),
+        "plaintext stays on this site"
+    );
+    assert!(
+        resolution.resolved.contains_key("remote-tls"),
+        "server TLS verifies the peer, so it may leave"
+    );
+}
+
+#[test]
+fn a_rendered_gateway_keeps_what_a_dialed_one_refuses() {
+    let entries = [
+        explicit("remote", TransportMode::Plaintext, None),
+        explicit("peer", TransportMode::MutualTls, Some("site-c.grid.internal")),
+    ];
+    let candidates = vec![candidate("remote", "site-b"), candidate("peer", "site-b")];
+    let resolution = resolve(&candidates, &entries, &decl_allowing(&[], &[], &[]));
+    assert!(
+        resolution.refused.is_empty(),
+        "the praxis.yaml path is unchanged: {:?}",
+        resolution.refused
+    );
+}
+
+#[test]
+fn dial_refusals_are_named() {
+    assert_eq!(Refusal::SiteNotEnrolled.as_str(), "site not enrolled");
+    assert_eq!(Refusal::PlaintextOffSite.as_str(), "plaintext off this site");
 }

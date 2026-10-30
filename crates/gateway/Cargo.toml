@@ -10,7 +10,7 @@ codegen-units = 16
 debug = 0
 
 [workspace.package]
-version = "0.3.0-rc.2"
+version = "0.3.0-rc.3"
 edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
@@ -316,7 +316,7 @@ name = "gateway"
 description = "Praxis-based grid data-plane gateway"
 # Hermeto 0.62.0 cannot resolve an inherited version for the workspace root package.
 # Keep this in sync with workspace.package.version above until that is supported.
-version = "0.3.0-rc.2"
+version = "0.3.0-rc.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

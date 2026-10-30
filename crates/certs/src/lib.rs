@@ -25,8 +25,8 @@ pub use enroll::{
 pub use generate::{
     CaCert, GenerateError, GeneratedCsr, MAX_SITE_NAME_LEN, SPIFFE_TRUST_DOMAIN, SiteCertOutput, generate_ca,
     generate_cert_with_org, generate_csr, generate_dns_cert, generate_dns_only_cert, generate_expired_dns_cert,
-    generate_not_yet_valid_dns_cert, generate_site_cert, generate_site_cert_with_names, is_valid_site_name, load_ca,
-    sign_with_ca, spiffe_id,
+    generate_not_yet_valid_dns_cert, generate_site_cert, generate_site_cert_with_names, is_grid_name, is_stable_id,
+    is_valid_site_name, load_ca, sign_with_ca, site_dns_name, spiffe_id,
 };
 #[cfg(feature = "verifier")]
 pub use grid_verifier::{DEFAULT_TRUST_DOMAIN, GridSpiffeClientVerifier, GridSpiffeServerVerifier};

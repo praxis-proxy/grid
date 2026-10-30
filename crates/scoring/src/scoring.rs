@@ -84,26 +84,26 @@ impl Default for ScoringWeights {
 
 /// Per-signal weighted contributions that compose a backend's total score.
 ///
-/// Each field holds `weight × signal_value`, not the raw signal.
+/// Each field holds `weight * signal_value`, not the raw signal.
 /// `total` is the sum of all fields.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ScoreBreakdown {
-    /// Locality contribution (`weight_locality × locality_signal`).
+    /// Locality contribution (`weight_locality * locality_signal`).
     pub locality: f64,
 
-    /// Queue depth contribution (`weight_queue × (1 - queue_depth)`).
+    /// Queue depth contribution (`weight_queue * (1 - queue_depth)`).
     pub queue_depth: f64,
 
-    /// KV cache contribution (`weight_kv × (1 - kv_utilization)`).
+    /// KV cache contribution (`weight_kv * (1 - kv_utilization)`).
     pub kv_cache: f64,
 
-    /// Prefix cache contribution (`weight_prefix × hit_ratio`).
+    /// Prefix cache contribution (`weight_prefix * hit_ratio`).
     pub prefix_cache: f64,
 
-    /// Latency contribution (`weight_latency × (1 - latency/max)`).
+    /// Latency contribution (`weight_latency * (1 - latency/max)`).
     pub latency: f64,
 
-    /// Cost contribution (`weight_cost × (1 - cost/max)`).
+    /// Cost contribution (`weight_cost * (1 - cost/max)`).
     pub cost: f64,
 
     /// Sum of all weighted contributions.

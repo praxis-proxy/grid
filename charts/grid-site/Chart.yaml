@@ -2,8 +2,8 @@ apiVersion: v2
 name: grid-site
 description: Grid site topology resources (GridNetwork, GridSite, InferenceProvider)
 type: application
-version: 0.3.0-rc.2
-appVersion: "v0.3.0-rc.2"
+version: 0.3.0-rc.3
+appVersion: "v0.3.0-rc.3"
 kubeVersion: ">=1.26.0-0"
 home: https://github.com/praxis-proxy/grid
 sources:

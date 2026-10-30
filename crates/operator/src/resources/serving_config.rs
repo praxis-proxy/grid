@@ -117,6 +117,118 @@ pub(crate) struct ServingConfig {
     pub(crate) peers: Vec<ServingPeer>,
 }
 
+/// Where the gateway reads a local dial's token, the provider credential mount `credential_inject` reads.
+pub(crate) const DIAL_CREDENTIAL_BASE: &str = "/run/secrets/grid-credentials";
+
+/// The base path an endpoint's path and query give a dial, `None` at the root, refusing what
+/// the gateway refuses: a query, a fragment, an empty segment or a dot segment.
+pub(crate) fn dial_base_path(path: &str) -> Result<Option<String>, &'static str> {
+    if path.contains(['?', '#']) {
+        return Err("the endpoint path carries a query or fragment");
+    }
+    if path.contains("//") || path.split('/').any(|segment| segment == ".." || segment == ".") {
+        return Err("the endpoint path has an empty or dot segment");
+    }
+    let trimmed = path.trim_end_matches('/');
+    Ok((!trimmed.is_empty()).then(|| trimmed.to_owned()))
+}
+
+/// `ConfigMap` data key holding the dial file, beside the serving config.
+pub(crate) const DIAL_KEY: &str = "dial.json";
+
+/// The dial file, field for field the gateway's `DialConfig`. A gateway that predates it
+/// never opens the key, so it needs no version gate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct DialFile {
+    /// How the gateway dials each candidate cluster, by cluster.
+    pub(crate) dial: BTreeMap<String, DialSpec>,
+    /// Always `v1`.
+    pub(crate) version: &'static str,
+}
+
+/// One cluster's upstream, field for field the gateway's `DialSpec`. Paths only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct DialSpec {
+    /// `host:port` dialed.
+    pub(crate) address: String,
+    /// The path every request is sent under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) base_path: Option<String>,
+    /// Connect retries on a connect failure, to the same address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) connect_retries: Option<u32>,
+    /// Connect timeout before TLS, milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) connect_timeout_ms: Option<u64>,
+    /// The token a local dial sends in place of the caller's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) credential: Option<DialCredential>,
+    /// Per-read timeout, milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) read_timeout_ms: Option<u64>,
+    /// The site serving the cluster.
+    pub(crate) site: String,
+    /// Connect timeout including the TLS handshake, milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) total_connect_timeout_ms: Option<u64>,
+    /// How the connection is secured.
+    pub(crate) transport: DialTransport,
+    /// Whether the address host may resolve to a private range.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) trusted_private: bool,
+    /// Per-write timeout, milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) write_timeout_ms: Option<u64>,
+}
+
+/// The bearer token file a local dial sends, field for field the gateway's `DialCredential`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct DialCredential {
+    /// The token file, under the provider credential mount.
+    pub(crate) path: String,
+    /// Always `bearer_token`.
+    pub(crate) strategy: &'static str,
+}
+
+/// How a dial is secured; verification is always on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub(crate) enum DialTransport {
+    /// Grid mutual TLS with the identity the gateway fixed at startup.
+    MutualTls {
+        /// The peer's `{site}.grid.internal`.
+        sni: String,
+    },
+    /// Server-only TLS.
+    Tls {
+        /// CA bundle; absent, the system roots.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ca_path: Option<String>,
+        /// Verified server name.
+        sni: String,
+    },
+    /// No TLS, only to this site.
+    Plaintext,
+}
+
+impl DialTransport {
+    /// The CA file a server-only TLS dial names.
+    pub(crate) fn ca_path(&self) -> Option<&str> {
+        match self {
+            Self::Tls { ca_path, .. } => ca_path.as_deref(),
+            Self::MutualTls { .. } | Self::Plaintext => None,
+        }
+    }
+
+    /// The verified server name, `None` for plaintext.
+    pub(crate) fn sni(&self) -> Option<&str> {
+        match self {
+            Self::MutualTls { sni } | Self::Tls { sni, .. } => Some(sni),
+            Self::Plaintext => None,
+        }
+    }
+}
+
 /// One routable `(model, site, cluster)`, `cluster` naming a `load_balancer` cluster.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct ServingCandidate {
@@ -236,6 +348,53 @@ pub(crate) fn render(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Se
         provider_hop_sni: inputs.provider_hop_sni.clone(),
         peers,
     }
+}
+
+/// The dial file for `config`'s clusters, keeping only dials the gateway's own checks accept.
+///
+/// The gateway refuses the whole file over one bad dial, so a dial it would refuse is
+/// dropped here instead, leaving its cluster to praxis.
+pub(crate) fn render_dials(config: &ServingConfig, dials: &BTreeMap<String, DialSpec>) -> DialFile {
+    let mut on_cluster: BTreeMap<&str, Vec<&ServingCandidate>> = BTreeMap::new();
+    for candidate in &config.candidates {
+        on_cluster
+            .entry(candidate.cluster.as_str())
+            .or_default()
+            .push(candidate);
+    }
+    let dial = on_cluster
+        .into_iter()
+        .filter_map(|(cluster, served)| {
+            let dial = dials.get(cluster)?;
+            let mutual = matches!(dial.transport, DialTransport::MutualTls { .. });
+            let local = dial.site == config.local_site && !mutual;
+            let accepted = served.iter().all(|candidate| {
+                candidate.site == dial.site
+                    && (candidate.credential.is_none() || (local && dial.credential.is_some()))
+                    && (!mutual || candidate.stable_id.is_some())
+            }) && (mutual || dial.site == config.local_site)
+                && (dial.credential.is_none() || local)
+                && dial.transport.ca_path().is_none_or(within_backend_ca)
+                && config
+                    .provider_hop_sni
+                    .get(cluster)
+                    .is_none_or(|sni| mutual && dial.transport.sni() == Some(sni.as_str()));
+            if !accepted {
+                tracing::warn!(cluster, "serving config: dropping a dial the gateway would refuse");
+            }
+            accepted.then(|| (cluster.to_owned(), dial.clone()))
+        })
+        .collect();
+    DialFile { dial, version: "v1" }
+}
+
+/// Whether `path` names a file below the backend CA mount, with no `..` to climb out, as the gateway requires.
+fn within_backend_ca(path: &str) -> bool {
+    let (path, base) = (
+        std::path::Path::new(path),
+        std::path::Path::new(crate::resources::consumer_config::BACKEND_CA_MOUNT_BASE),
+    );
+    path != base && path.starts_with(base) && !path.components().any(|part| part == std::path::Component::ParentDir)
 }
 
 /// A candidate's identity: remote after local, then site, name, cluster.
@@ -384,6 +543,16 @@ fn refused_sites(overlay: &RoutingOverlay) -> BTreeSet<String> {
 /// The refused sites last seen per `GridNetwork`, keyed by network name.
 pub(crate) type RefusedSites = Mutex<HashMap<String, BTreeSet<String>>>;
 
+/// Whether `refused` differs from what `key` last refused, recording it when it does.
+pub(crate) fn refusal_changed(key: &str, refused: &BTreeSet<String>, last: &RefusedSites) -> bool {
+    let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
+    if last.get(key) == Some(refused) {
+        return false;
+    }
+    last.insert(key.to_owned(), refused.clone());
+    true
+}
+
 /// Warn when `network`'s set of refused sites changes, so an operator sees why a site never
 /// routes. Kept per network, so two networks do not flip each other's warning.
 pub(crate) fn warn_refused_sites(overlay: &RoutingOverlay, network: &str, last: &RefusedSites) {
@@ -404,7 +573,7 @@ fn valid_id(value: &str) -> bool {
 
 /// The local operator entry, presenting this site's own identity from `tls_mount`.
 fn peer(site: String, addr: String, tls_mount: &str) -> ServingPeer {
-    let name = format!("{site}.{}", certs::SPIFFE_TRUST_DOMAIN);
+    let name = certs::site_dns_name(&site);
     ServingPeer {
         site,
         addr,
@@ -421,7 +590,7 @@ fn peer(site: String, addr: String, tls_mount: &str) -> ServingPeer {
 }
 
 /// Serialize deterministically as JSON, which the gateway parses as YAML.
-pub(crate) fn to_text(config: &ServingConfig) -> Result<String, serde_json::Error> {
+pub(crate) fn to_text(config: &impl Serialize) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(config)
 }
 
@@ -435,8 +604,15 @@ pub(crate) fn configmap_name(network_name: &str, gateway_name: &str) -> String {
     scoped_configmap_name("grid-serving", network_name, gateway_name)
 }
 
-/// The `ConfigMap` the gateway mounts.
-pub(crate) fn build_configmap(text: &str, network_name: &str, gateway_name: &str, namespace: &str) -> ConfigMap {
+/// The `ConfigMap` the gateway mounts. The digest covers the serving config alone: the
+/// gateway re-reads the dial file in place, so a dial change needs no rollout.
+pub(crate) fn build_configmap(
+    text: &str,
+    dial: &str,
+    network_name: &str,
+    gateway_name: &str,
+    namespace: &str,
+) -> ConfigMap {
     ConfigMap {
         metadata: kube::api::ObjectMeta {
             annotations: Some(BTreeMap::from([(ANNOTATION_DIGEST.to_owned(), digest(text))])),
@@ -445,7 +621,10 @@ pub(crate) fn build_configmap(text: &str, network_name: &str, gateway_name: &str
             namespace: Some(namespace.to_owned()),
             ..Default::default()
         },
-        data: Some(BTreeMap::from([(SERVING_CONFIG_KEY.to_owned(), text.to_owned())])),
+        data: Some(BTreeMap::from([
+            (SERVING_CONFIG_KEY.to_owned(), text.to_owned()),
+            (DIAL_KEY.to_owned(), dial.to_owned()),
+        ])),
         ..Default::default()
     }
 }
@@ -707,6 +886,28 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_is_news_only_when_its_set_changes() {
+        let last = RefusedSites::default();
+        let refused = BTreeSet::from(["pool-c: site not enrolled".to_owned()]);
+        assert!(
+            refusal_changed("net/ns/gw", &refused, &last),
+            "the first refusal is news"
+        );
+        assert!(
+            !refusal_changed("net/ns/gw", &refused, &last),
+            "the same refusal is not"
+        );
+        assert!(
+            refusal_changed("net/ns/other", &refused, &last),
+            "another gateway keeps its own record"
+        );
+        assert!(
+            refusal_changed("net/ns/gw", &BTreeSet::new(), &last),
+            "clearing it is news, so a later refusal warns again"
+        );
+    }
+
+    #[test]
     fn refused_sites_are_kept_per_network() {
         let last = RefusedSites::default();
         let bad = overlay(vec![cand("llama", "site.b", "pool-b", None)]);
@@ -924,6 +1125,110 @@ mod tests {
         );
     }
 
+    fn dial(site: &str, transport: DialTransport) -> DialSpec {
+        DialSpec {
+            address: "peer.example:8443".to_owned(),
+            base_path: None,
+            connect_retries: None,
+            connect_timeout_ms: None,
+            credential: None,
+            read_timeout_ms: None,
+            site: site.to_owned(),
+            total_connect_timeout_ms: None,
+            transport,
+            trusted_private: false,
+            write_timeout_ms: None,
+        }
+    }
+
+    fn mutual(sni: &str) -> DialTransport {
+        DialTransport::MutualTls { sni: sni.to_owned() }
+    }
+
+    #[test]
+    fn the_serving_config_never_carries_dials() {
+        let text = to_text(&render(&two_site(), &INPUTS)).expect("json");
+        assert!(
+            !text.contains("\"dial\""),
+            "an older gateway refuses the whole serving config over an unknown field"
+        );
+        let empty = to_text(&render_dials(&render(&two_site(), &INPUTS), &BTreeMap::new())).expect("json");
+        assert_eq!(
+            empty, "{\n  \"dial\": {},\n  \"version\": \"v1\"\n}",
+            "nothing admitted still writes the file, so a withdrawn dial does not linger"
+        );
+    }
+
+    #[test]
+    fn a_dial_the_gateway_would_refuse_is_dropped_alone() {
+        let mut remote = cand("llama", "site-b", "pool-b", None);
+        remote.stable_id = Some("id-b".to_owned());
+        let mut unnamed = cand("llama", "site-c", "pool-c", None);
+        unnamed.stable_id = None;
+        let mut misnamed = cand("llama", "site-e", "pool-e", None);
+        misnamed.stable_id = Some("id-e".to_owned());
+        let mut server_only = cand("llama", "site-g", "pool-g", None);
+        server_only.stable_id = Some("id-g".to_owned());
+        let tls = |ca: &str| DialTransport::Tls {
+            ca_path: Some(ca.to_owned()),
+            sni: "models.svc".to_owned(),
+        };
+        let source = overlay(vec![
+            server_only,
+            cand("llama", "site-a", "pool-h", None),
+            cand("llama", "site-a", "pool-i", None),
+            cand("llama", "site-a", "pool-a", None),
+            remote,
+            unnamed,
+            cand("llama", "site-d", "pool-d", None),
+            misnamed,
+            cand("llama", "site-a", "pool-f", None),
+        ]);
+        let dials = BTreeMap::from([
+            ("pool-a".to_owned(), dial("site-a", DialTransport::Plaintext)),
+            ("pool-b".to_owned(), dial("site-b", mutual("site-b.grid.internal"))),
+            ("pool-c".to_owned(), dial("site-c", mutual("site-c.grid.internal"))),
+            ("pool-d".to_owned(), dial("site-x", DialTransport::Plaintext)),
+            ("pool-e".to_owned(), dial("site-e", mutual("site-e.grid.internal"))),
+            ("pool-f".to_owned(), dial("site-a", DialTransport::Plaintext)),
+            ("pool-z".to_owned(), dial("site-a", DialTransport::Plaintext)),
+            (
+                "pool-g".to_owned(),
+                dial("site-g", tls("/run/secrets/grid-backend-ca/ca/ca.crt")),
+            ),
+            (
+                "pool-h".to_owned(),
+                dial("site-a", tls("/run/secrets/grid-backend-ca/ca/../../x")),
+            ),
+            (
+                "pool-i".to_owned(),
+                dial("site-a", tls("/run/secrets/grid-backend-ca/ca/ca.crt")),
+            ),
+        ]);
+        let hops = BTreeSet::from(["pool-b".to_owned(), "pool-e".to_owned(), "pool-f".to_owned()]);
+        let hop_sni = BTreeMap::from([
+            ("pool-b".to_owned(), "site-b.grid.internal".to_owned()),
+            ("pool-e".to_owned(), "other.grid.internal".to_owned()),
+            ("pool-f".to_owned(), "site-a.grid.internal".to_owned()),
+        ]);
+        let inputs = ServingInputs {
+            provider_hop_clusters: &hops,
+            provider_hop_sni: &hop_sni,
+            ..INPUTS
+        };
+        let rendered = render(&source, &inputs);
+        let file = render_dials(&rendered, &dials);
+        let kept: Vec<&str> = file.dial.keys().map(String::as_str).collect();
+        assert_eq!(
+            kept,
+            ["pool-a", "pool-b", "pool-i"],
+            "pool-c has no stable id, pool-d names another site, pool-e another hop SNI, pool-f a hop it does not \
+             verify, pool-g leaves the site without mutual TLS, pool-h reads a CA outside the mount, pool-z no \
+             candidate"
+        );
+        assert_eq!(rendered.candidates.len(), 9, "every candidate stays, only the dials go");
+    }
+
     #[test]
     fn write_is_gated_on_content_and_spacing() {
         let base = Instant::now();
@@ -973,11 +1278,16 @@ mod tests {
 
     #[test]
     fn configmap_carries_name_labels_and_digest() {
-        let cm = build_configmap("{}", "grid", "gw", "ns");
+        let cm = build_configmap("{}", "{\"dial\":{}}", "grid", "gw", "ns");
         assert_eq!(cm.metadata.name.as_deref(), Some("grid-serving-grid-gw"));
         let annotations = cm.metadata.annotations.expect("annotations");
         assert_eq!(annotations[ANNOTATION_DIGEST], digest("{}"));
-        assert_eq!(cm.data.expect("data")[SERVING_CONFIG_KEY], "{}");
+        let data = cm.data.expect("data");
+        assert_eq!(data[SERVING_CONFIG_KEY], "{}");
+        assert_eq!(
+            data[DIAL_KEY], "{\"dial\":{}}",
+            "the dial file rides in the same ConfigMap"
+        );
         assert_eq!(
             cm.metadata.labels.expect("labels")[COMPONENT_LABEL],
             "serving",

@@ -23,6 +23,7 @@ use serde::Deserialize;
 use tracing::info;
 
 mod metrics_listener;
+mod provider_preflight;
 
 /// Log line emitted once tracing is up; the startup test waits for it.
 const STARTUP_MESSAGE: &str = "starting grid-gateway";
@@ -105,6 +106,14 @@ fn main() -> ExitCode {
         return praxis::report_fatal(&err, log_output);
     }
 
+    // A provider never dials another site, so it must not also hold the consumer's dials.
+    if std::env::var_os("GRID_PROVIDER_CONFIG").is_some() && std::env::var_os("GRID_SERVING_CONFIG").is_some() {
+        return praxis::report_fatal(
+            &"grid: GRID_PROVIDER_CONFIG and GRID_SERVING_CONFIG cannot both be set",
+            log_output,
+        );
+    }
+
     let mut registry = praxis_filter::FilterRegistry::with_builtins();
     praxis_ai_filters::register_ai_filters(&mut registry, None);
 
@@ -114,17 +123,32 @@ fn main() -> ExitCode {
     // the pollers refresh. Dropping the runtime stops the pollers, so it is
     // bound until the server returns.
     let (grid_runtime, backend_tls) = match std::env::var("GRID_SERVING_CONFIG").ok().map(|path| {
-        let backend_tls = provider_hop_backends(&config)?;
-        let backend_sni = backend_tls
-            .iter()
-            .map(|(name, tls)| (name.clone(), tls.sni.clone()))
-            .collect();
-        let runtime = start_grid_routing(&path, backend_sni, &mut registry)?;
-        Ok::<_, praxis_filter::FilterError>((runtime, backend_tls))
+        let backends = load_balancer_backends(&config)?;
+        let binding = ai_grid_filters::Binding {
+            backend_tls: backends
+                .verified
+                .iter()
+                .map(|(name, tls)| (name.clone(), tls.sni.clone()))
+                .collect(),
+            // Captured once: praxis applies insecure options only at startup.
+            insecure: config.insecure_options.clone(),
+            lb_clusters: backends.names,
+            ..ai_grid_filters::Binding::default()
+        };
+        let runtime = start_grid_routing(&path, binding, &mut registry)?;
+        Ok::<_, praxis_filter::FilterError>((runtime, backends.verified))
     }) {
         Some(Err(err)) => return praxis::report_fatal(&err, log_output),
         Some(Ok((runtime, backend_tls))) => (Some(runtime), Some(backend_tls)),
         None => (None, None),
+    };
+
+    let provider = match std::env::var_os("GRID_PROVIDER_CONFIG")
+        .map(|path| start_provider(std::path::Path::new(&path), &config, &mut registry))
+    {
+        Some(Err(err)) => return praxis::report_fatal(&err, log_output),
+        Some(Ok(runtime)) => Some(runtime),
+        None => None,
     };
 
     // Use the returning server path so both the routing runtime and tracing
@@ -136,8 +160,16 @@ fn main() -> ExitCode {
                 .map_err(|error| praxis::CompositionError::new(error.to_string()))
         });
     }
+    if let Some((_, grid_ca)) = provider.as_ref() {
+        let grid_ca = grid_ca.clone();
+        // A reload must keep the same guarantees the startup config was checked for.
+        composition = composition.add_pipeline_validator(move |ctx| {
+            provider_preflight::check(ctx.config(), &grid_ca).map_err(praxis::CompositionError::new)
+        });
+    }
     let result = praxis::try_run_server_with_composition(config, composition, config_file, log_level);
     drop(grid_runtime);
+    drop(provider);
     let exit_code = result.map_or_else(|err| praxis::report_fatal(&err, log_output), |()| ExitCode::SUCCESS);
     // The Praxis guard shuts down the OTLP provider and flushes queued spans.
     drop(tracing_guard);
@@ -230,11 +262,22 @@ fn start_metrics_listener(config: &Config) -> Result<(), String> {
 /// registering the filters.
 fn start_grid_routing(
     path: &str,
-    backend_tls: BTreeMap<String, String>,
+    binding: ai_grid_filters::Binding,
     registry: &mut praxis_filter::FilterRegistry,
 ) -> Result<ai_grid_filters::GridRuntime, praxis_filter::FilterError> {
     let config = ai_grid_filters::load_serving_config(path)?;
-    let mut runtime = ai_grid_filters::spawn_grid_routing(&config, backend_tls)?;
+    let dial = ai_grid_filters::load_dial_config(&ai_grid_filters::dial_config_path(std::path::Path::new(path)))
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "grid: dial file unreadable at startup; serving without dials");
+            ai_grid_filters::DialConfig::default()
+        });
+    // The grid TLS mount, never the serving config: a dial presents only the identity mounted for it.
+    let binding = ai_grid_filters::Binding {
+        credential_base: credential_base(),
+        grid_identity: grid_identity(),
+        ..binding
+    };
+    let mut runtime = ai_grid_filters::spawn_grid_routing(&config, &dial, binding)?;
     ai_grid_filters::register_grid_filters(
         registry,
         runtime.snapshot(),
@@ -247,6 +290,43 @@ fn start_grid_routing(
         .watch(path, SERVING_RELOAD_INTERVAL)
         .map_err(|err| -> praxis_filter::FilterError { format!("grid: watching {path}: {err}").into() })?;
     Ok(runtime)
+}
+
+/// Check the config serves peers safely, then start the provider watcher and register
+/// `grid_provider` over its snapshot.
+///
+/// # Errors
+///
+/// Returns the preflight refusal, or the error starting the watcher or registering the filter.
+fn start_provider(
+    path: &std::path::Path,
+    config: &Config,
+    registry: &mut praxis_filter::FilterRegistry,
+) -> Result<(ai_grid_filters::ProviderRuntime, String), praxis_filter::FilterError> {
+    let binding = ai_grid_filters::Binding {
+        credential_base: credential_base(),
+        grid_identity: grid_identity(),
+        // Captured once: praxis applies insecure options only at startup.
+        insecure: config.insecure_options.clone(),
+        ..ai_grid_filters::Binding::default()
+    };
+    let grid_ca = binding.grid_identity.ca.clone();
+    provider_preflight::check(config, &grid_ca)?;
+    let runtime = ai_grid_filters::spawn_provider(path.to_path_buf(), binding, SERVING_RELOAD_INTERVAL)
+        .map_err(|err| -> praxis_filter::FilterError { format!("grid: watching {}: {err}", path.display()).into() })?;
+    ai_grid_filters::register_provider_filter(registry, runtime.snapshot())?;
+    Ok((runtime, grid_ca))
+}
+
+/// Where dial credentials are mounted: `GRID_CREDENTIAL_DIR`, else the default mount.
+fn credential_base() -> std::path::PathBuf {
+    std::env::var_os("GRID_CREDENTIAL_DIR").map_or_else(|| ai_grid_filters::CREDENTIAL_BASE.into(), Into::into)
+}
+
+/// The grid identity under `GRID_TLS_DIR`, else the default mount.
+fn grid_identity() -> ai_grid_filters::GridIdentity {
+    let dir = std::env::var("GRID_TLS_DIR").unwrap_or_else(|_| ai_grid_filters::GRID_TLS_MOUNT.to_owned());
+    ai_grid_filters::GridIdentity::under(&dir)
 }
 
 /// How often the grid serving config file is re-read.
@@ -297,8 +377,21 @@ struct BackendClientCert {
     key_path: String,
 }
 
+/// The `load_balancer` clusters of a praxis config.
+struct LoadBalancerClusters {
+    /// Every cluster name.
+    names: BTreeSet<String>,
+    /// The verified mutual TLS clusters.
+    verified: BTreeMap<String, BackendTls>,
+}
+
 /// Resolve unique verified mutual-TLS backends across all chains.
 fn provider_hop_backends(config: &Config) -> Result<BTreeMap<String, BackendTls>, praxis_filter::FilterError> {
+    load_balancer_backends(config).map(|clusters| clusters.verified)
+}
+
+/// Every `load_balancer` cluster, and the verified mutual-TLS ones, across all chains.
+fn load_balancer_backends(config: &Config) -> Result<LoadBalancerClusters, praxis_filter::FilterError> {
     let mut backends = BTreeMap::new();
     let mut unverified = BTreeSet::new();
     for chain in &config.filter_chains {
@@ -334,7 +427,11 @@ fn provider_hop_backends(config: &Config) -> Result<BTreeMap<String, BackendTls>
             }
         }
     }
-    Ok(backends)
+    let names = backends.keys().cloned().chain(unverified).collect();
+    Ok(LoadBalancerClusters {
+        names,
+        verified: backends,
+    })
 }
 
 /// Reject a Praxis config reload that changes a backend identity trusted by the Grid runtime.
@@ -385,7 +482,7 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::{
-        USAGE, backend_tls_unchanged, config_arg, otlp_headers_present, provider_hop_backends,
+        USAGE, backend_tls_unchanged, config_arg, load_balancer_backends, otlp_headers_present, provider_hop_backends,
         validate_otlp_endpoint_transport_values,
     };
 
@@ -435,6 +532,22 @@ mod tests {
                 "rejection must leave the original identity trusted"
             );
         }
+    }
+
+    #[test]
+    fn every_load_balancer_cluster_is_named_and_only_verified_ones_bind() {
+        let verified = "        tls:\n          sni: provider-a.grid.internal\n          verify: true\n          ca: { ca_path: /tls/ca.crt }\n          client_cert: { cert_path: /tls/tls.crt, key_path: /tls/tls.key }\n        endpoints: [provider-a:8443]\n      - name: local-model\n        endpoints: [model:80]\n";
+        let clusters = load_balancer_backends(&config_with_backend(verified)).expect("backends");
+        assert_eq!(
+            clusters.names.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["local-model", "provider-a"],
+            "a dial of either name shadows it"
+        );
+        assert_eq!(
+            clusters.verified.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["provider-a"],
+            "only the verified cluster binds a hop"
+        );
     }
 
     fn parse(args: &[&str]) -> Result<Option<String>, String> {

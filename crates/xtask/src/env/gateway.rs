@@ -77,7 +77,7 @@ pub(crate) fn deploy_all(cfg: &EnvConfig) -> Result<(), Box<dyn std::error::Erro
 
 /// Verify provider gateways for all provider clusters.
 ///
-/// Asserts the full `ext_proc → mock EPP → endpoint_selector → provider backend` path.
+/// Asserts the full `ext_proc -> mock EPP -> endpoint_selector -> provider backend` path.
 ///
 /// # Errors
 ///
@@ -500,7 +500,7 @@ fn verify_provider(
         }
     }
 
-    // Test unknown model → 503.
+    // Test unknown model -> 503.
     verify_unknown_model(name, &ctx, port, name, consumer_site, tally);
 
     // Test spoofed header is ignored (valid model still succeeds).

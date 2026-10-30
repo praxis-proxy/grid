@@ -376,10 +376,10 @@ pub(crate) enum Action {
     /// 2. Install Grid CRDs and apply `InferenceProvider` fixtures.
     /// 3. Run the Grid operator out-of-cluster (spawned via `cargo run`).
     /// 4. Wait for provider reconciliation:
-    ///    - healthy → `Pending`
-    ///    - invalid → `Unavailable`
-    ///    - degraded → `Degraded`
-    ///    - api fallback → `Pending`
+    ///    - healthy -> `Pending`
+    ///    - invalid -> `Unavailable`
+    ///    - degraded -> `Degraded`
+    ///    - api fallback -> `Pending`
     /// 5. Verify the overlay `ConfigMap` (healthy present, unavailable excluded, scoring order).
     /// 6. Export the overlay to a temp file.
     /// 7. Deploy the consumer gateway from the operator-exported overlay.
@@ -405,7 +405,7 @@ pub(crate) enum Action {
     /// convergence, then applies a `GridNetwork` resource and polls until:
     ///
     /// - `status.phase = Active` (derived from live `MembershipSnapshot`)
-    /// - `status.connectedSites ≥ 1` (one SWIM peer confirmed alive)
+    /// - `status.connectedSites >= 1` (one SWIM peer confirmed alive)
     ///
     /// Uses available localhost UDP ports selected at runtime. Both operators
     /// connect to the same kind cluster (context resolved from `config` via
@@ -431,7 +431,7 @@ pub(crate) enum Action {
     /// cluster.  Each operator publishes real `InferenceProvider`-derived state
     /// as a CRDT `GridStateSnapshot` on `GridNetwork` reconcile.  After SWIM
     /// gossip convergence the remote operator's provider-state broadcast arrives and
-    /// `GridNetwork.status.remoteProviderCount` becomes ≥ 1.
+    /// `GridNetwork.status.remoteProviderCount` becomes >= 1.
     ///
     /// Proves that:
     /// - Operators use real foca UDP custom broadcasts (not direct injection).
@@ -664,8 +664,8 @@ pub(crate) enum Action {
     /// for both.
     ///
     /// This is the minimal deterministic kind proof of:
-    ///   `InferenceProvider (west k8s) → CRDT over SWIM → overlay candidate →
-    ///    consumer intelligent_route → provider gateway → HTTP 200`
+    ///   `InferenceProvider (west k8s) -> CRDT over SWIM -> overlay candidate ->
+    ///    consumer intelligent_route -> provider gateway -> HTTP 200`
     ///
     /// Requires the two-provider kind environment.  Run
     /// `env up -c tests/env/operator-routing-two-provider.toml` and
@@ -750,7 +750,7 @@ pub(crate) enum Action {
     ///
     /// 1. Deploy provider gateways (idempotent).
     /// 2. Operator reconcile + overlay export.
-    /// 3. Deploy consumer gateway with `openai_responses_format` → `intelligent_route` filter chain.
+    /// 3. Deploy consumer gateway with `openai_responses_format` -> `intelligent_route` filter chain.
     /// 4. Send `/v1/responses` requests: each model returns HTTP 200 with valid Responses body, unknown model fails
     ///    closed.
     /// 5. Verify response model fields match the requested model.
@@ -818,7 +818,7 @@ pub(crate) enum Action {
     ///
     /// Starts a primary SWIM operator and a joining SWIM operator, waits for
     /// membership formation, then advances the joining `GridSite`'s lifecycle
-    /// through `Pending → Discovered → Connecting → Active`.  Only `Discovered`
+    /// through `Pending -> Discovered -> Connecting -> Active`.  Only `Discovered`
     /// is harness-patched; `Connecting` and `Active` are driven by the
     /// `GridSite` controller.  `Active` requires the TCP probe to succeed and
     /// the configured `spec.trust.certFingerprint` to match `status.publicCertPem`.
@@ -859,7 +859,7 @@ pub(crate) enum Action {
     /// identity, and asserts the final state is stable (no oscillation over
     /// a 30-second observation window).
     ///
-    /// Proves idempotent reconciliation: same inputs → same status patch,
+    /// Proves idempotent reconciliation: same inputs -> same status patch,
     /// `grid_site_status_needs_update` prevents redundant patches, and two
     /// replicas do not conflict on status ownership.
     ///
@@ -1520,8 +1520,8 @@ fn env_verify_gateway_e2e(config: &Path) -> Result<(), Box<dyn std::error::Error
 /// 3. Run the Grid operator to generate an overlay with both local and `api_provider` candidates.
 /// 4. Deploy the consumer gateway with a plain-HTTP cluster for the API-provider mock in addition to the standard mTLS
 ///    clusters for local providers.
-/// 5. Verify: `model-x` → local provider gateway (HTTP 200), `model-z` → mock API-provider (HTTP 200), unknown model →
-///    404.
+/// 5. Verify: `model-x` -> local provider gateway (HTTP 200), `model-z` -> mock API-provider (HTTP 200), unknown model
+///    -> 404.
 fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         API_FALLBACK_MODEL, API_PROVIDER_SECRET_KEY, API_PROVIDER_SECRET_NAME, API_PROVIDER_SECRET_NS,
@@ -1548,7 +1548,7 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
     let api_provider_endpoint = format!("{}.default.svc:{}", kind::MOCK_API_SVC, kind::MOCK_API_PORT);
     eprintln!("  api_provider endpoint: {api_provider_endpoint}");
 
-    // Step 3: operator reconcile → overlay with local + api_provider
+    // Step 3: operator reconcile -> overlay with local + api_provider
     eprintln!("verify-api-fallback: [3/5] operator reconcile + overlay export...");
     operator::install_grid_crds(&context)?;
     operator::cleanup_validation_resources(&context)?;
@@ -1625,13 +1625,13 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
 
     // Step 5: verify routing + credential injection
     eprintln!("verify-api-fallback: [5/5] verifying API-provider fallback routing and credential injection...");
-    eprintln!("  local model ({provider_cluster}) → {provider_model} via provider gateway");
+    eprintln!("  local model ({provider_cluster}) -> {provider_model} via provider gateway");
     eprintln!(
-        "  api fallback ({TEST_PROVIDER_API}) → {API_FALLBACK_MODEL} via mock api-provider (injected credential)"
+        "  api fallback ({TEST_PROVIDER_API}) -> {API_FALLBACK_MODEL} via mock api-provider (injected credential)"
     );
 
     // Port-forward directly to the mock-api-provider (not through consumer gateway)
-    // for the negative credential proof: direct access without auth → 401.
+    // for the negative credential proof: direct access without auth -> 401.
     let mock_port = verify::find_free_port()?;
     let mut mock_pf =
         verify::PortForwardGuard::start(&consumer_ctx, kind::MOCK_API_SVC, mock_port, kind::MOCK_API_PORT)?;
@@ -1663,7 +1663,7 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
 ///
 /// 1. Deploy provider gateways.
 /// 2. Deploy mock API-provider in consumer cluster.
-/// 3. Operator reconcile → overlay JSON with `credential.secretRef`.
+/// 3. Operator reconcile -> overlay JSON with `credential.secretRef`.
 /// 4. Validate the operator-generated consumer Praxis config.
 /// 5. Deploy the consumer gateway with the credential Secret mounted.
 /// 6. Verify routing, native injection, and token-absence invariants.
@@ -1696,7 +1696,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     let api_provider_endpoint = format!("{}.default.svc:{}", kind::MOCK_API_SVC, kind::MOCK_API_PORT);
     eprintln!("  api_provider endpoint: {api_provider_endpoint}");
 
-    // Step 3: operator reconcile → overlay with credential secretRef
+    // Step 3: operator reconcile -> overlay with credential secretRef
     eprintln!("verify-api-fallback-native: [3/8] operator reconcile + overlay export...");
     operator::install_grid_crds(&context)?;
     operator::cleanup_validation_resources(&context)?;
@@ -1833,8 +1833,8 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     // Step 6: verify routing + token-absence + native credential injection
     eprintln!("verify-api-fallback-native: [6/8] verifying routing with credential_inject...");
     eprintln!("  live consumer pod runs operator-generated config");
-    eprintln!("  local ({provider_cluster}) → {provider_model} via provider gateway");
-    eprintln!("  api fallback ({TEST_PROVIDER_API}) → {API_FALLBACK_MODEL} via mock api-provider (credential_inject)");
+    eprintln!("  local ({provider_cluster}) -> {provider_model} via provider gateway");
+    eprintln!("  api fallback ({TEST_PROVIDER_API}) -> {API_FALLBACK_MODEL} via mock api-provider (credential_inject)");
 
     let mock_port = verify::find_free_port()?;
     let mut mock_pf =
@@ -2160,8 +2160,8 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
     // Step 3: deploy metrics endpoint Pods.
     // Each Pod serves a fixed Prometheus gauge for queue depth.  They are deployed
     // before spawning the operator so they are ready when the first reconcile fires.
-    // - idle Pod → provider_queue_depth_normalized 0.1 (low queue → high score)
-    // - busy Pod → provider_queue_depth_normalized 0.9 (high queue → low score)
+    // - idle Pod -> provider_queue_depth_normalized 0.1 (low queue -> high score)
+    // - busy Pod -> provider_queue_depth_normalized 0.9 (high queue -> low score)
     operator::apply_and_wait_for_metrics_pods(context, POD_READY_TIMEOUT)?;
 
     // Step 4: port-forward all endpoints so the out-of-cluster operator can reach them.
@@ -2190,12 +2190,12 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
     // api_provider is last to prove scoring is score-driven, not input-order-driven.
     //
     // clusterName controls overlay candidate identity:
-    // - op-e2e-healthy:       clusterName="site-a"           → candidate.site="site-a"
-    // - op-e2e-degraded:      clusterName="site-a"           → fresh=false
-    // - op-e2e-invalid:       blank endpoint                       → Unavailable, excluded
-    // - op-e2e-api-fallback:  no clusterName                 → cluster="op-e2e-api-fallback"
-    // - op-e2e-metrics-idle:  clusterName="site-metrics-idle" → metrics scraped (queue=0.1)
-    // - op-e2e-metrics-busy:  clusterName="site-metrics-busy" → metrics scraped (queue=0.9)
+    // - op-e2e-healthy:       clusterName="site-a"           -> candidate.site="site-a"
+    // - op-e2e-degraded:      clusterName="site-a"           -> fresh=false
+    // - op-e2e-invalid:       blank endpoint                       -> Unavailable, excluded
+    // - op-e2e-api-fallback:  no clusterName                 -> cluster="op-e2e-api-fallback"
+    // - op-e2e-metrics-idle:  clusterName="site-metrics-idle" -> metrics scraped (queue=0.1)
+    // - op-e2e-metrics-busy:  clusterName="site-metrics-busy" -> metrics scraped (queue=0.9)
     let healthy_endpoint = "http://mock-openai-provider.default.svc:8080";
     let api_endpoint = "https://api.anthropic.com";
     operator::apply_test_fixtures(context, healthy_endpoint)?;
@@ -2278,7 +2278,7 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
     result
 }
 
-/// Verify Grid operator reconciliation only (CRD install → overlay export).
+/// Verify Grid operator reconciliation only (CRD install -> overlay export).
 fn env_verify_operator_reconcile(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
     let context = resolve_operator_context(&cfg, site)?;
@@ -2364,7 +2364,7 @@ fn run_multi_provider_reconcile(
 /// **Single-provider config (`site-a`):** runs the full fixture suite including
 /// health phases, degraded/API-fallback providers, and live metrics ordering.
 ///
-/// **Multi-provider config (≥2 provider sites):** runs a focused fixture suite
+/// **Multi-provider config (>=2 provider sites):** runs a focused fixture suite
 /// that proves the operator generates correct overlay candidates for every
 /// provider site and that the consumer can route to all declared models.
 fn env_validate_operator_routing(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
@@ -2406,7 +2406,7 @@ fn env_validate_operator_routing(config: &Path, site: Option<&str>) -> Result<()
 ///
 /// Starts two SWIM-enabled operator processes, waits for gossip convergence,
 /// applies a `GridNetwork` fixture, then polls until `phase = Active` and
-/// `connectedSites ≥ 1`.
+/// `connectedSites >= 1`.
 ///
 /// Both operators connect to the same kind cluster (the first provider site from
 /// `config`). They bind on available localhost UDP ports chosen at runtime.
@@ -3024,7 +3024,7 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
         &context,
         SWIM_ENCRYPT_NODE_A,
         std::slice::from_ref(&bind_e_b),
-        true, // swimKeySecretRef → points at non-existent Secret
+        true, // swimKeySecretRef -> points at non-existent Secret
     )?;
 
     let missing_secret_error_result = operator::wait_for_operator_log_contains(
@@ -3149,7 +3149,7 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
     // Step 10: ROUTING ELIGIBILITY PROOF (after Active/TlsVerified): poll until the
     // secondary's CRDT provider candidate appears in the overlay. The controller must:
     //   (a) probe the mTLS server (succeeds; TLS fixture guard holds the process)
-    //   (b) verify CA chain + DNS SAN + canonical pin → promote Connecting → Active (TlsVerified)
+    //   (b) verify CA chain + DNS SAN + canonical pin -> promote Connecting -> Active (TlsVerified)
     //   (c) re-render the overlay to include secondary CRDT providers
     let verify_result = tls_fixture_result.and_then(|_guard| {
         operator::wait_for_site_candidate_in_overlay(
@@ -3372,7 +3372,7 @@ fn reserve_three_swim_bind_addrs() -> Result<(String, String, String), Box<dyn s
 /// eligibility gating across a three-node mesh.
 ///
 /// Topology:
-///   A  ←seed-  B  ←seed-  C
+///   A  <-seed-  B  <-seed-  C
 ///
 /// A seeds nobody; B seeds A; C seeds B only.  A learns about C transitively.
 ///
@@ -3406,7 +3406,7 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
     let (bind_a, bind_b, bind_c) = reserve_three_swim_bind_addrs()?;
     eprintln!(
         "  A={bind_a}  B={bind_b}  C={bind_c} \
-         (topology: A←B←C, C does NOT seed A directly)"
+         (topology: A<-B<-C, C does NOT seed A directly)"
     );
 
     // Step 3: Spawn all three operators
@@ -3486,7 +3486,7 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
     let tls_fixture_result = isolation_result.and_then(|()| {
         eprintln!(
             "verify-swim-mesh-three-node: [10] configuring TLS identity trust for GridSite \
-             {c_site_k8s_name:?} (C) → waiting for Active/TlsVerified..."
+             {c_site_k8s_name:?} (C) -> waiting for Active/TlsVerified..."
         );
         operator::setup_tls_verified_gridsite(&context, &c_site_k8s_name, SWIM_MESH_NETWORK)
     });
@@ -3519,7 +3519,7 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
 
     eprintln!(
         "verify-swim-mesh-three-node: PASS: \
-         A→B→C transitive discovery proven; \
+         A->B->C transitive discovery proven; \
          C's CRDT state reached A through B (remoteProviderCount >= 2); \
          C absent before Active; C present after Active; \
          wrong-network model absent from A's overlay"
@@ -3931,7 +3931,7 @@ fn verify_responses_pod_restarts(
 /// with Grid overlay routing:
 /// 1. Deploy provider gateways.
 /// 2. Operator reconcile + Grid overlay export.
-/// 3. Deploy consumer gateway with `openai_responses_format` → `intelligent_route` filter chain.
+/// 3. Deploy consumer gateway with `openai_responses_format` -> `intelligent_route` filter chain.
 /// 4. Verify `/v1/responses` routing: each model returns 200, unknown fails.
 /// 5. Verify response model fields match the requested model.
 /// 6. Assert no unexpected pod restarts.
@@ -3977,11 +3977,11 @@ fn env_verify_responses_routing(config: &Path) -> Result<(), Box<dyn std::error:
         },
     };
 
-    // Step 3: Deploy consumer gateway with openai_responses_format → intelligent_route filter chain.
+    // Step 3: Deploy consumer gateway with openai_responses_format -> intelligent_route filter chain.
     eprintln!("responses-routing: [3/6] deploying responses consumer gateway...");
     let consumer_ok = responses_record_step("consumer deploy", &mut results, || {
         consumer::deploy_consumer_for_responses(&cfg, Some(&overlay_path))?;
-        Ok("deployed with openai_responses_format → intelligent_route filter chain".to_owned())
+        Ok("deployed with openai_responses_format -> intelligent_route filter chain".to_owned())
     });
     if !consumer_ok {
         print_validate_all_table(&results);
@@ -4170,10 +4170,10 @@ fn env_verify_full_grid_routing(config: &Path) -> Result<(), Box<dyn std::error:
 
     // Step 5: verify routing for all four models
     eprintln!("verify-full-grid-routing: [5/6] verifying full-grid routing...");
-    eprintln!("  {FULL_GRID_MODEL_EAST} → site-east (local/self-hosted)");
-    eprintln!("  {FULL_GRID_MODEL_WEST} → site-west (remote/self-hosted)");
-    eprintln!("  {FULL_GRID_MODEL_CLOUD} → cloud mock ({FULL_GRID_PROVIDER_CLOUD})");
-    eprintln!("  {FULL_GRID_MODEL_API} → api mock ({FULL_GRID_PROVIDER_API}, injected credential)");
+    eprintln!("  {FULL_GRID_MODEL_EAST} -> site-east (local/self-hosted)");
+    eprintln!("  {FULL_GRID_MODEL_WEST} -> site-west (remote/self-hosted)");
+    eprintln!("  {FULL_GRID_MODEL_CLOUD} -> cloud mock ({FULL_GRID_PROVIDER_CLOUD})");
+    eprintln!("  {FULL_GRID_MODEL_API} -> api mock ({FULL_GRID_PROVIDER_API}, injected credential)");
     consumer::verify_full_grid_e2e(
         &cfg,
         FULL_GRID_MODEL_EAST,
@@ -4509,7 +4509,7 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
 /// observed through at least one reconcile.  This proves the lifecycle type system is
 /// functional end-to-end.
 /// SWIM membership formation (two operators, east primary + west joining) provides the real
-/// distributed-system event that triggers the `Pending → Discovered` transition in production.
+/// distributed-system event that triggers the `Pending -> Discovered` transition in production.
 ///
 /// **Cross-network isolation:** a wrong-network `GridSite` and `InferenceProvider` are applied
 /// and their absence from the correct-network overlay is asserted by reading the overlay `ConfigMap`.
@@ -4520,7 +4520,7 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
 /// `spec.gatewayEndpoint.address` populated from the SWIM membership record.
 ///
 /// **Lifecycle proof (step 5):** a separate harness-created `GridSite` is advanced through
-/// `Pending → Discovered → Connecting → Active`.  Only `Discovered` is harness-patched;
+/// `Pending -> Discovered -> Connecting -> Active`.  Only `Discovered` is harness-patched;
 /// the controller drives `Connecting` (egress present) and `Active`
 /// (TCP probe succeeds + `spec.trust.certFingerprint` matches `status.publicCertPem`).
 #[expect(
@@ -4540,7 +4540,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     let providers = provider_clusters_from_config(&cfg);
     if providers.len() < 2 {
         return Err(format!(
-            "verify-site-join-discovery requires ≥ 2 provider clusters; got {}",
+            "verify-site-join-discovery requires >= 2 provider clusters; got {}",
             providers.len()
         )
         .into());
@@ -4623,7 +4623,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
         SITE_JOIN_NETWORK,
         SITE_JOIN_PHASE_POLL_TIMEOUT,
     )?;
-    // Wait for the GridSite controller to advance Discovered → Connecting.
+    // Wait for the GridSite controller to advance Discovered -> Connecting.
     // The GridNetwork controller sets Discovered; the GridSite controller then
     // advances to Connecting because the advertised gateway address is present.
     operator::wait_for_gridsite_phase(&east_ctx, &auto_site_name, "Connecting", SITE_JOIN_PHASE_POLL_TIMEOUT)?;
@@ -4682,14 +4682,14 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     eprintln!("  [OK] joining site: Pending (absent/unjoined state confirmed before SWIM event)");
 
     // Advance joining site to Discovered: simulates SWIM membership event.
-    // The Pending→Discovered transition requires SWIM membership, which the GridSite
+    // The Pending->Discovered transition requires SWIM membership, which the GridSite
     // controller does not have access to. The harness patches this to simulate the
     // SWIM Alive event (same as the GridNetwork controller does for auto-discovered sites).
     operator::patch_gridsite_phase(&east_ctx, SITE_JOIN_JOINING_SITE, "Discovered")?;
     operator::bump_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE)?;
-    // The GridSite controller now drives Discovered → Connecting automatically when
+    // The GridSite controller now drives Discovered -> Connecting automatically when
     // spec.gatewayEndpoint.address is non-empty and reachable by TCP.
-    // Wait for Connecting — do NOT wait for Discovered, which would be immediately
+    // Wait for Connecting -- do NOT wait for Discovered, which would be immediately
     // superseded by the operator's automated transition.
     operator::wait_for_gridsite_phase(
         &east_ctx,
@@ -4699,12 +4699,12 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     )?;
     eprintln!(
         "  [OK] joining site: Connecting \
-         (Discovered→Connecting driven by GridSite controller; egress address present)"
+         (Discovered->Connecting driven by GridSite controller; egress address present)"
     );
 
     // Advance to Active via identity-aware TLS probe. Spawn a local mTLS probe server and
     // configure the full identity trust chain (CA, client cert, canonical DER pin, serverName)
-    // so the controller promotes Connecting → Active (TlsVerified). This proves Active is only
+    // so the controller promotes Connecting -> Active (TlsVerified). This proves Active is only
     // reached when identity verification succeeds; TCP reachability alone is not sufficient.
     let _tls_guard = operator::setup_tls_verified_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE, SITE_JOIN_NETWORK)?;
     operator::bump_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE)?;
@@ -4789,8 +4789,8 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
 /// **Before partition:** east (local, `backendKind=local`) and west (remote CRDT) both serve
 /// `model-failover-shared`.  East sorts first in the overlay by locality score.
 ///
-/// **After killing the west operator:** SWIM marks west Dead →
-/// `apply_swim_staleness_override` downgrades the west CRDT provider to `Degraded` →
+/// **After killing the west operator:** SWIM marks west Dead ->
+/// `apply_swim_staleness_override` downgrades the west CRDT provider to `Degraded` ->
 /// overlay emits west with `fresh=false`.  East (local, `fresh=true`) remains the first
 /// candidate for the shared model.  A consumer request for the shared model returns HTTP 200,
 /// attributed to east via overlay-position evidence (both mocks echo the same model name in
@@ -4802,7 +4802,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
 /// so both SWIM runtimes lose their in-memory membership state.  East and west are
 /// then restarted with the same bind addresses, with west seeding east.  SWIM detects
 /// west as `Alive`, the staleness override is lifted, and the east overlay reflects
-/// west with `fresh=true` again.  This proves the lost-peer → clean-restart recovery
+/// west with `fresh=true` again.  This proves the lost-peer -> clean-restart recovery
 /// cycle without requiring fixture reapplication.
 ///
 /// **Honest boundaries:**
@@ -5011,7 +5011,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
         FAILOVER_GW,
         east_site,
         west_site,
-        true, // expect_west_stale = true: west is Dead → Degraded → fresh=false
+        true, // expect_west_stale = true: west is Dead -> Degraded -> fresh=false
     )?;
     eprintln!(
         "  [PASS] stale overlay: {FAILOVER_EAST_PROVIDER} fresh=true, \
@@ -5215,7 +5215,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
 /// The `wait_for_remote_candidate_absent` helper bumps the `GridNetwork` every 5 s so
 /// a reconcile fires after each age-tick window.  Each reconcile calls
 /// `apply_stale_gc_filter` with the age read from the SWIM membership snapshot.  Once
-/// age ≥ TTL the stale candidate is omitted from the overlay.
+/// age >= TTL the stale candidate is omitted from the overlay.
 ///
 /// **Honest boundaries:**
 /// - Only overlay-level filtering is proven.  CRDT storage records are not deleted.
@@ -6418,7 +6418,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
     let remote_site_name = operator::auto_discovered_gridsite_name(ROTATION_NETWORK, ROTATION_REMOTE_SWIM_ID);
     operator::apply_rotation_remote_provider(&context)?;
 
-    // Step 4: Apply GridSite with [fp-A] → Active/TlsVerified
+    // Step 4: Apply GridSite with [fp-A] -> Active/TlsVerified
     eprintln!("verify-gridsite-rotation: [4] apply GridSite with fp-A");
 
     operator::apply_tls_verified_gridsite_for_eligibility(
@@ -6479,10 +6479,10 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!(
             "  [PASS] step 4b: remote CRDT candidate present in overlay \
-             (remote GridSite Active → routing eligible)"
+             (remote GridSite Active -> routing eligible)"
         );
 
-        // Step 5: Restart with cert-B, fp-A still configured → PinMismatch
+        // Step 5: Restart with cert-B, fp-A still configured -> PinMismatch
         eprintln!("verify-gridsite-rotation: [5] restart server with cert-B (fp-A configured)");
         server_child = Some(operator::restart_tls_probe_server(
             &mut server_child,
@@ -6502,7 +6502,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!("  [PASS] step 5: Connecting/PinMismatch after cert swap");
 
-        // Step 6: Patch [fp-A, fp-B] → Active/TlsVerified (cert-B matches fp-B)
+        // Step 6: Patch [fp-A, fp-B] -> Active/TlsVerified (cert-B matches fp-B)
         eprintln!("verify-gridsite-rotation: [6] dual-pin overlap [fp-A, fp-B]");
         operator::patch_gridsite_fingerprints(&context, ROTATION_SITE, &[&fp_a, &fp_b])?;
         operator::bump_gridsite(&context, ROTATION_SITE)?;
@@ -6558,7 +6558,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         // No step for AdvertisedCertificateMismatch: it needs the remote TLS broadcast
         // secret patched apart from the probe cert, and no longer changes phase.
 
-        // Step 7: Patch [fp-B] only → still Active/TlsVerified
+        // Step 7: Patch [fp-B] only -> still Active/TlsVerified
         eprintln!("verify-gridsite-rotation: [7] single pin [fp-B]");
         operator::patch_gridsite_fingerprints(&context, ROTATION_SITE, &[&fp_b])?;
         operator::bump_gridsite(&context, ROTATION_SITE)?;
@@ -6634,7 +6634,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!("  [PASS] step 7c: TlsVerified, cert-B restored after C rejection");
 
-        // Step 8: Restart with expired cert → CertificateExpired
+        // Step 8: Restart with expired cert -> CertificateExpired
         eprintln!("verify-gridsite-rotation: [8] restart with expired cert");
         operator::patch_gridsite_fingerprints(&context, ROTATION_SITE, &[&fp_b])?;
         server_child = Some(operator::restart_tls_probe_server(
@@ -6655,7 +6655,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!("  [PASS] step 8: Connecting/CertificateExpired");
 
-        // Routing eligibility: expired cert → remote GridSite also Connecting → excluded.
+        // Routing eligibility: expired cert -> remote GridSite also Connecting -> excluded.
         operator::wait_for_no_site_candidate_in_overlay(
             &context,
             ROTATION_NETWORK,
@@ -6665,10 +6665,10 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!(
             "  [PASS] step 8 eligibility: remote CRDT candidate excluded from overlay \
-             (remote GridSite Connecting → routing ineligible)"
+             (remote GridSite Connecting -> routing ineligible)"
         );
 
-        // Step 8a: Not-yet-valid cert → CertificateNotYetValid
+        // Step 8a: Not-yet-valid cert -> CertificateNotYetValid
         eprintln!("verify-gridsite-rotation: [8a] restart with not-yet-valid cert");
         server_child = Some(operator::restart_tls_probe_server(
             &mut server_child,
@@ -6688,7 +6688,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!("  [PASS] step 8a: Connecting/CertificateNotYetValid");
 
-        // Step 9: Restore cert-B with [fp-B] → Active/TlsVerified
+        // Step 9: Restore cert-B with [fp-B] -> Active/TlsVerified
         eprintln!("verify-gridsite-rotation: [9] restore cert-B");
         server_child = Some(operator::restart_tls_probe_server(
             &mut server_child,
@@ -6708,7 +6708,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!("  [PASS] step 9: Active/TlsVerified recovered after full rotation matrix");
 
-        // Routing eligibility: recovery → remote GridSite also Active → included.
+        // Routing eligibility: recovery -> remote GridSite also Active -> included.
         operator::wait_for_site_candidate_in_overlay(
             &context,
             ROTATION_NETWORK,
@@ -6718,7 +6718,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!(
             "  [PASS] step 9 eligibility: remote CRDT candidate returned to overlay \
-             (remote GridSite Active → routing eligible again)"
+             (remote GridSite Active -> routing eligible again)"
         );
 
         // Event validation
@@ -6762,14 +6762,14 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
 
     eprintln!(
         "verify-gridsite-rotation: PASS: \
-         rotation matrix verified with routing eligibility: initial → mismatch → dual-pin → \
-         partial rollout → convergence-B → single-pin → rollback-A → \
-         reject-C → restore-B → expired → not-yet-valid → recovery"
+         rotation matrix verified with routing eligibility: initial -> mismatch -> dual-pin -> \
+         partial rollout -> convergence-B -> single-pin -> rollback-A -> \
+         reject-C -> restore-B -> expired -> not-yet-valid -> recovery"
     );
     Ok(())
 }
 
-/// Reserve a single SWIM bind address (port 0 → OS-assigned).
+/// Reserve a single SWIM bind address (port 0 -> OS-assigned).
 fn reserve_single_bind_addr() -> Result<String, Box<dyn std::error::Error>> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?.to_string();
@@ -6785,7 +6785,7 @@ fn reserve_single_bind_addr() -> Result<String, Box<dyn std::error::Error>> {
 /// oscillation on a shared `GridSite`.
 #[expect(
     clippy::too_many_lines,
-    reason = "sequential convergence test: setup → verify → destabilize → recover → observe stability"
+    reason = "sequential convergence test: setup -> verify -> destabilize -> recover -> observe stability"
 )]
 #[expect(
     clippy::similar_names,
@@ -6876,7 +6876,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
     operator::assert_operator_alive(op_b_guard.0.as_mut().ok_or("operator-B missing after spawn")?)?;
     eprintln!("  [OK] both operator replicas alive after startup");
 
-    // Step 3: Apply GridSite with [fp-A] → Active/TlsVerified
+    // Step 3: Apply GridSite with [fp-A] -> Active/TlsVerified
     eprintln!("verify-gridsite-convergence: [3] apply GridSite with fp-A");
     operator::apply_tls_verified_gridsite_for_eligibility(
         &context,
@@ -6902,7 +6902,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
 
         let conv_metrics_baseline = operator::scrape_metrics(&convergence_metrics_addr)?;
 
-        // Step 4: Cause pin mismatch → Connecting/PinMismatch
+        // Step 4: Cause pin mismatch -> Connecting/PinMismatch
         eprintln!("verify-gridsite-convergence: [4] restart with cert-B (fp-A configured)");
         let port = probe_addr
             .split(':')
@@ -6923,7 +6923,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
         )?;
         eprintln!("  [PASS] step 4: Connecting/PinMismatch with two replicas");
 
-        // Step 5: Restore identity → Active/TlsVerified
+        // Step 5: Restore identity -> Active/TlsVerified
         eprintln!("verify-gridsite-convergence: [5] restore identity [fp-A, fp-B]");
         operator::patch_gridsite_fingerprints(&context, CONVERGENCE_SITE, &[&fp_a, &fp_b])?;
         operator::bump_gridsite(&context, CONVERGENCE_SITE)?;
@@ -6983,7 +6983,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
             let reason = operator::read_gridsite_reason(&context, CONVERGENCE_SITE);
             if reason != last_reason {
                 transitions += 1;
-                eprintln!("  [WARN] unexpected transition: {last_reason:?} → {reason:?}");
+                eprintln!("  [WARN] unexpected transition: {last_reason:?} -> {reason:?}");
                 last_reason = reason;
             }
         }

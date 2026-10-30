@@ -9,7 +9,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
@@ -22,12 +22,15 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObjec
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    control::{Control, ReloadOutcome, Tuning, Watcher, watch},
+    control::{Binding, Control, ReloadOutcome, Tuning, Watcher, watch},
     descriptor::CandidateConfig,
     health::ClusterHealth,
     prefix::PrefixAffinity,
     snapshot::RouteSnapshot,
 };
+
+/// The dial file's name, beside the serving config in the same mount.
+pub const DIAL_FILE: &str = "dial.json";
 
 /// Default signals endpoint path.
 fn default_path() -> String {
@@ -76,6 +79,138 @@ pub struct GridServingConfig {
 
     /// Peers to poll for live load.
     pub peers: Vec<PeerServingConfig>,
+}
+
+/// The dial file the operator writes beside the serving config: how the gateway dials each
+/// candidate cluster it builds an upstream for. A gateway that predates it never opens it.
+///
+/// A cluster it names is dialed directly, replacing any praxis `load_balancer` cluster of the
+/// same name; any other cluster routes through praxis as before. A missing file names none.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DialConfig {
+    /// Dials by candidate cluster.
+    #[serde(default)]
+    pub dial: BTreeMap<String, DialSpec>,
+
+    /// The schema version, so a later one is refused rather than misread.
+    #[serde(default)]
+    pub version: DialVersion,
+}
+
+/// The dial file schema versions this gateway reads.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+pub enum DialVersion {
+    /// The first schema.
+    #[default]
+    #[serde(rename = "v1")]
+    V1,
+}
+
+/// One cluster's upstream, built by the gateway from paths only; certificate verification is always on.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DialSpec {
+    /// `host:port` dialed. A retry reconnects to the same address.
+    pub address: String,
+
+    /// The path every request is sent under, from the provider's endpoint URL.
+    #[serde(default)]
+    pub base_path: Option<String>,
+
+    /// Connect retries on a connect failure, to the same address.
+    #[serde(default)]
+    pub connect_retries: Option<u32>,
+
+    /// The token a local dial sends in place of the caller's credential.
+    #[serde(default)]
+    pub credential: Option<DialCredential>,
+
+    /// The connect timeout before TLS, milliseconds.
+    #[serde(default)]
+    pub connect_timeout_ms: Option<u64>,
+
+    /// The per-read timeout, milliseconds.
+    #[serde(default)]
+    pub read_timeout_ms: Option<u64>,
+
+    /// The site serving the cluster; every candidate on the cluster names it.
+    pub site: String,
+
+    /// The connect timeout including the TLS handshake, milliseconds.
+    #[serde(default)]
+    pub total_connect_timeout_ms: Option<u64>,
+
+    /// How the connection is secured.
+    pub transport: DialTransport,
+
+    /// Whether the address host may resolve to a private range. Only for this site's own hostnames.
+    #[serde(default)]
+    pub trusted_private: bool,
+
+    /// The per-write timeout, milliseconds.
+    #[serde(default)]
+    pub write_timeout_ms: Option<u64>,
+}
+
+/// The credential a local dial presents, read from a mounted file.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DialCredential {
+    /// The file holding the token, under the credential mount.
+    pub path: String,
+
+    /// How the token is sent.
+    pub strategy: CredentialStrategy,
+}
+
+/// How a dial's token is sent.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialStrategy {
+    /// `Authorization: Bearer <token>`.
+    BearerToken,
+}
+
+/// How a dial is secured.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "mode")]
+pub enum DialTransport {
+    /// Grid mutual TLS with this site's identity, verified against the grid CA, both read from
+    /// the identity the gateway fixed at startup.
+    MutualTls {
+        /// The peer's site name, `{site}.grid.internal`.
+        sni: String,
+    },
+    /// Server-only TLS.
+    Tls {
+        /// The CA bundle the server is verified with; absent, the system roots.
+        #[serde(default)]
+        ca_path: Option<String>,
+        /// The name the server is verified by.
+        sni: String,
+    },
+    /// No TLS. Only to this site.
+    Plaintext,
+}
+
+impl DialTransport {
+    /// The verified server name, `None` for plaintext.
+    #[must_use]
+    pub fn sni(&self) -> Option<&str> {
+        match self {
+            Self::MutualTls { sni, .. } | Self::Tls { sni, .. } => Some(sni),
+            Self::Plaintext => None,
+        }
+    }
+
+    /// The CA file a server-only TLS dial names; the grid identity is the gateway's own.
+    pub(crate) fn ca_path(&self) -> Option<&str> {
+        match self {
+            Self::Tls { ca_path, .. } => ca_path.as_deref(),
+            Self::MutualTls { .. } | Self::Plaintext => None,
+        }
+    }
 }
 
 /// Site availability tuning: how a site's ceiling is learned, how its saturation is
@@ -276,7 +411,7 @@ impl GridRuntime {
             .apply(config)
     }
 
-    /// Re-read `path` every `every` and apply it when it changes.
+    /// Re-read `path`, and the dial file beside it, every `every` and apply them when either changes.
     ///
     /// # Errors
     ///
@@ -304,6 +439,38 @@ pub fn load_serving_config(path: &str) -> Result<GridServingConfig, FilterError>
     serde_yaml::from_str(&text).map_err(|error| -> FilterError { format!("grid: parsing {path}: {error}").into() })
 }
 
+/// The dial file beside the serving config at `serving`.
+#[must_use]
+pub fn dial_config_path(serving: &Path) -> PathBuf {
+    serving.with_file_name(DIAL_FILE)
+}
+
+/// The revision a kubelet volume at `dir` points `..data` at now, else `dir` itself.
+///
+/// Reading every file under the one revision keeps a swap from pairing two revisions.
+pub(crate) fn mount_revision(dir: &Path) -> PathBuf {
+    fs::canonicalize(dir.join("..data")).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+/// Read and parse the dial file at `path`; a missing file names no dial.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if the file exists but cannot be read or does not parse.
+pub fn load_dial_config(path: &Path) -> Result<DialConfig, FilterError> {
+    match fs::read(path) {
+        Ok(bytes) => parse_dial_config(path, &bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DialConfig::default()),
+        Err(error) => Err(format!("grid: reading {}: {error}", path.display()).into()),
+    }
+}
+
+/// Parse the dial file at `path` from `bytes`.
+pub(crate) fn parse_dial_config(path: &Path, bytes: &[u8]) -> Result<DialConfig, FilterError> {
+    serde_yaml::from_slice(bytes)
+        .map_err(|error| -> FilterError { format!("grid: parsing {}: {error}", path.display()).into() })
+}
+
 /// Build the control plane from `config`: the store, the cold-start snapshot, and
 /// one poller per peer whose refresh re-orders and swaps the snapshot.
 ///
@@ -311,10 +478,11 @@ pub fn load_serving_config(path: &str) -> Result<GridServingConfig, FilterError>
 ///
 /// Returns [`FilterError`] if the local site or candidate topology is invalid, a
 /// peer's certificate material cannot be read or parsed, or a poller thread
-/// cannot be spawned.
+/// cannot be spawned. A dial file that breaks a trust rule is set aside with a warning.
 pub fn spawn_grid_routing(
     config: &GridServingConfig,
-    backend_tls: BTreeMap<String, String>,
+    dial: &DialConfig,
+    binding: Binding,
 ) -> Result<GridRuntime, FilterError> {
     // The peer scrapers load TLS here, before the server installs the provider.
     praxis_tls::provider::install();
@@ -327,7 +495,7 @@ pub fn spawn_grid_routing(
         spawn_on_thread_held(store, poller, scraper, refresh)
             .map_err(|error| -> FilterError { format!("grid: spawning poller for {}: {error}", peer.site).into() })
     });
-    start_runtime_with_backend_tls(config, start, backend_tls)
+    start_runtime_with(config, dial, start, binding)
 }
 
 /// Build the runtime over `start`, the peer poller constructor.
@@ -336,17 +504,25 @@ pub(crate) fn start_runtime(
     config: &GridServingConfig,
     start: crate::control::StartPeer,
 ) -> Result<GridRuntime, FilterError> {
-    start_runtime_with_backend_tls(config, start, BTreeMap::new())
+    start_runtime_with(config, &DialConfig::default(), start, Binding::default())
 }
 
-/// Build the runtime with TLS identities from the loaded Praxis backends.
-fn start_runtime_with_backend_tls(
+/// Build the runtime with what the loaded praxis config fixed at startup.
+pub(crate) fn start_runtime_with(
     config: &GridServingConfig,
+    dial: &DialConfig,
     start: crate::control::StartPeer,
-    backend_tls: BTreeMap<String, String>,
+    binding: Binding,
 ) -> Result<GridRuntime, FilterError> {
-    let mut control = Control::new_with_backend_tls(config, start, backend_tls)?;
-    control.apply(config)?;
+    let mut control = Control::new_with(config, start, binding)?;
+    if let Err(error) = control.apply_joined(config, dial) {
+        if dial.dial.is_empty() {
+            return Err(error);
+        }
+        // A bad dial file never stops the gateway: it serves without dials until a good one lands.
+        tracing::warn!(%error, "grid: dial file refused at startup; serving without dials");
+        control.apply_joined(config, &DialConfig::default())?;
+    }
     let health_tick = tick_health(control.health(), control.refresh(), control.store())
         .map_err(|error| -> FilterError { format!("grid: spawning the health tick: {error}").into() })?;
     let (snapshot, affinity, health, tuning) = (

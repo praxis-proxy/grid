@@ -473,7 +473,7 @@ type GridNetworkBudgetPolicy struct {
 
 // GatewayCASecretRef Optional gateway-namespace Secret supplying a custom CA bundle for tls transport. Specify only its name and optional key; the Secret must be in the namespace named by the containing GatewayRef. The mounted path is /run/secrets/grid-backend-ca/{secret-name}/{key}; the key defaults to ca.crt. Omitted uses the process trust store.
 type GatewayCASecretRef struct {
-	// Optional key containing the CA bundle. Defaults to ca.crt.
+	// Optional key containing the CA bundle. Defaults to ca.crt. A Secret key: no /, not . or .., and not starting with ...
 	Key *string `json:"key,omitempty"`
 	// Secret name in the target gateway namespace.
 	Name string `json:"name"`

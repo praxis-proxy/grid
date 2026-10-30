@@ -628,8 +628,8 @@ const STATE_REPUBLISH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Default TTL for dead SWIM members before eviction from the tracked table.
 ///
-/// 300 seconds = 10 × foca's WAN `suspect_to_down_after` (30 s), giving
-/// ample time for the full Alive → Suspect → Dead lifecycle and peer
+/// 300 seconds = 10 * foca's WAN `suspect_to_down_after` (30 s), giving
+/// ample time for the full Alive -> Suspect -> Dead lifecycle and peer
 /// convergence before cleanup.  Override with `GRID_SWIM_DEAD_MEMBER_TTL_SECS`.
 const DEFAULT_DEAD_MEMBER_TTL_SECS: u64 = 300;
 /// Maximum membership records retained by the operator-side mirror.
@@ -3161,7 +3161,7 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t0);
         apply_member_event(left("site-a"), &mut tracked, t0 + Duration::from_secs(10));
-        // Rejoin clears status_changed_at → age=0.
+        // Rejoin clears status_changed_at -> age=0.
         apply_member_event(joined("site-a"), &mut tracked, t0 + Duration::from_secs(50));
         let snap = members_snapshot(&tracked, t0 + Duration::from_secs(70), &PeerMetadata::default());
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());

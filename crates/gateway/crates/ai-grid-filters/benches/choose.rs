@@ -9,8 +9,8 @@ use std::{
 };
 
 use ai_grid_filters::{
-    AdmissionState, CandidateCredential, CapabilityKind, ClusterHealth, CredentialRef, RouteCandidate, RouteSnapshot,
-    load_serving_config, register_grid_filters, spawn_grid_routing,
+    AdmissionState, Binding, CandidateCredential, CapabilityKind, ClusterHealth, CredentialRef, DialConfig, Dialed,
+    RouteCandidate, RouteSnapshot, load_serving_config, register_grid_filters, spawn_grid_routing,
 };
 use arc_swap::ArcSwap;
 use divan::Bencher;
@@ -67,7 +67,7 @@ fn snapshot(sites: u32, shape: Shape) -> RouteSnapshot {
                 selection_tier: None,
                 site: Arc::clone(&site),
                 stable_id: site,
-                upstream: None,
+                dial: None,
             }
         })
         .collect();
@@ -82,7 +82,7 @@ fn snapshot(sites: u32, shape: Shape) -> RouteSnapshot {
 fn filter(snapshot: RouteSnapshot) -> Result<Box<dyn HttpFilter>, FilterError> {
     let mut config = load_serving_config("testdata/serving-config.json")?;
     config.peers.clear();
-    let runtime = spawn_grid_routing(&config, std::collections::BTreeMap::new())?;
+    let runtime = spawn_grid_routing(&config, &DialConfig::default(), Binding::default())?;
     let mut registry = FilterRegistry::with_builtins();
     let snapshot = Arc::new(ArcSwap::from_pointee(snapshot));
     register_grid_filters(
@@ -167,6 +167,8 @@ fn route(filter: &dyn HttpFilter, ctx: &mut HttpFilterContext<'_>) -> bool {
         matches!(polled, Poll::Ready(Ok(FilterAction::Continue)))
     };
     let chosen = ctx.cluster.take().is_some();
+    ctx.upstream = None;
+    ctx.retry_policy = None;
     ctx.request_headers_to_remove.clear();
     ctx.request_headers_to_set.clear();
     routed && chosen
@@ -263,6 +265,109 @@ fn measure_fresh(bencher: Bencher<'_, '_>, snapshot: RouteSnapshot) {
     bencher
         .with_inputs(|| context(&request))
         .bench_local_refs(|ctx| route(filter.as_ref(), ctx));
+}
+
+/// A pick of another site's gateway over a mutual TLS dial the gateway built.
+#[divan::bench(args = [4])]
+fn dialed(bencher: Bencher<'_, '_>, sites: u32) {
+    measure_dialed(bencher, sites);
+}
+
+/// Mutual TLS dials to every site, checked to reuse their read TLS material across 1k requests.
+#[expect(clippy::expect_used, reason = "bench setup")]
+fn measure_dialed(bencher: Bencher<'_, '_>, sites: u32) {
+    let (dial, built) = mutual_tls_dial().expect("the dial builds");
+    let mut snapshot = snapshot(sites, Shape::Measured);
+    snapshot.local_site = Arc::from("local");
+    for candidate in &mut snapshot.candidates {
+        candidate.dial = Some(Arc::clone(&dial));
+    }
+    snapshot.provider_hop_clusters = Arc::new(
+        snapshot
+            .candidates
+            .iter()
+            .map(|candidate| candidate.cluster.to_string())
+            .collect(),
+    );
+    let filter = filter(snapshot).expect("the filter builds");
+    let request = Request {
+        headers: [(HeaderName::from_static("x-model"), HeaderValue::from_static("llama"))]
+            .into_iter()
+            .collect(),
+        method: Method::POST,
+        uri: Uri::from_static("/v1/chat/completions"),
+    };
+    for _ in 0..1_000 {
+        let mut ctx = context(&request);
+        let routed = {
+            let mut call = pin!(filter.on_request(&mut ctx));
+            let polled = call.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+            matches!(polled, Poll::Ready(Ok(FilterAction::Continue)))
+        };
+        assert!(routed, "routes");
+        let sent = ctx
+            .upstream
+            .as_ref()
+            .and_then(|upstream| upstream.tls.as_ref())
+            .and_then(|tls| tls.client_cert())
+            .expect("dialed with this site's identity");
+        assert!(
+            Arc::ptr_eq(sent, &built),
+            "the request reuses the TLS material read at apply"
+        );
+    }
+    bencher
+        .with_inputs(|| context(&request))
+        .bench_local_refs(|ctx| route(filter.as_ref(), ctx));
+}
+
+/// A mutual TLS dial with a fresh grid identity, built as an apply builds it, and the certificate it read.
+fn mutual_tls_dial() -> Result<(Arc<Dialed>, Arc<praxis_tls::CachedClientCert>), FilterError> {
+    let dir = std::env::temp_dir().join(format!("grid-bench-dial-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|error| -> FilterError { error.to_string().into() })?;
+    let ca = certs::generate_ca("grid-ca").map_err(|error| -> FilterError { error.to_string().into() })?;
+    let leaf = certs::generate_site_cert(&ca, "local").map_err(|error| -> FilterError { error.to_string().into() })?;
+    let write = |name: &str, pem: &str| {
+        std::fs::write(dir.join(name), pem).map_err(|error| -> FilterError { error.to_string().into() })
+    };
+    write("ca.crt", &ca.cert_pem)?;
+    write("tls.crt", &leaf.cert_pem)?;
+    write("tls.key", &leaf.key_pem)?;
+    praxis_tls::provider::install();
+    let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let tls = praxis_tls::ClusterTls {
+        ca: Some(praxis_tls::CaConfig {
+            ca_path: path("ca.crt"),
+            crl_paths: Vec::new(),
+        }),
+        client_cert: Some(praxis_tls::CertKeyPair {
+            cert_path: path("tls.crt"),
+            default: false,
+            key_path: path("tls.key"),
+            server_names: Vec::new(),
+        }),
+        sni: Some("site-2.grid.internal".to_owned()),
+        verify: true,
+    };
+    let cached = praxis_tls::CachedClusterTls::try_from_config(&tls)
+        .map_err(|error| -> FilterError { error.to_string().into() })?;
+    let read = cached
+        .client_cert()
+        .cloned()
+        .ok_or_else(|| -> FilterError { "no client certificate read".into() })?;
+    let upstream = praxis_core::connectivity::Upstream {
+        address: Arc::from("site-2.example.com:8443"),
+        authority: None,
+        base_path: None,
+        connection: Arc::default(),
+        tls: Some(cached),
+    };
+    let dial = Dialed::new(
+        "site-2",
+        upstream,
+        Arc::new(praxis_core::config::RetryPolicy::legacy_default()),
+    );
+    Ok((Arc::new(dial), read))
 }
 
 fn main() {

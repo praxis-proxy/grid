@@ -71,6 +71,10 @@ pub(crate) enum Refusal {
     SiteKeyAmbiguous,
     /// A member hop whose egress is not mutual TLS, so the peer is not verified.
     MemberHopNotMutual,
+    /// The site is a discovery stub, so its address came from gossip, not enrollment.
+    SiteNotEnrolled,
+    /// A plaintext dial to another site, which the gateway refuses.
+    PlaintextOffSite,
 }
 
 impl Refusal {
@@ -95,6 +99,8 @@ impl Refusal {
             Self::NotOffered => "not offered by the member",
             Self::SiteKeyAmbiguous => "site key is ambiguous",
             Self::MemberHopNotMutual => "member hop is not mutual TLS",
+            Self::SiteNotEnrolled => "site not enrolled",
+            Self::PlaintextOffSite => "plaintext off this site",
         }
     }
 }
@@ -135,6 +141,10 @@ pub(crate) struct Resolved {
     pub(crate) endpoint: ClusterEndpointConfig,
     /// Where it came from.
     pub(crate) origin: Origin,
+    /// The site its candidates name.
+    pub(crate) site: String,
+    /// A derived local endpoint's path and query, `None` at the root.
+    pub(crate) endpoint_path: Option<String>,
 }
 
 /// The declarations resolution reads.
@@ -272,12 +282,14 @@ fn resolve_one(
         return Ok(Resolved {
             endpoint: (*entry).clone(),
             origin: Origin::Explicit,
+            site: site.to_owned(),
+            endpoint_path: None,
         });
     }
     if site == declarations.local_site {
         // Own site egress would hairpin through our own provider gateway.
         return match local.get(cluster) {
-            Some(provider) => derive_local(cluster, provider, declarations.transport),
+            Some(provider) => derive_local(cluster, site, provider, declarations.transport),
             None => Err(local_refusal(cluster, declarations)),
         };
     }
@@ -328,6 +340,7 @@ fn local_refusal(cluster: &str, declarations: &Declarations<'_>) -> Refusal {
 /// Derive a local backend entry from the provider's own endpoint URL.
 fn derive_local(
     cluster: &str,
+    site: &str,
     provider: &InferenceProvider,
     declared: Option<&EndpointTransport>,
 ) -> Result<Resolved, Refusal> {
@@ -354,6 +367,12 @@ fn derive_local(
             transport: Some(transport),
         },
         origin: Origin::DerivedLocal,
+        site: site.to_owned(),
+        endpoint_path: uri
+            .path_and_query()
+            .map(http::uri::PathAndQuery::as_str)
+            .filter(|path| !path.is_empty() && *path != "/")
+            .map(str::to_owned),
     })
 }
 
@@ -381,6 +400,8 @@ fn derive_remote(cluster: &str, site_name: &str, declarations: &Declarations<'_>
             transport: Some(transport),
         },
         origin: Origin::DerivedRemote,
+        site: site_name.to_owned(),
+        endpoint_path: None,
     })
 }
 
@@ -397,17 +418,17 @@ fn site_key_ambiguous(site: &str, declarations: &Declarations<'_>) -> bool {
         .is_some()
 }
 
+/// The `GridSite` of this network keyed to `site`, the first when several are.
+fn keyed_site<'site>(site: &str, declarations: &Declarations<'site>) -> Option<&'site GridSite> {
+    declarations.sites.iter().find(|known| {
+        crate::controller::grid_network::peer_site_key(known).is_some_and(|(key, _)| key == site)
+            && known.spec.grid_network_ref == declarations.network_name
+    })
+}
+
 /// The site named `site` in this network, if a probe verified its current spec.
 fn probed_site<'site>(site: &str, declarations: &Declarations<'site>) -> Result<&'site GridSite, Refusal> {
-    let network_name = declarations.network_name;
-    let site = declarations
-        .sites
-        .iter()
-        .find(|known| {
-            crate::controller::grid_network::peer_site_key(known).is_some_and(|(key, _)| key == site)
-                && known.spec.grid_network_ref == network_name
-        })
-        .ok_or(Refusal::SiteUnknown)?;
+    let site = keyed_site(site, declarations).ok_or(Refusal::SiteUnknown)?;
     // Only an Active or Unreachable site's address has been probed; earlier phases carry gossip.
     let status = site.status.as_ref().ok_or(Refusal::SiteNotActive)?;
     if !status.phase.routes(declarations.signal) {
@@ -419,6 +440,51 @@ fn probed_site<'site>(site: &str, declarations: &Declarations<'site>) -> Result<
     }
     Ok(site)
 }
+
+/// Withdraw what a gateway building its own upstreams must not dial.
+///
+/// The gateway refuses a whole serving config over one such dial, so each is refused
+/// here per cluster instead.
+pub(crate) fn refuse_undialable(resolution: &mut Resolution, declarations: &Declarations<'_>) {
+    let refused: Vec<Refused> = resolution
+        .resolved
+        .iter()
+        .filter_map(|(cluster, entry)| {
+            undialable(entry, declarations).map(|reason| Refused {
+                cluster: cluster.clone(),
+                site: entry.site.clone(),
+                reason,
+            })
+        })
+        .collect();
+    for refusal in &refused {
+        resolution.resolved.remove(&refusal.cluster);
+    }
+    resolution.refused.extend(refused);
+}
+
+/// Why `entry` cannot be dialed, if it cannot.
+fn undialable(entry: &Resolved, declarations: &Declarations<'_>) -> Option<Refusal> {
+    // Checks the discovery label itself: a labelled stub missing its id annotation keys as enrolled.
+    if entry.origin == Origin::DerivedRemote
+        && !keyed_site(&entry.site, declarations).is_some_and(crate::controller::grid_site::is_declared)
+    {
+        return Some(Refusal::SiteNotEnrolled);
+    }
+    // A missing transport is the renderer's to refuse.
+    let transport = entry.endpoint.transport.as_ref()?;
+    match transport.mode {
+        TransportMode::MutualTls => match transport.sni.as_deref().map(str::trim) {
+            None | Some("") => Some(Refusal::NoServerName),
+            // Exact: the gateway compares case-sensitively.
+            Some(sni) if sni != crate::signals::gateway_server_name(&entry.site) => Some(Refusal::ServerNameNotSite),
+            Some(_) => None,
+        },
+        TransportMode::Plaintext if entry.site != declarations.local_site => Some(Refusal::PlaintextOffSite),
+        TransportMode::Plaintext | TransportMode::Tls => None,
+    }
+}
+
 
 /// Transport for a provider hop. No CA: the consumer's grid identity carries trust.
 fn hop_transport(tls: &EgressTls) -> EndpointTransport {

@@ -702,7 +702,7 @@ mod tests {
             AdmissionState::ExistingOnly
         );
         // network-b's counter was preserved (not reset), so this second distinct
-        // observation reaches failureThreshold=2 → ExistingOnly.
+        // observation reaches failureThreshold=2 -> ExistingOnly.
         assert_eq!(
             memory.evaluate(
                 "network-b/provider",

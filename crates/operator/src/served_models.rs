@@ -7,15 +7,15 @@
 //!     list InferenceProviders with spec.modelDiscovery
 //!     poll each source (bounded concurrency)
 //!     ServedModelStore::refresh
-//!       success               → replace set, renew deadline
-//!       failure               → keep set, deadline unchanged
-//!       provider UID/URL changed → drop set
-//!       provider not polled   → drop set
-//!       deadline passed       → drop set
+//!       success               -> replace set, renew deadline
+//!       failure               -> keep set, deadline unchanged
+//!       provider UID/URL changed -> drop set
+//!       provider not polled   -> drop set
+//!       deadline passed       -> drop set
 //!     patch the discovery-owned status fields
-//!       successful poll       → status.servedModels, expiry, and observed generation
-//!       expired set           → inventory, expiry, and generation absent
-//!       failure reason        → status.modelDiscoveryError
+//!       successful poll       -> status.servedModels, expiry, and observed generation
+//!       expired set           -> inventory, expiry, and generation absent
+//!       failure reason        -> status.modelDiscoveryError
 //! ```
 //!
 //! The in-memory store uses provider UID, generation, source URL, and a

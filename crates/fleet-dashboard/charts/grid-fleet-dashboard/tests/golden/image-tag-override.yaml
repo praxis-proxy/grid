@@ -6,10 +6,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.2
+    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.3
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.0-rc.2"
+    app.kubernetes.io/version: "v0.3.0-rc.3"
     app.kubernetes.io/managed-by: Helm
   annotations:
     serviceaccounts.openshift.io/oauth-redirectreference.primary: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"grid-fleet-dashboard"}}'
@@ -21,10 +21,10 @@ metadata:
   name: grid-fleet-dashboard-cookie
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.2
+    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.3
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.0-rc.2"
+    app.kubernetes.io/version: "v0.3.0-rc.3"
     app.kubernetes.io/managed-by: Helm
 type: Opaque
 data:
@@ -37,10 +37,10 @@ metadata:
   name: fleet-config
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.2
+    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.3
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.0-rc.2"
+    app.kubernetes.io/version: "v0.3.0-rc.3"
     app.kubernetes.io/managed-by: Helm
 data:
   config.yaml: |
@@ -74,10 +74,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.2
+    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.3
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.0-rc.2"
+    app.kubernetes.io/version: "v0.3.0-rc.3"
     app.kubernetes.io/managed-by: Helm
 rules:
   - apiGroups: [""]
@@ -91,10 +91,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.2
+    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.3
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.0-rc.2"
+    app.kubernetes.io/version: "v0.3.0-rc.3"
     app.kubernetes.io/managed-by: Helm
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -112,10 +112,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.2
+    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.3
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.0-rc.2"
+    app.kubernetes.io/version: "v0.3.0-rc.3"
     app.kubernetes.io/managed-by: Helm
   annotations:
     service.beta.openshift.io/serving-cert-secret-name: grid-fleet-dashboard-tls
@@ -141,10 +141,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.2
+    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.3
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.0-rc.2"
+    app.kubernetes.io/version: "v0.3.0-rc.3"
     app.kubernetes.io/managed-by: Helm
 spec:
   replicas: 1
@@ -158,7 +158,7 @@ spec:
         app.kubernetes.io/name: grid-fleet-dashboard
         app.kubernetes.io/instance: grid-fleet-dashboard
       annotations:
-        checksum/config: 6152cc3abad1f0ff528c75dd480c9aa2c3cf6d34e6ea4e33e71f1cc768f4d517
+        checksum/config: 7aeb08e1ebff0469530634081d50adf41018309d09ea05dddc7764fe6d3cd617
     spec:
       serviceAccountName: grid-fleet-dashboard
       securityContext:
@@ -275,10 +275,10 @@ metadata:
   name: grid-fleet-dashboard
   namespace: aigrid-fleet
   labels:
-    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.2
+    helm.sh/chart: grid-fleet-dashboard-0.3.0-rc.3
     app.kubernetes.io/name: grid-fleet-dashboard
     app.kubernetes.io/instance: grid-fleet-dashboard
-    app.kubernetes.io/version: "v0.3.0-rc.2"
+    app.kubernetes.io/version: "v0.3.0-rc.3"
     app.kubernetes.io/managed-by: Helm
 spec:
   to:

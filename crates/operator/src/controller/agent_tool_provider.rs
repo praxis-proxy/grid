@@ -744,19 +744,19 @@ mod tests {
     #[test]
     fn no_matching_sites_yields_pending() {
         let phase = phase_from_matching(&[]);
-        assert_eq!(phase, ProviderPhase::Pending, "empty matching → Pending");
+        assert_eq!(phase, ProviderPhase::Pending, "empty matching -> Pending");
     }
 
     #[test]
     fn one_matching_site_yields_available() {
         let phase = phase_from_matching(&["site-a".to_owned()]);
-        assert_eq!(phase, ProviderPhase::Available, "one match → Available");
+        assert_eq!(phase, ProviderPhase::Available, "one match -> Available");
     }
 
     #[test]
     fn multiple_matching_sites_yields_available() {
         let phase = phase_from_matching(&["site-a".to_owned(), "site-b".to_owned()]);
-        assert_eq!(phase, ProviderPhase::Available, "multiple matches → Available");
+        assert_eq!(phase, ProviderPhase::Available, "multiple matches -> Available");
     }
 
     #[test]
