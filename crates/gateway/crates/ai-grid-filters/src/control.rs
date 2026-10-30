@@ -28,8 +28,8 @@ use crate::{
     pin::TagKey,
     prefix::{AffinitySettings, PrefixAffinity},
     serving::{
-        AvailabilitySettings, DialConfig, DialTransport, GridServingConfig, PeerServingConfig, dial_config_path,
-        parse_dial_config, validate_peer,
+        AvailabilitySettings, DIAL_FILE, DialConfig, DialTransport, GridServingConfig, PeerServingConfig,
+        dial_config_path, mount_revision, parse_dial_config, validate_peer,
     },
     snapshot::{self, Gauged, RouteSnapshot},
 };
@@ -445,17 +445,17 @@ impl Control {
             return Ok(None);
         }
         // Validated before any poller starts, so an invalid config starts and drops nothing.
-        validate_dials(raw, dial, &self.binding.backend_ca_base)?;
+        validate_dials(raw, dial, &self.binding)?;
         report_shadowed(dial, &self.binding.lb_clusters);
         let bound = routed_view_with(raw, dial, &self.binding.backend_tls)?;
-        validate_config(bound.as_ref(), dial, &self.binding.backend_ca_base)?;
+        validate_config(bound.as_ref(), dial, &self.binding)?;
         let dials = Dials::build(
             dial,
             &self.binding.insecure,
-            &self.binding.grid_identity,
+            &self.binding.grid_identity.snapshot(),
             self.health.dials(),
         );
-        let dialable = without_unroutable(bound, &dials);
+        let dialable = without_unroutable(bound, &dials, &self.binding.lb_clusters);
         let config = dialable.as_ref();
         let topology = Arc::new(Topology::with_dials(config, &dials)?);
         let tag_key = load_tag_key(&self.tuning.affinity())?;
@@ -604,12 +604,8 @@ pub(crate) fn load_tag_key(affinity: &AffinitySettings) -> Result<Option<TagKey>
 }
 
 /// The topology of `config`, refusing what no retry can fix: a bad candidate, peer, duplicate site, or dial.
-fn validate_config(
-    config: &GridServingConfig,
-    dial: &DialConfig,
-    backend_ca_base: &Path,
-) -> Result<Topology, FilterError> {
-    validate_dials(config, dial, backend_ca_base)?;
+fn validate_config(config: &GridServingConfig, dial: &DialConfig, binding: &Binding) -> Result<Topology, FilterError> {
+    validate_dials(config, dial, binding)?;
     let topology = Topology::from_config(config)?;
     let mut sites = std::collections::HashSet::with_capacity(config.peers.len());
     for peer in &config.peers {
@@ -737,17 +733,19 @@ fn mutual_tls_dials(dial: &DialConfig) -> impl Iterator<Item = (&String, &str)> 
     })
 }
 
-/// `config` without the candidates of a dial praxis refused or whose TLS material could not be read.
+/// `config` without the candidates of a dial praxis refused or whose TLS material could not be
+/// read, unless a `load_balancer` cluster of the same name still routes them.
 fn without_unroutable<'config>(
     config: Cow<'config, GridServingConfig>,
     dials: &Dials,
+    lb_clusters: &BTreeSet<String>,
 ) -> Cow<'config, GridServingConfig> {
-    if !dials.any_unroutable() {
+    let stranded = |cluster: &String| dials.unroutable(cluster) && !lb_clusters.contains(cluster);
+    if !config.candidates.iter().any(|candidate| stranded(&candidate.cluster)) {
         return config;
     }
     let mut view = config.into_owned();
-    view.candidates
-        .retain(|candidate| !dials.unroutable(&candidate.cluster));
+    view.candidates.retain(|candidate| !stranded(&candidate.cluster));
     Cow::Owned(view)
 }
 
@@ -911,6 +909,7 @@ impl Watcher {
 /// last good pair on a bad file.
 pub(crate) fn watch(control: Arc<Mutex<Control>>, path: PathBuf, every: Duration) -> std::io::Result<Watcher> {
     let dial_path = dial_config_path(&path);
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let (stop, stopped) = mpsc::channel::<()>();
     let counts = Arc::new(WatchCounts::default());
     let tally = Arc::clone(&counts);
@@ -921,8 +920,12 @@ pub(crate) fn watch(control: Arc<Mutex<Control>>, path: PathBuf, every: Duration
             // reason a retry can fix stays pending and is applied again next tick.
             let mut settled: Option<(Vec<u8>, Option<Vec<u8>>)> = None;
             while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(every) {
-                // Two reads may straddle a ..data swap and pair two revisions, which the next tick reconciles.
-                match (std::fs::read(&path), read_dial(&dial_path)) {
+                // Both files from one revision, so a ..data swap never pairs two.
+                let revision = mount_revision(&dir);
+                let serving = path
+                    .file_name()
+                    .map_or_else(|| path.clone(), |name| revision.join(name));
+                match (std::fs::read(&serving), read_dial(&revision.join(DIAL_FILE))) {
                     (Ok(bytes), Ok(dial)) => {
                         let pair = (bytes, dial);
                         if settled.as_ref() != Some(&pair)
@@ -975,7 +978,7 @@ fn apply_file(
     let (result, settled) = match parsed {
         Ok((config, dial)) => {
             let mut control = control.lock().unwrap_or_else(PoisonError::into_inner);
-            let outcome = match validate_config(&config, &dial, &control.binding.backend_ca_base) {
+            let outcome = match validate_config(&config, &dial, &control.binding) {
                 Ok(_) => {
                     let result = control.apply_joined(&config, &dial);
                     let settled = result.is_ok();
@@ -2445,6 +2448,37 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_dial_with_a_load_balancer_cluster_of_its_name_routes_through_it() {
+        let dir = temp_dir("refused-lb");
+        write_identity(&dir, &certs::generate_ca("grid-ca").expect("ca"));
+        let (config, mut dial) = dialed_east();
+        if let Some(east) = dial.dial.get_mut("pool-east") {
+            east.address = "east.cluster.internal:8443".to_owned();
+        }
+        for (lb, routes) in [(true, true), (false, false)] {
+            let binding = Binding {
+                lb_clusters: lb.then(|| "pool-east".to_owned()).into_iter().collect(),
+                ..bound_at(&dir)
+            };
+            let mut control = Control::new_with(&config, Peers::default().starter(), binding).expect("control");
+            control
+                .apply_joined(&config, &dial)
+                .expect("a refused dial never rejects the file");
+            let snapshot = control.snapshot().load_full();
+            assert_eq!(
+                !sites(&snapshot).is_empty(),
+                routes,
+                "a load_balancer cluster {lb}: east routes {routes}"
+            );
+            assert!(
+                snapshot.candidates.iter().all(|candidate| candidate.dial.is_none()),
+                "with no dial built"
+            );
+        }
+        let _cleaned = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_dial_file_breaking_a_trust_rule_at_startup_serves_without_dials() {
         let (config, mut dial) = dialed_east();
         if let Some(east) = dial.dial.get_mut("pool-east") {
@@ -2524,7 +2558,10 @@ mod tests {
                 },
             ),
         );
-        validate_dials(&config, &dial, Path::new(BACKEND_CA_BASE)).expect("within the trust rules");
+        assert!(
+            validate_dials(&config, &dial, &Binding::default()).is_err(),
+            "a credentialed candidate is never dialed"
+        );
 
         let view = routed_view_with(&config, &dial, &BTreeMap::new()).expect("view");
         let credentialed: BTreeSet<&str> = view
@@ -2600,7 +2637,7 @@ mod tests {
             )
         };
         write("serving-config.json", serving);
-        write(crate::serving::DIAL_FILE, &dial("mutual_tls"));
+        write(DIAL_FILE, &dial("mutual_tls"));
         let (config, _) = dialed_east();
 
         let mut grid = crate::serving::start_runtime_with(
@@ -2618,7 +2655,7 @@ mod tests {
         assert!(presented(&snapshot.load(), "pool-east").is_some(), "east is dialed");
 
         write(
-            crate::serving::DIAL_FILE,
+            DIAL_FILE,
             &dial("mutual_tls").replace("east.example.com:8443", "east-2.example.com:8443"),
         );
         eventually("the moved address applied", || counts().applied() == 2);
@@ -2628,14 +2665,14 @@ mod tests {
             "a dial file change alone re-applies"
         );
 
-        write(crate::serving::DIAL_FILE, &dial("insecure"));
+        write(DIAL_FILE, &dial("insecure"));
         eventually("the bad dial file refused", || counts().rejected() == 1);
         assert!(
             presented(&snapshot.load(), "pool-east").is_some(),
             "a bad dial file keeps the last good pair"
         );
 
-        std::fs::remove_file(dir.join(crate::serving::DIAL_FILE)).expect("remove");
+        std::fs::remove_file(dir.join(DIAL_FILE)).expect("remove");
         eventually("the removal applied", || counts().applied() == 3);
         let routed = snapshot.load_full();
         assert_eq!(sites(&routed), ["east"], "east still routes");

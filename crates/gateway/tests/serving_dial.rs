@@ -254,6 +254,23 @@ mod tests {
     }
 
     #[test]
+    fn a_post_whose_first_connect_fails_is_retried_on_the_dial() {
+        let work = fresh_work("dial-retry-post");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca, "local");
+        let east = Site::dropping_first(&ca, "east");
+        let mut serving = Mount::new(work.join("serving"));
+        dial_serving(&[("east", &east)], &identity).write(&mut serving);
+
+        let gateway = Gateway::start(&work, &serving);
+        let (status, head) = gateway.post_chat();
+        assert_eq!(status, 200, "the POST is retried after the failed handshake: {head}");
+        assert_eq!(east.heads().len(), 1, "sent once, on the retried connection");
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
     fn a_client_that_leaves_after_the_site_took_its_request_never_demotes_the_site() {
         let work = fresh_work("dial-client-abort");
         let ca = generate_ca("grid-ca").expect("ca");
@@ -362,15 +379,20 @@ mod tests {
 
     impl Site {
         fn start(ca: &CaCert, site: &str) -> Self {
-            Self::start_with(ca, site, true)
+            Self::start_with(ca, site, true, false)
         }
 
         /// A site that takes each request and never answers, holding the connection open.
         fn holding(ca: &CaCert, site: &str) -> Self {
-            Self::start_with(ca, site, false)
+            Self::start_with(ca, site, false, false)
         }
 
-        fn start_with(ca: &CaCert, site: &str, answer: bool) -> Self {
+        /// A site that hangs up its first connection before the TLS handshake.
+        fn dropping_first(ca: &CaCert, site: &str) -> Self {
+            Self::start_with(ca, site, true, true)
+        }
+
+        fn start_with(ca: &CaCert, site: &str, answer: bool, drop_first: bool) -> Self {
             let identity = generate_site_cert(ca, site).expect("site cert");
             let chain = CertificateDer::pem_slice_iter(identity.cert_pem.as_bytes())
                 .collect::<Result<Vec<_>, _>>()
@@ -399,11 +421,16 @@ mod tests {
             let (recorded_heads, recorded_leaves, stopping) =
                 (Arc::clone(&heads), Arc::clone(&seen), Arc::clone(&stop));
             thread::spawn(move || {
+                let mut dropping = drop_first;
                 for stream in listener.incoming() {
                     if stopping.load(Ordering::SeqCst) {
                         return;
                     }
                     let Ok(stream) = stream else { continue };
+                    if std::mem::take(&mut dropping) {
+                        drop(stream);
+                        continue;
+                    }
                     let Ok(conn) = ServerConnection::new(Arc::clone(&config)) else {
                         continue;
                     };
@@ -552,6 +579,7 @@ mod tests {
                 .arg("--config")
                 .arg(&config)
                 .env("GRID_SERVING_CONFIG", serving.path("serving-config.json"))
+                .env("GRID_TLS_DIR", work.join("identity"))
                 .env("RUST_LOG", "info")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -581,9 +609,29 @@ mod tests {
             stream
         }
 
+        /// One chat POST with a body: its status and lowercased response head.
+        fn post_chat(&self) -> (u16, String) {
+            let mut stream = TcpStream::connect(("127.0.0.1", self.listen)).expect("connect gateway");
+            let body = r#"{"model":"llama","messages":[]}"#;
+            stream
+                .write_all(
+                    format!(
+                        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nX-Model: llama\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .expect("send request");
+            Self::response(stream)
+        }
+
         /// One chat request carrying a caller credential: its status and lowercased response head.
         fn chat(&self) -> (u16, String) {
-            let mut stream = self.send_chat();
+            Self::response(self.send_chat())
+        }
+
+        /// The status and lowercased head `stream` answers with.
+        fn response(mut stream: TcpStream) -> (u16, String) {
             let mut response = String::new();
             stream.read_to_string(&mut response).expect("read response");
             let status = response

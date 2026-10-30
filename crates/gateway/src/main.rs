@@ -246,9 +246,10 @@ fn start_grid_routing(
             tracing::warn!(%error, "grid: dial file unreadable at startup; serving without dials");
             ai_grid_filters::DialConfig::default()
         });
+    // The grid TLS mount, never the serving config: a dial presents only the identity mounted for it.
+    let tls_dir = std::env::var("GRID_TLS_DIR").unwrap_or_else(|_| ai_grid_filters::GRID_TLS_MOUNT.to_owned());
     let binding = ai_grid_filters::Binding {
-        // Fixed at startup: dials present the identity the peers already present.
-        grid_identity: ai_grid_filters::GridIdentity::of(&config),
+        grid_identity: ai_grid_filters::GridIdentity::under(&tls_dir),
         ..binding
     };
     let mut runtime = ai_grid_filters::spawn_grid_routing(&config, &dial, binding)?;

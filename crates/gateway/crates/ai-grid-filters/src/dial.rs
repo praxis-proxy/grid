@@ -6,6 +6,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
     path::{Component, Path},
     sync::Arc,
 };
@@ -18,8 +19,9 @@ use praxis_filter::FilterError;
 use praxis_tls::{CaConfig, CachedClusterTls, CertKeyPair, ClusterTls};
 
 use crate::{
+    control::Binding,
     health::{DialHealth, DialState},
-    serving::{DialConfig, DialSpec, DialTransport, GridServingConfig},
+    serving::{DialConfig, DialSpec, DialTransport, GridServingConfig, mount_revision},
 };
 
 // ---------------------------------------------------------------------------
@@ -32,8 +34,20 @@ const DIAL_CHAIN: &str = "serving-config-dial";
 /// Where the CA bundles server-only TLS dials verify against are mounted.
 pub const BACKEND_CA_BASE: &str = "/run/secrets/grid-backend-ca";
 
-/// Where the grid identity is mounted when the serving config names no peer.
+/// Where the grid identity is mounted; the chart enforces this path.
 pub const GRID_TLS_MOUNT: &str = "/etc/praxis/tls";
+
+/// How long an idle dialed connection is pooled, milliseconds.
+const IDLE_TIMEOUT_MS: u64 = 60_000;
+
+/// A dial's connect timeout when the dial file names none, milliseconds.
+const CONNECT_TIMEOUT_MS: u64 = 3_000;
+
+/// A dial's connect timeout including TLS when the dial file names none, milliseconds.
+const TOTAL_CONNECT_TIMEOUT_MS: u64 = 6_000;
+
+/// A dial's per-read timeout when the dial file names none, milliseconds: a slow first token is not a dead site.
+const READ_TIMEOUT_MS: u64 = 600_000;
 
 // ---------------------------------------------------------------------------
 // Grid Identity
@@ -76,6 +90,30 @@ impl GridIdentity {
             cert: peer.client_cert_path.clone(),
             key: peer.client_key_path.clone(),
         })
+    }
+
+    /// The same three files under the one `..data` revision their mount points at now, so a
+    /// rotation never pairs one revision's certificate with another's key.
+    pub(crate) fn snapshot(&self) -> Self {
+        let dir = Path::new(&self.ca).parent();
+        let shared = [&self.cert, &self.key]
+            .iter()
+            .all(|path| Path::new(path).parent() == dir);
+        let Some(dir) = dir.filter(|_| shared) else {
+            return self.clone();
+        };
+        let revision = mount_revision(dir);
+        let rebase = |path: &str| {
+            Path::new(path).file_name().map_or_else(
+                || path.to_owned(),
+                |name| revision.join(name).to_string_lossy().into_owned(),
+            )
+        };
+        Self {
+            ca: rebase(&self.ca),
+            cert: rebase(&self.cert),
+            key: rebase(&self.key),
+        }
     }
 
     /// The three files, for the rotation digest.
@@ -205,16 +243,13 @@ impl Dials {
     pub(crate) fn unroutable(&self, cluster: &str) -> bool {
         self.refused.contains(cluster) || self.undialable.contains(cluster)
     }
-
-    /// Whether any dial was refused or could not be read.
-    pub(crate) fn any_unroutable(&self) -> bool {
-        !self.refused.is_empty() || !self.undialable.is_empty()
-    }
 }
 
-/// Refuse a dial file that, joined with `config`, would widen trust: a dial for another site's candidate, a mutual
-/// TLS dial to a name other than its site's, a plaintext or private dial off this site, a
-/// provider hop dialed under a name other than the one it declares, or a CA outside `backend_ca_base`.
+/// Refuse a dial file that, joined with `config`, would widen trust: a dial for another site's or a
+/// credentialed candidate, a mutual TLS dial to a name other than its site's, anything but grid
+/// mutual TLS off this site, a private IP literal trusted off this site, a provider hop dialed under
+/// a name other than the one it declares, a dial without the identity of the verified `load_balancer`
+/// cluster it shadows, a CA outside the backend CA mount, or peers presenting an identity mutual TLS dials do not.
 ///
 /// # Errors
 ///
@@ -222,7 +257,7 @@ impl Dials {
 pub(crate) fn validate_dials(
     config: &GridServingConfig,
     dials: &DialConfig,
-    backend_ca_base: &Path,
+    binding: &Binding,
 ) -> Result<(), FilterError> {
     for candidate in &config.candidates {
         let Some(dial) = dials.dial.get(&candidate.cluster) else {
@@ -235,6 +270,14 @@ pub(crate) fn validate_dials(
             )
             .into());
         }
+        // Nothing on a dialed path injects a credential, so a dial would drop it silently.
+        if candidate.credential.is_some() {
+            return Err(format!(
+                "grid: dial for cluster '{}' serves candidate '{}', which carries a credential",
+                candidate.cluster, candidate.name
+            )
+            .into());
+        }
         // A mutual TLS dial carries hop context, which names the candidate by its stable id.
         if matches!(dial.transport, DialTransport::MutualTls { .. }) && candidate.stable_id.is_none() {
             return Err(format!(
@@ -243,6 +286,25 @@ pub(crate) fn validate_dials(
             )
             .into());
         }
+    }
+    let mutual = dials
+        .dial
+        .values()
+        .any(|dial| matches!(dial.transport, DialTransport::MutualTls { .. }));
+    if mutual
+        && let Some(peer) = config.peers.iter().find(|peer| {
+            [
+                peer.grid_ca_path.as_str(),
+                peer.client_cert_path.as_str(),
+                peer.client_key_path.as_str(),
+            ] != binding.grid_identity.paths()
+        })
+    {
+        return Err(format!(
+            "grid: peer '{}' presents an identity other than the grid TLS mount every mutual TLS dial presents",
+            peer.site
+        )
+        .into());
     }
     for (cluster, dial) in &dials.dial {
         crate::descriptor::validate_site(&format!("dial.{cluster}.site"), &dial.site)?;
@@ -256,18 +318,19 @@ pub(crate) fn validate_dials(
             )
             .into());
         }
-        if !local && dial.transport == DialTransport::Plaintext {
-            return Err(format!("grid: plaintext dial for cluster '{cluster}' leaves this site").into());
+        if !local && !matches!(dial.transport, DialTransport::MutualTls { .. }) {
+            return Err(format!("grid: dial for cluster '{cluster}' leaves this site without grid mutual TLS").into());
         }
-        if !local && dial.trusted_private {
-            return Err(format!("grid: dial for cluster '{cluster}' trusts a private address off this site").into());
+        // Off this site only a hostname behind a verified grid handshake: no HTTP byte leaves before it.
+        if !local && dial.trusted_private && grid_client::address_host(&dial.address).parse::<IpAddr>().is_ok() {
+            return Err(format!("grid: dial for cluster '{cluster}' trusts a private IP literal off this site").into());
         }
         if let Some(ca_path) = dial.transport.ca_path()
-            && !within(Path::new(ca_path), backend_ca_base)
+            && !within(Path::new(ca_path), &binding.backend_ca_base)
         {
             return Err(format!(
                 "grid: dial for cluster '{cluster}' reads CA '{ca_path}' outside {}",
-                backend_ca_base.display()
+                binding.backend_ca_base.display()
             )
             .into());
         }
@@ -276,6 +339,12 @@ pub(crate) fn validate_dials(
         {
             return Err(format!(
                 "grid: provider hop '{cluster}' declares '{declared}' but is not a mutual TLS dial to it"
+            )
+            .into());
+        }
+        if binding.backend_tls.contains_key(cluster) && !matches!(dial.transport, DialTransport::MutualTls { .. }) {
+            return Err(format!(
+                "grid: dial for cluster '{cluster}' is weaker than the verified mutual TLS cluster it replaces"
             )
             .into());
         }
@@ -295,17 +364,21 @@ fn within(path: &Path, base: &Path) -> bool {
 /// The praxis cluster `spec` describes, presenting `identity` over mutual TLS, verification always on.
 fn cluster(name: &str, spec: &DialSpec, identity: &GridIdentity) -> Cluster {
     let mut cluster = Cluster::with_defaults(name, vec![spec.address.clone().into()]);
-    cluster.connection_timeout_ms = spec.connect_timeout_ms;
-    cluster.total_connection_timeout_ms = spec.total_connect_timeout_ms;
-    cluster.read_timeout_ms = spec.read_timeout_ms;
+    cluster.connection_timeout_ms = spec.connect_timeout_ms.or(Some(CONNECT_TIMEOUT_MS));
+    cluster.total_connection_timeout_ms = spec.total_connect_timeout_ms.or(Some(TOTAL_CONNECT_TIMEOUT_MS));
+    cluster.read_timeout_ms = spec.read_timeout_ms.or(Some(READ_TIMEOUT_MS));
     cluster.write_timeout_ms = spec.write_timeout_ms;
+    cluster.idle_timeout_ms = Some(IDLE_TIMEOUT_MS);
+    // Unconfigured, so praxis retries the same address: the dial has no reselector.
     let legacy = RetryPolicy::legacy_default();
     cluster.retry_policy = Some(RetryPolicy {
         max_retries: spec.connect_retries.or(legacy.max_retries),
+        // Only a connect failure retries, and a failed connect sent nothing (RFC 9110 9.2.2).
+        allow_non_idempotent: Some(true),
         ..legacy
     });
     if spec.trusted_private {
-        cluster.trusted_private_endpoints = vec![host(&spec.address).to_owned()];
+        cluster.trusted_private_endpoints = vec![grid_client::address_host(&spec.address).to_owned()];
     }
     cluster.tls = tls(&spec.transport, identity);
     cluster
@@ -337,11 +410,6 @@ fn tls(transport: &DialTransport, identity: &GridIdentity) -> Option<ClusterTls>
         }),
         DialTransport::Plaintext => None,
     }
-}
-
-/// The host part of a `host:port` address, unbracketed names kept as written.
-fn host(address: &str) -> &str {
-    address.rsplit_once(':').map_or(address, |(host, _)| host)
 }
 
 /// Run praxis' inline-cluster validator over `cluster`, as a synthetic `load_balancer`.
@@ -407,10 +475,8 @@ mod tests {
             ("local-plain", spec("local", DialTransport::Plaintext, true)),
             ("local-tls", backend),
             ("east", spec("east", mutual_tls("east"), false)),
-            ("api", spec("east", tls("api.example.com"), false)),
         ]);
-        validate_dials(&config.serving, &config.dial, Path::new(BACKEND_CA_BASE))
-            .expect("a dial file within every rule");
+        validate_dials(&config.serving, &config.dial, &Binding::default()).expect("a dial file within every rule");
     }
 
     #[test]
@@ -433,9 +499,78 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_never_leaves_this_site() {
-        let config = config(&[("east", spec("east", DialTransport::Plaintext, false))]);
-        assert!(refused(&config).contains("plaintext dial"), "plaintext is local only");
+    fn only_grid_mutual_tls_leaves_this_site() {
+        for transport in [DialTransport::Plaintext, tls("east.grid.internal")] {
+            let config = config(&[("east", spec("east", transport.clone(), false))]);
+            assert!(
+                refused(&config).contains("leaves this site without grid mutual TLS"),
+                "{transport:?} is local only"
+            );
+        }
+    }
+
+    #[test]
+    fn a_credentialed_candidate_is_never_dialed() {
+        let mut config = config(&[("local-plain", spec("local", DialTransport::Plaintext, true))]);
+        config.serving.candidates[0].credential = Some(crate::metadata::CandidateCredential {
+            strategy: "bearer_token".to_owned(),
+            secret_ref: crate::metadata::CredentialRef {
+                key: "token".to_owned(),
+                name: "grid-model-client".to_owned(),
+                namespace: "models".to_owned(),
+            },
+        });
+        assert!(
+            refused(&config).contains("carries a credential"),
+            "nothing on a dial injects it"
+        );
+    }
+
+    #[test]
+    fn a_dial_never_weakens_the_verified_cluster_it_replaces() {
+        let binding = Binding {
+            backend_tls: BTreeMap::from([("east".to_owned(), "east.grid.internal".to_owned())]),
+            ..Binding::default()
+        };
+        let mut local = spec("local", tls("east.models.svc"), true);
+        local.site = "local".to_owned();
+        for (transport, allowed) in [
+            (mutual_tls("local"), true),
+            (tls("east.models.svc"), false),
+            (DialTransport::Plaintext, false),
+        ] {
+            let mut config = config(&[("east", spec("local", transport.clone(), true))]);
+            config.serving.candidates[0].stable_id = Some("candidate-east".to_owned());
+            assert_eq!(
+                validate_dials(&config.serving, &config.dial, &binding).is_ok(),
+                allowed,
+                "{transport:?} over a verified mutual TLS cluster"
+            );
+        }
+    }
+
+    #[test]
+    fn peers_must_present_the_identity_every_mutual_tls_dial_presents() {
+        let mounted = GridIdentity::default();
+        let peer = |ca: &str| -> crate::serving::PeerServingConfig {
+            serde_yaml::from_str(&format!(
+                "{{site: east, addr: 'east.example.com:9443', server_name: east.grid.internal, authority: east.grid.internal, grid_ca_path: {ca}, client_cert_path: {}, client_key_path: {}}}",
+                mounted.cert, mounted.key
+            ))
+            .expect("a peer")
+        };
+        let mut config = config(&[("east", spec("east", mutual_tls("east"), false))]);
+        config.serving.peers = vec![peer(&mounted.ca)];
+        validate_dials(&config.serving, &config.dial, &Binding::default()).expect("the mounted identity");
+        config.serving.peers = vec![peer("/etc/other/ca.crt")];
+        assert!(
+            refused(&config).contains("presents an identity other than the grid TLS mount"),
+            "a peer with another identity"
+        );
+        let mut plain = self::config(&[("local-plain", spec("local", DialTransport::Plaintext, true))]);
+        plain.serving.peers = vec![peer("/etc/other/ca.crt")];
+        validate_dials(&plain.serving, &plain.dial, &Binding::default())
+            .expect("no mutual TLS dial presents the mount");
     }
 
     #[test]
@@ -448,9 +583,9 @@ mod tests {
             };
             config(&[("local-tls", dial)])
         };
-        let base = Path::new(BACKEND_CA_BASE);
+        let binding = Binding::default();
         let inside = with_ca(&format!("{BACKEND_CA_BASE}/models-ca/ca.crt"));
-        validate_dials(&inside.serving, &inside.dial, base).expect("a mounted backend CA");
+        validate_dials(&inside.serving, &inside.dial, &binding).expect("a mounted backend CA");
         for outside in [
             "/etc/praxis/tls/ca.crt",
             "/run/secrets/grid-backend-ca-other/ca.crt",
@@ -460,7 +595,7 @@ mod tests {
         ] {
             let config = with_ca(outside);
             assert!(
-                validate_dials(&config.serving, &config.dial, base)
+                validate_dials(&config.serving, &config.dial, &binding)
                     .expect_err(outside)
                     .to_string()
                     .contains("outside /run/secrets/grid-backend-ca"),
@@ -470,12 +605,45 @@ mod tests {
     }
 
     #[test]
-    fn a_private_address_is_trusted_only_on_this_site() {
-        let config = config(&[("east", spec("east", mutual_tls("east"), true))]);
-        assert!(
-            refused(&config).contains("trusts a private address"),
-            "trusted_private is local only"
-        );
+    fn an_off_site_private_address_is_trusted_only_for_a_hostname_behind_mutual_tls() {
+        for address in [
+            "site-b.ec2.internal:8443",
+            "internal-grid-nlb-0123.elb.us-east-1.amazonaws.com:8443",
+        ] {
+            let mut peer = spec("east", mutual_tls("east"), true);
+            peer.address = address.to_owned();
+            let config = config(&[("east", peer)]);
+            validate_dials(&config.serving, &config.dial, &Binding::default()).expect(address);
+            let dir = pem_dir("private-peer");
+            let dials = Dials::build(
+                &config.dial,
+                &InsecureOptions::default(),
+                &dir.identity(),
+                &DialHealth::default(),
+            );
+            let host = grid_client::address_host(address);
+            assert_eq!(
+                dials
+                    .get("east")
+                    .expect(address)
+                    .upstream()
+                    .connection
+                    .trusted_private_endpoints
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .collect::<Vec<&str>>(),
+                [host],
+                "praxis builds {address}, trusting only its host"
+            );
+        }
+        for literal in ["10.0.0.9:8443", "[fd00::9]:8443"] {
+            let mut peer = spec("east", mutual_tls("east"), true);
+            peer.address = literal.to_owned();
+            assert!(
+                refused(&config(&[("east", peer)])).contains("trusts a private IP literal"),
+                "{literal} is never trusted off this site"
+            );
+        }
     }
 
     #[test]
@@ -490,7 +658,7 @@ mod tests {
             "a hop dialed under another name"
         );
 
-        let mut server_only = self::config(&[("east", spec("east", tls("east.grid.internal"), false))]);
+        let mut server_only = self::config(&[("east", spec("local", tls("east.grid.internal"), false))]);
         server_only
             .serving
             .provider_hop_sni
@@ -554,7 +722,7 @@ mod tests {
             ("west", spec("west", mutual_tls("west"), false)),
             ("local-plain", spec("local", DialTransport::Plaintext, true)),
         ]);
-        validate_dials(&config.serving, &config.dial, Path::new(BACKEND_CA_BASE)).expect("no trust rule is broken");
+        validate_dials(&config.serving, &config.dial, &Binding::default()).expect("no trust rule is broken");
         let dials = Dials::build(
             &config.dial,
             &InsecureOptions::default(),
@@ -623,12 +791,53 @@ mod tests {
             connection.trusted_private_endpoints.is_empty(),
             "an off-site dial trusts no private address"
         );
-        assert_eq!(built.retry().effective_max_retries(), 1, "connect retries as written");
         assert_eq!(
-            built.retry().retriable_conditions,
+            connection.idle_timeout,
+            Some(std::time::Duration::from_millis(IDLE_TIMEOUT_MS)),
+            "an idle pooled connection is closed"
+        );
+        let retry = built.retry();
+        assert_eq!(retry.effective_max_retries(), 1, "connect retries as written");
+        assert_eq!(
+            retry.retriable_conditions,
             vec![praxis_core::config::RetriableCondition::ConnectFailure],
             "only a connect failure is retried"
         );
+        assert!(retry.allow_non_idempotent(), "a POST that never connected is retried");
+        assert!(
+            !retry.configured,
+            "configured would clear the one address for a reselector the dial lacks"
+        );
+    }
+
+    #[test]
+    fn a_dial_naming_no_timeouts_gets_bounded_connects_and_long_reads() {
+        let dials = build(
+            &config(&[("local-plain", spec("local", DialTransport::Plaintext, true))]).dial,
+            &InsecureOptions::default(),
+        );
+        let connection = &dials.get("local-plain").expect("built").upstream().connection;
+        let ms = |ms: u64| Some(std::time::Duration::from_millis(ms));
+        assert_eq!(connection.connection_timeout, ms(CONNECT_TIMEOUT_MS));
+        assert_eq!(connection.total_connection_timeout, ms(TOTAL_CONNECT_TIMEOUT_MS));
+        assert_eq!(connection.read_timeout, ms(READ_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn an_identity_is_read_from_the_one_revision_its_mount_points_at() {
+        let dir = std::env::temp_dir().join(format!("grid-dial-revision-{}", std::process::id()));
+        let _cleared = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("..2026_10_29")).expect("test io");
+        let identity = GridIdentity::under(&dir.to_string_lossy());
+        assert_eq!(identity.snapshot(), identity, "a plain directory is read as it is");
+        std::os::unix::fs::symlink("..2026_10_29", dir.join("..data")).expect("test io");
+        let revision = std::fs::canonicalize(dir.join("..2026_10_29")).expect("test io");
+        assert_eq!(
+            identity.snapshot(),
+            GridIdentity::under(&revision.to_string_lossy()),
+            "all three under the revision ..data names"
+        );
+        let _cleaned = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -728,7 +937,7 @@ mod tests {
 
     /// The message `validate_dials` refuses `config` with.
     fn refused(config: &Joined) -> String {
-        validate_dials(&config.serving, &config.dial, Path::new(BACKEND_CA_BASE))
+        validate_dials(&config.serving, &config.dial, &Binding::default())
             .expect_err("refused")
             .to_string()
     }

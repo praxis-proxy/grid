@@ -418,6 +418,13 @@ pub fn dial_config_path(serving: &Path) -> PathBuf {
     serving.with_file_name(DIAL_FILE)
 }
 
+/// The revision a kubelet volume at `dir` points `..data` at now, else `dir` itself.
+///
+/// Reading every file under the one revision keeps a swap from pairing two revisions.
+pub(crate) fn mount_revision(dir: &Path) -> PathBuf {
+    fs::canonicalize(dir.join("..data")).unwrap_or_else(|_| dir.to_path_buf())
+}
+
 /// Read and parse the dial file at `path`; a missing file names no dial.
 ///
 /// # Errors
