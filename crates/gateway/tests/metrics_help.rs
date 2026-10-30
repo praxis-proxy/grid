@@ -7,8 +7,7 @@
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     /// Names `describe_metrics` documents, which a scrape must explain.
-    const DOCUMENTED: [&str; 26] = [
-    const DOCUMENTED: [&str; 33] = [
+    const DOCUMENTED: [&str; 34] = [
         "grid_route_decisions_total",
         "grid_route_selections_total",
         "grid_route_prefix_affinity_total",

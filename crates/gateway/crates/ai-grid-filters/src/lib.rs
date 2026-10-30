@@ -92,8 +92,7 @@ const COUNTER_HELP: [(&str, &str); 11] = [
 ];
 
 /// Grid gauges the gateway emits.
-const GAUGE_HELP: [(&str, &str); 19] = [
-const GAUGE_HELP: [(&str, &str); 22] = [
+const GAUGE_HELP: [(&str, &str); 23] = [
     (
         "grid_serving_unbound_provider_hops",
         "Provider hops the applied serving config declares that no startup-verified backend binds. Their candidates take no traffic until a serving config names the SNI that backend verified at startup, or, for a backend not verified at startup, until the gateway restarts.",
