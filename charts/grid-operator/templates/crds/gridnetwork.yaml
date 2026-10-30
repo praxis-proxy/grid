@@ -266,10 +266,12 @@ spec:
                                       nullable: true
                                       properties:
                                         key:
-                                          description: 'Optional key containing the CA bundle. Defaults to `ca.crt`. A file name: no `/`, `.` or `..`.'
+                                          description: |-
+                                            Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                            or `..`, and not starting with `..`.
                                           minLength: 1
                                           nullable: true
-                                          pattern: ^\.?[-_A-Za-z0-9]+(\.[-_A-Za-z0-9]+)*$
+                                          pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                           type: string
                                         name:
                                           description: Secret name in the target gateway namespace.
@@ -363,10 +365,12 @@ spec:
                                     nullable: true
                                     properties:
                                       key:
-                                        description: 'Optional key containing the CA bundle. Defaults to `ca.crt`. A file name: no `/`, `.` or `..`.'
+                                        description: |-
+                                          Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                          or `..`, and not starting with `..`.
                                         minLength: 1
                                         nullable: true
-                                        pattern: ^\.?[-_A-Za-z0-9]+(\.[-_A-Za-z0-9]+)*$
+                                        pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                         type: string
                                       name:
                                         description: Secret name in the target gateway namespace.
@@ -663,10 +667,12 @@ spec:
                                       nullable: true
                                       properties:
                                         key:
-                                          description: 'Optional key containing the CA bundle. Defaults to `ca.crt`. A file name: no `/`, `.` or `..`.'
+                                          description: |-
+                                            Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                            or `..`, and not starting with `..`.
                                           minLength: 1
                                           nullable: true
-                                          pattern: ^\.?[-_A-Za-z0-9]+(\.[-_A-Za-z0-9]+)*$
+                                          pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                           type: string
                                         name:
                                           description: Secret name in the target gateway namespace.
@@ -765,10 +771,12 @@ spec:
                                     nullable: true
                                     properties:
                                       key:
-                                        description: 'Optional key containing the CA bundle. Defaults to `ca.crt`. A file name: no `/`, `.` or `..`.'
+                                        description: |-
+                                          Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                          or `..`, and not starting with `..`.
                                         minLength: 1
                                         nullable: true
-                                        pattern: ^\.?[-_A-Za-z0-9]+(\.[-_A-Za-z0-9]+)*$
+                                        pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                         type: string
                                       name:
                                         description: Secret name in the target gateway namespace.
@@ -1001,10 +1009,12 @@ spec:
                                   nullable: true
                                   properties:
                                     key:
-                                      description: 'Optional key containing the CA bundle. Defaults to `ca.crt`. A file name: no `/`, `.` or `..`.'
+                                      description: |-
+                                        Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                        or `..`, and not starting with `..`.
                                       minLength: 1
                                       nullable: true
-                                      pattern: ^\.?[-_A-Za-z0-9]+(\.[-_A-Za-z0-9]+)*$
+                                      pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                       type: string
                                     name:
                                       description: Secret name in the target gateway namespace.
@@ -1146,10 +1156,12 @@ spec:
                                       nullable: true
                                       properties:
                                         key:
-                                          description: 'Optional key containing the CA bundle. Defaults to `ca.crt`. A file name: no `/`, `.` or `..`.'
+                                          description: |-
+                                            Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                            or `..`, and not starting with `..`.
                                           minLength: 1
                                           nullable: true
-                                          pattern: ^\.?[-_A-Za-z0-9]+(\.[-_A-Za-z0-9]+)*$
+                                          pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                           type: string
                                         name:
                                           description: Secret name in the target gateway namespace.
@@ -1243,10 +1255,12 @@ spec:
                                     nullable: true
                                     properties:
                                       key:
-                                        description: 'Optional key containing the CA bundle. Defaults to `ca.crt`. A file name: no `/`, `.` or `..`.'
+                                        description: |-
+                                          Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                          or `..`, and not starting with `..`.
                                         minLength: 1
                                         nullable: true
-                                        pattern: ^\.?[-_A-Za-z0-9]+(\.[-_A-Za-z0-9]+)*$
+                                        pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                         type: string
                                       name:
                                         description: Secret name in the target gateway namespace.
@@ -1543,10 +1557,12 @@ spec:
                                       nullable: true
                                       properties:
                                         key:
-                                          description: 'Optional key containing the CA bundle. Defaults to `ca.crt`. A file name: no `/`, `.` or `..`.'
+                                          description: |-
+                                            Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                            or `..`, and not starting with `..`.
                                           minLength: 1
                                           nullable: true
-                                          pattern: ^\.?[-_A-Za-z0-9]+(\.[-_A-Za-z0-9]+)*$
+                                          pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                           type: string
                                         name:
                                           description: Secret name in the target gateway namespace.
@@ -1640,10 +1656,12 @@ spec:
                                     nullable: true
                                     properties:
                                       key:
-                                        description: 'Optional key containing the CA bundle. Defaults to `ca.crt`. A file name: no `/`, `.` or `..`.'
+                                        description: |-
+                                          Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                          or `..`, and not starting with `..`.
                                         minLength: 1
                                         nullable: true
-                                        pattern: ^\.?[-_A-Za-z0-9]+(\.[-_A-Za-z0-9]+)*$
+                                        pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                         type: string
                                       name:
                                         description: Secret name in the target gateway namespace.
@@ -1865,10 +1883,12 @@ spec:
                                   nullable: true
                                   properties:
                                     key:
-                                      description: 'Optional key containing the CA bundle. Defaults to `ca.crt`. A file name: no `/`, `.` or `..`.'
+                                      description: |-
+                                        Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                        or `..`, and not starting with `..`.
                                       minLength: 1
                                       nullable: true
-                                      pattern: ^\.?[-_A-Za-z0-9]+(\.[-_A-Za-z0-9]+)*$
+                                      pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                       type: string
                                     name:
                                       description: Secret name in the target gateway namespace.

@@ -1307,8 +1307,9 @@ pub struct EndpointCaSecretRef {
     #[schemars(length(min = 1))]
     pub name: String,
 
-    /// Optional key containing the CA bundle. Defaults to `ca.crt`. A file name: no `/`, `.` or `..`.
-    #[schemars(length(min = 1), regex(pattern = r"^\.?[-_A-Za-z0-9]+(\.[-_A-Za-z0-9]+)*$"))]
+    /// Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+    /// or `..`, and not starting with `..`.
+    #[schemars(length(min = 1), regex(pattern = r"^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$"))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
 }
@@ -1823,8 +1824,9 @@ mod tests {
                 .as_value()
                 .pointer("/properties/key/pattern")
                 .and_then(serde_json::Value::as_str),
-            Some(r"^\.?[-_A-Za-z0-9]+(\.[-_A-Za-z0-9]+)*$"),
-            "no '/', '.' or '..' reaches the gateway's backend CA mount"
+            Some(r"^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$"),
+            "what Kubernetes accepts as a Secret key: `root..crt` and `.hidden` pass, `/`, `.`, `..` \
+             and a `..` prefix do not"
         );
     }
 
