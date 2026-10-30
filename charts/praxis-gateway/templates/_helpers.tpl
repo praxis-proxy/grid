@@ -830,3 +830,10 @@ chart's own {fullname}-config for render and inline.
 {{- printf "%s-config" (include "praxis-gateway.fullname" .) -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+"true" when more than one replica runs.
+*/}}
+{{- define "praxis-gateway.ha" -}}
+{{- if gt (int .Values.replicaCount) 1 }}true{{ end }}
+{{- end }}

@@ -241,7 +241,7 @@ Praxis AI image; these values may advance independently.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `replicaCount` | int | `1` | Gateway replicas. |
+| `replicaCount` | int | `1` | Gateway replicas. Above 1 the Deployment rolls with one surge pod and none unavailable, spreads across nodes, and gets a PodDisruptionBudget. At 1 the render is unchanged. |
 | `image.repository` | string | `ghcr.io/praxis-proxy/ai` | Image repository. |
 | `image.tag` | string | `0.7.0` | Image tag (ignored when `image.digest` is set). |
 | `image.digest` | string | `""` | Immutable digest (sha256:...). When set, tag is ignored. |
@@ -354,7 +354,7 @@ Praxis AI image; these values may advance independently.
 | `nodeSelector` | object | `{}` | Node selector. |
 | `affinity` | object | `{}` | Pod affinity rules. |
 | `tolerations` | list | `[]` | Pod tolerations. |
-| `topologySpreadConstraints` | list | `[]` | Topology spread constraints. |
+| `topologySpreadConstraints` | list | `[]` | Topology spread constraints. Listing any replaces the default spread above one replica. |
 | `priorityClassName` | string | `""` | Pod priority class. |
 
 ## Metrics
@@ -400,6 +400,25 @@ directory read-only.
 
 These sections describe settings that matter only for particular setups.
 
+### More than one replica
+
+Set `replicaCount` above 1 and the chart renders what a safe rollout, node drain
+and pod loss need, with no other setting:
+
+- A RollingUpdate strategy with `maxSurge` 1 and `maxUnavailable` 0, so a new
+  pod is ready before an old one drains.
+- A topology spread across `kubernetes.io/hostname` that the scheduler prefers
+  but does not require, so a lone node still schedules every pod. List your
+  own `topologySpreadConstraints` to replace it.
+- A PodDisruptionBudget with `minAvailable` 1, so a node drain always leaves
+  one pod serving.
+
+The Service keeps its type and address, which peers depend on. The preStop
+delay and `terminationGracePeriodSeconds` are the same at any replica count:
+each pod keeps serving for `shutdownDelaySeconds` while the endpoints drop it,
+then Praxis drains in-flight requests. At `replicaCount` 1 the render is
+unchanged.
+
 ### Edge gateway
 
 An edge gateway is the entry point for clients outside the cluster. A typical
@@ -408,13 +427,6 @@ terminates TLS in Praxis:
 
 ```yaml
 replicaCount: 2
-topologySpreadConstraints:
-  - maxSkew: 1
-    topologyKey: kubernetes.io/hostname
-    whenUnsatisfiable: ScheduleAnyway
-    labelSelector:
-      matchLabels:
-        app.kubernetes.io/name: praxis-gateway
 service:
   type: LoadBalancer
 listenerTls:
