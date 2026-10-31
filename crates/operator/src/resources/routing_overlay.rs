@@ -5996,6 +5996,230 @@ mod tests {
     }
 
     #[test]
+    fn maximum_signed_inventory_crosses_swim_and_derives_every_remote_candidate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider = make_crdt_provider(
+            "remote-site",
+            "vcr",
+            crdt::ProviderPhase::Available,
+            &["configured-fallback-model"],
+        );
+        let (complete, empty) = deliver_maximum_inventory_lifecycle(&provider)?;
+        let candidates = remote_crdt_provider_to_candidates(&provider, std::slice::from_ref(&complete), "grid-a");
+        let candidate_names = candidates
+            .iter()
+            .map(|candidate| candidate.name.clone())
+            .collect::<BTreeSet<_>>();
+        let expected_names = complete.models.iter().cloned().collect::<BTreeSet<_>>();
+        let deadline = format_inventory_expiry(complete.expires_at_ms);
+
+        assert_eq!(
+            candidate_names, expected_names,
+            "every verified model must become a remote routing candidate"
+        );
+        assert_eq!(
+            candidates.len(),
+            swim::MAX_INVENTORY_MODELS,
+            "the complete supported inventory must route"
+        );
+        assert!(
+            candidates.iter().all(|candidate| {
+                candidate.site == "remote-site" && candidate.cluster == "vcr" && candidate.expires_at == deadline
+            }),
+            "every candidate must retain the provider hop and signed expiry"
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.name != "configured-fallback-model"),
+            "dynamic inventory must not fall back to configured model names"
+        );
+        assert!(
+            remote_crdt_provider_to_candidates(&provider, std::slice::from_ref(&empty), "grid-a").is_empty(),
+            "a newer empty signed inventory must remove every candidate"
+        );
+        Ok(())
+    }
+
+    fn deliver_maximum_inventory_lifecycle(
+        provider: &crdt::ProviderState,
+    ) -> Result<(swim::ModelInventory, swim::ModelInventory), Box<dyn std::error::Error>> {
+        use std::net::SocketAddr;
+
+        let id_a = swim::NodeId::new("remote-site".to_owned(), SocketAddr::from(([127, 0, 0, 1], 20_021)));
+        let id_b = swim::NodeId::new("hub-site".to_owned(), SocketAddr::from(([127, 0, 0, 1], 20_022)));
+        let mut source = swim::SwimNode::new(id_a.clone());
+        let mut receiver = swim::SwimNode::new(id_b.clone());
+        exchange_membership(&mut source, &mut receiver, &id_a, &id_b);
+
+        let key = rcgen::KeyPair::generate()?.serialize_der();
+        let public_key = swim::signing::public_key_ecdsa_p256(&key)?;
+        source.pin_origin_for_grid("grid-a", "remote-site".to_owned(), vec![public_key.clone()])?;
+        receiver.pin_origin_for_grid("grid-a", "remote-site".to_owned(), vec![public_key])?;
+        let now_ms = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)?;
+        let mut snapshot = crdt::GridStateSnapshot::new("remote-site".to_owned());
+        snapshot.upsert_provider(provider.clone());
+        let mut state = swim::StateBroadcast::new("remote-site".to_owned(), 1, snapshot, None)
+            .with_grid_id(Some("grid-a".to_owned()))
+            .with_provider_uids(vec![swim::ProviderUid {
+                identity: swim::ProviderIdentity {
+                    network: provider.network_id.clone(),
+                    site: provider.site_id.clone(),
+                    provider: provider.provider_id.clone(),
+                },
+                uid: "uid-a".to_owned(),
+            }])
+            .with_authoritative_provider_state();
+        state.signed_at_ms = Some(now_ms);
+        state.signature = Some(swim::signing::sign_ecdsa_p256(&key, &state.signable_bytes()?)?);
+        source.publish_state_broadcast(&state)?;
+        let state_output = source.broadcast();
+        exchange_broadcasts(&mut source, &mut receiver, state_output, &id_a, &id_b);
+        assert!(
+            receiver.model_inventories().is_empty(),
+            "provider UID metadata arrives before inventory assembly"
+        );
+
+        let complete = swim::ModelInventory {
+            origin_site: "remote-site".to_owned(),
+            grid_id: "grid-a".to_owned(),
+            network_id: provider.network_id.clone(),
+            provider_id: provider.provider_id.clone(),
+            provider_uid: "uid-a".to_owned(),
+            revision: now_ms,
+            expires_at_ms: now_ms.saturating_add(120_000),
+            models: (0..swim::MAX_INVENTORY_MODELS)
+                .map(|index| format!("model-{index:03}-{}", "x".repeat(246)))
+                .collect(),
+        };
+        let mut delayed_packet = None;
+        for frame in complete.frames()? {
+            let signed = frame.sign("remote-site", "grid-a", &key, now_ms)?;
+            source.publish_model_inventory_broadcast(&swim::ModelInventoryBroadcast::new(
+                "remote-site".to_owned(),
+                "grid-a".to_owned(),
+                signed,
+            ))?;
+        }
+        let first_round = source.broadcast();
+        for message in &first_round.messages {
+            if message.addr == id_b.socket_addr() {
+                delayed_packet = Some(message.data.clone());
+            }
+        }
+        exchange_broadcasts(&mut source, &mut receiver, first_round, &id_a, &id_b);
+        assert!(
+            receiver.model_inventories().is_empty(),
+            "incomplete 256-frame inventories remain invisible"
+        );
+        let delayed_packet = delayed_packet.ok_or("the queued maximum inventory emitted no SWIM packet")?;
+        drop(receiver.handle_data(&delayed_packet));
+        assert!(
+            receiver.model_inventories().is_empty(),
+            "a duplicate frame cannot publish an incomplete inventory"
+        );
+        for _ in 0..512 {
+            if receiver
+                .model_inventories()
+                .iter()
+                .any(|inventory| inventory.revision == complete.revision)
+            {
+                break;
+            }
+            let output = source.broadcast();
+            exchange_broadcasts(&mut source, &mut receiver, output, &id_a, &id_b);
+        }
+        let assembled_inventory = receiver
+            .model_inventories()
+            .into_iter()
+            .find(|inventory| inventory.revision == complete.revision)
+            .ok_or("the bounded SWIM drive did not complete the inventory")?;
+        let received_names = assembled_inventory.models.iter().cloned().collect::<BTreeSet<_>>();
+        let missing_indexes = complete
+            .models
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| !received_names.contains(*name))
+            .map(|(index, _)| index.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            assembled_inventory, complete,
+            "the assembled inventory must preserve UID, revision, expiry, and all names; missing frame indexes: {missing_indexes:?}"
+        );
+
+        let empty = swim::ModelInventory {
+            revision: complete.revision.saturating_add(1),
+            expires_at_ms: complete.expires_at_ms.saturating_add(120_000),
+            models: Vec::new(),
+            ..complete
+        };
+        let empty_frame = empty
+            .frames()?
+            .pop()
+            .ok_or("empty inventories must emit an authoritative frame")?
+            .sign("remote-site", "grid-a", &key, now_ms)?;
+        source.publish_model_inventory_broadcast(&swim::ModelInventoryBroadcast::new(
+            "remote-site".to_owned(),
+            "grid-a".to_owned(),
+            empty_frame,
+        ))?;
+        for _ in 0..64 {
+            let output = source.broadcast();
+            exchange_broadcasts(&mut source, &mut receiver, output, &id_a, &id_b);
+            if receiver
+                .model_inventories()
+                .iter()
+                .any(|inventory| inventory.revision == empty.revision && inventory.models.is_empty())
+            {
+                break;
+            }
+        }
+        drop(receiver.handle_data(&delayed_packet));
+        let received_empty = receiver
+            .model_inventories()
+            .into_iter()
+            .find(|inventory| inventory.revision == empty.revision)
+            .ok_or("the newer empty inventory did not arrive")?;
+        assert_eq!(
+            received_empty, empty,
+            "a delayed duplicate cannot restore withdrawn names"
+        );
+        Ok((assembled_inventory, received_empty))
+    }
+
+    fn exchange_membership(
+        source: &mut swim::SwimNode,
+        receiver: &mut swim::SwimNode,
+        source_id: &swim::NodeId,
+        receiver_id: &swim::NodeId,
+    ) {
+        let first_announce = source.announce(receiver_id.clone());
+        exchange_broadcasts(source, receiver, first_announce, source_id, receiver_id);
+        let second_announce = receiver.announce(source_id.clone());
+        exchange_broadcasts(receiver, source, second_announce, receiver_id, source_id);
+        let gossip = source.gossip();
+        exchange_broadcasts(source, receiver, gossip, source_id, receiver_id);
+    }
+
+    fn exchange_broadcasts(
+        source: &mut swim::SwimNode,
+        receiver: &mut swim::SwimNode,
+        output: swim::AccumulatedOutput,
+        source_id: &swim::NodeId,
+        receiver_id: &swim::NodeId,
+    ) {
+        for message in output.messages {
+            if message.addr == receiver_id.socket_addr() {
+                for reply in receiver.handle_data(&message.data).messages {
+                    if reply.addr == source_id.socket_addr() {
+                        drop(source.handle_data(&reply.data));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn expired_remote_dynamic_inventory_produces_no_candidates() {
         let provider = make_crdt_provider(
             "remote-site",
@@ -6260,6 +6484,103 @@ mod tests {
         );
         assert_eq!(c.name, "model-remote", "name must match CRDT model");
         assert!(c.fresh, "Available CRDT provider must be fresh");
+    }
+
+    #[test]
+    fn discovered_remote_route_requires_gateway_expiry_contract() {
+        let network = test_network("net");
+        let remote = make_crdt_provider(
+            "remote-site",
+            "remote-cluster",
+            crdt::ProviderPhase::Available,
+            &["configured-fallback-model"],
+        );
+        let expires_at_ms = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp())
+            .unwrap_or_else(|_| std::process::abort())
+            .saturating_add(60)
+            .saturating_mul(1_000);
+        let inventory = swim::ModelInventory {
+            origin_site: "remote-site".to_owned(),
+            grid_id: "grid-a".to_owned(),
+            network_id: "net".to_owned(),
+            provider_id: "prov-1".to_owned(),
+            provider_uid: "provider-uid".to_owned(),
+            revision: 2,
+            expires_at_ms,
+            models: vec!["discovered-model".to_owned()],
+        };
+
+        let overlay = render_routing_overlay_with_admission(
+            &network,
+            &[],
+            &[],
+            &[],
+            std::slice::from_ref(&remote),
+            std::slice::from_ref(&inventory),
+            "grid-a",
+            "local-site",
+            None,
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+            None,
+            &ServedModelStore::new(),
+            CandidateExpirySupport::Supported,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(overlay.candidates.len(), 1);
+        let candidate = overlay.candidates.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(candidate.name, "discovered-model");
+        assert_eq!(candidate.site, "remote-site");
+        assert_eq!(candidate.cluster, "remote-cluster");
+        assert!(candidate.expires_at.is_some());
+
+        let unsupported_overlay = render_routing_overlay_with_admission(
+            &network,
+            &[],
+            &[],
+            &[],
+            &[remote],
+            &[inventory],
+            "grid-a",
+            "local-site",
+            None,
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+            None,
+            &ServedModelStore::new(),
+            CandidateExpirySupport::Unsupported,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            unsupported_overlay.candidates.is_empty(),
+            "discovered route must be withheld when the gateway does not enforce expiry"
+        );
+
+        let mut unsupported = overlay.clone();
+        filter_for_gateway_candidate_expiry(
+            &mut unsupported.candidates,
+            &mut unsupported.excluded,
+            CandidateExpirySupport::Unsupported,
+        );
+        assert!(
+            unsupported.candidates.is_empty(),
+            "discovered route must be withheld when the gateway does not enforce expiry"
+        );
+
+        let mut supported = overlay;
+        filter_for_gateway_candidate_expiry(
+            &mut supported.candidates,
+            &mut supported.excluded,
+            CandidateExpirySupport::Supported,
+        );
+        assert_eq!(
+            supported.candidates.first().map(|selected| selected.name.as_str()),
+            Some("discovered-model"),
+            "discovered route must be available to a gateway that enforces expiry"
+        );
     }
 
     #[test]

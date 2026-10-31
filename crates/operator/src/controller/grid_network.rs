@@ -28,7 +28,7 @@ use kube::{
 use serde_json::{Value, json};
 use tokio::{
     sync::Mutex,
-    time::{Duration, timeout},
+    time::{Duration, timeout, timeout_at},
 };
 use tracing::info;
 
@@ -1101,7 +1101,128 @@ pub async fn refresh_served_models(
     client: &Client,
     config: &served_models::DiscoveryConfig,
 ) -> Result<(), OperatorError> {
-    served_models::discover(&ctx.served_models, client, config).await
+    served_models::discover(&ctx.served_models, client, config).await?;
+    publish_discovered_model_inventories(ctx, client).await
+}
+
+/// Publish complete signed inventories for enforcing grids after each discovery round.
+async fn publish_discovered_model_inventories(ctx: &OperatorCtx, client: &Client) -> Result<(), OperatorError> {
+    let Some(swim) = ctx.swim() else {
+        return Ok(());
+    };
+    let networks: Api<GridNetwork> = Api::all(client.clone());
+    let networks = Box::pin(networks.list(&ListParams::default())).await?.items;
+    let providers: Api<InferenceProvider> = Api::all(client.clone());
+    let providers = Box::pin(providers.list(&ListParams::default())).await?.items;
+    let publish_deadline = tokio::time::Instant::now() + INVENTORY_PUBLISH_TIMEOUT;
+    'networks: for network in networks
+        .iter()
+        .filter(|network| signed_state_mode(network) == SignedStateMode::Enforce)
+    {
+        let (Some(network_name), Some(grid_id)) = (network.metadata.name.as_deref(), persisted_grid_id(network)) else {
+            continue;
+        };
+        let inventories = providers
+            .iter()
+            .filter(|provider| provider.spec.grid_network_ref == network_name)
+            .filter_map(|provider| ctx.served_models.select_for_gossip(provider, swim.site_name(), grid_id))
+            .collect::<Vec<_>>();
+        if !inventories.is_empty()
+            && let Some(signing_key) = Box::pin(load_gossip_signing_identity(network, client, swim.site_name())).await
+        {
+            for inventory in inventories {
+                match timeout_at(
+                    publish_deadline,
+                    publish_model_inventory_frames(swim, &inventory, signing_key.as_slice()),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {},
+                    Ok(Err(error)) => {
+                        tracing::warn!(provider = %inventory.provider_id, %error, "local model inventory publication failed");
+                    },
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            timeout_secs = INVENTORY_PUBLISH_TIMEOUT.as_secs(),
+                            "model inventory publication round timed out"
+                        );
+                        break 'networks;
+                    },
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bound the total time a discovery round waits for SWIM queue capacity.
+const INVENTORY_PUBLISH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Queue every signed frame of one inventory, waiting for bounded queue capacity.
+async fn publish_model_inventory_frames(
+    swim: &SwimHandle,
+    inventory: &swim::ModelInventory,
+    signing_key: &[u8],
+) -> Result<(), ModelInventoryPublicationError> {
+    for broadcast in sign_model_inventory_frames(inventory, signing_key, gossip_wall_clock_millis())? {
+        swim.publish_model_inventory_frame(broadcast).await?;
+    }
+    Ok(())
+}
+
+/// Current Unix time in milliseconds for signed gossip frames.
+fn gossip_wall_clock_millis() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// Sign every frame of one complete provider inventory for its origin and grid.
+fn sign_model_inventory_frames(
+    inventory: &swim::ModelInventory,
+    signing_key: &[u8],
+    signed_at_ms: u64,
+) -> Result<Vec<swim::ModelInventoryBroadcast>, ModelInventorySigningError> {
+    inventory
+        .frames()?
+        .into_iter()
+        .map(|frame| {
+            let signed = frame.sign(&inventory.origin_site, &inventory.grid_id, signing_key, signed_at_ms)?;
+            Ok(swim::ModelInventoryBroadcast::new(
+                inventory.origin_site.clone(),
+                inventory.grid_id.clone(),
+                signed,
+            ))
+        })
+        .collect()
+}
+
+/// Failure while validating or signing a complete local inventory.
+#[derive(Debug, thiserror::Error)]
+enum ModelInventorySigningError {
+    /// The inventory could not be split into valid wire frames.
+    #[error(transparent)]
+    Frames(#[from] swim::InventoryFrameError),
+
+    /// A wire frame could not be signed for its origin and grid.
+    #[error(transparent)]
+    Signing(#[from] swim::FrameSigningError),
+}
+
+/// Failure while validating, signing, or queueing a complete discovered inventory.
+#[derive(Debug, thiserror::Error)]
+enum ModelInventoryPublicationError {
+    /// The inventory could not be validated or signed.
+    #[error(transparent)]
+    Signing(#[from] ModelInventorySigningError),
+
+    /// The runtime exited before a frame could be queued.
+    #[error(transparent)]
+    Runtime(#[from] crate::swim_runtime::BroadcastError),
 }
 
 /// Refresh who may read from the currently approved sites.
@@ -9703,6 +9824,106 @@ mod tests {
         assert!(
             mismatched_key.is_err(),
             "the private signer must match the existing site certificate"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "certificate and inventory signing test fixture")]
+    fn signed_model_inventory_frames_authenticate_each_model_for_origin_and_grid() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let leaf = certs::generate_site_cert(&ca, "site-east").expect("leaf");
+        let private_key = pem::parse(&leaf.key_pem).expect("key pem").into_contents();
+        let public_key = swim::signing::public_key_ecdsa_p256(&private_key).expect("public key");
+        let now_ms = gossip_wall_clock_millis();
+        let inventory = swim::ModelInventory {
+            origin_site: "site-east".to_owned(),
+            grid_id: "grid-a".to_owned(),
+            network_id: "grid".to_owned(),
+            provider_id: "provider-east".to_owned(),
+            provider_uid: "provider-uid".to_owned(),
+            revision: now_ms,
+            expires_at_ms: now_ms.saturating_add(60_000),
+            models: vec!["model-a".to_owned(), "model-b".to_owned()],
+        };
+
+        let broadcasts = sign_model_inventory_frames(&inventory, &private_key, now_ms).expect("signed frames");
+
+        assert_eq!(broadcasts.len(), 2, "one complete frame carries each model name");
+        assert!(
+            broadcasts.iter().all(|broadcast| {
+                broadcast.origin_site == "site-east"
+                    && broadcast.grid_id == "grid-a"
+                    && broadcast
+                        .frame
+                        .verifies("site-east", "grid-a", std::slice::from_ref(&public_key))
+            }),
+            "every frame must verify for its inventory origin and grid"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::expect_used,
+        reason = "a prefilled one-slot runtime queue proves bounded reliable publication of the maximum inventory"
+    )]
+    async fn full_model_inventory_waits_for_runtime_queue_capacity_without_stranding_frames() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let leaf = certs::generate_site_cert(&ca, "site-east").expect("leaf");
+        let private_key = pem::parse(&leaf.key_pem).expect("key pem").into_contents();
+        let now_ms = gossip_wall_clock_millis();
+        let queued = swim::ModelInventory {
+            origin_site: "site-east".to_owned(),
+            grid_id: "grid-a".to_owned(),
+            network_id: "grid".to_owned(),
+            provider_id: "provider-east".to_owned(),
+            provider_uid: "provider-uid".to_owned(),
+            revision: now_ms.saturating_sub(1),
+            expires_at_ms: now_ms.saturating_add(60_000),
+            models: Vec::new(),
+        };
+        let queued_frame = sign_model_inventory_frames(&queued, &private_key, now_ms)
+            .expect("signed queued frame")
+            .pop()
+            .expect("empty inventory has one frame");
+        let (handle, mut receiver) = SwimHandle::detached_with_inventory_capacity("site-east", 1);
+        handle
+            .publish_model_inventory_frame(queued_frame)
+            .await
+            .expect("prefill inventory queue");
+        let inventory = swim::ModelInventory {
+            revision: now_ms,
+            models: (0..swim::MAX_INVENTORY_MODELS)
+                .map(|index| format!("model-{index:03}-{}", "x".repeat(246)))
+                .collect(),
+            ..queued
+        };
+        let publisher =
+            tokio::spawn(async move { publish_model_inventory_frames(&handle, &inventory, &private_key).await });
+        let first = timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .expect("prefilled queue drains")
+            .expect("queued frame is present");
+        assert_eq!(first.frame.inventory_revision, now_ms.saturating_sub(1));
+        let mut indexes = Vec::with_capacity(swim::MAX_INVENTORY_MODELS);
+        for _ in 0..swim::MAX_INVENTORY_MODELS {
+            let frame = timeout(Duration::from_secs(10), receiver.recv())
+                .await
+                .expect("publisher waits only for bounded queue capacity")
+                .expect("every signed frame is queued");
+            indexes.push(frame.frame.frame_index);
+        }
+        publisher
+            .await
+            .expect("publisher task completes")
+            .expect("inventory publication succeeds");
+        indexes.sort_unstable();
+
+        assert_eq!(
+            indexes,
+            (0..swim::MAX_INVENTORY_MODELS)
+                .map(|index| u16::try_from(index).expect("frame index fits u16"))
+                .collect::<Vec<_>>(),
+            "the bounded runtime queue must not strand any frame"
         );
     }
 

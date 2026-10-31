@@ -8,6 +8,7 @@ use std::{
 
 use k8s_openapi::api::core::v1::ConfigMap;
 use serde::Serialize;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
     resources::{
@@ -410,7 +411,7 @@ struct Folded {
     stable_id: Option<String>,
     /// The first credential locator any duplicate carries.
     credential: Option<ProjectedCredential>,
-    /// The latest expiry, or `None` when any duplicate is static.
+    /// The earliest discovered inventory deadline among duplicates.
     expires_at_ms: Option<u64>,
 }
 
@@ -423,6 +424,22 @@ fn dedup<'overlay>(
 ) -> BTreeMap<CandidateKey<'overlay>, Folded> {
     let mut unique = BTreeMap::new();
     for candidate in overlay.filter(|candidate| routable(candidate)) {
+        let expires_at_ms = match candidate.expires_at.as_deref() {
+            Some(text) => match OffsetDateTime::parse(text, &Rfc3339) {
+                Ok(deadline) => match u64::try_from(deadline.unix_timestamp_nanos().div_euclid(1_000_000)) {
+                    Ok(milliseconds) => Some(milliseconds),
+                    Err(error) => {
+                        tracing::warn!(%error, "serving candidate has an out-of-range inventory deadline");
+                        continue;
+                    },
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "serving candidate has an invalid inventory deadline");
+                    continue;
+                },
+            },
+            None => None,
+        };
         let key = (
             candidate.site != local_site,
             candidate.site.as_str(),
@@ -430,7 +447,6 @@ fn dedup<'overlay>(
             candidate.cluster.as_str(),
         );
         let admission = candidate.admission_state.unwrap_or(AdmissionState::NewAndExisting);
-        let expires_at_ms = candidate_expiry_ms(candidate.expires_at.as_deref());
         // Seeded with the identities of both folds, so the first candidate and every
         // duplicate after it take the same path: fresh only if all are, admission as
         // restricted as the most restricted.
@@ -450,8 +466,9 @@ fn dedup<'overlay>(
             folded.credential.clone_from(&candidate.credential);
         }
         folded.expires_at_ms = match (folded.expires_at_ms, expires_at_ms) {
-            (Some(held), Some(incoming)) => Some(held.max(incoming)),
-            _ => None,
+            (Some(held), Some(incoming)) => Some(held.min(incoming)),
+            (Some(held), None) | (None, Some(held)) => Some(held),
+            (None, None) => None,
         };
     }
     unique
@@ -493,18 +510,6 @@ fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<Servi
             expires_at_ms: folded.expires_at_ms,
         })
         .collect()
-}
-
-/// Parse the overlay's RFC 3339 deadline to epoch milliseconds for the gateway.
-///
-/// An invalid present deadline becomes zero so the gateway fails closed.
-fn candidate_expiry_ms(expires_at: Option<&str>) -> Option<u64> {
-    expires_at.map(|timestamp| {
-        time::OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339)
-            .ok()
-            .and_then(|parsed| u64::try_from(parsed.unix_timestamp_nanos() / 1_000_000).ok())
-            .unwrap_or_default()
-    })
 }
 
 /// Whether `site` publishes load for `cluster`: a peer's once heard, this site's when it has metrics.
@@ -754,6 +759,50 @@ mod tests {
         ])
     }
 
+    #[test]
+    fn serving_config_preserves_the_earliest_inventory_expiry() {
+        let mut later = cand("discovered-model", "site-b", "pool-b", None);
+        later.expires_at = Some("2030-01-01T00:02:00Z".to_owned());
+        let mut earlier = later.clone();
+        earlier.expires_at = Some("2030-01-01T00:01:00Z".to_owned());
+        let static_duplicate = cand("discovered-model", "site-b", "pool-b", None);
+        let dynamic_only = render(&overlay(vec![later.clone(), earlier.clone()]), &INPUTS);
+        assert_eq!(
+            dynamic_only
+                .candidates
+                .first()
+                .and_then(|candidate| candidate.expires_at_ms),
+            Some(1_893_456_060_000),
+            "the canonical deadline is the earliest discovered inventory expiry"
+        );
+        for entries in [
+            vec![later.clone(), static_duplicate.clone(), earlier.clone()],
+            vec![earlier, static_duplicate, later],
+        ] {
+            let rendered = render(&overlay(entries), &INPUTS);
+            assert_eq!(rendered.candidates.len(), 1, "duplicates produce one serving route");
+            assert_eq!(
+                rendered
+                    .candidates
+                    .first()
+                    .and_then(|candidate| candidate.expires_at_ms),
+                Some(1_893_456_060_000),
+                "neither a static duplicate nor a later deadline may extend discovered inventory"
+            );
+            let wire: serde_json::Value =
+                serde_json::from_str(&to_text(&rendered).expect("serving JSON")).expect("valid serving JSON");
+            assert_eq!(
+                wire["candidates"][0]["expires_at_ms"], 1_893_456_060_000_u64,
+                "the gateway receives the inventory deadline"
+            );
+            assert!(
+                wire["candidates"][0].get("expires_at").is_none(),
+                "the gateway receives one deadline field"
+            );
+        }
+    }
+
+    /// Peer site identities and addresses in a rendered config.
     fn peer_sites(config: &ServingConfig) -> Vec<(&str, &str)> {
         config
             .peers

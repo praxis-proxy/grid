@@ -18,8 +18,10 @@
 #   IMAGE_PREFIX        image repository prefix (default localhost/grid-)
 #   IMAGE_TAG           image tag (default e2e)
 #   SKIP_BUILD=1        use prebuilt <prefix>{operator,gateway,enrollment}:<tag> images
+#   IMAGE_BUILD_PROFILE debug or release profile for images built by this script (default debug)
 #   GRID_FEEDBACK_CONTRACT_TEST=1  run the real API/TLS contract before install (CI pin leg)
 #   CONTAINER_TOOL      image build tool (default docker)
+#   VCR_PLATFORM        platform to pull vllm-vcr for (default linux/amd64 on arm64 hosts)
 #   FORGE_BIN           explicit executable override (default: pinned upstream Forge)
 #   KIND_CREATE_PREFIX  command prefix for cluster creation, e.g. the rootless podman
 #                       wrapper: systemd-run --scope --user -p Delegate=yes
@@ -30,6 +32,10 @@
 #                       then polls signals and asserts renewal, a fork, and re-enrollment
 #   SIGNED_STATE        peerTrust.signedState, off or enforce (default off). enforce also
 #                       asserts that the hub refuses the site's state once it stops signing
+#   MODEL_GOSSIP_TEST=1 test signed discovery and inference through the embedded gateway,
+#                       which implements model-discovery expiry contract v1 with a
+#                       configuration-driven fixture, authoritative withdrawal, stale-state
+#                       expiry, and all 256 maximum-length discovered models
 #   NET_PREFIX          command prefix for calls to LoadBalancer addresses, e.g. under
 #                       rootless podman: podman unshare --rootless-netns
 #   TOPOLOGY            topology under tests/e2e/topologies (default grid-hub-site, or
@@ -52,8 +58,11 @@ TOPO="$ROOT/tests/e2e/topologies/$TOPOLOGY"
 MODES=${MODES:-pin spiffe}
 HUB_ROUTER=${HUB_ROUTER:-render}
 SIGNED_STATE=${SIGNED_STATE:-off}
+MODEL_GOSSIP_TEST=${MODEL_GOSSIP_TEST:-0}
 IMAGE_PREFIX=${IMAGE_PREFIX:-localhost/grid-}
 IMAGE_TAG=${IMAGE_TAG:-e2e}
+IMAGE_BUILD_PROFILE=${IMAGE_BUILD_PROFILE:-debug}
+VCR_PLATFORM=${VCR_PLATFORM:-}
 CONTAINER_TOOL=${CONTAINER_TOOL:-docker}
 ARTIFACTS=${ARTIFACTS:-/tmp/grid-hub-site-e2e}
 TIMEOUT=${TIMEOUT:-180}
@@ -67,6 +76,7 @@ NS=grid
 ENS=grid-enrollment
 SITE="site-a"
 MODEL=Qwen/Qwen3-0.6B
+MODEL_DISCOVERY_ENDPOINT=http://model-discovery-fixture.model.svc:8000
 ENROLL_HOST=enroll.grid.example.com
 ENROLL_PORT=8443
 FORGE_STATE="$ROOT/.forge/$PREFIX"
@@ -82,6 +92,9 @@ CORDONED=""
 FRONTDOOR_PID=""
 CATALOG_PID=""
 DRAIN_PID=""
+MODEL_FIXTURE_INSTALLED=0
+HUB_OPERATOR_SCALED=0
+HUB_OPERATOR_REPLICAS_ORIGINAL=""
 
 # When signed state was turned on, for the signing log check.
 SIGNED_FROM=""
@@ -95,6 +108,8 @@ TRUST=""
 
 cleanup() {
   [[ -z $PF_PID ]] || kill "$PF_PID" 2>/dev/null || true
+  restore_hub_operator || true
+  cleanup_model_discovery_fixture || true
   uncordon_node
   stop_monitors
   if ((CREATED)) && [[ ${KEEP:-0} != 1 ]]; then
@@ -139,15 +154,45 @@ cluster_exists() {
 
 image() { printf '%s%s:%s' "$IMAGE_PREFIX" "$1" "$IMAGE_TAG"; }
 
+prepare_vcr_image() {
+  local platform=$VCR_PLATFORM arch image=ghcr.io/neuralmagic/vllm-vcr:vllm0.23
+  arch=$(uname -m)
+  if [[ -z $platform && ( $arch == arm64 || $arch == aarch64 ) ]]; then
+    platform=linux/amd64
+  fi
+  [[ -z $platform ]] && return 0
+  log "pulling vllm-vcr for $platform and loading it into the site Kind cluster"
+  "$CONTAINER_TOOL" pull --platform "$platform" "$image" || return 1
+  kind load docker-image "$image" --name "$PREFIX-site" || return 1
+}
+
 cmd_up() {
-  local c
+  local c buildkit=0 engine_components cargo_profile
+  case $IMAGE_BUILD_PROFILE in
+    debug) cargo_profile=dev ;;
+    release) cargo_profile=release ;;
+    *) die "IMAGE_BUILD_PROFILE must be debug or release" ;;
+  esac
+  if "$CONTAINER_TOOL" buildx version >/dev/null 2>&1; then
+    buildkit=1
+  else
+    engine_components=$("$CONTAINER_TOOL" version --format '{{json .Server.Components}}' 2>/dev/null || true)
+    [[ $engine_components == *"Podman Engine"* ]] \
+      || die "Docker Buildx is required unless the Docker-compatible engine is Podman"
+  fi
   for c in hub site; do
     ! cluster_exists "$c" || die "kind cluster $PREFIX-$c exists; refusing to reuse it. Run: $0 down"
   done
   if [[ ${SKIP_BUILD:-0} != 1 ]]; then
     for c in operator gateway enrollment; do
       log "building $(image "$c")"
-      "$CONTAINER_TOOL" build -f "$ROOT/deploy/$c/Containerfile" -t "$(image "$c")" "$ROOT"
+      if ((buildkit)); then
+        DOCKER_BUILDKIT=1 "$CONTAINER_TOOL" build --build-arg "CARGO_PROFILE=$cargo_profile" \
+          -f "$ROOT/deploy/$c/Containerfile" -t "$(image "$c")" "$ROOT"
+      else
+        DOCKER_BUILDKIT=0 "$CONTAINER_TOOL" build --build-arg "CARGO_PROFILE=$cargo_profile" \
+          -f "$ROOT/deploy/$c/Containerfile" -t "$(image "$c")" "$ROOT"
+      fi
     done
   fi
   resolve_forge
@@ -159,6 +204,9 @@ cmd_up() {
   ${KIND_CREATE_PREFIX:-} "$FORGE_BIN" --config "$TOPO/forge.yaml" --state-dir "$FORGE_STATE" \
     --non-interactive up || die "create the environment network and clusters"
   preload_model
+  if [[ -n $VCR_PLATFORM ]]; then
+    prepare_vcr_image || die "load the vllm-vcr image for the Kind node platform"
+  fi
   for c in hub site; do
     for img in operator gateway enrollment; do
       forge cluster load-image "$c" "$(image "$img")"
@@ -172,6 +220,7 @@ cmd_up() {
 # hosts before Forge applies the model workload; all other images keep their native platform.
 preload_model() {
   local img
+  [[ -z $VCR_PLATFORM ]] || return 0
   [[ $(uname -m) != x86_64 ]] || return 0
   img=$(sed -n 's/^ *vcrImage: "\(.*\)"$/\1/p' "$TOPO/forge.yaml")
   [[ -n $img ]] || die "no vcrImage in $TOPO/forge.yaml"
@@ -359,7 +408,7 @@ site_route_providers() {
   done
 }
 
-# signed_args: under enforce, signedState and the identity Secrets that sign, into SA.
+# signed_args: under enforce, signedState and the shared SWIM/signing Secrets, into SA.
 # Applied only after enrollment: naming absent Secrets makes the operator self-sign them,
 # and enrollment then finds an identity and never runs.
 signed_args() {
@@ -367,7 +416,8 @@ signed_args() {
   [[ $SIGNED_STATE == enforce ]] || return 0
   SA=(--set gridNetwork.peerTrust.signedState=enforce
     --set gridNetwork.tls.siteSecretRef.name=grid-site-identity --set "gridNetwork.tls.siteSecretRef.namespace=$NS"
-    --set gridNetwork.tls.caSecretRef.name=grid-ca --set "gridNetwork.tls.caSecretRef.namespace=$NS")
+    --set gridNetwork.tls.caSecretRef.name=grid-ca --set "gridNetwork.tls.caSecretRef.namespace=$NS"
+    --set gridNetwork.tls.swimKeySecretRef.name=grid-swim-key --set "gridNetwork.tls.swimKeySecretRef.namespace=$NS")
 }
 
 # images <component>: this run's image for a chart, into IMG.
@@ -535,9 +585,13 @@ install_hub() {
     || die "create grid-swim-key"
   renewal_args grid-site
   HUB_SITE_ARGS=("${RA[@]}" --set gridNetwork.gridId="$PREFIX-e2e" --set gridSite.name=hub
+    --set gridSite.providerSiteLabel=hub
     --set "peers.$SITE.address=$SITE_GW_IP:8080"
     --set gridNetwork.peerTrust.mode="$TRUST" --set "gridNetwork.consumerGateways[0].name=grid-gateway"
     --set "gridNetwork.consumerGateways[0].namespace=$NS" --set "gridNetwork.consumerGateways[0].siteName=hub")
+  if [[ $MODEL_GOSSIP_TEST == 1 ]]; then
+    HUB_SITE_ARGS+=(--set "gridNetwork.consumerGateways[0].modelDiscoveryContractVersion=v1")
+  fi
   SR=()
   site_route && site_route_providers vcr hub-local
   helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "install hub grid-site"
@@ -608,8 +662,74 @@ endpoints:
 EOF
 }
 
+install_model_discovery_fixture() {
+  [[ $MODEL_GOSSIP_TEST == 1 ]] || return 0
+  kubectl --context "$SITE_CTX" -n model create configmap model-discovery-fixture \
+    --from-literal=fixture.json='{"mode":"single"}' --dry-run=client -o yaml \
+    | kubectl --context "$SITE_CTX" apply -f - >/dev/null || return 1
+  kubectl --context "$SITE_CTX" apply \
+    -f "$TOPO/resources/model-discovery-fixture-code.yaml" \
+    -f "$TOPO/resources/model-discovery-fixture.yaml" >/dev/null || return 1
+  kubectl --context "$SITE_CTX" apply -f "$TOPO/resources/vcr-network-policy.yaml" >/dev/null || return 1
+  MODEL_FIXTURE_INSTALLED=1
+  kubectl --context "$SITE_CTX" -n model rollout status deployment/model-discovery-fixture \
+    --timeout=120s >/dev/null || return 1
+  pass "configuration-driven model discovery fixture is ready beside the live completion backend"
+}
+
+set_model_fixture_mode() {
+  local mode=$1
+  mkdir -p "$ARTIFACTS/$MODE/model-gossip"
+  printf '{"mode":"%s"}\n' "$mode" >"$WORK/model-discovery-fixture.json"
+  kubectl --context "$SITE_CTX" -n model create configmap model-discovery-fixture \
+    --from-file=fixture.json="$WORK/model-discovery-fixture.json" --dry-run=client -o yaml \
+    | kubectl --context "$SITE_CTX" apply -f - >/dev/null || return 1
+  kubectl --context "$SITE_CTX" -n model rollout restart deployment/model-discovery-fixture >/dev/null || return 1
+  kubectl --context "$SITE_CTX" -n model rollout status deployment/model-discovery-fixture \
+    --timeout=120s >/dev/null || return 1
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$mode" \
+    >>"$ARTIFACTS/$MODE/model-gossip/fixture-modes.txt"
+}
+
+cleanup_model_discovery_fixture() {
+  [[ $MODEL_FIXTURE_INSTALLED == 1 ]] || return 0
+  if [[ ${KEEP:-0} == 1 ]] && k "$SITE_CTX" get inferenceprovider vcr >/dev/null 2>&1; then
+    log "keeping the discovery fixture because the focused-run provider still references it"
+    return 0
+  fi
+  kubectl --context "$SITE_CTX" delete \
+    -f "$TOPO/resources/model-discovery-fixture.yaml" \
+    -f "$TOPO/resources/model-discovery-fixture-code.yaml" --ignore-not-found >/dev/null || return 1
+  kubectl --context "$SITE_CTX" -n model delete configmap model-discovery-fixture \
+    --ignore-not-found >/dev/null || return 1
+  MODEL_FIXTURE_INSTALLED=0
+}
+
+allow_model_fixture_private_endpoint() {
+  [[ $MODEL_GOSSIP_TEST == 1 ]] || return 0
+  local praxis_file="$WORK/site-gateway-praxis.yaml" patch_file="$WORK/site-gateway-config-patch.json"
+  k "$SITE_CTX" get configmap grid-gateway-config -o json \
+    | jq -er '.data["praxis.yaml"]' \
+    | python3 -c 'import sys; print("insecure_options:\n  allow_private_endpoints: true\n  allow_private_upstreams: true\n\n" + sys.stdin.read(), end="")' \
+      >"$praxis_file" || return 1
+  jq -n --rawfile praxis "$praxis_file" '{data: {"praxis.yaml": $praxis}}' >"$patch_file" || return 1
+  kubectl --context "$SITE_CTX" -n "$NS" patch configmap grid-gateway-config \
+    --type=merge --patch-file "$patch_file" >/dev/null || return 1
+  kubectl --context "$SITE_CTX" -n "$NS" rollout restart deployment/grid-gateway >/dev/null || return 1
+  kubectl --context "$SITE_CTX" -n "$NS" rollout status deployment/grid-gateway \
+    --timeout="${TIMEOUT}s" >/dev/null
+}
+
+restore_hub_operator() {
+  [[ $HUB_OPERATOR_SCALED == 1 ]] || return 0
+  k "$HUB_CTX" scale deployment/grid-operator --replicas="$HUB_OPERATOR_REPLICAS_ORIGINAL" >/dev/null || return 1
+  k "$HUB_CTX" rollout status deployment/grid-operator --timeout=120s >/dev/null || return 1
+  HUB_OPERATOR_SCALED=0
+  pass "hub operator restored to $HUB_OPERATOR_REPLICAS_ORIGINAL replicas"
+}
+
 install_site() {
-  local trust seeds
+  local trust seeds site_backend_endpoint
   images operator
   renewal_args grid-operator
   seeds=(--set "swim.seeds=$HUB_SWIM_IP:7946")
@@ -641,8 +761,14 @@ install_site() {
     fail "copied invite lacks its grid.praxis.fast/site label"
   fi
   renewal_args grid-site
+  site_backend_endpoint=http://$MODEL_IP:8000
+  if [[ $MODEL_GOSSIP_TEST == 1 ]]; then
+    install_model_discovery_fixture || die "install the model discovery fixture"
+    site_backend_endpoint=$MODEL_DISCOVERY_ENDPOINT
+  fi
   SITE_SITE_ARGS=("${RA[@]}" --set gridNetwork.gridId="$PREFIX-e2e" --set "gridSite.name=$SITE"
-    --set "peers.hub.digest=$HUB_DIGEST" --set "inferenceProviders.vcr.endpoint=http://$MODEL_IP:8000"
+    --set "gridSite.providerSiteLabel=$SITE"
+    --set "peers.hub.digest=$HUB_DIGEST" --set "inferenceProviders.vcr.endpoint=$site_backend_endpoint"
     --set "inferenceProviders.vcr.model=$MODEL" --set gridNetwork.peerTrust.mode="$TRUST")
   if [[ $SIGNED_STATE == enforce ]]; then
     SITE_SITE_ARGS+=(--set "gridNetwork.consumerGateways[0].name=grid-gateway"
@@ -659,9 +785,10 @@ install_site() {
   helm_on "$SITE_CTX" "$NS" grid-gateway praxis-gateway \
     --set fullnameOverride=grid-gateway --set praxisConfig.source=render --set praxisConfig.render.role=provider \
     --set "grid.siteName=$SITE" --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca "${trust[@]}" \
-    --set "praxisConfig.render.backends.local.endpoint=$MODEL_IP:8000" \
+    --set "praxisConfig.render.backends.local.endpoint=${site_backend_endpoint#http://}" \
     "${IMG[@]}" --set service.loadBalancerIP="$SITE_GW_IP" "${gw_shared[@]}" || die "install site grid-gateway"
   ! local_source || cluster_ip_gateway "$SITE_CTX" || die "create site ClusterIP gateway Service"
+  allow_model_fixture_private_endpoint || die "allow the test discovery fixture's private cluster endpoint"
   eventually "site operator enrolled from its copied invite through the hub enrollment URL" enrolled "$SITE_CTX" \
     || die "site not enrolled"
   eventually "$SITE GridNetwork reports Enrolled by the signer" site_reports_enrolled "$SITE_CTX" \
@@ -695,6 +822,177 @@ install_grid() {
     die "deployments on $ctx not ready"
   done
   pass "hub and site installed with helm, every deployment rolled out"
+}
+
+# Enable discovery after Helm has installed the site's provider. The static model
+# intentionally differs from the mock backend so only its discovered inventory can route.
+enable_model_gossip() {
+  [[ $MODEL_GOSSIP_TEST == 1 ]] || return 0
+  k "$HUB_CTX" delete inferenceprovider hub-local --wait=true >/dev/null \
+    || die "remove the hub's competing model advertisement"
+  k "$SITE_CTX" patch inferenceprovider vcr --type=merge \
+    -p '{"spec":{"models":[{"name":"configured-fallback-model"}],"modelDiscovery":{"openAiModels":{}}}}' >/dev/null \
+    || die "enable site model discovery for the gossip test"
+}
+
+model_discovered() {
+  k "$SITE_CTX" get inferenceprovider vcr -o json \
+    | jq -e --arg model "$MODEL" '(.status.servedModels // []) | any(. == $model)' >/dev/null
+}
+
+discovered_model_routed() {
+  k "$HUB_CTX" get configmap grid-overlay-grid-grid-gateway -o json \
+    | jq -e --arg model "$MODEL" '
+      .data["routing-config.json"] | fromjson | .candidates
+      | any(.kind == "inference_model" and .name == $model and .site == "site-a"
+          and .cluster == "vcr" and (.expires_at | type == "string"))
+      ' >/dev/null
+}
+
+FULL_MODELS=()
+
+prepare_full_model_inventory() {
+  local index model
+  FULL_MODELS=()
+  for ((index = 0; index < 256; index++)); do
+    printf -v model 'model-%03d-' "$index"
+    model+=$(printf '%246s' '' | tr ' ' x)
+    FULL_MODELS+=("$model")
+  done
+  jq -cn --args '$ARGS.positional' -- "${FULL_MODELS[@]}" >"$WORK/full-models.json"
+  printf '%s\n' "${FULL_MODELS[@]}" >"$WORK/full-models.txt"
+}
+
+site_inventory_matches() {
+  local expected=$1
+  k "$SITE_CTX" get inferenceprovider vcr -o json \
+    | jq -e --slurpfile expected "$expected" '
+      (.status.servedModels // []) == $expected[0]
+      and (.status.servedModelsExpiresAt | type == "string")
+      and (.status.modelDiscoveryError == null)
+      ' >/dev/null
+}
+
+site_empty_inventory_refreshed() {
+  local old_expiry=$1
+  k "$SITE_CTX" get inferenceprovider vcr -o json \
+    | jq -e --arg old "$old_expiry" '
+      (.status.servedModels // []) == []
+      and (.status.servedModelsExpiresAt | type == "string")
+      and .status.servedModelsExpiresAt != $old
+      and (.status.modelDiscoveryError == null)
+      ' >/dev/null
+}
+
+site_failed_poll_retained() {
+  local expected=$1
+  k "$SITE_CTX" get inferenceprovider vcr -o json \
+    | jq -e --slurpfile expected "$expected" '
+      (.status.servedModels // []) == $expected[0]
+      and (.status.servedModelsExpiresAt | type == "string")
+      and ((.status.modelDiscoveryError // "") | length > 0)
+      ' >/dev/null
+}
+
+hub_candidates_match() {
+  local expected=$1
+  k "$HUB_CTX" get configmap grid-overlay-grid-grid-gateway -o json \
+    | jq -e --slurpfile expected "$expected" --arg site "$SITE" '
+      [.data["routing-config.json"] | fromjson | .candidates[]
+        | select(.kind == "inference_model" and .site == $site and .cluster == "vcr") | .name]
+      | sort == ($expected[0] | sort)
+      ' >/dev/null
+}
+
+hub_candidate_deadlines_match() {
+  local expected=$1 expiry=$2
+  k "$HUB_CTX" get configmap grid-overlay-grid-grid-gateway -o json \
+    | jq -e --slurpfile expected "$expected" --arg site "$SITE" --arg expiry "$expiry" '
+      def millis:
+        if test("\\.[0-9]+Z$") then
+          capture("^(?<prefix>.*\\.)(?<fraction>[0-9]+)Z$")
+          | .prefix + ((.fraction + "000")[0:3]) + "Z"
+        else
+          sub("Z$"; ".000Z")
+        end;
+      [.data["routing-config.json"] | fromjson | .candidates[]
+        | select(.kind == "inference_model" and .site == $site and .cluster == "vcr")]
+      | (map(.name) | sort) == ($expected[0] | sort)
+        and (length == ($expected[0] | length))
+        and all(.[]; (.expires_at | millis) == ($expiry | millis))
+      ' >/dev/null
+}
+
+hub_model_candidate_absent() {
+  k "$HUB_CTX" get configmap grid-overlay-grid-grid-gateway -o json \
+    | jq -e --arg model "$1" '
+      [.data["routing-config.json"] | fromjson | .candidates[]? | select(.name == $model)] | length == 0
+      ' >/dev/null
+}
+
+hub_remote_candidate_count() {
+  k "$HUB_CTX" get configmap grid-overlay-grid-grid-gateway -o json \
+    | jq -e --arg site "$SITE" '
+      [.data["routing-config.json"] | fromjson | .candidates[]?
+        | select(.kind == "inference_model" and .site == $site and .cluster == "vcr")] | length == 0
+      ' >/dev/null
+}
+
+hub_operator_stopped() {
+  k "$HUB_CTX" get deployment grid-operator -o json \
+    | jq -e '.spec.replicas == 0 and (.status.replicas // 0) == 0' >/dev/null \
+    && k "$HUB_CTX" get pods \
+      -l app.kubernetes.io/name=grid-operator,app.kubernetes.io/instance=grid-operator -o json \
+      | jq -e '.items | length == 0' >/dev/null
+}
+
+capture_model_gossip_state() {
+  local label=$1 dir="$ARTIFACTS/$MODE/model-gossip"
+  mkdir -p "$dir"
+  k "$SITE_CTX" get inferenceprovider vcr -o json >"$dir/$label-site-status.json"
+  k "$HUB_CTX" get configmap grid-overlay-grid-grid-gateway -o json \
+    | jq -r '.data["routing-config.json"]' >"$dir/$label-routing-config.json"
+  consumer_praxis >"$dir/$label-consumer-praxis.yaml" 2>/dev/null || true
+  serving_json >"$dir/$label-serving-config.json" 2>/dev/null || true
+  printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$dir/$label-captured-at.txt"
+}
+
+site_inventory_expiry_epoch() {
+  python3 - "$1" <<'PY'
+import datetime
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as status_file:
+    status = json.load(status_file)
+value = status.get("status", {}).get("servedModelsExpiresAt")
+if not isinstance(value, str):
+    raise SystemExit("servedModelsExpiresAt is missing")
+print(int(datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()))
+PY
+}
+
+wait_for_within() {
+  local what=$1 seconds=$2 deadline
+  deadline=$((SECONDS + seconds))
+  shift 2
+  ((seconds > 0)) || { fail "$what (no time remained before the inventory boundary)"; return 1; }
+  until "$@" >/dev/null 2>&1; do
+    if ((SECONDS >= deadline)); then
+      fail "$what (not within ${seconds}s)"
+      return 1
+    fi
+    sleep 1
+  done
+  pass "$what"
+}
+
+model_route_rejected() {
+  local model=$1 out=$2
+  hub_chat "$out" "$model" && return 1
+  [[ $(cat "$out.status") == 404 ]] \
+    && jq -e '(.error.code == "model_not_found" or .error.code == "no_route")' "$out.body" >/dev/null \
+    && ! grep -qi '^x-grid-provider-site:' "$out.hdr"
 }
 
 spiffe_id_of() { # <context>
@@ -755,7 +1053,10 @@ assert_membership() {
     eventually "$SITE own GridSite reaches Connected through its ClusterIP gateway override" \
       own_site_connected "$SITE_CTX" "$SITE" || true
   else
-    if [[ $SIGNED_STATE == enforce ]]; then
+    if [[ $HUB_ROUTER == operator ]]; then
+      eventually "site observes hub membership over SWIM" \
+        site_phase_in "$SITE_CTX" grid-hub 'Discovered|Connecting|Active' || true
+    elif [[ $SIGNED_STATE == enforce ]]; then
       eventually "site GridSite grid-hub Active over SWIM" site_phase_in "$SITE_CTX" grid-hub Active || true
     else
       # The hub gateway is ClusterIP, so the hub gossips no gateway address and stays Discovered on the site.
@@ -763,7 +1064,7 @@ assert_membership() {
     fi
     eventually "hub GridNetwork Active with >=1 connected site" network_active "$HUB_CTX" || true
   fi
-  # Operator state only: the hub gateway routes on its static backends, not this overlay.
+  # Operator state only: verify the hub overlay independently of the gateway's route assertion below.
   eventually "operator renders the hub overlay with a remote candidate" overlay_distributed || true
 }
 
@@ -811,7 +1112,8 @@ refused_path() {
   fi
 }
 
-chat_body() { jq -cn --arg m "$MODEL" '{model: $m, messages: [{role: "user", content: "ping"}], max_tokens: 8}'; }
+chat_body_for() { jq -cn --arg m "$1" '{model: $m, messages: [{role: "user", content: "ping"}], max_tokens: 8}'; }
+chat_body() { chat_body_for "$MODEL"; }
 
 # served <out prefix>: the site's provider header and a mock model completion.
 served() {
@@ -833,7 +1135,7 @@ enroll_rogue() {
 
 # hub_chat <out prefix>: one chat completion through the hub gateway, succeeding on HTTP 200.
 hub_chat() {
-  local out=$1 url=http://127.0.0.1:18080/v1/chat/completions
+  local out=$1 model=${2:-$MODEL} url=http://127.0.0.1:18080/v1/chat/completions code
   local -a tls_args=()
   if [[ $SIGNED_STATE == enforce && $HUB_ROUTER == render ]]; then
     url=https://hub.grid.internal:18080/v1/chat/completions
@@ -845,8 +1147,12 @@ hub_chat() {
     PF_PID=$!
     sleep 2
   fi
-  [[ $(chat_body | curl -sS -o "$out.body" -D "$out.hdr" -w '%{http_code}' --max-time 15 \
-    -H 'Content-Type: application/json' -d @- "${tls_args[@]}" "$url") == 200 ]]
+  if ! code=$(chat_body_for "$model" | curl -sS -o "$out.body" -D "$out.hdr" -w '%{http_code}' --max-time 15 \
+    -H 'Content-Type: application/json' -d @- "${tls_args[@]}" "$url"); then
+    code=000
+  fi
+  printf '%s\n' "$code" >"$out.status"
+  [[ $code == 200 ]]
 }
 
 consumer_served() { hub_chat "$WORK/consumer" && served "$WORK/consumer"; }
@@ -978,6 +1284,257 @@ assert_site_route() {
   eventually "the restored site's hop returns" hop_clusters vcr || true
   eventually "the gateway rolls out past the restore" rolled_out || true
   eventually "the hub gateway serves the site again after the restore" consumer_served || true
+}
+
+discovered_model_served() {
+  consumer_served && grep -qi '^x-grid-backend: vcr' "$WORK/consumer.hdr" \
+    && jq -e --arg model "$MODEL" '.model == $model' "$WORK/consumer.body" >/dev/null
+}
+
+wait_discovered_model_served() {
+  eventually "the hub's generated grid_site_route includes the vcr cluster" routes_clusters vcr \
+    || { consumer_praxis >&2 || true; return 1; }
+  eventually "the hub gateway serves $MODEL through site-a and vcr" discovered_model_served \
+    || { cat "$WORK/consumer.hdr" "$WORK/consumer.body" 2>/dev/null >&2 || true; return 1; }
+}
+
+discovered_model_served_for() {
+  local out=$1 model=$2
+  hub_chat "$out" "$model" \
+    && grep -qi "^x-grid-provider-site: $SITE" "$out.hdr" \
+    && grep -qi '^x-grid-backend: vcr' "$out.hdr" \
+    && jq -e --arg model "$model" '.model == $model and (.choices | length > 0)' "$out.body" >/dev/null
+}
+
+hub_routing_deadline_matches() {
+  local model=$1 expiry=$2
+  k "$HUB_CTX" get configmap grid-overlay-grid-grid-gateway -o json \
+    | jq -e --arg model "$model" --arg expiry "$expiry" '
+      def millis:
+        if test("\\.[0-9]+Z$") then
+          capture("^(?<prefix>.*\\.)(?<fraction>[0-9]+)Z$")
+          | .prefix + ((.fraction + "000")[0:3]) + "Z"
+        else
+          sub("Z$"; ".000Z")
+        end;
+      [.data["routing-config.json"] | fromjson | .candidates[]
+        | select(.kind == "inference_model" and .name == $model and .site == "site-a" and .cluster == "vcr")
+        | (.expires_at | millis)] == [($expiry | millis)]
+      ' >/dev/null
+}
+
+hub_config_matches_snapshot() {
+  local expected=$1 actual="$WORK/current-routing-config.json"
+  k "$HUB_CTX" get configmap grid-overlay-grid-grid-gateway -o json \
+    | jq -r '.data["routing-config.json"]' >"$actual" || return 1
+  if cmp -s "$expected" "$actual"; then
+    return 0
+  fi
+  cp "$actual" "$ARTIFACTS/$MODE/model-gossip/routing-config-after-retained-wait.json" || true
+  diff -u "$expected" "$actual" >"$ARTIFACTS/$MODE/model-gossip/routing-config-after-retained-wait.diff" || true
+  return 1
+}
+
+hub_gateway_rejects_after_safety_boundary() {
+  (( $(date +%s) >= GATEWAY_SAFETY_EPOCH )) || return 1
+  local out="$WORK/gateway-expired" artifact_dir="$ARTIFACTS/$MODE/model-gossip" result=0
+  mkdir -p "$artifact_dir" || return 1
+  model_route_rejected "$MODEL" "$out" || result=$?
+  cp "$out.status" "$artifact_dir/gateway-expiry-last-response.status" || return 1
+  cp "$out.hdr" "$artifact_dir/gateway-expiry-last-response.hdr" || return 1
+  cp "$out.body" "$artifact_dir/gateway-expiry-last-response.body" || return 1
+  printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$artifact_dir/gateway-expiry-last-response-captured-at.txt"
+  return "$result"
+}
+
+assert_full_inventory_inference() {
+  local dir="$ARTIFACTS/$MODE/inference/full" index=0 active=0 model out pid
+  local -a pids=()
+  mkdir -p "$dir"
+  for model in "${FULL_MODELS[@]}"; do
+    out="$dir/$index"
+    (
+      if discovered_model_served_for "$out" "$model"; then
+        : >"$out.ok"
+      else
+        : >"$out.failed"
+      fi
+    ) &
+    pids+=("$!")
+    active=$((active + 1))
+    index=$((index + 1))
+    if ((active == 4)); then
+      for pid in "${pids[@]}"; do wait "$pid" || true; done
+      pids=()
+      active=0
+    fi
+  done
+  for pid in "${pids[@]}"; do wait "$pid" || true; done
+  local failures
+  failures=$(find "$dir" -name '*.failed' -print | sort)
+  if [[ -z $failures ]] && [[ $(find "$dir" -name '*.ok' | wc -l | tr -d ' ') == 256 ]]; then
+    pass "all 256 maximum-length models served completions through site-a to vcr at concurrency 4"
+    return 0
+  fi
+  fail "full inventory inference failures: ${failures:-missing successful response artifacts}"
+  return 1
+}
+
+assert_model_gossip() {
+  [[ $MODEL_GOSSIP_TEST == 1 ]] || return 0
+  local dir="$ARTIFACTS/$MODE/model-gossip" old_expiry old_epoch remaining new_expiry margin_epoch
+  mkdir -p "$dir" "$ARTIFACTS/$MODE/inference"
+  jq -cn --arg model "$MODEL" '[$model]' >"$WORK/single-models.json"
+  prepare_full_model_inventory
+  cp "$WORK/full-models.json" "$dir/expected-full-models.json"
+  set_model_fixture_mode single || { fail "configure singleton discovery fixture"; return; }
+  eventually "the site discovers $MODEL and publishes a fresh expiry" site_inventory_matches "$WORK/single-models.json" \
+    || { capture_model_gossip_state singleton-timeout || true; return; }
+  eventually "the hub routes only the discovered remote model" hub_candidates_match "$WORK/single-models.json" \
+    || { capture_model_gossip_state singleton-route-timeout || true; return; }
+  capture_model_gossip_state singleton || return
+  old_expiry=$(jq -er '.status.servedModelsExpiresAt' "$dir/singleton-site-status.json") || return
+  hub_candidate_deadlines_match "$WORK/single-models.json" "$old_expiry" \
+    || { fail "the hub candidate carries the site's signed expiry"; return; }
+  wait_discovered_model_served || { fail "discovered model inference must identify site-a, backend vcr, and the requested model"; return; }
+  mkdir -p "$ARTIFACTS/$MODE/inference/singleton"
+  cp "$WORK/consumer.hdr" "$WORK/consumer.body" "$ARTIFACTS/$MODE/inference/singleton/"
+
+  old_epoch=$(site_inventory_expiry_epoch "$dir/singleton-site-status.json") || { fail "parse singleton expiry"; return; }
+  set_model_fixture_mode empty || { fail "configure authoritative empty discovery"; return; }
+  remaining=$((old_epoch - $(date +%s) - 5))
+  wait_for_within "the site publishes a fresh empty inventory before the singleton expiry" "$remaining" \
+    site_empty_inventory_refreshed "$old_expiry" || { capture_model_gossip_state withdrawal-timeout || true; return; }
+  capture_model_gossip_state withdrawn || return
+  new_expiry=$(jq -er '.status.servedModelsExpiresAt' "$dir/withdrawn-site-status.json") || return
+  remaining=$((old_epoch - $(date +%s) - 5))
+  wait_for_within "the signed empty inventory withdraws the remote route before its previous expiry" "$remaining" \
+    hub_remote_candidate_count || { capture_model_gossip_state withdrawal-route-timeout || true; return; }
+  hub_model_candidate_absent "$MODEL" || { fail "withdrawn model remains in hub routing configuration"; return; }
+  hub_model_candidate_absent configured-fallback-model || { fail "configured fallback model appeared as a route"; return; }
+  remaining=$((old_epoch - $(date +%s) - 5))
+  wait_for_within "the hub gateway rejects the withdrawn model before its former expiry" "$remaining" \
+    model_route_rejected "$MODEL" "$WORK/withdrawn-model" || return
+  model_route_rejected configured-fallback-model "$WORK/fallback-model" \
+    || { fail "configured fallback model must produce model_not_found"; return; }
+  capture_model_gossip_state withdrawn-rejected || return
+
+  set_model_fixture_mode single || { fail "restore singleton discovery"; return; }
+  eventually "singleton discovery recovers after an authoritative withdrawal" site_inventory_matches "$WORK/single-models.json" \
+    || { capture_model_gossip_state singleton-recovery-timeout || true; return; }
+  eventually "the signed singleton route recovers after withdrawal" hub_candidates_match "$WORK/single-models.json" || return
+  capture_model_gossip_state singleton-recovered || return
+  new_expiry=$(jq -er '.status.servedModelsExpiresAt' "$dir/singleton-recovered-site-status.json") || return
+  [[ $new_expiry != "$old_expiry" ]] || { fail "recovery must publish a renewed inventory revision"; return; }
+  wait_discovered_model_served || { fail "remote inference must recover after withdrawal"; return; }
+  mkdir -p "$ARTIFACTS/$MODE/inference/singleton-recovered"
+  cp "$WORK/consumer.hdr" "$WORK/consumer.body" "$ARTIFACTS/$MODE/inference/singleton-recovered/"
+
+  old_epoch=$(site_inventory_expiry_epoch "$dir/singleton-recovered-site-status.json") || { fail "parse recovered singleton expiry"; return; }
+  set_model_fixture_mode failure || { fail "configure deterministic discovery failure"; return; }
+  eventually "the site reports a failed /v1/models poll while retaining its last inventory" \
+    site_failed_poll_retained "$WORK/single-models.json" \
+    || { capture_model_gossip_state failure-status-timeout || true; return; }
+  capture_model_gossip_state failed-poll || return
+  new_expiry=$(jq -er '.status.servedModelsExpiresAt' "$dir/failed-poll-site-status.json") \
+    || { fail "the failed poll retains the last successful inventory deadline"; return; }
+  old_expiry=$new_expiry
+  old_epoch=$(site_inventory_expiry_epoch "$dir/failed-poll-site-status.json") || { fail "parse failed-poll retained expiry"; return; }
+  remaining=$((old_epoch + 60 - $(date +%s)))
+  wait_for_within "failed discovery does not renew the route past expiry plus reconciliation allowance" "$remaining" \
+    hub_remote_candidate_count || { capture_model_gossip_state failed-expiry-timeout || true; return; }
+  wait_for_within "the gateway rejects the failed-discovery model after expiry" 30 \
+    model_route_rejected "$MODEL" "$WORK/failed-discovery-expired" || return
+  hub_model_candidate_absent configured-fallback-model || { fail "failed discovery exposed the configured fallback"; return; }
+  capture_model_gossip_state failed-expired || return
+
+  set_model_fixture_mode single || { fail "restore discovery after a failed poll"; return; }
+  eventually "discovery succeeds again after a failed poll" site_inventory_matches "$WORK/single-models.json" \
+    || { capture_model_gossip_state failed-poll-recovery-timeout || true; return; }
+  eventually "the remote route recovers after failed discovery" hub_candidates_match "$WORK/single-models.json" || return
+  wait_discovered_model_served || { fail "remote inference recovers after a failed poll"; return; }
+
+  HUB_OPERATOR_REPLICAS_ORIGINAL=$(k "$HUB_CTX" get deployment grid-operator -o jsonpath='{.spec.replicas}')
+  [[ $HUB_OPERATOR_REPLICAS_ORIGINAL =~ ^[0-9]+$ ]] || { fail "read hub operator replica count"; return; }
+  k "$HUB_CTX" scale deployment/grid-operator --replicas=0 >/dev/null || { fail "stop hub operator updates"; return; }
+  HUB_OPERATOR_SCALED=1
+  eventually "hub operator stopped after retaining the rendered routing configuration" hub_operator_stopped || {
+    restore_hub_operator || true
+    return
+  }
+  capture_model_gossip_state retained-after-stop || { restore_hub_operator || true; return; }
+  local retained_config="$dir/retained-after-stop-routing-config.json"
+  cp "$retained_config" "$WORK/retained-routing-config.json" || {
+    fail "copy retained hub routing configuration"
+    restore_hub_operator || true
+    return
+  }
+  old_expiry=$(jq -er --arg model "$MODEL" --arg site "$SITE" \
+    '.candidates[] | select(.kind == "inference_model" and .name == $model and .site == $site and .cluster == "vcr") | .expires_at' \
+    "$retained_config") || {
+    fail "read retained hub candidate expiry"
+    restore_hub_operator || true
+    return
+  }
+  old_epoch=$(date -d "$old_expiry" +%s) || {
+    fail "parse retained candidate expiry"
+    restore_hub_operator || true
+    return
+  }
+  discovered_model_served || fail "retained gateway route should serve before the expiry safety boundary"
+  margin_epoch=$((old_epoch - 30))
+  GATEWAY_SAFETY_EPOCH=$margin_epoch
+  remaining=$((margin_epoch + 8 - $(date +%s)))
+  wait_for_within "gateway rejects retained discovered state at expires_at minus 30 seconds" "$remaining" \
+    hub_gateway_rejects_after_safety_boundary || fail "gateway expiry behavior failed"
+  hub_config_matches_snapshot "$retained_config" \
+    || fail "gateway rejection must occur while the retained routing configuration still contains the candidate"
+  hub_routing_deadline_matches "$MODEL" "$old_expiry" \
+    || fail "the stopped operator's retained candidate must keep its original deadline"
+  restore_hub_operator || fail "hub operator cleanup after retained-config expiry"
+  eventually "hub operator re-renders a fresh discovered candidate after recovery" discovered_model_routed || return
+  wait_discovered_model_served || fail "remote inference recovers after hub operator restart"
+
+  set_model_fixture_mode full || { fail "configure the complete 256-model inventory"; return; }
+  eventually "the site status contains all 256 maximum-length model names" site_inventory_matches "$WORK/full-models.json" \
+    || { capture_model_gossip_state full-status-timeout || true; return; }
+  eventually "the hub candidate set exactly matches all 256 discovered models" hub_candidates_match "$WORK/full-models.json" \
+    || { capture_model_gossip_state full-route-timeout || true; return; }
+  capture_model_gossip_state full || return
+  old_expiry=$(jq -er '.status.servedModelsExpiresAt' "$dir/full-site-status.json") || return
+  hub_candidate_deadlines_match "$WORK/full-models.json" "$old_expiry" \
+    || { fail "all 256 route candidates carry the discovered expiry"; return; }
+  hub_model_candidate_absent configured-fallback-model || { fail "the full inventory added the configured fallback"; return; }
+  local readiness="$WORK/full-gateway-readiness"
+  if ! eventually "the gateway serves a maximum-length discovered model through site-a and vcr" \
+    discovered_model_served_for "$readiness" "${FULL_MODELS[0]}"; then
+    cp "$readiness.status" "$dir/full-gateway-readiness.status" 2>/dev/null || true
+    cp "$readiness.hdr" "$dir/full-gateway-readiness.hdr" 2>/dev/null || true
+    cp "$readiness.body" "$dir/full-gateway-readiness.body" 2>/dev/null || true
+    capture_model_gossip_state full-gateway-timeout || true
+    return
+  fi
+  cp "$readiness.status" "$dir/full-gateway-readiness.status" || return
+  cp "$readiness.hdr" "$dir/full-gateway-readiness.hdr" || return
+  cp "$readiness.body" "$dir/full-gateway-readiness.body" || return
+  assert_full_inventory_inference || return
+
+  old_epoch=$(site_inventory_expiry_epoch "$dir/full-site-status.json") || { fail "parse full inventory expiry"; return; }
+  set_model_fixture_mode empty || { fail "withdraw the full model inventory"; return; }
+  remaining=$((old_epoch - $(date +%s) - 5))
+  wait_for_within "the site status withdraws all 256 models before their previous expiry" "$remaining" \
+    site_empty_inventory_refreshed "$old_expiry" || { capture_model_gossip_state full-withdrawal-timeout || true; return; }
+  remaining=$((old_epoch - $(date +%s) - 5))
+  wait_for_within "the hub removes the entire 256-model candidate set" "$remaining" hub_remote_candidate_count \
+    || { capture_model_gossip_state full-route-withdrawal-timeout || true; return; }
+  hub_model_candidate_absent "${FULL_MODELS[0]}" || { fail "a stale full-inventory candidate survived withdrawal"; return; }
+  capture_model_gossip_state full-withdrawn || return
+
+  set_model_fixture_mode single || { fail "restore singleton after maximum-inventory withdrawal"; return; }
+  eventually "singleton discovery returns after maximum-inventory withdrawal" site_inventory_matches "$WORK/single-models.json" || return
+  eventually "the singleton route returns after maximum-inventory withdrawal" hub_candidates_match "$WORK/single-models.json" || return
+  wait_discovered_model_served || fail "remote inference recovers after maximum-inventory withdrawal"
+  capture_model_gossip_state final-singleton || return
 }
 
 assert_health() {
@@ -1989,15 +2546,22 @@ unsigned_refused() {
 }
 
 site_received_signed_probe() {
-  k "$SITE_CTX" get configmap grid-overlay-grid-grid-gateway -o json \
-    | jq -e '.data["routing-config.json"] | fromjson | any(.candidates[]; .name == "signed-state-probe" and .site == "hub")'
+  local remote_provider_count_before=${1:-0}
+  if site_route; then
+    k "$SITE_CTX" get gridnetwork grid -o json \
+      | jq -e --argjson before "$remote_provider_count_before" '(.status.remoteProviderCount // 0) > $before' >/dev/null
+  else
+    k "$SITE_CTX" get configmap grid-overlay-grid-grid-gateway -o json \
+      | jq -e --arg model signed-state-probe --arg cluster signed-state-probe \
+        '.data["routing-config.json"] | fromjson | any(.candidates[]; .name == $model and .site == "hub" and .cluster == $cluster)'
+  fi
 }
 
 # assert_signed_state: under enforce, both operators sign, so the remote candidate
 # assert_membership saw came from verified state. Once the site stops signing, the hub
 # refuses its state.
 assert_signed_state() {
-  local ctx logs since
+  local ctx logs since publication_errors remote_provider_count_before=0
   [[ $SIGNED_STATE == enforce ]] || return 0
   for ctx in "$HUB_CTX" "$SITE_CTX"; do
     logs=$(signed_operator_logs "$ctx" --since-time="$SIGNED_FROM")
@@ -2008,19 +2572,33 @@ assert_signed_state() {
     fi
     # The runtime holds state admission until the first GridNetwork trust snapshot arrives.
     # An address discovered during that startup window is retried after trust is initialized.
-    if grep 'failed to encode address broadcast' <<<"$logs" \
-      | grep -v 'arrived before GridNetwork trust was initialized' >/dev/null; then
+    publication_errors=$(grep 'failed to encode address broadcast' <<<"$logs" \
+      | grep -v 'arrived before GridNetwork trust was initialized' || true)
+    if [[ -n $publication_errors ]]; then
       fail "$ctx: operator could not publish its addresses under signed state"
     else
       pass "$ctx: operator publishes its addresses under signed state"
     fi
   done
-  eventually "site verifies the hub gateway identity" site_phase_in "$SITE_CTX" grid-hub Active \
-    || die "hub gateway identity is not Active on the site"
-  helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" \
-    --set inferenceProviders.signed-state-probe.endpoint=http://127.0.0.1:8000 \
-    || die "publish a fresh hub provider under signed state"
-  eventually "site accepts the named signed provider update from the hub" site_received_signed_probe
+  if [[ $HUB_ROUTER == operator ]]; then
+    skip "operator-source hub listener has no TLS probe; signed provider verification below checks hub state trust"
+  else
+    eventually "site verifies the hub gateway identity" site_phase_in "$SITE_CTX" grid-hub Active \
+      || die "hub gateway identity is not Active on the site"
+  fi
+  if site_route; then
+    remote_provider_count_before=$(k "$SITE_CTX" get gridnetwork grid -o json \
+      | jq -er '(.status.remoteProviderCount // 0)') || die "read the site remote provider count before hub publication"
+    site_route_providers vcr hub-local
+    helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" \
+      || die "publish the allowlisted hub-local provider under signed state"
+  else
+    helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" \
+      --set inferenceProviders.signed-state-probe.endpoint=http://127.0.0.1:8000 \
+      || die "publish a fresh hub provider under signed state"
+  fi
+  eventually "site accepts the named signed provider update from the hub" \
+    site_received_signed_probe "$remote_provider_count_before"
   since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   helm_on "$SITE_CTX" "$NS" grid-site grid-site "${SITE_SITE_ARGS[@]}" \
     --set gridNetwork.peerTrust.signedState=off || die "turn signed state off on the site"
@@ -2425,6 +3003,29 @@ assert_rotation_declared() {
   done
 }
 
+# Pin trust keeps the enrolled identity until it expires: no operator renewal log or
+# previous.crt in the Secret means neither site rotated its identity during this leg.
+assert_pin_no_renewal() {
+  [[ $TRUST == pin ]] || return 0
+  local ctx name logged previous
+  for ctx in "$HUB_CTX" "$SITE_CTX"; do
+    name=hub
+    [[ $ctx == "$HUB_CTX" ]] || name=$SITE
+    logged=$(renewals_logged "$ctx")
+    if [[ $logged == 0 ]]; then
+      pass "$name identity was not renewed under pin trust"
+    else
+      fail "$name operator logged $logged identity renewals under pin trust"
+    fi
+    previous=$(k "$ctx" get secret grid-site-identity -o jsonpath='{.data.previous\.crt}')
+    if [[ -z $previous ]]; then
+      pass "$name identity Secret has no previous certificate under pin trust"
+    else
+      fail "$name identity Secret has a previous certificate under pin trust"
+    fi
+  done
+}
+
 cmd_test() {
   local m tool
   for m in $MODES; do
@@ -2432,12 +3033,21 @@ cmd_test() {
   done
   case $HUB_ROUTER in render | operator) ;; *) die "HUB_ROUTER $HUB_ROUTER is not render or operator" ;; esac
   case $SIGNED_STATE in off | enforce) ;; *) die "SIGNED_STATE $SIGNED_STATE is not off or enforce" ;; esac
+  case $MODEL_GOSSIP_TEST in 0 | 1) ;; *) die "MODEL_GOSSIP_TEST $MODEL_GOSSIP_TEST is not 0 or 1" ;; esac
+  if [[ $MODEL_GOSSIP_TEST == 1 ]]; then
+    [[ $HUB_ROUTER == operator ]] || die "MODEL_GOSSIP_TEST requires HUB_ROUTER=operator"
+    [[ $SIGNED_STATE == enforce ]] || die "MODEL_GOSSIP_TEST requires SIGNED_STATE=enforce"
+    [[ $MODES == pin ]] || die "MODEL_GOSSIP_TEST requires MODES=pin"
+  fi
   # A renewed key is locked out under enforce: see docs/architecture/signed-gossip-trust.md.
   [[ $SIGNED_STATE == off || -z ${ROTATION_LIFETIME:-} || $MODES != *spiffe* ]] \
     || die "SIGNED_STATE=enforce cannot rotate"
   for tool in kubectl helm jq openssl curl; do
     command -v "$tool" >/dev/null || die "$tool is required"
   done
+  if [[ $MODEL_GOSSIP_TEST == 1 ]]; then
+    command -v python3 >/dev/null || die "python3 is required for timestamp-aware model inventory assertions"
+  fi
   MODE=setup
   if ha && [[ -z ${HA_OPERATOR_NODE:-} ]]; then
     HA_OPERATOR_NODE=$(kubectl --context "$HUB_CTX" get nodes \
@@ -2463,10 +3073,24 @@ cmd_test() {
     install_grid
     start_renewal_watch
     assert_membership
-    assert_serving
+    if [[ $MODEL_GOSSIP_TEST == 1 ]]; then
+      enable_model_gossip
+      assert_model_gossip
+      k "$SITE_CTX" delete inferenceprovider vcr --wait=true >/dev/null \
+        || die "remove the model gossip test provider override"
+      eventually "provider deletion withdraws its final signed remote candidate" hub_remote_candidate_count \
+        || capture_model_gossip_state provider-deletion-timeout || true
+      wait_for_within "provider deletion makes the hub gateway reject the withdrawn model" "$TIMEOUT" \
+        model_route_rejected "$MODEL" "$WORK/provider-deleted" \
+        || fail "provider deletion must reject the model with a no-route 404"
+      cleanup_model_discovery_fixture || fail "clean up the model discovery fixture"
+    else
+      assert_serving
+      assert_site_route
+    fi
     assert_ha
-    assert_site_route
     assert_rotation_declared
+    assert_pin_no_renewal
     assert_renewal
     assert_signed_state
     assert_health
