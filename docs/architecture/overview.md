@@ -5,6 +5,9 @@ gateways.  It watches Kubernetes resources, learns remote provider state,
 scores candidates, and writes a local routing overlay.  The gateway then uses
 that overlay on the request path.
 
+The [CRD ownership index](crds/README.md) maps each object's spec writer, status
+writer, and consumers.
+
 The important boundary is simple:
 
 ```text
