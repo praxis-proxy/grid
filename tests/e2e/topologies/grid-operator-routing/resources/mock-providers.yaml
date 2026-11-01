@@ -1,0 +1,145 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-a
+  namespace: grid-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: provider-a }
+  template:
+    metadata:
+      labels: { app: provider-a }
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: mock-provider
+          image: "{{ cluster.properties.mockProviderImage }}"
+          imagePullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+          args: ["--provider", "openai", "--port", "8080"]
+          env:
+            - name: MOCK_PROVIDER_SITE
+              value: provider-a
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-a
+  namespace: grid-system
+spec:
+  selector: { app: provider-a }
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-b-old
+  namespace: grid-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: provider-b-old }
+  template:
+    metadata:
+      labels: { app: provider-b-old }
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: mock-provider
+          image: "{{ cluster.properties.mockProviderImage }}"
+          imagePullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+          args: ["--provider", "openai", "--port", "8080"]
+          env:
+            - name: MOCK_PROVIDER_SITE
+              value: provider-b-old
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-b-old
+  namespace: grid-system
+spec:
+  selector: { app: provider-b-old }
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-b-replacement
+  namespace: grid-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: provider-b-replacement }
+  template:
+    metadata:
+      labels: { app: provider-b-replacement }
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: mock-provider
+          image: "{{ cluster.properties.mockProviderImage }}"
+          imagePullPolicy: "{{ cluster.properties.imagePullPolicy }}"
+          args: ["--provider", "openai", "--port", "8080"]
+          env:
+            - name: MOCK_PROVIDER_SITE
+              value: provider-b-replacement
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-b-replacement
+  namespace: grid-system
+spec:
+  selector: { app: provider-b-replacement }
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qualification-client
+  namespace: grid-system
+spec:
+  automountServiceAccountToken: false
+  restartPolicy: Always
+  containers:
+    - name: curl
+      image: curlimages/curl:8.10.1
+      imagePullPolicy: Never
+      command: ["/bin/sh", "-c", "sleep 86400"]

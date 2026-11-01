@@ -17,6 +17,7 @@ pub(crate) mod kubectl;
 pub(crate) mod llmd_pool_metrics_demo;
 pub(crate) mod operator;
 pub(crate) mod operator_overlay;
+pub(crate) mod operator_routing_qualification;
 pub(crate) mod provider_drain;
 pub(crate) mod provider_traffic_qualification;
 pub(crate) mod providers;
@@ -1110,6 +1111,22 @@ pub(crate) enum Action {
         evidence_dir: Option<PathBuf>,
     },
 
+    /// Qualify operator-derived local dials through the embedded Grid Gateway.
+    RunGridOperatorRoutingQualification {
+        /// Forge topology to deploy.
+        #[arg(long, default_value = "tests/e2e/topologies/grid-operator-routing/forge.yaml")]
+        forge_config: PathBuf,
+        /// Delete only this run's Kind cluster after the qualification.
+        #[arg(long)]
+        teardown: bool,
+        /// With `--teardown`, retain the run-owned cluster on failure for diagnosis.
+        #[arg(long, requires = "teardown")]
+        keep_on_failure: bool,
+        /// Evidence directory. Defaults to a timestamped path under the topology.
+        #[arg(long)]
+        evidence_dir: Option<PathBuf>,
+    },
+
     /// Run the distributed token-rate-limit topology with structured evidence.
     RunGridTokenRateLimitQualification {
         /// Path to the Forge environment config file.
@@ -1213,6 +1230,74 @@ mod static_weighted_qualification_cli_tests {
             forge_config,
             PathBuf::from("tests/e2e/topologies/grid-static-weighted/forge.yaml")
         );
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "CLI contract tests use clap's parse result directly")]
+mod operator_routing_qualification_cli_tests {
+    use std::path::PathBuf;
+
+    use clap::Parser as _;
+
+    use super::Action;
+    use crate::{Cli, Command};
+
+    #[test]
+    fn operator_routing_command_defaults_to_its_dedicated_topology() {
+        let cli = Cli::try_parse_from(["xtask", "env", "run-grid-operator-routing-qualification"])
+            .expect("operator-routing command with defaults parses");
+        let Command::Env { action } = cli.command else {
+            return;
+        };
+        assert!(matches!(action, Action::RunGridOperatorRoutingQualification { .. }));
+        let Action::RunGridOperatorRoutingQualification { forge_config, .. } = action else {
+            return;
+        };
+        assert_eq!(
+            forge_config,
+            PathBuf::from("tests/e2e/topologies/grid-operator-routing/forge.yaml")
+        );
+    }
+
+    #[test]
+    fn keep_on_failure_requires_explicit_teardown() {
+        let result = Cli::try_parse_from([
+            "xtask",
+            "env",
+            "run-grid-operator-routing-qualification",
+            "--keep-on-failure",
+        ]);
+        result.expect_err("--keep-on-failure requires --teardown");
+    }
+
+    #[test]
+    fn operator_routing_command_accepts_custom_config_and_scoped_teardown() {
+        let cli = Cli::try_parse_from([
+            "xtask",
+            "env",
+            "run-grid-operator-routing-qualification",
+            "--forge-config",
+            "custom/forge.yaml",
+            "--teardown",
+            "--keep-on-failure",
+        ])
+        .expect("operator-routing accepts its documented options");
+        let Command::Env { action } = cli.command else {
+            return;
+        };
+        assert!(matches!(
+            action,
+            Action::RunGridOperatorRoutingQualification {
+                teardown: true,
+                keep_on_failure: true,
+                ..
+            }
+        ));
+        let Action::RunGridOperatorRoutingQualification { forge_config, .. } = action else {
+            return;
+        };
+        assert_eq!(forge_config, PathBuf::from("custom/forge.yaml"));
     }
 }
 
@@ -1355,6 +1440,17 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
                 evidence_dir: evidence_dir.clone(),
             },
         ),
+        Action::RunGridOperatorRoutingQualification {
+            forge_config,
+            teardown,
+            keep_on_failure,
+            evidence_dir,
+        } => operator_routing_qualification::run(&operator_routing_qualification::Options {
+            forge_config: forge_config.clone(),
+            teardown: *teardown,
+            keep_on_failure: *keep_on_failure,
+            evidence_dir: evidence_dir.clone(),
+        }),
         Action::RunGridTokenRateLimitQualification {
             forge_config,
             evidence_dir,
