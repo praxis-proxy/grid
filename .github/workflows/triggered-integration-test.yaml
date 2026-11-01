@@ -592,15 +592,21 @@ jobs:
               ;;
             operator-routing)
               TOPOLOGY="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-operator-routing/forge.yaml"
+              MOCK_PROVIDER_MANIFEST="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-operator-routing/resources/mock-providers.yaml"
+              QUALIFICATION_SOURCE="${GITHUB_WORKSPACE}/grid/crates/xtask/src/env/operator_routing_qualification.rs"
               for endpoint in \
                 'endpoint: "http://provider-a.grid-system.svc:8080"' \
-                'endpoint: "http://provider-b-old.grid-system.svc:8080"' \
-                'endpoint: "http://provider-b-replacement.grid-system.svc:8080"'; do
+                'endpoint: "http://provider-b-old.grid-system.svc:8080"'; do
                 if ! grep -Fq "${endpoint}" "${TOPOLOGY}"; then
                   echo "::error::Operator-routing topology is missing expected local Service endpoint ${endpoint}"
                   exit 1
                 fi
               done
+              if ! grep -Fq 'name: provider-b-replacement' "${MOCK_PROVIDER_MANIFEST}" \
+                || ! grep -Fq 'http://provider-b-replacement.grid-system.svc:8080' "${QUALIFICATION_SOURCE}"; then
+                echo "::error::Operator-routing replacement endpoint is missing its run-owned Service or runtime spec update"
+                exit 1
+              fi
               echo "Validated operator-routing uses only the run-owned cluster-local provider Services"
               CONFIGS=()
               ;;
