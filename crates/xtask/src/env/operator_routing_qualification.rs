@@ -1197,7 +1197,7 @@ fn run_phases(ctx: &RunContext, evidence: &mut Evidence, request_id: &mut u64, i
 
     let mut replacement_failures = Vec::new();
     let mut replacement_requests = Vec::new();
-    let replacement_result = phase(evidence, "endpoint-replacement-resets-passive-health", || {
+    let replacement_result = phase(evidence, "endpoint-replacement-and-eventual-recovery", || {
         let prior_log_count = provider_down_logs(ctx)?.len();
         let prior_failure_count = provider_failure_logs(ctx, "provider-b-old.grid-system.svc:8080")?.len();
         kubectl_ok(

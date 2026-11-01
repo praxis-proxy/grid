@@ -67,7 +67,7 @@
 - [Operator-derived Local Routing Qualification](../tests/e2e/topologies/grid-operator-routing/README.md):
   proves operator-derived local dials reach the embedded Gateway, attributed
   requests follow those dials, passive health demotes and recovers a failed
-  backend, and endpoint replacement clears stale health state.
+  backend, and endpoint replacement eventually routes to the replacement backend.
 - [Static Weighted Provider Qualification](../tests/e2e/topologies/grid-static-weighted/README.md):
   proves configured capacity propagation, weighted overlay convergence,
   proportional request selection, hot reload, and equal-weight recovery. This

@@ -10,8 +10,8 @@ It verifies that the operator derives dials from local `InferenceProvider.spec.e
 published and mounted dial documents agree, and that attributed inference requests reach both providers. It then makes Provider B's inference Service
 unavailable while keeping its independent Grid health-check endpoint healthy. The embedded Gateway must detect repeated connection failures, demote that
 backend, route subsequent requests to Provider A, recover Provider B when its original endpoint returns, and route to a replacement endpoint after the
-provider spec changes. The replacement request verifies the new dial is published, mounted, and usable, rather than carrying old passive-health state to a
-new address.
+provider spec changes. After publishing and mounting the replacement dial, the test verifies that the replacement endpoint eventually serves an
+attributed request. It does not prove that replacement bypasses the Gateway's normal passive-health cooldown or that no transient request failures occur.
 
 This does not replace the llm-d qualification's cross-site signal, capacity, or EPP-metric tests. It also does not test administrative `existing_only`
 drain semantics, in-flight streaming behavior during drain, ingress, cross-cluster networking, or product API compatibility with a released Praxis image.
@@ -77,7 +77,7 @@ A passing run requires all of the following:
 - Provider B returns an attributable connection-failure response while its Grid health check remains healthy;
 - a new passive-health log entry confirms Provider B demotion, followed by ten attributed Provider A responses;
 - Provider B's original endpoint returns and serves two successful, correctly attributed requests;
-- changing Provider B's endpoint publishes and mounts the replacement address, and the replacement backend serves a correctly attributed request;
+- changing Provider B's endpoint publishes and mounts the replacement address, and the replacement backend eventually serves a correctly attributed request;
 - run-owned cluster teardown completes.
 
 The mock backend response marker, `x-grid-test-provider`, is checked against Grid's `x-grid-site` and `x-grid-backend` response attribution. A 200 response
