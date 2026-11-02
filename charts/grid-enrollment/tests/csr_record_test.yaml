@@ -19,7 +19,7 @@ tests:
           value:
             - apiGroups: ["certificates.k8s.io"]
               resources: ["certificatesigningrequests"]
-              verbs: ["create"]
+              verbs: ["create", "delete"]
             - apiGroups: ["certificates.k8s.io"]
               resources: ["certificatesigningrequests/status"]
               verbs: ["patch"]
@@ -94,11 +94,11 @@ tests:
       - documentIndex: 2
         equal:
           path: spec.validations[0].expression
-          value: "object.spec.signerName == \"grid.praxis.fast/site\""
+          value: "(object != null ? object : oldObject).spec.signerName == \"grid.praxis.fast/site\""
       - documentIndex: 2
         equal:
           path: spec.matchConstraints.resourceRules[0].operations
-          value: ["CREATE", "UPDATE"]
+          value: ["CREATE", "UPDATE", "DELETE"]
 
   - it: turns the record on in the service with its signer name
     template: templates/enrollment/deployment.yaml
