@@ -247,10 +247,14 @@ from what already decides who may serve:
 
 - A local candidate derives from the `InferenceProvider` of the network on this
   cluster that carries its routing identity (`clusterName`, else
-  `metadata.name`). Creating a cluster-scoped `InferenceProvider` takes cluster
-  RBAC; on RHOAI the model controller writes one only for a namespace an admin
-  labelled `grid.opendatahub.io/allowed=true`, with the serving Gateway's own
-  address.
+  `metadata.name`). Because `gridNetworkRef` and `spec.endpoint` are
+  self-asserted, anyone who can create an `InferenceProvider` can add an
+  upstream the generated gateway dials. RBAC on `InferenceProvider` create is
+  the trust control. On RHOAI the model controller writes one only for a
+  namespace an admin labelled `grid.opendatahub.io/allowed=true`, with the
+  serving Gateway's own address. The ambiguous-identity refusal
+  (`derived_topology::local_providers`) covers only a clash with an existing
+  identity, not a new one.
 - Under Local membership, a remote candidate derives when that member's own
   catalog offers it. The operator reads each catalog from the peer over mutual
   TLS and stamps its records with that peer's site, and the hop address and
