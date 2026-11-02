@@ -53,10 +53,12 @@ mod tests {
 
     use super::validate_no_policy_filter;
 
+    /// Parse a test configuration, aborting if the fixture is invalid.
     fn config_with_policy_chain(yaml: &str) -> Config {
         Config::from_yaml(yaml).unwrap_or_else(|_| std::process::abort())
     }
 
+    /// Reject a top-level policy filter with operator guidance.
     #[test]
     fn refuses_policy_filter() {
         let config = config_with_policy_chain(
@@ -96,6 +98,7 @@ clusters:
         );
     }
 
+    /// Reject a policy filter nested in an inline branch chain.
     #[test]
     fn refuses_policy_filter_in_inline_branch_chain() {
         let config = config_with_policy_chain(
@@ -140,6 +143,7 @@ clusters:
         );
     }
 
+    /// Accept a config whose filter chains do not use policy.
     #[test]
     fn accepts_config_without_policy_filter() {
         let config = config_with_policy_chain(

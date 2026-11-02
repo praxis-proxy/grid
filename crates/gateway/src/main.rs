@@ -89,6 +89,7 @@ fn preflight() -> Option<ExitCode> {
     None
 }
 
+/// Validate startup requirements, then run the configured gateway.
 fn main() -> ExitCode {
     if let Some(exit) = preflight() {
         return exit;
@@ -709,6 +710,7 @@ mod policy_config_tests {
     use praxis_core::config::Config;
 
     #[cfg(not(feature = "fips"))]
+    /// Keep policy filter configuration available in the regular build.
     #[test]
     fn policy_filter_config_stays_valid() {
         let config = Config::from_yaml(
