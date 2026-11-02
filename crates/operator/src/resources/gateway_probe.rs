@@ -133,8 +133,8 @@ pub(crate) struct ProbeTransition {
 
 /// Map a probe outcome to a deterministic phase transition.
 ///
-/// `current_phase` distinguishes demotion (Active → Connecting) from
-/// stall (Connecting → Connecting) and recovery (Unreachable → Active).
+/// `current_phase` distinguishes demotion (Active -> Connecting) from
+/// stall (Connecting -> Connecting) and recovery (Unreachable -> Active).
 pub(crate) fn probe_transition(current_phase: &GridSitePhase, outcome: &GatewayProbeOutcome) -> ProbeTransition {
     use GatewayProbeOutcome as O;
 
@@ -179,7 +179,7 @@ fn success(reason: &'static str, msg: &str) -> ProbeTransition {
     }
 }
 
-/// Connectivity failure: Active → Unreachable, others stay.
+/// Connectivity failure: Active -> Unreachable, others stay.
 fn connectivity_failure(current: &GridSitePhase, reason: &'static str, msg: &str) -> ProbeTransition {
     ProbeTransition {
         phase: match current {
@@ -811,7 +811,6 @@ mod tests {
     // ---- Safety: no secrets in reason strings or messages ----
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "exhaustive check of all 16 variants × 3 phases")]
     fn all_reasons_are_bounded_static_strings() {
         let all = [
             GatewayProbeOutcome::Verified,

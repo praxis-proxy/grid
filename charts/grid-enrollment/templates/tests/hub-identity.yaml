@@ -1,3 +1,4 @@
+{{- if eq .Values.mode "service" }}
 {{- include "grid-enrollment.normalize" . }}
 {{- if .Values.hubSite.name }}
 {{/*
@@ -51,4 +52,5 @@ spec:
     - name: ca
       secret:
         secretName: {{ .Values.hubSite.caSecretName | quote }}
+{{- end }}
 {{- end }}

@@ -143,7 +143,9 @@ borrowed from another site.
   first token, streaming requests, from `llm_d_epp_request_ttft_seconds`. Timed
   from receiving the request, so it includes flow-control wait and network.
 - `grid_provider_tpot_seconds`: mean time per output token, streaming requests.
-- `grid_provider_error_ratio`: failed over all requests. The latency histograms
+- `grid_provider_error_ratio`: requests the site failed over requests it
+  received, not counting those it reports as client errors (4xx other than 429).
+  It needs 20 received requests, not completed ones. The latency histograms
   record only successes, so a failing site can read fast; this shows it.
 
 The EPP labels these by model, not pool, so an EPP serving several pools reports

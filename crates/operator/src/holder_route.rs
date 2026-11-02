@@ -327,7 +327,7 @@ fn same(live: &EndpointSlice, desired: &EndpointSlice) -> bool {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, clippy::too_many_lines, reason = "tests")]
+#[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     use std::{
         collections::BTreeMap,

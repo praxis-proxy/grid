@@ -106,6 +106,26 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_serving_from_the_provider_file_loads() {
+        let Some(yaml) = render(&[
+            "--set=image.flavor=grid-gateway",
+            "--set=grid.networkName=grid",
+            "--set=praxisConfig.render.role=provider",
+            "--set=gridIdentity.tlsSecretName=grid-site-identity",
+            "--set=praxisConfig.render.peerTrust.mode=spiffe",
+            "--set=praxisConfig.render.gridServing.enabled=true",
+            "--set=praxisConfig.render.gridServing.gatewayRefName=grid-gateway",
+        ]) else {
+            return;
+        };
+        assert!(
+            yaml.contains("- filter: grid_provider"),
+            "the provider file render:\n{yaml}"
+        );
+        load(&yaml).unwrap_or_else(|error| panic!("provider file render: {error}"));
+    }
+
+    #[test]
     fn every_default_render_loads() {
         for (name, values) in CASES {
             let Some(yaml) = render(values) else { return };
@@ -140,5 +160,26 @@ mod tests {
             "prefixAffinity renders as the filter's prefix_affinity:\n{yaml}"
         );
         load(&yaml).unwrap_or_else(|error| panic!("grid serving with site route tuning: {error}"));
+    }
+
+    #[test]
+    fn a_grid_serving_render_without_backends_loads() {
+        let Some(yaml) = render(&[
+            "--set=image.flavor=grid-gateway",
+            "--set=praxisConfig.render.gridServing.enabled=true",
+            "--set=praxisConfig.render.gridServing.networkName=grid",
+            "--set=praxisConfig.render.gridServing.backendCAs[0].secretName=kserve-ca",
+            "--set=gridIdentity.tlsSecretName=grid-site-identity",
+            "--set=gridIdentity.caSecretName=grid-ca",
+        ]) else {
+            return;
+        };
+        assert!(
+            yaml.contains("clusters: []") && !yaml.contains("load_balancer"),
+            "grid_site_route declares no clusters and no load_balancer is rendered:\n{yaml}"
+        );
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("praxis.yaml");
+        assert!(parsed.get("clusters").is_none(), "no top-level clusters:\n{yaml}");
+        load(&yaml).unwrap_or_else(|error| panic!("grid serving without backends: {error}"));
     }
 }

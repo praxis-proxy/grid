@@ -35,6 +35,8 @@ pub mod overlay_bridge;
 pub mod overlay_envelope;
 /// Stateful provider admission and pressure-recovery evaluator.
 pub(crate) mod provider_admission;
+/// The provider file a provider gateway serves admitted peers from.
+pub(crate) mod provider_config;
 /// Provider metrics collection for the [`GridNetwork`] overlay renderer.
 ///
 /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork

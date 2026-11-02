@@ -518,7 +518,6 @@ fn spec_of(record: &Record) -> LeaseSpec {
 #[expect(
     clippy::expect_used,
     clippy::print_stderr,
-    clippy::too_many_lines,
     reason = "tests; the handover times are printed for the recovery-time targets"
 )]
 mod tests {

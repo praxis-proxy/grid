@@ -2,8 +2,15 @@
 resolver = "3"
 members = ["crates/ai-grid-filters"]
 
+# Keep local and Helm CI build settings aligned with the root workspace.
+[profile.dev]
+opt-level = 1
+lto = "off"
+codegen-units = 16
+debug = 0
+
 [workspace.package]
-version = "0.3.0-rc.1"
+version = "0.3.0-rc.3"
 edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
@@ -18,6 +25,7 @@ httpdate = "1.0.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { version = "0.10.7", package = "yaml_serde" }
 metrics = "0.24.6"
+time = "0.3.0"
 
 [workspace.lints.rust]
 dead_code = "deny"
@@ -258,8 +266,6 @@ float_cmp = "deny"
 host_endian_bytes = "deny"
 # Match exhaustiveness: name every variant; no `_` arms over enums
 wildcard_enum_match_arm = "deny"
-# Determinism: no iteration over unordered hash collections
-iter_over_hash_type = "deny"
 # Module organization: `foo.rs` style, never `foo/mod.rs`
 mod_module_files = "deny"
 # Naming clarity
@@ -311,7 +317,7 @@ name = "gateway"
 description = "Praxis-based grid data-plane gateway"
 # Hermeto 0.62.0 cannot resolve an inherited version for the workspace root package.
 # Keep this in sync with workspace.package.version above until that is supported.
-version = "0.3.0-rc.1"
+version = "0.3.0-rc.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

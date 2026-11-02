@@ -1,3 +1,4 @@
+{{- if eq .Values.mode "service" }}
 {{- include "grid-enrollment.normalize" . }}
 {{/*
 The Service routes only to ready endpoints, and readiness is the kubelet's own HTTPS probe
@@ -35,3 +36,4 @@ spec:
           set -eu
           nc -z -w 5 {{ include "grid-enrollment.fullname" . }} {{ include "grid-enrollment.listenPort" . }}
           echo "enrollment is serving on {{ include "grid-enrollment.listenPort" . }}, so its readiness probe passed"
+{{- end }}

@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::crd::inference_provider::Condition;
 
+/// Gateway model-discovery contract version required for dynamic model routes.
+pub const MODEL_DISCOVERY_CONTRACT_VERSION: &str = "v1";
+
 // ---------------------------------------------------------------------------
 // Routing policy
 // ---------------------------------------------------------------------------
@@ -169,10 +172,50 @@ pub struct SelectionPolicyConfig {
     pub mode: SelectionMode,
 }
 
+/// Where a site learns its members from.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize, clap::ValueEnum)]
+pub enum MembershipMode {
+    /// SWIM gossip discovers the members.
+    #[default]
+    #[value(name = "Swim")]
+    Swim,
+    /// Declared `GridSite` objects supply peers, whose catalogs and signals are polled over HTTPS.
+    #[value(name = "Local")]
+    Local,
+}
+
+impl MembershipMode {
+    /// The mode `name` names, ignoring case and surrounding space, `None` for any other value.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        let name = name.trim();
+        [Self::Swim, Self::Local]
+            .into_iter()
+            .find(|mode| mode.as_str().eq_ignore_ascii_case(name))
+    }
+
+    /// The name the API, charts, and signals response use.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Swim => "Swim",
+            Self::Local => "Local",
+        }
+    }
+}
+
+/// Grid-wide membership selection, overriding the install's startup setting when present.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct MembershipConfig {
+    /// Membership source. Local requires `signalTransport.mode: poll`.
+    pub mode: MembershipMode,
+}
+
 /// How signals propagate across the sites of a grid.
 ///
-/// The mode names the dissemination path, not the transport: SWIM membership
-/// runs in both modes. Only where the load signal travels changes.
+/// SWIM membership can use either path; Local membership requires polling.
 #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "camelCase")]
 pub enum SignalMode {
@@ -209,6 +252,17 @@ pub enum PeerTrustMode {
     Spiffe,
 }
 
+/// Whether grid-scoped SWIM state must carry a verified signature.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SignedStateMode {
+    /// State is neither signed nor verified.
+    #[default]
+    Off,
+    /// State is signed with the site identity, and unverified peer state is refused.
+    Enforce,
+}
+
 /// Grid-wide peer trust, the same at every site.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -216,6 +270,10 @@ pub enum PeerTrustMode {
 pub struct PeerTrustConfig {
     /// Peer trust mode.
     pub mode: PeerTrustMode,
+
+    /// Signed state, `off` when absent. Switch every site together: an enforcing site refuses unsigned peers.
+    #[serde(default)]
+    pub signed_state: SignedStateMode,
 }
 
 /// Explicit static provider-capacity placement strategy.
@@ -606,13 +664,17 @@ fn add_tls_config_legacy_fields(schema: &mut schemars::Schema) {
 }, {
     "rule": "!has(oldSelf.gridId) || oldSelf.gridId == '' || (has(self.gridId) && self.gridId == oldSelf.gridId)",
     "message": "gridId cannot change once set"
+}, {
+    "rule": "!has(self.membership) || self.membership.mode != 'Local' || (has(self.signalTransport) && self.signalTransport.mode == 'poll')",
+    "message": "membership.mode Local requires signalTransport.mode poll"
 }]))]
 #[schemars(transform = add_grid_network_spec_legacy_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct GridNetworkSpec {
-    /// The grid this network belongs to, set once. Empty only while unset: an install with no
-    /// operator config site section then mints one, and one with a site section holds the
-    /// grid runtime until it is set. Moving to another grid means recreating the network.
+    /// The grid this network belongs to, set once by bootstrap or its delivery automation.
+    /// The operator waits until this is declared and never generates a grid ID.
+    /// A grid ID that operators before #474 kept only in status is copied here once, and status then mirrors spec.
+    /// Moving to another grid means recreating the network.
     #[serde(default)]
     #[schemars(length(max = 63), regex(pattern = "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"))]
     pub grid_id: String,
@@ -688,6 +750,11 @@ pub struct GridNetworkSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_policy: Option<SelectionPolicyConfig>,
 
+    /// Grid-wide membership source. When absent, the install's startup setting applies.
+    /// A change causes the operator to restart gracefully into the declared mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership: Option<MembershipConfig>,
+
     /// Grid-wide signal transport.
     ///
     /// **Default (absent):** `gossip`, the established SWIM and CRDT overlay
@@ -697,7 +764,8 @@ pub struct GridNetworkSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal_transport: Option<SignalTransportConfig>,
 
-    /// Grid-wide peer trust on the signals path, `pin` when absent, read at operator start.
+    /// Grid-wide peer trust: signals-path mode, `pin` when absent, read at operator start; signed state, read each
+    /// reconcile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_trust: Option<PeerTrustConfig>,
 
@@ -788,6 +856,15 @@ pub struct GatewayRef {
     #[serde(default, alias = "localSiteName")]
     pub site_name: Option<String>,
 
+    /// Model-discovery contract version supported by the running gateway.
+    ///
+    /// Set this only after the gateway is running an image that understands
+    /// the `expires_at` routing-candidate field and enforces its deadline.
+    /// The operator includes discovered model candidates only when this is
+    /// exactly `v1`; absent or other values keep dynamic candidates withheld.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_discovery_contract_version: Option<String>,
+
     /// Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
     /// serving config. With the default `praxisConfig.siteRouter`
     /// `intelligentRoute` this allowlist is independent of `praxisConfig`, so a
@@ -816,6 +893,14 @@ pub struct GatewayRef {
     /// compatible filter config is already running.
     #[serde(default, alias = "consumerConfig", skip_serializing_if = "Option::is_none")]
     pub praxis_config: Option<ConsumerConfig>,
+}
+
+impl GatewayRef {
+    /// Whether the declared running gateway supports model-discovery contract `v1`, including candidate expiry.
+    #[must_use]
+    pub fn supports_model_discovery_contract(&self) -> bool {
+        self.model_discovery_contract_version.as_deref() == Some(MODEL_DISCOVERY_CONTRACT_VERSION)
+    }
 }
 
 /// Opt-in configuration for operator-generated consumer Praxis config.
@@ -916,8 +1001,8 @@ pub struct ConsumerConfig {
     #[serde(default = "default_tls_cert_mount_path")]
     pub tls_cert_mount_path: String,
 
-    /// Derive the endpoint topology from the declarations of named providers,
-    /// instead of requiring a `clusterEndpoints` entry per candidate.
+    /// Settings for the endpoint topology the operator derives for each candidate
+    /// with no `clusterEndpoints` entry. Absent still derives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derive_topology: Option<DeriveTopology>,
 
@@ -1034,10 +1119,6 @@ impl GatewayTelemetryConfig {
     ///
     /// Returns an explanatory message for invalid strings, sampling rates, or
     /// batch settings outside their supported ranges.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "validates all telemetry settings before CRD rendering"
-    )]
     pub fn validate(&self) -> Result<(), String> {
         if self.otlp_endpoint.as_ref().is_some_and(|endpoint| {
             if endpoint.is_empty() {
@@ -1110,7 +1191,8 @@ impl Default for ConsumerConfig {
     }
 }
 
-/// Providers a gateway derives its endpoint topology from. Empty derives nothing.
+/// How a gateway derives its endpoint topology. Every local provider of the network
+/// derives, and so does every candidate a member's catalog offers under Local membership.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -1119,7 +1201,8 @@ impl Default for ConsumerConfig {
     "message": "deriveTopology.transport mode must be tls"
 }]))]
 pub struct DeriveTopology {
-    /// Routing identities whose declarations this gateway derives from.
+    /// Remote routing identities this gateway derives a hop for without a member catalog,
+    /// as under SWIM membership.
     ///
     /// Each entry is a provider's `clusterName`, or its `metadata.name`
     /// when that is unset. At most 64 entries, each named once.
@@ -1224,8 +1307,9 @@ pub struct EndpointCaSecretRef {
     #[schemars(length(min = 1))]
     pub name: String,
 
-    /// Optional key containing the CA bundle. Defaults to `ca.crt`.
-    #[schemars(length(min = 1))]
+    /// Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+    /// or `..`, and not starting with `..`.
+    #[schemars(length(min = 1), regex(pattern = r"^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$"))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
 }
@@ -1733,6 +1817,20 @@ mod tests {
     }
 
     #[test]
+    fn a_backend_ca_key_is_a_file_name_never_a_path() {
+        let schema = schemars::schema_for!(EndpointCaSecretRef);
+        assert_eq!(
+            schema
+                .as_value()
+                .pointer("/properties/key/pattern")
+                .and_then(serde_json::Value::as_str),
+            Some(r"^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$"),
+            "what Kubernetes accepts as a Secret key: `root..crt` and `.hidden` pass, `/`, `.`, `..` \
+             and a `..` prefix do not"
+        );
+    }
+
+    #[test]
     fn default_swim_config() {
         let cfg = SwimConfig::default();
         assert_eq!(cfg.gossip_nodes, 3, "default gossip nodes");
@@ -2051,7 +2149,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "round-trip test covers all ConsumerConfig fields")]
     fn consumer_config_enabled_round_trips() {
         let json = serde_json::json!({
             "name": "gw",
@@ -2157,10 +2254,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "asserts every ConsumerConfig default as one contract"
-    )]
     fn consumer_config_defaults_when_subfields_absent() {
         let json = serde_json::json!({
             "name": "gw",
@@ -2194,6 +2287,33 @@ mod tests {
         assert_eq!(
             cc.tls_cert_mount_path, "/etc/praxis/tls",
             "tlsCertMountPath must use default"
+        );
+    }
+
+    #[test]
+    fn model_discovery_contract_requires_exact_supported_version() {
+        let parse_gateway = |version: Option<&str>| {
+            let mut value = serde_json::json!({"name": "gw", "namespace": "ns"});
+            if let Some(version) = version {
+                let Some(object) = value.as_object_mut() else {
+                    std::process::abort();
+                };
+                object.insert("modelDiscoveryContractVersion".to_owned(), serde_json::json!(version));
+            }
+            serde_json::from_value::<GatewayRef>(value).unwrap_or_else(|_| std::process::abort())
+        };
+
+        assert!(
+            parse_gateway(Some("v1")).supports_model_discovery_contract(),
+            "known model discovery contract must enable discovered routes"
+        );
+        assert!(
+            !parse_gateway(None).supports_model_discovery_contract(),
+            "missing gateway contract must fail closed"
+        );
+        assert!(
+            !parse_gateway(Some("v2")).supports_model_discovery_contract(),
+            "unknown future contract must fail closed"
         );
     }
 
@@ -2391,6 +2511,7 @@ mod tests {
             name: "gw".to_owned(),
             namespace: "ns".to_owned(),
             site_name: None,
+            model_discovery_contract_version: None,
             provider_hop_endpoints: Vec::new(),
             praxis_config: None,
         };
@@ -2402,10 +2523,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "asserts generated telemetry fields and all opt-in security boundaries"
-    )]
     fn grid_network_crd_has_consumer_config_field_on_gateway_ref() {
         let crd = crd_json();
         let gateway_ref_properties = crd
@@ -2421,6 +2538,10 @@ mod tests {
         assert!(
             gateway_ref_properties.contains_key("providerHopEndpoints"),
             "CRD schema must include independent providerHopEndpoints on GatewayRef"
+        );
+        assert!(
+            gateway_ref_properties.contains_key("modelDiscoveryContractVersion"),
+            "CRD schema must expose the gateway's model discovery contract version"
         );
         let consumer_config_properties = gateway_ref_properties
             .get("praxisConfig")
@@ -2760,7 +2881,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "full-field struct construction and assertion")]
     fn overlay_status_distributed_serialization() {
         let status = OverlayRevisionStatus {
             gateway_name: "gw".to_owned(),
@@ -3101,6 +3221,35 @@ mod tests {
     }
 
     #[test]
+    fn membership_round_trips_without_defaulting_absent_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let bare: GridNetworkSpec = serde_json::from_value(serde_json::json!({}))?;
+        assert!(bare.membership.is_none(), "legacy networks retain the install setting");
+        assert!(serde_json::to_value(bare)?.get("membership").is_none());
+        for (value, mode) in [("Local", MembershipMode::Local), ("Swim", MembershipMode::Swim)] {
+            let spec: GridNetworkSpec = serde_json::from_value(serde_json::json!({
+                "membership": {"mode": value}, "signalTransport": {"mode": "poll"}
+            }))?;
+            assert_eq!(spec.membership.as_ref().map(|policy| policy.mode), Some(mode));
+            assert_eq!(
+                serde_json::to_value(spec)?.pointer("/membership/mode"),
+                Some(&serde_json::json!(value))
+            );
+        }
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"mode": "local"}),
+            serde_json::json!({"mode": "Other"}),
+            serde_json::json!({"mode": "Local", "extra": true}),
+        ] {
+            let error = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({"membership": invalid}))
+                .err()
+                .ok_or("invalid membership was accepted")?;
+            assert!(error.is_data());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn peer_trust_round_trips_and_rejects_unknown_mode() {
         let spec: GridNetworkSpec =
             serde_json::from_value(serde_json::json!({"seeds": [], "peerTrust": {"mode": "spiffe"}}))
@@ -3115,6 +3264,31 @@ mod tests {
         else {
             std::process::abort();
         };
+    }
+
+    #[test]
+    fn signed_state_is_off_unless_enforced() {
+        let parse = |peer_trust: serde_json::Value| {
+            serde_json::from_value::<GridNetworkSpec>(serde_json::json!({"seeds": [], "peerTrust": peer_trust}))
+                .map(|spec| spec.peer_trust.map(|trust| trust.signed_state))
+        };
+
+        assert_eq!(
+            parse(serde_json::json!({"mode": "pin"})).ok().flatten(),
+            Some(SignedStateMode::Off),
+            "absent signedState keeps state unsigned"
+        );
+        assert_eq!(
+            parse(serde_json::json!({"mode": "pin", "signedState": "enforce"}))
+                .ok()
+                .flatten(),
+            Some(SignedStateMode::Enforce),
+            "enforce parses"
+        );
+        assert!(
+            parse(serde_json::json!({"mode": "pin", "signedState": "sign"})).is_err(),
+            "unknown signedState is rejected"
+        );
     }
 
     #[test]

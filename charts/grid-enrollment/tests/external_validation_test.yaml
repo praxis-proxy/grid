@@ -1,0 +1,151 @@
+suite: external lifecycle validation
+templates:
+- templates/external-validation.yaml
+tests:
+- it: rejects invites in external mode
+  set:
+    mode: external
+    invites.site-a.network: grid
+  asserts:
+  - failedTemplate:
+      errorMessage: mode=external uses external.sites, not invites
+    template: templates/external-validation.yaml
+- it: requires public trust for externally supplied delivery
+  set:
+    mode: external
+    external.sites.site-a.secretName: provided-site-a
+    external.sites.site-a.cluster: managed-a
+    external.trustBundleSecretRef: ''
+    external.delivery.enabled: true
+    external.delivery.namespace: grid-system
+  asserts:
+  - failedTemplate:
+      errorMessage: external issuer delivery requires external.trustBundleSecretRef
+    template: templates/external-validation.yaml
+- it: requires an operator namespace for delivery
+  set:
+    mode: external
+    external.sites.site-a.secretName: provided-site-a
+    external.sites.site-a.cluster: managed-a
+    external.trustBundleSecretRef: provided-trust
+    external.delivery.enabled: true
+    external.delivery.namespace: ''
+  asserts:
+  - failedTemplate:
+      errorMessage: external.delivery.namespace is required
+    template: templates/external-validation.yaml
+- it: refuses overwriting the CA with a site identity
+  set:
+    mode: external
+    external.certManager.enabled: true
+    external.sites.site-a.secretName: grid-ca-key
+  asserts:
+  - failedTemplate:
+      errorMessage: site secret names must be unique and must not overlap shared CA resources
+    template: templates/external-validation.yaml
+- it: refuses two identities overwriting one Secret
+  set:
+    mode: external
+    external.certManager.enabled: true
+    external.sites.site-a.secretName: same
+    external.sites.site-b.secretName: same
+  asserts:
+  - failedTemplate:
+      errorMessage: site secret names must be unique and must not overlap shared CA resources
+    template: templates/external-validation.yaml
+- it: refuses overlapping destination Secrets
+  set:
+    mode: external
+    external.sites.site-a.secretName: provided-site-a
+    external.sites.site-a.cluster: managed-a
+    external.trustBundleSecretRef: provided-trust
+    external.delivery.enabled: true
+    external.delivery.namespace: grid-system
+    external.delivery.caSecretName: grid-site-identity
+  asserts:
+  - failedTemplate:
+      errorMessage: external.delivery.identitySecretName and caSecretName must differ
+    template: templates/external-validation.yaml
+- it: refuses two identities targeting one cluster
+  set:
+    mode: external
+    external.sites.site-a.secretName: provided-site-a
+    external.sites.site-a.cluster: managed-a
+    external.trustBundleSecretRef: provided-trust
+    external.delivery.enabled: true
+    external.delivery.namespace: grid-system
+    external.sites.site-b.cluster: managed-a
+  asserts:
+  - failedTemplate:
+      errorMessage: external.delivery supports one site identity per managed cluster
+    template: templates/external-validation.yaml
+- it: requires issuer creation for fresh CA generation
+  set:
+    mode: external
+    external.certManager.enabled: true
+    external.certManager.ca.mode: Generate
+  asserts:
+  - failedTemplate:
+      errorMessage: external.certManager.ca.mode=Generate requires external.certManager.issuer.create=true
+    template: templates/external-validation.yaml
+- it: does not create a cluster scoped issuer
+  set:
+    mode: external
+    external.certManager.enabled: true
+    external.certManager.issuer.create: true
+    external.certManager.issuer.kind: ClusterIssuer
+  asserts:
+  - failedTemplate:
+      errorMessage: external.certManager.issuer.create supports only a namespaced cert-manager.io Issuer
+    template: templates/external-validation.yaml
+- it: rejects policy names that policy controllers cannot propagate
+  set:
+    mode: external
+    external.delivery.enabled: true
+    external.delivery.namespace: grid-system
+    external.trustBundleSecretRef: public-trust
+    external.sites.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.cluster: managed-a
+  asserts:
+  - failedTemplate:
+      errorMessage: Policy propagation requires namespace.grid-identity-site to fit within 63 characters
+    template: templates/external-validation.yaml
+- it: refuses managed membership while the chart selects SWIM
+  set:
+    mode: external
+    managedClusters.enabled: true
+  asserts:
+  - failedTemplate:
+      errorMessage: managedClusters.enabled requires grid.membership.source=Local
+    template: templates/external-validation.yaml
+- it: refuses a second source of inventory
+  set:
+    mode: external
+    grid.membership.source: Local
+    managedClusters.enabled: true
+    external.delivery.namespace: grid-system
+    external.sites.site-a.cluster: managed-a
+  asserts:
+  - failedTemplate:
+      errorMessage: managedClusters.enabled discovers sites from cluster inventory; leave external.sites empty
+    template: templates/external-validation.yaml
+- it: refuses a dynamic identity prefix that could overwrite the CA
+  set:
+    mode: external
+    grid.membership.source: Local
+    managedClusters.enabled: true
+    managedClusters.identitySecretPrefix: grid-
+    external.delivery.namespace: grid-system
+  asserts:
+  - failedTemplate:
+      errorMessage: managedClusters.identitySecretPrefix must not overlap shared CA or trust bundle names
+    template: templates/external-validation.yaml
+- it: requires public trust for a managed inventory with external PKI
+  set:
+    mode: external
+    grid.membership.source: Local
+    managedClusters.enabled: true
+    external.delivery.namespace: grid-system
+  asserts:
+  - failedTemplate:
+      errorMessage: external issuer delivery requires external.trustBundleSecretRef
+    template: templates/external-validation.yaml

@@ -66,7 +66,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -101,7 +101,7 @@ jobs:
         run: make crds-check
 
       - name: Set up Go
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go/go.mod
           cache-dependency-path: go/go.sum
@@ -190,6 +190,40 @@ jobs:
 
       - name: Unit tests
         run: make test-unit
+
+  # ---------------------------------------------------------------------------
+  # Release-profile build (exercise optimized code generation and linking)
+  # ---------------------------------------------------------------------------
+
+  release-profile:
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+
+      # Per-job release-profile cache; PRs restore main's cache and never save.
+      - name: Cache Rust release build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            . -> target
+            crates/gateway -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build root workspace in release mode
+        run: cargo build --locked --workspace --release
+
+      - name: Build gateway workspace in release mode
+        run: cargo build --locked --manifest-path crates/gateway/Cargo.toml --workspace --release
 
   # ----------------------------------------------------------------------------
   # FIPS build (operator + overlay-sync under system OpenSSL)

@@ -1,0 +1,302 @@
+suite: external identity lifecycle
+release:
+  name: grid-enrollment
+  namespace: grid-trust
+templates:
+- templates/tests/hub-identity.yaml
+- templates/tests/enrollment-ready.yaml
+- templates/enrollment/site-invite-rbac.yaml
+- templates/enrollment/service.yaml
+- templates/enrollment/route.yaml
+- templates/enrollment/invite-policy.yaml
+- templates/enrollment/invite-namespace.yaml
+- templates/enrollment/invite-job.yaml
+- templates/enrollment/grid-admin-rbac.yaml
+- templates/enrollment/deployment.yaml
+- templates/enrollment/csr-record-rbac.yaml
+- templates/enrollment/csr-record-policy.yaml
+- templates/enrollment/auth-rbac.yaml
+- templates/db/db-builtin.yaml
+- templates/certs/ca-bootstrap-rbac.yaml
+- templates/certs/ca-bootstrap-policy.yaml
+- templates/certs/ca-bootstrap-job.yaml
+- templates/certs/cert-manager-ca.yaml
+- templates/certs/cert-manager-issuer.yaml
+- templates/certs/site-certificates.yaml
+- templates/enrollment/identity-policy.yaml
+- templates/external-validation.yaml
+tests:
+- it: issues Local identities for HTTPS signals before the operator renewal deadline
+  set:
+    mode: external
+    grid.membership.source: Local
+    external.certManager.enabled: true
+    external.sites.site-a.secretName: identity-a
+  asserts:
+  - equal:
+      path: spec.dnsNames
+      value: [site-a.grid.internal, site-a-signals.grid.internal]
+    template: templates/certs/site-certificates.yaml
+  - equal:
+      path: spec.renewBefore
+      value: 1440h
+    template: templates/certs/site-certificates.yaml
+- it: identifies the hub Certificate as the delivered identity renewer
+  set:
+    mode: external
+    external.certManager.enabled: true
+    external.sites.site-a.secretName: identity-a
+    external.sites.site-a.cluster: managed-a
+    external.trustBundleSecretRef: grid-trust
+    external.delivery.enabled: true
+    external.delivery.namespace: grid-system
+  asserts:
+  - equal:
+      path: spec.policy-templates[0].objectDefinition.spec.object-templates[1].objectDefinition.metadata.annotations["cert-manager.io/certificate-name"]
+      value: identity-a
+    template: templates/enrollment/identity-policy.yaml
+    documentIndex: 3
+- it: does not invent a Certificate renewer for externally supplied Secrets
+  set:
+    mode: external
+    external.sites.site-a.secretName: identity-a
+    external.sites.site-a.cluster: managed-a
+    external.trustBundleSecretRef: grid-trust
+    external.delivery.enabled: true
+    external.delivery.namespace: grid-system
+  asserts:
+  - notExists:
+      path: spec.policy-templates[0].objectDefinition.spec.object-templates[1].objectDefinition.metadata.annotations
+    template: templates/enrollment/identity-policy.yaml
+    documentIndex: 3
+- it: renders no service workloads, database, invite jobs, or service RBAC in external mode
+  set:
+    mode: external
+  asserts:
+  - hasDocuments:
+      count: 0
+    template: templates/tests/hub-identity.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/tests/enrollment-ready.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/enrollment/site-invite-rbac.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/enrollment/service.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/enrollment/route.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/enrollment/invite-policy.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/enrollment/invite-namespace.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/enrollment/invite-job.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/enrollment/grid-admin-rbac.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/enrollment/deployment.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/enrollment/csr-record-rbac.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/enrollment/csr-record-policy.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/enrollment/auth-rbac.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/db/db-builtin.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/certs/ca-bootstrap-rbac.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/certs/ca-bootstrap-policy.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/certs/ca-bootstrap-job.yaml
+- it: uses existing identities without requiring cert-manager CRDs
+  set: &id001
+    mode: external
+    external.sites.site-a.secretName: provided-site-a
+    external.sites.site-a.cluster: managed-a
+    external.trustBundleSecretRef: provided-trust
+    external.delivery.enabled: true
+    external.delivery.namespace: grid-system
+  asserts:
+  - hasDocuments:
+      count: 0
+    template: templates/certs/cert-manager-ca.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/certs/cert-manager-issuer.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/certs/site-certificates.yaml
+  - hasDocuments:
+      count: 4
+    template: templates/enrollment/identity-policy.yaml
+- it: renders no external resources in service mode even when an integration is configured
+  set:
+    mode: service
+    external.sites.site-a.secretName: provided-site-a
+    external.sites.site-a.cluster: managed-a
+    external.trustBundleSecretRef: provided-trust
+    external.delivery.enabled: true
+    external.delivery.namespace: grid-system
+    external.certManager.enabled: true
+  asserts:
+  - hasDocuments:
+      count: 0
+    template: templates/certs/cert-manager-ca.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/certs/cert-manager-issuer.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/certs/site-certificates.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/enrollment/identity-policy.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/external-validation.yaml
+- it: requests the Grid identity profile from an external issuer
+  set:
+    mode: external
+    external.certManager.enabled: true
+    external.certManager.issuer.name: external-pki
+    external.certManager.issuer.kind: ClusterIssuer
+    external.sites.site-a.secretName: identity-a
+    external.sites.site-a.dnsNames:
+    - signals.example.com
+  asserts:
+  - hasDocuments:
+      count: 0
+    template: templates/certs/cert-manager-ca.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/certs/cert-manager-issuer.yaml
+  - hasDocuments:
+      count: 1
+    template: templates/certs/site-certificates.yaml
+  - equal:
+      path: spec.issuerRef
+      value:
+        name: external-pki
+        kind: ClusterIssuer
+        group: cert-manager.io
+    template: templates/certs/site-certificates.yaml
+  - equal:
+      path: spec.subject.organizations
+      value:
+      - site-a
+    template: templates/certs/site-certificates.yaml
+  - equal:
+      path: spec.uris
+      value:
+      - spiffe://grid.internal/site/site-a
+    template: templates/certs/site-certificates.yaml
+  - equal:
+      path: spec.dnsNames
+      value:
+      - site-a.grid.internal
+      - signals.example.com
+    template: templates/certs/site-certificates.yaml
+  - equal:
+      path: spec.usages
+      value:
+      - digital signature
+      - client auth
+      - server auth
+    template: templates/certs/site-certificates.yaml
+  - equal:
+      path: spec.privateKey.rotationPolicy
+      value: Always
+    template: templates/certs/site-certificates.yaml
+  - equal:
+      path: spec.secretName
+      value: identity-a
+    template: templates/certs/site-certificates.yaml
+- it: delivers only the selected site identity and public trust bundle
+  set: *id001
+  asserts:
+  - equal:
+      path: spec.predicates[0].requiredClusterSelector.labelSelector.matchExpressions[0].values
+      value:
+      - managed-a
+    template: templates/enrollment/identity-policy.yaml
+    documentIndex: 1
+  - equal:
+      path: spec.policy-templates[0].objectDefinition.spec.object-templates[1].objectDefinition.type
+      value: kubernetes.io/tls
+    template: templates/enrollment/identity-policy.yaml
+    documentIndex: 3
+  - equal:
+      path: spec.policy-templates[0].objectDefinition.spec.object-templates[1].objectDefinition.data
+      value:
+        tls.crt: '{{hub fromSecret "grid-trust" "provided-site-a" "tls.crt" hub}}'
+        tls.key: '{{hub fromSecret "grid-trust" "provided-site-a" "tls.key" hub}}'
+    template: templates/enrollment/identity-policy.yaml
+    documentIndex: 3
+  - equal:
+      path: spec.policy-templates[0].objectDefinition.spec.object-templates[2].objectDefinition.data
+      value:
+        ca.crt: '{{hub fromSecret "grid-trust" "provided-trust" "ca.crt" hub}}'
+    template: templates/enrollment/identity-policy.yaml
+    documentIndex: 3
+- it: delivers only the public certificate from a chart configured CA
+  set:
+    mode: external
+    external.sites.site-a.secretName: provided-site-a
+    external.sites.site-a.cluster: managed-a
+    external.trustBundleSecretRef: ''
+    external.delivery.enabled: true
+    external.delivery.namespace: grid-system
+    external.certManager.enabled: true
+    external.certManager.issuer.create: true
+  asserts:
+  - equal:
+      path: spec.policy-templates[0].objectDefinition.spec.object-templates[2].objectDefinition.data
+      value:
+        ca.crt: '{{hub fromSecret "grid-trust" "grid-ca-key" "tls.crt" hub}}'
+    template: templates/enrollment/identity-policy.yaml
+    documentIndex: 3
+- it: can reference a cluster set binding managed elsewhere
+  set:
+    mode: external
+    external.sites.site-a.secretName: provided-site-a
+    external.sites.site-a.cluster: managed-a
+    external.trustBundleSecretRef: provided-trust
+    external.delivery.enabled: true
+    external.delivery.namespace: grid-system
+    external.delivery.createClusterSetBinding: false
+  asserts:
+  - hasDocuments:
+      count: 3
+    template: templates/enrollment/identity-policy.yaml
+  - isKind:
+      of: Placement
+    template: templates/enrollment/identity-policy.yaml
+    documentIndex: 0
+- it: keeps hub certificates local when no managed cluster is assigned
+  set:
+    mode: external
+    external.certManager.enabled: true
+    external.sites.hub.secretName: hub-identity
+  asserts:
+  - hasDocuments:
+      count: 1
+    template: templates/certs/site-certificates.yaml
+  - hasDocuments:
+      count: 0
+    template: templates/enrollment/identity-policy.yaml

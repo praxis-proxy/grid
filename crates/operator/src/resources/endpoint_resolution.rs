@@ -331,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    /// RFC 9110 Sections 4.2.1–4.2.2 require an HTTP authority to contain a host.
+    /// RFC 9110 Sections 4.2.1--4.2.2 require an HTTP authority to contain a host.
     fn empty_authority_host_is_missing_for_http_and_https() {
         for url in ["http://:80", "https://:443"] {
             assert_eq!(validate_endpoint_url(url), EndpointUrlValidation::MissingHost);
@@ -411,7 +411,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "end-to-end client pinning test setup")]
     async fn pinned_client_uses_original_address_after_dns_changes() {
         #[cfg(not(feature = "fips"))]
         drop(rustls::crypto::ring::default_provider().install_default());

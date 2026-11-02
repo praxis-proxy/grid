@@ -2,10 +2,6 @@ use super::external_provider::ExternalProviderDescriptor;
 
 #[test]
 #[expect(clippy::unwrap_used, reason = "temporary standalone Forge fixture")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one fixture checks absent, unique, and ambiguous run state"
-)]
 fn standalone_glb_uses_only_an_unambiguous_live_run_state() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("forge.yaml");
@@ -108,7 +104,6 @@ fn normal_mode_no_openai() {
 #[test]
 #[expect(
     clippy::unwrap_used,
-    clippy::too_many_lines,
     reason = "one linear assertion verifies the generated credential mount"
 )]
 fn openai_mode_creates_required_credential() {
@@ -252,7 +247,6 @@ fn stack_selection() {
 }
 
 #[test]
-#[expect(clippy::too_many_lines, reason = "Test case with extensive configuration data")]
 fn existing_openai_stack_fails() {
     let config_with_existing_stack = "
 apiVersion: forge.praxis.dev/v1alpha1

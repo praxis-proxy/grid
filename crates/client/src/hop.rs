@@ -32,9 +32,45 @@ impl HopPolicy {
     };
 }
 
+/// The host of a `host:port` address, brackets stripped from an IPv6 literal.
+///
+/// ```
+/// assert_eq!(grid_client::address_host("[fd00::1]:8443"), "fd00::1");
+/// assert_eq!(
+///     grid_client::address_host("peer.example.com:8443"),
+///     "peer.example.com"
+/// );
+/// assert_eq!(grid_client::address_host("fd00::1"), "fd00::1");
+/// ```
+#[must_use]
+pub fn address_host(address: &str) -> &str {
+    if let Some(rest) = address.strip_prefix('[') {
+        return rest.split_once(']').map_or(rest, |(host, _)| host);
+    }
+    match address.split_once(':') {
+        // A second colon is an unbracketed IPv6 literal with no port.
+        Some((host, port)) if !port.contains(':') => host,
+        _ => address,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::HopPolicy;
+    use super::{HopPolicy, address_host};
+
+    #[test]
+    fn the_host_is_split_from_its_port_bracket_aware() {
+        for (address, host) in [
+            ("peer.example.com:8443", "peer.example.com"),
+            ("10.0.0.1:80", "10.0.0.1"),
+            ("[fd00::1]:8443", "fd00::1"),
+            ("[fd00::1]", "fd00::1"),
+            ("fd00::1", "fd00::1"),
+            ("peer", "peer"),
+        ] {
+            assert_eq!(address_host(address), host, "{address}");
+        }
+    }
 
     #[test]
     fn peer_connect_fits_inside_its_total_and_reads_outlast_connects() {

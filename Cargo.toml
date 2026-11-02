@@ -20,7 +20,7 @@ members = [
 exclude = ["crates/gateway"]
 
 [workspace.package]
-version = "0.3.0-rc.1"
+version = "0.3.0-rc.3"
 edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
@@ -73,7 +73,7 @@ sha2 = "0.11.0"
 hmac = "0.13.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-serde_json_canonicalizer = "0.3.0"
+serde_json_canonicalizer = "0.4.1"
 serde_yaml = { version = "0.10.7", package = "yaml_serde" }
 socket2 = "0.6.5"
 spiffe = { version = "0.18.0", default-features = false, features = ["x509"] }
@@ -115,6 +115,13 @@ codegen-units = 1
 strip = true
 panic = "abort"
 overflow-checks = true
+
+# Keep local builds and Helm CI images fast without debug-symbol overhead.
+[profile.dev]
+opt-level = 1
+lto = "off"
+codegen-units = 16
+debug = 0
 
 [profile.profiling]
 inherits = "release"
@@ -364,8 +371,6 @@ float_cmp = "deny"
 host_endian_bytes = "deny"
 # Match exhaustiveness: name every variant; no `_` arms over enums
 wildcard_enum_match_arm = "deny"
-# Determinism: no iteration over unordered hash collections
-iter_over_hash_type = "deny"
 # Module organization: `foo.rs` style, never `foo/mod.rs`
 mod_module_files = "deny"
 # Naming clarity

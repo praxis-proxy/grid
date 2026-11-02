@@ -152,11 +152,7 @@ impl PeerScraper {
     }
 
     /// Exchange a request while freshly authenticating the dialed operator.
-    #[expect(
-        clippy::too_many_lines,
-        clippy::large_stack_frames,
-        reason = "sequential authenticated TLS/HTTP exchange"
-    )]
+    #[expect(clippy::large_stack_frames, reason = "sequential authenticated TLS/HTTP exchange")]
     async fn exchange(
         &self,
         report: Option<&IngestReport>,

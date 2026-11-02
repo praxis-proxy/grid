@@ -277,10 +277,6 @@ fn handle_event(event: Event<ConfigMap>, config: &WatcherConfig, status: &Shared
 }
 
 /// Process a `ConfigMap`: extract, validate, and write the overlay.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the extraction, validation, and publication outcomes are clearer in one bounded pipeline"
-)]
 fn process_configmap(
     cm: &ConfigMap,
     config: &WatcherConfig,
@@ -498,6 +494,7 @@ mod tests {
                 site: scope.local_site.clone(),
                 cluster: "cluster-a".to_owned(),
                 fresh: true,
+                expires_at: None,
                 credential: None,
                 stable_id: Some("abcd1234".to_owned()),
                 admission_state: None,

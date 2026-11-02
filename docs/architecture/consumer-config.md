@@ -199,12 +199,27 @@ an empty list in arbitrary startup YAML:
 |---|---|---|---|
 | Praxis `intelligent_route` with `overlay_file` | Grid's versioned `routing-overlay.json` ConfigMap | A valid versioned envelope whose `overlay.candidates` is `[]` | Praxis validates and atomically serves the new snapshot; malformed replacements retain last-known-good. |
 | Generated `GatewayRef.praxisConfig` | The same scoped versioned overlay; generated `praxis.yaml` supplies filter and endpoint plumbing | The same empty envelope | Candidate-only updates hot reload. Credential-bearing revisions are held until `enableProjectedCredentials` has been rolled out and `supportsProjectedCredentials: true` attests the filter and Secret mounts are active. Listener, endpoint/TLS, and filter-pipeline changes still require the consumer owner to reload or roll out its Praxis configuration. |
-| Embedded `grid-gateway` `grid_site_route` filter | The operator-published `grid-serving-<network>-<gateway>` ConfigMap | A valid serving config with `candidates: []` | The running gateway watches the projected serving file and atomically replaces its candidate snapshot and provider-hop allowlist. Malformed updates retain the previous snapshot. Provider-hop trust is declared separately with `GatewayRef.providerHopEndpoints`. |
+| Embedded `grid-gateway` `grid_site_route` filter | The operator-published `grid-serving-<network>-<gateway>` ConfigMap | A valid serving config with `candidates: []` | The running gateway watches the projected serving file and atomically replaces its candidate snapshot and provider-hop allowlist. Discovered candidates carry `expires_at` as RFC 3339 UTC; the gateway normalizes that deadline and checks it during route selection even if config delivery stops. Malformed updates retain the previous snapshot. Provider-hop trust is declared separately with `GatewayRef.providerHopEndpoints`. |
 
 Grid publishes authoritative empty revisions without a capability flag. Every
 consumer of a gateway's overlay must therefore run an image with empty-snapshot
 support before this Grid version is deployed. The paired AI change and a
 compatible image release are prerequisites for the next Grid release.
+
+For discovered models, set `GatewayRef.modelDiscoveryContractVersion: v1`
+only after the running Praxis image implements the model-discovery contract. Without that
+declaration, Grid withholds discovered candidates from that gateway. The `v1`
+model-discovery contract carries `expires_at` as RFC 3339 UTC and expires the route
+when gateway UTC reaches the deadline minus 30 seconds, covering up to 30
+seconds of clock lag.
+
+The project-owned `grid-gateway` implements this contract for `grid_site_route`.
+Its serving config preserves `expires_at` as RFC 3339 UTC. For compatibility,
+the parser also accepts the legacy `expires_at_ms` field; when both are present,
+they must identify the same deadline. Request selection checks the normalized
+`expires_at` deadline even when the gateway retains an older snapshot or follows
+a stored-state pin.
+This does not declare support for the separately released Praxis AI `intelligent_route` filter.
 
 The embedded gateway's filter chain and upstream cluster definitions remain in
 its startup Praxis configuration, but its changing candidate list is not a
@@ -227,19 +242,27 @@ static Praxis configuration.
 
 ## Derived endpoint topology
 
-`praxisConfig.deriveTopology.fromProviders` lists the routing identities (a
-provider's `clusterName`, else its `metadata.name`) whose declarations the
-operator may use to fill `clusterEndpoints[]` for candidates that have no
-entry. An empty list derives nothing. An `InferenceProvider` is cluster scoped
-and its `gridNetworkRef` is self asserted, so only the allowlist decides where a
-gateway dials.
+The operator fills `clusterEndpoints[]` for every candidate that has no entry,
+from what already decides who may serve:
+
+- A local candidate derives from the `InferenceProvider` of the network on this
+  cluster that carries its routing identity (`clusterName`, else
+  `metadata.name`). Creating a cluster-scoped `InferenceProvider` takes cluster
+  RBAC; on RHOAI the model controller writes one only for a namespace an admin
+  labelled `grid.opendatahub.io/allowed=true`, with the serving Gateway's own
+  address.
+- Under Local membership, a remote candidate derives when that member's own
+  catalog offers it. The operator reads each catalog from the peer over mutual
+  TLS and stamps its records with that peer's site, and the hop address and
+  server name come from the `GridSite` an admin declared.
+- Under SWIM membership no catalog is read from a verified peer, so a remote
+  candidate derives only when `deriveTopology.fromProviders` names it.
 
 An explicit entry wins whole, never field by field. A candidate with no
 explicit entry that cannot be derived is withdrawn from this gateway's routes
-and named in the `praxisConfigStatus` message with a reason. With the list
-empty or `deriveTopology` absent, that is every candidate with no explicit
-entry, so removing a provider from the list withdraws its derived endpoint on
-the next render.
+and named in the `praxisConfigStatus` message with a reason. Deleting a
+provider, or marking it unavailable, withdraws its derived endpoint on the next
+render.
 
 | Candidate | Field | Source |
 |---|---|---|
@@ -261,13 +284,22 @@ different trust takes an explicit entry.
 ```yaml
 praxisConfig:
   deriveTopology:
-    fromProviders: [qwen2-7b, llama-3-8b]
     transport:
       mode: tls
       sni: inference-gateway.infra.svc.cluster.local
       caSecretRef:
         name: serving-gateway-ca
 ```
+
+A member hop derived from a catalog takes the existing remote checks, the
+site's `GridSite` probed at its current generation, and adds three refusals. A
+name in `fromProviders` keeps the existing checks only.
+
+| Reason | Cause |
+|---|---|
+| `not offered by the member` | The candidate's site did not offer the cluster, as when a local provider's `siteSelector` places it at a peer |
+| `site key is ambiguous` | More than one `GridSite` of the network keys to the candidate's site |
+| `member hop is not mutual TLS` | The site's egress is plaintext, so the hop does not verify the peer |
 
 ## Operational diagnostics
 
@@ -471,7 +503,7 @@ that all provider `clusterName` values are non-empty.
 A route candidate references a cluster with no `praxisConfig.clusterEndpoints[]`
 entry that could not be derived, so the operator withdrew it from this gateway.
 The message names the cluster and the reason. Add an endpoint entry for it, or
-allowlist its provider in `deriveTopology.fromProviders`.
+under SWIM membership name a remote cluster in `deriveTopology.fromProviders`.
 
 **Phase is `Error` / reason `MissingClusterEndpoint`**
 
@@ -586,6 +618,51 @@ keep the last accepted settings and topology. Changes to mounted identity files
 can still restart signals pollers using those accepted settings. The watcher
 does not update listener settings or add load-balancer clusters to `praxis.yaml`.
 See the [gateway chart serving guide](../../charts/praxis-gateway/README.md#cross-site-routing-in-agn).
+
+The same `ConfigMap` carries `dial.json` beside the serving config: one entry
+per cluster that derivation admits for this gateway, with its address, transport
+and timeouts. A typed `clusterEndpoints` entry is never written there, so it stays a
+`praxis.yaml` cluster. With nothing admitted, the file has no entries. A gateway
+that reads it builds the upstream itself; an older one never opens the key. The
+operator leaves out a cluster the gateway would refuse to dial: a site known only
+from discovery, whose address came from gossip; a mutual TLS hop whose server name
+is not exactly `{site}.grid.internal`; plaintext to another site; a credential-bearing
+cluster at another site; and a local one whose credential the gateway cannot read.
+A refused cluster is logged, with why, when the refused set for a gateway changes.
+
+A local dial carries the path of its provider's endpoint URL as `base_path`, which
+the gateway prepends to every request, so a serving gateway that routes by path
+still sees the provider's path. An endpoint path with a query, a fragment, an empty
+segment or a `..` segment is refused. When the local cluster's candidates name a
+`bearer_token` credential, the dial carries
+`credential: {strategy: bearer_token, path}` pointing at
+`/run/secrets/grid-credentials/<secret>/<key>`, the file `credential_inject` reads.
+The operator writes it only for a Secret in the gateway's namespace and only when
+`credentialMountPath` is that default; mount the Secret with `providerCredentials`
+or mount reconciliation. The gateway reads the token when it builds the dial, so a
+rotated file rebuilds it, and an unreadable token takes only that cluster out of
+routing. A routed request drops the caller's credential headers and query
+parameters and sends `Authorization: Bearer <token>`. The gateway refuses a
+credential on a dial to another site or over grid mutual TLS, and one outside the
+credential mount.
+
+A `mutual_tls` dial carries only its `sni`. The gateway presents the grid identity
+it fixed at startup, the `ca.crt`, `tls.crt` and `tls.key` its signals peers use,
+and re-reads those files on rotation. A `tls` dial may name a `ca_path`, which must
+be under `/run/secrets/grid-backend-ca`. A dial file that breaks a trust rule is
+refused whole and the last good one stays. At startup the gateway serves without
+dials until a good one lands. A single dial praxis refuses, such as an untrusted
+`.internal` or loopback host, takes only its own cluster out of routing.
+
+It also carries `provider.json`, which a provider gateway on the same site serves
+peers from. It lists the enrolled sites other than this one as `admitted_sites`,
+each local inference backend by the stable ID a consumer sends in
+`x-ai-routing-candidate`, and the local dial that reaches it. A credentialed
+backend is served with its dial's own token in place of the peer's. A backend is
+left out when it carries a credential its dial does not, its provider sets
+`accessPolicy.siteSelector`, it has no local dial other than mutual TLS, or
+another backend shares its stable ID. A deleting or discovered `GridSite` is never admitted. When the admitted set
+shrinks, the operator rewrites the file at once, past the write interval.
 
 [praxis-reload]: https://github.com/praxis-proxy/praxis/blob/main/docs/operating/configuration.md#dynamic-configuration-reload
 

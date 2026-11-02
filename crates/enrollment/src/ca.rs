@@ -104,10 +104,6 @@ impl SharedCa {
     ///
     /// Returns [`ReloadError`] when the new material does not load or the
     /// database records another CA. The current CA is kept.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "keep the CA validation and held-signer fallback together"
-    )]
     pub async fn reload(
         &self,
         record: RecordedCa<'_>,
@@ -612,10 +608,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "follow the held signer through record mismatch and recovery"
-    )]
     async fn malformed_material_still_checks_the_held_signer_against_the_record() {
         let (old_fp, ca) = fresh();
         let (new_fp, _) = fresh();
@@ -652,10 +644,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "exercise missing certificate and key through mismatch and recovery"
-    )]
     async fn unreadable_ca_files_still_check_the_held_signer_against_the_record() {
         let (old_fp, ca) = fresh();
         let (new_fp, _) = fresh();

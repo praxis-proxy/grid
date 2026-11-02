@@ -542,7 +542,6 @@ fn resign(site: &str) -> Result<Issued, StoreError> {
 
 /// Rotate, re-sign a lost response, fork, stay frozen, and release on delete.
 #[tokio::test]
-#[expect(clippy::too_many_lines, reason = "one record's whole lifecycle")]
 async fn a_renewal_rotates_the_recorded_key_and_a_fork_freezes_it() {
     let Some((store, _guard)) = store().await else {
         return;
@@ -611,7 +610,6 @@ async fn a_renewal_rotates_the_recorded_key_and_a_fork_freezes_it() {
 
 /// A seed registers and resets a reserved record; nothing else records without a token.
 #[tokio::test]
-#[expect(clippy::too_many_lines, reason = "the seed outcomes, then the schema check")]
 async fn a_seed_registers_a_reserved_name_and_only_it_records_without_a_token() {
     let Some((store, _guard)) = store().await else {
         return;
@@ -820,7 +818,6 @@ async fn a_redeem_racing_a_delete_never_claims_the_name() {
 
 /// Rotation to any key ever enrolled is refused without freezing the record.
 #[tokio::test]
-#[expect(clippy::too_many_lines, reason = "the reused keys, then the record")]
 async fn rotation_to_a_key_ever_enrolled_is_refused() {
     let Some((store, _guard)) = store().await else {
         return;

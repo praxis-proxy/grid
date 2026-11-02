@@ -94,10 +94,6 @@ impl Drop for DeploymentRestore {
 /// # Errors
 ///
 /// Returns an error when a prerequisite or any proof step fails.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the short sequential proof table is clearer when its seven steps remain together"
-)]
 pub(crate) fn verify(forge_config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let forge_bin = glb::resolve_forge_binary().ok_or("praxis-forge binary not found")?;
     let forge_state_dir = super::forge_config::state_dir_for_config(forge_config)?;
@@ -425,10 +421,6 @@ pub(crate) fn request_path(
 }
 
 /// Send one request with independent edge and provider affinity fixtures.
-#[expect(
-    clippy::too_many_lines,
-    reason = "keeping the complete curl trust and request contract together makes security review easier"
-)]
 pub(crate) fn request_path_with_affinity(
     edge_session: &str,
     provider_session: &str,

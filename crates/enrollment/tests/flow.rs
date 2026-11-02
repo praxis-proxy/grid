@@ -195,7 +195,6 @@ async fn a_site_enrolls_and_gets_a_certificate() {
 }
 
 #[tokio::test]
-#[expect(clippy::too_many_lines, reason = "exercises the invite key-binding retry flow")]
 async fn a_bound_invite_refuses_another_key_without_spending_the_token() {
     let (expected_csr, expected_key) = csr_and_key_hash();
     let (other_csr, other_key) = csr_and_key_hash();

@@ -1,3 +1,4 @@
+{{- if or (eq .Values.mode "service") .Values.gridIdentity.enabled }}
 {{- include "grid-enrollment.normalize" . }}
 {{- include "grid-enrollment.validateHubSite" . }}
 {{- if include "grid-enrollment.bootstrapRuns" . }}
@@ -53,7 +54,7 @@ spec:
           env:
             - name: RUST_LOG
               value: {{ include "grid-enrollment.rustLog" . | quote }}
-            {{- if dig "bootstrap" "policy" "enabled" true .Values.ca }}
+            {{- if and (eq .Values.mode "service") (dig "bootstrap" "policy" "enabled" true .Values.ca) }}
             {{- /* Only this chart knows it rendered the policy, so only it asks the
                    bootstrap to wait for enforcement. An env var rather than an argument,
                    so an image predating the gate ignores it instead of refusing to
@@ -69,6 +70,13 @@ spec:
             - "--namespace"
             - "{{ .Release.Namespace }}"
 
+            {{- if .Values.gridIdentity.enabled }}
+            - "--grid-id-config-map"
+            - {{ .Values.gridIdentity.configMapName | quote }}
+            {{- end }}
+            {{- if eq .Values.mode "external" }}
+            - "--skip-ca"
+            {{- else }}
             {{- if include "grid-enrollment.generatesDbCredentials" . }}
             - "--db-credentials-secret"
             - "{{ include "grid-enrollment.dbUrlSecret" . }}"
@@ -142,8 +150,10 @@ spec:
             - "--force-regenerate"
             {{- end }}
             {{- end }}
+            {{- end }}
           {{- with .Values.ca.bootstrap.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+{{- end }}
 {{- end }}

@@ -387,7 +387,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "case table")]
     fn plan_picks_the_source() {
         let own = |v: Option<&str>| v.map(str::to_owned);
         let lb = || Plan::LoadBalancer("swim".to_owned());
@@ -586,7 +585,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[expect(clippy::too_many_lines, reason = "case table of ingress sequences")]
     async fn watch_lb_restarts_only_on_a_sustained_change() {
         let advertised = "1.2.3.4:7946";
         let other = || Some(vec!["5.6.7.8:7946"]);

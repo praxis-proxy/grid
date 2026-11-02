@@ -130,10 +130,6 @@ fn a_hand_built_request_passes_only_when_its_key_matches_its_curve() {
 }
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "exercise each alternate encoding for both supported curves"
-)]
 fn alternate_encodings_cannot_give_one_key_another_fingerprint() {
     const ECDSA_WITH_SHA384: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03];
     for (algorithm, curve, signature) in [

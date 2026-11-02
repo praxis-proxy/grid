@@ -35,11 +35,16 @@ WORKDIR /src
 
 COPY . .
 
+# Select dev for faster local and Helm CI builds; releases use release.
+ARG CARGO_PROFILE=release
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p enrollment --bin enrollment \
+    case "${CARGO_PROFILE}" in dev) profile_dir=debug ;; *) profile_dir="${CARGO_PROFILE}" ;; esac \
+    && cargo build --profile "${CARGO_PROFILE}" -p enrollment --bin enrollment \
         --features "${CARGO_FEATURES}" \
-    && cp target/release/enrollment /usr/local/bin/enrollment
+    && cp "target/${profile_dir}/enrollment" /usr/local/bin/enrollment
 
 # ------------------------------------------------------------------------------
 # Stage 2: Runtime

@@ -49,7 +49,7 @@ from, and `grid_provider` the provider within it.
 | `grid_provider_ttft_p50_seconds` | gauge | Median streaming time to first token over the last 30s. |
 | `grid_provider_ttft_p90_seconds` | gauge | 90th percentile streaming time to first token over the last 30s. |
 | `grid_provider_tpot_seconds` | gauge | Mean streaming time per output token over the last 30s. |
-| `grid_provider_error_ratio` | gauge | Failed requests over all requests in the last 30s. |
+| `grid_provider_error_ratio` | gauge | Failed requests over received requests in the last 30s, reported client errors other than 429 left out. |
 
 ## Operator: scraping this site's providers
 
@@ -173,16 +173,31 @@ state, so two replicas agree only in steady state.
 | `grid_route_site_last_sample_age_seconds` | gauge | `site`, `cluster` | Seconds since the site's newest sample. Unlike `grid_route_site_reading_age_seconds`, which goes `NaN` once the sample leaves the freshness window, this keeps counting. |
 | `grid_route_site_round_age_seconds` | gauge | `site`, `cluster` | Seconds since the operator's last poll round that tried this peer; a peer's silence is judged at that round. `NaN` for this site or when the operator reports no rounds. A growing value with the poller running is a stalled poller, under which no peer goes silent. |
 | `grid_route_site_score` | gauge | `site`, `cluster` | Score the site ranks by in the current snapshot. |
+| `grid_route_site_score_unavailable` | gauge | `site`, `cluster`, `reason` | One-hot reason an otherwise routable load-publishing site has no queue score: `absent`, `stale`, or `unreadable`. The current reason is 1 and the others are 0. |
 | `grid_route_shedding` | gauge | `model` | 1 while the gateway sheds this model, 0 otherwise. |
 | `grid_route_prefix_affinity_total` | counter | `outcome` | Prefix-affinity decisions by outcome. |
 | `grid_serving_config_reload_total` | counter | `result` | Serving-config reloads by result. |
 | `grid_serving_unbound_provider_hops` | gauge | | Provider hops the applied serving config declares that no startup-verified backend binds. Their candidates take no traffic until a serving config names the verified SNI or the gateway restarts. |
+| `grid_serving_undialable_clusters` | gauge | | Dials in the applied dial file whose TLS files could not be read. Their candidates take no traffic until the files read, which re-applies the config. |
+| `grid_serving_refused_dial_clusters` | gauge | | Dials in the applied dial file praxis refused, such as a private, loopback, or metadata host the dial does not trust. Their candidates take no traffic, and the rest of the file applies. |
+| `grid_serving_dial_shadowed_clusters` | gauge | | Dials that replace a `load_balancer` cluster of the same name. |
+| `grid_dial_down` | gauge | `cluster` | 1 while a dial is down after 2 consecutive failures, until 2 consecutive successes. A down dial is ordered last for 10 s, then one request may try it again; it is never excluded. |
+| `grid_dial_failures_total` | counter | `cluster` | Dialed requests that got no response, or a 502, 503, or 504 no grid gateway attributed. |
+| `grid_provider_requests_total` | counter | `result` | Peer requests a provider gateway served or refused: `served`, `forbidden`, `method`, `path`, `candidate`, or `malformed` (a missing, repeated, or badly formed `x-ai-routing-candidate`, answered 400). |
+| `grid_provider_config_reload_total` | counter | `result` | Provider-file reloads, `applied` or `rejected`. A rejected file keeps the last good one. |
 
 A `NaN` rho or weight means the gateway holds no reading for that site, which
 distinguishes an unmeasured site from one measured at zero. A `NaN` score means
 the candidate is excluded or demoted from the order. A site that leaves the
 topology reads `NaN` on all four, since the exporter keeps a series until
 restart.
+
+`grid_route_site_score_unavailable` separates a provider that has published no
+sample (`absent`) from one whose newest sample is outside the freshness window
+(`stale`) and one with fresh samples but no recognized, valid queue value
+(`unreadable`). Metric names are deliberately not labels. The three `reason`
+values are fixed, while `site` and `cluster` come from the bounded serving
+topology. All three series read `NaN` after the pair leaves that topology.
 
 ## Gateway: polling the local operator
 

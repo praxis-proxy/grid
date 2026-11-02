@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "ai-grid-filters"
-version = "0.3.0-rc.1"
+version = "0.3.0-rc.3"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -63,6 +63,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "time",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -670,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "certs"
-version = "0.3.0-rc.1"
+version = "0.3.0-rc.3"
 dependencies = [
  "openssl",
  "pem 4.0.0",
@@ -1508,7 +1509,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.3.0-rc.1"
+version = "0.3.0-rc.3"
 dependencies = [
  "ai-grid-filters",
  "certs",
@@ -1611,7 +1612,7 @@ dependencies = [
 
 [[package]]
 name = "grid-client"
-version = "0.3.0-rc.1"
+version = "0.3.0-rc.3"
 dependencies = [
  "bytes",
  "certs",
@@ -1635,7 +1636,7 @@ dependencies = [
 
 [[package]]
 name = "grid-signals"
-version = "0.3.0-rc.1"
+version = "0.3.0-rc.3"
 dependencies = [
  "dashmap",
 ]
@@ -4215,9 +4216,9 @@ dependencies = [
 
 [[package]]
 name = "schemars"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
+checksum = "ab508826f74a77ca9d5aba6ff19b522583ee3eaf28a19384ff3d0e5835fadf6e"
 dependencies = [
  "dyn-clone",
  "ref-cast",
@@ -4369,7 +4370,7 @@ dependencies = [
  "indexmap 2.14.2",
  "jiff",
  "schemars 0.9.0",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde_core",
  "serde_json",
  "serde_with_macros",
@@ -5228,7 +5229,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version"
-version = "0.3.0-rc.1"
+version = "0.3.0-rc.3"
 dependencies = [
  "serde",
  "tracing",

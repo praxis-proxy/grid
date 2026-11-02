@@ -13,6 +13,9 @@ tests:
       peers.hub.address: 203.0.113.10:443
     asserts:
       - equal:
+          path: spec.membership.mode
+          value: Local
+      - equal:
           path: spec.signalTransport.mode
           value: poll
       - notExists:
@@ -27,6 +30,9 @@ tests:
     set:
       peers.hub.address: 203.0.113.10:443
     asserts:
+      - equal:
+          path: spec.membership.mode
+          value: Swim
       - equal:
           path: metadata.labels["grid.praxis.fast/auto-discover-sites"]
           value: "true"

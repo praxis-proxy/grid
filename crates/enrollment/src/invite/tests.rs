@@ -23,6 +23,23 @@ fn init_crypto() {
     drop(rustls::crypto::ring::default_provider().install_default());
 }
 
+/// Build an enrollment client whose `localhost` address uses the test listener's IPv4 socket.
+fn loopback_http_client(ca_pem: &[u8], port: u16, connect_timeout: Duration) -> reqwest::Client {
+    let roots = grid_client::roots_from_pem(ca_pem, "the enrollment CA bundle").expect("roots");
+    let timeouts = grid_client::Timeouts::ENROLLMENT;
+    reqwest::Client::builder()
+        .https_only(true)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .connect_timeout(connect_timeout)
+        .timeout(timeouts.request)
+        .tls_certs_only(roots)
+        .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+        .build()
+        .expect("client")
+}
+
 /// A temp file holding a grid-admin token, removed on drop.
 struct AdminFile(PathBuf);
 
@@ -172,7 +189,7 @@ mod live {
 
     use enrollment::{AppState, GridAdmins, SharedCa, Store, authz::Authorizer, router};
 
-    use super::{super::*, AdminFile, FAST, closed_port, init_crypto, invite};
+    use super::{super::*, AdminFile, FAST, closed_port, init_crypto, invite, loopback_http_client};
 
     /// What the fake does on create.
     #[derive(Clone, Copy)]
@@ -319,15 +336,14 @@ mod live {
 
     /// Serve `app` on the reserved `port` once `after` passes. Until then it refuses connections.
     async fn listen_after(port: super::ClosedPort, after: Duration, cert: certs::SiteCertOutput, app: axum::Router) {
-        let start = async move {
+        if after.is_zero() {
+            spawn_tls(port.listen(), cert, app).await;
+            return;
+        }
+        tokio::spawn(async move {
             tokio::time::sleep(after).await;
             spawn_tls(port.listen(), cert, app).await;
-        };
-        if after.is_zero() {
-            start.await;
-        } else {
-            tokio::spawn(start);
-        }
+        });
     }
 
     /// Serve the enrollment router over TLS with a pinned minter.
@@ -337,13 +353,22 @@ mod live {
 
     /// [`serve`], with the port closed for `after`.
     async fn serve_after(admin: &str, after: Duration) -> (Arc<AppState>, Minter, AdminFile) {
+        serve_after_with_connect_timeout(admin, after, grid_client::Timeouts::ENROLLMENT.connect).await
+    }
+
+    /// [`serve_after`], with a shorter connection bound for the outage-retry fixture.
+    async fn serve_after_with_connect_timeout(
+        admin: &str,
+        after: Duration,
+        connect_timeout: Duration,
+    ) -> (Arc<AppState>, Minter, AdminFile) {
         init_crypto();
         let ca = certs::generate_ca("grid-ca").expect("ca");
         let serving = certs::generate_dns_cert(&ca, "localhost", "localhost").expect("serving cert");
         let port = closed_port();
         let admin = AdminFile::new(admin);
         let minter = Minter {
-            http: http_client(ca.cert_pem.as_bytes()).expect("client"),
+            http: loopback_http_client(ca.cert_pem.as_bytes(), port.port, connect_timeout),
             base: format!("https://localhost:{}", port.port),
             admin_token_file: admin.0.clone(),
             retry: Retry::new(FAST),
@@ -539,7 +564,8 @@ mod live {
 
     #[tokio::test]
     async fn a_blip_is_retried_and_later_sites_start_at_the_initial_delay() {
-        let (state, mut minter, _admin) = serve_after("good-admin", Duration::from_millis(50)).await;
+        let (state, mut minter, _admin) =
+            serve_after_with_connect_timeout("good-admin", Duration::from_secs(2), Duration::from_secs(1)).await;
         let budget = Backoff {
             attempts: 100,
             initial: Duration::from_millis(5),

@@ -1,5 +1,8 @@
 //! The opt-in metrics listener serves only `GET /metrics` over TLS, to any Host.
 
+#[path = "support/ports.rs"]
+mod ports;
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
@@ -12,7 +15,7 @@
 mod tests {
     use std::{
         io::{Read as _, Write as _},
-        net::{TcpListener, TcpStream},
+        net::TcpStream,
         path::PathBuf,
         process::{Child, Command, Stdio},
         sync::Arc,
@@ -26,15 +29,13 @@ mod tests {
         pki_types::{CertificateDer, ServerName, pem::PemObject as _},
     };
 
+    use super::ports::free_port;
+
     /// Bound on how long a test waits for the child.
     const TIMEOUT: Duration = Duration::from_secs(30);
 
     /// The SAN `generate_site_cert` gives site `metrics`.
     const SERVER_NAME: &str = "metrics.grid.internal";
-
-    fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-    }
 
     /// A running gateway, killed on drop.
     struct Gateway(Child);

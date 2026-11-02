@@ -77,10 +77,6 @@ impl PgStore {
     /// Record a token, unless the name is held, deleted without opt-in, or pinned by a live token.
     ///
     /// A per-name advisory lock serializes the check and the insert.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the lock, check, and insert read as one transaction"
-    )]
     pub(super) async fn mint_site_token(&self, token: NewSiteToken) -> Result<Uuid, StoreError> {
         let token_id = token.token_id.unwrap_or_else(Uuid::new_v4);
         let mut tx = Box::pin(self.pool.begin()).await.map_err(backend)?;
@@ -206,10 +202,6 @@ impl PgStore {
     /// insert. A failing sign rolls it back, so the token is spent only when the
     /// certificate is issued; a deleted name revokes it. The guarded
     /// update is the row lock that serializes concurrent redemptions of one token.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the consume, sign, and audit insert read as one transaction"
-    )]
     pub(super) async fn redeem_and_issue<F>(&self, token_sha256: &str, sign: F) -> Result<(Uuid, Issued), StoreError>
     where
         F: FnOnce(&Pin) -> Result<Issued, StoreError> + Send,
@@ -338,10 +330,6 @@ impl PgStore {
     ///
     /// The row lock serializes renewals of one name, so two retries cannot both rotate.
     /// A fork commits the freeze before it is refused.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the lock, decide, sign, and write read as one transaction"
-    )]
     pub(super) async fn renew_and_issue<F>(&self, renewal: &Renewal, sign: F) -> Result<Renewed, StoreError>
     where
         F: FnOnce() -> Result<Issued, StoreError> + Send,
@@ -400,10 +388,6 @@ impl PgStore {
     }
 
     /// Apply a verified seed to a reserved name's locked record.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the lock, decide, and write read as one transaction"
-    )]
     pub(super) async fn seed_reserved(&self, seed: &SeedRecord) -> Result<Seeded, StoreError> {
         let mut tx = Box::pin(self.pool.begin()).await.map_err(backend)?;
         let locked = Box::pin(Self::locked(&mut tx, &seed.site_name)).await?;

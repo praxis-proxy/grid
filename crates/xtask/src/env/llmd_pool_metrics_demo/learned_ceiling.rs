@@ -4604,7 +4604,7 @@ fn safe_digest(digest: &str) -> String {
 /// Render a compact last-observation summary for timeout diagnostics.
 fn snapshot_summary(snapshot: &RuntimeSnapshot) -> String {
     format!(
-        "revision={} rv={} mounted={} candidates={:?} running={} queue={} kv_cache={}±{:?} ready={} per_endpoint={:?} held={:?}/{} origin={} relay={:?} reloads={} ceiling={:?}/{:?} soft={:?} hard={:?} rho_reported={:?} rho_counted={:?} in_flight={:?} pod={}",
+        "revision={} rv={} mounted={} candidates={:?} running={} queue={} kv_cache={}+/-{:?} ready={} per_endpoint={:?} held={:?}/{} origin={} relay={:?} reloads={} ceiling={:?}/{:?} soft={:?} hard={:?} rho_reported={:?} rho_counted={:?} in_flight={:?} pod={}",
         snapshot.operator_digest,
         snapshot.operator_resource_version,
         snapshot.mounted_digest,

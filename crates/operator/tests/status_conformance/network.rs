@@ -16,11 +16,13 @@ use crate::fixtures::{self, NETWORK};
 /// The gates the enrollment step and the renewal loop write, in roll-up order.
 const GATES: [&str; 4] = ["Accepted", "ResolvedRefs", "Enrolled", "IdentityValid"];
 
-/// An API holding the network alone.
-fn seeded() -> (FakeApi, String) {
+/// An API holding the network with the ID supplied by bootstrap, or empty while waiting.
+fn seeded(grid_id: &str) -> (FakeApi, String) {
     let api = FakeApi::new();
     let path = fixtures::network_path(NETWORK);
-    api.put(&path, fixtures::network(NETWORK));
+    let mut network = fixtures::network(NETWORK);
+    network["spec"]["gridId"] = serde_json::json!(grid_id);
+    api.put(&path, network);
     (api, path)
 }
 
@@ -84,7 +86,7 @@ fn reasons() -> Vec<(&'static str, &'static str, &'static str)> {
 
 #[tokio::test]
 async fn invariant_1_pending_network_is_unchanged_across_five_rounds() {
-    let (api, path) = seeded();
+    let (api, path) = seeded("bootstrap-grid");
     let rounds = fixtures::rounds(&api, &path, 5, |_round| reconcile(&api, &path)).await;
 
     invariants::unchanged_from(&rounds, 1).expect("invariant 1");
@@ -102,7 +104,7 @@ async fn invariant_1_pending_network_is_unchanged_across_five_rounds() {
 
 #[tokio::test]
 async fn invariant_2_available_follows_the_enrollment_gates_and_moves_only_with_its_status() {
-    let (api, path) = seeded();
+    let (api, path) = seeded("bootstrap-grid");
     let rounds = fixtures::rounds(&api, &path, 5, |round| {
         // Round 2: the enrollment step and the renewal loop have written every gate.
         if round == 2 {
@@ -138,7 +140,7 @@ fn available(rounds: &[status_harness::Observed], round: usize) -> (&str, &str) 
 
 #[tokio::test]
 async fn invariant_3_network_observed_generation_follows_a_spec_edit() {
-    let (api, path) = seeded();
+    let (api, path) = seeded("bootstrap-grid");
     let rounds = fixtures::rounds(&api, &path, 4, |round| {
         if round == 2 {
             api.edit(&path, true, |object| {
@@ -159,7 +161,7 @@ async fn invariant_3_network_observed_generation_follows_a_spec_edit() {
 
 #[tokio::test]
 async fn invariant_7_network_rollup_trio_is_present_after_round_one() {
-    let (api, path) = seeded();
+    let (api, path) = seeded("bootstrap-grid");
     gates_true(&api, &path);
     let rounds = fixtures::rounds(&api, &path, 1, |_round| reconcile(&api, &path)).await;
     invariants::rollup_present_and_equal(rounds.first().expect("one round"), &GATES).expect("invariant 7");
@@ -176,13 +178,13 @@ fn status_grid_id(api: &FakeApi, path: &str) -> String {
 }
 
 #[tokio::test]
-async fn invariant_3_a_minted_grid_id_gives_way_to_the_spec_once_a_site_section_names_one() {
-    let (api, path) = seeded();
+async fn invariant_3_status_mirrors_the_id_delivered_by_bootstrap() {
+    let (api, path) = seeded("");
     reconcile(&api, &path).await;
-    let minted = status_grid_id(&api, &path);
-    assert!(
-        !minted.is_empty(),
-        "with no site section, a standalone install mints one"
+    assert_eq!(
+        status_grid_id(&api, &path),
+        "",
+        "a standalone install waits for bootstrap to declare its grid ID"
     );
 
     api.edit(&path, true, |network| {
@@ -192,29 +194,33 @@ async fn invariant_3_a_minted_grid_id_gives_way_to_the_spec_once_a_site_section_
     assert_eq!(
         status_grid_id(&api, &path),
         "dagobah",
-        "status mirrors spec, over the minted ID"
+        "status mirrors the ID delivered by bootstrap"
     );
 }
 
 #[tokio::test]
-async fn invariant_3_with_a_site_section_and_no_grid_id_nothing_is_minted_and_the_runtime_waits() {
-    let (api, path) = seeded();
-    for _round in 0..2 {
-        reconcile_under(&api, &path, named_site()).await;
+async fn invariant_3_without_a_grid_id_the_runtime_waits_regardless_of_site_configuration() {
+    for config in [Snapshot::absent(), named_site()] {
+        let (api, path) = seeded("");
+        naming_secrets(&api, &path);
+        for _round in 0..2 {
+            reconcile_under(&api, &path, config.clone()).await;
+        }
+        assert_eq!(
+            status_grid_id(&api, &path),
+            "",
+            "bootstrap supplies the grid ID; the operator never generates one"
+        );
+        assert!(!created_a_secret(&api), "identity issuance waits for the grid ID");
+        let observed = api.observe(&path).expect("network stored");
+        assert_eq!(
+            observed
+                .condition("Available")
+                .map(|available| available["status"].clone()),
+            Some(serde_json::json!("Unknown")),
+            "the roll-up is still written while the runtime waits"
+        );
     }
-    assert_eq!(
-        status_grid_id(&api, &path),
-        "",
-        "an admin names the grid; the operator never mints one"
-    );
-    let observed = api.observe(&path).expect("network stored");
-    assert_eq!(
-        observed
-            .condition("Available")
-            .map(|available| available["status"].clone()),
-        Some(serde_json::json!("Unknown")),
-        "the roll-up is still written while the runtime waits"
-    );
 }
 
 /// A network naming this site's identity Secrets, which the controller self-signs when
@@ -237,7 +243,7 @@ fn created_a_secret(api: &FakeApi) -> bool {
 
 #[tokio::test]
 async fn invariant_6_a_config_deleted_after_it_named_a_site_never_lets_the_controller_self_sign() {
-    let (api, path) = seeded();
+    let (api, path) = seeded("bootstrap-grid");
     naming_secrets(&api, &path);
     let mut deleted = Snapshot::absent();
     deleted.site_seen = true;
@@ -249,7 +255,7 @@ async fn invariant_6_a_config_deleted_after_it_named_a_site_never_lets_the_contr
         "a placeholder identity would read as enrolled, and the site never enroll"
     );
 
-    let (control, control_path) = seeded();
+    let (control, control_path) = seeded("bootstrap-grid");
     naming_secrets(&control, &control_path);
     reconcile(&control, &control_path).await;
     assert!(

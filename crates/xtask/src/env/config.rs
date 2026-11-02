@@ -625,7 +625,6 @@ vertex = { port = 10004, project = "test-project" }
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "test exercises multiple cluster definitions")]
     fn mixed_backends_per_cluster() {
         let toml = r#"
 [clusters]

@@ -1006,10 +1006,6 @@ pub(super) fn start_ready_port_forward(
 }
 
 /// Partition pool-b's run-owned Docker link, keep traffic flowing, and prove recovery.
-#[expect(
-    clippy::too_many_lines,
-    reason = "partition, observed degradation, rollback, and recovery are one ordered proof"
-)]
 fn prove_network_partition(
     context: &DemoContext,
     gateway_port: u16,

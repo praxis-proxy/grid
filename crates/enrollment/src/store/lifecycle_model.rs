@@ -5,7 +5,6 @@
     clippy::panic,
     clippy::struct_excessive_bools,
     clippy::indexing_slicing,
-    clippy::too_many_lines,
     clippy::arithmetic_side_effects,
     clippy::shadow_unrelated,
     reason = "a test model: a broken invariant fails the walk with its trace"

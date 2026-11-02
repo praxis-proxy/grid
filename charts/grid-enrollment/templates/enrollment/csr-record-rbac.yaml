@@ -1,3 +1,4 @@
+{{- if eq .Values.mode "service" }}
 {{- include "grid-enrollment.normalize" . }}
 {{- if and (eq .Values.enrollment.authz "kube") .Values.enrollment.csrRecord.enabled }}
 {{- $signer := .Values.enrollment.csrRecord.signerName }}
@@ -72,4 +73,5 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "grid-enrollment.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- end }}

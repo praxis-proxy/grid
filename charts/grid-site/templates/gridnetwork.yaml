@@ -18,6 +18,8 @@ spec:
   with "spec: Required value" on both create and update.
   */}}
   gridId: {{ .Values.gridNetwork.gridId | quote }}
+  membership:
+    mode: {{ .Values.grid.membership.source | quote }}
   {{- with .Values.gridNetwork.region }}
   region: {{ . | quote }}
   {{- end }}
@@ -57,9 +59,12 @@ spec:
     mode: {{ .mode | quote }}
   {{- end }}
   {{- end }}
-  {{- with (.Values.gridNetwork.peerTrust).mode }}
+  {{- with .Values.gridNetwork.peerTrust }}
   peerTrust:
-    mode: {{ . | quote }}
+    mode: {{ .mode | quote }}
+    {{- with .signedState }}
+    signedState: {{ . | quote }}
+    {{- end }}
   {{- end }}
   {{- with .Values.gridNetwork.metricsRefreshInterval }}
   {{- if . }}

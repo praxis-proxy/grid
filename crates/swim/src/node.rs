@@ -20,9 +20,10 @@ use tokio::sync::watch;
 
 use crate::{
     AccumulatedOutput, GridRuntime, NodeId,
+    model_inventory::{ModelInventory, ModelInventoryBroadcast},
     runtime::TimerEvent,
     state_broadcast::{
-        DEFAULT_MAX_RETAINED_ORIGINS, MAX_PINNED_KEYS_PER_ORIGIN, OriginStateHandle, StateBroadcast,
+        DEFAULT_MAX_RETAINED_ORIGINS, MAX_PINNED_KEYS_PER_ORIGIN, OriginStateHandle, PinKey, StateBroadcast,
         StateBroadcastHandler, TooManyPinnedKeys, TrustStore,
     },
 };
@@ -69,6 +70,27 @@ pub enum PublishStateBroadcastError {
         /// Encoded payload length.
         actual_bytes: usize,
         /// Maximum payload length safe for every valid site identity.
+        maximum_bytes: usize,
+    },
+}
+
+/// Failure to encode or queue a signed model inventory frame.
+#[derive(Debug, thiserror::Error)]
+pub enum PublishModelInventoryError {
+    /// Bincode could not encode the frame.
+    #[error("failed to encode model inventory frame: {0}")]
+    Encode(#[from] bincode::error::EncodeError),
+    /// Foca rejected the encoded frame before queueing it.
+    #[error("failed to queue model inventory frame: {0}")]
+    Queue(#[from] foca::Error),
+    /// The frame cannot fit beside the SWIM broadcast header.
+    #[error(
+        "model inventory frame is {actual_bytes} bytes, exceeding safe SWIM payload budget of {maximum_bytes} bytes"
+    )]
+    TooLarge {
+        /// Encoded frame length.
+        actual_bytes: usize,
+        /// Maximum encoded payload length.
         maximum_bytes: usize,
     },
 }
@@ -138,6 +160,9 @@ pub struct SwimNode {
     /// Watch receiver for the signals address map, keyed by origin site.
     signals_addrs_rx: watch::Receiver<BTreeMap<String, String>>,
 
+    /// Watch receiver for complete signature-verified model inventories.
+    model_inventories_rx: watch::Receiver<Vec<ModelInventory>>,
+
     /// Immediate control path for coordinated per-origin state eviction.
     origin_state: OriginStateHandle,
 
@@ -162,7 +187,6 @@ impl SwimNode {
     }
 
     /// Create a node with an explicit hard bound for retained state origins.
-    #[expect(clippy::too_many_lines, reason = "seed + foca setup is one logical step")]
     pub fn with_origin_capacity(identity: NodeId, max_origins: usize) -> Self {
         let seed = {
             // Truncate nanoseconds to u64; we want spread, not precision.
@@ -190,6 +214,7 @@ impl SwimNode {
         let gateway_addrs_rx = handler.subscribe_gateway_addrs();
         let cert_pems_rx = handler.subscribe_cert_pems();
         let signals_addrs_rx = handler.subscribe_signals_addrs();
+        let model_inventories_rx = handler.subscribe_model_inventories();
         let trust_store_tx = handler.trust_store_sender();
 
         Self {
@@ -199,6 +224,7 @@ impl SwimNode {
             gateway_addrs_rx,
             cert_pems_rx,
             signals_addrs_rx,
+            model_inventories_rx,
             origin_state,
             trust_store_tx,
             warned_self_data: false,
@@ -253,14 +279,109 @@ impl SwimNode {
                 supplied: keys.len(),
             });
         }
-        let was_unpinned = self.trust_store_tx.borrow().get(&origin).is_none_or(Vec::is_empty);
+        let was_unpinned = self
+            .trust_store_tx
+            .borrow()
+            .pin(&PinKey::Site(origin.clone()))
+            .is_none_or(Vec::is_empty);
         if was_unpinned {
             self.evict_origin(&origin);
         }
         self.trust_store_tx.send_modify(|store| {
-            store.insert(origin, keys);
+            store.set_pin(PinKey::Site(origin), keys);
         });
         Ok(())
+    }
+
+    /// Pin a site's signing key within one `GridNetwork` trust domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TooManyPinnedKeys`] when more than
+    /// [`MAX_PINNED_KEYS_PER_ORIGIN`] keys are supplied.
+    pub fn pin_origin_for_grid(
+        &self,
+        grid_id: &str,
+        origin: String,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<(), TooManyPinnedKeys> {
+        if keys.len() > MAX_PINNED_KEYS_PER_ORIGIN {
+            return Err(TooManyPinnedKeys {
+                origin,
+                supplied: keys.len(),
+            });
+        }
+        let key = PinKey::grid(grid_id, &origin);
+        let previous = self.trust_store_tx.borrow().pin(&key).cloned();
+        let purge = previous.as_ref().is_none_or(Vec::is_empty)
+            || previous
+                .as_ref()
+                .is_some_and(|previous| previous.iter().any(|old| !keys.contains(old)));
+        if purge || keys.is_empty() {
+            self.evict_origin(&origin);
+        }
+        self.trust_store_tx.send_modify(|store| {
+            store.set_pin(key, keys);
+        });
+        Ok(())
+    }
+
+    /// Require a verified pin before accepting state in `grid_id`.
+    pub fn enforce_signed_grid(&self, grid_id: &str) {
+        let store = self.trust_store_tx.borrow();
+        if store.is_strict(grid_id) {
+            return;
+        }
+        let unpinned = self
+            .origin_state
+            .known_origins()
+            .into_iter()
+            .filter(|origin| store.pin(&PinKey::grid(grid_id, origin)).is_none_or(Vec::is_empty))
+            .collect::<Vec<_>>();
+        drop(store);
+        for origin in unpinned {
+            self.evict_origin(&origin);
+        }
+        self.trust_store_tx.send_modify(|pins| {
+            pins.enforce(grid_id);
+        });
+    }
+
+    /// Hold inbound state broadcasts until the controller applies `GridNetwork` trust.
+    pub fn hold_state_admission(&self) {
+        self.trust_store_tx.send_modify(TrustStore::hold_state_admission);
+    }
+
+    /// Resume inbound state broadcasts after the controller applies `GridNetwork` trust.
+    pub fn open_state_admission(&self) {
+        self.trust_store_tx.send_modify(TrustStore::open_state_admission);
+    }
+
+    /// Stop requiring signed state in `grid_id`, dropping its strictness and pins.
+    ///
+    /// Retained state is kept: it was verified when it merged.
+    pub fn relax_signed_grid(&self, grid_id: &str) {
+        self.trust_store_tx.send_modify(|store| store.forget_grid(grid_id));
+    }
+
+    /// Revoke a site identity in one `GridNetwork` and purge its retained state.
+    pub fn unpin_origin_for_grid(&self, grid_id: &str, origin: &str) {
+        self.evict_origin(origin);
+        self.trust_store_tx.send_modify(|store| {
+            store.set_pin(PinKey::grid(grid_id, origin), Vec::new());
+        });
+    }
+
+    /// Clear a site's current pin and allow only certificate bootstrap in a strict grid.
+    ///
+    /// This is used when a peer certificate is absent or no longer satisfies
+    /// the declared trust policy. Ordinary grid state remains blocked until a
+    /// newly validated pin is installed.
+    pub fn clear_origin_pin_for_grid(&self, grid_id: &str, origin: &str) {
+        self.evict_origin(origin);
+        self.trust_store_tx.send_modify(|store| {
+            store.remove_pin(&PinKey::grid(grid_id, origin));
+        });
     }
 
     /// Remove `origin`'s pin, returning it to unenforced (pass-through) status.
@@ -270,7 +391,7 @@ impl SwimNode {
     /// already accepted under whatever enforcement applied when it arrived.
     pub fn unpin_origin(&self, origin: &str) {
         self.trust_store_tx.send_modify(|store| {
-            store.remove(origin);
+            store.remove_pin(&PinKey::Site(origin.to_owned()));
         });
     }
 
@@ -391,6 +512,33 @@ impl SwimNode {
         Ok(())
     }
 
+    /// Queue one signed model inventory frame for SWIM gossip.
+    ///
+    /// The frame signature must already be bound to its origin and Grid ID.
+    /// Receivers accept it only from an origin with a pinned signing key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the payload cannot be encoded, exceeds the safe
+    /// UDP payload budget, or foca rejects it before queueing.
+    pub fn publish_model_inventory_broadcast(
+        &mut self,
+        broadcast: &ModelInventoryBroadcast,
+    ) -> Result<(), PublishModelInventoryError> {
+        let bytes = broadcast.encode()?;
+        let maximum_bytes = state_broadcast_byte_budget(self.foca.identity())?;
+        if bytes.len() > maximum_bytes {
+            return Err(PublishModelInventoryError::TooLarge {
+                actual_bytes: bytes.len(),
+                maximum_bytes,
+            });
+        }
+        match self.foca.add_broadcast(&bytes) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Return the current merged CRDT grid-state snapshot.
     ///
     /// The snapshot is updated each time a [`StateBroadcast`] is received from
@@ -399,6 +547,34 @@ impl SwimNode {
     #[must_use]
     pub fn state_snapshot(&self) -> GridStateSnapshot {
         self.state_rx.borrow().clone()
+    }
+
+    /// Return complete, signature-verified model inventories that have not expired.
+    #[must_use]
+    pub fn model_inventories(&self) -> Vec<ModelInventory> {
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        self.with_model_inventories(|inventories| {
+            inventories
+                .iter()
+                .filter(|inventory| inventory.expires_at_ms > now_ms)
+                .cloned()
+                .collect()
+        })
+    }
+
+    /// Read the retained model inventories without cloning them.
+    pub fn with_model_inventories<R, Read>(&self, read: Read) -> R
+    where
+        Read: FnOnce(&[ModelInventory]) -> R,
+    {
+        let inventories = self.model_inventories_rx.borrow();
+        read(&inventories)
     }
 
     /// Return the current gateway address map from all received broadcasts.
@@ -595,10 +771,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "boundary proof finds both catalogs, exercises foca delivery, and checks the rejection"
-    )]
     fn publish_state_broadcast_accepts_the_largest_fitting_catalog_and_rejects_the_next() {
         let id = local_id("site-a", 7946);
         let byte_budget = state_broadcast_byte_budget(&id).unwrap_or_else(|_| std::process::abort());
@@ -716,6 +888,107 @@ mod tests {
     }
 
     #[test]
+    fn relaxing_a_grid_drops_only_that_grids_policy_and_pins() {
+        let (node, _) = make_node("site-local", 19_232);
+        for grid in ["grid-a", "grid-b"] {
+            node.enforce_signed_grid(grid);
+            node.pin_origin_for_grid(grid, "site-peer".to_owned(), vec![vec![1]])
+                .unwrap_or_else(|_| std::process::abort());
+        }
+
+        node.relax_signed_grid("grid-a");
+
+        let pins = node.trust_store_tx.borrow().clone();
+        assert!(!pins.is_strict("grid-a"), "a relaxed grid stops requiring signed state");
+        assert!(
+            pins.pin(&PinKey::grid("grid-a", "site-peer")).is_none(),
+            "a relaxed grid keeps no peer pins"
+        );
+        assert!(
+            pins.is_strict("grid-b") && pins.pin(&PinKey::grid("grid-b", "site-peer")).is_some(),
+            "other grids keep enforcing"
+        );
+    }
+
+    #[test]
+    fn empty_certificate_bootstrap_establishes_grid_scoped_signed_gossip() {
+        let id_a = local_id("site-a", 19_229);
+        let id_b = local_id("site-b", 19_230);
+        let (mut node_a, _) = make_node("site-a", 19_229);
+        let (mut node_b, _) = make_node("site-b", 19_230);
+        establish_membership(&mut node_a, &mut node_b, &id_a, &id_b);
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        node_a
+            .pin_origin_for_grid("grid-a", "site-a".to_owned(), vec![public_key.clone()])
+            .unwrap_or_else(|_| std::process::abort());
+        node_b.enforce_signed_grid("grid-a");
+
+        let unsigned_bootstrap = StateBroadcast::new(
+            "site-a".to_owned(),
+            1,
+            GridStateSnapshot::new("site-a".to_owned()),
+            None,
+        )
+        .with_cert(Some("public certificate".to_owned()))
+        .with_grid_id(Some("grid-a".to_owned()))
+        .with_signed_at(Some(now_ms()));
+        let bootstrap_signature = crate::signing::sign_ecdsa_p256(
+            &private_key,
+            &unsigned_bootstrap
+                .signable_bytes()
+                .unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        node_a
+            .publish_state_broadcast(&unsigned_bootstrap.with_signature(Some(bootstrap_signature)))
+            .unwrap_or_else(|_| std::process::abort());
+        for message in &node_a.broadcast().messages {
+            if message.addr == id_b.socket_addr() {
+                drop(node_b.handle_data(&message.data));
+            }
+        }
+        assert_eq!(
+            node_b.cert_pems().get("site-a").map(String::as_str),
+            Some("public certificate"),
+            "strict grid accepts the empty certificate bootstrap for operator CA validation"
+        );
+
+        node_b
+            .pin_origin_for_grid("grid-a", "site-a".to_owned(), vec![public_key])
+            .unwrap_or_else(|_| std::process::abort());
+        let unsigned_metadata = StateBroadcast::new(
+            "site-a".to_owned(),
+            2,
+            GridStateSnapshot::new("site-a".to_owned()),
+            None,
+        )
+        .with_signals_address(Some("site-a:9443".to_owned()))
+        .with_grid_id(Some("grid-a".to_owned()))
+        .with_signed_at(Some(now_ms()));
+        let metadata_signature = crate::signing::sign_ecdsa_p256(
+            &private_key,
+            &unsigned_metadata
+                .signable_bytes()
+                .unwrap_or_else(|_| std::process::abort()),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        node_a
+            .publish_state_broadcast(&unsigned_metadata.with_signature(Some(metadata_signature)))
+            .unwrap_or_else(|_| std::process::abort());
+        for message in &node_a.broadcast().messages {
+            if message.addr == id_b.socket_addr() {
+                drop(node_b.handle_data(&message.data));
+            }
+        }
+
+        assert_eq!(
+            node_b.signals_addrs().get("site-a").map(String::as_str),
+            Some("site-a:9443"),
+            "after pinning, the same grid-scoped identity authenticates later empty metadata"
+        );
+    }
+
+    #[test]
     fn pin_origin_rejects_more_than_the_max_pinned_keys() {
         let (node, _) = make_node("site-b", 19_230);
 
@@ -728,10 +1001,26 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "establishes membership, publishes unpinned state, then pins and re-checks purge in one proof"
-    )]
+    fn clearing_a_grid_pin_leaves_strict_bootstrap_policy_enabled() {
+        let (node, _) = make_node("site-local", 19_231);
+        node.enforce_signed_grid("grid-a");
+        node.pin_origin_for_grid("grid-a", "site-peer".to_owned(), vec![vec![1]])
+            .unwrap_or_else(|_| std::process::abort());
+
+        node.clear_origin_pin_for_grid("grid-a", "site-peer");
+
+        let pins = node.trust_store_tx.borrow().clone();
+        assert!(
+            pins.pin(&PinKey::grid("grid-a", "site-peer")).is_none(),
+            "a cleared peer returns to the certificate-bootstrap state"
+        );
+        assert!(
+            pins.is_strict("grid-a"),
+            "clearing a peer pin must not disable the grid's strict policy"
+        );
+    }
+
+    #[test]
     fn pin_origin_purges_previously_unauthenticated_state_from_that_origin() {
         let id_a = local_id("site-a", 19_231);
         let id_b = local_id("site-b", 19_232);
@@ -776,10 +1065,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "establishes membership, pins, signs+publishes, and re-pins with a rotated key set in one proof"
-    )]
     fn pin_origin_rotation_update_does_not_purge_already_authenticated_state() {
         let id_a = local_id("site-a", 19_233);
         let id_b = local_id("site-b", 19_234);
@@ -832,10 +1117,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "establishes membership, publishes state, then unpins and re-checks retention in one proof"
-    )]
     fn unpin_origin_does_not_purge_existing_state() {
         let id_a = local_id("site-a", 19_235);
         let id_b = local_id("site-b", 19_236);
@@ -902,7 +1183,7 @@ mod tests {
         for msg in &from_b {
             if msg.addr == id_a.socket_addr() {
                 let oa = node_a.handle_data(&msg.data);
-                // Pass any A→B follow-ups to B (acknowledgements etc.)
+                // Pass any A->B follow-ups to B (acknowledgements etc.)
                 for followup in &oa.messages {
                     if followup.addr == id_b.socket_addr() {
                         drop(node_b.handle_data(&followup.data));
@@ -942,13 +1223,9 @@ mod tests {
     /// 1. Establish bidirectional SWIM membership (announce + ALIVE exchange).
     /// 2. A publishes a `StateBroadcast` (queued in foca's custom broadcast backlog).
     /// 3. A calls `gossip()`, and foca includes queued broadcasts in the gossip message.
-    /// 4. B processes the gossip message → `StateBroadcastHandler::receive_item` fires.
+    /// 4. B processes the gossip message -> `StateBroadcastHandler::receive_item` fires.
     /// 5. B's `state_snapshot()` reflects A's CRDT state.
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "multi-step gossip broadcast proof: membership + publish + gossip + receive"
-    )]
     fn crdt_state_propagates_to_peer_via_foca_gossip_broadcast() {
         let id_a = local_id("site-a", 19_201);
         let id_b = local_id("site-b", 19_202);
@@ -999,10 +1276,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "three-node proof establishes membership, broadcasts once, and verifies both receivers"
-    )]
     fn dedicated_broadcast_reaches_all_available_peers() {
         let id_a = local_id("site-a", 19_210);
         let id_b = local_id("site-b", 19_211);
@@ -1052,10 +1325,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "sends two broadcasts (rev=2 then rev=1) and verifies stale rejection at receiver"
-    )]
     fn stale_broadcast_does_not_overwrite_newer_state_at_receiver() {
         let id_a = local_id("site-a", 19_203);
         let id_b = local_id("site-b", 19_204);
@@ -1146,6 +1415,114 @@ mod tests {
     }
 
     #[test]
+    fn signed_frames_exceeding_the_swim_budget_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut node, _) = make_node("site-a", 19_252);
+        let (private_key, _) = generate_signing_key_and_pubkey();
+        let inventory = ModelInventory {
+            origin_site: "site-a".to_owned(),
+            grid_id: "g".repeat(253),
+            network_id: "n".repeat(253),
+            provider_id: "p".repeat(253),
+            provider_uid: "u".repeat(128),
+            revision: 1,
+            expires_at_ms: now_ms().saturating_add(60_000),
+            models: vec!["m".repeat(crate::MAX_MODEL_NAME_BYTES)],
+        };
+        let frame = inventory
+            .frames()?
+            .pop()
+            .unwrap_or_else(|| std::process::abort())
+            .sign(&inventory.origin_site, &inventory.grid_id, &private_key, now_ms())?;
+        let broadcast = ModelInventoryBroadcast::new(inventory.origin_site, inventory.grid_id, frame);
+        assert!(matches!(
+            node.publish_model_inventory_broadcast(&broadcast),
+            Err(PublishModelInventoryError::TooLarge { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn signed_inventory_frames_cross_foca_and_publish_only_after_completion() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let id_a = local_id("site-a", 19_250);
+        let id_b = local_id("site-b", 19_251);
+        let (mut node_a, _) = make_node("site-a", 19_250);
+        let (mut node_b, _) = make_node("site-b", 19_251);
+        establish_membership(&mut node_a, &mut node_b, &id_a, &id_b);
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        node_a.pin_origin_for_grid("grid-a", "site-a".to_owned(), vec![public_key.clone()])?;
+        node_b.pin_origin_for_grid("grid-a", "site-a".to_owned(), vec![public_key])?;
+        let mut snapshot = provider_snap("site-a", 0.2);
+        for provider in snapshot.providers.values_mut() {
+            provider.models.clear();
+        }
+        let mut state = StateBroadcast::new("site-a".to_owned(), 1, snapshot, None)
+            .with_grid_id(Some("grid-a".to_owned()))
+            .with_provider_uids(vec![crate::ProviderUid {
+                identity: crate::ProviderIdentity {
+                    network: "net".to_owned(),
+                    site: "site-a".to_owned(),
+                    provider: "provider-1".to_owned(),
+                },
+                uid: "uid-a".to_owned(),
+            }])
+            .with_signed_at(Some(now_ms()));
+        state.signature = Some(crate::signing::sign_ecdsa_p256(&private_key, &state.signable_bytes()?)?);
+        node_a.publish_state_broadcast(&state)?;
+        for message in node_a.broadcast().messages {
+            drop(node_b.handle_data(&message.data));
+        }
+        let expected = ModelInventory {
+            origin_site: "site-a".to_owned(),
+            grid_id: "grid-a".to_owned(),
+            network_id: "net".to_owned(),
+            provider_id: "provider-1".to_owned(),
+            provider_uid: "uid-a".to_owned(),
+            revision: 1,
+            expires_at_ms: now_ms().saturating_add(60_000),
+            models: vec![
+                "a".repeat(crate::MAX_MODEL_NAME_BYTES),
+                "b".repeat(crate::MAX_MODEL_NAME_BYTES),
+            ],
+        };
+        let mut frames = expected.frames()?;
+        let first =
+            frames
+                .pop()
+                .unwrap_or_else(|| std::process::abort())
+                .sign("site-a", "grid-a", &private_key, now_ms())?;
+        node_a.publish_model_inventory_broadcast(&ModelInventoryBroadcast::new(
+            "site-a".to_owned(),
+            "grid-a".to_owned(),
+            first,
+        ))?;
+        for message in node_a.broadcast().messages {
+            drop(node_b.handle_data(&message.data));
+        }
+        assert!(
+            node_b.model_inventories().is_empty(),
+            "a missing frame cannot produce an inventory"
+        );
+        for frame in frames {
+            let signed = frame.sign("site-a", "grid-a", &private_key, now_ms())?;
+            let broadcast = ModelInventoryBroadcast::new("site-a".to_owned(), "grid-a".to_owned(), signed);
+            assert!(broadcast.encode()?.len() <= state_broadcast_byte_budget(&id_a)?);
+            node_a.publish_model_inventory_broadcast(&broadcast)?;
+        }
+        for _ in 0..16 {
+            for message in node_a.broadcast().messages {
+                assert!(message.data.len() + crate::crypto::OVERHEAD <= MAX_SWIM_PACKET_BYTES);
+                drop(node_b.handle_data(&message.data));
+            }
+            if !node_b.model_inventories().is_empty() {
+                break;
+            }
+        }
+        assert_eq!(node_b.model_inventories(), [expected]);
+        Ok(())
+    }
+
+    #[test]
     fn gateway_address_propagates_to_peer_via_gossip_broadcast() {
         let id_a = local_id("site-a", 19_210);
         let id_b = local_id("site-b", 19_211);
@@ -1207,10 +1584,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "establishes two independent memberships (A-C and B-C), gossips from each, verifies merged state"
-    )]
     fn two_independent_origins_merge_correctly_at_receiver() {
         let id_a = local_id("site-a", 19_207);
         let id_b = local_id("site-b", 19_208);
@@ -1292,10 +1665,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "two-origin gossip proof establishes membership, broadcasts twice, and verifies convergence"
-    )]
     fn tenant_spend_from_two_origin_sites_converges_at_third_via_gossip() {
         let id_a = local_id("site-a", 19_216);
         let id_b = local_id("site-b", 19_217);

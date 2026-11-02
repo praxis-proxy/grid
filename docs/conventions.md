@@ -243,6 +243,10 @@ stops firing (because the code changed), the compiler
 warns that the expectation is unfulfilled. This
 prevents stale suppressions from accumulating.
 
+The `too_many_lines` threshold is 100 lines. Split a
+function when it improves the structure; do not compress
+or deeply nest expressions just to satisfy the threshold.
+
 #### Arithmetic Safety
 
 Unchecked arithmetic is denied
@@ -278,12 +282,33 @@ not a convenience.
 
 #### Deterministic Iteration
 
-Iterating `HashMap`/`HashSet` is denied
-(`iter_over_hash_type`). Hash iteration order is
-random per process, which breaks reproducible output,
-stable serialization, and deterministic tests. Use
-`BTreeMap`/`BTreeSet` when iteration is needed, or
-collect and sort before iterating.
+Choose a collection for its access and ordering needs:
+
+- Use `HashMap`/`HashSet` for keyed lookup or membership
+  when iteration order is irrelevant.
+- Use `BTreeMap`/`BTreeSet` when sorted-key iteration is
+  part of observable output or a deterministic contract.
+- Use a `Vec` for small collections that are traversed
+  linearly and do not need keyed lookup. A vector also
+  preserves insertion order.
+
+Hash collection iteration has arbitrary order. Do not
+depend on that order for output, serialization, tests, or
+side effects. When order matters, use a collection or
+explicit sorting that provides the required order.
+
+#### Iterator Readability
+
+Use iterator chains for short, straightforward
+transformations, filters, and predicates. Prefer a `for`
+loop when a chain becomes long, stateful, mutates external
+state, or obscures the order of work. Prefer a `for` loop
+to `.for_each` when it makes control flow clearer. Bind a
+complex chain to a descriptive name before iterating
+instead of putting it in a `for` header. Choose the form
+that makes the logic clear; do not compress it just to
+reduce line count. The `needless_for_each` lint enforces
+the loop preference when Clippy can identify it.
 
 #### Async Safety
 
@@ -425,6 +450,28 @@ rules.
 - **Enums over multiple `Option<T>` fields.** When
   exactly one of N fields must be set, use an N-variant
   enum.
+- **Enums over unclear boolean parameters.** Use an enum
+  when `true` or `false` does not make the argument's
+  meaning clear at the call site. If a boolean remains
+  appropriate, add an inline call-site comment explaining
+  it. The `fn_params_excessive_bools` lint also blocks
+  functions with more than two boolean parameters.
+- **Newtypes for distinct concepts.** Use separate types
+  for values that have the same representation but
+  different meanings, such as a site ID and a provider ID.
+  This prevents accidentally using one in place of the
+  other.
+- **Named fields over positional tuples.** Use a struct
+  when tuple positions have distinct roles or are not
+  obvious at the call site. Short local tuples and
+  single-field newtypes are fine when their meaning is
+  clear.
+- **Match API flexibility to its audience.** Reusable
+  library APIs should accept or return flexible borrowed
+  and iterator forms when callers benefit. For application
+  and internal APIs with known callers, prefer the simplest
+  direct interface; avoid generalizing for hypothetical
+  reuse.
 - **`#[serde(default)]` over `Option<T>` with
   `unwrap_or`.** Use the concrete type with
   `#[serde(default = "fn_name")]` instead.

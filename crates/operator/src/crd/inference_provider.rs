@@ -114,8 +114,10 @@ pub struct InferenceProviderSpec {
     ///
     /// When set, the operator polls the backend on a fixed cadence and holds
     /// the served-model set in memory, expiring it when polls stop succeeding.
-    /// Until route and provider-record formats support inventory expiry,
-    /// discovered names are withheld and do not fall back to `spec.models`.
+    /// Discovered names may be routed locally to gateways that declare
+    /// model-discovery contract `v1`. They are withheld from provider records,
+    /// whose current wire format cannot carry expiry, and never fall back to
+    /// `spec.models`.
     /// When absent, no discovery runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_discovery: Option<ModelDiscoveryConfig>,
@@ -730,6 +732,38 @@ impl InferenceProviderStatus {
     }
 }
 
+/// Status of a [`Condition`], matching `metav1.ConditionStatus`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
+pub enum ConditionStatus {
+    /// The condition holds.
+    True,
+
+    /// The condition does not hold.
+    False,
+
+    /// The operator cannot tell whether the condition holds.
+    #[default]
+    Unknown,
+}
+
+impl ConditionStatus {
+    /// The status as written to the wire.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::True => "True",
+            Self::False => "False",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for ConditionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One observed condition, shaped like `metav1.Condition`.
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -738,7 +772,7 @@ pub struct Condition {
     #[serde(rename = "type")]
     pub type_: String,
     /// `True`, `False`, or `Unknown`.
-    pub status: String,
+    pub status: ConditionStatus,
     /// CamelCase reason for the status.
     pub reason: String,
     /// Human-readable detail.
@@ -811,6 +845,90 @@ mod tests {
     }
 
     #[test]
+    fn condition_status_keeps_its_wire_values() {
+        for (status, wire) in [
+            (ConditionStatus::True, "True"),
+            (ConditionStatus::False, "False"),
+            (ConditionStatus::Unknown, "Unknown"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(status).ok(),
+                Some(serde_json::json!(wire)),
+                "{status:?} serialises to its wire string"
+            );
+            assert_eq!(
+                serde_json::from_value(serde_json::json!(wire)).ok(),
+                Some(status),
+                "{wire:?} deserialises back to the variant"
+            );
+            assert_eq!(
+                (status.as_str(), status.to_string()),
+                (wire, wire.to_owned()),
+                "{status:?} as_str and Display match the wire value"
+            );
+        }
+        assert_eq!(
+            ConditionStatus::default(),
+            ConditionStatus::Unknown,
+            "Unknown is the default"
+        );
+    }
+
+    #[test]
+    fn condition_status_rejects_values_outside_the_enum() {
+        for wire in ["true", "TRUE", "", "Maybe"] {
+            assert!(
+                serde_json::from_value::<ConditionStatus>(serde_json::json!(wire)).is_err(),
+                "{wire:?} is not a condition status"
+            );
+        }
+    }
+
+    #[test]
+    fn a_condition_round_trips_with_its_status() {
+        let wire = serde_json::json!({
+            "type": "Ready",
+            "status": "False",
+            "reason": "NoEndpointsReady",
+            "message": "0 ready endpoints",
+            "lastTransitionTime": "2026-10-28T12:00:00Z",
+        });
+        let condition: Condition = serde_json::from_value(wire.clone()).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            condition.status,
+            ConditionStatus::False,
+            "status field deserialises to the enum variant"
+        );
+        assert_eq!(
+            serde_json::to_value(&condition).ok(),
+            Some(wire),
+            "condition round-trips through JSON unchanged"
+        );
+    }
+
+    #[test]
+    fn every_crd_constrains_condition_status_to_the_enum() {
+        use crate::crd::{grid_network::GridNetwork, grid_site::GridSite};
+        let pointer =
+            "/spec/versions/0/schema/openAPIV3Schema/properties/status/properties/conditions/items/properties/status";
+        for crd in [InferenceProvider::crd(), GridSite::crd(), GridNetwork::crd()] {
+            let crd = serde_json::to_value(crd).unwrap_or_else(|_| std::process::abort());
+            let status = crd.pointer(pointer).unwrap_or_else(|| std::process::abort());
+            assert_eq!(
+                status.get("type"),
+                Some(&serde_json::json!("string")),
+                "status field schema type is string"
+            );
+            assert_eq!(
+                status.get("enum"),
+                Some(&serde_json::json!(["True", "False", "Unknown"])),
+                "{}",
+                crd.pointer("/spec/names/kind").unwrap_or(&serde_json::Value::Null)
+            );
+        }
+    }
+
+    #[test]
     fn default_phase() {
         let phase = ProviderPhase::default();
         assert_eq!(phase, ProviderPhase::Pending, "should default to Pending");
@@ -859,10 +977,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "checks duplicate rejection for every renamed provider field"
-    )]
     fn legacy_and_current_provider_field_names_are_rejected_together() {
         let gateway_json = serde_json::json!({
             "gridNetworkRef": "production",
@@ -1082,10 +1196,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "tests multiple signal_names fields in one assertion block"
-    )]
     fn metrics_config_with_path_and_signal_names_deserializes() {
         let json = serde_json::json!({
             "gridNetworkRef": "production",
@@ -1204,10 +1314,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "tests multiple schema paths in one assertion block"
-    )]
     fn crd_schema_enforces_min_length_on_tls_secret_fields() {
         let crd = crd_json();
         let tls_props = crd

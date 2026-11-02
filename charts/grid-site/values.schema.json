@@ -143,6 +143,10 @@
             "mode": {
               "type": "string",
               "enum": ["pin", "spiffe"]
+            },
+            "signedState": {
+              "type": "string",
+              "enum": ["off", "enforce"]
             }
           }
         },

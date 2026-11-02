@@ -240,10 +240,6 @@ fn route_operation(parts: &Parts) -> Operation {
 
 impl ApiError {
     /// The HTTP status, machine-readable code, and human message for the wire.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one arm per error variant, each with its wire message"
-    )]
     fn rendered(self) -> (StatusCode, ErrorCode, String) {
         match self {
             Self::BadRequest { code, message } => (StatusCode::BAD_REQUEST, code, message),
@@ -421,10 +417,6 @@ async fn enforce_timeout(request: Request, next: Next) -> Response {
 /// The pin is validated here, so a bad name fails at mint rather than at the
 /// site's enroll. The token is returned once, and only its digest is stored. A
 /// name an enrollment holds, or a live token already pins, is refused.
-#[expect(
-    clippy::too_many_lines,
-    reason = "validate, mint, store, and build the response read as one flow"
-)]
 async fn mint_site_token(
     State(state): State<Arc<AppState>>,
     GridAdmin(admin): GridAdmin,
@@ -516,10 +508,6 @@ async fn revoke_site_token(
 /// The token is checked before the CSR is parsed, so an unusable token is refused
 /// before any signature work. The certificate is signed against the token's
 /// pinned name, and the token is spent only when the certificate is issued.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the enroll flow, token to signed certificate, reads as one narrative"
-)]
 async fn enroll(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -653,7 +641,6 @@ impl FromRequestParts<Arc<AppState>> for SiteLeaf {
 }
 
 /// Renew a site identity with its current certificate: no token, the same name.
-#[expect(clippy::too_many_lines, reason = "decide, sign, and audit read as one flow")]
 async fn renew(
     State(state): State<Arc<AppState>>,
     leaf: SiteLeaf,
@@ -874,7 +861,6 @@ mod error_codes {
 
     /// Every code the API answers with, and its status: the set clients rely on.
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one row per wire code")]
     fn the_wire_codes_are_the_documented_set() {
         let bad = |code| ApiError::BadRequest {
             code,

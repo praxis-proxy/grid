@@ -455,10 +455,6 @@ impl MemoryStore {
     }
 
     /// Record a token, unless the name is held, deleted without opt-in, or pinned by a live token.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "idempotent retries and name guards must stay under one lock"
-    )]
     fn mint_site_token(&self, token: NewSiteToken) -> Result<Uuid, StoreError> {
         let mut inner = self.inner.lock().map_err(|_poisoned| poisoned())?;
         let token_id = token.token_id.unwrap_or_else(Uuid::new_v4);
@@ -547,10 +543,6 @@ impl MemoryStore {
     ///
     /// One lock covers the guard, the sign, and the record, so the token is spent
     /// only when the certificate is issued and a name check cannot race a record.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the guard, sign, and record read as one step under the lock"
-    )]
     fn redeem_and_issue<F>(&self, token_sha256: &str, sign: F) -> Result<(Uuid, Issued), StoreError>
     where
         F: FnOnce(&Pin) -> Result<Issued, StoreError>,
@@ -610,10 +602,6 @@ impl MemoryStore {
     }
 
     /// Admit a renewal, sign, and record the new key under one lock.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the decide, sign, and record read as one step under the lock"
-    )]
     fn renew_and_issue<F>(&self, renewal: &Renewal, sign: F) -> Result<Renewed, StoreError>
     where
         F: FnOnce() -> Result<Issued, StoreError>,
@@ -739,10 +727,6 @@ mod token_id_tests {
     use super::{MemoryStore, NewSiteToken, StoreError};
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the retry test checks all fields that define token identity"
-    )]
     fn token_id_mint_is_retryable_only_for_the_same_token() -> Result<(), StoreError> {
         let store = MemoryStore::default();
         let token_id = Uuid::new_v4();

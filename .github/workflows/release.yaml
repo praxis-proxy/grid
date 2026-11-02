@@ -166,6 +166,7 @@ jobs:
       mock_providers_digest: ${{ steps.mock_providers.outputs.digest }}
       enrollment_digest: ${{ steps.enrollment.outputs.digest }}
       overlay_sync_digest: ${{ steps.overlay_sync.outputs.digest }}
+      fleet_dashboard_digest: ${{ steps.fleet_dashboard.outputs.digest }}
       official_ai_digest: ${{ steps.official_ai.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -368,6 +369,15 @@ jobs:
       packages: write
     outputs:
       chart_digest: ${{ steps.push.outputs.digest }}
+    env:
+      # Release chart directories. The directory basename is the chart name.
+      CHART_DIRS: >-
+        charts/grid-operator
+        charts/praxis-gateway
+        charts/grid-site
+        charts/grid-mock-providers
+        charts/grid-enrollment
+        crates/fleet-dashboard/charts/grid-fleet-dashboard
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -384,9 +394,10 @@ jobs:
           TAG: ${{ needs.validate.outputs.tag }}
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          for chart in grid-operator praxis-gateway grid-site grid-mock-providers grid-enrollment; do
-            CHART_VERSION=$(grep '^version:' "charts/${chart}/Chart.yaml" | awk '{print $2}')
-            CHART_APP_VERSION=$(grep '^appVersion:' "charts/${chart}/Chart.yaml" | awk '{print $2}' | tr -d '"')
+          for dir in ${CHART_DIRS}; do
+            chart=$(basename "${dir}")
+            CHART_VERSION=$(grep '^version:' "${dir}/Chart.yaml" | awk '{print $2}')
+            CHART_APP_VERSION=$(grep '^appVersion:' "${dir}/Chart.yaml" | awk '{print $2}' | tr -d '"')
             if [ "$CHART_VERSION" != "$VERSION" ]; then
               echo "::error::${chart} version ($CHART_VERSION) != tag version ($VERSION)"
               exit 1
@@ -409,11 +420,15 @@ jobs:
           helm lint charts/grid-site --strict \
             --set gridNetwork.name=release-lint \
             --set gridSite.name=release-lint
+          helm lint crates/fleet-dashboard/charts/grid-fleet-dashboard --strict
+
+      - name: Render fleet dashboard chart
+        run: crates/fleet-dashboard/hack/helm-template-test.sh
 
       - name: Package charts
         run: |
-          for chart in grid-operator praxis-gateway grid-site grid-mock-providers grid-enrollment; do
-            helm package "charts/${chart}"
+          for dir in ${CHART_DIRS}; do
+            helm package "${dir}"
           done
 
       - name: Log in to GHCR
@@ -422,7 +437,8 @@ jobs:
       - name: Push charts to OCI registry
         id: push
         run: |
-          for chart in grid-operator praxis-gateway grid-site grid-mock-providers grid-enrollment; do
+          for dir in ${CHART_DIRS}; do
+            chart=$(basename "${dir}")
             OUTPUT=$(helm push "${chart}-${{ needs.validate.outputs.version }}.tgz" oci://ghcr.io/praxis-proxy/charts 2>&1)
             echo "$OUTPUT"
             if [ "$chart" = grid-operator ]; then
@@ -467,6 +483,7 @@ jobs:
           MOCK_PROVIDERS_DIGEST: ${{ needs.container.outputs.mock_providers_digest }}
           ENROLLMENT_DIGEST: ${{ needs.container.outputs.enrollment_digest }}
           OVERLAY_SYNC_DIGEST: ${{ needs.container.outputs.overlay_sync_digest }}
+          FLEET_DASHBOARD_DIGEST: ${{ needs.container.outputs.fleet_dashboard_digest }}
           OFFICIAL_AI_DIGEST: ${{ needs.container.outputs.official_ai_digest }}
           CHART_DIGEST: ${{ needs.chart.outputs.chart_digest }}
           SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
@@ -482,6 +499,7 @@ jobs:
           ${MOCK_PROVIDERS_IMAGE_NAME}@${MOCK_PROVIDERS_DIGEST}
           ${ENROLLMENT_IMAGE_NAME}@${ENROLLMENT_DIGEST}
           ${OVERLAY_SYNC_IMAGE_NAME}@${OVERLAY_SYNC_DIGEST}
+          ${FLEET_DASHBOARD_IMAGE_NAME}@${FLEET_DASHBOARD_DIGEST}
           \`\`\`
 
           ## Helm Chart
@@ -493,6 +511,7 @@ jobs:
           oci://ghcr.io/praxis-proxy/charts/grid-site --version ${VERSION}
           oci://ghcr.io/praxis-proxy/charts/grid-mock-providers --version ${VERSION}
           oci://ghcr.io/praxis-proxy/charts/grid-enrollment --version ${VERSION}
+          oci://ghcr.io/praxis-proxy/charts/grid-fleet-dashboard --version ${VERSION}
           \`\`\`
 
           Install:

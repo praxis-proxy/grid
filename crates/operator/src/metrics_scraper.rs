@@ -126,37 +126,24 @@ impl MetricsScrapeError {
 /// timed out, else a connect failure.
 fn transport_class(source: &(dyn std::error::Error + 'static)) -> crate::readiness::ScrapeClass {
     use crate::readiness::ScrapeClass;
+
+    let (tls, io_kind) = crate::resources::tls_backend::transport_error_details(source);
+    if tls {
+        return ScrapeClass::Tls;
+    }
+
     let mut cause = Some(source);
     while let Some(error) = cause {
-        if tls_within(error) {
-            return ScrapeClass::Tls;
-        }
         let text = error.to_string();
         if text.contains("dns error") || text.contains("failed to lookup address") {
             return ScrapeClass::Dns;
         }
-        if error
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
-        {
-            return ScrapeClass::Timeout;
-        }
         cause = error.source();
     }
+    if io_kind == Some(std::io::ErrorKind::TimedOut) {
+        return ScrapeClass::Timeout;
+    }
     ScrapeClass::Connect
-}
-
-/// Whether `error` is a TLS failure or wraps one through any depth of `io::Error`.
-///
-/// `io::Error::source` skips the error it wraps, which is where a TLS failure sits, and
-/// hyper-rustls wraps the connector's `io::Error` in another, so the chain is walked by
-/// `get_ref`, not `source`.
-fn tls_within(error: &(dyn std::error::Error + 'static)) -> bool {
-    crate::resources::tls_backend::is_tls_error(error)
-        || error
-            .downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::get_ref)
-            .is_some_and(|inner| tls_within(inner))
 }
 
 // ---------------------------------------------------------------------------
@@ -494,8 +481,8 @@ mod tests {
         );
     }
 
+    /// Every scrape failure maps to one stable, bounded readiness class.
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one table of failures and their classes")]
     fn a_scrape_failure_has_a_bounded_class() {
         use crate::readiness::ScrapeClass;
         let status = |status| MetricsScrapeError::NonOkStatus {
@@ -516,6 +503,14 @@ mod tests {
             (
                 "dns",
                 transport("dns error: failed to lookup address information".into()),
+                ScrapeClass::Dns,
+            ),
+            (
+                "timed out dns",
+                transport(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "dns error: failed to lookup address information",
+                ))),
                 ScrapeClass::Dns,
             ),
             (
@@ -797,10 +792,6 @@ mod tests {
     /// `client_ca_pem`: when `Some`, the server requires client certificate
     /// authentication (mTLS).  When `None`, one-way TLS only.
     #[cfg(not(feature = "fips"))]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "TLS server setup: certs + verifier + acceptor + one-shot handler"
-    )]
     async fn start_tls_test_server(
         server_cert_pem: &str,
         server_key_pem: &str,
@@ -1123,7 +1114,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "server + client handshake round-trip setup")]
     async fn server_accept_verifies_the_client_and_exposes_its_leaf() {
         use crate::resources::tls_backend::{
             accept, build_server_config, connect, parse_server_name, server_peer_leaf_der,
@@ -1301,10 +1291,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "exhaustive PEM-leak check across multiple error paths"
-    )]
     fn error_messages_never_contain_pem_material() {
         let ca = certs::generate_ca("test-ca").unwrap();
         let client = certs::generate_dns_cert(&ca, "client", "localhost").unwrap();

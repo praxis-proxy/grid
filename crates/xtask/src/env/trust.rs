@@ -41,10 +41,10 @@ const HOST_CERTS_DIR: &str = "tests/env/certs";
 ///
 /// For each provider cluster, exercises four trust cases:
 ///
-/// 1. Positive: valid client cert → model request returns 200.
-/// 2. Negative (TLS layer): no client cert → `curl` exits non-zero.
-/// 3. Negative (TLS layer): client cert from an untrusted CA → `curl` exits non-zero.
-/// 4. Negative (filter layer): same trusted CA but wrong organization → HTTP 403 from `peer_identity_trust`.
+/// 1. Positive: valid client cert -> model request returns 200.
+/// 2. Negative (TLS layer): no client cert -> `curl` exits non-zero.
+/// 3. Negative (TLS layer): client cert from an untrusted CA -> `curl` exits non-zero.
+/// 4. Negative (filter layer): same trusted CA but wrong organization -> HTTP 403 from `peer_identity_trust`.
 ///
 /// Cases 2 and 3 confirm that the gateway enforces `client_cert_mode:
 /// require` and that only certs from the generated test CA are accepted.
@@ -133,7 +133,7 @@ fn verify_provider_trust(
 // Individual tests
 // ---------------------------------------------------------------------------
 
-/// Positive: valid consumer client cert → model returns 200.
+/// Positive: valid consumer client cert -> model returns 200.
 #[expect(
     clippy::too_many_arguments,
     reason = "cluster, context, port, consumer_site, model, tally all distinct"
@@ -222,12 +222,11 @@ fn curl_post_mtls_args(
     ])
 }
 
-/// Negative: no client cert → TLS handshake failure (`curl` exits non-zero).
+/// Negative: no client cert -> TLS handshake failure (`curl` exits non-zero).
 ///
 /// Uses `--resolve` so `curl` reaches the server with the correct SNI,
 /// ensuring the test exercises `client_cert_mode: require` rather than an SNI
 /// mismatch.
-#[expect(clippy::too_many_lines, reason = "curl argument construction + result handling")]
 fn test_no_client_cert(cluster: &str, ctx: &str, port: u16, tally: &mut Tally) {
     let sni = format!("{cluster}.grid.internal");
     let resolve = format!("{sni}:{port}:127.0.0.1");
@@ -267,16 +266,12 @@ fn test_no_client_cert(cluster: &str, ctx: &str, port: u16, tally: &mut Tally) {
     }
 }
 
-/// Negative: client cert from an ephemeral untrusted CA → TLS handshake
+/// Negative: client cert from an ephemeral untrusted CA -> TLS handshake
 /// failure.
 ///
 /// Generates a fresh CA + site cert in the OS temp directory, then attempts
 /// an mTLS connection.  The provider only trusts the generated test CA, so
 /// rustls rejects the untrusted cert before any HTTP is exchanged.
-#[expect(
-    clippy::too_many_lines,
-    reason = "cert generation + temp file management + curl test"
-)]
 fn test_wrong_ca_cert(
     cluster: &str,
     ctx: &str,
@@ -337,7 +332,7 @@ fn test_wrong_ca_cert(
 }
 
 /// Negative: client cert from the same trusted CA but with a different
-/// organization → HTTP 403 from `peer_identity_trust`.
+/// organization -> HTTP 403 from `peer_identity_trust`.
 ///
 /// This specifically tests filter-level enforcement, not the TLS/PKI layer.
 /// The cert passes `client_cert_mode: require` because it is CA-valid;
@@ -350,10 +345,6 @@ fn test_wrong_ca_cert(
 /// tests may have reset the connection pool.  A connection error here is
 /// unexpected (same CA cert should succeed at TLS), so retrying once is
 /// appropriate.  A second failure is reported as a test failure.
-#[expect(
-    clippy::too_many_lines,
-    reason = "curl argument construction + retry + result handling"
-)]
 fn test_wrong_org_cert(cluster: &str, ctx: &str, port: u16, model: &str, tally: &mut Tally) {
     let cert_path = format!("{HOST_CERTS_DIR}/wrong-org-client-cert.pem");
     let key_path = format!("{HOST_CERTS_DIR}/wrong-org-client-key.pem");

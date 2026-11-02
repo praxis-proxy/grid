@@ -244,10 +244,10 @@ true
 {{- end }}
 
 {{/*
-The bootstrap Job runs to generate the CA or a credentials Secret. Emits "true" or nothing.
+The bootstrap Job persists grid identity and optionally generates service credentials.
 */}}
 {{- define "grid-enrollment.bootstrapRuns" -}}
-{{- if or (ne (include "grid-enrollment.caProvided" .) "true") (include "grid-enrollment.generatesAdminTokens" .) -}}
+{{- if or .Values.gridIdentity.enabled (and (eq .Values.mode "service") (or (ne (include "grid-enrollment.caProvided" .) "true") (include "grid-enrollment.generatesAdminTokens" .))) -}}
 true
 {{- end -}}
 {{- end }}

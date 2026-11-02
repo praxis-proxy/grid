@@ -4,6 +4,13 @@
 //! and time to rejoin one poll after it publishes 1. With the operator's defaults (5s
 //! scrape, 2 zero scrapes, 5s poll) that is at most about 15s to exclude and 10s to rejoin.
 
+#[path = "support/http.rs"]
+mod http;
+#[path = "support/logs.rs"]
+mod logs;
+#[path = "support/ports.rs"]
+mod ports;
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
@@ -20,8 +27,8 @@
 mod tests {
     use std::{
         collections::BTreeMap,
-        io::{BufRead as _, BufReader, ErrorKind, Read as _, Write as _},
-        net::{TcpListener, TcpStream},
+        io::{BufRead as _, BufReader, Read as _, Write as _},
+        net::TcpStream,
         path::{Path, PathBuf},
         process::{Child, Command, Stdio},
         sync::{
@@ -36,6 +43,11 @@ mod tests {
     use rustls::{
         ServerConfig, ServerConnection, StreamOwned,
         pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _},
+    };
+
+    use super::{
+        http::read_request,
+        ports::{bound_listener, free_port},
     };
 
     /// How often the gateway polls each peer.
@@ -58,6 +70,8 @@ mod tests {
     const OMITTED: u8 = 2;
     /// Accept and drop every poll, as a partitioned link.
     const PARTITIONED: u8 = 3;
+    /// Fresh provider samples under a queue name the gateway does not recognize.
+    const UNREADABLE: u8 = 4;
 
     /// A peer operator's signals endpoint over mutual TLS, publishing per `mode`.
     struct Peer {
@@ -88,7 +102,7 @@ mod tests {
                     .with_single_cert(chain, key)
                     .expect("server config"),
             );
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer");
+            let listener = bound_listener();
             let addr = listener.local_addr().expect("peer addr").to_string();
             let mode = Arc::new(AtomicU8::new(READY));
             let stop = Arc::new(AtomicBool::new(false));
@@ -146,6 +160,9 @@ mod tests {
         let load = format!("llm_d_epp_average_queue_size{{{labels}}} 0 {stamp}\n");
         match mode {
             OMITTED => load,
+            UNREADABLE => {
+                format!("vendor_queue_depth{{{labels}}} 0 {stamp}\nllm_d_epp_ready_endpoints{{{labels}}} 1 {stamp}\n")
+            },
             _ => format!(
                 "{load}llm_d_epp_ready_endpoints{{{labels}}} {} {stamp}\n",
                 u8::from(mode == READY)
@@ -155,22 +172,15 @@ mod tests {
 
     /// A plain HTTP backend answering 200 with its site name.
     fn backend(site: &'static str) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+        let listener = bound_listener();
         let port = listener.local_addr().expect("backend addr").port();
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 thread::spawn(move || {
-                    let mut head = Vec::new();
-                    let mut buf = [0_u8; 1024];
-                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                        match stream.read(&mut buf) {
-                            Ok(0) => return,
-                            Ok(n) => head.extend_from_slice(&buf[..n]),
-                            Err(e) if e.kind() == ErrorKind::Interrupted => {},
-                            Err(_) => return,
-                        }
-                    }
+                    let Ok((_head, _body)) = read_request(&mut stream) else {
+                        return;
+                    };
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{site}",
                         site.len()
@@ -180,14 +190,6 @@ mod tests {
             }
         });
         port
-    }
-
-    fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0")
-            .expect("bind")
-            .local_addr()
-            .expect("addr")
-            .port()
     }
 
     fn drain(pipe: impl std::io::Read + Send + 'static, lines: Arc<Mutex<Vec<String>>>) {
@@ -333,6 +335,7 @@ mod tests {
 
     impl Drop for Gateway {
         fn drop(&mut self) {
+            super::logs::gateway_output_on_failure(&self.output);
             let _killed = self.child.kill();
             let _reaped = self.child.wait();
         }
@@ -395,6 +398,8 @@ mod tests {
             std::fs::write(identity.join(key), pem).expect("identity file");
         }
         let peers: Vec<(&str, Peer)> = SITES.iter().map(|site| (*site, Peer::start(&ca, site))).collect();
+        let site_b = &peers[1].1;
+        site_b.mode.store(UNREADABLE, Ordering::SeqCst);
         let backends: Vec<(&str, u16)> = SITES.iter().map(|site| (*site, backend(site))).collect();
         let gateway = Gateway::start(
             &work,
@@ -402,11 +407,33 @@ mod tests {
             &peers.iter().map(|(site, peer)| (*site, peer)).collect::<Vec<_>>(),
             &identity,
         );
-        let site_b = &peers[1].1;
 
-        gateway.eventually("every site serving", || {
+        let to_unreadable_exclusion = time_until(&gateway, |site| site != "site-b");
+        assert!(
+            to_unreadable_exclusion < DEADLINE,
+            "unreadable score was not excluded: {to_unreadable_exclusion:?}"
+        );
+        gateway.eventually("unreadable score metric", || {
+            gateway.metrics().contains(
+                "grid_route_site_score_unavailable{site=\"site-b\",cluster=\"pool-site-b\",reason=\"unreadable\"} 1",
+            )
+        });
+        site_b.mode.store(PARTITIONED, Ordering::SeqCst);
+        thread::sleep(WINDOW * 3);
+        gateway.eventually("stale score metric", || {
+            gateway.metrics().contains(
+                "grid_route_site_score_unavailable{site=\"site-b\",cluster=\"pool-site-b\",reason=\"stale\"} 1",
+            )
+        });
+        site_b.mode.store(READY, Ordering::SeqCst);
+        gateway.eventually("every site serving after readable scores", || {
             let counts = split(&gateway, 9);
             SITES.iter().all(|site| counts.contains_key(*site))
+        });
+        gateway.eventually("unreadable score metric cleared", || {
+            gateway.metrics().contains(
+                "grid_route_site_score_unavailable{site=\"site-b\",cluster=\"pool-site-b\",reason=\"unreadable\"} 0",
+            )
         });
         // site-b's provider goes not ready.
         site_b.mode.store(NOT_READY, Ordering::SeqCst);
@@ -438,6 +465,14 @@ mod tests {
             "a silent peer is not readmitted: {partitioned:?}"
         );
         assert_eq!(partitioned.get("error"), None, "{partitioned:?}");
+        gateway.eventually("no unavailable-score reason for an unready site", || {
+            let metrics = gateway.metrics();
+            ["absent", "unreadable", "stale"].iter().all(|reason| {
+                metrics.contains(&format!(
+                    "grid_route_site_score_unavailable{{site=\"site-b\",cluster=\"pool-site-b\",reason=\"{reason}\"}} 0"
+                ))
+            })
+        });
 
         // It heals with an operator that no longer publishes readiness: absent reads as ready.
         site_b.mode.store(OMITTED, Ordering::SeqCst);

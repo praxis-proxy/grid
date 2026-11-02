@@ -175,12 +175,51 @@ pub struct SiteCertOutput {
 ///
 /// Returns [`GenerateError`] if key generation or signing fails.
 pub fn generate_site_cert(ca: &CaCert, site_name: &str) -> Result<SiteCertOutput, GenerateError> {
-    let dns_san = format!("{site_name}.grid.internal");
-    generate_dns_cert(ca, site_name, &dns_san)
+    generate_dns_cert(ca, site_name, &site_dns_name(site_name))
 }
 
 /// Trust domain every site in this grid is named under.
 pub const SPIFFE_TRUST_DOMAIN: &str = "grid.internal";
+
+/// The DNS name a site's certificate carries and its peers dial it by.
+///
+/// ```
+/// assert_eq!(certs::site_dns_name("east"), "east.grid.internal");
+/// ```
+#[must_use]
+pub fn site_dns_name(site_name: &str) -> String {
+    format!("{site_name}.{SPIFFE_TRUST_DOMAIN}")
+}
+
+/// Whether `host` is the grid's own name or a name under it, the names grid gateways answer to.
+///
+/// Case and a trailing dot are ignored, as DNS ignores them.
+///
+/// ```
+/// assert!(certs::is_grid_name("East.Grid.Internal."));
+/// assert!(certs::is_grid_name("grid.internal"));
+/// assert!(!certs::is_grid_name("notgrid.internal"));
+/// ```
+#[must_use]
+pub fn is_grid_name(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let Some(prefix) = host.len().checked_sub(SPIFFE_TRUST_DOMAIN.len()) else {
+        return false;
+    };
+    let (head, tail) = host.split_at_checked(prefix).unwrap_or_default();
+    tail.eq_ignore_ascii_case(SPIFFE_TRUST_DOMAIN) && (head.is_empty() || head.ends_with('.'))
+}
+
+/// Whether `id` is a routing candidate's stable ID: eight lowercase hex digits.
+///
+/// ```
+/// assert!(certs::is_stable_id("ccac628c"));
+/// assert!(!certs::is_stable_id("CCAC628C"));
+/// ```
+#[must_use]
+pub fn is_stable_id(id: &str) -> bool {
+    id.len() == 8 && id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// Generate a site certificate carrying extra DNS names.
 ///
@@ -226,7 +265,7 @@ fn issue_leaf_cert(
     extra: &[String],
     spiffe: bool,
 ) -> Result<SiteCertOutput, GenerateError> {
-    let primary = format!("{common_name}.grid.internal");
+    let primary = site_dns_name(common_name);
     let mut id = if spiffe {
         site_identity(common_name, &primary)?
     } else {
@@ -351,7 +390,7 @@ pub fn generate_cert_with_org(ca: &CaCert, site_name: &str, org: &str) -> Result
     if !is_valid_site_name(site_name) {
         return Err(GenerateError::InvalidSiteName);
     }
-    let dns_san = format!("{site_name}.grid.internal");
+    let dns_san = site_dns_name(site_name);
     let id = site_identity_with_org(site_name, &dns_san, org);
     let (not_before, not_after) = default_leaf_validity();
     let out = backend::issue_leaf(&ca.material, &id.spec(not_before, not_after)).map_err(map_backend)?;

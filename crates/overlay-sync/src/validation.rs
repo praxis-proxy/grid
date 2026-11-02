@@ -365,6 +365,7 @@ mod tests {
                 site: "site-a".to_owned(),
                 cluster: "cluster-a".to_owned(),
                 fresh: true,
+                expires_at: None,
                 credential: None,
                 stable_id: Some("abcd1234".to_owned()),
                 admission_state: None,
@@ -433,6 +434,24 @@ mod tests {
         let raw = serde_json::to_vec(&value).unwrap();
         let result = validate_envelope(&raw, &test_scope(), 1_048_576, None);
         assert!(result.is_ok(), "additive candidate metadata should survive validation");
+    }
+
+    #[test]
+    fn candidate_expiry_field_is_digest_significant_and_accepted() {
+        let mut env = valid_envelope();
+        let candidate = env.overlay.candidates.first_mut().unwrap();
+        candidate.expires_at = Some("2030-01-01T00:00:00Z".to_owned());
+        let digest = compute_semantic_digest(&env.overlay).unwrap();
+        env.revision.value.clone_from(&digest);
+        env.content_digest.value.clone_from(&digest);
+
+        let raw = serde_json::to_vec(&env).unwrap();
+        let result = validate_envelope(&raw, &test_scope(), 1_048_576, None);
+
+        assert!(
+            result.is_ok(),
+            "expiry metadata must pass through the overlay-sync contract"
+        );
     }
 
     #[test]

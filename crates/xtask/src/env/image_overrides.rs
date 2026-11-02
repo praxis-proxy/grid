@@ -164,10 +164,6 @@ pub(crate) fn should_skip_kind_image_loading() -> bool {
 /// Import a host image into a run-owned Kind node using only its linux/amd64
 /// image content. This avoids OCI-index imports failing when the local Docker
 /// store has only the linux/amd64 child content.
-#[expect(
-    clippy::too_many_lines,
-    reason = "ensures both image processes are reaped on every failure path"
-)]
 pub(crate) fn load_docker_image_into_kind(image: &str, kind_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let control_plane = format!("{kind_name}-control-plane");
     let engine = kind_engine();

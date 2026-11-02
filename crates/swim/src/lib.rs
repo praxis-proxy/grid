@@ -22,6 +22,8 @@ pub mod crypto;
 pub mod event;
 /// SWIM node identity for the AI Grid.
 pub mod identity;
+/// Signed, bounded model inventory frames for SWIM gossip.
+pub mod model_inventory;
 /// High-level SWIM node wrapping a foca Foca instance.
 pub mod node;
 /// Foca runtime adapter with accumulated output.
@@ -33,10 +35,16 @@ pub mod state_broadcast;
 
 pub use event::MemberEvent;
 pub use identity::NodeId;
-pub use node::SwimNode;
+pub use model_inventory::{
+    FrameSigningError, InventoryFrameError, MAX_IN_PROGRESS_FRAMES_PER_ORIGIN, MAX_INVENTORY_FRAMES,
+    MAX_INVENTORY_MODELS, MAX_MODEL_NAME_BYTES, MAX_ORIGIN_INVENTORY_NAME_BYTES, MODEL_INVENTORY_FRAME_VERSION,
+    ModelInventory, ModelInventoryBroadcast, ModelInventoryFrame,
+};
+pub use node::{PublishModelInventoryError, SwimNode};
 pub use runtime::{AccumulatedOutput, GridRuntime};
 pub use signing::{SigningError, VerificationError};
 pub use state_broadcast::{
-    MAX_PINNED_KEYS_PER_ORIGIN, STATE_BROADCAST_VERSION, STATE_BROADCAST_VERSION_V1, StateBroadcast,
-    StateBroadcastError, StateBroadcastHandler, StateBroadcastKey, TooManyPinnedKeys, TrustStore,
+    MAX_PINNED_KEYS_PER_ORIGIN, PinKey, ProviderIdentity, ProviderUid, STATE_BROADCAST_VERSION,
+    STATE_BROADCAST_VERSION_V1, StateBroadcast, StateBroadcastError, StateBroadcastHandler, StateBroadcastKey,
+    TooManyPinnedKeys, TrustStore,
 };

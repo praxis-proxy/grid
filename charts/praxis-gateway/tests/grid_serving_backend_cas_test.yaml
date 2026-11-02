@@ -1,0 +1,159 @@
+suite: grid serving without chart clusters, and backend CAs
+templates:
+  - templates/gateway-config.yaml
+  - templates/deployment.yaml
+release:
+  name: gw
+  namespace: grid
+set:
+  image.flavor: grid-gateway
+  praxisConfig.source: render
+  grid.siteName: hub
+  praxisConfig.render.auth.mode: none
+  gridIdentity.tlsSecretName: grid-site-identity
+  gridIdentity.caSecretName: grid-ca
+  praxisConfig.render.gridServing.enabled: true
+  praxisConfig.render.gridServing.networkName: grid
+tests:
+  - it: routes with grid_site_route over no chart clusters and no load_balancer
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'filter: grid_site_route\n\s+model_header: X-Gateway-Model-Name\n\s+clusters: \[\]\n'
+      - notMatchRegex:
+          path: data["praxis.yaml"]
+          pattern: load_balancer
+      - notMatchRegex:
+          path: data["praxis.yaml"]
+          pattern: '(?m)^clusters:'
+      - notMatchRegex:
+          path: data["praxis.yaml"]
+          pattern: intelligent_route
+
+  - it: keeps the listener, auth, model_to_header and telemetry of the praxisConfig render
+    template: templates/gateway-config.yaml
+    set:
+      listenerTls.secretName: gw-listener
+      praxisConfig.render.auth.mode: api-key
+      praxisConfig.render.auth.validateUrl: https://maas.example/validate
+      praxisConfig.render.telemetry.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'listeners:\n\s+- name: gateway\n\s+address: "0.0.0.0:8080"\n\s+tls:\n\s+certificates:'
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'filter: trace_context\n\s+- filter: policy\n(.+\n)+\s+- filter: headers\n\s+request_remove: \[Authorization\]\n\s+- filter: model_to_header\n\s+header: X-Gateway-Model-Name\n\s+- filter: grid_site_route'
+      - matchRegex:
+          path: data["policy.yaml"]
+          pattern: 'kind: identity/api-key'
+
+  - it: still renders declared backends, which dials of the same name override
+    template: templates/gateway-config.yaml
+    set:
+      praxisConfig.render.backends:
+        - cluster: pool-b
+          endpoints: ["203.0.113.7:8443"]
+          transport: { mode: mutual_tls, sni: site-b.grid.internal }
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'clusters:\n\s+- "pool-b"'
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'filter: load_balancer'
+
+  - it: mounts each backend CA where the operator's dial ca_path points
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.render.gridServing.backendCAs:
+        - secretName: kserve.ca
+        - configMapName: openshift-service-ca.crt
+          key: service-ca.crt
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: grid-backend-ca-0
+            mountPath: /run/secrets/grid-backend-ca/kserve-ca
+            readOnly: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: grid-backend-ca-1
+            mountPath: /run/secrets/grid-backend-ca/openshift-service-ca-crt
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: grid-backend-ca-0
+            secret:
+              secretName: kserve.ca
+              items:
+                - key: ca.crt
+                  path: ca.crt
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: grid-backend-ca-1
+            configMap:
+              name: openshift-service-ca.crt
+              items:
+                - key: service-ca.crt
+                  path: service-ca.crt
+
+  - it: mounts no backend CA without backendCAs
+    template: templates/deployment.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: grid-backend-ca-0
+            mountPath: /run/secrets/grid-backend-ca/kserve-ca
+            readOnly: true
+
+  - it: refuses two entries that mount at one directory
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.render.gridServing.backendCAs:
+        - secretName: kserve-ca
+        - configMapName: kserve.ca
+    asserts:
+      - failedTemplate:
+          errorPattern: "kserve-ca is listed twice"
+
+  - it: refuses an entry naming both a Secret and a ConfigMap
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.render.gridServing.backendCAs:
+        - secretName: a
+          configMapName: b
+    asserts:
+      - failedTemplate:
+          errorPattern: "backendCAs[./]0.*(oneOf|maxLength|less than or equal to 0)"
+
+  - it: refuses backendCAs without gridServing
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.render.gridServing.enabled: false
+      praxisConfig.render.model: m
+      praxisConfig.render.backends:
+        - cluster: a
+          endpoints: ["10.0.0.5:8000"]
+          transport: { mode: plaintext }
+      praxisConfig.render.gridServing.backendCAs:
+        - secretName: kserve-ca
+    asserts:
+      - failedTemplate:
+          errorPattern: "backendCAs needs praxisConfig.render.gridServing.enabled"
+
+  - it: refuses backendCAs beside mountReconciliation, which mounts the CAs itself
+    template: templates/deployment.yaml
+    set:
+      mountReconciliation.enabled: true
+      praxisConfig.render.gridServing.backendCAs:
+        - secretName: kserve-ca
+    asserts:
+      - failedTemplate:
+          errorPattern: "backendCAs and mountReconciliation both mount /run/secrets/grid-backend-ca"

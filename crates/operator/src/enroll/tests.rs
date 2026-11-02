@@ -1638,7 +1638,6 @@ fn the_schedule_has_no_attempt_limit() {
 /// A site whose identity is definitely gone, with an invite minted for it, restarts to enroll;
 /// anything less certain decides nothing.
 #[tokio::test]
-#[expect(clippy::too_many_lines, reason = "one case per standing")]
 async fn a_lost_identity_restarts_only_on_a_definite_absence_and_an_invite_for_this_site() {
     let site_secret = target().site_secret;
     let gone_invited = FakeStore::invited();

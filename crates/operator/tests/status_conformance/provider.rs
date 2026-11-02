@@ -43,28 +43,32 @@ async fn reconcile(api: &FakeApi, path: &str) {
         .expect("provider reconcile succeeds");
 }
 
-/// Serializes the signals passes: the readiness write slot is one per process, and a
-/// pass that finds it held skips its writes.
-static PASS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Serializes the signals passes in this test module.
+static PASS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 /// Run signals passes in Poll mode until the asynchronous readiness writer publishes `Ready`.
 ///
 /// A pass can skip its status write while the process-wide write slot is occupied, so one pass
-/// is not enough to guarantee that this API receives the condition. Retry within the same bound
-/// used by the other readiness waits in this test suite.
+/// is not enough to guarantee that this API receives the condition. `PASS` is held only for each
+/// `refresh_signals` call and released before the poll window, so other tests can run their own
+/// signals passes between attempts.
 async fn signals_pass(api: &FakeApi, path: &str) {
-    let _pass = PASS.lock().await;
-    let client = api.client("default");
-    let ctx = OperatorCtx::new(client.clone(), None, SignalMode::Poll);
     let publish = async {
         loop {
-            grid_network::refresh_signals(&ctx, &client, NETWORK)
-                .await
-                .expect("signals pass succeeds");
-            if fixtures::observe(api, path).condition("Ready").is_some() {
-                return;
+            {
+                let _pass = PASS.acquire().await.expect("signals pass semaphore is open");
+                let client = api.client("default");
+                let ctx = OperatorCtx::new(client.clone(), None, SignalMode::Poll);
+                grid_network::refresh_signals(&ctx, &client, NETWORK)
+                    .await
+                    .expect("signals pass succeeds");
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            for _poll in 0..10 {
+                if fixtures::observe(api, path).condition("Ready").is_some() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
         }
     };
     if tokio::time::timeout(std::time::Duration::from_secs(30), publish)
@@ -182,7 +186,7 @@ fn seeded_with_metrics() -> (FakeApi, String) {
 async fn signals_pass_until(api: &FakeApi, path: &str, mode: SignalMode, type_: &str, reason: &str) {
     for _attempt in 0..50 {
         {
-            let _pass = PASS.lock().await;
+            let _pass = PASS.acquire().await.expect("signals pass semaphore is open");
             let client = api.client("default");
             let ctx = OperatorCtx::new(client.clone(), None, mode);
             grid_network::refresh_signals(&ctx, &client, NETWORK)

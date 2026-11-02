@@ -35,7 +35,7 @@ mod feedback;
 
 #[cfg(feature = "peer-scraper")]
 pub use feedback::Reporter;
-pub use hop::HopPolicy;
+pub use hop::{HopPolicy, address_host};
 #[cfg(feature = "peer-scraper")]
 pub use mtls::{MtlsError, PeerScraper};
 #[cfg(feature = "peer-scraper")]

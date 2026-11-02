@@ -18,7 +18,7 @@
 /// | `error_rate` | `[0.0, 1.0]` | Pre-normalized ratio | Prometheus exporter; clamped in `PartialMetrics::into_backend_metrics` and `crdt_metrics_to_backend` |
 /// | `healthy` | `bool` | Derived | `PartialMetrics::into_backend_metrics` (from health gauge or `error_rate`); CRDT carries `bool` directly |
 /// | `kv_cache_utilization` | `[0.0, 1.0]` | Pre-normalized ratio | Prometheus exporter; clamped in both ingestion paths |
-/// | `latency_p99_ms` | `≥ 0.0 ms` | **Raw milliseconds** | Prometheus exporter exports a pre-computed P99 gauge; the scorer normalizes internally via `MAX_LATENCY = 5000 ms` |
+/// | `latency_p99_ms` | `>= 0.0 ms` | **Raw milliseconds** | Prometheus exporter exports a pre-computed P99 gauge; the scorer normalizes internally via `MAX_LATENCY = 5000 ms` |
 /// | `prefix_cache_hit_ratio` | `[0.0, 1.0]` | Pre-normalized ratio | Prometheus exporter; clamped in the scorer |
 /// | `queue_depth` | `[0.0, 1.0]` | Pre-normalized ratio | **Must be pre-normalized by the exporter**; raw queue counts are not accepted. Clamped in both ingestion paths. |
 ///
@@ -34,7 +34,7 @@
 ///
 /// # NaN / Infinity
 ///
-/// Prometheus scraping drops NaN and ±Inf at parse time (`.filter(|v| v.is_finite())`).
+/// Prometheus scraping drops NaN and +/-Inf at parse time (`.filter(|v| v.is_finite())`).
 /// CRDT values are filtered and clamped in `crdt_metrics_to_backend`.  The scorer
 /// itself does not re-check for NaN/Inf; callers must not propagate them into this
 /// struct.

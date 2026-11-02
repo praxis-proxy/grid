@@ -68,6 +68,15 @@
             }
           }
         },
+        "signedState": {
+          "description": "Signed state on the rendered GridNetwork. Enforce requires grid.id; empty keeps the GridNetwork default.",
+          "type": "string",
+          "enum": [
+            "",
+            "off",
+            "enforce"
+          ]
+        },
         "signals": {
           "description": "Signal transport, gossip or poll. Empty keeps the GridNetwork default.",
           "type": "string",

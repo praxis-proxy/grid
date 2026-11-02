@@ -21,11 +21,15 @@ grid:
     # endpoint derived from each gateway. Local assumes something outside the grid delivers
     # every site's GridSite records, the same set to every member, and discovers no peers. Local runs no SWIM: no SWIM Service, port or
     # seeds, poll signals on the signals Service, and every contradicting value fails the
-    # render. An unset grid.signals renders poll under Local.
+    # render. An unset grid.signals renders poll under Local. Also writes GridNetwork.spec.membership.mode when grid.id is set.
     source: Swim
   # -- Peer trust, pin or spiffe. Empty keeps the GridNetwork default, pin. The operator
   # also starts in it before any GridNetwork exists, so set it to match the grid.
   peerTrust: ""
+  # -- Signed state, off or enforce. Applies to the rendered GridNetwork when grid.id is
+  # set. Empty keeps its default, off. Set enforce at every site together; an enforcing
+  # site refuses unsigned peers.
+  signedState: ""
   # -- Signal transport, gossip or poll. poll also serves signals on the SWIM Service.
   # Empty keeps the GridNetwork default, gossip. The operator also starts in it before any
   # GridNetwork exists, so a poll install never restarts once its network appears.
@@ -306,13 +310,13 @@ signals:
   scrapeIntervalSeconds: ""
 # -- Advertised site gateway address configuration.
 gateway:
-  # -- Discover and advertise a LoadBalancer address for the site gateway.
+  # -- Discover a LoadBalancer address for SWIM and the own GridSite.
   discoveryEnabled: true
   # -- GridNetwork consumerGateways[].praxisConfig for the site gateway, as the CRD
   # takes it. Empty renders no block.
   praxisConfig: {}
   # -- Reachable site gateway host:port override. Set this for ClusterIP or
-  # NodePort Services; otherwise the operator discovers a LoadBalancer address.
+  # NodePort Services; the own GridSite uses it when gatewayEndpoint is absent.
   address: ""
   # -- Site gateway Kubernetes Service name for the operator to discover. Defaults
   # to grid-gateway with enrollment enabled or grid.id set; it also names the
@@ -381,7 +385,7 @@ priorityClassName: ""
 # -- This operator's own settings: a ConfigMap in the release namespace, watched, so an edit
 # applies without a restart. The enrollment values render its site section.
 operatorConfig:
-  # -- Render the ConfigMap. Set false to manage it yourself under name.
+  # -- Render the ConfigMap when the enrollment values give it a site section. Set false to manage it yourself under name.
   create: true
   # -- ConfigMap name.
   name: grid-operator-config

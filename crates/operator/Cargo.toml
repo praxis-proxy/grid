@@ -15,6 +15,7 @@ experimental = []
 # separate so other experimental work does not implicitly enable A2A.
 a2a = ["experimental"]
 tls-rustls = [
+  "swim/ring-signing",
   "certs/rcgen",
   "grid-client/rcgen",
   "rmcp/reqwest-tls-no-provider",
@@ -25,6 +26,7 @@ tls-rustls = [
   "dep:tokio-rustls",
 ]
 fips = [
+  "swim/fips",
   "certs/fips",
   "grid-client/fips",
   "rmcp/reqwest-native-tls",
@@ -43,7 +45,7 @@ clap = { workspace = true, features = ["env"] }
 certs = { path = "../certs", default-features = false }
 grid-client = { path = "../client", default-features = false, features = ["reqwest-client"] }
 crdt = { path = "../crdt" }
-swim = { path = "../swim" }
+swim = { path = "../swim", default-features = false }
 futures = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
@@ -58,6 +60,7 @@ site-invite-api = { path = "../site-invite-api" }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
 percent-encoding = { workspace = true }
+pem = { workspace = true }
 prometheus = { workspace = true }
 schemars = { workspace = true }
 reqwest = { workspace = true }

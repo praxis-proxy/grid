@@ -292,14 +292,21 @@ pub fn cert_dns_sans(cert_pem: &str) -> Result<Vec<String>, VerifyError> {
 ///
 /// # Errors
 ///
-/// Returns [`VerifyError`] if the certificate is oversized or unparseable.
+/// Returns [`VerifyError`] if the certificate is oversized, unparseable, or
+/// any organization attribute cannot be decoded as a string (e.g. a
+/// `BMPString` or `TeletexString` that `x509-parser` does not convert).
 pub fn cert_organizations(cert_pem: &str) -> Result<Vec<String>, VerifyError> {
     with_cert(cert_pem, |cert| {
         cert.subject()
             .iter_organization()
-            .filter_map(|organization| organization.as_str().ok().map(str::to_owned))
+            .map(|organization| {
+                organization
+                    .as_str()
+                    .map(str::to_owned)
+                    .map_err(|_err| VerifyError::Malformed)
+            })
             .collect()
-    })
+    })?
 }
 
 /// The public key a certificate request carries, as `SubjectPublicKeyInfo` DER.

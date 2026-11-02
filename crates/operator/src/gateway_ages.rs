@@ -20,7 +20,7 @@ use kube::{
 use crate::{
     crd::{
         grid_network::{GatewayAgeReport, GridNetwork},
-        inference_provider::Condition,
+        inference_provider::{Condition, ConditionStatus},
     },
     metrics::{GatewayFeedbackEvent, record_gateway_feedback},
     shutdown::Shutdown,
@@ -324,10 +324,6 @@ fn replace(held: &mut GatewayAgeReport, report: &IngestReport, now: &str) -> Res
 }
 
 /// Preserve transition time while updating diagnostic detail and observed generation.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one condition derives bounded detail and preserves transition metadata"
-)]
 fn condition(
     network: &GridNetwork,
     reports: &[GatewayAgeReport],
@@ -337,11 +333,11 @@ fn condition(
 ) -> Condition {
     let rejecting = reports.iter().filter(|held| held.rejected).collect::<Vec<_>>();
     let (standing, reason) = if rejecting.iter().any(|held| freshness.contains(held)) {
-        ("True", "GatewayAgesRejected")
+        (ConditionStatus::True, "GatewayAgesRejected")
     } else if uncertain || !rejecting.is_empty() {
-        ("Unknown", "GatewayEvidenceStale")
+        (ConditionStatus::Unknown, "GatewayEvidenceStale")
     } else {
-        ("False", "GatewayAgesAccepted")
+        (ConditionStatus::False, "GatewayAgesAccepted")
     };
     let labels = rejecting
         .iter()
@@ -361,7 +357,7 @@ fn condition(
     });
     Condition {
         type_: GATEWAY_AGES_REJECTED.to_owned(),
-        status: standing.to_owned(),
+        status: standing,
         reason: reason.to_owned(),
         message,
         last_transition_time: held
@@ -401,7 +397,6 @@ fn row(report: &IngestReport, rejected: bool, now: &str) -> GatewayAgeReport {
 #[expect(
     clippy::expect_used,
     clippy::indexing_slicing,
-    clippy::too_many_lines,
     reason = "tests and integration fixtures"
 )]
 mod tests {

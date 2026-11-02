@@ -72,7 +72,6 @@ type Row = (&'static str, &'static str, &'static str, &'static str);
 impl InviteState {
     /// The minted, redeemed and issued facts, with `Available` copying whether the token can
     /// still be presented.
-    #[expect(clippy::too_many_lines, reason = "one row per state, read as a table")]
     const fn facts(self) -> [Row; 4] {
         const SPENT: &str = "Invite token was redeemed";
         match self {
@@ -234,10 +233,6 @@ async fn reconcile(invite: Arc<SiteInvite>, ctx: Arc<Context>) -> Result<Action,
 }
 
 /// Create or recover an invite token and publish its public status.
-#[expect(
-    clippy::too_many_lines,
-    reason = "checkpoint recovery and terminal transitions must be ordered together"
-)]
 async fn apply_invite(invite: &SiteInvite, ctx: &Context) -> Result<Action, ReconcileError> {
     let namespace = &ctx.namespace;
     let secret_name = format!("grid-invite-{}", invite.name_any());
@@ -351,10 +346,6 @@ async fn token_phase(invite: &SiteInvite, ctx: &Context, token_id: Uuid) -> Resu
 }
 
 /// Record an unexpired token and expose only its Secret reference.
-#[expect(
-    clippy::too_many_lines,
-    reason = "pending status, token mint, and Ready status must remain ordered"
-)]
 async fn activate_invite(
     invite: &SiteInvite,
     ctx: &Context,
@@ -542,10 +533,6 @@ fn invite_conditions(invite: &SiteInvite, state: InviteState) -> Result<Vec<serd
 }
 
 /// Validate Secret ownership and extract only the values reconciliation needs.
-#[expect(
-    clippy::too_many_lines,
-    reason = "validate the owner and extract the restart checkpoint together"
-)]
 fn read_checkpoint(
     invite: &SiteInvite,
     secret: &Secret,
@@ -767,10 +754,6 @@ fn expiry(raw: &str) -> Result<OffsetDateTime, ReconcileError> {
 }
 
 /// Parse and bound a Kubernetes duration used for an invite.
-#[expect(
-    clippy::too_many_lines,
-    reason = "all supported duration units share the same bounds check"
-)]
 fn duration(raw: &str) -> Result<time::Duration, ReconcileError> {
     let mut rest = raw;
     let mut total_nanos = 0_i64;

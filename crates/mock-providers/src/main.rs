@@ -117,10 +117,6 @@ enum ProviderKind {
 // Main
 // ---------------------------------------------------------------------------
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "CLI dispatch: TLS probe, one-shot probes, or provider server"
-)]
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -214,10 +210,6 @@ async fn run_selected_probe(cli: &Cli) -> bool {
 /// `rustls` server configuration with mutual TLS client verification, and
 /// accepts connections in a loop. Each accepted connection completes the TLS
 /// handshake and is then dropped; no HTTP is served.
-#[expect(
-    clippy::too_many_lines,
-    reason = "linear TLS config: load PEM → build ServerConfig → accept loop"
-)]
 #[expect(clippy::infinite_loop, reason = "server runs forever until killed by parent process")]
 async fn run_tls_probe_server(
     port: u16,

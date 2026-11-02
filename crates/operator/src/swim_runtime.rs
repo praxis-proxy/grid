@@ -28,10 +28,10 @@
 //! [`OperatorCtx`]: crate::controller::grid_network::OperatorCtx
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     net::SocketAddr,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crdt::GridStateSnapshot;
@@ -44,6 +44,7 @@ use tokio::{
         oneshot, watch,
     },
 };
+use zeroize::Zeroizing;
 
 use crate::swim::{MemberRecord, MemberStatus, MembershipSnapshot};
 
@@ -173,6 +174,7 @@ fn wire_plaintext<'data>(key: &KeyState, data: &'data [u8]) -> Result<std::borro
         KeyState::Key(key) => swim::crypto::decrypt(key, data)
             .map(std::borrow::Cow::Owned)
             .map_err(|_e| Rejected::Unauthenticated),
+        KeyState::Plain if data.starts_with(&swim::crypto::MAGIC) => Err(Rejected::EncryptedWithoutKey),
         KeyState::Plain => Ok(std::borrow::Cow::Borrowed(data)),
         KeyState::Pending => Err(Rejected::Pending),
     }
@@ -206,32 +208,42 @@ impl PendingDrops {
     }
 }
 
-/// Inbound packets that failed authentication, warned at most once per [`UNAUTHENTICATED_WARN_EVERY`].
-#[derive(Default)]
-struct UnauthenticatedDrops {
+/// Inbound packets dropped for one reason, warned at most once per window.
+struct RateLimitedDrops {
+    /// The reason logged for each dropped packet.
+    message: &'static str,
     /// When the last warning was logged.
     warned_at: Option<Instant>,
     /// Drops since that warning.
     suppressed: u64,
 }
 
-/// Least time between warnings about unauthenticated packets.
-const UNAUTHENTICATED_WARN_EVERY: Duration = Duration::from_secs(60);
+/// Least time between warnings about dropped SWIM packets.
+const DROPPED_PACKET_WARN_EVERY: Duration = Duration::from_secs(60);
 
-impl UnauthenticatedDrops {
+impl RateLimitedDrops {
+    /// Create a drop counter with its log message.
+    fn new(message: &'static str) -> Self {
+        Self {
+            message,
+            warned_at: None,
+            suppressed: 0,
+        }
+    }
+
     /// Count one dropped packet, returning whether it was warned.
     fn dropped(&mut self, from: SocketAddr, bytes: usize, now: Instant) -> bool {
         let quiet = self
             .warned_at
-            .is_some_and(|at| now.saturating_duration_since(at) < UNAUTHENTICATED_WARN_EVERY);
+            .is_some_and(|at| now.saturating_duration_since(at) < DROPPED_PACKET_WARN_EVERY);
         if quiet {
             self.suppressed = self.suppressed.saturating_add(1);
-            tracing::debug!(addr = %from, bytes, "SWIM: dropped packet (authentication failed)");
+            tracing::debug!(addr = %from, bytes, message = self.message);
             return false;
         }
         let suppressed = std::mem::take(&mut self.suppressed);
         self.warned_at = Some(now);
-        tracing::warn!(addr = %from, bytes, suppressed, "SWIM: dropped packet (authentication failed)");
+        tracing::warn!(addr = %from, bytes, suppressed, message = self.message);
         true
     }
 }
@@ -243,6 +255,8 @@ enum Rejected {
     Pending,
     /// The packet did not authenticate under the key.
     Unauthenticated,
+    /// The packet is encrypted but this node has no configured key.
+    EncryptedWithoutKey,
 }
 
 impl std::fmt::Debug for SwimConfig {
@@ -458,6 +472,21 @@ fn publish_state(state_tx: &watch::Sender<GridStateSnapshot>, node: &SwimNode) {
     });
 }
 
+/// Publish complete, verified, unexpired model inventories from the SWIM node.
+fn publish_model_inventories(inventories_tx: &watch::Sender<Vec<swim::ModelInventory>>, node: &SwimNode) {
+    let now_ms = wall_clock_millis();
+    node.with_model_inventories(|held| {
+        inventories_tx.send_if_modified(|current| {
+            let fresh = held.iter().filter(|inventory| inventory.expires_at_ms > now_ms);
+            if current.iter().eq(fresh.clone()) {
+                return false;
+            }
+            *current = fresh.cloned().collect();
+            true
+        })
+    });
+}
+
 /// Evict departed origins and immediately expose the change to readers.
 ///
 /// A retained origin keeps its providers, signals address and revision guards and loses its
@@ -488,6 +517,85 @@ struct WithdrawalRequest {
     published: oneshot::Sender<()>,
 }
 
+/// Signed-gossip change for one `GridNetwork`.
+enum GridTrustUpdate {
+    /// Enforce signed state with this trust configuration.
+    Enforce(GridTrustSnapshot),
+    /// Stop signing and verifying state for this grid ID.
+    Off(String),
+    /// Allow state after the initial `GridNetwork` policy is known to be off.
+    AllowStateAdmission,
+}
+
+/// Verified peer signing keys for one grid, keyed by site identity.
+pub(crate) type PeerPins = BTreeMap<String, Vec<Vec<u8>>>;
+
+/// What a detached [`SwimHandle`] sends, in place of a runtime loop.
+#[cfg(test)]
+pub(crate) struct DetachedRuntime {
+    /// State broadcasts the handle published.
+    pub(crate) broadcasts: mpsc::Receiver<swim::StateBroadcast>,
+    /// Trust updates the handle sent, held so sends succeed.
+    trust_updates: mpsc::UnboundedReceiver<GridTrustUpdate>,
+    /// Withdrawals the handle queued, acknowledged on demand.
+    withdrawals: mpsc::Receiver<WithdrawalRequest>,
+}
+
+#[cfg(test)]
+impl DetachedRuntime {
+    /// Peer pins each enforcing update for `grid_id` carried, `None` where it kept the installed ones.
+    pub(crate) fn peer_pins_sent(&mut self, grid_id: &str) -> Vec<Option<PeerPins>> {
+        let mut sent = Vec::new();
+        while let Ok(update) = self.trust_updates.try_recv() {
+            if let GridTrustUpdate::Enforce(snapshot) = update
+                && snapshot.grid_id == grid_id
+            {
+                sent.push(snapshot.peer_pins);
+            }
+        }
+        sent
+    }
+
+    /// Acknowledge the next queued withdrawal as published, returning its grid ID.
+    pub(crate) async fn publish_withdrawal(&mut self) -> Option<String> {
+        let request = self.withdrawals.recv().await?;
+        request.published.send(()).ok()?;
+        Some(request.grid_id)
+    }
+
+    /// Grid IDs the handle started or kept enforcing, in order.
+    pub(crate) fn grids_enforced(&mut self) -> Vec<String> {
+        let mut enforced = Vec::new();
+        while let Ok(update) = self.trust_updates.try_recv() {
+            if let GridTrustUpdate::Enforce(snapshot) = update {
+                enforced.push(snapshot.grid_id);
+            }
+        }
+        enforced
+    }
+
+    /// Grid IDs the handle stopped enforcing, in order.
+    pub(crate) fn grids_relaxed(&mut self) -> Vec<String> {
+        let mut relaxed = Vec::new();
+        while let Ok(update) = self.trust_updates.try_recv() {
+            if let GridTrustUpdate::Off(grid_id) = update {
+                relaxed.push(grid_id);
+            }
+        }
+        relaxed
+    }
+}
+
+/// Complete trust configuration for one `GridNetwork`.
+struct GridTrustSnapshot {
+    /// Persisted grid identity.
+    grid_id: String,
+    /// Local PKCS8 private-key DER, zeroized when replaced or dropped.
+    local_signing_key: Option<Zeroizing<Vec<u8>>>,
+    /// Complete set of verified peer signing keys, `None` to keep the installed ones.
+    peer_pins: Option<PeerPins>,
+}
+
 /// Internal channels owned by the SWIM runtime loop.
 struct RuntimeChannels {
     /// Publishes membership snapshots to readers.
@@ -505,6 +613,12 @@ struct RuntimeChannels {
     /// `SwimNode::publish_state_broadcast` and immediately gossips so that
     /// peers receive the broadcast on the next outbound message.
     broadcast_rx: mpsc::Receiver<swim::StateBroadcast>,
+
+    /// Replaces the signed-gossip trust configuration for one grid.
+    trust_update_rx: mpsc::UnboundedReceiver<GridTrustUpdate>,
+
+    /// Receives signed provider inventory frames for SWIM publication.
+    inventory_broadcast_rx: mpsc::Receiver<swim::ModelInventoryBroadcast>,
 
     /// Receives batches of seed addresses to announce at runtime.
     ///
@@ -527,8 +641,8 @@ const STATE_REPUBLISH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Default TTL for dead SWIM members before eviction from the tracked table.
 ///
-/// 300 seconds = 10 × foca's WAN `suspect_to_down_after` (30 s), giving
-/// ample time for the full Alive → Suspect → Dead lifecycle and peer
+/// 300 seconds = 10 * foca's WAN `suspect_to_down_after` (30 s), giving
+/// ample time for the full Alive -> Suspect -> Dead lifecycle and peer
 /// convergence before cleanup.  Override with `GRID_SWIM_DEAD_MEMBER_TTL_SECS`.
 const DEFAULT_DEAD_MEMBER_TTL_SECS: u64 = 300;
 /// Maximum membership records retained by the operator-side mirror.
@@ -758,6 +872,7 @@ async fn publish_pending_withdrawals(
     snapshot_tx: &watch::Sender<MembershipSnapshot>,
     state_tx: &watch::Sender<GridStateSnapshot>,
     key: &KeyState,
+    trust: &GridTrust,
 ) {
     let grid_ids = pending.keys().cloned().collect::<Vec<_>>();
     for grid_id in grid_ids {
@@ -765,13 +880,21 @@ async fn publish_pending_withdrawals(
             tracing::debug!(grid_id, "SWIM revisions exhausted; withdrawal remains pending");
             break;
         };
-        let withdrawal = withdrawal_broadcast(site_name, &grid_id, revision);
-        if let Err(error) = node.publish_state_broadcast(&withdrawal) {
-            tracing::warn!(%grid_id, %error, "failed to publish pending GridNetwork withdrawal");
-            continue;
+        match trust.sign(withdrawal_broadcast(site_name, &grid_id, revision)) {
+            Ok(withdrawal) => {
+                if let Err(error) = node.publish_state_broadcast(&withdrawal) {
+                    tracing::warn!(%grid_id, %error, "failed to publish pending GridNetwork withdrawal");
+                    continue;
+                }
+                let output = node.broadcast();
+                drain_output(output, socket, timer_tx, tracked, snapshot_tx, node, key).await;
+                tracing::info!(%grid_id, revision, "published GridNetwork withdrawal");
+            },
+            Err(error) => {
+                tracing::warn!(%grid_id, %error, "GridNetwork withdrawal remains pending until it can be signed");
+                continue;
+            },
         }
-        let output = node.broadcast();
-        drain_output(output, socket, timer_tx, tracked, snapshot_tx, node, key).await;
         publish_state(state_tx, node);
         retained.remove(&Some(grid_id.clone()));
         if let Some(waiters) = pending.remove(&grid_id) {
@@ -781,7 +904,6 @@ async fn publish_pending_withdrawals(
                 }
             }
         }
-        tracing::info!(%grid_id, revision, "published GridNetwork withdrawal");
     }
 }
 
@@ -903,8 +1025,17 @@ pub struct SwimHandle {
     /// custom broadcasts.
     state_rx: watch::Receiver<GridStateSnapshot>,
 
+    /// Watch channel receiver for complete verified dynamic model inventories.
+    model_inventories_rx: watch::Receiver<Vec<swim::ModelInventory>>,
+
     /// Channel for sending CRDT state broadcasts to the runtime loop.
     broadcast_tx: mpsc::Sender<swim::StateBroadcast>,
+
+    /// Channel for replacing one grid's signed-gossip trust configuration.
+    trust_update_tx: mpsc::UnboundedSender<GridTrustUpdate>,
+
+    /// Channel for signed model inventory frame broadcasts.
+    inventory_broadcast_tx: mpsc::Sender<swim::ModelInventoryBroadcast>,
 
     /// Channel for withdrawing anti-entropy state for a deleted `GridNetwork` scope.
     withdraw_tx: mpsc::Sender<WithdrawalRequest>,
@@ -930,6 +1061,52 @@ pub struct SwimHandle {
 }
 
 impl SwimHandle {
+    /// Detached handle for `site_name`, exposing what callers send to it.
+    #[cfg(test)]
+    pub(crate) fn detached(site_name: &str) -> (Self, DetachedRuntime) {
+        let (broadcast_tx, broadcasts) = mpsc::channel(8);
+        let (trust_update_tx, trust_updates) = mpsc::unbounded_channel();
+        let (withdraw_tx, withdrawals) = mpsc::channel(1);
+        let handle = Self {
+            publisher_reservation: (1, 2),
+            site_name: site_name.to_owned(),
+            advertise_addr: SocketAddr::from(([127, 0, 0, 1], 7946)),
+            signals_address: None,
+            snapshot_rx: watch::channel(MembershipSnapshot::default()).1,
+            state_rx: watch::channel(GridStateSnapshot::new(site_name.to_owned())).1,
+            model_inventories_rx: watch::channel(Vec::new()).1,
+            broadcast_tx,
+            trust_update_tx,
+            inventory_broadcast_tx: mpsc::channel(1).0,
+            withdraw_tx,
+            seed_tx: mpsc::channel(1).0,
+            key_tx: watch::channel(KeyState::Plain).0,
+            gateway_tx: watch::channel(None).0,
+            runtime_tx: watch::channel(true).0,
+            leave_tx: mpsc::channel(1).0,
+        };
+        (
+            handle,
+            DetachedRuntime {
+                broadcasts,
+                trust_updates,
+                withdrawals,
+            },
+        )
+    }
+
+    /// Detached handle with a caller-selected inventory queue capacity.
+    #[cfg(test)]
+    pub(crate) fn detached_with_inventory_capacity(
+        site_name: &str,
+        capacity: usize,
+    ) -> (Self, mpsc::Receiver<swim::ModelInventoryBroadcast>) {
+        let (mut handle, _runtime) = Self::detached(site_name);
+        let (inventory_broadcast_tx, inventory_broadcast_rx) = mpsc::channel(capacity);
+        handle.inventory_broadcast_tx = inventory_broadcast_tx;
+        (handle, inventory_broadcast_rx)
+    }
+
     /// Immutable publisher epoch and the persisted generation high-water mark.
     pub(crate) fn publisher_reservation(&self) -> (u64, u64) {
         self.publisher_reservation
@@ -1033,6 +1210,24 @@ impl SwimHandle {
         self.state_rx.borrow().clone()
     }
 
+    /// Return complete, verified remote model inventories that have not expired.
+    #[must_use]
+    pub fn model_inventories(&self) -> Vec<swim::ModelInventory> {
+        let now_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        self.model_inventories_rx
+            .borrow()
+            .iter()
+            .filter(|inventory| inventory.expires_at_ms > now_ms)
+            .cloned()
+            .collect()
+    }
+
     /// Return a stream that emits when SWIM state relevant to a
     /// [`GridNetwork`] reconciliation changes.
     ///
@@ -1046,22 +1241,33 @@ impl SwimHandle {
     pub fn reconciliation_events(&self) -> impl Stream<Item = ()> + Send + Sync + use<> {
         let membership_rx = self.snapshot_rx.clone();
         let state_rx = self.state_rx.clone();
+        let inventories_rx = self.model_inventories_rx.clone();
         let runtime_rx = self.runtime_tx.subscribe();
-        let previous = reconciliation_view(&membership_rx.borrow(), &state_rx.borrow(), *runtime_rx.borrow());
+        let previous = reconciliation_view(
+            &membership_rx.borrow(),
+            &state_rx.borrow(),
+            &inventories_rx.borrow(),
+            *runtime_rx.borrow(),
+        );
         stream::unfold(
-            (membership_rx, state_rx, runtime_rx, previous),
-            |(mut membership_rx, mut state_rx, mut runtime_rx, mut previous)| async move {
+            (membership_rx, state_rx, inventories_rx, runtime_rx, previous),
+            |(mut membership_rx, mut state_rx, mut inventories_rx, mut runtime_rx, mut previous)| async move {
                 loop {
                     tokio::select! {
                         result = membership_rx.changed() => result.ok()?,
                         result = state_rx.changed() => result.ok()?,
+                        result = inventories_rx.changed() => result.ok()?,
                         result = runtime_rx.changed() => result.ok()?,
                     }
-                    let current =
-                        reconciliation_view(&membership_rx.borrow(), &state_rx.borrow(), *runtime_rx.borrow());
+                    let current = reconciliation_view(
+                        &membership_rx.borrow(),
+                        &state_rx.borrow(),
+                        &inventories_rx.borrow(),
+                        *runtime_rx.borrow(),
+                    );
                     if current != previous {
                         previous = current;
-                        return Some(((), (membership_rx, state_rx, runtime_rx, previous)));
+                        return Some(((), (membership_rx, state_rx, inventories_rx, runtime_rx, previous)));
                     }
                 }
             },
@@ -1084,6 +1290,78 @@ impl SwimHandle {
             TrySendError::Full(_) => BroadcastError::ChannelFull,
             TrySendError::Closed(_) => BroadcastError::ChannelClosed,
         })
+    }
+
+    /// Replace the local signer and verified peer pins for one grid.
+    ///
+    /// The snapshot enables strict signed-gossip policy. Peer pins omitted from
+    /// the snapshot are removed; an empty peer set permits certificate bootstrap
+    /// but rejects ordinary unpinned state. `None` keeps the installed peer pins,
+    /// for when they could not be re-verified.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BroadcastError::ChannelClosed`] if the runtime has exited.
+    pub fn set_grid_trust_snapshot(
+        &self,
+        grid_id: String,
+        local_signing_key: Option<Zeroizing<Vec<u8>>>,
+        peer_pins: Option<PeerPins>,
+    ) -> Result<(), BroadcastError> {
+        self.trust_update_tx
+            .send(GridTrustUpdate::Enforce(GridTrustSnapshot {
+                grid_id,
+                local_signing_key,
+                peer_pins,
+            }))
+            .map_err(|_error| BroadcastError::ChannelClosed)
+    }
+
+    /// Return one grid to unsigned state gossip.
+    ///
+    /// Drops the local signer and every pin the grid's snapshots installed.
+    /// A no-op for a grid that never enforced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BroadcastError::ChannelClosed`] if the runtime has exited.
+    pub fn relax_grid_trust(&self, grid_id: String) -> Result<(), BroadcastError> {
+        self.trust_update_tx
+            .send(GridTrustUpdate::Off(grid_id))
+            .map_err(|_error| BroadcastError::ChannelClosed)
+    }
+
+    /// Mark the initial `GridNetwork` policy as off and allow inbound state broadcasts.
+    ///
+    /// Use this when a network has not persisted its grid ID yet, so no scoped trust
+    /// snapshot can be installed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BroadcastError::ChannelClosed`] if the runtime has exited.
+    pub fn allow_state_admission(&self) -> Result<(), BroadcastError> {
+        self.trust_update_tx
+            .send(GridTrustUpdate::AllowStateAdmission)
+            .map_err(|_error| BroadcastError::ChannelClosed)
+    }
+
+    /// Queue a signed model inventory frame for delivery to SWIM peers.
+    ///
+    /// The runtime sends each frame through Foca's dedicated broadcast path.
+    /// Frames are accepted by peers only when their origin key is pinned.
+    ///
+    /// # Errors
+    ///
+    /// Waits for bounded queue capacity, or returns
+    /// [`BroadcastError::ChannelClosed`] after the runtime exits.
+    pub async fn publish_model_inventory_frame(
+        &self,
+        broadcast: swim::ModelInventoryBroadcast,
+    ) -> Result<(), BroadcastError> {
+        self.inventory_broadcast_tx
+            .send(broadcast)
+            .await
+            .map_err(|_error| BroadcastError::ChannelClosed)
     }
 
     /// Withdraw all anti-entropy state for the given `GridNetwork` scope.
@@ -1169,6 +1447,37 @@ impl SwimHandle {
     }
 }
 
+/// Create a test handle with a live gateway-address receiver.
+#[cfg(test)]
+pub(crate) fn test_handle() -> (SwimHandle, watch::Receiver<Option<String>>) {
+    let (snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
+    let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
+    let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
+    let (seed_tx, _seed_rx) = mpsc::channel(16);
+    let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
+    let (gateway_tx, gateway_rx) = watch::channel(None);
+    let handle = SwimHandle {
+        publisher_reservation: (1, 2),
+        site_name: "test".to_owned(),
+        advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
+        signals_address: None,
+        snapshot_rx,
+        state_rx,
+        model_inventories_rx: watch::channel(Vec::new()).1,
+        broadcast_tx,
+        seed_tx,
+        key_tx,
+        trust_update_tx: mpsc::unbounded_channel().0,
+        inventory_broadcast_tx: mpsc::channel(1).0,
+        gateway_tx,
+        runtime_tx: watch::channel(true).0,
+        withdraw_tx: mpsc::channel(16).0,
+        leave_tx: mpsc::channel(1).0,
+    };
+    drop((snapshot_tx, state_tx));
+    (handle, gateway_rx)
+}
+
 /// Stable SWIM data that can change rendered Grid resources.
 #[derive(Debug, PartialEq)]
 struct ReconciliationView {
@@ -1178,6 +1487,8 @@ struct ReconciliationView {
     members: Vec<ReconciliationMember>,
     /// Distributed provider and capability state.
     state: GridStateSnapshot,
+    /// Complete verified provider model inventories.
+    model_inventories: Vec<swim::ModelInventory>,
 }
 
 /// Membership fields consumed by Grid reconciliation.
@@ -1205,6 +1516,7 @@ struct ReconciliationMember {
 fn reconciliation_view(
     membership: &MembershipSnapshot,
     state: &GridStateSnapshot,
+    model_inventories: &[swim::ModelInventory],
     runtime_alive: bool,
 ) -> ReconciliationView {
     let mut members: Vec<ReconciliationMember> = membership
@@ -1231,6 +1543,7 @@ fn reconciliation_view(
         runtime_alive,
         members,
         state: state.clone(),
+        model_inventories: model_inventories.to_vec(),
     }
 }
 
@@ -1250,10 +1563,6 @@ fn reconciliation_view(
 /// # Errors
 ///
 /// Returns [`SwimRuntimeError::Bind`] if the socket cannot be bound.
-#[expect(
-    clippy::too_many_lines,
-    reason = "channel setup, socket bind, runtime spawn: linear startup sequence"
-)]
 pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeError> {
     let revisions = RevisionClock::new(&config.revision_lease, config.revision_renewer.clone())?;
     if config.revision_lease.first_node_generation == 0
@@ -1281,6 +1590,9 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
     let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new(site_name.clone()));
     let (timer_tx, timer_rx) = mpsc::channel::<TimerEvent>(256);
     let (broadcast_tx, broadcast_rx) = mpsc::channel::<swim::StateBroadcast>(32);
+    let (trust_update_tx, trust_update_rx) = mpsc::unbounded_channel::<GridTrustUpdate>();
+    let (inventory_broadcast_tx, inventory_broadcast_rx) = mpsc::channel::<swim::ModelInventoryBroadcast>(256);
+    let (model_inventories_tx, model_inventories_rx) = watch::channel(Vec::new());
     let (withdraw_tx, withdraw_rx) = mpsc::channel::<WithdrawalRequest>(16);
     let (seed_tx, seed_rx) = mpsc::channel::<Vec<SocketAddr>>(16);
     let (leave_tx, leave_rx) = mpsc::channel::<()>(1);
@@ -1292,6 +1604,8 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         timer_tx,
         timer_rx,
         broadcast_rx,
+        trust_update_rx,
+        inventory_broadcast_rx,
         seed_rx,
         leave_rx,
         withdraw_rx,
@@ -1317,6 +1631,7 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         advertise_addr,
         channels,
         state_tx,
+        model_inventories_tx,
         key_rx,
         gateway_loop_rx,
         revisions,
@@ -1337,7 +1652,10 @@ pub async fn start(config: SwimConfig) -> Result<Arc<SwimHandle>, SwimRuntimeErr
         signals_address,
         snapshot_rx,
         state_rx,
+        model_inventories_rx,
         broadcast_tx,
+        trust_update_tx,
+        inventory_broadcast_tx,
         withdraw_tx,
         seed_tx,
         key_tx,
@@ -1389,6 +1707,7 @@ async fn run_loop(
     advertise_addr: SocketAddr,
     mut channels: RuntimeChannels,
     state_tx: watch::Sender<GridStateSnapshot>,
+    model_inventories_tx: watch::Sender<Vec<swim::ModelInventory>>,
     mut key_rx: watch::Receiver<KeyState>,
     mut gateway_loop_rx: watch::Receiver<Option<String>>,
     mut revisions: RevisionClock,
@@ -1401,11 +1720,15 @@ async fn run_loop(
         config.revision_lease.last_node_generation,
     );
     let mut node = SwimNode::with_origin_capacity(identity, MAX_TRACKED_MEMBERS);
+    node.hold_state_admission();
     let mut tracked: HashMap<String, TrackedMember> = HashMap::new();
     let mut buf = vec![0_u8; 65_536];
     let mut age_tick = tokio::time::interval(Duration::from_secs(1));
     let mut pending_drops = PendingDrops::default();
-    let mut unauthenticated_drops = UnauthenticatedDrops::default();
+    let mut unauthenticated_drops = RateLimitedDrops::new("SWIM packet authentication failed");
+    let mut encrypted_without_key_drops = RateLimitedDrops::new(
+        "SWIM encrypted packet received without a configured key; peers may disagree on encryption",
+    );
     let own = [Some(advertise_addr), socket.local_addr().ok()];
     let mut seed_addrs = foreign_seeds(config.seeds.clone(), &own);
     let mut next_seed_announce_at = Instant::now() + Duration::from_secs(5);
@@ -1417,6 +1740,7 @@ async fn run_loop(
     let mut next_gateway_republish_at = Instant::now();
     let mut retained_state_broadcasts = RetainedStateBroadcasts::new();
     let mut pending_withdrawals = PendingWithdrawals::new();
+    let mut trust = GridTrust::default();
     let mut next_state_republish_at = Instant::now() + STATE_REPUBLISH_INTERVAL;
     let dead_member_ttl = Duration::from_secs(
         std::env::var("GRID_SWIM_DEAD_MEMBER_TTL_SECS")
@@ -1427,6 +1751,7 @@ async fn run_loop(
 
     publish_address_broadcast(
         &mut node,
+        &trust,
         &site_name,
         gateway_address_revision,
         gateway_address.as_deref(),
@@ -1455,6 +1780,10 @@ async fn run_loop(
         pending_drops.observe(&key);
 
         tokio::select! {
+            Some(update) = channels.trust_update_rx.recv() => {
+                trust.apply(&node, &site_name, update);
+                publish_state(&state_tx, &node);
+            }
             result = socket.recv_from(&mut buf) => {
                 match result {
                     Ok((n, from)) => {
@@ -1467,6 +1796,10 @@ async fn run_loop(
                             },
                             Err(Rejected::Unauthenticated) => {
                                 unauthenticated_drops.dropped(from, n, Instant::now());
+                                continue;
+                            },
+                            Err(Rejected::EncryptedWithoutKey) => {
+                                encrypted_without_key_drops.dropped(from, n, Instant::now());
                                 continue;
                             },
                         };
@@ -1487,6 +1820,7 @@ async fn run_loop(
                         // Broadcasts are received inside handle_data, so the snapshot
                         // may have advanced.
                         publish_state(&state_tx, &node);
+                        publish_model_inventories(&model_inventories_tx, &node);
                         // Gateway-address-only broadcasts update the node's gateway-address
                         // map but may not emit a membership event.  Republish the
                         // membership snapshot after every inbound packet so callers see the
@@ -1503,6 +1837,7 @@ async fn run_loop(
                             gateway_address_revision = revision;
                             publish_address_broadcast(
                                 &mut node,
+                                &trust,
                                 &site_name,
                                 gateway_address_revision,
                                 gateway_address.as_deref(),
@@ -1566,6 +1901,18 @@ async fn run_loop(
                         }
                     }
                 }
+                // A trust update queued before this broadcast must sign it.
+                while let Ok(update) = channels.trust_update_rx.try_recv() {
+                    trust.apply(&node, &site_name, update);
+                    publish_state(&state_tx, &node);
+                }
+                bc = match trust.sign(bc) {
+                    Ok(broadcast) => broadcast,
+                    Err(error) => {
+                        tracing::warn!(%error, "refusing to publish unsigned grid-scoped state");
+                        continue;
+                    },
+                };
                 // Publish through foca's dedicated custom-broadcast path so
                 // every currently available candidate receives the update.
                 if let Err(e) = node.publish_state_broadcast(&bc) {
@@ -1584,6 +1931,29 @@ async fn run_loop(
                     .await;
                 }
                 publish_state(&state_tx, &node);
+                publish_model_inventories(&model_inventories_tx, &node);
+            }
+            Some(frame) = channels.inventory_broadcast_rx.recv() => {
+                if pending_withdrawals.contains_key(&frame.grid_id) {
+                    tracing::debug!(grid_id = %frame.grid_id, "discarding model inventory for pending GridNetwork withdrawal");
+                    continue;
+                }
+                if let Err(error) = node.publish_model_inventory_broadcast(&frame) {
+                    tracing::warn!(error = %error, "failed to publish signed model inventory frame");
+                    continue;
+                }
+                let output = node.broadcast();
+                drain_output(
+                    output,
+                    &socket,
+                    &channels.timer_tx,
+                    &mut tracked,
+                    &channels.snapshot_tx,
+                    &node,
+                    &key,
+                )
+                .await;
+                publish_model_inventories(&model_inventories_tx, &node);
             }
             Some(()) = channels.leave_rx.recv() => {
                 let output = node.leave();
@@ -1614,6 +1984,7 @@ async fn run_loop(
                     &channels.snapshot_tx,
                     &state_tx,
                     &key,
+                    &trust,
                 )
                 .await;
             }
@@ -1638,6 +2009,7 @@ async fn run_loop(
             }
             _ = age_tick.tick() => {
                 let now = Instant::now();
+                publish_model_inventories(&model_inventories_tx, &node);
                 publish_pending_withdrawals(
                     &mut pending_withdrawals,
                     &mut retained_state_broadcasts,
@@ -1650,6 +2022,7 @@ async fn run_loop(
                     &channels.snapshot_tx,
                     &state_tx,
                     &key,
+                    &trust,
                 )
                 .await;
                 if now >= next_state_republish_at {
@@ -1663,7 +2036,13 @@ async fn run_loop(
                         let Some(retained) = retained_state_broadcasts.get_mut(&scope) else {
                             continue;
                         };
-                        let bc = retained.republish(revision);
+                        let bc = match trust.sign(retained.republish(revision)) {
+                            Ok(broadcast) => broadcast,
+                            Err(error) => {
+                                tracing::warn!(%error, "failed to sign retained grid state");
+                                continue;
+                            },
+                        };
                         if let Err(e) = node.publish_state_broadcast(&bc) {
                             tracing::warn!(error = %e, "failed to encode retained state broadcast");
                         } else {
@@ -1728,6 +2107,7 @@ async fn run_loop(
                     gateway_address_revision = revision;
                     publish_address_broadcast(
                         &mut node,
+                        &trust,
                         &site_name,
                         gateway_address_revision,
                         Some(addr),
@@ -1745,8 +2125,8 @@ async fn run_loop(
                     )
                     .await;
                     publish_state(&state_tx, &node);
-                    // Discovery re-announces an unchanged address for late joiners; only a change is news.
                     if previous.as_deref() == Some(addr) {
+                        // Discovery re-announces an unchanged address for late joiners; only a change is news.
                         tracing::debug!(addr = %addr, "gateway address re-announced");
                     } else {
                         tracing::info!(addr = %addr, "gateway address updated at runtime");
@@ -1764,9 +2144,17 @@ fn canonical_state_payload(broadcast: &swim::StateBroadcast) -> Result<Vec<u8>, 
     canonical.encode().map_err(|error| error.to_string())
 }
 
-/// Queue a broadcast of this site's gateway and signals addresses, without `grid_id`.
+/// Queue a broadcast of this site's gateway and signals addresses.
+///
+/// Unscoped unless a grid enforces signed state: such a grid refuses unscoped,
+/// unsigned broadcasts, so each strict grid gets its own signed copy.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the trust that scopes the broadcast joins the address fields"
+)]
 fn publish_address_broadcast(
     node: &mut SwimNode,
+    trust: &GridTrust,
     site_name: &str,
     revision: u64,
     gateway_address: Option<&str>,
@@ -1782,9 +2170,160 @@ fn publish_address_broadcast(
         gateway_address.map(str::to_owned),
     )
     .with_signals_address(signals_address.map(str::to_owned));
-    if let Err(e) = node.publish_state_broadcast(&broadcast) {
-        tracing::warn!(error = %e, "failed to encode address broadcast");
+
+    for scoped in trust.per_strict_grid(broadcast) {
+        let published =
+            scoped.and_then(|signed| node.publish_state_broadcast(&signed).map_err(|error| error.to_string()));
+        if let Err(error) = published {
+            tracing::warn!(%error, "failed to encode address broadcast");
+        }
     }
+}
+
+/// Signed-gossip trust the runtime enforces, by grid ID.
+#[derive(Default)]
+struct GridTrust {
+    /// Grids that enforce signed state; absent ones gossip unsigned.
+    enforced: HashMap<String, EnforcedGrid>,
+}
+
+/// What this site holds for one enforcing grid.
+#[derive(Default)]
+struct EnforcedGrid {
+    /// Local PKCS8 signing key, zeroized when replaced or dropped.
+    signing_key: Option<Zeroizing<Vec<u8>>>,
+    /// Peer sites the last snapshot pinned.
+    peer_sites: HashSet<String>,
+}
+
+impl GridTrust {
+    /// Apply one trust update to `node`.
+    fn apply(&mut self, node: &SwimNode, site_name: &str, update: GridTrustUpdate) {
+        match update {
+            GridTrustUpdate::Off(grid_id) => self.relax(node, &grid_id),
+            GridTrustUpdate::Enforce(snapshot) => self.enforce(node, site_name, snapshot),
+            GridTrustUpdate::AllowStateAdmission => {},
+        }
+        node.open_state_admission();
+    }
+
+    /// Return a grid to unsigned gossip, a no-op for one that never enforced.
+    fn relax(&mut self, node: &SwimNode, grid_id: &str) {
+        if self.enforced.remove(grid_id).is_some() {
+            node.relax_signed_grid(grid_id);
+        }
+    }
+
+    /// Require signed state in a grid, with the snapshot's signer and peer pins.
+    fn enforce(&mut self, node: &SwimNode, site_name: &str, snapshot: GridTrustSnapshot) {
+        let GridTrustSnapshot {
+            grid_id,
+            local_signing_key,
+            peer_pins,
+        } = snapshot;
+        node.enforce_signed_grid(&grid_id);
+        let grid = self.enforced.entry(grid_id.clone()).or_default();
+        grid.install_signer(node, site_name, &grid_id, local_signing_key);
+        if let Some(peer_pins) = peer_pins {
+            grid.install_peer_pins(node, &grid_id, peer_pins);
+        }
+    }
+
+    /// `broadcast` scoped to and signed for each strict grid, or unchanged when none is.
+    fn per_strict_grid(&self, broadcast: swim::StateBroadcast) -> Vec<Result<swim::StateBroadcast, String>> {
+        if self.enforced.is_empty() {
+            return vec![Ok(broadcast)];
+        }
+        self.enforced
+            .keys()
+            .map(|grid_id| self.sign(broadcast.clone().with_grid_id(Some(grid_id.clone()))))
+            .collect()
+    }
+
+    /// Sign a grid-scoped broadcast with the local certificate-backed identity.
+    ///
+    /// # Errors
+    ///
+    /// Fails for a strict grid with no usable local signer, or when signing fails.
+    fn sign(&self, mut broadcast: swim::StateBroadcast) -> Result<swim::StateBroadcast, String> {
+        broadcast.signature = None;
+        broadcast.signed_at_ms = None;
+        let Some(grid_id) = broadcast.grid_id.as_deref() else {
+            return Ok(broadcast);
+        };
+        let Some(grid) = self.enforced.get(grid_id) else {
+            return Ok(broadcast);
+        };
+        let Some(key) = grid.signing_key.as_ref() else {
+            return Err(format!("local signing identity is unavailable for grid {grid_id}"));
+        };
+
+        broadcast.signed_at_ms = Some(wall_clock_millis());
+        let bytes = broadcast.signable_bytes().map_err(|error| error.to_string())?;
+        broadcast.signature = Some(swim::signing::sign_ecdsa_p256(key, &bytes).map_err(|error| error.to_string())?);
+        Ok(broadcast)
+    }
+}
+
+impl EnforcedGrid {
+    /// Install the local signer, pinning its public key so no peer can speak as this site.
+    fn install_signer(&mut self, node: &SwimNode, site_name: &str, grid_id: &str, key: Option<Zeroizing<Vec<u8>>>) {
+        let installed = self.signing_key.as_ref().map(|installed| installed.as_slice());
+        if installed == key.as_ref().map(|incoming| incoming.as_slice()) {
+            return;
+        }
+        self.signing_key = None;
+        let Some(key) = key else {
+            node.unpin_origin_for_grid(grid_id, site_name);
+            return;
+        };
+
+        let public_key = match swim::signing::public_key_ecdsa_p256(&key) {
+            Ok(public_key) => public_key,
+            Err(error) => {
+                node.unpin_origin_for_grid(grid_id, site_name);
+                tracing::warn!(%grid_id, %error, "failed to derive the local SWIM public identity");
+                return;
+            },
+        };
+        if let Err(error) = node.pin_origin_for_grid(grid_id, site_name.to_owned(), vec![public_key]) {
+            tracing::warn!(%grid_id, %error, "failed to pin the local SWIM signing identity");
+            return;
+        }
+        self.signing_key = Some(key);
+    }
+
+    /// Replace the grid's peer pins, clearing peers the snapshot no longer verifies.
+    fn install_peer_pins(&mut self, node: &SwimNode, grid_id: &str, peer_pins: PeerPins) {
+        let current = peer_pins.keys().cloned().collect::<HashSet<_>>();
+        for origin in self.peer_sites.difference(&current) {
+            node.clear_origin_pin_for_grid(grid_id, origin);
+        }
+        let mut installed = HashSet::with_capacity(current.len());
+        for (origin, keys) in peer_pins {
+            match node.pin_origin_for_grid(grid_id, origin.clone(), keys) {
+                Ok(()) => {
+                    installed.insert(origin);
+                },
+                Err(error) => {
+                    node.unpin_origin_for_grid(grid_id, &origin);
+                    tracing::warn!(%grid_id, %origin, %error, "failed to install verified SWIM origin pin");
+                },
+            }
+        }
+        self.peer_sites = installed;
+    }
+}
+
+/// Current Unix time in milliseconds, saturating at the wire type's limit.
+fn wall_clock_millis() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// Send outbound messages, schedule timers, apply membership events.
@@ -1914,8 +2453,8 @@ fn is_from_the_future(generation: u64, now_nanos: u64) -> bool {
 
 /// Wall-clock nanoseconds, the unit generations are reserved in.
 fn unix_nanos_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map_or(0, |since| u64::try_from(since.as_nanos()).unwrap_or(u64::MAX))
 }
 
@@ -2021,6 +2560,136 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grid_scoped_empty_certificate_broadcast_is_signed_with_the_local_key() {
+        let pair = rcgen::KeyPair::generate().expect("P-256 key");
+        let private_key = pair.serialize_der();
+        let public_key = swim::signing::public_key_ecdsa_p256(&private_key).expect("public key");
+        let trust = GridTrust {
+            enforced: HashMap::from([(
+                "grid-a".to_owned(),
+                EnforcedGrid {
+                    signing_key: Some(Zeroizing::new(private_key)),
+                    peer_sites: HashSet::new(),
+                },
+            )]),
+        };
+        let empty = swim::StateBroadcast::new(
+            "site-a".to_owned(),
+            1,
+            GridStateSnapshot::new("site-a".to_owned()),
+            None,
+        )
+        .with_cert(Some("public certificate".to_owned()))
+        .with_grid_id(Some("grid-a".to_owned()));
+
+        let signed = trust.sign(empty).expect("sign");
+        let signature = signed.signature.as_deref().expect("signature");
+        let signable = signed.signable_bytes().expect("signable bytes");
+
+        assert!(
+            signed.snapshot.providers.is_empty(),
+            "bootstrap carries no provider data"
+        );
+        assert!(signed.signed_at_ms.is_some(), "signed bootstrap carries a timestamp");
+        swim::signing::verify_ecdsa_p256(&public_key, &signable, signature).expect("verified signature");
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "walks one grid through each trust update")]
+    fn grid_trust_tracks_signer_and_pins_across_updates() {
+        let node = SwimNode::new(NodeId::with_generation(
+            "site-a".to_owned(),
+            SocketAddr::from(([127, 0, 0, 1], 7946)),
+            1,
+        ));
+        let key = Zeroizing::new(rcgen::KeyPair::generate().expect("P-256 key").serialize_der());
+        let peer_der = rcgen::KeyPair::generate().expect("peer key").serialize_der();
+        let peer_public = swim::signing::public_key_ecdsa_p256(&peer_der).expect("peer public key");
+        let grid_state = || {
+            swim::StateBroadcast::new(
+                "site-a".to_owned(),
+                1,
+                GridStateSnapshot::new("site-a".to_owned()),
+                None,
+            )
+            .with_grid_id(Some("grid-a".to_owned()))
+        };
+        let enforce = |local_signing_key, peer_pins| {
+            GridTrustUpdate::Enforce(GridTrustSnapshot {
+                grid_id: "grid-a".to_owned(),
+                local_signing_key,
+                peer_pins,
+            })
+        };
+        let mut trust = GridTrust::default();
+
+        trust.apply(
+            &node,
+            "site-a",
+            enforce(
+                Some(key),
+                Some(PeerPins::from([("site-b".to_owned(), vec![peer_public])])),
+            ),
+        );
+        let signed = trust.sign(grid_state()).expect("signed");
+        trust.apply(&node, "site-a", enforce(None, None));
+        let unsignable = trust.sign(grid_state());
+        let kept = trust.enforced.get("grid-a").map(|grid| grid.peer_sites.clone());
+        trust.apply(&node, "site-a", enforce(None, Some(PeerPins::new())));
+        let cleared = trust.enforced.get("grid-a").map(|grid| grid.peer_sites.clone());
+        trust.apply(&node, "site-a", GridTrustUpdate::Off("grid-a".to_owned()));
+        let relaxed = trust.sign(grid_state()).expect("unsigned");
+
+        assert!(signed.signature.is_some(), "an installed signer signs grid state");
+        assert!(unsignable.is_err(), "a strict grid without a signer refuses to publish");
+        assert_eq!(
+            kept,
+            Some(HashSet::from(["site-b".to_owned()])),
+            "an update without pins keeps the installed ones"
+        );
+        assert_eq!(cleared, Some(HashSet::new()), "a complete snapshot clears absent peers");
+        assert!(
+            relaxed.signature.is_none() && trust.enforced.is_empty(),
+            "off returns the grid to unsigned gossip"
+        );
+    }
+
+    #[test]
+    fn a_strict_grid_still_carries_the_local_addresses() {
+        let mut node = SwimNode::new(NodeId::with_generation(
+            "site-a".to_owned(),
+            SocketAddr::from(([127, 0, 0, 1], 7946)),
+            1,
+        ));
+        let key = Zeroizing::new(rcgen::KeyPair::generate().expect("P-256 key").serialize_der());
+        let mut trust = GridTrust::default();
+        trust.apply(
+            &node,
+            "site-a",
+            GridTrustUpdate::Enforce(GridTrustSnapshot {
+                grid_id: "grid-a".to_owned(),
+                local_signing_key: Some(key),
+                peer_pins: Some(PeerPins::new()),
+            }),
+        );
+
+        publish_address_broadcast(
+            &mut node,
+            &trust,
+            "site-a",
+            wall_clock_millis(),
+            Some("192.0.2.1:8080"),
+            None,
+        );
+
+        assert_eq!(
+            node.gateway_addrs().get("site-a").map(String::as_str),
+            Some("192.0.2.1:8080"),
+            "the address broadcast is signed for the strict grid, not refused"
+        );
+    }
+
+    #[test]
     fn a_pending_key_holds_both_directions() {
         let addr = SocketAddr::from(([127, 0, 0, 1], 7946));
         let key = KeyState::Key(Arc::new([7_u8; 32]));
@@ -2035,6 +2704,11 @@ mod tests {
         assert_eq!(
             wire_plaintext(&key, b"ping").map(|_| ()),
             Err(Rejected::Unauthenticated)
+        );
+        assert_eq!(
+            wire_plaintext(&KeyState::Plain, &sealed).map(|_| ()),
+            Err(Rejected::EncryptedWithoutKey),
+            "a plaintext peer must reject encrypted frames before Foca decodes them"
         );
         assert_eq!(
             wire_plaintext(&KeyState::Plain, b"ping").expect("plain").as_ref(),
@@ -2101,7 +2775,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "case table")]
     fn a_stale_identity_never_downs_the_current_one() {
         let lb = "203.0.113.7:7946";
         let status = |events: Vec<MemberEvent>| {
@@ -2226,7 +2899,7 @@ mod tests {
         seeds: Vec<SocketAddr>,
         revision_seed: u64,
     ) -> Arc<SwimHandle> {
-        start(SwimConfig {
+        let handle = start(SwimConfig {
             bind_addr,
             advertise_addr: Some(bind_addr),
             site_name: site_name.to_owned(),
@@ -2234,7 +2907,9 @@ mod tests {
             ..test_config(revision_seed)
         })
         .await
-        .unwrap_or_else(|_| std::process::abort())
+        .unwrap_or_else(|_| std::process::abort());
+        handle.allow_state_admission().unwrap_or_else(|_| std::process::abort());
+        handle
     }
 
     async fn wait_until_provider_presence(handle: &SwimHandle, origin_site: &str, present: bool) {
@@ -2397,7 +3072,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "fills a site, then frees one slot")]
     fn identities_per_site_are_bounded() {
         let t0 = now();
         let mut tracked = HashMap::new();
@@ -2511,11 +3185,23 @@ mod tests {
     fn unauthenticated_drops_warn_once_per_window() {
         let t0 = now();
         let from = SocketAddr::from(([10, 0, 0, 1], 7946));
-        let mut drops = UnauthenticatedDrops::default();
+        let mut drops = RateLimitedDrops::new("SWIM packet authentication failed");
         assert!(drops.dropped(from, 10, t0), "first drop warns");
         assert!(!drops.dropped(from, 10, t0 + Duration::from_secs(1)), "then quiet");
         assert!(!drops.dropped(from, 10, t0 + Duration::from_secs(59)));
-        assert!(drops.dropped(from, 10, t0 + UNAUTHENTICATED_WARN_EVERY), "warns again");
+        assert!(drops.dropped(from, 10, t0 + DROPPED_PACKET_WARN_EVERY), "warns again");
+        assert_eq!(drops.suppressed, 0, "the count resets on a warning");
+    }
+
+    #[test]
+    fn encrypted_without_key_drops_warn_once_per_window() {
+        let t0 = now();
+        let from = SocketAddr::from(([10, 0, 0, 1], 7946));
+        let mut drops = RateLimitedDrops::new("encrypted packet received without key");
+        assert!(drops.dropped(from, 90, t0), "first mismatch warns");
+        assert!(!drops.dropped(from, 90, t0 + Duration::from_secs(1)), "then quiet");
+        assert!(!drops.dropped(from, 90, t0 + Duration::from_secs(59)));
+        assert!(drops.dropped(from, 90, t0 + DROPPED_PACKET_WARN_EVERY), "warns again");
         assert_eq!(drops.suppressed, 0, "the count resets on a warning");
     }
 
@@ -2553,7 +3239,7 @@ mod tests {
         let mut tracked = HashMap::new();
         apply_member_event(joined("site-a"), &mut tracked, t0);
         apply_member_event(left("site-a"), &mut tracked, t0 + Duration::from_secs(10));
-        // Rejoin clears status_changed_at → age=0.
+        // Rejoin clears status_changed_at -> age=0.
         apply_member_event(joined("site-a"), &mut tracked, t0 + Duration::from_secs(50));
         let snap = members_snapshot(&tracked, t0 + Duration::from_secs(70), &PeerMetadata::default());
         let m = snap.members.first().unwrap_or_else(|| std::process::abort());
@@ -2578,17 +3264,22 @@ mod tests {
     // SwimHandle
     // -----------------------------------------------------------------------
 
-    fn make_test_handle() -> (
+    /// A handle paired with every distributed-state publisher used by its event stream.
+    type TestHandle = (
         SwimHandle,
         watch::Sender<MembershipSnapshot>,
         watch::Sender<GridStateSnapshot>,
-    ) {
+        watch::Sender<Vec<swim::ModelInventory>>,
+    );
+
+    fn make_test_handle() -> TestHandle {
         let (snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
         let (state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, _seed_rx) = mpsc::channel(16);
         let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
         let (gateway_tx, _gateway_rx) = watch::channel(None);
+        let (inventories_tx, model_inventories_rx) = watch::channel(Vec::new());
         let handle = SwimHandle {
             publisher_reservation: (1, 2),
             site_name: "test".to_owned(),
@@ -2596,7 +3287,10 @@ mod tests {
             signals_address: None,
             snapshot_rx,
             state_rx,
+            model_inventories_rx,
             broadcast_tx,
+            trust_update_tx: mpsc::unbounded_channel().0,
+            inventory_broadcast_tx: mpsc::channel(1).0,
             seed_tx,
             key_tx,
             gateway_tx,
@@ -2604,7 +3298,7 @@ mod tests {
             withdraw_tx: mpsc::channel(16).0,
             leave_tx: mpsc::channel(1).0,
         };
-        (handle, snapshot_tx, state_tx)
+        (handle, snapshot_tx, state_tx, inventories_tx)
     }
 
     fn reconciliation_member(status: MemberStatus, age_secs: u64) -> MemberRecord {
@@ -2621,12 +3315,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one ordered test proves deduplication across membership, health, and provider-state changes"
-    )]
     async fn reconciliation_events_emit_only_for_semantic_changes() {
-        let (handle, snapshot_tx, state_tx) = make_test_handle();
+        let (handle, snapshot_tx, state_tx, _inventories_tx) = make_test_handle();
         let mut events = Box::pin(handle.reconciliation_events());
 
         drop(snapshot_tx.send(MembershipSnapshot::default()));
@@ -2734,9 +3424,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn complete_inventory_changes_trigger_reconciliation() {
+        let (handle, _snapshot_tx, _state_tx, inventories_tx) = make_test_handle();
+        let mut events = Box::pin(handle.reconciliation_events());
+        let inventory = swim::ModelInventory {
+            origin_site: "remote".to_owned(),
+            grid_id: "grid".to_owned(),
+            network_id: "net".to_owned(),
+            provider_id: "provider".to_owned(),
+            provider_uid: "uid".to_owned(),
+            revision: 1,
+            expires_at_ms: u64::MAX,
+            models: vec!["model".to_owned()],
+        };
+        inventories_tx.send_replace(vec![inventory.clone()]);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), events.next())
+                .await
+                .is_ok_and(|event| event.is_some())
+        );
+        inventories_tx.send_replace(vec![inventory]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), events.next())
+                .await
+                .is_err(),
+            "identical inventories are deduplicated"
+        );
+        inventories_tx.send_replace(Vec::new());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), events.next())
+                .await
+                .is_ok_and(|event| event.is_some()),
+            "expiry or withdrawal starts reconciliation"
+        );
+    }
+
     #[test]
     fn stopped_runtime_never_reports_retained_members_alive() {
-        let (handle, snapshot_tx, _state_tx) = make_test_handle();
+        let (handle, snapshot_tx, _state_tx, _inventories_tx) = make_test_handle();
         drop(snapshot_tx.send(MembershipSnapshot {
             members: vec![reconciliation_member(MemberStatus::Alive, 0)],
         }));
@@ -2766,7 +3492,10 @@ mod tests {
             signals_address: None,
             snapshot_rx,
             state_rx,
+            model_inventories_rx: watch::channel(Vec::new()).1,
             broadcast_tx,
+            trust_update_tx: mpsc::unbounded_channel().0,
+            inventory_broadcast_tx: mpsc::channel(1).0,
             seed_tx,
             key_tx,
             gateway_tx,
@@ -2786,7 +3515,6 @@ mod tests {
     #[test]
     fn set_gateway_address_sends_to_channel() {
         let (_snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
-        let (_state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, _seed_rx) = mpsc::channel(16);
         let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
@@ -2797,8 +3525,11 @@ mod tests {
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
             signals_address: None,
             snapshot_rx,
-            state_rx,
+            state_rx: watch::channel(GridStateSnapshot::new("test".to_owned())).1,
+            model_inventories_rx: watch::channel(Vec::new()).1,
             broadcast_tx,
+            trust_update_tx: mpsc::unbounded_channel().0,
+            inventory_broadcast_tx: mpsc::channel(1).0,
             seed_tx,
             key_tx,
             gateway_tx,
@@ -2818,7 +3549,7 @@ mod tests {
 
     #[test]
     fn set_gateway_address_returns_error_without_runtime_receiver() {
-        let (handle, _snapshot_tx, _state_tx) = make_test_handle();
+        let (handle, _snapshot_tx, _state_tx, _inventories_tx) = make_test_handle();
         assert!(
             matches!(
                 handle.set_gateway_address(Some("10.0.0.5:8080".to_owned())),
@@ -2938,10 +3669,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "ordered state-machine proof covers initial, duplicate, changed, and repair publications"
-    )]
     fn retained_state_deduplicates_updates_and_republishes_with_new_revision() {
         let original = provider_broadcast(0.1);
         let (retained, first) =
@@ -3018,7 +3745,7 @@ mod tests {
 
     #[test]
     fn handle_snapshot_starts_empty() {
-        let (handle, snapshot_tx, _state_tx) = make_test_handle();
+        let (handle, snapshot_tx, _state_tx, _inventories_tx) = make_test_handle();
         let snap = handle.snapshot();
         assert!(snap.members.is_empty(), "initial snapshot must be empty");
         drop(snapshot_tx);
@@ -3026,7 +3753,7 @@ mod tests {
 
     #[test]
     fn handle_snapshot_reflects_published_update() {
-        let (handle, snapshot_tx, _state_tx) = make_test_handle();
+        let (handle, snapshot_tx, _state_tx, _inventories_tx) = make_test_handle();
 
         let snap_with_member = MembershipSnapshot {
             members: vec![MemberRecord {
@@ -3047,10 +3774,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "eviction regression checks subscriber notification, provider withdrawal, and retained cumulative spend"
-    )]
     fn evicted_providers_disappear_from_subscribers_while_spend_survives() -> Result<(), Box<dyn std::error::Error>> {
         let identity = NodeId::with_generation("site-local".to_owned(), "127.0.0.1:7946".parse()?, 1);
         let mut node = SwimNode::new(identity);
@@ -3091,14 +3814,14 @@ mod tests {
 
     #[test]
     fn handle_state_snapshot_starts_empty() {
-        let (handle, _snap_tx, _state_tx) = make_test_handle();
+        let (handle, _snap_tx, _state_tx, _inventories_tx) = make_test_handle();
         let state = handle.state_snapshot();
         assert!(state.providers.is_empty(), "initial CRDT state must have no providers");
     }
 
     #[test]
     fn handle_state_snapshot_reflects_published_update() {
-        let (handle, _snap_tx, state_tx) = make_test_handle();
+        let (handle, _snap_tx, state_tx, _inventories_tx) = make_test_handle();
 
         let mut snap = GridStateSnapshot::new("site-a".to_owned());
         snap.upsert_provider(crdt::ProviderState {
@@ -3155,7 +3878,7 @@ mod tests {
 
     #[test]
     fn local_addr_returns_advertise_addr() {
-        let (handle, _snap_tx, _state_tx) = make_test_handle();
+        let (handle, _snap_tx, _state_tx, _inventories_tx) = make_test_handle();
         let addr: SocketAddr = "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort());
         assert_eq!(
             handle.local_addr(),
@@ -3166,7 +3889,7 @@ mod tests {
 
     #[test]
     fn announce_seeds_empty_is_noop() {
-        let (handle, _snap_tx, _state_tx) = make_test_handle();
+        let (handle, _snap_tx, _state_tx, _inventories_tx) = make_test_handle();
         let result = handle.announce_seeds(Vec::new());
         assert!(result.is_ok(), "announce_seeds with empty vec must return Ok");
     }
@@ -3186,7 +3909,10 @@ mod tests {
             signals_address: None,
             snapshot_rx,
             state_rx,
+            model_inventories_rx: watch::channel(Vec::new()).1,
             broadcast_tx,
+            trust_update_tx: mpsc::unbounded_channel().0,
+            inventory_broadcast_tx: mpsc::channel(1).0,
             seed_tx,
             key_tx,
             gateway_tx,
@@ -3207,7 +3933,6 @@ mod tests {
     #[test]
     fn announce_seeds_returns_closed_when_receiver_dropped() {
         let (_snapshot_tx, snapshot_rx) = watch::channel(MembershipSnapshot::default());
-        let (_state_tx, state_rx) = watch::channel(GridStateSnapshot::new("test".to_owned()));
         let (broadcast_tx, _broadcast_rx) = mpsc::channel(1);
         let (seed_tx, seed_rx) = mpsc::channel::<Vec<SocketAddr>>(16);
         let (key_tx, _key_rx) = watch::channel(KeyState::Plain);
@@ -3218,8 +3943,11 @@ mod tests {
             advertise_addr: "127.0.0.1:7946".parse().unwrap_or_else(|_| std::process::abort()),
             signals_address: None,
             snapshot_rx,
-            state_rx,
+            state_rx: watch::channel(GridStateSnapshot::new("test".to_owned())).1,
+            model_inventories_rx: watch::channel(Vec::new()).1,
             broadcast_tx,
+            trust_update_tx: mpsc::unbounded_channel().0,
+            inventory_broadcast_tx: mpsc::channel(1).0,
             seed_tx,
             key_tx,
             gateway_tx,
@@ -3349,6 +4077,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn withdrawal_stays_pending_for_a_strict_grid_without_a_signer() {
+        let addr = reserve_local_addr().await;
+        let handle = start_test_runtime("site-a", addr, Vec::new(), 45_000).await;
+        handle
+            .publish_state_broadcast(provider_broadcast(0.1).with_grid_id(Some("grid-delete".to_owned())))
+            .unwrap_or_else(|_| std::process::abort());
+        wait_until_provider_presence(&handle, "site-a", true).await;
+        handle
+            .set_grid_trust_snapshot("grid-delete".to_owned(), None, Some(PeerPins::new()))
+            .unwrap_or_else(|_| std::process::abort());
+        wait_until_provider_presence(&handle, "site-a", false).await;
+
+        let receipt = handle
+            .withdraw_scope("grid-delete".to_owned())
+            .unwrap_or_else(|_| std::process::abort());
+
+        let outcome = tokio::time::timeout(Duration::from_millis(100), receipt).await;
+        assert!(
+            outcome.is_err(),
+            "an unsigned withdrawal must not acknowledge publication: {outcome:?}"
+        );
+        handle.leave(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
     async fn withdrawal_retracts_scoped_provider_state_at_peer() {
         let addr1 = reserve_local_addr().await;
         let addr2 = reserve_local_addr().await;
@@ -3378,7 +4131,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "two real runtimes, a join, and a leave")]
     async fn a_leaving_runtime_stops_and_its_peer_sees_it_dead() {
         let addr1 = reserve_local_addr().await;
         let addr2 = reserve_local_addr().await;
@@ -3443,10 +4195,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "three-node real-UDP gossip proof: join, dual increment, convergence, late join, status tie-in"
-    )]
     async fn tenant_spend_converges_at_late_joining_site_after_partition_heals() {
         // grid#40 AC3, live network proof: sites A and B accumulate real per-request
         // spend for the same tenant *before* site C ever joins the mesh (a stand-in
@@ -3458,35 +4206,8 @@ mod tests {
         let addr_b = reserve_local_addr().await;
         let addr_c = reserve_local_addr().await;
 
-        let handle_a = start(SwimConfig {
-            bind_addr: addr_a,
-            advertise_addr: Some(addr_a),
-            site_name: "site-a".to_owned(),
-            seeds: Vec::new(),
-            signals_address: None,
-            gateway_address: None,
-            key: KeyState::Plain,
-            revision_lease: test_revision_lease(80_000),
-            revision_renewer: None,
-            departed: Departed::Evict,
-        })
-        .await
-        .unwrap_or_else(|_| std::process::abort());
-
-        let handle_b = start(SwimConfig {
-            bind_addr: addr_b,
-            advertise_addr: Some(addr_b),
-            site_name: "site-b".to_owned(),
-            seeds: vec![addr_a],
-            signals_address: None,
-            gateway_address: None,
-            key: KeyState::Plain,
-            revision_lease: test_revision_lease(90_000),
-            revision_renewer: None,
-            departed: Departed::Evict,
-        })
-        .await
-        .unwrap_or_else(|_| std::process::abort());
+        let handle_a = start_test_runtime("site-a", addr_a, Vec::new(), 80_000).await;
+        let handle_b = start_test_runtime("site-b", addr_b, vec![addr_a], 90_000).await;
         wait_until_member_alive(&handle_a, "site-b").await;
 
         // Real per-request cost values, matching `scoring::BackendConfig::cost_per_1k_input`
@@ -3511,20 +4232,7 @@ mod tests {
 
         // The partition "heals": site-c joins the already-converged A/B mesh for
         // the first time, having missed every prior broadcast.
-        let handle_c = start(SwimConfig {
-            bind_addr: addr_c,
-            advertise_addr: Some(addr_c),
-            site_name: "site-c".to_owned(),
-            seeds: vec![addr_a],
-            signals_address: None,
-            gateway_address: None,
-            key: KeyState::Plain,
-            revision_lease: test_revision_lease(100_000),
-            revision_renewer: None,
-            departed: Departed::Evict,
-        })
-        .await
-        .unwrap_or_else(|_| std::process::abort());
+        let handle_c = start_test_runtime("site-c", addr_c, vec![addr_a], 100_000).await;
         wait_until_member_alive(&handle_a, "site-c").await;
 
         wait_until_tenant_spend_converges(&handle_c, "tenant-acme", total_cents).await;

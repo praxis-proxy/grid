@@ -28,7 +28,7 @@
 //! | Health probe's shared or `healthCheck.tls` Secret is missing, has no key, or is invalid | `Degraded` |
 //! | Metrics' shared or `metricsConfig.tls` Secret is missing, has no key, or is invalid | `Degraded` |
 //! | Config valid, probe healthy or not run, no matching sites | `Pending` |
-//! | Config valid, probe healthy or not run, ≥1 matching site | `Available` |
+//! | Config valid, probe healthy or not run, >=1 matching site | `Available` |
 //!
 //! `Degraded` is emitted by `phase_from_probe` when a health probe
 //! returns a degraded response, or by the health check / metrics TLS
@@ -77,8 +77,8 @@ use crate::{
         grid_network::GridNetwork,
         grid_site::GridSite,
         inference_provider::{
-            Condition, HealthCheckConfig, InferenceProvider, InferenceProviderSpec, InferenceProviderStatus,
-            ModelDiscoveryConfig, ProviderPhase,
+            Condition, ConditionStatus, HealthCheckConfig, InferenceProvider, InferenceProviderSpec,
+            InferenceProviderStatus, ModelDiscoveryConfig, ProviderPhase,
         },
     },
     error::OperatorError,
@@ -176,7 +176,7 @@ fn provider_conditions(provider: &InferenceProvider, refs: Refs, phase_reason: O
     let resolved = rollup::condition(held, RESOLVED_REFS, resolved, stamp);
     let live = endpoint_live_gate(held, stamp);
     let degraded = find(readiness::METRICS_REACHABLE_CONDITION)
-        .filter(|condition| condition.status == "False")
+        .filter(|condition| condition.status == ConditionStatus::False)
         .map(|condition| (condition.reason.as_str(), condition.message.as_str()));
     let trio = rollup::trio(held, &[&accepted, &resolved, &live], (degraded, None), stamp);
     [accepted, resolved].into_iter().chain(trio).collect()
@@ -189,7 +189,7 @@ fn endpoint_live_gate(held: &[Condition], stamp: rollup::Stamp<'_>) -> Condition
         .cloned()
         .unwrap_or_else(|| {
             let awaiting = (
-                "Unknown",
+                ConditionStatus::Unknown,
                 "AwaitingFirstCheck",
                 "awaiting the first readiness pass".to_owned(),
             );
@@ -198,13 +198,13 @@ fn endpoint_live_gate(held: &[Condition], stamp: rollup::Stamp<'_>) -> Condition
 }
 
 /// `Accepted` as `(status, reason, message)`.
-fn accepted_verdict(provider: &InferenceProvider) -> (&'static str, &'static str, String) {
+fn accepted_verdict(provider: &InferenceProvider) -> (ConditionStatus, &'static str, String) {
     if let Some(why) = validate_provider_config(provider) {
-        ("False", "Invalid", format!("the spec has a {why}"))
+        (ConditionStatus::False, "Invalid", format!("the spec has a {why}"))
     } else if let Err(error) = credentials::credential_plan_from_auth(provider.spec.auth.as_ref()) {
-        ("False", "Invalid", format!("spec.auth: {error}"))
+        (ConditionStatus::False, "Invalid", format!("spec.auth: {error}"))
     } else {
-        ("True", ACCEPTED, String::new())
+        (ConditionStatus::True, ACCEPTED, String::new())
     }
 }
 
@@ -213,21 +213,21 @@ fn resolved_verdict(
     provider: &InferenceProvider,
     refs: Refs,
     phase_reason: Option<&str>,
-) -> (&'static str, &'static str, String) {
+) -> (ConditionStatus, &'static str, String) {
     match refs {
-        Refs::Resolved => ("True", RESOLVED_REFS, String::new()),
+        Refs::Resolved => (ConditionStatus::True, RESOLVED_REFS, String::new()),
         Refs::NetworkMissing => (
-            "False",
+            ConditionStatus::False,
             "BackendNotFound",
             format!("GridNetwork {:?} does not exist", provider.spec.grid_network_ref),
         ),
         Refs::NoSitesMatched => (
-            "False",
+            ConditionStatus::False,
             "NoSitesMatched",
             "siteSelector matches no site in the network".to_owned(),
         ),
         Refs::NotChecked => (
-            "Unknown",
+            ConditionStatus::Unknown,
             "NotEvaluated",
             format!("not resolved while {}", phase_reason.unwrap_or("the spec is invalid")),
         ),
@@ -465,8 +465,8 @@ pub(crate) fn parse_probe_timeout(hc: Option<&HealthCheckConfig>) -> Duration {
 /// Parse a human-readable duration string into a [`Duration`].
 ///
 /// Accepted suffixes:
-/// - `"ms"` → milliseconds
-/// - `"s"` → seconds
+/// - `"ms"` -> milliseconds
+/// - `"s"` -> seconds
 ///
 /// Returns `None` for any other format.
 fn parse_duration_str(s: &str) -> Option<Duration> {
@@ -552,10 +552,6 @@ pub(crate) fn requeue_interval_for_provider(spec: &InferenceProviderSpec) -> Dur
 /// [`Healthy`]: ProbeOutcome::Healthy
 /// [`Degraded`]: ProbeOutcome::Degraded
 /// [`Unavailable`]: ProbeOutcome::Unavailable
-#[expect(
-    clippy::too_many_lines,
-    reason = "scheme check + TLS branch + client build + request: sequential steps"
-)]
 pub(crate) async fn probe_endpoint(
     uri: Uri,
     timeout: Duration,
@@ -984,10 +980,6 @@ fn site_key(site: &GridSite) -> String {
     clippy::too_many_arguments,
     reason = "all parameters are distinct reconcile outputs; no logical grouping reduces them"
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "constructing and comparing reconcile-owned status fields belongs with the patch"
-)]
 async fn update_status(
     provider: &InferenceProvider,
     client: &Client,
@@ -1115,7 +1107,7 @@ mod tests {
         let changed_conditions = InferenceProviderStatus {
             conditions: vec![Condition {
                 type_: "Ready".to_owned(),
-                status: "False".to_owned(),
+                status: ConditionStatus::False,
                 ..Default::default()
             }],
             ..baseline.clone()
@@ -1270,9 +1262,9 @@ mod tests {
     #[test]
     fn endpoint_live_gates_available_and_a_metrics_failure_degrades() {
         let mut provider = test_provider("p", "grid", &["m"]);
-        let held = |type_: &str, status: &str, reason: &str| Condition {
+        let held = |type_: &str, status: ConditionStatus, reason: &str| Condition {
             type_: type_.to_owned(),
-            status: status.to_owned(),
+            status,
             reason: reason.to_owned(),
             ..Condition::default()
         };
@@ -1283,8 +1275,16 @@ mod tests {
         );
         provider.status = Some(InferenceProviderStatus {
             conditions: vec![
-                held(readiness::ENDPOINT_LIVE_CONDITION, "True", "EndpointLive"),
-                held(readiness::METRICS_REACHABLE_CONDITION, "False", "ScrapeFailed"),
+                held(
+                    readiness::ENDPOINT_LIVE_CONDITION,
+                    ConditionStatus::True,
+                    "EndpointLive",
+                ),
+                held(
+                    readiness::METRICS_REACHABLE_CONDITION,
+                    ConditionStatus::False,
+                    "ScrapeFailed",
+                ),
             ],
             ..InferenceProviderStatus::default()
         });
@@ -1963,7 +1963,7 @@ mod tests {
         );
     }
 
-    // Item 5: missing GridNetwork → Unavailable
+    // Item 5: missing GridNetwork -> Unavailable
     // Requires a Kubernetes API call (network_api.get_opt) and cannot be
     // unit-tested without a live cluster or a mock Kubernetes server.
     // Covered at the integration level; documented here for completeness.
@@ -1974,9 +1974,9 @@ mod tests {
 
     #[test]
     fn no_matching_sites_yields_pending() {
-        // Item 6: valid config, no matching sites → Pending
+        // Item 6: valid config, no matching sites -> Pending
         let phase = phase_from_matching(&[]);
-        assert_eq!(phase, ProviderPhase::Pending, "empty matching → Pending");
+        assert_eq!(phase, ProviderPhase::Pending, "empty matching -> Pending");
     }
 
     #[test]
@@ -2012,16 +2012,16 @@ mod tests {
 
     #[test]
     fn one_matching_site_yields_available() {
-        // Item 7: valid config, ≥1 matching site → Available
+        // Item 7: valid config, >=1 matching site -> Available
         let phase = phase_from_matching(&["site-a".to_owned()]);
-        assert_eq!(phase, ProviderPhase::Available, "one match → Available");
+        assert_eq!(phase, ProviderPhase::Available, "one match -> Available");
     }
 
     #[test]
     fn multiple_matching_sites_yields_available() {
-        // Item 7 (multi-site): all non-empty slices → Available
+        // Item 7 (multi-site): all non-empty slices -> Available
         let phase = phase_from_matching(&["site-a".to_owned(), "site-b".to_owned()]);
-        assert_eq!(phase, ProviderPhase::Available, "multiple matches → Available");
+        assert_eq!(phase, ProviderPhase::Available, "multiple matches -> Available");
     }
 
     #[test]
@@ -2227,7 +2227,7 @@ mod tests {
 
     #[test]
     fn http_2xx_boundary_is_inclusive_exclusive() {
-        // 200 → Healthy, 299 → Healthy, 300 → Degraded
+        // 200 -> Healthy, 299 -> Healthy, 300 -> Degraded
         assert_eq!(ProbeOutcome::from_http_status(200), ProbeOutcome::Healthy);
         assert_eq!(ProbeOutcome::from_http_status(299), ProbeOutcome::Healthy);
         assert_eq!(ProbeOutcome::from_http_status(300), ProbeOutcome::Degraded);
@@ -2373,7 +2373,7 @@ mod tests {
 
     #[test]
     fn no_matching_sites_returns_empty() {
-        // Item 9 (negative): label selector, no sites match → empty
+        // Item 9 (negative): label selector, no sites match -> empty
         let provider = test_provider_with_selector("prov", "net", &[("hw", "gpu")]);
         let sites = vec![test_site_with_labels("cpu-site", "net", &[("hw", "cpu")])];
         let matching = sites_matching_selector(&provider, &sites);
@@ -2384,13 +2384,13 @@ mod tests {
     fn multi_key_selector_requires_all_keys_to_match() {
         // Item 9 (AND semantics): all selector keys must match
         let provider = test_provider_with_selector("prov", "net", &[("hw", "gpu"), ("region", "us-east")]);
-        // Site with both keys → matches
+        // Site with both keys -> matches
         let both = test_site_with_labels(
             "full-match",
             "net",
             &[("hw", "gpu"), ("region", "us-east"), ("extra", "ignored")],
         );
-        // Site with only one key → no match
+        // Site with only one key -> no match
         let partial = test_site_with_labels("partial", "net", &[("hw", "gpu")]);
         let sites = vec![both, partial];
         let matching = sites_matching_selector(&provider, &sites);
@@ -2416,7 +2416,7 @@ mod tests {
 
     #[test]
     fn selector_wrong_value_does_not_match() {
-        // Item 9 (value mismatch): key present but wrong value → no match
+        // Item 9 (value mismatch): key present but wrong value -> no match
         let provider = test_provider_with_selector("prov", "net", &[("hw", "gpu")]);
         let site = test_site_with_labels("site", "net", &[("hw", "cpu")]);
         let matching = sites_matching_selector(&provider, &[site]);
@@ -2425,7 +2425,7 @@ mod tests {
 
     #[test]
     fn selector_missing_key_does_not_match() {
-        // Item 9 (missing key): site has no matching key → no match
+        // Item 9 (missing key): site has no matching key -> no match
         let provider = test_provider_with_selector("prov", "net", &[("hw", "gpu")]);
         let site = test_site_with_labels("site", "net", &[("zone", "us-east")]);
         let matching = sites_matching_selector(&provider, &[site]);
@@ -3019,7 +3019,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "tests multiple TLS fields in one assertion block")]
     fn health_check_config_with_tls_and_client_cert_deserializes() {
         let spec: InferenceProviderSpec = serde_json::from_value(serde_json::json!({
             "gridNetworkRef": "net",
@@ -3182,7 +3181,7 @@ mod tests {
     async fn probe_https_tls_handshake_failure_yields_unavailable() {
         // A plain (non-TLS) TCP server immediately closes each accepted
         // connection.  hyper-rustls will attempt a TLS handshake, receive
-        // EOF, and return a transport error → Unavailable.
+        // EOF, and return a transport error -> Unavailable.
         // This proves HTTPS is now *attempted* (not short-circuited) and
         // that TLS errors map correctly to Unavailable.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3485,7 +3484,7 @@ mod tests {
         let http_url = start_test_server(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").await;
         let plain_outcome = probe_endpoint(test_uri(&http_url), Duration::from_secs(5), None, None).await;
 
-        // HTTPS probe against a non-TLS server → Unavailable (TLS error).
+        // HTTPS probe against a non-TLS server -> Unavailable (TLS error).
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap_or_else(|_| std::process::abort());
@@ -3543,8 +3542,8 @@ mod tests {
 
     #[test]
     fn no_health_check_config_means_not_probed() {
-        // probe_url_for_provider returns None → ProbeOutcome::NotProbed
-        // → phase_from_probe preserves site_phase unchanged.
+        // probe_url_for_provider returns None -> ProbeOutcome::NotProbed
+        // -> phase_from_probe preserves site_phase unchanged.
         let spec = make_spec("http://vllm:8000", None, None);
         assert!(
             probe_url_for_provider(&spec).is_none(),

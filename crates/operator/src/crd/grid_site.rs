@@ -321,9 +321,9 @@ impl SiteCapabilities {
 /// Lifecycle phase of a [`GridSite`].
 ///
 /// ```text
-/// Pending → Discovered → Connecting → Active
-///                                       ↓
-///                                  Unreachable → Left
+/// Pending -> Discovered -> Connecting -> Active
+///                                       v
+///                                  Unreachable -> Left
 /// ```
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub enum GridSitePhase {
@@ -607,7 +607,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "checks the complete generated GridSite schema")]
     fn grid_site_crd_bounds_identity_fields() {
         let crd = crd_json();
         let pins = crd

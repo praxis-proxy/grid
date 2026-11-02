@@ -230,7 +230,6 @@ mod tests {
 
     /// A stray valid leaf is a fork only inside this incarnation, within the skew, at both edges.
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one row per edge")]
     fn a_stray_leaf_forks_only_within_the_record_incarnation() {
         let epoch = OffsetDateTime::now_utc().saturating_sub(Duration::days(10));
         let record = Held {
@@ -286,7 +285,6 @@ mod tests {
     type Case<'held> = (&'static str, Option<&'held Held>, Renewal, Result<RenewAction, Refusal>);
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one row per decision")]
     fn decisions() {
         let record = held("k1", Some("k0"));
         let frozen = Held {
@@ -350,7 +348,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one assertion per seed outcome")]
     fn seeds() {
         let seed = |generation| SeedRecord {
             site_name: "hub".to_owned(),

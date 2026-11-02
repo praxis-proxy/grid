@@ -2,7 +2,7 @@
 # Delivered membership records end to end on kind: two clusters, Local membership, no
 # enrollment service anywhere.
 #
-# Each cluster is a site. Its operator's config carries a site name and nothing else, and its
+# Each cluster is a site. Its operator runs without an operator config, and its
 # members are the GridSites its own configuration declares, applied here the way an external
 # source of truth delivers them: the same records on every cluster, written by something
 # outside the grid. Open Cluster Management is the reference example; this leg applies the
@@ -264,7 +264,8 @@ for site in "${SITES[@]}"; do
   else
     pass "${site}: no grid-enrollment Deployment in the cluster"
   fi
-  config=$(ns "${site}" get configmap grid-operator-config -o jsonpath='{.data.config\.yaml}')
+  # Without enrollment values the chart renders no operator config, which names no signer either.
+  config=$(ns "${site}" get configmap grid-operator-config --ignore-not-found -o jsonpath='{.data.config\.yaml}')
   grep -q signerEndpoint <<<"${config}" && fail "${site}: the operator config names a signer" \
     || pass "${site}: the operator config names no signer"
   if ns "${site}" get svc grid-operator-swim >/dev/null 2>&1; then

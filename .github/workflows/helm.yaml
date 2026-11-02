@@ -130,6 +130,12 @@ jobs:
           mapfile -t charts < <(find charts -mindepth 2 -maxdepth 2 -name tests -type d -printf '%h\n' | sort)
           helm unittest "${charts[@]}"
 
+      - name: Managed-cluster lifecycle templates
+        run: |
+          python3 -m venv /tmp/grid-policy-tests
+          /tmp/grid-policy-tests/bin/pip install 'PyYAML==6.0.3'
+          /tmp/grid-policy-tests/bin/python charts/grid-enrollment/tests/managed_clusters_test.py
+
       - name: Validate charts (static)
         env:
           RENDER_DIR: ${{ runner.temp }}/helm-rendered
@@ -162,7 +168,7 @@ jobs:
   # ----------------------------------------------------------------------------
   # Build each image once per commit; every kind job loads it from an artifact.
   # Artifacts work for fork PRs, which cannot push to a registry. Only main
-  # writes the layer cache, so a PR cannot seed layers that main reads.
+  # writes the image layer cache, so a PR cannot seed caches main reads.
   # ----------------------------------------------------------------------------
 
   images:
@@ -170,6 +176,8 @@ jobs:
     if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      CARGO_PROFILE: dev
     permissions:
       contents: read
     strategy:
@@ -187,13 +195,103 @@ jobs:
           persist-credentials: false
 
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Temporarily disabled until the organization Actions allowlist permits:
+      # reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723
+      # Once allowed, uncomment the Cargo cache steps below.
+      # - name: Define Cargo cache keys
+      #   id: cargo-cache
+      #   env:
+      #     PLATFORM: ${{ runner.os }}-${{ runner.arch }}
+      #     IMAGE: ${{ matrix.name }}
+      #     SOURCE_REVISION: ${{ hashFiles(matrix.file, 'rust-toolchain.toml', '.cargo/config.toml', 'Cargo.toml', 'Cargo.lock', 'crates/**/Cargo.toml', 'crates/**/Cargo.lock') }}
+      #     TOOLCHAIN: ${{ hashFiles(matrix.file, 'rust-toolchain.toml', '.cargo/config.toml', 'Cargo.toml', 'crates/gateway/Cargo.toml') }}
+      #     LOCKFILES: ${{ hashFiles('Cargo.lock', 'crates/gateway/Cargo.lock') }}
+      #   run: |
+      #     echo "sources=helm-cargo-sources-v1-${PLATFORM}-${LOCKFILES}" >> "${GITHUB_OUTPUT}"
+      #     echo "source-revision=${SOURCE_REVISION}" >> "${GITHUB_OUTPUT}"
+      #     echo "target=helm-cargo-target-v1-${PLATFORM}-${IMAGE}-${CARGO_PROFILE}-${TOOLCHAIN}" >> "${GITHUB_OUTPUT}"
+      #     echo "locked-target=helm-cargo-target-v1-${PLATFORM}-${IMAGE}-${CARGO_PROFILE}-${TOOLCHAIN}-${LOCKFILES}" >> "${GITHUB_OUTPUT}"
+      #
+      # # Each image writes a distinct key; fallback shares downloads across images.
+      # # Register saves before cache-dance so its post step extracts mounts first.
+      # - name: Cache Cargo downloads (main)
+      #   if: github.ref == 'refs/heads/main'
+      #   id: cargo-sources
+      #   uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      #   with:
+      #     path: ${{ runner.temp }}/cargo-sources
+      #     key: ${{ steps.cargo-cache.outputs.sources }}-${{ steps.cargo-cache.outputs.source-revision }}-${{ matrix.name }}
+      #     restore-keys: |
+      #       ${{ steps.cargo-cache.outputs.sources }}-
+      #
+      # - name: Restore Cargo downloads (PRs and merge queue)
+      #   if: github.ref != 'refs/heads/main'
+      #   uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      #   with:
+      #     path: ${{ runner.temp }}/cargo-sources
+      #     key: ${{ steps.cargo-cache.outputs.sources }}-${{ steps.cargo-cache.outputs.source-revision }}-${{ matrix.name }}
+      #     restore-keys: |
+      #       ${{ steps.cargo-cache.outputs.sources }}-
+      #
+      # # Target artifacts must match the image's Alpine toolchain and workspace.
+      # # A new key per commit lets immutable GHA caches retain source build updates.
+      # - name: Cache Cargo target (main)
+      #   if: github.ref == 'refs/heads/main'
+      #   id: cargo-target
+      #   uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      #   with:
+      #     path: ${{ runner.temp }}/cargo-target
+      #     key: ${{ steps.cargo-cache.outputs.locked-target }}-${{ github.sha }}
+      #     restore-keys: |
+      #       ${{ steps.cargo-cache.outputs.locked-target }}-
+      #       ${{ steps.cargo-cache.outputs.target }}-
+      #
+      # - name: Restore Cargo target (PRs and merge queue)
+      #   if: github.ref != 'refs/heads/main'
+      #   uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      #   with:
+      #     path: ${{ runner.temp }}/cargo-target
+      #     key: ${{ steps.cargo-cache.outputs.locked-target }}-${{ github.sha }}
+      #     restore-keys: |
+      #       ${{ steps.cargo-cache.outputs.locked-target }}-
+      #       ${{ steps.cargo-cache.outputs.target }}-
+      #
+      # # The GHA layer exporter omits RUN cache mounts; persist them separately.
+      # # Keep cache data and scratch files outside the whole-tree build context.
+      # - name: Inject Cargo downloads into BuildKit
+      #   uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
+      #   with:
+      #     builder: ${{ steps.buildx.outputs.name }}
+      #     cache-map: |
+      #       {
+      #         "${{ runner.temp }}/cargo-sources/registry": "/usr/local/cargo/registry",
+      #         "${{ runner.temp }}/cargo-sources/git": "/usr/local/cargo/git"
+      #       }
+      #     scratch-dir: ${{ runner.temp }}/cargo-sources-dance
+      #     skip-extraction: ${{ github.ref != 'refs/heads/main' || steps.cargo-sources.outputs.cache-hit == 'true' }}
+      #
+      # - name: Inject Cargo target into BuildKit
+      #   uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
+      #   with:
+      #     builder: ${{ steps.buildx.outputs.name }}
+      #     cache-map: |
+      #       {
+      #         "${{ runner.temp }}/cargo-target": "${{ matrix.name == 'gateway' && '/src/crates/gateway/target' || '/src/target' }}"
+      #       }
+      #     scratch-dir: ${{ runner.temp }}/cargo-target-dance
+      #     skip-extraction: ${{ github.ref != 'refs/heads/main' || steps.cargo-target.outputs.cache-hit == 'true' }}
+      #
 
       - name: Build ${{ matrix.name }} image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ${{ matrix.file }}
+          build-args: |
+            CARGO_PROFILE=${{ env.CARGO_PROFILE }}
           push: false
           tags: ghcr.io/praxis-proxy/grid-${{ matrix.name }}:ci
           outputs: type=docker,dest=/tmp/grid-${{ matrix.name }}.tar
@@ -296,6 +394,9 @@ jobs:
       - name: Run Kind lifecycle tests
         run: |
           KIND=1 GRID_IMAGE_TAG=ci ./scripts/verify-helm-chart.sh
+
+      - name: Verify cert-manager enrollment and CA retention
+        run: bash charts/grid-enrollment/tests/cert-manager-e2e.sh
 
       - name: Upload test logs
         if: always()
@@ -650,6 +751,14 @@ jobs:
             leg: pin, HA faults
           - peer-trust-mode: local
             leg: Local membership, no SWIM seed
+          - peer-trust-mode: pin
+            signed-state: enforce
+            leg: pin, signed state
+          - peer-trust-mode: pin
+            hub-router: operator
+            signed-state: enforce
+            model-gossip: true
+            leg: pin, signed model gossip routing
     timeout-minutes: 60
     permissions:
       contents: read
@@ -712,6 +821,8 @@ jobs:
           MODES: ${{ matrix.peer-trust-mode }}
           HUB_ROUTER: ${{ matrix.hub-router || 'render' }}
           HA: ${{ matrix.ha || '0' }}
+          SIGNED_STATE: ${{ matrix.signed-state || 'off' }}
+          MODEL_GOSSIP_TEST: ${{ matrix.model-gossip && '1' || '0' }}
           GRID_FEEDBACK_CONTRACT_TEST: ${{ matrix.peer-trust-mode == 'pin' && '1' || '0' }}
           # The spiffe leg rotates 8 minute identities; pin trust does not rotate.
           ROTATION_LIFETIME: "480"
@@ -725,7 +836,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: hub-site-e2e-logs-${{ matrix.peer-trust-mode }}${{ matrix.hub-router && format('-{0}', matrix.hub-router) || '' }}${{ matrix.ha && '-ha' || '' }}
+          name: hub-site-e2e-logs-${{ matrix.peer-trust-mode }}${{ matrix.hub-router && format('-{0}', matrix.hub-router) || '' }}${{ matrix.ha && '-ha' || '' }}-${{ matrix.signed-state || 'off' }}
           path: /tmp/grid-hub-site-e2e/
           if-no-files-found: ignore
           retention-days: 5

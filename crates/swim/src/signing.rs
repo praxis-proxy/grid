@@ -5,13 +5,31 @@
 //! verification) and this module only performs the cryptographic operation.
 //! Sourcing and pinning key material against a [`GridSite`] identity is an
 //! operator-level concern tracked separately.
+//! FIPS builds use OpenSSL; other builds use `ring`.
 //!
 //! [`GridSite`]: https://github.com/praxis-proxy/grid/issues/75
 
+#[cfg(feature = "fips")]
+use openssl::{
+    bn::BigNumContext,
+    ec::{EcGroup, EcKey, EcPoint, PointConversionForm},
+    hash::MessageDigest,
+    nid::Nid,
+    pkey::PKey,
+    sign::{Signer, Verifier},
+};
+#[cfg(feature = "ring-signing")]
 use ring::{
     rand::SystemRandom,
-    signature::{ECDSA_P256_SHA256_ASN1, ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, UnparsedPublicKey},
+    signature::{
+        ECDSA_P256_SHA256_ASN1, ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair as _, UnparsedPublicKey,
+    },
 };
+
+#[cfg(all(feature = "fips", feature = "ring-signing"))]
+compile_error!("features `fips` and `ring-signing` are mutually exclusive");
+#[cfg(not(any(feature = "fips", feature = "ring-signing")))]
+compile_error!("one of `fips` or `ring-signing` must be enabled");
 
 /// Errors produced while signing a payload.
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +51,35 @@ pub enum VerificationError {
     Invalid,
 }
 
+/// Derive the raw uncompressed P-256 public key from PKCS8 DER.
+///
+/// # Errors
+///
+/// Returns [`SigningError::InvalidKey`] when `pkcs8_der` is not a valid
+/// ECDSA P-256 key.
+pub fn public_key_ecdsa_p256(pkcs8_der: &[u8]) -> Result<Vec<u8>, SigningError> {
+    #[cfg(feature = "fips")]
+    {
+        let key = PKey::private_key_from_pkcs8(pkcs8_der).map_err(|_error| SigningError::InvalidKey)?;
+        let ec_key = key.ec_key().map_err(|_error| SigningError::InvalidKey)?;
+        if ec_key.group().curve_name() != Some(Nid::X9_62_PRIME256V1) {
+            return Err(SigningError::InvalidKey);
+        }
+        let mut context = BigNumContext::new().map_err(|_error| SigningError::InvalidKey)?;
+        ec_key
+            .public_key()
+            .to_bytes(ec_key.group(), PointConversionForm::UNCOMPRESSED, &mut context)
+            .map_err(|_error| SigningError::InvalidKey)
+    }
+    #[cfg(not(feature = "fips"))]
+    {
+        let rng = SystemRandom::new();
+        let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8_der, &rng)
+            .map_err(|_key_rejected| SigningError::InvalidKey)?;
+        Ok(key_pair.public_key().as_ref().to_vec())
+    }
+}
+
 /// Sign `payload` with an ECDSA P-256 key supplied as PKCS8 DER.
 ///
 /// Returns the signature in ASN.1 DER form (~70-72 bytes for P-256).
@@ -43,13 +90,27 @@ pub enum VerificationError {
 /// P-256 PKCS8 key, or [`SigningError::SigningFailed`] if the underlying RNG
 /// or signing operation fails.
 pub fn sign_ecdsa_p256(pkcs8_der: &[u8], payload: &[u8]) -> Result<Vec<u8>, SigningError> {
-    let rng = SystemRandom::new();
-    let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8_der, &rng)
-        .map_err(|_key_rejected| SigningError::InvalidKey)?;
-    let signature = key_pair
-        .sign(&rng, payload)
-        .map_err(|_signing_failed| SigningError::SigningFailed)?;
-    Ok(signature.as_ref().to_vec())
+    #[cfg(feature = "fips")]
+    {
+        let key = PKey::private_key_from_pkcs8(pkcs8_der).map_err(|_error| SigningError::InvalidKey)?;
+        let ec_key = key.ec_key().map_err(|_error| SigningError::InvalidKey)?;
+        if ec_key.group().curve_name() != Some(Nid::X9_62_PRIME256V1) {
+            return Err(SigningError::InvalidKey);
+        }
+        let mut signer = Signer::new(MessageDigest::sha256(), &key).map_err(|_error| SigningError::SigningFailed)?;
+        signer.update(payload).map_err(|_error| SigningError::SigningFailed)?;
+        signer.sign_to_vec().map_err(|_error| SigningError::SigningFailed)
+    }
+    #[cfg(not(feature = "fips"))]
+    {
+        let rng = SystemRandom::new();
+        let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8_der, &rng)
+            .map_err(|_key_rejected| SigningError::InvalidKey)?;
+        let signature = key_pair
+            .sign(&rng, payload)
+            .map_err(|_signing_failed| SigningError::SigningFailed)?;
+        Ok(signature.as_ref().to_vec())
+    }
 }
 
 /// Verify `signature` over `payload` under an ECDSA P-256 public key
@@ -61,10 +122,28 @@ pub fn sign_ecdsa_p256(pkcs8_der: &[u8], payload: &[u8]) -> Result<Vec<u8>, Sign
 /// Returns [`VerificationError::Invalid`] when the signature does not
 /// verify, including when `raw_pubkey` is malformed.
 pub fn verify_ecdsa_p256(raw_pubkey: &[u8], payload: &[u8], signature: &[u8]) -> Result<(), VerificationError> {
-    let verifier = UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, raw_pubkey);
-    verifier
-        .verify(payload, signature)
-        .map_err(|_unspecified| VerificationError::Invalid)
+    #[cfg(feature = "fips")]
+    {
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).map_err(|_error| VerificationError::Invalid)?;
+        let mut context = BigNumContext::new().map_err(|_error| VerificationError::Invalid)?;
+        let point =
+            EcPoint::from_bytes(&group, raw_pubkey, &mut context).map_err(|_error| VerificationError::Invalid)?;
+        let ec_key = EcKey::from_public_key(&group, &point).map_err(|_error| VerificationError::Invalid)?;
+        let key = PKey::from_ec_key(ec_key).map_err(|_error| VerificationError::Invalid)?;
+        let mut verifier = Verifier::new(MessageDigest::sha256(), &key).map_err(|_error| VerificationError::Invalid)?;
+        verifier.update(payload).map_err(|_error| VerificationError::Invalid)?;
+        match verifier.verify(signature) {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(_) => Err(VerificationError::Invalid),
+        }
+    }
+    #[cfg(not(feature = "fips"))]
+    {
+        let verifier = UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, raw_pubkey);
+        verifier
+            .verify(payload, signature)
+            .map_err(|_unspecified| VerificationError::Invalid)
+    }
 }
 
 #[cfg(test)]
@@ -97,6 +176,18 @@ mod tests {
         let signature = sign_ecdsa_p256(&pkcs8_der, payload).unwrap_or_else(|_| std::process::abort());
 
         verify_ecdsa_p256(&raw_pubkey, payload, &signature).unwrap_or_else(|_| std::process::abort());
+    }
+
+    #[test]
+    fn public_key_derivation_matches_the_certificate_key() {
+        let (pkcs8_der, raw_pubkey) = generate_key_and_raw_pubkey();
+
+        let derived = public_key_ecdsa_p256(&pkcs8_der).unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            derived, raw_pubkey,
+            "the signing backend derives the matching P-256 public point"
+        );
     }
 
     #[test]

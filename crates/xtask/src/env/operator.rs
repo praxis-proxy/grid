@@ -64,8 +64,8 @@ pub(crate) const TEST_PROVIDER_SSRF_BLOCKED: &str = "op-e2e-ssrf-blocked";
 pub(crate) const TEST_PROVIDER_DEGRADED: &str = "op-e2e-degraded";
 /// Name of the `InferenceProvider` with `api_provider` backend kind.
 ///
-/// Used to verify scoring-backed candidate ordering: `api_provider` (score ≈ 5.8) must
-/// appear after local providers (score ≈ 7.0) regardless of input order.
+/// Used to verify scoring-backed candidate ordering: `api_provider` (score ~ 5.8) must
+/// appear after local providers (score ~ 7.0) regardless of input order.
 pub(crate) const TEST_PROVIDER_API: &str = "op-e2e-api-fallback";
 
 /// Name of the `InferenceProvider` whose `healthCheck.tls.caSecretRef` points at a
@@ -194,9 +194,9 @@ pub(crate) const METRICS_BUSY_LOCAL_PORT: u16 = 18_502;
 ///
 /// The operator's `spec.metricsConfig.signalNames.queueDepth` is set to this name.
 const METRICS_QUEUE_SIGNAL_NAME: &str = "provider_queue_depth_normalized";
-/// Queue depth value served by the idle metrics endpoint Pod (low → high score).
+/// Queue depth value served by the idle metrics endpoint Pod (low -> high score).
 const METRICS_IDLE_QUEUE_DEPTH: &str = "0.1";
-/// Queue depth value served by the busy metrics endpoint Pod (high → low score).
+/// Queue depth value served by the busy metrics endpoint Pod (high -> low score).
 const METRICS_BUSY_QUEUE_DEPTH: &str = "0.9";
 
 // ---------------------------------------------------------------------------
@@ -525,7 +525,7 @@ pub(crate) const SITE_JOIN_PRIMARY_EGRESS: &str = "172.18.0.4:8443";
 ///
 /// 60 s covers two back-to-back reconcile windows plus the 5 s TCP probe timeout
 /// in the `GridSite` controller.  The assertion itself (e.g. `Connecting`) is not
-/// weakened; a longer window is required because the `Discovered → Connecting`
+/// weakened; a longer window is required because the `Discovered -> Connecting`
 /// transition depends on the `GridNetwork` controller applying the egress spec,
 /// which the `GridSite` controller then reconciles.  The primary anti-flakiness
 /// measure is the cleanup in [`cleanup_site_join_resources`], which removes stale
@@ -798,7 +798,7 @@ fn load_operator_image_podman(cluster_name: &str) -> Result<(), Box<dyn std::err
         .args(["tag", &operator_img, &qualified])
         .status()?;
     if !tag_status.success() {
-        return Err(format!("podman tag {operator_img} → {qualified} failed").into());
+        return Err(format!("podman tag {operator_img} -> {qualified} failed").into());
     }
     let archive = tempfile::NamedTempFile::new()?;
     let archive_path = archive.path().to_str().ok_or("temp path not UTF-8")?;
@@ -938,8 +938,8 @@ fn generate_crd_json() -> Result<String, Box<dyn std::error::Error>> {
 ///
 /// Creates:
 /// - `GridNetwork` `op-e2e-net` with one `consumerGateways` entry
-/// - `InferenceProvider` `op-e2e-healthy` — valid endpoint → reconciles to `Pending`
-/// - `InferenceProvider` `op-e2e-invalid` — blank endpoint → reconciles to `Unavailable`
+/// - `InferenceProvider` `op-e2e-healthy` -- valid endpoint -> reconciles to `Pending`
+/// - `InferenceProvider` `op-e2e-invalid` -- blank endpoint -> reconciles to `Unavailable`
 pub(crate) fn apply_test_fixtures(context: &str, provider_endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
     apply_test_fixtures_for_cluster(context, provider_endpoint, TEST_HEALTHY_ROUTING_CLUSTER, "model-x")
 }
@@ -1307,10 +1307,6 @@ pub(crate) fn spawn_operator(context: &str) -> Result<Child, Box<dyn std::error:
 /// `site_name` is the stable SWIM site identity.
 /// `seeds` is a comma-separated list of seed endpoints (empty = no seeds).
 #[expect(
-    clippy::too_many_lines,
-    reason = "kubeconfig export + process spawn + sleep: splitting obscures the startup contract"
-)]
-#[expect(
     clippy::too_many_arguments,
     reason = "each argument maps to a distinct operator env var; a wrapper struct would obscure the address model"
 )]
@@ -1619,7 +1615,7 @@ pub(crate) fn assert_probe_counter_increased(
         )
         .into());
     }
-    eprintln!("  [PASS] probe counter outcome={outcome:?}: {v_before} → {v_after}");
+    eprintln!("  [PASS] probe counter outcome={outcome:?}: {v_before} -> {v_after}");
     Ok(())
 }
 
@@ -1642,7 +1638,7 @@ pub(crate) fn assert_transition_counter_increased(
         )
         .into());
     }
-    eprintln!("  [PASS] transition counter to={to_phase:?} reason={reason:?}: {v_before} → {v_after}");
+    eprintln!("  [PASS] transition counter to={to_phase:?} reason={reason:?}: {v_before} -> {v_after}");
     Ok(())
 }
 
@@ -1697,7 +1693,6 @@ fn operator_log_files(site_name: &str) -> Result<(std::fs::File, std::fs::File),
     clippy::too_many_arguments,
     reason = "each argument maps to one operator env var; grouping would obscure the contract"
 )]
-#[expect(clippy::too_many_lines, reason = "env var setup for keyed SWIM operator spawn")]
 pub(crate) fn spawn_operator_with_swim_keyed(
     context: &str,
     bind_addr: &str,
@@ -1922,10 +1917,6 @@ pub(crate) fn wait_for_gridnetwork_active(
     clippy::disallowed_methods,
     reason = "synchronous poll loop in xtask harness; no async runtime available"
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "single observation loop keeps the negative proof easy to audit"
-)]
 pub(crate) fn assert_swim_peer_stays_isolated(
     context: &str,
     network: &str,
@@ -2006,10 +1997,6 @@ pub(crate) fn assert_swim_peer_stays_isolated(
 /// # Errors
 ///
 /// Returns an error if any SWIM side effect is observed during the window.
-#[expect(
-    clippy::too_many_lines,
-    reason = "single observation loop with three invariant checks; splitting would obscure the proof"
-)]
 #[expect(
     clippy::disallowed_methods,
     reason = "synchronous poll loop in xtask harness; no async runtime available"
@@ -2237,7 +2224,7 @@ pub(crate) fn bump_gridsite(context: &str, name: &str) -> Result<(), Box<dyn std
 /// Each SWIM-enabled operator publishes real `InferenceProvider`-derived state
 /// as a CRDT `GridStateSnapshot` on reconcile.  After SWIM gossip convergence
 /// the remote operator's broadcast arrives and `remoteProviderCount`
-/// becomes ≥ 1.
+/// becomes >= 1.
 ///
 /// Returns the observed count on success or `Err` on timeout.
 #[expect(
@@ -2589,10 +2576,6 @@ pub(crate) fn verify_overlay(
 /// Each expected tool must have the configured site and cluster and must be
 /// fresh. Unexpected tools, missing fields, null fields, and stale candidates
 /// are rejected.
-#[expect(
-    clippy::too_many_lines,
-    reason = "field validation and exact tuple comparison form one assertion path"
-)]
 pub(crate) fn verify_tool_provider_overlay(
     overlay: &serde_json::Value,
     expectation: &ToolOverlayExpectation<'_>,
@@ -2648,10 +2631,6 @@ pub(crate) fn verify_tool_provider_overlay(
 /// which in turn sets the provider's status phase to `Degraded`.
 ///
 /// Call `wait_for_error_endpoint_ready` before starting the port-forward.
-#[expect(
-    clippy::too_many_lines,
-    reason = "two JSON manifest builds + apply calls; splitting obscures the Pod/Service pair"
-)]
 pub(crate) fn apply_error_endpoint_fixture(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     let python_server = "import http.server,socketserver\nclass H(http.server.BaseHTTPRequestHandler):\n def do_GET(s):\n  s.send_response(503);s.end_headers()\n def log_message(s,*a):pass\nwith socketserver.TCPServer(('',8080),H) as srv:srv.serve_forever()";
     let pod = serde_json::to_string_pretty(&serde_json::json!({
@@ -2745,7 +2724,7 @@ pub(crate) fn start_error_endpoint_port_forward(context: &str) -> Result<Child, 
         .spawn()?;
     // Brief pause for the port-forward tunnel to establish.
     std::thread::sleep(Duration::from_secs(2));
-    eprintln!("  [OK] port-forward {local_port} → {ERROR_ENDPOINT_NAME}:{pod_port}");
+    eprintln!("  [OK] port-forward {local_port} -> {ERROR_ENDPOINT_NAME}:{pod_port}");
     Ok(child)
 }
 
@@ -2870,7 +2849,7 @@ pub(crate) fn start_named_pod_port_forward(
         .spawn()?;
     // Brief pause for the port-forward tunnel to establish.
     std::thread::sleep(Duration::from_secs(2));
-    eprintln!("  [OK] port-forward {local_port} → {name}:{cp}");
+    eprintln!("  [OK] port-forward {local_port} -> {name}:{cp}");
     Ok(child)
 }
 
@@ -2893,15 +2872,11 @@ pub(crate) fn apply_and_wait_for_metrics_pods(
 ///
 /// Both providers have `backendKind = "local"` so their baseline locality score is
 /// equal.  The operator scrapes their configured endpoints:
-/// - `idle_endpoint/metrics` → `{METRICS_QUEUE_SIGNAL_NAME} 0.1` (low queue → high score)
-/// - `busy_endpoint/metrics` → `{METRICS_QUEUE_SIGNAL_NAME} 0.9` (high queue → low score)
+/// - `idle_endpoint/metrics` -> `{METRICS_QUEUE_SIGNAL_NAME} 0.1` (low queue -> high score)
+/// - `busy_endpoint/metrics` -> `{METRICS_QUEUE_SIGNAL_NAME} 0.9` (high queue -> low score)
 ///
 /// After reconciliation, the overlay must order the idle provider before the busy
 /// provider.  Verified by [`verify_metrics_ordering`].
-#[expect(
-    clippy::too_many_lines,
-    reason = "two InferenceProvider JSON manifests with nested metricsConfig; cannot shorten without losing clarity"
-)]
 pub(crate) fn apply_metrics_provider_fixtures(
     context: &str,
     idle_endpoint: &str,
@@ -3000,7 +2975,6 @@ pub(crate) fn verify_metrics_ordering(
 /// `http://127.0.0.1:{west_port}`, the host-side port-forwards to the Python
 /// metrics pods.  The operator scrapes `{endpoint}/metrics` and uses the result in
 /// scoring.  This follows the same pattern as the single-provider metrics test.
-#[expect(clippy::too_many_lines, reason = "GridNetwork + 2 InferenceProvider JSON manifests")]
 pub(crate) fn apply_metrics_routing_fixtures(
     context: &str,
     east_site: &str,
@@ -3137,10 +3111,6 @@ pub(crate) fn cleanup_metrics_routing_resources(context: &str) -> Result<(), Box
 ///
 /// Returns `Ok(())` when ordering is correct; returns `Err` with a diagnostic
 /// message if any expected candidate is missing or the ordering is wrong.
-#[expect(
-    clippy::too_many_lines,
-    reason = "two candidate position lookups with diagnostic messages"
-)]
 pub(crate) fn verify_metrics_routing_overlay(
     overlay: &serde_json::Value,
     expected_first_site: &str,
@@ -3284,7 +3254,7 @@ pub(crate) fn apply_provider_with_health_check_tls_key_missing_fixture(
 /// Apply the `api_provider` `InferenceProvider` fixture.
 ///
 /// Uses `backendKind: "api_provider"` so the scoring engine assigns it a lower
-/// locality score (≈ 5.8) than local providers (≈ 7.0).  This fixture verifies
+/// locality score (~ 5.8) than local providers (~ 7.0).  This fixture verifies
 /// that scoring-backed ordering places `api_provider` candidates after local ones
 /// regardless of the order they were applied.
 pub(crate) fn apply_api_provider_fixture(context: &str, endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -3476,10 +3446,6 @@ fn network_fixture_with_consumer_config_json(
 ///
 /// Polls until the `ConfigMap` named `config_map_name` exists in `namespace`.
 /// Returns an error if the timeout expires before the `ConfigMap` appears.
-#[expect(
-    clippy::too_many_lines,
-    reason = "poll loop with kubectl args; mirrors wait_for_overlay_configmap structure"
-)]
 pub(crate) fn wait_for_consumer_configmap(
     context: &str,
     config_map_name: &str,
@@ -3568,10 +3534,6 @@ pub(crate) fn verify_operator_consumer_configmap(
 /// `secretRef:`, `file: .../{secret_name}/{secret_key}`, `endpoints:`.
 ///
 /// **Must be absent:** token value, `value:`, `filter: headers`, `request_set:`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "required-element loop + forbidden-element loop with an eprintln; hard to split without obscuring the invariants"
-)]
 pub(crate) fn verify_consumer_praxis_yaml(
     yaml: &str,
     api_token: &str,
@@ -3641,10 +3603,6 @@ pub(crate) fn read_gridnetwork_consumer_config_status(
 /// - Its `phase` is `"Rendered"`.
 /// - Its `configMapName` matches `expected_config_map`.
 /// - The status JSON does not contain the API token value (token-safety invariant).
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential validation steps: read → token-absent check → JSON parse → entry lookup → phase check → configmap check"
-)]
 pub(crate) fn verify_consumer_config_status_rendered(
     context: &str,
     network_name: &str,
@@ -3796,10 +3754,6 @@ pub(crate) fn verify_scoring_order(
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "multi-assertion overlay check: presence, freshness, and scoring order"
-)]
 /// Verify the API-provider fallback candidate is present in the overlay.
 ///
 /// Asserts that:
@@ -3876,10 +3830,6 @@ pub(crate) fn verify_api_fallback_overlay(
 /// backend categories in one overlay; they do not prove real Bedrock, Vertex,
 /// `OpenAI`, or Anthropic provider authentication.
 #[expect(clippy::too_many_arguments, reason = "one endpoint argument per backend kind")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "four JSON manifest builds (GridNetwork + 4 InferenceProviders) plus apply calls"
-)]
 pub(crate) fn apply_full_grid_fixtures(
     context: &str,
     east_site: &str,
@@ -4021,10 +3971,6 @@ pub(crate) fn cleanup_full_grid_resources(context: &str) -> Result<(), Box<dyn s
 /// - `model-cloud` candidate at cloud cluster identity (`fresh=true`)
 /// - `model-api` candidate at api cluster identity (`fresh=true`)
 /// - Scoring order respects locality: `local` > `remote` > `cloud_managed` > `api_provider`
-#[expect(
-    clippy::too_many_lines,
-    reason = "four candidate assertions plus scoring order check"
-)]
 pub(crate) fn verify_full_grid_overlay(
     overlay: &serde_json::Value,
     east_site: &str,
@@ -4067,7 +4013,7 @@ pub(crate) fn verify_full_grid_overlay(
         }
     }
 
-    // Verify scoring order: local (east) ≻ remote (west) ≻ cloud ≻ api_provider.
+    // Verify scoring order: local (east) > remote (west) > cloud > api_provider.
     // Each model is unique, so positions are determined by scoring, not routing ties.
     let pos = |model: &str, site: &str| -> Option<usize> {
         candidates
@@ -4128,10 +4074,6 @@ pub(crate) fn export_overlay_to_file(
 ///   `default` namespace, with `siteName` set to `primary_site_name`.
 /// - `InferenceProvider` [`SWIM_OVERLAY_PROVIDER`] belonging to [`SWIM_OVERLAY_NETWORK`] serving
 ///   [`SWIM_OVERLAY_MODEL`].
-#[expect(
-    clippy::too_many_lines,
-    reason = "two JSON manifest builds (GridNetwork + InferenceProvider) plus apply calls; splitting would obscure the fixture pair"
-)]
 pub(crate) fn apply_swim_overlay_test_fixtures(
     context: &str,
     primary_site_name: &str,
@@ -4209,7 +4151,7 @@ impl Drop for TlsFixtureGuard {
 /// Compute the canonical DER SHA-256 fingerprint from a PEM certificate string.
 ///
 /// Returns a 64-character lowercase hex string: `hex(sha256(der_bytes))`.
-/// Uses the `pem` crate for PEM→DER conversion (no `openssl` subprocess).
+/// Uses the `pem` crate for PEM->DER conversion (no `openssl` subprocess).
 pub(crate) fn pem_fingerprint(cert_pem: &str) -> Result<String, Box<dyn std::error::Error>> {
     use sha2::{Digest as _, Sha256};
     let parsed = pem::parse(cert_pem.trim())?;
@@ -4223,7 +4165,6 @@ pub(crate) fn pem_fingerprint(cert_pem: &str) -> Result<String, Box<dyn std::err
 /// generic --dry-run=client -o yaml | kubectl apply -f -`.
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "one kubectl call assembling CA + cert + key files into a Secret; splitting adds indirection"
 )]
 pub(crate) fn create_tls_secret_from_pem(
@@ -4317,7 +4258,6 @@ pub(crate) fn patch_gridnetwork_tls_refs(
 /// `canonicalFingerprints`, then seeds status to `Connecting/HarnessPreparation`.
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "two sequential kubectl calls (spec + status patch) with distinct error paths"
 )]
 pub(crate) fn apply_tls_verified_gridsite_for_eligibility(
@@ -4413,10 +4353,6 @@ pub(crate) fn apply_tls_verified_gridsite_for_eligibility(
 ///
 /// Returns a [`TlsFixtureGuard`] that kills the probe server on drop.
 /// After calling this function, wait for `Active` (`TlsVerified`).
-#[expect(
-    clippy::too_many_lines,
-    reason = "linear setup sequence: cert gen → secrets → network patch → server spawn → site patch"
-)]
 pub(crate) fn setup_tls_verified_gridsite(
     context: &str,
     site_k8s_name: &str,
@@ -4505,10 +4441,6 @@ pub(crate) fn spawn_tls_probe_server(
 ///
 /// Reads stderr until the `tls-probe-server=listening port=NNNN` line appears,
 /// then returns the listen address (e.g. `"127.0.0.1:NNNN"`).
-#[expect(
-    clippy::too_many_lines,
-    reason = "channel-based non-blocking read with deadline + child exit detection"
-)]
 pub(crate) fn wait_for_tls_server_ready(child: &mut Child) -> Result<String, Box<dyn std::error::Error>> {
     use std::io::BufRead as _;
 
@@ -4634,10 +4566,6 @@ pub(crate) fn restart_tls_probe_server(
 }
 
 /// Apply the `GridNetwork` and `InferenceProvider` fixtures for the rotation test.
-#[expect(
-    clippy::too_many_lines,
-    reason = "two JSON manifest builds (GridNetwork + InferenceProvider) plus apply calls"
-)]
 pub(crate) fn apply_rotation_test_fixtures(context: &str, site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
         "apiVersion": "grid.praxis.fast/v1alpha1",
@@ -4731,10 +4659,6 @@ pub(crate) fn cleanup_rotation_test_resources(context: &str) -> Result<(), Box<d
 }
 
 /// Apply the `GridNetwork` and `InferenceProvider` fixtures for the convergence test.
-#[expect(
-    clippy::too_many_lines,
-    reason = "two JSON manifest builds (GridNetwork + InferenceProvider) plus apply calls"
-)]
 pub(crate) fn apply_convergence_test_fixtures(
     context: &str,
     site_name: &str,
@@ -4842,15 +4766,11 @@ pub(crate) fn assert_no_crdt_candidates_for_site(
 /// "grid-site-controller"` and `action == "GatewayProbe"`, sorts by
 /// `eventTime`, then asserts:
 ///
-/// - Each event note is bounded (≤ 1024 bytes).
+/// - Each event note is bounded (<= 1024 bytes).
 /// - Event `type` matches the reason classification (Normal for
 ///   `TlsVerified`/`AwaitingDiscovery`/`GatewayAddressKnown`/`Left`, Warning otherwise).
 /// - No consecutive duplicate reasons after time-sort.
 /// - Every `expected_reasons` entry appears at least once.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential event fetch, filter, sort, and validate"
-)]
 pub(crate) fn validate_gridsite_events(
     context: &str,
     site_name: &str,
@@ -4986,10 +4906,6 @@ pub(crate) fn apply_swim_encrypt_test_fixtures(
 }
 
 /// Apply SWIM encryption fixtures with optional CRD seed and `SecretRef` config.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential GridNetwork + InferenceProvider JSON construction and apply"
-)]
 pub(crate) fn apply_swim_encrypt_test_fixtures_with_options(
     context: &str,
     site_a_name: &str,
@@ -5222,7 +5138,7 @@ pub(crate) fn verify_overlay_has_site_candidate(
     }
     eprintln!(
         "  [PASS] routing eligibility: overlay contains candidate with site={expected_site:?} \
-         (GridSite Active → eligible)"
+         (GridSite Active -> eligible)"
     );
     Ok(())
 }
@@ -5297,10 +5213,6 @@ pub(crate) fn wait_for_no_site_candidate_in_overlay(
 /// overlay `ConfigMap`.  The `InferenceProvider` has no `siteSelector` or `clusterName`,
 /// so each operator publishes it as CRDT with its own `site_id`.  The leaf node C's CRDT
 /// contribution (`site_id = site_c_name`) is the primary proof target.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential GridNetwork + InferenceProvider JSON construction and apply"
-)]
 pub(crate) fn apply_swim_mesh_test_fixtures(
     context: &str,
     site_a_name: &str,
@@ -5354,10 +5266,6 @@ pub(crate) fn apply_swim_mesh_test_fixtures(
 ///
 /// The fixtures use [`SWIM_MESH_WRONG_NETWORK`] as the network name.  Resources in
 /// this network must never appear in the overlay rendered for [`SWIM_MESH_NETWORK`].
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential wrong-network GridNetwork + InferenceProvider JSON construction and apply"
-)]
 pub(crate) fn apply_swim_mesh_wrong_network_fixtures(context: &str) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
         "apiVersion": "grid.praxis.fast/v1alpha1",
@@ -5463,7 +5371,6 @@ pub(crate) fn cleanup_swim_mesh_test_resources(context: &str) -> Result<(), Box<
 /// The `GridNetwork` is configured with `siteName = site_a_name` so that
 /// node A's operator renders the overlay.  `spec.tls` references are set so that
 /// node B's operator generates a site certificate and broadcasts it via SWIM.
-#[expect(clippy::too_many_lines, reason = "sequential JSON fixture construction")]
 pub(crate) fn apply_swim_trust_test_fixtures(
     context: &str,
     site_a_name: &str,
@@ -5754,10 +5661,6 @@ pub(crate) fn wait_for_gridsite_reason(
 /// The `clusterName` must match the east provider gateway's site name so
 /// that `candidates_yaml` maps the candidate to `gateway-{east_site_name}` in
 /// the consumer `load_balancer`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "two JSON manifest builds (GridNetwork + InferenceProvider) plus apply calls"
-)]
 pub(crate) fn apply_swim_routing_east_fixtures(
     context: &str,
     east_site_name: &str,
@@ -5816,16 +5719,12 @@ pub(crate) fn apply_swim_routing_east_fixtures(
 /// Apply the west-side fixtures for the cross-cluster SWIM routing validation.
 ///
 /// Creates on the west cluster:
-/// - [`SWIM_ROUTING_NETWORK`] `GridNetwork` without a `consumerGateways` entry — the peer operator reconciles this to
+/// - [`SWIM_ROUTING_NETWORK`] `GridNetwork` without a `consumerGateways` entry -- the peer operator reconciles this to
 ///   publish its CRDT state but does not write an overlay `ConfigMap` (only the east primary generates the overlay).
 /// - [`SWIM_ROUTING_WEST_PROVIDER`] `InferenceProvider` serving `west_model` with `clusterName = west_site_name`.
 ///
 /// After SWIM gossip, the primary (east) operator reads the peer's CRDT state
 /// and adds a remote candidate for `west_model` to the east overlay.
-#[expect(
-    clippy::too_many_lines,
-    reason = "two JSON manifest builds (GridNetwork + InferenceProvider) plus apply calls"
-)]
 pub(crate) fn apply_swim_routing_west_fixtures(
     context: &str,
     west_site_name: &str,
@@ -6469,10 +6368,6 @@ pub(crate) fn wait_for_gridsite_phase(
 /// provide the network identity and data-plane endpoint needed for routing.
 /// The `status.phase` value is reported but not asserted here; call
 /// [`wait_for_gridsite_phase`] separately to assert the lifecycle state.
-#[expect(
-    clippy::too_many_lines,
-    reason = "jsonpath field split + two field assertions + diagnostic messages"
-)]
 pub(crate) fn verify_gridsite_routing_data(
     context: &str,
     site_name: &str,
@@ -6634,10 +6529,6 @@ pub(crate) fn apply_site_join_wrong_provider(context: &str) -> Result<(), Box<dy
 ///
 /// Returns `Ok(())` when all three assertions pass.
 #[expect(
-    clippy::too_many_lines,
-    reason = "three candidate assertions with diagnostic messages"
-)]
-#[expect(
     clippy::too_many_arguments,
     reason = "six distinct check parameters: primary/joining/wrong each need site and model"
 )]
@@ -6767,10 +6658,6 @@ pub(crate) fn auto_discovered_gridsite_name(network_name: &str, site_id: &str) -
 ///
 /// Used by the auto-discovery validation to confirm that the primary operator created a
 /// `GridSite` for a remote SWIM Alive member without any harness-assisted `kubectl apply`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "polling loop with per-iteration kubectl + deadline + sleep"
-)]
 pub(crate) fn wait_for_auto_gridsite(
     context: &str,
     site_name: &str,
@@ -6823,13 +6710,9 @@ pub(crate) fn wait_for_auto_gridsite(
 /// before calling this to ensure the operator has had time to advance the phase.
 ///
 /// For auto-discovered sites with a non-empty advertised gateway address, the `GridSite`
-/// controller advances the phase from `Discovered` → `Connecting` automatically,
+/// controller advances the phase from `Discovered` -> `Connecting` automatically,
 /// so `expected_phase` should be `"Connecting"` in E2E tests that wait long enough
 /// for the second reconcile.
-#[expect(
-    clippy::too_many_lines,
-    reason = "kubectl fetch + three field validations + diagnostic messages"
-)]
 pub(crate) fn verify_auto_gridsite_fields(
     context: &str,
     site_name: &str,
@@ -6894,10 +6777,6 @@ pub(crate) fn verify_auto_gridsite_fields(
 /// Hard-fails if the egress address equals the SWIM UDP address, since that would indicate
 /// the gateway address was not propagated through the SWIM state broadcast and the site
 /// received the SWIM endpoint instead of the data-plane gateway address.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential kubectl fetch + three defensive checks + diagnostic eprintln; splitting would obscure the invariant"
-)]
 pub(crate) fn verify_auto_gridsite_egress(
     context: &str,
     site_name: &str,
@@ -6933,7 +6812,7 @@ pub(crate) fn verify_auto_gridsite_egress(
     if actual == swim_udp_addr {
         return Err(format!(
             "GridSite {site_name:?}: spec.gatewayEndpoint.address={actual:?} equals the SWIM UDP address; \
-             expected gateway address {expected_gateway_addr:?} — \
+             expected gateway address {expected_gateway_addr:?} -- \
              the data-plane gateway address was not propagated through SWIM"
         )
         .into());
@@ -7134,7 +7013,6 @@ pub(crate) fn patch_gridsite_identity_trust(
 /// Creates `GridNetwork` [`FAILOVER_NETWORK`] with a `consumerGateways` entry pointing at
 /// [`FAILOVER_GW`] (the overlay is generated on the east/primary cluster) and
 /// `InferenceProvider` [`FAILOVER_EAST_PROVIDER`] with `backendKind: "local"`.
-#[expect(clippy::too_many_lines, reason = "two JSON manifests with full K8s structure")]
 pub(crate) fn apply_failover_east_fixtures(
     context: &str,
     east_site: &str,
@@ -7237,10 +7115,6 @@ pub(crate) fn wait_for_remote_candidate_stale(
 /// # Errors
 ///
 /// Returns an error when `timeout` elapses without `fresh=true` for the candidate.
-#[expect(
-    clippy::too_many_lines,
-    reason = "polling loop with periodic bump + overlay read + deadline check; splitting would hide the recovery protocol"
-)]
 pub(crate) fn wait_for_remote_candidate_fresh(
     context: &str,
     network: &str,
@@ -7293,7 +7167,6 @@ pub(crate) fn wait_for_remote_candidate_fresh(
 ///
 /// When `expect_remote_stale = true`, uses [`verify_degraded_candidate`] to assert `fresh=false`.
 /// When `expect_remote_stale = false`, asserts the remote candidate is present with `fresh=true`.
-#[expect(clippy::too_many_lines, reason = "two candidate assertions with diagnostic messages")]
 #[expect(
     clippy::too_many_arguments,
     reason = "local and remote each need cluster + model + stale flag: 8 params total"
@@ -7386,7 +7259,6 @@ pub(crate) fn apply_failover_shared_east_provider(
 /// The west CRDT provider publishes both [`FAILOVER_REMOTE_MODEL`] and
 /// [`FAILOVER_SHARED_MODEL`], allowing the east overlay to contain a remote stale
 /// candidate for the shared model after west is lost.
-#[expect(clippy::too_many_lines, reason = "two JSON manifests with full K8s structure")]
 pub(crate) fn apply_failover_west_fixtures_with_shared(
     context: &str,
     west_site: &str,
@@ -7439,10 +7311,6 @@ pub(crate) fn apply_failover_west_fixtures_with_shared(
 /// Attribution is overlay-based: the same mock backend echoes the model name in both cases,
 /// so response body cannot distinguish east from west.  The shared-model ordering proof
 /// (east first among candidates for that model) is the stated evidence for routing preference.
-#[expect(
-    clippy::too_many_lines,
-    reason = "two candidate position lookups with diagnostic messages"
-)]
 #[expect(
     clippy::too_many_arguments,
     reason = "six distinct check parameters: context, network, gw, two clusters, stale flag"
@@ -7517,7 +7385,7 @@ pub(crate) fn verify_shared_model_overlay_ordering(
     };
     eprintln!(
         "  [PASS] shared model {FAILOVER_SHARED_MODEL:?}: east ({east_cluster:?}) \
-         pos={east_pos} fresh=true → west ({west_cluster:?}) pos={west_pos} {stale_tag}"
+         pos={east_pos} fresh=true -> west ({west_cluster:?}) pos={west_pos} {stale_tag}"
     );
     Ok(())
 }
@@ -7553,7 +7421,6 @@ pub(crate) fn cleanup_failover_west_resources(context: &str) -> Result<(), Box<d
 ///
 /// Creates [`STALE_GC_NETWORK`] with `spec.staleCandidateTtlSeconds = ttl_secs`
 /// and [`STALE_GC_EAST_PROVIDER`] (local, `backendKind=local`).
-#[expect(clippy::too_many_lines, reason = "two JSON manifests with full K8s structure")]
 pub(crate) fn apply_stale_gc_east_fixtures(
     context: &str,
     east_site: &str,
@@ -7607,7 +7474,6 @@ pub(crate) fn apply_stale_gc_east_fixtures(
 ///
 /// Creates [`STALE_GC_NETWORK`] on the west cluster and
 /// [`STALE_GC_WEST_PROVIDER`] (remote, `backendKind=remote`).
-#[expect(clippy::too_many_lines, reason = "two JSON manifests with full K8s structure")]
 pub(crate) fn apply_stale_gc_west_fixtures(context: &str, west_site: &str) -> Result<(), Box<dyn std::error::Error>> {
     let network = serde_json::to_string_pretty(&serde_json::json!({
         "apiVersion": "grid.praxis.fast/v1alpha1",
@@ -7664,10 +7530,6 @@ pub(crate) fn apply_stale_gc_west_fixtures(context: &str, west_site: &str) -> Re
 /// reconcile fires after each age-tick window.
 ///
 /// `GridNetwork`: the `operator` crate's `GridNetwork` CRD type
-#[expect(
-    clippy::too_many_lines,
-    reason = "periodic bump + overlay read + deadline check; splitting would obscure the GC polling protocol"
-)]
 pub(crate) fn wait_for_remote_candidate_absent(
     context: &str,
     network: &str,
@@ -7751,7 +7613,7 @@ pub(crate) fn cleanup_stale_gc_west_resources(context: &str) -> Result<(), Box<d
 /// [`api_credential_plan_from_overlay`] (production path).
 #[derive(Debug, PartialEq)]
 pub(crate) enum ApiCredentialPlan {
-    /// `auth.credentialsManagedExternally = true` — the user manages credentials; the harness does not inject.
+    /// `auth.credentialsManagedExternally = true` -- the user manages credentials; the harness does not inject.
     ///
     /// Constructed by `parse_api_credential_plan` (test-only); kept as a
     /// valid arm in [`resolve_api_credential`] for defensive completeness.
@@ -7796,10 +7658,6 @@ pub(crate) enum ApiCredentialPlan {
 /// | `false` | `bearer_token` | absent | `Err("missing secretRef")` |
 /// | `false` | other | any | `Err("unsupported strategy ...")` |
 #[cfg(test)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "match table with diagnostic messages for each auth variant"
-)]
 pub(crate) fn parse_api_credential_plan(
     auth_json: &serde_json::Value,
 ) -> Result<ApiCredentialPlan, Box<dyn std::error::Error>> {
@@ -7898,7 +7756,6 @@ pub(crate) fn create_api_credential_secret(
 ///
 /// The decoded token value is returned but **never logged**; callers
 /// must not print the return value.
-#[expect(clippy::too_many_lines, reason = "kubectl fetch + JSON parse + base64 decode chain")]
 pub(crate) fn read_api_credential(
     context: &str,
     secret_name: &str,
@@ -8181,7 +8038,7 @@ mod tests {
 
     #[test]
     fn verify_degraded_candidate_accepts_when_shared_site_has_fresh_false() {
-        // Two candidates at the same site — healthy (fresh=true) and degraded (fresh=false).
+        // Two candidates at the same site -- healthy (fresh=true) and degraded (fresh=false).
         // Two providers sharing clusterName="site-a" produces two candidates at the same
         // site: one healthy (fresh=true) and one degraded (fresh=false).  The degraded check must find the fresh=false
         // one.
@@ -8274,10 +8131,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "table of malformed candidate fixtures covers every routed field"
-    )]
     fn verify_tool_provider_overlay_rejects_wrong_candidate_fields() {
         let tools = ["read_file"];
         let expectation = ToolOverlayExpectation {
@@ -8818,7 +8671,7 @@ mod tests {
 
     #[test]
     fn verify_multi_provider_overlay_empty_site_list_always_passes() {
-        // Degenerate case: no sites expected → validation trivially passes.
+        // Degenerate case: no sites expected -> validation trivially passes.
         let overlay = make_overlay_with_sites(&[("site-east", true)]);
         assert!(
             verify_multi_provider_overlay(&overlay, &[]).is_ok(),
@@ -9222,11 +9075,7 @@ mod tests {
     /// Build a minimal but structurally valid operator-generated consumer Praxis YAML.
     ///
     /// Matches the complete config shape produced by `generate_consumer_praxis_config`:
-    /// `listeners:` → `filter_chains:` → `admin:` → `shutdown_timeout_secs`.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "multi-line YAML template; each line is a required field"
-    )]
+    /// `listeners:` -> `filter_chains:` -> `admin:` -> `shutdown_timeout_secs`.
     fn sample_consumer_yaml(secret_name: &str, secret_key: &str) -> String {
         format!(
             "listeners:\n\
@@ -9379,10 +9228,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "six assertions across two endpoint entries; splitting would lose the single-test readability"
-    )]
     fn consumer_cluster_endpoints_use_provider_cluster_for_mtls_sni() {
         let endpoints = build_consumer_cluster_endpoints(
             Some("172.18.0.2:30443"),

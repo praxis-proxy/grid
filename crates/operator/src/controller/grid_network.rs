@@ -28,7 +28,7 @@ use kube::{
 use serde_json::{Value, json};
 use tokio::{
     sync::Mutex,
-    time::{Duration, timeout},
+    time::{Duration, timeout, timeout_at},
 };
 use tracing::info;
 
@@ -37,19 +37,19 @@ use crate::{
         agent_tool_provider::AgentToolProvider,
         grid_network::{
             ClusterEndpointConfig, ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork,
-            GridNetworkPhase, GridNetworkStatus, MountReconciliation, MountReconciliationPhase,
-            MountReconciliationStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode, SiteRouter,
-            TenantBudgetStatus, TransportMode,
+            GridNetworkPhase, GridNetworkStatus, MembershipMode, MountReconciliation, MountReconciliationPhase,
+            MountReconciliationStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode, SignedStateMode,
+            SiteRouter, TenantBudgetStatus, TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
-        inference_provider::{Condition, InferenceProvider, InferenceProviderStatus},
+        inference_provider::{Condition, ConditionStatus, InferenceProvider, InferenceProviderStatus},
     },
     error::OperatorError,
     readiness,
     resources::{
         consumer_config::{self, ConsumerConfigError, SiteRoutePrerequisite},
-        derived_topology, gateway_mounts, overlay_envelope, provider_admission, provider_metrics, routing_overlay,
-        secret,
+        derived_topology, gateway_mounts, overlay_envelope, provider_admission, provider_config, provider_metrics,
+        routing_overlay, secret,
         serving_config::{self, ServingInputs, WriteDecision, WriteGate},
         tls_backend::ServerTlsConfig,
         trust_bundle::{self, CertPemStatus},
@@ -57,7 +57,7 @@ use crate::{
     rollup, served_models, signals, site_providers,
     swim::{MemberStatus, MembershipSnapshot},
     swim_endpoint::{SeedResolution, resolve_endpoint_list_partial},
-    swim_runtime::SwimHandle,
+    swim_runtime::{PeerPins, SwimHandle},
 };
 
 
@@ -70,8 +70,8 @@ use crate::{
 /// Bundles the Kubernetes client with an optional live SWIM handle.
 /// When `swim` is `Some`, each reconcile obtains a fresh
 /// [`MembershipSnapshot`] to feed into `determine_phase` and
-/// `update_status`.  When `swim` is `None`, the controller falls back
-/// to its existing static phase logic.
+/// `update_status`. When `swim` is `None`, phase follows the configured
+/// membership mode and local identity prerequisites.
 #[expect(
     clippy::partial_pub_fields,
     reason = "client is public API; the SWIM handle and caches are reached through methods"
@@ -125,6 +125,9 @@ pub struct OperatorCtx {
 
     /// Sites each `GridNetwork`'s serving config last refused, for warning on change.
     pub(crate) refused_sites: serving_config::RefusedSites,
+
+    /// Clusters each gateway's dial file last refused, for warning on change.
+    pub(crate) refused_dials: serving_config::RefusedSites,
 
     /// Who may read the signals endpoint, keyed by presented-cert fingerprint.
     /// Set by reconcile from each `GridSite`'s trust pins.
@@ -196,6 +199,9 @@ pub struct OperatorCtx {
     /// How this site learns its members.
     membership: crate::cli::Membership,
 
+    /// Membership selected by the install when the network omits its override.
+    membership_fallback: MembershipMode,
+
     /// The last value logged per state, so a pass logs at INFO only what changed.
     pub(crate) logged: ChangeLog,
 
@@ -237,6 +243,8 @@ fn send_declared_trust(sender: &tokio::sync::watch::Sender<PeerTrustMode>, decla
 /// Grid-wide modes, fixed for the life of the process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridModes {
+    /// Membership discovery.
+    pub membership: MembershipMode,
     /// Signal propagation.
     pub signal: SignalMode,
     /// Peer authorization on the signals path.
@@ -246,6 +254,7 @@ pub struct GridModes {
 impl GridModes {
     /// Without a `GridNetwork`: SPIFFE trust in the Grid CA identity, never an implicit pin.
     pub const WITHOUT_NETWORK: Self = Self {
+        membership: MembershipMode::Swim,
         signal: SignalMode::Gossip,
         trust: PeerTrustMode::Spiffe,
     };
@@ -256,15 +265,28 @@ impl GridModes {
     #[must_use]
     pub fn without_network(signal: Option<SignalMode>, trust: Option<PeerTrustMode>) -> Self {
         Self {
+            membership: Self::WITHOUT_NETWORK.membership,
             signal: signal.unwrap_or(Self::WITHOUT_NETWORK.signal),
             trust: trust.unwrap_or(Self::WITHOUT_NETWORK.trust),
         }
     }
 
-    /// The modes `network` declares, defaults for absent fields.
+    /// Select the install's membership before a network overrides it.
     #[must_use]
-    pub fn of(network: &GridNetwork) -> Self {
+    pub const fn with_membership(mut self, membership: MembershipMode) -> Self {
+        self.membership = membership;
+        self
+    }
+
+    /// The modes `network` declares, using `membership` when its override is absent.
+    #[must_use]
+    pub fn of(network: &GridNetwork, membership: MembershipMode) -> Self {
         Self {
+            membership: network
+                .spec
+                .membership
+                .as_ref()
+                .map_or(membership, |policy| policy.mode),
             signal: network
                 .spec
                 .signal_transport
@@ -283,11 +305,15 @@ impl GridModes {
 
     /// The modes to restart into when `network` declares other than `self`, the running modes.
     #[must_use]
-    pub fn restart_for(self, network: Option<&GridNetwork>) -> Option<Self> {
+    pub fn restart_for(self, network: Option<&GridNetwork>, membership_fallback: MembershipMode) -> Option<Self> {
         // Only the poll path reads trust, so a trust change under gossip needs no restart.
-        network.map(Self::of).filter(|declared| {
-            declared.signal != self.signal || (declared.signal == SignalMode::Poll && declared.trust != self.trust)
-        })
+        network
+            .map(|network| Self::of(network, membership_fallback))
+            .filter(|declared| {
+                declared.membership != self.membership
+                    || declared.signal != self.signal
+                    || (declared.signal == SignalMode::Poll && declared.trust != self.trust)
+            })
     }
 }
 
@@ -354,7 +380,6 @@ impl OperatorCtx {
     /// This is the canonical constructor used by the operator binary so that
     /// the internal metrics cache type does not need to be exported from the
     /// library crate.
-    #[expect(clippy::too_many_lines, reason = "one initializer per field")]
     pub fn new(client: Client, swim: Option<Arc<SwimHandle>>, signal_mode: SignalMode) -> Self {
         Self {
             client,
@@ -371,6 +396,7 @@ impl OperatorCtx {
             admission_memory: Mutex::new(provider_admission::AdmissionMemory::default()),
             last_seeds: std::sync::Mutex::new(HashMap::new()),
             refused_sites: std::sync::Mutex::new(HashMap::new()),
+            refused_dials: std::sync::Mutex::new(HashMap::new()),
             peer_identities: signals::PeerIdentities::new(),
             peers: signals::SignalStore::new(),
             peer_rounds: signals::PeerRounds::default(),
@@ -392,6 +418,7 @@ impl OperatorCtx {
             mode_restart: None,
             site_name: None,
             membership: crate::cli::Membership::Swim,
+            membership_fallback: MembershipMode::Swim,
             logged: ChangeLog::default(),
             started: Instant::now(),
         }
@@ -430,7 +457,7 @@ impl OperatorCtx {
     /// Publish the trust `network` declares, waking its watchers only on a change.
     fn publish_declared_trust(&self, network: &GridNetwork) {
         if let Some(sender) = &self.declared_trust {
-            send_declared_trust(sender, GridModes::of(network).trust);
+            send_declared_trust(sender, GridModes::of(network, self.membership_fallback).trust);
         }
     }
 
@@ -532,6 +559,14 @@ impl OperatorCtx {
     #[must_use]
     pub const fn with_membership(mut self, membership: crate::cli::Membership) -> Self {
         self.membership = membership;
+        self.membership_fallback = membership;
+        self
+    }
+
+    /// Restore the install's membership if the network override is removed.
+    #[must_use]
+    pub const fn with_membership_fallback(mut self, membership: MembershipMode) -> Self {
+        self.membership_fallback = membership;
         self
     }
 
@@ -957,7 +992,7 @@ async fn apply_ready_condition(
     if verdict.reason.excludes() {
         tracing::warn!(
             provider = name,
-            status = verdict.reason.status(),
+            status = %verdict.reason.status(),
             reason = verdict.reason.as_str(),
             message = %verdict.message,
             "provider readiness changed"
@@ -965,7 +1000,7 @@ async fn apply_ready_condition(
     } else {
         tracing::info!(
             provider = name,
-            status = verdict.reason.status(),
+            status = %verdict.reason.status(),
             reason = verdict.reason.as_str(),
             message = %verdict.message,
             "provider readiness changed"
@@ -1066,7 +1101,128 @@ pub async fn refresh_served_models(
     client: &Client,
     config: &served_models::DiscoveryConfig,
 ) -> Result<(), OperatorError> {
-    served_models::discover(&ctx.served_models, client, config).await
+    served_models::discover(&ctx.served_models, client, config).await?;
+    publish_discovered_model_inventories(ctx, client).await
+}
+
+/// Publish complete signed inventories for enforcing grids after each discovery round.
+async fn publish_discovered_model_inventories(ctx: &OperatorCtx, client: &Client) -> Result<(), OperatorError> {
+    let Some(swim) = ctx.swim() else {
+        return Ok(());
+    };
+    let networks: Api<GridNetwork> = Api::all(client.clone());
+    let networks = Box::pin(networks.list(&ListParams::default())).await?.items;
+    let providers: Api<InferenceProvider> = Api::all(client.clone());
+    let providers = Box::pin(providers.list(&ListParams::default())).await?.items;
+    let publish_deadline = tokio::time::Instant::now() + INVENTORY_PUBLISH_TIMEOUT;
+    'networks: for network in networks
+        .iter()
+        .filter(|network| signed_state_mode(network) == SignedStateMode::Enforce)
+    {
+        let (Some(network_name), Some(grid_id)) = (network.metadata.name.as_deref(), persisted_grid_id(network)) else {
+            continue;
+        };
+        let inventories = providers
+            .iter()
+            .filter(|provider| provider.spec.grid_network_ref == network_name)
+            .filter_map(|provider| ctx.served_models.select_for_gossip(provider, swim.site_name(), grid_id))
+            .collect::<Vec<_>>();
+        if !inventories.is_empty()
+            && let Some(signing_key) = Box::pin(load_gossip_signing_identity(network, client, swim.site_name())).await
+        {
+            for inventory in inventories {
+                match timeout_at(
+                    publish_deadline,
+                    publish_model_inventory_frames(swim, &inventory, signing_key.as_slice()),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {},
+                    Ok(Err(error)) => {
+                        tracing::warn!(provider = %inventory.provider_id, %error, "local model inventory publication failed");
+                    },
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            timeout_secs = INVENTORY_PUBLISH_TIMEOUT.as_secs(),
+                            "model inventory publication round timed out"
+                        );
+                        break 'networks;
+                    },
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bound the total time a discovery round waits for SWIM queue capacity.
+const INVENTORY_PUBLISH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Queue every signed frame of one inventory, waiting for bounded queue capacity.
+async fn publish_model_inventory_frames(
+    swim: &SwimHandle,
+    inventory: &swim::ModelInventory,
+    signing_key: &[u8],
+) -> Result<(), ModelInventoryPublicationError> {
+    for broadcast in sign_model_inventory_frames(inventory, signing_key, gossip_wall_clock_millis())? {
+        swim.publish_model_inventory_frame(broadcast).await?;
+    }
+    Ok(())
+}
+
+/// Current Unix time in milliseconds for signed gossip frames.
+fn gossip_wall_clock_millis() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// Sign every frame of one complete provider inventory for its origin and grid.
+fn sign_model_inventory_frames(
+    inventory: &swim::ModelInventory,
+    signing_key: &[u8],
+    signed_at_ms: u64,
+) -> Result<Vec<swim::ModelInventoryBroadcast>, ModelInventorySigningError> {
+    inventory
+        .frames()?
+        .into_iter()
+        .map(|frame| {
+            let signed = frame.sign(&inventory.origin_site, &inventory.grid_id, signing_key, signed_at_ms)?;
+            Ok(swim::ModelInventoryBroadcast::new(
+                inventory.origin_site.clone(),
+                inventory.grid_id.clone(),
+                signed,
+            ))
+        })
+        .collect()
+}
+
+/// Failure while validating or signing a complete local inventory.
+#[derive(Debug, thiserror::Error)]
+enum ModelInventorySigningError {
+    /// The inventory could not be split into valid wire frames.
+    #[error(transparent)]
+    Frames(#[from] swim::InventoryFrameError),
+
+    /// A wire frame could not be signed for its origin and grid.
+    #[error(transparent)]
+    Signing(#[from] swim::FrameSigningError),
+}
+
+/// Failure while validating, signing, or queueing a complete discovered inventory.
+#[derive(Debug, thiserror::Error)]
+enum ModelInventoryPublicationError {
+    /// The inventory could not be validated or signed.
+    #[error(transparent)]
+    Signing(#[from] ModelInventorySigningError),
+
+    /// The runtime exited before a frame could be queued.
+    #[error(transparent)]
+    Runtime(#[from] crate::swim_runtime::BroadcastError),
 }
 
 /// Refresh who may read from the currently approved sites.
@@ -1196,11 +1352,7 @@ fn declared_signals(site: &GridSite, name: &str, signals_port: Option<u16>) -> O
 /// The bare `site_id` a peer is keyed by, and whether the object is enrolled
 /// rather than a discovered stub carrying [`ANNOTATION_SITE_ID`].
 pub(crate) fn peer_site_key(site: &GridSite) -> Option<(String, bool)> {
-    let discovered = site
-        .metadata
-        .labels
-        .as_ref()
-        .is_some_and(|labels| labels.get(LABEL_AUTO_DISCOVERED).is_some_and(|v| v == "true"));
+    let discovered = !crate::controller::grid_site::is_declared(site);
     // Only discovery's own stubs speak for another id; any other object is its name.
     site.metadata
         .annotations
@@ -1371,6 +1523,286 @@ async fn read_signals_pem(
         .map_err(|(_, message)| message)
 }
 
+/// Load the local join-issued leaf and return its validated P-256 signing key.
+async fn load_gossip_signing_key(
+    network: &GridNetwork,
+    client: &Client,
+    site: &str,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    let ca_ref = network
+        .spec
+        .tls
+        .ca_secret_ref
+        .as_ref()
+        .ok_or_else(|| "Grid CA Secret is not configured".to_owned())?;
+    let site_ref = network
+        .spec
+        .tls
+        .site_secret_ref
+        .as_ref()
+        .ok_or_else(|| "site identity Secret is not configured".to_owned())?;
+    let ca = read_signals_pem(client, ca_ref, "ca.crt").await?;
+    let cert = read_signals_pem(client, site_ref, "tls.crt").await?;
+    let key = zeroize::Zeroizing::new(read_signals_pem(client, site_ref, "tls.key").await?);
+    validated_gossip_key(&ca, &cert, &key, site)
+}
+
+/// PEM tag of a PKCS8 private key.
+const PKCS8_PEM_TAG: &str = "PRIVATE KEY";
+
+/// Length of an uncompressed SEC1 P-256 point: a tag, then two 32-byte coordinates.
+const P256_POINT_LEN: usize = 65;
+
+/// SEC1 tag of an uncompressed point.
+const SEC1_UNCOMPRESSED_TAG: u8 = 0x04;
+
+/// Whether `public_key` has the shape of an uncompressed P-256 point.
+///
+/// The curve itself is enforced when a signature verifies against it.
+fn is_p256_point(public_key: &[u8]) -> bool {
+    public_key.len() == P256_POINT_LEN && public_key.first() == Some(&SEC1_UNCOMPRESSED_TAG)
+}
+
+/// Validate the site-bound leaf and its matching P-256 PKCS8 key, returning the key DER.
+fn validated_gossip_key(ca: &[u8], cert: &[u8], key: &[u8], site: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    let ca = std::str::from_utf8(ca).map_err(|_error| "Grid CA certificate is not UTF-8".to_owned())?;
+    let cert = std::str::from_utf8(cert).map_err(|_error| "site certificate is not UTF-8".to_owned())?;
+    if trust_bundle::check_cert_pem(cert) != CertPemStatus::ValidStructure {
+        return Err("site certificate is not public certificate PEM".to_owned());
+    }
+    let key_pem = std::str::from_utf8(key).map_err(|_error| "site private key is not UTF-8".to_owned())?;
+    let public_key = certs::verify_site_cert(ca, cert, site).map_err(|error| error.to_string())?;
+
+    let block = pem::parse(key_pem).map_err(|_error| "site private key is not PEM".to_owned())?;
+    if block.tag() != PKCS8_PEM_TAG {
+        return Err("site private key is not PKCS8".to_owned());
+    }
+    let der = zeroize::Zeroizing::new(block.into_contents());
+
+    // Loading the key as the runtime will checks its curve and proves it matches the leaf.
+    let derived = swim::signing::public_key_ecdsa_p256(&der)
+        .map_err(|_error| "site private key is not a P-256 PKCS8 key".to_owned())?;
+    if derived != public_key {
+        return Err("site private key does not match its certificate".to_owned());
+    }
+    Ok(der)
+}
+
+/// Load and validate this site's signed-gossip identity.
+async fn load_gossip_signing_identity(
+    network: &GridNetwork,
+    client: &Client,
+    site: &str,
+) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+    match load_gossip_signing_key(network, client, site).await {
+        Ok(key) => Some(key),
+        Err(reason) => {
+            tracing::warn!(%reason, "signed gossip disabled: local site identity is unusable");
+            None
+        },
+    }
+}
+
+/// Validate one peer certificate against this `GridNetwork`'s CA and trust mode.
+fn verified_peer_gossip_key(site: &GridSite, ca_pem: &str, trust: PeerTrustMode) -> Result<Option<Vec<u8>>, String> {
+    let Some((site_name, _)) = peer_site_key(site) else {
+        return Ok(None);
+    };
+    let Some(cert_pem) = site
+        .status
+        .as_ref()
+        .and_then(|status| status.public_cert_pem.as_deref())
+    else {
+        return Ok(None);
+    };
+    if trust_bundle::check_cert_pem(cert_pem) != CertPemStatus::ValidStructure {
+        return Err("peer certificate is not public certificate PEM".to_owned());
+    }
+    let public_key = certs::verify_site_cert(ca_pem, cert_pem, &site_name).map_err(|error| error.to_string())?;
+    if !is_p256_point(&public_key) {
+        return Err("peer certificate does not carry an uncompressed P-256 key".to_owned());
+    }
+    if trust == PeerTrustMode::Pin
+        && !peer_has_declared_fingerprint(
+            site,
+            &certs::canonical_fingerprint(cert_pem).map_err(|error| error.to_string())?,
+        )
+    {
+        return Err("peer certificate does not match a declared canonical fingerprint".to_owned());
+    }
+    Ok(Some(public_key))
+}
+
+/// Whether `site` declares this certificate's canonical SHA-256 fingerprint.
+fn peer_has_declared_fingerprint(site: &GridSite, fingerprint: &str) -> bool {
+    site.spec
+        .trust
+        .as_ref()
+        .and_then(|policy| policy.canonical_fingerprints.as_ref())
+        .is_some_and(|pins| {
+            pins.iter()
+                .any(|pin| signals::canonical_fingerprint(pin) == fingerprint)
+        })
+}
+
+/// This grid's signed-state mode, `off` when `peerTrust` is absent.
+fn signed_state_mode(network: &GridNetwork) -> SignedStateMode {
+    network
+        .spec
+        .peer_trust
+        .as_ref()
+        .map_or_else(SignedStateMode::default, |trust| trust.signed_state)
+}
+
+/// Apply this grid's signed-state mode to the SWIM runtime.
+///
+/// `off` drops any trust installed while enforcing, so state flows unsigned
+/// again. `enforce` installs the local signer and verified peer pins.
+/// Returns whether this site can sign its grid-scoped state.
+async fn apply_signed_state(
+    network: &GridNetwork,
+    ctx: &OperatorCtx,
+    swim: &SwimHandle,
+    grid_id: &str,
+    signed_state: SignedStateMode,
+) -> Result<bool, OperatorError> {
+    if signed_state == SignedStateMode::Off {
+        swim.relax_grid_trust(grid_id.to_owned())
+            .map_err(|error| OperatorError::InvalidResource(error.to_string()))?;
+        return Ok(false);
+    }
+
+    let client = &ctx.client;
+
+    // Peers that cannot be re-verified keep their pins: a transient read failure must not drop all state.
+    let peer_pins = match collect_gossip_peer_pins(network, client, swim.site_name()).await {
+        Ok(peer_pins) => Some(peer_pins),
+        Err(error) => {
+            tracing::warn!(%grid_id, %error, "keeping installed SWIM peer pins: peers could not be re-verified");
+            None
+        },
+    };
+    let local_signing_key = load_gossip_signing_identity(network, client, swim.site_name()).await;
+    let signing_ready = local_signing_key.is_some();
+    swim.set_grid_trust_snapshot(grid_id.to_owned(), local_signing_key, peer_pins)
+        .map_err(|error| OperatorError::InvalidResource(error.to_string()))?;
+    Ok(signing_ready)
+}
+
+/// Apply this grid's signed-state mode, then publish the certificate bootstrap it allows.
+async fn sign_grid_state(
+    network: &GridNetwork,
+    ctx: &OperatorCtx,
+    swim: &SwimHandle,
+    name: &str,
+) -> Result<(), OperatorError> {
+    let signed_state = signed_state_mode(network);
+    let Some(grid_id) = persisted_grid_id(network) else {
+        // Enrollment owns grid IDs. Reconciliation waits for `spec.grid_id`
+        // rather than minting a local fallback.
+        return Ok(());
+    };
+    let signing_ready = Box::pin(apply_signed_state(network, ctx, swim, grid_id, signed_state)).await?;
+
+    match signed_state {
+        SignedStateMode::Off => Box::pin(publish_site_cert(network, &ctx.client, swim, name)).await,
+        SignedStateMode::Enforce if signing_ready => {
+            Box::pin(publish_signed_site_cert(network, &ctx.client, swim, grid_id, name)).await;
+        },
+        // An unusable local identity cannot sign; stay silent rather than send unsigned.
+        SignedStateMode::Enforce => {},
+    }
+    Ok(())
+}
+
+/// Empty-state broadcast carrying this site's public certificate PEM.
+fn site_cert_broadcast(swim: &SwimHandle, cert_pem: String) -> swim::StateBroadcast {
+    swim::StateBroadcast::new(
+        swim.site_name().to_owned(),
+        cert_broadcast_revision(),
+        crdt::GridStateSnapshot::new(swim.site_name().to_owned()),
+        None,
+    )
+    .with_cert(Some(cert_pem))
+}
+
+/// Broadcast this site's public certificate, unsigned, on every reconcile.
+///
+/// Remote peers populate `GridSite.status.publicCertPem` from it. Only the
+/// public cert is read; the private key (`tls.key`) is never accessed here.
+async fn publish_site_cert(network: &GridNetwork, client: &Client, swim: &SwimHandle, name: &str) {
+    let Ok(Some(cert_pem)) = secret::read_site_cert_pem(client, network.spec.tls.site_secret_ref.as_ref()).await else {
+        return;
+    };
+    if let Err(error) = swim.publish_state_broadcast(site_cert_broadcast(swim, cert_pem)) {
+        tracing::warn!(network = name, %error, "failed to publish site cert broadcast");
+    }
+}
+
+/// Publish this site's grid-scoped certificate bootstrap on every reconcile.
+///
+/// The runtime signs it; peers validate the certificate, then pin its key.
+/// Republishing reaches peers that joined, restarted, or evicted it since.
+async fn publish_signed_site_cert(
+    network: &GridNetwork,
+    client: &Client,
+    swim: &SwimHandle,
+    grid_id: &str,
+    name: &str,
+) {
+    let Ok(Some(cert_pem)) = secret::read_site_cert_pem(client, network.spec.tls.site_secret_ref.as_ref()).await else {
+        return;
+    };
+    let broadcast = site_cert_broadcast(swim, cert_pem).with_grid_id(Some(grid_id.to_owned()));
+    if let Err(error) = swim.publish_state_broadcast(broadcast) {
+        tracing::warn!(network = name, %error, "failed to publish site cert broadcast");
+    }
+}
+
+
+/// Collect the currently verified peer certificates as a complete trust snapshot.
+async fn collect_gossip_peer_pins(
+    network: &GridNetwork,
+    client: &Client,
+    local_site_name: &str,
+) -> Result<PeerPins, OperatorError> {
+    let Some(ca_ref) = network.spec.tls.ca_secret_ref.as_ref() else {
+        return Ok(BTreeMap::new());
+    };
+    let ca = read_signals_pem(client, ca_ref, "ca.crt")
+        .await
+        .map_err(OperatorError::InvalidResource)?;
+    let ca = std::str::from_utf8(&ca)
+        .map_err(|_error| OperatorError::InvalidResource("Grid CA certificate is not UTF-8".to_owned()))?;
+    let network_name = network.metadata.name.as_deref().unwrap_or_default();
+    // The declared mode, not the startup one: a trust change under gossip does not restart.
+    let trust = GridModes::of(network, MembershipMode::Swim).trust;
+    let mut verified = PeerPins::new();
+    for site in list_all_grid_sites(client)
+        .await?
+        .iter()
+        .filter(|site| site.spec.grid_network_ref == network_name)
+    {
+        let Some((site_name, _)) = peer_site_key(site) else {
+            continue;
+        };
+        if site_name == local_site_name {
+            continue;
+        }
+        match verified_peer_gossip_key(site, ca, trust) {
+            Ok(Some(key)) => {
+                let keys = verified.entry(site_name).or_default();
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            },
+            Ok(None) => {},
+            Err(reason) => tracing::warn!(site = %site_name, %reason, "peer gossip signing pin refused"),
+        }
+    }
+    Ok(verified)
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -1407,7 +1839,7 @@ const WITHDRAWAL_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// When this label is present with value `"true"`, the `GridNetwork` controller
 /// creates `GridSite` resources for remote Alive SWIM members automatically.
-/// Networks without this label are unaffected — their overlay generation uses
+/// Networks without this label are unaffected -- their overlay generation uses
 /// the existing `clusterName`-based (Phase 1) fallback.
 ///
 /// This opt-in gate prevents auto-discovery from changing the overlay generation
@@ -1506,9 +1938,7 @@ fn has_withdrawal_finalizer(network: &GridNetwork) -> bool {
 
 /// The persisted grid ID used to scope state that may have reached SWIM peers.
 ///
-/// Unlike [`resolve_grid_id`], this never generates a fallback UUID: an
-/// unpersisted UUID cannot identify a scope that another reconciliation may
-/// have published.
+/// Legacy status-only IDs remain valid for withdrawing state published before migration.
 fn persisted_grid_id(network: &GridNetwork) -> Option<&str> {
     (!network.spec.grid_id.is_empty())
         .then_some(network.spec.grid_id.as_str())
@@ -1521,11 +1951,78 @@ fn persisted_grid_id(network: &GridNetwork) -> Option<&str> {
         })
 }
 
-/// Add or remove the SWIM-withdrawal finalizer without changing other finalizers.
+/// Field manager for the operator's one write to `spec.gridId`.
+const GRID_ID_FIELD_MANAGER: &str = "grid-operator-grid-id";
+
+/// Tries at copying a status-only grid ID into spec before the reconcile reports the conflict.
+const GRID_ID_PATCH_ATTEMPTS: usize = 3;
+
+/// Copy a status-only grid ID into an empty `spec.gridId`, never replacing a set one.
+///
+/// Operators before #474 minted the ID into status only; rc.2 then stopped running such members.
+/// Returns whether spec now holds a grid ID, the copied one or one another writer set first.
+///
+/// # Errors
+///
+/// [`OperatorError::InvalidResource`] when the API refuses the status ID as `spec.gridId`.
 #[expect(
-    clippy::too_many_lines,
-    reason = "bounded conflict retry must keep its rebase invariants together"
+    clippy::large_stack_frames,
+    reason = "async Kubernetes API calls carry large request and response values"
 )]
+async fn adopt_status_grid_id(network: &GridNetwork, client: &Client) -> Result<bool, OperatorError> {
+    let name = grid_network_name(network)?;
+    let api: Api<GridNetwork> = Api::all(client.clone());
+    let mut latest = network.clone();
+    for attempt in 0..GRID_ID_PATCH_ATTEMPTS {
+        if !latest.spec.grid_id.is_empty() {
+            return Ok(true);
+        }
+        // Spec is empty here, so this is the status ID.
+        let Some(grid_id) = persisted_grid_id(&latest) else {
+            return Ok(false);
+        };
+        let Some(resource_version) = latest.metadata.resource_version.as_deref() else {
+            return Ok(false);
+        };
+        // The resource version makes this a compare-and-swap against a writer that sets spec first.
+        let patch = serde_json::json!({
+            "metadata": { "resourceVersion": resource_version },
+            "spec": { "gridId": grid_id },
+        });
+        let params = PatchParams {
+            field_manager: Some(GRID_ID_FIELD_MANAGER.to_owned()),
+            ..PatchParams::default()
+        };
+        match api.patch(name, &params, &Patch::Merge(&patch)).await {
+            Ok(_) => {
+                tracing::info!(network = name, %grid_id, "copied the status grid ID into spec.gridId");
+                return Ok(true);
+            },
+            Err(kube::Error::Api(error)) if error.code == 409 && attempt + 1 < GRID_ID_PATCH_ATTEMPTS => {
+                let Some(current) = api.get_opt(name).await? else {
+                    return Ok(false);
+                };
+                latest = current;
+            },
+            // The same patch cannot pass again, so only adopt a spec another writer set meanwhile.
+            Err(kube::Error::Api(error)) if error.code == 422 => {
+                return match api.get_opt(name).await? {
+                    Some(current) if !current.spec.grid_id.is_empty() => Ok(true),
+                    _ => Err(OperatorError::InvalidResource(format!(
+                        "GridNetwork {name} status.gridId {grid_id:?} cannot become spec.gridId: {}; set spec.gridId \
+                         by hand",
+                        error.message
+                    ))),
+                };
+            },
+            Err(error) => return Err(error.into()),
+        }
+    }
+    // Not reached: the last attempt returns from its match.
+    Ok(false)
+}
+
+/// Add or remove the SWIM-withdrawal finalizer without changing other finalizers.
 #[expect(
     clippy::large_stack_frames,
     reason = "async Kubernetes API calls carry large request and response values"
@@ -1601,10 +2098,6 @@ fn set_withdrawal_finalizer(finalizers: &mut Vec<String>, present: bool) -> bool
 
 /// Complete a deleting network's local SWIM withdrawal before Kubernetes removes it.
 #[expect(
-    clippy::too_many_lines,
-    reason = "finalizer lifecycle keeps the retry and confirmation decisions adjacent"
-)]
-#[expect(
     clippy::cognitive_complexity,
     reason = "finalizer lifecycle has explicit branches for every safe deletion outcome"
 )]
@@ -1643,6 +2136,10 @@ async fn reconcile_deleting_grid_network(
     };
     match timeout(WITHDRAWAL_PUBLICATION_TIMEOUT, receipt).await {
         Ok(Ok(())) => {
+            // The withdrawal was the grid's last signed message; drop its signer and pins.
+            if let Err(error) = swim.relax_grid_trust(grid_id.to_owned()) {
+                tracing::warn!(network = name, %grid_id, %error, "failed to drop deleted GridNetwork's gossip trust");
+            }
             patch_withdrawal_finalizer(network, &ctx.client, false).await?;
             tracing::info!(network = name, %grid_id, "published GridNetwork SWIM withdrawal; removed finalizer");
             Ok(Action::await_change())
@@ -1706,6 +2203,13 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         return Ok(Action::await_change());
     }
 
+    // Ahead of every spec check, so an unrelated invalid field cannot keep a member status-only.
+    let client = &ctx.client;
+    if network.spec.grid_id.is_empty() && Box::pin(adopt_status_grid_id(&network, client)).await? {
+        // The spec write triggers the next reconcile, which runs with spec as the only source.
+        return Ok(Action::await_change());
+    }
+
     reject_invalid_budget_policy(&network)?;
 
     tracing::debug!(name, "reconciling GridNetwork");
@@ -1713,24 +2217,30 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // Modes are fixed at startup, so a change stands the process down and its restart applies it,
     // and nothing here runs under the old modes meanwhile.
     let running = GridModes {
+        membership: ctx.membership(),
         signal: ctx.signal_mode,
         trust: ctx.peer_settings.trust,
     };
-    if let Some(next) = running.restart_for(Some(&network)) {
+    let declared = GridModes::of(&network, ctx.membership_fallback);
+    if declared.membership == MembershipMode::Local && declared.signal != SignalMode::Poll {
+        return Err(OperatorError::InvalidResource(
+            "Local membership requires signalTransport.mode poll".to_owned(),
+        ));
+    }
+    if let Some(next) = running.restart_for(Some(&network), ctx.membership_fallback) {
         tracing::info!(
-            "GridNetwork {name} sets signalTransport={:?} peerTrust={:?}; running {:?}/{:?}; restarting to apply",
+            "GridNetwork {name} sets membership={:?} signalTransport={:?} peerTrust={:?}; running {:?}; restarting to apply",
+            next.membership,
             next.signal,
             next.trust,
-            running.signal,
-            running.trust
+            running
         );
         ctx.owe_restart(next);
         return Ok(Action::await_change());
     }
     ctx.publish_declared_trust(&network);
 
-    let client = &ctx.client;
-    if holds_for_grid_id(&network, &ctx.operator_config.current()) {
+    if network.spec.grid_id.is_empty() {
         tracing::info!(name, "spec.gridId is not set; the grid runtime waits until it is");
         Box::pin(apply_rollup(client, &network)).await;
         return Ok(Action::await_change());
@@ -1752,22 +2262,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         // diff_seed_sets tracks additions/removals for diagnostic logging.
         announce_crd_seeds(&network, swim, &ctx.last_seeds).await;
 
-        // Broadcast the local site's public certificate PEM so remote peers can
-        // populate GridSite.status.publicCertPem.  Only the public cert is read;
-        // the private key (tls.key) is never accessed by this code path.
-        if let Ok(Some(cert_pem)) = secret::read_site_cert_pem(client, network.spec.tls.site_secret_ref.as_ref()).await
-        {
-            let cert_broadcast = swim::StateBroadcast::new(
-                swim.site_name().to_owned(),
-                cert_broadcast_revision(),
-                crdt::GridStateSnapshot::new(swim.site_name().to_owned()),
-                None,
-            )
-            .with_cert(Some(cert_pem));
-            if let Err(e) = swim.publish_state_broadcast(cert_broadcast) {
-                tracing::warn!(network = name, error = %e, "failed to publish site cert broadcast");
-            }
-        }
+        Box::pin(sign_grid_state(&network, &ctx, swim, name)).await?;
     }
 
     // List providers and tools once; shared between the catalog, the overlay and CRDT publishing.
@@ -1904,6 +2399,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         memory.retain_network_keys(name, admission_keys.iter().cloned());
     }
 
+    let grid_id = network.spec.grid_id.clone();
     let remote_crdt_providers: Vec<crdt::ProviderState> = if reads_polled_catalogs(ctx.membership()) {
         ctx.peer_providers()
             .admit(name, &reserved_clusters(&network, &providers), &hop_sites(&network))
@@ -1912,6 +2408,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
             .map(|swim| collect_remote_crdt_providers(swim, name))
             .unwrap_or_default()
     };
+    let remote_model_inventories = ctx.swim().map(|swim| swim.model_inventories()).unwrap_or_default();
 
     // Obtain a live membership snapshot here - used both for staleness override below
     // and for phase determination after the overlay step.
@@ -1929,29 +2426,32 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         mount_statuses: mount_reconciliation_statuses,
         overlay_statuses,
         serving_retry,
+        inventory_expiry_deadline,
     } = Box::pin(reconcile_routing_overlay_inner(
         &network,
+        &grid_id,
         client,
         &providers,
         &tool_providers,
         &remote_crdt_providers,
+        &remote_model_inventories,
         &ctx.served_models,
         &raw_metrics,
         &scoring_weights,
         &admission_states,
         serving.as_ref(),
         ctx.site_name(),
+        reads_polled_catalogs(ctx.membership()),
     ))
     .await?;
 
-    let grid_id = resolve_grid_id(&network);
     // An expired or unreadable identity, as IdentityValid reports it, degrades the network.
     let identity_failed = network.status.as_ref().is_some_and(|status| {
         held_condition(&status.conditions, crate::enroll::local::IDENTITY_VALID)
             .is_some_and(|valid| matches!(valid.reason.as_str(), "CertificateExpired" | "CertificateUnreadable"))
     });
     let phase = if swim_runtime_running && !identity_failed {
-        determine_phase(&network, &grid_id, membership.as_ref())
+        determine_phase(&network, &grid_id, membership.as_ref(), ctx.membership())
     } else {
         GridNetworkPhase::Degraded
     };
@@ -2014,10 +2514,72 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         reconcile_discovered_sites(&ctx, &network, name, swim.site_name(), snapshot).await?;
     }
 
-    // A deferred serving write lands as soon as its spacing allows.
-    Ok(Action::requeue(
-        serving_retry.map_or(requeue_interval, |wait| requeue_interval.min(wait)),
-    ))
+    // A deferred serving write lands as soon as its spacing allows. Discovered inventory
+    // candidates also set a deadline so both generated router configs are refreshed on expiry.
+    let retry = soonest_reconcile_retry(
+        requeue_interval,
+        serving_retry,
+        inventory_expiry_deadline,
+        time::OffsetDateTime::now_utc(),
+    );
+    Ok(Action::requeue(retry))
+}
+
+/// Requeue at the earliest discovered-model deadline still present in a gateway overlay.
+///
+/// The next reconcile re-renders each router config after the inventory renderer has dropped
+/// expired models. This covers both the generated Praxis router and the embedded Grid router.
+fn next_discovered_model_expiry(overlay: &routing_overlay::RoutingOverlay) -> Option<time::OffsetDateTime> {
+    overlay
+        .candidates
+        .iter()
+        .chain(&overlay.excluded)
+        .filter_map(|candidate| {
+            let expires_at = candidate.expires_at.as_deref()?;
+            time::OffsetDateTime::parse(expires_at, &time::format_description::well_known::Rfc3339).ok()
+        })
+        .min()
+}
+
+/// Convert an absolute inventory deadline to a positive controller requeue delay.
+fn wait_until_deadline(deadline: time::OffsetDateTime, now: time::OffsetDateTime) -> Duration {
+    let wait_nanos = deadline
+        .unix_timestamp_nanos()
+        .saturating_sub(now.unix_timestamp_nanos())
+        .max(1);
+    let wait_millis = wait_nanos.saturating_add(999_999) / 1_000_000;
+    Duration::from_millis(u64::try_from(wait_millis).unwrap_or(u64::MAX))
+}
+
+/// Wake well before the gateway's 30-second expiry cutoff, retrying briefly when inside the lead.
+fn inventory_expiry_retry(deadline: time::OffsetDateTime, now: time::OffsetDateTime) -> Duration {
+    const RECONCILE_LEAD: Duration = Duration::from_secs(60);
+    const LATE_RETRY_MAX: Duration = Duration::from_secs(10);
+
+    if deadline <= now {
+        return Duration::from_secs(1);
+    }
+    let until_deadline = wait_until_deadline(deadline, now);
+    if until_deadline > RECONCILE_LEAD {
+        return until_deadline.saturating_sub(RECONCILE_LEAD);
+    }
+    let half_wait = Duration::from_nanos(u64::try_from(until_deadline.as_nanos() / 2).unwrap_or(0));
+    half_wait.min(LATE_RETRY_MAX).max(Duration::from_nanos(1))
+}
+
+/// Choose the earliest normal, deferred-write, or discovered-inventory requeue.
+fn soonest_reconcile_retry(
+    normal_retry: Duration,
+    serving_retry: Option<Duration>,
+    inventory_expiry_deadline: Option<time::OffsetDateTime>,
+    now: time::OffsetDateTime,
+) -> Duration {
+    let expiry_retry = inventory_expiry_deadline.map(|deadline| inventory_expiry_retry(deadline, now));
+    [Some(normal_retry), serving_retry, expiry_retry]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(normal_retry)
 }
 
 /// Manager for the `GridNetwork`'s `Available`, `Progressing` and `Degraded`, written only here.
@@ -2026,14 +2588,14 @@ pub const ROLLUP_FIELD_MANAGER: &str = "grid-operator-rollup";
 /// What raises the `GridNetwork`'s `Degraded`, each with the status that does, the first held
 /// read: this site's own identity and clocks first, then its view of its peers. None gates
 /// `Available`, since peers being down leaves this site available.
-const DEGRADED_BY: [(&str, &str); 7] = [
-    (crate::enroll::local::ROTATION_ON_SCHEDULE, "False"),
-    (crate::peer_ages::PEER_TIME_VALID, "False"),
-    (crate::gateway_ages::GATEWAY_AGES_REJECTED, "True"),
-    (crate::peer_reach::PEER_SIGNALS_REACHABLE, "False"),
-    (crate::peer_reach::PEER_CATALOGS_ACCEPTED, "False"),
-    (crate::peer_membership::PEER_MEMBERSHIP, "False"),
-    (crate::peer_reach::PEER_POLLS_COMPLETE, "False"),
+const DEGRADED_BY: [(&str, ConditionStatus); 7] = [
+    (crate::enroll::local::ROTATION_ON_SCHEDULE, ConditionStatus::False),
+    (crate::peer_ages::PEER_TIME_VALID, ConditionStatus::False),
+    (crate::gateway_ages::GATEWAY_AGES_REJECTED, ConditionStatus::True),
+    (crate::peer_reach::PEER_SIGNALS_REACHABLE, ConditionStatus::False),
+    (crate::peer_reach::PEER_CATALOGS_ACCEPTED, ConditionStatus::False),
+    (crate::peer_membership::PEER_MEMBERSHIP, ConditionStatus::False),
+    (crate::peer_reach::PEER_POLLS_COMPLETE, ConditionStatus::False),
 ];
 
 /// The network's roll-up: the enrollment step's and the renewal loop's conditions gate it, and
@@ -2066,7 +2628,11 @@ fn enrollment_gates(held: &[Condition], stamp: rollup::Stamp<'_>) -> Vec<Conditi
         .iter()
         .map(|type_| {
             held_condition(held, type_).cloned().unwrap_or_else(|| {
-                let unwritten = ("Unknown", "AwaitingFirstCheck", "not evaluated yet".to_owned());
+                let unwritten = (
+                    ConditionStatus::Unknown,
+                    "AwaitingFirstCheck",
+                    "not evaluated yet".to_owned(),
+                );
                 rollup::condition(&[], type_, unwritten, stamp)
             })
         })
@@ -2112,10 +2678,6 @@ fn held_condition<'held>(held: &'held [Condition], type_: &str) -> Option<&'held
 /// its local `GridSite` declaratively, this controller must still hand it to the
 /// `GridSite` controller for gateway probing. The status write is idempotent and
 /// only applies while the site is still pending.
-#[expect(
-    clippy::too_many_lines,
-    reason = "status patch keeps the local-site transition explicit"
-)]
 async fn reconcile_local_site(network_name: &str, local_site: &str, client: &Client) -> Result<(), OperatorError> {
     let api: Api<GridSite> = Api::all(client.clone());
     let Ok(site) = Box::pin(api.get(local_site)).await.map(Box::new) else {
@@ -2261,7 +2823,7 @@ pub fn error_policy(_network: Arc<GridNetwork>, error: &OperatorError, _ctx: Arc
 /// # Removal semantics
 ///
 /// A seed appearing in `removed` will **not** be actively disconnected from the
-/// SWIM runtime.  The SWIM protocol's own failure detection (probe → Suspect →
+/// SWIM runtime.  The SWIM protocol's own failure detection (probe -> Suspect ->
 /// Dead) handles peers that stop responding.  Use the `removed` list only for
 /// diagnostics and logging.
 pub(crate) fn diff_seed_sets(previous: &[SocketAddr], desired: &[SocketAddr]) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
@@ -2309,10 +2871,6 @@ pub(crate) fn diff_seed_sets(previous: &[SocketAddr], desired: &[SocketAddr]) ->
 #[expect(
     clippy::cognitive_complexity,
     reason = "conditional logging paths for add/remove/announce; splitting would obscure the announce sequence"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "linear announce sequence: resolve → diff → log → announce → update tracker"
 )]
 async fn announce_crd_seeds(
     network: &GridNetwork,
@@ -2498,7 +3056,6 @@ fn config_enrolls(config: &crate::operator_config::Snapshot) -> bool {
 /// wrote is the grid's, and a new one would split it.
 #[expect(
     clippy::large_stack_frames,
-    clippy::too_many_lines,
     clippy::cognitive_complexity,
     reason = "decide, then create the CA and the identity it signs, as one step"
 )]
@@ -2643,7 +3200,7 @@ fn site_phases(sites: &[GridSite]) -> impl Iterator<Item = (&str, &'static str)>
 ///
 /// Lists all [`InferenceProvider`]s and [`GridSite`]s cluster-wide, then
 /// renders one overlay `ConfigMap` per `consumerGateways` entry.  Each gateway may
-/// declare its own `siteName` — the `local_site` in the overlay for
+/// declare its own `siteName` -- the `local_site` in the overlay for
 /// gateway G is `G.siteName ?? network_name`.  This ensures that in a
 /// multi-gateway network each gateway's overlay identifies the correct local
 /// site.  A network with no `consumerGateways` is a no-op.
@@ -2681,19 +3238,22 @@ fn site_phases(sites: &[GridSite]) -> impl Iterator<Item = (&str, &'static str)>
 )]
 async fn reconcile_routing_overlay_inner(
     network: &GridNetwork,
+    grid_id: &str,
     client: &Client,
     providers: &[InferenceProvider],
     tool_providers: &[AgentToolProvider],
     remote_crdt_providers: &[crdt::ProviderState],
+    remote_model_inventories: &[swim::ModelInventory],
     served_model_store: &served_models::ServedModelStore,
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
     scoring_weights: &scoring::ScoringWeights,
     admission_states: &HashMap<String, crate::resources::geography::AdmissionState>,
     serving: Option<&ServingSource<'_>>,
     owning_site: Option<&str>,
+    member_catalogs: bool,
 ) -> Result<OverlayOutcome, OperatorError> {
     let network_name = grid_network_name(network)?;
-    let signal = GridModes::of(network).signal;
+    let signal = GridModes::of(network, MembershipMode::Swim).signal;
 
     // Every reconcile lists the sites, so the phase gauge follows each status change and deletion.
     let sites = list_all_grid_sites(client)
@@ -2714,11 +3274,26 @@ async fn reconcile_routing_overlay_inner(
     let mut mount_statuses: Vec<MountReconciliationStatus> = Vec::new();
     let mut overlay_statuses: Vec<OverlayRevisionStatus> = Vec::new();
     let mut serving_retry: Option<Duration> = None;
+    let mut inventory_expiry_deadline: Option<time::OffsetDateTime> = None;
+    // Peer records are the same for every gateway; only Local reads them from verified peers.
+    let peer_catalog = member_catalogs.then(|| {
+        derived_topology::peer_catalog(filter_eligible_remote_crdt_providers(
+            network_name,
+            &sites,
+            remote_crdt_providers,
+            signal,
+        ))
+    });
 
     for gw_ref in &network.spec.consumer_gateways {
         // Each gateway identifies its own local site.  Fall back to the
         // network name for single-site deployments where the two are equal.
         let local_site = gw_ref.site_name.as_deref().unwrap_or(network_name);
+        let admitted = provider_config::admitted_sites(&sites, network_name, local_site);
+        // Before anything that can skip this gateway, so a removed site never outlives a failed render.
+        if serving.is_some() {
+            revoke_provider_admission(network_name, gw_ref, &admitted, client).await;
+        }
 
         // Filter remote CRDT providers to those whose source GridSite is Active.
         // Providers from sites in any other phase (Discovered, Connecting, Pending,
@@ -2747,6 +3322,8 @@ async fn reconcile_routing_overlay_inner(
             providers,
             tool_providers,
             &eligible_remote_owned,
+            remote_model_inventories,
+            grid_id,
             local_site,
             owning_site,
             metrics_arg,
@@ -2754,6 +3331,11 @@ async fn reconcile_routing_overlay_inner(
             scoring_weights,
             Some(admission_states),
             served_model_store,
+            if gw_ref.supports_model_discovery_contract() {
+                routing_overlay::CandidateExpirySupport::Supported
+            } else {
+                routing_overlay::CandidateExpirySupport::Unsupported
+            },
         ) {
             Ok(overlay) => overlay,
             Err(error) => {
@@ -2774,19 +3356,22 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
-        let (cluster_endpoints, derived_summary, refused) = gateway_cluster_endpoints(
-            gw_ref,
-            &overlay.candidates,
-            &derived_topology::Declarations {
-                providers,
-                sites: &sites,
-                local_site,
-                network_name,
-                from_providers: &[],
-                transport: None,
-                signal,
-            },
-        );
+        if let Some(deadline) = next_discovered_model_expiry(&overlay) {
+            inventory_expiry_deadline =
+                Some(inventory_expiry_deadline.map_or(deadline, |current| current.min(deadline)));
+        }
+        let declarations = derived_topology::Declarations {
+            providers,
+            sites: &sites,
+            local_site,
+            network_name,
+            from_providers: &[],
+            transport: None,
+            signal,
+            peer_catalog: peer_catalog.as_ref(),
+        };
+        let (cluster_endpoints, derived_summary, refused) =
+            gateway_cluster_endpoints(gw_ref, &overlay.candidates, &declarations);
         if !refused.is_empty() {
             tracing::warn!(
                 network = network_name,
@@ -2796,6 +3381,21 @@ async fn reconcile_routing_overlay_inner(
             );
         }
         withdraw_refused(&mut overlay, &refused);
+        let dials = serving.as_ref().map_or_else(BTreeMap::new, |source| {
+            let (dials, undialable) = gateway_dials(gw_ref, &overlay, &declarations);
+            let key = format!("{network_name}/{}/{}", gw_ref.namespace, gw_ref.name);
+            if serving_config::refusal_changed(&key, &undialable, source.refused_dials) && !undialable.is_empty() {
+                tracing::warn!(network = network_name, gateway = %gw_ref.name, refused = ?undialable, "dial file: refusing clusters the gateway must not dial");
+            }
+            dials
+        });
+        if let Some(source) = serving.as_ref() {
+            let provider =
+                provider_config::render_provider(&overlay, &dials, admitted.clone(), &restricted_clusters(providers));
+            let key = format!("provider:{network_name}/{}/{}", gw_ref.namespace, gw_ref.name);
+            provider_config::warn_dropped(&overlay, &provider, &key, source.refused_dials);
+            apply_provider_file(network_name, gw_ref, &provider, client).await;
+        }
         let site_route = gw_ref
             .praxis_config
             .as_ref()
@@ -2930,6 +3530,7 @@ async fn reconcile_routing_overlay_inner(
                     let target = ServingTarget {
                         gw_ref,
                         hops,
+                        dials: &dials,
                         bootstrap: true,
                     };
                     let written = apply_serving_config(&overlay, source, network_name, target, client).await;
@@ -3007,6 +3608,7 @@ async fn reconcile_routing_overlay_inner(
             let target = ServingTarget {
                 gw_ref,
                 hops,
+                dials: &dials,
                 bootstrap: false,
             };
             let written = apply_serving_config(&overlay, source, network_name, target, client).await;
@@ -3071,6 +3673,7 @@ async fn reconcile_routing_overlay_inner(
         mount_statuses,
         overlay_statuses,
         serving_retry,
+        inventory_expiry_deadline,
     })
 }
 
@@ -3088,6 +3691,8 @@ struct OverlayOutcome {
     overlay_statuses: Vec<OverlayRevisionStatus>,
     /// Soonest a deferred serving config write can land.
     serving_retry: Option<Duration>,
+    /// Soonest a discovered model inventory expires.
+    inventory_expiry_deadline: Option<time::OffsetDateTime>,
 }
 
 /// What the serving config renders from, present only under poll.
@@ -3100,6 +3705,8 @@ struct ServingSource<'src> {
     scrape_interval: Duration,
     /// Sites each network's serving config last refused.
     refused: &'src serving_config::RefusedSites,
+    /// Clusters each gateway's dial file last refused.
+    refused_dials: &'src serving_config::RefusedSites,
     /// Peer providers the poller has heard load for.
     load_heard: &'src signals::LoadHeard,
     /// This site's provider clusters with no metrics to scrape.
@@ -3123,6 +3730,7 @@ fn serving_source<'ctx>(ctx: &'ctx OperatorCtx, providers: &[InferenceProvider])
         settings: &ctx.peer_settings,
         scrape_interval: ctx.scrape_interval,
         refused: &ctx.refused_sites,
+        refused_dials: &ctx.refused_dials,
         load_heard: &ctx.load_heard,
         quiet_local,
     })
@@ -3141,13 +3749,216 @@ fn site_route_unmet(gw_ref: &GatewayRef, cc: &ConsumerConfig, polling: bool) -> 
     }
 }
 
-/// Render the serving config text for one gateway, including authoritative no-route state.
-fn render_serving_text(
+/// The dials derivation admits for one gateway, and each cluster refused, with why.
+///
+/// Produced for any gateway with `gridServing` whose derivation admits clusters, whether or
+/// not it generates its praxis config. Only derived clusters: a typed `clusterEndpoints`
+/// entry stays a praxis cluster and no derived dial shadows it. A local dial carries its
+/// provider endpoint's path and the bearer token its candidates name.
+fn gateway_dials(
+    gw_ref: &GatewayRef,
+    overlay: &routing_overlay::RoutingOverlay,
+    declarations: &derived_topology::Declarations<'_>,
+) -> (BTreeMap<String, serving_config::DialSpec>, BTreeSet<String>) {
+    let cc = gw_ref.praxis_config.as_ref();
+    let derive = cc.and_then(|cc| cc.derive_topology.as_ref());
+    let resolve_with = derived_topology::Declarations {
+        from_providers: derive.map_or(&[][..], |derive| derive.from_providers.as_slice()),
+        transport: derive.and_then(|derive| derive.transport.as_ref()),
+        ..*declarations
+    };
+    let typed = cc.map_or(&[][..], |cc| cc.cluster_endpoints.as_slice());
+    let mut resolution = derived_topology::resolve(&overlay.candidates, typed, &resolve_with);
+    resolution
+        .resolved
+        .retain(|_, entry| entry.origin != derived_topology::Origin::Explicit);
+    derived_topology::refuse_undialable(&mut resolution, &resolve_with);
+    let mut refused: BTreeSet<String> = resolution
+        .refused
+        .iter()
+        .filter(|refused| {
+            matches!(
+                refused.reason,
+                derived_topology::Refusal::SiteNotEnrolled
+                    | derived_topology::Refusal::PlaintextOffSite
+                    | derived_topology::Refusal::ServerNameNotSite
+                    | derived_topology::Refusal::NoServerName
+            )
+        })
+        .map(|refused| format!("{}: {}", refused.cluster, refused.reason.as_str()))
+        .collect();
+    let paths: BTreeMap<String, Option<String>> = resolution
+        .resolved
+        .iter()
+        .map(|(cluster, entry)| (cluster.clone(), entry.endpoint_path.clone()))
+        .collect();
+    let endpoints: Vec<ClusterEndpointConfig> = resolution.resolved.into_values().map(|entry| entry.endpoint).collect();
+    let sites: BTreeMap<&str, &str> = overlay
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.kind == routing_overlay::CANDIDATE_KIND)
+        .map(|candidate| (candidate.cluster.as_str(), candidate.site.as_str()))
+        .collect();
+    let (mut dials, unrendered) = consumer_config::dial_specs(&endpoints, &sites, &overlay.local_site);
+    refused.extend(unrendered.iter().map(|(cluster, error)| format!("{cluster}: {error}")));
+    dials.retain(|cluster, dial| {
+        let path = paths.get(cluster).and_then(Option::as_deref);
+        match dial_request_shape(cluster, dial, path, overlay, gw_ref) {
+            Ok((base_path, credential)) => {
+                dial.base_path = base_path;
+                dial.credential = credential;
+                true
+            },
+            Err(reason) => {
+                refused.insert(format!("{cluster}: {reason}"));
+                false
+            },
+        }
+    });
+    (dials, refused)
+}
+
+/// The base path and credential `dial` sends for `cluster`, or why it cannot be dialed.
+fn dial_request_shape(
+    cluster: &str,
+    dial: &serving_config::DialSpec,
+    endpoint_path: Option<&str>,
+    overlay: &routing_overlay::RoutingOverlay,
+    gw_ref: &GatewayRef,
+) -> Result<(Option<String>, Option<serving_config::DialCredential>), &'static str> {
+    let credential_mount = gw_ref
+        .praxis_config
+        .as_ref()
+        .map_or(serving_config::DIAL_CREDENTIAL_BASE, |cc| {
+            cc.credential_mount_path.as_str()
+        });
+    let base_path = endpoint_path.map(serving_config::dial_base_path).transpose()?.flatten();
+    let mut credentials = overlay
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.cluster == cluster)
+        .filter_map(|candidate| candidate.credential.as_ref());
+    let Some(credential) = credentials.next() else {
+        return Ok((base_path, None));
+    };
+    if dial.site != overlay.local_site || matches!(dial.transport, serving_config::DialTransport::MutualTls { .. }) {
+        return Err("a credential is never sent off this site");
+    }
+    if credentials.any(|other| other != credential) {
+        return Err("its candidates name different credentials");
+    }
+    if credential.strategy != "bearer_token" {
+        return Err("only a bearer_token credential is dialed");
+    }
+    if credential.secret_ref.namespace != gw_ref.namespace {
+        return Err("the credential Secret is not in the gateway's namespace");
+    }
+    if credential_mount != serving_config::DIAL_CREDENTIAL_BASE {
+        return Err("credentialMountPath is not the gateway's credential mount");
+    }
+    let path = consumer_config::credential_file_path(
+        credential_mount,
+        &credential.secret_ref.name,
+        &credential.secret_ref.key,
+    );
+    Ok((
+        base_path,
+        Some(serving_config::DialCredential {
+            path,
+            strategy: "bearer_token",
+        }),
+    ))
+}
+
+/// Clusters whose local provider limits which sites may route to it, which a provider file
+/// never serves to an admitted peer.
+fn restricted_clusters(providers: &[InferenceProvider]) -> BTreeSet<&str> {
+    providers
+        .iter()
+        .filter(|provider| !provider.spec.access_policy.site_selector.match_labels.is_empty())
+        .filter_map(routing_overlay::routing_identity)
+        .collect()
+}
+
+/// Rewrite `gw_ref`'s stored provider file at once when it admits a site `admitted` does not.
+async fn revoke_provider_admission(network_name: &str, gw_ref: &GatewayRef, admitted: &[String], client: &Client) {
+    let (api, name) = provider_api(network_name, gw_ref, client);
+    let stored = match api.get_opt(&name).await {
+        Ok(existing) => stored_provider(existing),
+        Err(error) => {
+            tracing::warn!(network = network_name, gateway = %gw_ref.name, %error, "provider file: cannot read the stored admission");
+            return;
+        },
+    };
+    if let Some(revoked) = stored
+        .as_deref()
+        .and_then(|stored| provider_config::revoked(stored, admitted))
+    {
+        apply_provider_text(&api, network_name, gw_ref, &revoked).await;
+    }
+}
+
+/// Apply `provider` as `gw_ref`'s provider file when it differs from what is stored.
+///
+/// Its own field manager and key, so it is written whatever happens to the serving config.
+async fn apply_provider_file(
+    network_name: &str,
+    gw_ref: &GatewayRef,
+    provider: &provider_config::ProviderConfig,
+    client: &Client,
+) {
+    let Ok(text) = serving_config::to_text(provider) else {
+        tracing::warn!(network = network_name, gateway = %gw_ref.name, "provider file: render failed");
+        return;
+    };
+    let (api, name) = provider_api(network_name, gw_ref, client);
+    let stored = api.get_opt(&name).await.ok().flatten();
+    if stored_provider(stored).as_deref() != Some(text.as_str()) {
+        apply_provider_text(&api, network_name, gw_ref, &text).await;
+    }
+}
+
+/// The `ConfigMap` API and name `gw_ref`'s provider file lives in.
+fn provider_api(network_name: &str, gw_ref: &GatewayRef, client: &Client) -> (Api<ConfigMap>, String) {
+    (
+        Api::namespaced(client.clone(), &gw_ref.namespace),
+        serving_config::configmap_name(network_name, &gw_ref.name),
+    )
+}
+
+/// The provider file `existing` holds.
+fn stored_provider(existing: Option<ConfigMap>) -> Option<String> {
+    existing
+        .and_then(|cm| cm.data)
+        .and_then(|mut data| data.remove(provider_config::PROVIDER_KEY))
+}
+
+/// Apply `text` as the provider file under its own field manager, logging the outcome.
+async fn apply_provider_text(api: &Api<ConfigMap>, network_name: &str, gw_ref: &GatewayRef, text: &str) {
+    let cm = provider_config::build_configmap(text, network_name, &gw_ref.name, &gw_ref.namespace);
+    let name = serving_config::configmap_name(network_name, &gw_ref.name);
+    match api
+        .patch(
+            &name,
+            &PatchParams::apply(provider_config::FIELD_MANAGER).force(),
+            &Patch::Apply(&cm),
+        )
+        .await
+    {
+        Ok(_) => info!(cm_name = %name, digest = %serving_config::digest(text), "applied provider file"),
+        Err(error) => {
+            tracing::warn!(network = network_name, gateway = %gw_ref.name, %error, "provider file apply failed");
+        },
+    }
+}
+
+/// Render the serving config for one gateway, including authoritative no-route state.
+fn render_serving_config(
     overlay: &routing_overlay::RoutingOverlay,
     source: &ServingSource<'_>,
     gw_ref: &GatewayRef,
     hops: HopSource<'_>,
-) -> Result<String, OperatorError> {
+) -> Result<serving_config::ServingConfig, OperatorError> {
     let tls_mount = gw_ref
         .praxis_config
         .as_ref()
@@ -3169,7 +3980,7 @@ fn render_serving_text(
         quiet_local: &source.quiet_local,
         inject_local_credentials: matches!(hops, HopSource::Rendered(_)),
     };
-    serving_config::to_text(&serving_config::render(overlay, &inputs)).map_err(OperatorError::Json)
+    Ok(serving_config::render(overlay, &inputs))
 }
 
 /// Where a gateway's serving config takes its provider hops from.
@@ -3225,10 +4036,6 @@ fn serving_provider_hop_sni_for_overlay(
 
 /// Resolve embedded-gateway provider hops from their dedicated `GatewayRef`
 /// contract, not from the optional generated consumer Praxis config.
-#[expect(
-    clippy::too_many_lines,
-    reason = "each provider-hop declaration is checked before routing"
-)]
 fn serving_provider_hop_clusters(gw_ref: &GatewayRef) -> Result<BTreeSet<String>, OperatorError> {
     let mut clusters = BTreeSet::new();
     for endpoint in &gw_ref.provider_hop_endpoints {
@@ -3271,6 +4078,8 @@ struct ServingTarget<'target> {
     gw_ref: &'target GatewayRef,
     /// Where its provider hops come from.
     hops: HopSource<'target>,
+    /// What the dial file may carry, before the gateway's own checks.
+    dials: &'target BTreeMap<String, serving_config::DialSpec>,
     /// Write only a missing one, for a gateway whose first pod needs it to start.
     bootstrap: bool,
 }
@@ -3291,8 +4100,8 @@ fn fold_serving_write(
 
 /// Apply the serving config `ConfigMap` when changed, returning when to retry a deferred write.
 #[expect(
-    clippy::too_many_lines,
-    reason = "the render, the write gate, and the apply are one serving write"
+    clippy::large_stack_frames,
+    reason = "the rendered config and dial file cross the ConfigMap API calls"
 )]
 async fn apply_serving_config(
     overlay: &routing_overlay::RoutingOverlay,
@@ -3304,33 +4113,42 @@ async fn apply_serving_config(
     let ServingTarget {
         gw_ref,
         hops,
+        dials,
         bootstrap,
     } = target;
     serving_config::warn_refused_sites(overlay, network_name, source.refused);
-    let text = render_serving_text(overlay, source, gw_ref, hops)?;
+    let config = render_serving_config(overlay, source, gw_ref, hops)?;
+    let text = serving_config::to_text(&config).map_err(OperatorError::Json)?;
+    let dial = serving_config::to_text(&serving_config::render_dials(&config, dials)).map_err(OperatorError::Json)?;
     let name = serving_config::configmap_name(network_name, &gw_ref.name);
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
     let existing = api.get_opt(&name).await?;
-    let stored = existing
-        .as_ref()
-        .and_then(|cm| cm.data.as_ref())
+    let data = existing.as_ref().and_then(|cm| cm.data.as_ref());
+    // One decision for both keys, so a dial change alone is written too.
+    let stored = data
         .and_then(|data| data.get(serving_config::SERVING_CONFIG_KEY))
-        .map(String::as_str);
+        .map(|stored_text| {
+            let stored_dial = data.and_then(|data| data.get(serving_config::DIAL_KEY));
+            format!("{stored_text}\0{}", stored_dial.map_or("", String::as_str))
+        });
+    let stored = stored.as_deref();
+    let desired = format!("{text}\0{dial}");
     let key = format!("{}/{name}", gw_ref.namespace);
     let now = Instant::now();
-    let decision = if bootstrap && existing.is_some() {
+    // The provider file may have created the ConfigMap, so only a stored serving config holds.
+    let decision = if bootstrap && stored.is_some() {
         WriteDecision::Unchanged
     } else if overlay.candidates.is_empty() {
-        serving_config::decide_empty_withdrawal(stored, &text)
+        serving_config::decide_empty_withdrawal(stored, &desired)
     } else {
-        serving_config::decide_write(stored, &text, source.gate.last(&key), now)
+        serving_config::decide_write(stored, &desired, source.gate.last(&key), now)
     };
     match decision {
         WriteDecision::Unchanged => return Ok(None),
         WriteDecision::Deferred(wait) => return Ok(Some(wait)),
         WriteDecision::Write => {},
     }
-    let cm = serving_config::build_configmap(&text, network_name, &gw_ref.name, &gw_ref.namespace);
+    let cm = serving_config::build_configmap(&text, &dial, network_name, &gw_ref.name, &gw_ref.namespace);
     api.patch(&name, &PatchParams::apply(FIELD_MANAGER).force(), &Patch::Apply(&cm))
         .await?;
     source.gate.record(&key, now);
@@ -3382,10 +4200,6 @@ fn keep_rendered_at(
 
 /// Keep last applied consumer status for gateways whose empty candidate set
 /// deliberately retained their previous working config.
-#[expect(
-    clippy::too_many_lines,
-    reason = "preserving last-good per-gateway status is one compact selection pass"
-)]
 fn keep_consumer_config_status_at(
     network: &GridNetwork,
     desired: &[ConsumerConfigStatus],
@@ -3683,10 +4497,6 @@ fn inactive_consumer_config_map_name(base: &str, active: &str) -> String {
     reason = "the exact GridNetwork/gateway inputs define this immutable render"
 )]
 #[expect(
-    clippy::too_many_lines,
-    reason = "render, publish requirements, and apply config as one gateway operation"
-)]
-#[expect(
     clippy::large_stack_frames,
     reason = "render result crosses the optional delegated async boundary"
 )]
@@ -3779,10 +4589,6 @@ fn mount_requirements_document(
 #[expect(
     clippy::too_many_arguments,
     reason = "the helper combines one render with its exact owner configuration"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "all delegated requirements must be canonicalized as one document"
 )]
 fn delegated_mount_requirements_document(
     rendered: &consumer_config::ConsumerRenderResult,
@@ -3883,10 +4689,6 @@ fn add_chart_serving_tls_item(
 }
 
 /// Confirm that the chart's read-only TLS mount supplies each serving file.
-#[expect(
-    clippy::too_many_lines,
-    reason = "validate every external TLS file against its mounted Secret source"
-)]
 fn validate_chart_managed_serving_tls(
     requirements: &consumer_config::MountRequirementsDocument,
     deployment: &Deployment,
@@ -4566,10 +5368,6 @@ async fn reconcile_delegated_gateway(
 
 /// Build a Grid-owned volume replacement or deletion patch after checking all
 /// consumers outside the target container.
-#[expect(
-    clippy::too_many_lines,
-    reason = "keep ownership checks and the matching mutation patch in one policy helper"
-)]
 fn owned_volume_mutation_patch(
     pod_spec: &k8s_openapi::api::core::v1::PodSpec,
     target_container_name: &str,
@@ -4613,10 +5411,6 @@ fn owned_volume_mutation_patch(
 }
 
 /// Confirm the Deployment's explicit opt-in and selected container identity.
-#[expect(
-    clippy::too_many_lines,
-    reason = "validate explicit owner annotations and selected container together"
-)]
 fn validate_deployment_delegation(
     deployment: &Deployment,
     network_name: &str,
@@ -4662,10 +5456,6 @@ fn validate_deployment_delegation(
 }
 
 /// Verify that the selected container receives Grid's generated praxis.yaml.
-#[expect(
-    clippy::too_many_lines,
-    reason = "mount path, volume source, and key projection form one fail-closed config-source check"
-)]
 fn validate_deployment_config_source(
     pod_spec: &k8s_openapi::api::core::v1::PodSpec,
     container: &k8s_openapi::api::core::v1::Container,
@@ -4731,10 +5521,6 @@ fn validate_deployment_config_source(
 }
 
 /// Read only Secret key presence and resource versions for a requirements document.
-#[expect(
-    clippy::too_many_lines,
-    reason = "validate same-namespace Secret references, keys, and versions in one pass"
-)]
 async fn validate_required_secrets(
     document: &consumer_config::MountRequirementsDocument,
     gateway_namespace: &str,
@@ -4873,10 +5659,6 @@ fn mount_failure(reason: &'static str, message: impl Into<String>) -> crate::err
 }
 
 /// Build a sanitized status entry after mount reconciliation failed.
-#[expect(
-    clippy::too_many_lines,
-    reason = "maps stable failure categories to the public mount lifecycle status"
-)]
 fn mount_reconciliation_status_error(
     gw_ref: &GatewayRef,
     delegation: Option<&MountReconciliation>,
@@ -5080,10 +5862,6 @@ fn legacy_overlay_payload_matches(existing: &ConfigMap, desired: &ConfigMap, rev
 /// Returns the Kubernetes `resourceVersion` of the (applied or pre-existing)
 /// `ConfigMap`.
 #[expect(
-    clippy::too_many_lines,
-    reason = "fetch-guard, apply, and logging is a single cohesive sequence"
-)]
-#[expect(
     clippy::large_stack_frames,
     reason = "async future over Kubernetes API types with serde_json values"
 )]
@@ -5140,47 +5918,39 @@ async fn distribute_overlay_configmap(
 // Grid ID
 // ---------------------------------------------------------------------------
 
-/// Resolve the grid ID: use spec if set, or status if
-/// previously generated, or generate a new one.
-/// Whether `network` must wait for `spec.gridId`: unset, while the operator config names a
-/// site, which joins a grid an admin names rather than one this operator would mint.
-fn holds_for_grid_id(network: &GridNetwork, config: &crate::operator_config::Snapshot) -> bool {
-    network.spec.grid_id.is_empty() && !matches!(config.loaded.site(), crate::operator_config::Section::Unset)
-}
-
-/// The grid ID: `spec.gridId` whenever set, else the one minted earlier, else a new one. Only
-/// an install whose operator config names no site gets here without `spec.gridId`.
-fn resolve_grid_id(network: &GridNetwork) -> String {
-    if !network.spec.grid_id.is_empty() {
-        return network.spec.grid_id.clone();
-    }
-    if let Some(status) = &network.status
-        && !status.grid_id.is_empty()
-    {
-        return status.grid_id.clone();
-    }
-    uuid::Uuid::new_v4().to_string()
-}
-
 /// Determine the lifecycle phase.
 ///
 /// When a [`MembershipSnapshot`] is provided, the live membership state takes
 /// precedence:
-/// - ≥1 [`Alive`] member → [`Active`].
-/// - Members present but all [`Suspect`]/[`Dead`] → [`Degraded`].
-/// - Empty snapshot → falls through to the existing TLS-based logic.
+/// - >=1 [`Alive`] member -> [`Active`].
+/// - Members present but all [`Suspect`]/[`Dead`] -> [`Degraded`].
+/// - Empty snapshot -> falls through to the existing TLS-based logic.
 ///
-/// When `membership` is `None` (no SWIM runtime wired yet), the existing
-/// `Pending`/`Initializing` logic is unchanged.
+/// Local membership needs a grid identity and TLS trust, but no SWIM runtime.
+/// Peer reachability is reported by the polling conditions independently.
+/// In Swim mode, an absent runtime retains the `Pending`/`Initializing` logic.
 ///
 /// [`Alive`]: MemberStatus::Alive
 /// [`Suspect`]: MemberStatus::Suspect
 /// [`Dead`]: MemberStatus::Dead
 /// [`Active`]: GridNetworkPhase::Active
 /// [`Degraded`]: GridNetworkPhase::Degraded
-fn determine_phase(network: &GridNetwork, grid_id: &str, membership: Option<&MembershipSnapshot>) -> GridNetworkPhase {
+fn determine_phase(
+    network: &GridNetwork,
+    grid_id: &str,
+    membership: Option<&MembershipSnapshot>,
+    mode: MembershipMode,
+) -> GridNetworkPhase {
     if grid_id.is_empty() {
         return GridNetworkPhase::Pending;
+    }
+    let has_tls = network.spec.tls.ca_secret_ref.is_some();
+    if mode == MembershipMode::Local {
+        return if has_tls {
+            GridNetworkPhase::Active
+        } else {
+            GridNetworkPhase::Pending
+        };
     }
     // Live membership takes precedence when available and non-empty.
     if let Some(snap) = membership
@@ -5192,7 +5962,6 @@ fn determine_phase(network: &GridNetwork, grid_id: &str, membership: Option<&Mem
     // Alive/Degraded peer exists, so we reach here when the network has no peers
     // yet: either the SWIM runtime is not up (`membership` is `None`) or it is
     // up but no peers have joined (`Some`, empty snapshot).
-    let has_tls = network.spec.tls.ca_secret_ref.is_some();
     if !has_tls {
         return GridNetworkPhase::Pending;
     }
@@ -5220,7 +5989,7 @@ fn determine_phase(network: &GridNetwork, grid_id: &str, membership: Option<&Mem
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Provider → CRDT state mapping
+// Provider -> CRDT state mapping
 // ---------------------------------------------------------------------------
 
 /// Map a Kubernetes `ProviderPhase` to the CRDT `ProviderPhase`.
@@ -5491,7 +6260,7 @@ pub(crate) fn tool_names_from_agent_tool_provider(provider: &AgentToolProvider) 
 /// ones.  The routing overlay layer already filters `Unavailable` providers
 /// from local routing decisions.
 ///
-/// `grid_id` (the caller's already-[`resolve_grid_id`]d value) is attached to
+/// `grid_id` (the caller's declared grid identity) is attached to
 /// the broadcast so a signature over this `GridNetwork`'s state cannot be
 /// replayed as valid for a different `GridNetwork` sharing the same
 /// cluster's `SwimHandle`; see [`swim::StateBroadcast::grid_id`].
@@ -5509,7 +6278,7 @@ fn upsert_provider_with_capabilities(
         }
     }
     // Tool names are NOT registered as Capability::Tool in the OR-set.
-    // They travel in the BroadcastExtension's `provider_tools` map and are
+    // They travel in the versioned provider-state extension and are
     // stored directly on the ProviderState. Duplicating them as capabilities
     // would bloat the SWIM byte budget for providers with large tool catalogs.
     snap.upsert_provider(state);
@@ -5600,6 +6369,29 @@ fn retain_tool_catalogs_within_budget(
     retained
 }
 
+/// Maximum DER-encoded ECDSA P-256 signature size.
+const MAX_P256_DER_SIGNATURE_BYTES: usize = 72;
+
+/// Retain whole provider UID records only while the inference snapshot remains transport-safe.
+///
+/// UID values are identity tokens and are never truncated. Providers whose UID metadata does not
+/// fit still remain in the provider snapshot; their discovered inventories will be ignored until
+/// a later snapshot can carry the matching UID.
+fn fit_provider_uids_to_swim_budget(broadcast: &mut swim::StateBroadcast, byte_budget: usize) -> usize {
+    let mut offered = std::mem::take(&mut broadcast.provider_uids);
+    offered.sort_by(|left, right| left.identity.cmp(&right.identity));
+    let mut dropped = 0_usize;
+    for provider_uid in offered {
+        broadcast.provider_uids.push(provider_uid);
+        if !broadcast.encode().is_ok_and(|encoded| encoded.len() <= byte_budget)
+            && broadcast.provider_uids.pop().is_some()
+        {
+            dropped = dropped.saturating_add(1);
+        }
+    }
+    dropped
+}
+
 /// Deterministically trim tool catalogs until the encoded state fits SWIM.
 ///
 /// Inference provider records and capabilities are never removed. Tool
@@ -5607,31 +6399,15 @@ fn retain_tool_catalogs_within_budget(
 /// least one tool fit. If the inference-only baseline already exceeds the
 /// transport budget, all tool providers remain omitted and the runtime reports
 /// the oversized inference snapshot.
-#[expect(
-    clippy::too_many_lines,
-    reason = "transport preflight, deterministic trimming, and its summary log form one bounded operation"
-)]
 fn fit_provider_tools_to_swim_budget(broadcast: &mut swim::StateBroadcast) {
-    // The runtime's advertised address may be IPv6, so preflight against the
-    // largest valid source identity for this site name. This cannot exceed the
-    // runtime's real transport budget.
-    let local_id = worst_case_swim_identity(&broadcast.origin_site);
-    let Ok(byte_budget) = swim::node::state_broadcast_byte_budget(&local_id) else {
-        tracing::warn!("failed to calculate SWIM state-broadcast byte budget");
+    let Some(byte_budget) = provider_tool_byte_budget(broadcast) else {
         return;
     };
-    // The runtime replaces the CRD-derived revision with a leased transport
-    // revision. Fit against the largest bincode representation so that rewrite
-    // cannot push an edge-sized snapshot over the node's byte limit.
-    let original_revision = std::mem::replace(&mut broadcast.revision, u64::MAX);
-    if broadcast.encode().is_ok_and(|encoded| encoded.len() <= byte_budget) {
-        broadcast.revision = original_revision;
-        return;
-    }
 
     let catalogs = detach_tool_catalogs(broadcast);
     let providers_offered = catalogs.len();
     let offered = catalogs.iter().map(|catalog| catalog.tools.len()).sum::<usize>();
+    let provider_uids_dropped = fit_provider_uids_to_swim_budget(broadcast, byte_budget);
     let baseline_fits = broadcast.encode().is_ok_and(|encoded| encoded.len() <= byte_budget);
     let retained = if baseline_fits {
         retain_tool_catalogs_within_budget(broadcast, &catalogs, byte_budget)
@@ -5649,7 +6425,6 @@ fn fit_provider_tools_to_swim_budget(broadcast: &mut swim::StateBroadcast) {
         .iter()
         .filter(|catalog| broadcast.snapshot.providers.contains_key(&catalog.key))
         .count();
-    broadcast.revision = original_revision;
     tracing::warn!(
         providers_offered,
         providers_retained,
@@ -5657,9 +6432,46 @@ fn fit_provider_tools_to_swim_budget(broadcast: &mut swim::StateBroadcast) {
         offered,
         retained,
         dropped = offered.saturating_sub(retained),
+        provider_uids_dropped,
         byte_budget,
-        "trimmed MCP tool providers and catalogs to fit the SWIM broadcast budget"
+        "trimmed provider UID metadata and MCP tool catalogs to fit the SWIM broadcast budget"
     );
+}
+
+/// Returns the payload budget when this broadcast needs its provider tools trimmed.
+fn provider_tool_byte_budget(broadcast: &swim::StateBroadcast) -> Option<usize> {
+    // The runtime's advertised address may be IPv6, so preflight against the
+    // largest valid source identity for this site name. This cannot exceed the
+    // runtime's real transport budget.
+    let local_id = worst_case_swim_identity(&broadcast.origin_site);
+    let Ok(maximum_bytes) = swim::node::state_broadcast_byte_budget(&local_id) else {
+        tracing::warn!("failed to calculate SWIM state-broadcast byte budget");
+        return None;
+    };
+    // The runtime replaces the CRD-derived revision with a leased transport
+    // revision. Fit against the largest bincode representation so that rewrite
+    // cannot push an edge-sized snapshot over the node's byte limit.
+    // P-256 ECDSA signatures use DER encoding, whose largest valid signature is
+    // 72 bytes. Include the maximum signature and timestamp representation when
+    // measuring so the runtime's later signing step cannot exceed foca's limit.
+    let mut maximum_signed = broadcast.clone();
+    maximum_signed.revision = u64::MAX;
+    maximum_signed.signature = Some(vec![0; MAX_P256_DER_SIGNATURE_BYTES]);
+    maximum_signed.signed_at_ms = Some(u64::MAX);
+    let Ok(current_len) = broadcast.encode().map(|encoded| encoded.len()) else {
+        tracing::warn!("failed to encode SWIM state broadcast for size preflight");
+        return None;
+    };
+    let Ok(signed_maximum_len) = maximum_signed.encode().map(|encoded| encoded.len()) else {
+        tracing::warn!("failed to encode maximum signed SWIM state broadcast for size preflight");
+        return None;
+    };
+    if signed_maximum_len <= maximum_bytes {
+        return None;
+    }
+    // Covers both leased-revision growth and the signature fields.
+    let signing_overhead = signed_maximum_len.saturating_sub(current_len);
+    Some(maximum_bytes.saturating_sub(signing_overhead))
 }
 
 /// Return the largest valid local SWIM identity for `site_name`.
@@ -5712,6 +6524,7 @@ fn publish_real_provider_state(
     let site_name = swim.site_name();
     let mut snap = crdt::GridStateSnapshot::new(site_name.to_owned());
     let mut max_revision: u64 = 0;
+    let mut provider_uids = Vec::new();
 
     for provider in providers {
         if provider.spec.grid_network_ref != network_name {
@@ -5719,7 +6532,13 @@ fn publish_real_provider_state(
         }
         let routing_id = routing_overlay::routing_identity(provider).unwrap_or("");
         let metrics = raw_metrics.get(routing_id).copied();
-        if let Some(state) = provider_state_from_kube(provider, network_name, site_name, metrics, served_model_store) {
+        let provider_state = provider_state_from_kube(provider, network_name, site_name, metrics, served_model_store);
+        if let Some(state) = provider_state {
+            if provider.spec.model_discovery.is_some()
+                && let Some(uid) = provider.metadata.uid.as_deref()
+            {
+                provider_uids.push(provider_uid_from_state(uid.to_owned(), &state));
+            }
             upsert_provider_with_capabilities(&mut snap, &mut max_revision, state);
         }
     }
@@ -5735,7 +6554,8 @@ fn publish_real_provider_state(
         }
     }
 
-    let mut bc = provider_state_broadcast(site_name, grid_id, max_revision, snap, swim.gateway_address());
+    let mut bc = provider_state_broadcast(site_name, grid_id, max_revision, snap, swim.gateway_address())
+        .with_provider_uids(provider_uids);
     fit_provider_tools_to_swim_budget(&mut bc);
     if let Err(e) = swim.publish_state_broadcast(bc) {
         tracing::debug!(error = %e, "CRDT broadcast channel unavailable (runtime not yet receiving)");
@@ -5760,6 +6580,16 @@ fn local_wire_providers(
         .filter_map(|provider| tool_provider_state_from_kube(provider, network_name, ""))
         .filter(|state| !state.tools.is_empty());
     inference.chain(tools).map(site_providers::WireProvider::from).collect()
+}
+
+/// Associate a Kubernetes provider UID with the identity published in CRDT state.
+fn provider_uid_from_state(uid: String, state: &crdt::ProviderState) -> swim::ProviderUid {
+    let identity = swim::ProviderIdentity {
+        network: state.network_id.clone(),
+        site: state.site_id.clone(),
+        provider: state.provider_id.clone(),
+    };
+    swim::ProviderUid { identity, uid }
 }
 
 /// Count provider records learned from remote sites through distributed state.
@@ -5825,7 +6655,7 @@ fn membership_staleness(
     providers: Vec<crdt::ProviderState>,
     membership: Option<&MembershipSnapshot>,
 ) -> Vec<crdt::ProviderState> {
-    if GridModes::of(network).signal == SignalMode::Poll {
+    if GridModes::of(network, MembershipMode::Swim).signal == SignalMode::Poll {
         return providers;
     }
     // Dead or Suspect members' providers go Degraded, so their candidates render fresh=false.
@@ -6070,7 +6900,6 @@ pub(crate) fn consumer_config_status_disabled(
 /// `message` is derived from the `OperatorError` `Display` impl only.  That
 /// impl never includes credential token bytes; error messages describe
 /// structural failures (blank fields, JSON errors, Kubernetes API errors).
-#[expect(clippy::too_many_lines, reason = "one arm per status reason")]
 pub(crate) fn consumer_config_status_error(
     gw_ref: &GatewayRef,
     cc: &ConsumerConfig,
@@ -6134,7 +6963,7 @@ fn network_site_name(network: &GridNetwork) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Routing eligibility: CRDT provider → GridSite phase
+// Routing eligibility: CRDT provider -> GridSite phase
 // ---------------------------------------------------------------------------
 
 /// Filter remote CRDT provider records to those whose source `GridSite` is
@@ -6693,10 +7522,6 @@ fn already_recorded_invalid(existing: Option<&GridSiteStatus>, message: &str) ->
     reason = "three sequential match arms, each a distinct security invariant (store/reject/security-log); splitting further would fragment cohesive I/O steps rather than reduce complexity"
 )]
 #[expect(
-    clippy::too_many_lines,
-    reason = "three JSON-patch-plus-log branches read clearer inline than split further"
-)]
-#[expect(
     clippy::large_stack_frames,
     reason = "async future over Kubernetes API types with serde_json values"
 )]
@@ -6796,14 +7621,10 @@ fn discovered_site_spec(site: &DiscoveredSite, network_name: &str, plaintext: bo
 /// has already advanced to `Connecting` or beyond.
 ///
 /// Phase ownership:
-/// - Pending → Discovered: this function (`GridNetwork` controller), based on SWIM Alive
-/// - Discovered → Connecting: `GridSite` controller, based on data-plane gateway address presence.
-/// - Connecting → Active: only an identity-verified TLS probe can promote a site. Plaintext probes report reachability
+/// - Pending -> Discovered: this function (`GridNetwork` controller), based on SWIM Alive
+/// - Discovered -> Connecting: `GridSite` controller, based on data-plane gateway address presence.
+/// - Connecting -> Active: only an identity-verified TLS probe can promote a site. Plaintext probes report reachability
 ///   but remain in Connecting.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential spec-apply + conditional status-patch per discovered site"
-)]
 #[expect(
     clippy::large_stack_frames,
     reason = "async future over Kubernetes API types with serde_json values"
@@ -7056,7 +7877,6 @@ mod tests {
     #[expect(
         clippy::expect_used,
         clippy::indexing_slicing,
-        clippy::too_many_lines,
         reason = "test assertions on a JSON patch"
     )]
     fn the_ready_condition_is_patched_only_on_a_change() {
@@ -7138,11 +7958,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::expect_used,
-        clippy::too_many_lines,
-        reason = "test: two Secrets, then three reads"
-    )]
+    #[expect(clippy::expect_used, reason = "test: two Secrets, then three reads")]
     async fn a_new_grid_ca_alone_changes_the_material_a_listener_was_built_from() {
         crate::init_process_crypto();
         let ca = certs::generate_ca("grid-ca").expect("ca");
@@ -7193,24 +8009,33 @@ mod tests {
     #[test]
     fn modes_restart_only_when_a_grid_network_declares_others() {
         let running = GridModes::WITHOUT_NETWORK;
-        assert_eq!(running.restart_for(None), None, "no GridNetwork, no restart");
+        assert_eq!(
+            running.restart_for(None, MembershipMode::Swim),
+            None,
+            "no GridNetwork, no restart"
+        );
 
         let same = network_with_modes(&serde_json::json!({"peerTrust": {"mode": "spiffe"}}));
-        assert_eq!(running.restart_for(Some(&same)), None, "same modes, no restart");
+        assert_eq!(
+            running.restart_for(Some(&same), MembershipMode::Swim),
+            None,
+            "same modes, no restart"
+        );
 
         let poll = network_with_modes(&serde_json::json!({
             "peerTrust": {"mode": "spiffe"},
             "signalTransport": {"mode": "poll"},
         }));
         assert_eq!(
-            running.restart_for(Some(&poll)),
+            running.restart_for(Some(&poll), MembershipMode::Swim),
             Some(GridModes {
+                membership: MembershipMode::Swim,
                 signal: SignalMode::Poll,
                 trust: PeerTrustMode::Spiffe,
             })
         );
         assert_eq!(
-            GridModes::of(&poll).restart_for(Some(&poll)),
+            GridModes::of(&poll, MembershipMode::Swim).restart_for(Some(&poll), MembershipMode::Swim),
             None,
             "the restarted process runs what it declares, so it never loops"
         );
@@ -7220,7 +8045,7 @@ mod tests {
     fn a_trust_change_restarts_only_under_poll() {
         let pin = network_with_modes(&serde_json::json!({"peerTrust": {"mode": "pin"}}));
         assert_eq!(
-            GridModes::WITHOUT_NETWORK.restart_for(Some(&pin)),
+            GridModes::WITHOUT_NETWORK.restart_for(Some(&pin), MembershipMode::Swim),
             None,
             "gossip reads no trust, so a fresh install declaring pin does not restart"
         );
@@ -7233,9 +8058,72 @@ mod tests {
             "signalTransport": {"mode": "poll"},
         }));
         assert_eq!(
-            GridModes::of(&poll).restart_for(Some(&poll_pin)),
-            Some(GridModes::of(&poll_pin)),
+            GridModes::of(&poll, MembershipMode::Swim).restart_for(Some(&poll_pin), MembershipMode::Swim),
+            Some(GridModes::of(&poll_pin, MembershipMode::Swim)),
             "under poll a trust change restarts"
+        );
+    }
+
+    #[test]
+    fn membership_override_and_removal_resolve_against_the_install() {
+        let legacy = network_with_modes(&serde_json::json!({"signalTransport": {"mode": "poll"}}));
+        for mode in [MembershipMode::Swim, MembershipMode::Local] {
+            assert_eq!(GridModes::of(&legacy, mode).membership, mode);
+            assert_eq!(GridModes::of(&legacy, mode).restart_for(Some(&legacy), mode), None);
+        }
+        let declared = network_with_modes(&serde_json::json!({
+            "membership": {"mode": "Local"}, "signalTransport": {"mode": "poll"}
+        }));
+        let running = GridModes::of(&declared, MembershipMode::Swim);
+        assert_eq!(running.membership, MembershipMode::Local);
+        assert_eq!(running.restart_for(Some(&declared), MembershipMode::Swim), None);
+        assert_eq!(
+            running
+                .restart_for(Some(&legacy), MembershipMode::Swim)
+                .map(|next| next.membership),
+            Some(MembershipMode::Swim),
+            "removing the override restores the install setting"
+        );
+        assert_eq!(running.restart_for(Some(&legacy), MembershipMode::Local), None);
+    }
+
+    #[tokio::test]
+    async fn membership_changes_restart_before_reconciling_other_resources() -> Result<(), OperatorError> {
+        for (running, wanted) in [
+            (MembershipMode::Swim, MembershipMode::Local),
+            (MembershipMode::Local, MembershipMode::Swim),
+        ] {
+            let client = crate::resources::test_doubles::mock_kube_client_with_secrets(HashMap::new());
+            let (owed, mut restart) = tokio::sync::watch::channel(None);
+            let ctx = Arc::new(
+                OperatorCtx::new(client, None, SignalMode::Poll)
+                    .with_membership(running)
+                    .with_mode_restart(owed),
+            );
+            let network = network_with_modes(&serde_json::json!({
+                "membership": {"mode": wanted.as_str()},
+                "signalTransport": {"mode": "poll"}, "peerTrust": {"mode": "pin"}
+            }));
+            assert_eq!(
+                Box::pin(reconcile(Arc::new(network), ctx)).await?,
+                Action::await_change()
+            );
+            assert_eq!(restart.borrow_and_update().map(|next| next.membership), Some(wanted));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_membership_rejects_gossip_before_requesting_restart() {
+        let client = crate::resources::test_doubles::mock_kube_client_with_secrets(HashMap::new());
+        let (owed, restart) = tokio::sync::watch::channel(None);
+        let ctx = Arc::new(OperatorCtx::new(client, None, SignalMode::Gossip).with_mode_restart(owed));
+        let network = network_with_modes(&serde_json::json!({"membership": {"mode": "Local"}}));
+        assert!(matches!(Box::pin(reconcile(Arc::new(network), ctx)).await,
+                         Err(OperatorError::InvalidResource(message)) if message.contains("requires signalTransport.mode poll")));
+        assert!(
+            restart.borrow().is_none(),
+            "invalid modes must not cause a restart loop"
         );
     }
 
@@ -7248,12 +8136,14 @@ mod tests {
             "signalTransport": {"mode": "poll"},
         }));
         assert_eq!(
-            startup.restart_for(Some(&poll_pin)),
+            startup.restart_for(Some(&poll_pin), MembershipMode::Swim),
             None,
             "the network it declared needs no restart"
         );
         assert!(
-            GridModes::WITHOUT_NETWORK.restart_for(Some(&poll_pin)).is_some(),
+            GridModes::WITHOUT_NETWORK
+                .restart_for(Some(&poll_pin), MembershipMode::Swim)
+                .is_some(),
             "without the declared modes the same install restarts"
         );
         assert_eq!(
@@ -7481,6 +8371,34 @@ mod tests {
     // determine_phase with membership seam
     // -----------------------------------------------------------------------
 
+    /// API path of [`stored_grid_id_network`]'s network.
+    const GRID_ID_PATH: &str = "/apis/grid.praxis.fast/v1alpha1/gridnetworks/net";
+
+    /// A fake API holding a network with these spec and status grid IDs, and the network as read back.
+    fn stored_grid_id_network(
+        spec: &str,
+        status: &str,
+    ) -> Result<(status_harness::FakeApi, GridNetwork), OperatorError> {
+        let api = status_harness::FakeApi::new();
+        let mut network = base_network();
+        spec.clone_into(&mut network.spec.grid_id);
+        network.status = (!status.is_empty()).then(|| GridNetworkStatus {
+            grid_id: status.to_owned(),
+            ..GridNetworkStatus::default()
+        });
+        api.put(GRID_ID_PATH, serde_json::to_value(&network)?);
+        let stored = serde_json::from_value(api.get(GRID_ID_PATH).unwrap_or_default())?;
+        Ok((api, stored))
+    }
+
+    /// Writes to the network's main resource, which is where `spec.gridId` lives.
+    fn grid_id_spec_writes(api: &status_harness::FakeApi) -> Vec<status_harness::Write> {
+        api.writes()
+            .into_iter()
+            .filter(|write| write.path == GRID_ID_PATH && !write.status)
+            .collect()
+    }
+
     fn base_network() -> GridNetwork {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "grid.praxis.fast/v1alpha1",
@@ -7634,10 +8552,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one fenced pass must refresh collection, readiness and peer inventory"
-    )]
     async fn fenced_publication_keeps_scraping_readiness_and_refreshing_peers() -> Result<(), Box<dyn std::error::Error>>
     {
         let response = "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n"
@@ -7833,10 +8747,33 @@ mod tests {
     }
 
     #[test]
+    fn determine_phase_local_does_not_wait_for_swim() {
+        for (grid_id, trust, mode, expected) in [
+            ("some-id", true, MembershipMode::Local, GridNetworkPhase::Active),
+            ("", true, MembershipMode::Local, GridNetworkPhase::Pending),
+            ("some-id", false, MembershipMode::Local, GridNetworkPhase::Pending),
+            ("some-id", true, MembershipMode::Swim, GridNetworkPhase::Initializing),
+        ] {
+            let mut network = base_network();
+            network.spec.seeds = vec!["legacy-peer:7946".to_owned()];
+            network.spec.tls.ca_secret_ref = trust.then(|| crate::crd::grid_network::SecretRef {
+                name: "ca".to_owned(),
+                namespace: "default".to_owned(),
+                key: None,
+            });
+            assert_eq!(
+                determine_phase(&network, grid_id, None, mode),
+                expected,
+                "mode={mode:?}, grid_id={grid_id:?}, trust={trust} without a SWIM runtime"
+            );
+        }
+    }
+
+    #[test]
     fn determine_phase_none_membership_preserves_tls_logic() {
         let network = base_network();
         // Without TLS config, phase is Pending regardless of grid_id.
-        let phase = determine_phase(&network, "some-id", None);
+        let phase = determine_phase(&network, "some-id", None, MembershipMode::Swim);
         assert_eq!(
             phase,
             GridNetworkPhase::Pending,
@@ -7848,7 +8785,7 @@ mod tests {
     fn determine_phase_empty_snapshot_preserves_tls_logic() {
         let network = base_network();
         let empty = MembershipSnapshot::default();
-        let phase = determine_phase(&network, "some-id", Some(&empty));
+        let phase = determine_phase(&network, "some-id", Some(&empty), MembershipMode::Swim);
         assert_eq!(
             phase,
             GridNetworkPhase::Pending,
@@ -7860,7 +8797,7 @@ mod tests {
     fn determine_phase_with_alive_member_is_active() {
         let network = base_network();
         let snap = alive_snapshot(2);
-        let phase = determine_phase(&network, "some-id", Some(&snap));
+        let phase = determine_phase(&network, "some-id", Some(&snap), MembershipMode::Swim);
         assert_eq!(
             phase,
             GridNetworkPhase::Active,
@@ -7872,7 +8809,7 @@ mod tests {
     fn determine_phase_with_suspect_only_is_degraded() {
         let network = base_network();
         let snap = suspect_snapshot();
-        let phase = determine_phase(&network, "some-id", Some(&snap));
+        let phase = determine_phase(&network, "some-id", Some(&snap), MembershipMode::Swim);
         assert_eq!(
             phase,
             GridNetworkPhase::Degraded,
@@ -7891,7 +8828,7 @@ mod tests {
             key: None,
         });
         let snap = alive_snapshot(1);
-        let phase = determine_phase(&network, "some-id", Some(&snap));
+        let phase = determine_phase(&network, "some-id", Some(&snap), MembershipMode::Swim);
         assert_eq!(
             phase,
             GridNetworkPhase::Active,
@@ -7913,7 +8850,7 @@ mod tests {
         });
         network.spec.seeds.clear();
         let empty = MembershipSnapshot::default();
-        let phase = determine_phase(&network, "some-id", Some(&empty));
+        let phase = determine_phase(&network, "some-id", Some(&empty), MembershipMode::Swim);
         assert_eq!(
             phase,
             GridNetworkPhase::Active,
@@ -7933,7 +8870,7 @@ mod tests {
         });
         network.spec.seeds = vec!["grid.peer:7946".to_owned()];
         let empty = MembershipSnapshot::default();
-        let phase = determine_phase(&network, "some-id", Some(&empty));
+        let phase = determine_phase(&network, "some-id", Some(&empty), MembershipMode::Swim);
         assert_eq!(
             phase,
             GridNetworkPhase::Initializing,
@@ -7943,7 +8880,7 @@ mod tests {
 
     #[test]
     fn connected_sites_is_zero_without_membership() {
-        // Verify the update_status path: no membership → connected_sites = 0.
+        // Verify the update_status path: no membership -> connected_sites = 0.
         let count = None::<MembershipSnapshot>
             .as_ref()
             .map_or(0, MembershipSnapshot::connected_count);
@@ -8112,7 +9049,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // InferenceProvider → crdt::ProviderState mapping
+    // InferenceProvider -> crdt::ProviderState mapping
     // -----------------------------------------------------------------------
 
     fn make_provider(name: &str, network: &str, backend_kind: &str, generation: i64) -> InferenceProvider {
@@ -8248,15 +9185,11 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "this table proves current and stale withdrawal behavior for every provider phase"
-    )]
     fn crdt_phase_from_provider_maps_all_variants() {
         assert_eq!(
             crdt_phase_from_provider(None, 1),
             crdt::ProviderPhase::Pending,
-            "absent status → Pending"
+            "absent status -> Pending"
         );
         let pending: InferenceProviderStatus = serde_json::from_value(serde_json::json!({
             "phase": "Pending", "observedGeneration": 3
@@ -8345,9 +9278,9 @@ mod tests {
     #[test]
     fn metrics_to_crdt_returns_all_none_when_no_metrics() {
         let m = metrics_to_crdt(None);
-        assert!(m.error_rate.is_none(), "no metrics → error_rate=None");
-        assert!(m.queue_depth.is_none(), "no metrics → queue_depth=None");
-        assert!(m.healthy.is_none(), "no metrics → healthy=None");
+        assert!(m.error_rate.is_none(), "no metrics -> error_rate=None");
+        assert!(m.queue_depth.is_none(), "no metrics -> queue_depth=None");
+        assert!(m.healthy.is_none(), "no metrics -> healthy=None");
     }
 
     #[test]
@@ -8550,7 +9483,7 @@ mod tests {
         // This is the pure-function equivalent of the rejoin recovery proof.
         let provider = make_crdt_provider("site-west", crdt::ProviderPhase::Available);
 
-        // Partition: Dead → Degraded
+        // Partition: Dead -> Degraded
         let dead_membership = make_swim_membership("site-west", MemberStatus::Dead);
         let degraded = apply_swim_staleness_override(std::slice::from_ref(&provider), Some(&dead_membership));
         assert_eq!(
@@ -8559,7 +9492,7 @@ mod tests {
             "Dead peer must produce Degraded phase (partition)"
         );
 
-        // Recovery: Alive → Available (override lifted)
+        // Recovery: Alive -> Available (override lifted)
         let alive_membership = make_swim_membership("site-west", MemberStatus::Alive);
         let recovered = apply_swim_staleness_override(std::slice::from_ref(&provider), Some(&alive_membership));
         assert_eq!(
@@ -8590,10 +9523,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "two-provider membership fixture with inline vec construction"
-    )]
     fn staleness_override_multiple_providers_only_dead_site_degraded() {
         // Multi-provider recovery: west is Dead, east is Alive.
         // Only west's provider becomes Degraded; east's provider stays Available.
@@ -8637,36 +9566,6 @@ mod tests {
             east.phase,
             crdt::ProviderPhase::Available,
             "Alive east must stay Available"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // resolve_grid_id: pure ID resolution (three branches)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn resolve_grid_id_prefers_spec_grid_id() {
-        let network = base_network();
-        let id = resolve_grid_id(&network);
-        assert_eq!(
-            id, "test-id",
-            "spec.gridId must be returned verbatim when non-empty, with no status lookup or UUID generation"
-        );
-    }
-
-    #[test]
-    fn resolve_grid_id_falls_back_to_status_grid_id_when_spec_is_empty() {
-        let mut network = base_network();
-        network.spec.grid_id = String::new();
-        network.status = Some(GridNetworkStatus {
-            grid_id: "persisted-id".to_owned(),
-            ..Default::default()
-        });
-        let id = resolve_grid_id(&network);
-        assert_eq!(
-            id, "persisted-id",
-            "status.gridId must be returned when spec.gridId is empty, \
-             preserving a previously negotiated ID across operator restarts"
         );
     }
 
@@ -8881,10 +9780,426 @@ mod tests {
         assert!(!note_inconsistent(network(), false) && !note_inconsistent(other(), false));
     }
 
-    /// The identity status reports expiry and the renewal window, and an expired identity says how to recover.
+    #[test]
+    #[expect(clippy::expect_used, reason = "certificate trust boundary test fixture")]
+    fn validated_gossip_key_requires_grid_ca_site_identity_and_matching_private_key() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let leaf = certs::generate_site_cert(&ca, "site-east").expect("leaf");
+        let der = pem::parse(&leaf.key_pem).expect("key pem").into_contents();
+        let validated = validated_gossip_key(
+            ca.cert_pem.as_bytes(),
+            leaf.cert_pem.as_bytes(),
+            leaf.key_pem.as_bytes(),
+            "site-east",
+        )
+        .expect("valid local identity");
+        let wrong_name = validated_gossip_key(
+            ca.cert_pem.as_bytes(),
+            leaf.cert_pem.as_bytes(),
+            leaf.key_pem.as_bytes(),
+            "site-west",
+        );
+        let other_ca = certs::generate_ca("other-ca").expect("other ca");
+        let wrong_ca = validated_gossip_key(
+            other_ca.cert_pem.as_bytes(),
+            leaf.cert_pem.as_bytes(),
+            leaf.key_pem.as_bytes(),
+            "site-east",
+        );
+        let other_leaf = certs::generate_site_cert(&ca, "site-east").expect("other leaf");
+        let mismatched_key = validated_gossip_key(
+            ca.cert_pem.as_bytes(),
+            leaf.cert_pem.as_bytes(),
+            other_leaf.key_pem.as_bytes(),
+            "site-east",
+        );
+
+        assert_eq!(
+            validated.as_slice(),
+            der.as_slice(),
+            "the installed signer is the validated PKCS8 key"
+        );
+        assert!(wrong_name.is_err(), "another site's leaf must not identify this site");
+        assert!(wrong_ca.is_err(), "a leaf outside this grid CA must not be trusted");
+        assert!(
+            mismatched_key.is_err(),
+            "the private signer must match the existing site certificate"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "certificate and inventory signing test fixture")]
+    fn signed_model_inventory_frames_authenticate_each_model_for_origin_and_grid() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let leaf = certs::generate_site_cert(&ca, "site-east").expect("leaf");
+        let private_key = pem::parse(&leaf.key_pem).expect("key pem").into_contents();
+        let public_key = swim::signing::public_key_ecdsa_p256(&private_key).expect("public key");
+        let now_ms = gossip_wall_clock_millis();
+        let inventory = swim::ModelInventory {
+            origin_site: "site-east".to_owned(),
+            grid_id: "grid-a".to_owned(),
+            network_id: "grid".to_owned(),
+            provider_id: "provider-east".to_owned(),
+            provider_uid: "provider-uid".to_owned(),
+            revision: now_ms,
+            expires_at_ms: now_ms.saturating_add(60_000),
+            models: vec!["model-a".to_owned(), "model-b".to_owned()],
+        };
+
+        let broadcasts = sign_model_inventory_frames(&inventory, &private_key, now_ms).expect("signed frames");
+
+        assert_eq!(broadcasts.len(), 2, "one complete frame carries each model name");
+        assert!(
+            broadcasts.iter().all(|broadcast| {
+                broadcast.origin_site == "site-east"
+                    && broadcast.grid_id == "grid-a"
+                    && broadcast
+                        .frame
+                        .verifies("site-east", "grid-a", std::slice::from_ref(&public_key))
+            }),
+            "every frame must verify for its inventory origin and grid"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::expect_used,
+        reason = "a prefilled one-slot runtime queue proves bounded reliable publication of the maximum inventory"
+    )]
+    async fn full_model_inventory_waits_for_runtime_queue_capacity_without_stranding_frames() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let leaf = certs::generate_site_cert(&ca, "site-east").expect("leaf");
+        let private_key = pem::parse(&leaf.key_pem).expect("key pem").into_contents();
+        let now_ms = gossip_wall_clock_millis();
+        let queued = swim::ModelInventory {
+            origin_site: "site-east".to_owned(),
+            grid_id: "grid-a".to_owned(),
+            network_id: "grid".to_owned(),
+            provider_id: "provider-east".to_owned(),
+            provider_uid: "provider-uid".to_owned(),
+            revision: now_ms.saturating_sub(1),
+            expires_at_ms: now_ms.saturating_add(60_000),
+            models: Vec::new(),
+        };
+        let queued_frame = sign_model_inventory_frames(&queued, &private_key, now_ms)
+            .expect("signed queued frame")
+            .pop()
+            .expect("empty inventory has one frame");
+        let (handle, mut receiver) = SwimHandle::detached_with_inventory_capacity("site-east", 1);
+        handle
+            .publish_model_inventory_frame(queued_frame)
+            .await
+            .expect("prefill inventory queue");
+        let inventory = swim::ModelInventory {
+            revision: now_ms,
+            models: (0..swim::MAX_INVENTORY_MODELS)
+                .map(|index| format!("model-{index:03}-{}", "x".repeat(246)))
+                .collect(),
+            ..queued
+        };
+        let publisher =
+            tokio::spawn(async move { publish_model_inventory_frames(&handle, &inventory, &private_key).await });
+        let first = timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .expect("prefilled queue drains")
+            .expect("queued frame is present");
+        assert_eq!(first.frame.inventory_revision, now_ms.saturating_sub(1));
+        let mut indexes = Vec::with_capacity(swim::MAX_INVENTORY_MODELS);
+        for _ in 0..swim::MAX_INVENTORY_MODELS {
+            let frame = timeout(Duration::from_secs(10), receiver.recv())
+                .await
+                .expect("publisher waits only for bounded queue capacity")
+                .expect("every signed frame is queued");
+            indexes.push(frame.frame.frame_index);
+        }
+        publisher
+            .await
+            .expect("publisher task completes")
+            .expect("inventory publication succeeds");
+        indexes.sort_unstable();
+
+        assert_eq!(
+            indexes,
+            (0..swim::MAX_INVENTORY_MODELS)
+                .map(|index| u16::try_from(index).expect("frame index fits u16"))
+                .collect::<Vec<_>>(),
+            "the bounded runtime queue must not strand any frame"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "peer certificate trust test fixture")]
+    fn peer_gossip_pin_obeys_grid_ca_and_declared_fingerprint_policy() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let leaf = certs::generate_site_cert(&ca, "site-peer").expect("leaf");
+        let fingerprint = certs::canonical_fingerprint(&leaf.cert_pem).expect("fingerprint");
+        let peer = |fingerprints: Vec<String>| {
+            serde_json::from_value::<GridSite>(serde_json::json!({
+                "apiVersion": "grid.praxis.fast/v1alpha1",
+                "kind": "GridSite",
+                "metadata": { "name": "site-peer" },
+                "spec": {
+                    "gridNetworkRef": "grid-a",
+                    "trust": { "canonicalFingerprints": fingerprints }
+                },
+                "status": { "publicCertPem": leaf.cert_pem.clone() }
+            }))
+            .expect("GridSite")
+        };
+        let formatted_fingerprint: String = fingerprint
+            .char_indices()
+            .flat_map(|(index, character)| {
+                let character = character.to_ascii_uppercase();
+                if index > 0 && index.is_multiple_of(2) {
+                    vec![':', character]
+                } else {
+                    vec![character]
+                }
+            })
+            .collect();
+        let pinned = peer(vec![fingerprint]);
+        let unpinned = peer(Vec::new());
+        let other_ca = certs::generate_ca("other-ca").expect("other ca");
+        assert!(
+            verified_peer_gossip_key(&pinned, &ca.cert_pem, PeerTrustMode::Pin)
+                .expect("verified certificate")
+                .is_some(),
+            "matching CA and declared fingerprint yield a peer pin"
+        );
+        assert!(
+            verified_peer_gossip_key(&peer(vec![formatted_fingerprint]), &ca.cert_pem, PeerTrustMode::Pin)
+                .expect("non-canonical declared fingerprint")
+                .is_some(),
+            "uppercase colon-separated pins authorize the same certificate"
+        );
+        assert!(
+            verified_peer_gossip_key(&unpinned, &ca.cert_pem, PeerTrustMode::Pin).is_err(),
+            "pin trust refuses a certificate with no declared fingerprint"
+        );
+        assert!(
+            verified_peer_gossip_key(&pinned, &other_ca.cert_pem, PeerTrustMode::Spiffe).is_err(),
+            "SPIFFE trust still requires the Grid CA"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unpersisted_grid_id_waits_without_installing_signed_state() {
+        let mut network = network_with_endpoint_transport("plaintext", None);
+        network.spec.grid_id = String::new();
+        network.spec.peer_trust = Some(crate::crd::grid_network::PeerTrustConfig {
+            mode: PeerTrustMode::Pin,
+            signed_state: SignedStateMode::Enforce,
+        });
+        let client = crate::resources::test_doubles::mock_kube_client_with_grid_networks(HashMap::from([(
+            "glb-demo",
+            network.clone(),
+        )]));
+        let ctx = OperatorCtx::new(client, None, SignalMode::default());
+        let (swim, mut runtime) = SwimHandle::detached("site-a");
+
+        let result = sign_grid_state(&network, &ctx, &swim, "glb-demo").await;
+
+        assert!(
+            result.is_ok(),
+            "missing enrollment-owned grid ID waits without failing: {result:?}"
+        );
+        assert_eq!(
+            runtime.grids_enforced(),
+            Vec::<String>::new(),
+            "signed state is not enabled before enrollment provides a grid ID"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "certificate and API server fixture")]
+    async fn peer_pins_follow_the_declared_trust_not_the_startup_one() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let leaf = certs::generate_site_cert(&ca, "site-peer").expect("leaf");
+        let sites = serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridSiteList",
+            "metadata": { "resourceVersion": "1" },
+            "items": [{
+                "apiVersion": "grid.praxis.fast/v1alpha1",
+                "kind": "GridSite",
+                "metadata": { "name": "site-peer" },
+                "spec": { "gridNetworkRef": "glb-demo" },
+                "status": { "publicCertPem": leaf.cert_pem }
+            }]
+        });
+        let ca_secret = serde_json::to_value(crate::resources::test_doubles::secret_with_key(
+            "ca.crt",
+            ca.cert_pem.as_bytes(),
+        ))
+        .expect("Secret");
+        let client = crate::resources::test_doubles::mock_kube_client_with_json(HashMap::from([
+            ("ca", ca_secret),
+            ("gridsites", sites),
+        ]));
+        let mut network = network_with_endpoint_transport("plaintext", None);
+        network.spec.peer_trust = Some(crate::crd::grid_network::PeerTrustConfig {
+            mode: PeerTrustMode::Pin,
+            signed_state: SignedStateMode::Enforce,
+        });
+
+        let pins = collect_gossip_peer_pins(&network, &client, "site-local")
+            .await
+            .expect("pins");
+
+        assert!(
+            pins.is_empty(),
+            "declared pin trust refuses a peer with no declared fingerprint: {pins:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::expect_used,
+        reason = "multiple certificate fixtures verify key accumulation and deduplication"
+    )]
+    async fn peer_gossip_pins_accumulate_distinct_keys_for_one_site() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let first = certs::generate_site_cert(&ca, "site-peer").expect("first leaf");
+        let second = certs::generate_site_cert(&ca, "site-peer").expect("second leaf");
+        let first_fingerprint = certs::canonical_fingerprint(&first.cert_pem).expect("first fingerprint");
+        let second_fingerprint = certs::canonical_fingerprint(&second.cert_pem).expect("second fingerprint");
+        let discovered = |name: &str, cert_pem: &str, fingerprint: &str| {
+            serde_json::json!({
+                "apiVersion": "grid.praxis.fast/v1alpha1",
+                "kind": "GridSite",
+                "metadata": {
+                    "name": name,
+                    "labels": { "grid.praxis.fast/auto-discovered": "true" },
+                    "annotations": { "grid.praxis.fast/site-id": "site-peer" }
+                },
+                "spec": {
+                    "gridNetworkRef": "glb-demo",
+                    "trust": { "canonicalFingerprints": [fingerprint] }
+                },
+                "status": { "publicCertPem": cert_pem }
+            })
+        };
+        let enrolled = serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridSite",
+            "metadata": { "name": "site-peer" },
+            "spec": {
+                "gridNetworkRef": "glb-demo",
+                "trust": { "canonicalFingerprints": [first_fingerprint] }
+            },
+            "status": { "publicCertPem": first.cert_pem }
+        });
+        let sites = serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridSiteList",
+            "metadata": { "resourceVersion": "1" },
+            "items": [
+                enrolled,
+                discovered("glb-demo-site-peer", &second.cert_pem, &second_fingerprint),
+                discovered("glb-demo-site-peer-copy", &second.cert_pem, &second_fingerprint)
+            ]
+        });
+        let ca_secret = serde_json::to_value(crate::resources::test_doubles::secret_with_key(
+            "ca.crt",
+            ca.cert_pem.as_bytes(),
+        ))
+        .expect("Secret");
+        let client = crate::resources::test_doubles::mock_kube_client_with_json(HashMap::from([
+            ("ca", ca_secret),
+            ("gridsites", sites),
+        ]));
+        let network = network_with_endpoint_transport("plaintext", None);
+        let pins = collect_gossip_peer_pins(&network, &client, "site-local")
+            .await
+            .expect("pins");
+        let first_key = certs::verify_site_cert(&ca.cert_pem, &first.cert_pem, "site-peer").expect("first key");
+        let second_key = certs::verify_site_cert(&ca.cert_pem, &second.cert_pem, "site-peer").expect("second key");
+
+        assert!(
+            matches!(pins.get("site-peer"), Some(keys) if keys.len() == 2
+                && keys.contains(&first_key) && keys.contains(&second_key)),
+            "both distinct certificates are retained once: {pins:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "certificate fixture")]
+    async fn signed_cert_bootstrap_republishes_on_every_reconcile() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let leaf = certs::generate_site_cert(&ca, "site-a").expect("leaf");
+        let site = crate::resources::test_doubles::secret_with_key("tls.crt", leaf.cert_pem.as_bytes());
+        let client = crate::resources::test_doubles::mock_kube_client_with_secrets(HashMap::from([("site", site)]));
+        let ctx = OperatorCtx::new(client, None, SignalMode::default());
+        let (swim, mut runtime) = SwimHandle::detached("site-a");
+        let network = network_with_endpoint_transport("plaintext", None);
+
+        publish_signed_site_cert(&network, &ctx.client, &swim, "grid-a", "net").await;
+        publish_signed_site_cert(&network, &ctx.client, &swim, "grid-a", "net").await;
+
+        for reconcile in ["first", "second"] {
+            let bootstrap = runtime.broadcasts.try_recv().expect(reconcile);
+            assert_eq!(
+                bootstrap.grid_id.as_deref(),
+                Some("grid-a"),
+                "{reconcile} reconcile publishes a grid-scoped bootstrap"
+            );
+            assert_eq!(
+                bootstrap.site_cert_pem.as_deref(),
+                Some(leaf.cert_pem.as_str()),
+                "{reconcile} reconcile carries the site certificate for late joiners"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_grid_ca_keeps_installed_pins_and_reconciles() {
+        let client = crate::resources::test_doubles::mock_kube_client_with_secrets(HashMap::new());
+        let ctx = OperatorCtx::new(client, None, SignalMode::default());
+        let (swim, mut runtime) = SwimHandle::detached("site-a");
+        let network = network_with_endpoint_transport("plaintext", None);
+
+        let ready = apply_signed_state(&network, &ctx, &swim, "grid-a", SignedStateMode::Enforce).await;
+
+        assert!(
+            matches!(ready, Ok(false)),
+            "a missing Grid CA must not fail the reconcile, nor yield a signer"
+        );
+        assert_eq!(
+            runtime.peer_pins_sent("grid-a"),
+            vec![None],
+            "the grid still enforces, keeping the pins it has"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_network_relaxes_its_trust_once_withdrawn() {
+        let mut network = network_with_endpoint_transport("plaintext", None);
+        network.metadata.finalizers = Some(vec![GRID_NETWORK_WITHDRAWAL_FINALIZER.to_owned()]);
+        let client = crate::resources::test_doubles::mock_kube_client_with_grid_networks(HashMap::from([(
+            "glb-demo",
+            network.clone(),
+        )]));
+        let (swim, mut runtime) = SwimHandle::detached("site-a");
+        let ctx = OperatorCtx::new(client, Some(Arc::new(swim)), SignalMode::default());
+
+        let (action, withdrawn) = tokio::join!(
+            reconcile_deleting_grid_network(&network, &ctx, "glb-demo"),
+            runtime.publish_withdrawal()
+        );
+
+        assert!(action.is_ok(), "the finalizer is removed: {action:?}");
+        assert_eq!(withdrawn.as_deref(), Some("id"));
+        assert_eq!(
+            runtime.grids_relaxed(),
+            vec!["id".to_owned()],
+            "a withdrawn grid keeps no signer or pins"
+        );
+    }
+
     #[test]
     fn only_spiffe_trust_renews() {
         let modes = |trust| GridModes {
+            membership: MembershipMode::Swim,
             signal: SignalMode::Gossip,
             trust,
         };
@@ -8958,7 +10273,7 @@ mod tests {
         let mut independently_owned = baseline.clone();
         independently_owned.conditions = vec![Condition {
             type_: crate::peer_ages::PEER_TIME_VALID.to_owned(),
-            status: "False".to_owned(),
+            status: ConditionStatus::False,
             reason: "TimestampOutOfRange".to_owned(),
             ..Default::default()
         }];
@@ -8987,14 +10302,14 @@ mod tests {
     }
 
     /// A network holding `conditions` as `(type, status, reason)`.
-    fn network_holding(conditions: &[(&str, &str, &str)]) -> GridNetwork {
+    fn network_holding(conditions: &[(&str, ConditionStatus, &str)]) -> GridNetwork {
         let mut network = base_network();
         network.status = Some(GridNetworkStatus {
             conditions: conditions
                 .iter()
                 .map(|(type_, status, reason)| Condition {
                     type_: (*type_).to_owned(),
-                    status: (*status).to_owned(),
+                    status: *status,
                     reason: (*reason).to_owned(),
                     ..Condition::default()
                 })
@@ -9009,7 +10324,7 @@ mod tests {
         network_rollup(network)
             .into_iter()
             .find(|condition| condition.type_ == type_)
-            .map(|condition| (condition.status, condition.reason))
+            .map(|condition| (condition.status.to_string(), condition.reason))
     }
 
     #[test]
@@ -9017,10 +10332,14 @@ mod tests {
         let network = network_holding(&[
             (
                 crate::gateway_ages::GATEWAY_AGES_REJECTED,
-                "True",
+                ConditionStatus::True,
                 "GatewayAgesRejected",
             ),
-            (crate::peer_ages::PEER_TIME_VALID, "False", "TimestampOutOfRange"),
+            (
+                crate::peer_ages::PEER_TIME_VALID,
+                ConditionStatus::False,
+                "TimestampOutOfRange",
+            ),
         ]);
         let pair = |status: &str, reason: &str| Some((status.to_owned(), reason.to_owned()));
         assert_eq!(
@@ -9032,30 +10351,29 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one network per gate state")]
     fn available_copies_the_first_failing_enrollment_gate_in_order() {
         use crate::enroll::local::{ACCEPTED, ENROLLED, IDENTITY_VALID, RESOLVED_REFS, ROTATION_ON_SCHEDULE};
         let pair = |status: &str, reason: &str| Some((status.to_owned(), reason.to_owned()));
-        let gates = |identity: (&'static str, &'static str)| {
+        let gates = |identity: (ConditionStatus, &'static str)| {
             network_holding(&[
-                (ROTATION_ON_SCHEDULE, "False", "RenewalFailing"),
-                (ENROLLED, "True", "Issued"),
-                (ACCEPTED, "True", ACCEPTED),
-                (RESOLVED_REFS, "False", "RefNotFound"),
+                (ROTATION_ON_SCHEDULE, ConditionStatus::False, "RenewalFailing"),
+                (ENROLLED, ConditionStatus::True, "Issued"),
+                (ACCEPTED, ConditionStatus::True, ACCEPTED),
+                (RESOLVED_REFS, ConditionStatus::False, "RefNotFound"),
                 (IDENTITY_VALID, identity.0, identity.1),
             ])
         };
-        let held = gates(("Unknown", "AwaitingFirstAttempt"));
+        let held = gates((ConditionStatus::Unknown, "AwaitingFirstAttempt"));
         assert_eq!(
             rolled_up(&held, "Available"),
             pair("False", "RefNotFound"),
             "ResolvedRefs comes first"
         );
-        let mut valid = gates(("True", IDENTITY_VALID));
+        let mut valid = gates((ConditionStatus::True, IDENTITY_VALID));
         if let Some(status) = valid.status.as_mut() {
             for condition in &mut status.conditions {
                 if condition.type_ == RESOLVED_REFS {
-                    condition.status = "True".to_owned();
+                    condition.status = ConditionStatus::True;
                     condition.reason = RESOLVED_REFS.to_owned();
                 }
             }
@@ -9078,17 +10396,17 @@ mod tests {
         let pair = |status: &str, reason: &str| Some((status.to_owned(), reason.to_owned()));
         let enrolled = |status, reason| network_holding(&[(ENROLLED, status, reason)]);
         assert_eq!(
-            rolled_up(&enrolled("Unknown", ENROLLING), "Progressing"),
+            rolled_up(&enrolled(ConditionStatus::Unknown, ENROLLING), "Progressing"),
             pair("True", ENROLLING)
         );
         assert_eq!(
-            rolled_up(&enrolled("False", "InviteMaybeSpent"), "Progressing"),
+            rolled_up(&enrolled(ConditionStatus::False, "InviteMaybeSpent"), "Progressing"),
             pair("True", RETRYING)
         );
         for (status, reason) in [
-            ("False", "AwaitingInvite"),
-            ("False", "InviteInvalid"),
-            ("True", "Issued"),
+            (ConditionStatus::False, "AwaitingInvite"),
+            (ConditionStatus::False, "InviteInvalid"),
+            (ConditionStatus::True, "Issued"),
         ] {
             assert_eq!(
                 rolled_up(&enrolled(status, reason), "Progressing").map(|(status, _)| status),
@@ -9099,7 +10417,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "each peer condition both ways, then the order")]
     fn the_peer_conditions_degrade_the_network_after_its_own_and_never_gate_it() {
         use crate::{peer_membership::PEER_MEMBERSHIP, peer_reach};
         let pair = |status: &str, reason: &str| Some((status.to_owned(), reason.to_owned()));
@@ -9109,7 +10426,7 @@ mod tests {
             (PEER_MEMBERSHIP, crate::peer_membership::PEER_MEMBERSHIP_MISMATCH),
             (peer_reach::PEER_POLLS_COMPLETE, peer_reach::POLL_ROUND_OVERRUN),
         ] {
-            let failing = network_holding(&[(type_, "False", reason)]);
+            let failing = network_holding(&[(type_, ConditionStatus::False, reason)]);
             assert_eq!(
                 rolled_up(&failing, "Degraded"),
                 pair("True", reason),
@@ -9120,7 +10437,7 @@ mod tests {
                 Some(reason),
                 "{type_} never gates Available"
             );
-            let clear = network_holding(&[(type_, "True", type_)]);
+            let clear = network_holding(&[(type_, ConditionStatus::True, type_)]);
             assert_eq!(
                 rolled_up(&clear, "Degraded").map(|(status, _)| status).as_deref(),
                 Some("False"),
@@ -9130,10 +10447,14 @@ mod tests {
         let both = network_holding(&[
             (
                 peer_reach::PEER_SIGNALS_REACHABLE,
-                "False",
+                ConditionStatus::False,
                 peer_reach::PEERS_UNREACHABLE,
             ),
-            (crate::peer_ages::PEER_TIME_VALID, "False", "TimestampOutOfRange"),
+            (
+                crate::peer_ages::PEER_TIME_VALID,
+                ConditionStatus::False,
+                "TimestampOutOfRange",
+            ),
         ]);
         assert_eq!(
             rolled_up(&both, "Degraded"),
@@ -9153,7 +10474,7 @@ mod tests {
     fn rejected_gateway_ages_degrade() {
         let network = network_holding(&[(
             crate::gateway_ages::GATEWAY_AGES_REJECTED,
-            "True",
+            ConditionStatus::True,
             "GatewayAgesRejected",
         )]);
         let degraded = rolled_up(&network, "Degraded");
@@ -9170,7 +10491,7 @@ mod tests {
         let with_condition = GridNetworkStatus {
             conditions: vec![Condition {
                 type_: crate::peer_ages::PEER_TIME_VALID.to_owned(),
-                status: "True".to_owned(),
+                status: ConditionStatus::True,
                 ..Condition::default()
             }],
             ..baseline.clone()
@@ -9185,17 +10506,167 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_grid_id_generates_uuid_when_both_spec_and_status_are_empty() {
-        let mut network = base_network();
-        network.spec.grid_id = String::new();
-        network.status = None;
-        let id = resolve_grid_id(&network);
-        assert!(!id.is_empty(), "a freshly generated grid ID must not be empty");
-        assert!(
-            uuid::Uuid::parse_str(&id).is_ok(),
-            "generated grid ID must be a valid UUID, got: {id}"
+    #[tokio::test]
+    async fn an_unconfigured_operator_waits_for_bootstrap_instead_of_minting_a_grid_id() -> Result<(), OperatorError> {
+        let (api, network) = stored_grid_id_network("", "")?;
+        let ctx = Arc::new(OperatorCtx::new(api.client("grid"), None, SignalMode::Gossip));
+        assert_eq!(
+            Box::pin(reconcile(Arc::new(network), ctx)).await?,
+            Action::await_change()
         );
+        let writes = api.writes();
+        assert!(
+            !writes.is_empty(),
+            "the waiting reconcile still applies its status rollup"
+        );
+        assert!(
+            writes
+                .iter()
+                .all(|write| write.status && write.body.pointer("/status/gridId").is_none()),
+            "neither spec nor status gains a minted grid ID"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refused_status_grid_id_is_a_terminal_invalid_resource() -> Result<(), OperatorError> {
+        let (api, network) = stored_grid_id_network("", "legacy-grid")?;
+        api.reject_next_patch(GRID_ID_PATH, None);
+        let result = Box::pin(adopt_status_grid_id(&network, &api.client("grid"))).await;
+        assert!(
+            matches!(&result, Err(OperatorError::InvalidResource(message)) if message.contains("\"legacy-grid\"")),
+            "a 422 names the status grid ID and does not retry: {result:?}"
+        );
+        assert_eq!(grid_id_spec_writes(&api).len(), 1, "a 422 is never retried");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refused_copy_adopts_a_spec_another_writer_set_meanwhile() -> Result<(), OperatorError> {
+        let (api, network) = stored_grid_id_network("", "legacy-grid")?;
+        let mut winner = api.get(GRID_ID_PATH).unwrap_or_default();
+        if let Some(spec) = winner.get_mut("spec") {
+            spec["gridId"] = serde_json::json!("bootstrap-grid");
+        }
+        api.reject_next_patch(GRID_ID_PATH, Some(winner));
+        assert!(Box::pin(adopt_status_grid_id(&network, &api.client("grid"))).await?);
+        assert_eq!(
+            grid_id_spec_writes(&api).len(),
+            1,
+            "the refused patch is the only write"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_invalid_budget_policy_does_not_keep_a_member_status_only() -> Result<(), OperatorError> {
+        let (api, mut network) = stored_grid_id_network("", "legacy-grid")?;
+        network.spec.budget_policy = Some(BudgetPolicyConfig {
+            tenants: vec![tenant("", 100.0)],
+        });
+        let ctx = Arc::new(OperatorCtx::new(api.client("grid"), None, SignalMode::Gossip));
+        assert_eq!(
+            Box::pin(reconcile(Arc::new(network), ctx)).await?,
+            Action::await_change()
+        );
+        assert_eq!(
+            api.get(GRID_ID_PATH)
+                .and_then(|stored| stored.pointer("/spec/gridId").cloned()),
+            Some(serde_json::json!("legacy-grid")),
+            "the copy runs before spec validation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_reconcile_after_the_copy_runs_with_the_copied_spec() -> Result<(), OperatorError> {
+        let (api, mut declared) = stored_grid_id_network("", "legacy-grid")?;
+        // A mode the operator is not running, so reaching the mode check is observable.
+        declared.spec.signal_transport = Some(serde_json::from_value(serde_json::json!({ "mode": "poll" }))?);
+        api.put(GRID_ID_PATH, serde_json::to_value(&declared)?);
+        let network: GridNetwork = serde_json::from_value(api.get(GRID_ID_PATH).unwrap_or_default())?;
+        let (restart, restarts) = tokio::sync::watch::channel(None);
+        let ctx = Arc::new(OperatorCtx::new(api.client("grid"), None, SignalMode::Gossip).with_mode_restart(restart));
+        assert_eq!(
+            Box::pin(reconcile(Arc::new(network), Arc::clone(&ctx))).await?,
+            Action::await_change()
+        );
+        assert!(restarts.borrow().is_none(), "the copy returns before the mode check");
+        let copied: GridNetwork = serde_json::from_value(api.get(GRID_ID_PATH).unwrap_or_default())?;
+        assert_eq!(copied.spec.grid_id, "legacy-grid");
+        assert_eq!(
+            Box::pin(reconcile(Arc::new(copied), ctx)).await?,
+            Action::await_change()
+        );
+        assert_eq!(
+            grid_id_spec_writes(&api).len(),
+            1,
+            "a set spec.gridId is not written again"
+        );
+        assert_eq!(
+            restarts.borrow().map(|next| next.signal),
+            Some(SignalMode::Poll),
+            "the next reconcile reaches the mode check"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_status_only_grid_id_is_copied_into_spec() -> Result<(), OperatorError> {
+        let (api, network) = stored_grid_id_network("", "legacy-grid")?;
+        let ctx = Arc::new(OperatorCtx::new(api.client("grid"), None, SignalMode::Gossip));
+        assert_eq!(
+            Box::pin(reconcile(Arc::new(network), ctx)).await?,
+            Action::await_change()
+        );
+        let spec_writes = grid_id_spec_writes(&api);
+        assert_eq!(spec_writes.len(), 1, "one spec write: {spec_writes:?}");
+        assert!(
+            spec_writes.iter().all(|write| {
+                write.manager.as_deref() == Some(GRID_ID_FIELD_MANAGER)
+                    && write.body.get("spec") == Some(&serde_json::json!({ "gridId": "legacy-grid" }))
+            }),
+            "the write carries spec.gridId alone under its own manager: {spec_writes:?}"
+        );
+        let stored = api.get(GRID_ID_PATH).unwrap_or_default();
+        assert_eq!(stored.pointer("/spec/gridId"), Some(&serde_json::json!("legacy-grid")));
+        assert_eq!(
+            stored.pointer("/status/gridId"),
+            Some(&serde_json::json!("legacy-grid")),
+            "status keeps the ID it already mirrored"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_set_spec_grid_id_is_never_patched() -> Result<(), OperatorError> {
+        let (api, network) = stored_grid_id_network("declared", "legacy-grid")?;
+        assert!(Box::pin(adopt_status_grid_id(&network, &api.client("grid"))).await?);
+        assert!(api.writes().is_empty(), "a set spec.gridId is never written");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_grid_id_another_writer_sets_first_is_adopted_without_a_second_write() -> Result<(), OperatorError> {
+        let (api, network) = stored_grid_id_network("", "legacy-grid")?;
+        let mut winner = api.get(GRID_ID_PATH).unwrap_or_default();
+        if let Some(spec) = winner.get_mut("spec") {
+            spec["gridId"] = serde_json::json!("bootstrap-grid");
+        }
+        api.win_patch_race(GRID_ID_PATH, winner);
+        assert!(Box::pin(adopt_status_grid_id(&network, &api.client("grid"))).await?);
+        assert_eq!(
+            grid_id_spec_writes(&api).len(),
+            1,
+            "the losing patch is the only write; the re-read adopts what is there"
+        );
+        assert_eq!(
+            api.get(GRID_ID_PATH)
+                .and_then(|stored| stored.pointer("/spec/gridId").cloned()),
+            Some(serde_json::json!("bootstrap-grid")),
+            "the other writer's ID stands"
+        );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -10434,8 +11905,8 @@ mod tests {
     #[test]
     fn diff_seed_sets_empty_to_empty_is_no_op() {
         let (added, removed) = diff_seed_sets(&[], &[]);
-        assert!(added.is_empty(), "empty→empty must produce no additions");
-        assert!(removed.is_empty(), "empty→empty must produce no removals");
+        assert!(added.is_empty(), "empty->empty must produce no additions");
+        assert!(removed.is_empty(), "empty->empty must produce no removals");
     }
 
     #[test]
@@ -10521,6 +11992,7 @@ mod tests {
             name: name.to_owned(),
             namespace: ns.to_owned(),
             site_name: None,
+            model_discovery_contract_version: None,
             provider_hop_endpoints: Vec::new(),
             praxis_config: None,
         }
@@ -10630,10 +12102,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the chart TLS fixture exercises every required projected file"
-    )]
     fn chart_managed_serving_tls_must_match_the_secret_refs_and_files() {
         let deployment: Deployment = serde_json::from_value(serde_json::json!({
             "apiVersion": "apps/v1",
@@ -10745,7 +12213,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "checks retention across an empty prior overlay")]
     fn retained_overlay_status_does_not_retain_an_error_without_revision() {
         let gw = make_gw_ref("gw", "grid-system");
         let mut network = base_network();
@@ -10893,10 +12360,6 @@ mod tests {
         );
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "test helper constructing deeply nested envelope struct"
-    )]
     fn make_render_result(revision: &str, candidate_count: u32) -> OverlayRenderResult {
         OverlayRenderResult {
             config_map_name: "grid-overlay-net-gw".to_owned(),
@@ -11076,6 +12539,7 @@ mod tests {
             from_providers: &[],
             transport: None,
             signal: SignalMode::Gossip,
+            peer_catalog: None,
         }
     }
 
@@ -11133,7 +12597,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "each prerequisite is asserted in order")]
     fn site_route_prerequisites_fail_closed() {
         let gw = site_route_gateway(SiteRouter::GridSiteRoute);
         let cc = gw.praxis_config.clone().unwrap_or_else(|| std::process::abort());
@@ -11169,10 +12632,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "derived, declared, and withdrawn hops share one fixture"
-    )]
     fn site_route_serving_hops_are_the_rendered_mutual_tls_endpoints() {
         let mtls = |cluster: &str, sni: &str| ClusterEndpointConfig {
             cluster: cluster.to_owned(),
@@ -11225,6 +12684,369 @@ mod tests {
                 .is_empty(),
             "no candidate receives hop context after an authoritative withdrawal"
         );
+    }
+
+    /// An `Active` site egressing over mutual TLS, discovered by gossip when `stub`.
+    fn dial_site(name: &str, site_id: &str, stub: bool) -> GridSite {
+        let mut site = make_active_grid_site(name, "net");
+        site.spec.gateway_endpoint = Some(crate::crd::grid_site::EgressConfig {
+            address: format!("{site_id}.example.invalid:8443"),
+            tls: crate::crd::grid_site::EgressTls {
+                server_name: Some(format!("{site_id}.grid.internal")),
+                ..Default::default()
+            },
+        });
+        if stub {
+            site.metadata.labels = Some(BTreeMap::from([(LABEL_AUTO_DISCOVERED.to_owned(), "true".to_owned())]));
+            site.metadata.annotations = Some(BTreeMap::from([(ANNOTATION_SITE_ID.to_owned(), site_id.to_owned())]));
+        }
+        site
+    }
+
+    fn dial_overlay(candidates: Vec<routing_overlay::RoutingCandidate>) -> routing_overlay::RoutingOverlay {
+        routing_overlay::RoutingOverlay {
+            network: "net".to_owned(),
+            local_site: "site-a".to_owned(),
+            candidates,
+            excluded: Vec::new(),
+            selection_policy: None,
+            generated_at: None,
+        }
+    }
+
+    #[test]
+    fn the_dial_file_carries_only_derived_enrolled_uncredentialed_clusters() {
+        let sites = vec![
+            dial_site("site-b", "site-b", false),
+            dial_site("net-site-c-1", "site-c", true),
+        ];
+        let mut credentialed = topology_candidate("site-d", "site-b");
+        credentialed.credential = serde_json::from_value(json!({
+            "strategy": "bearer_token",
+            "secretRef": {"namespace": "models", "name": "token", "key": "token"}
+        }))
+        .ok();
+        assert!(credentialed.credential.is_some(), "fixture carries a credential");
+        let overlay = dial_overlay(vec![
+            topology_candidate("prov-b", "site-b"),
+            topology_candidate("prov-c", "site-c"),
+            topology_candidate("typed", "site-b"),
+            credentialed,
+        ]);
+        let mut gw = make_gw_ref("inference-gw", "praxis-system");
+        gw.praxis_config = Some(ConsumerConfig {
+            derive_topology: Some(crate::crd::grid_network::DeriveTopology {
+                from_providers: vec!["prov-b".to_owned(), "prov-c".to_owned(), "site-d".to_owned()],
+                transport: None,
+            }),
+            cluster_endpoints: vec![typed_endpoint("typed", "typed.example.invalid:8080")],
+            ..make_consumer_config("praxis-consumer-config")
+        });
+        let declarations = derived_topology::Declarations {
+            sites: &sites,
+            ..empty_declarations()
+        };
+        assert!(
+            sites.iter().all(|site| site.metadata.generation.is_none()),
+            "fixture sites are probed at their generation"
+        );
+        let (dials, refused) = gateway_dials(&gw, &overlay, &declarations);
+        assert_eq!(
+            dials.keys().collect::<Vec<_>>(),
+            ["prov-b"],
+            "a stub's gossiped address, a typed entry and a credential-bearing cluster are never dialed"
+        );
+        assert_eq!(
+            dials.get("prov-b").map(|dial| dial.address.as_str()),
+            Some("site-b.example.invalid:8443")
+        );
+        assert_eq!(
+            refused,
+            BTreeSet::from([
+                "prov-c: site not enrolled".to_owned(),
+                "site-d: a credential is never sent off this site".to_owned(),
+            ]),
+            "the stub and the off-site credential are refused, with why"
+        );
+        let generating = gw.praxis_config.as_ref().is_some_and(|cc| cc.generate);
+        if let Some(cc) = gw.praxis_config.as_mut() {
+            cc.generate = !generating;
+        }
+        assert_eq!(
+            gateway_dials(&gw, &overlay, &declarations).0.keys().collect::<Vec<_>>(),
+            ["prov-b"],
+            "dials do not depend on generating the praxis config"
+        );
+
+        let unconfigured = make_gw_ref("other-gw", "praxis-system");
+        assert!(
+            gateway_dials(&unconfigured, &overlay, &declarations).0.is_empty(),
+            "nothing admitted, no entries"
+        );
+    }
+
+    /// A client serving one serving `ConfigMap` holding `stored` as its provider file, recording
+    /// every apply's body.
+    #[expect(clippy::indexing_slicing, reason = "tests")]
+    fn provider_store(stored: Option<&str>) -> (Client, Arc<std::sync::Mutex<Vec<Value>>>) {
+        let patches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&patches);
+        let data = stored.map_or_else(
+            || serde_json::json!({"serving-config.json": "{}"}),
+            |stored| serde_json::json!({"serving-config.json": "{}", provider_config::PROVIDER_KEY: stored}),
+        );
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": serving_config::configmap_name("net", "gw"), "namespace": "ns"},
+            "data": data,
+        });
+        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let (seen, cm) = (Arc::clone(&seen), cm.clone());
+            async move {
+                let manager = req.uri().query().unwrap_or_default().to_owned();
+                if req.method() == http::Method::PATCH {
+                    let bytes = http_body_util::BodyExt::collect(req.into_body())
+                        .await
+                        .map(http_body_util::Collected::to_bytes)
+                        .unwrap_or_default();
+                    let mut body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                    body["fieldManager"] = Value::from(manager);
+                    seen.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(body);
+                }
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(200)
+                        .body(kube::client::Body::from(serde_json::to_vec(&cm).unwrap_or_default()))
+                        .unwrap_or_else(|_| std::process::abort()),
+                )
+            }
+        });
+        (Client::new(service, "ns"), patches)
+    }
+
+    #[tokio::test]
+    #[expect(clippy::indexing_slicing, reason = "tests")]
+    async fn a_removed_site_is_revoked_without_the_serving_path() {
+        let stored = "{\n  \"admitted_sites\": [\"site-b\", \"site-c\"],\n  \"candidates\": [],\n  \"dial\": {},\n  \"local_site\": \"site-a\",\n  \"version\": \"v1\"\n}";
+        let gw = make_gw_ref("gw", "ns");
+        let (client, patches) = provider_store(Some(stored));
+        revoke_provider_admission("net", &gw, &["site-b".to_owned(), "site-c".to_owned()], &client).await;
+        assert!(
+            patches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "nothing removed, nothing written"
+        );
+
+        revoke_provider_admission("net", &gw, &["site-b".to_owned()], &client).await;
+        let written = patches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(written.len(), 1, "the removal is written at once");
+        let patch = written.first().cloned().unwrap_or_default();
+        assert!(
+            patch["fieldManager"]
+                .as_str()
+                .is_some_and(|query| query.contains(provider_config::FIELD_MANAGER)),
+            "under the provider's own field manager: {patch}"
+        );
+        let data = patch["data"].as_object().cloned().unwrap_or_default();
+        assert_eq!(
+            data.keys().collect::<Vec<_>>(),
+            [provider_config::PROVIDER_KEY],
+            "only the provider file, so the serving config is untouched"
+        );
+        let provider: Value =
+            serde_json::from_str(data[provider_config::PROVIDER_KEY].as_str().unwrap_or_default()).unwrap_or_default();
+        assert_eq!(
+            provider["admitted_sites"],
+            serde_json::json!(["site-b"]),
+            "site-c revoked"
+        );
+
+        let (missing, untouched) = provider_store(None);
+        revoke_provider_admission("net", &gw, &[], &missing).await;
+        assert!(
+            untouched
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "no stored file admits no one, so there is nothing to revoke"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_provider_file_is_applied_only_when_it_changes() {
+        let gw = make_gw_ref("gw", "ns");
+        let provider = provider_config::ProviderConfig {
+            admitted_sites: vec!["site-b".to_owned()],
+            candidates: Vec::new(),
+            dial: BTreeMap::new(),
+            local_site: "site-a".to_owned(),
+            version: "v1",
+        };
+        let text = serving_config::to_text(&provider).unwrap_or_default();
+        let (same, unchanged) = provider_store(Some(&text));
+        apply_provider_file("net", &gw, &provider, &same).await;
+        assert!(
+            unchanged
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "an equal file is not rewritten"
+        );
+        let (stale, changed) = provider_store(Some("{}"));
+        apply_provider_file("net", &gw, &provider, &stale).await;
+        assert_eq!(
+            changed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(),
+            1,
+            "a changed file is written"
+        );
+    }
+
+    #[test]
+    fn a_site_restricted_provider_is_never_served_to_peers() {
+        let provider = |name: &str, cluster: Option<&str>, restricted: bool| -> InferenceProvider {
+            let mut provider = cluster.map_or_else(
+                || make_inference_provider(name, "net"),
+                |cluster| make_provider_with_routing_ref(name, "net", cluster),
+            );
+            if restricted {
+                provider.spec.access_policy.site_selector.match_labels =
+                    BTreeMap::from([("tier".to_owned(), "gold".to_owned())]);
+            }
+            provider
+        };
+        let providers = vec![
+            provider("open", None, false),
+            provider("gold-by-name", None, true),
+            provider("gold", Some("pool-gold"), true),
+        ];
+        let restricted = restricted_clusters(&providers);
+        assert_eq!(
+            restricted.iter().copied().collect::<Vec<_>>(),
+            ["gold-by-name", "pool-gold"],
+            "the routing identity, clusterName or else the name, of each restricted provider"
+        );
+        let local = |cluster: &str| {
+            let mut local = topology_candidate(cluster, "site-a");
+            local.stable_id = Some(crate::resources::geography::compute_stable_id(
+                routing_overlay::CANDIDATE_KIND,
+                "model-x",
+                "site-a",
+                cluster,
+            ));
+            local
+        };
+        let mut overlay = dial_overlay(vec![local("open"), local("gold-by-name"), local("pool-gold")]);
+        overlay.local_site = "site-a".to_owned();
+        let dial = |site: &str| serving_config::DialSpec {
+            address: "m.models.svc:8000".to_owned(),
+            base_path: None,
+            connect_retries: None,
+            connect_timeout_ms: None,
+            credential: None,
+            read_timeout_ms: None,
+            site: site.to_owned(),
+            total_connect_timeout_ms: None,
+            transport: serving_config::DialTransport::Plaintext,
+            trusted_private: true,
+            write_timeout_ms: None,
+        };
+        let dials = ["open", "gold-by-name", "pool-gold"]
+            .map(|cluster| (cluster.to_owned(), dial("site-a")))
+            .into();
+        let rendered = provider_config::render_provider(&overlay, &dials, Vec::new(), &restricted);
+        assert_eq!(
+            rendered
+                .candidates
+                .iter()
+                .map(|candidate| candidate.cluster.as_str())
+                .collect::<Vec<_>>(),
+            ["open"],
+            "only the unrestricted provider is served to peers"
+        );
+    }
+
+    #[test]
+    fn a_local_dial_carries_its_endpoint_path_and_its_candidates_token() {
+        let mut local = topology_candidate("prov-a", "site-a");
+        local.credential = serde_json::from_value(json!({
+            "strategy": "bearer_token",
+            "secretRef": {"namespace": "praxis-system", "name": "grid-model-client-token", "key": "token"}
+        }))
+        .ok();
+        let overlay = dial_overlay(vec![local]);
+        let plain = serving_config::DialSpec {
+            address: "model.svc:80".to_owned(),
+            base_path: None,
+            connect_retries: None,
+            connect_timeout_ms: None,
+            credential: None,
+            read_timeout_ms: None,
+            site: "site-a".to_owned(),
+            total_connect_timeout_ms: None,
+            transport: serving_config::DialTransport::Plaintext,
+            trusted_private: true,
+            write_timeout_ms: None,
+        };
+        let shape = |dial: &serving_config::DialSpec, path: Option<&str>, namespace: &str| {
+            dial_request_shape("prov-a", dial, path, &overlay, &make_gw_ref("inference-gw", namespace))
+        };
+        let (base_path, credential) =
+            shape(&plain, Some("/publishers/p/models/m/"), "praxis-system").unwrap_or_else(|_| std::process::abort());
+        assert_eq!(base_path.as_deref(), Some("/publishers/p/models/m"));
+        assert_eq!(
+            credential.map(|credential| credential.path),
+            Some("/run/secrets/grid-credentials/grid-model-client-token/token".to_owned()),
+            "the token file credential_inject reads"
+        );
+        let remote = serving_config::DialSpec {
+            site: "site-b".to_owned(),
+            ..plain.clone()
+        };
+        assert_eq!(
+            shape(&remote, None, "praxis-system").err(),
+            Some("a credential is never sent off this site")
+        );
+        assert_eq!(
+            shape(&plain, None, "other").err(),
+            Some("the credential Secret is not in the gateway's namespace")
+        );
+        assert_eq!(
+            shape(&plain, Some("/p?x=1"), "praxis-system").err(),
+            Some("the endpoint path carries a query or fragment")
+        );
+    }
+
+    #[test]
+    fn a_typed_entry_is_never_shadowed_by_a_dial_for_the_same_cluster() {
+        let sites = vec![dial_site("site-b", "site-b", false)];
+        let overlay = dial_overlay(vec![topology_candidate("prov-b", "site-b")]);
+        let mut gw = make_gw_ref("inference-gw", "praxis-system");
+        gw.praxis_config = Some(ConsumerConfig {
+            derive_topology: Some(crate::crd::grid_network::DeriveTopology {
+                from_providers: vec!["prov-b".to_owned()],
+                transport: None,
+            }),
+            cluster_endpoints: vec![typed_endpoint("prov-b", "typed.example.invalid:8080")],
+            ..make_consumer_config("praxis-consumer-config")
+        });
+        let declarations = derived_topology::Declarations {
+            sites: &sites,
+            ..empty_declarations()
+        };
+        let (dials, refused) = gateway_dials(&gw, &overlay, &declarations);
+        assert!(
+            dials.is_empty(),
+            "the typed entry stays a praxis cluster, not a derived dial: {dials:?}"
+        );
+        assert!(refused.is_empty(), "nothing refused: {refused:?}");
     }
 
     #[test]
@@ -11362,34 +13184,21 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one real render per allowlist step")]
-    fn narrowing_and_removing_the_allowlist_withdraws_the_revoked_endpoint_from_the_render() {
-        let providers = vec![
-            local_http_provider("prov-a", "prov-a.models.svc"),
-            local_http_provider("prov-b", "prov-b.models.svc"),
-        ];
-        let declarations = derived_topology::Declarations {
-            providers: &providers,
-            ..empty_declarations()
-        };
-        let allow = |names: &[&str]| {
-            Some(crate::crd::grid_network::DeriveTopology {
-                from_providers: names.iter().map(|name| (*name).to_owned()).collect(),
-                transport: None,
-            })
-        };
-        // The typed entry keeps the inventory non-empty once every derivation is revoked.
-        let steps = [
-            (allow(&["prov-a", "prov-b"]), &["prov-a", "prov-b"][..]),
-            (allow(&["prov-a"]), &["prov-a"][..]),
-            (allow(&[]), &[][..]),
-            (None, &[][..]),
-        ];
-        for (derive_topology, live) in steps {
+    fn removing_a_provider_withdraws_its_derived_endpoint_from_the_render() {
+        // The typed entry keeps the inventory non-empty once every provider is gone.
+        let steps: [&[&str]; 3] = [&["prov-a", "prov-b"], &["prov-a"], &[]];
+        for live in steps {
+            let providers: Vec<InferenceProvider> = live
+                .iter()
+                .map(|name| local_http_provider(name, &format!("{name}.models.svc")))
+                .collect();
+            let declarations = derived_topology::Declarations {
+                providers: &providers,
+                ..empty_declarations()
+            };
             let mut gw = make_gw_ref("inference-gw", "praxis-system");
             gw.site_name = Some("site-a".to_owned());
             let cc = ConsumerConfig {
-                derive_topology,
                 cluster_endpoints: vec![typed_endpoint("typed-c", "typed-c.models.svc:8000")],
                 ..make_consumer_config("praxis-consumer-config")
             };
@@ -11429,15 +13238,15 @@ mod tests {
                 assert_eq!(
                     rendered.config_yaml.contains(&address),
                     live.contains(&cluster),
-                    "{live:?}: {address} is live only while allowlisted"
+                    "{live:?}: {address} is live only while its provider exists"
                 );
                 assert_eq!(
                     overlay.candidates.iter().any(|c| c.cluster == cluster),
                     live.contains(&cluster),
-                    "{live:?}: {cluster} routes only while allowlisted"
+                    "{live:?}: {cluster} routes only while its provider exists"
                 );
                 assert_eq!(
-                    summary.contains(&format!("{cluster}: not allowlisted")),
+                    summary.contains(&format!("{cluster}: no provider")),
                     !live.contains(&cluster),
                     "{live:?}: the status names {cluster} once withdrawn: {summary}"
                 );
@@ -11618,10 +13427,6 @@ mod tests {
 
     #[test]
     #[expect(
-        clippy::too_many_lines,
-        reason = "the rollout status transitions are exercised against one Deployment fixture"
-    )]
-    #[expect(
         clippy::expect_used,
         reason = "deserializing a fixed Deployment fixture must succeed"
     )]
@@ -11670,10 +13475,6 @@ mod tests {
         );
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the Deployment fixture keeps the config volume and target container together"
-    )]
     fn delegated_config_source_fixture() -> Value {
         json!({
             "apiVersion": "apps/v1",
@@ -11726,10 +13527,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "config source validation cases share one Deployment fixture"
-    )]
     fn delegated_config_source_requires_the_expected_config_map_and_projection() {
         let valid = delegated_config_source_fixture();
         assert!(matches!(delegated_config_source_check(valid.clone()), Ok(false)));
@@ -11772,10 +13569,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one patch must carry config, Secret volume, revision, and resourceVersion together"
-    )]
     fn config_and_secret_projection_switch_in_one_version_guarded_patch() {
         let mut fixture = delegated_config_source_fixture();
         let metadata = fixture
@@ -11842,10 +13635,6 @@ mod tests {
         );
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "keep the preserved Deployment and all of its consumers visible as one regression fixture"
-    )]
     fn mount_ownership_test_deployment_value() -> Value {
         json!({
             "apiVersion": "apps/v1",
@@ -12506,7 +14295,7 @@ mod tests {
             ("site-a", "tool/mcp-server"),
             "the eligible provider must retain its source site and tool identity"
         );
-        let excluded_candidates = routing_overlay::remote_crdt_provider_to_candidates(&inactive_provider);
+        let excluded_candidates = routing_overlay::remote_crdt_provider_to_candidates(&inactive_provider, &[], "");
         assert!(
             !excluded_candidates.is_empty(),
             "the inactive-site provider carries tools so it would produce candidates if not filtered"
@@ -12524,9 +14313,9 @@ mod tests {
             make_phase_grid_site("site-b", "net", "Connecting"),
         ];
         let providers = vec![
-            make_eligible_crdt_provider("net", "site-a"), // Active → eligible
-            make_eligible_crdt_provider("net", "site-b"), // Connecting → ineligible
-            make_eligible_crdt_provider("net", "site-c"), // Missing → ineligible
+            make_eligible_crdt_provider("net", "site-a"), // Active -> eligible
+            make_eligible_crdt_provider("net", "site-b"), // Connecting -> ineligible
+            make_eligible_crdt_provider("net", "site-c"), // Missing -> ineligible
         ];
         let eligible = filter_eligible_remote_crdt_providers("net", &sites, &providers, SignalMode::Gossip);
         assert_eq!(eligible.len(), 1, "only Active site provider must pass filter");
@@ -12650,6 +14439,60 @@ mod tests {
     }
 
     #[test]
+    fn discovered_model_expiry_uses_the_earliest_routable_or_excluded_candidate() {
+        let mut routable = topology_candidate("cluster-a", "site-a");
+        routable.expires_at = Some("2030-01-01T00:00:30Z".to_owned());
+        let mut excluded = topology_candidate("cluster-b", "site-b");
+        excluded.expires_at = Some("2030-01-01T00:00:10Z".to_owned());
+        let overlay = routing_overlay::RoutingOverlay {
+            network: "net".to_owned(),
+            local_site: "site-a".to_owned(),
+            candidates: vec![routable],
+            excluded: vec![excluded],
+            selection_policy: None,
+            generated_at: None,
+        };
+        let expected =
+            time::OffsetDateTime::parse("2030-01-01T00:00:10Z", &time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            next_discovered_model_expiry(&overlay),
+            Some(expected),
+            "excluded candidates also remain in serving config until their inventory expires"
+        );
+    }
+
+    #[test]
+    fn discovered_model_expiry_retries_before_gateway_cutoff() {
+        let now = time::OffsetDateTime::parse("2030-01-01T00:00:00Z", &time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| std::process::abort());
+        let normal_retry = Duration::from_secs(300);
+        let serving_retry = Some(Duration::from_secs(10));
+
+        assert_eq!(
+            soonest_reconcile_retry(normal_retry, serving_retry, Some(now + time::Duration::seconds(5)), now,),
+            Duration::from_secs(2) + Duration::from_millis(500),
+            "a deadline inside the lead window must retry before the deadline"
+        );
+        assert_eq!(
+            soonest_reconcile_retry(normal_retry, serving_retry, Some(now - time::Duration::seconds(1)), now,),
+            Duration::from_secs(1),
+            "a deadline reached during reconciliation must still schedule a bounded short retry"
+        );
+        assert_eq!(
+            inventory_expiry_retry(now + time::Duration::seconds(120), now),
+            Duration::from_secs(60),
+            "a deadline 120 seconds away must requeue no later than 60 seconds"
+        );
+        let inside_lead = inventory_expiry_retry(now + time::Duration::seconds(20), now);
+        assert!(
+            inside_lead < Duration::from_secs(20),
+            "a deadline inside the lead window must requeue before the deadline"
+        );
+    }
+
+    #[test]
     fn network_requeue_tls_provider_uses_tls_interval() {
         let providers = vec![make_provider_with_tls("p1", "net")];
         assert_eq!(
@@ -12753,7 +14596,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "exhaustive rejection table")]
     fn metrics_refresh_duration_parser_rejects_unsupported_values() {
         assert!(
             parse_metrics_refresh_interval("").is_err(),
@@ -12956,8 +14798,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Tool names are stored on the provider record, NOT as `Capability::Tool`
-    /// in the OR-set. They travel in the `BroadcastExtension`'s `provider_tools`
-    /// map. This test verifies the provider is upserted with tools intact and
+    /// in the OR-set. They travel in the versioned provider-state extension.
+    /// This test verifies the provider is upserted with tools intact and
     /// that no `Capability::Tool` entries are created.
     #[test]
     fn upsert_tool_provider_stores_tools_on_provider_not_as_capabilities() {
@@ -12990,10 +14832,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "constructs a mixed provider and verifies both capability classes"
-    )]
     fn upsert_mixed_provider_registers_models_but_not_tools_as_capabilities() {
         let mut snap = crdt::GridStateSnapshot::new("site-a".to_owned());
         let mut max_rev = 0_u64;
@@ -13033,10 +14871,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "constructs an oversized provider snapshot and verifies both transport and retention invariants"
-    )]
     fn tool_catalog_is_trimmed_to_the_serialized_swim_budget() {
         let mut snap = crdt::GridStateSnapshot::new("site-a".to_owned());
         let offered = 128_usize;
@@ -13082,10 +14916,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "constructs many tool providers and verifies inference survives whole-record trimming"
-    )]
     fn many_tool_provider_records_cannot_evict_inference_or_overfill_swim() {
         let mut snap = crdt::GridStateSnapshot::new("site-a".to_owned());
         snap.upsert_provider(crdt::ProviderState {
@@ -13142,6 +14972,61 @@ mod tests {
                 .values()
                 .any(|provider| !provider.tools.is_empty()),
             "the fair fit should retain at least one reachable tool provider"
+        );
+    }
+
+    #[test]
+    fn uid_metadata_cannot_overflow_an_otherwise_fitting_inference_snapshot() {
+        let local_id = worst_case_swim_identity("site-a");
+        let budget = swim::node::state_broadcast_byte_budget(&local_id).unwrap_or_else(|_| std::process::abort());
+        let uid = swim::ProviderUid {
+            identity: swim::ProviderIdentity {
+                network: "net".to_owned(),
+                site: "site-a".to_owned(),
+                provider: "inference".to_owned(),
+            },
+            uid: "uid-entire-and-never-truncated".to_owned(),
+        };
+        let make_broadcast = |model: &str| {
+            let mut snapshot = crdt::GridStateSnapshot::new("site-a".to_owned());
+            let mut state = provider_state("site-a", "inference");
+            state.models = vec![model.to_owned()];
+            let mut max_revision = 0;
+            upsert_provider_with_capabilities(&mut snapshot, &mut max_revision, state);
+            provider_state_broadcast("site-a", "grid", max_revision, snapshot, None)
+        };
+        let mut model = String::new();
+        let mut baseline = None;
+        for _ in 0..budget {
+            let candidate = make_broadcast(&model);
+            let candidate_fits = candidate.encode().is_ok_and(|encoded| encoded.len() <= budget);
+            let with_uid_fits = candidate
+                .clone()
+                .with_provider_uids(vec![uid.clone()])
+                .encode()
+                .is_ok_and(|encoded| encoded.len() <= budget);
+            if candidate_fits && !with_uid_fits {
+                baseline = Some(candidate);
+                break;
+            }
+            model.push('x');
+        }
+        let mut broadcast = baseline
+            .unwrap_or_else(|| std::process::abort())
+            .with_provider_uids(vec![uid]);
+
+        assert!(
+            !broadcast.encode().is_ok_and(|encoded| encoded.len() <= budget),
+            "the UID metadata pushes this inference snapshot past the transport budget"
+        );
+        fit_provider_tools_to_swim_budget(&mut broadcast);
+
+        let encoded = broadcast.encode().unwrap_or_else(|_| std::process::abort());
+        assert!(encoded.len() <= budget);
+        assert!(broadcast.snapshot.providers.contains_key("net/site-a/inference"));
+        assert!(
+            broadcast.provider_uids.is_empty(),
+            "the complete UID is omitted rather than truncated"
         );
     }
 }

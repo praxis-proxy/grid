@@ -21,7 +21,7 @@ pub const TTFT_P50_SIGNAL: &str = "grid_provider_ttft_p50_seconds";
 pub const TTFT_P90_SIGNAL: &str = "grid_provider_ttft_p90_seconds";
 /// Mean time per output token, streaming requests only, seconds.
 pub const TPOT_SIGNAL: &str = "grid_provider_tpot_seconds";
-/// Failed requests over all requests.
+/// Failed requests over received requests, reported client errors other than 429 left out of both.
 pub const ERROR_RATIO_SIGNAL: &str = "grid_provider_error_ratio";
 
 /// EPP time to first token, labeled `streaming`.
@@ -30,10 +30,21 @@ const TTFT: &str = "llm_d_epp_request_ttft_seconds";
 const TPOT: &str = "llm_d_epp_request_streaming_tpot_seconds";
 /// EPP input tokens per request.
 const INPUT_TOKENS: &str = "llm_d_epp_request_input_tokens";
-/// EPP requests processed.
+/// EPP requests scheduled.
 const REQUESTS: &str = "llm_d_epp_request_total";
-/// EPP requests that failed.
+/// EPP requests that failed, labeled `error_code`.
 const ERRORS: &str = "llm_d_epp_request_error_total";
+/// The error code of a scheduled request the model server answered with any non-200, its 4xx included.
+const ANSWERED: &str = "ModelServerError";
+/// Error codes that fault the client, not the site: the 4xx answers other than 429, including the 412 a
+/// conditional decode gets on a cache miss.
+const CLIENT_CODES: [&str; 5] = [
+    "BadRequest",
+    "Unauthorized",
+    "Forbidden",
+    "NotFound",
+    "PreconditionFailed",
+];
 
 /// A histogram's `_sum` and `_count`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -71,10 +82,13 @@ pub(crate) struct Snapshot {
     tpot: SumCount,
     /// Input tokens per request.
     input: SumCount,
-    /// Requests processed.
+    /// Requests scheduled.
     requests: f64,
-    /// Requests failed.
-    errors: f64,
+    /// Scheduled requests the model server answered with an error.
+    answered: f64,
+    /// Requests the EPP failed itself, most before scheduling, so the request counter never saw them. An
+    /// eviction shares its code with a rejection, so an evicted request is counted here and as scheduled.
+    refused: f64,
 }
 
 /// The sum of `metric` over the observations `keep` accepts, `None` when none match.
@@ -97,6 +111,11 @@ fn sum_count(observations: &[Observation], name: &str, keep: impl Fn(&Observatio
 /// Whether a TTFT series counts streaming requests.
 fn streaming(o: &Observation) -> bool {
     o.labels.get("streaming").is_some_and(|value| value == "true")
+}
+
+/// An error series' EPP error code.
+fn code(o: &Observation) -> Option<&str> {
+    o.labels.get("error_code").map(String::as_str)
 }
 
 /// Streaming TTFT bucket counts by upper bound, summed across series.
@@ -122,7 +141,11 @@ impl Snapshot {
             tpot: sum_count(observations, TPOT, any).unwrap_or_default(),
             input: sum_count(observations, INPUT_TOKENS, any).unwrap_or_default(),
             requests: summed(observations, REQUESTS, any).unwrap_or(0.0),
-            errors: summed(observations, ERRORS, any).unwrap_or(0.0),
+            answered: summed(observations, ERRORS, |o| code(o) == Some(ANSWERED)).unwrap_or(0.0),
+            refused: summed(observations, ERRORS, |o| {
+                code(o).is_none_or(|code| code != ANSWERED && !CLIENT_CODES.contains(&code))
+            })
+            .unwrap_or(0.0),
         }
     }
 
@@ -140,14 +163,16 @@ impl Snapshot {
 
     /// `self - earlier`, `None` when any counter went backwards.
     fn since(&self, earlier: &Self) -> Option<Self> {
-        (self.requests >= earlier.requests && self.errors >= earlier.errors).then_some(())?;
+        (self.requests >= earlier.requests && self.answered >= earlier.answered && self.refused >= earlier.refused)
+            .then_some(())?;
         Some(Self {
             ttft_buckets: self.bucket_deltas(earlier)?,
             ttft: self.ttft.since(earlier.ttft)?,
             tpot: self.tpot.since(earlier.tpot)?,
             input: self.input.since(earlier.input)?,
             requests: self.requests - earlier.requests,
-            errors: self.errors - earlier.errors,
+            answered: self.answered - earlier.answered,
+            refused: self.refused - earlier.refused,
         })
     }
 
@@ -182,11 +207,12 @@ impl Snapshot {
         if enough(self.tpot.count) {
             published.extend(self.tpot.mean().map(|value| sample(TPOT_SIGNAL, value)));
         }
-        if enough(self.requests) {
-            published.push(sample(
-                ERROR_RATIO_SIGNAL,
-                (self.errors / self.requests).clamp(0.0, 1.0),
-            ));
+        // A refused request never reached the request counter; an answered one did.
+        let received = self.requests + self.refused;
+        if enough(received) {
+            // Above 1 only when requests scheduled before the window fail inside it.
+            let ratio = ((self.answered + self.refused) / received).clamp(0.0, 1.0);
+            published.push(sample(ERROR_RATIO_SIGNAL, ratio));
         }
         published
     }
@@ -327,7 +353,7 @@ mod tests {
         out.push(obs(&format!("{INPUT_TOKENS}_sum"), &[], input * requests));
         out.push(obs(&format!("{INPUT_TOKENS}_count"), &[], requests));
         out.push(obs(REQUESTS, &[], requests));
-        out.push(obs(ERRORS, &[("error_code", "500")], errors));
+        out.push(obs(ERRORS, &[("error_code", "ModelServerError")], errors));
         out
     }
 
@@ -361,6 +387,91 @@ mod tests {
         let published =
             history.record_observations(&scrape(105.0, 0.3, 0.02, 1000.0, 0.0), start + Duration::from_secs(10));
         assert!(published.is_empty(), "5 requests is too few: {published:?}");
+    }
+
+    /// The error ratio a 10 s window publishes after `requests` scheduled requests and
+    /// `errors` by EPP error code, from counters that start at zero.
+    fn ratio_after(requests: f64, errors: &[(&str, f64)]) -> Option<f64> {
+        let mut history = History::default();
+        let start = Instant::now();
+        history.record_observations(&[obs(REQUESTS, &[], 0.0)], start);
+        let mut later = vec![obs(REQUESTS, &[], requests)];
+        later.extend(errors.iter().map(|(code, n)| obs(ERRORS, &[("error_code", code)], *n)));
+        value(
+            &history.record_observations(&later, start + Duration::from_secs(10)),
+            ERROR_RATIO_SIGNAL,
+        )
+    }
+
+    /// A scenario, its requests scheduled, its errors by EPP code, and the ratio it publishes.
+    type Case = (&'static str, f64, &'static [(&'static str, f64)], Option<f64>);
+
+    #[test]
+    fn the_error_ratio_counts_each_request_once() {
+        let cases: &[Case] = &[
+            ("every request succeeds", 100.0, &[], Some(0.0)),
+            (
+                "20 of 100 shed before scheduling",
+                80.0,
+                &[("ResourceExhausted", 20.0)],
+                Some(0.2),
+            ),
+            (
+                "70 of 100 shed before scheduling",
+                30.0,
+                &[("ResourceExhausted", 70.0)],
+                Some(0.7),
+            ),
+            (
+                "the site refuses everything",
+                0.0,
+                &[("ServiceUnavailable", 100.0)],
+                Some(1.0),
+            ),
+            (
+                "the model server fails everything",
+                100.0,
+                &[("ModelServerError", 100.0)],
+                Some(1.0),
+            ),
+            (
+                "malformed bodies are the client's fault",
+                50.0,
+                &[("BadRequest", 50.0)],
+                Some(0.0),
+            ),
+            (
+                "conditional-decode misses are not failures",
+                60.0,
+                &[("PreconditionFailed", 40.0)],
+                Some(0.0),
+            ),
+            (
+                "client errors do not dilute the site's",
+                50.0,
+                &[("BadRequest", 50.0), ("ModelServerError", 50.0)],
+                Some(1.0),
+            ),
+            ("too few requests to judge", 10.0, &[], None),
+            (
+                "only client errors, nothing to judge",
+                0.0,
+                &[("BadRequest", 100.0)],
+                None,
+            ),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter_map(|(scenario, requests, errors, want)| {
+                let got = ratio_after(*requests, errors);
+                let same = match (got, *want) {
+                    (Some(got), Some(want)) => (got - want).abs() < 1e-9,
+                    (got, want) => got.is_none() && want.is_none(),
+                };
+                (!same).then(|| format!("{scenario}: want {want:?}, got {got:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

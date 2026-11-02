@@ -6,10 +6,6 @@ use super::{Harness, KeepAll, LoadStore, MODEL, NOW_MS, REFRESH_MS, RouteSnapsho
 use crate::{descriptor::CapabilityKind, route::select_spread};
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "each failure mode exercises disable, replay and recovery together"
-)]
 fn learning_recovers_after_each_disable_condition_without_resurrecting_old_state() {
     for cause in ["missing", "expired", "invalid", "incomplete", "invalidation"] {
         let mut grid = learned();
@@ -71,10 +67,6 @@ fn learning_recovers_after_each_disable_condition_without_resurrecting_old_state
 }
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the scenario covers the complete shared-model shedding lifecycle"
-)]
 fn revision_reset_releases_old_shedding_for_every_model_sharing_the_provider() {
     let mut grid = learned();
     grid.availability.shedding = true;
@@ -133,10 +125,6 @@ fn revision_reset_releases_old_shedding_for_every_model_sharing_the_provider() {
 }
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the race setup and both snapshot assertions belong to one scenario"
-)]
 fn concurrent_revision_between_metric_reads_cannot_mix_epochs() {
     let mut grid = learned();
     let at = NOW_MS + REFRESH_MS;
@@ -177,10 +165,6 @@ fn concurrent_revision_between_metric_reads_cannot_mix_epochs() {
 }
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the race setup and recovered learning belong to one scenario"
-)]
 fn concurrent_publication_of_the_same_revision_preserves_learning() {
     let mut grid = learned();
     let at = NOW_MS + WINDOW_MS + 1;
@@ -219,10 +203,6 @@ fn concurrent_publication_of_the_same_revision_preserves_learning() {
 }
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "both bound histories must stay qualified through withdrawal and recovery"
-)]
 fn guarded_withdrawal_discards_learning_while_fresh_topology_retains_it() {
     for queued in [0.0, 4.0] {
         let mut grid = learned();
@@ -268,10 +248,6 @@ fn guarded_withdrawal_discards_learning_while_fresh_topology_retains_it() {
 }
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "stable revision, invalidation and recovery share one learned history"
-)]
 fn unchanged_revision_retains_learning_but_new_generation_retires_it() {
     let mut grid = learned();
     for turn in 1..=20 {
@@ -338,10 +314,6 @@ fn unchanged_revision_retains_learning_but_new_generation_retires_it() {
 }
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the ordering scenario compares complete snapshots around delayed data"
-)]
 fn an_unseen_old_uid_cannot_replace_a_new_publisher() {
     let mut grid = guarded();
     publish(
@@ -504,10 +476,6 @@ fn truncated_batch_cannot_teach_or_partly_publish_a_new_revision() {
 }
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "each revision checks selection, shedding and independent retained learning"
-)]
 fn repeated_revisions_preserve_routing_and_do_not_shed_queue_free_pools() {
     let mut grid = learned();
     grid.availability.shedding = true;

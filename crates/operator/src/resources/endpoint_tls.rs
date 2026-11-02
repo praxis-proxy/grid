@@ -228,7 +228,6 @@ async fn read_ca_for_verify(
 /// and are never written to logs, events, status fields, or Prometheus labels.
 #[expect(
     clippy::large_stack_frames,
-    clippy::too_many_lines,
     reason = "async future with kube API types and PEM buffers; sequential Secret reads for CA, client cert, and client key"
 )]
 pub(crate) async fn resolve_tls_config(

@@ -3,7 +3,7 @@
 //! Generates the `praxis.yaml` content for a consumer gateway `ConfigMap` from
 //! a [`RoutingOverlay`].  The generated config includes:
 //!
-//! - `json_body_field` filter (model field → `X-Model` header)
+//! - `json_body_field` filter (model field -> `X-Model` header)
 //! - `intelligent_route` filter with inference candidates from the overlay
 //! - `credential_inject` filter (only when credential-bearing candidates exist)
 //! - `load_balancer` filter with one cluster entry per unique inference cluster
@@ -31,7 +31,10 @@ use serde::{Deserialize, Serialize};
 use crate::crd::grid_network::SelectionMode;
 use crate::{
     crd::grid_network::{ClusterEndpointConfig, GatewayTelemetryConfig, SiteRouter, TlsConfig, TransportMode},
-    resources::routing_overlay::{RoutingCandidate, RoutingOverlay},
+    resources::{
+        routing_overlay::{RoutingCandidate, RoutingOverlay},
+        serving_config::{DialSpec, DialTransport},
+    },
 };
 
 /// Path at which a consumer gateway must mount the operator-published overlay.
@@ -337,10 +340,6 @@ pub(crate) fn generate_consumer_praxis_config(
 /// Returns [`ConsumerConfigError`] when the overlay, endpoint topology, or
 /// optional telemetry settings are invalid.
 #[expect(
-    clippy::too_many_lines,
-    reason = "sequential validation + three rendering passes; splitting would obscure the overall config shape"
-)]
-#[expect(
     clippy::too_many_arguments,
     reason = "preserves the renderer's established inputs and adds optional telemetry"
 )]
@@ -431,10 +430,6 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
 }
 
 /// Render validated exporter settings without secret material.
-#[expect(
-    clippy::too_many_lines,
-    reason = "serializes every optional telemetry value in a stable YAML order"
-)]
 fn render_telemetry(telemetry: &GatewayTelemetryConfig) -> Result<String, ConsumerConfigError> {
     if telemetry.otlp_endpoint.as_deref().is_none_or(str::is_empty)
         && telemetry.sampling_rate.is_none()
@@ -671,10 +666,6 @@ struct Pipeline<'input> {
 
 impl Pipeline<'_> {
     /// Render the pipeline around router `R`.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "validation and each pipeline section in filter order"
-    )]
     fn render<R: RouterRender>(&self) -> Result<String, ConsumerConfigError> {
         let overlay = self.overlay;
         if overlay.local_site.trim().is_empty() {
@@ -1026,10 +1017,6 @@ fn render_consumer_config(
 
 /// Add one validated file reference to the grouped requirements map.
 #[expect(
-    clippy::type_complexity,
-    reason = "the tuple provides deterministic grouping by purpose and Secret identity"
-)]
-#[expect(
     clippy::too_many_arguments,
     reason = "each argument identifies one projected Secret key and destination"
 )]
@@ -1264,10 +1251,6 @@ fn rendered_sni(ep: &ClusterEndpointConfig) -> Result<&str, ConsumerConfigError>
 }
 
 /// Render one `intelligent_route` candidate.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Candidate YAML fields are kept together to mirror the wire contract."
-)]
 #[cfg(test)]
 fn render_candidate(c: &RoutingCandidate, include_credential: bool) -> String {
     let mut lines = vec![
@@ -1336,17 +1319,13 @@ fn render_credential_reference(cred: &crate::resources::routing_overlay::Project
 /// unconditionally in explicit projected-credential mode. The latter keeps a
 /// filter present at empty-overlay startup so a later credential-bearing
 /// revision cannot bypass injection. Missing projected files fail closed.
-#[expect(
-    clippy::too_many_lines,
-    reason = "BTreeMap collection + format strings for each credential field"
-)]
 fn render_credential_inject(
     candidates: &[&RoutingCandidate],
     credential_mount_path: &str,
     local_site: &str,
     enable_projected_credentials: bool,
 ) -> String {
-    // Collect unique (strategy, name, namespace, key) → rendered entry.
+    // Collect unique (strategy, name, namespace, key) -> rendered entry.
     // BTreeMap provides deterministic sorted order by key.
     let mut entries: BTreeMap<(String, String, String, String), String> = BTreeMap::new();
 
@@ -1422,7 +1401,7 @@ fn render_load_balancer(
     cluster_endpoints: &[ClusterEndpointConfig],
     tls_cert_mount_path: &str,
 ) -> Result<String, ConsumerConfigError> {
-    // Build a lookup map: cluster name → endpoint config.
+    // Build a lookup map: cluster name -> endpoint config.
     let endpoint_map: BTreeMap<&str, &ClusterEndpointConfig> =
         cluster_endpoints.iter().map(|ep| (ep.cluster.as_str(), ep)).collect();
 
@@ -1454,10 +1433,6 @@ fn render_load_balancer(
 /// Validates that `transport` is present and, for `mutual_tls`, that `sni`
 /// is non-blank.  Missing transport fails closed with [`ConsumerConfigError::MissingTransport`];
 /// missing SNI on mTLS fails with [`ConsumerConfigError::MissingSni`].
-#[expect(
-    clippy::too_many_lines,
-    reason = "transport validation + two format branches; splitting would separate the match arms from their YAML templates"
-)]
 fn render_cluster_entry(
     quoted_name: &str,
     ep: &ClusterEndpointConfig,
@@ -1576,26 +1551,106 @@ fn peer_limits() -> String {
     )
 }
 
+/// The dial for each cluster in `sites`, with the transport, timeouts and trust its rendered
+/// `load_balancer` entry carries, and the clusters refused the same way, with why.
+///
+/// One refused cluster leaves the others' dials standing. A local dial, or another site's over
+/// grid mutual TLS, may trust a private address, and only for a hostname: an IP literal is never
+/// resolved, and praxis refuses trusting one.
+pub(crate) fn dial_specs(
+    cluster_endpoints: &[ClusterEndpointConfig],
+    sites: &BTreeMap<&str, &str>,
+    local_site: &str,
+) -> (BTreeMap<String, DialSpec>, BTreeMap<String, ConsumerConfigError>) {
+    let mut refused = BTreeMap::new();
+    let dials = cluster_endpoints
+        .iter()
+        .filter_map(|ep| sites.get(ep.cluster.as_str()).map(|site| (ep, *site)))
+        .filter_map(|(ep, site)| {
+            let transport = match dial_transport(ep) {
+                Ok(transport) => transport,
+                Err(error) => {
+                    refused.insert(ep.cluster.clone(), error);
+                    return None;
+                },
+            };
+            let peer = matches!(transport, DialTransport::MutualTls { .. });
+            let hop = grid_client::HopPolicy::PEER;
+            let ms =
+                |duration: std::time::Duration| peer.then(|| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+            let spec = DialSpec {
+                address: ep.address.clone(),
+                base_path: None,
+                connect_retries: peer.then_some(hop.connect_retries),
+                connect_timeout_ms: ms(hop.connect),
+                credential: None,
+                read_timeout_ms: ms(hop.read),
+                site: site.to_owned(),
+                total_connect_timeout_ms: ms(hop.total_connect),
+                transport,
+                // Off this site only behind grid mutual TLS: nothing is sent before the handshake verifies the site.
+                trusted_private: (site == local_site || peer) && private_trust_host(&ep.address).is_some(),
+                write_timeout_ms: ms(hop.write),
+            };
+            Some((ep.cluster.clone(), spec))
+        })
+        .collect();
+    (dials, refused)
+}
+
+/// The dial transport for `ep`, refused exactly as [`render_cluster_entry`] refuses it.
+fn dial_transport(ep: &ClusterEndpointConfig) -> Result<DialTransport, ConsumerConfigError> {
+    let cluster = || ep.cluster.clone();
+    let transport = ep
+        .transport
+        .as_ref()
+        .ok_or_else(|| ConsumerConfigError::MissingTransport { cluster: cluster() })?;
+    match transport.mode {
+        TransportMode::MutualTls if transport.ca_secret_ref.is_some() => {
+            Err(ConsumerConfigError::MutualTlsCustomCa { cluster: cluster() })
+        },
+        TransportMode::MutualTls => Ok(DialTransport::MutualTls {
+            sni: rendered_sni(ep)?.to_owned(),
+        }),
+        TransportMode::Tls => Ok(DialTransport::Tls {
+            ca_path: transport
+                .ca_secret_ref
+                .as_ref()
+                .map(|ca| backend_ca_file_path(&ca.name, ca.key.as_deref().unwrap_or("ca.crt"))),
+            sni: rendered_sni(ep)?.to_owned(),
+        }),
+        TransportMode::Plaintext if transport.sni.as_deref().is_some_and(|sni| !sni.trim().is_empty()) => {
+            Err(ConsumerConfigError::PlaintextWithSni { cluster: cluster() })
+        },
+        TransportMode::Plaintext if transport.ca_secret_ref.is_some() => {
+            Err(ConsumerConfigError::PlaintextWithCa { cluster: cluster() })
+        },
+        TransportMode::Plaintext => Ok(DialTransport::Plaintext),
+    }
+}
+
 /// Praxis refuses a hostname endpoint that resolves to a private address unless the
 /// cluster lists it as trusted. Cluster-local Services always do, so every hostname
 /// endpoint is listed; an IP literal is never resolved and needs no entry.
 fn render_trusted_private(address: &str) -> String {
-    let host = address
-        .rsplit_once(':')
-        .map_or(address, |(host, _port)| host)
-        .trim_matches(|c| c == '[' || c == ']');
-    if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
+    let Some(host) = private_trust_host(address) else {
         return String::new();
-    }
+    };
     let quoted = yaml_scalar(host).unwrap_or_else(|_| "\"\"".to_owned());
     format!("\n            trusted_private_endpoints:\n              - {quoted}")
+}
+
+/// The hostname of `address` praxis may trust as private, `None` for an IP literal.
+fn private_trust_host(address: &str) -> Option<&str> {
+    let host = grid_client::address_host(address);
+    (!host.is_empty() && host.parse::<std::net::IpAddr>().is_err()).then_some(host)
 }
 
 /// Compute the `file:` path for a credential entry.
 ///
 /// Uses `{credential_mount_path}/{secret-name}/{secret-key}`.
 /// The secret name is sanitized to be DNS-label-safe before use.
-fn credential_file_path(mount_base: &str, secret_name: &str, secret_key: &str) -> String {
+pub(crate) fn credential_file_path(mount_base: &str, secret_name: &str, secret_key: &str) -> String {
     let safe_name = dns_safe(secret_name);
     format!("{mount_base}/{safe_name}/{secret_key}")
 }
@@ -1664,7 +1719,6 @@ mod tests {
     const SITE_ROUTE_SERVING: &str = include_str!("../../../gateway/tests/testdata/serving-config-site-route.json");
 
     /// A local model behind a bearer token and another site's gateway, its SNI written with stray spaces.
-    #[expect(clippy::too_many_lines, reason = "both endpoint declarations are spelled out")]
     fn site_route_topology() -> (RoutingOverlay, Vec<ClusterEndpointConfig>) {
         let local = credential_candidate(
             "inference_model",
@@ -1740,6 +1794,193 @@ mod tests {
             .expect("serving text")
     }
 
+    /// Contract fixture the gateway crate loads: the dial file beside a serving config.
+    const DIAL_FILE: &str = include_str!("../../../gateway/tests/testdata/dial.json");
+
+    /// Two local backends, one behind a custom CA, and another site's gateway.
+    fn dial_topology() -> (RoutingOverlay, Vec<ClusterEndpointConfig>) {
+        let mut remote = plain_candidate("inference_model", "llama", "site-b", "site-b", true);
+        remote.stable_id = Some("candidate-site-b".to_owned());
+        let overlay = simple_overlay(vec![
+            plain_candidate("inference_model", "llama", "site-a", "local-llama", true),
+            plain_candidate("inference_model", "granite", "site-a", "local-granite", true),
+            remote,
+        ]);
+        let mut granite = plain_ep("local-granite", "granite.models.svc.cluster.local:8443");
+        granite.transport = Some(EndpointTransport {
+            mode: TransportMode::Tls,
+            sni: Some("granite.models.svc".to_owned()),
+            ca_secret_ref: Some(EndpointCaSecretRef {
+                name: "models-ca".to_owned(),
+                key: None,
+            }),
+        });
+        let endpoints = vec![
+            mtls_ep("site-b", "site-b-gateway.grid.example.com:8443", "site-b.grid.internal"),
+            plain_ep("local-llama", "llama.models.svc.cluster.local:8000"),
+            granite,
+        ];
+        (overlay, endpoints)
+    }
+
+    /// The cluster each candidate names, by the site it names.
+    fn candidate_sites(overlay: &RoutingOverlay) -> BTreeMap<&str, &str> {
+        overlay
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.cluster.as_str(), candidate.site.as_str()))
+            .collect()
+    }
+
+    /// The dial file written beside the serving config for `overlay` over `endpoints`.
+    fn dial_file(overlay: &RoutingOverlay, endpoints: &[ClusterEndpointConfig]) -> String {
+        let (dials, refused) = dial_specs(endpoints, &candidate_sites(overlay), &overlay.local_site);
+        assert!(refused.is_empty(), "every fixture dial renders: {refused:?}");
+        let none = BTreeSet::new();
+        let no_sni = BTreeMap::new();
+        let inputs = crate::resources::serving_config::ServingInputs {
+            provider_hop_clusters: &none,
+            provider_hop_sni: &no_sni,
+            tls_mount: "/etc/praxis/tls",
+            local_signals_addr: Some("grid-operator-signals.grid.svc:9091"),
+            scrape_interval: std::time::Duration::from_secs(5),
+            peer_interval: std::time::Duration::from_secs(30),
+            peer_budget: std::time::Duration::from_secs(10),
+            heard: &|_, _| true,
+            quiet_local: &none,
+            inject_local_credentials: false,
+        };
+        let serving = crate::resources::serving_config::render(overlay, &inputs);
+        crate::resources::serving_config::to_text(&crate::resources::serving_config::render_dials(&serving, &dials))
+            .expect("dial text")
+    }
+
+    #[test]
+    fn a_dial_render_matches_the_fixture_the_gateway_loads() {
+        let (overlay, endpoints) = dial_topology();
+        assert_eq!(dial_file(&overlay, &endpoints), DIAL_FILE.trim_end(), "golden drifted");
+    }
+
+    #[test]
+    fn a_peer_dial_carries_the_hop_bounds_and_a_local_one_the_backend_defaults() {
+        let (overlay, endpoints) = dial_topology();
+        let (dials, _) = dial_specs(&endpoints, &candidate_sites(&overlay), "site-a");
+        let hop = grid_client::HopPolicy::PEER;
+        let ms = |duration: std::time::Duration| Some(u64::try_from(duration.as_millis()).expect("ms"));
+        let peer = &dials["site-b"];
+        assert_eq!(
+            (
+                peer.connect_timeout_ms,
+                peer.total_connect_timeout_ms,
+                peer.read_timeout_ms,
+                peer.write_timeout_ms
+            ),
+            (ms(hop.connect), ms(hop.total_connect), ms(hop.read), ms(hop.write)),
+            "the same bounds the rendered load_balancer entry carries"
+        );
+        assert_eq!(peer.connect_retries, Some(hop.connect_retries));
+        assert!(
+            peer.trusted_private,
+            "a peer hostname behind grid mutual TLS may resolve privately"
+        );
+        for local in ["local-llama", "local-granite"] {
+            let dial = &dials[local];
+            assert_eq!(
+                (dial.connect_timeout_ms, dial.read_timeout_ms, dial.connect_retries),
+                (None, None, None),
+                "{local}: a local backend keeps praxis' defaults, as its rendered entry does"
+            );
+            assert!(dial.trusted_private, "{local}: a local hostname resolves privately");
+        }
+        assert_eq!(
+            dials["local-granite"].transport,
+            DialTransport::Tls {
+                ca_path: Some("/run/secrets/grid-backend-ca/models-ca/ca.crt".to_owned()),
+                sni: "granite.models.svc".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_hostname_dial_trusts_a_private_address_locally_or_behind_grid_mutual_tls() {
+        let endpoints = vec![
+            plain_ep("by-ip", "10.96.0.20:8000"),
+            plain_ep("by-v6", "[fd00::1]:8000"),
+            plain_ep("by-name", "llama.models.svc:8000"),
+            mtls_ep("remote", "site-b.ec2.internal:8443", "site-b.grid.internal"),
+            mtls_ep("remote-ip", "10.1.0.9:8443", "site-b.grid.internal"),
+            plain_ep("remote-plain", "llama.site-b.internal:8000"),
+        ];
+        let sites = BTreeMap::from([
+            ("by-ip", "site-a"),
+            ("by-v6", "site-a"),
+            ("by-name", "site-a"),
+            ("remote", "site-b"),
+            ("remote-ip", "site-b"),
+            ("remote-plain", "site-b"),
+        ]);
+        let (dials, _) = dial_specs(&endpoints, &sites, "site-a");
+        let trusted: Vec<&str> = dials
+            .iter()
+            .filter(|(_, dial)| dial.trusted_private)
+            .map(|(cluster, _)| cluster.as_str())
+            .collect();
+        assert_eq!(
+            trusted,
+            ["by-name", "remote"],
+            "praxis refuses trusting an IP literal; off this site only behind grid mutual TLS"
+        );
+    }
+
+    #[test]
+    fn a_dial_is_refused_exactly_as_its_rendered_entry_is() {
+        let endpoint = |mode: TransportMode, sni: Option<&str>, ca: bool| ClusterEndpointConfig {
+            cluster: "bad".to_owned(),
+            address: "peer:8443".to_owned(),
+            transport: Some(EndpointTransport {
+                mode,
+                sni: sni.map(str::to_owned),
+                ca_secret_ref: ca.then(|| EndpointCaSecretRef {
+                    name: "ca".to_owned(),
+                    key: None,
+                }),
+            }),
+        };
+        let untransported = ClusterEndpointConfig {
+            transport: None,
+            ..plain_ep("bad", "peer:8000")
+        };
+        let cases = [
+            (
+                "mutual TLS with a custom CA",
+                endpoint(TransportMode::MutualTls, Some("site-b.grid.internal"), true),
+            ),
+            (
+                "plaintext with an SNI",
+                endpoint(TransportMode::Plaintext, Some("peer"), false),
+            ),
+            ("no transport", untransported),
+            (
+                "mutual TLS without an SNI",
+                endpoint(TransportMode::MutualTls, Some(" "), false),
+            ),
+        ];
+        let sites = BTreeMap::from([("bad", "site-a"), ("good", "site-a")]);
+        for (label, bad) in cases {
+            let rendered = render_cluster_entry("\"bad\"", &bad, "/etc/praxis/tls").map(drop);
+            let (dials, refused) = dial_specs(&[bad, plain_ep("good", "good:8000")], &sites, "site-a");
+            assert!(rendered.is_err(), "{label}: the rendered entry refuses");
+            assert!(refused.contains_key("bad"), "{label}: the dial refuses");
+            assert_eq!(
+                dials.keys().collect::<Vec<_>>(),
+                ["good"],
+                "{label}: only the bad cluster is dropped"
+            );
+        }
+        let (unnamed, _) = dial_specs(&[plain_ep("other", "x:1")], &sites, "site-a");
+        assert!(unnamed.is_empty(), "a cluster no candidate names is not dialed");
+    }
+
     /// The bootstrap config, which the gateway crate loads through Praxis.
     const BOOTSTRAP_PRAXIS: &str = include_str!("../../../gateway/tests/testdata/consumer-config-bootstrap.yaml");
 
@@ -1762,10 +2003,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "asserts the whole generated chain and cluster tables"
-    )]
     fn a_site_route_render_routes_with_grid_site_route_over_every_dialed_cluster() {
         let (overlay, endpoints) = site_route_topology();
         let yaml = render_site_route(&overlay, &endpoints).expect("render").config_yaml;
@@ -1893,10 +2130,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the praxis.yaml and serving sides of one credential"
-    )]
     fn a_site_route_render_injects_the_local_credential_its_router_selects() {
         let (mut overlay, endpoints) = site_route_topology();
         overlay.candidates[1] = credential_candidate(
@@ -1976,10 +2209,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one render per router, each assertion naming its contract"
-    )]
     fn an_intelligent_route_render_is_unchanged_by_the_router_choice() {
         let (overlay, endpoints) = site_route_topology();
         let render = |router| {
@@ -2037,6 +2266,7 @@ mod tests {
             site: site.to_owned(),
             cluster: cluster.to_owned(),
             fresh,
+            expires_at: None,
             credential: None,
             stable_id: None,
             admission_state: None,
@@ -2065,6 +2295,7 @@ mod tests {
             site: site.to_owned(),
             cluster: cluster.to_owned(),
             fresh: true,
+            expires_at: None,
             credential: Some(ProjectedCredential {
                 strategy: "bearer_token".to_owned(),
                 secret_ref: ProjectedCredentialRef {
@@ -2100,10 +2331,6 @@ mod tests {
     const SENTINEL_TOKEN: &str = "sk-super-secret-bearer-token-do-not-emit";
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "covers local and remote candidates in one final-hop regression"
-    )]
     fn requirements_keep_backend_credentials_at_the_final_local_hop() {
         let overlay = simple_overlay(vec![
             credential_candidate(
@@ -2185,10 +2412,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "asserts both required Grid TLS Secret projections and file paths"
-    )]
     fn mutual_tls_requirements_project_grid_ca_and_site_identity_together() {
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
@@ -2297,10 +2520,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "asserts generated TLS config and its matching projected CA requirement"
-    )]
     fn server_tls_backend_ca_is_rendered_and_reported_as_a_file_requirement() -> Result<(), serde_yaml::Error> {
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
@@ -2437,10 +2656,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "asserts the generated filter chain and complete restoration endpoint inventory"
-    )]
     fn production_consumer_config_uses_scoped_reloadable_overlay_and_complete_endpoint_inventory() {
         let overlay = simple_overlay(vec![credential_candidate(
             "inference_model",
@@ -2512,10 +2727,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "checks the cold-start empty overlay contract with a configured endpoint"
-    )]
     fn empty_uncredentialed_consumer_config_does_not_require_new_praxis_filter() {
         let overlay = simple_overlay(Vec::new());
         let endpoints = [ClusterEndpointConfig {
@@ -2593,10 +2804,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "checks that projected credential references stay dynamic in rendered YAML"
-    )]
     fn projected_credential_mode_keeps_reference_dynamic_for_credential_route() {
         let overlay = simple_overlay(vec![credential_candidate(
             "inference_model",
@@ -2670,10 +2877,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "checks opt-in output, secret exclusion, and overlay separation"
-    )]
     fn telemetry_is_opt_in_and_rendered_outside_routing_filters() {
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
@@ -2737,10 +2940,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "covers environment fallback, sampling boundaries, and credential rejection"
-    )]
     fn telemetry_rejects_invalid_sampling_rates_and_credentials_in_endpoint() {
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
@@ -2864,10 +3063,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "test parses route and load-balancer sections and checks credential omission"
-    )]
     fn mixed_capability_overlay_projects_only_inference_pipeline() {
         let overlay = simple_overlay(vec![
             plain_candidate("inference_model", "model-a", "site-a", "model-cluster", true),
@@ -3050,10 +3245,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "test constructs duplicate credential candidates and asserts rendered dedupe behavior"
-    )]
     fn multiple_candidates_sharing_same_secret_ref_produce_one_credential_entry() {
         let overlay = simple_overlay(vec![
             credential_candidate(
@@ -3091,10 +3282,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "test constructs two credential references and asserts both rendered entries"
-    )]
     fn multiple_different_credentials_produce_multiple_entries() {
         let overlay = simple_overlay(vec![
             credential_candidate(
@@ -3609,7 +3796,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "checks every rendered mTLS property")]
     fn cluster_with_mtls_transport_renders_mtls_entry() {
         let endpoints = [mtls_ep("site-a", "172.18.0.4:30080", "site-a.grid.internal")];
         let overlay = simple_overlay(vec![plain_candidate(

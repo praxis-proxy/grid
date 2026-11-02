@@ -70,10 +70,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "wire-bound matrix independently checks each invalid field"
-    )]
     fn wire_bounds_and_terminal_values_are_enforced() {
         let valid = IngestReport {
             replica: "gateway-1".to_owned(),

@@ -30,10 +30,15 @@ WORKDIR /src
 
 COPY . .
 
+# Select dev for faster local and Helm CI builds; releases use release.
+ARG CARGO_PROFILE=release
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release --package mock-providers \
-    && cp target/release/mock-providers /usr/local/bin/mock-providers
+    case "${CARGO_PROFILE}" in dev) profile_dir=debug ;; *) profile_dir="${CARGO_PROFILE}" ;; esac \
+    && cargo build --profile "${CARGO_PROFILE}" --package mock-providers \
+    && cp "target/${profile_dir}/mock-providers" /usr/local/bin/mock-providers
 
 # ------------------------------------------------------------------------------
 # Stage 2: Runtime

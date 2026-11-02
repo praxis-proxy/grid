@@ -121,10 +121,6 @@ fn evidence_path(config: &Path, requested: Option<&Path>, run: &str) -> PathBuf 
     )
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "bounded process setup, polling, collection, and timeout handling stay together"
-)]
 fn command_output(command: &mut Command, timeout: Duration) -> Result<Output, String> {
     let description = format!("{command:?}");
     let stdout_file = tempfile::NamedTempFile::new().map_err(|error| format!("stdout temp file: {error}"))?;
@@ -350,10 +346,6 @@ fn discover_node(kind_cluster: &str) -> Result<String, String> {
 }
 
 /// Load and verify every local image before any Forge stack is applied.
-#[expect(
-    clippy::too_many_lines,
-    reason = "each image is inspected, loaded, and verified before deployment"
-)]
 fn load_and_verify_images(images: &ResolvedImages) -> Result<BTreeMap<String, serde_json::Value>, String> {
     let image_names = [
         ("gateway", images.gateway.as_str()),
@@ -406,10 +398,6 @@ fn load_and_verify_images(images: &ResolvedImages) -> Result<BTreeMap<String, se
 }
 
 /// Materialize the topology using the resolved image references.
-#[expect(
-    clippy::too_many_lines,
-    reason = "materialization validates the complete image contract at one boundary"
-)]
 fn materialize_config(forge_config: &Path, evidence_dir: &Path, images: &ResolvedImages) -> Result<PathBuf, String> {
     let output = forge_config.parent().unwrap_or_else(|| Path::new(".")).join(format!(
         ".grid-single-cluster-multi-gateway-{}.resolved.yaml",
@@ -507,10 +495,6 @@ fn forge_up(forge: &str, config: &Path, evidence_dir: &Path) -> Result<(), Strin
 }
 
 /// Capture setup-boundary diagnostics without exposing kubeconfig or secrets.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the setup failure record intentionally captures each boundary in one place"
-)]
 fn capture_setup_diagnostics(evidence_dir: &Path) {
     let identity = cluster_identity();
     let commands = [
@@ -636,7 +620,6 @@ struct RetriedProbe {
 }
 
 /// Retry only transport failures; a received HTTP response is final.
-#[expect(clippy::too_many_lines, reason = "the bounded retry records every probe attempt")]
 fn attributed_request_with_transport_retry(
     consumer: &str,
     request_id: u32,
@@ -945,10 +928,6 @@ fn strip_ansi(input: &str) -> String {
 }
 
 /// Assert that both consumers serve the same accepted candidate snapshot.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the overlay contract is validated as one atomic evidence boundary"
-)]
 fn assert_overlay_contract(state: &serde_json::Value) -> Result<serde_json::Value, String> {
     let overlays = ["consumer-gateway-a", "consumer-gateway-b"]
         .into_iter()
@@ -1028,10 +1007,6 @@ fn assert_serving_revisions(state: &serde_json::Value) -> Result<serde_json::Val
 }
 
 /// Wait until both consumer overlays contain exactly the requested provider set.
-#[expect(
-    clippy::too_many_lines,
-    reason = "polling keeps candidate state and last error together"
-)]
 fn wait_for_candidate_set(expected: &BTreeSet<&str>) -> Result<serde_json::Value, String> {
     let started = Instant::now();
     let mut last_error = "no overlay observed".to_owned();
@@ -1095,10 +1070,6 @@ fn json_kubectl(args: &[&str]) -> Result<serde_json::Value, String> {
     serde_json::from_slice(&output.stdout).map_err(|error| format!("invalid kubectl JSON: {error}"))
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "readiness polling keeps the last observed resource contract together"
-)]
 fn wait_deployment(name: &str) -> Result<(), String> {
     let started = Instant::now();
     let args = ["-n", NAMESPACE, "get", "deployment", name, "-o", "json"];
