@@ -2485,10 +2485,10 @@ pub(crate) mod tests {
         snapshot.candidates[1].weight = 1;
         snapshot.candidates[2].weight = 1;
         let taken = shares(&snapshot, 10_000, &KeepAll);
-        let a = taken["a"];
-        let b = taken["b"];
-        let c = taken["c"];
-        assert!(a > b && a > c, "the heavier site takes the most: a={a}, b={b}, c={c}");
+        assert!(
+            (5_700..=6_300).contains(&taken["a"]),
+            "weight 3 vs 1 vs 1 with equal pressure should give ~60% to a, got {taken:?}"
+        );
     }
 
     #[test]
