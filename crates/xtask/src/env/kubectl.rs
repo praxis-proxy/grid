@@ -174,3 +174,88 @@ pub(crate) fn get_configmap_yaml(
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
+
+/// Delete a namespaced resource, ignoring absence.
+///
+/// Returns an error only if `kubectl` itself cannot be spawned.
+pub(crate) fn delete_ignoring_not_found(
+    context: &str,
+    namespace: &str,
+    resource: &str,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            namespace,
+            "delete",
+            resource,
+            name,
+            "--ignore-not-found",
+        ])
+        .status()?;
+    Ok(())
+}
+
+/// Try to merge-patch a namespaced resource impersonating the `grid-operator` `ServiceAccount`.
+///
+/// Returns `true` if the patch was accepted, `false` if it was denied (exit code non-zero).
+/// Sends an empty merge-patch `{}` which is a no-op in content but still goes through admission.
+///
+/// # Errors
+///
+/// Returns an error only if `kubectl` itself cannot be spawned.
+pub(crate) fn patch_as_operator_sa(
+    context: &str,
+    namespace: &str,
+    resource: &str,
+    name: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            namespace,
+            "patch",
+            resource,
+            name,
+            "--type=merge",
+            "--patch={}",
+            "--as=system:serviceaccount:grid-system:grid-operator",
+        ])
+        .output()?;
+    Ok(output.status.success())
+}
+
+/// Try to delete a namespaced resource impersonating the `grid-operator` `ServiceAccount`.
+///
+/// Returns `true` if the delete succeeded, `false` if it was denied (exit code non-zero).
+/// Does **not** pass `--ignore-not-found`: a 404 returns `false`, but the caller creates the
+/// resource immediately before calling this so that case should not arise.
+///
+/// # Errors
+///
+/// Returns an error only if `kubectl` itself cannot be spawned.
+pub(crate) fn delete_as_operator_sa(
+    context: &str,
+    namespace: &str,
+    resource: &str,
+    name: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            namespace,
+            "delete",
+            resource,
+            name,
+            "--as=system:serviceaccount:grid-system:grid-operator",
+        ])
+        .output()?;
+    Ok(output.status.success())
+}

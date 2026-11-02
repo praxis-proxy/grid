@@ -1,0 +1,42 @@
+{{- if and .Values.rbac.create (.Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy") }}
+{{- $fullname := include "grid-operator.fullname" . }}
+{{- $services := compact (list (include "grid-operator.holderSignalsServices" .) (include "grid-operator.holderSwimServices" .)) }}
+{{- if $services }}
+{{- $saName := include "grid-operator.serviceAccountName" . }}
+# Guards the EndpointSlice delete verb granted by the leader-election Role: the operator
+# may only remove slices that the built-in EndpointSlice controller placed on its own Services.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $fullname }}-endpointslice-cleanup
+  labels:
+    {{- include "grid-operator.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["discovery.k8s.io"]
+      apiVersions: ["v1"]
+      resources: ["endpointslices"]
+      operations: ["DELETE"]
+  matchConditions:
+  - name: is-operator-sa
+    expression: >-
+      request.userInfo.username == "system:serviceaccount:" + request.namespace + ":{{ $saName }}"
+  validations:
+  - expression: >-
+      oldObject.?metadata.?labels[?"kubernetes.io/service-name"].orValue("") in [{{ range $i, $s := $services }}{{ if $i }}, {{ end }}"{{ $s }}"{{ end }}] &&
+      oldObject.?metadata.?labels[?"endpointslice.kubernetes.io/managed-by"].orValue("") == "endpointslice-controller.k8s.io"
+    message: "the operator may only delete controller-managed EndpointSlices on its own Services"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $fullname }}-endpointslice-cleanup
+  labels:
+    {{- include "grid-operator.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $fullname }}-endpointslice-cleanup
+  validationActions: [Deny]
+{{- end }}
+{{- end }}

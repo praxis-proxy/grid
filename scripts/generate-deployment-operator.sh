@@ -106,7 +106,7 @@ render() {
     local ns_filter="."
     case "$strip_ns:$kind:$ns" in
       yes:*) ns_filter="del(.metadata.namespace) | del(.subjects[]? | select(.kind == \"ServiceAccount\" and .namespace == \"$NAMESPACE_PLACEHOLDER\") | .namespace)" ;;
-      no:ClusterRole:*|no:ClusterRoleBinding:*|no:Namespace:*) ;;
+      no:ClusterRole:*|no:ClusterRoleBinding:*|no:Namespace:*|no:ValidatingAdmissionPolicy:*|no:ValidatingAdmissionPolicyBinding:*) ;;
       no:*:) ns_filter=".metadata.namespace = \"$NAMESPACE_PLACEHOLDER\"" ;;
     esac
     yq eval-all "select(documentIndex == $i)
@@ -207,7 +207,7 @@ EOF
 
 # The platform base, with no platform assumptions.
 BASE="$TMP_DIR/operator"
-render_base "$BASE" deploy/operator/values.yaml --
+render_base "$BASE" deploy/operator/values.yaml -- admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy
 
 # Every flavor: the base values plus the flavor's delta, with its API versions.
 FLAVORS=()
@@ -219,14 +219,14 @@ for dir in deploy/overlays/*/; do
   if [ -f "$dir/api-versions" ]; then
     mapfile -t api_versions < <(grep -v '^\s*#' "$dir/api-versions" | grep -v '^\s*$')
   fi
-  render_base "$TMP_DIR/$flavor" deploy/operator/values.yaml "$dir/values.yaml" -- "${api_versions[@]}"
+  render_base "$TMP_DIR/$flavor" deploy/operator/values.yaml "$dir/values.yaml" -- admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy "${api_versions[@]}"
   FLAVORS+=("$flavor")
 done
 
 # The kind overlay: plain, with its own Namespace so kubectl apply -k works bare.
 APP_VERSION="$(yq '.appVersion' "$CHART/Chart.yaml")"
 KIND="$TMP_DIR/kind"
-render "$KIND" deploy/overlays/kind/values.yaml -- no
+render "$KIND" deploy/overlays/kind/values.yaml -- no admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy
 cat > "$KIND/namespace.yaml" <<EOF
 apiVersion: v1
 kind: Namespace

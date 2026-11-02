@@ -5,7 +5,9 @@ controller on Kubernetes.
 
 ## Prerequisites
 
-- Kubernetes >= 1.26
+- Kubernetes >= 1.26; the EndpointSlice and ConfigMap admission guards are only
+  rendered on Kubernetes >= 1.30 / OpenShift >= 4.17; on older clusters they
+  are omitted
 - Helm >= 3.12
 
 ## Install

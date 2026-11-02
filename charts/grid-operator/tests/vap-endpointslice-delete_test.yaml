@@ -1,0 +1,64 @@
+suite: EndpointSlice delete ValidatingAdmissionPolicy
+templates:
+  - templates/vap-endpointslice-delete.yaml
+capabilities:
+  apiVersions:
+    - admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy
+release:
+  name: grid-operator
+  namespace: grid-system
+tests:
+  - it: renders no policy when rbac.create is false
+    set:
+      rbac.create: false
+      signals.enabled: true
+      signals.service.enabled: true
+      swim.service.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders no policy when no holder Services are configured
+    set:
+      signals.enabled: false
+      swim.service.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders a policy and binding when holder Services exist
+    set:
+      signals.enabled: true
+      signals.service.enabled: true
+      swim.service.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 2
+
+  - it: matches only the operator service account in the slice namespace
+    set:
+      swim.service.enabled: true
+    asserts:
+      - equal:
+          path: spec.matchConditions[0].expression
+          value: 'request.userInfo.username == "system:serviceaccount:" + request.namespace + ":grid-operator"'
+        documentIndex: 0
+
+  - it: allows deletion only of controller-managed slices on the operator Services
+    set:
+      signals.enabled: true
+      signals.service.enabled: true
+      swim.service.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.validations[0].expression
+          pattern: 'oldObject\.'
+        documentIndex: 0
+      - matchRegex:
+          path: spec.validations[0].expression
+          pattern: '"grid-operator-signals", "grid-operator-swim"'
+        documentIndex: 0
+      - matchRegex:
+          path: spec.validations[0].expression
+          pattern: 'endpointslice-controller\.k8s\.io'
+        documentIndex: 0

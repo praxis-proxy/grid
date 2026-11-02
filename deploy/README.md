@@ -132,12 +132,18 @@ kubectl kustomize deploy/operator/ |
 
 Matching selectors apply in place and need no delete.
 
+```bash
 # Verify operator is running
 kubectl get pods -n grid-system
 kubectl logs -n grid-system deployment/grid-operator
 ```
 
 ### RBAC Structure
+
+These manifests include `ValidatingAdmissionPolicy` resources and require
+Kubernetes >= 1.30 (OpenShift >= 4.17). Earlier clusters must remove the four
+`validatingadmissionpolicy*` entries from the relevant `kustomization.yaml`
+before applying.
 
 The operator uses a split RBAC model:
 

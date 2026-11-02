@@ -1,0 +1,11 @@
+suite: ConfigMap protect ValidatingAdmissionPolicy - API absent
+templates:
+  - templates/vap-configmap-protect.yaml
+release:
+  name: grid-operator
+  namespace: grid-system
+tests:
+  - it: renders no policy when the ValidatingAdmissionPolicy API is not available
+    asserts:
+      - hasDocuments:
+          count: 0
