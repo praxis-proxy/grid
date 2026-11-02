@@ -150,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // feature, kept off the startup stack frame.
     let authorizer = Box::pin(build_authorizer()).await?;
     #[cfg(feature = "csr-record")]
-    let recorder = load_recorder(&authorizer).await?;
+    let recorder = Box::pin(load_recorder(&authorizer)).await?;
     let state = Arc::new(AppState {
         store,
         ca: SharedCa::new(ca),
@@ -517,13 +517,12 @@ async fn load_recorder(authorizer: &Authorizer) -> Result<Option<Arc<enrollment:
 /// a slow record stays inside the default thirty-second grace period.
 #[cfg(feature = "csr-record")]
 async fn drain_records(recorder: Option<Arc<enrollment::record::Recorder>>) {
-    if let Some(recorder) = &recorder {
-        if tokio::time::timeout(Duration::from_secs(4), recorder.drain())
+    if let Some(recorder) = &recorder
+        && tokio::time::timeout(Duration::from_secs(4), recorder.drain())
             .await
             .is_err()
-        {
-            tracing::warn!("recording tasks still running at shutdown");
-        }
+    {
+        tracing::warn!("recording tasks still running at shutdown");
     }
 }
 
