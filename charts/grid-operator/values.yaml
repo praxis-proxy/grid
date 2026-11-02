@@ -303,13 +303,13 @@ signals:
   scrapeIntervalSeconds: ""
 # -- Advertised site gateway address configuration.
 gateway:
-  # -- Discover and advertise a LoadBalancer address for the site gateway.
+  # -- Discover a LoadBalancer address for SWIM and the own GridSite.
   discoveryEnabled: true
   # -- GridNetwork consumerGateways[].praxisConfig for the site gateway, as the CRD
   # takes it. Empty renders no block.
   praxisConfig: {}
   # -- Reachable site gateway host:port override. Set this for ClusterIP or
-  # NodePort Services; otherwise the operator discovers a LoadBalancer address.
+  # NodePort Services; the own GridSite uses it when gatewayEndpoint is absent.
   address: ""
   # -- Site gateway Kubernetes Service name for the operator to discover. Defaults
   # to grid-gateway with enrollment enabled or grid.id set; it also names the

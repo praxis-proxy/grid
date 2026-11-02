@@ -285,7 +285,7 @@ fn seconds(timestamp: f64) -> Result<OffsetDateTime, MetricsError> {
 }
 
 /// Parses a Prometheus sample value, rejecting NaN and anything beyond
-/// `±1e300`, which the dashboard treats as no data.
+/// `+/-1e300`, which the dashboard treats as no data.
 fn finite(raw: &str) -> Option<f64> {
     raw.parse::<f64>()
         .ok()

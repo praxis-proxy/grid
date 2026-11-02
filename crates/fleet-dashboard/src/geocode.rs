@@ -10,7 +10,7 @@ pub struct Coordinates {
     pub longitude: f64,
 }
 
-/// Region code → (latitude, longitude) of its principal data-center metro,
+/// Region code -> (latitude, longitude) of its principal data-center metro,
 /// rounded to 0.01 degree.
 const TABLE: &[(&str, f64, f64)] = &[
     // AWS

@@ -17,6 +17,8 @@ pub struct SiteReading {
     pub in_flight: Option<f64>,
     /// Work waiting at the site as a whole, per serving unit, worst within the window.
     pub queued: Option<f64>,
+    /// When the newest recognized queue sample arrived, even after it becomes stale.
+    pub queue_sampled_at: Option<i64>,
     /// Work held before scheduling, a count for the whole site, worst within the window.
     pub held: Option<f64>,
     /// The most any one serving unit of the site has waiting, so a scale-out cannot hide a

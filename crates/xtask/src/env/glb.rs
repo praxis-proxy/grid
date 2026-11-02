@@ -2738,9 +2738,9 @@ fn check_overlay_metadata() -> Result<String, Box<dyn std::error::Error>> {
         .into());
     }
 
-    eprintln!("  rendered → revision={}", safe_truncate_str(rendered_revision, 16));
+    eprintln!("  rendered -> revision={}", safe_truncate_str(rendered_revision, 16));
     eprintln!(
-        "  distributed → revision={}, resourceVersion={config_map_resource_version}",
+        "  distributed -> revision={}, resourceVersion={config_map_resource_version}",
         safe_truncate_str(distributed_revision, 16)
     );
 
@@ -3217,7 +3217,7 @@ fn check_edge_overlay_mounts_with_count(expected_candidates: usize) -> Result<St
         revisions.push((edge, revision));
     }
     for (edge, revision) in revisions {
-        eprintln!("  distributed → {edge}: revision={}", safe_truncate_str(&revision, 16));
+        eprintln!("  distributed -> {edge}: revision={}", safe_truncate_str(&revision, 16));
     }
     Ok(evidence.join(", "))
 }
@@ -3997,7 +3997,7 @@ pub(crate) fn verify_edge_serving_revision(edge: &str, revision: &str) -> Result
             }
             if stable_observations >= 2 {
                 eprintln!(
-                    "  serving → {edge}: revision={} observed twice on pod {}/restarts:{}; {} | {}",
+                    "  serving -> {edge}: revision={} observed twice on pod {}/restarts:{}; {} | {}",
                     safe_truncate_str(revision, 16),
                     safe_truncate_str(&current.uid, 12),
                     current.restart_count,
@@ -4382,7 +4382,7 @@ fn check_edge_gateway_pods() -> Result<(String, EdgePodIdentity), Box<dyn std::e
         let identity = edge_pod_identity(edge)?;
         let revision = overlay_revision(edge)?;
         verify_edge_accepted_revision(edge, &revision)?;
-        eprintln!("  accepted → {edge}: revision={}", safe_truncate_str(&revision, 16));
+        eprintln!("  accepted -> {edge}: revision={}", safe_truncate_str(&revision, 16));
         evidence.push(format!(
             "{edge}=uid:{}, restarts:{}, accepted_revision:{}",
             safe_truncate_str(&identity.uid, 12),
@@ -4567,7 +4567,7 @@ fn check_inference_routed() -> Result<String, Box<dyn std::error::Error>> {
         .into());
     }
     let distributed_revision = overlay_revision(PRIMARY_EDGE)?;
-    eprintln!("  serving → revision={}", safe_truncate_str(&distributed_revision, 16));
+    eprintln!("  serving -> revision={}", safe_truncate_str(&distributed_revision, 16));
     let body: serde_json::Value =
         serde_json::from_str(&resp.body).map_err(|e| format!("inference response body is not valid JSON: {e}"))?;
     let model = body
@@ -4874,7 +4874,7 @@ fn check_invalid_overlay_protection(edge: &str) -> Result<String, Box<dyn std::e
             expected_candidates,
         )?;
         eprintln!(
-            "  published → {edge}: revision={}, ConfigMap resourceVersion={}, GridNetwork resourceVersion={}",
+            "  published -> {edge}: revision={}, ConfigMap resourceVersion={}, GridNetwork resourceVersion={}",
             safe_truncate_str(&publication.revision, 16),
             publication.resource_version,
             publication.network_resource_version
@@ -4888,7 +4888,7 @@ fn check_invalid_overlay_protection(edge: &str) -> Result<String, Box<dyn std::e
             edge_mounted_overlay_observation,
         )?;
         eprintln!(
-            "  projected → {edge}: revision={} (pod {}, restarts {})",
+            "  projected -> {edge}: revision={} (pod {}, restarts {})",
             safe_truncate_str(&projection.mounted_revision, 16),
             safe_truncate_str(&projection.identity.uid, 12),
             projection.identity.restart_count
@@ -5360,7 +5360,7 @@ pub(crate) fn wait_for_withdrawal_serving_revision(
     let projection = wait_for_withdrawal_overlay_projection(edge, provider)?;
     let revision = projection.distributed_revision;
     eprintln!(
-        "  projected → {edge}: revision={} (pod {}, restarts {})",
+        "  projected -> {edge}: revision={} (pod {}, restarts {})",
         safe_truncate_str(&revision, 16),
         safe_truncate_str(&projection.identity.uid, 12),
         projection.identity.restart_count

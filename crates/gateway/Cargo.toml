@@ -25,6 +25,7 @@ httpdate = "1.0.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { version = "0.10.7", package = "yaml_serde" }
 metrics = "0.24.6"
+time = "0.3.0"
 
 [workspace.lints.rust]
 dead_code = "deny"

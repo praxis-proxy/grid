@@ -6,7 +6,7 @@
 //!
 //! [`GridSite`]: crate::crd::grid_site::GridSite
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use k8s_openapi::api::core::v1::ObjectReference;
 use kube::{
@@ -24,7 +24,7 @@ use crate::{
     controller::grid_network,
     crd::{
         grid_network::{GridNetwork, PeerTrustMode},
-        grid_site::{EgressTlsMode, GridSite, GridSitePhase, GridSiteStatus},
+        grid_site::{EgressConfig, EgressTls, EgressTlsMode, GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::ConditionStatus,
     },
     error::OperatorError,
@@ -73,6 +73,10 @@ pub struct SiteContext {
     pub client: Arc<Client>,
     /// How this site learns its members; declared sites leave `Pending` without discovery only under Local.
     pub membership: crate::cli::Membership,
+    /// This operator's site name, when it has an identity.
+    pub site_name: Option<String>,
+    /// The configured or discovered address for this operator's gateway.
+    pub gateway_address: tokio::sync::watch::Receiver<Option<String>>,
 }
 
 /// Reconcile a [`GridSite`] resource.
@@ -98,6 +102,9 @@ pub async fn reconcile(site: Arc<GridSite>, ctx: Arc<SiteContext>) -> Result<Act
 
     tracing::debug!(name, "reconciling GridSite");
 
+    let address = ctx.gateway_address.borrow().clone();
+    let (probe_site, gateway_source) = apply_local_gateway_address(&site, ctx.site_name.as_deref(), address.as_deref());
+
     let network = match fetch_network(&site, client.as_ref()).await {
         Ok(network) => network,
         // A declared site can precede its GridNetwork, as this cluster's own does while it enrolls.
@@ -111,8 +118,8 @@ pub async fn reconcile(site: Arc<GridSite>, ctx: Arc<SiteContext>) -> Result<Act
 
     let outcome = if needs_probe(current_phase) {
         let start = std::time::Instant::now();
-        let result = evaluate_gateway(&site, client.as_ref(), &network).await;
-        let tls_mode = if is_plaintext_transport(&site) {
+        let result = evaluate_gateway(&probe_site, client.as_ref(), &network).await;
+        let tls_mode = if is_plaintext_transport(&probe_site) {
             "Plaintext"
         } else {
             "Mutual"
@@ -124,8 +131,13 @@ pub async fn reconcile(site: Arc<GridSite>, ctx: Arc<SiteContext>) -> Result<Act
     };
 
     let probed = outcome.is_some();
-    let declared = ctx.membership == crate::cli::Membership::Local;
-    let (next_phase, reason, message) = site_phase_under(current_phase, &site, outcome.as_ref(), declared);
+    let (next_phase, reason, message) = site_phase_for_gateway(
+        current_phase,
+        &probe_site,
+        outcome.as_ref(),
+        ctx.membership,
+        gateway_source,
+    );
     Box::pin(update_status(
         &site,
         client.as_ref(),
@@ -181,6 +193,72 @@ fn needs_probe(phase: &GridSitePhase) -> bool {
 // ---------------------------------------------------------------------------
 // Phase Determination
 // ---------------------------------------------------------------------------
+
+/// How the own site's gateway endpoint was supplied for reconciliation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GatewayAddressSource {
+    /// The `GridSite` declares a usable gateway endpoint or operator settings supplied one.
+    Available,
+    /// This is a peer `GridSite`; the local gateway setting does not apply.
+    Peer,
+    /// The own `GridSite` has no declared or resolved gateway address.
+    Undeclared,
+}
+
+/// Add this operator's resolved address to a reconciliation copy of its own `GridSite`.
+fn apply_local_gateway_address<'site>(
+    site: &'site GridSite,
+    local_site: Option<&str>,
+    address: Option<&str>,
+) -> (Cow<'site, GridSite>, GatewayAddressSource) {
+    let Some(name) = site.metadata.name.as_deref() else {
+        return (Cow::Borrowed(site), GatewayAddressSource::Peer);
+    };
+    if local_site != Some(name) {
+        return (Cow::Borrowed(site), GatewayAddressSource::Peer);
+    }
+    if site
+        .spec
+        .gateway_endpoint
+        .as_ref()
+        .is_some_and(|endpoint| !endpoint.address.trim().is_empty())
+    {
+        return (Cow::Borrowed(site), GatewayAddressSource::Available);
+    }
+    if let Some(address) = address.map(str::trim).filter(|address| !address.is_empty()) {
+        let mut reconciled = site.clone();
+        reconciled.spec.gateway_endpoint = Some(EgressConfig {
+            address: address.to_owned(),
+            tls: EgressTls {
+                server_name: Some(crate::signals::gateway_server_name(name)),
+                ..EgressTls::default()
+            },
+        });
+        return (Cow::Owned(reconciled), GatewayAddressSource::Available);
+    }
+    (Cow::Borrowed(site), GatewayAddressSource::Undeclared)
+}
+
+/// Advance a site's phase, giving the own site an actionable reason when its endpoint is absent.
+fn site_phase_for_gateway(
+    current: &GridSitePhase,
+    site: &GridSite,
+    outcome: Option<&GatewayProbeOutcome>,
+    membership: crate::cli::Membership,
+    gateway_source: GatewayAddressSource,
+) -> (GridSitePhase, String, String) {
+    let (phase, reason, message) =
+        site_phase_under(current, site, outcome, membership == crate::cli::Membership::Local);
+    if gateway_source == GatewayAddressSource::Undeclared && phase != GridSitePhase::Left {
+        return (
+            phase,
+            "GatewayAddressMissing".to_owned(),
+            "this site's gateway address is not declared or discoverable; set gateway.address in the operator configuration"
+                .to_owned(),
+        );
+    }
+    (phase, reason, message)
+}
 
 /// The next lifecycle phase under Swim membership, as [`site_phase_under`] with `declared` false.
 #[cfg(test)]
@@ -949,37 +1027,23 @@ mod tests {
         )
     }
 
+    /// Checks that Connected status preserves each lifecycle reason and its verdict.
     #[test]
     fn connected_names_the_cause() {
-        assert_eq!(connected_for("TlsVerified"), ("True", CONNECTED.to_owned(), None));
-        assert_eq!(
-            connected_for("AdvertisedCertMismatch"),
-            ("True", CONNECTED.to_owned(), None)
-        );
-        assert_eq!(
-            connected_for("ConnectTimeout"),
-            ("False", "Unreachable".to_owned(), None)
-        );
-        assert_eq!(
-            connected_for("PlaintextUnreachable"),
-            ("False", "Unreachable".to_owned(), None)
-        );
-        assert_eq!(
-            connected_for("HandshakeTimeout"),
-            ("False", "TLSProtocolError".to_owned(), None)
-        );
-        assert_eq!(
-            connected_for("GatewayAddressMissing"),
-            ("False", "AddressMissing".to_owned(), None)
-        );
-        assert_eq!(
-            connected_for("GossipedAddressRefused"),
-            ("False", "AddressRefused".to_owned(), None)
-        );
-        assert_eq!(
-            connected_for("UntrustedIssuer"),
-            ("False", "UntrustedIssuer".to_owned(), None)
-        );
+        let cases = [
+            ("TlsVerified", ("True", CONNECTED, None)),
+            ("AdvertisedCertMismatch", ("True", CONNECTED, None)),
+            ("ConnectTimeout", ("False", "Unreachable", None)),
+            ("PlaintextUnreachable", ("False", "Unreachable", None)),
+            ("HandshakeTimeout", ("False", "TLSProtocolError", None)),
+            ("GatewayAddressMissing", ("False", "AddressMissing", None)),
+            ("GossipedAddressRefused", ("False", "AddressRefused", None)),
+            ("UntrustedIssuer", ("False", "UntrustedIssuer", None)),
+        ];
+        for (reason, expected) in cases {
+            let (status, connected, moving) = connected_for(reason);
+            assert_eq!((status, connected.as_str(), moving), expected);
+        }
     }
 
     #[test]
@@ -1017,7 +1081,7 @@ mod tests {
             "patch should carry null resourceVersion when not set"
         );
     }
-    use crate::crd::grid_site::{EgressConfig, EgressTls, GridSiteSpec};
+    use crate::crd::grid_site::GridSiteSpec;
 
     fn site_with_egress(phase: Option<GridSitePhase>, egress: &str) -> GridSite {
         GridSite {
@@ -1106,13 +1170,80 @@ mod tests {
         assert_eq!(reason, "EndpointsDeclared");
     }
 
+    /// Checks the missing-address reason for an own site with no declared endpoint.
     #[test]
-    fn pending_declared_without_a_gateway_stays_pending() {
+    fn pending_declared_without_a_gateway_reports_missing() {
         let mut site = declared_at("peer.example.com:443");
         site.spec.gateway_endpoint = None;
-        let (next, reason, _msg) = site_phase_under(&GridSitePhase::Pending, &site, None, true);
+        let (site, source) = apply_local_gateway_address(&site, Some("test-site"), None);
+        let (next, reason, message) = site_phase_for_gateway(
+            &GridSitePhase::Pending,
+            &site,
+            None,
+            crate::cli::Membership::Local,
+            source,
+        );
         assert_eq!(next, GridSitePhase::Pending, "no gateway, no endpoints");
-        assert_eq!(reason, "AwaitingDiscovery");
+        assert_eq!(reason, "GatewayAddressMissing");
+        assert!(
+            message.contains("gateway.address"),
+            "message names the configuration setting"
+        );
+    }
+
+    /// Checks that a resolved operator address advances its own site without changing the API spec.
+    #[test]
+    fn local_gateway_override_advances_the_own_site_without_mutating_its_spec() {
+        let site = site_no_egress(Some(GridSitePhase::Pending));
+        let (reconciled, source) = apply_local_gateway_address(&site, Some("test-site"), Some("gateway.test:8443"));
+        let endpoint = reconciled
+            .spec
+            .gateway_endpoint
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(source, GatewayAddressSource::Available);
+        assert_eq!(endpoint.address, "gateway.test:8443");
+        assert_eq!(endpoint.tls.server_name.as_deref(), Some("test-site.grid.internal"));
+        assert!(site.spec.gateway_endpoint.is_none(), "the API object remains unchanged");
+        let (next, reason, _) = site_phase_for_gateway(
+            &GridSitePhase::Pending,
+            &reconciled,
+            None,
+            crate::cli::Membership::Local,
+            source,
+        );
+        assert_eq!(
+            next,
+            GridSitePhase::Connecting,
+            "the override supplies the own gateway endpoint"
+        );
+        assert_eq!(reason, "EndpointsDeclared");
+    }
+
+    /// Checks declared-endpoint precedence and keeps the local override off peer sites.
+    #[test]
+    fn declared_own_endpoint_wins_and_the_local_override_does_not_apply_to_peers() {
+        let own_site = site_with_egress(Some(GridSitePhase::Pending), "declared.test:8443");
+        let (own_site, own_source) =
+            apply_local_gateway_address(&own_site, Some("test-site"), Some("gateway.test:9443"));
+        assert_eq!(own_source, GatewayAddressSource::Available);
+        assert_eq!(
+            own_site
+                .spec
+                .gateway_endpoint
+                .as_ref()
+                .map(|endpoint| endpoint.address.as_str()),
+            Some("declared.test:8443"),
+            "the declared endpoint takes precedence over the local setting"
+        );
+
+        let peer = site_no_egress(Some(GridSitePhase::Pending));
+        let (peer, peer_source) = apply_local_gateway_address(&peer, Some("another-site"), Some("gateway.test:9443"));
+        assert_eq!(peer_source, GatewayAddressSource::Peer);
+        assert!(
+            peer.spec.gateway_endpoint.is_none(),
+            "the local override stays on this site's record"
+        );
     }
 
     #[test]

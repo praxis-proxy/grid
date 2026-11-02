@@ -28,7 +28,7 @@ use kube::{
 use serde_json::{Value, json};
 use tokio::{
     sync::Mutex,
-    time::{Duration, timeout},
+    time::{Duration, timeout, timeout_at},
 };
 use tracing::info;
 
@@ -1101,7 +1101,128 @@ pub async fn refresh_served_models(
     client: &Client,
     config: &served_models::DiscoveryConfig,
 ) -> Result<(), OperatorError> {
-    served_models::discover(&ctx.served_models, client, config).await
+    served_models::discover(&ctx.served_models, client, config).await?;
+    publish_discovered_model_inventories(ctx, client).await
+}
+
+/// Publish complete signed inventories for enforcing grids after each discovery round.
+async fn publish_discovered_model_inventories(ctx: &OperatorCtx, client: &Client) -> Result<(), OperatorError> {
+    let Some(swim) = ctx.swim() else {
+        return Ok(());
+    };
+    let networks: Api<GridNetwork> = Api::all(client.clone());
+    let networks = Box::pin(networks.list(&ListParams::default())).await?.items;
+    let providers: Api<InferenceProvider> = Api::all(client.clone());
+    let providers = Box::pin(providers.list(&ListParams::default())).await?.items;
+    let publish_deadline = tokio::time::Instant::now() + INVENTORY_PUBLISH_TIMEOUT;
+    'networks: for network in networks
+        .iter()
+        .filter(|network| signed_state_mode(network) == SignedStateMode::Enforce)
+    {
+        let (Some(network_name), Some(grid_id)) = (network.metadata.name.as_deref(), persisted_grid_id(network)) else {
+            continue;
+        };
+        let inventories = providers
+            .iter()
+            .filter(|provider| provider.spec.grid_network_ref == network_name)
+            .filter_map(|provider| ctx.served_models.select_for_gossip(provider, swim.site_name(), grid_id))
+            .collect::<Vec<_>>();
+        if !inventories.is_empty()
+            && let Some(signing_key) = Box::pin(load_gossip_signing_identity(network, client, swim.site_name())).await
+        {
+            for inventory in inventories {
+                match timeout_at(
+                    publish_deadline,
+                    publish_model_inventory_frames(swim, &inventory, signing_key.as_slice()),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {},
+                    Ok(Err(error)) => {
+                        tracing::warn!(provider = %inventory.provider_id, %error, "local model inventory publication failed");
+                    },
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            timeout_secs = INVENTORY_PUBLISH_TIMEOUT.as_secs(),
+                            "model inventory publication round timed out"
+                        );
+                        break 'networks;
+                    },
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bound the total time a discovery round waits for SWIM queue capacity.
+const INVENTORY_PUBLISH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Queue every signed frame of one inventory, waiting for bounded queue capacity.
+async fn publish_model_inventory_frames(
+    swim: &SwimHandle,
+    inventory: &swim::ModelInventory,
+    signing_key: &[u8],
+) -> Result<(), ModelInventoryPublicationError> {
+    for broadcast in sign_model_inventory_frames(inventory, signing_key, gossip_wall_clock_millis())? {
+        swim.publish_model_inventory_frame(broadcast).await?;
+    }
+    Ok(())
+}
+
+/// Current Unix time in milliseconds for signed gossip frames.
+fn gossip_wall_clock_millis() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// Sign every frame of one complete provider inventory for its origin and grid.
+fn sign_model_inventory_frames(
+    inventory: &swim::ModelInventory,
+    signing_key: &[u8],
+    signed_at_ms: u64,
+) -> Result<Vec<swim::ModelInventoryBroadcast>, ModelInventorySigningError> {
+    inventory
+        .frames()?
+        .into_iter()
+        .map(|frame| {
+            let signed = frame.sign(&inventory.origin_site, &inventory.grid_id, signing_key, signed_at_ms)?;
+            Ok(swim::ModelInventoryBroadcast::new(
+                inventory.origin_site.clone(),
+                inventory.grid_id.clone(),
+                signed,
+            ))
+        })
+        .collect()
+}
+
+/// Failure while validating or signing a complete local inventory.
+#[derive(Debug, thiserror::Error)]
+enum ModelInventorySigningError {
+    /// The inventory could not be split into valid wire frames.
+    #[error(transparent)]
+    Frames(#[from] swim::InventoryFrameError),
+
+    /// A wire frame could not be signed for its origin and grid.
+    #[error(transparent)]
+    Signing(#[from] swim::FrameSigningError),
+}
+
+/// Failure while validating, signing, or queueing a complete discovered inventory.
+#[derive(Debug, thiserror::Error)]
+enum ModelInventoryPublicationError {
+    /// The inventory could not be validated or signed.
+    #[error(transparent)]
+    Signing(#[from] ModelInventorySigningError),
+
+    /// The runtime exited before a frame could be queued.
+    #[error(transparent)]
+    Runtime(#[from] crate::swim_runtime::BroadcastError),
 }
 
 /// Refresh who may read from the currently approved sites.
@@ -1718,7 +1839,7 @@ const WITHDRAWAL_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// When this label is present with value `"true"`, the `GridNetwork` controller
 /// creates `GridSite` resources for remote Alive SWIM members automatically.
-/// Networks without this label are unaffected — their overlay generation uses
+/// Networks without this label are unaffected -- their overlay generation uses
 /// the existing `clusterName`-based (Phase 1) fallback.
 ///
 /// This opt-in gate prevents auto-discovery from changing the overlay generation
@@ -2702,7 +2823,7 @@ pub fn error_policy(_network: Arc<GridNetwork>, error: &OperatorError, _ctx: Arc
 /// # Removal semantics
 ///
 /// A seed appearing in `removed` will **not** be actively disconnected from the
-/// SWIM runtime.  The SWIM protocol's own failure detection (probe → Suspect →
+/// SWIM runtime.  The SWIM protocol's own failure detection (probe -> Suspect ->
 /// Dead) handles peers that stop responding.  Use the `removed` list only for
 /// diagnostics and logging.
 pub(crate) fn diff_seed_sets(previous: &[SocketAddr], desired: &[SocketAddr]) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
@@ -3079,7 +3200,7 @@ fn site_phases(sites: &[GridSite]) -> impl Iterator<Item = (&str, &'static str)>
 ///
 /// Lists all [`InferenceProvider`]s and [`GridSite`]s cluster-wide, then
 /// renders one overlay `ConfigMap` per `consumerGateways` entry.  Each gateway may
-/// declare its own `siteName` — the `local_site` in the overlay for
+/// declare its own `siteName` -- the `local_site` in the overlay for
 /// gateway G is `G.siteName ?? network_name`.  This ensures that in a
 /// multi-gateway network each gateway's overlay identifies the correct local
 /// site.  A network with no `consumerGateways` is a no-op.
@@ -5801,9 +5922,9 @@ async fn distribute_overlay_configmap(
 ///
 /// When a [`MembershipSnapshot`] is provided, the live membership state takes
 /// precedence:
-/// - ≥1 [`Alive`] member → [`Active`].
-/// - Members present but all [`Suspect`]/[`Dead`] → [`Degraded`].
-/// - Empty snapshot → falls through to the existing TLS-based logic.
+/// - >=1 [`Alive`] member -> [`Active`].
+/// - Members present but all [`Suspect`]/[`Dead`] -> [`Degraded`].
+/// - Empty snapshot -> falls through to the existing TLS-based logic.
 ///
 /// Local membership needs a grid identity and TLS trust, but no SWIM runtime.
 /// Peer reachability is reported by the polling conditions independently.
@@ -5868,7 +5989,7 @@ fn determine_phase(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Provider → CRDT state mapping
+// Provider -> CRDT state mapping
 // ---------------------------------------------------------------------------
 
 /// Map a Kubernetes `ProviderPhase` to the CRDT `ProviderPhase`.
@@ -6842,7 +6963,7 @@ fn network_site_name(network: &GridNetwork) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Routing eligibility: CRDT provider → GridSite phase
+// Routing eligibility: CRDT provider -> GridSite phase
 // ---------------------------------------------------------------------------
 
 /// Filter remote CRDT provider records to those whose source `GridSite` is
@@ -7500,9 +7621,9 @@ fn discovered_site_spec(site: &DiscoveredSite, network_name: &str, plaintext: bo
 /// has already advanced to `Connecting` or beyond.
 ///
 /// Phase ownership:
-/// - Pending → Discovered: this function (`GridNetwork` controller), based on SWIM Alive
-/// - Discovered → Connecting: `GridSite` controller, based on data-plane gateway address presence.
-/// - Connecting → Active: only an identity-verified TLS probe can promote a site. Plaintext probes report reachability
+/// - Pending -> Discovered: this function (`GridNetwork` controller), based on SWIM Alive
+/// - Discovered -> Connecting: `GridSite` controller, based on data-plane gateway address presence.
+/// - Connecting -> Active: only an identity-verified TLS probe can promote a site. Plaintext probes report reachability
 ///   but remain in Connecting.
 #[expect(
     clippy::large_stack_frames,
@@ -8759,7 +8880,7 @@ mod tests {
 
     #[test]
     fn connected_sites_is_zero_without_membership() {
-        // Verify the update_status path: no membership → connected_sites = 0.
+        // Verify the update_status path: no membership -> connected_sites = 0.
         let count = None::<MembershipSnapshot>
             .as_ref()
             .map_or(0, MembershipSnapshot::connected_count);
@@ -8928,7 +9049,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // InferenceProvider → crdt::ProviderState mapping
+    // InferenceProvider -> crdt::ProviderState mapping
     // -----------------------------------------------------------------------
 
     fn make_provider(name: &str, network: &str, backend_kind: &str, generation: i64) -> InferenceProvider {
@@ -9068,7 +9189,7 @@ mod tests {
         assert_eq!(
             crdt_phase_from_provider(None, 1),
             crdt::ProviderPhase::Pending,
-            "absent status → Pending"
+            "absent status -> Pending"
         );
         let pending: InferenceProviderStatus = serde_json::from_value(serde_json::json!({
             "phase": "Pending", "observedGeneration": 3
@@ -9157,9 +9278,9 @@ mod tests {
     #[test]
     fn metrics_to_crdt_returns_all_none_when_no_metrics() {
         let m = metrics_to_crdt(None);
-        assert!(m.error_rate.is_none(), "no metrics → error_rate=None");
-        assert!(m.queue_depth.is_none(), "no metrics → queue_depth=None");
-        assert!(m.healthy.is_none(), "no metrics → healthy=None");
+        assert!(m.error_rate.is_none(), "no metrics -> error_rate=None");
+        assert!(m.queue_depth.is_none(), "no metrics -> queue_depth=None");
+        assert!(m.healthy.is_none(), "no metrics -> healthy=None");
     }
 
     #[test]
@@ -9362,7 +9483,7 @@ mod tests {
         // This is the pure-function equivalent of the rejoin recovery proof.
         let provider = make_crdt_provider("site-west", crdt::ProviderPhase::Available);
 
-        // Partition: Dead → Degraded
+        // Partition: Dead -> Degraded
         let dead_membership = make_swim_membership("site-west", MemberStatus::Dead);
         let degraded = apply_swim_staleness_override(std::slice::from_ref(&provider), Some(&dead_membership));
         assert_eq!(
@@ -9371,7 +9492,7 @@ mod tests {
             "Dead peer must produce Degraded phase (partition)"
         );
 
-        // Recovery: Alive → Available (override lifted)
+        // Recovery: Alive -> Available (override lifted)
         let alive_membership = make_swim_membership("site-west", MemberStatus::Alive);
         let recovered = apply_swim_staleness_override(std::slice::from_ref(&provider), Some(&alive_membership));
         assert_eq!(
@@ -9703,6 +9824,106 @@ mod tests {
         assert!(
             mismatched_key.is_err(),
             "the private signer must match the existing site certificate"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "certificate and inventory signing test fixture")]
+    fn signed_model_inventory_frames_authenticate_each_model_for_origin_and_grid() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let leaf = certs::generate_site_cert(&ca, "site-east").expect("leaf");
+        let private_key = pem::parse(&leaf.key_pem).expect("key pem").into_contents();
+        let public_key = swim::signing::public_key_ecdsa_p256(&private_key).expect("public key");
+        let now_ms = gossip_wall_clock_millis();
+        let inventory = swim::ModelInventory {
+            origin_site: "site-east".to_owned(),
+            grid_id: "grid-a".to_owned(),
+            network_id: "grid".to_owned(),
+            provider_id: "provider-east".to_owned(),
+            provider_uid: "provider-uid".to_owned(),
+            revision: now_ms,
+            expires_at_ms: now_ms.saturating_add(60_000),
+            models: vec!["model-a".to_owned(), "model-b".to_owned()],
+        };
+
+        let broadcasts = sign_model_inventory_frames(&inventory, &private_key, now_ms).expect("signed frames");
+
+        assert_eq!(broadcasts.len(), 2, "one complete frame carries each model name");
+        assert!(
+            broadcasts.iter().all(|broadcast| {
+                broadcast.origin_site == "site-east"
+                    && broadcast.grid_id == "grid-a"
+                    && broadcast
+                        .frame
+                        .verifies("site-east", "grid-a", std::slice::from_ref(&public_key))
+            }),
+            "every frame must verify for its inventory origin and grid"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::expect_used,
+        reason = "a prefilled one-slot runtime queue proves bounded reliable publication of the maximum inventory"
+    )]
+    async fn full_model_inventory_waits_for_runtime_queue_capacity_without_stranding_frames() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let leaf = certs::generate_site_cert(&ca, "site-east").expect("leaf");
+        let private_key = pem::parse(&leaf.key_pem).expect("key pem").into_contents();
+        let now_ms = gossip_wall_clock_millis();
+        let queued = swim::ModelInventory {
+            origin_site: "site-east".to_owned(),
+            grid_id: "grid-a".to_owned(),
+            network_id: "grid".to_owned(),
+            provider_id: "provider-east".to_owned(),
+            provider_uid: "provider-uid".to_owned(),
+            revision: now_ms.saturating_sub(1),
+            expires_at_ms: now_ms.saturating_add(60_000),
+            models: Vec::new(),
+        };
+        let queued_frame = sign_model_inventory_frames(&queued, &private_key, now_ms)
+            .expect("signed queued frame")
+            .pop()
+            .expect("empty inventory has one frame");
+        let (handle, mut receiver) = SwimHandle::detached_with_inventory_capacity("site-east", 1);
+        handle
+            .publish_model_inventory_frame(queued_frame)
+            .await
+            .expect("prefill inventory queue");
+        let inventory = swim::ModelInventory {
+            revision: now_ms,
+            models: (0..swim::MAX_INVENTORY_MODELS)
+                .map(|index| format!("model-{index:03}-{}", "x".repeat(246)))
+                .collect(),
+            ..queued
+        };
+        let publisher =
+            tokio::spawn(async move { publish_model_inventory_frames(&handle, &inventory, &private_key).await });
+        let first = timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .expect("prefilled queue drains")
+            .expect("queued frame is present");
+        assert_eq!(first.frame.inventory_revision, now_ms.saturating_sub(1));
+        let mut indexes = Vec::with_capacity(swim::MAX_INVENTORY_MODELS);
+        for _ in 0..swim::MAX_INVENTORY_MODELS {
+            let frame = timeout(Duration::from_secs(10), receiver.recv())
+                .await
+                .expect("publisher waits only for bounded queue capacity")
+                .expect("every signed frame is queued");
+            indexes.push(frame.frame.frame_index);
+        }
+        publisher
+            .await
+            .expect("publisher task completes")
+            .expect("inventory publication succeeds");
+        indexes.sort_unstable();
+
+        assert_eq!(
+            indexes,
+            (0..swim::MAX_INVENTORY_MODELS)
+                .map(|index| u16::try_from(index).expect("frame index fits u16"))
+                .collect::<Vec<_>>(),
+            "the bounded runtime queue must not strand any frame"
         );
     }
 
@@ -11684,8 +11905,8 @@ mod tests {
     #[test]
     fn diff_seed_sets_empty_to_empty_is_no_op() {
         let (added, removed) = diff_seed_sets(&[], &[]);
-        assert!(added.is_empty(), "empty→empty must produce no additions");
-        assert!(removed.is_empty(), "empty→empty must produce no removals");
+        assert!(added.is_empty(), "empty->empty must produce no additions");
+        assert!(removed.is_empty(), "empty->empty must produce no removals");
     }
 
     #[test]
@@ -14092,9 +14313,9 @@ mod tests {
             make_phase_grid_site("site-b", "net", "Connecting"),
         ];
         let providers = vec![
-            make_eligible_crdt_provider("net", "site-a"), // Active → eligible
-            make_eligible_crdt_provider("net", "site-b"), // Connecting → ineligible
-            make_eligible_crdt_provider("net", "site-c"), // Missing → ineligible
+            make_eligible_crdt_provider("net", "site-a"), // Active -> eligible
+            make_eligible_crdt_provider("net", "site-b"), // Connecting -> ineligible
+            make_eligible_crdt_provider("net", "site-c"), // Missing -> ineligible
         ];
         let eligible = filter_eligible_remote_crdt_providers("net", &sites, &providers, SignalMode::Gossip);
         assert_eq!(eligible.len(), 1, "only Active site provider must pass filter");

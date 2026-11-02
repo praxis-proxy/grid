@@ -37,6 +37,10 @@ const UNHEALTHY: f64 = f64::NAN.abs();
 
 /// A resolved, pre-ordered candidate list read atomically per request.
 #[derive(Debug)]
+#[expect(
+    clippy::partial_pub_fields,
+    reason = "score observability metadata is not part of the request-path API"
+)]
 pub struct RouteSnapshot {
     /// Candidates in priority order. `select_admitted` takes the front match.
     pub candidates: Vec<RouteCandidate>,
@@ -46,6 +50,9 @@ pub struct RouteSnapshot {
 
     /// Each candidate's score, parallel to `candidates`; equal scores share traffic.
     pub scores: Vec<f64>,
+
+    /// Why each candidate has no score, parallel to `candidates`.
+    score_unavailable: Vec<Option<ScoreUnavailable>>,
 
     /// Each candidate's site decision counters, parallel to `candidates`.
     pub decisions: Vec<SiteDecisions>,
@@ -85,11 +92,13 @@ impl RouteSnapshot {
     /// any signals exist and as the cold-start fallback.
     pub fn from_static(candidates: Vec<RouteCandidate>, local_site: Arc<str>) -> Self {
         let scores = vec![f64::INFINITY; candidates.len()];
+        let score_unavailable = vec![None; candidates.len()];
         Self {
             decisions: decisions_for(&candidates),
             candidates,
             local_site,
             scores,
+            score_unavailable,
             shedding: BTreeSet::new(),
             provider_hop_clusters: Arc::default(),
         }
@@ -139,8 +148,9 @@ impl RouteSnapshot {
         local: bool,
         inputs: &mut Inputs<'_, S>,
         reset_pairs: &mut BTreeSet<SitePair>,
-    ) -> (f64, RouteCandidate, bool) {
+    ) -> ResolvedCandidate {
         let readings = observed(&mut candidate, local, inputs);
+        let score_unavailable = ScoreUnavailable::for_candidate(&candidate, &readings, inputs);
         let reading = &readings.horizon;
         let recent = &readings.recent;
         if reading.unready {
@@ -174,7 +184,12 @@ impl RouteSnapshot {
         } else {
             UNHEALTHY
         };
-        (load, candidate, measured.is_some())
+        ResolvedCandidate {
+            candidate,
+            load,
+            measured: measured.is_some(),
+            score_unavailable,
+        }
     }
 
     /// The site over the horizon, and over the settling time alone: `room_after_ms`. Both are
@@ -220,20 +235,29 @@ impl RouteSnapshot {
     /// small ceiling carries little. Without a floor an unproven site would never prove more.
     /// The floor as a device follows Brent Salisbury's pressure-weighted placement, where it keeps
     /// a saturated site eligible; here it keeps an unproven one exploring.
-    fn explore_floor(ranked: Vec<(f64, RouteCandidate, bool)>, share: f64) -> Vec<(f64, RouteCandidate)> {
+    fn explore_floor(
+        ranked: Vec<ResolvedCandidate>,
+        share: f64,
+    ) -> Vec<(f64, RouteCandidate, Option<ScoreUnavailable>)> {
         let largest = ranked
             .iter()
-            .filter(|(_, _, measured)| *measured)
-            .filter_map(|(_, candidate, _)| candidate.capacity)
+            .filter(|resolved| resolved.measured)
+            .filter_map(|resolved| resolved.candidate.capacity)
             .fold(0.0_f64, f64::max);
         let floor = largest * share;
         ranked
             .into_iter()
-            .map(|(load, mut candidate, measured)| {
+            .map(|resolved| {
+                let ResolvedCandidate {
+                    mut candidate,
+                    load,
+                    measured,
+                    score_unavailable,
+                } = resolved;
                 if measured {
                     candidate.capacity = candidate.capacity.map(|ceiling| ceiling.max(floor));
                 }
-                (load, candidate)
+                (load, candidate, score_unavailable)
             })
             .collect()
     }
@@ -355,13 +379,14 @@ impl RouteSnapshot {
             .scores
             .into_iter()
             .zip(self.candidates)
-            .map(|(load, candidate)| {
+            .zip(self.score_unavailable)
+            .map(|((load, candidate), score_unavailable)| {
                 let demoted = if key(&candidate).is_some_and(|key| down.contains(key)) {
                     UNHEALTHY
                 } else {
                     load
                 };
-                (demoted, candidate)
+                (demoted, candidate, score_unavailable)
             })
             .collect();
         let mut ordered = Self::ranked(ranked, self.local_site);
@@ -378,12 +403,22 @@ impl RouteSnapshot {
     #[must_use]
     pub(crate) fn published(self, gauged: &mut Gauged) -> Self {
         let Gauged { published, learned } = gauged;
+        let unavailable_by_pair: BTreeMap<SitePair, ScoreUnavailable> = self
+            .candidates
+            .iter()
+            .zip(&self.score_unavailable)
+            .filter_map(|(candidate, unavailable)| {
+                unavailable.map(|reason| ((Arc::clone(&candidate.site), Arc::clone(&candidate.cluster)), reason))
+            })
+            .collect();
         let mut current = BTreeSet::new();
         for (candidate, score) in self.candidates.iter().zip(&self.scores) {
             let key = (Arc::clone(&candidate.site), Arc::clone(&candidate.cluster));
             // The front entry for a pair is its best; later ones are other models.
             if current.insert(key.clone()) {
                 site_score(&key, *score);
+                let unavailable = unavailable_by_pair.get(&key).copied();
+                publish_score_unavailable(&key, |reason| f64::from(u8::from(unavailable == Some(reason))));
                 site_gauge("grid_route_site_rho", &key, candidate.rho.unwrap_or(f64::NAN));
                 site_gauge("grid_route_site_weight", &key, candidate.capacity.unwrap_or(f64::NAN));
                 // The limits are set where they are learned; an unmeasured site must not keep
@@ -396,6 +431,7 @@ impl RouteSnapshot {
         }
         for gone in published.difference(&current) {
             site_score(gone, f64::NAN);
+            publish_score_unavailable(gone, |_| f64::NAN);
             site_gauge("grid_route_site_silent", gone, f64::NAN);
             site_gauge("grid_route_site_last_sample_age_seconds", gone, f64::NAN);
             site_gauge("grid_route_site_round_age_seconds", gone, f64::NAN);
@@ -413,13 +449,21 @@ impl RouteSnapshot {
     }
 
     /// Sort `ranked` ascending by score, stable among equals, and wrap it.
-    fn ranked(mut ranked: Vec<(f64, RouteCandidate)>, local_site: Arc<str>) -> Self {
-        ranked.sort_by(|(left, _), (right, _)| left.total_cmp(right));
-        let (scores, ordered): (Vec<f64>, Vec<RouteCandidate>) = ranked.into_iter().unzip();
+    fn ranked(mut ranked: Vec<(f64, RouteCandidate, Option<ScoreUnavailable>)>, local_site: Arc<str>) -> Self {
+        ranked.sort_by(|(left, ..), (right, ..)| left.total_cmp(right));
+        let mut scores = Vec::with_capacity(ranked.len());
+        let mut ordered = Vec::with_capacity(ranked.len());
+        let mut score_unavailable = Vec::with_capacity(ranked.len());
+        for (score, candidate, unavailable) in ranked {
+            scores.push(score);
+            ordered.push(candidate);
+            score_unavailable.push(unavailable);
+        }
         Self {
             decisions: decisions_for(&ordered),
             candidates: ordered,
             scores,
+            score_unavailable,
             local_site,
             shedding: BTreeSet::new(),
             provider_hop_clusters: Arc::default(),
@@ -437,6 +481,64 @@ pub(crate) fn decisions_for(candidates: &[RouteCandidate]) -> Vec<SiteDecisions>
 
 /// A candidate's site and cluster, the labels of its score gauge.
 type SitePair = (Arc<str>, Arc<str>);
+
+/// A candidate resolved against one consistent set of signal readings.
+struct ResolvedCandidate {
+    /// Candidate after applying the readings.
+    candidate: RouteCandidate,
+    /// Queue-derived ordering score.
+    load: f64,
+    /// Whether the readings produced learned capacity and saturation.
+    measured: bool,
+    /// Why the candidate lacks a queue score, when applicable.
+    score_unavailable: Option<ScoreUnavailable>,
+}
+
+/// Why an otherwise routable load-publishing candidate has no queue score.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScoreUnavailable {
+    /// The gateway has never held a sample for the candidate.
+    Absent,
+    /// The newest sample is outside the scoring freshness window.
+    Stale,
+    /// Fresh samples exist, but none maps to a readable queue value.
+    Unreadable,
+}
+
+impl ScoreUnavailable {
+    /// Every bounded label value this metric can publish.
+    const ALL: [Self; 3] = [Self::Absent, Self::Stale, Self::Unreadable];
+
+    /// Classify why `candidate` has no queue score, if it was expected to have one.
+    fn for_candidate<S: SiteSignals>(
+        candidate: &RouteCandidate,
+        readings: &Readings,
+        inputs: &Inputs<'_, S>,
+    ) -> Option<Self> {
+        if candidate.admission_state != AdmissionState::NewAndExisting
+            || !candidate.publishes_load
+            || !readings.coherent
+            || readings.horizon.queued.is_some()
+            || readings.horizon.unready
+        {
+            return None;
+        }
+        match readings.horizon.queue_sampled_at.or(readings.horizon.sampled_at) {
+            None => Some(Self::Absent),
+            Some(at) if inputs.now_ms.saturating_sub(at) > inputs.window_ms => Some(Self::Stale),
+            Some(_) => Some(Self::Unreadable),
+        }
+    }
+
+    /// The bounded Prometheus label for this reason.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Stale => "stale",
+            Self::Unreadable => "unreadable",
+        }
+    }
+}
 
 /// What one site's own load has taught the gateway: its running ceiling and smoothed saturation.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1025,6 +1127,22 @@ fn sample_spell_since(prior: Option<SiteLearned>, backlogged_at: Option<i64>, wi
 /// Set `grid_route_site_score` for one site/cluster pair.
 fn site_score(key: &SitePair, score: f64) {
     site_gauge("grid_route_site_score", key, score);
+}
+
+/// Publish each unavailable-reason series with its value for this candidate.
+fn publish_score_unavailable<F>(key: &SitePair, value_for: F)
+where
+    F: Fn(ScoreUnavailable) -> f64,
+{
+    for reason in ScoreUnavailable::ALL {
+        metrics::gauge!(
+            "grid_route_site_score_unavailable",
+            "site" => Arc::clone(&key.0),
+            "cluster" => Arc::clone(&key.1),
+            "reason" => reason.as_str()
+        )
+        .set(value_for(reason));
+    }
 }
 
 /// The gauges only a measured refresh sets. A pair that is still a candidate but published no
@@ -2266,6 +2384,120 @@ mod tests {
     }
 
     #[test]
+    fn unready_site_does_not_publish_score_unavailable_reason() {
+        let recorder = Captured::default();
+        metrics::with_local_recorder(&recorder, || {
+            let store = LoadStore::new(Duration::from_secs(600));
+            let availability = AvailabilitySettings::default();
+            let mut gauged = Gauged::new();
+            with_series(&store, "a", "vendor_queue_depth", 4.0, 1_000);
+            store.ingest_at(&ready("a", "pool-a", 0.0, 1_000), 1_000, 1_000, "a");
+
+            drop(
+                RouteSnapshot::from_store(
+                    one("a"),
+                    Arc::from("hub"),
+                    &mut at(&store, &availability, &mut gauged.learned, 1_000, 500),
+                )
+                .published(&mut gauged),
+            );
+
+            for reason in ["absent", "unreadable", "stale"] {
+                recorder.assert_gauge(&format!("grid_route_site_score_unavailable:{reason}"), 0.0);
+            }
+        });
+    }
+
+    #[test]
+    fn unavailable_score_reason_uses_eligible_candidate_for_pair_in_either_order() {
+        let recorder = Captured::default();
+        metrics::with_local_recorder(&recorder, || {
+            let store = LoadStore::new(Duration::from_secs(600));
+            let availability = AvailabilitySettings::default();
+            let mut without_load = cand("without-load", "a", "pool-a");
+            without_load.publishes_load = false;
+            let with_load = cand("with-load", "a", "pool-a");
+
+            for candidates in [
+                vec![without_load.clone(), with_load.clone()],
+                vec![with_load, without_load],
+            ] {
+                let mut gauged = Gauged::new();
+                drop(
+                    RouteSnapshot::from_store(
+                        validate_candidates(candidates).unwrap(),
+                        Arc::from("hub"),
+                        &mut at(&store, &availability, &mut gauged.learned, 1_000, 500),
+                    )
+                    .published(&mut gauged),
+                );
+
+                recorder.assert_gauge("grid_route_site_score_unavailable:absent", 1.0);
+            }
+        });
+    }
+
+    #[test]
+    fn unavailable_score_reason_tracks_absent_unreadable_stale_and_recovery() {
+        let recorder = Captured::default();
+        metrics::with_local_recorder(&recorder, || {
+            let store = LoadStore::new(Duration::from_secs(600));
+            let availability = AvailabilitySettings::default();
+            let mut gauged = Gauged::new();
+            let publish = |now_ms: i64, state: &mut Gauged| {
+                drop(
+                    RouteSnapshot::from_store(
+                        one("a"),
+                        Arc::from("hub"),
+                        &mut at(&store, &availability, &mut state.learned, now_ms, 500),
+                    )
+                    .published(state),
+                );
+            };
+
+            publish(1_000, &mut gauged);
+            recorder.assert_gauge("grid_route_site_score_unavailable:absent", 1.0);
+            recorder.assert_gauge("grid_route_site_score_unavailable:unreadable", 0.0);
+            recorder.assert_gauge("grid_route_site_score_unavailable:stale", 0.0);
+
+            with_series(&store, "a", "vendor_queue_depth", 4.0, 2_000);
+            publish(2_000, &mut gauged);
+            recorder.assert_gauge("grid_route_site_score_unavailable:absent", 0.0);
+            recorder.assert_gauge("grid_route_site_score_unavailable:unreadable", 1.0);
+            recorder.assert_gauge("grid_route_site_score_unavailable:stale", 0.0);
+
+            publish(2_501, &mut gauged);
+            recorder.assert_gauge("grid_route_site_score_unavailable:absent", 0.0);
+            recorder.assert_gauge("grid_route_site_score_unavailable:unreadable", 0.0);
+            recorder.assert_gauge("grid_route_site_score_unavailable:stale", 1.0);
+
+            with_queue(&store, "a", 0.0, 3_000);
+            publish(3_000, &mut gauged);
+            for reason in ["absent", "unreadable", "stale"] {
+                recorder.assert_gauge(&format!("grid_route_site_score_unavailable:{reason}"), 0.0);
+            }
+
+            with_series(&store, "a", "vendor_queue_depth", 3.0, 3_600);
+            publish(3_600, &mut gauged);
+            recorder.assert_gauge("grid_route_site_score_unavailable:stale", 1.0);
+
+            with_queue(&store, "a", 0.0, 3_700);
+            publish(3_700, &mut gauged);
+            recorder.assert_gauge("grid_route_site_score_unavailable:stale", 0.0);
+
+            drop(RouteSnapshot::from_static(Vec::new(), Arc::from("hub")).published(&mut gauged));
+            for reason in ["absent", "unreadable", "stale"] {
+                assert!(
+                    recorder
+                        .get(&format!("grid_route_site_score_unavailable:{reason}"))
+                        .is_nan(),
+                    "withdrawn pair must clear {reason}"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn silence_is_published_per_site_with_a_growing_age() {
         let recorder = Captured::default();
         metrics::with_local_recorder(&recorder, || {
@@ -2312,6 +2544,10 @@ mod tests {
     struct Captured(std::sync::Mutex<BTreeMap<String, Arc<metrics::atomics::AtomicU64>>>);
 
     impl Captured {
+        fn assert_gauge(&self, name: &str, expected: f64) {
+            assert_eq!(self.get(name).to_bits(), expected.to_bits(), "{name}");
+        }
+
         fn count(&self, name: &str) -> u64 {
             let counters = self.0.lock().unwrap();
             counters
@@ -2344,8 +2580,17 @@ mod tests {
         }
 
         fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            let reason = key
+                .labels()
+                .find(|label| label.key() == "reason")
+                .map_or("", |label| label.value());
+            let name = if reason.is_empty() {
+                key.name().to_owned()
+            } else {
+                format!("{}:{reason}", key.name())
+            };
             let mut gauges = self.0.lock().unwrap();
-            metrics::Gauge::from_arc(Arc::clone(gauges.entry(key.name().to_owned()).or_default()))
+            metrics::Gauge::from_arc(Arc::clone(gauges.entry(name).or_default()))
         }
 
         fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {

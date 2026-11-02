@@ -1183,7 +1183,7 @@ mod tests {
         for msg in &from_b {
             if msg.addr == id_a.socket_addr() {
                 let oa = node_a.handle_data(&msg.data);
-                // Pass any A→B follow-ups to B (acknowledgements etc.)
+                // Pass any A->B follow-ups to B (acknowledgements etc.)
                 for followup in &oa.messages {
                     if followup.addr == id_b.socket_addr() {
                         drop(node_b.handle_data(&followup.data));
@@ -1223,7 +1223,7 @@ mod tests {
     /// 1. Establish bidirectional SWIM membership (announce + ALIVE exchange).
     /// 2. A publishes a `StateBroadcast` (queued in foca's custom broadcast backlog).
     /// 3. A calls `gossip()`, and foca includes queued broadcasts in the gossip message.
-    /// 4. B processes the gossip message → `StateBroadcastHandler::receive_item` fires.
+    /// 4. B processes the gossip message -> `StateBroadcastHandler::receive_item` fires.
     /// 5. B's `state_snapshot()` reflects A's CRDT state.
     #[test]
     fn crdt_state_propagates_to_peer_via_foca_gossip_broadcast() {

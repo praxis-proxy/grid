@@ -513,6 +513,7 @@ async fn invariant_8_no_signer_reads_rotation_on_schedule_no_signer_and_never_bl
     assert_eq!(degraded["status"], "False");
 }
 
+/// Checks that `GridSite` reconciliation leaves the own-site peer rollup to its designated writer.
 #[tokio::test]
 async fn invariant_5_the_own_grid_site_carries_only_the_peer_rollup_and_the_network_one_writer_each() {
     let api = seeded();
@@ -526,11 +527,14 @@ async fn invariant_5_the_own_grid_site_carries_only_the_peer_rollup_and_the_netw
             .expect("networks list");
         observed.push(rolled(&api, &client).await);
         let site: GridSite = serde_json::from_value(api.get(SITE_PATH).expect("own site stored")).expect("a GridSite");
+        let (_gateway_address_tx, gateway_address) = tokio::sync::watch::channel(None);
         Box::pin(crate::controller::grid_site::reconcile(
             Arc::new(site),
             Arc::new(crate::controller::grid_site::SiteContext {
                 client: Arc::new(client.clone()),
                 membership: crate::cli::Membership::default(),
+                site_name: Some(SITE.to_owned()),
+                gateway_address,
             }),
         ))
         .await
