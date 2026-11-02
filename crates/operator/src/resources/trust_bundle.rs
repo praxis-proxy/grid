@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn sha256_fingerprint_is_64_hex_bytes_with_colons() {
         let fp = sha256_fingerprint(SAMPLE_CERT_PEM);
-        // 32 bytes × 2 hex chars + 31 colons = 95 chars
+        // 32 bytes * 2 hex chars + 31 colons = 95 chars
         assert_eq!(fp.len(), 95, "fingerprint must be 95 chars (32 hex pairs, 31 colons)");
         assert!(
             fp.chars().all(|c| c.is_ascii_hexdigit() || c == ':'),

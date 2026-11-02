@@ -4487,8 +4487,8 @@ fn collect_overlay_diagnostics() {
 /// For each cluster, extracts the `stable_id` for the local
 /// `vcr-{cluster}-provider` candidate and renders the provider praxis.yaml
 /// template with:
-/// - `SITE_PLACEHOLDER` → cluster name
-/// - `CANDIDATE_ID_PLACEHOLDER` → stable ID from the overlay
+/// - `SITE_PLACEHOLDER` -> cluster name
+/// - `CANDIDATE_ID_PLACEHOLDER` -> stable ID from the overlay
 ///
 /// Creates the `provider-gateway-config` ConfigMap in each cluster.
 ///

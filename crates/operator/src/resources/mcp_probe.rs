@@ -1680,7 +1680,7 @@ mod integration_tests {
         BearerToken, McpProbeOutcome, ProbeRequest, build_probe_client, resolve_endpoint_for_probe, run_probe_session,
     };
 
-    /// Runs the same resolve → build-client → session pipeline as
+    /// Runs the same resolve -> build-client -> session pipeline as
     /// [`super::probe_agent_tool_provider`], skipping only its
     /// `validate_probe_url` SSRF/format gate.
     ///

@@ -365,6 +365,7 @@ The metrics listener serves the Praxis registry, including the grid gateway's ow
 |--------|--------|---------|
 | `grid_route_decisions_total` | `site`, `reason` | Requests `grid_site_route` decided. `site` is a site name from the serving config, or empty for a refusal. No label comes from the request. |
 | `grid_route_site_score` | `site`, `cluster` | The queue depth the last route order used for each candidate, lower first. `inf` when unmeasured, `NaN` when excluded or demoted, or when the pair left the topology. |
+| `grid_route_site_score_unavailable` | `site`, `cluster`, `reason` | One-hot reason an otherwise routable load-publishing site has no queue score: `absent`, `stale`, or `unreadable`. Metric names are not labels. |
 
 `reason` is one of five values, and adding one is a deliberate change:
 

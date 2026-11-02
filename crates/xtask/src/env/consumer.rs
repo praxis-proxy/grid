@@ -43,7 +43,7 @@ const NAMESPACE: &str = "default";
 /// config.  It is never logged, and the generated YAML receives the value from
 /// the resolved Secret rather than embedding this compile-time constant directly.
 ///
-/// The validation proves the Secret-backed CRD → Praxis-config flow, not
+/// The validation proves the Secret-backed CRD -> Praxis-config flow, not
 /// production credential management.
 pub(crate) const API_PROVIDER_INJECTED_TOKEN: &str = "grid-api-fallback-secret";
 
@@ -320,7 +320,7 @@ pub(crate) fn deploy_consumer(
     Ok(())
 }
 
-/// Deploy the consumer gateway with `openai_responses_format` → `intelligent_route` filter chain.
+/// Deploy the consumer gateway with `openai_responses_format` -> `intelligent_route` filter chain.
 ///
 /// Identical to [`deploy_consumer`] except the generated config uses
 /// [`responses_consumer_gateway_config`], which starts the filter chain
@@ -614,7 +614,7 @@ fn apply_consumer_config(
 /// Apply the Responses-aware consumer gateway config as a `ConfigMap`.
 ///
 /// Uses [`responses_consumer_gateway_config`] which generates a filter chain:
-/// `openai_responses_format` → `intelligent_route` → `load_balancer`.
+/// `openai_responses_format` -> `intelligent_route` -> `load_balancer`.
 fn apply_consumer_responses_config(
     context: &str,
     consumer_site: &str,
@@ -693,7 +693,7 @@ fn consumer_gateway_config(
     )
 }
 
-/// Consumer gateway config with `openai_responses_format` → `intelligent_route` filter chain.
+/// Consumer gateway config with `openai_responses_format` -> `intelligent_route` filter chain.
 ///
 /// Identical to [`consumer_gateway_config`] except the filter chain starts
 /// with `openai_responses_format` (which parses Responses API request bodies
@@ -1597,8 +1597,8 @@ pub(crate) fn verify_api_fallback_e2e(
     );
 
     // Assertion 3: credential injection proof (if mock port-forward is available).
-    // Negative: direct request to mock WITHOUT auth → 401.
-    // Positive: request via consumer gateway WITHOUT client auth → 200 (gateway injects credential).
+    // Negative: direct request to mock WITHOUT auth -> 401.
+    // Positive: request via consumer gateway WITHOUT client auth -> 200 (gateway injects credential).
     if let Some(mock_port) = mock_api_port {
         verify_credential_injection(&ctx, port, api_model, mock_port, api_provider_secret, &mut tally);
     }
@@ -2019,7 +2019,7 @@ pub(crate) fn verify_credential_injection(
         },
     }
 
-    // Positive proof: consumer gateway injects credential → 200
+    // Positive proof: consumer gateway injects credential -> 200
     match send_request_without_auth(consumer_port, api_model) {
         Ok(resp) if resp.status == 200 => {
             tally.pass(

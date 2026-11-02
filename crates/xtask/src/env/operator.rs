@@ -64,8 +64,8 @@ pub(crate) const TEST_PROVIDER_SSRF_BLOCKED: &str = "op-e2e-ssrf-blocked";
 pub(crate) const TEST_PROVIDER_DEGRADED: &str = "op-e2e-degraded";
 /// Name of the `InferenceProvider` with `api_provider` backend kind.
 ///
-/// Used to verify scoring-backed candidate ordering: `api_provider` (score ≈ 5.8) must
-/// appear after local providers (score ≈ 7.0) regardless of input order.
+/// Used to verify scoring-backed candidate ordering: `api_provider` (score ~ 5.8) must
+/// appear after local providers (score ~ 7.0) regardless of input order.
 pub(crate) const TEST_PROVIDER_API: &str = "op-e2e-api-fallback";
 
 /// Name of the `InferenceProvider` whose `healthCheck.tls.caSecretRef` points at a
@@ -194,9 +194,9 @@ pub(crate) const METRICS_BUSY_LOCAL_PORT: u16 = 18_502;
 ///
 /// The operator's `spec.metricsConfig.signalNames.queueDepth` is set to this name.
 const METRICS_QUEUE_SIGNAL_NAME: &str = "provider_queue_depth_normalized";
-/// Queue depth value served by the idle metrics endpoint Pod (low → high score).
+/// Queue depth value served by the idle metrics endpoint Pod (low -> high score).
 const METRICS_IDLE_QUEUE_DEPTH: &str = "0.1";
-/// Queue depth value served by the busy metrics endpoint Pod (high → low score).
+/// Queue depth value served by the busy metrics endpoint Pod (high -> low score).
 const METRICS_BUSY_QUEUE_DEPTH: &str = "0.9";
 
 // ---------------------------------------------------------------------------
@@ -525,7 +525,7 @@ pub(crate) const SITE_JOIN_PRIMARY_EGRESS: &str = "172.18.0.4:8443";
 ///
 /// 60 s covers two back-to-back reconcile windows plus the 5 s TCP probe timeout
 /// in the `GridSite` controller.  The assertion itself (e.g. `Connecting`) is not
-/// weakened; a longer window is required because the `Discovered → Connecting`
+/// weakened; a longer window is required because the `Discovered -> Connecting`
 /// transition depends on the `GridNetwork` controller applying the egress spec,
 /// which the `GridSite` controller then reconciles.  The primary anti-flakiness
 /// measure is the cleanup in [`cleanup_site_join_resources`], which removes stale
@@ -798,7 +798,7 @@ fn load_operator_image_podman(cluster_name: &str) -> Result<(), Box<dyn std::err
         .args(["tag", &operator_img, &qualified])
         .status()?;
     if !tag_status.success() {
-        return Err(format!("podman tag {operator_img} → {qualified} failed").into());
+        return Err(format!("podman tag {operator_img} -> {qualified} failed").into());
     }
     let archive = tempfile::NamedTempFile::new()?;
     let archive_path = archive.path().to_str().ok_or("temp path not UTF-8")?;
@@ -938,8 +938,8 @@ fn generate_crd_json() -> Result<String, Box<dyn std::error::Error>> {
 ///
 /// Creates:
 /// - `GridNetwork` `op-e2e-net` with one `consumerGateways` entry
-/// - `InferenceProvider` `op-e2e-healthy` — valid endpoint → reconciles to `Pending`
-/// - `InferenceProvider` `op-e2e-invalid` — blank endpoint → reconciles to `Unavailable`
+/// - `InferenceProvider` `op-e2e-healthy` -- valid endpoint -> reconciles to `Pending`
+/// - `InferenceProvider` `op-e2e-invalid` -- blank endpoint -> reconciles to `Unavailable`
 pub(crate) fn apply_test_fixtures(context: &str, provider_endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
     apply_test_fixtures_for_cluster(context, provider_endpoint, TEST_HEALTHY_ROUTING_CLUSTER, "model-x")
 }
@@ -1615,7 +1615,7 @@ pub(crate) fn assert_probe_counter_increased(
         )
         .into());
     }
-    eprintln!("  [PASS] probe counter outcome={outcome:?}: {v_before} → {v_after}");
+    eprintln!("  [PASS] probe counter outcome={outcome:?}: {v_before} -> {v_after}");
     Ok(())
 }
 
@@ -1638,7 +1638,7 @@ pub(crate) fn assert_transition_counter_increased(
         )
         .into());
     }
-    eprintln!("  [PASS] transition counter to={to_phase:?} reason={reason:?}: {v_before} → {v_after}");
+    eprintln!("  [PASS] transition counter to={to_phase:?} reason={reason:?}: {v_before} -> {v_after}");
     Ok(())
 }
 
@@ -2224,7 +2224,7 @@ pub(crate) fn bump_gridsite(context: &str, name: &str) -> Result<(), Box<dyn std
 /// Each SWIM-enabled operator publishes real `InferenceProvider`-derived state
 /// as a CRDT `GridStateSnapshot` on reconcile.  After SWIM gossip convergence
 /// the remote operator's broadcast arrives and `remoteProviderCount`
-/// becomes ≥ 1.
+/// becomes >= 1.
 ///
 /// Returns the observed count on success or `Err` on timeout.
 #[expect(
@@ -2724,7 +2724,7 @@ pub(crate) fn start_error_endpoint_port_forward(context: &str) -> Result<Child, 
         .spawn()?;
     // Brief pause for the port-forward tunnel to establish.
     std::thread::sleep(Duration::from_secs(2));
-    eprintln!("  [OK] port-forward {local_port} → {ERROR_ENDPOINT_NAME}:{pod_port}");
+    eprintln!("  [OK] port-forward {local_port} -> {ERROR_ENDPOINT_NAME}:{pod_port}");
     Ok(child)
 }
 
@@ -2849,7 +2849,7 @@ pub(crate) fn start_named_pod_port_forward(
         .spawn()?;
     // Brief pause for the port-forward tunnel to establish.
     std::thread::sleep(Duration::from_secs(2));
-    eprintln!("  [OK] port-forward {local_port} → {name}:{cp}");
+    eprintln!("  [OK] port-forward {local_port} -> {name}:{cp}");
     Ok(child)
 }
 
@@ -2872,8 +2872,8 @@ pub(crate) fn apply_and_wait_for_metrics_pods(
 ///
 /// Both providers have `backendKind = "local"` so their baseline locality score is
 /// equal.  The operator scrapes their configured endpoints:
-/// - `idle_endpoint/metrics` → `{METRICS_QUEUE_SIGNAL_NAME} 0.1` (low queue → high score)
-/// - `busy_endpoint/metrics` → `{METRICS_QUEUE_SIGNAL_NAME} 0.9` (high queue → low score)
+/// - `idle_endpoint/metrics` -> `{METRICS_QUEUE_SIGNAL_NAME} 0.1` (low queue -> high score)
+/// - `busy_endpoint/metrics` -> `{METRICS_QUEUE_SIGNAL_NAME} 0.9` (high queue -> low score)
 ///
 /// After reconciliation, the overlay must order the idle provider before the busy
 /// provider.  Verified by [`verify_metrics_ordering`].
@@ -3254,7 +3254,7 @@ pub(crate) fn apply_provider_with_health_check_tls_key_missing_fixture(
 /// Apply the `api_provider` `InferenceProvider` fixture.
 ///
 /// Uses `backendKind: "api_provider"` so the scoring engine assigns it a lower
-/// locality score (≈ 5.8) than local providers (≈ 7.0).  This fixture verifies
+/// locality score (~ 5.8) than local providers (~ 7.0).  This fixture verifies
 /// that scoring-backed ordering places `api_provider` candidates after local ones
 /// regardless of the order they were applied.
 pub(crate) fn apply_api_provider_fixture(context: &str, endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -4013,7 +4013,7 @@ pub(crate) fn verify_full_grid_overlay(
         }
     }
 
-    // Verify scoring order: local (east) ≻ remote (west) ≻ cloud ≻ api_provider.
+    // Verify scoring order: local (east) > remote (west) > cloud > api_provider.
     // Each model is unique, so positions are determined by scoring, not routing ties.
     let pos = |model: &str, site: &str| -> Option<usize> {
         candidates
@@ -4151,7 +4151,7 @@ impl Drop for TlsFixtureGuard {
 /// Compute the canonical DER SHA-256 fingerprint from a PEM certificate string.
 ///
 /// Returns a 64-character lowercase hex string: `hex(sha256(der_bytes))`.
-/// Uses the `pem` crate for PEM→DER conversion (no `openssl` subprocess).
+/// Uses the `pem` crate for PEM->DER conversion (no `openssl` subprocess).
 pub(crate) fn pem_fingerprint(cert_pem: &str) -> Result<String, Box<dyn std::error::Error>> {
     use sha2::{Digest as _, Sha256};
     let parsed = pem::parse(cert_pem.trim())?;
@@ -4766,7 +4766,7 @@ pub(crate) fn assert_no_crdt_candidates_for_site(
 /// "grid-site-controller"` and `action == "GatewayProbe"`, sorts by
 /// `eventTime`, then asserts:
 ///
-/// - Each event note is bounded (≤ 1024 bytes).
+/// - Each event note is bounded (<= 1024 bytes).
 /// - Event `type` matches the reason classification (Normal for
 ///   `TlsVerified`/`AwaitingDiscovery`/`GatewayAddressKnown`/`Left`, Warning otherwise).
 /// - No consecutive duplicate reasons after time-sort.
@@ -5138,7 +5138,7 @@ pub(crate) fn verify_overlay_has_site_candidate(
     }
     eprintln!(
         "  [PASS] routing eligibility: overlay contains candidate with site={expected_site:?} \
-         (GridSite Active → eligible)"
+         (GridSite Active -> eligible)"
     );
     Ok(())
 }
@@ -5719,7 +5719,7 @@ pub(crate) fn apply_swim_routing_east_fixtures(
 /// Apply the west-side fixtures for the cross-cluster SWIM routing validation.
 ///
 /// Creates on the west cluster:
-/// - [`SWIM_ROUTING_NETWORK`] `GridNetwork` without a `consumerGateways` entry — the peer operator reconciles this to
+/// - [`SWIM_ROUTING_NETWORK`] `GridNetwork` without a `consumerGateways` entry -- the peer operator reconciles this to
 ///   publish its CRDT state but does not write an overlay `ConfigMap` (only the east primary generates the overlay).
 /// - [`SWIM_ROUTING_WEST_PROVIDER`] `InferenceProvider` serving `west_model` with `clusterName = west_site_name`.
 ///
@@ -6710,7 +6710,7 @@ pub(crate) fn wait_for_auto_gridsite(
 /// before calling this to ensure the operator has had time to advance the phase.
 ///
 /// For auto-discovered sites with a non-empty advertised gateway address, the `GridSite`
-/// controller advances the phase from `Discovered` → `Connecting` automatically,
+/// controller advances the phase from `Discovered` -> `Connecting` automatically,
 /// so `expected_phase` should be `"Connecting"` in E2E tests that wait long enough
 /// for the second reconcile.
 pub(crate) fn verify_auto_gridsite_fields(
@@ -6812,7 +6812,7 @@ pub(crate) fn verify_auto_gridsite_egress(
     if actual == swim_udp_addr {
         return Err(format!(
             "GridSite {site_name:?}: spec.gatewayEndpoint.address={actual:?} equals the SWIM UDP address; \
-             expected gateway address {expected_gateway_addr:?} — \
+             expected gateway address {expected_gateway_addr:?} -- \
              the data-plane gateway address was not propagated through SWIM"
         )
         .into());
@@ -7385,7 +7385,7 @@ pub(crate) fn verify_shared_model_overlay_ordering(
     };
     eprintln!(
         "  [PASS] shared model {FAILOVER_SHARED_MODEL:?}: east ({east_cluster:?}) \
-         pos={east_pos} fresh=true → west ({west_cluster:?}) pos={west_pos} {stale_tag}"
+         pos={east_pos} fresh=true -> west ({west_cluster:?}) pos={west_pos} {stale_tag}"
     );
     Ok(())
 }
@@ -7613,7 +7613,7 @@ pub(crate) fn cleanup_stale_gc_west_resources(context: &str) -> Result<(), Box<d
 /// [`api_credential_plan_from_overlay`] (production path).
 #[derive(Debug, PartialEq)]
 pub(crate) enum ApiCredentialPlan {
-    /// `auth.credentialsManagedExternally = true` — the user manages credentials; the harness does not inject.
+    /// `auth.credentialsManagedExternally = true` -- the user manages credentials; the harness does not inject.
     ///
     /// Constructed by `parse_api_credential_plan` (test-only); kept as a
     /// valid arm in [`resolve_api_credential`] for defensive completeness.
@@ -8038,7 +8038,7 @@ mod tests {
 
     #[test]
     fn verify_degraded_candidate_accepts_when_shared_site_has_fresh_false() {
-        // Two candidates at the same site — healthy (fresh=true) and degraded (fresh=false).
+        // Two candidates at the same site -- healthy (fresh=true) and degraded (fresh=false).
         // Two providers sharing clusterName="site-a" produces two candidates at the same
         // site: one healthy (fresh=true) and one degraded (fresh=false).  The degraded check must find the fresh=false
         // one.
@@ -8671,7 +8671,7 @@ mod tests {
 
     #[test]
     fn verify_multi_provider_overlay_empty_site_list_always_passes() {
-        // Degenerate case: no sites expected → validation trivially passes.
+        // Degenerate case: no sites expected -> validation trivially passes.
         let overlay = make_overlay_with_sites(&[("site-east", true)]);
         assert!(
             verify_multi_provider_overlay(&overlay, &[]).is_ok(),
@@ -9075,7 +9075,7 @@ mod tests {
     /// Build a minimal but structurally valid operator-generated consumer Praxis YAML.
     ///
     /// Matches the complete config shape produced by `generate_consumer_praxis_config`:
-    /// `listeners:` → `filter_chains:` → `admin:` → `shutdown_timeout_secs`.
+    /// `listeners:` -> `filter_chains:` -> `admin:` -> `shutdown_timeout_secs`.
     fn sample_consumer_yaml(secret_name: &str, secret_key: &str) -> String {
         format!(
             "listeners:\n\

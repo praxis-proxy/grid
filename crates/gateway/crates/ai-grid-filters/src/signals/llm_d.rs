@@ -152,10 +152,17 @@ impl SiteSignals for Mapped<'_> {
     fn read(&self, site: &str, cluster: &str, over: Over) -> SiteReading {
         let key = LoadStore::key(site, cluster);
         let sampled_at = self.store.newest_at(&key);
+        let queue_sampled_at = self
+            .series
+            .queued
+            .iter()
+            .filter_map(|metric| self.store.latest(&key, metric).map(|sample| sample.at_ms))
+            .max();
         // A pool whose per-unit series stopped while its gauges kept stamping has no units:
         // the gauges are frozen, so the site is unready and nothing it says is measured.
         if self.drained(&key, over.horizon_ms) {
             return SiteReading {
+                queue_sampled_at,
                 unready: true,
                 sampled_at,
                 ..SiteReading::default()
@@ -164,6 +171,7 @@ impl SiteSignals for Mapped<'_> {
         // Past the freshness window the site is unmeasured; only its standing readiness verdict holds.
         let Some(newest) = sampled_at.filter(|at| over.now_ms.saturating_sub(*at) <= over.window_ms) else {
             return SiteReading {
+                queue_sampled_at,
                 unready: self.unready(&key, sampled_at),
                 sampled_at,
                 ..SiteReading::default()
@@ -182,6 +190,7 @@ impl SiteSignals for Mapped<'_> {
                 window_ms: lookback,
                 ..over
             },
+            queue_sampled_at,
             sampled_at,
         )
     }
@@ -189,7 +198,7 @@ impl SiteSignals for Mapped<'_> {
 
 impl Mapped<'_> {
     /// The reading of a site with units, `over` its window.
-    fn live(&self, key: &str, over: Over, sampled_at: Option<i64>) -> SiteReading {
+    fn live(&self, key: &str, over: Over, queue_sampled_at: Option<i64>, sampled_at: Option<i64>) -> SiteReading {
         let Over {
             now_ms,
             window_ms,
@@ -210,6 +219,7 @@ impl Mapped<'_> {
             in_flight: self.in_flight(key, now_ms, window_ms, |_, _| true),
             congested_in_flight: self.in_flight(key, now_ms, window_ms, backlog),
             queued: first(self.series.queued),
+            queue_sampled_at,
             held: worst(self.series.held),
             deepest_queue: first(self.series.per_unit_queue),
             // Mean and spread are joined per scrape before the worst is chosen. Maximising
@@ -442,6 +452,7 @@ mod tests {
             in_flight: Some(24.0),
             congested_in_flight: Some(24.0),
             queued: Some(0.5),
+            queue_sampled_at: Some(1_000),
             held: Some(3.0),
             deepest_queue: Some(2.0),
             saturation: None,

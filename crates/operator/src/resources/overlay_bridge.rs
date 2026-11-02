@@ -12,12 +12,12 @@
 //!
 //! The mapping is 1:1 because the overlay shape was designed to match
 //! `intelligent_route` config:
-//! - `overlay.local_site` → `local_site`
-//! - `overlay.candidates[].kind` → `candidates[].kind`
-//! - `overlay.candidates[].name` → `candidates[].name`
-//! - `overlay.candidates[].site` → `candidates[].site`
-//! - `overlay.candidates[].cluster` → `candidates[].cluster`
-//! - `overlay.candidates[].fresh` → `candidates[].fresh`
+//! - `overlay.local_site` -> `local_site`
+//! - `overlay.candidates[].kind` -> `candidates[].kind`
+//! - `overlay.candidates[].name` -> `candidates[].name`
+//! - `overlay.candidates[].site` -> `candidates[].site`
+//! - `overlay.candidates[].cluster` -> `candidates[].cluster`
+//! - `overlay.candidates[].fresh` -> `candidates[].fresh`
 //!
 //! # Local validation and config-generation path
 //!
@@ -259,9 +259,9 @@ mod tests {
     // Round-trip tests
     //
     // These prove the complete local consumption path:
-    //   operator ConfigMap JSON → RoutingOverlay deserialize
-    //                           → to_intelligent_route_value
-    //                           → Praxis filter stanza
+    //   operator ConfigMap JSON -> RoutingOverlay deserialize
+    //                           -> to_intelligent_route_value
+    //                           -> Praxis filter stanza
     //
     // Each test uses a realistic JSON fixture that mirrors what
     // `build_overlay_configmap` produces.

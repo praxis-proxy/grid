@@ -1077,7 +1077,9 @@ auto-discovered sites.
 poller retries every 5 seconds (configurable via
 `GRID_GATEWAY_DISCOVERY_INTERVAL_MS`) until the address appears, then
 continues watching for changes.  Discovered addresses are pushed to the SWIM
-runtime via a watch channel.
+runtime and the `GridSite` controller via watch channels. The own `GridSite`
+uses this address when its spec has no `gatewayEndpoint`; the operator leaves
+the spec unchanged.
 
 **Explicit override:** Set `GRID_GATEWAY_ADDRESS` to skip the self-discovery
 poller entirely.
@@ -1090,8 +1092,9 @@ still wins and is advertised.
 Discovery uses the first LoadBalancer ingress hostname or IP. The advertised
 port is `GRID_GATEWAY_PORT` when set, otherwise the first Service `spec.ports`
 entry, with `8080` as the fallback if no usable port exists. A ClusterIP or
-NodePort Service supplies no discovered address; use an explicit reachable
-address for those Service types.
+NodePort Service supplies no discovered address; set `GRID_GATEWAY_ADDRESS`
+to a reachable `host:port`. This override is also used by the own `GridSite`
+when the operator runs without SWIM.
 
 ```bash
 # Self-discovery (default): operator discovers from provider-gateway Service
@@ -1183,6 +1186,12 @@ separate steps.
   or set `GRID_GATEWAY_ADDRESS` as an explicit override.  The self-discovery poller
   will propagate the address through SWIM once discovered.
 - Reason will be `GatewayAddressMissing`.
+
+**The own GridSite has no gateway address**
+
+- Reason will be `GatewayAddressMissing`. Set `gateway.address` in the
+  operator configuration, or declare `spec.gatewayEndpoint.address` on the
+  own `GridSite`.
 
 **Phase stays Connecting**
 

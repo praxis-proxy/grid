@@ -41,6 +41,27 @@ kubectl apply --server-side -f "$WORK/cert-manager.yaml"
 for deployment in cert-manager cert-manager-cainjector cert-manager-webhook; do
   kubectl -n cert-manager rollout status "deployment/$deployment" --timeout=180s
 done
+webhook_deadline=$((SECONDS + 60))
+webhook_ready=false
+while ((SECONDS < webhook_deadline)); do
+  if kubectl create --dry-run=server -n cert-manager -f - >/dev/null 2>&1 <<'YAML'
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: webhook-readiness-check
+spec:
+  selfSigned: {}
+YAML
+  then
+    webhook_ready=true
+    break
+  fi
+  sleep 1
+done
+[[ "$webhook_ready" == true ]] || {
+  echo "cert-manager webhook did not accept a server-side Issuer dry run" >&2
+  exit 1
+}
 kubectl create namespace fresh
 kubectl create namespace existing
 

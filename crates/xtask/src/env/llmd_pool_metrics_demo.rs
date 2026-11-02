@@ -92,7 +92,7 @@ const QUEUE_CAPACITY: f64 = 4.0;
 /// Minimum score gap required before capturing the pressure scorecard.
 ///
 /// With real VCR backends, pressure creates modest score differences
-/// (queue=2 → gap ≈ 0.03) from live VCR/EPP pressure.
+/// (queue=2 -> gap ~ 0.03) from live VCR/EPP pressure.
 const MIN_PRESSURE_SCORE_GAP: f64 = 0.01;
 
 /// Queue-depth pressure-phase threshold (raw queue size, out of `QUEUE_CAPACITY`).
@@ -1142,7 +1142,7 @@ fn proof_baseline(context: &DemoContext) -> ProofResult {
 }
 
 /// Proof 3: Scale up pressure through the consumer gateway, wait for
-/// A→B flip with live metrics table and attribution tracking.
+/// A->B flip with live metrics table and attribution tracking.
 fn proof_pressure_and_flip(context: &DemoContext, table_start: Instant) -> ProofResult {
     let mut observations = Vec::new();
     let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
@@ -4205,7 +4205,7 @@ fn proof_tls_handshake_rejection() -> ProofResult {
     }
 }
 
-/// TLS Stage 3: Delete client cert Secret → provider becomes unobservable.
+/// TLS Stage 3: Delete client cert Secret -> provider becomes unobservable.
 fn proof_tls_missing_client() -> ProofResult {
     let mut observations = Vec::new();
     let cluster = "pool-a";
@@ -4244,7 +4244,7 @@ fn proof_tls_missing_client() -> ProofResult {
     }
 }
 
-/// TLS Stage 3: Replace CA Secret with wrong CA → scrape fails.
+/// TLS Stage 3: Replace CA Secret with wrong CA -> scrape fails.
 fn proof_tls_wrong_ca() -> ProofResult {
     let mut observations = Vec::new();
     let cluster = "pool-a";
@@ -4330,7 +4330,7 @@ fn proof_tls_wrong_ca() -> ProofResult {
     }
 }
 
-/// TLS Stage 4: Restore correct Secrets → provider recovers.
+/// TLS Stage 4: Restore correct Secrets -> provider recovers.
 fn proof_tls_restore() -> ProofResult {
     let mut observations = Vec::new();
     let cluster = "pool-a";
@@ -4378,7 +4378,7 @@ fn proof_tls_restore() -> ProofResult {
     }
 }
 
-/// TLS Stage 5: Rotate client cert (new cert, same CA) → scrape continues.
+/// TLS Stage 5: Rotate client cert (new cert, same CA) -> scrape continues.
 fn proof_tls_client_rotation() -> ProofResult {
     let mut observations = Vec::new();
     let cluster = "pool-a";
@@ -4447,7 +4447,7 @@ fn proof_tls_client_rotation() -> ProofResult {
     }
 }
 
-/// TLS Stage 6: Rotate server cert + restart nginx → scrape continues.
+/// TLS Stage 6: Rotate server cert + restart nginx -> scrape continues.
 ///
 /// **Limitation:** nginx does not reload TLS material automatically.
 /// A `rollout restart` of the EPP Deployment is required. This is

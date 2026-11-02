@@ -321,9 +321,9 @@ impl SiteCapabilities {
 /// Lifecycle phase of a [`GridSite`].
 ///
 /// ```text
-/// Pending → Discovered → Connecting → Active
-///                                       ↓
-///                                  Unreachable → Left
+/// Pending -> Discovered -> Connecting -> Active
+///                                       v
+///                                  Unreachable -> Left
 /// ```
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub enum GridSitePhase {

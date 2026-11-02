@@ -37,7 +37,7 @@ pub struct OrSet<T: Ord> {
     /// Counter for generating unique add tags.
     counter: u64,
 
-    /// Active entries: item → set of (site, counter) tags.
+    /// Active entries: item -> set of (site, counter) tags.
     entries: BTreeMap<T, BTreeSet<Tag>>,
 
     /// Site identifier for this replica.

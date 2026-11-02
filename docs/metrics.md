@@ -173,6 +173,7 @@ state, so two replicas agree only in steady state.
 | `grid_route_site_last_sample_age_seconds` | gauge | `site`, `cluster` | Seconds since the site's newest sample. Unlike `grid_route_site_reading_age_seconds`, which goes `NaN` once the sample leaves the freshness window, this keeps counting. |
 | `grid_route_site_round_age_seconds` | gauge | `site`, `cluster` | Seconds since the operator's last poll round that tried this peer; a peer's silence is judged at that round. `NaN` for this site or when the operator reports no rounds. A growing value with the poller running is a stalled poller, under which no peer goes silent. |
 | `grid_route_site_score` | gauge | `site`, `cluster` | Score the site ranks by in the current snapshot. |
+| `grid_route_site_score_unavailable` | gauge | `site`, `cluster`, `reason` | One-hot reason an otherwise routable load-publishing site has no queue score: `absent`, `stale`, or `unreadable`. The current reason is 1 and the others are 0. |
 | `grid_route_shedding` | gauge | `model` | 1 while the gateway sheds this model, 0 otherwise. |
 | `grid_route_prefix_affinity_total` | counter | `outcome` | Prefix-affinity decisions by outcome. |
 | `grid_serving_config_reload_total` | counter | `result` | Serving-config reloads by result. |
@@ -190,6 +191,13 @@ distinguishes an unmeasured site from one measured at zero. A `NaN` score means
 the candidate is excluded or demoted from the order. A site that leaves the
 topology reads `NaN` on all four, since the exporter keeps a series until
 restart.
+
+`grid_route_site_score_unavailable` separates a provider that has published no
+sample (`absent`) from one whose newest sample is outside the freshness window
+(`stale`) and one with fresh samples but no recognized, valid queue value
+(`unreadable`). Metric names are deliberately not labels. The three `reason`
+values are fixed, while `site` and `cluster` come from the bounded serving
+topology. All three series read `NaN` after the pair leaves that topology.
 
 ## Gateway: polling the local operator
 

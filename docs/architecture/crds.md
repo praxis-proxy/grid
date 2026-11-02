@@ -790,7 +790,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 |---|---|---|
 | `Pending` | Resource created (manually or by auto-discovery) | Initial default |
 | `Discovered` | SWIM peer observed as Alive | `GridNetwork` controller writes on first observation |
-| `Connecting` | Gateway address known (`spec.gatewayEndpoint.address` non-empty) | `GridSite` controller advances from Discovered, or from Pending for a declared site with both endpoints; performs identity-aware probe |
+| `Connecting` | Gateway address known (`spec.gatewayEndpoint.address` non-empty, or the own site's resolved operator address) | `GridSite` controller advances from Discovered, or from Pending for a declared site with both endpoints; performs identity-aware probe |
 | `Active` | `TlsVerified` | `GridSite` controller promotes from Connecting only after identity-verified TLS succeeds |
 | `Unreachable` | Connectivity failure while Active | `GridSite` controller moves Active → Unreachable when the endpoint cannot be reached |
 | `Left` | Set on graceful site departure | Preserved by operator once set |
@@ -803,7 +803,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 | `SWIMDiscovered` | Discovered | Peer observed as Alive in SWIM membership; gateway address propagating |
 | `GatewayAddressKnown` | Connecting | Gateway address received; advancing to Connecting |
 | `EndpointsDeclared` | Connecting | Declared site names a dialable gateway endpoint, which also gives its signals endpoint; advancing without discovery |
-| `GatewayAddressMissing` | Discovered, Connecting, or Unreachable | No gateway address known (see `GRID_GATEWAY_ADDRESS`), or a previously probed site lost it |
+| `GatewayAddressMissing` | Pending, Discovered, Connecting, or Unreachable | No usable gateway address is known: the own site's endpoint and configured address are absent, or a peer has not announced an address |
 | `TlsVerified` | Active | TLS handshake succeeded; certificate chain, identity, and configured pin verified |
 | `IdentityVerificationRequired` | Connecting | TCP endpoint is reachable, but plaintext cannot establish the gateway identity |
 | `PlaintextUnreachable` | Connecting or Unreachable | TCP probe failed (explicit Plaintext mode) |
@@ -824,9 +824,12 @@ A discovered SWIM peer is not automatically authorized for routing.
   label on the `GridNetwork`).
 - Pending → Connecting: the `GridSite` controller advances a declared site (one without
   the `grid.praxis.fast/auto-discovered` label) that sets a dialable
-  `spec.gatewayEndpoint.address`, so it does not wait on SWIM.
+  `spec.gatewayEndpoint.address`, so it does not wait on SWIM. For this operator's own
+  site, the resolved `gateway.address` or LoadBalancer address supplies the endpoint when
+  the spec omits it; the operator does not write that address to the spec.
 - Discovered → Connecting: the `GridSite` controller advances automatically when
-  `spec.gatewayEndpoint.address` is non-empty. For auto-discovered sites, the egress address comes from
+  `spec.gatewayEndpoint.address` is non-empty. The own site can also use its resolved
+  operator address without changing the spec. For auto-discovered sites, the egress address comes from
   the remote operator's `GRID_GATEWAY_ADDRESS` env var, propagated via SWIM state broadcast.
   If the remote operator has not configured `GRID_GATEWAY_ADDRESS`, the egress address is empty
   and the site stays Discovered with reason `GatewayAddressMissing`.
@@ -853,7 +856,9 @@ still counts the transitions by phase and reason.
 the remote operator's `GRID_GATEWAY_ADDRESS` environment variable, propagated through the SWIM
 state broadcast.  If the remote operator has not configured `GRID_GATEWAY_ADDRESS`, the field
 is empty and the site stays Discovered.  For manually-applied `GridSite` resources, set
-`spec.gatewayEndpoint.address` explicitly to the data-plane gateway endpoint.
+`spec.gatewayEndpoint.address` explicitly to the data-plane gateway endpoint. The operator's
+own `GridSite` uses its configured or discovered local gateway address at reconcile time when
+the spec omits it, without patching the spec.
 
 **`status.publicCertPem`:** The public site certificate PEM received from the remote site via
 SWIM state broadcast.  Before storage, the operator performs a structural check:
@@ -930,9 +935,13 @@ time by provider gateway filters.
 **Single-site / combined-site deployments:** Site discovery is driven by *remote*
 SWIM peers - the `Pending -> Discovered` transition above requires a remote peer
 observed Alive. A single or combined cluster has no peers, so its own `GridSite`
-stays `Pending` with reason `AwaitingDiscovery`. **This is expected and does not
-block local serving:** local `InferenceProvider`s are eligible regardless of
-`GridSite.status.phase`; only *remote* CRDT provider records are phase-gated (see
+stays `Pending` with reason `AwaitingDiscovery` when a usable gateway address is
+available. If its endpoint is undeclared and gateway discovery has no address,
+reconciliation uses `GatewayAddressMissing` under both Swim and Local
+membership; this reason is emitted as a `Warning` event. **Either reason is
+expected and does not block local serving:** local `InferenceProvider`s are
+eligible regardless of `GridSite.status.phase`; only *remote* CRDT provider
+records are phase-gated (see
 "Routing eligibility" above). Do not add SWIM seeds or extra operator replicas to
 try to force the site `Active` - there is no second site to discover, and a lone
 operator legitimately runs a single-node mesh with zero peers. The `Active` phase

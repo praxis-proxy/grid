@@ -754,6 +754,11 @@ jobs:
           - peer-trust-mode: pin
             signed-state: enforce
             leg: pin, signed state
+          - peer-trust-mode: pin
+            hub-router: operator
+            signed-state: enforce
+            model-gossip: true
+            leg: pin, signed model gossip routing
     timeout-minutes: 60
     permissions:
       contents: read
@@ -817,6 +822,7 @@ jobs:
           HUB_ROUTER: ${{ matrix.hub-router || 'render' }}
           HA: ${{ matrix.ha || '0' }}
           SIGNED_STATE: ${{ matrix.signed-state || 'off' }}
+          MODEL_GOSSIP_TEST: ${{ matrix.model-gossip && '1' || '0' }}
           GRID_FEEDBACK_CONTRACT_TEST: ${{ matrix.peer-trust-mode == 'pin' && '1' || '0' }}
           # The spiffe leg rotates 8 minute identities; pin trust does not rotate.
           ROTATION_LIFETIME: "480"
