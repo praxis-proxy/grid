@@ -247,15 +247,35 @@ FIPS-enabled host's `libcrypto` supplies. To make the FIPS requirement itself
 enforced, set `PRAXIS_REQUIRE_FIPS` (for example through `env`) so the gateway
 refuses to start unless FIPS mode is actually in effect on the host.
 
-The FIPS build leaves the Praxis policy engine out, so API-key caller
-authentication (`praxisConfig.render.auth.mode: api-key`) is unavailable in
-it: that mode renders a `policy` filter the FIPS gateway refuses at startup.
-A FIPS deployment sets `praxisConfig.render.auth.mode: none` and puts an
+The FIPS build leaves the Praxis policy engine out and rejects every `policy`
+filter at startup, including filters in hand-written configurations and inline
+branch chains. API-key caller authentication
+(`praxisConfig.render.auth.mode: api-key`) is unavailable because that mode
+renders a `policy` filter. Set `praxisConfig.render.auth.mode: none` and put an
 authenticating front (an edge gateway, an API gateway, or a similar component
-that validates callers) in front of the gateway. Keep that arrangement inside
-the cluster and restrict the gateway's `networkPolicy.from` to the front, as
-described under [Exposing the gateway](#exposing-the-gateway) and
-[Edge gateway](#edge-gateway).
+that validates callers) in front of the gateway.
+
+Enable the chart's NetworkPolicy and allow only the authenticating front's pods
+to reach the gateway listener. Replace these example namespace and pod labels
+with the labels used by your front:
+
+```yaml
+networkPolicy:
+  enabled: true
+  from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress
+      podSelector:
+        matchLabels:
+          app: authenticating-front
+```
+
+`networkPolicy.from` has no effect while `networkPolicy.enabled` is false. Keep
+the front and gateway inside the cluster, as described under
+[Exposing the gateway](#exposing-the-gateway) and
+[Edge gateway](#edge-gateway). NetworkPolicy enforcement depends on the
+cluster's CNI.
 
 ## Values
 
