@@ -243,9 +243,10 @@ FIPS deployments run a `grid-gateway` image built from this repository with
 `cargo build --manifest-path crates/gateway/Cargo.toml --no-default-features
 --features fips`. That build keeps the gateway's runtime, reload, admin, OTel,
 and SPIFFE capabilities and uses the OpenSSL-backed crypto provider that a
-FIPS-enabled host's `libcrypto` supplies. To make the FIPS requirement itself
-enforced, set `PRAXIS_REQUIRE_FIPS` (for example through `env`) so the gateway
-refuses to start unless FIPS mode is actually in effect on the host.
+FIPS-enabled host's `libcrypto` supplies. To enforce the FIPS requirement at
+startup, set `PRAXIS_REQUIRE_FIPS=1` (for example through `env`). The gateway
+then refuses to start unless FIPS mode is actually in effect on the host;
+`PRAXIS_REQUIRE_FIPS=false` disables this requirement.
 
 The FIPS build leaves the Praxis policy engine out and rejects every `policy`
 filter at startup, including filters in hand-written configurations and inline
