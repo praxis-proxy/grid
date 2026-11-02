@@ -16,9 +16,14 @@ rust-version = "1.96"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-praxis-proxy = "0.7.5"
+# Keep defaults explicit so FIPS builds can omit the policy engine.
+praxis-proxy = { version = "0.7.5", default-features = false, features = [
+  "pingora",
+  "config-reload",
+  "admin-api",
+] }
 praxis-core = { version = "0.7.5", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.7.5", package = "praxis-proxy-filter" }
+praxis-filter = { version = "0.7.5", package = "praxis-proxy-filter", default-features = false }
 praxis-protocol = { version = "0.7.5", package = "praxis-proxy-protocol" }
 praxis-tls = { version = "0.7.5", package = "praxis-proxy-tls" }
 httpdate = "1.0.3"
@@ -323,6 +328,12 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = ["policy-engine"]
+policy-engine = ["praxis-proxy/policy-engine"]
+# Cargo features are additive; build FIPS with --no-default-features.
+fips = ["dep:certs", "certs/fips"]
+
 [[bin]]
 name = "grid-gateway"
 path = "src/main.rs"
@@ -347,6 +358,7 @@ tokio-rustls = { version = "0.26.5", default-features = false, features = ["logg
 httparse = "1.10.1"
 serde.workspace = true
 serde_yaml.workspace = true
+certs = { path = "../certs", default-features = false, optional = true }
 
 [dev-dependencies]
 # The reload test runs a real mTLS signals peer against the binary.
@@ -357,9 +369,16 @@ tokio = { version = "1.53.1", features = ["macros"] }
 # The help-text test emits one sample per documented metric.
 metrics = { workspace = true }
 
-# machete can't see these: used as `praxis` / `praxis_core` / `praxis_filter`, not their package names.
+# machete can't see these: used as `praxis` / `praxis_core` / `praxis_filter`, not
+# their package names. `certs` is a feature-gated dependency of the `fips` build.
 [package.metadata.cargo-machete]
-ignored = ["opentelemetry-otlp", "praxis-proxy", "praxis-proxy-core", "praxis-proxy-filter"]
+ignored = [
+  "opentelemetry-otlp",
+  "praxis-proxy",
+  "praxis-proxy-core",
+  "praxis-proxy-filter",
+  "certs",
+]
 
 [lints]
 workspace = true

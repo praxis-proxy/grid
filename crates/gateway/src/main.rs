@@ -25,6 +25,9 @@ use tracing::info;
 mod metrics_listener;
 mod provider_preflight;
 
+#[cfg(feature = "fips")]
+mod fips;
+
 /// Log line emitted once tracing is up; the startup test waits for it.
 const STARTUP_MESSAGE: &str = "starting grid-gateway";
 /// OTel-standard environment variable used as the OTLP endpoint fallback.
@@ -92,6 +95,10 @@ fn main() -> ExitCode {
     }
 
     let (config_file, config) = load_config();
+
+    // Refuse before listeners bind, or callers could reach inference without policy auth.
+    #[cfg(feature = "fips")]
+    fips::validate_no_policy_filter(&config).unwrap_or_else(|err| praxis::fatal(&err));
 
     validate_otlp_endpoint_transport(&config).unwrap_or_else(|err| praxis::fatal(&err));
 
@@ -686,6 +693,52 @@ mod tests {
             )
             .is_err(),
             "the shipped Praxis HTTP client is incompatible with its thread-based batch processor"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Regular-Build Policy Config
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod policy_config_tests {
+    //! Confirms the default build still accepts policy filter entries.
+
+    #[cfg(not(feature = "fips"))]
+    use praxis_core::config::Config;
+
+    #[cfg(not(feature = "fips"))]
+    #[test]
+    fn policy_filter_config_stays_valid() {
+        let config = Config::from_yaml(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: policy
+        config_path: /etc/praxis/policy.yaml
+      - filter: router
+        routes:
+          - path: /v1/models
+            cluster: upstream
+clusters:
+  - name: upstream
+    endpoints: ["10.96.0.20:9090"]
+"#,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            config
+                .filter_chains
+                .first()
+                .and_then(|chain| chain.filters.first())
+                .is_some_and(|entry| entry.filter_type == "policy"),
+            "the policy filter entry is preserved for the regular build"
         );
     }
 }

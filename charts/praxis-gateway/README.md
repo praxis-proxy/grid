@@ -237,6 +237,26 @@ The chart uses [Semantic Versioning](https://semver.org/). Its `version`
 identifies the chart package, while `appVersion` identifies the default
 Praxis AI image; these values may advance independently.
 
+### FIPS image
+
+FIPS deployments run a `grid-gateway` image built from this repository with
+`cargo build --manifest-path crates/gateway/Cargo.toml --no-default-features
+--features fips`. That build keeps the gateway's runtime, reload, admin, OTel,
+and SPIFFE capabilities and uses the OpenSSL-backed crypto provider that a
+FIPS-enabled host's `libcrypto` supplies. To make the FIPS requirement itself
+enforced, set `PRAXIS_REQUIRE_FIPS` (for example through `env`) so the gateway
+refuses to start unless FIPS mode is actually in effect on the host.
+
+The FIPS build leaves the Praxis policy engine out, so API-key caller
+authentication (`praxisConfig.render.auth.mode: api-key`) is unavailable in
+it: that mode renders a `policy` filter the FIPS gateway refuses at startup.
+A FIPS deployment sets `praxisConfig.render.auth.mode: none` and puts an
+authenticating front (an edge gateway, an API gateway, or a similar component
+that validates callers) in front of the gateway. Keep that arrangement inside
+the cluster and restrict the gateway's `networkPolicy.from` to the front, as
+described under [Exposing the gateway](#exposing-the-gateway) and
+[Edge gateway](#edge-gateway).
+
 ## Values
 
 | Key | Type | Default | Description |
@@ -289,7 +309,7 @@ Praxis AI image; these values may advance independently.
 | `praxisConfig.render.provider.allowedPaths` | list | chat, completions, models, embeddings, messages, responses | Exact paths a provider forwards, GET and POST only. Other paths get a 404, other methods a 405. |
 | `grid.networkName` | string | `""` | GridNetwork name for overlay-sidecar scope validation. Required when the sidecar is on. |
 | `grid.siteName` | string | `""` | This gateway's site name. Required for render and when the overlay sidecar is on. A consumer scores locality with it; a provider returns it in `X-Grid-Provider-Site`. |
-| `praxisConfig.render.auth.mode` | string | **required** for a render consumer | `api-key` validates a consumer caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); provider role rejects it because providers authenticate peers by Grid identity. The render refuses it on the legacy `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
+| `praxisConfig.render.auth.mode` | string | **required** for a render consumer | `api-key` validates a consumer caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); provider role rejects it because providers authenticate peers by Grid identity. The render refuses it on the legacy `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). It also requires the policy engine, so the FIPS `grid-gateway` build refuses it at startup; a FIPS deployment uses `none` behind an authenticating front. `none` renders no policy filter, for use only behind an authenticating front. |
 | `praxisConfig.render.auth.allowUnauthenticatedExposure` | bool | `false` | With `none`, allow a LoadBalancer or NodePort Service. Without it the render fails. The guard sees only this chart's Service, not `oc expose`, another Service selecting the pod labels, an HTTPRoute, or a hand-made Service with `service.enabled=false`. Use `networkPolicy` for those. |
 | `praxisConfig.render.auth.stripAuthorization` | bool | `true` | Remove the caller's `Authorization` before routing, in either mode. Forwarded grid hops authenticate by mTLS identity. `false` forwards the caller's key or bearer to every backend and cross-site peer, so use it only when the backend validates that same credential. |
 | `praxisConfig.render.auth.validateUrl` | string | **required** for `api-key` | https validate endpoint. |

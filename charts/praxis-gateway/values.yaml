@@ -253,7 +253,8 @@ praxisConfig:
       # consumer caller's key against validateUrl and needs an image whose policy engine
       # registers identity/api-key (praxis-policy 0.4 or later); provider role rejects it
       # because providers authenticate peers by Grid identity. The render refuses it on
-      # the legacy ai:0.4.0 image. none
+      # the legacy ai:0.4.0 image. FIPS grid-gateway omits the policy engine, so use none
+      # behind an authenticating front. none
       # renders no policy filter and belongs only behind an authenticating front.
       mode: ""
       # -- With mode none, allow a LoadBalancer or NodePort Service. Without it the render
