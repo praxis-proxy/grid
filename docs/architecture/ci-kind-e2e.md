@@ -54,6 +54,7 @@ Topology and execution details are maintained in the
 | `verify-stale-gc-ttl` | Aged stale candidates are omitted from rendered overlays when TTL is configured. |
 | `verify-api-fallback-native` | Provider credentials are injected from mounted Secret files, not overlay or ConfigMap token bytes. |
 | `verify-failover-under-lost-peer` | Lost peer state degrades remote candidates and routes shared-model traffic to healthy fallback capacity. |
+| `verify-local-site-status` | Local-membership site phase reasons and `NoDeclaredPeers` network conditions clear once a peer is declared. |
 
 ## Sequencing requirements
 

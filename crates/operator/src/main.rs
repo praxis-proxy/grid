@@ -3716,6 +3716,51 @@ impl PeerPoller {
         self.catalogs = catalogs;
     }
 
+    /// Under Local membership with no peer `GridSite` declared, write every `GridNetwork` peer
+    /// condition `Unknown` until all land, and forget what earlier rounds judged.
+    async fn report_no_peers(&mut self, membership_ready: bool) {
+        use operator::{
+            peer_ages::{self, PEER_TIME_VALID},
+            peer_membership::{self, PEER_MEMBERSHIP},
+            peer_reach::{CATALOGS, PEER_POLLS_COMPLETE, POLLS_FIELD_MANAGER, PeerReach, REACH},
+        };
+        self.reach = PeerReach::default();
+        self.catalogs = PeerReach::none(&CATALOGS);
+        self.ages = peer_ages::PeerAges::default();
+        self.memberships = peer_membership::PeerMemberships::default();
+        if self.written.lone {
+            return;
+        }
+        let mut conditions = vec![
+            (REACH.field_manager, REACH.type_, true),
+            (CATALOGS.field_manager, CATALOGS.type_, true),
+            (POLLS_FIELD_MANAGER, PEER_POLLS_COMPLETE, false),
+        ];
+        if membership_ready {
+            conditions.push((peer_ages::FIELD_MANAGER, PEER_TIME_VALID, true));
+            conditions.push((peer_membership::FIELD_MANAGER, PEER_MEMBERSHIP, true));
+        }
+        let mut landed = membership_ready;
+        for (manager, type_, generational) in conditions {
+            landed &= Box::pin(write_network_condition(
+                &self.client,
+                manager,
+                |network, now| {
+                    let generation = network.metadata.generation.filter(|_| generational);
+                    operator::peer_reach::network_patch(network, |current| {
+                        operator::peer_reach::no_peers_condition(type_, current, now, generation)
+                    })
+                },
+                &self.shutdown,
+            ))
+            .await;
+        }
+        self.written = NetworkWritten {
+            lone: landed,
+            ..NetworkWritten::default()
+        };
+    }
+
     /// Write each `GridNetwork` peer condition this round changed, or whose last write failed.
     async fn write_network(
         &mut self,
@@ -3875,6 +3920,11 @@ impl PeerPoller {
             .filter(|site| !answered.contains_key(*site))
             .cloned()
             .collect();
+        if self.ctx.membership() == Membership::Local && identities.peers_besides(&local_site) == 0 {
+            Box::pin(self.report_no_peers(membership_ready)).await;
+            return;
+        }
+        self.written.lone = false;
         Box::pin(self.report_reach((source, &local_site), &polled, &answered, &urls)).await;
         if observe_peer_ages(membership_ready, &mut self.ages, &polled, &answered) {
             Box::pin(write_peer_ages(&self.client, &self.ages, &self.shutdown)).await;
@@ -4055,6 +4105,8 @@ struct NetworkWritten {
     reach: Option<operator::peer_reach::PeerReach>,
     /// `PeerCatalogsAccepted`'s verdicts.
     catalogs: Option<operator::peer_reach::PeerReach>,
+    /// Whether every peer condition landed `Unknown` for a round with no peer declared.
+    lone: bool,
 }
 
 /// Whether a round with nothing to poll still runs: under Local once the peers are read, so
@@ -6241,6 +6293,121 @@ mod tests {
         assert!(write_due(None, &1), "the last write did not land");
         assert!(write_due(Some(&1), &2), "the verdict changed");
         assert!(!write_due(Some(&1), &1), "unchanged and written");
+    }
+
+    #[test]
+    fn report_no_peers_dispatches_on_local_membership_without_declared_peers() {
+        use operator::signals::{PeerIdentities, PeerRecord};
+        let dispatches = |membership: Membership, site: &str, identities: &PeerIdentities| {
+            membership == Membership::Local && identities.peers_besides(site) == 0
+        };
+
+        let identities = PeerIdentities::new();
+        assert!(
+            !dispatches(Membership::Swim, "site-a", &identities),
+            "Swim membership never dispatches to report_no_peers"
+        );
+        assert!(
+            dispatches(Membership::Local, "site-a", &identities),
+            "Local with empty store dispatches to report_no_peers"
+        );
+
+        identities.set(BTreeMap::from([("site-a".to_owned(), PeerRecord::default())]));
+        assert!(
+            dispatches(Membership::Local, "site-a", &identities),
+            "Local with only own record dispatches to report_no_peers"
+        );
+
+        identities.set(BTreeMap::from([
+            ("site-a".to_owned(), PeerRecord::default()),
+            ("site-b".to_owned(), PeerRecord::default()),
+        ]));
+        assert!(
+            !dispatches(Membership::Local, "site-a", &identities),
+            "Local with a declared peer does not dispatch to report_no_peers"
+        );
+    }
+
+    #[tokio::test]
+    async fn report_no_peers_writes_unknown_conditions_then_is_idempotent() {
+        use std::sync::{
+            Arc as StdArc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        use operator::peer_reach::CATALOGS;
+
+        let writes = StdArc::new(AtomicUsize::new(0));
+        let w = StdArc::clone(&writes);
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let w = StdArc::clone(&w);
+            async move {
+                let network = serde_json::json!({
+                    "apiVersion": "grid.praxis.fast/v1alpha1",
+                    "kind": "GridNetwork",
+                    "metadata": {"name": "grid", "generation": 1},
+                    "spec": {"seeds": []}
+                });
+                let body = if request.method() == http::Method::GET {
+                    serde_json::json!({
+                        "apiVersion": "grid.praxis.fast/v1alpha1",
+                        "kind": "GridNetworkList",
+                        "metadata": {}, "items": [network]
+                    })
+                } else {
+                    w.fetch_add(1, Ordering::SeqCst);
+                    network
+                };
+                Ok::<_, std::convert::Infallible>(http::Response::new(axum::body::Body::from(body.to_string())))
+            }
+        });
+        let client = Client::new(service, "default");
+        let shutdown = operator::shutdown::Shutdown::never();
+        let ctx = Arc::new(OperatorCtx::new(client.clone(), None, SignalMode::Poll));
+        let settings = Cli::try_parse_from(["operator"]).expect("default CLI settings").signals;
+
+        let mut poller = PeerPoller {
+            ctx,
+            swim: None,
+            client,
+            settings,
+            shutdown,
+            ages: operator::peer_ages::PeerAges::default(),
+            memberships: operator::peer_membership::PeerMemberships::default(),
+            reach: operator::peer_reach::PeerReach::default(),
+            misses: operator::peer_reach::Misses::default(),
+            written: NetworkWritten::default(),
+            catalogs: operator::peer_reach::PeerReach::none(&CATALOGS),
+            sites_written: false,
+            catalog_versions: std::collections::HashMap::default(),
+            remembered: BTreeMap::default(),
+            unanswered: BTreeSet::default(),
+            turn: 0,
+        };
+
+        poller.report_no_peers(true).await;
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            5,
+            "five conditions written for membership_ready=true"
+        );
+        assert!(poller.written.lone, "lone flag set after successful write");
+
+        poller.report_no_peers(true).await;
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            5,
+            "lone guard suppresses redundant writes"
+        );
+
+        poller.written.lone = false;
+        poller.report_no_peers(false).await;
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            5 + 3,
+            "three conditions written when membership not ready"
+        );
+        assert!(!poller.written.lone, "lone not set when membership write was excluded");
     }
 
     #[test]

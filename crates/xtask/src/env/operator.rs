@@ -631,6 +631,49 @@ pub(crate) const STALE_GC_TTL_SECS: u32 = 5;
 pub(crate) const STALE_GC_ABSENT_POLL_TIMEOUT: Duration = Duration::from_secs(45);
 
 // ---------------------------------------------------------------------------
+// Local-site status validation constants (issue #485)
+// ---------------------------------------------------------------------------
+
+/// `GridNetwork` used by the local-site status validation.
+pub(crate) const LOCAL_STATUS_NETWORK: &str = "op-e2e-local-status-net";
+
+/// The operator's own site name in the local-site status validation.
+pub(crate) const LOCAL_STATUS_OWN_SITE: &str = "local-status-site";
+
+/// A declared peer site name in the local-site status validation.
+pub(crate) const LOCAL_STATUS_PEER_SITE: &str = "local-status-peer";
+
+/// How long to wait for a `GridSite` phase/reason transition.
+pub(crate) const LOCAL_STATUS_POLL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// DNS SAN used for the mTLS certificate generated in the local-site status validation.
+pub(crate) const LOCAL_STATUS_DNS_SAN: &str = "local-status-site.grid.internal";
+
+/// Name of the CA `Secret` created for the local-site status validation.
+pub(crate) const LOCAL_STATUS_CA_SECRET: &str = "local-status-ca";
+
+/// Name of the site TLS `Secret` created for the local-site status validation.
+pub(crate) const LOCAL_STATUS_TLS_SECRET: &str = "local-status-tls";
+
+/// `GridNetwork` condition type for peer signals reachability.
+pub(crate) const PEER_SIGNALS_REACHABLE: &str = "PeerSignalsReachable";
+
+/// `GridNetwork` condition type for peer catalog acceptance.
+pub(crate) const PEER_CATALOGS_ACCEPTED: &str = "PeerCatalogsAccepted";
+
+/// `GridNetwork` condition type for whether poll rounds completed.
+pub(crate) const PEER_POLLS_COMPLETE: &str = "PeerPollsComplete";
+
+/// `GridNetwork` condition type for peer timestamp validity.
+pub(crate) const PEER_TIME_VALID: &str = "PeerTimeValid";
+
+/// `GridNetwork` condition type for peer membership consistency.
+pub(crate) const PEER_MEMBERSHIP: &str = "PeerMembership";
+
+/// Reason every peer condition carries while no peer `GridSite` is declared.
+pub(crate) const NO_DECLARED_PEERS: &str = "NoDeclaredPeers";
+
+// ---------------------------------------------------------------------------
 // CRD installation
 // ---------------------------------------------------------------------------
 
@@ -1290,6 +1333,37 @@ pub(crate) fn spawn_operator(context: &str) -> Result<Child, Box<dyn std::error:
         .stdin(Stdio::null())
         .spawn()?;
     // Brief pause so the operator establishes its watches before fixtures are polled.
+    std::thread::sleep(Duration::from_secs(3));
+    Ok(child)
+}
+
+/// Spawn the operator in Local membership mode with `site_name` as its stable identity.
+///
+/// Sets `GRID_MEMBERSHIP_SOURCE=Local` and `GRID_SITE_NAME` so the operator
+/// does not start SWIM and uses the given name for its own `GridSite`.
+pub(crate) fn spawn_local_operator(context: &str, site_name: &str) -> Result<Child, Box<dyn std::error::Error>> {
+    eprintln!("  setting kubectl context to {context}...");
+    Command::new("kubectl")
+        .args(["config", "use-context", context])
+        .status()?;
+
+    let metrics_addr = reserve_metrics_addr()?;
+    eprintln!("  spawning operator (Local membership, site={site_name}, metrics={metrics_addr})...");
+    let child = Command::new("cargo")
+        .args(["run", "--quiet", "-p", "operator", "--bin", "operator"])
+        .env("GRID_METRICS_ADDR", &metrics_addr)
+        .env("GRID_MODEL_DISCOVERY_INTERVAL_SECS", "1")
+        .env("GRID_MODEL_DISCOVERY_TIMEOUT_SECS", "2")
+        .env("GRID_MODEL_DISCOVERY_TTL_SECS", "5")
+        .env("GRID_MEMBERSHIP_SOURCE", "Local")
+        .env("GRID_SITE_NAME", site_name)
+        .env("GRID_CREATE_LOCAL_RECORDS", "false")
+        .stdin(Stdio::null())
+        .spawn()?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "startup pause so watches are established before fixtures are applied"
+    )]
     std::thread::sleep(Duration::from_secs(3));
     Ok(child)
 }
@@ -7600,6 +7674,106 @@ pub(crate) fn cleanup_stale_gc_west_resources(context: &str) -> Result<(), Box<d
     cleanup_auto_discovered_gridsites_for_network(context, STALE_GC_NETWORK);
     eprintln!("  [OK] stale-GC west resources removed");
     Ok(())
+}
+
+/// Remove all resources the local-site status validation created.
+pub(crate) fn cleanup_local_status_resources(context: &str) {
+    drop(delete_cluster_resource(context, "gridsite", LOCAL_STATUS_PEER_SITE));
+    drop(delete_cluster_resource(context, "gridsite", LOCAL_STATUS_OWN_SITE));
+    drop(delete_cluster_resource(context, "gridnetwork", LOCAL_STATUS_NETWORK));
+    drop(delete_namespaced_resource(
+        context,
+        "default",
+        "secret",
+        LOCAL_STATUS_CA_SECRET,
+    ));
+    drop(delete_namespaced_resource(
+        context,
+        "default",
+        "secret",
+        LOCAL_STATUS_TLS_SECRET,
+    ));
+}
+
+/// Poll until `GridNetwork` `network`'s condition `type_` shows `status` and `reason`.
+///
+/// Bumps the network on each iteration so the controller reconciles.
+#[expect(clippy::disallowed_methods, reason = "synchronous poll loop in xtask harness")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each parameter is a distinct field of the K8s condition object"
+)]
+pub(crate) fn wait_for_network_condition(
+    context: &str,
+    network: &str,
+    type_: &str,
+    expected_status: &str,
+    expected_reason: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    let resource = format!("gridnetworks/{network}");
+    let jsonpath = format!(
+        "{{.status.conditions[?(@.type==\"{type_}\")].status}}:{{.status.conditions[?(@.type==\"{type_}\")].reason}}"
+    );
+    loop {
+        drop(bump_gridnetwork(context, network));
+        let raw = kubectl_jsonpath(context, &resource, &jsonpath).unwrap_or_default();
+        let (status, reason) = raw.split_once(':').unwrap_or(("", ""));
+        if status == expected_status && reason == expected_reason {
+            eprintln!("  [OK] GridNetwork {network:?} condition {type_:?}: {status}/{reason}");
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timeout waiting for GridNetwork {network:?} condition {type_:?} \
+                 status={expected_status:?} reason={expected_reason:?}; \
+                 last: {status:?}/{reason:?}"
+            )
+            .into());
+        }
+        eprintln!(
+            "  waiting for GridNetwork {network:?} {type_:?}={expected_status}/{expected_reason} \
+             (current: {status:?}/{reason:?})..."
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Poll until `GridNetwork` `network`'s condition `type_` carries any reason except `excluded_reason`.
+#[expect(clippy::disallowed_methods, reason = "synchronous poll loop in xtask harness")]
+pub(crate) fn wait_for_network_condition_not_reason(
+    context: &str,
+    network: &str,
+    type_: &str,
+    excluded_reason: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    let resource = format!("gridnetworks/{network}");
+    let jsonpath = format!("{{.status.conditions[?(@.type==\"{type_}\")].reason}}");
+    loop {
+        drop(bump_gridnetwork(context, network));
+        let reason = kubectl_jsonpath(context, &resource, &jsonpath).unwrap_or_default();
+        if !reason.is_empty() && reason != excluded_reason {
+            eprintln!(
+                "  [OK] GridNetwork {network:?} condition {type_:?}: reason={reason:?} (left {excluded_reason:?})"
+            );
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timeout waiting for GridNetwork {network:?} condition {type_:?} \
+                 to leave reason={excluded_reason:?}; last: {reason:?}"
+            )
+            .into());
+        }
+        eprintln!(
+            "  waiting for GridNetwork {network:?} {type_:?} to leave {excluded_reason:?} \
+             (current: {reason:?})..."
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
 }
 
 // ---------------------------------------------------------------------------

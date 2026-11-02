@@ -647,6 +647,14 @@ impl PeerIdentities {
         self.inner.read().map_or(0, |guard| guard.len())
     }
 
+    /// How many peers are held besides `local_site`, whose own record is no peer.
+    #[must_use]
+    pub fn peers_besides(&self, local_site: &str) -> usize {
+        self.inner
+            .read()
+            .map_or(0, |guard| guard.keys().filter(|site| *site != local_site).count())
+    }
+
     /// Whether a record is held for `site`.
     #[must_use]
     pub fn knows(&self, site: &str) -> bool {
@@ -4136,6 +4144,23 @@ mod tests {
         );
         store.set_access(BTreeMap::from([("secret-pool".to_owned(), vec![gold()])]));
         store
+    }
+
+    #[test]
+    fn the_own_record_is_no_peer() {
+        let identities = PeerIdentities::new();
+        let record = || PeerRecord {
+            labels: BTreeMap::new(),
+            pins: Vec::new(),
+            signals: None,
+        };
+        identities.set(BTreeMap::from([("site-a".to_owned(), record())]));
+        assert_eq!(identities.peers_besides("site-a"), 0, "a lone site declares no peer");
+        identities.set(BTreeMap::from([
+            ("site-a".to_owned(), record()),
+            ("site-b".to_owned(), record()),
+        ]));
+        assert_eq!(identities.peers_besides("site-a"), 1);
     }
 
     #[test]
