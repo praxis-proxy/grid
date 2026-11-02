@@ -2921,12 +2921,13 @@ async fn spoke_in_time(
     remote: SocketAddr,
     shutdown: &operator::shutdown::Shutdown,
 ) -> bool {
+    let mut first_byte = [0_u8; 1];
     let ready = tokio::select! {
         biased;
         () = shutdown.triggered() => return false,
-        ready = tokio::time::timeout(SIGNALS_SILENT_TIMEOUT, tcp.readable()) => ready,
+        ready = tokio::time::timeout(SIGNALS_SILENT_TIMEOUT, tcp.peek(&mut first_byte)) => ready,
     };
-    if matches!(ready, Ok(Ok(()))) {
+    if matches!(ready, Ok(Ok(bytes_read)) if bytes_read > 0) {
         return true;
     }
     operator::metrics::record_signals_shed("silent");
