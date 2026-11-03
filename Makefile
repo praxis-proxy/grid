@@ -20,8 +20,8 @@ endif
 	coverage coverage-check \
 	mutants semver publish-dry-run \
 	require-container-engine \
-	images container operator-image gateway-image \
-	mock-providers-image overlay-sync-image fleet-dashboard-image fleet-dashboard-web glb-demo-images \
+	images container operator-image operator-fips-image gateway-image \
+	mock-providers-image overlay-sync-image overlay-sync-fips-image fleet-dashboard-image fleet-dashboard-web glb-demo-images \
 	kind-up kind-down \
 	dev-env dev-push \
 	setup-hooks \
@@ -204,6 +204,9 @@ images: container
 operator-image: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f deploy/operator/Containerfile -t grid-operator:latest .
 
+operator-fips-image: | require-container-engine
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f deploy/operator/Containerfile.fips -t grid-operator:latest-fips .
+
 gateway-image: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f deploy/gateway/Containerfile -t grid-gateway:latest .
 
@@ -212,6 +215,9 @@ mock-providers-image: | require-container-engine
 
 overlay-sync-image: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f crates/overlay-sync/Containerfile -t grid-overlay-sync:latest .
+
+overlay-sync-fips-image: | require-container-engine
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f crates/overlay-sync/Containerfile.fips -t grid-overlay-sync:latest-fips .
 
 fleet-dashboard-image: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f crates/fleet-dashboard/Containerfile -t grid-fleet-dashboard:latest .
@@ -316,9 +322,11 @@ help:
 	@echo "  container            build operator image as PROJECT_IMAGE"
 	@echo "  images               alias for container"
 	@echo "  operator-image       build operator container image"
+	@echo "  operator-fips-image  build operator FIPS container image on UBI 9"
 	@echo "  gateway-image        build gateway container image"
 	@echo "  mock-providers-image build mock-providers container image"
 	@echo "  overlay-sync-image   build overlay-sync sidecar image"
+	@echo "  overlay-sync-fips-image build overlay-sync FIPS sidecar image on UBI 9"
 	@echo "  fleet-dashboard-image build fleet dashboard image (opt-in hub web UI)"
 	@echo "  fleet-dashboard-web   build the dashboard UI and stage it for cargo build"
 	@echo "  glb-demo-images      build all Grid images tagged :glb-demo"

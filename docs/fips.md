@@ -12,6 +12,24 @@ routes the TLS stacks through system openssl instead of rustls:
 
 Default builds keep rustls and are unchanged.
 
+## Runtime images
+
+The deployable FIPS images use the same opt-in feature set and dynamically link
+to the system OpenSSL libraries. They are built on Rust 1.96 and run on a pinned
+Red Hat UBI 9 minimal image that includes OpenSSL's FIPS provider:
+
+| Component | Containerfile | Local build target | Release tag |
+| --- | --- | --- | --- |
+| Operator | `deploy/operator/Containerfile.fips` | `make operator-fips-image` | `grid-operator:<version>-fips` |
+| Overlay sync | `crates/overlay-sync/Containerfile.fips` | `make overlay-sync-fips-image` | `grid-overlay-sync:<version>-fips` |
+
+The standard Alpine images are unchanged. The FIPS images require a host running
+with `fips=1`; UBI's OpenSSL follows the host FIPS state and activates the
+provider. For example, a release image is
+`ghcr.io/praxis-proxy/grid-operator:0.3.0-fips`. The matching overlay-sync image
+uses the same tag suffix. These images select the FIPS code path at build time;
+they do not enable FIPS mode on the host.
+
 The `fips` feature also routes certificate keygen, signing, verification, and
 fingerprint hashing (peer identity and pin matching) through system openssl, so
 no identity crypto runs on ring or the sha2 crate. Keygen uses OpenSSL EVP, which
