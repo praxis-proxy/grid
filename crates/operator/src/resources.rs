@@ -41,6 +41,15 @@ pub(crate) mod provider_config;
 ///
 /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
 pub(crate) mod provider_metrics;
+/// Pure regional and sovereignty policy eligibility evaluator.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Stage 3 evaluator is consumed by the Stage 4 overlay integration"
+    )
+)]
+pub(crate) mod regional_policy;
 /// Pure overlay renderer for Praxis `intelligent_route` routing candidates.
 pub mod routing_overlay;
 /// Secret builders for grid TLS certificates.
