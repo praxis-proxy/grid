@@ -63,6 +63,8 @@ RUN rpm -q openssl-libs openssl-fips-provider-so ca-certificates \
 COPY --from=builder --chown=root:root --chmod=0555 \
     /usr/local/bin/grid-overlay-sync /usr/local/bin/grid-overlay-sync
 
+RUN ["/usr/local/bin/grid-overlay-sync", "--version"]
+
 USER 100:101
 
 EXPOSE 9091
