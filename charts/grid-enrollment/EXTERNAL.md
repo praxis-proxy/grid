@@ -253,7 +253,10 @@ Each member owns its local GridSite, including its public gateway and signals
 endpoints. An observer watches changes and returns only selected public spec
 fields. The hub distributes remote records to the other selected members and
 supplies `grid-operator-config` with their site name. It never copies a record
-back to its source or replicates health/status. The Local operator then polls
+back to its source or replicates health/status. A member with no gateway, such as
+a consumer-only site, is still distributed with `gatewayEndpoint: null`: peers
+admit it as a caller and never dial it, and poll it only if it declares a
+signals endpoint. The Local operator then polls
 the peer's provider catalog and signals; no InferenceProvider copies or SWIM
 key distribution are needed.
 
