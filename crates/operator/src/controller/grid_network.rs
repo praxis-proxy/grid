@@ -11992,6 +11992,7 @@ mod tests {
             name: name.to_owned(),
             namespace: ns.to_owned(),
             site_name: None,
+            regional_policy: None,
             model_discovery_contract_version: None,
             provider_hop_endpoints: Vec::new(),
             praxis_config: None,

@@ -176,6 +176,22 @@ const (
 	GridNetworkConsumerGatewaysItemPraxisConfigSiteRouterGridSiteRoute    GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter = "gridSiteRoute"
 )
 
+// GridNetworkConsumerGatewaysItemRegionalPolicyCrossRegionFallback is a string enumeration.
+type GridNetworkConsumerGatewaysItemRegionalPolicyCrossRegionFallback string
+
+const (
+	GridNetworkConsumerGatewaysItemRegionalPolicyCrossRegionFallbackAllow GridNetworkConsumerGatewaysItemRegionalPolicyCrossRegionFallback = "allow"
+	GridNetworkConsumerGatewaysItemRegionalPolicyCrossRegionFallbackDeny  GridNetworkConsumerGatewaysItemRegionalPolicyCrossRegionFallback = "deny"
+)
+
+// GridNetworkConsumerGatewaysItemRegionalPolicyMode is a string enumeration.
+type GridNetworkConsumerGatewaysItemRegionalPolicyMode string
+
+const (
+	GridNetworkConsumerGatewaysItemRegionalPolicyModeAffinity GridNetworkConsumerGatewaysItemRegionalPolicyMode = "affinity"
+	GridNetworkConsumerGatewaysItemRegionalPolicyModeLocked   GridNetworkConsumerGatewaysItemRegionalPolicyMode = "locked"
+)
+
 // GridNetworkMembershipMode is a string enumeration.
 type GridNetworkMembershipMode string
 
@@ -607,6 +623,22 @@ type GridNetworkConsumerGatewaysItemProviderHopEndpointsItem struct {
 	Transport EndpointTransport `json:"transport"`
 }
 
+// GridNetworkConsumerGatewaysItemRegionalPolicy Regional eligibility and preference policy for this gateway's overlay.
+// The policy applies to every capability rendered for this gateway. When absent, Grid preserves the existing unconstrained routing behavior. Per-route overrides are outside this contract.
+type GridNetworkConsumerGatewaysItemRegionalPolicy struct {
+	// Unordered hard region allowlist for locked mode.
+	AllowedRegions []string `json:"allowedRegions,omitempty"`
+	// Independent hard sovereignty-zone allowlist for either mode.
+	AllowedSovereigntyZones []string `json:"allowedSovereigntyZones,omitempty"`
+	// Whether affinity routing may consider candidates outside preferred regions.
+	CrossRegionFallback *GridNetworkConsumerGatewaysItemRegionalPolicyCrossRegionFallback `json:"crossRegionFallback,omitempty"`
+	// Whether regions are preferred or form a hard eligibility boundary.
+	Mode GridNetworkConsumerGatewaysItemRegionalPolicyMode `json:"mode"`
+	// Unordered preferred-region set for affinity mode.
+	// When absent, the operator derives the preferred region from the trusted [GridSite] resolved through [GatewayRef::site_name].
+	PreferredRegions []string `json:"preferredRegions,omitempty"`
+}
+
 // GridNetworkConsumerGatewaysItem Reference to a Praxis Gateway that participates in this grid.
 type GridNetworkConsumerGatewaysItem struct {
 	// Model-discovery contract version supported by the running gateway.
@@ -622,6 +654,9 @@ type GridNetworkConsumerGatewaysItem struct {
 	PraxisConfig *GridNetworkConsumerGatewaysItemPraxisConfig `json:"praxisConfig,omitempty"`
 	// Explicit mTLS provider-hop endpoints for the embedded grid-gateway serving config. With the default praxisConfig.siteRouter intelligentRoute this allowlist is independent of praxisConfig, so a missing or disabled generated Praxis config cannot alter embedded serving behavior. With gridSiteRoute the hops are the generated config's mutual TLS endpoints instead, and this must be empty. Every entry must declare mutual_tls and a nonblank SNI. The embedded gateway compares each declaration against the loaded Praxis load-balancer's verified mTLS backend before it sends provider-hop context. Changing Praxis backend transport requires a gateway restart while gridServing is enabled.
 	ProviderHopEndpoints []GridNetworkConsumerGatewaysItemProviderHopEndpointsItem `json:"providerHopEndpoints,omitempty"`
+	// Regional eligibility and preference policy for this gateway's overlay.
+	// The policy applies to every capability rendered for this gateway. When absent, Grid preserves the existing unconstrained routing behavior. Per-route overrides are outside this contract.
+	RegionalPolicy *GridNetworkConsumerGatewaysItemRegionalPolicy `json:"regionalPolicy,omitempty"`
 	// Local site name for the intelligent_route overlay generated for this gateway.
 	// Identifies which [GridSite] this gateway's cluster represents. Praxis uses local_site to score candidates running on the same site higher than remote candidates.
 	// When absent, the [GridNetwork] metadata name is used as a fallback. This is correct for single-site networks where the network name and site name are the same. Multi-site networks should set this to the [GridSite] name for the cluster hosting this gateway.

@@ -729,6 +729,35 @@ func (in *GridNetworkConsumerGatewaysItemProviderHopEndpointsItem) DeepCopy() *G
 	return out
 }
 
+func (in *GridNetworkConsumerGatewaysItemRegionalPolicy) DeepCopyInto(out *GridNetworkConsumerGatewaysItemRegionalPolicy) {
+	*out = *in
+	if in.AllowedRegions != nil {
+		out.AllowedRegions = make([]string, len(in.AllowedRegions))
+		copy(out.AllowedRegions, in.AllowedRegions)
+	}
+	if in.AllowedSovereigntyZones != nil {
+		out.AllowedSovereigntyZones = make([]string, len(in.AllowedSovereigntyZones))
+		copy(out.AllowedSovereigntyZones, in.AllowedSovereigntyZones)
+	}
+	if in.CrossRegionFallback != nil {
+		x := *in.CrossRegionFallback
+		out.CrossRegionFallback = &x
+	}
+	if in.PreferredRegions != nil {
+		out.PreferredRegions = make([]string, len(in.PreferredRegions))
+		copy(out.PreferredRegions, in.PreferredRegions)
+	}
+}
+
+func (in *GridNetworkConsumerGatewaysItemRegionalPolicy) DeepCopy() *GridNetworkConsumerGatewaysItemRegionalPolicy {
+	if in == nil {
+		return nil
+	}
+	out := new(GridNetworkConsumerGatewaysItemRegionalPolicy)
+	in.DeepCopyInto(out)
+	return out
+}
+
 func (in *GridNetworkConsumerGatewaysItem) DeepCopyInto(out *GridNetworkConsumerGatewaysItem) {
 	*out = *in
 	if in.ModelDiscoveryContractVersion != nil {
@@ -744,6 +773,10 @@ func (in *GridNetworkConsumerGatewaysItem) DeepCopyInto(out *GridNetworkConsumer
 		for i := range in.ProviderHopEndpoints {
 			in.ProviderHopEndpoints[i].DeepCopyInto(&out.ProviderHopEndpoints[i])
 		}
+	}
+	if in.RegionalPolicy != nil {
+		out.RegionalPolicy = new(GridNetworkConsumerGatewaysItemRegionalPolicy)
+		in.RegionalPolicy.DeepCopyInto(out.RegionalPolicy)
 	}
 	if in.SiteName != nil {
 		x := *in.SiteName

@@ -3,7 +3,7 @@
 //! The top-level tenancy boundary for the AI Grid. A cluster
 //! can host multiple `GridNetworks` for multi-tenancy.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crdt::GCounter;
 use kube::CustomResource;
@@ -43,6 +43,169 @@ pub enum RoutingPolicy {
     /// KV-cache pressure, latency) should drive routing decisions across
     /// sites.
     ScoreFirst,
+}
+
+// ---------------------------------------------------------------------------
+// Regional policy
+// ---------------------------------------------------------------------------
+
+/// Maximum number of regions or sovereignty zones accepted by one policy set.
+pub const REGIONAL_POLICY_MAX_VALUES: usize = 64;
+
+/// Maximum length of one region or sovereignty-zone identifier.
+pub const REGIONAL_POLICY_MAX_VALUE_LENGTH: usize = 253;
+
+/// Regional eligibility and preference mode for a consumer gateway.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RegionalPolicyMode {
+    /// Prefer configured or gateway-local regions, with optional explicit fallback.
+    Affinity,
+    /// Exclude every candidate outside an explicit region allowlist.
+    Locked,
+}
+
+/// Whether affinity routing may consider candidates outside preferred regions.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CrossRegionFallback {
+    /// Allow fallback only when no preferred-region candidate can accept new work.
+    Allow,
+    /// Do not route outside preferred regions.
+    #[default]
+    Deny,
+}
+
+/// Per-gateway regional routing contract.
+///
+/// The policy applies to every capability in the containing [`GatewayRef`]'s
+/// edge-local overlay. It uses trusted [`GridSite`] metadata; caller-supplied
+/// region headers are not policy inputs.
+///
+/// [`GridSite`]: crate::crd::grid_site::GridSite
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": "self.mode != 'affinity' || !has(self.allowedRegions)",
+    "message": "allowedRegions is not valid in affinity mode"
+}, {
+    "rule": "self.mode != 'locked' || has(self.allowedRegions)",
+    "message": "allowedRegions is required in locked mode"
+}, {
+    "rule": "self.mode != 'locked' || !has(self.preferredRegions)",
+    "message": "preferredRegions is not valid in locked mode"
+}, {
+    "rule": "self.mode != 'locked' || !has(self.crossRegionFallback)",
+    "message": "crossRegionFallback is not valid in locked mode"
+}]))]
+pub struct RegionalPolicy {
+    /// Whether regions are preferred or form a hard eligibility boundary.
+    pub mode: RegionalPolicyMode,
+
+    /// Unordered preferred-region set for affinity mode.
+    ///
+    /// When absent, the operator derives the preferred region from the trusted
+    /// [`GridSite`] resolved through [`GatewayRef::site_name`].
+    #[schemars(
+        length(min = 1, max = 64),
+        inner(length(min = 1, max = 253), regex(pattern = r"^\S+$")),
+        extend("x-kubernetes-list-type" = "set")
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_regions: Option<Vec<String>>,
+
+    /// Unordered hard region allowlist for locked mode.
+    #[schemars(
+        length(min = 1, max = 64),
+        inner(length(min = 1, max = 253), regex(pattern = r"^\S+$")),
+        extend("x-kubernetes-list-type" = "set")
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_regions: Option<Vec<String>>,
+
+    /// Explicit cross-region fallback behavior for affinity mode.
+    ///
+    /// Omission is equivalent to [`CrossRegionFallback::Deny`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_region_fallback: Option<CrossRegionFallback>,
+
+    /// Independent hard sovereignty-zone allowlist for either mode.
+    #[schemars(
+        length(min = 1, max = 64),
+        inner(length(min = 1, max = 253), regex(pattern = r"^\S+$")),
+        extend("x-kubernetes-list-type" = "set")
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_sovereignty_zones: Option<Vec<String>>,
+}
+
+impl RegionalPolicy {
+    /// Return the effective affinity fallback behavior.
+    #[must_use]
+    pub fn effective_cross_region_fallback(&self) -> CrossRegionFallback {
+        self.cross_region_fallback.unwrap_or_default()
+    }
+
+    /// Validate mode-specific fields and bounded policy sets defensively.
+    ///
+    /// # Errors
+    ///
+    /// Returns an explanatory message when the policy combines incompatible
+    /// fields or contains an invalid set value.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.mode {
+            RegionalPolicyMode::Affinity => {
+                if self.allowed_regions.is_some() {
+                    return Err("allowedRegions is not valid in affinity mode".to_owned());
+                }
+                validate_regional_policy_set("preferredRegions", self.preferred_regions.as_deref())?;
+            },
+            RegionalPolicyMode::Locked => {
+                if self.allowed_regions.is_none() {
+                    return Err("allowedRegions is required in locked mode".to_owned());
+                }
+                if self.preferred_regions.is_some() {
+                    return Err("preferredRegions is not valid in locked mode".to_owned());
+                }
+                if self.cross_region_fallback.is_some() {
+                    return Err("crossRegionFallback is not valid in locked mode".to_owned());
+                }
+                validate_regional_policy_set("allowedRegions", self.allowed_regions.as_deref())?;
+            },
+        }
+        validate_regional_policy_set("allowedSovereigntyZones", self.allowed_sovereignty_zones.as_deref())
+    }
+}
+
+/// Validate one optional bounded set in the regional policy contract.
+fn validate_regional_policy_set(field: &'static str, values: Option<&[String]>) -> Result<(), String> {
+    let Some(values) = values else {
+        return Ok(());
+    };
+    if values.is_empty() {
+        return Err(format!("{field} must not be empty when present"));
+    }
+    if values.len() > REGIONAL_POLICY_MAX_VALUES {
+        return Err(format!(
+            "{field} must contain at most {REGIONAL_POLICY_MAX_VALUES} values"
+        ));
+    }
+    let mut seen = HashSet::with_capacity(values.len());
+    for value in values {
+        if value.is_empty() || value.chars().any(char::is_whitespace) {
+            return Err(format!("{field} contains a blank or whitespace-bearing value"));
+        }
+        if value.chars().count() > REGIONAL_POLICY_MAX_VALUE_LENGTH {
+            return Err(format!(
+                "{field} contains a value longer than {REGIONAL_POLICY_MAX_VALUE_LENGTH} characters"
+            ));
+        }
+        if !seen.insert(value.as_str()) {
+            return Err(format!("{field} contains duplicate value {value:?}"));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -475,7 +638,7 @@ pub enum BudgetPolicyValidationError {
 /// found, in declaration order: a blank `tenantId`, a duplicate `tenantId`, a
 /// negative `capUsd`, or a non-finite `capUsd`.
 pub fn validate_budget_policy(policy: &BudgetPolicyConfig) -> Result<(), BudgetPolicyValidationError> {
-    let mut seen_tenant_ids = std::collections::HashSet::new();
+    let mut seen_tenant_ids = HashSet::new();
     for tenant in &policy.tenants {
         if tenant.tenant_id.trim().is_empty() {
             return Err(BudgetPolicyValidationError::BlankTenantId);
@@ -855,6 +1018,14 @@ pub struct GatewayRef {
     /// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
     #[serde(default, alias = "localSiteName")]
     pub site_name: Option<String>,
+
+    /// Regional eligibility and preference policy for this gateway's overlay.
+    ///
+    /// The policy applies to every capability rendered for this gateway. When
+    /// absent, Grid preserves the existing unconstrained routing behavior.
+    /// Per-route overrides are outside this contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regional_policy: Option<RegionalPolicy>,
 
     /// Model-discovery contract version supported by the running gateway.
     ///
@@ -1989,6 +2160,228 @@ mod tests {
         assert!(gw.site_name.is_none(), "absent siteName must default to None");
     }
 
+    // -----------------------------------------------------------------------
+    // RegionalPolicy tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn regional_policy_absent_preserves_gateway_compatibility() {
+        let gateway: GatewayRef = serde_json::from_value(serde_json::json!({
+            "name": "gw",
+            "namespace": "ns"
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            gateway.regional_policy.is_none(),
+            "an omitted regionalPolicy must preserve unconstrained behavior"
+        );
+        let serialized = serde_json::to_value(gateway).unwrap_or_else(|_| std::process::abort());
+        assert!(
+            serialized.get("regionalPolicy").is_none(),
+            "an absent regionalPolicy must remain omitted on serialization"
+        );
+    }
+
+    #[test]
+    fn affinity_policy_round_trips_with_explicit_sets() {
+        let gateway: GatewayRef = serde_json::from_value(serde_json::json!({
+            "name": "gw",
+            "namespace": "ns",
+            "regionalPolicy": {
+                "mode": "affinity",
+                "preferredRegions": ["east", "west"],
+                "crossRegionFallback": "allow",
+                "allowedSovereigntyZones": ["eu"]
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let policy = gateway
+            .regional_policy
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(policy.mode, RegionalPolicyMode::Affinity);
+        assert_eq!(policy.effective_cross_region_fallback(), CrossRegionFallback::Allow);
+        assert!(policy.validate().is_ok(), "the approved affinity shape must be valid");
+    }
+
+    #[test]
+    fn affinity_policy_defaults_fallback_to_deny() {
+        let policy = RegionalPolicy {
+            mode: RegionalPolicyMode::Affinity,
+            preferred_regions: None,
+            allowed_regions: None,
+            cross_region_fallback: None,
+            allowed_sovereignty_zones: None,
+        };
+        assert_eq!(
+            policy.effective_cross_region_fallback(),
+            CrossRegionFallback::Deny,
+            "omitting crossRegionFallback must fail closed"
+        );
+        assert!(
+            policy.validate().is_ok(),
+            "affinity may derive its preferred region from the gateway GridSite"
+        );
+    }
+
+    #[test]
+    fn locked_policy_requires_only_an_allowed_region_set() {
+        let policy = RegionalPolicy {
+            mode: RegionalPolicyMode::Locked,
+            preferred_regions: None,
+            allowed_regions: Some(vec!["east".to_owned(), "west".to_owned()]),
+            cross_region_fallback: None,
+            allowed_sovereignty_zones: Some(vec!["eu".to_owned()]),
+        };
+        assert!(policy.validate().is_ok(), "the approved locked shape must be valid");
+    }
+
+    #[test]
+    fn regional_policy_rejects_mode_incompatible_fields() {
+        let affinity = RegionalPolicy {
+            mode: RegionalPolicyMode::Affinity,
+            preferred_regions: None,
+            allowed_regions: Some(vec!["east".to_owned()]),
+            cross_region_fallback: None,
+            allowed_sovereignty_zones: None,
+        };
+        assert_eq!(
+            affinity.validate(),
+            Err("allowedRegions is not valid in affinity mode".to_owned())
+        );
+
+        for policy in [
+            RegionalPolicy {
+                mode: RegionalPolicyMode::Locked,
+                preferred_regions: None,
+                allowed_regions: None,
+                cross_region_fallback: None,
+                allowed_sovereignty_zones: None,
+            },
+            RegionalPolicy {
+                mode: RegionalPolicyMode::Locked,
+                preferred_regions: Some(vec!["east".to_owned()]),
+                allowed_regions: Some(vec!["east".to_owned()]),
+                cross_region_fallback: None,
+                allowed_sovereignty_zones: None,
+            },
+            RegionalPolicy {
+                mode: RegionalPolicyMode::Locked,
+                preferred_regions: None,
+                allowed_regions: Some(vec!["east".to_owned()]),
+                cross_region_fallback: Some(CrossRegionFallback::Deny),
+                allowed_sovereignty_zones: None,
+            },
+        ] {
+            assert!(
+                policy.validate().is_err(),
+                "locked mode must reject missing allowedRegions, preferredRegions, and fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn regional_policy_rejects_invalid_set_values() {
+        for (values, expected_message) in [
+            (Vec::new(), "preferredRegions must not be empty when present"),
+            (
+                vec!["east".to_owned(), "east".to_owned()],
+                "preferredRegions contains duplicate value \"east\"",
+            ),
+            (
+                vec!["east region".to_owned()],
+                "preferredRegions contains a blank or whitespace-bearing value",
+            ),
+            (
+                vec!["x".repeat(REGIONAL_POLICY_MAX_VALUE_LENGTH + 1)],
+                "preferredRegions contains a value longer than 253 characters",
+            ),
+            (
+                (0..=REGIONAL_POLICY_MAX_VALUES)
+                    .map(|index| format!("r{index}"))
+                    .collect(),
+                "preferredRegions must contain at most 64 values",
+            ),
+        ] {
+            let policy = RegionalPolicy {
+                mode: RegionalPolicyMode::Affinity,
+                preferred_regions: Some(values),
+                allowed_regions: None,
+                cross_region_fallback: None,
+                allowed_sovereignty_zones: None,
+            };
+            assert_eq!(policy.validate(), Err(expected_message.to_owned()));
+        }
+    }
+
+    #[test]
+    fn regional_policy_schema_encodes_bounds_sets_and_mode_rules() {
+        let crd = crd_json();
+        let policy_schema = crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/consumerGateways/items/properties/regionalPolicy",
+            )
+            .unwrap_or_else(|| std::process::abort());
+        for field in ["preferredRegions", "allowedRegions", "allowedSovereigntyZones"] {
+            let field_schema = policy_schema
+                .pointer(&format!("/properties/{field}"))
+                .unwrap_or_else(|| std::process::abort());
+            assert_eq!(field_schema.get("minItems"), Some(&serde_json::json!(1)));
+            assert_eq!(field_schema.get("maxItems"), Some(&serde_json::json!(64)));
+            assert_eq!(
+                field_schema.get("x-kubernetes-list-type"),
+                Some(&serde_json::json!("set"))
+            );
+            assert_eq!(field_schema.pointer("/items/minLength"), Some(&serde_json::json!(1)));
+            assert_eq!(field_schema.pointer("/items/maxLength"), Some(&serde_json::json!(253)));
+            assert_eq!(
+                field_schema.pointer("/items/pattern"),
+                Some(&serde_json::json!(r"^\S+$"))
+            );
+        }
+        let rules = policy_schema
+            .get("x-kubernetes-validations")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        for expected_rule in [
+            "self.mode != 'affinity' || !has(self.allowedRegions)",
+            "self.mode != 'locked' || has(self.allowedRegions)",
+            "self.mode != 'locked' || !has(self.preferredRegions)",
+            "self.mode != 'locked' || !has(self.crossRegionFallback)",
+        ] {
+            assert!(
+                rules.iter().any(|validation| {
+                    validation.get("rule").and_then(serde_json::Value::as_str) == Some(expected_rule)
+                }),
+                "regionalPolicy schema must contain rule {expected_rule:?}"
+            );
+        }
+        assert_eq!(
+            policy_schema.pointer("/properties/mode/enum"),
+            Some(&serde_json::json!(["affinity", "locked"]))
+        );
+        assert_eq!(
+            policy_schema.pointer("/properties/crossRegionFallback/enum"),
+            Some(&serde_json::json!(["allow", "deny"]))
+        );
+    }
+
+    #[test]
+    fn regional_policy_rejects_unknown_fields() {
+        let result = serde_json::from_value::<GatewayRef>(serde_json::json!({
+            "name": "gw",
+            "namespace": "ns",
+            "regionalPolicy": {
+                "mode": "affinity",
+                "regionHeader": "x-region"
+            }
+        }));
+        assert!(
+            result.is_err(),
+            "caller-controlled policy inputs must not enter the contract"
+        );
+    }
+
     #[test]
     fn grid_network_crd_has_correct_group_and_plural() {
         let crd = crd_json();
@@ -2511,6 +2904,7 @@ mod tests {
             name: "gw".to_owned(),
             namespace: "ns".to_owned(),
             site_name: None,
+            regional_policy: None,
             model_discovery_contract_version: None,
             provider_hop_endpoints: Vec::new(),
             praxis_config: None,
