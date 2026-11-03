@@ -19,14 +19,17 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use serde::Serialize;
 
 use super::{
-    DemoMode, GlbDemoOptions, certs,
+    DemoMode, GlbDemoOptions, Membership, certs,
     external_provider::{self, ExternalProviderDescriptor},
     glb, kubectl, operator, safe_truncate_str,
 };
@@ -43,6 +46,20 @@ const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.7.0";
 
 /// Ordered cluster names in the combined-site scenario environment.
 const CLUSTERS: &[&str] = &["west", "central", "east"];
+
+/// The run's membership, set once by [`run`]. The assertions are plain `fn()` and read it here.
+static MEMBERSHIP: OnceLock<Membership> = OnceLock::new();
+
+/// The run's membership, Swim until [`run`] sets it.
+fn membership() -> Membership {
+    MEMBERSHIP.get().copied().unwrap_or_default()
+}
+
+/// Port the operator serves signals and its provider catalog on under Local membership.
+const SIGNALS_PORT: &str = "9091";
+
+/// Signals LoadBalancer Service the operator chart renders under Local membership.
+const SIGNALS_SERVICE: &str = "grid-operator-signals";
 
 /// Consumer gateway identity Secret name (matches Helm `gridIdentity.tlsSecretName`).
 const CONSUMER_TLS_SECRET: &str = "consumer-gateway-tls";
@@ -1273,6 +1290,140 @@ fn assert_site_auto_discovery() -> AssertionResult {
             start.elapsed(),
         ))
     }
+}
+
+/// Assert every site runs Local membership with poll signals and nothing from SWIM.
+fn assert_local_membership() -> AssertionResult {
+    let start = Instant::now();
+    let mut observed_facts = BTreeMap::new();
+    let mut all_ok = true;
+
+    for cluster in CLUSTERS {
+        let context = format!("kind-grid-combined-{cluster}");
+        let network = poll_until(
+            || {
+                let output = Command::new("kubectl")
+                    .args([
+                        "get",
+                        "gridnetwork/grid-combined-site",
+                        "--context",
+                        &context,
+                        "-o",
+                        "jsonpath={.status.phase},{.spec.membership.mode},{.spec.signalTransport.mode}",
+                    ])
+                    .output()?;
+                let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                Ok((output.status.success() && value == "Active,Local,poll").then_some(value))
+            },
+            Duration::from_secs(90),
+            Duration::from_secs(3),
+        );
+        let swim_service = kubectl_names(&context, &["svc", "grid-operator-swim", "-n", GRID_SYSTEM_NS])?;
+        let discovered = kubectl_names(
+            &context,
+            &["gridsites", "-A", "-l", "grid.praxis.fast/auto-discovered=true"],
+        )?;
+        let ok = network.is_ok() && swim_service.is_empty() && discovered.is_empty();
+        all_ok &= ok;
+        observed_facts.insert(
+            format!("{cluster}_network"),
+            serde_json::Value::String(network.unwrap_or_else(|error| error.to_string())),
+        );
+        observed_facts.insert(format!("{cluster}_swim_service"), serde_json::json!(swim_service));
+        observed_facts.insert(
+            format!("{cluster}_auto_discovered_sites"),
+            serde_json::json!(discovered),
+        );
+    }
+
+    if all_ok {
+        Ok(proof_success(
+            "Every GridNetwork is Active under Local membership with poll signals, no SWIM Service and no discovered GridSite",
+            observed_facts,
+            start.elapsed(),
+        ))
+    } else {
+        Ok(proof_failure(
+            "One or more sites is not running Local membership without SWIM",
+            observed_facts,
+            start.elapsed(),
+        ))
+    }
+}
+
+/// Assert every site holds both other sites as declared, pinned, Active peers with a signals endpoint.
+fn assert_local_declared_peers() -> AssertionResult {
+    let start = Instant::now();
+    let mut observed_facts = BTreeMap::new();
+    let mut all_ok = true;
+    let port_suffix = format!(":{PROVIDER_GATEWAY_PORT}");
+    let signals_suffix = format!(":{SIGNALS_PORT}");
+
+    for local in CLUSTERS {
+        let context = format!("kind-grid-combined-{local}");
+        for remote in CLUSTERS.iter().filter(|remote| *remote != local) {
+            let expected_pin = certs::site_certificate_fingerprint(remote)?;
+            let output = Command::new("kubectl")
+                .args([
+                    "get",
+                    "gridsite",
+                    remote,
+                    "--context",
+                    &context,
+                    "-o",
+                    "jsonpath={.status.phase}\t{.spec.gatewayEndpoint.address}\t{.spec.signalsEndpoint.address}\t{.spec.trust.canonicalFingerprints[0]}",
+                ])
+                .output()?;
+            let body = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let fields: Vec<&str> = body.split('\t').collect();
+            let ok = output.status.success()
+                && matches!(fields.as_slice(), [phase, gateway, signals, pin]
+                    if *phase == "Active"
+                        && gateway.ends_with(&port_suffix)
+                        && signals.ends_with(&signals_suffix)
+                        && *pin == expected_pin);
+            all_ok &= ok;
+            observed_facts.insert(
+                format!("{local}_peer_{remote}"),
+                serde_json::json!({ "ok": ok, "observed": body }),
+            );
+        }
+    }
+
+    if all_ok {
+        Ok(proof_success(
+            "Every site holds both other sites as Active declared peers pinned to their certificates, with signals endpoints",
+            observed_facts,
+            start.elapsed(),
+        ))
+    } else {
+        Ok(proof_failure(
+            "One or more declared Local peers is missing, unpinned or not Active",
+            observed_facts,
+            start.elapsed(),
+        ))
+    }
+}
+
+/// Names `kubectl get <args>` returns in `context`, empty when nothing matches.
+fn kubectl_names(context: &str, args: &[&str]) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args(["--context", context, "get"])
+        .args(args)
+        .args(["--ignore-not-found", "-o", "name"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "kubectl get {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Assert each consumer receives and accepts a versioned overlay.
@@ -2978,8 +3129,42 @@ fn assert_operator_restart_recovery() -> AssertionResult {
         )
         .is_ok();
 
-        // Verify SWIM membership from the reconciled GridNetwork status.
-        let swim_recovered = if deploy_recovered {
+        // Local has no connectedSites: the GridNetwork and both declared peers return to Active.
+        let swim_recovered = if deploy_recovered && membership() == Membership::Local {
+            poll_until(
+                || {
+                    let network = Command::new("kubectl")
+                        .args([
+                            "get",
+                            "gridnetwork/grid-combined-site",
+                            "--context",
+                            &context,
+                            "-o",
+                            "jsonpath={.status.phase}",
+                        ])
+                        .output()?;
+                    let mut active = String::from_utf8_lossy(&network.stdout).trim() == "Active";
+                    for remote in CLUSTERS.iter().filter(|remote| **remote != *cluster) {
+                        let site = Command::new("kubectl")
+                            .args([
+                                "get",
+                                "gridsite",
+                                remote,
+                                "--context",
+                                &context,
+                                "-o",
+                                "jsonpath={.status.phase}",
+                            ])
+                            .output()?;
+                        active &= String::from_utf8_lossy(&site.stdout).trim() == "Active";
+                    }
+                    Ok(active.then_some(()))
+                },
+                Duration::from_secs(60),
+                Duration::from_secs(3),
+            )
+            .is_ok()
+        } else if deploy_recovered {
             poll_until(
                 || {
                     let membership_output = Command::new("kubectl")
@@ -3054,7 +3239,7 @@ fn assert_operator_restart_recovery() -> AssertionResult {
 
     if all_recovered {
         Ok(proof_success(
-            "All three operators restarted sequentially with SWIM re-convergence and routing proof after each",
+            "All three operators restarted sequentially with membership re-convergence and routing proof after each",
             observed_facts,
             start.elapsed(),
         ))
@@ -4598,6 +4783,9 @@ fn render_config(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut config: serde_yaml::Value = serde_yaml::from_str(content)?;
     apply_image_overrides(&mut config)?;
+    if membership() == Membership::Local {
+        apply_local_membership(&mut config)?;
+    }
     match (external_provider, external_site) {
         (Some(ext), Some(site)) => materialize_external_provider_stack(&mut config, ext, site)?,
         (Some(_), None) => {
@@ -4606,6 +4794,78 @@ fn render_config(
         _ => {},
     }
     Ok(serde_yaml::to_string(&config)?)
+}
+
+/// Rewrite each site's operator and grid-site stacks for Local membership.
+///
+/// The operator runs no SWIM and serves signals on a LoadBalancer, and the GridNetwork
+/// declares Local with no discovery label. Peers are declared after the gateways are up.
+fn apply_local_membership(config: &mut serde_yaml::Value) -> Result<(), Box<dyn std::error::Error>> {
+    let stacks = config
+        .get_mut("spec")
+        .and_then(|spec| spec.get_mut("stacks"))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .ok_or("forge config missing spec.stacks mapping")?;
+    let local: serde_yaml::Value = serde_yaml::from_str("membership: {source: Local}")?;
+
+    for cluster in CLUSTERS {
+        let operator = format!("{cluster}-operator-base");
+        for step in stack_steps(stacks, &operator)? {
+            match step.get("type").and_then(serde_yaml::Value::as_str) {
+                Some("helm") => {
+                    let values = step_values(step, &operator)?;
+                    values.insert("swim".into(), serde_yaml::from_str(&format!("siteName: {cluster}"))?);
+                    values.insert("grid".into(), local.clone());
+                    values.insert("signals".into(), serde_yaml::from_str("service: {type: LoadBalancer}")?);
+                },
+                Some("capture") => {
+                    let capture = step.as_mapping_mut().ok_or("capture step is not a mapping")?;
+                    capture.insert("resource".into(), format!("svc/{SIGNALS_SERVICE}").into());
+                    capture.insert("key".into(), "signals-lb-ip".into());
+                },
+                _ => {},
+            }
+        }
+
+        let site = format!("{cluster}-site");
+        for step in stack_steps(stacks, &site)? {
+            if step.get("type").and_then(serde_yaml::Value::as_str) != Some("helm") {
+                continue;
+            }
+            let values = step_values(step, &site)?;
+            values.remove("commonLabels");
+            if let Some(network) = values
+                .get_mut("gridNetwork")
+                .and_then(serde_yaml::Value::as_mapping_mut)
+            {
+                network.remove("swim");
+            }
+            values.insert("grid".into(), local.clone());
+        }
+    }
+    Ok(())
+}
+
+/// The steps of `name` in the Forge stacks mapping.
+fn stack_steps<'config>(
+    stacks: &'config mut serde_yaml::Mapping,
+    name: &str,
+) -> Result<&'config mut Vec<serde_yaml::Value>, Box<dyn std::error::Error>> {
+    stacks
+        .get_mut(name)
+        .and_then(|stack| stack.get_mut("steps"))
+        .and_then(serde_yaml::Value::as_sequence_mut)
+        .ok_or_else(|| format!("stack '{name}' has no steps").into())
+}
+
+/// The Helm values of one step in stack `name`.
+fn step_values<'step>(
+    step: &'step mut serde_yaml::Value,
+    name: &str,
+) -> Result<&'step mut serde_yaml::Mapping, Box<dyn std::error::Error>> {
+    step.get_mut("values")
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .ok_or_else(|| format!("stack '{name}' helm step has no values").into())
 }
 
 /// Forge stack name for the provider gateway with an external credential mount.
@@ -5115,14 +5375,21 @@ fn deploy_setup(context: &CombinedSiteContext) -> Result<OverlayState, Box<dyn s
     eprintln!("  [OK] Consumer gateways deployed");
 
     eprintln!();
-    eprintln!(
-        "[SETUP {}/{}] SWIM discovery and trust authorization",
-        next(),
-        total_phases
-    );
-
-    configure_swim_peers(&context.forge_bin, &context.resolved_config)?;
-    authorize_discovered_sites()?;
+    match membership() {
+        Membership::Swim => {
+            eprintln!(
+                "[SETUP {}/{}] SWIM discovery and trust authorization",
+                next(),
+                total_phases
+            );
+            configure_swim_peers(&context.forge_bin, &context.resolved_config)?;
+            authorize_discovered_sites()?;
+        },
+        Membership::Local => {
+            eprintln!("[SETUP {}/{}] Declaring Local peers", next(), total_phases);
+            declare_local_peers()?;
+        },
+    }
 
     eprintln!();
     eprintln!(
@@ -5175,13 +5442,26 @@ fn run_quick_scenarios(
     eprintln!("[SCENARIO {}] Verify component deployment", scenario());
     run_and_insert(&mut results, "component_deployment", assert_component_deployment);
 
-    eprintln!();
-    eprintln!("[SCENARIO {}] Verify SWIM convergence", scenario());
-    run_and_insert(&mut results, "swim_convergence", assert_swim_convergence);
+    match membership() {
+        Membership::Swim => {
+            eprintln!();
+            eprintln!("[SCENARIO {}] Verify SWIM convergence", scenario());
+            run_and_insert(&mut results, "swim_convergence", assert_swim_convergence);
 
-    eprintln!();
-    eprintln!("[SCENARIO {}] Verify site auto-discovery", scenario());
-    run_and_insert(&mut results, "site_auto_discovery", assert_site_auto_discovery);
+            eprintln!();
+            eprintln!("[SCENARIO {}] Verify site auto-discovery", scenario());
+            run_and_insert(&mut results, "site_auto_discovery", assert_site_auto_discovery);
+        },
+        Membership::Local => {
+            eprintln!();
+            eprintln!("[SCENARIO {}] Verify Local membership runs no SWIM", scenario());
+            run_and_insert(&mut results, "local_membership", assert_local_membership);
+
+            eprintln!();
+            eprintln!("[SCENARIO {}] Verify declared Local peers", scenario());
+            run_and_insert(&mut results, "local_declared_peers", assert_local_declared_peers);
+        },
+    }
 
     if let (Some(site), Some(ext)) = (external_provider_site, external_provider) {
         eprintln!();
@@ -5498,8 +5778,81 @@ fn configure_swim_peers(_forge_bin: &Path, _resolved_config: &Path) -> Result<()
     Ok(())
 }
 
+/// Declare every site to the other two as a Local peer.
+///
+/// Each GridSite carries the peer's provider gateway and signals addresses, pinned to its
+/// staged certificate. The signals server name is the one that certificate carries.
+fn declare_local_peers() -> Result<(), Box<dyn std::error::Error>> {
+    const PEER_TIMEOUT: Duration = Duration::from_secs(180);
+
+    let mut endpoints = BTreeMap::new();
+    for cluster in CLUSTERS {
+        let gateway = read_lb_ip(cluster, PROVIDER_GATEWAY_SERVICE)?;
+        let signals = read_lb_ip(cluster, SIGNALS_SERVICE)?;
+        eprintln!("  {cluster}: gateway {gateway}, signals {signals}");
+        endpoints.insert(*cluster, (gateway, signals));
+    }
+
+    for local in CLUSTERS {
+        let mut peers = serde_json::Map::new();
+        for remote in CLUSTERS.iter().filter(|remote| *remote != local) {
+            let (gateway, signals) = endpoints.get(remote).ok_or("missing peer endpoints")?;
+            peers.insert(
+                (*remote).to_owned(),
+                serde_json::json!({
+                    "address": format!("{gateway}:{PROVIDER_GATEWAY_PORT}"),
+                    "digest": certs::site_certificate_fingerprint(remote)?,
+                    "signalsEndpoint": {
+                        "address": format!("{signals}:{SIGNALS_PORT}"),
+                        "serverName": format!("{remote}.grid.internal"),
+                    },
+                }),
+            );
+        }
+        let context = format!("kind-grid-combined-{local}");
+        let output = Command::new("helm")
+            .args([
+                "upgrade",
+                "grid-site",
+                "charts/grid-site",
+                "--version",
+                "0.1.0",
+                "--namespace",
+                GRID_SYSTEM_NS,
+                "--kube-context",
+                &context,
+                "--reuse-values",
+                "--set-json",
+            ])
+            .arg(format!("peers={}", serde_json::Value::Object(peers)))
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "{local}: declaring Local peers failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        eprintln!("  [OK] {local}: peers declared");
+    }
+
+    for local in CLUSTERS {
+        let context = format!("kind-grid-combined-{local}");
+        for remote in CLUSTERS.iter().filter(|remote| *remote != local) {
+            operator::wait_for_gridsite_phase(&context, remote, "Active", PEER_TIMEOUT)?;
+        }
+        eprintln!("  [OK] {local}: both declared peers Active");
+    }
+    Ok(())
+}
+
 /// Read the SWIM LoadBalancer IP for a cluster directly from Kubernetes.
 fn read_swim_lb_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error>> {
+    read_lb_ip(cluster, "grid-operator-swim")
+}
+
+/// Read the ingress IP of LoadBalancer `service` in a cluster.
+fn read_lb_ip(cluster: &str, service: &str) -> Result<String, Box<dyn std::error::Error>> {
     let context = format!("kind-grid-combined-{cluster}");
     let output = Command::new("kubectl")
         .args([
@@ -5509,7 +5862,7 @@ fn read_swim_lb_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error>> 
             GRID_SYSTEM_NS,
             "get",
             "svc",
-            "grid-operator-swim",
+            service,
             "-o",
             "jsonpath={.status.loadBalancer.ingress[0].ip}",
         ])
@@ -5517,7 +5870,7 @@ fn read_swim_lb_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error>> 
 
     if !output.status.success() {
         return Err(format!(
-            "{cluster}: cannot read SWIM service: {}",
+            "{cluster}: cannot read Service {service}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )
         .into());
@@ -5525,7 +5878,7 @@ fn read_swim_lb_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error>> 
 
     let ip = String::from_utf8(output.stdout)?.trim().to_owned();
     if ip.is_empty() {
-        return Err(format!("{cluster}: SWIM LoadBalancer has no ingress IP").into());
+        return Err(format!("{cluster}: LoadBalancer {service} has no ingress IP").into());
     }
 
     Ok(ip)
@@ -6790,7 +7143,7 @@ fn lifecycle_assert_global_convergence(site: &str) -> AssertionResult {
     }
 
     Ok(proof_success(
-        "secondary candidate converged on all sites via SWIM; routing verified from every consumer",
+        "secondary candidate converged on all sites; routing verified from every consumer",
         facts,
         start.elapsed(),
     ))
@@ -7417,7 +7770,14 @@ fn kind_cluster_exists(cluster_name: &str) -> Result<bool, Box<dyn std::error::E
     clippy::too_many_lines,
     reason = "main demo orchestration function with error handling; splitting obscures the complete flow"
 )]
-pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run(
+    forge_config: &Path,
+    membership: Membership,
+    options: &GlbDemoOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    MEMBERSHIP
+        .set(membership)
+        .map_err(|held| format!("combined-site membership is already {held:?}"))?;
     let mode = options.mode();
 
     // Resolve external provider (reusing GLB demo logic)
@@ -7461,6 +7821,7 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
             eprintln!("{OUTPUT_RULE}");
             eprintln!("Grid Combined-Site Demo");
             eprintln!("Mode: {}", if mode == DemoMode::Quick { "quick" } else { "full" });
+            eprintln!("Membership: {membership:?}");
             eprintln!("Config: {}", forge_config.display());
             eprintln!("{OUTPUT_RULE}");
 
@@ -7562,7 +7923,11 @@ pub(crate) fn run(forge_config: &Path, options: &GlbDemoOptions) -> Result<(), B
     let evidence = Evidence {
         schema_version: EVIDENCE_SCHEMA_VERSION.to_owned(),
         mode: if mode == DemoMode::Quick { "quick" } else { "full" }.to_owned(),
-        topology: "combined-site".to_owned(),
+        topology: match membership {
+            Membership::Swim => "combined-site",
+            Membership::Local => "combined-site-local",
+        }
+        .to_owned(),
         clusters: CLUSTERS.iter().map(|&s| s.to_owned()).collect(),
         proof_results,
         images,
@@ -8637,5 +9002,63 @@ spec:
             "pod label must match VCR app name for NetworkPolicy coverage",
         );
         drop((routing_cluster, label, vcr_image, image_pull_policy));
+    }
+
+    #[test]
+    fn local_membership_rewrites_every_site_without_swim() {
+        /// The value at `path`. An absent node aborts the test.
+        fn at<'value>(value: &'value serde_yaml::Value, path: &[&str]) -> &'value serde_yaml::Value {
+            path.iter()
+                .try_fold(value, |node, key| node.get(*key))
+                .unwrap_or_else(|| std::process::abort())
+        }
+        /// The first step of `stack` of `kind`. A missing step aborts the test.
+        fn step<'value>(config: &'value serde_yaml::Value, stack: &str, kind: &str) -> &'value serde_yaml::Value {
+            at(config, &["spec", "stacks", stack, "steps"])
+                .as_sequence()
+                .and_then(|steps| {
+                    steps
+                        .iter()
+                        .find(|step| step.get("type").and_then(serde_yaml::Value::as_str) == Some(kind))
+                })
+                .unwrap_or_else(|| std::process::abort())
+        }
+
+        let source = include_str!("../../../../tests/e2e/topologies/grid-combined-site/forge.yaml");
+        let mut config: serde_yaml::Value = serde_yaml::from_str(source).unwrap();
+        apply_local_membership(&mut config).unwrap();
+        for cluster in CLUSTERS {
+            let operator = format!("{cluster}-operator-base");
+            let values = at(step(&config, &operator, "helm"), &["values"]);
+            assert_eq!(
+                at(values, &["grid", "membership", "source"]),
+                "Local",
+                "{cluster} operator runs Local"
+            );
+            let swim: serde_yaml::Value = serde_yaml::from_str(&format!("siteName: {cluster}")).unwrap();
+            assert_eq!(at(values, &["swim"]), &swim, "{cluster} keeps only its site name");
+            assert_eq!(
+                at(values, &["signals", "service", "type"]),
+                "LoadBalancer",
+                "{cluster} signals are reachable"
+            );
+            assert_eq!(
+                at(step(&config, &operator, "capture"), &["resource"]),
+                "svc/grid-operator-signals",
+                "{cluster} captures the signals Service"
+            );
+
+            let site = at(step(&config, &format!("{cluster}-site"), "helm"), &["values"]);
+            assert_eq!(
+                at(site, &["grid", "membership", "source"]),
+                "Local",
+                "{cluster} GridNetwork declares Local"
+            );
+            assert!(site.get("commonLabels").is_none(), "{cluster} has no discovery label");
+            assert!(
+                at(site, &["gridNetwork"]).get("swim").is_none(),
+                "{cluster} has no SWIM block"
+            );
+        }
     }
 }
