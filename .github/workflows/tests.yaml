@@ -226,7 +226,7 @@ jobs:
         run: cargo build --locked --manifest-path crates/gateway/Cargo.toml --workspace --release
 
   # ----------------------------------------------------------------------------
-  # FIPS build (operator + overlay-sync under system OpenSSL)
+  # FIPS build (operator, overlay-sync, and gateway under system OpenSSL)
   # ----------------------------------------------------------------------------
 
   fips:
@@ -272,6 +272,10 @@ jobs:
           cargo clippy -p swim --no-default-features --features fips --all-targets -- -D warnings
           cargo clippy --manifest-path crates/operator/Cargo.toml --no-default-features --features fips --lib --bins --test fips_startup -- -D warnings
           cargo clippy --manifest-path crates/overlay-sync/Cargo.toml --no-default-features --features fips --bins --test fips_startup -- -D warnings
+          cargo clippy --locked --manifest-path crates/gateway/Cargo.toml -p gateway --no-default-features --features fips --all-targets -- -D warnings
+
+      - name: Build gateway (fips)
+        run: cargo build --locked --manifest-path crates/gateway/Cargo.toml -p gateway --no-default-features --features fips
 
       - name: Unit tests (fips)
         run: |
@@ -282,6 +286,7 @@ jobs:
           cargo test -p swim --no-default-features --features fips
           cargo test --manifest-path crates/operator/Cargo.toml --no-default-features --features fips
           cargo test --manifest-path crates/overlay-sync/Cargo.toml --no-default-features --features fips
+          cargo test --locked --manifest-path crates/gateway/Cargo.toml -p gateway --no-default-features --features fips
 
       # fips must exclude rustls: TLS routes through system OpenSSL. ring and
       # the RustCrypto AEAD/hashing crates stay out of swim's fips build (asserted
@@ -389,7 +394,7 @@ jobs:
               exit 1
             fi
           done
-          for m in crates/operator/Cargo.toml crates/overlay-sync/Cargo.toml; do
+          for m in crates/operator/Cargo.toml crates/overlay-sync/Cargo.toml crates/gateway/Cargo.toml; do
             if cargo tree --manifest-path "$m" --no-default-features --features fips -e no-dev 2>/dev/null | grep -q 'openssl-src'; then
               echo "fips build of $m unexpectedly vendors openssl (openssl-src)"
               exit 1
