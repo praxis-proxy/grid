@@ -3226,7 +3226,7 @@ dependencies = [
 [[package]]
 name = "praxis-policy"
 version = "0.5.0"
-source = "git+https://github.com/evacchi/policy?rev=13996eade509c43dcefae1f7db349fa1bbc5f39c#13996eade509c43dcefae1f7db349fa1bbc5f39c"
+source = "git+https://github.com/evacchi/policy?rev=ad990cbe095a090540d387c1e44e702fb154468d#ad990cbe095a090540d387c1e44e702fb154468d"
 dependencies = [
  "praxis-policy-apl-cmf",
  "praxis-policy-apl-core",
@@ -3238,7 +3238,7 @@ dependencies = [
 [[package]]
 name = "praxis-policy-apl-cmf"
 version = "0.5.0"
-source = "git+https://github.com/evacchi/policy?rev=13996eade509c43dcefae1f7db349fa1bbc5f39c#13996eade509c43dcefae1f7db349fa1bbc5f39c"
+source = "git+https://github.com/evacchi/policy?rev=ad990cbe095a090540d387c1e44e702fb154468d#ad990cbe095a090540d387c1e44e702fb154468d"
 dependencies = [
  "chrono",
  "praxis-policy-apl-core",
@@ -3249,7 +3249,7 @@ dependencies = [
 [[package]]
 name = "praxis-policy-apl-core"
 version = "0.5.0"
-source = "git+https://github.com/evacchi/policy?rev=13996eade509c43dcefae1f7db349fa1bbc5f39c#13996eade509c43dcefae1f7db349fa1bbc5f39c"
+source = "git+https://github.com/evacchi/policy?rev=ad990cbe095a090540d387c1e44e702fb154468d#ad990cbe095a090540d387c1e44e702fb154468d"
 dependencies = [
  "async-trait",
  "futures",
@@ -3265,7 +3265,7 @@ dependencies = [
 [[package]]
 name = "praxis-policy-apl-runtime"
 version = "0.5.0"
-source = "git+https://github.com/evacchi/policy?rev=13996eade509c43dcefae1f7db349fa1bbc5f39c#13996eade509c43dcefae1f7db349fa1bbc5f39c"
+source = "git+https://github.com/evacchi/policy?rev=ad990cbe095a090540d387c1e44e702fb154468d#ad990cbe095a090540d387c1e44e702fb154468d"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3282,7 +3282,7 @@ dependencies = [
 [[package]]
 name = "praxis-policy-builtins"
 version = "0.5.0"
-source = "git+https://github.com/evacchi/policy?rev=13996eade509c43dcefae1f7db349fa1bbc5f39c#13996eade509c43dcefae1f7db349fa1bbc5f39c"
+source = "git+https://github.com/evacchi/policy?rev=ad990cbe095a090540d387c1e44e702fb154468d#ad990cbe095a090540d387c1e44e702fb154468d"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3297,7 +3297,6 @@ dependencies = [
  "hmac",
  "jsonwebtoken",
  "moka",
- "openssl",
  "praxis-policy-apl-cmf",
  "praxis-policy-apl-core",
  "praxis-policy-apl-runtime",
@@ -3320,7 +3319,7 @@ dependencies = [
 [[package]]
 name = "praxis-policy-core"
 version = "0.5.0"
-source = "git+https://github.com/evacchi/policy?rev=13996eade509c43dcefae1f7db349fa1bbc5f39c#13996eade509c43dcefae1f7db349fa1bbc5f39c"
+source = "git+https://github.com/evacchi/policy?rev=ad990cbe095a090540d387c1e44e702fb154468d#ad990cbe095a090540d387c1e44e702fb154468d"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3348,7 +3347,7 @@ dependencies = [
 [[package]]
 name = "praxis-policy-orchestration"
 version = "0.5.0"
-source = "git+https://github.com/evacchi/policy?rev=13996eade509c43dcefae1f7db349fa1bbc5f39c#13996eade509c43dcefae1f7db349fa1bbc5f39c"
+source = "git+https://github.com/evacchi/policy?rev=ad990cbe095a090540d387c1e44e702fb154468d#ad990cbe095a090540d387c1e44e702fb154468d"
 dependencies = [
  "futures",
  "tokio",
@@ -3357,7 +3356,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy"
 version = "0.7.5"
-source = "git+https://github.com/evacchi/praxis?rev=f69757c4cff4e5ded881ea24ffea0ee2bc41d4c5#f69757c4cff4e5ded881ea24ffea0ee2bc41d4c5"
+source = "git+https://github.com/evacchi/praxis?rev=ed47f771#ed47f771a2ecb6add194cb7b3343e81e3bb85a62"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -3378,7 +3377,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-core"
 version = "0.7.5"
-source = "git+https://github.com/evacchi/praxis?rev=f69757c4cff4e5ded881ea24ffea0ee2bc41d4c5#f69757c4cff4e5ded881ea24ffea0ee2bc41d4c5"
+source = "git+https://github.com/evacchi/praxis?rev=ed47f771#ed47f771a2ecb6add194cb7b3343e81e3bb85a62"
 dependencies = [
  "bytes",
  "chrono",
@@ -3408,7 +3407,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-filter"
 version = "0.7.5"
-source = "git+https://github.com/evacchi/praxis?rev=f69757c4cff4e5ded881ea24ffea0ee2bc41d4c5#f69757c4cff4e5ded881ea24ffea0ee2bc41d4c5"
+source = "git+https://github.com/evacchi/praxis?rev=ed47f771#ed47f771a2ecb6add194cb7b3343e81e3bb85a62"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3444,7 +3443,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-protocol"
 version = "0.7.5"
-source = "git+https://github.com/evacchi/praxis?rev=f69757c4cff4e5ded881ea24ffea0ee2bc41d4c5#f69757c4cff4e5ded881ea24ffea0ee2bc41d4c5"
+source = "git+https://github.com/evacchi/praxis?rev=ed47f771#ed47f771a2ecb6add194cb7b3343e81e3bb85a62"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3475,7 +3474,7 @@ dependencies = [
 [[package]]
 name = "praxis-proxy-tls"
 version = "0.7.5"
-source = "git+https://github.com/evacchi/praxis?rev=f69757c4cff4e5ded881ea24ffea0ee2bc41d4c5#f69757c4cff4e5ded881ea24ffea0ee2bc41d4c5"
+source = "git+https://github.com/evacchi/praxis?rev=ed47f771#ed47f771a2ecb6add194cb7b3343e81e3bb85a62"
 dependencies = [
  "arc-swap",
  "notify",
