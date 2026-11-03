@@ -4,6 +4,8 @@ extend-exclude = ["Cargo.lock", "**/target/**", "*.csr"]
 [default.extend-words]
 # Accepted spelling used in parser errors and documentation.
 unparseable = "unparseable"
+# A deliberately misspelled field that unknown-field tests expect to be refused.
+endpont = "endpont"
 
 [default.extend-identifiers]
 # B merged with A in CRDT laws, and a backend node in a topology diagram.
