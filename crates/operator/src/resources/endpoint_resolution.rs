@@ -411,6 +411,7 @@ mod tests {
         );
     }
 
+    /// Confirms the pinned client keeps using its validated address after DNS changes.
     #[tokio::test]
     async fn pinned_client_uses_original_address_after_dns_changes() {
         #[cfg(not(feature = "fips"))]
