@@ -200,7 +200,7 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
           - filter: load_balancer
             clusters:
               {{- range $i, $backend := $cfg.backends }}
-              {{- include "praxis-gateway.backendCluster" (dict "root" $ "i" $i "b" $backend) | trim | nindent 14 }}
+              {{- include "praxis-gateway.backendCluster" (dict "root" $ "i" $i "b" $backend "inline" true) | trim | nindent 14 }}
               {{- end }}
           {{- end }}
   {{- if $apiKey }}
@@ -298,6 +298,7 @@ load_balancer, which selects by the same name and endpoint order.
   {{- with $total }}
   total_connection_timeout_ms: {{ . }}
   {{- end }}
+  {{- if not (.inline | default false) }}
   health_check:
     {{- /* TLS backends default to a tcp probe. The active http probe is plaintext and cannot reach a TLS peer. A tcp connect works and still satisfies the present-health_check SSRF-skip guard. */}}
     {{- $hcType := $hc.type | default (ternary "http" "tcp" (eq $mode "plaintext")) }}
@@ -312,4 +313,5 @@ load_balancer, which selects by the same name and endpoint order.
     {{- /* Passive checks mark an endpoint that refuses or fails requests down within a few of them. */}}
     passive_unhealthy_threshold: {{ $hc.passiveUnhealthyThreshold | default 2 }}
     passive_healthy_threshold: {{ $hc.passiveHealthyThreshold | default 2 }}
+  {{- end }}
 {{- end }}
