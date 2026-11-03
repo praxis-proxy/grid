@@ -10878,6 +10878,23 @@ mod tests {
     }
 
     #[test]
+    fn under_local_a_consumer_only_member_is_admitted_and_never_polled() {
+        let sites = [peer_grid_site("consumer", None, &[])];
+        let identities = peer_identities(&sites, PeerTrustMode::Spiffe, SignalsAt::Derived(None));
+        // A declared member with no endpoints is a peer.
+        let record = identities.get("consumer").unwrap_or_else(|| std::process::abort());
+        assert!(record.signals.is_none(), "with no endpoint there is nothing to poll");
+        let held = signals::PeerIdentities::new();
+        held.set(identities);
+        assert!(held.knows("consumer"), "its calls are admitted");
+        assert_eq!(
+            held.without_endpoint("local"),
+            ["consumer"],
+            "and it is left out of polls"
+        );
+    }
+
+    #[test]
     fn peer_identities_falls_back_to_name_for_local_site() {
         let sites = [peer_grid_site("site-a", None, &["pin-a"])];
         let identities = peer_identities(&sites, PeerTrustMode::Pin, SignalsAt::Advertised);

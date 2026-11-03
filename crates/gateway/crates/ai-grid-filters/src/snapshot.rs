@@ -229,7 +229,7 @@ impl RouteSnapshot {
         }
     }
 
-    /// Lift every measured site's weight to at least `share` of the largest ceiling.
+    /// Lift every measured site's weighted capacity to at least `share` of the largest weighted ceiling.
     ///
     /// A soft bound only grows when a site carries queue-free load, and a site weighted by a
     /// small ceiling carries little. Without a floor an unproven site would never prove more.
@@ -242,7 +242,12 @@ impl RouteSnapshot {
         let largest = ranked
             .iter()
             .filter(|resolved| resolved.measured)
-            .filter_map(|resolved| resolved.candidate.capacity)
+            .filter_map(|resolved| {
+                resolved
+                    .candidate
+                    .capacity
+                    .map(|capacity| capacity * f64::from(resolved.candidate.weight))
+            })
             .fold(0.0_f64, f64::max);
         let floor = largest * share;
         ranked
@@ -255,7 +260,9 @@ impl RouteSnapshot {
                     score_unavailable,
                 } = resolved;
                 if measured {
-                    candidate.capacity = candidate.capacity.map(|ceiling| ceiling.max(floor));
+                    candidate.capacity = candidate
+                        .capacity
+                        .map(|ceiling| ceiling.max(floor / f64::from(candidate.weight)));
                 }
                 (load, candidate, score_unavailable)
             })
@@ -1344,6 +1351,7 @@ mod tests {
             publishes_load: true,
             site: site.to_owned(),
             stable_id: None,
+            weight: None,
         }
     }
 
@@ -3246,6 +3254,41 @@ mod tests {
             Some(AvailabilitySettings::default().ceiling_floor),
             "a site that rejoins starts untaught, at the floor"
         );
+    }
+
+    #[test]
+    fn exploration_floor_applies_after_declared_weights() {
+        for share in [0.0_f64, 0.1, 0.25, 1.0] {
+            let candidates = validate_candidates(vec![cand("m", "a", "pool-a"), cand("m", "b", "pool-b")])
+                .unwrap_or_else(|_| std::process::abort());
+            let resolved = candidates
+                .into_iter()
+                .map(|mut candidate| {
+                    candidate.capacity = Some(10.0);
+                    candidate.weight = if candidate.site.as_ref() == "a" { 1_000 } else { 1 };
+                    ResolvedCandidate {
+                        candidate,
+                        load: 0.0,
+                        measured: true,
+                        score_unavailable: None,
+                    }
+                })
+                .collect();
+            let floored = RouteSnapshot::explore_floor(resolved, share);
+            for (_, candidate, _) in floored {
+                let effective = candidate.capacity.unwrap_or(0.0) * f64::from(candidate.weight);
+                let expected = if candidate.site.as_ref() == "a" {
+                    10_000.0
+                } else {
+                    (10_000.0 * share).max(10.0)
+                };
+                assert!(
+                    (effective - expected).abs() < 1e-9,
+                    "site {} has effective capacity {effective}, expected {expected} at floor {share}",
+                    candidate.site
+                );
+            }
+        }
     }
 
     #[test]

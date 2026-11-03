@@ -1124,7 +1124,7 @@
     "replicaCount": {
       "type": "integer",
       "minimum": 1,
-      "description": "Number of gateway replicas."
+      "description": "Number of gateway replicas. Above 1 the Deployment rolls with a surge pod and none unavailable, spreads across nodes, and gets a PodDisruptionBudget."
     },
     "image": {
       "type": "object",
@@ -1701,7 +1701,7 @@
       "items": {
         "type": "object"
       },
-      "description": "Topology spread constraints."
+      "description": "Topology spread constraints. Listing any replaces the default spread above one replica."
     },
     "priorityClassName": {
       "type": "string",

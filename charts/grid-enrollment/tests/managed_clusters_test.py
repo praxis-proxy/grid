@@ -156,9 +156,18 @@ class ManagedClusterTemplates(unittest.TestCase):
         self.assertIsNone(peer['spec']['trust'])
         self.assertIsNone(peer['spec']['zone'])
 
+    def test_member_without_a_gateway_is_still_a_peer(self):
+        resources = self.inventory()
+        resources[WORK_PREFIX + 'east/grid-site-observer'] = work(
+            'east', gatewayAddress=None, signalsAddress=None, signalsServerName=None)
+        peer, = self.peers(resources)
+        self.assertEqual(peer['metadata']['name'], 'east')
+        self.assertEqual(peer['metadata']['labels']['grid.praxis.fast/membership'], 'declared')
+        self.assertIsNone(peer['spec']['gatewayEndpoint'])
+        self.assertIsNone(peer['spec']['signalsEndpoint'])
+
     def test_withdrawal_missing_feedback_and_identity_mismatch(self):
-        for replacement in ({}, work('impostor'), work('east', networkName='other'),
-                            work('east', gatewayAddress=None)):
+        for replacement in ({}, work('impostor'), work('east', networkName='other')):
             with self.subTest(replacement=replacement):
                 resources = self.inventory()
                 resources[WORK_PREFIX + 'east/grid-site-observer'] = replacement
