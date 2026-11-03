@@ -19,7 +19,8 @@ use super::{
     GRID_SERVING_GATEWAY, GRID_SERVING_GATEWAY_PORT, GRID_SERVING_METRICS_PORT, GRID_SERVING_SITE, GRID_SYSTEM_NS,
     MetricsTransport, OPERATOR_METRICS_PORT, OVERLAY_CONFIGMAP, PROVIDER_GATEWAY_PORT, PortForwardGuard, ProofResult,
     VCR_MODEL, curl_probe_diagnostics, find_free_port, format_utc_iso, get_configmap_data_key, kind_context, kubectl,
-    run_cluster_prefix, set_simulator_waiting_requests, split_image_reference,
+    run_cluster_prefix, set_simulator_fake_metrics_with_endpoint_kv, set_simulator_waiting_requests,
+    split_image_reference,
 };
 
 /// One live peer is sufficient for the two-site topology used by this proof.
@@ -30,8 +31,18 @@ const WEIGHTED_ROUTE_SAMPLE_REQUESTS: usize = 256;
 const WEIGHTED_ROUTE_SAMPLE_BATCH_REQUESTS: usize = 32;
 /// Maximum absolute difference between observed and metric-predicted two-site route share.
 const WEIGHTED_ROUTE_SHARE_TOLERANCE: f64 = 0.15;
+/// Permit small scrape-to-scrape gauge movement while requiring a stable effective route share.
+const WEIGHTED_ROUTE_METRIC_STABILITY_REL_TOLERANCE: f64 = 0.01;
 /// `grid_site_route` clamps a two-site weighted share to this range.
 const TWO_SITE_SHARE_RANGE: (f64, f64) = (0.1, 0.9);
+/// Queue capacity is four per endpoint; this pressure changes the score without making the site full.
+const CROSS_SITE_HIGHER_WAITING_REQUESTS: u32 = 2;
+/// The test Gateway keeps the moderate queue above its default backlog threshold but below EPP capacity.
+const CROSS_SITE_QUEUE_FULL_THRESHOLD: u32 = 3;
+/// A reported load signal gives the embedded Gateway a nonzero rho while both sites remain eligible.
+const CROSS_SITE_HIGHER_KV_CACHE: f64 = 0.95;
+/// A lighter local signal than the peer's trusted baseline for the wrong-pin check.
+const WRONG_PIN_LOCAL_WAITING_REQUESTS: u32 = 1;
 /// Provider identity retained while pool-a's EPP signal expires.
 const POOL_A_PROVIDER: &str = "llmd-pool-a-provider";
 /// Gateway gauges that a measured refresh owns and must clear when its reading disappears.
@@ -51,6 +62,8 @@ const ACTIVE_SIGNAL_GAUGES: [&str; 3] = [
     "grid_route_site_full",
     "grid_route_site_reading_age_seconds",
 ];
+/// The operator's serving-config builder currently polls its local peer every second.
+const EXPECTED_GATEWAY_POLL_INTERVAL_MS: u64 = 1_000;
 /// Site and cluster identity in the Gateway's serving topology.
 type ServingCandidatePair = (String, String);
 /// Parsed site/cluster pairs from the operator-generated serving configuration.
@@ -383,6 +396,21 @@ pub(super) fn proof(context: &DemoContext) -> ProofResult {
         record(&mut observations, format!("primary proof assertion failed: {error}"));
     }
 
+    let restore_gateway = match context.images.grid_gateway.as_deref() {
+        Some(image) => restore_gateway_default_queue_threshold(image),
+        None => Err("full mode did not resolve a Grid Gateway image".into()),
+    };
+    match &restore_gateway {
+        Ok(()) => record(
+            &mut observations,
+            "Grid Gateway queue_full tuning restored to the chart default before later proofs".to_owned(),
+        ),
+        Err(error) => record(
+            &mut observations,
+            format!("Grid Gateway queue_full restoration failed: {error}"),
+        ),
+    }
+
     record(
         &mut observations,
         "final restoration started for EPP and simulator pressure".to_owned(),
@@ -419,9 +447,15 @@ pub(super) fn proof(context: &DemoContext) -> ProofResult {
         format!("Grid Gateway response attribution diagnostics: {attribution}"),
     );
     let attribution_error = attribution.contract_error();
-    let result = match (result, attribution_error) {
-        (Ok(()), Some(error)) => Err(error.into()),
-        (result, _) => result,
+    let result = match (result, restore_gateway, attribution_error) {
+        (Ok(()), Err(restore_error), _) => {
+            Err(format!("Grid Gateway tuning restoration failed: {restore_error}").into())
+        },
+        (Err(error), Err(restore_error), _) => {
+            Err(format!("{error}; Grid Gateway tuning restoration failed: {restore_error}").into())
+        },
+        (Ok(()), Ok(()), Some(error)) => Err(error.into()),
+        (result, Ok(()), _) => result,
     };
     let run_succeeded = result.is_ok();
     if let Err(error) = &result {
@@ -463,8 +497,13 @@ fn run(
         .ok_or("full mode did not resolve a Grid Gateway image")?;
     let mtls = context.metrics_transport == MetricsTransport::MtlsProxy;
 
-    set_simulator_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
-    set_simulator_waiting_requests("pool-b", 9, context.scoring_flavor, mtls)?;
+    set_cross_site_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
+    set_cross_site_waiting_requests(
+        "pool-b",
+        CROSS_SITE_HIGHER_WAITING_REQUESTS,
+        context.scoring_flavor,
+        mtls,
+    )?;
     prepare_poll_gateway(image)?;
 
     let local_context = kind_context(GRID_SERVING_SITE);
@@ -543,9 +582,20 @@ fn run(
     let gateway_uid = gateway_pod_uid(&local_context)?;
     let gateway_reloads_before_shift = applied_gateway_reload_count(gateway_metrics_port)?;
 
-    set_simulator_waiting_requests("pool-a", 9, context.scoring_flavor, mtls)?;
-    set_simulator_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
-    wait_for_pressure_order(operator_metrics_port, "pool-b", Duration::from_secs(120))?;
+    set_cross_site_waiting_requests(
+        "pool-a",
+        CROSS_SITE_HIGHER_WAITING_REQUESTS,
+        context.scoring_flavor,
+        mtls,
+    )?;
+    set_cross_site_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
+    wait_for_pressure_order_recorded(
+        operator_metrics_port,
+        "pool-b",
+        Duration::from_secs(120),
+        observations,
+        "pool-a operator observed the post-shift pressure order",
+    )?;
     verify_weighted_site_distribution(
         gateway_http_port,
         gateway_metrics_port,
@@ -644,8 +694,13 @@ fn run(
     );
 
     scale_epp("pool-a", 1)?;
-    set_simulator_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
-    set_simulator_waiting_requests("pool-b", 9, context.scoring_flavor, mtls)?;
+    set_cross_site_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
+    set_cross_site_waiting_requests(
+        "pool-b",
+        CROSS_SITE_HIGHER_WAITING_REQUESTS,
+        context.scoring_flavor,
+        mtls,
+    )?;
     wait_for_relay_samples(operator_metrics_port, Duration::from_secs(120))?;
     verify_weighted_site_distribution(
         gateway_http_port,
@@ -662,9 +717,20 @@ fn run(
         "pool-a provider signal returned after EPP recovery".to_owned(),
     );
 
-    set_simulator_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
-    set_simulator_waiting_requests("pool-b", 9, context.scoring_flavor, mtls)?;
-    wait_for_pressure_order(operator_metrics_port, "pool-a", Duration::from_secs(120))?;
+    set_cross_site_waiting_requests("pool-a", 0, context.scoring_flavor, mtls)?;
+    set_cross_site_waiting_requests(
+        "pool-b",
+        CROSS_SITE_HIGHER_WAITING_REQUESTS,
+        context.scoring_flavor,
+        mtls,
+    )?;
+    wait_for_pressure_order_recorded(
+        operator_metrics_port,
+        "pool-a",
+        Duration::from_secs(120),
+        observations,
+        "pool-a operator observed the restored pressure order",
+    )?;
     let pre_pin_route = verify_weighted_site_distribution(
         gateway_http_port,
         gateway_metrics_port,
@@ -747,8 +813,8 @@ fn run(
         // pool-a must keep the exact trusted sample. The same failed identity
         // probe makes the remote GridSite Connecting, so fail-closed routing
         // must keep requests on pool-a until trust is restored.
-        set_simulator_waiting_requests("pool-a", 6, context.scoring_flavor, mtls)?;
-        set_simulator_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
+        set_cross_site_waiting_requests("pool-a", WRONG_PIN_LOCAL_WAITING_REQUESTS, context.scoring_flavor, mtls)?;
+        set_cross_site_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
         let pool_b_origin = wait_for_signal_decrease(
             peer_operator_metrics_port,
             "pool-b",
@@ -905,7 +971,13 @@ fn run(
         pool_b_before_bad_pin,
         Duration::from_secs(90),
     )?;
-    wait_for_pressure_order(operator_metrics_port, "pool-b", Duration::from_secs(90))?;
+    wait_for_pressure_order_recorded(
+        operator_metrics_port,
+        "pool-b",
+        Duration::from_secs(90),
+        observations,
+        "pool-a operator observed the recovered pressure order",
+    )?;
     verify_weighted_site_distribution(
         gateway_http_port,
         gateway_metrics_port,
@@ -971,9 +1043,60 @@ fn prepare_poll_gateway(image: &str) -> Result<(), Box<dyn std::error::Error>> {
     for cluster in CLUSTERS {
         restart_operator(cluster)?;
     }
-    install_grid_gateway(image, &endpoints)?;
+    install_grid_gateway(image, &endpoints, Some(CROSS_SITE_QUEUE_FULL_THRESHOLD))?;
     wait_for_grid_serving_snapshot(Duration::from_secs(120))?;
     Ok(())
+}
+
+/// Restore the chart's configured queue threshold before the learned-ceiling proof uses backlog evidence.
+fn restore_gateway_default_queue_threshold(image: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let context = kind_context(GRID_SERVING_SITE);
+    let status = Command::new("helm")
+        .args([
+            "status",
+            GRID_SERVING_GATEWAY,
+            "--kube-context",
+            &context,
+            "--namespace",
+            GRID_SYSTEM_NS,
+        ])
+        .output()?;
+    if !status.status.success() {
+        let stderr = String::from_utf8_lossy(&status.stderr);
+        if stderr.contains("release: not found") {
+            return Ok(());
+        }
+        return Err(format!(
+            "could not inspect the run-owned Grid Gateway Helm release: {}",
+            stderr.trim()
+        )
+        .into());
+    }
+    let endpoints = [
+        provider_gateway_endpoint("pool-a")?,
+        provider_gateway_endpoint("pool-b")?,
+    ];
+    install_grid_gateway(image, &endpoints, None)
+}
+
+/// Apply EPP queue pressure plus a reported fullness signal so the embedded Gateway can weight both sites.
+fn set_cross_site_waiting_requests(
+    cluster: &str,
+    waiting_requests: u32,
+    scoring_flavor: super::ScoringFlavor,
+    mtls: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (waiting_requests, kv_cache_usage) = cross_site_simulator_metrics(waiting_requests, scoring_flavor);
+    set_simulator_fake_metrics_with_endpoint_kv(cluster, waiting_requests, 0, kv_cache_usage, kv_cache_usage, mtls)
+}
+
+/// Keep the EPP queue signal and Gateway saturation signal distinct and deterministic.
+fn cross_site_simulator_metrics(waiting_requests: u32, scoring_flavor: super::ScoringFlavor) -> (u32, f64) {
+    let (waiting_requests, mut kv_cache_usage) = super::simulator_metrics(waiting_requests, scoring_flavor);
+    if scoring_flavor == super::ScoringFlavor::QueueDepth && waiting_requests > 0 {
+        kv_cache_usage = CROSS_SITE_HIGHER_KV_CACHE;
+    }
+    (waiting_requests, kv_cache_usage)
 }
 
 /// Start one diagnostic port-forward and retry if its local listener exits during startup.
@@ -1016,9 +1139,20 @@ fn prove_network_partition(
     attribution: &mut RoutingAttributionDiagnostics,
     observations: &mut Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    set_simulator_waiting_requests("pool-a", 9, context.scoring_flavor, mtls)?;
-    set_simulator_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
-    wait_for_pressure_order(operator_port, "pool-b", Duration::from_secs(120))?;
+    set_cross_site_waiting_requests(
+        "pool-a",
+        CROSS_SITE_HIGHER_WAITING_REQUESTS,
+        context.scoring_flavor,
+        mtls,
+    )?;
+    set_cross_site_waiting_requests("pool-b", 0, context.scoring_flavor, mtls)?;
+    wait_for_pressure_order_recorded(
+        operator_port,
+        "pool-b",
+        Duration::from_secs(120),
+        observations,
+        "pool-a operator observed the pre-partition pressure order",
+    )?;
     verify_weighted_site_distribution(
         gateway_port,
         gateway_metrics_port,
@@ -1052,6 +1186,7 @@ fn prove_network_partition(
 
     let degradation_result = wait_for_partition_degradation(
         gateway_port,
+        gateway_metrics_port,
         &local_context,
         remote_cluster,
         Duration::from_secs(180),
@@ -1112,9 +1247,10 @@ fn prove_network_partition(
     Ok(())
 }
 
-/// Send requests during a partition until membership and the remote route both become stale.
+/// Send requests during a partition until SWIM membership is lost and real traffic falls back locally.
 fn wait_for_partition_degradation(
     gateway_port: u16,
+    gateway_metrics_port: u16,
     local_context: &str,
     remote_cluster: &str,
     timeout: Duration,
@@ -1130,6 +1266,7 @@ fn wait_for_partition_degradation(
     let mut last_request_observation = None;
     let mut last_membership_observation = None;
     let mut last_state = String::from("partition active; waiting for SWIM and overlay updates");
+    let remote_site = "pool-b";
 
     while Instant::now() < deadline {
         attempts += 1;
@@ -1158,19 +1295,32 @@ fn wait_for_partition_degradation(
         }
 
         let connected = read_connected_sites(local_context);
-        let fresh = read_overlay_candidate_fresh(GRID_SERVING_SITE, remote_cluster);
-        let state = format!("connectedSites={connected:?}, remote_candidate_fresh={fresh:?}");
+        let overlay_fresh = read_overlay_candidate_fresh(GRID_SERVING_SITE, remote_cluster);
+        let gateway_metrics = read_gateway_metrics(gateway_metrics_port);
+        let (signal_silent, last_sample_age) = gateway_metrics.as_ref().map_or((None, None), |metrics| {
+            (
+                gateway_site_signal_silent(metrics, remote_site, remote_cluster),
+                sample_value(
+                    metrics,
+                    "grid_route_site_last_sample_age_seconds",
+                    &[("site", remote_site), ("cluster", remote_cluster)],
+                ),
+            )
+        });
+        let state = format!(
+            "connectedSites={connected:?}, operator_overlay_candidate_fresh={overlay_fresh:?}, Gateway_signal_silent={signal_silent:?}, Gateway_last_sample_age_seconds={last_sample_age:?}, Gateway_metrics_error={:?}",
+            gateway_metrics.as_ref().err()
+        );
         if last_membership_observation.as_deref() != Some(state.as_str()) {
             record(observations, format!("partition control-plane state: {state}"));
             last_membership_observation = Some(state.clone());
         }
         last_state.clone_from(&state);
-        if connected.is_ok_and(|count| !has_connected_swim_peer(count)) && fresh.is_ok_and(|value| value != Some(true))
-        {
+        if connected.is_ok_and(|count| !has_connected_swim_peer(count)) {
             record(
                 observations,
                 format!(
-                    "partition traffic summary: attempts={attempts}, transport_errors={transport_errors}, HTTP statuses={statuses:?}, attributed sites={attributed_sites:?}"
+                    "pool-b SWIM membership was lost; Gateway silence and overlay freshness are diagnostic only for this partition; requiring successful attributed local fallback traffic: {state}; partition traffic summary: attempts={attempts}, transport_errors={transport_errors}, HTTP statuses={statuses:?}, attributed sites={attributed_sites:?}"
                 ),
             );
             wait_for_site_distribution(
@@ -1191,9 +1341,20 @@ fn wait_for_partition_degradation(
         std::thread::sleep(Duration::from_secs(2));
     }
     Err(format!(
-        "network partition did not make SWIM membership and the remote candidate stale within {timeout:?}: {last_state}"
+        "network partition did not remove pool-b SWIM membership and prove local fallback traffic within {timeout:?}: {last_state}"
     )
     .into())
+}
+
+/// Read whether the Gateway has aged one remote site's signal past its silence window.
+fn gateway_site_signal_silent(metrics: &str, site: &str, cluster: &str) -> Option<bool> {
+    sample_value(
+        metrics,
+        "grid_route_site_silent",
+        &[("site", site), ("cluster", cluster)],
+    )
+    .filter(|value| value.is_finite())
+    .map(|value| (value - 1.0).abs() <= f64::EPSILON)
 }
 
 /// Read one candidate's current freshness from the operator's distributed overlay.
@@ -1328,7 +1489,11 @@ fn patch_network_for_poll(cluster: &str, endpoints: &[serde_json::Value]) -> Res
 }
 
 /// Install the embedded Grid Gateway with a TLS metrics listener for proof evidence.
-fn install_grid_gateway(image: &str, endpoints: &[serde_json::Value]) -> Result<(), Box<dyn std::error::Error>> {
+fn install_grid_gateway(
+    image: &str,
+    endpoints: &[serde_json::Value],
+    queue_full_threshold: Option<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (repository, tag) = split_image_reference(image)?;
     let chart = crate::workspace_root().join("charts/praxis-gateway");
     let chart = chart.to_str().ok_or("Praxis Gateway chart path is not UTF-8")?;
@@ -1403,6 +1568,12 @@ fn install_grid_gateway(image: &str, endpoints: &[serde_json::Value]) -> Result<
         "--set",
         "metricsListener.enabled=true",
     ]);
+    if let Some(queue_full_threshold) = queue_full_threshold {
+        command.args([
+            "--set",
+            &format!("praxisConfig.render.gridServing.siteRoute.availability.queue_full={queue_full_threshold}"),
+        ]);
+    }
     let output = command.output()?;
     if !output.status.success() {
         return Err(format!(
@@ -1566,7 +1737,7 @@ fn is_expected_local_operator_peer(peer: &serde_json::Value) -> bool {
         && peer.get("server_name").and_then(serde_json::Value::as_str) == Some(identity.as_str())
         && peer.get("authority").and_then(serde_json::Value::as_str) == Some(identity.as_str())
         && peer.get("path").and_then(serde_json::Value::as_str) == Some("/v1/site/signals")
-        && peer.get("interval_ms").and_then(serde_json::Value::as_u64) == Some(5_000)
+        && peer.get("interval_ms").and_then(serde_json::Value::as_u64) == Some(EXPECTED_GATEWAY_POLL_INTERVAL_MS)
         && peer
             .get("grid_ca_path")
             .and_then(serde_json::Value::as_str)
@@ -1799,26 +1970,19 @@ fn verify_weighted_site_distribution(
     let mut previous: Option<WeightedRouteMetrics> = None;
     let mut stable_samples = 0_u32;
     let mut pre_sample_retries = 0_u32;
+    let mut metric_observations = 0_u32;
     while Instant::now() < deadline {
         match read_gateway_metrics(metrics_port).and_then(|metrics| {
             weighted_route_metrics(&metrics, expected_site, require_strict_pressure_preference).map_err(Into::into)
         }) {
             Ok(current) => {
-                last = format!(
-                    "expected site score={:.3}, weight={:.3}, rho={:.6}, weighted share={:.1}%; other site score={:.3}, weight={:.3}, rho={:.6}",
-                    current.preferred_score,
-                    current.preferred_weight,
-                    current.preferred_rho,
-                    current.preferred_share * 100.0,
-                    current.other_score,
-                    current.other_weight,
-                    current.other_rho
-                );
+                metric_observations = metric_observations.saturating_add(1);
                 if previous.is_some_and(|before| weighted_route_metrics_stable(before, current)) {
                     stable_samples = stable_samples.saturating_add(1);
                 } else {
                     stable_samples = 1;
                 }
+                last = format!("metrics={current:?}; consecutive stable observations={stable_samples}");
                 previous = Some(current);
                 if stable_samples >= 2 {
                     let before_snapshot: Result<_, Box<dyn std::error::Error>> = read_gateway_metrics(metrics_port)
@@ -1938,7 +2102,11 @@ fn verify_weighted_site_distribution(
                 }
             },
             Err(error) => {
-                last = error.to_string();
+                let telemetry = read_gateway_metrics(metrics_port).map_or_else(
+                    |metrics_error| format!("Gateway telemetry unavailable: {metrics_error}"),
+                    |metrics| route_metric_diagnostics(&metrics),
+                );
+                last = format!("{error}; latest Gateway signal and route gauges: {telemetry}");
                 previous = None;
                 stable_samples = 0;
             },
@@ -1946,7 +2114,7 @@ fn verify_weighted_site_distribution(
         std::thread::sleep(Duration::from_secs(2));
     }
     Err(format!(
-        "Gateway did not expose a stable queue-score and pressure order with {expected_site} preferred within {timeout:?}: {last}"
+        "Gateway did not expose a stable queue-score and pressure order with {expected_site} preferred within {timeout:?} after {metric_observations} valid metric observations: {last}"
     )
     .into())
 }
@@ -2029,8 +2197,11 @@ fn route_metric_diagnostics(metrics: &str) -> String {
     let samples = metrics
         .lines()
         .filter(|line| {
-            line.starts_with("grid_route_site_")
-                && (line.contains("site=\"pool-a\"") || line.contains("site=\"pool-b\""))
+            (line.starts_with("grid_route_site_")
+                && (line.contains("site=\"pool-a\"") || line.contains("site=\"pool-b\"")))
+                || line.starts_with("grid_signals_poll_total")
+                || line.starts_with("grid_signals_last_success_timestamp_seconds")
+                || line.starts_with("grid_signals_ingest_dropped_total")
         })
         .collect::<Vec<_>>();
     if samples.is_empty() {
@@ -2052,7 +2223,9 @@ fn weighted_route_metrics_stable(before: WeightedRouteMetrics, after: WeightedRo
         (before.preferred_share, after.preferred_share),
     ]
     .into_iter()
-    .all(|(left, right)| (left - right).abs() <= f64::EPSILON)
+    .all(|(left, right)| {
+        (left - right).abs() <= WEIGHTED_ROUTE_METRIC_STABILITY_REL_TOLERANCE * left.abs().max(right.abs()).max(1.0)
+    })
 }
 
 /// Whether an attributed sample is within the explicit tolerance of the Gateway's weighted choice.
@@ -2118,7 +2291,7 @@ fn wait_for_pressure_order(
     port: u16,
     lower_pressure_site: &str,
     timeout: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
     let (expected_lower, expected_higher) = if lower_pressure_site == "pool-a" {
         ("pool-a", "pool-b")
@@ -2141,7 +2314,7 @@ fn wait_for_pressure_order(
             last = format!("pool-a={a:?}, pool-b={b:?}");
             let (low, high) = if expected_lower == "pool-a" { (a, b) } else { (b, a) };
             if low.zip(high).is_some_and(|(low, high)| low < high) {
-                return Ok(());
+                return Ok(last);
             }
         }
         std::thread::sleep(Duration::from_secs(2));
@@ -2150,6 +2323,19 @@ fn wait_for_pressure_order(
         "operator did not relay the expected pressure order ({expected_lower} below {expected_higher}): {last}"
     )
     .into())
+}
+
+/// Wait for and record the operator-side pressure order before checking Gateway routing.
+fn wait_for_pressure_order_recorded(
+    port: u16,
+    lower_pressure_site: &str,
+    timeout: Duration,
+    observations: &mut Vec<String>,
+    description: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pressure_order = wait_for_pressure_order(port, lower_pressure_site, timeout)?;
+    record(observations, format!("{description}: {pressure_order}"));
+    Ok(())
 }
 
 /// Read a provider's in-flight sample from operator exposition.
@@ -2684,7 +2870,7 @@ mod serving_peer_tests {
             "server_name": "pool-a.grid.internal",
             "authority": "pool-a.grid.internal",
             "path": "/v1/site/signals",
-            "interval_ms": 5000,
+            "interval_ms": 1000,
             "grid_ca_path": "/etc/praxis/tls/ca.crt",
             "client_cert_path": "/etc/praxis/tls/tls.crt",
             "client_key_path": "/etc/praxis/tls/tls.key"
@@ -2707,13 +2893,21 @@ mod serving_peer_tests {
         }
         assert!(!is_expected_local_operator_peer(&wrong_path));
 
-        let mut wrong_identity = valid;
+        let mut wrong_identity = valid.clone();
         if let Some(server_name) = wrong_identity.get_mut("server_name") {
             *server_name = serde_json::json!("pool-b.grid.internal");
         } else {
             std::process::abort();
         }
         assert!(!is_expected_local_operator_peer(&wrong_identity));
+
+        let mut wrong_interval = valid;
+        if let Some(interval) = wrong_interval.get_mut("interval_ms") {
+            *interval = serde_json::json!(5000);
+        } else {
+            std::process::abort();
+        }
+        assert!(!is_expected_local_operator_peer(&wrong_interval));
     }
 
     #[test]
@@ -2981,6 +3175,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cross_site_pressure_keeps_queue_depth_and_gateway_saturation_explicit() {
+        let queue_pressure = cross_site_simulator_metrics(2, super::super::ScoringFlavor::QueueDepth);
+        assert_eq!(
+            queue_pressure,
+            (2, CROSS_SITE_HIGHER_KV_CACHE),
+            "queue-depth pressure must preserve queue count and use the paired saturation signal"
+        );
+
+        let queue_clear = cross_site_simulator_metrics(0, super::super::ScoringFlavor::QueueDepth);
+        assert_eq!(
+            queue_clear,
+            (0, 0.0),
+            "clearing queue-depth pressure must clear both simulator signals"
+        );
+
+        let kv_pressure = cross_site_simulator_metrics(2, super::super::ScoringFlavor::KvCachePressure);
+        assert_eq!(
+            kv_pressure,
+            (0, CROSS_SITE_HIGHER_KV_CACHE),
+            "KV-cache pressure must use saturation without introducing queue depth"
+        );
+
+        let kv_clear = cross_site_simulator_metrics(0, super::super::ScoringFlavor::KvCachePressure);
+        assert_eq!(
+            kv_clear,
+            (0, 0.0),
+            "clearing KV-cache pressure must clear both simulator signals"
+        );
+    }
+
+    #[test]
     fn repeated_sample_sequence_gets_a_unique_request_identity() {
         let first = unique_site_request_id(0);
         let second = unique_site_request_id(0);
@@ -3060,6 +3285,41 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0.5
     }
 
     #[test]
+    fn weighted_route_stability_allows_small_scrape_jitter_but_rejects_route_changes() {
+        let stable = WeightedRouteMetrics {
+            preferred_score: 0.0,
+            other_score: 2.0,
+            preferred_weight: 8.0,
+            other_weight: 8.0,
+            preferred_rho: 0.20,
+            other_rho: 0.95,
+            preferred_share: 0.55,
+        };
+        let jittered = WeightedRouteMetrics {
+            preferred_score: 0.002,
+            other_score: 2.01,
+            preferred_weight: 8.01,
+            other_weight: 8.0,
+            preferred_rho: 0.205,
+            other_rho: 0.955,
+            preferred_share: 0.551,
+        };
+        let changed = WeightedRouteMetrics {
+            other_score: 2.1,
+            ..jittered
+        };
+
+        assert!(
+            weighted_route_metrics_stable(stable, jittered),
+            "small scrape jitter must preserve a stable weighted-route observation"
+        );
+        assert!(
+            !weighted_route_metrics_stable(stable, changed),
+            "a meaningful route-metric change must not be classified as scrape jitter"
+        );
+    }
+
+    #[test]
     fn pressure_transition_rejects_equal_rho_even_when_the_route_score_is_lower() {
         let metrics = r#"grid_route_site_score{site="pool-a",cluster="llmd-pool-a-provider"} 0
 grid_route_site_weight{site="pool-a",cluster="llmd-pool-a-provider"} 18
@@ -3093,6 +3353,25 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0
         assert!(error.contains("current route metrics:"));
         assert!(error.contains("grid_route_site_rho{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} NaN"));
         assert!(error.contains("grid_route_site_rho{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 0.5"));
+    }
+
+    #[test]
+    fn route_diagnostics_include_signal_poll_freshness_and_both_sites() {
+        let metrics = "grid_signals_poll_total{result=\"ok\"} 17\n\
+                       grid_signals_last_success_timestamp_seconds 1792677000\n\
+                       grid_signals_ingest_dropped_total{reason=\"mismatched\"} 3\n\
+                       grid_route_site_rho_reported{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 0.95\n\
+                       grid_route_site_last_sample_age_seconds{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 0.4\n\
+                       grid_route_site_score{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 2\n";
+
+        let diagnostics = route_metric_diagnostics(metrics);
+
+        assert!(diagnostics.contains("grid_signals_poll_total{result=\"ok\"} 17"));
+        assert!(diagnostics.contains("grid_signals_last_success_timestamp_seconds 1792677000"));
+        assert!(diagnostics.contains("grid_signals_ingest_dropped_total{reason=\"mismatched\"} 3"));
+        assert!(diagnostics.contains("grid_route_site_rho_reported{site=\"pool-a\""));
+        assert!(diagnostics.contains("grid_route_site_last_sample_age_seconds{site=\"pool-b\""));
+        assert!(diagnostics.contains("grid_route_site_score{site=\"pool-a\""));
     }
 
     #[test]
@@ -3293,6 +3572,35 @@ grid_route_site_rho{site="pool-b",cluster="llmd-pool-b-provider"} 0
             ),
             Some(0.0),
             "a longer metric name with the same prefix must not shadow the exact gauge"
+        );
+    }
+
+    #[test]
+    fn gateway_silent_signal_requires_the_exact_finite_site_gauge() {
+        let exposition = r#"grid_route_site_silent{site="pool-b",cluster="llmd-pool-b-provider"} 1
+grid_route_site_silent{site="pool-a",cluster="llmd-pool-a-provider"} 0
+grid_route_site_silent{site="pool-c",cluster="llmd-pool-c-provider"} NaN
+"#;
+
+        assert_eq!(
+            gateway_site_signal_silent(exposition, "pool-b", "llmd-pool-b-provider"),
+            Some(true),
+            "the exact remote site/provider series must report a silent signal"
+        );
+        assert_eq!(
+            gateway_site_signal_silent(exposition, "pool-a", "llmd-pool-a-provider"),
+            Some(false),
+            "the exact local site/provider series must report a live signal"
+        );
+        assert_eq!(
+            gateway_site_signal_silent(exposition, "pool-c", "llmd-pool-c-provider"),
+            None,
+            "a non-finite silence gauge must not be interpreted as a valid signal"
+        );
+        assert_eq!(
+            gateway_site_signal_silent(exposition, "pool-b", "wrong-provider"),
+            None,
+            "a silence gauge for another provider must not match the requested series"
         );
     }
 

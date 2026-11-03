@@ -2913,20 +2913,21 @@ fn site_by_spiffe(leaf: &[u8], identity: &SignalsIdentity) -> Option<(String, BT
 /// Whether `tcp` sent anything within [`SIGNALS_SILENT_TIMEOUT`].
 ///
 /// A connection that never speaks costs a slot and proves nothing, and opening many of them
-/// is the cheapest way to hold the handshake share. `readable()` does not consume, so the
-/// handshake that follows still sees the `ClientHello`. False also covers shutdown, where the
-/// caller stops for its own reasons.
+/// is the cheapest way to hold the handshake share. Require at least one byte before the
+/// deadline; `peek()` does not consume it, so the TLS handshake still sees the `ClientHello`.
+/// Returns `false` if shutdown wins the race.
 async fn spoke_in_time(
     tcp: &tokio::net::TcpStream,
     remote: SocketAddr,
     shutdown: &operator::shutdown::Shutdown,
 ) -> bool {
+    let mut first_byte = [0_u8; 1];
     let ready = tokio::select! {
         biased;
         () = shutdown.triggered() => return false,
-        ready = tokio::time::timeout(SIGNALS_SILENT_TIMEOUT, tcp.readable()) => ready,
+        ready = tokio::time::timeout(SIGNALS_SILENT_TIMEOUT, tcp.peek(&mut first_byte)) => ready,
     };
-    if matches!(ready, Ok(Ok(()))) {
+    if matches!(ready, Ok(Ok(bytes_read)) if bytes_read > 0) {
         return true;
     }
     operator::metrics::record_signals_shed("silent");
