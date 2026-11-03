@@ -227,7 +227,7 @@ pub struct AvailabilitySettings {
     pub smoothing: f64,
     /// The least a learned ceiling can be, so a quiet site does not read as full, at least 1.
     pub ceiling_floor: f64,
-    /// A measured site's weight is at least this share of the largest ceiling, in [0, 1].
+    /// A measured site's weighted capacity is at least this share of the largest weighted ceiling, in [0, 1].
     pub explore_floor: f64,
     /// How long a site must stay at its ceiling with work waiting before it counts as full,
     /// milliseconds, at least 0. A debounce in time, so a site polled every 500 ms and one
