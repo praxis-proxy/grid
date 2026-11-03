@@ -205,9 +205,17 @@ class ManagedClusterTemplates(unittest.TestCase):
         hub = placements['grid-bootstrap-membership-hub']['predicates'][0]
         members = placements['grid-bootstrap-membership']['predicates'][0]
         self.assertEqual(hub['requiredClusterSelector']['labelSelector']['matchLabels'],
-                         {'name': 'local-cluster'})
+                         {'local-cluster': 'true'})
         self.assertEqual(members['requiredClusterSelector']['labelSelector']['matchLabels'],
                          {'grid.praxis.fast/member': 'true'})
+
+    def test_hub_name_overrides_the_hub_label(self):
+        values = {**self.values, 'managedClusters': {'enabled': True, 'hubClusterName': 'hub-a'}}
+        docs = self.render_chart(values)
+        placements = {d['metadata']['name']: d['spec'] for d in docs if d['kind'] == 'Placement'}
+        hub = placements['grid-bootstrap-membership-hub']['predicates'][0]
+        self.assertEqual(hub['requiredClusterSelector']['labelSelector']['matchLabels'],
+                         {'name': 'hub-a'})
 
     def test_hub_needs_no_grid_api(self):
         def grid_refs(objects):
