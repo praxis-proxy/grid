@@ -61,7 +61,7 @@ managedClusters:
   workName: grid-site-observer
   # -- The hub must be registered with the policy add-on so it can reconcile
   # dynamically generated Certificates, observers and their RBAC. Empty selects
-  # it by ACM's local-cluster=true label, which follows a renamed hub. A name
+  # it by the hub's local-cluster=true label, which follows a renamed hub. A name
   # selects that ManagedCluster instead.
   hubClusterName: ""
   identitySecretPrefix: grid-site-

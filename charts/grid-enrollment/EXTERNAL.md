@@ -9,7 +9,7 @@ same lifecycle: bootstrap, enroll, and decommission.
 ## Bootstrap
 
 A management-only hub can host bootstrap and enrollment policies without local
-Grid workloads. The hub policy targets the cluster ACM labels `local-cluster=true`, or `managedClusters.hubClusterName` when set;
+Grid workloads. The hub policy targets the cluster labelled `local-cluster=true`, or `managedClusters.hubClusterName` when set;
 grid membership uses the separate member-label selector. Leave that label off
 the hub to enroll only spokes. If the hub also hosts Grid workloads, select it
 as a member and it receives the same identity and GridNetwork as any other
