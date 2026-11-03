@@ -551,6 +551,7 @@ fn as_serving(config: &ProviderConfig) -> GridServingConfig {
                 publishes_load: true,
                 site: config.local_site.clone(),
                 stable_id: Some(candidate.stable_id.clone()),
+                weight: None,
             })
             .collect(),
         provider_hop_clusters: Vec::new(),

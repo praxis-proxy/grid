@@ -1,5 +1,8 @@
-# -- Number of gateway replicas.
+# -- Number of gateway replicas. Above 1 the Deployment rolls one surge pod at a time with
+# none unavailable, prefers a spread across nodes, and gets a PodDisruptionBudget with
+# minAvailable 1. At 1 the render is unchanged.
 replicaCount: 1
+
 
 # -- Gateway container image settings.
 image:
@@ -580,7 +583,7 @@ nodeSelector: {}
 affinity: {}
 # -- Pod tolerations.
 tolerations: []
-# -- Topology spread constraints.
+# -- Topology spread constraints. Listing any replaces the default spread above one replica.
 topologySpreadConstraints: []
 # -- Priority class for the gateway pod.
 priorityClassName: ""

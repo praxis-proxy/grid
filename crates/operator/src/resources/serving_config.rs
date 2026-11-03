@@ -260,6 +260,10 @@ pub(crate) struct ServingCandidate {
     /// A local candidate's credential locator, which `grid_site_route` selects for `credential_inject`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) credential: Option<ProjectedCredential>,
+    /// Declared capacity weight from the provider's `capacityWeight`, carried from the overlay's
+    /// `capacity_weight`. Always emitted by the renderer. Older gateways reject this field via
+    /// `deny_unknown_fields`, so compatible gateways must ship first in every rollout.
+    pub(crate) weight: u32,
 }
 
 /// Whether `publishes_load` is the default, which the gateway assumes when absent.
@@ -413,6 +417,8 @@ struct Folded {
     credential: Option<ProjectedCredential>,
     /// The earliest discovered inventory deadline among duplicates.
     expires_at_ms: Option<u64>,
+    /// The largest declared weight across duplicates.
+    weight: u32,
 }
 
 /// Each routable candidate once, folded.
@@ -456,6 +462,7 @@ fn dedup<'overlay>(
             stable_id: None,
             credential: None,
             expires_at_ms,
+            weight: candidate.capacity_weight,
         });
         folded.fresh &= candidate.fresh;
         folded.admission = folded.admission.max(admission);
@@ -470,6 +477,7 @@ fn dedup<'overlay>(
             (Some(held), None) | (None, Some(held)) => Some(held),
             (None, None) => None,
         };
+        folded.weight = folded.weight.max(candidate.capacity_weight);
     }
     unique
 }
@@ -508,6 +516,7 @@ fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<Servi
                 inputs.inject_local_credentials && !remote && !inputs.provider_hop_clusters.contains(cluster)
             }),
             expires_at_ms: folded.expires_at_ms,
+            weight: folded.weight,
         })
         .collect()
 }
@@ -738,7 +747,9 @@ mod tests {
         if let Some(state) = admission {
             value["admission_state"] = serde_json::Value::from(state);
         }
-        serde_json::from_value(value).expect("candidate")
+        let mut candidate: RoutingCandidate = serde_json::from_value(value).expect("candidate");
+        candidate.capacity_weight = 1;
+        candidate
     }
 
     fn overlay(candidates: Vec<RoutingCandidate>) -> RoutingOverlay {
@@ -1344,5 +1355,45 @@ mod tests {
         );
         let long = configmap_name(&"n".repeat(60), &"g".repeat(60));
         assert!(long.len() <= 63 && long.starts_with("grid-serving-"), "{long}");
+    }
+
+    #[test]
+    fn capacity_weight_reaches_serving_candidate_without_traffic_weight() {
+        let mut c = cand("llama", "site-a", "pool-a", None);
+        c.capacity_weight = 3;
+        let config = render(&overlay(vec![c]), &INPUTS);
+        assert_eq!(
+            config.candidates[0].weight, 3,
+            "capacity_weight must reach the gateway even without weightedRandom traffic_weight"
+        );
+        let json = to_text(&config).expect("json");
+        assert!(json.contains("\"weight\": 3"), "weight serializes into the config JSON");
+    }
+
+    #[test]
+    fn default_capacity_weight_is_emitted_in_json() {
+        let config = render(&two_site(), &INPUTS);
+        let json = to_text(&config).expect("json");
+        assert!(
+            config.candidates.iter().all(|candidate| candidate.weight == 1),
+            "the default capacity weight must be rendered for every candidate"
+        );
+        assert!(json.contains("\"weight\": 1"), "the default weight must be serialized");
+    }
+
+    #[test]
+    fn duplicate_candidates_fold_to_the_largest_weight() {
+        let mut c1 = cand("llama", "site-a", "pool-a", None);
+        c1.capacity_weight = 2;
+        let mut c2 = cand("llama", "site-a", "pool-a", None);
+        c2.capacity_weight = 5;
+        for pair in [[c1.clone(), c2.clone()], [c2, c1]] {
+            let config = render(&overlay(pair.to_vec()), &INPUTS);
+            assert_eq!(config.candidates.len(), 1, "dedup should merge duplicates");
+            assert_eq!(
+                config.candidates[0].weight, 5,
+                "the larger weight survives either order"
+            );
+        }
     }
 }
