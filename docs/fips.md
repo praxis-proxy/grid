@@ -23,6 +23,10 @@ Red Hat UBI 9 minimal image that includes OpenSSL's FIPS provider:
 | Operator | `deploy/operator/Containerfile.fips` | `make operator-fips-image` | `grid-operator:<version>-fips` |
 | Overlay sync | `crates/overlay-sync/Containerfile.fips` | `make overlay-sync-fips-image` | `grid-overlay-sync:<version>-fips` |
 
+Both Containerfiles accept `UBI9_MINIMAL_DIGEST`; the local Make targets pass the
+shared `FIPS_UBI9_MINIMAL_DIGEST` value. Override it when intentionally updating
+the pinned UBI runtime image.
+
 The standard Alpine images are unchanged. The FIPS images require a host running
 with `fips=1`; UBI's OpenSSL follows the host FIPS state and activates the
 provider. For example, a release image is

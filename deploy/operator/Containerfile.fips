@@ -4,6 +4,8 @@
 # Stage 1: Build with the FIPS feature set and dynamic system OpenSSL
 # ------------------------------------------------------------------------------
 
+ARG UBI9_MINIMAL_DIGEST=sha256:8ebe2ad8fdf3cab3e5a53c1edc69194c98209cfadab24b884f4ad9ebcf7bbbfc
+
 FROM rust:1.96-bookworm AS builder
 
 # Do not vendor OpenSSL or request static linkage. The runtime uses UBI's
@@ -44,7 +46,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Stage 2: Runtime on Red Hat UBI 9 with its OpenSSL FIPS provider
 # ------------------------------------------------------------------------------
 
-FROM registry.access.redhat.com/ubi9/ubi-minimal@sha256:8ebe2ad8fdf3cab3e5a53c1edc69194c98209cfadab24b884f4ad9ebcf7bbbfc
+FROM registry.access.redhat.com/ubi9/ubi-minimal@${UBI9_MINIMAL_DIGEST}
 
 ARG GRID_GIT_COMMIT=unknown
 ARG GRID_GIT_VERSION=unknown
