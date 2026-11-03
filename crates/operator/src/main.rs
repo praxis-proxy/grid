@@ -2913,8 +2913,8 @@ fn site_by_spiffe(leaf: &[u8], identity: &SignalsIdentity) -> Option<(String, BT
 /// Whether `tcp` sent anything within [`SIGNALS_SILENT_TIMEOUT`].
 ///
 /// A connection that never speaks costs a slot and proves nothing, and opening many of them
-/// is the cheapest way to hold the handshake share. `readable()` does not consume, so the
-/// handshake that follows still sees the `ClientHello`. False also covers shutdown, where the
+/// is the cheapest way to hold the handshake share. `peek()` does not consume, so the handshake
+/// that follows still sees the `ClientHello`. False also covers shutdown, where the
 /// caller stops for its own reasons.
 async fn spoke_in_time(
     tcp: &tokio::net::TcpStream,
