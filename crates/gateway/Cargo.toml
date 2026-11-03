@@ -33,11 +33,11 @@ time = "0.3.0"
 # filter dependency also uses these crates, so patch the registry packages to
 # prevent a second, unconfigured copy from entering the gateway.
 [patch.crates-io]
-praxis-proxy = { git = "https://github.com/evacchi/praxis", rev = "f69757c4cff4e5ded881ea24ffea0ee2bc41d4c5" }
-praxis-proxy-core = { git = "https://github.com/evacchi/praxis", rev = "f69757c4cff4e5ded881ea24ffea0ee2bc41d4c5" }
-praxis-proxy-filter = { git = "https://github.com/evacchi/praxis", rev = "f69757c4cff4e5ded881ea24ffea0ee2bc41d4c5" }
-praxis-proxy-protocol = { git = "https://github.com/evacchi/praxis", rev = "f69757c4cff4e5ded881ea24ffea0ee2bc41d4c5" }
-praxis-proxy-tls = { git = "https://github.com/evacchi/praxis", rev = "f69757c4cff4e5ded881ea24ffea0ee2bc41d4c5" }
+praxis-proxy = { git = "https://github.com/evacchi/praxis", rev = "ed47f771" }
+praxis-proxy-core = { git = "https://github.com/evacchi/praxis", rev = "ed47f771" }
+praxis-proxy-filter = { git = "https://github.com/evacchi/praxis", rev = "ed47f771" }
+praxis-proxy-protocol = { git = "https://github.com/evacchi/praxis", rev = "ed47f771" }
+praxis-proxy-tls = { git = "https://github.com/evacchi/praxis", rev = "ed47f771" }
 
 [workspace.lints.rust]
 dead_code = "deny"
