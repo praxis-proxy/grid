@@ -1418,14 +1418,12 @@ fn mean_capacity(sites: &Sites<'_>) -> f64 {
     if count > 0.0 { sum / count } else { 1.0 }
 }
 
-/// A pick between two sites by capacity over 1 + rho, with the exploration clamp applied before weights.
+/// A pick between two sites by weighted capacity over 1 + rho, each share clamped to 0.1..0.9.
 fn between_two<'snap>(first: Site<'snap>, second: Site<'snap>, turn: usize, unpublished: f64) -> Site<'snap> {
-    let rate =
-        |candidate: &RouteCandidate| candidate.capacity.unwrap_or(unpublished) / (1.0 + candidate.rho.unwrap_or(0.0));
-    let base_share = (rate(first.0) / (rate(first.0) + rate(second.0))).clamp(TWO_SITE_SHARE.0, TWO_SITE_SHARE.1);
-    let first_weighted = base_share * f64::from(first.0.weight);
-    let second_weighted = (1.0 - base_share) * f64::from(second.0.weight);
-    let share = first_weighted / (first_weighted + second_weighted);
+    let rate = |candidate: &RouteCandidate| {
+        candidate.capacity.unwrap_or(unpublished) * f64::from(candidate.weight) / (1.0 + candidate.rho.unwrap_or(0.0))
+    };
+    let share = (rate(first.0) / (rate(first.0) + rate(second.0))).clamp(TWO_SITE_SHARE.0, TWO_SITE_SHARE.1);
     if unit(turn, SALTS.0) < share { first } else { second }
 }
 
@@ -2172,6 +2170,11 @@ pub(crate) mod tests {
 
     /// Sites publishing (in flight, capacity), each `None` to publish nothing, as one snapshot.
     fn loaded(sites: &[(&str, Option<f64>, Option<f64>)]) -> RouteSnapshot {
+        loaded_with_weights(sites, &[])
+    }
+
+    /// Sites with declared weights applied before learning and exploration flooring.
+    fn loaded_with_weights(sites: &[(&str, Option<f64>, Option<f64>)], weights: &[(&str, u32)]) -> RouteSnapshot {
         let store = grid_signals::LoadStore::new(Duration::from_secs(60));
         let mut candidates = Vec::new();
         for (site, in_flight, capacity) in sites {
@@ -2183,6 +2186,11 @@ pub(crate) mod tests {
                 }
             }
             candidates.extend(one("llama", site, &cluster, AdmissionState::NewAndExisting));
+        }
+        for candidate in &mut candidates {
+            if let Some((_, weight)) = weights.iter().find(|(site, _)| *site == candidate.site.as_ref()) {
+                candidate.weight = *weight;
+            }
         }
         // Exact: a sample moves saturation all the way, and the floor is one request.
         let availability = AvailabilitySettings {
@@ -2536,6 +2544,71 @@ pub(crate) mod tests {
             (2_700..=3_300).contains(&taken["a"]),
             "weight 3 vs 1 with equal pressure should give ~75% to a, got {taken:?}"
         );
+    }
+
+    #[test]
+    fn capacity_draw_preserves_exploration_after_declared_weights() {
+        for (weight, expected) in [(3, 7_500), (1_000, 8_000)] {
+            let snapshot = loaded_with_weights(
+                &[("a", Some(2.0), Some(10.0)), ("b", Some(2.0), Some(10.0))],
+                &[("a", weight), ("b", 1)],
+            );
+            let sites = Sites::gather(
+                snapshot
+                    .candidates
+                    .iter()
+                    .zip(&snapshot.decisions)
+                    .map(|(candidate, decisions)| (candidate, decisions, 0.0)),
+            );
+            let heavier = (0..10_000)
+                .filter(|turn| {
+                    select(&sites, false, *turn).is_some_and(|(candidate, ..)| candidate.site.as_ref() == "a")
+                })
+                .count();
+            assert!(
+                (expected - 300..=expected + 300).contains(&heavier),
+                "weight {weight}:1 preserves ordinary ratios and floors extreme ones: {heavier}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_choices_preserve_exploration_after_declared_weights() {
+        let mut snapshot = loaded_with_weights(
+            &[
+                ("a", Some(2.0), Some(10.0)),
+                ("b", Some(2.0), Some(10.0)),
+                ("c", Some(2.0), Some(10.0)),
+            ],
+            &[("a", 1_000), ("b", 1), ("c", 1)],
+        );
+        for candidate in &mut snapshot.candidates {
+            candidate.backlog = Some(false);
+        }
+        let taken = shares(&snapshot, 10_000, &KeepAll);
+        for site in ["b", "c"] {
+            assert!(
+                (1_300..=2_000).contains(&taken[site]),
+                "equal pressure preserves the floored first-draw share for {site}: {taken:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_site_exploration_survives_extreme_declared_weights() {
+        for (first_weight, second_weight, expected) in [(1_000, 1, 9_000), (1, 1_000, 1_000)] {
+            let mut snapshot = loaded(&[("a", Some(3.0), Some(10.0)), ("b", Some(3.0), Some(10.0))]);
+            for candidate in &mut snapshot.candidates {
+                candidate.backlog = Some(false);
+            }
+            snapshot.candidates[0].weight = first_weight;
+            snapshot.candidates[1].weight = second_weight;
+            let taken = shares(&snapshot, 10_000, &KeepAll);
+            assert!(
+                (expected - 300..=expected + 300).contains(&taken["a"]),
+                "the final share stays clamped for weights {first_weight}:{second_weight}: {taken:?}"
+            );
+        }
     }
 
     #[test]
