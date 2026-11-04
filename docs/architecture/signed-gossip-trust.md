@@ -101,11 +101,23 @@ provider-network state. Forwarded records do not grant ownership of another
 site's providers. Signed model-inventory frames use the same binding before
 any frame is buffered, in addition to their existing provider-UID checks.
 
-Installing or changing a binding purges retained origins, including provider
-revisions, UID history, and model inventories. The existing origin eviction
-also removes that origin's metadata and providers in other grid scopes, so
-valid state may be temporarily unavailable until peers republish. Reapplying
-an unchanged binding preserves state. A new or changed binding also clears
+The receiver tracks the admitting origin/grid scope for each provider value
+in its shared snapshot. Ownership changes with the accepted value; an empty
+withdrawal can remove only values currently owned by its scope. Overlapping
+identities retain only the current contribution, not older values to restore.
+This ownership index is local memory and does not change the wire format.
+
+Installing or changing a binding clears provider values currently owned by
+that grid, its provider revision guards, UID history, and complete or pending
+model inventories. Providers verified in other grids and origin-wide metadata
+(gateway, certificate, and signals addresses, including their revision guards)
+are preserved. Grid-scoped peer pin installation, rotation that removes keys,
+and revocation use the same cleanup restricted to that peer and grid.
+Provider values admitted without a grid-specific verified signing key are
+also cleared in the affected origins; unsigned grid labels do not establish
+trusted ownership. Full origin eviction remains reserved for origin-wide
+events such as membership expiry or legacy site-pin enforcement.
+Reapplying an unchanged binding preserves state. A new or changed binding also clears
 that grid's signing-key pins. The runtime reinstalls the local signer and only
 the peer keys verified for the new binding. If peer verification cannot run,
 old peer pins are retained only for an unchanged binding; a changed binding

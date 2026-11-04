@@ -1271,17 +1271,29 @@ struct ProviderStateScope {
     grid_id: Option<String>,
 }
 
+/// Admission provenance of the provider value currently in the shared snapshot.
+struct ProviderOwner {
+    /// Envelope scope that supplied this value, including legacy unsigned labels.
+    scope: ProviderStateScope,
+    /// Whether admission verified a signing key pinned specifically for this grid.
+    verified_grid: bool,
+}
+
 /// Per-origin metadata retained by the broadcast handler.
 #[derive(Default)]
 struct RetainedOrigins {
+    /// Current provider ownership, changed together with the merged provider values.
+    provider_owners: BTreeMap<ProviderIdentity, ProviderOwner>,
     /// Highest provider-state revision received from each origin and Grid ID.
     latest_by_scope: BTreeMap<ProviderStateScope, u64>,
+    /// Scopes whose latest provider revision was admitted without a verified grid key.
+    unverified_scopes: BTreeSet<ProviderStateScope>,
     /// Provider network IDs last associated with each origin and Grid ID.
     provider_networks_by_scope: BTreeMap<ProviderStateScope, BTreeSet<String>>,
     /// Provider UIDs keyed by structured identity for each origin/grid.
     provider_uids_by_scope: BTreeMap<ProviderStateScope, BTreeMap<ProviderIdentity, String>>,
-    /// Origins with authenticated inventory assembly state.
-    inventory_origins: BTreeSet<String>,
+    /// Origin/grid scopes with authenticated inventory assembly state.
+    inventory_scopes: BTreeSet<ProviderStateScope>,
     /// Gateway addresses received from each origin site.
     gateway_addrs: BTreeMap<String, String>,
     /// Highest gateway-address revision received from each origin.
@@ -1341,6 +1353,66 @@ fn wall_ms() -> u64 {
 }
 
 impl RetainedOrigins {
+    /// Replace values supplied by this scope, preserving values owned by other scopes.
+    /// Incoming values take ownership of matching identities in the shared snapshot.
+    fn replace_providers(
+        &mut self,
+        snapshot: &mut GridStateSnapshot,
+        broadcast: &StateBroadcast,
+        networks: &BTreeSet<String>,
+        verified_grid: bool,
+    ) -> BTreeSet<String> {
+        let scope = broadcast.provider_state_scope();
+        let incoming: BTreeSet<ProviderIdentity> = broadcast
+            .snapshot
+            .providers
+            .values()
+            .filter(|provider| provider.site_id == broadcast.origin_site && networks.contains(&provider.network_id))
+            .map(provider_identity)
+            .collect();
+        let replace = |identity: &ProviderIdentity| {
+            incoming.contains(identity)
+                || (networks.contains(&identity.network)
+                    && self
+                        .provider_owners
+                        .get(identity)
+                        .is_some_and(|owner| owner.scope == scope))
+        };
+        snapshot
+            .providers
+            .retain(|_, provider| !replace(&provider_identity(provider)));
+        let removed: Vec<ProviderIdentity> = self
+            .provider_owners
+            .keys()
+            .filter(|identity| replace(identity))
+            .cloned()
+            .collect();
+        for identity in removed {
+            self.provider_owners.remove(&identity);
+        }
+        let mut accepted = BTreeSet::new();
+        for provider in broadcast
+            .snapshot
+            .providers
+            .values()
+            .filter(|provider| incoming.contains(&provider_identity(provider)))
+        {
+            let mut provider = provider.clone();
+            provider.revision = broadcast.revision;
+            broadcast.origin_site.clone_into(&mut provider.writer_id);
+            accepted.insert(provider.network_id.clone());
+            self.provider_owners.insert(
+                provider_identity(&provider),
+                ProviderOwner {
+                    scope: scope.clone(),
+                    verified_grid,
+                },
+            );
+            snapshot.upsert_provider(provider);
+        }
+        accepted
+    }
+
     /// The values and revision guard for `lane`.
     fn lane_mut(&mut self, lane: Lane) -> (&mut BTreeMap<String, String>, &mut BTreeMap<String, u64>) {
         match lane {
@@ -1356,7 +1428,7 @@ impl RetainedOrigins {
             .keys()
             .map(|scope| &scope.origin_site)
             .chain(self.provider_networks_by_scope.keys().map(|scope| &scope.origin_site))
-            .chain(self.inventory_origins.iter())
+            .chain(self.inventory_scopes.iter().map(|scope| &scope.origin_site))
             .chain(self.gateway_addrs.keys())
             .chain(self.latest_gateway_revision_by_origin.keys())
             .chain(self.cert_pems.keys())
@@ -1369,12 +1441,14 @@ impl RetainedOrigins {
 
     /// Remove every revision and metadata value associated with one origin.
     fn remove(&mut self, origin: &str) {
+        self.provider_owners.retain(|identity, _| identity.site != origin);
         self.latest_by_scope.retain(|scope, _| scope.origin_site != origin);
+        self.unverified_scopes.retain(|scope| scope.origin_site != origin);
         self.provider_networks_by_scope
             .retain(|scope, _| scope.origin_site != origin);
         self.provider_uids_by_scope
             .retain(|scope, _| scope.origin_site != origin);
-        self.inventory_origins.remove(origin);
+        self.inventory_scopes.retain(|scope| scope.origin_site != origin);
         self.forget_departed(origin);
         self.latest_gateway_revision_by_origin.remove(origin);
         self.latest_cert_revision_by_origin.remove(origin);
@@ -1423,9 +1497,57 @@ impl OriginStateHandle {
             })
     }
 
-    /// Return the origins represented by retained provider or metadata state.
-    pub(crate) fn known_origins(&self) -> BTreeSet<String> {
-        self.lock().known_origins()
+    /// Clear one grid's provider state, optionally restricted to a single origin.
+    ///
+    /// State admitted without a grid-specific verified key is also discarded in
+    /// the selected origins: an unsigned grid label cannot establish ownership
+    /// for a trust transition. Origin-wide metadata and its guards are preserved.
+    pub(crate) fn remove_grid(&self, grid_id: &str, origin: Option<&str>) {
+        let selected = |scope: &ProviderStateScope| {
+            scope.grid_id.as_deref() == Some(grid_id) && origin.is_none_or(|origin| scope.origin_site == origin)
+        };
+        let mut retained = self.lock();
+        let removed: BTreeSet<ProviderIdentity> = retained
+            .provider_owners
+            .iter()
+            .filter(|(_, owner)| {
+                origin.is_none_or(|origin| owner.scope.origin_site == origin)
+                    && (selected(&owner.scope) || !owner.verified_grid)
+            })
+            .map(|(identity, _)| identity.clone())
+            .collect();
+        let unverified_scopes: BTreeSet<ProviderStateScope> = retained
+            .unverified_scopes
+            .iter()
+            .filter(|scope| origin.is_none_or(|origin| scope.origin_site == origin))
+            .cloned()
+            .collect();
+        let clear_scope = |scope: &ProviderStateScope| selected(scope) || unverified_scopes.contains(scope);
+        retained.latest_by_scope.retain(|scope, _| !clear_scope(scope));
+        retained.unverified_scopes.retain(|scope| !clear_scope(scope));
+        retained
+            .provider_networks_by_scope
+            .retain(|scope, _| !clear_scope(scope));
+        retained.provider_uids_by_scope.retain(|scope, _| !clear_scope(scope));
+        retained.inventory_scopes.retain(|scope| !selected(scope));
+        self.state_tx.send_modify(|snapshot| {
+            snapshot
+                .providers
+                .retain(|_, provider| !removed.contains(&provider_identity(provider)));
+            retained
+                .provider_owners
+                .retain(|identity, _| !removed.contains(identity));
+        });
+        drop(retained);
+        self.model_inventory_assembler
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove_grid(grid_id, origin);
+        self.model_inventories_tx.send_modify(|inventories| {
+            inventories.retain(|inventory| {
+                inventory.grid_id != grid_id || origin.is_some_and(|origin| inventory.origin_site != origin)
+            });
+        });
     }
 
     /// Remove provider and transport state for a departed origin, and
@@ -1445,10 +1567,12 @@ impl OriginStateHandle {
     /// covers bounding per-tenant site-slot growth now that this path no
     /// longer prunes it.
     pub(crate) fn remove_origin(&self, origin: &str) {
-        self.lock().remove(origin);
+        let mut retained = self.lock();
+        retained.remove(origin);
         self.state_tx.send_modify(|snapshot| {
             snapshot.remove_origin_providers(origin);
         });
+        drop(retained);
         self.publish_departed(origin);
         self.signals_addrs_tx.send_modify(|addresses| {
             addresses.remove(origin);
@@ -1763,12 +1887,11 @@ impl StateBroadcastHandler {
 
     /// Remove one origin from provider state, metadata, and revision guards.
     fn remove_origin(&self, origin: &str) {
-        self.retained
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(origin);
+        let mut retained = self.retained.lock().unwrap_or_else(PoisonError::into_inner);
+        retained.remove(origin);
         self.state_tx
             .send_modify(|snapshot| snapshot.remove_origin_providers(origin));
+        drop(retained);
         self.gateway_addrs_tx.send_modify(|addresses| {
             addresses.remove(origin);
         });
@@ -2027,8 +2150,11 @@ impl StateBroadcastHandler {
         self.retained
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .inventory_origins
-            .insert(broadcast.origin_site.clone());
+            .inventory_scopes
+            .insert(ProviderStateScope {
+                origin_site: broadcast.origin_site.clone(),
+                grid_id: Some(broadcast.grid_id.clone()),
+            });
         let key = broadcast.key();
         let result = self
             .model_inventory_assembler
@@ -2074,6 +2200,10 @@ impl StateBroadcastHandler {
                     .get(&scope)
                     .and_then(|uids| uids.get(&identity))
                     == Some(&inventory.provider_uid)
+                    && retained
+                        .provider_owners
+                        .get(&identity)
+                        .is_some_and(|owner| owner.scope == scope)
             })
             .collect::<Vec<_>>();
         drop(retained);
@@ -2206,6 +2336,13 @@ impl StateBroadcastHandler {
             networks_to_replace.retain(|network| *network == allowed);
         }
         let mut accepted_networks = BTreeSet::new();
+        let verified_grid = broadcast.grid_id.as_deref().is_some_and(|grid| {
+            self.trust_store_rx
+                .borrow()
+                .pin(&PinKey::grid(grid, &broadcast.origin_site))
+                .is_some_and(|keys| !keys.is_empty())
+        });
+        let mut retained = self.retained.lock().unwrap_or_else(PoisonError::into_inner);
         self.state_tx.send_modify(|snap| {
             snap.capabilities.merge(&broadcast.snapshot.capabilities);
             snap.merge_tenant_spend_from_origin(&broadcast.origin_site, &broadcast.snapshot.tenant_spend);
@@ -2213,18 +2350,17 @@ impl StateBroadcastHandler {
             // origin-provider replace below; it doesn't carry an
             // authoritative provider list for this cycle at all.
             if carries_provider_state {
-                accepted_networks = snap.replace_origin_providers_in_networks(
-                    &broadcast.origin_site,
-                    broadcast.revision,
-                    &networks_to_replace,
-                    &broadcast.snapshot,
-                );
+                accepted_networks = retained.replace_providers(snap, broadcast, &networks_to_replace, verified_grid);
             }
         });
-        let mut retained = self.retained.lock().unwrap_or_else(PoisonError::into_inner);
         retained
             .latest_by_scope
             .insert(provider_scope.clone(), broadcast.revision);
+        if verified_grid {
+            retained.unverified_scopes.remove(&provider_scope);
+        } else {
+            retained.unverified_scopes.insert(provider_scope.clone());
+        }
         if !accepted_networks.is_empty() {
             retained
                 .provider_networks_by_scope
@@ -2646,6 +2782,129 @@ mod tests {
             handler.snapshot().provider("network-b", "site-p", "provider").is_some(),
             "B survives"
         );
+    }
+
+    #[test]
+    fn overlapping_provider_values_follow_the_current_owner() -> Result<(), Box<dyn std::error::Error>> {
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        let (handler, control) = scoped_receiver_with_control(&public_key);
+        handler
+            .trust_store_tx
+            .send_modify(|store| store.bind_provider_network("grid-b", "network-a"));
+        handler.receive_state_broadcast(&scoped_provider_broadcast("grid-a", "network-a", 10, &private_key))?;
+        handler.receive_state_broadcast(&scoped_provider_broadcast("grid-b", "network-a", 1, &private_key))?;
+        let from_b = handler.snapshot();
+        let withdrawal = sign_state_broadcast(
+            StateBroadcast::new(
+                "site-p".to_owned(),
+                11,
+                GridStateSnapshot::new("site-p".to_owned()),
+                None,
+            )
+            .with_grid_id(Some("grid-a".to_owned()))
+            .with_authoritative_provider_state(),
+            &private_key,
+        );
+        handler.receive_state_broadcast(&withdrawal)?;
+        assert_eq!(
+            handler.snapshot(),
+            from_b,
+            "A's withdrawal cannot remove B's current value"
+        );
+        control.remove_grid("grid-a", None);
+        assert_eq!(
+            handler.snapshot(),
+            from_b,
+            "A's historical network ownership cannot erase B's value"
+        );
+        assert_eq!(control.lock().provider_owners.len(), 1);
+        assert!(
+            handler
+                .receive_state_broadcast(&scoped_provider_broadcast("grid-b", "network-a", 0, &private_key))?
+                .is_none(),
+            "B's revision guard survives A's cleanup"
+        );
+        control.remove_grid("grid-b", Some("site-p"));
+        assert!(
+            handler.snapshot().providers.is_empty(),
+            "clearing the current owner removes the value without restoring an old contribution"
+        );
+        assert!(control.lock().provider_owners.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn grid_cleanup_discards_unsigned_ownership_without_trusting_grid_labels() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (handler, control) = StateBroadcastHandler::with_capacity("local".to_owned(), 8);
+        for grid in [None, Some("unverified-grid".to_owned())] {
+            let state =
+                StateBroadcast::new("site-p".to_owned(), 10, snapshot("site-p", 10, 0.2), None).with_grid_id(grid);
+            handler.receive_state_broadcast(&state)?;
+        }
+        assert_eq!(
+            control.lock().provider_owners.len(),
+            1,
+            "the index tracks only current provider values"
+        );
+        control.remove_grid("grid-a", None);
+        assert!(
+            handler.snapshot().providers.is_empty(),
+            "an unsigned grid label cannot protect unverified state from a trust transition"
+        );
+        assert!(control.lock().provider_owners.is_empty());
+        assert!(
+            control.lock().latest_by_scope.is_empty(),
+            "unsigned scopes do not retain poisoned revision guards, even after ownership changes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn grid_cleanup_preserves_other_scope_uids_and_origin_revision_guards() -> Result<(), Box<dyn std::error::Error>> {
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        let (handler, control) = scoped_receiver_with_control(&public_key);
+        for (grid, network) in [("grid-a", "network-a"), ("grid-b", "network-b")] {
+            let mut broadcast =
+                scoped_provider_broadcast(grid, network, 10, &private_key).with_provider_uids(vec![ProviderUid {
+                    identity: ProviderIdentity {
+                        network: network.to_owned(),
+                        site: "site-p".to_owned(),
+                        provider: "provider".to_owned(),
+                    },
+                    uid: grid.to_owned(),
+                }]);
+            broadcast.gateway_address = Some("gateway".to_owned());
+            broadcast.signals_address = Some("signals".to_owned());
+            broadcast.site_cert_pem = Some("certificate".to_owned());
+            handler.receive_state_broadcast(&sign_state_broadcast(broadcast, &private_key))?;
+        }
+        control.remove_grid("grid-a", None);
+        let retained = control.lock();
+        assert_eq!(retained.latest_by_scope.len(), 1);
+        assert_eq!(retained.provider_networks_by_scope.len(), 1);
+        assert_eq!(retained.provider_uids_by_scope.len(), 1);
+        assert!(retained.provider_uids_by_scope.iter().all(
+            |(scope, uids)| scope.grid_id.as_deref() == Some("grid-b") && uids.values().all(|uid| uid == "grid-b")
+        ));
+        drop(retained);
+        let stale = StateBroadcast::new(
+            "site-p".to_owned(),
+            1,
+            GridStateSnapshot::new("site-p".to_owned()),
+            Some("stale".to_owned()),
+        )
+        .with_grid_id(Some("grid-b".to_owned()))
+        .with_cert(Some("stale".to_owned()))
+        .with_signals_address(Some("stale".to_owned()));
+        handler.receive_state_broadcast(&sign_state_broadcast(stale, &private_key))?;
+        assert_eq!(handler.gateway_address_for_site("site-p").as_deref(), Some("gateway"));
+        assert_eq!(handler.cert_pem_for_site("site-p").as_deref(), Some("certificate"));
+        assert_eq!(
+            handler.signals_addrs_tx.borrow().get("site-p").map(String::as_str),
+            Some("signals")
+        );
+        Ok(())
     }
 
     #[test]
@@ -5818,7 +6077,12 @@ mod tests {
 
     /// A receiver trusting one origin in two explicitly authorized grid/network scopes.
     fn scoped_receiver(public_key: &[u8]) -> StateBroadcastHandler {
-        let handler = StateBroadcastHandler::new("local".to_owned());
+        scoped_receiver_with_control(public_key).0
+    }
+
+    /// A scoped receiver and its coordinated cleanup handle.
+    fn scoped_receiver_with_control(public_key: &[u8]) -> (StateBroadcastHandler, OriginStateHandle) {
+        let (handler, control) = StateBroadcastHandler::with_capacity("local".to_owned(), DEFAULT_MAX_RETAINED_ORIGINS);
         handler.trust_store_tx.send_modify(|store| {
             for (grid, network) in [("grid-a", "network-a"), ("grid-b", "network-b")] {
                 store.enforce(grid);
@@ -5826,7 +6090,7 @@ mod tests {
                 store.set_pin(PinKey::grid(grid, "site-p"), vec![public_key.to_vec()]);
             }
         });
-        handler
+        (handler, control)
     }
 
     /// A correctly signed provider snapshot with distinct grid and provider-network IDs.
