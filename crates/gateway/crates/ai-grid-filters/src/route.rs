@@ -1248,9 +1248,12 @@ impl<'snap> Sites<'snap> {
 
 /// Choose a site for `name` among the admitted, `routable` matches.
 ///
-/// Choose a pressure tier before affinity, keeping entirely missing telemetry as fallback.
-/// Spread observed room by pressure. Unknown capacity uses mean-known weights.
-/// Queue-only and saturated tiers retain least-queue routing.
+/// The lowest operator-assigned selection group with a candidate that can
+/// accept new work is an eligibility boundary. Within that group, choose a
+/// pressure tier before affinity, keeping entirely missing telemetry as
+/// fallback. Spread observed room by pressure. Unknown capacity uses
+/// mean-known weights. Queue-only and saturated tiers retain least-queue
+/// routing.
 #[expect(
     clippy::too_many_arguments,
     reason = "the request path passes its inputs directly rather than build a struct per request"
@@ -1264,6 +1267,8 @@ pub(crate) fn select_spread<'snap>(
     narrow: &impl Narrow,
 ) -> Option<Pick<'snap>> {
     let matches = matching(snapshot, kind, name, &routable);
+    let selection_group = matches.clone().map(|(candidate, ..)| candidate.selection_group).min()?;
+    let matches = matches.filter(move |(candidate, ..)| candidate.selection_group == selection_group);
     let (front, front_score, front_decisions) = matches.clone().next()?;
     let site = |(candidate, score, decisions): Scored<'snap>| (candidate, decisions, score);
     let healthy = Sites::gather(matches.filter(|(_, score, _)| !score.is_nan()).map(site));
@@ -1539,12 +1544,47 @@ pub(crate) mod tests {
             kind: CapabilityKind::InferenceModel,
             name: model.to_owned(),
             publishes_load: true,
+            selection_group: 0,
             site: site.to_owned(),
             stable_id: None,
         }])
         .unwrap();
         candidates[0].admission_state = admission;
         candidates
+    }
+
+    #[test]
+    fn selection_groups_hold_fallback_until_preferred_cannot_accept_new_work() {
+        let mut preferred = one("llama", "east", "pool-east", AdmissionState::NewAndExisting);
+        let mut fallback = one("llama", "west", "pool-west", AdmissionState::NewAndExisting);
+        preferred[0].selection_group = 0;
+        fallback[0].selection_group = 1;
+
+        assert_eq!(
+            front(
+                vec![fallback.pop().unwrap(), preferred.pop().unwrap()],
+                CapabilityKind::InferenceModel,
+                "llama",
+            ),
+            Some("pool-east".to_owned()),
+            "fallback load ordering must not bypass the preferred group"
+        );
+
+        let existing_only_preferred = one("llama", "east", "pool-east", AdmissionState::ExistingOnly);
+        let mut fallback_after_preferred = one("llama", "west", "pool-west", AdmissionState::NewAndExisting);
+        fallback_after_preferred[0].selection_group = 1;
+        assert_eq!(
+            front(
+                vec![
+                    existing_only_preferred.into_iter().next().unwrap(),
+                    fallback_after_preferred.pop().unwrap(),
+                ],
+                CapabilityKind::InferenceModel,
+                "llama",
+            ),
+            Some("pool-west".to_owned()),
+            "new work may use the fallback only after the preferred group no longer admits it"
+        );
     }
 
     /// A filter over `snapshot` with affinity at `settings`.
@@ -1743,6 +1783,7 @@ pub(crate) mod tests {
                     kind: CapabilityKind::InferenceModel,
                     name: name.to_owned(),
                     publishes_load: true,
+                    selection_group: 0,
                     site: "a".to_owned(),
                 })
                 .collect(),

@@ -65,6 +65,7 @@ fn snapshot(sites: u32, shape: Shape) -> RouteSnapshot {
                 publishes_load: true,
                 rank: None,
                 selection_tier: None,
+                selection_group: 0,
                 site: Arc::clone(&site),
                 stable_id: site,
                 dial: None,

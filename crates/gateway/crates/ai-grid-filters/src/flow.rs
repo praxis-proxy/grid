@@ -179,6 +179,7 @@ fn candidates(model: &str, sites: &[(&str, &str)]) -> Vec<RouteCandidate> {
             kind: CapabilityKind::InferenceModel,
             name: model.to_owned(),
             publishes_load: true,
+            selection_group: 0,
             site: (*site).to_owned(),
             stable_id: None,
         })

@@ -257,6 +257,12 @@ pub(crate) struct ServingCandidate {
     /// operator has heard load for. Omitted when it does, as the gateway assumes when absent.
     #[serde(skip_serializing_if = "publishes")]
     pub(crate) publishes_load: bool,
+    /// Operator-assigned priority boundary for new-session selection.
+    ///
+    /// `0` preserves the pre-regional-policy behavior. Higher groups are only
+    /// considered when no candidate in a lower group can accept new work.
+    #[serde(skip_serializing_if = "selection_group_zero")]
+    pub(crate) selection_group: u32,
     /// A local candidate's credential locator, which `grid_site_route` selects for `credential_inject`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) credential: Option<ProjectedCredential>,
@@ -266,6 +272,12 @@ pub(crate) struct ServingCandidate {
 #[expect(clippy::trivially_copy_pass_by_ref, reason = "serde skip_serializing_if signature")]
 const fn publishes(publishes_load: &bool) -> bool {
     *publishes_load
+}
+
+/// Whether a candidate belongs to the default priority group.
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde skip_serializing_if signature")]
+const fn selection_group_zero(selection_group: &u32) -> bool {
+    *selection_group == 0
 }
 
 /// Whether `admission` is the default, which the gateway assumes when absent.
@@ -413,6 +425,8 @@ struct Folded {
     credential: Option<ProjectedCredential>,
     /// The earliest discovered inventory deadline among duplicates.
     expires_at_ms: Option<u64>,
+    /// Earliest active routing priority boundary among duplicates.
+    selection_group: u32,
 }
 
 /// Each routable candidate once, folded.
@@ -447,6 +461,7 @@ fn dedup<'overlay>(
             candidate.cluster.as_str(),
         );
         let admission = candidate.admission_state.unwrap_or(AdmissionState::NewAndExisting);
+        let selection_group = candidate.selection_group.unwrap_or(0);
         // Seeded with the identities of both folds, so the first candidate and every
         // duplicate after it take the same path: fresh only if all are, admission as
         // restricted as the most restricted.
@@ -456,9 +471,11 @@ fn dedup<'overlay>(
             stable_id: None,
             credential: None,
             expires_at_ms,
+            selection_group,
         });
         folded.fresh &= candidate.fresh;
         folded.admission = folded.admission.max(admission);
+        folded.selection_group = folded.selection_group.min(selection_group);
         if folded.stable_id.is_none() {
             folded.stable_id.clone_from(&candidate.stable_id);
         }
@@ -476,7 +493,8 @@ fn dedup<'overlay>(
 
 /// Inference candidates within gateway limits, deduplicated and ordered.
 ///
-/// Past the cap, candidates taking new requests are kept before the rest.
+/// Past the cap, lower selection groups and candidates taking new requests are
+/// kept before the rest.
 fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<ServingCandidate> {
     if overlay.candidates.is_empty() {
         return Vec::new();
@@ -489,7 +507,13 @@ fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<Servi
             candidates = kept.len(),
             "serving config: dropping candidates past the gateway cap"
         );
-        kept.sort_by_key(|(key, folded)| (folded.admission != AdmissionState::NewAndExisting, *key));
+        kept.sort_by_key(|(key, folded)| {
+            (
+                folded.selection_group,
+                folded.admission != AdmissionState::NewAndExisting,
+                *key,
+            )
+        });
         kept.truncate(MAX_CANDIDATES);
         kept.sort_by_key(|(key, _)| *key);
     }
@@ -503,6 +527,7 @@ fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<Servi
             fresh: folded.fresh,
             admission: folded.admission,
             publishes_load: publishes_load(inputs, remote, site, cluster),
+            selection_group: folded.selection_group,
             // Never on another site's cluster or a provider hop, so the secret stays on this site.
             credential: folded.credential.filter(|_| {
                 inputs.inject_local_credentials && !remote && !inputs.provider_hop_clusters.contains(cluster)
@@ -1050,6 +1075,32 @@ mod tests {
     }
 
     #[test]
+    fn past_the_cap_keeps_the_preferred_regional_group() {
+        let mut source = overlay(
+            (0..MAX_CANDIDATES)
+                .map(|i| {
+                    let mut fallback = cand("llama", "site-b", &format!("fallback-{i:04}"), None);
+                    fallback.selection_group = Some(1);
+                    fallback
+                })
+                .collect(),
+        );
+        let mut preferred = cand("llama", "site-z", "preferred", None);
+        preferred.selection_group = Some(0);
+        source.candidates.push(preferred);
+
+        let rendered = render(&source, &INPUTS);
+        assert_eq!(rendered.candidates.len(), MAX_CANDIDATES);
+        assert!(
+            rendered
+                .candidates
+                .iter()
+                .any(|candidate| candidate.cluster == "preferred"),
+            "a preferred-region candidate must survive the serving-config cap before fallback candidates"
+        );
+    }
+
+    #[test]
     fn a_candidate_not_taking_new_requests_stays_in_with_its_admission() {
         let rendered = render(
             &overlay(vec![
@@ -1141,6 +1192,38 @@ mod tests {
                 "{label}: one cluster, so a duplicate calling it unservable closes it"
             );
         }
+    }
+
+    #[test]
+    fn regional_selection_group_reaches_the_serving_config_and_duplicates_keep_the_earliest_group() {
+        let default = cand("llama", "site-a", "pool-a", None);
+        let mut preferred = cand("llama", "site-b", "pool-b", None);
+        preferred.selection_group = Some(1);
+        let mut fallback = cand("llama", "site-b", "pool-b", None);
+        fallback.selection_group = Some(2);
+
+        let rendered = render(&overlay(vec![default, fallback, preferred]), &INPUTS);
+        let text = to_text(&rendered).expect("serving JSON");
+        let wire: serde_json::Value = serde_json::from_str(&text).expect("valid serving JSON");
+        let preferred_wire = wire["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .find(|candidate| candidate["cluster"] == "pool-b")
+            .expect("remote candidate");
+
+        assert_eq!(preferred_wire["selection_group"], 1, "the lowest duplicate group wins");
+        assert!(
+            wire["candidates"]
+                .as_array()
+                .expect("candidates")
+                .iter()
+                .find(|candidate| candidate["cluster"] == "pool-a")
+                .expect("default candidate")
+                .get("selection_group")
+                .is_none(),
+            "zero stays omitted so gateways with older serving configs retain their default"
+        );
     }
 
     #[test]

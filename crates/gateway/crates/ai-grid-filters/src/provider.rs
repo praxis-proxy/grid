@@ -549,6 +549,7 @@ fn as_serving(config: &ProviderConfig) -> GridServingConfig {
                 kind: CapabilityKind::InferenceModel,
                 name: candidate.name.clone(),
                 publishes_load: true,
+                selection_group: 0,
                 site: config.local_site.clone(),
                 stable_id: Some(candidate.stable_id.clone()),
             })
