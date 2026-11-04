@@ -255,6 +255,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `gateway.allowSystemNamespace` | bool | `false` | Allow `gateway.namespace` to be `default`, `kube-*`, or `openshift-*`. |
 | `gateway.port` | string | `""` | Site gateway Service port override. Empty uses the first Service `spec.ports` entry, with `8080` as the fallback if no usable port exists. Maps to `GRID_GATEWAY_PORT`. |
 | `gateway.discoveryEnabled` | bool | `true` | Discover and advertise a LoadBalancer address for the site gateway. Maps to `GRID_GATEWAY_DISCOVERY_ENABLED`. |
+| `modelDiscovery.ttlSeconds` | int or string | `""` | Seconds a discovered model set stays routable without a fresh poll, 1 to 31536000, as `GRID_MODEL_DISCOVERY_TTL_SECS`. The operator raises it to cover one poll round. Empty keeps the operator's 180s. |
 | `health.liveness.initialDelaySeconds` | int | `5` | Liveness probe initial delay. |
 | `health.liveness.periodSeconds` | int | `10` | Liveness probe period. |
 | `health.startup.periodSeconds` | int | `10` | Startup probe period, for `metrics.tls.source` `siteIdentity`. |

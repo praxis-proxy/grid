@@ -32,7 +32,7 @@ tests:
     asserts:
       - matchRegex:
           path: data["praxis.yaml"]
-          pattern: '(?s)filters:\s+- filter: grid_provider\s+allowed_paths:\s+- "/v1/chat/completions"\s+- "/v1/completions"\s+- "/v1/models"\s+- "/v1/embeddings"\s+- filter: headers\s+response_set:\s+- name: X-Grid-Provider-Site\s+value: "site-a"'
+          pattern: '(?s)filters:\s+- filter: grid_provider\s+allowed_paths:\s+- "/v1/chat/completions"\s+- "/v1/completions"\s+- "/v1/models"\s+- "/v1/embeddings"\s+- "/v1/messages"\s+- "/v1/responses"\s+- filter: headers\s+response_set:\s+- name: X-Grid-Provider-Site\s+value: "site-a"'
       - notMatchRegex:
           path: data["praxis.yaml"]
           pattern: 'load_balancer|router|grid_site_route|intelligent_route|provider_route|static_response|clusters:'
