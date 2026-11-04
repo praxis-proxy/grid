@@ -3825,15 +3825,16 @@ fn load_images_into_clusters(forge_bin: &Path, resolved_config: &Path) -> Result
     let gateway = std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| DEFAULT_GATEWAY_IMAGE.to_owned());
     let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-operator:v0.1.4".to_owned());
+    let overlay_sync = crate::env::image_overrides::overlay_sync_image();
     let vcr = crate::env::image_overrides::sim_image();
 
-    for image in [&gateway, &operator, &vcr] {
+    for image in [&gateway, &operator, &overlay_sync, &vcr] {
         require_local_image(image)?;
         eprintln!("  verified local image: {image}");
     }
 
     for cluster in CLUSTERS {
-        for image in [&gateway, &operator, &vcr] {
+        for image in [&gateway, &operator, &overlay_sync, &vcr] {
             eprintln!("  loading {image} into {cluster}...");
             let output = super::forge_config::command(forge_bin.as_os_str(), resolved_config)?
                 .arg("--config")
@@ -4725,11 +4726,13 @@ fn apply_image_overrides(config: &mut serde_yaml::Value) {
     let gateway_image = std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| DEFAULT_GATEWAY_IMAGE.to_owned());
     let operator_image = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-operator:v0.1.4".to_owned());
+    let overlay_sync_image = crate::env::image_overrides::overlay_sync_image();
     let vcr_image = crate::env::image_overrides::sim_image();
     let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "IfNotPresent".to_owned());
 
     let (gateway_repo, gateway_tag) = parse_image_ref(&gateway_image);
     let (operator_repo, operator_tag) = parse_image_ref(&operator_image);
+    let (overlay_sync_repo, overlay_sync_tag) = parse_image_ref(&overlay_sync_image);
 
     if let Some(spec) = config.get_mut("spec") {
         if let Some(clusters) = spec.get_mut("clusters") {
@@ -4740,12 +4743,15 @@ fn apply_image_overrides(config: &mut serde_yaml::Value) {
                             let pairs = [
                                 ("gatewayImage", &gateway_image),
                                 ("operatorImage", &operator_image),
+                                ("overlaySyncImage", &overlay_sync_image),
                                 ("vcrImage", &vcr_image),
                                 ("imagePullPolicy", &image_pull_policy),
                                 ("gatewayImageRepo", &gateway_repo),
                                 ("gatewayImageTag", &gateway_tag),
                                 ("operatorImageRepo", &operator_repo),
                                 ("operatorImageTag", &operator_tag),
+                                ("overlaySyncImageRepo", &overlay_sync_repo),
+                                ("overlaySyncImageTag", &overlay_sync_tag),
                             ];
                             for (key, val) in pairs {
                                 props_map.insert(

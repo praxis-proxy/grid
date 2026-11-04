@@ -668,17 +668,25 @@ jobs:
             ARTIFACT_PREFIX="grid-main-${SHORT_SHA}"
           fi
           TAG="${TAG}-${QUALIFICATION}"
+          if [[ "${QUALIFICATION}" == "combined-site" ]]; then
+            OPERATOR_IMAGE="grid-operator-fips:${TAG}"
+          else
+            OPERATOR_IMAGE="grid-operator:${TAG}"
+          fi
           {
             echo "tag=${TAG}"
+            echo "operator_image=${OPERATOR_IMAGE}"
             echo "short_sha=${SHORT_SHA}"
             echo "artifact_prefix=${ARTIFACT_PREFIX}"
           } >> "${GITHUB_OUTPUT}"
           echo "Image tag: ${TAG}"
+          echo "Operator image: ${OPERATOR_IMAGE}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build Grid Operator image
+        if: env.QUALIFICATION != 'combined-site'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: grid
@@ -689,6 +697,21 @@ jobs:
           labels: org.opencontainers.image.revision=${{ env.TESTED_SHA }}
           cache-from: type=gha,scope=triggered-e2e-operator
           cache-to: type=gha,mode=max,scope=triggered-e2e-operator
+
+      - name: Build Grid Operator FIPS image
+        # The shared-key combined-site topology then exercises SWIM packets
+        # through the OpenSSL backend. Hosted runners are not FIPS-mode hosts.
+        if: env.QUALIFICATION == 'combined-site'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: grid
+          file: grid/deploy/operator/Containerfile.fips
+          push: false
+          load: true
+          tags: grid-operator-fips:${{ steps.tags.outputs.tag }}
+          labels: org.opencontainers.image.revision=${{ env.TESTED_SHA }}
+          cache-from: type=gha,scope=triggered-e2e-operator-fips
+          cache-to: type=gha,mode=max,scope=triggered-e2e-operator-fips
 
       - name: Build source-matched Grid Gateway image
         if: env.QUALIFICATION == 'llmd-pool-metrics' && env.MODE == 'full'
@@ -863,12 +886,13 @@ jobs:
 
       - name: Verify locally built images
         env:
+          OPERATOR_IMAGE: ${{ steps.tags.outputs.operator_image }}
           TAG: ${{ steps.tags.outputs.tag }}
         run: |
           set -euo pipefail
           FAILED=0
 
-          operator_img="grid-operator:${TAG}"
+          operator_img="${OPERATOR_IMAGE}"
           if ! docker image inspect "${operator_img}" > /dev/null 2>&1; then
             echo "::error::Required locally-built image missing: ${operator_img}"
             FAILED=1
@@ -877,6 +901,13 @@ jobs:
             echo "${operator_img}: revision label ${IMAGE_REVISION}"
             if [[ "${IMAGE_REVISION}" != "${TESTED_SHA}" ]]; then
               echo "::error::${operator_img} was not built from verified source ${TESTED_SHA}"
+              FAILED=1
+            fi
+          fi
+          if [[ "${QUALIFICATION}" == "combined-site" ]]; then
+            IMAGE_DESCRIPTION=$(docker image inspect --format='{{index .Config.Labels "org.opencontainers.image.description"}}' "${operator_img}")
+            if [[ "${IMAGE_DESCRIPTION}" != *"FIPS build"* ]]; then
+              echo "::error::Combined-site operator image is not labeled as a FIPS build: ${operator_img}"
               FAILED=1
             fi
           fi
@@ -941,6 +972,7 @@ jobs:
 
       - name: Write image manifest
         env:
+          OPERATOR_IMAGE: ${{ steps.tags.outputs.operator_image }}
           TAG: ${{ steps.tags.outputs.tag }}
           RESOLVED_DIGEST: ${{ steps.gateway.outputs.digest }}
           STATIC_SIMULATOR_DIGESTS: ${{ steps.static-simulator.outputs.repo_digests || 'unknown' }}
@@ -982,9 +1014,13 @@ jobs:
           {
             echo "=== Image Manifest ==="
             echo ""
-            echo "grid-operator:${TAG}"
-            docker inspect --format='  ID: {{.Id}}' "grid-operator:${TAG}"
-            docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "grid-operator:${TAG}"
+            echo "${OPERATOR_IMAGE}"
+            docker inspect --format='  ID: {{.Id}}' "${OPERATOR_IMAGE}"
+            docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "${OPERATOR_IMAGE}"
+            if [[ "${QUALIFICATION}" == "combined-site" ]]; then
+              echo "  Build: deploy/operator/Containerfile.fips"
+              echo "  Crypto backend: OpenSSL (fips feature; host FIPS mode is not asserted)"
+            fi
             echo ""
             if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" || "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
               echo "grid-overlay-sync:${TAG}"
@@ -1018,7 +1054,7 @@ jobs:
             docker inspect --format='  ID: {{.Id}}' "${PROBE_IMAGE_TAG}"
             echo ""
             echo "=== Override Environment ==="
-            echo "GRID_XTASK_OPERATOR_IMAGE=grid-operator:${TAG}"
+            echo "GRID_XTASK_OPERATOR_IMAGE=${OPERATOR_IMAGE}"
             if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" || "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
               echo "GRID_XTASK_OVERLAY_SYNC_IMAGE=grid-overlay-sync:${TAG}"
             else
@@ -1099,7 +1135,7 @@ jobs:
         id: qualification
         env:
           GRID_REPO: ${{ github.workspace }}/grid
-          GRID_XTASK_OPERATOR_IMAGE: grid-operator:${{ steps.tags.outputs.tag }}
+          GRID_XTASK_OPERATOR_IMAGE: ${{ steps.tags.outputs.operator_image }}
           GRID_XTASK_GATEWAY_IMAGE: ${{ env.GATEWAY_IMAGE_REF }}
           GRID_GATEWAY_IMAGE: grid-gateway:${{ steps.tags.outputs.tag }}
           LLMD_EPP_IMAGE: ${{ env.LLMD_EPP_IMAGE_TAG }}
@@ -1781,6 +1817,7 @@ jobs:
         if: always()
         env:
           TAG: ${{ steps.tags.outputs.tag || 'unknown' }}
+          OPERATOR_IMAGE: ${{ steps.tags.outputs.operator_image || 'unknown' }}
           ARTIFACT_PREFIX: ${{ steps.tags.outputs.artifact_prefix || format('grid-{0}-{1}', needs.resolve-source.outputs.source_kind, needs.resolve-source.outputs.tested_sha) }}
           QUALIFICATION_RESULT: ${{ steps.qualification.outcome }}
           CLEANUP_RESULT: ${{ steps.cleanup.outputs.result || 'unknown' }}
@@ -1850,6 +1887,9 @@ jobs:
 
             echo "| **Topology** | \`${TOPOLOGY}\` at tested Grid SHA |"
             echo "| **Mode** | \`${MODE}\` |"
+            if [[ "${QUALIFICATION}" == "combined-site" ]]; then
+              echo "| **Operator crypto backend** | OpenSSL (`fips` feature) |"
+            fi
             echo "| **Qualification result** | ${QUALIFICATION_DISPLAY_RESULT} |"
             echo "| **Cleanup** | ${CLEANUP_RESULT} |"
             if [[ "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
@@ -1864,7 +1904,7 @@ jobs:
             echo ""
             echo "| Image | Reference |"
             echo "|-------|-----------|"
-            echo "| Grid Operator | \`grid-operator:${TAG}\` |"
+            echo "| Grid Operator | \`${OPERATOR_IMAGE}\` |"
             echo "| Gateway (pinned) | \`${GATEWAY_IMAGE_REF}\` (\`${RESOLVED_DIGEST}\`) |"
             echo "| Simulator | \`${SIMULATOR}\` |"
             if [[ "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
