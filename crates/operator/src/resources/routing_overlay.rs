@@ -1274,10 +1274,16 @@ fn apply_regional_policy(
         let metadata = resolve_regional_policy_site_metadata(&candidate.site, sites, network_name);
         match evaluator.evaluate(metadata) {
             crate::resources::regional_policy::RegionalPolicyDecision::Permitted { group } => {
+                crate::metrics::record_regional_policy_candidate(evaluator.mode_label(), "permitted", group.as_label());
                 candidate.regional_policy_group = Some(group);
                 true
             },
             crate::resources::regional_policy::RegionalPolicyDecision::Excluded { reason } => {
+                crate::metrics::record_regional_policy_candidate(
+                    evaluator.mode_label(),
+                    "excluded",
+                    reason.as_metric_label(),
+                );
                 tracing::debug!(
                     network = network_name,
                     candidate_site = %candidate.site,

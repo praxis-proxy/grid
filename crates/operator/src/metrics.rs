@@ -97,7 +97,26 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(SignalsAdmission::gauges()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(REGIONAL_POLICY_CANDIDATES.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r
+});
+
+/// Candidate decisions made by the regional-policy eligibility gate.
+///
+/// All labels are closed sets: `mode` is `affinity` or `locked`; `outcome`
+/// is `permitted` or `excluded`; and `reason` is a policy enum label. Region
+/// names, sovereignty-zone values, gateway names, and request identifiers are
+/// deliberately never labels.
+static REGIONAL_POLICY_CANDIDATES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "grid_regional_policy_candidates_total",
+            "Routing candidates evaluated by regional policy mode, outcome, and bounded reason",
+        ),
+        &["mode", "outcome", "reason"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
 });
 
 /// Peer catalog reads by peer and outcome: `replaced` when a catalog landed, `failed` when
@@ -482,6 +501,17 @@ impl GatewayFeedbackEvent {
 /// Count a bounded gateway status feedback event.
 pub(crate) fn record_gateway_feedback(event: GatewayFeedbackEvent) {
     GATEWAY_FEEDBACK_EVENTS.with_label_values(&[event.as_str()]).inc();
+}
+
+/// Count one candidate decision from the regional-policy eligibility gate.
+///
+/// Callers must pass only the stable labels exposed by
+/// `resources::regional_policy`; this API intentionally receives no inventory
+/// identifiers or policy values.
+pub(crate) fn record_regional_policy_candidate(mode: &str, outcome: &str, reason: &str) {
+    REGIONAL_POLICY_CANDIDATES
+        .with_label_values(&[mode, outcome, reason])
+        .inc();
 }
 
 /// What a bounded relay render left out, by store and by what was cut.
@@ -1357,6 +1387,24 @@ mod tests {
             text.contains("grid_gateway_feedback_events_total"),
             "the operator exports the feedback events"
         );
+    }
+
+    #[test]
+    fn regional_policy_candidate_decisions_are_counted_with_bounded_labels() {
+        let permitted = REGIONAL_POLICY_CANDIDATES.with_label_values(&["affinity", "permitted", "preferred"]);
+        let excluded = REGIONAL_POLICY_CANDIDATES.with_label_values(&["locked", "excluded", "region_not_allowed"]);
+        let permitted_before = permitted.get();
+        let excluded_before = excluded.get();
+
+        record_regional_policy_candidate("affinity", "permitted", "preferred");
+        record_regional_policy_candidate("locked", "excluded", "region_not_allowed");
+
+        assert_eq!(permitted.get(), permitted_before + 1);
+        assert_eq!(excluded.get(), excluded_before + 1);
+        let text = String::from_utf8(encode_metrics()).unwrap_or_else(|_| std::process::abort());
+        assert!(text.contains("grid_regional_policy_candidates_total"));
+        assert!(text.contains("mode=\"affinity\""));
+        assert!(text.contains("reason=\"region_not_allowed\""));
     }
 
     #[test]

@@ -29,6 +29,17 @@ pub(crate) enum RegionalPolicyGroup {
     Permitted,
 }
 
+impl RegionalPolicyGroup {
+    /// Bounded metric and status label for this permitted candidate outcome.
+    pub(crate) const fn as_label(self) -> &'static str {
+        match self {
+            Self::Preferred => "preferred",
+            Self::Fallback => "fallback",
+            Self::Permitted => "permitted",
+        }
+    }
+}
+
 /// Regional-policy metadata field that could not be resolved.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RegionalPolicyMetadataField {
@@ -72,6 +83,53 @@ pub(crate) enum RegionalPolicyExclusionReason {
     CrossRegionFallbackDenied,
     /// The independent sovereignty constraint does not allow the candidate.
     SovereigntyZoneNotAllowed,
+}
+
+impl RegionalPolicyExclusionReason {
+    /// Bounded metric label for this exclusion reason.
+    ///
+    /// This deliberately excludes the candidate's region, sovereignty zone,
+    /// gateway, and cluster so operator metrics cannot acquire unbounded
+    /// cardinality from policy values or inventory identifiers.
+    pub(crate) const fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::UnresolvedGatewayRegion { failure } => match failure {
+                RegionalPolicyMetadataFailure::Missing => "gateway_region_missing",
+                RegionalPolicyMetadataFailure::Unknown => "gateway_region_unknown",
+                RegionalPolicyMetadataFailure::Malformed => "gateway_region_malformed",
+                RegionalPolicyMetadataFailure::Conflicting => "gateway_region_conflicting",
+            },
+            Self::UnresolvedCandidateMetadata { field, failure } => match (field, failure) {
+                (RegionalPolicyMetadataField::Region, RegionalPolicyMetadataFailure::Missing) => {
+                    "candidate_region_missing"
+                },
+                (RegionalPolicyMetadataField::Region, RegionalPolicyMetadataFailure::Unknown) => {
+                    "candidate_region_unknown"
+                },
+                (RegionalPolicyMetadataField::Region, RegionalPolicyMetadataFailure::Malformed) => {
+                    "candidate_region_malformed"
+                },
+                (RegionalPolicyMetadataField::Region, RegionalPolicyMetadataFailure::Conflicting) => {
+                    "candidate_region_conflicting"
+                },
+                (RegionalPolicyMetadataField::SovereigntyZone, RegionalPolicyMetadataFailure::Missing) => {
+                    "candidate_sovereignty_zone_missing"
+                },
+                (RegionalPolicyMetadataField::SovereigntyZone, RegionalPolicyMetadataFailure::Unknown) => {
+                    "candidate_sovereignty_zone_unknown"
+                },
+                (RegionalPolicyMetadataField::SovereigntyZone, RegionalPolicyMetadataFailure::Malformed) => {
+                    "candidate_sovereignty_zone_malformed"
+                },
+                (RegionalPolicyMetadataField::SovereigntyZone, RegionalPolicyMetadataFailure::Conflicting) => {
+                    "candidate_sovereignty_zone_conflicting"
+                },
+            },
+            Self::RegionNotAllowed => "region_not_allowed",
+            Self::CrossRegionFallbackDenied => "cross_region_fallback_denied",
+            Self::SovereigntyZoneNotAllowed => "sovereignty_zone_not_allowed",
+        }
+    }
 }
 
 /// Regional-policy decision for one candidate before health and scoring.
@@ -179,6 +237,14 @@ impl<'policy, 'site> RegionalPolicyEvaluator<'policy, 'site> {
             policy,
             resolve_gateway_regional_policy_metadata(gateway, sites, network_name),
         )
+    }
+
+    /// Bounded metric label for the active policy mode.
+    pub(crate) const fn mode_label(&self) -> &'static str {
+        match &self.region_rule {
+            RegionalPolicyRegionRule::Affinity { .. } => "affinity",
+            RegionalPolicyRegionRule::Locked { .. } => "locked",
+        }
     }
 
     /// Evaluate one candidate before health, admission, and scoring.
@@ -486,6 +552,25 @@ mod tests {
         assert!(
             RegionalPolicyEvaluator::new(&policy, missing_metadata()).is_err(),
             "invalid configuration must remain distinct from valid fail-closed inventory"
+        );
+    }
+
+    #[test]
+    fn telemetry_labels_are_closed_policy_enum_values() {
+        assert_eq!(RegionalPolicyGroup::Preferred.as_label(), "preferred");
+        assert_eq!(RegionalPolicyGroup::Fallback.as_label(), "fallback");
+        assert_eq!(RegionalPolicyGroup::Permitted.as_label(), "permitted");
+        assert_eq!(
+            RegionalPolicyExclusionReason::UnresolvedCandidateMetadata {
+                field: RegionalPolicyMetadataField::SovereigntyZone,
+                failure: RegionalPolicyMetadataFailure::Conflicting,
+            }
+            .as_metric_label(),
+            "candidate_sovereignty_zone_conflicting"
+        );
+        assert_eq!(
+            RegionalPolicyExclusionReason::CrossRegionFallbackDenied.as_metric_label(),
+            "cross_region_fallback_denied"
         );
     }
 

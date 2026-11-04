@@ -3587,6 +3587,7 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
+        let (reason, message) = regional_policy_empty_overlay_status(gw_ref, no_candidates);
         overlay_statuses.push(OverlayRevisionStatus {
             gateway_name: gw_ref.name.clone(),
             namespace: gw_ref.namespace.clone(),
@@ -3599,8 +3600,8 @@ async fn reconcile_routing_overlay_inner(
             rendered_at: render.rendered_at,
             candidate_count: render.candidate_count,
             phase: OverlayPhase::Distributed,
-            reason: String::new(),
-            message: String::new(),
+            reason,
+            message,
             observed_generation,
         });
 
@@ -3676,6 +3677,22 @@ async fn reconcile_routing_overlay_inner(
         serving_retry,
         inventory_expiry_deadline,
     })
+}
+
+/// Bounded status evidence for an authoritative no-route overlay under an
+/// active regional policy.
+///
+/// A valid policy that permits no candidates is intentionally distributed; it
+/// is not an invalid update and must not retain a prior cross-region route.
+fn regional_policy_empty_overlay_status(gw_ref: &GatewayRef, no_candidates: bool) -> (String, String) {
+    if no_candidates && gw_ref.regional_policy.is_some() {
+        (
+            "RegionalPolicyNoEligibleCandidates".to_owned(),
+            "regional policy permits no eligible candidates; authoritative empty overlay distributed".to_owned(),
+        )
+    } else {
+        (String::new(), String::new())
+    }
 }
 
 /// Legacy status reason used by retained-status compatibility tests.
@@ -8433,6 +8450,35 @@ mod tests {
         for (label, network, want) in cases {
             assert_eq!(already_empty(&network, &gw), want, "{label}");
         }
+    }
+
+    #[test]
+    fn active_regional_policy_marks_an_empty_overlay_as_authoritative() {
+        let mut gateway = make_gw_ref("gw", "grid-system");
+        gateway.regional_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "mode": "locked",
+                "allowedRegions": ["east"],
+            }))
+            .unwrap_or_else(|_| std::process::abort()),
+        );
+
+        assert_eq!(
+            regional_policy_empty_overlay_status(&gateway, true),
+            (
+                "RegionalPolicyNoEligibleCandidates".to_owned(),
+                "regional policy permits no eligible candidates; authoritative empty overlay distributed".to_owned(),
+            )
+        );
+        assert_eq!(
+            regional_policy_empty_overlay_status(&gateway, false),
+            (String::new(), String::new())
+        );
+        gateway.regional_policy = None;
+        assert_eq!(
+            regional_policy_empty_overlay_status(&gateway, true),
+            (String::new(), String::new())
+        );
     }
 
     // -----------------------------------------------------------------------
