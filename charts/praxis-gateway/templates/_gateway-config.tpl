@@ -170,6 +170,13 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
               {{- else }} []
               {{- end }}
             {{- with ($.Values.praxisConfig.render.gridServing).siteRoute }}
+            {{- with .sovereignty }}
+            {{- if .header }}
+            sovereignty:
+              header: {{ .header | quote }}
+              mode: {{ .mode | default "enforce" }}
+            {{- end }}
+            {{- end }}
             {{- with .availability }}
             availability:
               {{- toYaml . | nindent 14 }}

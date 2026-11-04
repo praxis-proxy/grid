@@ -215,6 +215,9 @@ pub struct RouteCandidate {
     /// Site that owns this capability.
     pub site: Arc<str>,
 
+    /// The owning site's sovereignty zone, from the serving config's `sovereignty_zones`. `None` never passes a fence.
+    pub sovereignty_zone: Option<Arc<str>>,
+
     /// Deterministic identifier for session affinity binding.
     pub stable_id: Arc<str>,
 
@@ -322,6 +325,7 @@ fn validate_candidates_with_empty(
             rank: None,
             selection_tier: None,
             site: Arc::from(cand.site.as_str()),
+            sovereignty_zone: None,
             stable_id,
             dial: None,
             weight: cand.weight.unwrap_or(1),

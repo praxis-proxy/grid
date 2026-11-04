@@ -7,8 +7,9 @@
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     /// Names `describe_metrics` documents, which a scrape must explain.
-    const DOCUMENTED: [&str; 34] = [
+    const DOCUMENTED: [&str; 35] = [
         "grid_route_decisions_total",
+        "grid_route_fenced_total",
         "grid_route_selections_total",
         "grid_route_prefix_affinity_total",
         "grid_serving_config_reload_total",
@@ -68,6 +69,7 @@ mod tests {
         ai_grid_filters::describe_metrics();
 
         metrics::counter!("grid_route_decisions_total").increment(1);
+        metrics::counter!("grid_route_fenced_total", "cause" => "zone_required", "enforced" => "true").increment(1);
         metrics::counter!("grid_route_selections_total", "path" => "cross_site").increment(1);
         metrics::counter!("grid_route_prefix_affinity_total", "outcome" => "hit").increment(1);
         metrics::counter!("grid_serving_config_reload_total", "result" => "ok").increment(1);

@@ -114,6 +114,10 @@ pub(crate) struct ServingConfig {
     /// Expected verified TLS SNI for each provider-hop cluster.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) provider_hop_sni: BTreeMap<String, String>,
+    /// Each candidate site's `sovereigntyZone`, which a `grid_site_route` fence matches.
+    /// Omitted when empty, so a config without zones still loads on an older gateway.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) sovereignty_zones: BTreeMap<String, String>,
     /// Sorted by site.
     pub(crate) peers: Vec<ServingPeer>,
 }
@@ -326,6 +330,8 @@ pub(crate) struct ServingInputs<'input> {
     pub(crate) heard: &'input (dyn Fn(&str, &str) -> bool + Sync),
     /// This site's provider clusters with no metrics to scrape.
     pub(crate) quiet_local: &'input BTreeSet<String>,
+    /// Each site's `sovereigntyZone`, by site name.
+    pub(crate) zones: &'input BTreeMap<String, String>,
     /// Whether the gateway's generated config injects the local credentials the router selects.
     pub(crate) inject_local_credentials: bool,
 }
@@ -337,6 +343,10 @@ pub(crate) struct ServingInputs<'input> {
 /// be written so a gateway cannot retain candidates from an older config.
 pub(crate) fn render(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> ServingConfig {
     let candidates = candidates(overlay, inputs);
+    let sovereignty_zones = candidates
+        .iter()
+        .filter_map(|candidate| Some((candidate.site.clone(), inputs.zones.get(&candidate.site)?.clone())))
+        .collect();
     let peers = inputs
         .local_signals_addr
         .filter(|_| certs::validate_site_name(&overlay.local_site).is_ok())
@@ -351,6 +361,7 @@ pub(crate) fn render(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Se
         candidates,
         provider_hop_clusters: inputs.provider_hop_clusters.iter().cloned().collect(),
         provider_hop_sni: inputs.provider_hop_sni.clone(),
+        sovereignty_zones,
         peers,
     }
 }
@@ -724,6 +735,7 @@ mod tests {
     const LOCAL_ADDR: &str = "grid-operator-signals.grid.svc:9091";
     /// No authenticated provider gateway in this fixture.
     static NO_PROVIDER_HOPS: BTreeSet<String> = BTreeSet::new();
+    static NO_ZONES: BTreeMap<String, String> = BTreeMap::new();
     /// No declared provider-hop identities in the default fixture.
     static NO_PROVIDER_HOP_SNI: BTreeMap<String, String> = BTreeMap::new();
 
@@ -737,6 +749,7 @@ mod tests {
         peer_budget: Duration::from_secs(10),
         heard: &|_, _| true,
         quiet_local: &NO_PROVIDER_HOPS,
+        zones: &NO_ZONES,
         inject_local_credentials: false,
     };
 
@@ -820,6 +833,40 @@ mod tests {
             .iter()
             .map(|peer| (peer.site.as_str(), peer.addr.as_str()))
             .collect()
+    }
+
+    #[test]
+    fn the_config_carries_each_candidate_sites_zone_once_and_no_other() {
+        let zones = BTreeMap::from([
+            ("site-a".to_owned(), "eu".to_owned()),
+            ("site-elsewhere".to_owned(), "us".to_owned()),
+        ]);
+        let inputs = ServingInputs {
+            zones: &zones,
+            ..INPUTS
+        };
+        let source = overlay(vec![
+            cand("llama", "site-a", "pool-a", None),
+            cand("mistral", "site-a", "pool-a2", None),
+            cand("llama", "site-b", "pool-b", None),
+        ]);
+        let config = render(&source, &inputs);
+        assert_eq!(
+            config.sovereignty_zones,
+            BTreeMap::from([("site-a".to_owned(), "eu".to_owned())]),
+            "a zone per serving site; one with none or no candidate is left out"
+        );
+        let text = to_text(&config).expect("json");
+        assert_eq!(
+            text.matches("\"eu\"").count(),
+            1,
+            "the zone is written once, not per candidate: {text}"
+        );
+        let unzoned = to_text(&render(&source, &INPUTS)).expect("json");
+        assert!(
+            !unzoned.contains("sovereignty_zones"),
+            "omitted when empty, so an older gateway still loads it"
+        );
     }
 
     #[test]
