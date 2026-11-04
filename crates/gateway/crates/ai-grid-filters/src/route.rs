@@ -34,8 +34,9 @@ use serde::Deserialize;
 
 use crate::{
     control::Tuning,
-    decisions::{Refused, SiteDecisions},
+    decisions::{FenceCause, Refused, SiteDecisions},
     descriptor::{AdmissionState, CapabilityKind, RouteCandidate, validate_model_header},
+    geo::{Fence, FenceConfig, FenceMode, Fencing, SovereigntyConfig, Zones},
     health::{Admission, ClusterHealth},
     pin::{self, Collection, Pushed, StatePath, TagKey, Tagger},
     prefix::{self, Affinity, AffinitySettings, Api, PrefixAffinity, PrefixKeys, QueueGate, Queued},
@@ -262,6 +263,12 @@ struct GridSiteRouteConfig {
     #[serde(default = "default_model_header")]
     model_header: String,
 
+    /// The sovereignty fence: the header naming the zones a request may be served in. When
+    /// set, a request naming none is refused and only sites in a named zone are routed to;
+    /// in `audit` mode nothing is refused, and what would be is logged and counted.
+    #[serde(default)]
+    sovereignty: Option<SovereigntyConfig>,
+
     /// The `load_balancer` clusters this gateway declares. When set, a candidate
     /// with no peer gateway and a cluster not listed has no route and is skipped.
     #[serde(default)]
@@ -355,6 +362,15 @@ impl DeclaredCluster {
     }
 }
 
+/// What one request brings to a pick: its prompt's prefix keys and its geo fence.
+#[derive(Clone, Copy, Default)]
+struct Scope<'req> {
+    /// The prompt's prefix keys, for affinity.
+    keys: Option<&'req PrefixKeys>,
+    /// The request's sovereignty zones, `None` when no fence is configured.
+    fence: Option<&'req Fencing<'req>>,
+}
+
 /// Routes a request to a cross-site cluster by model, honouring live-load order.
 #[derive(Debug)]
 pub(crate) struct GridSiteRouteFilter {
@@ -364,6 +380,9 @@ pub(crate) struct GridSiteRouteFilter {
 
     /// Header the request carries the model name in.
     model_header: http::header::HeaderName,
+
+    /// The sovereignty fence, `None` when none is configured.
+    sovereignty: Option<FenceConfig>,
 
     /// The replica's prefix index and the live affinity settings.
     affinity: Arc<PrefixAffinity>,
@@ -397,6 +416,16 @@ impl GridSiteRouteFilter {
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: GridSiteRouteConfig = parse_filter_config("grid_site_route", config)?;
         let model_header = validate_model_header(&cfg.model_header)?;
+        let sovereignty = cfg
+            .sovereignty
+            .map(|fence| {
+                validate_model_header(&fence.header).map(|header| FenceConfig {
+                    header,
+                    enforce: fence.mode == FenceMode::Enforce,
+                })
+            })
+            .transpose()
+            .map_err(|error| -> FilterError { format!("grid_site_route: sovereignty.header: {error}").into() })?;
         let tuned = |error: String| -> FilterError { format!("grid_site_route: {error}").into() };
         cfg.availability.validate().map_err(tuned)?;
         cfg.prefix_affinity.validate().map_err(tuned)?;
@@ -412,6 +441,7 @@ impl GridSiteRouteFilter {
         Ok(Box::new(Self {
             snapshot,
             model_header,
+            sovereignty,
             affinity,
             turn: AtomicUsize::new(random_seed()),
             health,
@@ -427,9 +457,10 @@ impl GridSiteRouteFilter {
         &self,
         snapshot: &'snap RouteSnapshot,
         model: &str,
-        keys: Option<&PrefixKeys>,
+        scope: Scope<'_>,
         skip: Option<&str>,
     ) -> Result<Pick<'snap>, FilterAction> {
+        let Scope { keys, fence } = scope;
         let turn = self.turn.fetch_add(1, Ordering::Relaxed);
         let now_ms = grid_signals::now_ms();
         if snapshot.is_shedding(model, now_ms) {
@@ -439,6 +470,7 @@ impl GridSiteRouteFilter {
             !candidate.expired_at(now_ms)
                 && has_route(candidate, self.clusters.as_ref())
                 && skip.is_none_or(|skip| *candidate.cluster != *skip)
+                && fence.is_none_or(|fence| fence.allows(candidate))
         };
         let settings = self.affinity.settings.load();
         let pick = if settings.enabled {
@@ -464,7 +496,18 @@ impl GridSiteRouteFilter {
                 &KeepAll,
             )
         };
-        pick.ok_or_else(|| refuse(unserved(snapshot, model, routable), model, turn))
+        pick.ok_or_else(|| {
+            let reason = fenced(
+                snapshot,
+                model,
+                fence.and_then(Fencing::enforced),
+                unserved(snapshot, model, routable),
+            );
+            if reason == Refused::Fenced {
+                FenceCause::OutsideZones.record(true);
+            }
+            refuse(reason, model, turn)
+        })
     }
 
     /// Send the request to `pick`: count the decision, select its cluster, and record its prefix
@@ -498,12 +541,39 @@ impl GridSiteRouteFilter {
         Ok(())
     }
 
+    /// The request's fence, `None` when none applies; one that refuses refuses a request naming no valid zone.
+    fn fence(&self, ctx: &mut HttpFilterContext<'_>) -> Result<Option<Fencing<'_>>, FilterAction> {
+        let Some(config) = self.sovereignty.as_ref() else {
+            return Ok(None);
+        };
+        match Fence::from_headers(&ctx.request.headers, &config.header) {
+            Zones::Named(fence) => {
+                if config.enforce {
+                    ctx.request_headers_to_set
+                        .push((config.header.clone(), fence.value().clone()));
+                }
+                Ok(Some(Fencing::new(fence, config)))
+            },
+            Zones::Absent | Zones::Invalid if config.refuses(FenceCause::ZoneRequired, None) => Err(refuse(
+                Refused::ZoneRequired,
+                "",
+                self.turn.fetch_add(1, Ordering::Relaxed),
+            )),
+            Zones::Absent | Zones::Invalid => Ok(None),
+        }
+    }
+
     /// Route a request that names stored state to the site that stored it.
     ///
     /// `None` for a request that names none. A site no longer in the grid gets
     /// 404, since the state lives only there. One that admits no new request now
     /// gets 503.
-    fn pin(&self, ctx: &mut HttpFilterContext<'_>, model: Option<&str>) -> Result<Option<FilterAction>, FilterError> {
+    fn pin(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        model: Option<&str>,
+        fence: Option<&Fencing<'_>>,
+    ) -> Result<Option<FilterAction>, FilterError> {
         let snapshot = self.snapshot.load();
         let now_ms = grid_signals::now_ms();
         let key = self.affinity.tag_key.load();
@@ -533,6 +603,11 @@ impl GridSiteRouteFilter {
                 )));
             },
         };
+        if fence.is_some_and(|fence| !fence.passes(candidate)) {
+            tracing::debug!(site = ?site, "grid_site_route: the state lives outside the request's sovereignty zones");
+            let turn = self.turn.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(refuse(Refused::Fenced, model.unwrap_or_default(), turn)));
+        }
         with_state(ctx, |state| {
             state.responses = true;
             state.served = Some((Arc::clone(&candidate.site), Arc::clone(&candidate.cluster)));
@@ -785,18 +860,33 @@ impl HttpFilter for GridSiteRouteFilter {
             .headers
             .get(&self.model_header)
             .and_then(|value| value.to_str().ok());
-        match route_decision(&snapshot, earlier_selected, model, grid_signals::now_ms()) {
+        let fence = match self.fence(ctx) {
+            Ok(fence) => fence,
+            Err(answer) => return Ok(answer),
+        };
+        let decision = route_decision(&snapshot, earlier_selected, model, grid_signals::now_ms());
+        let keeps_earlier = matches!(decision, RouteDecision::KeepEarlier) || (earlier_selected && model.is_none());
+        match decision {
             RouteDecision::NoRoute => {
                 return Ok(refuse(Refused::NoRoute, "", self.turn.fetch_add(1, Ordering::Relaxed)));
             },
+            // A fence cannot check a cluster another filter chose, so it refuses rather than keep it.
+            _ if keeps_earlier
+                && fence
+                    .as_ref()
+                    .is_some_and(|fence| fence.config().refuses(FenceCause::EarlierRoute, None)) =>
+            {
+                let turn = self.turn.fetch_add(1, Ordering::Relaxed);
+                return Ok(refuse(Refused::Fenced, model.unwrap_or_default(), turn));
+            },
             RouteDecision::KeepEarlier => return Ok(FilterAction::Continue),
-            RouteDecision::Select if earlier_selected && model.is_none() => return Ok(FilterAction::Continue),
+            RouteDecision::Select if keeps_earlier => return Ok(FilterAction::Continue),
             RouteDecision::Select => {
                 ctx.cluster = None;
                 ctx.upstream = None;
             },
         }
-        if let Some(action) = self.pin(ctx, model)? {
+        if let Some(action) = self.pin(ctx, model, fence.as_ref())? {
             return Ok(action);
         }
         let Some(model) = model else {
@@ -810,13 +900,17 @@ impl HttpFilter for GridSiteRouteFilter {
             .get_filter_state_mut::<RouteState>()
             .and_then(|state| state.keys.take())
             .map(|keys| keys.for_model(model));
-        let pick = match self.choose(&snapshot, model, keys.as_ref(), None) {
+        let scope = Scope {
+            keys: keys.as_ref(),
+            fence: fence.as_ref(),
+        };
+        let pick = match self.choose(&snapshot, model, scope, None) {
             Ok(pick) => pick,
             Err(answer) => return Ok(answer),
         };
         let (pick, admitted) = match admission(pick.candidate) {
             // Another request probes this down dial: pick elsewhere when anywhere else routes.
-            Admission::Busy => match self.choose(&snapshot, model, keys.as_ref(), Some(&pick.candidate.cluster)) {
+            Admission::Busy => match self.choose(&snapshot, model, scope, Some(&pick.candidate.cluster)) {
                 Ok(other) => {
                     let admitted = admission(other.candidate);
                     (other, admitted)
@@ -825,6 +919,9 @@ impl HttpFilter for GridSiteRouteFilter {
             },
             admitted @ (Admission::Open | Admission::Probe) => (pick, admitted),
         };
+        if let Some(fence) = fence.as_ref() {
+            fence.audit(pick.candidate);
+        }
         self.route(ctx, &snapshot, &pick, keys)?;
         if admitted == Admission::Probe {
             with_state(ctx, |state| {
@@ -1054,6 +1151,20 @@ fn refuse(reason: Refused, model: &str, turn: usize) -> FilterAction {
             "no route serves this model",
             None,
         ),
+        Refused::Fenced => error_response(
+            403,
+            "permission_error",
+            "sovereignty_zone",
+            "no site in the requested sovereignty zones serves this model",
+            None,
+        ),
+        Refused::ZoneRequired => error_response(
+            400,
+            "invalid_request_error",
+            "sovereignty_zone_required",
+            "the request must name its sovereignty zones in one header line",
+            None,
+        ),
         Refused::NotReady | Refused::NoModel => retry_later(
             turn,
             503,
@@ -1119,6 +1230,22 @@ fn retry_later(turn: usize, status: u16, kind: &str, code: &str, message: &str) 
         .copied()
         .unwrap_or("5");
     error_response(status, kind, code, message, Some(retry_after))
+}
+
+/// `unserved`, or `Fenced` when the model is served but no site serving it lies in the fence.
+fn fenced(snapshot: &RouteSnapshot, model: &str, fence: Option<&Fence>, unserved: Refused) -> Refused {
+    let Some(fence) = fence.filter(|_| unserved != Refused::UnknownModel) else {
+        return unserved;
+    };
+    let mut served = snapshot
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.kind == CapabilityKind::InferenceModel && *candidate.name == *model);
+    if served.any(|candidate| fence.admits(candidate)) {
+        unserved
+    } else {
+        Refused::Fenced
+    }
 }
 
 /// A gateway-originated error: `status`, an OpenAI-style error object, and an optional Retry-After.
@@ -1371,7 +1498,7 @@ fn select<'snap>(sites: &Sites<'snap>, spread: bool, turn: usize) -> Option<Site
     let unpublished = mean_capacity(sites);
     match arm {
         0 => weighted(sites, unit(turn, SALTS.0), None, |candidate| {
-            candidate.capacity.unwrap_or(unpublished)
+            candidate.capacity.unwrap_or(unpublished) * f64::from(candidate.weight)
         }),
         1 => sites.get(0),
         2 => Some(between_two(sites.get(0)?, sites.get(1)?, turn, unpublished)),
@@ -1418,17 +1545,18 @@ fn mean_capacity(sites: &Sites<'_>) -> f64 {
     if count > 0.0 { sum / count } else { 1.0 }
 }
 
-/// A pick between two sites by capacity over 1 + rho, each share clamped to 0.1..0.9.
+/// A pick between two sites by weighted capacity over 1 + rho, each share clamped to 0.1..0.9.
 fn between_two<'snap>(first: Site<'snap>, second: Site<'snap>, turn: usize, unpublished: f64) -> Site<'snap> {
-    let rate =
-        |candidate: &RouteCandidate| candidate.capacity.unwrap_or(unpublished) / (1.0 + candidate.rho.unwrap_or(0.0));
+    let rate = |candidate: &RouteCandidate| {
+        candidate.capacity.unwrap_or(unpublished) * f64::from(candidate.weight) / (1.0 + candidate.rho.unwrap_or(0.0))
+    };
     let share = (rate(first.0) / (rate(first.0) + rate(second.0))).clamp(TWO_SITE_SHARE.0, TWO_SITE_SHARE.1);
     if unit(turn, SALTS.0) < share { first } else { second }
 }
 
 /// Two distinct picks from `sites` by capacity, taking the lower rho; exact ties go to the first.
 fn two_choices<'snap>(sites: &Sites<'snap>, turn: usize, unpublished: f64) -> Option<Site<'snap>> {
-    let capacity = |candidate: &RouteCandidate| candidate.capacity.unwrap_or(unpublished);
+    let capacity = |candidate: &RouteCandidate| candidate.capacity.unwrap_or(unpublished) * f64::from(candidate.weight);
     let first = weighted(sites, unit(turn, SALTS.0), None, capacity)?;
     let second = weighted(sites, unit(turn, SALTS.1), Some(first.0), capacity).unwrap_or(first);
     Some(if second.0.rho < first.0.rho { second } else { first })
@@ -1541,6 +1669,7 @@ pub(crate) mod tests {
             publishes_load: true,
             site: site.to_owned(),
             stable_id: None,
+            weight: None,
         }])
         .unwrap();
         candidates[0].admission_state = admission;
@@ -1556,6 +1685,7 @@ pub(crate) mod tests {
             health: Arc::default(),
             clusters: None,
             model_header: http::header::HeaderName::from_static("x-model"),
+            sovereignty: None,
             affinity: Arc::new(affinity),
             turn: AtomicUsize::new(0),
         }
@@ -1588,7 +1718,15 @@ pub(crate) mod tests {
         filter.affinity.index.confirm(&keys, &Arc::from("pool-a"));
         let snapshot = filter.snapshot.load();
         filter
-            .choose(&snapshot, "llama", Some(&keys), None)
+            .choose(
+                &snapshot,
+                "llama",
+                Scope {
+                    keys: Some(&keys),
+                    fence: None,
+                },
+                None,
+            )
             .ok()
             .map(|pick| pick.candidate.site.to_string())
     }
@@ -1744,6 +1882,7 @@ pub(crate) mod tests {
                     name: name.to_owned(),
                     publishes_load: true,
                     site: "a".to_owned(),
+                    weight: None,
                 })
                 .collect(),
         )
@@ -1847,6 +1986,54 @@ pub(crate) mod tests {
             .expect("a tag key that does not load is refused here, not at every reload");
         assert!(refused.to_string().contains("tag key"), "{refused}");
         assert_eq!(tuning.generation(), 1, "a refused block sets nothing");
+    }
+
+    #[test]
+    fn a_sovereignty_header_is_optional_and_validated_like_the_model_header() {
+        let parse = |yaml: &str| {
+            let config: serde_yaml::Value = serde_yaml::from_str(yaml).expect("yaml");
+            GridSiteRouteFilter::from_config(
+                &config,
+                Arc::new(ArcSwap::from_pointee(RouteSnapshot::from_static(
+                    Vec::new(),
+                    Arc::from("hub"),
+                ))),
+                Arc::default(),
+                Arc::default(),
+                &Tuning::default(),
+            )
+        };
+        parse("{}").expect("no fence by default");
+        parse("sovereignty: {header: x-grid-sovereignty-zone}").expect("a fence header loads");
+        let error = parse("sovereignty: {header: x-praxis-zone}")
+            .err()
+            .expect("a reserved prefix is refused");
+        assert!(error.to_string().contains("sovereignty.header"), "{error}");
+
+        let mode = |yaml: &str| {
+            let config: serde_yaml::Value = serde_yaml::from_str(yaml).expect("yaml");
+            parse_filter_config::<GridSiteRouteConfig>("grid_site_route", &config)
+                .map(|cfg| cfg.sovereignty.map(|fence| fence.mode))
+                .map_err(|refused| refused.to_string())
+        };
+        assert_eq!(
+            mode("sovereignty: {header: x-zone}"),
+            Ok(Some(FenceMode::Enforce)),
+            "enforcing by default"
+        );
+        assert_eq!(
+            mode("sovereignty: {header: x-zone, mode: audit}"),
+            Ok(Some(FenceMode::Audit))
+        );
+        assert!(
+            mode("sovereignty: {header: x-zone, mode: off}").is_err(),
+            "mode is a closed set"
+        );
+        assert!(mode("sovereignty: {mode: audit}").is_err(), "a mode needs a header");
+        assert!(
+            mode("sovereignty: {header: x-zone, enabled: false}").is_err(),
+            "no second switch"
+        );
     }
 
     /// Invalid cache limits are rejected atomically without changing previously applied plugin tuning.
@@ -2167,6 +2354,11 @@ pub(crate) mod tests {
 
     /// Sites publishing (in flight, capacity), each `None` to publish nothing, as one snapshot.
     fn loaded(sites: &[(&str, Option<f64>, Option<f64>)]) -> RouteSnapshot {
+        loaded_with_weights(sites, &[])
+    }
+
+    /// Sites with declared weights applied before learning and exploration flooring.
+    fn loaded_with_weights(sites: &[(&str, Option<f64>, Option<f64>)], weights: &[(&str, u32)]) -> RouteSnapshot {
         let store = grid_signals::LoadStore::new(Duration::from_secs(60));
         let mut candidates = Vec::new();
         for (site, in_flight, capacity) in sites {
@@ -2178,6 +2370,11 @@ pub(crate) mod tests {
                 }
             }
             candidates.extend(one("llama", site, &cluster, AdmissionState::NewAndExisting));
+        }
+        for candidate in &mut candidates {
+            if let Some((_, weight)) = weights.iter().find(|(site, _)| *site == candidate.site.as_ref()) {
+                candidate.weight = *weight;
+            }
         }
         // Exact: a sample moves saturation all the way, and the floor is one request.
         let availability = AvailabilitySettings {
@@ -2491,6 +2688,134 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn declared_weight_scales_draw_share() {
+        let mut snapshot = two_sites(Some(5.0), Some(5.0));
+        snapshot.candidates[0].weight = 3;
+        snapshot.candidates[1].weight = 1;
+        let east = (0..4_000)
+            .filter(|&turn| {
+                select_spread(
+                    &snapshot,
+                    CapabilityKind::InferenceModel,
+                    "llama",
+                    turn,
+                    |_| true,
+                    &KeepAll,
+                )
+                .unwrap()
+                .candidate
+                .site
+                .as_ref()
+                    == "east"
+            })
+            .count();
+        assert!(
+            (2_700..=3_300).contains(&east),
+            "weight 3 vs 1 should give ~75% to east, got {east}/4000"
+        );
+    }
+
+    #[test]
+    fn declared_weight_scales_between_two_with_pressure() {
+        let mut snapshot = loaded(&[("a", Some(3.0), Some(10.0)), ("b", Some(3.0), Some(10.0))]);
+        for candidate in &mut snapshot.candidates {
+            candidate.backlog = Some(false);
+        }
+        snapshot.candidates[0].weight = 3;
+        snapshot.candidates[1].weight = 1;
+        let taken = shares(&snapshot, 4_000, &KeepAll);
+        assert!(
+            (2_700..=3_300).contains(&taken["a"]),
+            "weight 3 vs 1 with equal pressure should give ~75% to a, got {taken:?}"
+        );
+    }
+
+    #[test]
+    fn capacity_draw_preserves_exploration_after_declared_weights() {
+        for (weight, expected) in [(3, 7_500), (1_000, 8_000)] {
+            let snapshot = loaded_with_weights(
+                &[("a", Some(2.0), Some(10.0)), ("b", Some(2.0), Some(10.0))],
+                &[("a", weight), ("b", 1)],
+            );
+            let sites = Sites::gather(
+                snapshot
+                    .candidates
+                    .iter()
+                    .zip(&snapshot.decisions)
+                    .map(|(candidate, decisions)| (candidate, decisions, 0.0)),
+            );
+            let heavier = (0..10_000)
+                .filter(|turn| {
+                    select(&sites, false, *turn).is_some_and(|(candidate, ..)| candidate.site.as_ref() == "a")
+                })
+                .count();
+            assert!(
+                (expected - 300..=expected + 300).contains(&heavier),
+                "weight {weight}:1 preserves ordinary ratios and floors extreme ones: {heavier}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_choices_preserve_exploration_after_declared_weights() {
+        let mut snapshot = loaded_with_weights(
+            &[
+                ("a", Some(2.0), Some(10.0)),
+                ("b", Some(2.0), Some(10.0)),
+                ("c", Some(2.0), Some(10.0)),
+            ],
+            &[("a", 1_000), ("b", 1), ("c", 1)],
+        );
+        for candidate in &mut snapshot.candidates {
+            candidate.backlog = Some(false);
+        }
+        let taken = shares(&snapshot, 10_000, &KeepAll);
+        for site in ["b", "c"] {
+            assert!(
+                (1_300..=2_000).contains(&taken[site]),
+                "equal pressure preserves the floored first-draw share for {site}: {taken:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_site_exploration_survives_extreme_declared_weights() {
+        for (first_weight, second_weight, expected) in [(1_000, 1, 9_000), (1, 1_000, 1_000)] {
+            let mut snapshot = loaded(&[("a", Some(3.0), Some(10.0)), ("b", Some(3.0), Some(10.0))]);
+            for candidate in &mut snapshot.candidates {
+                candidate.backlog = Some(false);
+            }
+            snapshot.candidates[0].weight = first_weight;
+            snapshot.candidates[1].weight = second_weight;
+            let taken = shares(&snapshot, 10_000, &KeepAll);
+            assert!(
+                (expected - 300..=expected + 300).contains(&taken["a"]),
+                "the final share stays clamped for weights {first_weight}:{second_weight}: {taken:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_weight_scales_two_choices_with_pressure() {
+        let mut snapshot = loaded(&[
+            ("a", Some(2.0), Some(10.0)),
+            ("b", Some(2.0), Some(10.0)),
+            ("c", Some(2.0), Some(10.0)),
+        ]);
+        for candidate in &mut snapshot.candidates {
+            candidate.backlog = Some(false);
+        }
+        snapshot.candidates[0].weight = 3;
+        snapshot.candidates[1].weight = 1;
+        snapshot.candidates[2].weight = 1;
+        let taken = shares(&snapshot, 10_000, &KeepAll);
+        assert!(
+            (5_700..=6_300).contains(&taken["a"]),
+            "weight 3 vs 1 vs 1 with equal pressure should give ~60% to a, got {taken:?}"
+        );
+    }
+
+    #[test]
     fn complete_pressure_uses_mean_capacity_for_unknown_sites() {
         for count in [2, 3, MAX_SITES] {
             let names: Vec<_> = (0..count).map(|index| format!("s{index}")).collect();
@@ -2654,6 +2979,65 @@ pub(crate) mod tests {
             | FilterAction::Release
             | FilterAction::BodyDone => panic!("a refusal is answered here"),
         }
+    }
+
+    /// `llama` at sites `a` (zone `eu`), `b` (zone `us`) and `c` (no zone).
+    fn zoned() -> GridSiteRouteFilter {
+        let mut snapshot = queued(&[("a", 0.0, OPEN), ("b", 0.0, OPEN), ("c", 0.0, OPEN)]);
+        for candidate in &mut snapshot.candidates {
+            candidate.sovereignty_zone = match &*candidate.site {
+                "a" => Some(Arc::from("eu")),
+                "b" => Some(Arc::from("us")),
+                _ => None,
+            };
+        }
+        filter(snapshot, AffinitySettings::default())
+    }
+
+    /// The sites `filter` picks for `model` across many turns under `zones`.
+    fn fenced_picks(filter: &GridSiteRouteFilter, model: &str, zones: &[&str]) -> Result<BTreeSet<String>, u16> {
+        let config = FenceConfig {
+            header: ZONE,
+            enforce: true,
+        };
+        let fence = Fencing::new(crate::geo::tests::fence(&zones.join(",")), &config);
+        let snapshot = filter.snapshot.load();
+        let scope = Scope {
+            keys: None,
+            fence: Some(&fence),
+        };
+        std::iter::repeat_with(|| match filter.choose(&snapshot, model, scope, None) {
+            Ok(pick) => Ok(pick.candidate.site.to_string()),
+            Err(FilterAction::TerminalResponse(response)) => Err(response.status),
+            Err(_) => Err(0),
+        })
+        .take(60)
+        .collect()
+    }
+
+    #[test]
+    fn a_fence_routes_only_to_sites_in_its_zones() {
+        let filter = zoned();
+        assert_eq!(
+            fenced_picks(&filter, "llama", &["us"]),
+            Ok(BTreeSet::from(["b".to_owned()]))
+        );
+        assert_eq!(
+            fenced_picks(&filter, "llama", &["eu", "us"]),
+            Ok(BTreeSet::from(["a".to_owned(), "b".to_owned()])),
+            "a site with no zone never passes a fence"
+        );
+    }
+
+    #[test]
+    fn a_fence_no_site_lies_in_is_refused_and_an_unknown_model_stays_unknown() {
+        let filter = zoned();
+        assert_eq!(fenced_picks(&filter, "llama", &["ch"]), Err(403));
+        assert_eq!(fenced_picks(&filter, "mistral", &["eu"]), Err(404));
+        let (status, retry, body) = answered(Refused::Fenced);
+        assert_eq!(status, 403);
+        assert!(!retry, "the same zones will not succeed later");
+        assert!(body.contains(r#""code":"sovereignty_zone""#), "{body}");
     }
 
     #[test]
@@ -3117,6 +3501,239 @@ pub(crate) mod tests {
             health.down(),
             "a client that left before the upstream answered proves nothing"
         );
+    }
+
+    /// The fence header the end-to-end fence tests configure.
+    const ZONE: http::header::HeaderName = http::header::HeaderName::from_static("x-zone");
+
+    /// `filter` with the fence on.
+    fn fencing(filter: GridSiteRouteFilter) -> GridSiteRouteFilter {
+        fencing_as(filter, true)
+    }
+
+    /// `filter` with the fence on, refusing when `enforce` and only logging otherwise.
+    fn fencing_as(mut filter: GridSiteRouteFilter, enforce: bool) -> GridSiteRouteFilter {
+        filter.sovereignty = Some(FenceConfig { header: ZONE, enforce });
+        filter
+    }
+
+    /// `candidates` with `site` in `zone`.
+    fn in_zone(mut candidates: Vec<RouteCandidate>, zone: &str) -> Vec<RouteCandidate> {
+        for candidate in &mut candidates {
+            candidate.sovereignty_zone = Some(Arc::from(zone));
+        }
+        candidates
+    }
+
+    /// A `llama` request at `path` carrying each of `lines` as a zone header line.
+    fn zoned_request(path: &'static str, lines: &[&str]) -> praxis_filter::Request {
+        let mut request = llama_request(path);
+        for line in lines {
+            request.headers.append(ZONE, http::HeaderValue::from_str(line).unwrap());
+        }
+        request
+    }
+
+    /// The status and body a refusal answered, `None` when the request went on.
+    fn refusal(action: &FilterAction) -> Option<(u16, String)> {
+        match action {
+            FilterAction::TerminalResponse(response) => Some((
+                response.status,
+                String::from_utf8(response.body.clone().unwrap_or_default().to_vec()).unwrap(),
+            )),
+            FilterAction::Reject(rejection) => Some((rejection.status, String::new())),
+            FilterAction::Continue
+            | FilterAction::StreamingTerminalResponse(_)
+            | FilterAction::Release
+            | FilterAction::BodyDone => None,
+        }
+    }
+
+    /// East in `eu` and west in `us`, both dialed, the fence on.
+    fn east_west() -> GridSiteRouteFilter {
+        let mut candidates = in_zone(dialed("east", "east", Some("10.0.0.9:8443")), "eu");
+        candidates.extend(in_zone(dialed("west", "west", Some("10.0.0.10:8443")), "us"));
+        fencing(dial_filter(candidates, "local", Some(&[])))
+    }
+
+    #[tokio::test]
+    async fn a_fenced_request_naming_no_valid_zone_in_one_line_is_a_bad_request() {
+        let filter = east_west();
+        for lines in [&[][..], &[""], &[" , "], &["eu west"], &["eu", "us"]] {
+            let request = zoned_request("/v1/chat/completions", lines);
+            let mut ctx = context(&request);
+            let action = filter.on_request(&mut ctx).await.expect("answers");
+            let (status, body) = refusal(&action).unwrap_or_else(|| panic!("{lines:?} must be refused"));
+            assert_eq!(status, 400, "{lines:?}");
+            assert!(
+                body.contains(r#""code":"sovereignty_zone_required""#),
+                "{lines:?}: {body}"
+            );
+            assert!(ctx.cluster.is_none(), "{lines:?} selects nothing");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fenced_request_goes_only_to_its_zone_and_carries_the_canonical_list_on() {
+        let filter = east_west();
+        let request = zoned_request("/v1/chat/completions", &[" US , us"]);
+        for sent in 1..=20 {
+            let mut ctx = context(&request);
+            let action = filter.on_request(&mut ctx).await.expect("routes");
+            assert!(refusal(&action).is_none(), "request {sent} routes");
+            assert_eq!(ctx.cluster.as_deref(), Some("west"), "request {sent} stays in us");
+            assert_eq!(
+                ctx.request_headers_to_set
+                    .iter()
+                    .filter(|(name, _)| *name == ZONE)
+                    .map(|(_, value)| value.as_bytes())
+                    .collect::<Vec<_>>(),
+                [b"us".as_slice()],
+                "the caller's copy is replaced by the canonical list"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fence_no_serving_site_lies_in_is_forbidden_and_an_unknown_model_is_not_found() {
+        let filter = east_west();
+        let request = zoned_request("/v1/chat/completions", &["ch"]);
+        let mut ctx = context(&request);
+        let (status, body) = refusal(&filter.on_request(&mut ctx).await.expect("answers")).expect("refused");
+        assert_eq!(status, 403);
+        assert!(body.contains(r#""code":"sovereignty_zone""#), "{body}");
+        assert!(ctx.cluster.is_none(), "nothing is selected");
+
+        let mut unknown = zoned_request("/v1/chat/completions", &["eu"]);
+        unknown
+            .headers
+            .insert("x-model", http::HeaderValue::from_static("mistral"));
+        let mut unknown_ctx = context(&unknown);
+        let answered = refusal(&filter.on_request(&mut unknown_ctx).await.expect("answers")).expect("refused");
+        assert_eq!(answered.0, 404, "a model no site serves is unknown, whatever the fence");
+    }
+
+    #[tokio::test]
+    async fn without_a_fence_the_zone_header_is_ignored() {
+        let mut filter = east_west();
+        filter.sovereignty = None;
+        let request = zoned_request("/v1/chat/completions", &["ch"]);
+        let mut picked = BTreeSet::new();
+        for _ in 0..40 {
+            let mut ctx = context(&request);
+            let action = filter.on_request(&mut ctx).await.expect("routes");
+            assert!(refusal(&action).is_none(), "routes");
+            picked.extend(ctx.cluster.as_deref().map(str::to_owned));
+        }
+        assert_eq!(picked, BTreeSet::from(["east".to_owned(), "west".to_owned()]));
+    }
+
+    #[tokio::test]
+    async fn a_fence_refuses_a_cluster_another_filter_chose() {
+        let filter = east_west();
+        for model in [Some("llama"), None] {
+            let mut request = zoned_request("/v1/chat/completions", &["eu"]);
+            if model.is_none() {
+                request.headers.remove("x-model");
+            }
+            let mut ctx = context(&request);
+            ctx.cluster = Some(Arc::from("earlier-cluster"));
+            let (status, _) = refusal(&filter.on_request(&mut ctx).await.expect("answers")).expect("refused");
+            assert_eq!(
+                status, 403,
+                "model {model:?}: the fence cannot check another filter's pick"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_busy_in_zone_dial_is_never_traded_for_a_site_outside_the_fence() {
+        let filter = east_west();
+        let east = Arc::clone(
+            filter.snapshot.load().candidates[0]
+                .dial
+                .as_ref()
+                .expect("dialed")
+                .health(),
+        );
+        east.record(false, 0);
+        east.record(false, 0);
+        let request = zoned_request("/v1/chat/completions", &["eu"]);
+        let mut probe = context(&request);
+        drop(filter.on_request(&mut probe).await.expect("routes"));
+        for sent in 1..=8 {
+            let mut ctx = context(&request);
+            let action = filter.on_request(&mut ctx).await.expect("routes");
+            assert!(refusal(&action).is_none(), "request {sent} routes");
+            assert_eq!(ctx.cluster.as_deref(), Some("east"), "request {sent} stays in eu");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pinned_request_is_fenced_like_any_other() {
+        let local = in_zone(dialed("local", "local-pool", Some("10.0.0.7:8000")), "eu");
+        let filter = fencing(dial_filter(local, "local", Some(&[])));
+        let outside = zoned_request("/v1/conversations", &["us"]);
+        let mut ctx = context(&outside);
+        let (status, _) = refusal(&filter.on_request(&mut ctx).await.expect("answers")).expect("refused");
+        assert_eq!(status, 403, "state outside the fence is not reached");
+        assert!(ctx.upstream.is_none(), "nothing is dialed");
+
+        let inside = zoned_request("/v1/conversations", &["eu"]);
+        let mut inside_ctx = context(&inside);
+        let action = filter.on_request(&mut inside_ctx).await.expect("routes");
+        assert!(refusal(&action).is_none(), "state inside the fence is reached");
+        assert_eq!(inside_ctx.cluster.as_deref(), Some("local-pool"));
+    }
+
+    #[tokio::test]
+    async fn an_auditing_fence_refuses_nothing_and_leaves_the_header_alone() {
+        let mut candidates = in_zone(dialed("east", "east", Some("10.0.0.9:8443")), "eu");
+        candidates.extend(in_zone(dialed("west", "west", Some("10.0.0.10:8443")), "us"));
+        let filter = fencing_as(dial_filter(candidates, "local", Some(&[])), false);
+        for lines in [&[][..], &["eu west"], &["eu", "us"], &["ch"], &["eu"]] {
+            let request = zoned_request("/v1/chat/completions", lines);
+            let mut picked = BTreeSet::new();
+            for _ in 0..40 {
+                let mut ctx = context(&request);
+                let action = filter.on_request(&mut ctx).await.expect("routes");
+                assert!(
+                    refusal(&action).is_none(),
+                    "{lines:?}: an auditing fence refuses nothing"
+                );
+                assert!(
+                    ctx.request_headers_to_set.iter().all(|(name, _)| *name != ZONE),
+                    "{lines:?}: an auditing fence only observes"
+                );
+                picked.extend(ctx.cluster.as_deref().map(str::to_owned));
+            }
+            assert_eq!(
+                picked,
+                BTreeSet::from(["east".to_owned(), "west".to_owned()]),
+                "{lines:?}: routed as if unfenced"
+            );
+        }
+
+        let mut ctx = {
+            let request = zoned_request("/v1/chat/completions", &["eu"]);
+            let mut ctx = context(&request);
+            ctx.cluster = Some(Arc::from("earlier-cluster"));
+            let action = filter.on_request(&mut ctx).await.expect("routes");
+            assert!(refusal(&action).is_none(), "an earlier route is kept, only logged");
+            ctx.cluster.clone()
+        };
+        assert_eq!(ctx.take().as_deref(), Some("earlier-cluster"));
+    }
+
+    #[tokio::test]
+    async fn an_auditing_fence_lets_a_pin_outside_its_zones_through() {
+        let local = in_zone(dialed("local", "local-pool", Some("10.0.0.7:8000")), "eu");
+        let filter = fencing_as(dial_filter(local, "local", Some(&[])), false);
+        let request = zoned_request("/v1/conversations", &["us"]);
+        let mut ctx = context(&request);
+        let action = filter.on_request(&mut ctx).await.expect("routes");
+        assert!(refusal(&action).is_none(), "only logged");
+        assert_eq!(ctx.cluster.as_deref(), Some("local-pool"));
     }
 
     // ---------------------------------------------------------------------------

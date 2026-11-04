@@ -425,6 +425,35 @@ capability, access policy, freshness, phase filters). It does not override
 data-residency or sovereignty constraints; those must be enforced separately
 before candidates reach the ordering phase.
 
+### Sovereignty fence
+
+A site's zone is its `GridSite` `spec.sovereigntyZone`; every provider on the site
+is in it. The operator writes each serving site's zone once, as `sovereignty_zones`
+in the serving config, and reads the `GridSite` objects again on every reconcile, so
+a zone change reaches the render it triggers. When `grid_site_route` sets a
+`sovereignty` block, a request names its zones in `sovereignty.header`, one zone or
+a comma-separated list in a single line, and only sites in one of them serve it:
+
+```yaml
+- filter: grid_site_route
+  sovereignty:
+    header: x-grid-sovereignty-zone
+    mode: enforce   # or audit
+```
+
+| Request | `enforce` | `audit` |
+|---------|-----------|---------|
+| No header, an empty or invalid zone, or more than one header line | 400 | routed, counted |
+| Model served, but by no site in the named zones | 403 | routed, counted |
+| Model served by no site at all | 404 | 404 |
+| Another filter already chose a cluster | 403 | kept, counted |
+
+`grid_route_fenced_total{cause, enforced}` counts each refusal, or each request
+`audit` would have refused. Zones match case-insensitively. A site with no zone, or
+an invalid one, is in none, and no fence admits it. The fence trusts the header: the
+gateway in front must set it from the caller's identity and replace any copy the
+caller sent.
+
 ### Admission state derivation
 
 When `spec.admissionPolicy` is omitted, admission preserves the legacy

@@ -2913,20 +2913,21 @@ fn site_by_spiffe(leaf: &[u8], identity: &SignalsIdentity) -> Option<(String, BT
 /// Whether `tcp` sent anything within [`SIGNALS_SILENT_TIMEOUT`].
 ///
 /// A connection that never speaks costs a slot and proves nothing, and opening many of them
-/// is the cheapest way to hold the handshake share. `readable()` does not consume, so the
-/// handshake that follows still sees the `ClientHello`. False also covers shutdown, where the
-/// caller stops for its own reasons.
+/// is the cheapest way to hold the handshake share. Require at least one byte before the
+/// deadline; `peek()` does not consume it, so the TLS handshake still sees the `ClientHello`.
+/// Returns `false` if shutdown wins the race.
 async fn spoke_in_time(
     tcp: &tokio::net::TcpStream,
     remote: SocketAddr,
     shutdown: &operator::shutdown::Shutdown,
 ) -> bool {
+    let mut first_byte = [0_u8; 1];
     let ready = tokio::select! {
         biased;
         () = shutdown.triggered() => return false,
-        ready = tokio::time::timeout(SIGNALS_SILENT_TIMEOUT, tcp.readable()) => ready,
+        ready = tokio::time::timeout(SIGNALS_SILENT_TIMEOUT, tcp.peek(&mut first_byte)) => ready,
     };
-    if matches!(ready, Ok(Ok(()))) {
+    if matches!(ready, Ok(Ok(bytes_read)) if bytes_read > 0) {
         return true;
     }
     operator::metrics::record_signals_shed("silent");
@@ -4707,6 +4708,7 @@ mod tests {
             labels: gpu(),
             pins,
             signals: None,
+            sovereignty_zone: None,
         };
         let peers = operator::signals::PeerIdentities::new();
         peers.set(BTreeMap::from([
@@ -4960,6 +4962,7 @@ mod tests {
                     labels: gpu(),
                     pins: vec![operator::signals::leaf_fingerprint(&pem_der(&self.west.cert_pem))],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             )]));
             SignalsIdentity {
@@ -5341,6 +5344,7 @@ mod tests {
                     labels: gpu(),
                     pins: Vec::new(),
                     signals: None,
+                    sovereignty_zone: None,
                 },
             )]));
             SignalsIdentity {
@@ -5824,6 +5828,7 @@ mod tests {
             labels: BTreeMap::new(),
             pins: vec!["aa".to_owned()],
             signals: None,
+            sovereignty_zone: None,
         };
         let heard = operator::signals::LoadHeard::default();
         let nothing = crdt::GridStateSnapshot::new("hub".to_owned());
@@ -6096,6 +6101,7 @@ mod tests {
                     labels: gpu(),
                     pins: vec!["bb".to_owned()],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
             (
@@ -6104,6 +6110,7 @@ mod tests {
                     labels: gpu(),
                     pins: vec!["aa".to_owned()],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
             (
@@ -6112,6 +6119,7 @@ mod tests {
                     labels: gpu(),
                     pins: Vec::new(),
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
         ]));
@@ -6151,6 +6159,7 @@ mod tests {
                 endpoint: operator::signals::SignalsEndpoint::parse(address).expect("endpoint"),
                 server_name: server_name.map(str::to_owned),
             }),
+            sovereignty_zone: None,
         };
         let pinned = || vec!["aa".to_owned()];
         let identities = operator::signals::PeerIdentities::new();
@@ -6283,6 +6292,7 @@ mod tests {
                     server_name: None,
                 }
             }),
+            sovereignty_zone: None,
         };
         let identities = operator::signals::PeerIdentities::new();
         identities.set(BTreeMap::from([
@@ -6334,6 +6344,7 @@ mod tests {
             labels: BTreeMap::new(),
             pins: vec!["aa".to_owned()],
             signals: None,
+            sovereignty_zone: None,
         };
         let identities = operator::signals::PeerIdentities::new();
         identities.set(BTreeMap::from([
@@ -6522,6 +6533,7 @@ mod tests {
                 labels: gpu(),
                 pins: Vec::new(),
                 signals: None,
+                sovereignty_zone: None,
             },
         )]));
         Serving {

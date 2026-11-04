@@ -743,13 +743,17 @@ install_site() {
     shared=(--set-string 'signals.service.annotations.metallb\.universe\.tf/allow-shared-ip=grid-site'
       --set signals.service.externalTrafficPolicy=Cluster --set signals.maxHandshakesPerSource=64)
   fi
+  # Withdrawal checks wait on the gateway's mounted ConfigMap, which the kubelet syncs about once a minute.
+  local discovery=()
+  [[ $MODEL_GOSSIP_TEST != 1 ]] || discovery=(--set modelDiscovery.ttlSeconds=300)
   helm_on "$SITE_CTX" "$NS" grid-operator grid-operator "${RA[@]}" \
     --set "swim.siteName=$SITE" "${seeds[@]}" \
     --set enrollment.enabled=true \
     --set "enrollment.url=https://grid-enrollment.$ENS.svc:$ENROLL_PORT" \
     --set grid.peerTrust="$TRUST" \
     "${IMG[@]}" --set swim.service.loadBalancerIP="$SITE_SWIM_IP" \
-    --set signals.service.loadBalancerIP="$sig_ip" "${shared[@]}" || die "install site grid-operator"
+    --set signals.service.loadBalancerIP="$sig_ip" "${shared[@]}" "${discovery[@]}" \
+    || die "install site grid-operator"
   enrollment_forward || die "enrollment forward"
   copy_key "$HUB_CTX" "$ENS" "$SITE_CTX" grid-ca-bundle ca.crt || die "copy the site CA bundle"
   k "$SITE_CTX" label secret grid-ca-bundle grid.praxis.fast/signer-bundle=true >/dev/null || die "opt the site CA bundle in"

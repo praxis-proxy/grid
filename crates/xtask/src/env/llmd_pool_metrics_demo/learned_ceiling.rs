@@ -27,10 +27,10 @@ use super::{
         RouteDistribution, SiteRouteResponse, has_connected_swim_peer, read_connected_sites, read_gateway_metrics,
         read_operator_metrics, send_site_request, start_ready_port_forward,
     },
-    format_utc_iso, get_configmap_data_key, kind_context, kubectl, kubectl_exec_epp_metrics, run_cluster_prefix,
-    set_simulator_fake_metrics, set_simulator_fake_metrics_with_endpoint_kv,
+    deployment_generation, format_utc_iso, get_configmap_data_key, kind_context, kubectl, kubectl_exec_epp_metrics,
+    run_cluster_prefix, set_simulator_fake_metrics, simulator_config,
 };
-use crate::env::verify::PortForwardGuard;
+use crate::env::verify::{PortForwardGuard, curl_post, find_free_port};
 
 /// Remote site whose learned ceiling is exercised.
 const SITE: &str = "pool-b";
@@ -914,13 +914,7 @@ fn run_lifecycle(
         probe_failures,
     )?;
 
-    set_simulator_fake_metrics(
-        SITE,
-        0,
-        0,
-        0.0,
-        context.metrics_transport == MetricsTransport::MtlsProxy,
-    )?;
+    observations.extend(set_simulator_fake_metrics_live(SITE, 0, 0, 0.0)?);
     let idle = wait_for_ceiling(
         context,
         forwards,
@@ -1169,14 +1163,13 @@ fn run_lifecycle(
         KV_HARD_BOUND_ROUTE_REQUESTS,
     )?;
 
-    set_simulator_fake_metrics_with_endpoint_kv(
+    observations.extend(set_simulator_fake_metrics_live_with_endpoint_kv(
         SITE,
         0,
         LOW_RUNNING_REQUESTS,
         KV_HARD_BOUND_CACHE_HIGH_ENDPOINT,
         KV_HARD_BOUND_CACHE_LOW_ENDPOINT,
-        context.metrics_transport == MetricsTransport::MtlsProxy,
-    )?;
+    )?);
     observations.push(format!(
         "pool-B simulator set low running-requests={LOW_RUNNING_REQUESTS}, waiting-requests={KV_REPORTED_ONLY_WAITING_REQUESTS}, vcr-1 KV-cache={KV_HARD_BOUND_CACHE_HIGH_ENDPOINT}, vcr-2 KV-cache={KV_HARD_BOUND_CACHE_LOW_ENDPOINT}; the provider signal must route as saturated without a learned hard ceiling"
     ));
@@ -1221,14 +1214,13 @@ fn run_lifecycle(
         (reported_only_soft_pool_b_share - reported_only_pool_b_share) * 100.0
     ));
 
-    set_simulator_fake_metrics_with_endpoint_kv(
+    observations.extend(set_simulator_fake_metrics_live_with_endpoint_kv(
         SITE,
         KV_HARD_BOUND_WAITING_REQUESTS,
         KV_HARD_BOUND_RUNNING_REQUESTS,
         KV_HARD_BOUND_CACHE_HIGH_ENDPOINT,
         KV_HARD_BOUND_CACHE_LOW_ENDPOINT,
-        context.metrics_transport == MetricsTransport::MtlsProxy,
-    )?;
+    )?);
     observations.push(format!(
         "pool-B simulator set running-requests={KV_HARD_BOUND_RUNNING_REQUESTS}, waiting-requests={KV_HARD_BOUND_WAITING_REQUESTS} per endpoint, vcr-1 KV-cache={KV_HARD_BOUND_CACHE_HIGH_ENDPOINT}, vcr-2 KV-cache={KV_HARD_BOUND_CACHE_LOW_ENDPOINT}; expected pinned EPP mean={KV_HARD_BOUND_CACHE_MEAN}, sample standard deviation={KV_HARD_BOUND_CACHE_SPREAD}, and zero held-work capacity"
     ));
@@ -1321,6 +1313,202 @@ fn run_lifecycle(
         probe_failures,
     )?;
     Ok(())
+}
+
+/// Change fake metrics through the simulator runtime API without restarting its endpoints.
+fn set_simulator_fake_metrics_live(
+    cluster: &str,
+    waiting_requests: u32,
+    running_requests: u32,
+    kv_cache_usage: f64,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    set_simulator_fake_metrics_live_with_endpoint_kv(
+        cluster,
+        waiting_requests,
+        running_requests,
+        kv_cache_usage,
+        kv_cache_usage,
+    )
+}
+
+/// Update persistent per-endpoint fake metrics through the simulator API without replacing endpoint pods.
+fn set_simulator_fake_metrics_live_with_endpoint_kv(
+    cluster: &str,
+    waiting_requests: u32,
+    running_requests: u32,
+    vcr1_kv_cache_usage: f64,
+    vcr2_kv_cache_usage: f64,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let context = kind_context(cluster);
+    let mut observations = Vec::new();
+    for (deployment, configmap) in SIMULATOR_CONFIGMAPS {
+        let kv_cache_usage = endpoint_kv_cache_for_deployment(deployment, vcr1_kv_cache_usage, vcr2_kv_cache_usage)
+            .map_err(std::io::Error::other)?;
+        let expected_manifest = simulator_config(configmap, waiting_requests, running_requests, kv_cache_usage);
+        kubectl::apply_manifest(&context, &expected_manifest)
+            .map_err(|error| format!("persist simulator configmap/{configmap} on {cluster}: {error}"))?;
+        let expected_data = super::simulator_config_data(waiting_requests, running_requests, kv_cache_usage);
+        let observed_data = get_configmap_data_key(&context, GRID_SYSTEM_NS, configmap, "config.yaml")
+            .map_err(|error| format!("read persisted simulator configmap/{configmap} on {cluster}: {error}"))?;
+        if observed_data != expected_data {
+            return Err(format!(
+                "simulator configmap/{configmap} on {cluster} did not retain the requested fake metrics"
+            )
+            .into());
+        }
+
+        let generation_before = deployment_generation(&context, deployment)?;
+        let pod_uid_before = simulator_pod_uid(&context, deployment)?;
+        let local_port = find_free_port()?;
+        let mut forward = PortForwardGuard::start_deployment_with_diagnostics(
+            &context,
+            GRID_SYSTEM_NS,
+            deployment,
+            local_port,
+            8000,
+        )?;
+        forward.wait_until_ready(local_port)?;
+        let update = json!({
+            "fake-metrics": {
+                "waiting-requests": waiting_requests,
+                "running-requests": running_requests,
+                "kv-cache-usage": kv_cache_usage
+            }
+        });
+        let response = curl_post(
+            &format!("http://127.0.0.1:{local_port}/admin/config"),
+            &update.to_string(),
+        )?;
+        if response.status != 200 {
+            return Err(format!(
+                "simulator deployment/{deployment} on {cluster} rejected its runtime fake-metrics update with HTTP {}: {}",
+                response.status, response.body
+            )
+            .into());
+        }
+        let applied: Value = serde_json::from_str(&response.body)
+            .map_err(|error| format!("parse simulator deployment/{deployment} runtime config response: {error}"))?;
+        let fake_metrics = applied
+            .get("fake-metrics")
+            .ok_or_else(|| format!("simulator deployment/{deployment} response omitted fake-metrics"))?;
+        for (field, expected_value) in [
+            ("waiting-requests", f64::from(waiting_requests)),
+            ("running-requests", f64::from(running_requests)),
+            ("kv-cache-usage", kv_cache_usage),
+        ] {
+            let actual = fake_metrics
+                .get(field)
+                .and_then(Value::as_f64)
+                .ok_or_else(|| format!("simulator deployment/{deployment} response omitted numeric {field}"))?;
+            if (actual - expected_value).abs() > f64::EPSILON {
+                return Err(format!(
+                    "simulator deployment/{deployment} on {cluster} applied {field}={actual}, expected {expected_value}"
+                )
+                .into());
+            }
+        }
+        drop(forward);
+
+        let generation_after = deployment_generation(&context, deployment)?;
+        if generation_after != generation_before {
+            return Err(format!(
+                "simulator deployment/{deployment} on {cluster} changed generation during runtime metrics update: {generation_before} -> {generation_after}"
+            )
+            .into());
+        }
+        let pod_uid_after = simulator_pod_uid(&context, deployment)?;
+        if pod_uid_after != pod_uid_before {
+            return Err(format!(
+                "simulator deployment/{deployment} on {cluster} replaced its endpoint during runtime metrics update: {pod_uid_before} -> {pod_uid_after}"
+            )
+            .into());
+        }
+        eprintln!(
+            "  [OK] {cluster}/{deployment}: runtime fake-metrics update applied without replacing its endpoint (generation={generation_after}, pod UID={pod_uid_after})"
+        );
+        observations.push(format!(
+            "{cluster}/{deployment}: runtime fake-metrics update applied with /admin/config; Deployment generation stayed {generation_after} and pod UID stayed {pod_uid_after}"
+        ));
+    }
+
+    // The caller's stable Gateway observation verifies these updates reached EPP without losing the learned ceiling.
+    Ok(observations)
+}
+
+/// Select the pinned KV-cache stimulus for one of the two simulator Deployments.
+fn endpoint_kv_cache_for_deployment(
+    deployment: &str,
+    vcr1_kv_cache_usage: f64,
+    vcr2_kv_cache_usage: f64,
+) -> Result<f64, &'static str> {
+    match deployment {
+        "vcr-1" => Ok(vcr1_kv_cache_usage),
+        "vcr-2" => Ok(vcr2_kv_cache_usage),
+        _ => Err("no per-endpoint KV-cache stimulus was specified for this simulator deployment"),
+    }
+}
+
+/// Return simulator Pods that are not already terminating.
+fn non_terminating_simulator_pods(pods: &[Value]) -> Vec<&Value> {
+    pods.iter()
+        .filter(|pod| {
+            pod.pointer("/metadata/deletionTimestamp")
+                .and_then(Value::as_str)
+                .is_none()
+        })
+        .collect()
+}
+
+/// Identify the single Ready simulator pod behind a run-owned Deployment.
+fn simulator_pod_uid(context: &str, deployment: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let selector = format!("app=vllm-vcr,pool={SITE},instance={deployment}");
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "get",
+            "pods",
+            "-l",
+            &selector,
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "list simulator pods for deployment/{deployment}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let pods: Value = serde_json::from_slice(&output.stdout)?;
+    let items = pods
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or("kubectl simulator pod list omitted items")?;
+    let active_pods = non_terminating_simulator_pods(items);
+    let [pod] = active_pods.as_slice() else {
+        return Err(format!(
+            "expected exactly one non-terminating pod for deployment/{deployment}, found {} active among {} total",
+            active_pods.len(),
+            items.len(),
+        )
+        .into());
+    };
+    if pod.pointer("/status/phase").and_then(Value::as_str) != Some("Running")
+        || pod
+            .pointer("/status/containerStatuses/0/ready")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err(format!("simulator deployment/{deployment} pod is not Ready: {pod}").into());
+    }
+    pod.pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("simulator deployment/{deployment} pod omitted metadata.uid").into())
 }
 
 /// Prove that a re-added saturated pair learns a hard bound without a queue-free soft sample.
@@ -4115,6 +4303,21 @@ fn epp_readings_match(actual: &EppReadings, expected: &EppReadings) -> bool {
         && (actual.held_capacity_utilization - expected.held_capacity_utilization).abs() < f64::EPSILON
 }
 
+/// Accept an unchanged original mount when an unserved intermediate operator revision was never loaded.
+fn restored_revision_is_observed(
+    operator_digest: &str,
+    mounted_digest: &str,
+    gateway_reloads: f64,
+    original_digest: &str,
+    before_restore: Option<(&str, f64)>,
+) -> bool {
+    before_restore.is_none_or(|(previous_digest, previous_reloads)| {
+        operator_digest == previous_digest
+            || gateway_reloads > previous_reloads
+            || (operator_digest == original_digest && mounted_digest == original_digest)
+    })
+}
+
 /// Wait for the original operator topology, Gateway mount, and same Gateway pod after restoration.
 #[expect(
     clippy::too_many_arguments,
@@ -4142,10 +4345,13 @@ fn wait_for_restored_topology(
                     && candidate_set(&snapshot.mounted_candidates) == expected
                     && snapshot.operator_digest == snapshot.operator_digest_annotation
                     && snapshot.mounted_digest == snapshot.operator_digest
-                    && before_restore.is_none_or(|previous| {
-                        snapshot.operator_digest == previous.operator_digest
-                            || snapshot.gateway_reloads > previous.gateway_reloads
-                    })
+                    && restored_revision_is_observed(
+                        &snapshot.operator_digest,
+                        &snapshot.mounted_digest,
+                        snapshot.gateway_reloads,
+                        &original.baseline.operator_digest,
+                        before_restore.map(|previous| (previous.operator_digest.as_str(), previous.gateway_reloads)),
+                    )
                     && original_signals_restored(&snapshot, original);
                 if stable {
                     let response =
@@ -4165,10 +4371,14 @@ fn wait_for_restored_topology(
                         && candidate_set(&post_request.mounted_candidates) == expected
                         && post_request.operator_digest == post_request.operator_digest_annotation
                         && post_request.mounted_digest == post_request.operator_digest
-                        && before_restore.is_none_or(|previous| {
-                            post_request.operator_digest == previous.operator_digest
-                                || post_request.gateway_reloads > previous.gateway_reloads
-                        })
+                        && restored_revision_is_observed(
+                            &post_request.operator_digest,
+                            &post_request.mounted_digest,
+                            post_request.gateway_reloads,
+                            &original.baseline.operator_digest,
+                            before_restore
+                                .map(|previous| (previous.operator_digest.as_str(), previous.gateway_reloads)),
+                        )
                         && original_signals_restored(&post_request, original)
                     {
                         let response_evidence = response_value(&response);
@@ -4643,13 +4853,14 @@ mod tests {
         KV_HARD_BOUND_ROUTE_REQUESTS, KV_HARD_BOUND_WAITING_REQUESTS, KV_REPORTED_ONLY_WAITING_REQUESTS,
         LOW_RUNNING_REQUESTS, MIN_REPORTED_KV_POOL_B_SHARE_REDUCTION, MIN_SOFT_BASELINE_POOL_B_SHARE, QUEUE_METRIC,
         READY_METRIC, RUN_EXCLUSION_LABEL, RUNNING_METRIC, RouteDistribution, SITE, access_policy_json_patch,
-        capacity_metrics_are_cleared, counted_saturation_is_absent, expected_kv_cache_origin_in_flight,
-        gateway_config_observation_count, gateway_config_values_match, hard_bound_without_soft_is_valid,
-        hard_only_epp_in_flight, idle_ceiling_is_retained, kv_cache_hard_bound_is_valid,
-        kv_cache_reported_only_route_share_shift, kv_cache_route_share_shift, lifecycle_ceiling_sequence_valid,
-        local_relay_matches, metric_values, no_waiting_or_held_work, parse_epp_readings, policy_with_run_exclusion,
-        probe_failure_value, qualification_succeeded, reported_only_kv_cache_is_valid, returned_ceiling_is_valid,
-        validate_response_attribution,
+        capacity_metrics_are_cleared, counted_saturation_is_absent, endpoint_kv_cache_for_deployment,
+        expected_kv_cache_origin_in_flight, gateway_config_observation_count, gateway_config_values_match,
+        hard_bound_without_soft_is_valid, hard_only_epp_in_flight, idle_ceiling_is_retained,
+        kv_cache_hard_bound_is_valid, kv_cache_reported_only_route_share_shift, kv_cache_route_share_shift,
+        lifecycle_ceiling_sequence_valid, local_relay_matches, metric_values, no_waiting_or_held_work,
+        non_terminating_simulator_pods, parse_epp_readings, policy_with_run_exclusion, probe_failure_value,
+        qualification_succeeded, reported_only_kv_cache_is_valid, restored_revision_is_observed,
+        returned_ceiling_is_valid, validate_response_attribution,
     };
 
     fn route_distribution(pool_a: usize, pool_b: usize) -> RouteDistribution {
@@ -4657,6 +4868,77 @@ mod tests {
             sites: BTreeMap::from([("pool-a".to_owned(), pool_a), (SITE.to_owned(), pool_b)]),
             ..RouteDistribution::default()
         }
+    }
+
+    #[test]
+    fn live_simulator_stimulus_keeps_distinct_endpoint_cache_values() {
+        assert_eq!(
+            endpoint_kv_cache_for_deployment("vcr-1", 1.0, 0.0).ok(),
+            Some(1.0),
+            "the first simulator endpoint must receive its configured KV-cache stimulus"
+        );
+        assert_eq!(
+            endpoint_kv_cache_for_deployment("vcr-2", 1.0, 0.0).ok(),
+            Some(0.0),
+            "the second simulator endpoint must receive its independent KV-cache stimulus"
+        );
+        assert_eq!(
+            endpoint_kv_cache_for_deployment("other", 1.0, 0.0),
+            Err("no per-endpoint KV-cache stimulus was specified for this simulator deployment"),
+            "an unconfigured simulator endpoint must not inherit another endpoint's cache value"
+        );
+    }
+
+    #[test]
+    fn simulator_pod_selection_ignores_pods_during_rollout_termination() {
+        let pods = vec![
+            serde_json::json!({"metadata":{"name":"old","deletionTimestamp":"2026-10-30T00:00:00Z"}}),
+            serde_json::json!({"metadata":{"name":"new","deletionTimestamp":null}}),
+        ];
+
+        let active = non_terminating_simulator_pods(&pods);
+
+        assert_eq!(
+            active.len(),
+            1,
+            "a terminating old ReplicaSet Pod must not make a single-active-Pod rollout ambiguous"
+        );
+        assert_eq!(
+            active
+                .first()
+                .and_then(|pod| pod.pointer("/metadata/name"))
+                .and_then(serde_json::Value::as_str),
+            Some("new"),
+            "the surviving non-terminating simulator Pod must be selected"
+        );
+    }
+
+    #[test]
+    fn restoration_accepts_an_original_revision_that_never_left_the_gateway() {
+        assert!(
+            restored_revision_is_observed(
+                "original",
+                "original",
+                3.0,
+                "original",
+                Some(("unserved-intermediate", 3.0)),
+            ),
+            "an unchanged original revision may remain serving while a newer revision is observed"
+        );
+        assert!(
+            restored_revision_is_observed(
+                "original",
+                "original",
+                4.0,
+                "original",
+                Some(("served-intermediate", 3.0)),
+            ),
+            "the original revision must be accepted after a previously served intermediate revision"
+        );
+        assert!(
+            !restored_revision_is_observed("new", "new", 3.0, "original", Some(("unserved-intermediate", 3.0)),),
+            "a different current revision must not be mistaken for successful restoration"
+        );
     }
 
     #[test]

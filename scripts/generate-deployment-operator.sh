@@ -44,7 +44,7 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 # Files the generator never touches in a target directory.
-KEEP_FILES=(values.yaml api-versions Containerfile Containerfile.ubi9)
+KEEP_FILES=(values.yaml api-versions Containerfile Containerfile.ubi9 Containerfile.fips)
 
 # The rendered objects in a directory, as kustomization resource lines, namespace first.
 resource_list() {

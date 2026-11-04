@@ -311,7 +311,8 @@ impl PortForwardGuard {
         local_port: u16,
         svc_port: u16,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::start_inner(context, NAMESPACE, svc_name, local_port, svc_port, Stdio::null())
+        let (resource, mapping) = port_forward_args("svc", svc_name, local_port, svc_port);
+        Self::start_inner(context, NAMESPACE, &resource, &mapping, Stdio::null())
     }
 
     /// Start a port-forward with child diagnostics inherited by the xtask log.
@@ -322,33 +323,32 @@ impl PortForwardGuard {
         local_port: u16,
         svc_port: u16,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::start_inner(context, namespace, svc_name, local_port, svc_port, Stdio::inherit())
+        let (resource, mapping) = port_forward_args("svc", svc_name, local_port, svc_port);
+        Self::start_inner(context, namespace, &resource, &mapping, Stdio::inherit())
+    }
+
+    /// Start a port-forward directly to a named Deployment.
+    pub(crate) fn start_deployment_with_diagnostics(
+        context: &str,
+        namespace: &str,
+        deployment: &str,
+        local_port: u16,
+        deployment_port: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let (resource, mapping) = port_forward_args("deployment", deployment, local_port, deployment_port);
+        Self::start_inner(context, namespace, &resource, &mapping, Stdio::inherit())
     }
 
     /// Spawn a port-forward with the requested stderr handling.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the common command builder receives independent context, namespace, Service, and port settings"
-    )]
     fn start_inner(
         context: &str,
         namespace: &str,
-        svc_name: &str,
-        local_port: u16,
-        svc_port: u16,
+        resource: &str,
+        mapping: &str,
         stderr: Stdio,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let (resource, mapping) = port_forward_args(svc_name, local_port, svc_port);
         let child = Command::new("kubectl")
-            .args([
-                "--context",
-                context,
-                "-n",
-                namespace,
-                "port-forward",
-                &resource,
-                &mapping,
-            ])
+            .args(["--context", context, "-n", namespace, "port-forward", resource, mapping])
             .stdout(Stdio::null())
             .stderr(stderr)
             .spawn()?;
@@ -403,10 +403,10 @@ impl Drop for PortForwardGuard {
 
 /// Build the `kubectl port-forward` resource and mapping arguments.
 ///
-/// Returns `("svc/{svc_name}", "{local_port}:8000")`.
-fn port_forward_args(svc_name: &str, local_port: u16, svc_port: u16) -> (String, String) {
-    let resource = format!("svc/{svc_name}");
-    let mapping = format!("{local_port}:{svc_port}");
+/// Returns `("{resource_type}/{name}", "{local_port}:{target_port}")`.
+fn port_forward_args(resource_type: &str, name: &str, local_port: u16, target_port: u16) -> (String, String) {
+    let resource = format!("{resource_type}/{name}");
+    let mapping = format!("{local_port}:{target_port}");
     (resource, mapping)
 }
 
@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn port_forward_args_correct_syntax() {
-        let (resource, mapping) = port_forward_args("inference-sim-llama-3-2-8b", 12345, 8000);
+        let (resource, mapping) = port_forward_args("svc", "inference-sim-llama-3-2-8b", 12345, 8000);
         assert_eq!(
             resource, "svc/inference-sim-llama-3-2-8b",
             "resource should be svc/ prefix only"
