@@ -3307,9 +3307,11 @@ async fn reconcile_routing_overlay_inner(
     let mut overlay_statuses: Vec<OverlayRevisionStatus> = Vec::new();
     let mut serving_retry: Option<Duration> = None;
     let mut inventory_expiry_deadline: Option<time::OffsetDateTime> = None;
-    let eligible_remote_refs: Vec<&crdt::ProviderState> =
-        filter_eligible_remote_crdt_providers(network_name, &sites, remote_crdt_providers, signal);
-    let eligible_remote_owned: Vec<crdt::ProviderState> = eligible_remote_refs.iter().copied().cloned().collect();
+    let eligible_remote_owned: Vec<crdt::ProviderState> =
+        filter_eligible_remote_crdt_providers(network_name, &sites, remote_crdt_providers, signal)
+            .into_iter()
+            .cloned()
+            .collect();
     let filtered_count = remote_crdt_providers.len() - eligible_remote_owned.len();
     if filtered_count > 0 {
         tracing::debug!(
