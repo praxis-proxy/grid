@@ -266,6 +266,8 @@ impl PinKey {
 /// APIs also purge state accepted before a pin was installed.
 #[derive(Clone, Debug, Default)]
 pub struct TrustStore {
+    /// Administrator-declared provider network for each authenticated grid.
+    provider_networks: BTreeMap<String, String>,
     /// Signing keys by whose they are.
     pins: HashMap<PinKey, Vec<Vec<u8>>>,
     /// Grids that refuse unsigned state.
@@ -310,8 +312,19 @@ impl TrustStore {
         self.strict.insert(grid.to_owned());
     }
 
+    /// The provider network authorized for `grid`, if its policy is installed.
+    pub(crate) fn provider_network(&self, grid: &str) -> Option<&str> {
+        self.provider_networks.get(grid).map(String::as_str)
+    }
+
+    /// Bind `grid` to a locally declared provider network.
+    pub(crate) fn bind_provider_network(&mut self, grid: &str, network: &str) {
+        self.provider_networks.insert(grid.to_owned(), network.to_owned());
+    }
+
     /// Drop `grid`'s strictness and pins.
     pub(crate) fn forget_grid(&mut self, grid: &str) {
+        self.provider_networks.remove(grid);
         self.strict.remove(grid);
         self.pins
             .retain(|key, _| !matches!(key, PinKey::Grid { grid: pinned, .. } if pinned == grid));
@@ -1149,6 +1162,21 @@ impl foca::Invalidates for StateBroadcastKey {
 /// Errors produced while decoding state broadcasts.
 #[derive(Debug, thiserror::Error)]
 pub enum StateBroadcastError {
+    /// Signed provider state arrived before its grid's network policy was installed.
+    #[error("provider-network policy is missing for authenticated grid {grid_id}")]
+    ProviderScopeMissing {
+        /// Authenticated grid whose local policy is missing.
+        grid_id: String,
+    },
+
+    /// Signed state names a provider network outside its authenticated grid.
+    #[error("provider network {network_id} is not authorized for authenticated grid {grid_id}")]
+    ProviderNetworkNotAllowed {
+        /// Authenticated grid that sent the state.
+        grid_id: String,
+        /// Provider network rejected by local policy.
+        network_id: String,
+    },
     /// The payload could not be decoded.
     #[error("state broadcast decode failed: {0}")]
     Decode(#[from] bincode::error::DecodeError),
@@ -1790,6 +1818,53 @@ impl StateBroadcastHandler {
                 origin_site: broadcast.origin_site.clone(),
             });
         }
+        if let Some(grid_id) = broadcast.grid_id.as_deref()
+            && (broadcast.carries_provider_state() || !broadcast.provider_uids.is_empty())
+        {
+            let networks = broadcast
+                .snapshot
+                .providers
+                .values()
+                .filter(|provider| provider.site_id == broadcast.origin_site)
+                .map(|provider| provider.network_id.as_str())
+                .chain(
+                    broadcast
+                        .provider_uids
+                        .iter()
+                        .filter(|uid| uid.identity.site == broadcast.origin_site)
+                        .map(|uid| uid.identity.network.as_str()),
+                );
+            self.validate_provider_networks(grid_id, networks)?;
+        }
+        Ok(())
+    }
+
+    /// Authorize signed provider-network names before retaining any part of a message.
+    fn validate_provider_networks<'network, Networks>(
+        &self,
+        grid_id: &str,
+        networks: Networks,
+    ) -> Result<(), StateBroadcastError>
+    where
+        Networks: IntoIterator<Item = &'network str>,
+    {
+        let policy = self.trust_store_rx.borrow();
+        let Some(allowed) = policy.provider_network(grid_id) else {
+            tracing::warn!(reason = "provider_scope_missing", REJECTED_BROADCAST_LOG);
+            return Err(StateBroadcastError::ProviderScopeMissing {
+                grid_id: grid_id.to_owned(),
+            });
+        };
+        for network in networks {
+            if network != allowed {
+                tracing::warn!(reason = "provider_network_not_allowed", REJECTED_BROADCAST_LOG);
+                return Err(StateBroadcastError::ProviderNetworkNotAllowed {
+                    grid_id: grid_id.to_owned(),
+                    network_id: network.to_owned(),
+                });
+            }
+        }
+        drop(policy);
         Ok(())
     }
 
@@ -1945,6 +2020,7 @@ impl StateBroadcastHandler {
                 origin_site: broadcast.origin_site,
             });
         }
+        self.validate_provider_networks(&broadcast.grid_id, [broadcast.frame.network_id.as_str()])?;
         if !self.make_room_for(&broadcast.origin_site) {
             return Ok(None);
         }
@@ -2121,7 +2197,14 @@ impl StateBroadcastHandler {
             .filter(|provider| provider.site_id == broadcast.origin_site)
             .map(|provider| provider.network_id.clone())
             .collect();
-        let networks_to_replace: BTreeSet<String> = previous_networks.union(&incoming_networks).cloned().collect();
+        let mut networks_to_replace: BTreeSet<String> = previous_networks.union(&incoming_networks).cloned().collect();
+        if let Some(allowed) = broadcast
+            .grid_id
+            .as_deref()
+            .and_then(|grid| self.trust_store_rx.borrow().provider_network(grid).map(str::to_owned))
+        {
+            networks_to_replace.retain(|network| *network == allowed);
+        }
         let mut accepted_networks = BTreeSet::new();
         self.state_tx.send_modify(|snap| {
             snap.capabilities.merge(&broadcast.snapshot.capabilities);
@@ -2439,8 +2522,263 @@ mod tests {
         let inventories = handler.subscribe_model_inventories();
         handler.trust_store_tx.send_modify(|store| {
             store.set_pin(PinKey::grid("grid-p", "site-p"), vec![raw_public_key]);
+            store.bind_provider_network("grid-p", "net");
         });
         (handler, inventories)
+    }
+
+    #[test]
+    fn signed_provider_network_violations_are_atomic_and_do_not_poison_revisions() {
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        for attack in ["insert", "replace", "mixed"] {
+            let handler = scoped_receiver(&public_key);
+            handler
+                .receive_state_broadcast(&scoped_provider_broadcast("grid-a", "network-a", 1, &private_key))
+                .unwrap_or_else(|_| std::process::abort());
+            handler
+                .receive_state_broadcast(&scoped_provider_broadcast("grid-b", "network-b", 1, &private_key))
+                .unwrap_or_else(|_| std::process::abort());
+            let before = handler.snapshot();
+            let retained_before = handler
+                .retained
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .latest_by_scope
+                .clone();
+            let mut forged = scoped_provider_broadcast("grid-a", "network-b", 100, &private_key);
+            if attack != "replace" {
+                for provider in forged.snapshot.providers.values_mut() {
+                    provider.provider_id = "injected".to_owned();
+                }
+            }
+            if attack == "mixed" {
+                let allowed = scoped_provider_broadcast("grid-a", "network-a", 100, &private_key);
+                for provider in allowed.snapshot.providers.into_values() {
+                    forged.snapshot.upsert_provider(provider);
+                }
+            }
+            forged.gateway_address = Some("poison:8443".to_owned());
+            forged.signals_address = Some("poison:9091".to_owned());
+            forged.site_cert_pem = Some("poison".to_owned());
+            forged.snapshot.capabilities.add(Capability::Model("poison".to_owned()));
+            forged.snapshot.increment_tenant_spend("tenant", 100);
+            let forged = sign_state_broadcast(forged, &private_key);
+
+            assert!(
+                matches!(
+                    handler.receive_state_broadcast(&forged),
+                    Err(StateBroadcastError::ProviderNetworkNotAllowed { .. })
+                ),
+                "{attack}: a valid Grid A signature cannot authorize network B"
+            );
+            assert_eq!(handler.snapshot(), before, "{attack}: all CRDT lanes remain unchanged");
+            assert!(
+                handler.gateway_addrs().is_empty(),
+                "{attack}: rejected metadata is not retained"
+            );
+            assert!(
+                handler.cert_pems().is_empty(),
+                "{attack}: rejected certificate is not retained"
+            );
+            assert!(
+                handler.signals_addrs_tx.borrow().is_empty(),
+                "{attack}: signals address is not retained"
+            );
+            assert_eq!(
+                handler
+                    .retained
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .latest_by_scope,
+                retained_before,
+                "{attack}: rejected revisions do not advance any scope"
+            );
+            let valid = scoped_provider_broadcast("grid-a", "network-a", 2, &private_key);
+            assert!(
+                handler
+                    .receive_state_broadcast(&valid)
+                    .unwrap_or_else(|_| std::process::abort())
+                    .is_some(),
+                "{attack}: a valid lower revision remains admissible"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_empty_withdrawal_preserves_another_authorized_grid() {
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        let handler = scoped_receiver(&public_key);
+        for (grid, network) in [("grid-a", "network-a"), ("grid-b", "network-b")] {
+            handler
+                .receive_state_broadcast(&scoped_provider_broadcast(grid, network, 1, &private_key))
+                .unwrap_or_else(|_| std::process::abort());
+        }
+        handler
+            .retained
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .provider_networks_by_scope
+            .entry(ProviderStateScope {
+                origin_site: "site-p".to_owned(),
+                grid_id: Some("grid-a".to_owned()),
+            })
+            .or_default()
+            .insert("network-b".to_owned());
+        let withdrawal = sign_state_broadcast(
+            StateBroadcast::new(
+                "site-p".to_owned(),
+                2,
+                GridStateSnapshot::new("site-p".to_owned()),
+                None,
+            )
+            .with_grid_id(Some("grid-a".to_owned()))
+            .with_authoritative_provider_state(),
+            &private_key,
+        );
+        handler
+            .receive_state_broadcast(&withdrawal)
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            handler.snapshot().provider("network-a", "site-p", "provider").is_none(),
+            "A withdraws"
+        );
+        assert!(
+            handler.snapshot().provider("network-b", "site-p", "provider").is_some(),
+            "B survives"
+        );
+    }
+
+    #[test]
+    fn forwarded_foreign_origin_providers_gain_no_authority() {
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        let handler = scoped_receiver(&public_key);
+        let mut broadcast = scoped_provider_broadcast("grid-a", "network-a", 1, &private_key);
+        let mut foreign = provider_state("foreign", Vec::new(), Vec::new(), 1);
+        foreign.site_id = "another-site".to_owned();
+        foreign.network_id = "network-b".to_owned();
+        broadcast.snapshot.upsert_provider(foreign);
+        handler
+            .receive_state_broadcast(&sign_state_broadcast(broadcast, &private_key))
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            handler.snapshot().provider("network-a", "site-p", "provider").is_some(),
+            "origin state is admitted"
+        );
+        assert!(
+            handler
+                .snapshot()
+                .provider("network-b", "another-site", "foreign")
+                .is_none(),
+            "forwarding confers no ownership"
+        );
+    }
+
+    #[test]
+    fn scoped_signed_state_requires_policy_even_for_empty_withdrawals() {
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        let handler = scoped_receiver(&public_key);
+        handler.trust_store_tx.send_modify(|store| {
+            store.provider_networks.clear();
+        });
+        for broadcast in [
+            scoped_provider_broadcast("grid-a", "network-a", 1, &private_key),
+            sign_state_broadcast(
+                StateBroadcast::new(
+                    "site-p".to_owned(),
+                    2,
+                    GridStateSnapshot::new("site-p".to_owned()),
+                    None,
+                )
+                .with_grid_id(Some("grid-a".to_owned()))
+                .with_authoritative_provider_state(),
+                &private_key,
+            ),
+        ] {
+            assert!(
+                matches!(
+                    handler.receive_state_broadcast(&broadcast),
+                    Err(StateBroadcastError::ProviderScopeMissing { .. })
+                ),
+                "a pinned signer alone grants no network authority"
+            );
+        }
+        assert!(handler.known_origins().is_empty(), "missing policy retains no state");
+    }
+
+    #[test]
+    fn scope_validation_follows_signature_validation_and_checks_uid_metadata() {
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        let handler = scoped_receiver(&public_key);
+        let mut invalid_signature = scoped_provider_broadcast("grid-a", "network-b", 1, &private_key);
+        invalid_signature.signature = Some(vec![0; 64]);
+        assert!(
+            matches!(
+                handler.receive_state_broadcast(&invalid_signature),
+                Err(StateBroadcastError::SignatureInvalid { .. })
+            ),
+            "signature validation precedes network authorization"
+        );
+        let mut invalid_uid = scoped_provider_broadcast("grid-a", "network-a", 1, &private_key);
+        invalid_uid.provider_uids.push(ProviderUid {
+            identity: ProviderIdentity {
+                network: "network-b".to_owned(),
+                site: "site-p".to_owned(),
+                provider: "provider".to_owned(),
+            },
+            uid: "uid-b".to_owned(),
+        });
+        let invalid_uid = sign_state_broadcast(invalid_uid, &private_key);
+        assert!(
+            matches!(
+                handler.receive_state_broadcast(&invalid_uid),
+                Err(StateBroadcastError::ProviderNetworkNotAllowed { .. })
+            ),
+            "UID metadata cannot authorize another network"
+        );
+        assert!(
+            handler.snapshot().providers.is_empty(),
+            "invalid UID rejects the whole update"
+        );
+    }
+
+    #[test]
+    fn signed_inventory_scope_is_checked_before_buffering() {
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        let (mut handler, inventories) = pinned_handler(public_key);
+        let provider = dynamic_provider_state("site-p", "grid-p", "uid", 1, &private_key);
+        handler
+            .receive_state_broadcast(&provider)
+            .unwrap_or_else(|_| std::process::abort());
+        let valid = signed_frames(&["model".to_owned()], "uid", 1, &private_key)
+            .pop()
+            .unwrap_or_else(|| std::process::abort());
+        let mut invalid = valid.clone();
+        invalid.frame.network_id = "forbidden".to_owned();
+        invalid.frame.inventory_revision = 100;
+        invalid.frame = invalid
+            .frame
+            .sign("site-p", "grid-p", &private_key, now_ms())
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            matches!(
+                receive_inventory(&mut handler, &invalid),
+                Err(StateBroadcastError::ProviderNetworkNotAllowed { .. })
+            ),
+            "an authenticated frame cannot buffer under an unauthorized network"
+        );
+        assert!(inventories.borrow().is_empty(), "rejected inventory is not published");
+        receive_inventory(&mut handler, &valid).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(inventories.borrow().len(), 1, "valid lower revision still assembles");
+        handler.trust_store_tx.send_modify(|store| {
+            store.provider_networks.clear();
+        });
+        assert!(
+            matches!(
+                receive_inventory(&mut handler, &valid),
+                Err(StateBroadcastError::ProviderScopeMissing { .. })
+            ),
+            "inventory also requires an installed binding"
+        );
     }
 
     #[test]
@@ -5292,9 +5630,10 @@ mod tests {
         )
         .unwrap_or_else(|_| std::process::abort());
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());
-        handler
-            .trust_store_sender()
-            .send_modify(|store| store.set_pin(PinKey::Site("site-a".to_owned()), vec![public_key]));
+        handler.trust_store_sender().send_modify(|store| {
+            store.set_pin(PinKey::Site("site-a".to_owned()), vec![public_key]);
+            store.bind_provider_network("grid-1", "net");
+        });
 
         let accepted = receive(&mut handler, &unsigned.with_signature(Some(signature)));
         let tools = handler
@@ -5475,6 +5814,34 @@ mod tests {
         let mut signable = SIGNATURE_DOMAIN.to_vec();
         signable.extend(encoded);
         signable
+    }
+
+    /// A receiver trusting one origin in two explicitly authorized grid/network scopes.
+    fn scoped_receiver(public_key: &[u8]) -> StateBroadcastHandler {
+        let handler = StateBroadcastHandler::new("local".to_owned());
+        handler.trust_store_tx.send_modify(|store| {
+            for (grid, network) in [("grid-a", "network-a"), ("grid-b", "network-b")] {
+                store.enforce(grid);
+                store.bind_provider_network(grid, network);
+                store.set_pin(PinKey::grid(grid, "site-p"), vec![public_key.to_vec()]);
+            }
+        });
+        handler
+    }
+
+    /// A correctly signed provider snapshot with distinct grid and provider-network IDs.
+    fn scoped_provider_broadcast(grid: &str, network: &str, revision: u64, private_key: &[u8]) -> StateBroadcast {
+        let mut snap = snapshot("site-p", revision, 0.2);
+        for mut provider in std::mem::take(&mut snap.providers).into_values() {
+            network.clone_into(&mut provider.network_id);
+            snap.upsert_provider(provider);
+        }
+        sign_state_broadcast(
+            StateBroadcast::new("site-p".to_owned(), revision, snap, None)
+                .with_grid_id(Some(grid.to_owned()))
+                .with_authoritative_provider_state(),
+            private_key,
+        )
     }
 
     fn provider_state(id: &str, models: Vec<String>, tools: Vec<String>, revision: u64) -> ProviderState {
