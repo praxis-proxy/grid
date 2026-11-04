@@ -501,8 +501,8 @@ impl GridSiteRouteFilter {
     /// Route a request that names stored state to the site that stored it.
     ///
     /// `None` for a request that names none. A site no longer in the grid gets
-    /// 404, since the state lives only there. One that admits no new request now
-    /// gets 503.
+    /// 404, since the state lives only there. One that admits no bound request
+    /// now gets 503.
     fn pin(&self, ctx: &mut HttpFilterContext<'_>, model: Option<&str>) -> Result<Option<FilterAction>, FilterError> {
         let snapshot = self.snapshot.load();
         let now_ms = grid_signals::now_ms();
@@ -527,7 +527,7 @@ impl GridSiteRouteFilter {
                 return Ok(Some(FilterAction::Reject(Rejection::status(404))));
             },
             Target::Unavailable => {
-                tracing::debug!(site = ?site, "grid_site_route: the cluster holding the state admits no new request");
+                tracing::debug!(site = ?site, "grid_site_route: the cluster holding the state admits no existing request");
                 return Ok(Some(FilterAction::Reject(
                     Rejection::status(503).with_header("retry-after", RETRY_AFTER_SECS),
                 )));
@@ -981,7 +981,7 @@ enum Target<'snap> {
     Found(&'snap RouteCandidate),
     /// The site serves nothing that matches: it left the grid.
     Gone,
-    /// The site is in the grid but admits no new request now.
+    /// The site is in the grid but admits no existing request now.
     Unavailable,
 }
 
@@ -1022,7 +1022,7 @@ fn pinned_target<'snap>(
         return Target::Gone;
     }
     at_site
-        .find(|candidate| is_admitted_for_new_request(candidate.admission_state) && !candidate.expired_at(now_ms))
+        .find(|candidate| is_admitted_for_existing_request(candidate.admission_state) && !candidate.expired_at(now_ms))
         .map_or(Target::Unavailable, Target::Found)
 }
 
@@ -1502,6 +1502,11 @@ fn is_admitted_for_new_request(state: AdmissionState) -> bool {
     matches!(state, AdmissionState::NewAndExisting)
 }
 
+/// Whether a candidate in this admission state accepts work bound to an existing session.
+fn is_admitted_for_existing_request(state: AdmissionState) -> bool {
+    matches!(state, AdmissionState::NewAndExisting | AdmissionState::ExistingOnly)
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
@@ -1720,6 +1725,33 @@ pub(crate) mod tests {
             ),
             "the cluster that stored it left, though the site did not"
         );
+    }
+
+    #[test]
+    fn existing_sessions_keep_an_eligible_fallback_binding_without_being_pulled_back() {
+        let mut preferred = one("llama", "east", "pool-east", AdmissionState::NewAndExisting);
+        let mut fallback = one("llama", "west", "pool-west", AdmissionState::ExistingOnly);
+        preferred[0].selection_group = 0;
+        fallback[0].selection_group = 1;
+        let bound = RouteSnapshot::from_static(
+            [preferred, fallback].into_iter().flatten().collect(),
+            Arc::from("east"),
+        );
+        let fallback_holder = holder("west", Some("pool-west"));
+
+        assert!(matches!(
+            pinned_target(&bound, Some(&fallback_holder), Some("llama"), TEST_NOW_MS),
+            Target::Found(candidate) if &*candidate.cluster == "pool-west"
+        ));
+
+        let policy_loss = RouteSnapshot::from_static(
+            one("llama", "east", "pool-east", AdmissionState::NewAndExisting),
+            Arc::from("east"),
+        );
+        assert!(matches!(
+            pinned_target(&policy_loss, Some(&fallback_holder), Some("llama"), TEST_NOW_MS),
+            Target::Gone
+        ));
     }
 
     #[test]
