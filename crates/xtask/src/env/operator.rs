@@ -673,6 +673,12 @@ pub(crate) const PEER_MEMBERSHIP: &str = "PeerMembership";
 /// Reason every peer condition carries while no peer `GridSite` is declared.
 pub(crate) const NO_DECLARED_PEERS: &str = "NoDeclaredPeers";
 
+/// `GridSite` phase reason when the gateway endpoint is set but its address is not dialable.
+pub(crate) const SIGNALS_ADDRESS_MISSING: &str = "SignalsAddressMissing";
+
+/// `GridNetwork` `Degraded` reason when no concern holds.
+pub(crate) const AS_EXPECTED: &str = "AsExpected";
+
 // ---------------------------------------------------------------------------
 // CRD installation
 // ---------------------------------------------------------------------------

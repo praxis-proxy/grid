@@ -4156,6 +4156,7 @@ mod tests {
             labels: BTreeMap::new(),
             pins: Vec::new(),
             signals: None,
+            sovereignty_zone: None,
         };
         identities.set(BTreeMap::from([("site-a".to_owned(), record())]));
         assert_eq!(identities.peers_besides("site-a"), 0, "a lone site declares no peer");
