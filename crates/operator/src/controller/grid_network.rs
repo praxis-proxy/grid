@@ -3312,15 +3312,24 @@ async fn reconcile_routing_overlay_inner(
     let mut overlay_statuses: Vec<OverlayRevisionStatus> = Vec::new();
     let mut serving_retry: Option<Duration> = None;
     let mut inventory_expiry_deadline: Option<time::OffsetDateTime> = None;
+    let eligible_remote_owned: Vec<crdt::ProviderState> =
+        filter_eligible_remote_crdt_providers(network_name, &sites, remote_crdt_providers, signal)
+            .into_iter()
+            .cloned()
+            .collect();
+    let filtered_count = remote_crdt_providers.len() - eligible_remote_owned.len();
+    if filtered_count > 0 {
+        tracing::debug!(
+            network = network_name,
+            total_remote = remote_crdt_providers.len(),
+            filtered = filtered_count,
+            eligible = eligible_remote_owned.len(),
+            "filtered remote CRDT providers: source GridSite not Active"
+        );
+    }
+
     // Peer records are the same for every gateway; only Local reads them from verified peers.
-    let peer_catalog = member_catalogs.then(|| {
-        derived_topology::peer_catalog(filter_eligible_remote_crdt_providers(
-            network_name,
-            &sites,
-            remote_crdt_providers,
-            signal,
-        ))
-    });
+    let peer_catalog = member_catalogs.then(|| derived_topology::peer_catalog(&eligible_remote_owned));
 
     for gw_ref in &network.spec.consumer_gateways {
         // Each gateway identifies its own local site.  Fall back to the
@@ -3330,26 +3339,6 @@ async fn reconcile_routing_overlay_inner(
         // Before anything that can skip this gateway, so a removed site never outlives a failed render.
         if serving.is_some() {
             revoke_provider_admission(network_name, gw_ref, &admitted, client).await;
-        }
-
-        // Filter remote CRDT providers to those whose source GridSite is Active.
-        // Providers from sites in any other phase (Discovered, Connecting, Pending,
-        // Unreachable, Left, or missing) are excluded before the overlay is rendered.
-        // This is the routing eligibility gate: SWIM membership alone does not
-        // make a remote site routable.
-        let eligible_remote: Vec<&crdt::ProviderState> =
-            filter_eligible_remote_crdt_providers(network_name, &sites, remote_crdt_providers, signal);
-        let eligible_remote_owned: Vec<crdt::ProviderState> = eligible_remote.into_iter().cloned().collect();
-        let filtered_count = remote_crdt_providers.len() - eligible_remote_owned.len();
-        if filtered_count > 0 {
-            tracing::debug!(
-                network = network_name,
-                gateway = %gw_ref.name,
-                total_remote = remote_crdt_providers.len(),
-                filtered = filtered_count,
-                eligible = eligible_remote_owned.len(),
-                "filtered remote CRDT providers: source GridSite not Active"
-            );
         }
 
         let timestamp = rfc3339_now();
