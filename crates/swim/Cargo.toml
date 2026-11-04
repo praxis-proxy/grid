@@ -8,13 +8,16 @@ license.workspace = true
 publish = false
 
 [features]
-default = ["ring-signing"]
-ring-signing = ["dep:ring"]
-# Use the host OpenSSL provider for model inventory digest verification.
+default = ["rust-crypto"]
+# RustCrypto backend: ring ECDSA signing, aes-gcm transport AEAD, sha2 digests.
+rust-crypto = ["dep:ring", "dep:aes-gcm", "dep:sha2"]
+# Backwards-compatible alias for the signing-backend selection.
+ring-signing = ["rust-crypto"]
+# System OpenSSL backend: EVP ECDSA, symm AES-256-GCM, EVP digests.
 fips = ["dep:openssl"]
 
 [dependencies]
-aes-gcm = { workspace = true }
+aes-gcm = { workspace = true, optional = true }
 bincode = { workspace = true }
 crdt = { path = "../crdt" }
 foca = { workspace = true }
@@ -23,7 +26,7 @@ rand09 = { workspace = true }
 ring = { workspace = true, optional = true }
 openssl = { workspace = true, optional = true }
 serde = { workspace = true }
-sha2 = { workspace = true }
+sha2 = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }

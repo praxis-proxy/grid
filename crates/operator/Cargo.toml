@@ -10,7 +10,7 @@ publish = false
 [features]
 default = ["tls-rustls"]
 tls-rustls = [
-  "swim/ring-signing",
+  "swim/rust-crypto",
   "certs/rcgen",
   "grid-client/rcgen",
   "rmcp/reqwest-tls-no-provider",
