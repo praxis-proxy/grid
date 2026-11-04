@@ -1,0 +1,37 @@
+suite: model discovery
+templates:
+  - templates/deployment.yaml
+tests:
+  - it: leaves the TTL to the operator when unset
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_MODEL_DISCOVERY_TTL_SECS
+          any: true
+
+  - it: sets the TTL only when asked
+    set:
+      modelDiscovery.ttlSeconds: 300
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_MODEL_DISCOVERY_TTL_SECS, value: "300"}
+
+  - it: refuses zero, which Helm would drop for the default without saying so
+    set:
+      modelDiscovery.ttlSeconds: 0
+    asserts:
+      - failedTemplate: {}
+
+  - it: refuses a non-numeric TTL
+    set:
+      modelDiscovery.ttlSeconds: long
+    asserts:
+      - failedTemplate: {}
+
+  - it: refuses a TTL past the operator's one-year cap
+    set:
+      modelDiscovery.ttlSeconds: 31536001
+    asserts:
+      - failedTemplate: {}
