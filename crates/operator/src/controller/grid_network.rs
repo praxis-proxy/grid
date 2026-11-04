@@ -1699,18 +1699,23 @@ async fn apply_signed_state(
 
     let client = &ctx.client;
 
-    // Peers that cannot be re-verified keep their pins: a transient read failure must not drop all state.
+    // Failed verification preserves cached pins only while the provider-network binding is unchanged.
     let peer_pins = match collect_gossip_peer_pins(network, client, swim.site_name()).await {
         Ok(peer_pins) => Some(peer_pins),
         Err(error) => {
-            tracing::warn!(%grid_id, %error, "keeping installed SWIM peer pins: peers could not be re-verified");
+            tracing::warn!(%grid_id, %error, "SWIM peer pins could not be re-verified; retaining pins only for an unchanged provider-network binding");
             None
         },
     };
     let local_signing_key = load_gossip_signing_identity(network, client, swim.site_name()).await;
     let signing_ready = local_signing_key.is_some();
-    swim.set_grid_trust_snapshot(grid_id.to_owned(), local_signing_key, peer_pins)
-        .map_err(|error| OperatorError::InvalidResource(error.to_string()))?;
+    swim.set_grid_trust_snapshot(
+        grid_id.to_owned(),
+        grid_network_name(network)?.to_owned(),
+        local_signing_key,
+        peer_pins,
+    )
+    .map_err(|error| OperatorError::InvalidResource(error.to_string()))?;
     Ok(signing_ready)
 }
 
@@ -10183,6 +10188,22 @@ mod tests {
                 "{reconcile} reconcile carries the site certificate for late joiners"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn signed_state_scope_comes_from_the_local_network_even_without_signer_or_pins() -> Result<(), OperatorError>
+    {
+        let client = crate::resources::test_doubles::mock_kube_client_with_secrets(HashMap::new());
+        let ctx = OperatorCtx::new(client, None, SignalMode::default());
+        let (swim, mut runtime) = SwimHandle::detached("site-a");
+        let network = network_with_endpoint_transport("plaintext", None);
+        apply_signed_state(&network, &ctx, &swim, "authenticated-grid-id", SignedStateMode::Enforce).await?;
+        assert_eq!(
+            runtime.network_scopes_sent(),
+            [("authenticated-grid-id".to_owned(), "glb-demo".to_owned())],
+            "resource metadata.name authorizes provider networks independently of signer and peer-pin readiness"
+        );
+        Ok(())
     }
 
     #[tokio::test]

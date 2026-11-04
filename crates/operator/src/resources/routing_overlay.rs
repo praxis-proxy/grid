@@ -6054,6 +6054,8 @@ mod tests {
 
         let key = rcgen::KeyPair::generate()?.serialize_der();
         let public_key = swim::signing::public_key_ecdsa_p256(&key)?;
+        source.enforce_signed_grid("grid-a", &provider.network_id);
+        receiver.enforce_signed_grid("grid-a", &provider.network_id);
         source.pin_origin_for_grid("grid-a", "remote-site".to_owned(), vec![public_key.clone()])?;
         receiver.pin_origin_for_grid("grid-a", "remote-site".to_owned(), vec![public_key])?;
         let now_ms = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)?;
