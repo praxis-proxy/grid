@@ -556,6 +556,7 @@ fn as_serving(config: &ProviderConfig) -> GridServingConfig {
             .collect(),
         provider_hop_clusters: Vec::new(),
         provider_hop_sni: BTreeMap::new(),
+        sovereignty_zones: BTreeMap::new(),
         peers: Vec::new(),
     }
 }

@@ -58,7 +58,9 @@ pub struct GridSiteSpec {
     /// Deployment region.
     pub region: Option<String>,
 
-    /// Sovereignty zone for data residency constraints.
+    /// Sovereignty zone for data residency constraints, matched case-insensitively by a
+    /// `grid_site_route` fence. Every provider on the site is in it.
+    #[schemars(regex(pattern = "^[A-Za-z0-9._-]{1,63}$"))]
     pub sovereignty_zone: Option<String>,
 
     /// Availability zone.

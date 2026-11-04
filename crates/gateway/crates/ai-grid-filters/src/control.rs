@@ -160,6 +160,11 @@ impl Topology {
         let mut base = validate_serving_candidates(config.candidates.clone())?;
         for candidate in &mut base {
             candidate.dial = dials.get(&candidate.cluster).cloned();
+            candidate.sovereignty_zone = config
+                .sovereignty_zones
+                .get(&*candidate.site)
+                .and_then(|zone| grid_signals::zone::sovereignty_zone(zone))
+                .map(Arc::from);
         }
         let provider_hop_clusters = validate_provider_hop_clusters(config.provider_hop_clusters.clone())?;
         for candidate in &config.candidates {
@@ -1231,8 +1236,36 @@ mod tests {
             candidates: sites.iter().map(|site| candidate(site)).collect(),
             provider_hop_clusters: Vec::new(),
             provider_hop_sni: BTreeMap::new(),
+            sovereignty_zones: BTreeMap::new(),
             peers: sites.iter().map(|site| peer(site)).collect(),
         }
+    }
+
+    #[test]
+    fn each_candidate_takes_its_sites_zone_and_one_bad_zone_does_not_refuse_the_file() {
+        let mut config = config(&["east", "west", "north", "south"]);
+        config.sovereignty_zones = BTreeMap::from([
+            ("east".to_owned(), " EU ".to_owned()),
+            ("west".to_owned(), "eu west".to_owned()),
+            ("north".to_owned(), "us".to_owned()),
+            ("nowhere".to_owned(), "ch".to_owned()),
+        ]);
+        let topology = Topology::from_config(&config).expect("an invalid zone is not a config error");
+        let zones: BTreeMap<&str, Option<&str>> = topology
+            .base
+            .iter()
+            .map(|candidate| (&*candidate.site, candidate.sovereignty_zone.as_deref()))
+            .collect();
+        assert_eq!(
+            zones,
+            BTreeMap::from([
+                ("east", Some("eu")),
+                ("west", None),
+                ("north", Some("us")),
+                ("south", None),
+            ]),
+            "normalized; invalid or unlisted is none, which no fence admits"
+        );
     }
 
     #[test]

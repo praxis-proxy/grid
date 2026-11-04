@@ -77,6 +77,11 @@ pub struct GridServingConfig {
     #[serde(default)]
     pub provider_hop_sni: BTreeMap<String, String>,
 
+    /// Each site's sovereignty zone, by site name. A zone belongs to the site, so every candidate
+    /// there carries it; an invalid zone is none, which no fence admits.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sovereignty_zones: BTreeMap<String, String>,
+
     /// Peers to poll for live load.
     pub peers: Vec<PeerServingConfig>,
 }

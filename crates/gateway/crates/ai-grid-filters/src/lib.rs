@@ -13,6 +13,7 @@ mod descriptor;
 mod dial;
 #[cfg(test)]
 mod flow;
+mod geo;
 mod health;
 mod metadata;
 mod pin;
@@ -50,7 +51,7 @@ pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;
 
 /// Grid counters the gateway emits, with the help text a scrape shows.
-const COUNTER_HELP: [(&str, &str); 11] = [
+const COUNTER_HELP: [(&str, &str); 12] = [
     (
         "grid_route_decisions_total",
         "Requests the gateway decided, by outcome. A refusal records an empty site and cluster.",
@@ -58,6 +59,10 @@ const COUNTER_HELP: [(&str, &str); 11] = [
     (
         "grid_route_selections_total",
         "Decisions by the path that produced them.",
+    ),
+    (
+        "grid_route_fenced_total",
+        "Requests the sovereignty fence refused, or would have when it only logs, by cause.",
     ),
     (
         "grid_route_prefix_affinity_total",

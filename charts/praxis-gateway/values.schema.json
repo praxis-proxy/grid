@@ -897,6 +897,21 @@
                   "additionalProperties": false,
                   "description": "grid_site_route tuning, rendered into its filter block with the keys the filter reads.",
                   "properties": {
+                    "sovereignty": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "description": "Sovereignty fence. Empty header is no fence.",
+                      "properties": {
+                        "header": {
+                          "type": "string",
+                          "pattern": "^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)?$"
+                        },
+                        "mode": {
+                          "type": "string",
+                          "enum": ["enforce", "audit"]
+                        }
+                      }
+                    },
                     "availability": {
                       "type": "object",
                       "additionalProperties": false,

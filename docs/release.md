@@ -39,6 +39,9 @@ An AGN release publishes:
 
 - `ghcr.io/praxis-proxy/grid-gateway:v<version>`;
 - `ghcr.io/praxis-proxy/grid-operator`;
+- `ghcr.io/praxis-proxy/grid-operator:<version>-fips` and
+  `ghcr.io/praxis-proxy/grid-overlay-sync:<version>-fips` for the UBI 9 FIPS
+  images;
 - `ghcr.io/praxis-proxy/grid-mock-providers`;
 - `ghcr.io/praxis-proxy/grid-overlay-sync`;
 - `ghcr.io/praxis-proxy/grid-enrollment`;

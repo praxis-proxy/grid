@@ -4708,6 +4708,7 @@ mod tests {
             labels: gpu(),
             pins,
             signals: None,
+            sovereignty_zone: None,
         };
         let peers = operator::signals::PeerIdentities::new();
         peers.set(BTreeMap::from([
@@ -4961,6 +4962,7 @@ mod tests {
                     labels: gpu(),
                     pins: vec![operator::signals::leaf_fingerprint(&pem_der(&self.west.cert_pem))],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             )]));
             SignalsIdentity {
@@ -5342,6 +5344,7 @@ mod tests {
                     labels: gpu(),
                     pins: Vec::new(),
                     signals: None,
+                    sovereignty_zone: None,
                 },
             )]));
             SignalsIdentity {
@@ -5825,6 +5828,7 @@ mod tests {
             labels: BTreeMap::new(),
             pins: vec!["aa".to_owned()],
             signals: None,
+            sovereignty_zone: None,
         };
         let heard = operator::signals::LoadHeard::default();
         let nothing = crdt::GridStateSnapshot::new("hub".to_owned());
@@ -6097,6 +6101,7 @@ mod tests {
                     labels: gpu(),
                     pins: vec!["bb".to_owned()],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
             (
@@ -6105,6 +6110,7 @@ mod tests {
                     labels: gpu(),
                     pins: vec!["aa".to_owned()],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
             (
@@ -6113,6 +6119,7 @@ mod tests {
                     labels: gpu(),
                     pins: Vec::new(),
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
         ]));
@@ -6152,6 +6159,7 @@ mod tests {
                 endpoint: operator::signals::SignalsEndpoint::parse(address).expect("endpoint"),
                 server_name: server_name.map(str::to_owned),
             }),
+            sovereignty_zone: None,
         };
         let pinned = || vec!["aa".to_owned()];
         let identities = operator::signals::PeerIdentities::new();
@@ -6284,6 +6292,7 @@ mod tests {
                     server_name: None,
                 }
             }),
+            sovereignty_zone: None,
         };
         let identities = operator::signals::PeerIdentities::new();
         identities.set(BTreeMap::from([
@@ -6335,6 +6344,7 @@ mod tests {
             labels: BTreeMap::new(),
             pins: vec!["aa".to_owned()],
             signals: None,
+            sovereignty_zone: None,
         };
         let identities = operator::signals::PeerIdentities::new();
         identities.set(BTreeMap::from([
@@ -6523,6 +6533,7 @@ mod tests {
                 labels: gpu(),
                 pins: Vec::new(),
                 signals: None,
+                sovereignty_zone: None,
             },
         )]));
         Serving {

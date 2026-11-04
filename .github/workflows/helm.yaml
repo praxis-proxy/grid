@@ -184,11 +184,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {name: operator, file: deploy/operator/Containerfile}
-          - {name: gateway, file: deploy/gateway/Containerfile}
-          - {name: enrollment, file: deploy/enrollment/Containerfile}
-          - {name: mock-providers, file: crates/mock-providers/Containerfile}
-          - {name: overlay-sync, file: crates/overlay-sync/Containerfile}
+          - {name: operator, repo: operator, tag: ci, file: deploy/operator/Containerfile}
+          - {name: operator-fips, repo: operator, tag: ci-fips, profile: release, file: deploy/operator/Containerfile.fips}
+          - {name: gateway, repo: gateway, tag: ci, file: deploy/gateway/Containerfile}
+          - {name: enrollment, repo: enrollment, tag: ci, file: deploy/enrollment/Containerfile}
+          - {name: mock-providers, repo: mock-providers, tag: ci, file: crates/mock-providers/Containerfile}
+          - {name: overlay-sync, repo: overlay-sync, tag: ci, file: crates/overlay-sync/Containerfile}
+          - {name: overlay-sync-fips, repo: overlay-sync, tag: ci-fips, profile: release, file: crates/overlay-sync/Containerfile.fips}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -291,9 +293,9 @@ jobs:
           context: .
           file: ${{ matrix.file }}
           build-args: |
-            CARGO_PROFILE=${{ env.CARGO_PROFILE }}
+            CARGO_PROFILE=${{ matrix.profile || env.CARGO_PROFILE }}
           push: false
-          tags: ghcr.io/praxis-proxy/grid-${{ matrix.name }}:ci
+          tags: ghcr.io/praxis-proxy/grid-${{ matrix.repo }}:${{ matrix.tag }}
           outputs: type=docker,dest=/tmp/grid-${{ matrix.name }}.tar
           cache-from: type=gha,scope=img-${{ matrix.name }}
           cache-to: ${{ github.event_name == 'push' && format('type=gha,mode=max,scope=img-{0}', matrix.name) || '' }}
@@ -341,6 +343,12 @@ jobs:
             ref="ghcr.io/praxis-proxy/grid-${name}"
             docker tag "${ref}:ci" "${ref}:sha-${GITHUB_SHA::7}"
             docker push "${ref}:sha-${GITHUB_SHA::7}"
+          done
+          for name in operator overlay-sync; do
+            docker load -i "/tmp/images/grid-${name}-fips.tar"
+            ref="ghcr.io/praxis-proxy/grid-${name}"
+            docker tag "${ref}:ci-fips" "${ref}:sha-${GITHUB_SHA::7}-fips"
+            docker push "${ref}:sha-${GITHUB_SHA::7}-fips"
           done
 
   # ----------------------------------------------------------------------------
