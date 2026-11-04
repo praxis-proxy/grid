@@ -105,7 +105,12 @@ Installing or changing a binding purges retained origins, including provider
 revisions, UID history, and model inventories. The existing origin eviction
 also removes that origin's metadata and providers in other grid scopes, so
 valid state may be temporarily unavailable until peers republish. Reapplying
-an unchanged binding preserves state. Relaxing or deleting the grid removes
+an unchanged binding preserves state. A new or changed binding also clears
+that grid's signing-key pins. The runtime reinstalls the local signer and only
+the peer keys verified for the new binding. If peer verification cannot run,
+old peer pins are retained only for an unchanged binding; a changed binding
+remains closed to ordinary peer state until verification succeeds.
+Relaxing or deleting the grid removes
 its binding with its pins; `signedState: off` retains its unsigned behavior
 and does not provide this isolation.
 

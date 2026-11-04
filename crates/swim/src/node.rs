@@ -329,7 +329,8 @@ impl SwimNode {
     /// Require signed state and authorize only the locally declared provider network.
     ///
     /// A new or changed binding purges retained origins before accepting more state.
-    /// Unchanged policy preserves state. Peers republish after a purge.
+    /// It also clears this grid's signing-key pins, which must be reverified.
+    /// Unchanged policy preserves state and pins. Peers republish after a purge.
     pub fn enforce_signed_grid(&self, grid_id: &str, network_name: &str) {
         let store = self.trust_store_tx.borrow();
         if store.is_strict(grid_id) && store.provider_network(grid_id) == Some(network_name) {
@@ -341,6 +342,7 @@ impl SwimNode {
             self.evict_origin(&origin);
         }
         self.trust_store_tx.send_modify(|pins| {
+            pins.forget_grid(grid_id);
             pins.enforce(grid_id);
             pins.bind_provider_network(grid_id, network_name);
         });

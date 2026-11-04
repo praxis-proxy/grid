@@ -1850,14 +1850,14 @@ impl StateBroadcastHandler {
     {
         let policy = self.trust_store_rx.borrow();
         let Some(allowed) = policy.provider_network(grid_id) else {
-            tracing::warn!(reason = "provider_scope_missing", REJECTED_BROADCAST_LOG);
+            tracing::warn!(%grid_id, reason = "provider_scope_missing", REJECTED_BROADCAST_LOG);
             return Err(StateBroadcastError::ProviderScopeMissing {
                 grid_id: grid_id.to_owned(),
             });
         };
         for network in networks {
             if network != allowed {
-                tracing::warn!(reason = "provider_network_not_allowed", REJECTED_BROADCAST_LOG);
+                tracing::warn!(%grid_id, reason = "provider_network_not_allowed", REJECTED_BROADCAST_LOG);
                 return Err(StateBroadcastError::ProviderNetworkNotAllowed {
                     grid_id: grid_id.to_owned(),
                     network_id: network.to_owned(),
