@@ -827,6 +827,7 @@ jobs:
 
       - name: Test signed provider-scope probe over encrypted UDP
         if: matrix.provider-scope
+        # make test-unit skips examples; this step is the probe tests' only CI invocation.
         run: cargo test --locked -p swim --example provider_scope_probe
 
       - name: Run hub and site e2e (${{ matrix.leg }})

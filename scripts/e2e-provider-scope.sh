@@ -110,11 +110,21 @@ assert_provider_scope() {
   SCOPE_RECOVERY_CREATED=1
   k "$SITE_CTX" create -f "$dir/recovery-provider.json" >/dev/null || die "publish a fresh legitimate provider after the attack"
   eventually "hub accepts the named legitimate provider after rejecting a higher revision" \
-    scope_recovery_present "$dir" || return
-  scope_original_preserved "$dir" || { fail "fresh valid state must retain the original provider"; return; }
+    scope_recovery_present "$dir" || {
+      cleanup_provider_scope || fail "clean up after recovery provider timeout"
+      return 1
+    }
+  scope_original_preserved "$dir" || {
+    fail "fresh valid state must retain the original provider"
+    cleanup_provider_scope || fail "clean up after provider preservation failure"
+    return 1
+  }
   k "$SITE_CTX" delete inferenceprovider scope-recovery --wait=true >/dev/null || die "withdraw the recovery provider"
   SCOPE_RECOVERY_CREATED=0
-  eventually "hub accepts the recovery provider withdrawal" scope_recovery_absent "$dir" || return
+  eventually "hub accepts the recovery provider withdrawal" scope_recovery_absent "$dir" || {
+    cleanup_provider_scope || fail "clean up after recovery withdrawal timeout"
+    return 1
+  }
   cleanup_provider_scope || { fail "restore the provider-scope qualification allowlist"; return; }
   eventually "original remote inference survives valid updates and withdrawal" consumer_served || return
   cp "$WORK/consumer.hdr" "$dir/after-cleanup.hdr"
