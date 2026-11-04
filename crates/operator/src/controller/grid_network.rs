@@ -3324,7 +3324,7 @@ async fn reconcile_routing_overlay_inner(
     }
 
     // Peer records are the same for every gateway; only Local reads them from verified peers.
-    let peer_catalog = member_catalogs.then(|| derived_topology::peer_catalog(eligible_remote_refs.iter().copied()));
+    let peer_catalog = member_catalogs.then(|| derived_topology::peer_catalog(&eligible_remote_owned));
 
     for gw_ref in &network.spec.consumer_gateways {
         // Each gateway identifies its own local site.  Fall back to the
