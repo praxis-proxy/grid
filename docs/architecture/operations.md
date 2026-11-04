@@ -1419,7 +1419,7 @@ Available commands:
 | `cargo xtask env verify-crd-schema` | Verifies required generated CRD schema fields without requiring kind clusters |
 | `cargo xtask env verify-swim-dns-hostnames` | Verifies hostname-based SWIM advertise/seeds, membership convergence, and CRDT provider-state propagation |
 | `cargo xtask env verify-operator-install-rbac` | Applies install manifests, runs positive/negative RBAC checks, proves minimal reconcile succeeds |
-| `cargo xtask env verify-local-site-status` | Verifies Local-membership site phase reasons (`GatewayAddressMissing`, `SignalsAddressMissing`), `NoDeclaredPeers` peer conditions, `Available=True`, `Degraded=False` rollup, and condition clearing once a peer is declared |
+| `cargo xtask env verify-local-site-status` | Verifies Local-membership site phase reasons (`GatewayAddressMissing`, `SignalsAddressMissing`), `NoDeclaredPeers` peer conditions, `Available=True`, `Degraded=False` rollup, condition clearing once an undialable peer is declared, then per-peer signals/catalog evidence and all five healthy network conditions from a real mTLS peer. Requires two configured kind clusters with no other operators or networks, plus a non-loopback host IPv4 address |
 | `cargo xtask env validate-all` | Runs the local validation suite and prints a Markdown result table |
 
 ### Operator and SWIM local validation

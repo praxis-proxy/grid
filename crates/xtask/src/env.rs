@@ -5991,28 +5991,34 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
 
 /// Verify `GridSite` and `GridNetwork` peer-condition status under Local membership.
 ///
-/// Asserts five checkpoints against an out-of-cluster operator under Local membership:
+/// Asserts six checkpoints against an out-of-cluster operator under Local membership:
 ///
 /// 1. **Clean slate** - no `GridSite` exists before the network is delivered.
 /// 2. **Operator started** - operator spawned with `GRID_MEMBERSHIP_SOURCE=Local`.
-/// 3. **Site phase reasons** - own site advances `GatewayAddressMissing` → `SignalsAddressMissing`.
+/// 3. **Site phase reasons** - own site advances `GatewayAddressMissing` then `SignalsAddressMissing`.
 /// 4. **Rollup** - all 5 peer conditions are `Unknown/NoDeclaredPeers`; `Available=True`; `Degraded=False/AsExpected`.
-/// 5. **After peer declared** - all 5 peer conditions leave `NoDeclaredPeers`.
+/// 5. **Undialable peer declared** - all 5 peer conditions leave `NoDeclaredPeers`.
+/// 6. **Reachable peer** - a second Local operator serves mTLS signals and a catalog; per-peer response evidence and
+///    all 5 healthy network conditions are required.
+///
+/// Requires two configured kind clusters, with no other operators or networks running.
 fn env_verify_local_site_status(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         AS_EXPECTED, LOCAL_STATUS_CA_SECRET, LOCAL_STATUS_DNS_SAN, LOCAL_STATUS_NETWORK, LOCAL_STATUS_OWN_SITE,
         LOCAL_STATUS_PEER_SITE, LOCAL_STATUS_POLL_TIMEOUT, LOCAL_STATUS_TLS_SECRET, NO_DECLARED_PEERS,
         PEER_CATALOGS_ACCEPTED, PEER_MEMBERSHIP, PEER_POLLS_COMPLETE, PEER_SIGNALS_REACHABLE, PEER_TIME_VALID,
-        PEER_TIMESTAMPS_VALID, SIGNALS_ADDRESS_MISSING, SIGNALS_REACHABLE,
+        PEER_TIMESTAMPS_VALID, SIGNALS_ADDRESS_MISSING,
     };
 
     let cfg = EnvConfig::from_file(config)?;
     let context = resolve_operator_context(&cfg, site)?;
+    let peer_context = resolve_local_status_peer_context(&cfg, &context)?;
     eprintln!("verify-local-site-status: context={context}");
 
-    eprintln!("verify-local-site-status: [1/5] preflight: CRDs, clean slate, no stale GridSite...");
+    eprintln!("verify-local-site-status: [1/6] preflight: CRDs, clean slate, no stale GridSite...");
     operator::install_grid_crds(&context)?;
     operator::cleanup_local_status_resources(&context);
+    let _resources = LocalStatusResourcesGuard(&context);
     operator::assert_gridsite_absent(&context, LOCAL_STATUS_OWN_SITE)?;
     eprintln!("  [OK] no GridSite {LOCAL_STATUS_OWN_SITE:?} before network delivery");
 
@@ -6055,32 +6061,32 @@ fn env_verify_local_site_status(config: &Path, site: Option<&str>) -> Result<(),
         "default",
     )?;
 
-    eprintln!("verify-local-site-status: [2/5] spawning operator (Local, no auto-records)...");
-    let op = operator::spawn_local_operator(&context, LOCAL_STATUS_OWN_SITE)?;
-    let mut op_guard = ProcGuard(Some(op), "operator");
+    eprintln!("verify-local-site-status: [2/6] spawning operator (Local, no auto-records)...");
+    let signals_addr = operator::reserve_metrics_addr()?;
+    let op = operator::spawn_local_operator(&context, LOCAL_STATUS_OWN_SITE, &signals_addr, temp)?;
+    let op_guard = ProcGuard(Some(op), "operator");
+    let peer_conditions = [
+        (PEER_SIGNALS_REACHABLE, PEER_SIGNALS_REACHABLE),
+        (PEER_CATALOGS_ACCEPTED, PEER_CATALOGS_ACCEPTED),
+        (PEER_POLLS_COMPLETE, PEER_POLLS_COMPLETE),
+        (PEER_TIME_VALID, PEER_TIMESTAMPS_VALID),
+        (PEER_MEMBERSHIP, PEER_MEMBERSHIP),
+    ];
 
     let result = run_local_site_status_checks(
         &context,
         LOCAL_STATUS_OWN_SITE,
         LOCAL_STATUS_NETWORK,
         LOCAL_STATUS_PEER_SITE,
-        &[
-            (PEER_SIGNALS_REACHABLE, SIGNALS_REACHABLE),
-            (PEER_CATALOGS_ACCEPTED, PEER_CATALOGS_ACCEPTED),
-            (PEER_POLLS_COMPLETE, PEER_POLLS_COMPLETE),
-            (PEER_TIME_VALID, PEER_TIMESTAMPS_VALID),
-            (PEER_MEMBERSHIP, PEER_MEMBERSHIP),
-        ],
+        &peer_conditions,
         NO_DECLARED_PEERS,
         SIGNALS_ADDRESS_MISSING,
         AS_EXPECTED,
         LOCAL_STATUS_POLL_TIMEOUT,
-    );
+    )
+    .and_then(|()| run_local_status_reachable_peer((&context, &peer_context), &ca, &cert, temp, &peer_conditions));
 
-    if let Some(c) = op_guard.0.take() {
-        operator::kill_operator(c);
-    }
-    operator::cleanup_local_status_resources(&context);
+    drop(op_guard);
 
     result.inspect_err(|e| eprintln!("verify-local-site-status: FAIL: {e}"))?;
     eprintln!("verify-local-site-status: PASS");
@@ -6089,11 +6095,12 @@ fn env_verify_local_site_status(config: &Path, site: Option<&str>) -> Result<(),
 
 /// Run the site-status assertions once the operator is running and the network exists.
 ///
-/// 1. Applies own site with no endpoint → `Pending/GatewayAddressMissing`.
-/// 2. Updates own site to a loopback address → `Pending/SignalsAddressMissing`.
+/// 1. Applies own site with no endpoint, requiring `Pending/GatewayAddressMissing`.
+/// 2. Updates own site to a loopback address, requiring `Pending/SignalsAddressMissing`.
 /// 3. Confirms all `peer_conditions` are `Unknown/NoDeclaredPeers`.
 /// 4. Confirms `Available=True` and `Degraded=False/AsExpected` on the network.
-/// 5. Declares a peer and confirms every condition leaves `no_peers_reason`.
+/// 5. Declares an undialable peer and confirms every condition leaves `no_peers_reason`. This transition alone makes no
+///    claim about a successful peer poll.
 ///
 /// The caller is responsible for asserting that no `GridSite` exists before this runs.
 #[expect(
@@ -6112,7 +6119,7 @@ fn run_local_site_status_checks(
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
-        "verify-local-site-status: [3/5] own-site phase reasons: GatewayAddressMissing → SignalsAddressMissing..."
+        "verify-local-site-status: [3/6] own-site phase reasons: GatewayAddressMissing then SignalsAddressMissing..."
     );
     let own_site_json = serde_json::to_string_pretty(&serde_json::json!({
         "apiVersion": "grid.praxis.fast/v1alpha1",
@@ -6150,7 +6157,7 @@ fn run_local_site_status_checks(
     )?;
     eprintln!("  [OK] GridSite {own_site:?}: Pending/{signals_address_missing}");
 
-    eprintln!("verify-local-site-status: [4/5] peer conditions + network rollup...");
+    eprintln!("verify-local-site-status: [4/6] peer conditions + network rollup...");
     for &(type_, _) in peer_conditions {
         operator::wait_for_network_condition(context, network, type_, "Unknown", no_peers_reason, timeout)?;
     }
@@ -6173,11 +6180,123 @@ fn run_local_site_status_checks(
     }))?;
     kubectl::apply_manifest(context, &peer_site_json)?;
 
-    eprintln!("verify-local-site-status: [5/5] peer declared: conditions leave NoDeclaredPeers and go True...");
-    for &(type_, true_reason) in peer_conditions {
-        operator::wait_for_network_condition(context, network, type_, "True", true_reason, timeout)?;
+    eprintln!("verify-local-site-status: [5/6] undialable peer declared: conditions leave NoDeclaredPeers...");
+    for &(type_, _) in peer_conditions {
+        operator::wait_for_network_condition_to_leave_no_peers(context, network, type_, timeout)?;
     }
-    eprintln!("  [OK] all 5 peer conditions True after peer declared");
+    eprintln!("  [OK] all 5 peer conditions left NoDeclaredPeers; no successful poll asserted");
+    Ok(())
+}
+
+/// Select a different configured cluster so the peer cannot overwrite the tested status.
+fn resolve_local_status_peer_context(cfg: &EnvConfig, context: &str) -> Result<String, Box<dyn std::error::Error>> {
+    cfg.clusters
+        .names
+        .iter()
+        .map(|name| kind::kubectl_context(name))
+        .find(|candidate| candidate != context)
+        .ok_or_else(|| "verify-local-site-status requires two configured kind clusters".into())
+}
+
+/// Remove fixture resources even when setup or an assertion fails.
+struct LocalStatusResourcesGuard<'context>(&'context str);
+
+impl Drop for LocalStatusResourcesGuard<'_> {
+    fn drop(&mut self) {
+        operator::cleanup_local_status_resources(self.0);
+    }
+}
+
+/// Serve a real peer from an isolated cluster and require non-empty polling evidence.
+fn run_local_status_reachable_peer(
+    (context, peer_context): (&str, &str),
+    ca: &::certs::CaCert,
+    own_cert: &::certs::SiteCertOutput,
+    temp: &Path,
+    peer_conditions: &[(&str, &str)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        LOCAL_STATUS_CA_SECRET, LOCAL_STATUS_NETWORK, LOCAL_STATUS_OWN_SITE, LOCAL_STATUS_PEER_SITE,
+        LOCAL_STATUS_POLL_TIMEOUT, LOCAL_STATUS_TLS_SECRET,
+    };
+
+    eprintln!("verify-local-site-status: [6/6] real peer: mTLS signals, catalog, and healthy conditions...");
+    operator::install_grid_crds(peer_context)?;
+    operator::cleanup_local_status_resources(peer_context);
+    let _resources = LocalStatusResourcesGuard(peer_context);
+    let peer_addr = operator::reserve_local_signals_addr()?;
+    let peer_san = format!("{LOCAL_STATUS_PEER_SITE}-signals.grid.internal");
+    let peer_cert = ::certs::generate_dns_cert(ca, LOCAL_STATUS_PEER_SITE, &peer_san)
+        .map_err(|e| format!("peer cert gen failed: {e}"))?;
+    for secret in [LOCAL_STATUS_CA_SECRET, LOCAL_STATUS_TLS_SECRET] {
+        operator::create_tls_secret_from_pem(
+            peer_context,
+            "default",
+            secret,
+            &ca.cert_pem,
+            &peer_cert.cert_pem,
+            &peer_cert.key_pem,
+            temp,
+        )?;
+    }
+    let network_json = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": LOCAL_STATUS_NETWORK },
+        "spec": {
+            "seeds": [], "gridId": "local-status-test",
+            "membership": { "mode": "Local" }, "signalTransport": { "mode": "poll" },
+            "tls": {
+                "caSecretRef": { "name": LOCAL_STATUS_CA_SECRET, "namespace": "default" },
+                "siteSecretRef": { "name": LOCAL_STATUS_TLS_SECRET, "namespace": "default" }
+            }
+        }
+    }))?;
+    kubectl::apply_manifest(peer_context, &network_json)?;
+    let caller_json = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridSite",
+        "metadata": { "name": LOCAL_STATUS_OWN_SITE },
+        "spec": {
+            "gridNetworkRef": LOCAL_STATUS_NETWORK,
+            "trust": { "canonicalFingerprints": [operator::pem_fingerprint(&own_cert.cert_pem)?] }
+        }
+    }))?;
+    kubectl::apply_manifest(peer_context, &caller_json)?;
+    let peer_json = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridSite",
+        "metadata": { "name": LOCAL_STATUS_PEER_SITE },
+        "spec": {
+            "gridNetworkRef": LOCAL_STATUS_NETWORK,
+            "gatewayEndpoint": {
+                "address": peer_addr, "tls": { "mode": "Mutual", "serverName": peer_san }
+            },
+            "signalsEndpoint": { "address": peer_addr, "serverName": peer_san },
+            "trust": { "canonicalFingerprints": [operator::pem_fingerprint(&peer_cert.cert_pem)?] }
+        }
+    }))?;
+    kubectl::apply_manifest(peer_context, &peer_json)?;
+    let peer = operator::spawn_local_operator(peer_context, LOCAL_STATUS_PEER_SITE, &peer_addr, temp)?;
+    let mut peer_guard = ProcGuard(Some(peer), "local-status peer operator");
+    kubectl::apply_manifest(context, &peer_json)?;
+    for type_ in ["SignalsReachable", "CatalogAccepted"] {
+        operator::wait_for_local_status_peer_condition(context, type_, LOCAL_STATUS_POLL_TIMEOUT)?;
+    }
+    for &(type_, reason) in peer_conditions {
+        operator::wait_for_network_condition(
+            context,
+            LOCAL_STATUS_NETWORK,
+            type_,
+            "True",
+            reason,
+            LOCAL_STATUS_POLL_TIMEOUT,
+        )?;
+    }
+    if let Some(child) = peer_guard.0.as_mut() {
+        operator::assert_operator_alive(child)?;
+    }
+    eprintln!("  [OK] peer at {peer_addr} answered with verified TLS ({peer_san}); all 5 network conditions True");
     Ok(())
 }
 
@@ -6229,6 +6348,32 @@ mod multi_provider_tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn local_status_peer_context_is_distinct_from_selected_context() {
+        let cfg = make_config(&[
+            ("site-a", ClusterRole::Provider, vec!["model-x".to_owned()]),
+            ("site-b", ClusterRole::Provider, vec!["model-y".to_owned()]),
+        ]);
+        assert_eq!(
+            resolve_local_status_peer_context(&cfg, &kind::kubectl_context("site-a")).unwrap(),
+            kind::kubectl_context("site-b")
+        );
+        assert_eq!(
+            resolve_local_status_peer_context(&cfg, &kind::kubectl_context("site-b")).unwrap(),
+            kind::kubectl_context("site-a")
+        );
+    }
+
+    #[test]
+    fn local_status_peer_context_requires_another_cluster() {
+        let cfg = make_config(&[("site-a", ClusterRole::Provider, vec!["model-x".to_owned()])]);
+        let error = resolve_local_status_peer_context(&cfg, &kind::kubectl_context("site-a")).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "verify-local-site-status requires two configured kind clusters"
+        );
     }
 
     #[test]

@@ -3729,7 +3729,15 @@ impl PeerPoller {
         self.catalogs = PeerReach::none(&CATALOGS);
         self.ages = peer_ages::PeerAges::default();
         self.memberships = peer_membership::PeerMemberships::default();
-        if self.written.lone {
+        let Some(identity) = Box::pin(sole_network(&self.client))
+            .await
+            .as_ref()
+            .map(NetworkIdentity::of)
+        else {
+            self.written = NetworkWritten::default();
+            return;
+        };
+        if self.written.lone.as_ref() == Some(&identity) {
             return;
         }
         let mut conditions = vec![
@@ -3757,7 +3765,7 @@ impl PeerPoller {
             .await;
         }
         self.written = NetworkWritten {
-            lone: landed,
+            lone: landed.then_some(identity),
             ..NetworkWritten::default()
         };
     }
@@ -3925,7 +3933,7 @@ impl PeerPoller {
             Box::pin(self.report_no_peers(membership_ready)).await;
             return;
         }
-        self.written.lone = false;
+        self.written.lone = None;
         Box::pin(self.report_reach((source, &local_site), &polled, &answered, &urls)).await;
         if observe_peer_ages(membership_ready, &mut self.ages, &polled, &answered) {
             Box::pin(write_peer_ages(&self.client, &self.ages, &self.shutdown)).await;
@@ -4106,8 +4114,27 @@ struct NetworkWritten {
     reach: Option<operator::peer_reach::PeerReach>,
     /// `PeerCatalogsAccepted`'s verdicts.
     catalogs: Option<operator::peer_reach::PeerReach>,
-    /// Whether every peer condition landed `Unknown` for a round with no peer declared.
-    lone: bool,
+    /// The `GridNetwork` every peer condition landed `Unknown` on for a round with no peer declared.
+    lone: Option<NetworkIdentity>,
+}
+
+/// Which `GridNetwork`, at which spec generation, a write was made against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NetworkIdentity {
+    /// The object's UID, new when the network is recreated.
+    uid: Option<String>,
+    /// The spec generation, bumped by a spec edit.
+    generation: Option<i64>,
+}
+
+impl NetworkIdentity {
+    /// The identity of `network` as read now.
+    fn of(network: &GridNetwork) -> Self {
+        Self {
+            uid: network.metadata.uid.clone(),
+            generation: network.metadata.generation,
+        }
+    }
 }
 
 /// Whether a round with nothing to poll still runs: under Local once the peers are read, so
@@ -6344,20 +6371,23 @@ mod tests {
     async fn report_no_peers_writes_unknown_conditions_then_is_idempotent() {
         use std::sync::{
             Arc as StdArc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicI64, AtomicUsize, Ordering},
         };
 
         use operator::peer_reach::CATALOGS;
 
         let writes = StdArc::new(AtomicUsize::new(0));
+        let generation = StdArc::new(AtomicI64::new(1));
         let w = StdArc::clone(&writes);
+        let g = StdArc::clone(&generation);
         let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
             let w = StdArc::clone(&w);
+            let g = StdArc::clone(&g);
             async move {
                 let network = serde_json::json!({
                     "apiVersion": "grid.praxis.fast/v1alpha1",
                     "kind": "GridNetwork",
-                    "metadata": {"name": "grid", "generation": 1},
+                    "metadata": {"name": "grid", "uid": "grid-uid", "generation": g.load(Ordering::SeqCst)},
                     "spec": {"seeds": []}
                 });
                 let body = if request.method() == http::Method::GET {
@@ -6403,7 +6433,10 @@ mod tests {
             5,
             "five conditions written for membership_ready=true"
         );
-        assert!(poller.written.lone, "lone flag set after successful write");
+        assert!(
+            poller.written.lone.is_some(),
+            "lone identity set after successful write"
+        );
 
         poller.report_no_peers(true).await;
         assert_eq!(
@@ -6412,14 +6445,25 @@ mod tests {
             "lone guard suppresses redundant writes"
         );
 
-        poller.written.lone = false;
+        generation.store(2, Ordering::SeqCst);
+        poller.report_no_peers(true).await;
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            5 + 5,
+            "a spec edit rewrites the conditions at the new generation"
+        );
+
+        poller.written.lone = None;
         poller.report_no_peers(false).await;
         assert_eq!(
             writes.load(Ordering::SeqCst),
-            5 + 3,
+            5 + 5 + 3,
             "three conditions written when membership not ready"
         );
-        assert!(!poller.written.lone, "lone not set when membership write was excluded");
+        assert!(
+            poller.written.lone.is_none(),
+            "lone not set when membership write was excluded"
+        );
     }
 
     #[test]
