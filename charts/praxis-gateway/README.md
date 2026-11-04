@@ -250,6 +250,7 @@ Praxis AI image; these values may advance independently.
 | `imagePullSecrets` | list | `[]` | Pull secrets for private registries. |
 | `log.level` | string | `""` | Level for every module, rendered as RUST_LOG on the gateway and overlay-sync: off, error, warn, info, debug, or trace, in any case. Empty leaves RUST_LOG unset, so the binaries use their info default. An `env` entry named RUST_LOG takes precedence on the gateway. |
 | `log.filter` | string | `""` | Full RUST_LOG directive, such as `info,praxis_filter=debug`. When set, it replaces `log.level`. |
+| `fips.required` | bool | `false` | Set `PRAXIS_REQUIRE_FIPS=1` on the gateway container, so Praxis refuses to start unless the kernel, the system crypto policy and the OpenSSL provider all report FIPS mode. Needs a FIPS build of the gateway (see [FIPS support](../../docs/fips.md); the release images land with the FIPS epic) on a host booted with `fips=1` and a FIPS system crypto policy. The standard gateway build registers the policy filter and refuses to start under this setting. An `env` entry named `PRAXIS_REQUIRE_FIPS` takes precedence on the gateway. |
 | `nameOverride` | string | `""` | Override chart name. |
 | `fullnameOverride` | string | `""` | Override the fully qualified app name. Set it to the GridNetwork `gatewayRefs[].name` when the operator targets this Service by name. |
 | `commonLabels` | object | `{}` | Labels added to all resources. |
@@ -401,6 +402,16 @@ automatic token mounting remains disabled. A short-lived projected token is
 mounted only into the overlay-sync init and sidecar containers. The Praxis
 container has no Kubernetes API credential and mounts the delivered overlay
 directory read-only.
+
+### FIPS mode
+
+Set `fips.required` to render `PRAXIS_REQUIRE_FIPS=1` on the gateway container.
+Praxis then refuses to start unless FIPS mode is in effect: the kernel booted
+with `fips=1`, the system crypto policy set to FIPS, and the OpenSSL FIPS
+provider active. This needs a FIPS build of the gateway on a FIPS host; see
+[FIPS support](../../docs/fips.md). The standard gateway build registers the
+policy filter, so it refuses to start under this setting. An `env` entry named
+`PRAXIS_REQUIRE_FIPS` takes precedence over the value.
 
 ## Optional uses
 

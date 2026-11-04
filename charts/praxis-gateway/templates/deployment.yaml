@@ -217,15 +217,22 @@ spec:
           {{- end }}
           {{- $validateCA := .Values.praxisConfig.render.auth.validateCA }}
           {{- $withCA := and (eq .Values.praxisConfig.source "render") (eq .Values.praxisConfig.render.auth.mode "api-key") (or $validateCA.configMapName $validateCA.secretName) }}
-          {{- /* A user RUST_LOG in env wins: a duplicate name fails server-side apply. */ -}}
+          {{- /* A user RUST_LOG or PRAXIS_REQUIRE_FIPS in env wins: a duplicate name fails server-side apply. */ -}}
           {{- $userLog := false }}
           {{- range .Values.env }}{{- if eq .name "RUST_LOG" }}{{- $userLog = true }}{{- end }}{{- end }}
+          {{- $userFips := false }}
+          {{- range .Values.env }}{{- if eq .name "PRAXIS_REQUIRE_FIPS" }}{{- $userFips = true }}{{- end }}{{- end }}
           {{- $rustLog := and (not $userLog) (include "praxis-gateway.rustLog" .) }}
-          {{- if or $rustLog .Values.env $gridServing.enabled $withCA (.Values.metricsListener).enabled }}
+          {{- $fips := and (.Values.fips).required (not $userFips) }}
+          {{- if or $rustLog $fips .Values.env $gridServing.enabled $withCA (.Values.metricsListener).enabled }}
           env:
             {{- if $rustLog }}
             - name: RUST_LOG
               value: {{ include "praxis-gateway.rustLog" . | quote }}
+            {{- end }}
+            {{- if $fips }}
+            - name: PRAXIS_REQUIRE_FIPS
+              value: "1"
             {{- end }}
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}

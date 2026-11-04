@@ -118,6 +118,16 @@ log:
   # -- Full RUST_LOG directive, such as "info,praxis_filter=debug". When set, it replaces level.
   filter: ""
 
+# -- FIPS mode. Sets PRAXIS_REQUIRE_FIPS=1 on the gateway container, so Praxis refuses
+# to start unless the kernel, the system crypto policy and the OpenSSL provider all
+# report FIPS. Needs a FIPS build of the gateway (see docs/fips.md; the release images
+# land with the FIPS epic) on a host booted with fips=1 and a FIPS system crypto policy.
+# The standard gateway build registers the policy filter and refuses to start under it.
+# An env entry named PRAXIS_REQUIRE_FIPS takes precedence on the gateway.
+fips:
+  # -- Refuse to start without FIPS mode.
+  required: false
+
 # -- GridNetwork and local site used by render and the overlay sidecar.
 grid:
   # -- GridNetwork name. Required when the overlay sidecar is enabled.

@@ -1313,6 +1313,17 @@
         }
       }
     },
+    "fips": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "FIPS mode for the gateway container.",
+      "properties": {
+        "required": {
+          "type": "boolean",
+          "description": "Set PRAXIS_REQUIRE_FIPS=1, so Praxis refuses to start without FIPS mode. Needs a FIPS build of the gateway on a FIPS host; the standard build refuses to start under it."
+        }
+      }
+    },
     "env": {
       "type": "array",
       "items": {
