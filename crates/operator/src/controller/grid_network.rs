@@ -3325,6 +3325,7 @@ async fn reconcile_routing_overlay_inner(
             remote_model_inventories,
             grid_id,
             local_site,
+            Some(gw_ref),
             owning_site,
             metrics_arg,
             timestamp.as_deref(),

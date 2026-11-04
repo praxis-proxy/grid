@@ -2275,6 +2275,7 @@ mod tests {
             score_breakdown: None,
             rank: None,
             selection_group: None,
+            regional_policy_group: None,
             traffic_weight: None,
             capacity_weight: 1,
         }
@@ -2311,6 +2312,7 @@ mod tests {
             score_breakdown: None,
             rank: None,
             selection_group: None,
+            regional_policy_group: None,
             traffic_weight: None,
             capacity_weight: 1,
         }
