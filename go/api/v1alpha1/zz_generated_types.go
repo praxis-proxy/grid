@@ -532,7 +532,7 @@ type GridNetworkConsumerGatewaysItemPraxisConfigMountReconciliation struct {
 	Enabled bool `json:"enabled,omitempty"`
 }
 
-// GridNetworkConsumerGatewaysItemPraxisConfigSovereignty The sovereignty fence gridSiteRoute applies: the header naming the zones a request may be served in, and whether it refuses or only audits.
+// GridNetworkConsumerGatewaysItemPraxisConfigSovereignty The sovereignty fence gridSiteRoute applies: the header naming the zones a request may be served in, and whether it refuses or only audits. Under any other router the config is not rendered, and the status names SovereigntyWithoutGridSiteRoute.
 // Default: unset, no fence.
 type GridNetworkConsumerGatewaysItemPraxisConfigSovereignty struct {
 	// Request header naming the zones a request may be served in: one zone, or a comma-separated list in a single header line, matched against each GridSite sovereigntyZone. The upstream that sets it must replace, never append to, a caller's copy.
@@ -598,7 +598,7 @@ type GridNetworkConsumerGatewaysItemPraxisConfig struct {
 	// gridSiteRoute reads the serving config, so it needs the operator's poll signal transport. It also needs an enabled mountReconciliation, whose rollout per config revision re-reads the provider-hop backends, and an empty providerHopEndpoints, since hops follow clusterEndpoints. Every cluster is health-checked, so the gateway's readiness probe must ask Praxis /healthy: /ready fails while any one site is down.
 	// Default: intelligentRoute.
 	SiteRouter GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter `json:"siteRouter,omitempty"`
-	// The sovereignty fence gridSiteRoute applies: the header naming the zones a request may be served in, and whether it refuses or only audits.
+	// The sovereignty fence gridSiteRoute applies: the header naming the zones a request may be served in, and whether it refuses or only audits. Under any other router the config is not rendered, and the status names SovereigntyWithoutGridSiteRoute.
 	// Default: unset, no fence.
 	Sovereignty *GridNetworkConsumerGatewaysItemPraxisConfigSovereignty `json:"sovereignty,omitempty"`
 	// Declare that the running consumer has the dynamic credential_inject filter configured with the projected Secret mount root. This is a fail-closed capability gate for credential-bearing overlay revisions. Set it only after the consumer has loaded a config containing that filter; the Grid operator does not own or roll out the consumer Deployment.

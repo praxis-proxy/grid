@@ -57,6 +57,10 @@ const INFERENCE_MODEL: &str = "inference_model";
 #[derive(Debug, thiserror::Error)]
 #[expect(unnameable_types, reason = "pub(crate) module restricts reachability")]
 pub enum ConsumerConfigError {
+    /// A sovereignty fence is set on a router that cannot apply it.
+    #[error("sovereignty is applied only by siteRouter gridSiteRoute; refusing to render the fence away")]
+    SovereigntyWithoutGridSiteRoute,
+
     /// The overlay's `local_site` field is blank.
     #[error("overlay local_site must not be blank")]
     BlankLocalSite,
@@ -644,6 +648,10 @@ fn generate_consumer_praxis_config_for_gateway_with_telemetry(
         sovereignty,
     };
     match site_router {
+        // Every config path reaches here, including legacy aliases whose schema carries no CEL rule.
+        SiteRouter::IntelligentRoute if sovereignty.is_some() => {
+            Err(ConsumerConfigError::SovereigntyWithoutGridSiteRoute)
+        },
         SiteRouter::IntelligentRoute => pipeline.render::<IntelligentRouteRender>(),
         SiteRouter::GridSiteRoute => pipeline.render::<GridSiteRouteRender>(),
     }
@@ -2060,6 +2068,30 @@ mod tests {
             header: "x-grid-sovereignty-zone".to_owned(),
             mode: crate::crd::grid_network::FenceMode::Enforce,
         }
+    }
+
+    #[test]
+    fn a_fence_on_a_router_that_cannot_apply_it_is_refused_not_dropped() {
+        let (overlay, endpoints) = site_route_topology();
+        let rendered = render_consumer_config_with_projected(
+            &overlay,
+            MOUNT_BASE,
+            &endpoints,
+            "/etc/praxis/tls",
+            8080,
+            &TlsConfig::default(),
+            "inference-gw",
+            "praxis-system",
+            None,
+            false,
+            false,
+            SiteRouter::IntelligentRoute,
+            Some(&enforcing_fence()),
+        );
+        assert!(
+            matches!(rendered, Err(ConsumerConfigError::SovereigntyWithoutGridSiteRoute)),
+            "{rendered:?}"
+        );
     }
 
     #[test]

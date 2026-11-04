@@ -1226,7 +1226,7 @@ enum ModelInventoryPublicationError {
 }
 
 /// Refresh who may read from the currently approved sites.
-async fn register_peers(ctx: &OperatorCtx, client: &Client) -> Result<(), OperatorError> {
+async fn register_peers(ctx: &OperatorCtx, client: &Client) -> Result<Vec<GridSite>, OperatorError> {
     let sites = list_all_grid_sites(client).await?;
     let identities = peer_identities(&sites, ctx.peer_settings.trust, derived_signals(ctx));
     // The overlay's ceiling is shared among the declared peers, this site left out.
@@ -1234,7 +1234,25 @@ async fn register_peers(ctx: &OperatorCtx, client: &Client) -> Result<(), Operat
     let peers = identities.keys().filter(|site| own != Some(site.as_str())).count();
     ctx.peer_providers.declare(peers);
     ctx.peer_identities.set(identities);
-    Ok(())
+    Ok(sites)
+}
+
+/// Each of `network`'s sites' zone, from its own `GridSite` objects, ranked as trust ranks them.
+fn network_zones(
+    sites: &[GridSite],
+    network: &str,
+    trust: PeerTrustMode,
+    signals_at: SignalsAt,
+) -> BTreeMap<String, String> {
+    let own: Vec<GridSite> = sites
+        .iter()
+        .filter(|site| site.spec.grid_network_ref == network)
+        .cloned()
+        .collect();
+    peer_identities(&own, trust, signals_at)
+        .into_iter()
+        .filter_map(|(site, record)| Some((site, record.sovereignty_zone?)))
+        .collect()
 }
 
 /// Where a peer's signals are polled.
@@ -2426,11 +2444,14 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let remote_crdt_providers = membership_staleness(&network, remote_crdt_providers, membership.as_ref());
 
     let scoring_weights = crate::crd::grid_network::resolve_scoring_weights(network.spec.scoring_policy.as_ref());
-    // Peer records carry each site's zone, so a GridSite edit is read before the render it triggers.
-    if ctx.signal_mode == SignalMode::Poll {
-        Box::pin(register_peers(&ctx, client)).await?;
-    }
-    let serving = serving_source(&ctx, &providers);
+    // Read before the render, so a GridSite edit reaches the render it triggers.
+    let zones = if ctx.signal_mode == SignalMode::Poll {
+        let sites = Box::pin(register_peers(&ctx, client)).await?;
+        network_zones(&sites, name, ctx.peer_settings.trust, derived_signals(&ctx))
+    } else {
+        BTreeMap::new()
+    };
+    let serving = serving_source(&ctx, &providers, zones);
 
     let OverlayOutcome {
         consumer_statuses: consumer_config_statuses,
@@ -3722,12 +3743,16 @@ struct ServingSource<'src> {
     load_heard: &'src signals::LoadHeard,
     /// This site's provider clusters with no metrics to scrape.
     quiet_local: BTreeSet<String>,
-    /// Each site's `sovereigntyZone`, as last read.
+    /// Each of the network's sites' `sovereigntyZone`, read this reconcile.
     zones: BTreeMap<String, String>,
 }
 
 /// Build the serving source, `None` outside poll mode.
-fn serving_source<'ctx>(ctx: &'ctx OperatorCtx, providers: &[InferenceProvider]) -> Option<ServingSource<'ctx>> {
+fn serving_source<'ctx>(
+    ctx: &'ctx OperatorCtx,
+    providers: &[InferenceProvider],
+    zones: BTreeMap<String, String>,
+) -> Option<ServingSource<'ctx>> {
     if ctx.signal_mode != SignalMode::Poll {
         return None;
     }
@@ -3746,7 +3771,7 @@ fn serving_source<'ctx>(ctx: &'ctx OperatorCtx, providers: &[InferenceProvider])
         refused_dials: &ctx.refused_dials,
         load_heard: &ctx.load_heard,
         quiet_local,
-        zones: ctx.peer_identities.sovereignty_zones(),
+        zones,
     })
 }
 
@@ -6934,6 +6959,9 @@ pub(crate) fn consumer_config_status_error(
             "ProjectedCredentialsUnsupported"
         },
         OperatorError::ConsumerConfigRender(ConsumerConfigError::SiteRouteUnsupported(_)) => "SiteRouteUnsupported",
+        OperatorError::ConsumerConfigRender(ConsumerConfigError::SovereigntyWithoutGridSiteRoute) => {
+            "SovereigntyWithoutGridSiteRoute"
+        },
         OperatorError::ConsumerConfigRender(_) => "PraxisConfigRenderFailed",
         OperatorError::MountReconciliation(failure) => failure.reason,
         OperatorError::Kube(_) => "PraxisConfigApplyFailed",
@@ -10874,19 +10902,28 @@ mod tests {
     }
 
     #[test]
-    fn a_sites_zone_comes_from_the_record_trust_ranks_first_and_is_normalized() {
+    fn a_sites_zone_comes_from_its_own_networks_record_trust_ranks_first() {
+        let in_net = |mut site: GridSite| {
+            site.spec.grid_network_ref = "net".to_owned();
+            site
+        };
+        let mut other = zoned_site(peer_grid_site("site-c", None, &["pin-c", "pin-c2"]), "us");
+        other.spec.grid_network_ref = "other-net".to_owned();
         let sites = [
-            zoned_site(peer_grid_site("site-a", None, &["pin-a"]), " EU "),
-            zoned_site(peer_grid_site("net-site-a", Some("site-a"), &[]), "us"),
-            zoned_site(peer_grid_site("site-b", None, &["pin-b"]), "eu west"),
-            peer_grid_site("site-c", None, &["pin-c"]),
+            in_net(zoned_site(peer_grid_site("site-a", None, &["pin-a"]), " EU ")),
+            in_net(zoned_site(peer_grid_site("net-site-a", Some("site-a"), &[]), "us")),
+            in_net(zoned_site(peer_grid_site("site-b", None, &["pin-b"]), "eu west")),
+            in_net(zoned_site(peer_grid_site("site-c", None, &[]), "eu")),
+            other,
+            in_net(peer_grid_site("site-d", None, &["pin-d"])),
         ];
-        let held = signals::PeerIdentities::new();
-        held.set(peer_identities(&sites, PeerTrustMode::Pin, SignalsAt::Advertised));
         assert_eq!(
-            held.sovereignty_zones(),
-            BTreeMap::from([("site-a".to_owned(), "eu".to_owned())]),
-            "the pinned record wins over an unpinned stub; invalid or unset is none"
+            network_zones(&sites, "net", PeerTrustMode::Pin, SignalsAt::Advertised),
+            BTreeMap::from([
+                ("site-a".to_owned(), "eu".to_owned()),
+                ("site-c".to_owned(), "eu".to_owned()),
+            ]),
+            "the pinned record wins over a stub; another network's record never counts; invalid or unset is none"
         );
     }
 

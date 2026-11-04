@@ -644,20 +644,6 @@ impl PeerIdentities {
         self.loaded.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Each held site's sovereignty zone, by site name.
-    #[must_use]
-    pub fn sovereignty_zones(&self) -> BTreeMap<String, String> {
-        self.inner.read().map_or_else(
-            |_| BTreeMap::new(),
-            |guard| {
-                guard
-                    .iter()
-                    .filter_map(|(site, record)| Some((site.clone(), record.sovereignty_zone.clone()?)))
-                    .collect()
-            },
-        )
-    }
-
     /// How many peers are held.
     #[must_use]
     pub fn count(&self) -> usize {

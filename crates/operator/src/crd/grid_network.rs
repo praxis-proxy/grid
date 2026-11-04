@@ -1052,7 +1052,8 @@ pub struct ConsumerConfig {
     pub site_router: SiteRouter,
 
     /// The sovereignty fence `gridSiteRoute` applies: the header naming the zones a request
-    /// may be served in, and whether it refuses or only audits.
+    /// may be served in, and whether it refuses or only audits. Under any other router the
+    /// config is not rendered, and the status names `SovereigntyWithoutGridSiteRoute`.
     ///
     /// Default: unset, no fence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
