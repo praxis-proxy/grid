@@ -766,6 +766,7 @@ jobs:
             hub-router: operator
             signed-state: enforce
             model-gossip: true
+            provider-scope: true
             leg: pin, signed model gossip routing
     timeout-minutes: 60
     permissions:
@@ -820,9 +821,14 @@ jobs:
             docker load -i "/tmp/images/grid-${name}.tar"
           done
 
-      - name: Check the HA verdicts against synthetic logs
-        if: matrix.ha
+      - name: Check qualification verdicts against synthetic logs
+        if: matrix.ha || matrix.provider-scope
         run: ./scripts/e2e-hub-site.sh selftest
+
+      - name: Test signed provider-scope probe over encrypted UDP
+        if: matrix.provider-scope
+        # make test-unit skips examples; this step is the probe tests' only CI invocation.
+        run: cargo test --locked -p swim --example provider_scope_probe
 
       - name: Run hub and site e2e (${{ matrix.leg }})
         env:
@@ -831,6 +837,7 @@ jobs:
           HA: ${{ matrix.ha || '0' }}
           SIGNED_STATE: ${{ matrix.signed-state || 'off' }}
           MODEL_GOSSIP_TEST: ${{ matrix.model-gossip && '1' || '0' }}
+          PROVIDER_SCOPE_TEST: ${{ matrix.provider-scope && '1' || '0' }}
           GRID_FEEDBACK_CONTRACT_TEST: ${{ matrix.peer-trust-mode == 'pin' && '1' || '0' }}
           # The spiffe leg rotates 8 minute identities; pin trust does not rotate.
           ROTATION_LIFETIME: "480"

@@ -56,8 +56,9 @@ a verified signing key for gossip.
    CA chain, expected site identity, and the configured trust mode. Only
    verified public keys enter the trust snapshot.
 3. A single complete snapshot is sent to the SWIM runtime per reconcile. It
-   carries the grid ID, local signing identity when usable, and the verified
-   peer keys. Applying a replacement snapshot removes installed peer keys for
+   carries the grid ID, the local `GridNetwork` name, local signing identity
+   when usable, and the verified peer keys. The name authorizes the provider
+   network for that grid. Applying a replacement snapshot removes peer keys for
    peers no longer present, so deleted or changed trust does not leave stale
    signing keys trusted. If the Grid CA cannot be read, the grid still
    enforces, but keeps its installed peer keys rather than dropping all state.
@@ -84,18 +85,51 @@ the withdrawal remains pending and the deletion finalizer stays in place until
 the runtime can publish the signed empty state. The runtime stops republishing
 the prior provider state while the withdrawal is pending.
 
-## Known provider-scope limitation
+## Provider-network authorization
 
-The signature authenticates the origin site and `grid_id`, but provider records
-also carry a `network_id`. The receiver currently does not verify that each
-provider `network_id` is authorized for the authenticated `grid_id`. A trusted
-site in one grid can therefore sign a provider record labeled with another
-network name, and that record can enter shared state under that name. Routing
-still requires the site's `GridSite` in that network to pass the normal
-routing-eligibility checks, but signed gossip does not yet provide isolation
-between those provider-network scopes. Do not rely on it for cross-grid provider
-isolation; binding each grid identity to its allowed provider-network IDs needs
-a follow-up change.
+The receiver binds `GridNetwork.spec.gridId` to that local resource's
+`metadata.name`, which providers carry as `network_id`. These identifiers need
+not be equal. Peers must use the declared network name for provider state in
+that grid; a peer's signed payload cannot establish or expand the binding.
+
+After signature and timestamp verification, every origin-owned provider and
+provider UID must name the authorized network. A violation rejects the whole
+broadcast before metadata, revisions, capabilities, spend, or providers change.
+A missing binding also rejects signed provider state, including authoritative
+empty withdrawals. A withdrawal can remove only that origin's authorized
+provider-network state. Forwarded records do not grant ownership of another
+site's providers. Signed model-inventory frames use the same binding before
+any frame is buffered, in addition to their existing provider-UID checks.
+
+The receiver tracks the admitting origin/grid scope for each provider value
+in its shared snapshot. Ownership changes with the accepted value; an empty
+withdrawal can remove only values currently owned by its scope. Overlapping
+identities retain only the current contribution, not older values to restore.
+This ownership index is local memory and does not change the wire format.
+
+Installing or changing a binding clears provider values currently owned by
+that grid, its provider revision guards, UID history, and complete or pending
+model inventories. Providers verified in other grids and origin-wide metadata
+(gateway, certificate, and signals addresses, including their revision guards)
+are preserved. Grid-scoped peer pin installation, rotation that removes keys,
+and revocation use the same cleanup restricted to that peer and grid.
+Provider values admitted without a grid-specific verified signing key are
+also cleared in the affected origins; unsigned grid labels do not establish
+trusted ownership. Full origin eviction remains reserved for origin-wide
+events such as membership expiry or legacy site-pin enforcement.
+Reapplying an unchanged binding preserves state. A new or changed binding also clears
+that grid's signing-key pins. The runtime reinstalls the local signer and only
+the peer keys verified for the new binding. If peer verification cannot run,
+old peer pins are retained only for an unchanged binding; a changed binding
+remains closed to ordinary peer state until verification succeeds.
+Relaxing or deleting the grid removes
+its binding with its pins; `signedState: off` retains its unsigned behavior
+and does not provide this isolation.
+
+Upgrade receivers to obtain this protection. Sending from an upgraded operator
+does not make an older receiver enforce provider-network scope. No wire-format
+or CRD change is required. The binding governs provider state and inventories;
+it does not add network identities to the capability or tenant-spend formats.
 
 ## Routing remains a separate decision
 

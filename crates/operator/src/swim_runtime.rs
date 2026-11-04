@@ -543,6 +543,17 @@ pub(crate) struct DetachedRuntime {
 
 #[cfg(test)]
 impl DetachedRuntime {
+    /// Network bindings sent with enforcing updates, including updates that retain peer pins.
+    pub(crate) fn network_scopes_sent(&mut self) -> Vec<(String, String)> {
+        let mut sent = Vec::new();
+        while let Ok(update) = self.trust_updates.try_recv() {
+            if let GridTrustUpdate::Enforce(snapshot) = update {
+                sent.push((snapshot.grid_id, snapshot.network_name));
+            }
+        }
+        sent
+    }
+
     /// Peer pins each enforcing update for `grid_id` carried, `None` where it kept the installed ones.
     pub(crate) fn peer_pins_sent(&mut self, grid_id: &str) -> Vec<Option<PeerPins>> {
         let mut sent = Vec::new();
@@ -590,6 +601,8 @@ impl DetachedRuntime {
 struct GridTrustSnapshot {
     /// Persisted grid identity.
     grid_id: String,
+    /// Locally declared `GridNetwork` name authorized to carry provider state.
+    network_name: String,
     /// Local PKCS8 private-key DER, zeroized when replaced or dropped.
     local_signing_key: Option<Zeroizing<Vec<u8>>>,
     /// Complete set of verified peer signing keys, `None` to keep the installed ones.
@@ -1292,12 +1305,13 @@ impl SwimHandle {
         })
     }
 
-    /// Replace the local signer and verified peer pins for one grid.
+    /// Replace the signer, peer pins, and locally authorized provider-network name for one grid.
     ///
     /// The snapshot enables strict signed-gossip policy. Peer pins omitted from
     /// the snapshot are removed; an empty peer set permits certificate bootstrap
-    /// but rejects ordinary unpinned state. `None` keeps the installed peer pins,
-    /// for when they could not be re-verified.
+    /// but rejects ordinary unpinned state. `None` keeps the installed peer pins
+    /// only when the provider-network binding is unchanged. A changed binding
+    /// requires freshly verified peer pins.
     ///
     /// # Errors
     ///
@@ -1305,12 +1319,14 @@ impl SwimHandle {
     pub fn set_grid_trust_snapshot(
         &self,
         grid_id: String,
+        network_name: String,
         local_signing_key: Option<Zeroizing<Vec<u8>>>,
         peer_pins: Option<PeerPins>,
     ) -> Result<(), BroadcastError> {
         self.trust_update_tx
             .send(GridTrustUpdate::Enforce(GridTrustSnapshot {
                 grid_id,
+                network_name,
                 local_signing_key,
                 peer_pins,
             }))
@@ -2190,6 +2206,8 @@ struct GridTrust {
 /// What this site holds for one enforcing grid.
 #[derive(Default)]
 struct EnforcedGrid {
+    /// Provider network for which the cached signer and peer pins were verified.
+    network_name: Option<String>,
     /// Local PKCS8 signing key, zeroized when replaced or dropped.
     signing_key: Option<Zeroizing<Vec<u8>>>,
     /// Peer sites the last snapshot pinned.
@@ -2218,11 +2236,17 @@ impl GridTrust {
     fn enforce(&mut self, node: &SwimNode, site_name: &str, snapshot: GridTrustSnapshot) {
         let GridTrustSnapshot {
             grid_id,
+            network_name,
             local_signing_key,
             peer_pins,
         } = snapshot;
-        node.enforce_signed_grid(&grid_id);
+        node.enforce_signed_grid(&grid_id, &network_name);
         let grid = self.enforced.entry(grid_id.clone()).or_default();
+        if grid.network_name.as_deref() != Some(network_name.as_str()) {
+            grid.network_name = Some(network_name);
+            grid.signing_key = None;
+            grid.peer_sites.clear();
+        }
         grid.install_signer(node, site_name, &grid_id, local_signing_key);
         if let Some(peer_pins) = peer_pins {
             grid.install_peer_pins(node, &grid_id, peer_pins);
@@ -2568,6 +2592,7 @@ mod tests {
             enforced: HashMap::from([(
                 "grid-a".to_owned(),
                 EnforcedGrid {
+                    network_name: Some("net".to_owned()),
                     signing_key: Some(Zeroizing::new(private_key)),
                     peer_sites: HashSet::new(),
                 },
@@ -2597,7 +2622,7 @@ mod tests {
     #[test]
     #[expect(clippy::expect_used, reason = "walks one grid through each trust update")]
     fn grid_trust_tracks_signer_and_pins_across_updates() {
-        let node = SwimNode::new(NodeId::with_generation(
+        let mut node = SwimNode::new(NodeId::with_generation(
             "site-a".to_owned(),
             SocketAddr::from(([127, 0, 0, 1], 7946)),
             1,
@@ -2617,6 +2642,7 @@ mod tests {
         let enforce = |local_signing_key, peer_pins| {
             GridTrustUpdate::Enforce(GridTrustSnapshot {
                 grid_id: "grid-a".to_owned(),
+                network_name: "net".to_owned(),
                 local_signing_key,
                 peer_pins,
             })
@@ -2632,6 +2658,15 @@ mod tests {
             ),
         );
         let signed = trust.sign(grid_state()).expect("signed");
+        let valid = trust
+            .sign(provider_broadcast(0.1).with_grid_id(Some("grid-a".to_owned())))
+            .expect("signed providers");
+        node.publish_state_broadcast(&valid)
+            .expect("locally authorized provider network");
+        assert!(
+            node.state_snapshot().provider("net", "site-a", "provider-a").is_some(),
+            "runtime trust installs the declared provider-network binding"
+        );
         trust.apply(&node, "site-a", enforce(None, None));
         let unsignable = trust.sign(grid_state());
         let kept = trust.enforced.get("grid-a").map(|grid| grid.peer_sites.clone());
@@ -2655,6 +2690,71 @@ mod tests {
     }
 
     #[test]
+    fn grid_trust_requires_fresh_peer_pins_after_network_change() -> Result<(), Box<dyn std::error::Error>> {
+        let mut node = SwimNode::new(NodeId::with_generation(
+            "local".to_owned(),
+            SocketAddr::from(([127, 0, 0, 1], 7946)),
+            1,
+        ));
+        let local_key = rcgen::KeyPair::generate()?.serialize_der();
+        let peer_key = rcgen::KeyPair::generate()?.serialize_der();
+        let peer_public = swim::signing::public_key_ecdsa_p256(&peer_key)?;
+        let pins = || PeerPins::from([("site-a".to_owned(), vec![peer_public.clone()])]);
+        let mut trust = GridTrust::default();
+        let update = |network: &str, peer_pins| {
+            GridTrustUpdate::Enforce(GridTrustSnapshot {
+                grid_id: "grid-a".to_owned(),
+                network_name: network.to_owned(),
+                local_signing_key: Some(Zeroizing::new(local_key.clone())),
+                peer_pins,
+            })
+        };
+        let signed_peer = |network: &str| -> Result<swim::StateBroadcast, Box<dyn std::error::Error>> {
+            let mut broadcast = provider_broadcast(0.1).with_grid_id(Some("grid-a".to_owned()));
+            let providers = std::mem::take(&mut broadcast.snapshot.providers);
+            for mut provider in providers.into_values() {
+                provider.network_id = network.to_owned();
+                broadcast.snapshot.upsert_provider(provider);
+            }
+            broadcast.signed_at_ms = Some(wall_clock_millis());
+            broadcast.signature = Some(swim::signing::sign_ecdsa_p256(&peer_key, &broadcast.signable_bytes()?)?);
+            Ok(broadcast)
+        };
+
+        trust.apply(&node, "local", update("net", Some(pins())));
+        trust.apply(&node, "local", update("net", None));
+        node.publish_state_broadcast(&signed_peer("net")?)?;
+        assert!(node.state_snapshot().provider("net", "site-a", "provider-a").is_some());
+
+        trust.apply(&node, "local", update("replacement", None));
+        assert!(
+            node.publish_state_broadcast(&signed_peer("replacement")?).is_err(),
+            "old peer pins cannot authorize state in a newly bound network"
+        );
+        let local = trust.sign(
+            swim::StateBroadcast::new("local".to_owned(), 8, GridStateSnapshot::new("local".to_owned()), None)
+                .with_grid_id(Some("grid-a".to_owned())),
+        )?;
+        node.publish_state_broadcast(&local)?;
+        assert!(
+            node.state_snapshot()
+                .provider("replacement", "site-a", "provider-a")
+                .is_none(),
+            "a rejected peer must not mutate retained state"
+        );
+
+        trust.apply(&node, "local", update("replacement", Some(pins())));
+        node.publish_state_broadcast(&signed_peer("replacement")?)?;
+        assert!(
+            node.state_snapshot()
+                .provider("replacement", "site-a", "provider-a")
+                .is_some(),
+            "fresh verification can authorize the same peer key for the new network"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_strict_grid_still_carries_the_local_addresses() {
         let mut node = SwimNode::new(NodeId::with_generation(
             "site-a".to_owned(),
@@ -2668,6 +2768,7 @@ mod tests {
             "site-a",
             GridTrustUpdate::Enforce(GridTrustSnapshot {
                 grid_id: "grid-a".to_owned(),
+                network_name: "net".to_owned(),
                 local_signing_key: Some(key),
                 peer_pins: Some(PeerPins::new()),
             }),
@@ -4085,7 +4186,7 @@ mod tests {
             .unwrap_or_else(|_| std::process::abort());
         wait_until_provider_presence(&handle, "site-a", true).await;
         handle
-            .set_grid_trust_snapshot("grid-delete".to_owned(), None, Some(PeerPins::new()))
+            .set_grid_trust_snapshot("grid-delete".to_owned(), "net".to_owned(), None, Some(PeerPins::new()))
             .unwrap_or_else(|_| std::process::abort());
         wait_until_provider_presence(&handle, "site-a", false).await;
 
