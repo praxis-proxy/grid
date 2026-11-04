@@ -339,6 +339,7 @@ Praxis AI image; these values may advance independently.
 | `praxisConfig.render.gridServing.configMapName` | string | `""` | Overrides `grid-serving-<networkName>-<gatewayRefName>`. Needed when that name passes 63 characters. |
 | `praxisConfig.render.gridServing.mountPath` | string | `/etc/praxis/grid-serving` | Mount directory for the ConfigMap. |
 | `praxisConfig.render.gridServing.backendCAs` | list | `[]` | CA bundles for the operator's `tls` dials, each `{secretName or configMapName, key}` (`key` defaults to `ca.crt`), mounted read-only at `/run/secrets/grid-backend-ca/<name>/<key>`, where a dial's `ca_path` points. One entry per Secret or ConfigMap. Needs `gridServing.enabled`, and refused with `mountReconciliation`, which mounts them itself. |
+| `praxisConfig.render.gridServing.siteRoute.sovereignty` | object | `{header: "", mode: enforce}` | Sovereignty fence. `header` names the zones a request may be served in: one zone, or a comma-separated list in one header line, matched case-insensitively against each `GridSite` `sovereigntyZone`. Empty is no fence. In `enforce` mode a request naming no valid zone gets 400, and one whose model no site in its zones serves gets 403. In `audit` mode nothing is refused, and each would-be refusal is logged and counted in `grid_route_fenced_total`. Whatever sets the header must replace, never append to, a caller's copy. |
 | `praxisConfig.render.gridServing.siteRoute.availability` | object | `{}` | Site availability, rendered into the `grid_site_route` filter block with keys snake_case as the filter reads them (`shedding`, `smoothing`, `ceiling_half_life_ms`, `ceiling_floor`, `explore_floor`, `full_after_ms`, `room_after_ms`, `queue_full`). Every field defaults and `shedding` is the one switch. See `examples/gateway/grid-site-route.yaml`. |
 | `praxisConfig.render.gridServing.siteRoute.prefixAffinity` | object | `{}` | Prefix affinity tuning rendered as the filter's `prefix_affinity` (`enabled`, `threshold`, `exploration`, `capacity`, `ttl_secs`, `prefill_tokens_per_second`, `queued_request_seconds`, `tag_key_path`). Cache limits default to 16384 entries per backend cluster and a 600-second lifetime after confirmation; both require positive integers. |
 | `gridIdentity.tlsSecretName` | string | `""` | Secret with `tls.crt` and `tls.key`. Non-empty mounts the identity and makes implicit render transports use mTLS. |
@@ -367,7 +368,7 @@ The metrics listener serves the Praxis registry, including the grid gateway's ow
 | `grid_route_site_score` | `site`, `cluster` | The queue depth the last route order used for each candidate, lower first. `inf` when unmeasured, `NaN` when excluded or demoted, or when the pair left the topology. |
 | `grid_route_site_score_unavailable` | `site`, `cluster`, `reason` | One-hot reason an otherwise routable load-publishing site has no queue score: `absent`, `stale`, or `unreadable`. Metric names are not labels. |
 
-`reason` is one of five values, and adding one is a deliberate change:
+`reason` is one of seven values, and adding one is a deliberate change:
 
 | `reason` | `site` | Response |
 |----------|--------|----------|
@@ -375,7 +376,11 @@ The metrics listener serves the Praxis registry, including the grid gateway's ow
 | `fallback` | chosen site | Sent to a demoted site because no healthy one was left. |
 | `not_ready` | empty | 503: every candidate was excluded. |
 | `no_route` | empty | 503: an admitted candidate had no route from this gateway. |
-| `bad_request` | empty | 400 or 404: no model, or a model no candidate serves. |
+| `bad_request` | empty | 400 or 404: no model, a model no candidate serves, or no valid sovereignty zone under a fence. |
+| `shed` | empty | 429: every healthy site serving the model was past full. |
+| `fenced` | empty | 403: no site serving the model lies in the request's sovereignty zones. |
+
+`grid_route_fenced_total{cause, enforced}` counts the requests the sovereignty fence refused (`enforced="true"`) or, in `audit` mode, would have refused (`enforced="false"`). `cause` is `zone_required` (no valid zone in one header line), `outside_zones` (no site in the zones serves the model, or an audited pick lay outside them), or `earlier_route` (another filter chose the cluster).
 
 ## Security
 

@@ -623,6 +623,19 @@ func (in *GridNetworkConsumerGatewaysItemPraxisConfigMountReconciliation) DeepCo
 	return out
 }
 
+func (in *GridNetworkConsumerGatewaysItemPraxisConfigSovereignty) DeepCopyInto(out *GridNetworkConsumerGatewaysItemPraxisConfigSovereignty) {
+	*out = *in
+}
+
+func (in *GridNetworkConsumerGatewaysItemPraxisConfigSovereignty) DeepCopy() *GridNetworkConsumerGatewaysItemPraxisConfigSovereignty {
+	if in == nil {
+		return nil
+	}
+	out := new(GridNetworkConsumerGatewaysItemPraxisConfigSovereignty)
+	in.DeepCopyInto(out)
+	return out
+}
+
 func (in *GridNetworkConsumerGatewaysItemPraxisConfigTelemetry) DeepCopyInto(out *GridNetworkConsumerGatewaysItemPraxisConfigTelemetry) {
 	*out = *in
 	if in.BatchIntervalSecs != nil {
@@ -691,6 +704,10 @@ func (in *GridNetworkConsumerGatewaysItemPraxisConfig) DeepCopyInto(out *GridNet
 	if in.MountReconciliation != nil {
 		out.MountReconciliation = new(GridNetworkConsumerGatewaysItemPraxisConfigMountReconciliation)
 		in.MountReconciliation.DeepCopyInto(out.MountReconciliation)
+	}
+	if in.Sovereignty != nil {
+		out.Sovereignty = new(GridNetworkConsumerGatewaysItemPraxisConfigSovereignty)
+		in.Sovereignty.DeepCopyInto(out.Sovereignty)
 	}
 	if in.Telemetry != nil {
 		out.Telemetry = new(GridNetworkConsumerGatewaysItemPraxisConfigTelemetry)

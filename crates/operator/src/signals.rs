@@ -564,6 +564,9 @@ pub struct PeerRecord {
 
     /// Where this peer serves its signals, derived from the local object's gateway endpoint.
     pub signals: Option<DeclaredSignals>,
+
+    /// The local object's `spec.sovereigntyZone`, normalized; `None` when unset or invalid.
+    pub sovereignty_zone: Option<String>,
 }
 
 /// The server name `site`'s gateway is reached and verified under, the DNS name its leaf carries.
@@ -639,6 +642,20 @@ impl PeerIdentities {
     #[must_use]
     pub fn loaded(&self) -> bool {
         self.loaded.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Each held site's sovereignty zone, by site name.
+    #[must_use]
+    pub fn sovereignty_zones(&self) -> BTreeMap<String, String> {
+        self.inner.read().map_or_else(
+            |_| BTreeMap::new(),
+            |guard| {
+                guard
+                    .iter()
+                    .filter_map(|(site, record)| Some((site.clone(), record.sovereignty_zone.clone()?)))
+                    .collect()
+            },
+        )
     }
 
     /// How many peers are held.
@@ -4147,6 +4164,7 @@ mod tests {
                 labels: gold(),
                 pins: Vec::new(),
                 signals: None,
+                sovereignty_zone: None,
             },
         )]));
         assert_eq!(
@@ -4166,6 +4184,7 @@ mod tests {
                 labels: gold(),
                 pins: vec!["ab".repeat(32)],
                 signals: None,
+                sovereignty_zone: None,
             },
         )]));
         assert_eq!(
@@ -4190,6 +4209,7 @@ mod tests {
                     labels: gold(),
                     pins: vec!["cc".repeat(32)],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
             (
@@ -4198,6 +4218,7 @@ mod tests {
                     labels: BTreeMap::from([("tier".to_owned(), "silver".to_owned())]),
                     pins: vec!["bb".repeat(32)],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
         ]));
@@ -4226,6 +4247,7 @@ mod tests {
                 labels: gold(),
                 pins: vec!["ab".repeat(32), "cd".repeat(32)],
                 signals: None,
+                sovereignty_zone: None,
             },
         )]));
         assert_eq!(identities.resolve_by_key(&"ab".repeat(32)), Some(gold()), "the old key");
@@ -4251,6 +4273,7 @@ mod tests {
                     labels: gold(),
                     pins: Vec::new(),
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
             (
@@ -4259,6 +4282,7 @@ mod tests {
                     labels: gold(),
                     pins: vec!["cd".repeat(32)],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
         ]));
@@ -4308,6 +4332,7 @@ mod tests {
             labels: BTreeMap::from([("tier".to_owned(), "gold".to_owned())]),
             pins: vec![canonical_fingerprint(&declared)],
             signals: None,
+            sovereignty_zone: None,
         };
         let identities = PeerIdentities::new();
         identities.set(BTreeMap::from([("peer".to_owned(), record)]));

@@ -349,6 +349,14 @@ praxisConfig:
       # -- Tuning for the grid_site_route filter block: availability and prefixAffinity, keys as
       # the filter reads them. Fields and defaults in examples/gateway/grid-site-route.yaml.
       siteRoute:
+        # -- Sovereignty fence. `header` names the zones a request may be served in, one
+        # zone or a comma-separated list; empty is no fence. Only sites whose GridSite
+        # sovereigntyZone is listed serve it. `mode` enforce refuses the rest; audit
+        # routes as if unfenced and logs and counts what it would refuse. Whatever sets
+        # the header must replace, never append to, a caller's copy.
+        sovereignty:
+          header: ""
+          mode: enforce
         # -- Site availability. Every field defaults; `shedding` is the one switch.
         availability: {}
         # -- Prefix affinity. Cache limits: capacity (16384 entries per backend cluster),

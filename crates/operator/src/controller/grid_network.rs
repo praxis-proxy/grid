@@ -1287,6 +1287,13 @@ fn peer_identities(
                 SignalsAt::Derived(signals_port) => declared_signals(site, &key, signals_port),
                 SignalsAt::Advertised => None,
             },
+            sovereignty_zone: site.spec.sovereignty_zone.as_deref().and_then(|zone| {
+                let normalized = grid_signals::zone::sovereignty_zone(zone);
+                if normalized.is_none() {
+                    tracing::warn!(site = %key, zone, "GridSite sovereigntyZone is not a valid zone; the site is in none");
+                }
+                normalized
+            }),
         };
         let rank = (!record.pins.is_empty(), enrolled);
         if ranked.get(&key).is_none_or(|(held, _)| rank > *held) {
@@ -2419,6 +2426,10 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let remote_crdt_providers = membership_staleness(&network, remote_crdt_providers, membership.as_ref());
 
     let scoring_weights = crate::crd::grid_network::resolve_scoring_weights(network.spec.scoring_policy.as_ref());
+    // Peer records carry each site's zone, so a GridSite edit is read before the render it triggers.
+    if ctx.signal_mode == SignalMode::Poll {
+        Box::pin(register_peers(&ctx, client)).await?;
+    }
     let serving = serving_source(&ctx, &providers);
 
     let OverlayOutcome {
@@ -3711,6 +3722,8 @@ struct ServingSource<'src> {
     load_heard: &'src signals::LoadHeard,
     /// This site's provider clusters with no metrics to scrape.
     quiet_local: BTreeSet<String>,
+    /// Each site's `sovereigntyZone`, as last read.
+    zones: BTreeMap<String, String>,
 }
 
 /// Build the serving source, `None` outside poll mode.
@@ -3733,6 +3746,7 @@ fn serving_source<'ctx>(ctx: &'ctx OperatorCtx, providers: &[InferenceProvider])
         refused_dials: &ctx.refused_dials,
         load_heard: &ctx.load_heard,
         quiet_local,
+        zones: ctx.peer_identities.sovereignty_zones(),
     })
 }
 
@@ -3978,6 +3992,7 @@ fn render_serving_config(
         peer_budget: source.settings.peer_budget,
         heard: &heard,
         quiet_local: &source.quiet_local,
+        zones: &source.zones,
         inject_local_credentials: matches!(hops, HopSource::Rendered(_)),
     };
     Ok(serving_config::render(overlay, &inputs))
@@ -4523,6 +4538,7 @@ async fn apply_consumer_config_for_gateway(
         cc.enable_projected_credentials,
         cc.mount_reconciliation.as_ref().is_some_and(|mounts| mounts.enabled),
         cc.site_router,
+        cc.sovereignty.as_ref(),
     )?;
     if let Some(mounts) = cc.mount_reconciliation.as_ref().filter(|mounts| mounts.enabled) {
         let mut attempts = 0;
@@ -8573,6 +8589,7 @@ mod tests {
                 labels: BTreeMap::new(),
                 pins: vec!["previous-pin".to_owned()],
                 signals: None,
+                sovereignty_zone: None,
             },
         )]));
         assert!(
@@ -10848,6 +10865,29 @@ mod tests {
             "spec": Value::Object(spec),
         }))
         .unwrap_or_else(|_| std::process::abort())
+    }
+
+    /// `site` declaring `zone` as its `sovereigntyZone`.
+    fn zoned_site(mut site: GridSite, zone: &str) -> GridSite {
+        site.spec.sovereignty_zone = Some(zone.to_owned());
+        site
+    }
+
+    #[test]
+    fn a_sites_zone_comes_from_the_record_trust_ranks_first_and_is_normalized() {
+        let sites = [
+            zoned_site(peer_grid_site("site-a", None, &["pin-a"]), " EU "),
+            zoned_site(peer_grid_site("net-site-a", Some("site-a"), &[]), "us"),
+            zoned_site(peer_grid_site("site-b", None, &["pin-b"]), "eu west"),
+            peer_grid_site("site-c", None, &["pin-c"]),
+        ];
+        let held = signals::PeerIdentities::new();
+        held.set(peer_identities(&sites, PeerTrustMode::Pin, SignalsAt::Advertised));
+        assert_eq!(
+            held.sovereignty_zones(),
+            BTreeMap::from([("site-a".to_owned(), "eu".to_owned())]),
+            "the pinned record wins over an unpinned stub; invalid or unset is none"
+        );
     }
 
     #[test]
@@ -13247,6 +13287,7 @@ mod tests {
                 false,
                 false,
                 cc.site_router,
+                cc.sovereignty.as_ref(),
             );
             assert!(render.is_ok(), "{live:?}: the render must succeed: {render:?}");
             let rendered = render.unwrap_or_else(|_| std::process::abort());
