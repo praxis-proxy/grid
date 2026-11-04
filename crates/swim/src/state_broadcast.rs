@@ -119,7 +119,7 @@ pub struct StateBroadcast {
 
     /// Data-plane gateway address advertised by this site.
     ///
-    /// Carried as optional trailing extension data.  `None` when the originating
+    /// Carried as optional trailing extension data. `None` when the originating
     /// operator has no configured gateway address.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_address: Option<String>,
@@ -4562,6 +4562,7 @@ mod tests {
         );
     }
 
+    /// Checks that an address broadcast is retained for a remote site.
     #[test]
     fn handler_stores_gateway_address_from_extended_broadcast() {
         let mut handler = StateBroadcastHandler::new("site-local".to_owned());

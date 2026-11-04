@@ -17,7 +17,8 @@
           "namespace": "models",
           "key": "token"
         }
-      }
+      },
+      "weight": 1
     },
     {
       "stable_id": "candidate-site-b",
@@ -25,7 +26,8 @@
       "name": "llama",
       "site": "site-b",
       "cluster": "site-b",
-      "fresh": true
+      "fresh": true,
+      "weight": 1
     }
   ],
   "provider_hop_clusters": [

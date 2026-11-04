@@ -586,7 +586,7 @@ fn record_enrollment(state: &AppState, enrollment_id: Uuid, issued: &Issued, csr
         csr_pem,
         cert_pem: issued.certificate.clone(),
     };
-    crate::record::spawn(Arc::clone(recorder), record);
+    recorder.spawn(record);
 }
 
 /// The client certificate the TLS handshake proved, DER, set per connection.

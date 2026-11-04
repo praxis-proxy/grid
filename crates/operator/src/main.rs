@@ -87,6 +87,7 @@ use operator::{
 // Main
 // ---------------------------------------------------------------------------
 
+/// Starts the operator and its controllers.
 #[tokio::main]
 #[expect(
     clippy::large_stack_frames,
@@ -318,7 +319,7 @@ async fn main() {
     // This site's providers first, then what its peers publish, on /metrics.
     operator::metrics::register_provider_signals(vec![ctx.signals(), ctx.peers()]);
 
-    // Controllers run now. Only SWIM and what dials peers wait on the advertise address.
+    // Controllers run now; the GridSite controller follows gateway address updates as they arrive.
     let (swim_tx, swim_rx) = tokio::sync::watch::channel(SwimStage::Starting);
     route_to_holder(&routes, signals_enabled.then(|| ctx.signals()), &leadership.holding());
 
@@ -333,10 +334,26 @@ async fn main() {
     let writer_site_name = ctx.site_name().map(str::to_owned);
     // Every mode scrapes for readiness; only Poll mode publishes what it scrapes.
     let writer_scrape_interval = config.signals.scrape_interval();
+    let (gateway_address_tx, gateway_address_rx) =
+        tokio::sync::watch::channel(gateway::configured_address(&config.gateway));
+    let (swim_handle_tx, swim_handle_rx) = tokio::sync::watch::channel(None);
+    if writer_site_name.is_some() {
+        tokio::spawn(gateway::run_discovery_poller(
+            client.clone(),
+            config.gateway.clone(),
+            gateway_address_tx,
+            swim_handle_rx,
+        ));
+    }
     let writer_group = async move {
         tokio::try_join!(
             run_network_controller(writer_client.clone(), Arc::clone(&writer_ctx), writer_swim),
-            run_site_controller(writer_client.clone(), writer_ctx.membership()),
+            run_site_controller(
+                writer_client.clone(),
+                writer_ctx.membership(),
+                writer_site_name.clone(),
+                gateway_address_rx.clone(),
+            ),
             run_provider_controller(writer_client.clone(), writer_site_name),
             run_agent_tool_provider_controller(writer_client.clone()),
             run_local_scraper(writer_scrape_interval, Arc::clone(&writer_ctx), writer_client.clone()),
@@ -368,7 +385,7 @@ async fn main() {
                     ready: Arc::clone(&ready),
                     routes: routes.clone(),
                 },
-                swim_tx,
+                (swim_tx, swim_handle_tx),
                 membership_declared,
             ),
             writers,
@@ -582,6 +599,12 @@ enum SwimStage {
 /// SWIM startup progress, watched by what waits on the advertise address.
 type SwimStartup = tokio::sync::watch::Receiver<SwimStage>;
 
+/// Senders that publish SWIM lifecycle progress and the running handle.
+type SwimStartupSenders = (
+    tokio::sync::watch::Sender<SwimStage>,
+    tokio::sync::watch::Sender<Option<Arc<swim_runtime::SwimHandle>>>,
+);
+
 /// Start SWIM off the controllers' path, marking ready once it runs or is not configured.
 ///
 /// # Errors
@@ -591,9 +614,10 @@ async fn start_swim(
     cli: Cli,
     ctx: Arc<OperatorCtx>,
     restart: StandDown,
-    started: tokio::sync::watch::Sender<SwimStage>,
+    startup: SwimStartupSenders,
     membership_declared: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (started, swim_handle) = startup;
     let client = ctx.client.clone();
     let retry = restart.clone();
     let ready = Arc::clone(&restart.ready);
@@ -608,11 +632,7 @@ async fn start_swim(
     let swim = report_swim(&client, cli.grid.membership, started_swim, retry)?;
     if let Some(handle) = &swim {
         ctx.set_swim(Arc::clone(handle));
-        tokio::spawn(gateway::run_discovery_poller(
-            client.clone(),
-            Arc::clone(handle),
-            cli.gateway.clone(),
-        ));
+        swim_handle.send_replace(Some(Arc::clone(handle)));
         tokio::spawn(release_membership_once_settled(Arc::clone(handle), Arc::clone(&ctx)));
     } else {
         settle_without_swim(&client, cli.grid.membership, &ctx).await?;
@@ -1879,11 +1899,18 @@ fn watch_expired<R>(error: &kube::runtime::controller::Error<R, watcher::Error>)
 async fn run_site_controller(
     client: Client,
     membership: Membership,
+    site_name: Option<String>,
+    gateway_address: tokio::sync::watch::Receiver<Option<String>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api = Api::<GridSite>::all(client.clone());
+    let address_changes = futures::stream::unfold(gateway_address.clone(), |mut address| async move {
+        address.changed().await.ok()?;
+        Some(((), address))
+    });
 
     // Unfiltered: a status write from the peer poller reconciles, so Degraded follows it.
     Controller::new(api, watcher::Config::default())
+        .reconcile_all_on(address_changes)
         .with_config(kube::runtime::controller::Config::default().concurrency(16))
         .run(
             grid_site::reconcile,
@@ -1891,6 +1918,8 @@ async fn run_site_controller(
             Arc::new(grid_site::SiteContext {
                 client: Arc::new(client),
                 membership,
+                site_name,
+                gateway_address,
             }),
         )
         .for_each(|result| async {
@@ -2884,20 +2913,21 @@ fn site_by_spiffe(leaf: &[u8], identity: &SignalsIdentity) -> Option<(String, BT
 /// Whether `tcp` sent anything within [`SIGNALS_SILENT_TIMEOUT`].
 ///
 /// A connection that never speaks costs a slot and proves nothing, and opening many of them
-/// is the cheapest way to hold the handshake share. `readable()` does not consume, so the
-/// handshake that follows still sees the `ClientHello`. False also covers shutdown, where the
-/// caller stops for its own reasons.
+/// is the cheapest way to hold the handshake share. Require at least one byte before the
+/// deadline; `peek()` does not consume it, so the TLS handshake still sees the `ClientHello`.
+/// Returns `false` if shutdown wins the race.
 async fn spoke_in_time(
     tcp: &tokio::net::TcpStream,
     remote: SocketAddr,
     shutdown: &operator::shutdown::Shutdown,
 ) -> bool {
+    let mut first_byte = [0_u8; 1];
     let ready = tokio::select! {
         biased;
         () = shutdown.triggered() => return false,
-        ready = tokio::time::timeout(SIGNALS_SILENT_TIMEOUT, tcp.readable()) => ready,
+        ready = tokio::time::timeout(SIGNALS_SILENT_TIMEOUT, tcp.peek(&mut first_byte)) => ready,
     };
-    if matches!(ready, Ok(Ok(()))) {
+    if matches!(ready, Ok(Ok(bytes_read)) if bytes_read > 0) {
         return true;
     }
     operator::metrics::record_signals_shed("silent");
@@ -4678,6 +4708,7 @@ mod tests {
             labels: gpu(),
             pins,
             signals: None,
+            sovereignty_zone: None,
         };
         let peers = operator::signals::PeerIdentities::new();
         peers.set(BTreeMap::from([
@@ -4931,6 +4962,7 @@ mod tests {
                     labels: gpu(),
                     pins: vec![operator::signals::leaf_fingerprint(&pem_der(&self.west.cert_pem))],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             )]));
             SignalsIdentity {
@@ -5312,6 +5344,7 @@ mod tests {
                     labels: gpu(),
                     pins: Vec::new(),
                     signals: None,
+                    sovereignty_zone: None,
                 },
             )]));
             SignalsIdentity {
@@ -5795,6 +5828,7 @@ mod tests {
             labels: BTreeMap::new(),
             pins: vec!["aa".to_owned()],
             signals: None,
+            sovereignty_zone: None,
         };
         let heard = operator::signals::LoadHeard::default();
         let nothing = crdt::GridStateSnapshot::new("hub".to_owned());
@@ -6067,6 +6101,7 @@ mod tests {
                     labels: gpu(),
                     pins: vec!["bb".to_owned()],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
             (
@@ -6075,6 +6110,7 @@ mod tests {
                     labels: gpu(),
                     pins: vec!["aa".to_owned()],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
             (
@@ -6083,6 +6119,7 @@ mod tests {
                     labels: gpu(),
                     pins: Vec::new(),
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
         ]));
@@ -6122,6 +6159,7 @@ mod tests {
                 endpoint: operator::signals::SignalsEndpoint::parse(address).expect("endpoint"),
                 server_name: server_name.map(str::to_owned),
             }),
+            sovereignty_zone: None,
         };
         let pinned = || vec!["aa".to_owned()];
         let identities = operator::signals::PeerIdentities::new();
@@ -6254,6 +6292,7 @@ mod tests {
                     server_name: None,
                 }
             }),
+            sovereignty_zone: None,
         };
         let identities = operator::signals::PeerIdentities::new();
         identities.set(BTreeMap::from([
@@ -6305,6 +6344,7 @@ mod tests {
             labels: BTreeMap::new(),
             pins: vec!["aa".to_owned()],
             signals: None,
+            sovereignty_zone: None,
         };
         let identities = operator::signals::PeerIdentities::new();
         identities.set(BTreeMap::from([
@@ -6493,6 +6533,7 @@ mod tests {
                 labels: gpu(),
                 pins: Vec::new(),
                 signals: None,
+                sovereignty_zone: None,
             },
         )]));
         Serving {

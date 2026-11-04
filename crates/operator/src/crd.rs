@@ -122,7 +122,7 @@ fn append_legacy_validations(schema: &mut schemars::Schema, validation_rules: Ve
     }
 }
 
-/// [`AgentToAgentProvider`] — A2A agents available over the grid.
+/// [`AgentToAgentProvider`] -- A2A agents available over the grid.
 ///
 /// [`AgentToAgentProvider`]: agent_to_agent_provider::AgentToAgentProvider
 pub mod agent_to_agent_provider;

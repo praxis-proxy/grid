@@ -3,7 +3,7 @@
 //! Generates the `praxis.yaml` content for a consumer gateway `ConfigMap` from
 //! a [`RoutingOverlay`].  The generated config includes:
 //!
-//! - `json_body_field` filter (model field → `X-Model` header)
+//! - `json_body_field` filter (model field -> `X-Model` header)
 //! - `intelligent_route` filter with inference candidates from the overlay
 //! - `credential_inject` filter (only when credential-bearing candidates exist)
 //! - `load_balancer` filter with one cluster entry per unique inference cluster
@@ -30,7 +30,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use crate::crd::grid_network::SelectionMode;
 use crate::{
-    crd::grid_network::{ClusterEndpointConfig, GatewayTelemetryConfig, SiteRouter, TlsConfig, TransportMode},
+    crd::grid_network::{
+        ClusterEndpointConfig, GatewayTelemetryConfig, SiteRouter, SovereigntyFence, TlsConfig, TransportMode,
+    },
     resources::{
         routing_overlay::{RoutingCandidate, RoutingOverlay},
         serving_config::{DialSpec, DialTransport},
@@ -55,6 +57,10 @@ const INFERENCE_MODEL: &str = "inference_model";
 #[derive(Debug, thiserror::Error)]
 #[expect(unnameable_types, reason = "pub(crate) module restricts reachability")]
 pub enum ConsumerConfigError {
+    /// A sovereignty fence is set on a router that cannot apply it.
+    #[error("sovereignty is applied only by siteRouter gridSiteRoute; refusing to render the fence away")]
+    SovereigntyWithoutGridSiteRoute,
+
     /// The overlay's `local_site` field is blank.
     #[error("overlay local_site must not be blank")]
     BlankLocalSite,
@@ -496,6 +502,8 @@ struct RouterInputs<'input> {
     gateway: &'input str,
     /// This gateway's namespace, quoted.
     namespace: &'input str,
+    /// The `grid_site_route` sovereignty block, rendered; `None` for no fence.
+    sovereignty: Option<&'input str>,
 }
 
 /// How the operator renders one request router into a consumer pipeline.
@@ -566,8 +574,9 @@ impl RouterRender for GridSiteRouteRender {
             .map(|endpoint| yaml_scalar(&endpoint.cluster))
             .collect::<Result<Vec<_>, _>>()?
             .join(", ");
+        let fence = inputs.sovereignty.unwrap_or_default();
         Ok(format!(
-            "      - filter: grid_site_route\n        model_header: X-Model\n        clusters: [{clusters}]"
+            "      - filter: grid_site_route\n        model_header: X-Model\n        clusters: [{clusters}]{fence}"
         ))
     }
 
@@ -624,6 +633,7 @@ fn generate_consumer_praxis_config_for_gateway_with_telemetry(
     projected_credentials: bool,
     telemetry: Option<&GatewayTelemetryConfig>,
     site_router: SiteRouter,
+    sovereignty: Option<&SovereigntyFence>,
 ) -> Result<String, ConsumerConfigError> {
     let pipeline = Pipeline {
         overlay,
@@ -635,8 +645,13 @@ fn generate_consumer_praxis_config_for_gateway_with_telemetry(
         gateway_namespace,
         projected_credentials,
         telemetry,
+        sovereignty,
     };
     match site_router {
+        // Every config path reaches here, including legacy aliases whose schema carries no CEL rule.
+        SiteRouter::IntelligentRoute if sovereignty.is_some() => {
+            Err(ConsumerConfigError::SovereigntyWithoutGridSiteRoute)
+        },
         SiteRouter::IntelligentRoute => pipeline.render::<IntelligentRouteRender>(),
         SiteRouter::GridSiteRoute => pipeline.render::<GridSiteRouteRender>(),
     }
@@ -662,6 +677,8 @@ struct Pipeline<'input> {
     projected_credentials: bool,
     /// Tracing export, when opted in.
     telemetry: Option<&'input GatewayTelemetryConfig>,
+    /// The `grid_site_route` sovereignty fence, `None` for no fence.
+    sovereignty: Option<&'input SovereigntyFence>,
 }
 
 impl Pipeline<'_> {
@@ -719,6 +736,18 @@ impl Pipeline<'_> {
             network: &yaml_scalar(&overlay.network)?,
             gateway: &yaml_scalar(self.gateway_name)?,
             namespace: &yaml_scalar(self.gateway_namespace)?,
+            sovereignty: self
+                .sovereignty
+                .map(|fence| {
+                    yaml_scalar(&fence.header).map(|header| {
+                        format!(
+                            "\n        sovereignty:\n          header: {header}\n          mode: {}",
+                            fence.mode.as_str()
+                        )
+                    })
+                })
+                .transpose()?
+                .as_deref(),
         })?;
         let trace_context_filter = if self.telemetry.is_some() {
             "      - filter: trace_context\n"
@@ -818,6 +847,7 @@ fn generate_consumer_praxis_config_for_gateway(
         projected_credentials,
         None,
         SiteRouter::IntelligentRoute,
+        None,
     )
 }
 
@@ -847,6 +877,7 @@ pub(crate) fn render_consumer_config_with_projected(
     projected_credentials: bool,
     delegated_mounts: bool,
     site_router: SiteRouter,
+    sovereignty: Option<&SovereigntyFence>,
 ) -> Result<ConsumerRenderResult, ConsumerConfigError> {
     let inference_candidates: Vec<&RoutingCandidate> = overlay
         .candidates
@@ -864,6 +895,7 @@ pub(crate) fn render_consumer_config_with_projected(
         projected_credentials,
         telemetry,
         site_router,
+        sovereignty,
     )?;
     let mut requirements = BTreeMap::<(MountPurpose, String, String, String), BTreeSet<RequirementItem>>::new();
 
@@ -1012,6 +1044,7 @@ fn render_consumer_config(
         false,
         delegated_mounts,
         SiteRouter::IntelligentRoute,
+        None,
     )
 }
 
@@ -1325,7 +1358,7 @@ fn render_credential_inject(
     local_site: &str,
     enable_projected_credentials: bool,
 ) -> String {
-    // Collect unique (strategy, name, namespace, key) → rendered entry.
+    // Collect unique (strategy, name, namespace, key) -> rendered entry.
     // BTreeMap provides deterministic sorted order by key.
     let mut entries: BTreeMap<(String, String, String, String), String> = BTreeMap::new();
 
@@ -1401,7 +1434,7 @@ fn render_load_balancer(
     cluster_endpoints: &[ClusterEndpointConfig],
     tls_cert_mount_path: &str,
 ) -> Result<String, ConsumerConfigError> {
-    // Build a lookup map: cluster name → endpoint config.
+    // Build a lookup map: cluster name -> endpoint config.
     let endpoint_map: BTreeMap<&str, &ClusterEndpointConfig> =
         cluster_endpoints.iter().map(|ep| (ep.cluster.as_str(), ep)).collect();
 
@@ -1758,6 +1791,15 @@ mod tests {
         overlay: &RoutingOverlay,
         endpoints: &[ClusterEndpointConfig],
     ) -> Result<ConsumerRenderResult, ConsumerConfigError> {
+        render_fenced_site_route(overlay, endpoints, None)
+    }
+
+    /// [`render_site_route`] under `fence`.
+    fn render_fenced_site_route(
+        overlay: &RoutingOverlay,
+        endpoints: &[ClusterEndpointConfig],
+        fence: Option<&SovereigntyFence>,
+    ) -> Result<ConsumerRenderResult, ConsumerConfigError> {
         render_consumer_config_with_projected(
             overlay,
             MOUNT_BASE,
@@ -1771,10 +1813,20 @@ mod tests {
             false,
             false,
             SiteRouter::GridSiteRoute,
+            fence,
         )
     }
 
     fn site_route_serving(overlay: &RoutingOverlay, endpoints: &[ClusterEndpointConfig]) -> String {
+        fenced_site_route_serving(overlay, endpoints, &BTreeMap::new())
+    }
+
+    /// [`site_route_serving`] with each site in `zones`.
+    fn fenced_site_route_serving(
+        overlay: &RoutingOverlay,
+        endpoints: &[ClusterEndpointConfig],
+        zones: &BTreeMap<String, String>,
+    ) -> String {
         let sni = provider_hops(endpoints).expect("hop SNI");
         let clusters: BTreeSet<String> = sni.keys().cloned().collect();
         let none = BTreeSet::new();
@@ -1788,6 +1840,7 @@ mod tests {
             peer_budget: std::time::Duration::from_secs(10),
             heard: &|_, _| true,
             quiet_local: &none,
+            zones,
             inject_local_credentials: true,
         };
         crate::resources::serving_config::to_text(&crate::resources::serving_config::render(overlay, &inputs))
@@ -1848,6 +1901,7 @@ mod tests {
             peer_budget: std::time::Duration::from_secs(10),
             heard: &|_, _| true,
             quiet_local: &none,
+            zones: &BTreeMap::new(),
             inject_local_credentials: false,
         };
         let serving = crate::resources::serving_config::render(overlay, &inputs);
@@ -2000,6 +2054,68 @@ mod tests {
         let serving = site_route_serving(&overlay, &endpoints);
         assert_eq!(rendered.config_yaml, SITE_ROUTE_PRAXIS, "praxis fixture drifted");
         assert_eq!(serving, SITE_ROUTE_SERVING, "serving fixture drifted");
+    }
+
+    /// The fenced gridSiteRoute fixtures the gateway crate runs end to end.
+    const FENCED_SITE_ROUTE_PRAXIS: &str =
+        include_str!("../../../gateway/tests/testdata/consumer-config-site-route-fenced.yaml");
+    const FENCED_SITE_ROUTE_SERVING: &str =
+        include_str!("../../../gateway/tests/testdata/serving-config-site-route-fenced.json");
+
+    /// An enforcing fence on the header the fenced fixtures carry.
+    fn enforcing_fence() -> SovereigntyFence {
+        SovereigntyFence {
+            header: "x-grid-sovereignty-zone".to_owned(),
+            mode: crate::crd::grid_network::FenceMode::Enforce,
+        }
+    }
+
+    #[test]
+    fn a_fence_on_a_router_that_cannot_apply_it_is_refused_not_dropped() {
+        let (overlay, endpoints) = site_route_topology();
+        let rendered = render_consumer_config_with_projected(
+            &overlay,
+            MOUNT_BASE,
+            &endpoints,
+            "/etc/praxis/tls",
+            8080,
+            &TlsConfig::default(),
+            "inference-gw",
+            "praxis-system",
+            None,
+            false,
+            false,
+            SiteRouter::IntelligentRoute,
+            Some(&enforcing_fence()),
+        );
+        assert!(
+            matches!(rendered, Err(ConsumerConfigError::SovereigntyWithoutGridSiteRoute)),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_fenced_site_route_render_matches_the_fixtures_the_gateway_runs() {
+        let (overlay, endpoints) = site_route_topology();
+        let rendered = render_fenced_site_route(&overlay, &endpoints, Some(&enforcing_fence())).expect("render");
+        let zones = BTreeMap::from([
+            ("site-a".to_owned(), "eu".to_owned()),
+            ("site-b".to_owned(), "us".to_owned()),
+        ]);
+        assert_eq!(rendered.config_yaml, FENCED_SITE_ROUTE_PRAXIS, "praxis fixture drifted");
+        assert_eq!(
+            fenced_site_route_serving(&overlay, &endpoints, &zones),
+            FENCED_SITE_ROUTE_SERVING,
+            "serving fixture drifted"
+        );
+        assert_eq!(
+            rendered.config_yaml.replace(
+                "\n        sovereignty:\n          header: \"x-grid-sovereignty-zone\"\n          mode: enforce",
+                ""
+            ),
+            SITE_ROUTE_PRAXIS,
+            "the fence adds one line and changes nothing else"
+        );
     }
 
     #[test]
@@ -2225,6 +2341,7 @@ mod tests {
                 false,
                 false,
                 router,
+                None,
             )
             .expect("render")
             .config_yaml

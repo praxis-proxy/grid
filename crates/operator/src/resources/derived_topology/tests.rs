@@ -1021,6 +1021,7 @@ fn a_derived_tls_render_matches_the_fixture_praxis_loads() {
         false,
         false,
         crate::crd::grid_network::SiteRouter::IntelligentRoute,
+        None,
     )
     .expect("render");
     assert_eq!(rendered.config_yaml, DERIVED_RENDER_GOLDEN, "golden drifted");

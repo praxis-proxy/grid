@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1
+
+# ------------------------------------------------------------------------------
+# Stage 1: Build with the FIPS feature set and dynamic system OpenSSL
+# ------------------------------------------------------------------------------
+
+ARG UBI9_MINIMAL_DIGEST=sha256:8ebe2ad8fdf3cab3e5a53c1edc69194c98209cfadab24b884f4ad9ebcf7bbbfc
+
+FROM rust:1.96-bookworm AS builder
+
+# Do not vendor OpenSSL or request static linkage. The runtime uses UBI's
+# system OpenSSL libraries and FIPS provider.
+ENV OPENSSL_NO_VENDOR=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev cmake make g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG GRID_GIT_COMMIT=unknown
+ARG GRID_GIT_VERSION=unknown
+ARG GRID_GIT_TREE_STATE=unknown
+ARG GRID_BUILD_DATE=unknown
+ENV GRID_GIT_COMMIT=$GRID_GIT_COMMIT \
+    GRID_GIT_VERSION=$GRID_GIT_VERSION \
+    GRID_GIT_TREE_STATE=$GRID_GIT_TREE_STATE \
+    GRID_BUILD_DATE=$GRID_BUILD_DATE
+
+WORKDIR /src
+
+COPY . .
+
+ARG CARGO_PROFILE=release
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    case "${CARGO_PROFILE}" in dev) profile_dir=debug ;; *) profile_dir="${CARGO_PROFILE}" ;; esac \
+    && cargo build --profile "${CARGO_PROFILE}" --manifest-path crates/overlay-sync/Cargo.toml \
+        --bin grid-overlay-sync --no-default-features --features fips \
+    && binary="target/${profile_dir}/grid-overlay-sync" \
+    && ldd "${binary}" | grep -Eq 'libssl\.so\.3 => ' \
+    && ldd "${binary}" | grep -Eq 'libcrypto\.so\.3 => ' \
+    && cp "${binary}" /usr/local/bin/grid-overlay-sync
+
+# ------------------------------------------------------------------------------
+# Stage 2: Runtime on Red Hat UBI 9 with its OpenSSL FIPS provider
+# ------------------------------------------------------------------------------
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal@${UBI9_MINIMAL_DIGEST}
+
+ARG GRID_GIT_COMMIT=unknown
+ARG GRID_GIT_VERSION=unknown
+LABEL org.opencontainers.image.revision="$GRID_GIT_COMMIT" \
+    org.opencontainers.image.version="$GRID_GIT_VERSION" \
+    org.opencontainers.image.source="https://github.com/praxis-proxy/grid" \
+    org.opencontainers.image.description="Grid overlay sync FIPS build on Red Hat UBI 9" \
+    org.opencontainers.image.licenses="Apache-2.0"
+
+# The pinned UBI minimal base carries the system OpenSSL libraries, FIPS
+# provider, and CA bundle. Fail the image build if that contract changes.
+RUN rpm -q openssl-libs openssl-fips-provider-so ca-certificates \
+    && printf '%s\n' 'grid:x:100:101:grid:/nonexistent:/sbin/nologin' >> /etc/passwd \
+    && printf '%s\n' 'grid:x:101:' >> /etc/group
+
+COPY --from=builder --chown=root:root --chmod=0555 \
+    /usr/local/bin/grid-overlay-sync /usr/local/bin/grid-overlay-sync
+
+RUN ["/usr/local/bin/grid-overlay-sync", "--version"]
+
+USER 100:101
+
+EXPOSE 9091
+
+ENTRYPOINT ["grid-overlay-sync"]

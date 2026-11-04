@@ -298,6 +298,7 @@ mod tests {
     use http::{Request, StatusCode};
     use http_body_util::Empty;
     use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
     use super::*;
     use crate::resources::tls_backend::build_native_connector_with_resolver;
@@ -331,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    /// RFC 9110 Sections 4.2.1–4.2.2 require an HTTP authority to contain a host.
+    /// RFC 9110 Sections 4.2.1--4.2.2 require an HTTP authority to contain a host.
     fn empty_authority_host_is_missing_for_http_and_https() {
         for url in ["http://:80", "https://:443"] {
             assert_eq!(validate_endpoint_url(url), EndpointUrlValidation::MissingHost);
@@ -410,6 +411,7 @@ mod tests {
         );
     }
 
+    /// Confirms the pinned client keeps using its validated address after DNS changes.
     #[tokio::test]
     async fn pinned_client_uses_original_address_after_dns_changes() {
         #[cfg(not(feature = "fips"))]
@@ -421,8 +423,17 @@ mod tests {
         let address = listener.local_addr().unwrap_or_else(|_| std::process::abort());
         let dns = Arc::new(ControllableDns::new(address));
         tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                use tokio::io::AsyncWriteExt as _;
+            if let Ok((stream, _)) = listener.accept().await {
+                let mut stream = BufReader::new(stream);
+                loop {
+                    let mut line = Vec::new();
+                    match stream.read_until(b'\n', &mut line).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) if line == b"\r\n" => break,
+                        Ok(_) => {},
+                    }
+                }
+                let mut stream = stream.into_inner();
                 drop(
                     stream
                         .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")

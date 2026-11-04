@@ -1,8 +1,8 @@
 //! Site gateway address self-discovery.
 //!
 //! Resolves the data-plane gateway address this operator advertises to SWIM
-//! peers (populates `GridSite.spec.gatewayEndpoint.address`): an explicit override wins,
-//! else a background poller discovers the Service `LoadBalancer` address.
+//! peers and uses for its own `GridSite`: an explicit override wins, else a
+//! background poller discovers the Service `LoadBalancer` address.
 
 use std::{sync::Arc, time::Duration};
 
@@ -45,7 +45,7 @@ pub struct Config {
     )]
     pub discovery_enabled: bool,
 
-    /// Explicit gateway address (host:port); skips discovery when set.
+    /// Explicit gateway address (host:port); skips discovery and supplies the own site's endpoint.
     ///
     /// Blank means unset here, unlike the discovery fields.
     #[arg(long = "gateway-address", env = "GRID_GATEWAY_ADDRESS")]
@@ -104,6 +104,12 @@ impl Config {
     }
 }
 
+/// The configured override, trimmed and empty values treated as unset.
+#[must_use]
+pub fn configured_address(config: &Config) -> Option<String> {
+    config.address_override().map(str::to_owned)
+}
+
 /// Resolve the gateway address: explicit override, else Service discovery.
 ///
 /// `Ok(None)` means no address yet.
@@ -125,10 +131,15 @@ pub async fn resolve(client: &Client, config: &Config) -> Result<Option<String>,
     Ok(discovery.into_address())
 }
 
-/// Poll for the gateway Service address and re-announce it via SWIM.
+/// Poll for the gateway Service address and publish it to controllers and SWIM.
 ///
 /// No-op when discovery is disabled or an explicit address override is set.
-pub async fn run_discovery_poller(client: Client, swim: Arc<SwimHandle>, config: Config) {
+pub async fn run_discovery_poller(
+    client: Client,
+    config: Config,
+    resolved_address: tokio::sync::watch::Sender<Option<String>>,
+    swim: tokio::sync::watch::Receiver<Option<Arc<SwimHandle>>>,
+) {
     if !config.discovery_enabled {
         tracing::info!("gateway address discovery disabled; skipping discovery poller");
         return;
@@ -140,29 +151,30 @@ pub async fn run_discovery_poller(client: Client, swim: Arc<SwimHandle>, config:
     let interval = config.discovery_interval();
     let interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
     tracing::info!(interval_ms, "starting gateway address discovery poller");
-    poll_loop(&client, &swim, interval, &config).await;
+    poll_loop(&client, &resolved_address, &swim, interval, &config).await;
 }
 
 /// Inner polling loop; separated to satisfy clippy complexity lints.
-async fn poll_loop(client: &Client, swim: &SwimHandle, interval: Duration, config: &Config) -> ! {
+async fn poll_loop(
+    client: &Client,
+    resolved_address: &tokio::sync::watch::Sender<Option<String>>,
+    swim: &tokio::sync::watch::Receiver<Option<Arc<SwimHandle>>>,
+    interval: Duration,
+    config: &Config,
+) -> ! {
     let mut last: Option<Discovery> = None;
     loop {
-        tokio::time::sleep(interval).await;
         match discover_from_service(client, config).await {
             Ok(discovery) => {
                 log_discovery(&discovery, config, is_new(last.as_ref(), &discovery));
-                // Re-announce even if unchanged: a peer may have joined since.
-                if let Discovery::Found(addr) = &discovery
-                    && let Err(e) = swim.set_gateway_address(Some(addr.clone()))
-                {
-                    tracing::warn!(error = %e, "failed to update gateway address on SWIM handle");
-                }
+                publish_address(resolved_address, swim, discovery.address());
                 last = Some(discovery);
             },
             Err(e) => {
                 tracing::warn!(error = %e, "gateway discovery poll failed; will retry");
             },
         }
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -180,12 +192,48 @@ enum Discovery {
 }
 
 impl Discovery {
+    /// The discovered address, if any, without consuming the outcome.
+    fn address(&self) -> Option<&str> {
+        match self {
+            Self::Found(addr) => Some(addr),
+            Self::NoAddress | Self::NotLoadBalancer(_) | Self::NoService => None,
+        }
+    }
+
     /// The discovered address, if any.
     fn into_address(self) -> Option<String> {
         match self {
             Self::Found(addr) => Some(addr),
             Self::NoAddress | Self::NotLoadBalancer(_) | Self::NoService => None,
         }
+    }
+}
+
+/// Publish a discovery result to controllers and any active SWIM runtime.
+///
+/// Missing discovery results preserve the last published address. This avoids
+/// flapping during Service recreation and keeps the wire format compatible
+/// with peers that treat an empty address as a value.
+fn publish_address(
+    resolved_address: &tokio::sync::watch::Sender<Option<String>>,
+    swim: &tokio::sync::watch::Receiver<Option<Arc<SwimHandle>>>,
+    address: Option<&str>,
+) {
+    let Some(address) = address else {
+        return;
+    };
+    resolved_address.send_if_modified(|current| {
+        if current.as_deref() == Some(address) {
+            false
+        } else {
+            *current = Some(address.to_owned());
+            true
+        }
+    });
+    if let Some(handle) = swim.borrow().as_ref()
+        && let Err(error) = handle.set_gateway_address(Some(address.to_owned()))
+    {
+        tracing::warn!(%error, "failed to update gateway address on SWIM handle");
     }
 }
 
@@ -332,6 +380,70 @@ mod tests {
 
     fn svc_no_status() -> Service {
         Service::default()
+    }
+
+    /// Checks that repeating an address does not notify watch receivers.
+    #[test]
+    fn publishing_an_unchanged_address_does_not_notify_watchers() {
+        let (resolved_address, mut address_rx) = tokio::sync::watch::channel(None);
+        let (_swim_tx, swim_rx) = tokio::sync::watch::channel(None);
+
+        publish_address(&resolved_address, &swim_rx, Some("gateway.test:8080"));
+        assert!(address_rx.has_changed().is_ok_and(|changed| changed));
+        drop(address_rx.borrow_and_update());
+
+        publish_address(&resolved_address, &swim_rx, Some("gateway.test:8080"));
+
+        assert!(address_rx.has_changed().is_ok_and(|changed| !changed));
+    }
+
+    /// Checks that a later poll applies an address after the SWIM handle appears.
+    #[test]
+    fn publishing_updates_a_swim_handle_that_appears_afterward() {
+        let (resolved_address, _address_rx) = tokio::sync::watch::channel(None);
+        let (swim_tx, swim_rx) = tokio::sync::watch::channel(None);
+        let (handle, _gateway_rx) = crate::swim_runtime::test_handle();
+        let handle = Arc::new(handle);
+
+        publish_address(&resolved_address, &swim_rx, Some("gateway.test:8080"));
+        assert_eq!(
+            *resolved_address.borrow(),
+            Some("gateway.test:8080".to_owned()),
+            "the first publication reaches controller watchers"
+        );
+
+        assert!(swim_tx.send(Some(Arc::clone(&handle))).is_ok());
+        publish_address(&resolved_address, &swim_rx, Some("gateway.test:8080"));
+
+        assert_eq!(
+            handle.gateway_address().as_deref(),
+            Some("gateway.test:8080"),
+            "a later poll applies the address to the newly available SWIM handle"
+        );
+    }
+
+    /// Checks that a missing lookup preserves the last address held by SWIM and controllers.
+    #[test]
+    fn publishing_a_missing_lookup_preserves_the_last_address() {
+        let (resolved_address, _address_rx) = tokio::sync::watch::channel(None);
+        let (handle, _gateway_rx) = crate::swim_runtime::test_handle();
+        let handle = Arc::new(handle);
+        assert!(handle.set_gateway_address(Some("gateway.test:8080".to_owned())).is_ok());
+        let (_swim_tx, swim_rx) = tokio::sync::watch::channel(Some(Arc::clone(&handle)));
+
+        publish_address(&resolved_address, &swim_rx, Some("gateway.test:8080"));
+        publish_address(&resolved_address, &swim_rx, None);
+
+        assert_eq!(
+            handle.gateway_address().as_deref(),
+            Some("gateway.test:8080"),
+            "an absent Service lookup must not withdraw the address from SWIM"
+        );
+        assert_eq!(
+            resolved_address.borrow().as_deref(),
+            Some("gateway.test:8080"),
+            "an absent Service lookup must not withdraw the address from controllers"
+        );
     }
 
     #[test]

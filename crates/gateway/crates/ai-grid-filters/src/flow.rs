@@ -181,6 +181,7 @@ fn candidates(model: &str, sites: &[(&str, &str)]) -> Vec<RouteCandidate> {
             publishes_load: true,
             site: (*site).to_owned(),
             stable_id: None,
+            weight: None,
         })
         .collect();
     validate_candidates(raw).expect("valid candidates")

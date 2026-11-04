@@ -35,7 +35,7 @@ const HANG: Duration = Duration::from_secs(60);
 /// client's error instead of a hang.
 #[derive(Debug, Default)]
 pub(crate) struct FakePrometheus {
-    /// `(path, query)` → `(status, body)`.
+    /// `(path, query)` -> `(status, body)`.
     answers: HashMap<(String, String), (u16, String)>,
     /// Sleep before every answer, to exercise timeouts.
     hang: bool,

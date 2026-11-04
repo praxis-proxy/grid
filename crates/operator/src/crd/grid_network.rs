@@ -926,6 +926,10 @@ impl GatewayRef {
     reason = "wire-compatible opt-in and attestation fields are separate"
 )]
 #[schemars(transform = add_consumer_config_legacy_fields)]
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": "!has(self.sovereignty) || (has(self.siteRouter) && self.siteRouter == 'gridSiteRoute')",
+    "message": "sovereignty is applied only by siteRouter gridSiteRoute"
+}]))]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumerConfig {
     /// Enable operator-managed consumer Praxis config generation for this gateway.
@@ -1046,6 +1050,55 @@ pub struct ConsumerConfig {
     /// Default: `intelligentRoute`.
     #[serde(default)]
     pub site_router: SiteRouter,
+
+    /// The sovereignty fence `gridSiteRoute` applies: the header naming the zones a request
+    /// may be served in, and whether it refuses or only audits. Under any other router the
+    /// config is not rendered, and the status names `SovereigntyWithoutGridSiteRoute`.
+    ///
+    /// Default: unset, no fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sovereignty: Option<SovereigntyFence>,
+}
+
+/// A `gridSiteRoute` sovereignty fence.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SovereigntyFence {
+    /// Request header naming the zones a request may be served in: one zone, or a
+    /// comma-separated list in a single header line, matched against each `GridSite`
+    /// `sovereigntyZone`. The upstream that sets it must replace, never append to, a
+    /// caller's copy.
+    #[schemars(regex(pattern = "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$"), length(max = 63))]
+    pub header: String,
+
+    /// What the fence does with a request it does not admit.
+    ///
+    /// Default: `enforce`.
+    #[serde(default)]
+    pub mode: FenceMode,
+}
+
+/// What a sovereignty fence does with a request it does not admit.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FenceMode {
+    /// Refuse it: 400 for no valid zone, 403 when no site in its zones serves it.
+    #[default]
+    Enforce,
+    /// Route it as if unfenced, and log and count what would be refused.
+    Audit,
+}
+
+impl FenceMode {
+    /// The value `grid_site_route` reads.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforce => "enforce",
+            Self::Audit => "audit",
+        }
+    }
 }
 
 /// The filter an operator-generated consumer config routes with.
@@ -1187,6 +1240,7 @@ impl Default for ConsumerConfig {
             listener_port: default_listener_port(),
             telemetry: None,
             site_router: SiteRouter::IntelligentRoute,
+            sovereignty: None,
         }
     }
 }

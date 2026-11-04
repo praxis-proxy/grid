@@ -11,7 +11,7 @@
 #   cargo xtask env up -c tests/env/operator-routing-two-provider.toml
 #   cargo xtask env load-gateway-images -c tests/env/operator-routing-two-provider.toml
 #
-# Operator routing validation (two-provider, model-east → site-east, model-west → site-west):
+# Operator routing validation (two-provider, model-east -> site-east, model-west -> site-west):
 #   cargo xtask env validate-operator-routing -c tests/env/operator-routing-two-provider.toml
 #
 # Gateway E2E (static consumer routing without operator):

@@ -14,11 +14,11 @@
 //! # Wire format
 //!
 //! ```text
-//! ┌──────────┬─────────┬──────────────┬──────────────────────────────┐
-//! │ MAGIC    │ VERSION │ NONCE        │ CIPHERTEXT + GCM TAG         │
-//! │ 4 bytes  │ 1 byte  │ 12 bytes     │ plaintext.len() + 16 bytes   │
-//! │ b"GRID"  │ 0x01    │ random       │ AES-256-GCM AEAD output      │
-//! └──────────┴─────────┴──────────────┴──────────────────────────────┘
+//! +----------+---------+--------------+------------------------------+
+//! | MAGIC    | VERSION | NONCE        | CIPHERTEXT + GCM TAG         |
+//! | 4 bytes  | 1 byte  | 12 bytes     | plaintext.len() + 16 bytes   |
+//! | b"GRID"  | 0x01    | random       | AES-256-GCM AEAD output      |
+//! +----------+---------+--------------+------------------------------+
 //! ```
 //!
 //! Total overhead per packet: 33 bytes.

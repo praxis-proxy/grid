@@ -7,8 +7,9 @@
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     /// Names `describe_metrics` documents, which a scrape must explain.
-    const DOCUMENTED: [&str; 33] = [
+    const DOCUMENTED: [&str; 35] = [
         "grid_route_decisions_total",
+        "grid_route_fenced_total",
         "grid_route_selections_total",
         "grid_route_prefix_affinity_total",
         "grid_serving_config_reload_total",
@@ -33,6 +34,7 @@ mod tests {
         "grid_route_site_last_sample_age_seconds",
         "grid_route_site_round_age_seconds",
         "grid_route_site_score",
+        "grid_route_site_score_unavailable",
         "grid_route_shedding",
         "grid_signals_poll_total",
         "grid_signals_ingest_dropped_total",
@@ -67,6 +69,7 @@ mod tests {
         ai_grid_filters::describe_metrics();
 
         metrics::counter!("grid_route_decisions_total").increment(1);
+        metrics::counter!("grid_route_fenced_total", "cause" => "zone_required", "enforced" => "true").increment(1);
         metrics::counter!("grid_route_selections_total", "path" => "cross_site").increment(1);
         metrics::counter!("grid_route_prefix_affinity_total", "outcome" => "hit").increment(1);
         metrics::counter!("grid_serving_config_reload_total", "result" => "ok").increment(1);
@@ -74,6 +77,13 @@ mod tests {
         for name in SITE_GAUGES {
             metrics::gauge!(name, "site" => "east").set(1.0);
         }
+        metrics::gauge!(
+            "grid_route_site_score_unavailable",
+            "site" => "east",
+            "cluster" => "pool-east",
+            "reason" => "absent"
+        )
+        .set(1.0);
         metrics::gauge!("grid_route_shedding", "model" => "llama").set(0.0);
         metrics::counter!("grid_signals_poll_total", "result" => "ok").increment(1);
         metrics::counter!("grid_signals_ingest_dropped_total", "reason" => "skew").increment(1);

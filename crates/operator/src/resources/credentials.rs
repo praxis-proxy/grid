@@ -96,7 +96,7 @@ pub enum CredentialPlan {
     /// `spec.auth` is absent; no credential injection.
     Absent,
 
-    /// `auth.credentials_managed_externally = true` — the user manages credentials; the operator does not inject.
+    /// `auth.credentials_managed_externally = true` -- the user manages credentials; the operator does not inject.
     Manual,
 
     /// `auth.strategy = bearer_token`: resolve a bearer token from the referenced Secret.

@@ -142,7 +142,7 @@ impl MembershipSnapshot {
     /// | Snapshot state | Hint |
     /// |----------------|------|
     /// | Empty | `None` (caller uses its own phase logic) |
-    /// | ≥1 `Alive` member | `Some(Active)` (network is operational) |
+    /// | >=1 `Alive` member | `Some(Active)` (network is operational) |
     /// | Members exist, all `Suspect`/`Dead` | `Some(Degraded)` (network is impaired) |
     ///
     /// The caller applies the hint on top of its existing phase logic, so an

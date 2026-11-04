@@ -29,9 +29,12 @@ fn seeded() -> (FakeApi, String) {
 /// One reconcile of the site at `path` under `membership`.
 async fn reconcile_under(api: &FakeApi, path: &str, membership: Membership) {
     let site: GridSite = fixtures::stored(api, path);
+    let (_gateway_address_tx, gateway_address) = tokio::sync::watch::channel(None);
     let ctx = Arc::new(grid_site::SiteContext {
         client: Arc::new(api.client("default")),
         membership,
+        site_name: None,
+        gateway_address,
     });
     Box::pin(grid_site::reconcile(Arc::new(site), ctx))
         .await

@@ -13,6 +13,7 @@ mod descriptor;
 mod dial;
 #[cfg(test)]
 mod flow;
+mod geo;
 mod health;
 mod metadata;
 mod pin;
@@ -50,7 +51,7 @@ pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;
 
 /// Grid counters the gateway emits, with the help text a scrape shows.
-const COUNTER_HELP: [(&str, &str); 11] = [
+const COUNTER_HELP: [(&str, &str); 12] = [
     (
         "grid_route_decisions_total",
         "Requests the gateway decided, by outcome. A refusal records an empty site and cluster.",
@@ -58,6 +59,10 @@ const COUNTER_HELP: [(&str, &str); 11] = [
     (
         "grid_route_selections_total",
         "Decisions by the path that produced them.",
+    ),
+    (
+        "grid_route_fenced_total",
+        "Requests the sovereignty fence refused, or would have when it only logs, by cause.",
     ),
     (
         "grid_route_prefix_affinity_total",
@@ -92,7 +97,7 @@ const COUNTER_HELP: [(&str, &str); 11] = [
 ];
 
 /// Grid gauges the gateway emits.
-const GAUGE_HELP: [(&str, &str); 22] = [
+const GAUGE_HELP: [(&str, &str); 23] = [
     (
         "grid_serving_unbound_provider_hops",
         "Provider hops the applied serving config declares that no startup-verified backend binds. Their candidates take no traffic until a serving config names the SNI that backend verified at startup, or, for a backend not verified at startup, until the gateway restarts.",
@@ -168,6 +173,10 @@ const GAUGE_HELP: [(&str, &str); 22] = [
     (
         "grid_route_site_score",
         "Score the site ranks by in the current snapshot. NaN when excluded or demoted.",
+    ),
+    (
+        "grid_route_site_score_unavailable",
+        "1 when an otherwise routable load-publishing site has no queue score, by bounded reason: absent, stale, or unreadable. 0 otherwise.",
     ),
     (
         "grid_route_shedding",

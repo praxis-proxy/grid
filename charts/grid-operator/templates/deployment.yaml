@@ -160,6 +160,10 @@ spec:
             {{- end }}
             - name: GRID_GATEWAY_DISCOVERY_ENABLED
               value: {{ (ne (toString .Values.gateway.discoveryEnabled) "false") | quote }}
+            {{- with (.Values.modelDiscovery).ttlSeconds }}
+            - name: GRID_MODEL_DISCOVERY_TTL_SECS
+              value: {{ . | quote }}
+            {{- end }}
             {{- /* Start in the modes the install declares, so its GridNetwork appearing restarts nothing. */}}
             {{- with (.Values.grid).signals }}
             - name: GRID_SIGNAL_TRANSPORT

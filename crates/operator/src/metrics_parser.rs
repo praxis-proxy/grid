@@ -66,7 +66,7 @@ pub struct MetricNames {
 
     /// Metric name for a health liveness gauge (any positive value = healthy).
     ///
-    /// If absent, liveness is inferred: `error_rate < 1.0` → healthy.
+    /// If absent, liveness is inferred: `error_rate < 1.0` -> healthy.
     /// If both are absent, the backend is assumed healthy (conservative default).
     pub healthy: Option<String>,
 
@@ -151,8 +151,8 @@ impl PartialMetrics {
     /// | `prefix_cache_hit_ratio` | `0.5` (neutral score for missing prefix-cache data) |
     ///
     /// The `healthy` bool is derived as follows:
-    /// - If a health gauge was scraped: positive non-zero → `true`, zero → `false`.
-    /// - Otherwise, if `error_rate` is present: `error_rate < 1.0` → `true`.
+    /// - If a health gauge was scraped: positive non-zero -> `true`, zero -> `false`.
+    /// - Otherwise, if `error_rate` is present: `error_rate < 1.0` -> `true`.
     /// - Otherwise: `true` (conservative default).
     #[must_use]
     pub fn into_backend_metrics(self) -> BackendMetrics {
@@ -303,7 +303,7 @@ pub fn parse_prometheus_text(text: &str, names: &MetricNames) -> Result<PartialM
 
 /// Strip a Prometheus label selector from a metric name token.
 ///
-/// `"my_metric{foo=\"bar\"}"` → `"my_metric"`.
+/// `"my_metric{foo=\"bar\"}"` -> `"my_metric"`.
 /// Tokens without labels are returned unchanged.
 fn strip_labels(name_with_labels: &str) -> &str {
     name_with_labels
@@ -313,7 +313,7 @@ fn strip_labels(name_with_labels: &str) -> &str {
 
 /// Check whether a metric name token contains a specific label key-value pair.
 ///
-/// `has_label_value("my_metric{name=\"pool-a\",zone=\"us\"}", "name", "pool-a")` → `true`.
+/// `has_label_value("my_metric{name=\"pool-a\",zone=\"us\"}", "name", "pool-a")` -> `true`.
 ///
 /// Returns `false` when the token has no labels or the label is absent/mismatched.
 fn has_label_value(name_with_labels: &str, label_key: &str, expected_value: &str) -> bool {
@@ -436,16 +436,16 @@ mod tests {
         let text = "test_queue_depth 0.5\n";
         let names = names_for_all_signals();
         let result = parse_prometheus_text(text, &names).unwrap();
-        assert_eq!(result.queue_depth, Some(0.5_f64), "configured and present → Some");
-        assert!(result.kv_cache_utilization.is_none(), "not in text → None");
-        assert!(result.latency_p99_ms.is_none(), "not in text → None");
-        assert!(result.prefix_cache_hit_ratio.is_none(), "not in text → None");
+        assert_eq!(result.queue_depth, Some(0.5_f64), "configured and present -> Some");
+        assert!(result.kv_cache_utilization.is_none(), "not in text -> None");
+        assert!(result.latency_p99_ms.is_none(), "not in text -> None");
+        assert!(result.prefix_cache_hit_ratio.is_none(), "not in text -> None");
     }
 
     #[test]
     fn malformed_lines_do_not_panic_and_are_skipped() {
         // Lines without a parseable float value must be skipped silently.
-        // "not_a_number" cannot be parsed as f64 → the metric is absent.
+        // "not_a_number" cannot be parsed as f64 -> the metric is absent.
         // A bare metric name with no value token is also skipped.
         let text = "not_a_metric_line\n\
                     test_queue_depth   \n\
@@ -591,7 +591,7 @@ test_kv_cache{model="llama"} 0.3
         assert_eq!(
             result,
             PartialMetrics::default(),
-            "no configured names → all fields remain None"
+            "no configured names -> all fields remain None"
         );
     }
 
@@ -657,7 +657,7 @@ test_kv_cache{model="llama"} 0.3
         };
         assert!(
             partial.into_backend_metrics().healthy,
-            "positive health gauge → healthy"
+            "positive health gauge -> healthy"
         );
     }
 
@@ -667,7 +667,10 @@ test_kv_cache{model="llama"} 0.3
             healthy: Some(0.0),
             ..Default::default()
         };
-        assert!(!partial.into_backend_metrics().healthy, "zero health gauge → unhealthy");
+        assert!(
+            !partial.into_backend_metrics().healthy,
+            "zero health gauge -> unhealthy"
+        );
     }
 
     #[test]
@@ -696,7 +699,7 @@ test_kv_cache{model="llama"} 0.3
 
     #[test]
     fn health_gauge_takes_precedence_over_error_rate() {
-        // healthy=0 (unhealthy gauge) even though error_rate < 1.0 → unhealthy.
+        // healthy=0 (unhealthy gauge) even though error_rate < 1.0 -> unhealthy.
         let partial = PartialMetrics {
             healthy: Some(0.0),
             error_rate: Some(0.1),
@@ -923,7 +926,7 @@ my_metric{name="pool-y"} 0.9
             ..Default::default()
         };
         let result = parse_prometheus_text(text, &names).unwrap();
-        assert_eq!(result.queue_depth, Some(0.3), "no capacity → raw value passes through");
+        assert_eq!(result.queue_depth, Some(0.3), "no capacity -> raw value passes through");
     }
 
     #[test]
