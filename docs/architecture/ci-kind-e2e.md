@@ -43,6 +43,12 @@ positive and negative security probes before it can report success.
 Topology and execution details are maintained in the
 [single-cluster topology README](../../tests/e2e/topologies/grid-single-cluster-multi-gateway/README.md).
 
+## Single-cluster Local-status coverage
+
+| Validation | Behavior proven |
+|---|---|
+| `verify-local-site-status` | Local-membership site phase reasons (`GatewayAddressMissing`, `SignalsAddressMissing`), `NoDeclaredPeers` peer conditions, `Available=True`, `Degraded=False` rollup, and condition clearing once a peer is declared. |
+
 ## Multi-cluster coverage set
 
 | Validation | Behavior proven |
@@ -54,7 +60,6 @@ Topology and execution details are maintained in the
 | `verify-stale-gc-ttl` | Aged stale candidates are omitted from rendered overlays when TTL is configured. |
 | `verify-api-fallback-native` | Provider credentials are injected from mounted Secret files, not overlay or ConfigMap token bytes. |
 | `verify-failover-under-lost-peer` | Lost peer state degrades remote candidates and routes shared-model traffic to healthy fallback capacity. |
-| `verify-local-site-status` | Local-membership site phase reasons (`GatewayAddressMissing`, `SignalsAddressMissing`), `NoDeclaredPeers` peer conditions, `Available=True`, `Degraded=False` rollup, and condition clearing once a peer is declared. |
 
 ## Sequencing requirements
 

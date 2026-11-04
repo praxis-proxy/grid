@@ -5991,11 +5991,11 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
 
 /// Verify `GridSite` and `GridNetwork` peer-condition status under Local membership.
 ///
-/// Asserts five checkpoints on an out-of-cluster operator:
+/// Asserts five checkpoints against an out-of-cluster operator under Local membership:
 ///
-/// 1. **Before delivery** - no `GridSite` exists yet.
-/// 2. **`GatewayAddressMissing`** - own `GridSite` Pending/GatewayAddressMissing when no endpoint is set.
-/// 3. **`SignalsAddressMissing`** - own `GridSite` Pending/SignalsAddressMissing when endpoint is a loopback address.
+/// 1. **Clean slate** - no `GridSite` exists before the network is delivered.
+/// 2. **Operator started** - operator spawned with `GRID_MEMBERSHIP_SOURCE=Local`.
+/// 3. **Site phase reasons** - own site advances `GatewayAddressMissing` → `SignalsAddressMissing`.
 /// 4. **Rollup** - all 5 peer conditions are `Unknown/NoDeclaredPeers`; `Available=True`; `Degraded=False/AsExpected`.
 /// 5. **After peer declared** - all 5 peer conditions leave `NoDeclaredPeers`.
 fn env_verify_local_site_status(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
@@ -6003,17 +6003,20 @@ fn env_verify_local_site_status(config: &Path, site: Option<&str>) -> Result<(),
         AS_EXPECTED, LOCAL_STATUS_CA_SECRET, LOCAL_STATUS_DNS_SAN, LOCAL_STATUS_NETWORK, LOCAL_STATUS_OWN_SITE,
         LOCAL_STATUS_PEER_SITE, LOCAL_STATUS_POLL_TIMEOUT, LOCAL_STATUS_TLS_SECRET, NO_DECLARED_PEERS,
         PEER_CATALOGS_ACCEPTED, PEER_MEMBERSHIP, PEER_POLLS_COMPLETE, PEER_SIGNALS_REACHABLE, PEER_TIME_VALID,
-        SIGNALS_ADDRESS_MISSING,
+        PEER_TIMESTAMPS_VALID, SIGNALS_ADDRESS_MISSING, SIGNALS_REACHABLE,
     };
 
     let cfg = EnvConfig::from_file(config)?;
     let context = resolve_operator_context(&cfg, site)?;
     eprintln!("verify-local-site-status: context={context}");
 
-    eprintln!("verify-local-site-status: [1/5] preflight + TLS + network...");
+    eprintln!("verify-local-site-status: [1/5] preflight: CRDs, clean slate, no stale GridSite...");
     operator::install_grid_crds(&context)?;
     operator::cleanup_local_status_resources(&context);
+    operator::assert_gridsite_absent(&context, LOCAL_STATUS_OWN_SITE)?;
+    eprintln!("  [OK] no GridSite {LOCAL_STATUS_OWN_SITE:?} before network delivery");
 
+    eprintln!("verify-local-site-status: TLS + network...");
     let ca = ::certs::generate_ca("local-status-test-ca").map_err(|e| format!("CA gen failed: {e}"))?;
     let cert = ::certs::generate_dns_cert(&ca, LOCAL_STATUS_OWN_SITE, LOCAL_STATUS_DNS_SAN)
         .map_err(|e| format!("site cert gen failed: {e}"))?;
@@ -6062,11 +6065,11 @@ fn env_verify_local_site_status(config: &Path, site: Option<&str>) -> Result<(),
         LOCAL_STATUS_NETWORK,
         LOCAL_STATUS_PEER_SITE,
         &[
-            PEER_SIGNALS_REACHABLE,
-            PEER_CATALOGS_ACCEPTED,
-            PEER_POLLS_COMPLETE,
-            PEER_TIME_VALID,
-            PEER_MEMBERSHIP,
+            (PEER_SIGNALS_REACHABLE, SIGNALS_REACHABLE),
+            (PEER_CATALOGS_ACCEPTED, PEER_CATALOGS_ACCEPTED),
+            (PEER_POLLS_COMPLETE, PEER_POLLS_COMPLETE),
+            (PEER_TIME_VALID, PEER_TIMESTAMPS_VALID),
+            (PEER_MEMBERSHIP, PEER_MEMBERSHIP),
         ],
         NO_DECLARED_PEERS,
         SIGNALS_ADDRESS_MISSING,
@@ -6091,6 +6094,8 @@ fn env_verify_local_site_status(config: &Path, site: Option<&str>) -> Result<(),
 /// 3. Confirms all `peer_conditions` are `Unknown/NoDeclaredPeers`.
 /// 4. Confirms `Available=True` and `Degraded=False/AsExpected` on the network.
 /// 5. Declares a peer and confirms every condition leaves `no_peers_reason`.
+///
+/// The caller is responsible for asserting that no `GridSite` exists before this runs.
 #[expect(
     clippy::too_many_arguments,
     reason = "each parameter is a distinct field of the K8s condition object"
@@ -6100,21 +6105,14 @@ fn run_local_site_status_checks(
     own_site: &str,
     network: &str,
     peer_site: &str,
-    peer_conditions: &[&str],
+    peer_conditions: &[(&str, &str)],
     no_peers_reason: &str,
     signals_address_missing: &str,
     degraded_ok_reason: &str,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("verify-local-site-status: [3/5] asserting no GridSite before own-site delivery...");
-    let phase = operator::read_gridsite_phase(context, own_site).unwrap_or_default();
-    if !phase.is_empty() {
-        return Err(format!("GridSite {own_site:?} exists before delivery (phase={phase:?})").into());
-    }
-    eprintln!("  [OK] no GridSite present before delivery");
-
     eprintln!(
-        "verify-local-site-status: [4/5] own-site phase reasons: GatewayAddressMissing → SignalsAddressMissing..."
+        "verify-local-site-status: [3/5] own-site phase reasons: GatewayAddressMissing → SignalsAddressMissing..."
     );
     let own_site_json = serde_json::to_string_pretty(&serde_json::json!({
         "apiVersion": "grid.praxis.fast/v1alpha1",
@@ -6152,9 +6150,9 @@ fn run_local_site_status_checks(
     )?;
     eprintln!("  [OK] GridSite {own_site:?}: Pending/{signals_address_missing}");
 
-    eprintln!("verify-local-site-status: [5/5] peer conditions + network rollup + peer declared...");
-    for cond in peer_conditions {
-        operator::wait_for_network_condition(context, network, cond, "Unknown", no_peers_reason, timeout)?;
+    eprintln!("verify-local-site-status: [4/5] peer conditions + network rollup...");
+    for &(type_, _) in peer_conditions {
+        operator::wait_for_network_condition(context, network, type_, "Unknown", no_peers_reason, timeout)?;
     }
     eprintln!("  [OK] all 5 peer conditions: Unknown/{no_peers_reason}");
 
@@ -6175,10 +6173,11 @@ fn run_local_site_status_checks(
     }))?;
     kubectl::apply_manifest(context, &peer_site_json)?;
 
-    for cond in peer_conditions {
-        operator::wait_for_network_condition_not_reason(context, network, cond, no_peers_reason, timeout)?;
+    eprintln!("verify-local-site-status: [5/5] peer declared: conditions leave NoDeclaredPeers and go True...");
+    for &(type_, true_reason) in peer_conditions {
+        operator::wait_for_network_condition(context, network, type_, "True", true_reason, timeout)?;
     }
-    eprintln!("  [OK] all 5 peer conditions left {no_peers_reason} after peer declared");
+    eprintln!("  [OK] all 5 peer conditions True after peer declared");
     Ok(())
 }
 

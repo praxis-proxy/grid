@@ -3921,7 +3921,7 @@ impl PeerPoller {
             .filter(|site| !answered.contains_key(*site))
             .cloned()
             .collect();
-        if self.ctx.membership() == Membership::Local && identities.peers_besides(&local_site) == 0 {
+        if lone_round(self.ctx.membership(), &identities, &local_site) {
             Box::pin(self.report_no_peers(membership_ready)).await;
             return;
         }
@@ -4115,6 +4115,11 @@ struct NetworkWritten {
 /// the round waits.
 fn idle_round(membership: Membership, peers_read: bool) -> bool {
     membership == Membership::Local && peers_read
+}
+
+/// Whether a round has no peer `GridSite` declared besides this site, under Local membership.
+fn lone_round(membership: Membership, identities: &operator::signals::PeerIdentities, local_site: &str) -> bool {
+    membership == Membership::Local && identities.peers_besides(local_site) == 0
 }
 
 /// Withdraw what a Local run left on the `GridNetwork`, so a site now under Swim is not
@@ -6307,23 +6312,21 @@ mod tests {
     #[test]
     fn report_no_peers_dispatches_on_local_membership_without_declared_peers() {
         use operator::signals::{PeerIdentities, PeerRecord};
-        let dispatches = |membership: Membership, site: &str, identities: &PeerIdentities| {
-            membership == Membership::Local && identities.peers_besides(site) == 0
-        };
+        let dispatches = lone_round;
 
         let identities = PeerIdentities::new();
         assert!(
-            !dispatches(Membership::Swim, "site-a", &identities),
+            !dispatches(Membership::Swim, &identities, "site-a"),
             "Swim membership never dispatches to report_no_peers"
         );
         assert!(
-            dispatches(Membership::Local, "site-a", &identities),
+            dispatches(Membership::Local, &identities, "site-a"),
             "Local with empty store dispatches to report_no_peers"
         );
 
         identities.set(BTreeMap::from([("site-a".to_owned(), PeerRecord::default())]));
         assert!(
-            dispatches(Membership::Local, "site-a", &identities),
+            dispatches(Membership::Local, &identities, "site-a"),
             "Local with only own record dispatches to report_no_peers"
         );
 
@@ -6332,7 +6335,7 @@ mod tests {
             ("site-b".to_owned(), PeerRecord::default()),
         ]));
         assert!(
-            !dispatches(Membership::Local, "site-a", &identities),
+            !dispatches(Membership::Local, &identities, "site-a"),
             "Local with a declared peer does not dispatch to report_no_peers"
         );
     }

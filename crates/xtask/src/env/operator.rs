@@ -673,6 +673,12 @@ pub(crate) const PEER_MEMBERSHIP: &str = "PeerMembership";
 /// Reason every peer condition carries while no peer `GridSite` is declared.
 pub(crate) const NO_DECLARED_PEERS: &str = "NoDeclaredPeers";
 
+/// `PeerSignalsReachable` reason when every declared peer is reachable or endpoint-less.
+pub(crate) const SIGNALS_REACHABLE: &str = "SignalsReachable";
+
+/// `PeerTimeValid` reason when no relayed peer age is rejected.
+pub(crate) const PEER_TIMESTAMPS_VALID: &str = "PeerTimestampsValid";
+
 /// `GridSite` phase reason when the gateway endpoint is set but its address is not dialable.
 pub(crate) const SIGNALS_ADDRESS_MISSING: &str = "SignalsAddressMissing";
 
@@ -1348,6 +1354,7 @@ pub(crate) fn spawn_operator(context: &str) -> Result<Child, Box<dyn std::error:
 /// Sets `GRID_MEMBERSHIP_SOURCE=Local` and `GRID_SITE_NAME` so the operator
 /// does not start SWIM and uses the given name for its own `GridSite`.
 pub(crate) fn spawn_local_operator(context: &str, site_name: &str) -> Result<Child, Box<dyn std::error::Error>> {
+    ensure_operator_binary_built()?;
     eprintln!("  setting kubectl context to {context}...");
     Command::new("kubectl")
         .args(["config", "use-context", context])
@@ -6401,6 +6408,34 @@ pub(crate) fn read_gridsite_phase(context: &str, site_name: &str) -> Result<Stri
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
+/// Assert that `GridSite` `site_name` does not exist in `context`.
+///
+/// Returns `Ok(())` when the API server responds with `NotFound`. Returns `Err` when
+/// the site exists (reports its phase) or when `kubectl` fails for any other reason
+/// (wrong context, unreachable API server, etc.).
+pub(crate) fn assert_gridsite_absent(context: &str, site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "get",
+            "gridsites",
+            site_name,
+            "-o",
+            "jsonpath={.status.phase}",
+        ])
+        .output()?;
+    if out.status.success() {
+        let phase = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        return Err(format!("GridSite {site_name:?} already exists (phase={phase:?})").into());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("NotFound") {
+        return Ok(());
+    }
+    Err(format!("kubectl get gridsites/{site_name} failed: {stderr}").into())
+}
+
 /// Poll until `GridSite` `site_name` reaches `expected_phase`, or return `Err` on timeout.
 ///
 /// The polling interval is 2 seconds, matching the pattern used by
@@ -7741,42 +7776,6 @@ pub(crate) fn wait_for_network_condition(
         eprintln!(
             "  waiting for GridNetwork {network:?} {type_:?}={expected_status}/{expected_reason} \
              (current: {status:?}/{reason:?})..."
-        );
-        std::thread::sleep(POLL_INTERVAL);
-    }
-}
-
-/// Poll until `GridNetwork` `network`'s condition `type_` carries any reason except `excluded_reason`.
-#[expect(clippy::disallowed_methods, reason = "synchronous poll loop in xtask harness")]
-pub(crate) fn wait_for_network_condition_not_reason(
-    context: &str,
-    network: &str,
-    type_: &str,
-    excluded_reason: &str,
-    timeout: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let start = Instant::now();
-    let resource = format!("gridnetworks/{network}");
-    let jsonpath = format!("{{.status.conditions[?(@.type==\"{type_}\")].reason}}");
-    loop {
-        drop(bump_gridnetwork(context, network));
-        let reason = kubectl_jsonpath(context, &resource, &jsonpath).unwrap_or_default();
-        if !reason.is_empty() && reason != excluded_reason {
-            eprintln!(
-                "  [OK] GridNetwork {network:?} condition {type_:?}: reason={reason:?} (left {excluded_reason:?})"
-            );
-            return Ok(());
-        }
-        if start.elapsed() >= timeout {
-            return Err(format!(
-                "timeout waiting for GridNetwork {network:?} condition {type_:?} \
-                 to leave reason={excluded_reason:?}; last: {reason:?}"
-            )
-            .into());
-        }
-        eprintln!(
-            "  waiting for GridNetwork {network:?} {type_:?} to leave {excluded_reason:?} \
-             (current: {reason:?})..."
         );
         std::thread::sleep(POLL_INTERVAL);
     }
