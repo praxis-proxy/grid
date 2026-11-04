@@ -1699,18 +1699,23 @@ async fn apply_signed_state(
 
     let client = &ctx.client;
 
-    // Peers that cannot be re-verified keep their pins: a transient read failure must not drop all state.
+    // Failed verification preserves cached pins only while the provider-network binding is unchanged.
     let peer_pins = match collect_gossip_peer_pins(network, client, swim.site_name()).await {
         Ok(peer_pins) => Some(peer_pins),
         Err(error) => {
-            tracing::warn!(%grid_id, %error, "keeping installed SWIM peer pins: peers could not be re-verified");
+            tracing::warn!(%grid_id, %error, "SWIM peer pins could not be re-verified; retaining pins only for an unchanged provider-network binding");
             None
         },
     };
     let local_signing_key = load_gossip_signing_identity(network, client, swim.site_name()).await;
     let signing_ready = local_signing_key.is_some();
-    swim.set_grid_trust_snapshot(grid_id.to_owned(), local_signing_key, peer_pins)
-        .map_err(|error| OperatorError::InvalidResource(error.to_string()))?;
+    swim.set_grid_trust_snapshot(
+        grid_id.to_owned(),
+        grid_network_name(network)?.to_owned(),
+        local_signing_key,
+        peer_pins,
+    )
+    .map_err(|error| OperatorError::InvalidResource(error.to_string()))?;
     Ok(signing_ready)
 }
 
@@ -3307,15 +3312,24 @@ async fn reconcile_routing_overlay_inner(
     let mut overlay_statuses: Vec<OverlayRevisionStatus> = Vec::new();
     let mut serving_retry: Option<Duration> = None;
     let mut inventory_expiry_deadline: Option<time::OffsetDateTime> = None;
+    let eligible_remote_owned: Vec<crdt::ProviderState> =
+        filter_eligible_remote_crdt_providers(network_name, &sites, remote_crdt_providers, signal)
+            .into_iter()
+            .cloned()
+            .collect();
+    let filtered_count = remote_crdt_providers.len() - eligible_remote_owned.len();
+    if filtered_count > 0 {
+        tracing::debug!(
+            network = network_name,
+            total_remote = remote_crdt_providers.len(),
+            filtered = filtered_count,
+            eligible = eligible_remote_owned.len(),
+            "filtered remote CRDT providers: source GridSite not Active"
+        );
+    }
+
     // Peer records are the same for every gateway; only Local reads them from verified peers.
-    let peer_catalog = member_catalogs.then(|| {
-        derived_topology::peer_catalog(filter_eligible_remote_crdt_providers(
-            network_name,
-            &sites,
-            remote_crdt_providers,
-            signal,
-        ))
-    });
+    let peer_catalog = member_catalogs.then(|| derived_topology::peer_catalog(&eligible_remote_owned));
 
     for gw_ref in &network.spec.consumer_gateways {
         // Each gateway identifies its own local site.  Fall back to the
@@ -3325,26 +3339,6 @@ async fn reconcile_routing_overlay_inner(
         // Before anything that can skip this gateway, so a removed site never outlives a failed render.
         if serving.is_some() {
             revoke_provider_admission(network_name, gw_ref, &admitted, client).await;
-        }
-
-        // Filter remote CRDT providers to those whose source GridSite is Active.
-        // Providers from sites in any other phase (Discovered, Connecting, Pending,
-        // Unreachable, Left, or missing) are excluded before the overlay is rendered.
-        // This is the routing eligibility gate: SWIM membership alone does not
-        // make a remote site routable.
-        let eligible_remote: Vec<&crdt::ProviderState> =
-            filter_eligible_remote_crdt_providers(network_name, &sites, remote_crdt_providers, signal);
-        let eligible_remote_owned: Vec<crdt::ProviderState> = eligible_remote.into_iter().cloned().collect();
-        let filtered_count = remote_crdt_providers.len() - eligible_remote_owned.len();
-        if filtered_count > 0 {
-            tracing::debug!(
-                network = network_name,
-                gateway = %gw_ref.name,
-                total_remote = remote_crdt_providers.len(),
-                filtered = filtered_count,
-                eligible = eligible_remote_owned.len(),
-                "filtered remote CRDT providers: source GridSite not Active"
-            );
         }
 
         let timestamp = rfc3339_now();
@@ -10194,6 +10188,22 @@ mod tests {
                 "{reconcile} reconcile carries the site certificate for late joiners"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn signed_state_scope_comes_from_the_local_network_even_without_signer_or_pins() -> Result<(), OperatorError>
+    {
+        let client = crate::resources::test_doubles::mock_kube_client_with_secrets(HashMap::new());
+        let ctx = OperatorCtx::new(client, None, SignalMode::default());
+        let (swim, mut runtime) = SwimHandle::detached("site-a");
+        let network = network_with_endpoint_transport("plaintext", None);
+        apply_signed_state(&network, &ctx, &swim, "authenticated-grid-id", SignedStateMode::Enforce).await?;
+        assert_eq!(
+            runtime.network_scopes_sent(),
+            [("authenticated-grid-id".to_owned(), "glb-demo".to_owned())],
+            "resource metadata.name authorizes provider networks independently of signer and peer-pin readiness"
+        );
+        Ok(())
     }
 
     #[tokio::test]
