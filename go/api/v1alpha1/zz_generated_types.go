@@ -176,6 +176,14 @@ const (
 	GridNetworkConsumerGatewaysItemPraxisConfigSiteRouterGridSiteRoute    GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter = "gridSiteRoute"
 )
 
+// GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode is a string enumeration.
+type GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode string
+
+const (
+	GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyModeEnforce GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode = "enforce"
+	GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyModeAudit   GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode = "audit"
+)
+
 // GridNetworkMembershipMode is a string enumeration.
 type GridNetworkMembershipMode string
 
@@ -524,6 +532,16 @@ type GridNetworkConsumerGatewaysItemPraxisConfigMountReconciliation struct {
 	Enabled bool `json:"enabled,omitempty"`
 }
 
+// GridNetworkConsumerGatewaysItemPraxisConfigSovereignty The sovereignty fence gridSiteRoute applies: the header naming the zones a request may be served in, and whether it refuses or only audits. Under any other router the config is not rendered, and the status names SovereigntyWithoutGridSiteRoute.
+// Default: unset, no fence.
+type GridNetworkConsumerGatewaysItemPraxisConfigSovereignty struct {
+	// Request header naming the zones a request may be served in: one zone, or a comma-separated list in a single header line, matched against each GridSite sovereigntyZone. The upstream that sets it must replace, never append to, a caller's copy.
+	Header string `json:"header"`
+	// What the fence does with a request it does not admit.
+	// Default: enforce.
+	Mode GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode `json:"mode,omitempty"`
+}
+
 // GridNetworkConsumerGatewaysItemPraxisConfigTelemetry Optional OpenTelemetry exporter and sampling settings for this gateway.
 // When present, the generated Praxis configuration opts into telemetry and adds the trace_context filter for outbound W3C header propagation. Collector authentication must be provided to the gateway Deployment via OTEL_EXPORTER_OTLP_HEADERS from a Secret; credentials are never copied into this ConfigMap.
 type GridNetworkConsumerGatewaysItemPraxisConfigTelemetry struct {
@@ -580,6 +598,9 @@ type GridNetworkConsumerGatewaysItemPraxisConfig struct {
 	// gridSiteRoute reads the serving config, so it needs the operator's poll signal transport. It also needs an enabled mountReconciliation, whose rollout per config revision re-reads the provider-hop backends, and an empty providerHopEndpoints, since hops follow clusterEndpoints. Every cluster is health-checked, so the gateway's readiness probe must ask Praxis /healthy: /ready fails while any one site is down.
 	// Default: intelligentRoute.
 	SiteRouter GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter `json:"siteRouter,omitempty"`
+	// The sovereignty fence gridSiteRoute applies: the header naming the zones a request may be served in, and whether it refuses or only audits. Under any other router the config is not rendered, and the status names SovereigntyWithoutGridSiteRoute.
+	// Default: unset, no fence.
+	Sovereignty *GridNetworkConsumerGatewaysItemPraxisConfigSovereignty `json:"sovereignty,omitempty"`
 	// Declare that the running consumer has the dynamic credential_inject filter configured with the projected Secret mount root. This is a fail-closed capability gate for credential-bearing overlay revisions. Set it only after the consumer has loaded a config containing that filter; the Grid operator does not own or roll out the consumer Deployment.
 	// Default: false.
 	SupportsProjectedCredentials bool `json:"supportsProjectedCredentials,omitempty"`
@@ -966,7 +987,7 @@ type GridSiteSpec struct {
 	// Where this site serves its signals, where its gateway endpoint does not say.
 	// Absent, signals are polled at the gateway endpoint's host under the server name <site>-signals.grid.internal, at the operator's signals port setting or the gateway's.
 	SignalsEndpoint *GridSiteSignalsEndpoint `json:"signalsEndpoint,omitempty"`
-	// Sovereignty zone for data residency constraints.
+	// Sovereignty zone for data residency constraints, matched case-insensitively by a grid_site_route fence. Every provider on the site is in it.
 	SovereigntyZone *string `json:"sovereigntyZone,omitempty"`
 	// Trust policy for this site.
 	// When configured, the operator verifies the received public certificate against this policy before promoting the site to Active. If absent, the site remains Connecting with reason TrustMaterialMissing regardless of certificate material.

@@ -332,6 +332,12 @@ gateway:
   # is used. Maps to GRID_GATEWAY_PORT.
   port: ""
 
+# -- Served-model discovery from this site's providers.
+modelDiscovery:
+  # -- Seconds a discovered model set stays routable without a fresh poll. The
+  # operator raises it to cover one poll round. Empty keeps the operator's 180s.
+  ttlSeconds: ""
+
 # -- Probe timing configuration.
 health:
   # -- Liveness probe settings.

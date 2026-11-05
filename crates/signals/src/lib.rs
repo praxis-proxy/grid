@@ -16,6 +16,9 @@ pub mod poller;
 
 pub mod revision;
 
+/// Sovereignty zone tokens.
+pub mod zone;
+
 /// Clock-skew margin the gateway applies before a discovered-model expiry deadline.
 pub const CANDIDATE_EXPIRY_SKEW_MARGIN_MS: u64 = 30_000;
 

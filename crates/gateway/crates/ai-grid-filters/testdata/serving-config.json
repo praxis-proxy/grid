@@ -9,14 +9,16 @@
       "name": "llama",
       "site": "site-a",
       "cluster": "pool-a",
-      "fresh": true
+      "fresh": true,
+      "weight": 1
     },
     {
       "kind": "inference_model",
       "name": "llama",
       "site": "site-b",
       "cluster": "pool-b",
-      "fresh": true
+      "fresh": true,
+      "weight": 1
     }
   ],
   "peers": [

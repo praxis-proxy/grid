@@ -114,6 +114,10 @@ pub(crate) struct ServingConfig {
     /// Expected verified TLS SNI for each provider-hop cluster.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) provider_hop_sni: BTreeMap<String, String>,
+    /// Each candidate site's `sovereigntyZone`, which a `grid_site_route` fence matches.
+    /// Omitted when empty, so a config without zones still loads on an older gateway.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) sovereignty_zones: BTreeMap<String, String>,
     /// Sorted by site.
     pub(crate) peers: Vec<ServingPeer>,
 }
@@ -260,6 +264,10 @@ pub(crate) struct ServingCandidate {
     /// A local candidate's credential locator, which `grid_site_route` selects for `credential_inject`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) credential: Option<ProjectedCredential>,
+    /// Declared capacity weight from the provider's `capacityWeight`, carried from the overlay's
+    /// `capacity_weight`. Always emitted by the renderer. Older gateways reject this field via
+    /// `deny_unknown_fields`, so compatible gateways must ship first in every rollout.
+    pub(crate) weight: u32,
 }
 
 /// Whether `publishes_load` is the default, which the gateway assumes when absent.
@@ -322,6 +330,8 @@ pub(crate) struct ServingInputs<'input> {
     pub(crate) heard: &'input (dyn Fn(&str, &str) -> bool + Sync),
     /// This site's provider clusters with no metrics to scrape.
     pub(crate) quiet_local: &'input BTreeSet<String>,
+    /// Each site's `sovereigntyZone`, by site name.
+    pub(crate) zones: &'input BTreeMap<String, String>,
     /// Whether the gateway's generated config injects the local credentials the router selects.
     pub(crate) inject_local_credentials: bool,
 }
@@ -333,6 +343,10 @@ pub(crate) struct ServingInputs<'input> {
 /// be written so a gateway cannot retain candidates from an older config.
 pub(crate) fn render(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> ServingConfig {
     let candidates = candidates(overlay, inputs);
+    let sovereignty_zones = candidates
+        .iter()
+        .filter_map(|candidate| Some((candidate.site.clone(), inputs.zones.get(&candidate.site)?.clone())))
+        .collect();
     let peers = inputs
         .local_signals_addr
         .filter(|_| certs::validate_site_name(&overlay.local_site).is_ok())
@@ -347,6 +361,7 @@ pub(crate) fn render(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Se
         candidates,
         provider_hop_clusters: inputs.provider_hop_clusters.iter().cloned().collect(),
         provider_hop_sni: inputs.provider_hop_sni.clone(),
+        sovereignty_zones,
         peers,
     }
 }
@@ -413,6 +428,8 @@ struct Folded {
     credential: Option<ProjectedCredential>,
     /// The earliest discovered inventory deadline among duplicates.
     expires_at_ms: Option<u64>,
+    /// The largest declared weight across duplicates.
+    weight: u32,
 }
 
 /// Each routable candidate once, folded.
@@ -456,6 +473,7 @@ fn dedup<'overlay>(
             stable_id: None,
             credential: None,
             expires_at_ms,
+            weight: candidate.capacity_weight,
         });
         folded.fresh &= candidate.fresh;
         folded.admission = folded.admission.max(admission);
@@ -470,6 +488,7 @@ fn dedup<'overlay>(
             (Some(held), None) | (None, Some(held)) => Some(held),
             (None, None) => None,
         };
+        folded.weight = folded.weight.max(candidate.capacity_weight);
     }
     unique
 }
@@ -508,6 +527,7 @@ fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<Servi
                 inputs.inject_local_credentials && !remote && !inputs.provider_hop_clusters.contains(cluster)
             }),
             expires_at_ms: folded.expires_at_ms,
+            weight: folded.weight,
         })
         .collect()
 }
@@ -715,6 +735,7 @@ mod tests {
     const LOCAL_ADDR: &str = "grid-operator-signals.grid.svc:9091";
     /// No authenticated provider gateway in this fixture.
     static NO_PROVIDER_HOPS: BTreeSet<String> = BTreeSet::new();
+    static NO_ZONES: BTreeMap<String, String> = BTreeMap::new();
     /// No declared provider-hop identities in the default fixture.
     static NO_PROVIDER_HOP_SNI: BTreeMap<String, String> = BTreeMap::new();
 
@@ -728,6 +749,7 @@ mod tests {
         peer_budget: Duration::from_secs(10),
         heard: &|_, _| true,
         quiet_local: &NO_PROVIDER_HOPS,
+        zones: &NO_ZONES,
         inject_local_credentials: false,
     };
 
@@ -738,7 +760,9 @@ mod tests {
         if let Some(state) = admission {
             value["admission_state"] = serde_json::Value::from(state);
         }
-        serde_json::from_value(value).expect("candidate")
+        let mut candidate: RoutingCandidate = serde_json::from_value(value).expect("candidate");
+        candidate.capacity_weight = 1;
+        candidate
     }
 
     fn overlay(candidates: Vec<RoutingCandidate>) -> RoutingOverlay {
@@ -809,6 +833,40 @@ mod tests {
             .iter()
             .map(|peer| (peer.site.as_str(), peer.addr.as_str()))
             .collect()
+    }
+
+    #[test]
+    fn the_config_carries_each_candidate_sites_zone_once_and_no_other() {
+        let zones = BTreeMap::from([
+            ("site-a".to_owned(), "eu".to_owned()),
+            ("site-elsewhere".to_owned(), "us".to_owned()),
+        ]);
+        let inputs = ServingInputs {
+            zones: &zones,
+            ..INPUTS
+        };
+        let source = overlay(vec![
+            cand("llama", "site-a", "pool-a", None),
+            cand("mistral", "site-a", "pool-a2", None),
+            cand("llama", "site-b", "pool-b", None),
+        ]);
+        let config = render(&source, &inputs);
+        assert_eq!(
+            config.sovereignty_zones,
+            BTreeMap::from([("site-a".to_owned(), "eu".to_owned())]),
+            "a zone per serving site; one with none or no candidate is left out"
+        );
+        let text = to_text(&config).expect("json");
+        assert_eq!(
+            text.matches("\"eu\"").count(),
+            1,
+            "the zone is written once, not per candidate: {text}"
+        );
+        let unzoned = to_text(&render(&source, &INPUTS)).expect("json");
+        assert!(
+            !unzoned.contains("sovereignty_zones"),
+            "omitted when empty, so an older gateway still loads it"
+        );
     }
 
     #[test]
@@ -1344,5 +1402,45 @@ mod tests {
         );
         let long = configmap_name(&"n".repeat(60), &"g".repeat(60));
         assert!(long.len() <= 63 && long.starts_with("grid-serving-"), "{long}");
+    }
+
+    #[test]
+    fn capacity_weight_reaches_serving_candidate_without_traffic_weight() {
+        let mut c = cand("llama", "site-a", "pool-a", None);
+        c.capacity_weight = 3;
+        let config = render(&overlay(vec![c]), &INPUTS);
+        assert_eq!(
+            config.candidates[0].weight, 3,
+            "capacity_weight must reach the gateway even without weightedRandom traffic_weight"
+        );
+        let json = to_text(&config).expect("json");
+        assert!(json.contains("\"weight\": 3"), "weight serializes into the config JSON");
+    }
+
+    #[test]
+    fn default_capacity_weight_is_emitted_in_json() {
+        let config = render(&two_site(), &INPUTS);
+        let json = to_text(&config).expect("json");
+        assert!(
+            config.candidates.iter().all(|candidate| candidate.weight == 1),
+            "the default capacity weight must be rendered for every candidate"
+        );
+        assert!(json.contains("\"weight\": 1"), "the default weight must be serialized");
+    }
+
+    #[test]
+    fn duplicate_candidates_fold_to_the_largest_weight() {
+        let mut c1 = cand("llama", "site-a", "pool-a", None);
+        c1.capacity_weight = 2;
+        let mut c2 = cand("llama", "site-a", "pool-a", None);
+        c2.capacity_weight = 5;
+        for pair in [[c1.clone(), c2.clone()], [c2, c1]] {
+            let config = render(&overlay(pair.to_vec()), &INPUTS);
+            assert_eq!(config.candidates.len(), 1, "dedup should merge duplicates");
+            assert_eq!(
+                config.candidates[0].weight, 5,
+                "the larger weight survives either order"
+            );
+        }
     }
 }

@@ -36,6 +36,8 @@
 #                       which implements model-discovery expiry contract v1 with a
 #                       configuration-driven fixture, authoritative withdrawal, stale-state
 #                       expiry, and all 256 maximum-length discovered models
+#   PROVIDER_SCOPE_TEST=1  inject an authenticated out-of-scope provider update, prove
+#                       rejection without route loss, and accept a fresh valid update
 #   NET_PREFIX          command prefix for calls to LoadBalancer addresses, e.g. under
 #                       rootless podman: podman unshare --rootless-netns
 #   TOPOLOGY            topology under tests/e2e/topologies (default grid-hub-site, or
@@ -59,6 +61,7 @@ MODES=${MODES:-pin spiffe}
 HUB_ROUTER=${HUB_ROUTER:-render}
 SIGNED_STATE=${SIGNED_STATE:-off}
 MODEL_GOSSIP_TEST=${MODEL_GOSSIP_TEST:-0}
+PROVIDER_SCOPE_TEST=${PROVIDER_SCOPE_TEST:-0}
 IMAGE_PREFIX=${IMAGE_PREFIX:-localhost/grid-}
 IMAGE_TAG=${IMAGE_TAG:-e2e}
 IMAGE_BUILD_PROFILE=${IMAGE_BUILD_PROFILE:-debug}
@@ -106,10 +109,14 @@ CREATED=0
 MODE=""
 TRUST=""
 
+# shellcheck source=scripts/e2e-provider-scope.sh
+source "$ROOT/scripts/e2e-provider-scope.sh"
+
 cleanup() {
   [[ -z $PF_PID ]] || kill "$PF_PID" 2>/dev/null || true
   restore_hub_operator || true
   cleanup_model_discovery_fixture || true
+  cleanup_provider_scope || true
   uncordon_node
   stop_monitors
   if ((CREATED)) && [[ ${KEEP:-0} != 1 ]]; then
@@ -743,13 +750,17 @@ install_site() {
     shared=(--set-string 'signals.service.annotations.metallb\.universe\.tf/allow-shared-ip=grid-site'
       --set signals.service.externalTrafficPolicy=Cluster --set signals.maxHandshakesPerSource=64)
   fi
+  # Withdrawal checks wait on the gateway's mounted ConfigMap, which the kubelet syncs about once a minute.
+  local discovery=()
+  [[ $MODEL_GOSSIP_TEST != 1 ]] || discovery=(--set modelDiscovery.ttlSeconds=300)
   helm_on "$SITE_CTX" "$NS" grid-operator grid-operator "${RA[@]}" \
     --set "swim.siteName=$SITE" "${seeds[@]}" \
     --set enrollment.enabled=true \
     --set "enrollment.url=https://grid-enrollment.$ENS.svc:$ENROLL_PORT" \
     --set grid.peerTrust="$TRUST" \
     "${IMG[@]}" --set swim.service.loadBalancerIP="$SITE_SWIM_IP" \
-    --set signals.service.loadBalancerIP="$sig_ip" "${shared[@]}" || die "install site grid-operator"
+    --set signals.service.loadBalancerIP="$sig_ip" "${shared[@]}" "${discovery[@]}" \
+    || die "install site grid-operator"
   enrollment_forward || die "enrollment forward"
   copy_key "$HUB_CTX" "$ENS" "$SITE_CTX" grid-ca-bundle ca.crt || die "copy the site CA bundle"
   k "$SITE_CTX" label secret grid-ca-bundle grid.praxis.fast/signer-bundle=true >/dev/null || die "opt the site CA bundle in"
@@ -2519,6 +2530,8 @@ cmd_selftest() {
   printf '%s\n' "100 200 0" "101 200 3" >"$WORK/catalog.log"
   refutes "a 200 carrying no providers" assert_catalog "selftest empty catalog" 100
 
+  provider_scope_selftest
+
   rm -rf "$WORK"
   if ((FAILED)); then
     printf 'RESULT: FAIL (selftest)\n'
@@ -3034,6 +3047,12 @@ cmd_test() {
   case $HUB_ROUTER in render | operator) ;; *) die "HUB_ROUTER $HUB_ROUTER is not render or operator" ;; esac
   case $SIGNED_STATE in off | enforce) ;; *) die "SIGNED_STATE $SIGNED_STATE is not off or enforce" ;; esac
   case $MODEL_GOSSIP_TEST in 0 | 1) ;; *) die "MODEL_GOSSIP_TEST $MODEL_GOSSIP_TEST is not 0 or 1" ;; esac
+  case $PROVIDER_SCOPE_TEST in 0 | 1) ;; *) die "PROVIDER_SCOPE_TEST must be 0 or 1" ;; esac
+  if [[ $PROVIDER_SCOPE_TEST == 1 ]]; then
+    [[ $HUB_ROUTER == operator && $SIGNED_STATE == enforce && $MODES == pin ]] \
+      || die "PROVIDER_SCOPE_TEST requires HUB_ROUTER=operator SIGNED_STATE=enforce MODES=pin"
+    prepare_provider_scope_probe
+  fi
   if [[ $MODEL_GOSSIP_TEST == 1 ]]; then
     [[ $HUB_ROUTER == operator ]] || die "MODEL_GOSSIP_TEST requires HUB_ROUTER=operator"
     [[ $SIGNED_STATE == enforce ]] || die "MODEL_GOSSIP_TEST requires SIGNED_STATE=enforce"
@@ -3076,6 +3095,7 @@ cmd_test() {
     if [[ $MODEL_GOSSIP_TEST == 1 ]]; then
       enable_model_gossip
       assert_model_gossip
+      assert_provider_scope
       k "$SITE_CTX" delete inferenceprovider vcr --wait=true >/dev/null \
         || die "remove the model gossip test provider override"
       eventually "provider deletion withdraws its final signed remote candidate" hub_remote_candidate_count \
@@ -3087,6 +3107,7 @@ cmd_test() {
     else
       assert_serving
       assert_site_route
+      assert_provider_scope
     fi
     assert_ha
     assert_rotation_declared
