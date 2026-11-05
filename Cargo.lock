@@ -2526,6 +2526,7 @@ dependencies = [
  "hyper-util",
  "k8s-openapi",
  "kube",
+ "kube-runtime",
  "openssl",
  "openssl-sys",
  "pem 4.0.0",
