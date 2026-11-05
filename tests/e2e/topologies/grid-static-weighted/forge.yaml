@@ -508,6 +508,11 @@ spec:
               siteName: "{{ cluster.name }}"
             overlay:
               configMapName: "grid-overlay-grid-static-weighted-consumer-gateway"
+              sidecar:
+                image:
+                  repository: "{{ cluster.properties.overlaySyncImageRepo }}"
+                  tag: "{{ cluster.properties.overlaySyncImageTag }}"
+                  pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
             gridIdentity:
               tlsSecretName: "consumer-gateway-tls"
               caSecretName: "consumer-gateway-tls"
