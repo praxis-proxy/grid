@@ -61,9 +61,12 @@ use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use kube::{
     Api, Client,
     api::{ObjectMeta, Patch, PatchParams, PostParams},
-    runtime::{PredicateConfig, WatchStreamExt as _, reflector, watcher},
+    runtime::{WatchStreamExt as _, reflector, watcher},
 };
-use kube_runtime::Controller;
+use kube_runtime::{
+    Controller,
+    controller::{applier, trigger_self},
+};
 use operator::{
     cli::{Cli, Membership},
     controller::{
@@ -1813,45 +1816,17 @@ type GridNetworkRollupWatch = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>
 
 /// Keep the primary watch construction out of the controller's async stack frame.
 fn filtered_grid_network_watch(api: Api<GridNetwork>) -> (reflector::Store<GridNetwork>, GridNetworkWatch) {
-    let (reader, writer) = reflector::store();
-    let primary = Box::pin(
-        watcher(api, watcher::Config::default())
-            .default_backoff()
-            .reflect(writer)
-            .applied_objects()
-            .predicate_filter(grid_network_reconcile_fingerprint, PredicateConfig::default()),
-    );
-    (reader, primary)
-}
-
-/// Fingerprint fields that require the full network reconcile loop.
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "kube's predicate filter requires an optional fingerprint"
-)]
-fn grid_network_reconcile_fingerprint(network: &GridNetwork) -> Option<u64> {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(&network.metadata.generation, &mut hasher);
-    let has_withdrawal_finalizer = network.metadata.finalizers.as_ref().is_some_and(|finalizers| {
-        finalizers
-            .iter()
-            .any(|finalizer| finalizer == grid_network::GRID_NETWORK_WITHDRAWAL_FINALIZER)
-    });
-    std::hash::Hash::hash(&has_withdrawal_finalizer, &mut hasher);
-    let is_deleting = network.metadata.deletion_timestamp.is_some();
-    std::hash::Hash::hash(&is_deleting, &mut hasher);
-    Some(std::hash::Hasher::finish(&hasher))
+    let (reader, primary) =
+        operator::network_watch::routing_watch(watcher(api, watcher::Config::default()).default_backoff());
+    (reader, Box::pin(primary))
 }
 
 /// Watch `GatewayAgesRejected` transitions without routing unrelated status updates.
 fn filtered_grid_network_rollup_watch(client: Client) -> GridNetworkRollupWatch {
     let api = Api::<GridNetwork>::all(client.clone());
     Box::pin(
-        watcher(api, watcher::Config::default())
-            .default_backoff()
-            .applied_objects()
-            .predicate_filter(grid_network_rollup_fingerprint, PredicateConfig::default())
-            .for_each(move |result| {
+        operator::network_watch::rollup_updates(watcher(api, watcher::Config::default()).default_backoff()).for_each(
+            move |result| {
                 let client = client.clone();
                 async move {
                     match result {
@@ -1859,7 +1834,8 @@ fn filtered_grid_network_rollup_watch(client: Client) -> GridNetworkRollupWatch 
                         Err(error) => tracing::warn!(%error, "GridNetwork roll-up watch failed"),
                     }
                 }
-            }),
+            },
+        ),
     )
 }
 
@@ -1869,32 +1845,11 @@ async fn run_grid_network_rollup_watch(client: Client) -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// Fingerprint only the rejection condition inputs consumed by `network_rollup`.
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "kube's predicate filter requires an optional fingerprint"
-)]
-fn grid_network_rollup_fingerprint(network: &GridNetwork) -> Option<u64> {
-    let rejection = network
-        .status
-        .as_ref()
-        .and_then(|status| {
-            status
-                .conditions
-                .iter()
-                .find(|condition| condition.type_ == operator::gateway_ages::GATEWAY_AGES_REJECTED)
-        })
-        .map(|condition| (condition.status, condition.reason.as_str(), condition.message.as_str()));
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(&rejection, &mut hasher);
-    Some(std::hash::Hasher::finish(&hasher))
-}
-
 /// Run the [`GridNetwork`] controller.
 ///
 /// In addition to watching `GridNetwork` resources, this controller watches
-/// `InferenceProvider`, `GridSite`, and `Secret` resources.  Secret changes
-/// trigger reconciliation of affected `GridNetwork`s when providers change.
+/// `InferenceProvider`, `AgentToolProvider`, and `GridSite` resources. Their changes
+/// trigger reconciliation of affected `GridNetwork`s.
 ///
 /// Metrics TLS rotation is detected by bounded requeue rather than a
 /// cluster-wide Secret watch; the operator only reads referenced
@@ -1905,43 +1860,47 @@ async fn run_network_controller(
     swim: SwimStartup,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api = Api::<GridNetwork>::all(client.clone());
-    let provider_api = Api::<InferenceProvider>::all(client.clone());
-    let tool_provider_api = Api::<AgentToolProvider>::all(client.clone());
-    let site_api = Api::<GridSite>::all(client.clone());
 
     let (reader, primary) = filtered_grid_network_watch(api);
-    let controller = Controller::for_stream(primary, reader)
-        .watches(
-            provider_api,
-            watcher::Config::default(),
-            grid_network::network_refs_from_inference_provider,
-        )
-        .watches(
-            tool_provider_api,
-            watcher::Config::default(),
-            grid_network::network_refs_from_agent_tool_provider,
-        )
-        .watches(
-            site_api,
-            watcher::Config::default(),
-            grid_network::network_refs_from_grid_site,
-        );
+    let mut requests = futures::stream::SelectAll::new();
+    requests.push(trigger_self(primary, ()).boxed());
+    requests.push(operator::network_watch::related_requests(
+        Api::<InferenceProvider>::all(client.clone()),
+        grid_network::network_refs_from_inference_provider,
+    ));
+    requests.push(operator::network_watch::related_requests(
+        Api::<AgentToolProvider>::all(client.clone()),
+        grid_network::network_refs_from_agent_tool_provider,
+    ));
+    requests.push(operator::network_watch::related_requests(
+        Api::<GridSite>::all(client.clone()),
+        grid_network::network_refs_from_grid_site,
+    ));
     // Reconcile everything once SWIM starts, then on every membership change.
     let swim_events = futures::stream::once(swim_settled(swim))
         .filter_map(std::future::ready)
         .flat_map(|handle| futures::stream::once(std::future::ready(())).chain(handle.reconciliation_events()));
     // And whenever a polled peer's catalog changes, which no watched object reflects.
     let catalog_events = ctx.peer_providers().changes();
-    controller
-        .reconcile_all_on(futures::stream::select(swim_events, catalog_events))
-        .run(grid_network::reconcile, grid_network::error_policy, ctx)
-        .for_each(|result| async {
-            match result {
-                Ok((obj, _action)) => tracing::debug!(%obj, "reconciled GridNetwork"),
-                Err(e) => log_controller_error("GridNetwork", &e),
-            }
-        })
-        .await;
+    requests.push(
+        operator::network_watch::bulk_requests(futures::stream::select(swim_events, catalog_events), reader.clone())
+            .boxed(),
+    );
+    applier(
+        |network, ctx| Box::pin(grid_network::reconcile(network, ctx)),
+        grid_network::error_policy,
+        ctx,
+        reader,
+        requests.default_backoff(),
+        kube_runtime::controller::Config::default(),
+    )
+    .for_each(|result| async {
+        match result {
+            Ok((obj, _action)) => tracing::debug!(%obj, "reconciled GridNetwork"),
+            Err(e) => log_controller_error("GridNetwork", &e),
+        }
+    })
+    .await;
 
     Ok(())
 }
@@ -4490,32 +4449,34 @@ mod tests {
             .expect("GridNetwork fixture")
         };
         let updates = Box::pin(
-            futures::stream::iter([
-                Ok::<_, watcher::Error>(network(1, "1", 0, None, None)),
-                Ok(network(1, "2", 1, None, None)),
-                Ok(network(
-                    1,
-                    "3",
-                    1,
-                    Some(grid_network::GRID_NETWORK_WITHDRAWAL_FINALIZER),
-                    None,
-                )),
-                Ok(network(
-                    1,
-                    "4",
-                    1,
-                    Some(grid_network::GRID_NETWORK_WITHDRAWAL_FINALIZER),
-                    Some("2026-01-01T00:00:00Z"),
-                )),
-                Ok(network(
-                    2,
-                    "5",
-                    1,
-                    Some(grid_network::GRID_NETWORK_WITHDRAWAL_FINALIZER),
-                    Some("2026-01-01T00:00:00Z"),
-                )),
-            ])
-            .predicate_filter(grid_network_reconcile_fingerprint, PredicateConfig::default())
+            operator::network_watch::routing_updates(
+                futures::stream::iter([
+                    Ok::<_, watcher::Error>(network(1, "1", 0, None, None)),
+                    Ok(network(1, "2", 1, None, None)),
+                    Ok(network(
+                        1,
+                        "3",
+                        1,
+                        Some(grid_network::GRID_NETWORK_WITHDRAWAL_FINALIZER),
+                        None,
+                    )),
+                    Ok(network(
+                        1,
+                        "4",
+                        1,
+                        Some(grid_network::GRID_NETWORK_WITHDRAWAL_FINALIZER),
+                        Some("2026-01-01T00:00:00Z"),
+                    )),
+                    Ok(network(
+                        2,
+                        "5",
+                        1,
+                        Some(grid_network::GRID_NETWORK_WITHDRAWAL_FINALIZER),
+                        Some("2026-01-01T00:00:00Z"),
+                    )),
+                ])
+                .map(|result| result.map(watcher::Event::Apply)),
+            )
             .collect::<Vec<_>>(),
         )
         .await;
@@ -4594,12 +4555,14 @@ mod tests {
             .expect("GridNetwork fixture")
         };
         let updates = Box::pin(
-            futures::stream::iter([
-                Ok::<_, watcher::Error>(network("1", 1, "True", "SkewRejected", "gateway age rejected")),
-                Ok(network("2", 2, "True", "SkewRejected", "gateway age rejected")),
-                Ok(network("3", 2, "False", "Recovered", "gateway age recovered")),
-            ])
-            .predicate_filter(grid_network_rollup_fingerprint, PredicateConfig::default())
+            operator::network_watch::rollup_updates(
+                futures::stream::iter([
+                    Ok::<_, watcher::Error>(network("1", 1, "True", "SkewRejected", "gateway age rejected")),
+                    Ok(network("2", 2, "True", "SkewRejected", "gateway age rejected")),
+                    Ok(network("3", 2, "False", "Recovered", "gateway age recovered")),
+                ])
+                .map(|result| result.map(watcher::Event::Apply)),
+            )
             .collect::<Vec<_>>(),
         )
         .await;
