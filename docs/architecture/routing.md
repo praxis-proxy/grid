@@ -454,6 +454,38 @@ an invalid one, is in none, and no fence admits it. The fence trusts the header:
 gateway in front must set it from the caller's identity and replace any copy the
 caller sent.
 
+#### Gateway-first rollout
+
+Where any `GridSite` sets `spec.sovereigntyZone`, upgrade every gateway before
+upgrading the operator that publishes `sovereignty_zones`. The operator emits
+the map for serving sites with zones even when no gateway has enabled the
+fence. Older gateways reject this unknown field and retain their last accepted
+serving config, so a mixed-version rollout can leave them routing on stale
+config. When no serving site has a zone, the empty map is omitted and this
+compatibility constraint does not apply.
+
+1. Roll out a gateway image that supports `sovereignty_zones` and the
+   sovereignty fence to every gateway replica at every site. Wait for all
+   replicas to finish upgrading before upgrading the operator.
+2. Upgrade the operator and let it publish the serving configs with the site
+   zone maps. Wait for the mounted configs to update on every gateway.
+3. Before enabling `mode: enforce`, confirm that every gateway replica has
+   accepted a serving config carrying the expected site zones. Correlate each
+   replica's gateway logs and an increase in
+   `grid_serving_config_reload_total{result="applied"}` with the zone-bearing
+   update. Check each replica individually; an aggregate counter can hide a
+   gateway still using stale config. A mounted ConfigMap or the
+   `grid.praxis.fast/serving-digest` annotation proves publication, not gateway
+   acceptance.
+4. Enable the fence in `enforce` mode only after all gateways have passed
+   these checks. Loading the zone map alone does not enable enforcement.
+
+For the separate legacy pin-format migration, see the gateway chart's
+[upgrade guidance][gateway-upgrade].
+
+[gateway-upgrade]:
+  ../../charts/praxis-gateway/README.md#providers-from-the-provider-file
+
 ### Admission state derivation
 
 When `spec.admissionPolicy` is omitted, admission preserves the legacy

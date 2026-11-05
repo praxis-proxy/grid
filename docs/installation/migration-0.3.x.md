@@ -61,7 +61,16 @@ naming it. Under SWIM membership `fromProviders` still gates remote candidates.
 Delete or disable a provider that must not be served before upgrading. See
 [Derived endpoint topology](../architecture/consumer-config.md#derived-endpoint-topology).
 
-Upgrade in this order:
+If any `GridSite` sets `spec.sovereigntyZone`, upgrade every gateway before the
+operator that publishes the zone map. Before enabling the sovereignty fence in
+`enforce` mode, verify that every gateway has accepted a config carrying the
+expected zones. Follow the
+[sovereignty rollout procedure][sovereignty-rollout]
+as an additional prerequisite to the operator upgrade below.
+
+[sovereignty-rollout]: ../architecture/routing.md#gateway-first-rollout
+
+Upgrade CRDs and charts in this order:
 
 1. Apply the 0.3.x CRDs first. When the platform owns the CRDs, apply the
    chart's CRD templates before installing the charts with `crds.enabled=false`.

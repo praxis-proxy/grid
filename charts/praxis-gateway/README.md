@@ -673,13 +673,28 @@ Check gateway logs and
 `grid_serving_config_reload_total{result="applied"}` for acceptance; the
 `grid.praxis.fast/serving-digest` annotation records publication, not acceptance.
 
-Upgrade order across the operator and this gateway: under SPIFFE peer trust roll
+For sovereignty zones, upgrade every gateway replica at every site before the
+operator that publishes `sovereignty_zones`, including when the fence is still
+disabled or in audit mode. An older gateway rejects the zone map and keeps its
+last accepted config. Before enabling `enforce`, verify on each replica that
+the zone-bearing config was accepted, using gateway logs and
+`grid_serving_config_reload_total{result="applied"}` for that update. The map is
+omitted when empty, so networks without serving-site zones are unaffected. See
+[the sovereignty rollout procedure][sovereignty-rollout].
+
+[sovereignty-rollout]:
+  ../../docs/architecture/routing.md#gateway-first-rollout
+
+For the separate peer-trust format upgrade: under SPIFFE peer trust roll
 the gateway first, since a new gateway reads an old operator's serving config.
 Under pin trust roll the operator first and the gateway right after it: an old
 operator renders `pins` the new gateway refuses, and an old gateway holds its last
 accepted config only while its pod keeps running. A gateway pod that restarts
 between the two rollouts exits at startup and crash-loops until the gateway
 rolls, so do not leave the two rollouts apart.
+Complete that legacy pin-format migration without sovereignty zones before
+following the gateway-first sovereignty rollout above.
+
 The same watcher detects changes to the mounted CA, client certificate, and
 key, and rebuilds the signals pollers. This refreshes their mTLS identity; it
 does not renew certificates or change provider-listener TLS settings. Older
