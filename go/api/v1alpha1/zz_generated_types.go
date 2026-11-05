@@ -810,7 +810,7 @@ type GridNetworkGatewayAgeReportsItem struct {
 	Replica string `json:"replica"`
 	// Original wire flag, retained to verify exact duplicates.
 	ReportedRejected bool `json:"reportedRejected"`
-	// Last durably accepted sequence.
+	// Last durably recorded sequence; live sequence watermarks are process-local.
 	Sequence int64 `json:"sequence"`
 	// Cumulative skew rejection count.
 	Skew int64 `json:"skew"`
