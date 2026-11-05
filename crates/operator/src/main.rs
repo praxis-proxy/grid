@@ -61,7 +61,7 @@ use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use kube::{
     Api, Client,
     api::{ObjectMeta, Patch, PatchParams, PostParams},
-    runtime::{Controller, WatchStreamExt as _, predicates, reflector, watcher},
+    runtime::{Controller, PredicateConfig, WatchStreamExt as _, predicates, reflector, watcher},
 };
 use operator::{
     cli::{Cli, Membership},
@@ -1803,6 +1803,22 @@ async fn create_local_records(
 // Controller Setup
 // ---------------------------------------------------------------------------
 
+/// Boxed `GridNetwork` watch after filtering status-only updates.
+type GridNetworkWatch = std::pin::Pin<Box<dyn futures::Stream<Item = Result<GridNetwork, watcher::Error>> + Send>>;
+
+/// Keep the primary watch construction out of the controller's async stack frame.
+fn filtered_grid_network_watch(api: Api<GridNetwork>) -> (reflector::Store<GridNetwork>, GridNetworkWatch) {
+    let (reader, writer) = reflector::store();
+    let primary = Box::pin(
+        watcher(api, watcher::Config::default())
+            .default_backoff()
+            .reflect(writer)
+            .applied_objects()
+            .predicate_filter(predicates::generation, PredicateConfig::default()),
+    );
+    (reader, primary)
+}
+
 /// Run the [`GridNetwork`] controller.
 ///
 /// In addition to watching `GridNetwork` resources, this controller watches
@@ -1822,12 +1838,7 @@ async fn run_network_controller(
     let tool_provider_api = Api::<AgentToolProvider>::all(client.clone());
     let site_api = Api::<GridSite>::all(client.clone());
 
-    let (reader, writer) = reflector::store();
-    let primary = watcher(api, watcher::Config::default())
-        .default_backoff()
-        .reflect(writer)
-        .applied_objects()
-        .predicate_filter(predicates::generation, Default::default());
+    let (reader, primary) = filtered_grid_network_watch(api);
     let controller = Controller::for_stream(primary, reader)
         .watches(
             provider_api,
@@ -4400,7 +4411,7 @@ mod tests {
             Ok(network(1, "2", 1)),
             Ok(network(2, "3", 1)),
         ])
-        .predicate_filter(predicates::generation, Default::default())
+        .predicate_filter(predicates::generation, PredicateConfig::default())
         .collect::<Vec<_>>()
         .await;
         assert_eq!(updates.len(), 2, "status-only changes do not produce watch triggers");

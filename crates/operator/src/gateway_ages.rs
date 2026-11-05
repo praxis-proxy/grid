@@ -576,9 +576,8 @@ mod tests {
         let instant = Instant::now();
         let first = report("a", 1, 0, false);
         let accepted = fold(&network, &first, "t0", &BTreeMap::new(), instant).expect("first report");
-        let first_receipt = accepted.receipt.clone().expect("receipt");
         apply(&mut network, &accepted);
-        let receipts = BTreeMap::from([(first.epoch.clone(), first_receipt)]);
+        let receipts = BTreeMap::from([(first.epoch, accepted.receipt.expect("receipt"))]);
 
         let second = report("a", 2, 0, false);
         let one_second_later = instant.checked_add(Duration::from_secs(1)).expect("test instant");
@@ -588,20 +587,17 @@ mod tests {
             unchanged.evidence.reports[0].sequence, 1,
             "the durable sequence remains unchanged between refreshes"
         );
-        let second_receipt = unchanged.receipt.clone().expect("advanced watermark");
+        let second_receipt = unchanged.receipt.expect("advanced watermark");
         assert_eq!(second_receipt.sequence, 2, "the live sequence advances in memory");
 
-        let receipts = BTreeMap::from([(second.epoch.clone(), second_receipt)]);
-        let stale = IngestReport {
-            sequence: 1,
-            ..second.clone()
-        };
+        let advanced_receipts = BTreeMap::from([(second.epoch.clone(), second_receipt)]);
+        let stale = IngestReport { sequence: 1, ..second };
         assert!(
             fold(
                 &network,
                 &stale,
                 "t2",
-                &receipts,
+                &advanced_receipts,
                 instant.checked_add(Duration::from_secs(2)).expect("test instant")
             )
             .is_err(),
@@ -612,7 +608,7 @@ mod tests {
             &network,
             &report("a", 3, 0, false),
             "t3",
-            &receipts,
+            &advanced_receipts,
             instant.checked_add(FRESHNESS).expect("test instant"),
         )
         .expect("freshness refresh");
