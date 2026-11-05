@@ -3079,6 +3079,8 @@ fn assert_operator_restart_recovery() -> AssertionResult {
             continue;
         }
 
+        let before = operator_pods(&context)?;
+
         // Restart the operator
         let restart_output = Command::new("kubectl")
             .args([
@@ -3098,39 +3100,27 @@ fn assert_operator_restart_recovery() -> AssertionResult {
             continue;
         }
 
-        // Poll until operator is ready again
-        let deploy_recovered = poll_until(
-            || {
-                let out = Command::new("kubectl")
-                    .args([
-                        "get",
-                        "deployment/grid-operator",
-                        "--context",
-                        &context,
-                        "-n",
-                        "grid-system",
-                        "-o",
-                        "jsonpath={.status.readyReplicas}",
-                    ])
-                    .output();
-                match out {
-                    Ok(o) if o.status.success() => {
-                        if String::from_utf8_lossy(&o.stdout).trim() == "1" {
-                            Ok(Some(()))
-                        } else {
-                            Ok(None)
-                        }
-                    },
-                    _ => Ok(None),
-                }
-            },
-            Duration::from_secs(90),
-            Duration::from_secs(3),
-        )
-        .is_ok();
+        // readyReplicas can still describe the old pod, so wait for the rollout and a new pod.
+        let rolled_out = Command::new("kubectl")
+            .args([
+                "rollout",
+                "status",
+                "deployment/grid-operator",
+                "--context",
+                &context,
+                "-n",
+                "grid-system",
+                "--timeout=90s",
+            ])
+            .output()?
+            .status
+            .success();
+        let after = operator_pods(&context)?;
+        let deploy_recovered = rolled_out && !after.is_empty() && after.iter().all(|pod| !before.contains(pod));
 
-        // Local has no connectedSites: the GridNetwork and both declared peers return to Active.
-        let swim_recovered = if deploy_recovered && membership() == Membership::Local {
+        // Local has no connectedSites: the GridNetwork and both declared peers read Active. Those
+        // phases can outlive the restart, so under Local this shows availability, not resumed polling.
+        let membership_recovered = if deploy_recovered && membership() == Membership::Local {
             poll_until(
                 || {
                     let network = Command::new("kubectl")
@@ -3218,7 +3208,7 @@ fn assert_operator_restart_recovery() -> AssertionResult {
             false
         };
 
-        let cluster_ok = deploy_recovered && swim_recovered && routing_works;
+        let cluster_ok = deploy_recovered && membership_recovered && routing_works;
         if !cluster_ok {
             all_recovered = false;
         }
@@ -3227,9 +3217,13 @@ fn assert_operator_restart_recovery() -> AssertionResult {
             format!("{cluster}_deploy_recovered"),
             serde_json::Value::Bool(deploy_recovered),
         );
+        let membership_key = match membership() {
+            Membership::Local => "local_peers_active",
+            Membership::Swim => "swim_recovered",
+        };
         observed_facts.insert(
-            format!("{cluster}_swim_recovered"),
-            serde_json::Value::Bool(swim_recovered),
+            format!("{cluster}_{membership_key}"),
+            serde_json::Value::Bool(membership_recovered),
         );
         observed_facts.insert(
             format!("{cluster}_routing_after_restart"),
@@ -3238,11 +3232,15 @@ fn assert_operator_restart_recovery() -> AssertionResult {
     }
 
     if all_recovered {
-        Ok(proof_success(
-            "All three operators restarted sequentially with membership re-convergence and routing proof after each",
-            observed_facts,
-            start.elapsed(),
-        ))
+        let summary = match membership() {
+            Membership::Local => {
+                "All three operators restarted sequentially onto new pods, with declared peers Active and routing proof after each"
+            },
+            Membership::Swim => {
+                "All three operators restarted sequentially with membership re-convergence and routing proof after each"
+            },
+        };
+        Ok(proof_success(summary, observed_facts, start.elapsed()))
     } else {
         Ok(proof_failure(
             "Operator restart recovery failed on one or more clusters",
@@ -3250,6 +3248,29 @@ fn assert_operator_restart_recovery() -> AssertionResult {
             start.elapsed(),
         ))
     }
+}
+
+/// Names of the operator pods in `context`, Running or not.
+fn operator_pods(context: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let out = Command::new("kubectl")
+        .args([
+            "get",
+            "pods",
+            "--context",
+            context,
+            "-n",
+            "grid-system",
+            "-l",
+            "app.kubernetes.io/name=grid-operator",
+            "--field-selector=status.phase=Running",
+            "-o",
+            "jsonpath={.items[*].metadata.name}",
+        ])
+        .output()?;
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Assert post-recovery soak period validates stability.
@@ -5778,12 +5799,41 @@ fn configure_swim_peers(_forge_bin: &Path, _resolved_config: &Path) -> Result<()
     Ok(())
 }
 
+/// The oldest Helm the repository supports, and the first with `--set-json`.
+const HELM_FLOOR: (u32, u32) = (3, 12);
+
+/// Refuse a Helm older than [`HELM_FLOOR`] before any peer is declared.
+fn require_helm_floor() -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("helm")
+        .args(["version", "--template", "{{.Version}}"])
+        .output()
+        .map_err(|error| format!("helm not found: {error}"))?;
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    eprintln!("  helm {version}");
+    match helm_minor(&version) {
+        Some(found) if found >= HELM_FLOOR => Ok(()),
+        _ => Err(format!(
+            "helm {version} is older than {}.{} or unreadable; Local peers need --set-json",
+            HELM_FLOOR.0, HELM_FLOOR.1
+        )
+        .into()),
+    }
+}
+
+/// The major and minor of a `vX.Y.Z` Helm version.
+fn helm_minor(version: &str) -> Option<(u32, u32)> {
+    let mut parts = version.strip_prefix('v')?.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
 /// Declare every site to the other two as a Local peer.
 ///
 /// Each GridSite carries the peer's provider gateway and signals addresses, pinned to its
 /// staged certificate. The signals server name is the one that certificate carries.
 fn declare_local_peers() -> Result<(), Box<dyn std::error::Error>> {
     const PEER_TIMEOUT: Duration = Duration::from_secs(180);
+
+    require_helm_floor()?;
 
     let mut endpoints = BTreeMap::new();
     for cluster in CLUSTERS {
@@ -9002,6 +9052,15 @@ spec:
             "pod label must match VCR app name for NetworkPolicy coverage",
         );
         drop((routing_cluster, label, vcr_image, image_pull_policy));
+    }
+
+    #[test]
+    fn helm_floor_reads_major_and_minor() {
+        assert_eq!(helm_minor("v3.12.0"), Some((3, 12)));
+        assert_eq!(helm_minor("v4.0.1"), Some((4, 0)));
+        assert!(helm_minor("v3.11.3") < Some(HELM_FLOOR));
+        assert_eq!(helm_minor("3.12.0"), None, "the v prefix is required");
+        assert_eq!(helm_minor(""), None);
     }
 
     #[test]
