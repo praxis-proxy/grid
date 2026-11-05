@@ -7,6 +7,10 @@
 //! operator-level concern tracked separately.
 //! FIPS builds use OpenSSL; other builds use `ring`.
 //!
+//! The backend is selected by the `fips` / `rust-crypto` features: the AEAD in
+//! [`crate::crypto`] and the digests in [`crate::model_inventory`] follow the
+//! same seam.
+//!
 //! [`GridSite`]: https://github.com/praxis-proxy/grid/issues/75
 
 #[cfg(feature = "fips")]
@@ -18,7 +22,7 @@ use openssl::{
     pkey::PKey,
     sign::{Signer, Verifier},
 };
-#[cfg(feature = "ring-signing")]
+#[cfg(feature = "rust-crypto")]
 use ring::{
     rand::SystemRandom,
     signature::{
@@ -26,10 +30,10 @@ use ring::{
     },
 };
 
-#[cfg(all(feature = "fips", feature = "ring-signing"))]
-compile_error!("features `fips` and `ring-signing` are mutually exclusive");
-#[cfg(not(any(feature = "fips", feature = "ring-signing")))]
-compile_error!("one of `fips` or `ring-signing` must be enabled");
+#[cfg(all(feature = "fips", feature = "rust-crypto"))]
+compile_error!("features `fips` and `rust-crypto` are mutually exclusive");
+#[cfg(not(any(feature = "fips", feature = "rust-crypto")))]
+compile_error!("one of `fips` or `rust-crypto` must be enabled");
 
 /// Errors produced while signing a payload.
 #[derive(Debug, thiserror::Error)]
