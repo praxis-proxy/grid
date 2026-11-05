@@ -200,7 +200,7 @@ pub(crate) fn apply_image_values(
     Ok(())
 }
 
-/// Apply the selected overlay-sync image to Praxis gateway Helm steps with an overlay ConfigMap.
+/// Apply the selected overlay-sync image to Praxis gateway Helm steps with an overlay `ConfigMap`.
 pub(crate) fn apply_overlay_sync_image_values(
     config: &mut serde_yaml::Value,
     image: &str,
