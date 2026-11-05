@@ -197,6 +197,8 @@ spec:
     west-site:
       description: West combined site with Grid CRs via grid-site chart
       steps:
+        - type: manifest
+          path: resources/common/grid-swim-key.yaml
         - type: helm
           release: grid-site
           chart: charts/grid-site
@@ -225,6 +227,9 @@ spec:
                   namespace: grid-system
                 siteSecretRef:
                   name: consumer-gateway-tls
+                  namespace: grid-system
+                swimKeySecretRef:
+                  name: grid-swim-key
                   namespace: grid-system
               consumerGateways:
                 - name: consumer-gateway
@@ -260,6 +265,8 @@ spec:
     central-site:
       description: Central combined site with Grid CRs via grid-site chart
       steps:
+        - type: manifest
+          path: resources/common/grid-swim-key.yaml
         - type: helm
           release: grid-site
           chart: charts/grid-site
@@ -288,6 +295,9 @@ spec:
                   namespace: grid-system
                 siteSecretRef:
                   name: consumer-gateway-tls
+                  namespace: grid-system
+                swimKeySecretRef:
+                  name: grid-swim-key
                   namespace: grid-system
               consumerGateways:
                 - name: consumer-gateway
@@ -323,6 +333,8 @@ spec:
     east-site:
       description: East combined site with Grid CRs via grid-site chart
       steps:
+        - type: manifest
+          path: resources/common/grid-swim-key.yaml
         - type: helm
           release: grid-site
           chart: charts/grid-site
@@ -351,6 +363,9 @@ spec:
                   namespace: grid-system
                 siteSecretRef:
                   name: consumer-gateway-tls
+                  namespace: grid-system
+                swimKeySecretRef:
+                  name: grid-swim-key
                   namespace: grid-system
               consumerGateways:
                 - name: consumer-gateway
@@ -496,6 +511,11 @@ spec:
               siteName: "{{ cluster.name }}"
             overlay:
               configMapName: "grid-overlay-grid-combined-site-consumer-gateway"
+              sidecar:
+                image:
+                  repository: "{{ cluster.properties.overlaySyncImageRepo }}"
+                  tag: "{{ cluster.properties.overlaySyncImageTag }}"
+                  pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
             gridIdentity:
               tlsSecretName: "consumer-gateway-tls"
               caSecretName: "consumer-gateway-tls"
