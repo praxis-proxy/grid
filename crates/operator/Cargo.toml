@@ -54,6 +54,7 @@ grid-signals = { path = "../signals" }
 site-invite-api = { path = "../site-invite-api" }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
+kube-runtime = { workspace = true }
 percent-encoding = { workspace = true }
 pem = { workspace = true }
 prometheus = { workspace = true }
