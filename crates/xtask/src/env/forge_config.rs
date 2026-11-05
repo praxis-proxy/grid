@@ -196,6 +196,86 @@ pub(crate) fn apply_image_values(
             );
         }
     }
+    apply_overlay_sync_image_values(config, &overlay_sync, &pull_policy)?;
+    Ok(())
+}
+
+/// Apply the selected overlay-sync image to Praxis gateway Helm steps with an overlay ConfigMap.
+pub(crate) fn apply_overlay_sync_image_values(
+    config: &mut serde_yaml::Value,
+    image: &str,
+    pull_policy: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (repository, tag) = parse_image_ref(image);
+    let Some(stacks) = config
+        .get_mut("spec")
+        .and_then(|spec| spec.get_mut("stacks"))
+        .and_then(serde_yaml::Value::as_mapping_mut)
+    else {
+        return Ok(());
+    };
+
+    for stack in stacks.values_mut() {
+        let Some(steps) = stack.get_mut("steps").and_then(serde_yaml::Value::as_sequence_mut) else {
+            continue;
+        };
+        for step in steps {
+            let is_praxis_gateway = step
+                .get("chart")
+                .and_then(serde_yaml::Value::as_str)
+                .is_some_and(|chart| chart.ends_with("praxis-gateway"));
+            if !is_praxis_gateway {
+                continue;
+            }
+            let Some(values) = step.get_mut("values").and_then(serde_yaml::Value::as_mapping_mut) else {
+                continue;
+            };
+            let overlay_key = serde_yaml::Value::String("overlay".to_owned());
+            let Some(overlay) = values.get_mut(&overlay_key).and_then(serde_yaml::Value::as_mapping_mut) else {
+                continue;
+            };
+            if overlay
+                .get("configMapName")
+                .and_then(serde_yaml::Value::as_str)
+                .is_none()
+            {
+                continue;
+            }
+
+            let sidecar_key = serde_yaml::Value::String("sidecar".to_owned());
+            if !overlay.contains_key(sidecar_key.clone()) {
+                overlay.insert(
+                    sidecar_key.clone(),
+                    serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+                );
+            }
+            let sidecar = overlay
+                .get_mut(&sidecar_key)
+                .and_then(serde_yaml::Value::as_mapping_mut)
+                .ok_or("gateway overlay.sidecar must be a mapping")?;
+            let image_key = serde_yaml::Value::String("image".to_owned());
+            if !sidecar.contains_key(image_key.clone()) {
+                sidecar.insert(
+                    image_key.clone(),
+                    serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+                );
+            }
+            let image_values = sidecar
+                .get_mut(&image_key)
+                .and_then(serde_yaml::Value::as_mapping_mut)
+                .ok_or("gateway overlay.sidecar.image must be a mapping")?;
+            for (key, value) in [
+                ("repository", repository.as_str()),
+                ("tag", tag.as_str()),
+                ("pullPolicy", pull_policy),
+            ] {
+                image_values.insert(
+                    serde_yaml::Value::String(key.to_owned()),
+                    serde_yaml::Value::String(value.to_owned()),
+                );
+            }
+        }
+    }
     Ok(())
 }
 

@@ -4596,7 +4596,7 @@ fn render_config(
     external_site: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut config: serde_yaml::Value = serde_yaml::from_str(content)?;
-    apply_image_overrides(&mut config);
+    apply_image_overrides(&mut config)?;
     match (external_provider, external_site) {
         (Some(ext), Some(site)) => materialize_external_provider_stack(&mut config, ext, site)?,
         (Some(_), None) => {
@@ -4721,12 +4721,13 @@ fn materialize_external_provider_stack(
     clippy::collapsible_if,
     reason = "Image override application with structured YAML manipulation; nested ifs follow YAML structure hierarchy"
 )]
-fn apply_image_overrides(config: &mut serde_yaml::Value) {
+fn apply_image_overrides(config: &mut serde_yaml::Value) -> Result<(), Box<dyn std::error::Error>> {
     let gateway_image = std::env::var("GRID_XTASK_GATEWAY_IMAGE").unwrap_or_else(|_| DEFAULT_GATEWAY_IMAGE.to_owned());
     let operator_image = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/praxis-proxy/grid-operator:v0.1.4".to_owned());
     let vcr_image = crate::env::image_overrides::sim_image();
     let image_pull_policy = std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "IfNotPresent".to_owned());
+    let overlay_sync_override = std::env::var("GRID_XTASK_OVERLAY_SYNC_IMAGE").ok();
 
     let (gateway_repo, gateway_tag) = parse_image_ref(&gateway_image);
     let (operator_repo, operator_tag) = parse_image_ref(&operator_image);
@@ -4759,6 +4760,10 @@ fn apply_image_overrides(config: &mut serde_yaml::Value) {
             }
         }
     }
+    if let Some(image) = overlay_sync_override {
+        crate::env::forge_config::apply_overlay_sync_image_values(config, &image, &image_pull_policy)?;
+    }
+    Ok(())
 }
 
 /// Parse image reference into (repo, tag) components.
