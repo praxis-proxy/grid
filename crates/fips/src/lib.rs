@@ -89,8 +89,7 @@ fn check_host(kernel: &str, policy: &str) -> Result<(), FipsError> {
         .collect::<Vec<_>>()
         .join(":")
         .to_ascii_uppercase();
-    let mut parts = normalized.split(':');
-    if parts.next() != Some("FIPS") || !parts.all(|part| part == "OSPP") {
+    if !matches!(normalized.as_str(), "FIPS" | "FIPS:OSPP") {
         return Err(FipsError::Policy);
     }
     Ok(())
@@ -103,9 +102,15 @@ mod tests {
     #[test]
     fn only_an_explicit_kernel_fips_flag_is_accepted() {
         for kernel in ["", "0", "true", "2", "1 extra"] {
-            assert!(matches!(check_host(kernel, "FIPS"), Err(FipsError::Kernel)));
+            assert!(
+                matches!(check_host(kernel, "FIPS"), Err(FipsError::Kernel)),
+                "kernel value {kernel:?} must be refused"
+            );
         }
-        assert!(matches!(check_host("1\n", "FIPS"), Ok(())));
+        assert!(
+            matches!(check_host("1\n", "FIPS"), Ok(())),
+            "kernel flag 1 with a trailing newline must be accepted"
+        );
     }
 
     #[test]
@@ -120,6 +125,8 @@ mod tests {
             "FIPS:SHA1",
             "FIPS:",
             "FIPS:UNKNOWN",
+            "FIPS:OSPP:OSPP",
+            "FIPS\nOSPP\nOSPP",
         ] {
             assert!(matches!(check_host("1", policy), Err(FipsError::Policy)), "{policy}");
         }

@@ -182,6 +182,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Check default startup helpers without OpenSSL
+        env:
+          OPENSSL_LIB_DIR: /nonexistent
+          OPENSSL_INCLUDE_DIR: /nonexistent
+        run: cargo check --locked -p grid-fips -p grid-openssl-fips --target-dir /tmp/grid-startup-without-openssl
+
       - name: Unit tests
         run: make test-unit
 
@@ -259,7 +265,7 @@ jobs:
       - name: Clippy (fips)
         run: |
           cargo clippy -p grid-fips --features runtime --all-targets -- -D warnings
-          cargo clippy -p grid-openssl-fips -- -D warnings
+          cargo clippy -p grid-openssl-fips --features runtime -- -D warnings
           cargo clippy -p certs --no-default-features --features fips --all-targets -- -D warnings
           cargo clippy -p enrollment --no-default-features --features fips --all-targets -- -D warnings
           cargo clippy -p enrollment --no-default-features --features fips,sar,bootstrap --bins --test fips_startup -- -D warnings

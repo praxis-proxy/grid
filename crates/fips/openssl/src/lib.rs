@@ -3,10 +3,12 @@
 //! This is the sole documented exception to Grid's unsafe-code prohibition.
 //! Replace it with the upstream safe getter when available; do not add other
 //! FFI operations here. See docs/fips.md in the parent repository.
+//! The `runtime` feature enables the query and its system OpenSSL dependency;
+//! default workspace builds do not probe or link OpenSSL through this crate.
 
 #![deny(unsafe_code)]
 
-#[cfg(not(openssl3))]
+#[cfg(all(feature = "runtime", not(openssl3)))]
 compile_error!("Grid FIPS startup verification requires the OpenSSL 3 provider API");
 
 /// Whether the process's default OpenSSL library context requires `fips=yes`.
@@ -20,6 +22,7 @@ compile_error!("Grid FIPS startup verification requires the OpenSSL 3 provider A
     unsafe_code,
     reason = "documented read-only OpenSSL 3 query; replace with a safe rust-openssl getter when available"
 )]
+#[cfg(feature = "runtime")]
 pub fn enabled() -> bool {
     openssl_sys::init();
     // SAFETY: OpenSSL is initialized. NULL is the documented selector for the

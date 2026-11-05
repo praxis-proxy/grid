@@ -13,7 +13,7 @@ runtime = ["dep:openssl", "dep:grid-openssl-fips"]
 
 [dependencies]
 openssl = { workspace = true, optional = true }
-grid-openssl-fips = { path = "openssl", optional = true }
+grid-openssl-fips = { workspace = true, optional = true, features = ["runtime"] }
 thiserror = { workspace = true }
 
 [lints]

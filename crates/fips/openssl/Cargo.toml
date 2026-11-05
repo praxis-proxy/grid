@@ -7,8 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = []
+runtime = ["dep:openssl-sys"]
+
 [dependencies]
-openssl-sys = { workspace = true }
+openssl-sys = { workspace = true, optional = true }
 
 # The only crate deliberately not inheriting the workspace's unsafe `forbid`:
 # deny plus one function-level expectation confines the documented exception.

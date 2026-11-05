@@ -31,6 +31,7 @@ license = "Apache-2.0"
 metrics = "0.24.6"
 version = { path = "crates/version" }
 grid-fips = { path = "crates/fips" }
+grid-openssl-fips = { path = "crates/fips/openssl" }
 tempfile = "3.0.0"
 status-harness = { path = "crates/status-harness" }
 aes-gcm = "0.11.1"
