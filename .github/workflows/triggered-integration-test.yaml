@@ -2,8 +2,8 @@ name: Triggered Integration Test
 
 # ------------------------------------------------------------------------------
 # Maintainer-triggered integration test of Grid main, a pull request, or a branch,
-# plus the legacy nightly quick GLB run against main. Manual and scheduled
-# release qualifications share this workflow through workflow_call.
+# plus nightly GLB quick and combined-site full runs against main. Manual runs
+# and reusable workflow calls can select a supported release qualification.
 #
 # Runs the selected qualification against the tested revision. GLB verifies
 # multi-cluster routing, SWIM discovery, mTLS, overlay hot-reload, and provider
@@ -52,11 +52,15 @@ on:
         type: string
         default: ""
   schedule:
+    # Nightly GLB quick qualification.
     - cron: "0 18 * * *"
+      timezone: America/New_York
+    # Nightly combined-site qualification (mapped to full mode below).
+    - cron: "0 19 * * *"
       timezone: America/New_York
 
 concurrency:
-  group: grid-triggered-integration-${{ github.workflow }}-${{ inputs.release_qualification || 'glb-quick' }}-${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.branch != '' && format('branch-{0}', inputs.branch) || 'main' }}-${{ github.event_name }}
+  group: grid-triggered-integration-${{ github.workflow }}-${{ github.event_name == 'schedule' && github.event.schedule == '0 19 * * *' && 'combined-site' || inputs.release_qualification || 'glb-quick' }}-${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.branch != '' && format('branch-{0}', inputs.branch) || 'main' }}-${{ github.event_name }}-${{ github.event_name == 'schedule' && github.event.schedule || '' }}
   cancel-in-progress: true
 
 permissions: {}
@@ -134,7 +138,7 @@ jobs:
       - name: Resolve release qualification
         id: selection
         env:
-          RELEASE_QUALIFICATION: ${{ inputs.release_qualification || 'glb-quick' }}
+          RELEASE_QUALIFICATION: ${{ github.event_name == 'schedule' && github.event.schedule == '0 19 * * *' && 'combined-site' || inputs.release_qualification || 'glb-quick' }}
         run: |
           set -euo pipefail
           case "${RELEASE_QUALIFICATION}" in
