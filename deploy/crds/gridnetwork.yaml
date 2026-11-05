@@ -2529,7 +2529,7 @@ spec:
                         description: Original wire flag, retained to verify exact duplicates.
                         type: boolean
                       sequence:
-                        description: Last durably accepted sequence.
+                        description: Last durably recorded sequence; live sequence watermarks are process-local.
                         format: int64
                         minimum: 1.0
                         type: integer

@@ -231,7 +231,7 @@ impl ChangeLog {
     }
 }
 
-/// Whether a gateway's empty-candidate state has just begun.
+/// Retain each gateway's prior empty state so repeated reconciles do not repeat no-route warnings.
 fn should_warn_empty_overlay(logged: &ChangeLog, key: &str, no_candidates: bool) -> bool {
     let changed = logged.changed(key, no_candidates.to_string());
     changed && no_candidates
@@ -1860,7 +1860,7 @@ const MOUNT_RECONCILIATION_REQUEUE: Duration = Duration::from_secs(60);
 const FIELD_MANAGER: &str = "grid-operator";
 
 /// Finalizer that keeps a `GridNetwork` present until its SWIM scope withdraws.
-const GRID_NETWORK_WITHDRAWAL_FINALIZER: &str = "grid.praxis.fast/gridnetwork-withdrawal";
+pub const GRID_NETWORK_WITHDRAWAL_FINALIZER: &str = "grid.praxis.fast/gridnetwork-withdrawal";
 
 /// Bound retries when another reconcile updates a `GridNetwork` finalizer at the same time.
 const FINALIZER_PATCH_ATTEMPTS: usize = 4;
@@ -3342,6 +3342,8 @@ async fn reconcile_routing_overlay_inner(
     let peer_catalog = member_catalogs.then(|| derived_topology::peer_catalog(&eligible_remote_owned));
 
     for gw_ref in &network.spec.consumer_gateways {
+        let empty_overlay_key = format!("{}{}/{}", empty_overlay_prefix, gw_ref.namespace, gw_ref.name);
+        logged_empty_overlays.insert(empty_overlay_key.clone());
         // Each gateway identifies its own local site.  Fall back to the
         // network name for single-site deployments where the two are equal.
         let local_site = gw_ref.site_name.as_deref().unwrap_or(network_name);
@@ -3474,8 +3476,6 @@ async fn reconcile_routing_overlay_inner(
             },
         };
         let no_candidates = overlay.candidates.is_empty();
-        let empty_overlay_key = format!("{}{}/{}", empty_overlay_prefix, gw_ref.namespace, gw_ref.name);
-        logged_empty_overlays.insert(empty_overlay_key.clone());
         if should_warn_empty_overlay(logged, &empty_overlay_key, no_candidates) {
             tracing::warn!(
                 network = network_name,
