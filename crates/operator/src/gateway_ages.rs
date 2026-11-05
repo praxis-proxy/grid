@@ -44,8 +44,8 @@ pub struct GatewayFeedback {
     client: Client,
     /// Serializes the CAS flow and receipt commit under the request budget.
     publication: Arc<tokio::sync::Semaphore>,
-    /// Updated only after durable acceptance; empty after operator restart.
-    receipts: Arc<Mutex<BTreeMap<String, Instant>>>,
+    /// Updated only after acceptance; empty after operator restart.
+    receipts: Arc<Mutex<BTreeMap<String, Receipt>>>,
     /// Cancels publication when the operator terminates.
     shutdown: Shutdown,
 }
@@ -90,10 +90,10 @@ impl GatewayFeedback {
         let api: Api<GridNetwork> = Api::all(self.client.clone());
         for _attempt in 0..3 {
             match attempt(&api, &report, &receipts).await {
-                Ok((update, instant)) => {
+                Ok(update) => {
                     let mut accepted_receipts = self.receipts.lock().unwrap_or_else(PoisonError::into_inner);
-                    if update.fresh {
-                        accepted_receipts.insert(report.epoch.clone(), instant);
+                    if let Some(receipt) = update.receipt {
+                        accepted_receipts.insert(report.epoch.clone(), receipt);
                     }
                     accepted_receipts.retain(|epoch, _| update.evidence.reports.iter().any(|row| &row.epoch == epoch));
                     drop(accepted_receipts);
@@ -112,14 +112,17 @@ impl GatewayFeedback {
 async fn attempt(
     api: &Api<GridNetwork>,
     report: &IngestReport,
-    receipts: &BTreeMap<String, Instant>,
-) -> Result<(Update, Instant), StatusCode> {
+    receipts: &BTreeMap<String, Receipt>,
+) -> Result<Update, StatusCode> {
     let network = Box::pin(read_network(api)).await?;
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .map_err(|_format| StatusCode::SERVICE_UNAVAILABLE)?;
     let instant = Instant::now();
     let update = fold(&network, report, &now, receipts, instant).map_err(|()| StatusCode::BAD_REQUEST)?;
+    if !update.write {
+        return Ok(update);
+    }
     let name = network
         .metadata
         .name
@@ -137,7 +140,7 @@ async fn attempt(
         tracing::warn!("gateway feedback response did not contain the intended evidence");
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    Ok((update, instant))
+    Ok(update)
 }
 
 /// Echo exact report identity only after storage and capacity acceptance.
@@ -220,10 +223,27 @@ struct Update {
     patch: serde_json::Value,
     /// Structured desired evidence for verifying the storage response.
     evidence: Evidence,
-    /// Whether this is a strictly newer accepted observation.
-    fresh: bool,
+    /// A receipt watermark to commit after acceptance.
+    receipt: Option<Receipt>,
+    /// Whether status differs from the current durable evidence.
+    write: bool,
     /// Capacity refusal, whose uncertainty is still published.
     overflow: bool,
+}
+
+/// Accepted in-process watermark for one gateway process epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Receipt {
+    /// Highest accepted sequence, including reports not durably rewritten.
+    sequence: i64,
+    /// Highest accepted cumulative skew count.
+    skew: i64,
+    /// Rejection flag at the accepted sequence.
+    rejected: bool,
+    /// Last accepted report time on this operator's monotonic clock.
+    instant: Instant,
+    /// Last time the report row itself was durably refreshed.
+    persisted: Instant,
 }
 
 /// Separately owned durable evidence and its diagnostic condition.
@@ -239,7 +259,7 @@ struct Evidence {
 /// Monotonic receipt context; missing receipt knowledge remains stale after restart.
 struct Freshness<'receipt> {
     /// Live accepted receipts.
-    receipts: &'receipt BTreeMap<String, Instant>,
+    receipts: &'receipt BTreeMap<String, Receipt>,
     /// Shared reading for this operation.
     instant: Instant,
     /// Only a strictly newer observation renews its epoch.
@@ -253,7 +273,7 @@ impl Freshness<'_> {
             || self
                 .receipts
                 .get(&row.epoch)
-                .is_some_and(|received| self.instant.saturating_duration_since(*received) < FRESHNESS)
+                .is_some_and(|received| self.instant.saturating_duration_since(received.instant) < FRESHNESS)
     }
 }
 
@@ -262,20 +282,30 @@ fn fold(
     network: &GridNetwork,
     report: &IngestReport,
     now: &str,
-    receipts: &BTreeMap<String, Instant>,
+    receipts: &BTreeMap<String, Receipt>,
     instant: Instant,
 ) -> Result<Update, ()> {
     let status = network.status.as_ref();
     let mut reports = status.map_or_else(Vec::new, |status| status.gateway_age_reports.clone());
-    let (fresh, overflow) = observe(&mut reports, report, now)?;
+    let observed = observe(&mut reports, report, now, receipts, instant)?;
+    let overflow = observed.overflow;
     let uncertain = overflow || status.is_some_and(|status| status.gateway_age_report_overflow);
     reports.sort_by(|left, right| left.epoch.cmp(&right.epoch));
     let freshness = Freshness {
         receipts,
         instant,
-        epoch: fresh.then_some(report.epoch.as_str()),
+        epoch: observed.fresh.then_some(report.epoch.as_str()),
     };
     let condition = condition(network, &reports, uncertain, now, &freshness);
+    let write = status.is_none_or(|status| {
+        status.gateway_age_reports != reports
+            || status.gateway_age_report_overflow != uncertain
+            || status
+                .conditions
+                .iter()
+                .find(|held| held.type_ == GATEWAY_AGES_REJECTED)
+                != Some(&condition)
+    });
     let patch = serde_json::json!({
         "apiVersion": "grid.praxis.fast/v1alpha1", "kind": "GridNetwork",
         "metadata": { "name": network.metadata.name, "resourceVersion": network.metadata.resource_version },
@@ -288,39 +318,104 @@ fn fold(
             uncertain,
             condition,
         },
-        fresh,
+        receipt: observed.receipt,
+        write,
         overflow,
     })
 }
 
+/// One validated report folded into durable evidence and the live receipt watermark.
+struct Observation {
+    /// Whether the report is strictly newer than the accepted watermark.
+    fresh: bool,
+    /// Whether reporter capacity rejected this identity.
+    overflow: bool,
+    /// Receipt watermark to commit after publication.
+    receipt: Option<Receipt>,
+}
+
 /// Admit a new identity only by reclaiming clean bookkeeping.
-fn observe(reports: &mut Vec<GatewayAgeReport>, report: &IngestReport, now: &str) -> Result<(bool, bool), ()> {
+fn observe(
+    reports: &mut Vec<GatewayAgeReport>,
+    report: &IngestReport,
+    now: &str,
+    receipts: &BTreeMap<String, Receipt>,
+    instant: Instant,
+) -> Result<Observation, ()> {
     if let Some(held) = reports.iter_mut().find(|held| held.epoch == report.epoch) {
-        return replace(held, report, now).map(|fresh| (fresh, false));
+        return replace(held, report, now, receipts.get(&report.epoch), instant);
     }
     if reports.len() >= MAX_REPORTERS {
         reports.sort_by(|left, right| (&left.received_at, &left.epoch).cmp(&(&right.received_at, &right.epoch)));
         let Some(position) = reports.iter().position(|held| !held.rejected) else {
-            return Ok((false, true));
+            return Ok(Observation {
+                fresh: false,
+                overflow: true,
+                receipt: None,
+            });
         };
         reports.remove(position);
     }
     reports.push(row(report, report.rejected || report.skew > 0, now));
-    Ok((true, false))
+    Ok(Observation {
+        fresh: true,
+        overflow: false,
+        receipt: Some(Receipt {
+            sequence: report.sequence,
+            skew: report.skew,
+            rejected: report.rejected,
+            instant,
+            persisted: instant,
+        }),
+    })
 }
 
 /// Reject replay or changed duplicates; counter rises override a clean claim.
-fn replace(held: &mut GatewayAgeReport, report: &IngestReport, now: &str) -> Result<bool, ()> {
-    if held.replica != report.replica || report.sequence < held.sequence || report.skew < held.skew {
+fn replace(
+    held: &mut GatewayAgeReport,
+    report: &IngestReport,
+    now: &str,
+    receipt: Option<&Receipt>,
+    instant: Instant,
+) -> Result<Observation, ()> {
+    let sequence = receipt.map_or(held.sequence, |current| current.sequence);
+    let skew = receipt.map_or(held.skew, |current| current.skew);
+    let rejected = receipt.map_or(held.reported_rejected, |current| current.rejected);
+    if held.replica != report.replica || report.sequence < sequence || report.skew < skew {
         return Err(());
     }
-    if report.sequence == held.sequence {
-        return (report.skew == held.skew && report.rejected == held.reported_rejected)
-            .then_some(false)
+    if report.sequence == sequence {
+        return (report.skew == skew && report.rejected == rejected)
+            .then_some(Observation {
+                fresh: false,
+                overflow: false,
+                receipt: None,
+            })
             .ok_or(());
     }
-    *held = row(report, report.rejected || report.skew > held.skew, now);
-    Ok(true)
+    let effective_rejected = report.rejected || report.skew > skew;
+    let refresh_due = receipt.is_none_or(|current| instant.saturating_duration_since(current.persisted) >= FRESHNESS);
+    let decision_changed =
+        report.skew != held.skew || report.rejected != held.reported_rejected || effective_rejected != held.rejected;
+    let persist = refresh_due || decision_changed;
+    if persist {
+        *held = row(report, effective_rejected, now);
+    }
+    Ok(Observation {
+        fresh: true,
+        overflow: false,
+        receipt: Some(Receipt {
+            sequence: report.sequence,
+            skew: report.skew,
+            rejected: report.rejected,
+            instant,
+            persisted: if persist {
+                instant
+            } else {
+                receipt.map_or(instant, |current| current.persisted)
+            },
+        }),
+    })
 }
 
 /// Preserve transition time while updating diagnostic detail and observed generation.
@@ -409,7 +504,7 @@ mod tests {
         let first = report("a", 1, 1, true);
         let update = fold(&network, &first, "t0", &BTreeMap::new(), instant).expect("bad");
         apply(&mut network, &update);
-        let receipts = BTreeMap::from([(first.epoch, instant)]);
+        let receipts = BTreeMap::from([(first.epoch.clone(), receipt(&first, instant))]);
         let other = fold(&network, &report("b", 1, 0, false), "t1", &receipts, instant).expect("other");
         assert_eq!(
             standing(&other),
@@ -441,7 +536,10 @@ mod tests {
         );
         apply(&mut network, &update);
         let duplicate = fold(&network, &report, "t1", &BTreeMap::new(), instant).expect("exact duplicate");
-        assert!(!duplicate.fresh, "an exact replay must not renew the receipt");
+        assert!(
+            duplicate.receipt.is_none(),
+            "an exact replay must not renew the receipt"
+        );
         assert_eq!(
             standing(&duplicate),
             "Unknown",
@@ -469,6 +567,63 @@ mod tests {
             )
             .is_err(),
             "a newer sequence must not regress the cumulative skew counter"
+        );
+    }
+
+    #[test]
+    fn unchanged_newer_reports_skip_writes_until_the_freshness_refresh() {
+        let mut network = network();
+        let instant = Instant::now();
+        let first = report("a", 1, 0, false);
+        let accepted = fold(&network, &first, "t0", &BTreeMap::new(), instant).expect("first report");
+        let first_receipt = accepted.receipt.clone().expect("receipt");
+        apply(&mut network, &accepted);
+        let receipts = BTreeMap::from([(first.epoch.clone(), first_receipt)]);
+
+        let second = report("a", 2, 0, false);
+        let one_second_later = instant.checked_add(Duration::from_secs(1)).expect("test instant");
+        let unchanged = fold(&network, &second, "t1", &receipts, one_second_later).expect("unchanged report");
+        assert!(!unchanged.write, "routine sequence increments do not write status");
+        assert_eq!(
+            unchanged.evidence.reports[0].sequence, 1,
+            "the durable sequence remains unchanged between refreshes"
+        );
+        let second_receipt = unchanged.receipt.clone().expect("advanced watermark");
+        assert_eq!(second_receipt.sequence, 2, "the live sequence advances in memory");
+
+        let receipts = BTreeMap::from([(second.epoch.clone(), second_receipt)]);
+        let stale = IngestReport {
+            sequence: 1,
+            ..second.clone()
+        };
+        assert!(
+            fold(
+                &network,
+                &stale,
+                "t2",
+                &receipts,
+                instant.checked_add(Duration::from_secs(2)).expect("test instant")
+            )
+            .is_err(),
+            "the in-memory watermark rejects a sequence below one already acknowledged"
+        );
+
+        let refresh = fold(
+            &network,
+            &report("a", 3, 0, false),
+            "t3",
+            &receipts,
+            instant.checked_add(FRESHNESS).expect("test instant"),
+        )
+        .expect("freshness refresh");
+        assert!(refresh.write, "the durable row refreshes at the freshness boundary");
+        assert_eq!(
+            refresh.evidence.reports[0].sequence, 3,
+            "refresh persists the latest sequence"
+        );
+        assert_eq!(
+            refresh.evidence.reports[0].received_at, "t3",
+            "refresh records the new receipt time"
         );
     }
 
@@ -519,7 +674,7 @@ mod tests {
         let instant = Instant::now();
         let first = fold(&network, &report, "t0", &BTreeMap::new(), instant).expect("bad");
         apply(&mut network, &first);
-        let receipts = BTreeMap::from([(report.epoch.clone(), instant)]);
+        let receipts = BTreeMap::from([(report.epoch.clone(), receipt(&report, instant))]);
         let expired = instant.checked_add(FRESHNESS).expect("bounded instant");
         let stale = fold(&network, &report, "t1", &receipts, expired).expect("duplicate");
         assert_eq!(standing(&stale), "Unknown", "receipt expiry cannot prove recovery");
@@ -619,6 +774,27 @@ mod tests {
             patches.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "bad and clean reports each require one durable write"
+        );
+    }
+
+    #[tokio::test]
+    async fn routine_reports_are_acknowledged_without_status_writes() {
+        let (client, _stored, patches) = mock_api(StorageMode::Normal);
+        let feedback = GatewayFeedback::new(client, Shutdown::never());
+        for sequence in [1, 2] {
+            assert_eq!(
+                feedback
+                    .respond(true, request(&report("a", sequence, 0, false), ""))
+                    .await
+                    .status(),
+                StatusCode::NO_CONTENT,
+                "a valid report is acknowledged"
+            );
+        }
+        assert_eq!(
+            patches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an unchanged sequence increment does not patch GridNetwork status"
         );
     }
 
@@ -924,6 +1100,17 @@ mod tests {
             sequence,
             skew,
             rejected,
+        }
+    }
+
+    /// Live receipt watermark for a test report.
+    fn receipt(report: &IngestReport, instant: Instant) -> Receipt {
+        Receipt {
+            sequence: report.sequence,
+            skew: report.skew,
+            rejected: report.rejected,
+            instant,
+            persisted: instant,
         }
     }
 

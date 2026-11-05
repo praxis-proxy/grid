@@ -61,7 +61,7 @@ use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use kube::{
     Api, Client,
     api::{ObjectMeta, Patch, PatchParams, PostParams},
-    runtime::{controller::Controller, watcher},
+    runtime::{Controller, WatchStreamExt as _, predicates, reflector, watcher},
 };
 use operator::{
     cli::{Cli, Membership},
@@ -1822,7 +1822,13 @@ async fn run_network_controller(
     let tool_provider_api = Api::<AgentToolProvider>::all(client.clone());
     let site_api = Api::<GridSite>::all(client.clone());
 
-    let controller = Controller::new(api, watcher::Config::default())
+    let (reader, writer) = reflector::store();
+    let primary = watcher(api, watcher::Config::default())
+        .default_backoff()
+        .reflect(writer)
+        .applied_objects()
+        .predicate_filter(predicates::generation, Default::default());
+    let controller = Controller::for_stream(primary, reader)
         .watches(
             provider_api,
             watcher::Config::default(),
@@ -4374,6 +4380,40 @@ mod tests {
         assert!(
             minimum > std::time::Duration::from_millis(grid_signals::CANDIDATE_EXPIRY_SKEW_MARGIN_MS),
             "the TTL must remain valid when received by the gateway"
+        );
+    }
+
+    #[tokio::test]
+    async fn grid_network_generation_filter_suppresses_status_only_updates() {
+        let network = |generation, resource_version, remote_provider_count| -> GridNetwork {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "grid.praxis.fast/v1alpha1",
+                "kind": "GridNetwork",
+                "metadata": { "name": "net", "generation": generation, "resourceVersion": resource_version },
+                "spec": { "seeds": [], "gridId": "grid" },
+                "status": { "remoteProviderCount": remote_provider_count }
+            }))
+            .expect("GridNetwork fixture")
+        };
+        let updates = futures::stream::iter([
+            Ok::<_, watcher::Error>(network(1, "1", 0)),
+            Ok(network(1, "2", 1)),
+            Ok(network(2, "3", 1)),
+        ])
+        .predicate_filter(predicates::generation, Default::default())
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(updates.len(), 2, "status-only changes do not produce watch triggers");
+        assert_eq!(
+            updates
+                .get(1)
+                .expect("spec update")
+                .as_ref()
+                .expect("watch result")
+                .metadata
+                .generation,
+            Some(2),
+            "spec generation changes still produce watch triggers"
         );
     }
 
