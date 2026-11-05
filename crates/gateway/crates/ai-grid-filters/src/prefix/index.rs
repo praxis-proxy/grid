@@ -9,7 +9,10 @@ use std::{
     collections::HashMap,
     fmt,
     num::NonZeroUsize,
-    sync::{Arc, PoisonError, RwLock},
+    sync::{
+        Arc, PoisonError, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -34,9 +37,103 @@ struct Entry {
     confirmed: bool,
 }
 
-/// One candidate's keys. Keys are already uniform hashes, so a fast hasher does,
+/// One candidate's LRU. Keys are already uniform hashes, so a fast hasher does,
 /// seeded per process so a client cannot aim prompts at one bucket.
-type Keys = Arc<RwLock<LruCache<u64, Entry, foldhash::fast::RandomState>>>;
+type Lru = LruCache<u64, Entry, foldhash::fast::RandomState>;
+
+/// One candidate's keys and the series that describe them.
+///
+/// The handles are registered once, when the candidate is created, so the request
+/// path updates them with atomic stores and adds rather than a registry lookup.
+struct Held {
+    /// The candidate's keys.
+    keys: RwLock<Lru>,
+    /// Keys held, `grid_route_prefix_index_entries`.
+    entries: metrics::Gauge,
+    /// Configured capacity, `grid_route_prefix_index_capacity`.
+    capacity: metrics::Gauge,
+    /// Live keys a full LRU displaced, the undersizing signal.
+    evicted_capacity: metrics::Counter,
+    /// Expired keys displaced, and confirmed keys sent again after their lifetime.
+    evicted_ttl: metrics::Counter,
+    /// Keys a failure or refusal removed.
+    evicted_forgotten: metrics::Counter,
+    /// Set when an apply drops the candidate, so a request still holding it cannot revive its gauge.
+    retired: AtomicBool,
+}
+
+impl Held {
+    /// An empty LRU limited to `capacity`, with its series registered under `cluster`.
+    fn new(cluster: &str, capacity: NonZeroUsize) -> Self {
+        let mut keys = LruCache::unbounded_with_hasher(foldhash::fast::RandomState::default());
+        // Set the entry limit without reserving its full capacity.
+        keys.resize(capacity);
+        let evicted =
+            |reason: &'static str| metrics::counter!(EVICTIONS, "cluster" => cluster.to_owned(), "reason" => reason);
+        let held = Self {
+            keys: RwLock::new(keys),
+            entries: metrics::gauge!(ENTRIES, "cluster" => cluster.to_owned()),
+            capacity: metrics::gauge!(CAPACITY, "cluster" => cluster.to_owned()),
+            evicted_capacity: evicted("capacity"),
+            evicted_ttl: evicted("ttl"),
+            evicted_forgotten: evicted("forgotten"),
+            retired: AtomicBool::new(false),
+        };
+        held.capacity.set(usize_gauge(capacity.get()));
+        held.entries.set(0.0);
+        held
+    }
+
+    /// Write access to the keys.
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Lru> {
+        self.keys.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Publish the number of keys held. Called under the write lock, which orders it after [`Self::retire`].
+    fn publish(&self, keys: &Lru) {
+        if !self.retired.load(Ordering::Relaxed) {
+            self.entries.set(usize_gauge(keys.len()));
+        }
+    }
+
+    /// Clear the series of a candidate an apply dropped.
+    fn retire(&self) {
+        let lru = self.write();
+        self.retired.store(true, Ordering::Relaxed);
+        self.entries.set(0.0);
+        self.capacity.set(0.0);
+        drop(lru);
+    }
+}
+
+/// A shared candidate.
+type Keys = Arc<Held>;
+
+/// Keys held for a backend cluster in this replica.
+pub(crate) const ENTRIES: &str = "grid_route_prefix_index_entries";
+
+/// Keys a backend cluster's LRU may hold.
+pub(crate) const CAPACITY: &str = "grid_route_prefix_index_capacity";
+
+/// Keys that left a backend cluster's LRU, by reason.
+pub(crate) const EVICTIONS: &str = "grid_route_prefix_index_evictions_total";
+
+/// A count as a gauge value. Exact below 2^53, far above any capacity.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::as_conversions,
+    reason = "counts stay below 2^53"
+)]
+const fn usize_gauge(count: usize) -> f64 {
+    count as f64
+}
+
+/// Add `count` to `counter`, skipping the atomic add when nothing left.
+fn add(counter: &metrics::Counter, count: usize) {
+    if count > 0 {
+        counter.increment(u64::try_from(count).unwrap_or(u64::MAX));
+    }
+}
 
 /// The per-replica prefix index. Cheap to clone; clones share state.
 #[derive(Clone, Default)]
@@ -101,7 +198,7 @@ impl PrefixIndex {
             .into_iter()
             .map(|candidate| {
                 index.candidates.get(candidate.as_ref()).map_or(0, |held| {
-                    let held = held.read().unwrap_or_else(PoisonError::into_inner);
+                    let held = held.keys.read().unwrap_or_else(PoisonError::into_inner);
                     keys.as_slice()
                         .iter()
                         .take_while(|key| {
@@ -116,12 +213,16 @@ impl PrefixIndex {
 
     /// Record `keys` as sent to `candidate`, waiting on [`Self::confirm`] or [`Self::forget`].
     pub(crate) fn record(&self, keys: &PrefixKeys, candidate: &Arc<str>) {
+        self.record_at(keys, candidate, Instant::now());
+    }
+
+    /// Record at one observation time.
+    fn record_at(&self, keys: &PrefixKeys, candidate: &Arc<str>, now: Instant) {
         let Some((held, _)) = self.candidate(candidate) else {
             return;
         };
-        let now = Instant::now();
         let until = now.checked_add(PENDING_TTL).unwrap_or(now);
-        Self::update(keys, &held, |held| match held {
+        Self::update(keys, &held, now, |held| match held {
             Some(entry) if now < entry.until => Entry {
                 pending: entry.pending.saturating_add(1),
                 ..entry
@@ -136,12 +237,16 @@ impl PrefixIndex {
 
     /// The request sent to `candidate` got a success: its keys hold there.
     pub(crate) fn confirm(&self, keys: &PrefixKeys, candidate: &Arc<str>) {
+        self.confirm_at(keys, candidate, Instant::now());
+    }
+
+    /// Confirm at one observation time.
+    fn confirm_at(&self, keys: &PrefixKeys, candidate: &Arc<str>, now: Instant) {
         let Some((held, confirmed_ttl)) = self.candidate(candidate) else {
             return;
         };
-        let now = Instant::now();
         let until = now.checked_add(confirmed_ttl).unwrap_or(now);
-        Self::update(keys, &held, |held| Entry {
+        Self::update(keys, &held, now, |held| Entry {
             until,
             pending: held.map_or(0, |entry| entry.pending.saturating_sub(1)),
             confirmed: true,
@@ -153,16 +258,21 @@ impl PrefixIndex {
         let Some(held) = self.existing(candidate) else {
             return;
         };
-        let mut held = held.write().unwrap_or_else(PoisonError::into_inner);
+        let mut lru = held.write();
+        let mut removed = 0_usize;
         for key in keys.as_slice() {
-            let Some(entry) = held.peek_mut(key) else {
+            let Some(entry) = lru.peek_mut(key) else {
                 continue;
             };
             entry.pending = entry.pending.saturating_sub(1);
             if entry.pending == 0 && !entry.confirmed {
-                held.pop(key);
+                lru.pop(key);
+                removed = removed.saturating_add(1);
             }
         }
+        held.publish(&lru);
+        drop(lru);
+        add(&held.evicted_forgotten, removed);
     }
 
     /// `candidate` refused or failed the request: drop its keys there, confirmed or not.
@@ -170,42 +280,79 @@ impl PrefixIndex {
         let Some(held) = self.existing(candidate) else {
             return;
         };
-        let mut held = held.write().unwrap_or_else(PoisonError::into_inner);
-        for key in keys.as_slice() {
-            held.pop(key);
-        }
+        let mut lru = held.write();
+        let removed = keys.as_slice().iter().filter(|key| lru.pop(*key).is_some()).count();
+        held.publish(&lru);
+        drop(lru);
+        add(&held.evicted_forgotten, removed);
     }
 
     /// Adopt cache limits and retain routed candidates. Existing keys keep their expiry times.
     pub(crate) fn apply(&self, settings: &AffinitySettings, candidates: &[Arc<str>]) {
+        let now = Instant::now();
         let mut index = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         index.capacity = settings.capacity;
         index.confirmed_ttl = Duration::from_secs(settings.ttl_secs.get());
-        index.candidates.retain(|candidate, _| candidates.contains(candidate));
+        index.candidates.retain(|candidate, held| {
+            let kept = candidates.contains(candidate);
+            if !kept {
+                held.retire();
+            }
+            kept
+        });
         index.adopted = Some(candidates.to_vec());
         for candidate in candidates {
             if let Some(held) = index.candidates.get(candidate) {
-                held.write()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .resize(settings.capacity);
+                let mut lru = held.write();
+                // A smaller capacity drops the least recent keys, sorted as a full LRU's displacements are.
+                let (mut capacity, mut ttl) = (0_usize, 0_usize);
+                while lru.len() > settings.capacity.get() {
+                    match lru.pop_lru() {
+                        Some((_, dropped)) if dropped.until <= now => ttl = ttl.saturating_add(1),
+                        Some(_) => capacity = capacity.saturating_add(1),
+                        None => break,
+                    }
+                }
+                lru.resize(settings.capacity);
+                held.publish(&lru);
+                drop(lru);
+                held.capacity.set(usize_gauge(settings.capacity.get()));
+                add(&held.evicted_capacity, capacity);
+                add(&held.evicted_ttl, ttl);
             }
         }
     }
 
     /// Update each of `keys` for `candidate`, tail first, so the head of a prompt is evicted last.
-    fn update(keys: &PrefixKeys, held: &Keys, entry: impl Fn(Option<Entry>) -> Entry) {
+    ///
+    /// Counts what leaves at `now`: a key a full LRU displaces is a capacity eviction while it
+    /// still counts and a TTL one once it has expired; a confirmed key sent again after its
+    /// lifetime is a TTL one too. The counters are added once per call, outside the lock.
+    fn update(keys: &PrefixKeys, held: &Keys, now: Instant, entry: impl Fn(Option<Entry>) -> Entry) {
+        let (mut capacity, mut ttl) = (0_usize, 0_usize);
         // A short lock per chunk lets depth lookups in between; no reader needs the whole prompt at once.
         for chunk in keys.as_slice().rchunks(WRITE_CHUNK) {
-            let mut held = held.write().unwrap_or_else(PoisonError::into_inner);
+            let mut lru = held.write();
             for key in chunk.iter().rev() {
-                match held.get_mut(key) {
-                    Some(current) => *current = entry(Some(*current)),
-                    None => {
-                        held.put(*key, entry(None));
-                    },
+                if let Some(current) = lru.get_mut(key) {
+                    if current.confirmed && current.until <= now {
+                        ttl = ttl.saturating_add(1);
+                    }
+                    *current = entry(Some(*current));
+                } else if let Some((_, displaced)) = lru.push(*key, entry(None)) {
+                    // The key was absent, so push returned the entry the full LRU displaced.
+                    if displaced.until <= now {
+                        ttl = ttl.saturating_add(1);
+                    } else {
+                        capacity = capacity.saturating_add(1);
+                    }
                 }
             }
+            held.publish(&lru);
+            drop(lru);
         }
+        add(&held.evicted_capacity, capacity);
+        add(&held.evicted_ttl, ttl);
     }
 
     /// `candidate`'s keys, when it has any.
@@ -237,12 +384,12 @@ impl PrefixIndex {
             return None;
         }
         let capacity = index.capacity;
-        let held = Arc::clone(index.candidates.entry(Arc::clone(candidate)).or_insert_with(|| {
-            let mut cache = LruCache::unbounded_with_hasher(foldhash::fast::RandomState::default());
-            // Set the entry limit without reserving its full capacity.
-            cache.resize(capacity);
-            Arc::new(RwLock::new(cache))
-        }));
+        let held = Arc::clone(
+            index
+                .candidates
+                .entry(Arc::clone(candidate))
+                .or_insert_with(|| Arc::new(Held::new(candidate, capacity))),
+        );
         Some((held, index.confirmed_ttl))
     }
 
@@ -253,7 +400,7 @@ impl PrefixIndex {
         index
             .candidates
             .get(candidate)
-            .map_or(0, |held| held.read().unwrap_or_else(PoisonError::into_inner).len())
+            .map_or(0, |held| held.keys.read().unwrap_or_else(PoisonError::into_inner).len())
     }
 }
 
@@ -449,7 +596,7 @@ mod tests {
         );
         let held = index.existing("east").expect("east cache");
         assert_eq!(
-            held.read().unwrap().cap(),
+            held.keys.read().unwrap().cap(),
             settings.capacity,
             "the configured limit is retained"
         );
@@ -612,9 +759,178 @@ mod tests {
         assert_eq!(format!("{index:?}"), "PrefixIndex { .. }");
     }
 
+    /// Thread-local capture of the index series, keyed by name and labels.
+    #[derive(Default)]
+    struct Series(std::sync::Mutex<std::collections::BTreeMap<String, Arc<metrics::atomics::AtomicU64>>>);
+
+    impl Series {
+        fn slot(&self, key: &metrics::Key) -> Arc<metrics::atomics::AtomicU64> {
+            let labels: Vec<String> = key.labels().map(|label| label.value().to_owned()).collect();
+            let name = format!("{}{{{}}}", key.name(), labels.join(","));
+            Arc::clone(self.0.lock().unwrap().entry(name).or_default())
+        }
+
+        fn count(&self, cluster: &str, reason: &str) -> u64 {
+            self.0
+                .lock()
+                .unwrap()
+                .get(&format!("{EVICTIONS}{{{cluster},{reason}}}"))
+                .map_or(0, |value| value.load(Ordering::Relaxed))
+        }
+
+        /// A gauge holding a count, `None` when never set.
+        fn gauge(&self, name: &str, cluster: &str) -> Option<u64> {
+            self.0
+                .lock()
+                .unwrap()
+                .get(&format!("{name}{{{cluster}}}"))
+                .map(|value| f64::from_bits(value.load(Ordering::Relaxed)) as u64)
+        }
+    }
+
+    impl metrics::Recorder for Series {
+        fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+            metrics::Counter::from_arc(self.slot(key))
+        }
+
+        fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::from_arc(self.slot(key))
+        }
+
+        fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    /// An index limited to `capacity` keys per cluster, with the default lifetime.
+    fn sized(capacity: usize) -> PrefixIndex {
+        let index = PrefixIndex::default();
+        let settings = AffinitySettings {
+            capacity: NonZeroUsize::new(capacity).unwrap(),
+            ..AffinitySettings::default()
+        };
+        index.apply(&settings, &[name("east")]);
+        index
+    }
+
+    /// One second past the default confirmed lifetime.
+    fn past_ttl(from: Instant) -> Instant {
+        from + Duration::from_secs(AffinitySettings::default().ttl_secs.get() + 1)
+    }
+
+    #[test]
+    fn a_full_index_counts_the_live_keys_it_displaces_as_capacity() {
+        let series = Series::default();
+        metrics::with_local_recorder(&series, || {
+            let index = sized(4);
+            let east = name("east");
+            index.confirm(&keys(0..4), &east);
+            index.confirm(&keys(10..12), &east);
+            assert_eq!(series.count("east", "capacity"), 2, "two live keys displaced");
+            assert_eq!(series.count("east", "ttl"), 0);
+            assert_eq!(series.gauge(ENTRIES, "east"), Some(4), "the index stays full");
+            assert_eq!(series.gauge(CAPACITY, "east"), Some(4));
+        });
+    }
+
+    #[test]
+    fn an_expired_key_counts_as_ttl_when_displaced_or_sent_again() {
+        let series = Series::default();
+        metrics::with_local_recorder(&series, || {
+            let index = sized(3);
+            let east = name("east");
+            let start = Instant::now();
+            index.confirm_at(&keys(0..2), &east, start);
+            index.confirm_at(&keys(0..2), &east, past_ttl(start));
+            assert_eq!(series.count("east", "ttl"), 2, "a turn after the lifetime");
+            index.confirm_at(&keys(10..13), &east, past_ttl(past_ttl(start)));
+            assert_eq!(series.count("east", "ttl"), 4, "two expired keys displaced");
+            assert_eq!(series.count("east", "capacity"), 0, "nothing live was displaced");
+            assert_eq!(series.gauge(ENTRIES, "east"), Some(3));
+        });
+    }
+
+    #[test]
+    fn an_expired_pending_key_confirmed_late_is_not_a_ttl_eviction() {
+        let series = Series::default();
+        metrics::with_local_recorder(&series, || {
+            let index = sized(8);
+            let east = name("east");
+            let start = Instant::now();
+            index.record_at(&keys(0..3), &east, start);
+            index.confirm_at(&keys(0..3), &east, start + PENDING_TTL + Duration::from_secs(1));
+            assert_eq!(series.count("east", "ttl"), 0, "a long response is not a long turn gap");
+        });
+    }
+
+    #[test]
+    fn a_failure_or_refusal_counts_its_removed_keys_as_forgotten() {
+        let series = Series::default();
+        metrics::with_local_recorder(&series, || {
+            let index = sized(16);
+            let east = name("east");
+            index.record(&keys(0..4), &east);
+            index.forget(&keys(0..4), &east);
+            assert_eq!(series.count("east", "forgotten"), 4);
+            assert_eq!(series.gauge(ENTRIES, "east"), Some(0));
+            index.confirm(&keys(0..3), &east);
+            index.forget(&keys(0..3), &east);
+            assert_eq!(series.count("east", "forgotten"), 4, "a failure keeps confirmed keys");
+            index.evict(&keys(0..5), &east);
+            assert_eq!(
+                series.count("east", "forgotten"),
+                7,
+                "a refusal drops the three it held"
+            );
+            assert_eq!(series.gauge(ENTRIES, "east"), Some(0));
+        });
+    }
+
+    #[test]
+    fn a_capacity_cut_counts_its_drops_and_a_removed_cluster_reads_zero() {
+        let series = Series::default();
+        metrics::with_local_recorder(&series, || {
+            let index = sized(8);
+            let east = name("east");
+            index.confirm(&keys(0..8), &east);
+            let smaller = AffinitySettings {
+                capacity: NonZeroUsize::new(5).unwrap(),
+                ..AffinitySettings::default()
+            };
+            index.apply(&smaller, &[name("east")]);
+            assert_eq!(series.count("east", "capacity"), 3);
+            assert_eq!(series.gauge(ENTRIES, "east"), Some(5));
+            assert_eq!(series.gauge(CAPACITY, "east"), Some(5));
+            let in_flight = index.existing("east").expect("east");
+            index.apply(&smaller, &[]);
+            assert_eq!(
+                series.gauge(ENTRIES, "east"),
+                Some(0),
+                "a dropped cluster holds nothing"
+            );
+            assert_eq!(series.gauge(CAPACITY, "east"), Some(0));
+            PrefixIndex::update(&keys(20..22), &in_flight, Instant::now(), |_| Entry {
+                until: Instant::now(),
+                pending: 1,
+                confirmed: false,
+            });
+            assert_eq!(
+                series.gauge(ENTRIES, "east"),
+                Some(0),
+                "a request that held the dropped cluster does not revive its gauge"
+            );
+        });
+    }
+
     /// The recorded deadline of a key, without changing its recency.
     fn deadline(index: &PrefixIndex, candidate: &str, key: u64) -> Instant {
         let held = index.existing(candidate).expect("candidate");
-        held.read().unwrap().peek(&key).expect("key").until
+        held.keys.read().unwrap().peek(&key).expect("key").until
     }
 }

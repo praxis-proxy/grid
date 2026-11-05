@@ -51,7 +51,7 @@ pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;
 
 /// Grid counters the gateway emits, with the help text a scrape shows.
-const COUNTER_HELP: [(&str, &str); 12] = [
+const COUNTER_HELP: [(&str, &str); 13] = [
     (
         "grid_route_decisions_total",
         "Requests the gateway decided, by outcome. A refusal records an empty site and cluster.",
@@ -67,6 +67,10 @@ const COUNTER_HELP: [(&str, &str); 12] = [
     (
         "grid_route_prefix_affinity_total",
         "Prefix-affinity decisions by outcome.",
+    ),
+    (
+        "grid_route_prefix_index_evictions_total",
+        "Prefix keys that left a backend cluster's index, by reason: capacity for a live key a full index displaced, ttl for an expired one, forgotten for a failed or refused request's.",
     ),
     ("grid_serving_config_reload_total", "Serving-config reloads by result."),
     (
@@ -97,7 +101,7 @@ const COUNTER_HELP: [(&str, &str); 12] = [
 ];
 
 /// Grid gauges the gateway emits.
-const GAUGE_HELP: [(&str, &str); 23] = [
+const GAUGE_HELP: [(&str, &str); 25] = [
     (
         "grid_serving_unbound_provider_hops",
         "Provider hops the applied serving config declares that no startup-verified backend binds. Their candidates take no traffic until a serving config names the SNI that backend verified at startup, or, for a backend not verified at startup, until the gateway restarts.",
@@ -181,6 +185,14 @@ const GAUGE_HELP: [(&str, &str); 23] = [
     (
         "grid_route_shedding",
         "1 while the gateway sheds this model, 0 otherwise.",
+    ),
+    (
+        "grid_route_prefix_index_entries",
+        "Prefix keys this replica holds for a backend cluster, expired ones included until displaced.",
+    ),
+    (
+        "grid_route_prefix_index_capacity",
+        "Prefix keys this replica may hold for a backend cluster. 0 once the cluster leaves the serving config.",
     ),
     (
         "grid_signals_last_success_timestamp_seconds",
