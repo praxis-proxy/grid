@@ -70,7 +70,7 @@ const COUNTER_HELP: [(&str, &str); 13] = [
     ),
     (
         "grid_route_prefix_index_evictions_total",
-        "Prefix keys that left a backend cluster's index, by reason: capacity for a live key a full index displaced, ttl for an expired one, forgotten for a failed or refused request's.",
+        "Prefix keys that left a backend cluster's index, by reason: capacity for a live key a full index displaced, ttl for a confirmed key past its lifetime, pending for an expired key a request still waited on, forgotten for a failed or refused request's.",
     ),
     ("grid_serving_config_reload_total", "Serving-config reloads by result."),
     (

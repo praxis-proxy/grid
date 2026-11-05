@@ -54,8 +54,10 @@ struct Held {
     capacity: metrics::Gauge,
     /// Live keys a full LRU displaced, the undersizing signal.
     evicted_capacity: metrics::Counter,
-    /// Expired keys displaced, and confirmed keys sent again after their lifetime.
+    /// Expired confirmed keys displaced, and confirmed keys sent again after their lifetime.
     evicted_ttl: metrics::Counter,
+    /// Expired keys displaced while a request still waited on them.
+    evicted_pending: metrics::Counter,
     /// Keys a failure or refusal removed.
     evicted_forgotten: metrics::Counter,
     /// Set when an apply drops the candidate, so a request still holding it cannot revive its gauge.
@@ -76,6 +78,7 @@ impl Held {
             capacity: metrics::gauge!(CAPACITY, "cluster" => cluster.to_owned()),
             evicted_capacity: evicted("capacity"),
             evicted_ttl: evicted("ttl"),
+            evicted_pending: evicted("pending"),
             evicted_forgotten: evicted("forgotten"),
             retired: AtomicBool::new(false),
         };
@@ -108,6 +111,38 @@ impl Held {
 
 /// A shared candidate.
 type Keys = Arc<Held>;
+
+/// Keys that left one candidate's LRU in one call, by reason, added outside its lock.
+#[derive(Default)]
+struct Tally {
+    /// Live keys displaced.
+    capacity: usize,
+    /// Expired confirmed keys with nothing waiting: a gap between turns.
+    ttl: usize,
+    /// Expired keys a request still waited on: a slow or lost response.
+    pending: usize,
+}
+
+impl Tally {
+    /// Count an entry the LRU dropped at `now`.
+    fn dropped(&mut self, entry: &Entry, now: Instant) {
+        let reason = if now < entry.until {
+            &mut self.capacity
+        } else if entry.confirmed && entry.pending == 0 {
+            &mut self.ttl
+        } else {
+            &mut self.pending
+        };
+        *reason = reason.saturating_add(1);
+    }
+
+    /// Add the counts to `held`'s counters.
+    fn add_to(&self, held: &Held) {
+        add(&held.evicted_capacity, self.capacity);
+        add(&held.evicted_ttl, self.ttl);
+        add(&held.evicted_pending, self.pending);
+    }
+}
 
 /// What wrote a key: the request that sent it, or the success that confirmed it.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -314,55 +349,47 @@ impl PrefixIndex {
             if let Some(held) = index.candidates.get(candidate) {
                 let mut lru = held.write();
                 // A smaller capacity drops the least recent keys, sorted as a full LRU's displacements are.
-                let (mut capacity, mut ttl) = (0_usize, 0_usize);
+                let mut tally = Tally::default();
                 while lru.len() > settings.capacity.get() {
-                    match lru.pop_lru() {
-                        Some((_, dropped)) if dropped.until <= now => ttl = ttl.saturating_add(1),
-                        Some(_) => capacity = capacity.saturating_add(1),
-                        None => break,
-                    }
+                    let Some((_, dropped)) = lru.pop_lru() else {
+                        break;
+                    };
+                    tally.dropped(&dropped, now);
                 }
                 lru.resize(settings.capacity);
                 held.publish(&lru);
                 drop(lru);
                 held.capacity.set(usize_gauge(settings.capacity.get()));
-                add(&held.evicted_capacity, capacity);
-                add(&held.evicted_ttl, ttl);
+                tally.add_to(held);
             }
         }
     }
 
     /// Update each of `keys` for `candidate`, tail first, so the head of a prompt is evicted last.
     ///
-    /// Counts what leaves at `now`: a key a full LRU displaces is a capacity eviction while it
-    /// still counts and a TTL one once it has expired. A confirmed key a request sends again
+    /// Counts what leaves at `now`, sorted by [`Tally::dropped`]. A confirmed key a request sends again
     /// after its lifetime is a TTL one too, judged when the request arrives so response latency
     /// stays out of it. The counters are added once per call, outside the lock.
     fn update(keys: &PrefixKeys, held: &Keys, now: Instant, arrival: Arrival, entry: impl Fn(Option<Entry>) -> Entry) {
-        let (mut capacity, mut ttl) = (0_usize, 0_usize);
+        let mut tally = Tally::default();
         // A short lock per chunk lets depth lookups in between; no reader needs the whole prompt at once.
         for chunk in keys.as_slice().rchunks(WRITE_CHUNK) {
             let mut lru = held.write();
             for key in chunk.iter().rev() {
                 if let Some(current) = lru.get_mut(key) {
                     if arrival == Arrival::Request && current.confirmed && current.until <= now {
-                        ttl = ttl.saturating_add(1);
+                        tally.ttl = tally.ttl.saturating_add(1);
                     }
                     *current = entry(Some(*current));
                 } else if let Some((_, displaced)) = lru.push(*key, entry(None)) {
                     // The key was absent, so push returned the entry the full LRU displaced.
-                    if displaced.until <= now {
-                        ttl = ttl.saturating_add(1);
-                    } else {
-                        capacity = capacity.saturating_add(1);
-                    }
+                    tally.dropped(&displaced, now);
                 }
             }
             held.publish(&lru);
             drop(lru);
         }
-        add(&held.evicted_capacity, capacity);
-        add(&held.evicted_ttl, ttl);
+        tally.add_to(held);
     }
 
     /// `candidate`'s keys, when it has any.
@@ -858,6 +885,7 @@ mod tests {
             let start = Instant::now();
             index.confirm_at(&keys(0..2), &east, start);
             index.record_at(&keys(0..2), &east, past_ttl(start));
+            index.confirm_at(&keys(0..2), &east, past_ttl(start));
             assert_eq!(series.count("east", "ttl"), 2, "a turn after the lifetime");
             index.confirm_at(&keys(10..13), &east, past_ttl(past_ttl(start)));
             assert_eq!(series.count("east", "ttl"), 4, "two expired keys displaced");
@@ -882,6 +910,51 @@ mod tests {
                 0,
                 "the turn arrived before the lifetime ended"
             );
+        });
+    }
+
+    #[test]
+    fn an_expired_key_still_waiting_on_a_response_is_pending_not_ttl() {
+        let series = Series::default();
+        metrics::with_local_recorder(&series, || {
+            let index = sized(2);
+            let east = name("east");
+            let start = Instant::now();
+            let late = start + PENDING_TTL + Duration::from_secs(1);
+            index.record_at(&keys(0..1), &east, start);
+            index.confirm_at(&keys(1..2), &east, start);
+            index.record_at(&keys(1..2), &east, start);
+            index.confirm_at(&keys(10..12), &east, past_ttl(start).max(late));
+            assert_eq!(
+                series.count("east", "pending"),
+                2,
+                "an unconfirmed key and a confirmed one with a request out"
+            );
+            assert_eq!(series.count("east", "ttl"), 0, "neither is a gap between turns");
+            assert_eq!(series.count("east", "capacity"), 0);
+        });
+    }
+
+    #[test]
+    fn a_capacity_cut_sorts_expired_pending_keys_apart_from_late_turns() {
+        let series = Series::default();
+        metrics::with_local_recorder(&series, || {
+            let index = sized(8);
+            let east = name("east");
+            index.record_at(
+                &keys(0..2),
+                &east,
+                Instant::now()
+                    .checked_sub(PENDING_TTL + Duration::from_secs(1))
+                    .expect("uptime past the pending window"),
+            );
+            let one = AffinitySettings {
+                capacity: NonZeroUsize::new(1).unwrap(),
+                ..AffinitySettings::default()
+            };
+            index.apply(&one, &[name("east")]);
+            assert_eq!(series.count("east", "pending"), 1);
+            assert_eq!(series.count("east", "ttl"), 0);
         });
     }
 
