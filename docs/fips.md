@@ -39,9 +39,15 @@ fingerprint hashing (peer identity and pin matching) through system openssl, so
 no identity crypto runs on ring or the sha2 crate. Keygen uses OpenSSL EVP, which
 a FIPS host refuses for a non-approved curve.
 
-The operator's `fips` feature propagates to `swim`, where model inventory
-digests are computed through system openssl before a completed inventory is
-accepted. Non-FIPS builds continue to compute those digests with `sha2`.
+The operator's `fips` feature propagates to `swim`, where the gossip transport
+crypto runs through system openssl: AES-256-GCM packet encryption and
+decryption through the OpenSSL `symm` EVP interface, ECDSA P-256 broadcast
+signing through OpenSSL `PKey`/`Signer`/`Verifier`, nonces from the OpenSSL
+DRBG, and model inventory digests through the EVP hash before a completed
+inventory is accepted. The fips swim build links no ring, aes-gcm, or sha2.
+The gossip wire format is unchanged, so FIPS and non-FIPS sites interoperate
+on the same key. Non-FIPS builds keep the RustCrypto backend (ring signing,
+aes-gcm transport, sha2 digests) and are unchanged.
 
 The enrollment service is the production certificate signer. Its `fips` feature
 routes the same certs backend and, through system openssl, the server TLS

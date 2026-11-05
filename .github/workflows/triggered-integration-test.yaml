@@ -2,8 +2,8 @@ name: Triggered Integration Test
 
 # ------------------------------------------------------------------------------
 # Maintainer-triggered integration test of Grid main, a pull request, or a branch,
-# plus the legacy nightly quick GLB run against main. Manual and scheduled
-# release qualifications share this workflow through workflow_call.
+# plus nightly GLB quick and combined-site full runs against main. Manual runs
+# and reusable workflow calls can select a supported release qualification.
 #
 # Runs the selected qualification against the tested revision. GLB verifies
 # multi-cluster routing, SWIM discovery, mTLS, overlay hot-reload, and provider
@@ -52,11 +52,15 @@ on:
         type: string
         default: ""
   schedule:
+    # Nightly GLB quick qualification.
     - cron: "0 18 * * *"
+      timezone: America/New_York
+    # Nightly combined-site qualification (mapped to full mode below).
+    - cron: "0 19 * * *"
       timezone: America/New_York
 
 concurrency:
-  group: grid-triggered-integration-${{ github.workflow }}-${{ inputs.release_qualification || 'glb-quick' }}-${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.branch != '' && format('branch-{0}', inputs.branch) || 'main' }}-${{ github.event_name }}
+  group: grid-triggered-integration-${{ github.workflow }}-${{ inputs.release_qualification || 'scheduled' }}-${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.branch != '' && format('branch-{0}', inputs.branch) || 'main' }}-${{ github.event_name }}-${{ github.event_name == 'schedule' && github.event.schedule || '' }}
   cancel-in-progress: true
 
 permissions: {}
@@ -128,33 +132,66 @@ jobs:
       head_sha: ${{ steps.pr.outputs.head_sha }}
       base_sha: ${{ steps.source.outputs.base_sha }}
       release_qualification: ${{ steps.selection.outputs.release_qualification }}
-      qualification: ${{ steps.selection.outputs.qualification }}
-      mode: ${{ steps.selection.outputs.mode }}
+      qualification: ${{ steps.mode.outputs.qualification }}
+      mode: ${{ steps.mode.outputs.mode }}
     steps:
-      - name: Resolve release qualification
+      - name: Select release qualification
         id: selection
         env:
-          RELEASE_QUALIFICATION: ${{ inputs.release_qualification || 'glb-quick' }}
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_RELEASE_QUALIFICATION: ${{ inputs.release_qualification }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == "schedule" ]]; then
+            case "${SCHEDULE}" in
+              "0 18 * * *")
+                RELEASE_QUALIFICATION=glb-quick
+                ;;
+              "0 19 * * *")
+                RELEASE_QUALIFICATION=combined-site
+                ;;
+              *)
+                echo "::error::No release qualification is mapped for schedule '${SCHEDULE}'"
+                exit 1
+                ;;
+            esac
+          else
+            RELEASE_QUALIFICATION="${INPUT_RELEASE_QUALIFICATION:-glb-quick}"
+          fi
+          echo "release_qualification=${RELEASE_QUALIFICATION}" >> "${GITHUB_OUTPUT}"
+          echo "Release qualification: ${RELEASE_QUALIFICATION}"
+
+      - name: Resolve qualification mode
+        id: mode
+        env:
+          RELEASE_QUALIFICATION: ${{ steps.selection.outputs.release_qualification }}
         run: |
           set -euo pipefail
           case "${RELEASE_QUALIFICATION}" in
             glb-quick)
-              QUALIFICATION=glb MODE=quick
+              QUALIFICATION=glb
+              MODE=quick
               ;;
             glb-full)
-              QUALIFICATION=glb MODE=full
+              QUALIFICATION=glb
+              MODE=full
               ;;
             static-weighted)
-              QUALIFICATION=static-weighted MODE=quick
+              QUALIFICATION=static-weighted
+              MODE=quick
               ;;
             combined-site)
-              QUALIFICATION=combined-site MODE=full
+              QUALIFICATION=combined-site
+              MODE=full
               ;;
             llmd-pool-metrics-quick)
-              QUALIFICATION=llmd-pool-metrics MODE=quick
+              QUALIFICATION=llmd-pool-metrics
+              MODE=quick
               ;;
             llmd-pool-metrics-full)
-              QUALIFICATION=llmd-pool-metrics MODE=full
+              QUALIFICATION=llmd-pool-metrics
+              MODE=full
               ;;
             *)
               echo "::error::Unknown release qualification '${RELEASE_QUALIFICATION}'"
@@ -162,7 +199,6 @@ jobs:
               ;;
           esac
           {
-            echo "release_qualification=${RELEASE_QUALIFICATION}"
             echo "qualification=${QUALIFICATION}"
             echo "mode=${MODE}"
           } >> "${GITHUB_OUTPUT}"
@@ -668,17 +704,25 @@ jobs:
             ARTIFACT_PREFIX="grid-main-${SHORT_SHA}"
           fi
           TAG="${TAG}-${QUALIFICATION}"
+          if [[ "${QUALIFICATION}" == "combined-site" ]]; then
+            OPERATOR_IMAGE="grid-operator-fips:${TAG}"
+          else
+            OPERATOR_IMAGE="grid-operator:${TAG}"
+          fi
           {
             echo "tag=${TAG}"
+            echo "operator_image=${OPERATOR_IMAGE}"
             echo "short_sha=${SHORT_SHA}"
             echo "artifact_prefix=${ARTIFACT_PREFIX}"
           } >> "${GITHUB_OUTPUT}"
           echo "Image tag: ${TAG}"
+          echo "Operator image: ${OPERATOR_IMAGE}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build Grid Operator image
+        if: env.QUALIFICATION != 'combined-site'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: grid
@@ -689,6 +733,21 @@ jobs:
           labels: org.opencontainers.image.revision=${{ env.TESTED_SHA }}
           cache-from: type=gha,scope=triggered-e2e-operator
           cache-to: type=gha,mode=max,scope=triggered-e2e-operator
+
+      - name: Build Grid Operator FIPS image
+        # The shared-key combined-site topology then exercises SWIM packets
+        # through the OpenSSL backend. Hosted runners are not FIPS-mode hosts.
+        if: env.QUALIFICATION == 'combined-site'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: grid
+          file: grid/deploy/operator/Containerfile.fips
+          push: false
+          load: true
+          tags: grid-operator-fips:${{ steps.tags.outputs.tag }}
+          labels: org.opencontainers.image.revision=${{ env.TESTED_SHA }}
+          cache-from: type=gha,scope=triggered-e2e-operator-fips
+          cache-to: type=gha,mode=max,scope=triggered-e2e-operator-fips
 
       - name: Build source-matched Grid Gateway image
         if: env.QUALIFICATION == 'llmd-pool-metrics' && env.MODE == 'full'
@@ -863,12 +922,13 @@ jobs:
 
       - name: Verify locally built images
         env:
+          OPERATOR_IMAGE: ${{ steps.tags.outputs.operator_image }}
           TAG: ${{ steps.tags.outputs.tag }}
         run: |
           set -euo pipefail
           FAILED=0
 
-          operator_img="grid-operator:${TAG}"
+          operator_img="${OPERATOR_IMAGE}"
           if ! docker image inspect "${operator_img}" > /dev/null 2>&1; then
             echo "::error::Required locally-built image missing: ${operator_img}"
             FAILED=1
@@ -877,6 +937,13 @@ jobs:
             echo "${operator_img}: revision label ${IMAGE_REVISION}"
             if [[ "${IMAGE_REVISION}" != "${TESTED_SHA}" ]]; then
               echo "::error::${operator_img} was not built from verified source ${TESTED_SHA}"
+              FAILED=1
+            fi
+          fi
+          if [[ "${QUALIFICATION}" == "combined-site" ]]; then
+            IMAGE_DESCRIPTION=$(docker image inspect --format='{{index .Config.Labels "org.opencontainers.image.description"}}' "${operator_img}")
+            if [[ "${IMAGE_DESCRIPTION}" != *"FIPS build"* ]]; then
+              echo "::error::Combined-site operator image is not labeled as a FIPS build: ${operator_img}"
               FAILED=1
             fi
           fi
@@ -941,6 +1008,7 @@ jobs:
 
       - name: Write image manifest
         env:
+          OPERATOR_IMAGE: ${{ steps.tags.outputs.operator_image }}
           TAG: ${{ steps.tags.outputs.tag }}
           RESOLVED_DIGEST: ${{ steps.gateway.outputs.digest }}
           STATIC_SIMULATOR_DIGESTS: ${{ steps.static-simulator.outputs.repo_digests || 'unknown' }}
@@ -982,9 +1050,13 @@ jobs:
           {
             echo "=== Image Manifest ==="
             echo ""
-            echo "grid-operator:${TAG}"
-            docker inspect --format='  ID: {{.Id}}' "grid-operator:${TAG}"
-            docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "grid-operator:${TAG}"
+            echo "${OPERATOR_IMAGE}"
+            docker inspect --format='  ID: {{.Id}}' "${OPERATOR_IMAGE}"
+            docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "${OPERATOR_IMAGE}"
+            if [[ "${QUALIFICATION}" == "combined-site" ]]; then
+              echo "  Build: deploy/operator/Containerfile.fips"
+              echo "  Crypto backend: OpenSSL (fips feature; host FIPS mode is not asserted)"
+            fi
             echo ""
             if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" || "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
               echo "grid-overlay-sync:${TAG}"
@@ -1018,7 +1090,7 @@ jobs:
             docker inspect --format='  ID: {{.Id}}' "${PROBE_IMAGE_TAG}"
             echo ""
             echo "=== Override Environment ==="
-            echo "GRID_XTASK_OPERATOR_IMAGE=grid-operator:${TAG}"
+            echo "GRID_XTASK_OPERATOR_IMAGE=${OPERATOR_IMAGE}"
             if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" || "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
               echo "GRID_XTASK_OVERLAY_SYNC_IMAGE=grid-overlay-sync:${TAG}"
             else
@@ -1099,7 +1171,7 @@ jobs:
         id: qualification
         env:
           GRID_REPO: ${{ github.workspace }}/grid
-          GRID_XTASK_OPERATOR_IMAGE: grid-operator:${{ steps.tags.outputs.tag }}
+          GRID_XTASK_OPERATOR_IMAGE: ${{ steps.tags.outputs.operator_image }}
           GRID_XTASK_GATEWAY_IMAGE: ${{ env.GATEWAY_IMAGE_REF }}
           GRID_GATEWAY_IMAGE: grid-gateway:${{ steps.tags.outputs.tag }}
           LLMD_EPP_IMAGE: ${{ env.LLMD_EPP_IMAGE_TAG }}
@@ -1781,6 +1853,7 @@ jobs:
         if: always()
         env:
           TAG: ${{ steps.tags.outputs.tag || 'unknown' }}
+          OPERATOR_IMAGE: ${{ steps.tags.outputs.operator_image || 'unknown' }}
           ARTIFACT_PREFIX: ${{ steps.tags.outputs.artifact_prefix || format('grid-{0}-{1}', needs.resolve-source.outputs.source_kind, needs.resolve-source.outputs.tested_sha) }}
           QUALIFICATION_RESULT: ${{ steps.qualification.outcome }}
           CLEANUP_RESULT: ${{ steps.cleanup.outputs.result || 'unknown' }}
@@ -1850,6 +1923,9 @@ jobs:
 
             echo "| **Topology** | \`${TOPOLOGY}\` at tested Grid SHA |"
             echo "| **Mode** | \`${MODE}\` |"
+            if [[ "${QUALIFICATION}" == "combined-site" ]]; then
+              echo "| **Operator crypto backend** | OpenSSL (`fips` feature) |"
+            fi
             echo "| **Qualification result** | ${QUALIFICATION_DISPLAY_RESULT} |"
             echo "| **Cleanup** | ${CLEANUP_RESULT} |"
             if [[ "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
@@ -1864,7 +1940,7 @@ jobs:
             echo ""
             echo "| Image | Reference |"
             echo "|-------|-----------|"
-            echo "| Grid Operator | \`grid-operator:${TAG}\` |"
+            echo "| Grid Operator | \`${OPERATOR_IMAGE}\` |"
             echo "| Gateway (pinned) | \`${GATEWAY_IMAGE_REF}\` (\`${RESOLVED_DIGEST}\`) |"
             echo "| Simulator | \`${SIMULATOR}\` |"
             if [[ "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
