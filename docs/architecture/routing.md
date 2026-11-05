@@ -461,24 +461,57 @@ upgrading the operator that publishes `sovereignty_zones`. The operator emits
 the map for serving sites with zones even when no gateway has enabled the
 fence. Older gateways reject this unknown field and retain their last accepted
 serving config, so a mixed-version rollout can leave them routing on stale
-config. When no serving site has a zone, the empty map is omitted and this
-compatibility constraint does not apply.
+config. If an older gateway restarts after the operator publishes the map, it
+has no last accepted config to retain and fails startup when parsing the file.
+When no `GridSite` sets `spec.sovereigntyZone`, the empty map is omitted and
+this compatibility constraint does not apply. A zoned site that is not serving
+yet still requires gateway-first ordering: it may become a candidate during
+the rollout.
 
 1. Roll out a gateway image that supports `sovereignty_zones` and the
    sovereignty fence to every gateway replica at every site. Wait for all
    replicas to finish upgrading before upgrading the operator.
 2. Upgrade the operator and let it publish the serving configs with the site
    zone maps. Wait for the mounted configs to update on every gateway.
-3. Before enabling `mode: enforce`, confirm that every gateway replica has
-   accepted a serving config carrying the expected site zones. Correlate each
-   replica's gateway logs and an increase in
-   `grid_serving_config_reload_total{result="applied"}` with the zone-bearing
-   update. Check each replica individually; an aggregate counter can hide a
-   gateway still using stale config. A mounted ConfigMap or the
-   `grid.praxis.fast/serving-digest` annotation proves publication, not gateway
-   acceptance.
+3. Before enabling `mode: enforce`, verify the exact zone-bearing config on
+   every gateway replica using the controlled startup procedure below. A
+   mounted ConfigMap or the `grid.praxis.fast/serving-digest` annotation alone
+   proves publication, not gateway acceptance.
 4. Enable the fence in `enforce` mode only after all gateways have passed
    these checks. Loading the zone map alone does not enable enforcement.
+
+The gateway does not expose an accepted serving-config digest or revision.
+`grid_serving_config_reload_total{result="applied"}` does not identify content:
+identity rotation can increment it while reapplying the last good config.
+Checking that `result="rejected"` did not increase is a useful additional
+diagnostic, but neither counter alone proves acceptance of a particular map.
+
+Use a controlled verification window in which serving-config publication and
+changes to the mounted serving and identity files are held stable. For each
+gateway deployment, record its expected serving-config bytes or a checksum,
+and inspect `sovereignty_zones` for the expected site-to-zone assignments.
+For each replica:
+
+1. Check that the file at its active `GRID_SERVING_CONFIG` path matches that
+   exact config, including the zone map.
+2. Restart the gateway against that unchanged file and require successful
+   data-plane startup with Grid serving enabled. Check the replacement process,
+   not a still-running old replica or just the metrics listener. A fresh process
+   has no cached serving config: it must read and parse this file before
+   starting Grid routing. If recreating the pod, gate gateway startup on the
+   expected file checksum in the new pod, for example with an init container;
+   checking only the previous pod's mount does not verify the new one.
+3. Confirm that the same file bytes or checksum are still present after
+   startup. If the file changed during verification, repeat the check against a
+   stable revision. Inspect that replica's logs and check that its
+   `grid_serving_config_reload_total{result="rejected"}` does not increase
+   during verification. A new rejection blocks proceeding until its cause is
+   resolved.
+
+Do not enable enforcement if a stable verification window cannot be arranged
+or any replica's accepted config remains uncertain. Resume normal publication
+after all replicas pass. Loading the map and enforcing the request fence remain
+separate steps.
 
 For the separate legacy pin-format migration, see the gateway chart's
 [upgrade guidance][gateway-upgrade].

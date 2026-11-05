@@ -676,10 +676,19 @@ Check gateway logs and
 For sovereignty zones, upgrade every gateway replica at every site before the
 operator that publishes `sovereignty_zones`, including when the fence is still
 disabled or in audit mode. An older gateway rejects the zone map and keeps its
-last accepted config. Before enabling `enforce`, verify on each replica that
-the zone-bearing config was accepted, using gateway logs and
-`grid_serving_config_reload_total{result="applied"}` for that update. The map is
-omitted when empty, so networks without serving-site zones are unaffected. See
+last accepted config while running; if it restarts with the new file, parsing
+fails at startup. Before enabling `enforce`, use a controlled verification
+window: hold serving-config publication and mounted config/identity changes
+stable, check the exact zone-bearing file at each replica's active
+`GRID_SERVING_CONFIG` path, and restart each gateway against that unchanged
+file. Require successful data-plane startup and confirm the file still matches
+afterward. Inspect per-replica logs and check that
+`grid_serving_config_reload_total{result="rejected"}` does not increase during
+verification. An `applied` increase or absence of rejections alone does not
+identify the accepted config; identity rotation can reapply an old one. Do not
+enable enforcement while acceptance is uncertain.
+The map is omitted when empty; the rollout constraint is waived only when no
+`GridSite` sets `spec.sovereigntyZone`, including sites not yet serving. See
 [the sovereignty rollout procedure][sovereignty-rollout].
 
 [sovereignty-rollout]:
