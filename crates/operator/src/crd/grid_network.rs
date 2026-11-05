@@ -1594,7 +1594,7 @@ pub struct GatewayAgeReport {
     /// Random process identity, unchanged across poller reloads.
     #[schemars(regex(pattern = "^[0-9a-f]{32}$"))]
     pub epoch: String,
-    /// Last durably accepted sequence.
+    /// Last durably recorded sequence; live sequence watermarks are process-local.
     #[schemars(range(min = 1))]
     pub sequence: i64,
     /// Cumulative skew rejection count.

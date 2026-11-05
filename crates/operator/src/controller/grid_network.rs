@@ -9,7 +9,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet as StdHashSet},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     path::Path,
     sync::Arc,
@@ -209,7 +209,7 @@ pub struct OperatorCtx {
     started: Instant,
 }
 
-/// The last value logged per key, so INFO fires on a change rather than on every pass.
+/// The last value logged per key, so transition messages fire on change rather than every pass.
 #[derive(Debug, Default)]
 pub(crate) struct ChangeLog(std::sync::Mutex<HashMap<String, String>>);
 
@@ -229,6 +229,12 @@ impl ChangeLog {
         let mut held = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         held.retain(|key, _| !key.starts_with(prefix) || keep.contains(key));
     }
+}
+
+/// Retain each gateway's prior empty state so repeated reconciles do not repeat no-route warnings.
+fn should_warn_empty_overlay(logged: &ChangeLog, key: &str, no_candidates: bool) -> bool {
+    let changed = logged.changed(key, no_candidates.to_string());
+    changed && no_candidates
 }
 
 /// Send `declared` to `sender`, returning whether it changed, so a repeat wakes nobody.
@@ -1854,7 +1860,7 @@ const MOUNT_RECONCILIATION_REQUEUE: Duration = Duration::from_secs(60);
 const FIELD_MANAGER: &str = "grid-operator";
 
 /// Finalizer that keeps a `GridNetwork` present until its SWIM scope withdraws.
-const GRID_NETWORK_WITHDRAWAL_FINALIZER: &str = "grid.praxis.fast/gridnetwork-withdrawal";
+pub const GRID_NETWORK_WITHDRAWAL_FINALIZER: &str = "grid.praxis.fast/gridnetwork-withdrawal";
 
 /// Bound retries when another reconcile updates a `GridNetwork` finalizer at the same time.
 const FINALIZER_PATCH_ATTEMPTS: usize = 4;
@@ -2467,6 +2473,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     } = Box::pin(reconcile_routing_overlay_inner(
         &network,
         &grid_id,
+        &ctx.logged,
         client,
         &providers,
         &tool_providers,
@@ -3276,6 +3283,7 @@ fn site_phases(sites: &[GridSite]) -> impl Iterator<Item = (&str, &'static str)>
 async fn reconcile_routing_overlay_inner(
     network: &GridNetwork,
     grid_id: &str,
+    logged: &ChangeLog,
     client: &Client,
     providers: &[InferenceProvider],
     tool_providers: &[AgentToolProvider],
@@ -3310,6 +3318,8 @@ async fn reconcile_routing_overlay_inner(
     let mut consumer_statuses: Vec<ConsumerConfigStatus> = Vec::new();
     let mut mount_statuses: Vec<MountReconciliationStatus> = Vec::new();
     let mut overlay_statuses: Vec<OverlayRevisionStatus> = Vec::new();
+    let empty_overlay_prefix = format!("empty-overlay/{network_name}/");
+    let mut logged_empty_overlays = StdHashSet::new();
     let mut serving_retry: Option<Duration> = None;
     let mut inventory_expiry_deadline: Option<time::OffsetDateTime> = None;
     let eligible_remote_owned: Vec<crdt::ProviderState> =
@@ -3332,6 +3342,8 @@ async fn reconcile_routing_overlay_inner(
     let peer_catalog = member_catalogs.then(|| derived_topology::peer_catalog(&eligible_remote_owned));
 
     for gw_ref in &network.spec.consumer_gateways {
+        let empty_overlay_key = format!("{}{}/{}", empty_overlay_prefix, gw_ref.namespace, gw_ref.name);
+        logged_empty_overlays.insert(empty_overlay_key.clone());
         // Each gateway identifies its own local site.  Fall back to the
         // network name for single-site deployments where the two are equal.
         let local_site = gw_ref.site_name.as_deref().unwrap_or(network_name);
@@ -3464,7 +3476,7 @@ async fn reconcile_routing_overlay_inner(
             },
         };
         let no_candidates = overlay.candidates.is_empty();
-        if no_candidates {
+        if should_warn_empty_overlay(logged, &empty_overlay_key, no_candidates) {
             tracing::warn!(
                 network = network_name,
                 gateway = %gw_ref.name,
@@ -3694,6 +3706,7 @@ async fn reconcile_routing_overlay_inner(
             consumer_statuses.push(consumer_config_status_disabled(gw_ref, cc, observed_generation));
         }
     }
+    logged.retain_under(&empty_overlay_prefix, &logged_empty_overlays);
     Ok(OverlayOutcome {
         consumer_statuses,
         mount_statuses,
@@ -3702,10 +3715,6 @@ async fn reconcile_routing_overlay_inner(
         inventory_expiry_deadline,
     })
 }
-
-/// Legacy status reason used by retained-status compatibility tests.
-#[cfg(test)]
-const EMPTY_CANDIDATES: &str = "EmptyCandidates";
 
 /// What one routing overlay pass produced, per gateway.
 struct OverlayOutcome {
@@ -4188,16 +4197,6 @@ async fn apply_serving_config(
     source.gate.record(&key, now);
     info!(cm_name = %name, digest = %serving_config::digest(&text), "applied grid serving config");
     Ok(None)
-}
-
-/// Whether the last recorded status for this gateway already had no candidates.
-#[cfg(test)]
-fn already_empty(network: &GridNetwork, gw_ref: &GatewayRef) -> bool {
-    network.status.as_ref().is_some_and(|status| {
-        status.routing_map_status.iter().any(|entry| {
-            entry.gateway_name == gw_ref.name && entry.namespace == gw_ref.namespace && entry.reason == EMPTY_CANDIDATES
-        })
-    })
 }
 
 /// Find the last successfully distributed overlay status for a gateway.
@@ -8448,28 +8447,24 @@ mod tests {
     }
 
     #[test]
-    fn empty_overlay_warns_only_on_entering_the_state() {
-        let gw: GatewayRef = serde_json::from_value(serde_json::json!({"name": "gw", "namespace": "ns"}))
-            .unwrap_or_else(|_| std::process::abort());
-        let with_reason = |reason: &str| {
-            let mut network = base_network();
-            network.status = Some(
-                serde_json::from_value(serde_json::json!({"routingMapStatus": [{
-                    "gatewayName": "gw", "namespace": "ns", "configMapName": "c", "schemaVersion": "v",
-                    "renderedRevision": "r", "distributedRevision": "r", "contentDigest": "r", "reason": reason,
-                }]}))
-                .unwrap_or_else(|_| std::process::abort()),
-            );
-            network
-        };
-        let cases = [
-            ("no status yet", base_network(), false),
-            ("was distributed", with_reason(""), false),
-            ("was already empty", with_reason("EmptyCandidates"), true),
-        ];
-        for (label, network, want) in cases {
-            assert_eq!(already_empty(&network, &gw), want, "{label}");
-        }
+    fn empty_overlay_warns_only_on_state_transitions() {
+        let logged = ChangeLog::default();
+        assert!(
+            should_warn_empty_overlay(&logged, "net/ns/gw", true),
+            "initial empty state warns"
+        );
+        assert!(
+            !should_warn_empty_overlay(&logged, "net/ns/gw", true),
+            "repeated empty state is quiet"
+        );
+        assert!(
+            !should_warn_empty_overlay(&logged, "net/ns/gw", false),
+            "leaving empty state is quiet"
+        );
+        assert!(
+            should_warn_empty_overlay(&logged, "net/ns/gw", true),
+            "reentering empty state warns"
+        );
     }
 
     // -----------------------------------------------------------------------

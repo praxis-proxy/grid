@@ -370,15 +370,21 @@ gateway process has unresolved rejected ages. `False` requires genuine newer
 clean evidence from every recorded rejecting process. `Unknown` means the
 remaining evidence is stale, predates the operator restart, or reporter
 capacity was exceeded. Conditions never change network phase or routing.
+The primary `GridNetwork` watch filters status-only changes; spec generation
+and watched related-resource changes still trigger routing reconciliation.
 
 `gatewayAgeReports[]` retains at most 128 records keyed by random process epoch:
-replica label, sequence, cumulative skew count, original report flag, effective
-rejection state, and receipt timestamp. Live freshness uses a five-minute
-monotonic receipt window. Expiration is evaluated when another report arrives;
-if reporting stops entirely, the last condition remains until a report arrives.
-After an operator restart, persisted rejected epochs have unknown freshness
-until that same epoch submits a strictly newer observation. Wall-clock changes
-and duplicate reports cannot establish recovery or renew freshness.
+replica label, last durably recorded sequence, cumulative skew count, original
+report flag, effective rejection state, and receipt timestamp. The operator
+keeps the latest accepted sequence and freshness on its monotonic clock in
+memory, so routine reports with unchanged evidence do not write status. It
+refreshes the durable row at most once per five-minute freshness window and
+writes evidence transitions immediately. Expiration is evaluated when another
+report arrives; if reporting stops entirely, the last condition remains until
+a report arrives. After an operator restart, persisted rejected epochs have
+unknown freshness until that same epoch submits a strictly newer observation.
+Wall-clock changes and duplicate reports cannot establish recovery or renew
+freshness.
 
 A clean report from another replica or replacement process never clears an
 older rejected epoch. The listener identifies the site, not authoritative pod
