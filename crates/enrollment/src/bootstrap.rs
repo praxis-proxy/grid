@@ -126,6 +126,8 @@ struct BootstrapArgs {
 /// sits in the argv0 slot clap ignores and the flags parse as usual.
 pub(crate) async fn run() -> Result<(), BoxError> {
     let args = BootstrapArgs::parse_from(std::env::args_os().skip(1));
+    #[cfg(feature = "fips")]
+    grid_fips::verify().map_err(|error| error.to_string())?;
     Box::pin(bootstrap(&args)).await
 }
 

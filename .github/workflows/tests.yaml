@@ -258,17 +258,20 @@ jobs:
       # operator tls_probe.rs.
       - name: Clippy (fips)
         run: |
+          cargo clippy -p grid-fips --features runtime --all-targets -- -D warnings
+          cargo clippy -p grid-openssl-fips -- -D warnings
           cargo clippy -p certs --no-default-features --features fips --all-targets -- -D warnings
           cargo clippy -p enrollment --no-default-features --features fips --all-targets -- -D warnings
-          cargo clippy -p enrollment --no-default-features --features fips,sar,bootstrap --bins -- -D warnings
-          cargo clippy --manifest-path crates/operator/Cargo.toml --no-default-features --features fips --lib --bins -- -D warnings
-          cargo clippy --manifest-path crates/overlay-sync/Cargo.toml --no-default-features --features fips --bins -- -D warnings
+          cargo clippy -p enrollment --no-default-features --features fips,sar,bootstrap --bins --test fips_startup -- -D warnings
+          cargo clippy --manifest-path crates/operator/Cargo.toml --no-default-features --features fips --lib --bins --test fips_startup -- -D warnings
+          cargo clippy --manifest-path crates/overlay-sync/Cargo.toml --no-default-features --features fips --bins --test fips_startup -- -D warnings
 
       - name: Unit tests (fips)
         run: |
+          cargo test -p grid-fips --features runtime
           cargo test -p certs --no-default-features --features fips
           cargo test -p enrollment --no-default-features --features fips
-          cargo test -p enrollment --no-default-features --features fips,sar,bootstrap --bins
+          cargo test -p enrollment --no-default-features --features fips,sar,bootstrap --bins --test fips_startup
           cargo test --manifest-path crates/operator/Cargo.toml --no-default-features --features fips
           cargo test --manifest-path crates/overlay-sync/Cargo.toml --no-default-features --features fips
 

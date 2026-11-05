@@ -98,11 +98,17 @@ use operator::{
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    let mut config = Cli::parse();
+    #[cfg(feature = "fips")]
+    if let Err(error) = grid_fips::verify() {
+        tracing::error!(%error, "refusing to start the FIPS operator");
+        std::process::exit(1);
+    }
+
     // Install the process-wide crypto provider the TLS stack requires, once,
     // up front, before any reconciler builds a client.
     operator::init_process_crypto();
 
-    let mut config = Cli::parse();
     version::get().log_startup("grid-operator");
     // A Local install names its site without the SWIM prefix; either name serves.
     if let Some(site_name) = config.grid.site_name.take() {

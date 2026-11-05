@@ -1,0 +1,22 @@
+[package]
+name = "grid-openssl-fips"
+version.workspace = true
+description = "Isolated read-only OpenSSL FIPS-state query for Grid startup verification"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+openssl-sys = { workspace = true }
+
+# The only crate deliberately not inheriting the workspace's unsafe `forbid`:
+# deny plus one function-level expectation confines the documented exception.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+unexpected_cfgs = { level = "deny", check-cfg = ['cfg(openssl3)'] }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+allow_attributes = "deny"

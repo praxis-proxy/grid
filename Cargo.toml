@@ -6,6 +6,8 @@ members = [
   "crates/crdt",
   "crates/enrollment",
   "crates/fleet-dashboard",
+  "crates/fips",
+  "crates/fips/openssl",
   "crates/mock-providers",
   "crates/operator",
   "crates/overlay-sync",
@@ -28,6 +30,8 @@ license = "Apache-2.0"
 [workspace.dependencies]
 metrics = "0.24.6"
 version = { path = "crates/version" }
+grid-fips = { path = "crates/fips" }
+tempfile = "3.0.0"
 status-harness = { path = "crates/status-harness" }
 aes-gcm = "0.11.1"
 axum = "0.8.9"
