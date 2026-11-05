@@ -109,6 +109,15 @@ impl Held {
 /// A shared candidate.
 type Keys = Arc<Held>;
 
+/// What wrote a key: the request that sent it, or the success that confirmed it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arrival {
+    /// [`PrefixIndex::record`], when the turn reaches the gateway.
+    Request,
+    /// [`PrefixIndex::confirm`], when its response succeeds.
+    Response,
+}
+
 /// Keys held for a backend cluster in this replica.
 pub(crate) const ENTRIES: &str = "grid_route_prefix_index_entries";
 
@@ -222,7 +231,7 @@ impl PrefixIndex {
             return;
         };
         let until = now.checked_add(PENDING_TTL).unwrap_or(now);
-        Self::update(keys, &held, now, |held| match held {
+        Self::update(keys, &held, now, Arrival::Request, |held| match held {
             Some(entry) if now < entry.until => Entry {
                 pending: entry.pending.saturating_add(1),
                 ..entry
@@ -246,7 +255,7 @@ impl PrefixIndex {
             return;
         };
         let until = now.checked_add(confirmed_ttl).unwrap_or(now);
-        Self::update(keys, &held, now, |held| Entry {
+        Self::update(keys, &held, now, Arrival::Response, |held| Entry {
             until,
             pending: held.map_or(0, |entry| entry.pending.saturating_sub(1)),
             confirmed: true,
@@ -326,16 +335,17 @@ impl PrefixIndex {
     /// Update each of `keys` for `candidate`, tail first, so the head of a prompt is evicted last.
     ///
     /// Counts what leaves at `now`: a key a full LRU displaces is a capacity eviction while it
-    /// still counts and a TTL one once it has expired; a confirmed key sent again after its
-    /// lifetime is a TTL one too. The counters are added once per call, outside the lock.
-    fn update(keys: &PrefixKeys, held: &Keys, now: Instant, entry: impl Fn(Option<Entry>) -> Entry) {
+    /// still counts and a TTL one once it has expired. A confirmed key a request sends again
+    /// after its lifetime is a TTL one too, judged when the request arrives so response latency
+    /// stays out of it. The counters are added once per call, outside the lock.
+    fn update(keys: &PrefixKeys, held: &Keys, now: Instant, arrival: Arrival, entry: impl Fn(Option<Entry>) -> Entry) {
         let (mut capacity, mut ttl) = (0_usize, 0_usize);
         // A short lock per chunk lets depth lookups in between; no reader needs the whole prompt at once.
         for chunk in keys.as_slice().rchunks(WRITE_CHUNK) {
             let mut lru = held.write();
             for key in chunk.iter().rev() {
                 if let Some(current) = lru.get_mut(key) {
-                    if current.confirmed && current.until <= now {
+                    if arrival == Arrival::Request && current.confirmed && current.until <= now {
                         ttl = ttl.saturating_add(1);
                     }
                     *current = entry(Some(*current));
@@ -847,12 +857,31 @@ mod tests {
             let east = name("east");
             let start = Instant::now();
             index.confirm_at(&keys(0..2), &east, start);
-            index.confirm_at(&keys(0..2), &east, past_ttl(start));
+            index.record_at(&keys(0..2), &east, past_ttl(start));
             assert_eq!(series.count("east", "ttl"), 2, "a turn after the lifetime");
             index.confirm_at(&keys(10..13), &east, past_ttl(past_ttl(start)));
             assert_eq!(series.count("east", "ttl"), 4, "two expired keys displaced");
             assert_eq!(series.count("east", "capacity"), 0, "nothing live was displaced");
             assert_eq!(series.gauge(ENTRIES, "east"), Some(3));
+        });
+    }
+
+    #[test]
+    fn a_turn_on_time_with_a_late_response_is_not_a_ttl_eviction() {
+        let series = Series::default();
+        metrics::with_local_recorder(&series, || {
+            let index = sized(8);
+            let east = name("east");
+            let start = Instant::now();
+            let ttl = Duration::from_secs(AffinitySettings::default().ttl_secs.get());
+            index.confirm_at(&keys(0..3), &east, start);
+            index.record_at(&keys(0..3), &east, start + ttl.saturating_sub(Duration::from_secs(1)));
+            index.confirm_at(&keys(0..3), &east, start + ttl + Duration::from_secs(1));
+            assert_eq!(
+                series.count("east", "ttl"),
+                0,
+                "the turn arrived before the lifetime ended"
+            );
         });
     }
 
@@ -915,7 +944,7 @@ mod tests {
                 "a dropped cluster holds nothing"
             );
             assert_eq!(series.gauge(CAPACITY, "east"), Some(0));
-            PrefixIndex::update(&keys(20..22), &in_flight, Instant::now(), |_| Entry {
+            PrefixIndex::update(&keys(20..22), &in_flight, Instant::now(), Arrival::Request, |_| Entry {
                 until: Instant::now(),
                 pending: 1,
                 confirmed: false,
