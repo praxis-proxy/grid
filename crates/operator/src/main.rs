@@ -358,6 +358,7 @@ async fn main() {
             run_agent_tool_provider_controller(writer_client.clone()),
             run_local_scraper(writer_scrape_interval, Arc::clone(&writer_ctx), writer_client.clone()),
             run_model_discovery(writer_ctx, writer_client),
+            run_grid_network_rollup_watch(writer_client.clone()),
         )
         .map(|_joined| ())
     };
@@ -1861,6 +1862,14 @@ fn filtered_grid_network_rollup_watch(client: Client) -> GridNetworkRollupWatch 
     )
 }
 
+/// Run the status-only GridNetwork roll-up watch as a state writer.
+async fn run_grid_network_rollup_watch(
+    client: Client,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    filtered_grid_network_rollup_watch(client).await;
+    Ok(())
+}
+
 /// Fingerprint only the rejection condition inputs consumed by `network_rollup`.
 #[expect(
     clippy::unnecessary_wraps,
@@ -1902,7 +1911,6 @@ async fn run_network_controller(
     let site_api = Api::<GridSite>::all(client.clone());
 
     let (reader, primary) = filtered_grid_network_watch(api);
-    let _rollup_watch = tokio::spawn(filtered_grid_network_rollup_watch(client.clone()));
     let controller = Controller::for_stream(primary, reader)
         .watches(
             provider_api,
