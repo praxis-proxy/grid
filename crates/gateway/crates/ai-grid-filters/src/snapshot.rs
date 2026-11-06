@@ -2497,10 +2497,15 @@ mod tests {
         let recorder = Named::default();
         metrics::with_local_recorder(&recorder, || {
             let mut gauged = Gauged::new();
+            let tool = CandidateConfig {
+                kind: CapabilityKind::McpTool,
+                ..cand("llama", "north", "tools-north")
+            };
             let candidates = validate_candidates(vec![
                 cand("llama", "east", "pool-east"),
                 cand("qwen", "east", "pool-east"),
                 cand("llama", "west", "pool-west"),
+                tool,
             ])
             .unwrap();
             drop(RouteSnapshot::from_static(candidates, Arc::from("hub")).published(&mut gauged));
@@ -2515,6 +2520,11 @@ mod tests {
                     "{model} on {cluster} at {site}, including a second model on one cluster"
                 );
             }
+            assert_eq!(
+                recorder.get("north", "tools-north", "llama"),
+                None,
+                "a tool sharing a model's name names no series"
+            );
 
             let remaining = validate_candidates(vec![cand("llama", "east", "pool-east")]).unwrap();
             drop(RouteSnapshot::from_static(remaining, Arc::from("hub")).published(&mut gauged));
