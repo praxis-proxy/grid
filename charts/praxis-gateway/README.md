@@ -352,11 +352,11 @@ Praxis AI image; these values may advance independently.
 | `mountReconciliation.operator.namespace` | string | required | Namespace of that ServiceAccount. Blank fails the render while `rbac.create` is true. |
 | `networkPolicy.enabled` | bool | `false` | Render a NetworkPolicy that limits which pods can reach the listener port, where the CNI enforces NetworkPolicy. It is not authentication. Node and host-network traffic handling is CNI-specific (OVN-Kubernetes: the `policy-group.network.openshift.io/host-network` label), and a LoadBalancer with `externalTrafficPolicy: Cluster` can SNAT clients to node IPs. |
 | `networkPolicy.from` | list | `[]` | NetworkPolicyPeer entries allowed in. Required when enabled. With `auth.mode: none`, list only the authenticating front. `{podSelector: {}}` admits every pod in this namespace. An empty `namespaceSelector` and an `ipBlock` of `0.0.0.0/0` or `::/0` admit everyone and fail the render. An all-address `ipBlock` with `except` entries is allowed. The check reads selector emptiness and the cidr only, so `matchExpressions` that happen to select every pod pass. A provider gateway behind a LoadBalancer that SNATs clients to node IPs needs `ipBlock` peers for those node addresses. |
-| `metricsListener.enabled` | bool or `auto` | `auto` | Serve `GET /metrics` over TLS on its own port and ClusterIP Service, for an in-cluster Prometheus. The admin listener refuses a non-loopback Host, so Prometheus cannot scrape it. Needs the grid-gateway image, `existingSecret`, `fromNamespaces`, and `networkPolicy.enabled`. The port answers only `/metrics` but has no authentication, so the NetworkPolicy is its access control, and that holds only where the CNI enforces NetworkPolicy. `auto` serves it for the grid-gateway image on OpenShift with `networkPolicy.enabled`, and fills each unset value from the platform: `existingSecret` is `<fullname>-metrics-tls`, requested from the service serving signer by an annotation on the metrics Service, `fromNamespaces` is `openshift-user-workload-monitoring`, and `serviceMonitor.caConfigMap` is `openshift-service-ca.crt`, key `service-ca.crt`. Elsewhere `auto` is off, since no cert source exists by default. On OpenShift without the NetworkPolicy it stays off and the install notes say so. |
-| `metricsListener.existingSecret` | string | `""` | Secret with `tls.crt` and `tls.key`. On OpenShift, request it with `metricsListener.service.annotations` `service.beta.openshift.io/serving-cert-secret-name`. The listener reloads the cert when the Secret changes. |
-| `metricsListener.fromNamespaces` | list | `[]` | Namespace names allowed to reach the metrics port, for example `openshift-user-workload-monitoring`. |
-| `metricsListener.serviceMonitor.enabled` | bool or `auto` | `auto` | Render a ServiceMonitor that verifies the cert against `caConfigMap` (for example `openshift-service-ca.crt`, key `service-ca.crt`) and renames Praxis's `cluster` label to `backend`, reserving `cluster` for the managed cluster. `auto` renders it when the listener is on, `monitoring.coreos.com/v1` is served, and `caConfigMap.name` is set. |
-| `metricsListener.serviceMonitor.labels` | map | `{}` | Additional labels on the ServiceMonitor, for a collector that selects by label. |
+| `metricsListener.enabled` | bool or `auto` | `auto` | Serve authorized `GET /metrics` over TLS on its own port and ClusterIP Service. The listener validates the caller's bearer token with Kubernetes TokenReview and checks a release-scoped scrape permission with SubjectAccessReview. The chart creates a long-lived scraper ServiceAccount token Secret for the ServiceMonitor, grants the scraper a namespace-scoped synthetic permission, and grants the gateway only TokenReview and SubjectAccessReview creation rights. Installing it requires permission to create ClusterRoles and ClusterRoleBindings. `auto` serves it for the grid-gateway image on OpenShift, or when `existingSecret` is supplied. OpenShift requests `<fullname>-metrics-tls` from the service serving signer and uses `openshift-service-ca.crt`, key `service-ca.crt`, for scrape verification. The OpenShift AI collector label is not added by default; set `serviceMonitor.labels` for any collector that selects by label. A NetworkPolicy is recommended to limit which pods can trigger authorization API requests. |
+| `metricsListener.existingSecret` | string | `""` | Secret with `tls.crt` and `tls.key`. On OpenShift, the chart requests it with `metricsListener.service.annotations` `service.beta.openshift.io/serving-cert-secret-name`. The listener reloads the cert when the Secret changes. |
+| `metricsListener.fromNamespaces` | list | `[]` | Namespace names allowed by the optional NetworkPolicy to reach the metrics port, for example `openshift-user-workload-monitoring`. Required when NetworkPolicy is enabled while the metrics listener is active. |
+| `metricsListener.serviceMonitor.enabled` | bool or `auto` | `auto` | Render a ServiceMonitor that authenticates with the chart-created scraper token, verifies the server cert against `caConfigMap` (for example `openshift-service-ca.crt`, key `service-ca.crt`), and renames Praxis's `cluster` label to `backend`, reserving `cluster` for the managed cluster. `auto` renders it when the listener is on, `monitoring.coreos.com/v1` is served, and `caConfigMap.name` is set. |
+| `metricsListener.serviceMonitor.labels` | map | `{}` | Labels on the ServiceMonitor for collectors that select by label. OpenShift AI's observability collector uses `monitoring.opendatahub.io/scrape: "true"`; set it when using that collector. |
 | `metricsListener.serviceMonitor.scrapeTimeout` | string | `""` | Scrape timeout. Unset leaves Prometheus's default of 10s, which Prometheus refuses when it exceeds the interval, so an interval under 10s needs this set to at most the interval. |
 | `upstreamCA.secretName` | string | `""` | CA bundle for backend TLS without a per-cluster CA. Empty disables the mount. Works with `render` and `byo`; BYO `praxis.yaml` must set `runtime.upstream_ca_file`. The bundle replaces system trust roots; include public and private roots when both are needed. Per-cluster CAs override this bundle. Not supported with `operator`. |
 | `listenerTls.secretName` | string | `""` | Server certificate Secret (`tls.crt`, `tls.key`) for listener TLS. Non-empty enables TLS and names the port `https`. Works with render consumers and `byo`; BYO `praxis.yaml` must reference `listenerTls.mountPath`. Render providers reject this setting and use `gridIdentity.tlsSecretName` for listener TLS. Not supported with `operator`. On OpenShift, annotate the Service with `service.beta.openshift.io/serving-cert-secret-name`. |
@@ -407,10 +407,12 @@ Praxis AI image; these values may advance independently.
 
 ## Metrics
 
-The metrics listener serves the Praxis registry, including the grid gateway's own series. With the ServiceMonitor, Praxis's `cluster` label arrives as `backend`.
+The metrics listener serves the Praxis registry, including the grid gateway's own series. It authenticates each scrape through Kubernetes TokenReview and SubjectAccessReview. A NetworkPolicy is recommended to limit which pods can reach the listener and trigger those API reviews. The ServiceMonitor uses the chart-created scraper token, and Praxis's `cluster` label arrives as `backend`. Set `metricsListener.serviceMonitor.labels` to the selector required by the platform collector. For OpenShift AI, use `monitoring.opendatahub.io/scrape: "true"`.
 
 | Metric | Labels | Meaning |
 |--------|--------|---------|
+| `grid_metrics_auth_total` | `result` | Gateway metrics scrape outcomes: `missing`, `allowed`, `unauthenticated`, `forbidden`, `overloaded`, and `api_error`. |
+| `grid_metrics_auth_in_flight` | | Kubernetes TokenReview and SubjectAccessReview requests currently running for scrapes. |
 | `grid_route_decisions_total` | `site`, `reason` | Requests `grid_site_route` decided. `site` is a site name from the serving config, or empty for a refusal. No label comes from the request. |
 | `grid_route_site_score` | `site`, `cluster` | The queue depth the last route order used for each candidate, lower first. `inf` when unmeasured, `NaN` when excluded or demoted, or when the pair left the topology. |
 | `grid_route_site_score_unavailable` | `site`, `cluster`, `reason` | One-hot reason an otherwise routable load-publishing site has no queue score: `absent`, `stale`, or `unreadable`. Metric names are not labels. |
@@ -443,11 +445,15 @@ The chart enforces Kubernetes restricted security defaults:
 - `seccompProfile.type: RuntimeDefault`
 - `automountServiceAccountToken: false`
 
-When overlay-sync is enabled, the pod uses a dedicated ServiceAccount, but
-automatic token mounting remains disabled. A short-lived projected token is
-mounted only into the overlay-sync init and sidecar containers. The Praxis
-container has no Kubernetes API credential and mounts the delivered overlay
-directory read-only.
+Automatic ServiceAccount token mounting remains disabled. When overlay-sync is
+enabled, its short-lived projected token is mounted only into the overlay-sync
+init and sidecar containers. When `metricsListener.enabled` is true, the Praxis
+container receives a separate short-lived projected token for its metrics
+authorization reviews. Its ServiceAccount can create `TokenReview` and
+`SubjectAccessReview` objects cluster-wide. When both metrics authorization and
+overlay-sync are enabled, the overlay-sync RoleBinding grants that same
+ServiceAccount read access to the configured overlay ConfigMap. The Praxis
+container mounts the delivered overlay directory read-only.
 
 ## Optional uses
 

@@ -6,7 +6,14 @@ components expose Prometheus endpoints and they answer different questions.
 | Endpoint | Component | Serves |
 |---|---|---|
 | `/metrics` on `GRID_METRICS_ADDR`, default `0.0.0.0:9090` | Site operator | Reconciliation, probing, peer polling, and the provider readings this site publishes |
-| `/metrics` on the gateway metrics listener, `metricsListener.enabled` in the gateway chart, port 9443, TLS only | Grid gateway | Site selection, shedding, serving-config reloads, and its poll of the local operator |
+| `/metrics` on the gateway metrics listener, `metricsListener.enabled` in the gateway chart, port 9443, TLS with Kubernetes bearer-token authorization | Grid gateway | Site selection, shedding, serving-config reloads, and its poll of the local operator |
+
+The gateway listener validates bearer tokens with TokenReview and checks scrape
+permission with SubjectAccessReview. A NetworkPolicy is recommended to limit
+which pods can reach the listener and cause those API reviews. The listener also
+exports `grid_metrics_auth_total{result}` for `missing`, `allowed`,
+`unauthenticated`, `forbidden`, `overloaded`, and `api_error` outcomes, plus
+`grid_metrics_auth_in_flight` for concurrent Kubernetes reviews.
 | `/metrics` on `OVERLAY_SYNC_HEALTH_ADDR`, default `0.0.0.0:9091` | Overlay-sync sidecar, when `overlay.sidecar.enabled` | Delivery of the serving overlay from its ConfigMap to the gateway |
 
 The `grid-gateway` operand built with Praxis 0.7.4 serves `/metrics`, `/healthy`,
@@ -156,6 +163,8 @@ state, so two replicas agree only in steady state.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
+| `grid_metrics_auth_total` | counter | `result` | Gateway metrics scrape outcomes: `missing`, `allowed`, `unauthenticated`, `forbidden`, `overloaded`, and `api_error`. |
+| `grid_metrics_auth_in_flight` | gauge | | Kubernetes TokenReview and SubjectAccessReview requests currently running for scrapes. |
 | `grid_route_decisions_total` | counter | `site`, `cluster`, `reason` | Requests the gateway decided, by outcome. A refusal records an empty site and cluster. |
 | `grid_route_selections_total` | counter | `path` | Decisions by the path that produced them. |
 | `grid_route_site_rho` | gauge | `site`, `cluster` | Smoothed saturation used by the draw: the comparator for an llm-d site, otherwise in-flight over the learned ceiling. |

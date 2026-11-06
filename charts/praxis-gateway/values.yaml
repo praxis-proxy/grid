@@ -426,14 +426,14 @@ networkPolicy:
   # - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress}}
   #   podSelector: {matchLabels: {app: authenticating-front}}
 
-# -- TLS listener serving only GET /metrics, for an in-cluster Prometheus. The admin
-# listener cannot be scraped from outside the pod. Needs the grid-gateway image and
-# networkPolicy.enabled, since the port is reachable only from fromNamespaces.
+# -- TLS listener serving only authorized GET /metrics requests, for an in-cluster
+# Prometheus. Kubernetes TokenReview and SubjectAccessReview authorize the scrape.
+# NetworkPolicy is recommended to limit which pods can reach the listener and trigger
+# authorization API requests, even though token authorization protects the metrics data.
 metricsListener:
-  # -- Serve the listener. auto serves it for the grid-gateway image on OpenShift with
-  # networkPolicy.enabled, and fills each unset value below from the platform: the service
-  # serving cert in <fullname>-metrics-tls, openshift-user-workload-monitoring, and the
-  # openshift-service-ca.crt CA. true needs each value set.
+  # -- Serve the listener. auto serves it for grid-gateway on OpenShift, or when an
+  # existingSecret is supplied. OpenShift requests the serving cert in <fullname>-metrics-tls
+  # and defaults the CA to openshift-service-ca.crt. Other platforms need TLS and CA values.
   enabled: auto
   # -- Container and Service port.
   port: 9443
@@ -442,7 +442,8 @@ metricsListener:
   existingSecret: ""
   # -- Mount path for the cert. The listener reloads it when it changes.
   mountPath: "/etc/praxis/metrics-tls"
-  # -- Namespaces, by name, whose pods may reach the port. Required when enabled.
+  # -- Namespaces, by name, allowed by NetworkPolicy to reach the port. Required only when
+  # networkPolicy.enabled. OpenShift defaults this to openshift-user-workload-monitoring.
   fromNamespaces: []
   service:
     # -- Annotations on the ClusterIP metrics Service.
@@ -461,7 +462,8 @@ metricsListener:
     caConfigMap:
       name: ""
       key: "ca.crt"
-    # -- Additional labels on the ServiceMonitor, for a collector that selects by label.
+    # -- Labels on the ServiceMonitor, for collectors that select by label. For example,
+    # OpenShift AI's observability collector selects monitoring.opendatahub.io/scrape: "true".
     labels: {}
 
 # -- Gateway Service configuration.
