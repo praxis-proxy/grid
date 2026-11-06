@@ -196,7 +196,7 @@ const GAUGE_HELP: [(&str, &str); 29] = [
     ),
     (
         "grid_route_candidate_info",
-        "1 while the gateway routes the model to the site's backend cluster, 0 once it no longer does. Join on site and cluster to name a per-site series.",
+        "1 while the gateway lists the model as a candidate at the site's backend cluster, 0 once it no longer does. Join a per-site series on site and cluster with == 1; a cluster serving more than one model has one series per model.",
     ),
     (
         "grid_route_shedding",

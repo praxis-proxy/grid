@@ -450,23 +450,13 @@ impl RouteSnapshot {
             })
             .collect();
         let mut current = BTreeSet::new();
-        let mut naming = BTreeSet::new();
-        for candidate in &self.candidates {
-            naming.insert((
-                Arc::clone(&candidate.site),
-                Arc::clone(&candidate.cluster),
-                Arc::clone(&candidate.name),
-            ));
-        }
-        for (site, cluster, model) in &naming {
-            candidate_info(site, cluster, model, 1.0);
-        }
-        for (site, cluster, model) in named.difference(&naming) {
-            candidate_info(site, cluster, model, 0.0);
-        }
-        *named = naming;
+        let mut naming: BTreeSet<SiteModel> = BTreeSet::new();
         for (candidate, score) in self.candidates.iter().zip(&self.scores) {
             let key = (Arc::clone(&candidate.site), Arc::clone(&candidate.cluster));
+            // Only inference models name a `model`; a tool with the same name is not one.
+            if candidate.kind == CapabilityKind::InferenceModel {
+                naming.insert((Arc::clone(&key.0), Arc::clone(&key.1), Arc::clone(&candidate.name)));
+            }
             // The front entry for a pair is its best; later ones are other models.
             if current.insert(key.clone()) {
                 site_score(&key, *score);
@@ -482,6 +472,13 @@ impl RouteSnapshot {
                 }
             }
         }
+        for (site, cluster, model) in &naming {
+            candidate_info(site, cluster, model, 1.0);
+        }
+        for (site, cluster, model) in named.difference(&naming) {
+            candidate_info(site, cluster, model, 0.0);
+        }
+        *named = naming;
         for gone in published.difference(&current) {
             site_score(gone, f64::NAN);
             publish_score_unavailable(gone, |_| f64::NAN);
@@ -534,6 +531,8 @@ pub(crate) fn decisions_for(candidates: &[RouteCandidate]) -> Vec<SiteDecisions>
 
 /// A candidate's site and cluster, the labels of its score gauge.
 type SitePair = (Arc<str>, Arc<str>);
+/// A `(site, cluster, model)` triple: one inference model a site's cluster serves.
+type SiteModel = (Arc<str>, Arc<str>, Arc<str>);
 
 /// A candidate resolved against one consistent set of signal readings.
 struct ResolvedCandidate {
@@ -851,7 +850,7 @@ pub(crate) struct Gauged {
     /// `(site, cluster)` pairs with a published score.
     pub(crate) published: BTreeSet<SitePair>,
     /// `(site, cluster, model)` triples with a published candidate info series.
-    pub(crate) named: BTreeSet<(Arc<str>, Arc<str>, Arc<str>)>,
+    pub(crate) named: BTreeSet<SiteModel>,
     /// Learned ceilings and smoothed saturation per site.
     pub(crate) learned: Learned,
 }
@@ -1353,8 +1352,9 @@ fn clear_measured(key: &SitePair) {
     }
 }
 
-/// `grid_route_candidate_info`: 1 while the snapshot routes `model` to `cluster` at `site`, 0
-/// once it no longer does, so a dashboard can name the cluster a per-site series carries.
+/// `grid_route_candidate_info`: 1 while the snapshot lists `model` as a candidate at `cluster` on
+/// `site`, 0 once it no longer does. The 0 is a tombstone the exporter keeps until restart, so a
+/// join filters on `== 1`.
 fn candidate_info(site: &Arc<str>, cluster: &Arc<str>, model: &Arc<str>, value: f64) {
     metrics::gauge!(
         "grid_route_candidate_info",
