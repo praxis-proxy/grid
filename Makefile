@@ -25,7 +25,7 @@ endif
 	kind-up kind-down \
 	dev-env dev-push \
 	setup-hooks \
-	helm-lint helm-test praxis-gateway-e2e \
+	helm-lint helm-test praxis-gateway-e2e gateway-metrics-e2e \
 	help
 
 # -------------------------------------------------------------------
@@ -248,6 +248,9 @@ helm-test:
 praxis-gateway-e2e:
 	./scripts/e2e-praxis-gateway.sh
 
+gateway-metrics-e2e:
+	E2E_STACK=gateway-metrics ./scripts/e2e-praxis-gateway.sh
+
 # -------------------------------------------------------------------
 # KIND
 # -------------------------------------------------------------------
@@ -320,6 +323,7 @@ help:
 	@echo "  helm-lint        lint, template, schema, CRD sync, package"
 	@echo "  helm-test        helm-lint + Kind install/upgrade/test/uninstall"
 	@echo "  praxis-gateway-e2e  Forge Kind run of the standalone gateway chart"
+	@echo "  gateway-metrics-e2e Forge Kind run of gateway metrics auth only"
 	@echo ""
 	@echo "Container:"
 	@echo "  container            build operator image as PROJECT_IMAGE"

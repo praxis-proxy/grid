@@ -1579,7 +1579,7 @@ assert_health() {
     hits=$(cat "$dir"/*.log | strip_ansi | awk -v refusal_from="$REFUSALS_FROM" \
       -v self_site="$SITE" -v self_ip="$self_probe_ip" '
         function report(line) {
-          if (line ~ / (ERROR)|panic|fatal/) { print line }
+          if (line ~ / (ERROR)|panicked at|panic:|fatal/) { print line }
         }
         pending_rejection != "" {
           expected_self_probe = /^\[pod\/grid-gateway-[^\/]+\/praxis\] .*Downstream handshake error / \
