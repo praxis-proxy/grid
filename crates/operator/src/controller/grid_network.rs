@@ -1634,8 +1634,20 @@ async fn load_gossip_signing_identity(
     }
 }
 
+/// A trusted signing key and its certificate's authenticated issuance ordering.
+struct VerifiedPeerGossipKey {
+    /// Uncompressed P-256 public key.
+    key: Vec<u8>,
+    /// Certificate start time used to prefer newer rotation identities.
+    not_before: time::OffsetDateTime,
+}
+
 /// Validate one peer certificate against this `GridNetwork`'s CA and trust mode.
-fn verified_peer_gossip_key(site: &GridSite, ca_pem: &str, trust: PeerTrustMode) -> Result<Option<Vec<u8>>, String> {
+fn verified_peer_gossip_key(
+    site: &GridSite,
+    ca_pem: &str,
+    trust: PeerTrustMode,
+) -> Result<Option<VerifiedPeerGossipKey>, String> {
     let Some((site_name, _)) = peer_site_key(site) else {
         return Ok(None);
     };
@@ -1661,7 +1673,11 @@ fn verified_peer_gossip_key(site: &GridSite, ca_pem: &str, trust: PeerTrustMode)
     {
         return Err("peer certificate does not match a declared canonical fingerprint".to_owned());
     }
-    Ok(Some(public_key))
+    let (not_before, _) = certs::cert_validity(cert_pem).map_err(|error| error.to_string())?;
+    Ok(Some(VerifiedPeerGossipKey {
+        key: public_key,
+        not_before,
+    }))
 }
 
 /// Whether `site` declares this certificate's canonical SHA-256 fingerprint.
@@ -1797,6 +1813,10 @@ async fn publish_signed_site_cert(
 
 
 /// Collect the currently verified peer certificates as a complete trust snapshot.
+///
+/// Prefer the newest verified certificates by `notBefore`, breaking ties by
+/// public key bytes, up to SWIM's pin limit. Excess certificates cannot exclude
+/// a peer and resource iteration order cannot change the selected keys.
 async fn collect_gossip_peer_pins(
     network: &GridNetwork,
     client: &Client,
@@ -1813,7 +1833,7 @@ async fn collect_gossip_peer_pins(
     let network_name = network.metadata.name.as_deref().unwrap_or_default();
     // The declared mode, not the startup one: a trust change under gossip does not restart.
     let trust = GridModes::of(network, MembershipMode::Swim).trust;
-    let mut verified = PeerPins::new();
+    let mut verified = BTreeMap::<String, BTreeMap<Vec<u8>, time::OffsetDateTime>>::new();
     for site in list_all_grid_sites(client)
         .await?
         .iter()
@@ -1828,15 +1848,32 @@ async fn collect_gossip_peer_pins(
         match verified_peer_gossip_key(site, ca, trust) {
             Ok(Some(key)) => {
                 let keys = verified.entry(site_name).or_default();
-                if !keys.contains(&key) {
-                    keys.push(key);
-                }
+                keys.entry(key.key)
+                    .and_modify(|not_before| *not_before = (*not_before).max(key.not_before))
+                    .or_insert(key.not_before);
             },
             Ok(None) => {},
             Err(reason) => tracing::warn!(site = %site_name, %reason, "peer gossip signing pin refused"),
         }
     }
-    Ok(verified)
+    Ok(verified
+        .into_iter()
+        .map(|(site, keys)| {
+            let mut keys: Vec<_> = keys.into_iter().collect();
+            keys.sort_by(|(key_a, date_a), (key_b, date_b)| date_b.cmp(date_a).then_with(|| key_a.cmp(key_b)));
+            let limit = swim::MAX_PINNED_KEYS_PER_ORIGIN;
+            if keys.len() > limit {
+                tracing::warn!(
+                    network = network_name,
+                    %site,
+                    dropped = keys.len() - limit,
+                    limit,
+                    "peer gossip key limit exceeded; keeping newest certificates, clean up extra GridSites"
+                );
+            }
+            (site, keys.into_iter().take(limit).map(|(key, _)| key).collect())
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -10157,6 +10194,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_gossip_pins_bound_tied_certificates_independently_of_resource_order() {
+        Box::pin(assert_bounded_peer_gossip_pins(false)).await;
+    }
+
+    #[tokio::test]
+    async fn peer_gossip_pins_prefer_newer_certificates_independently_of_resource_order() {
+        Box::pin(assert_bounded_peer_gossip_pins(true)).await;
+    }
+
+    #[tokio::test]
     #[expect(clippy::expect_used, reason = "certificate fixture")]
     async fn signed_cert_bootstrap_republishes_on_every_reconcile() {
         let ca = certs::generate_ca("grid-ca").expect("ca");
@@ -15128,5 +15175,103 @@ mod tests {
             broadcast.provider_uids.is_empty(),
             "the complete UID is omitted rather than truncated"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test Utilities
+    // ---------------------------------------------------------------------------
+
+    /// Verify stable selection for tied issuance dates and for rotated identities.
+    #[expect(clippy::expect_used, reason = "certificate fixture")]
+    async fn assert_bounded_peer_gossip_pins(newer_keys: bool) {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let mut items = Vec::new();
+        let mut expected = Vec::new();
+        let now = time::OffsetDateTime::now_utc();
+        let mut requests = Vec::new();
+        for _ in 0..swim::MAX_PINNED_KEYS_PER_ORIGIN + 2 {
+            let csr = certs::generate_csr("site-peer").expect("CSR");
+            let leaf = certs::sign_csr(&ca, "site-peer", &csr.csr_pem, certs::Validity::default()).expect("leaf");
+            let key = certs::verify_site_cert(&ca.cert_pem, &leaf.cert_pem, "site-peer").expect("key");
+            requests.push((key, csr));
+        }
+        requests.sort_by(|(key_a, _), (key_b, _)| key_a.cmp(key_b));
+        for (index, (_, csr)) in requests.iter().enumerate() {
+            let age = if newer_keys { requests.len() - index } else { 1 };
+            let validity = certs::Validity {
+                not_before: now - time::Duration::hours(i64::try_from(age).expect("small fixture")),
+                not_after: now + time::Duration::days(1),
+            };
+            let leaf = certs::sign_csr(&ca, "site-peer", &csr.csr_pem, validity).expect("peer certificate");
+            let fingerprint = certs::canonical_fingerprint(&leaf.cert_pem).expect("fingerprint");
+            expected.push(certs::verify_site_cert(&ca.cert_pem, &leaf.cert_pem, "site-peer").expect("key"));
+            items.push(serde_json::json!({
+                "apiVersion": "grid.praxis.fast/v1alpha1",
+                "kind": "GridSite",
+                "metadata": {
+                    "name": format!("peer-{index}"),
+                    "labels": { "grid.praxis.fast/auto-discovered": "true" },
+                    "annotations": { "grid.praxis.fast/site-id": "site-peer" }
+                },
+                "spec": {
+                    "gridNetworkRef": "glb-demo",
+                    "trust": { "canonicalFingerprints": [fingerprint] }
+                },
+                "status": { "publicCertPem": leaf.cert_pem }
+            }));
+        }
+        expected.sort();
+        if newer_keys {
+            expected.reverse();
+        }
+        expected.truncate(swim::MAX_PINNED_KEYS_PER_ORIGIN);
+        let duplicate = items.first().expect("peer fixture").clone();
+        items.push(duplicate);
+        let ca_secret = serde_json::to_value(crate::resources::test_doubles::secret_with_key(
+            "ca.crt",
+            ca.cert_pem.as_bytes(),
+        ))
+        .expect("CA secret");
+        let mut network = network_with_endpoint_transport("plaintext", None);
+        network.spec.peer_trust = Some(crate::crd::grid_network::PeerTrustConfig {
+            mode: PeerTrustMode::Pin,
+            signed_state: SignedStateMode::Enforce,
+        });
+        let node = swim::SwimNode::new(swim::NodeId::with_generation(
+            "site-local".to_owned(),
+            "127.0.0.1:7946".parse().expect("local address"),
+            1,
+        ));
+        for reversed in [false, true] {
+            if reversed {
+                items.reverse();
+            }
+            for _ in 0..items.len() {
+                let sites = serde_json::json!({
+                    "apiVersion": "grid.praxis.fast/v1alpha1",
+                    "kind": "GridSiteList",
+                    "metadata": { "resourceVersion": "1" },
+                    "items": items
+                });
+                let client = crate::resources::test_doubles::mock_kube_client_with_json(HashMap::from([
+                    ("ca", ca_secret.clone()),
+                    ("gridsites", sites),
+                ]));
+                let pins = collect_gossip_peer_pins(&network, &client, "site-local")
+                    .await
+                    .expect("verified peer pins");
+
+                assert_eq!(
+                    pins.get("site-peer"),
+                    Some(&expected),
+                    "excess and duplicate certificates retain the same bounded keys for every ordering"
+                );
+                for (origin, keys) in pins {
+                    let result = node.pin_origin_for_grid("grid-a", origin, keys);
+                    assert!(result.is_ok(), "SWIM must accept the bounded peer pin: {result:?}");
+                }
+                items.rotate_left(1);
+            }
+        }
     }
 }
