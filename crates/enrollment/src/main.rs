@@ -22,14 +22,15 @@ mod bootstrap;
 #[cfg(feature = "bootstrap")]
 mod invite;
 
-/// The namespace a one-shot command works in: the flag, else `POD_NAMESPACE`.
+/// The namespace a one-shot command works in: the flag, else `pod_namespace`, the value
+/// of `POD_NAMESPACE`.
 ///
 /// Refuses to guess, since a fallback to `default` would write the CA or invites where no
 /// reader looks.
 #[cfg(feature = "bootstrap")]
-fn work_namespace(flag: Option<&str>) -> Result<String, String> {
+fn work_namespace(flag: Option<&str>, pod_namespace: Option<String>) -> Result<String, String> {
     flag.map(str::to_owned)
-        .or_else(|| std::env::var("POD_NAMESPACE").ok())
+        .or(pod_namespace)
         .map(|namespace| namespace.trim().to_owned())
         .filter(|namespace| !namespace.is_empty())
         .ok_or_else(|| "no namespace: pass --namespace or set POD_NAMESPACE".to_owned())
@@ -792,16 +793,19 @@ mod tests {
     #[cfg(feature = "bootstrap")]
     #[test]
     fn a_one_shot_command_needs_a_namespace() {
+        let namespace = |flag: Option<&str>, pod: Option<&str>| super::work_namespace(flag, pod.map(str::to_owned));
+        assert_eq!(namespace(Some(" grid-system "), None).as_deref(), Ok("grid-system"));
+        assert_eq!(namespace(None, Some(" grid-system ")).as_deref(), Ok("grid-system"));
         assert_eq!(
-            super::work_namespace(Some(" grid-system ")).as_deref(),
-            Ok("grid-system")
+            namespace(Some("flagged"), Some("pod")).as_deref(),
+            Ok("flagged"),
+            "the flag wins over POD_NAMESPACE"
         );
-        if std::env::var_os("POD_NAMESPACE").is_none() {
-            assert!(super::work_namespace(None).is_err(), "no flag and no POD_NAMESPACE");
-        }
+        assert!(namespace(None, None).is_err(), "no flag and no POD_NAMESPACE");
+        assert!(namespace(Some(" "), None).is_err(), "a blank flag is not a namespace");
         assert!(
-            super::work_namespace(Some(" ")).is_err(),
-            "a blank flag is not a namespace"
+            namespace(None, Some(" ")).is_err(),
+            "a blank POD_NAMESPACE is not a namespace"
         );
     }
 }

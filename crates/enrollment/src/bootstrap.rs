@@ -140,7 +140,7 @@ async fn bootstrap(args: &BootstrapArgs) -> Result<(), BoxError> {
     use k8s_openapi::api::core::v1::Secret;
     use kube::api::Api;
 
-    let namespace = crate::work_namespace(args.namespace.as_deref())?;
+    let namespace = crate::work_namespace(args.namespace.as_deref(), std::env::var("POD_NAMESPACE").ok())?;
     check_site_args(args)?;
     let client = kube::Client::try_default().await?;
     if let Some(name) = &args.grid_id_config_map {

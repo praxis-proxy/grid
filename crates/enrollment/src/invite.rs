@@ -61,7 +61,7 @@ pub(crate) async fn run() -> Result<(), BoxError> {
     #[cfg(feature = "fips")]
     grid_fips::verify().map_err(|error| error.to_string())?;
     let invites = parse_invites(&args.invites).map_err(|err| format!("ENROLLMENT_INVITES: {err}"))?;
-    let namespace = crate::work_namespace(args.namespace.as_deref())?;
+    let namespace = crate::work_namespace(args.namespace.as_deref(), std::env::var("POD_NAMESPACE").ok())?;
     #[cfg(not(feature = "fips"))]
     if rustls::crypto::ring::default_provider().install_default().is_err() {
         tracing::debug!("a rustls crypto provider was already installed");
