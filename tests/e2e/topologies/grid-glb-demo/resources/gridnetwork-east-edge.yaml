@@ -8,14 +8,13 @@ spec:
   gridId: grid-glb-demo-v1
   region: east
   zone: east-edge-1
-  seeds:
-    - "{{ captures.east-provider.swim-lb-ip }}:7946"
-    - "{{ captures.west-edge.swim-lb-ip }}:7946"
-    - "{{ captures.west-provider.swim-lb-ip }}:7946"
-  swim:
-    probeInterval: "5s"
-    suspicionTimeout: "15s"
-    gossipNodes: 3
+  membership:
+    mode: Swim
+    swim:
+      seeds:
+        - "{{ captures.east-provider.swim-lb-ip }}:7946"
+        - "{{ captures.west-edge.swim-lb-ip }}:7946"
+        - "{{ captures.west-provider.swim-lb-ip }}:7946"
   consumerGateways:
     - name: edge-gateway
       namespace: grid-system

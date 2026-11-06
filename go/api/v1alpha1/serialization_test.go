@@ -2,7 +2,6 @@
 //
 // Run "make generate-go-types" first to produce the zz_generated_*.go files,
 // then "make go-types-check" to run these tests.
-//
 package v1alpha1_test
 
 import (
@@ -42,7 +41,7 @@ func TestSchemeRegistration(t *testing.T) {
 
 // TestCRDSpecPropertiesMatchGoJSONTags is the structural drift check.
 // It recursively walks the full OpenAPI v3 spec and status schemas of each
-// deployed CRD and verifies that every property  -  at every nesting level  - 
+// deployed CRD and verifies that every property  -  at every nesting level  -
 // appears as a json struct tag on the corresponding Go type with a compatible
 // Go kind (string/int64/float64/bool/slice/map/struct).
 //
@@ -420,8 +419,8 @@ func TestGridNetworkRoundTrip(t *testing.T) {
 	if gn.Name != "production" {
 		t.Errorf("Name = %q, want production", gn.Name)
 	}
-	if len(gn.Spec.Seeds) != 2 {
-		t.Errorf("Seeds len = %d, want 2", len(gn.Spec.Seeds))
+	if gn.Spec.Membership == nil || gn.Spec.Membership.SWIM == nil || len(gn.Spec.Membership.SWIM.Seeds) != 2 {
+		t.Errorf("membership.swim.seeds not preserved")
 	}
 	if gn.Spec.SelectionPolicy == nil || gn.Spec.SelectionPolicy.Mode != v1alpha1.SelectionModeRoundRobin {
 		t.Errorf("SelectionPolicy.Mode not roundRobin")
@@ -431,14 +430,6 @@ func TestGridNetworkRoundTrip(t *testing.T) {
 	}
 	if gn.Spec.PeerTrust == nil || gn.Spec.PeerTrust.Mode != v1alpha1.PeerTrustModePin {
 		t.Errorf("PeerTrust.Mode not pin")
-	}
-	if gn.Spec.SWIM == nil || gn.Spec.SWIM.ProbeInterval == nil || *gn.Spec.SWIM.ProbeInterval != "5s" {
-		t.Errorf("SWIM.ProbeInterval not preserved")
-	}
-	// gossipNodes has a non-zero CRD default (3), so it must be *int64 to let
-	// a client send 0 without omitempty silently dropping it to the default.
-	if gn.Spec.SWIM == nil || gn.Spec.SWIM.GossipNodes == nil || *gn.Spec.SWIM.GossipNodes != 5 {
-		t.Errorf("SWIM.GossipNodes not preserved as pointer")
 	}
 	if gn.Spec.TLS == nil || gn.Spec.TLS.CASecretRef == nil || gn.Spec.TLS.CASecretRef.Name != "grid-ca" {
 		t.Errorf("TLS.CASecretRef not preserved")
@@ -455,32 +446,6 @@ func TestGridNetworkRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(gn, gn2) {
 		t.Errorf("round-trip produced different object:\n  got  %+v\n  want %+v", gn2, gn)
-	}
-}
-
-// TestGossipNodesZeroPreserved verifies that gossipNodes:0 survives a
-// marshal/unmarshal cycle without being swallowed by omitempty. The field has
-// a non-zero CRD default (3), so the generator must emit *int64, not int64.
-func TestGossipNodesZeroPreserved(t *testing.T) {
-	zero := int64(0)
-	gn := v1alpha1.GridNetwork{
-		Spec: v1alpha1.GridNetworkSpec{
-			SWIM: &v1alpha1.GridNetworkSWIM{GossipNodes: &zero},
-		},
-	}
-	b, err := json.Marshal(&gn)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	var gn2 v1alpha1.GridNetwork
-	if err := json.Unmarshal(b, &gn2); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if gn2.Spec.SWIM == nil || gn2.Spec.SWIM.GossipNodes == nil {
-		t.Fatal("SWIM.GossipNodes is nil after round-trip; zero was dropped by omitempty")
-	}
-	if *gn2.Spec.SWIM.GossipNodes != 0 {
-		t.Errorf("SWIM.GossipNodes = %d after round-trip, want 0", *gn2.Spec.SWIM.GossipNodes)
 	}
 }
 
