@@ -188,10 +188,11 @@ failure; a failed reload retains the previous policy. JWT/DPoP requires approved
 asymmetric algorithms and keys; HMAC JWTs are refused. See [Policy FIPS] for
 provider setup, algorithm restrictions and the host's responsibilities.
 
-Run `make gateway-fips-check` for the API-key and combined profiles. Gateway CI
-runs the same target: compile all targets, check the assembled registry's Policy
+Run `make gateway-fips-check` for the API-key, JWT-only and combined profiles.
+Gateway CI runs the same target: compile all targets, check the registry's Policy
 capability assessment, and reject ring, AWS-LC, SHA-2/HMAC crates and vendored
-OpenSSL in normal/build dependencies. Test-only ring remains for mock TLS peers.
+OpenSSL in normal/build dependencies. In these profiles, ring and AWS-LC appear
+only through test dependencies, including the certificate and mock TLS fixtures.
 These checks do not prove runtime provider readiness or FIPS host compliance.
 
 The standard `deploy/gateway/Containerfile` builds the default profile with
