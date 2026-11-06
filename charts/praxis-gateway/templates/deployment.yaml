@@ -51,7 +51,7 @@ spec:
       {{- /* A changed chart-rendered config must reach new pods: the hash rolls the Deployment. */}}
       {{- if eq $configSource "byoInline" }}
       {{- /* A changed praxisConfig.byo.inline must reach new pods: the hash rolls the Deployment. */}}
-      {{- $_ := set $podAnnotations "checksum/config" (toString .Values.praxisConfig.byo.inline | sha256sum) }}
+      {{- $_ := set $podAnnotations "checksum/config" (include "praxis-gateway.byoInline" . | sha256sum) }}
       {{- else if eq $configSource "render" }}
       {{- $_ := set $podAnnotations "checksum/config" (include "praxis-gateway.gatewayConfigData" . | sha256sum) }}
       {{- end }}
@@ -218,16 +218,17 @@ spec:
           {{- $validateCA := .Values.praxisConfig.render.auth.validateCA }}
           {{- $withCA := and (eq .Values.praxisConfig.source "render") (eq .Values.praxisConfig.render.auth.mode "api-key") (or $validateCA.configMapName $validateCA.secretName) }}
           {{- /* A user RUST_LOG in env wins: a duplicate name fails server-side apply. */ -}}
+          {{- $env := include "praxis-gateway.env" . | fromYamlArray }}
           {{- $userLog := false }}
-          {{- range .Values.env }}{{- if eq .name "RUST_LOG" }}{{- $userLog = true }}{{- end }}{{- end }}
+          {{- range $env }}{{- if eq .name "RUST_LOG" }}{{- $userLog = true }}{{- end }}{{- end }}
           {{- $rustLog := and (not $userLog) (include "praxis-gateway.rustLog" .) }}
-          {{- if or $rustLog .Values.env $gridServing.enabled $withCA (.Values.metricsListener).enabled }}
+          {{- if or $rustLog $env $gridServing.enabled $withCA (.Values.metricsListener).enabled }}
           env:
             {{- if $rustLog }}
             - name: RUST_LOG
               value: {{ include "praxis-gateway.rustLog" . | quote }}
             {{- end }}
-            {{- with .Values.env }}
+            {{- with $env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
             {{- if and $gridServing.enabled $providerRole }}

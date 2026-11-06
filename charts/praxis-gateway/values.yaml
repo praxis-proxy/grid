@@ -108,6 +108,10 @@ args:
 # -- credentials and other deployment-managed secrets.
 env: []
 
+# -- Render env as a Helm template (tpl) against this chart's context, so a parent chart
+# can set values or Secret names from {{ .Values.global.* }}. Escape literal {{ as {{ "{{" }}.
+envTpl: false
+
 # -- Logging, rendered as RUST_LOG on the gateway and overlay-sync containers. An env
 # entry named RUST_LOG takes precedence on the gateway. Praxis adds config.runtime.log_overrides
 # per module on top, and its admin listener can change the level at runtime without a restart.
@@ -138,6 +142,10 @@ praxisConfig:
     configMapName: ""
     # -- Key within configMapName that holds praxis.yaml.
     key: "praxis.yaml"
+    # -- Render inline as a Helm template (tpl) against this chart's context, so it can
+    # reference values such as {{ .Release.Name }} or {{ .Values.global.* }} from a parent
+    # chart. Escape literal {{ as {{ "{{" }}.
+    tpl: false
     # -- Praxis configuration the chart stores in its own ConfigMap when configMapName
     # is empty. Changing it rolls the pods. One listener must bind port.containerPort,
     # or the install fails. The default answers GET / with a small JSON status and
@@ -513,7 +521,7 @@ overlay:
       repository: ghcr.io/praxis-proxy/grid-overlay-sync
       # -- Image tag. Empty uses the chart appVersion, which is the praxis version,
       # not a grid-overlay-sync tag, so keep this set.
-      tag: "v0.3.0-rc.4"
+      tag: "v0.3.0"
       # -- Image pull policy.
       pullPolicy: IfNotPresent
     # -- ConfigMap data key containing the overlay envelope.

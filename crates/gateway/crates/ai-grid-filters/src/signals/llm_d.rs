@@ -36,6 +36,11 @@ const KV_METRICS: [&str; 2] = [
 /// The deviation across the pool's units, the cheap bound on one hot unit behind a low mean.
 const KV_SPREAD_METRIC: &str = "llm_d_epp_std_dev_kv_cache_utilization";
 
+/// The EPP's own detector reading, the worst of its stage partitions: one line per stage
+/// (prefill, decode and their maximum, effective), so the store's maximum is `effective`. Set
+/// only with the flowControl gate on.
+const POOL_SATURATION_METRIC: &str = "llm_d_epp_flow_control_pool_saturation";
+
 /// Requests the EPP's flow control holds before scheduling: in flight, and a backlog. One
 /// series per priority and fairness partition, summed at each instant.
 const FLOW_CONTROL_QUEUE_METRIC: &str = "llm_d_epp_flow_control_queue_size";
@@ -56,6 +61,17 @@ pub(crate) fn combine(metric: &str) -> Combine {
         Combine::Max
     }
 }
+
+/// Waiting requests per unit that read as a full unit, the llm-d utilization detector's default
+/// queue threshold.
+pub(crate) const SATURATION_QUEUE_DEPTH: f64 = 5.0;
+
+/// KV share that reads as a full unit, the llm-d utilization detector's default KV threshold.
+pub(crate) const SATURATION_KV_SHARE: f64 = 0.8;
+
+/// The least KV share running is divided by. Below it the share is mostly rounding (the EPP
+/// publishes two decimals) and the quotient is noise.
+pub(crate) const MIN_IMPLYING_SHARE: f64 = 0.15;
 
 /// Lower is better for every series read here, so the worst sample is the maximum.
 const LOWER_IS_BETTER: bool = true;
@@ -98,11 +114,12 @@ pub(crate) struct Series {
     /// Work waiting at each serving unit, first name found wins. Present only while the
     /// site has units.
     pub(crate) per_unit_queue: &'static [&'static str],
-    /// What an llm-d EPP reports as its own fullness: the share of the KV cache committed,
-    /// averaged over the pool's units.
+    /// The share of the KV cache committed, averaged over the pool's units.
     pub(crate) saturation: &'static [&'static str],
     /// The deviation of that share across the units.
     pub(crate) saturation_spread: &'static str,
+    /// The EPP's own saturation reading, preferred over the gateway's approximation.
+    pub(crate) pool_saturation: &'static str,
 }
 
 impl Series {
@@ -115,6 +132,7 @@ impl Series {
         per_unit_queue: &PER_UNIT_QUEUE_METRICS,
         saturation: &KV_METRICS,
         saturation_spread: KV_SPREAD_METRIC,
+        pool_saturation: POOL_SATURATION_METRIC,
     };
 }
 
@@ -194,6 +212,34 @@ impl SiteSignals for Mapped<'_> {
             sampled_at,
         )
     }
+
+    /// Running over KV share at queue-free instants, the least in the window.
+    fn implied_capacity(&self, site: &str, cluster: &str, over: Over) -> Option<f64> {
+        let key = LoadStore::key(site, cluster);
+        self.store.window_worst_of(
+            &key,
+            [
+                self.published(&key, self.series.saturation),
+                self.series.saturation_spread,
+                self.published(&key, self.series.running),
+                self.published(&key, self.series.queued),
+                self.published(&key, self.series.endpoints),
+                self.series.held,
+            ],
+            over.now_ms,
+            over.horizon_ms,
+            !LOWER_IS_BETTER,
+            |[share, spread, running, queued, endpoints, held]| {
+                if queued.and_then(as_count).is_some_and(|queued| queued >= 1.0)
+                    || held.and_then(as_count).is_some_and(|held| held >= 1.0)
+                {
+                    return None;
+                }
+                let share = joined_share(share, spread).filter(|share| *share >= MIN_IMPLYING_SHARE)?;
+                as_count(as_count(running?)? * as_count(endpoints?)? / share)
+            },
+        )
+    }
 }
 
 impl Mapped<'_> {
@@ -214,7 +260,7 @@ impl Mapped<'_> {
         let backlog = |queued: Option<f64>, held: Option<f64>| {
             queued.is_some_and(|queued| queued >= queue_full) || held.is_some_and(|held| held >= 1.0)
         };
-        let units = self.units(key);
+        let published_saturation = self.published_saturation(key, now_ms, window_ms, |_, _| true);
         SiteReading {
             in_flight: self.in_flight(key, now_ms, window_ms, |_, _| true),
             congested_in_flight: self.in_flight(key, now_ms, window_ms, backlog),
@@ -222,15 +268,80 @@ impl Mapped<'_> {
             queue_sampled_at,
             held: worst(self.series.held),
             deepest_queue: first(self.series.per_unit_queue),
-            // Mean and spread are joined per scrape before the worst is chosen. Maximising
-            // them apart invents a fullness no scrape reported during scale-out.
-            saturation: self.reported_saturation(key, now_ms, window_ms),
-            full_in_flight: self.full_in_flight(key, over, units, backlog),
             backlogged_at: sampled_at.filter(|at| self.in_flight(key, *at, 0, backlog).is_some()),
             unready: self.unready(key, sampled_at),
             sampled_at,
-            units,
+            units: self.units(key),
+            published_saturation,
+            derived_saturation: self.derived_saturation(key, now_ms, window_ms, |_, _| true),
+            congested_saturation: if published_saturation.is_some() {
+                self.published_saturation(key, now_ms, window_ms, backlog)
+            } else {
+                self.derived_saturation(key, now_ms, window_ms, backlog)
+            },
         }
+    }
+
+    /// The EPP's published reading, per sample so one non-finite sample does not lose the
+    /// window, over the instants `at` admits by that instant's waiting and held readings.
+    fn published_saturation(
+        &self,
+        key: &str,
+        now_ms: i64,
+        window_ms: i64,
+        at: impl Fn(Option<f64>, Option<f64>) -> bool,
+    ) -> Option<f64> {
+        self.store.window_worst_of(
+            key,
+            [
+                self.series.pool_saturation,
+                self.published(key, self.series.queued),
+                self.series.held,
+            ],
+            now_ms,
+            window_ms,
+            LOWER_IS_BETTER,
+            |[saturation, queued, held]| {
+                at(queued.and_then(as_count), held.and_then(as_count)).then_some(())?;
+                saturation.and_then(as_count)
+            },
+        )
+    }
+
+    /// The detector's rule at its default thresholds over pool averages; needs a KV share, so a
+    /// queue-only provider still learns. Held work counts per unit, so the gate cannot move it.
+    /// Over the instants `at` admits by that instant's waiting and held readings.
+    fn derived_saturation(
+        &self,
+        key: &str,
+        now_ms: i64,
+        window_ms: i64,
+        at: impl Fn(Option<f64>, Option<f64>) -> bool,
+    ) -> Option<f64> {
+        self.store.window_worst_of(
+            key,
+            [
+                self.published(key, self.series.saturation),
+                self.series.saturation_spread,
+                self.published(key, self.series.queued),
+                self.published(key, self.series.endpoints),
+                self.series.held,
+            ],
+            now_ms,
+            window_ms,
+            LOWER_IS_BETTER,
+            |[share, spread, queued, endpoints, held]| {
+                let queued = queued.and_then(as_count);
+                let held = held.and_then(as_count);
+                at(queued, held).then_some(())?;
+                let cache = joined_share(share, spread)? / SATURATION_KV_SHARE;
+                let held = held
+                    .zip(endpoints.and_then(as_count).filter(|units| *units > 0.0))
+                    .map_or(0.0, |(held, units)| held / units);
+                let waiting = queued.map_or(held, |queued| queued + held);
+                Some(cache.max(waiting / SATURATION_QUEUE_DEPTH))
+            },
+        )
     }
 
     /// The site's latest ready-unit count, at any age.
@@ -276,66 +387,6 @@ impl Mapped<'_> {
                 let endpoints = as_count(endpoints?)?;
                 as_count((running + queued.unwrap_or(0.0)) * endpoints + held.unwrap_or(0.0))
             },
-        )
-    }
-
-    /// The most the site held at an instant that `at` admits and that reported itself full.
-    ///
-    /// One pass, so the count and the fullness that makes it a limit come from one sample. Taken
-    /// apart, the highest count among congested instants pairs with the highest fullness among
-    /// them, and a limit is recorded for a combination the site was never in.
-    fn full_in_flight(
-        &self,
-        key: &str,
-        over: Over,
-        latest_units: Option<f64>,
-        at: impl Fn(Option<f64>, Option<f64>) -> bool,
-    ) -> Option<f64> {
-        let reported_full = over.reported_full;
-        self.store.window_worst_of(
-            key,
-            [
-                self.published(key, self.series.saturation),
-                self.series.saturation_spread,
-                self.published(key, self.series.running),
-                self.published(key, self.series.queued),
-                self.published(key, self.series.endpoints),
-                self.series.held,
-            ],
-            over.now_ms,
-            over.window_ms,
-            LOWER_IS_BETTER,
-            |[share, spread, running, queued, endpoints, held]| {
-                let queued = queued.and_then(as_count);
-                let held = held.and_then(as_count);
-                let endpoints = as_count(endpoints?)?;
-                // Samples from the smaller pool remain in the horizon after scale-out. They
-                // cannot reteach its hard bound once the latest ready-unit count has grown.
-                if latest_units.is_some_and(|latest| endpoints < latest) {
-                    return None;
-                }
-                let reported = joined_share(share, spread)?;
-                if !at(queued, held) || reported < reported_full {
-                    return None;
-                }
-                let running = as_count(running?)?;
-                as_count((running + queued.unwrap_or(0.0)) * endpoints + held.unwrap_or(0.0))
-            },
-        )
-    }
-
-    /// The worst provider-reported fullness, joining mean and spread at each scrape.
-    fn reported_saturation(&self, key: &str, now_ms: i64, window_ms: i64) -> Option<f64> {
-        self.store.window_worst_of(
-            key,
-            [
-                self.published(key, self.series.saturation),
-                self.series.saturation_spread,
-            ],
-            now_ms,
-            window_ms,
-            LOWER_IS_BETTER,
-            |[share, spread]| joined_share(share, spread),
         )
     }
 
@@ -394,6 +445,14 @@ impl SiteSignals for LoadStore {
         }
         .read(site, cluster, over)
     }
+
+    fn implied_capacity(&self, site: &str, cluster: &str, over: Over) -> Option<f64> {
+        Mapped {
+            store: self,
+            series: &Series::LLM_D,
+        }
+        .implied_capacity(site, cluster, over)
+    }
 }
 
 #[cfg(test)]
@@ -409,7 +468,6 @@ mod tests {
             window_ms,
             horizon_ms: window_ms,
             queue_full,
-            reported_full: 0.8,
         }
     }
 
@@ -421,6 +479,7 @@ mod tests {
         per_unit_queue: &["vendor_unit_queue"],
         saturation: &["vendor_kv"],
         saturation_spread: "vendor_kv_spread",
+        pool_saturation: "vendor_saturation",
     };
 
     /// A store holding one sample of each of `OTHER`'s series for site a.
@@ -455,12 +514,14 @@ mod tests {
             queue_sampled_at: Some(1_000),
             held: Some(3.0),
             deepest_queue: Some(2.0),
-            saturation: None,
-            full_in_flight: None,
             backlogged_at: Some(1_000),
             unready: false,
             sampled_at: Some(1_000),
             units: Some(2.0),
+            // No KV share and no published saturation, so no comparator: this site is learned.
+            published_saturation: None,
+            derived_saturation: None,
+            congested_saturation: None,
         };
         assert_eq!(mapped.read("a", "pool-a", over(1_000, 30_000, 1.0)), expected);
         // The llm-d names see the sample stamp and nothing else.
@@ -600,7 +661,7 @@ mod tests {
             );
         }
         let reading = store.read("a", "pool-a", over(2_000, 30_000, 1.0));
-        assert_eq!(reading.saturation, Some(0.85));
+        assert_eq!(reading.derived_saturation, Some(0.85 / SATURATION_KV_SHARE));
     }
 
     #[test]
@@ -612,7 +673,10 @@ mod tests {
             1_000,
             "a",
         );
-        assert_eq!(store.read("a", "pool-a", over(1_000, 30_000, 1.0)).saturation, None);
+        assert_eq!(
+            store.read("a", "pool-a", over(1_000, 30_000, 1.0)).derived_saturation,
+            None
+        );
     }
 
     #[test]
@@ -634,7 +698,6 @@ mod tests {
             window_ms,
             horizon_ms,
             queue_full: 1.0,
-            reported_full: 0.8,
         }
     }
 
@@ -685,5 +748,102 @@ mod tests {
         assert_eq!(reading.in_flight, None, "stale, however far the horizon reaches");
         assert!(!reading.unready, "stale is not unready");
         assert_eq!(reading.sampled_at, Some(1_000), "the age is still reported");
+    }
+
+    /// A store holding one llm-d sample per series named, for site a at 1000.
+    fn llm_d(series: &[(&str, f64)]) -> LoadStore {
+        let store = LoadStore::new(Duration::from_secs(60));
+        for (metric, value) in series {
+            let line = format!(r#"{metric}{{grid_site="a",grid_provider="pool-a"}} {value} 1000"#);
+            store.ingest_at(&line, 1_000, 1_000, "a");
+        }
+        store
+    }
+
+    #[test]
+    fn a_kv_share_at_the_detector_threshold_reads_full() {
+        let store = llm_d(&[("llm_d_epp_average_kv_cache_utilization", 0.8)]);
+        let reading = store.read("a", "pool-a", over(1_000, 30_000, 1.0));
+        assert_eq!(reading.derived_saturation, Some(1.0));
+    }
+
+    #[test]
+    fn flow_control_held_counts_per_unit_and_absent_reads_as_none_held() {
+        let base = [
+            ("llm_d_epp_average_kv_cache_utilization", 0.1),
+            ("llm_d_epp_average_queue_size", 1.0),
+            ("llm_d_epp_ready_endpoints", 2.0),
+        ];
+        let held = llm_d(&[base[0], base[1], base[2], ("llm_d_epp_flow_control_queue_size", 4.0)]);
+        let ungated = llm_d(&base);
+        let read = |store: &LoadStore| {
+            store
+                .read("a", "pool-a", over(1_000, 30_000, 1.0))
+                .derived_saturation
+                .unwrap_or(f64::NAN)
+        };
+        // One waiting per unit plus four held over two units, over a depth of five.
+        assert!((read(&held) - 0.6).abs() < 1e-9, "held adds per unit: {}", read(&held));
+        assert!(
+            (read(&ungated) - 0.2).abs() < 1e-9,
+            "no held series adds nothing: {}",
+            read(&ungated)
+        );
+    }
+
+    #[test]
+    fn the_comparator_is_not_capped_at_full() {
+        let store = llm_d(&[
+            ("llm_d_epp_average_kv_cache_utilization", 0.2),
+            ("llm_d_epp_average_queue_size", 10.0),
+            ("llm_d_epp_ready_endpoints", 1.0),
+        ]);
+        let reading = store.read("a", "pool-a", over(1_000, 30_000, 1.0));
+        assert_eq!(
+            reading.derived_saturation,
+            Some(2.0),
+            "ten waiting over a depth of five"
+        );
+    }
+
+    #[test]
+    fn the_epps_own_saturation_is_preferred_and_read_as_its_worst_stage() {
+        let store = llm_d(&[
+            ("llm_d_epp_average_kv_cache_utilization", 0.4),
+            ("llm_d_epp_average_queue_size", 0.0),
+            ("llm_d_epp_ready_endpoints", 1.0),
+        ]);
+        let labels = r#"grid_site="a",grid_provider="pool-a",inference_pool="p""#;
+        for (stage, value) in [("decode", 0.4), ("prefill", 1.3), ("effective", 1.3)] {
+            store.ingest_at(
+                &format!(r#"llm_d_epp_flow_control_pool_saturation{{{labels},stage="{stage}"}} {value} 1000"#),
+                1_000,
+                1_000,
+                "a",
+            );
+        }
+        let reading = store.read("a", "pool-a", over(1_000, 30_000, 1.0));
+        assert_eq!(
+            reading.published_saturation,
+            Some(1.3),
+            "the effective stage is the worst one"
+        );
+        assert_eq!(reading.derived_saturation, Some(0.4 / SATURATION_KV_SHARE));
+        assert_eq!(reading.comparator(), Some(1.3), "the EPP's configured detector wins");
+    }
+
+    #[test]
+    fn without_the_epps_saturation_the_gateway_approximation_is_read() {
+        let store = llm_d(&[
+            ("llm_d_epp_average_kv_cache_utilization", 0.4),
+            ("llm_d_epp_average_queue_size", 0.0),
+            ("llm_d_epp_ready_endpoints", 1.0),
+        ]);
+        let reading = store.read("a", "pool-a", over(1_000, 30_000, 1.0));
+        assert_eq!(
+            reading.published_saturation, None,
+            "flow control off publishes no pool saturation"
+        );
+        assert_eq!(reading.comparator(), Some(0.4 / SATURATION_KV_SHARE));
     }
 }
