@@ -211,6 +211,21 @@ impl MembershipMode {
 pub struct MembershipConfig {
     /// Membership source. Local requires `signalTransport.mode: poll`.
     pub mode: MembershipMode,
+
+    /// SWIM seed peers used when `mode` is `Swim`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swim: Option<SwimConfig>,
+}
+
+impl MembershipConfig {
+    /// Whether this membership mode permits a SWIM configuration block.
+    #[must_use]
+    pub const fn swim_config_matches_mode(&self) -> bool {
+        match self.mode {
+            MembershipMode::Swim => true,
+            MembershipMode::Local => self.swim.is_none(),
+        }
+    }
 }
 
 /// How signals propagate across the sites of a grid.
@@ -636,8 +651,7 @@ fn add_tls_config_legacy_fields(schema: &mut schemars::Schema) {
 
 /// Specification for a [`GridNetwork`].
 ///
-/// Defines the grid's seed peers, gateway associations, SWIM
-/// tuning, and TLS secret references.
+/// Defines the grid's gateway associations, membership, and TLS secret references.
 #[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, Serialize)]
 #[kube(
     group = "grid.praxis.fast",
@@ -667,6 +681,9 @@ fn add_tls_config_legacy_fields(schema: &mut schemars::Schema) {
 }, {
     "rule": "!has(self.membership) || self.membership.mode != 'Local' || (has(self.signalTransport) && self.signalTransport.mode == 'poll')",
     "message": "membership.mode Local requires signalTransport.mode poll"
+}, {
+    "rule": "!has(self.membership) || self.membership.mode == 'Swim' || !has(self.membership.swim)",
+    "message": "membership.swim is only valid when membership.mode is Swim"
 }]))]
 #[schemars(transform = add_grid_network_spec_legacy_fields)]
 #[serde(rename_all = "camelCase")]
@@ -679,21 +696,12 @@ pub struct GridNetworkSpec {
     #[schemars(length(max = 63), regex(pattern = "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"))]
     pub grid_id: String,
 
-    /// Initial SWIM seed peer endpoints in host:port form. Literal IPv4, bracketed
-    /// IPv6, and DNS hostnames are accepted.
-    #[serde(default)]
-    pub seeds: Vec<String>,
-
     /// References to Praxis Gateways that participate in this grid.
     #[serde(default, alias = "gatewayRefs")]
     pub consumer_gateways: Vec<GatewayRef>,
 
     /// Region where this site is deployed.
     pub region: Option<String>,
-
-    /// SWIM protocol configuration.
-    #[serde(default)]
-    pub swim: SwimConfig,
 
     /// TLS secret references for grid certificate management.
     #[serde(default)]
@@ -1439,21 +1447,18 @@ fn default_listener_port() -> u16 {
     8080
 }
 
-/// SWIM protocol tuning parameters.
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// Optional SWIM membership configuration.
+///
+/// The controller passes seeds to the SWIM runtime for peer discovery.
+/// Protocol tuning values are not exposed because the runtime does not consume them.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub struct SwimConfig {
-    /// Fanout for indirect probes.
-    #[serde(default = "default_gossip_nodes")]
-    pub gossip_nodes: u32,
-
-    /// WAN probe interval (e.g. "5s").
-    #[serde(default = "default_probe_interval")]
-    pub probe_interval: String,
-
-    /// Suspicion timeout before declaring dead (e.g. "10s").
-    #[serde(default = "default_suspicion_timeout")]
-    pub suspicion_timeout: String,
+    /// SWIM peer endpoints in host:port form. Literal IPv4, bracketed IPv6,
+    /// and DNS hostnames are accepted.
+    #[serde(default)]
+    pub seeds: Vec<String>,
 }
 
 /// TLS configuration for grid certificate management.
@@ -1827,31 +1832,6 @@ pub struct OverlayRevisionStatus {
 // Defaults
 // ---------------------------------------------------------------------------
 
-/// Default SWIM gossip fanout.
-fn default_gossip_nodes() -> u32 {
-    3
-}
-
-/// Default WAN probe interval.
-fn default_probe_interval() -> String {
-    "5s".to_owned()
-}
-
-/// Default suspicion timeout.
-fn default_suspicion_timeout() -> String {
-    "10s".to_owned()
-}
-
-impl Default for SwimConfig {
-    fn default() -> Self {
-        Self {
-            gossip_nodes: default_gossip_nodes(),
-            probe_interval: default_probe_interval(),
-            suspicion_timeout: default_suspicion_timeout(),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1875,6 +1855,81 @@ mod tests {
     }
 
     #[test]
+    fn membership_swim_is_optional_and_only_allowed_for_swim_mode() {
+        let crd = crd_json();
+        let spec = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec")
+            .unwrap_or_else(|| std::process::abort());
+        let spec_properties = spec
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            !spec_properties.contains_key("seeds"),
+            "top-level seeds must be removed"
+        );
+        assert!(
+            !spec_properties.contains_key("swim"),
+            "top-level swim tuning must be removed"
+        );
+
+        let membership = spec_properties
+            .get("membership")
+            .unwrap_or_else(|| std::process::abort());
+        let swim_schema = membership
+            .pointer("/properties/swim")
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            swim_schema.get("default").is_none(),
+            "membership.swim must not have a schema default"
+        );
+        assert!(
+            !membership
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|required| { required.iter().any(|field| field.as_str() == Some("swim")) }),
+            "membership.swim must be optional"
+        );
+        let validations = spec
+            .get("x-kubernetes-validations")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            validations.iter().any(|validation| {
+                validation.get("rule").and_then(serde_json::Value::as_str)
+                    == Some("!has(self.membership) || self.membership.mode == 'Swim' || !has(self.membership.swim)")
+            }),
+            "CRD must reject membership.swim for Local mode"
+        );
+        let configured_swim = serde_json::from_value::<MembershipConfig>(serde_json::json!({
+            "mode": "Swim",
+            "swim": {"seeds": ["peer.example:7946"]}
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            configured_swim.swim_config_matches_mode(),
+            "Swim mode must accept membership.swim"
+        );
+        let local = serde_json::from_value::<MembershipConfig>(serde_json::json!({
+            "mode": "Local",
+            "swim": {"seeds": ["peer.example:7946"]}
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            !local.swim_config_matches_mode(),
+            "Local mode must reject membership.swim"
+        );
+        assert!(
+            serde_json::from_value::<MembershipConfig>(serde_json::json!({
+                "mode": "Swim",
+                "swim": {"probeInterval": "2s"}
+            }))
+            .is_err(),
+            "unsupported tuning fields must be rejected"
+        );
+    }
+
+    #[test]
     fn a_backend_ca_key_is_a_file_name_never_a_path() {
         let schema = schemars::schema_for!(EndpointCaSecretRef);
         assert_eq!(
@@ -1886,14 +1941,6 @@ mod tests {
             "what Kubernetes accepts as a Secret key: `root..crt` and `.hidden` pass, `/`, `.`, `..` \
              and a `..` prefix do not"
         );
-    }
-
-    #[test]
-    fn default_swim_config() {
-        let cfg = SwimConfig::default();
-        assert_eq!(cfg.gossip_nodes, 3, "default gossip nodes");
-        assert_eq!(cfg.probe_interval, "5s", "default probe interval");
-        assert_eq!(cfg.suspicion_timeout, "10s", "default suspicion timeout");
     }
 
     #[test]
@@ -1914,14 +1961,19 @@ mod tests {
     fn spec_serde_round_trip() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": ["grid.cluster-b:7946"],
             "consumerGateways": [{"name": "gw", "namespace": "ns"}],
-            "swim": {"probeInterval": "3s"},
+            "membership": {"mode": "Swim", "swim": {"seeds": ["grid.cluster-b:7946"]}},
             "tls": {}
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(spec.seeds.len(), 1, "should have 1 seed");
-        assert_eq!(spec.swim.probe_interval, "3s", "custom probe interval");
+        assert_eq!(
+            spec.membership
+                .as_ref()
+                .and_then(|membership| membership.swim.as_ref())
+                .map(|swim| swim.seeds.len()),
+            Some(1),
+            "membership SWIM config carries its seed"
+        );
     }
 
     #[test]
@@ -2096,9 +2148,7 @@ mod tests {
     #[test]
     fn stale_candidate_ttl_defaults_to_none_when_absent() {
         let json = serde_json::json!({
-            "gridId": "",
-            "seeds": [],
-            "swim": {}
+            "gridId": ""
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -2111,7 +2161,6 @@ mod tests {
     fn stale_candidate_ttl_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "staleCandidateTtlSeconds": 3600
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -2125,7 +2174,7 @@ mod tests {
     #[test]
     fn stale_candidate_ttl_serializes_only_when_present() {
         // absent field must not appear in serialized output
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -2881,9 +2930,7 @@ mod tests {
     #[test]
     fn routing_policy_defaults_to_none_when_absent() {
         let json = serde_json::json!({
-            "gridId": "",
-            "seeds": [],
-            "swim": {}
+            "gridId": ""
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -2896,7 +2943,6 @@ mod tests {
     fn routing_policy_geography_first_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "routingPolicy": "geographyFirst"
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -2911,7 +2957,6 @@ mod tests {
     fn routing_policy_score_first_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "routingPolicy": "scoreFirst"
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -2924,7 +2969,7 @@ mod tests {
 
     #[test]
     fn routing_policy_absent_not_serialized() {
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -3074,7 +3119,7 @@ mod tests {
 
     #[test]
     fn scoring_policy_absent_defaults_to_none() {
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert!(
             spec.scoring_policy.is_none(),
@@ -3086,7 +3131,6 @@ mod tests {
     fn scoring_policy_queue_depth_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": { "strategy": "queueDepth" }
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -3102,7 +3146,6 @@ mod tests {
     fn scoring_policy_no_metrics_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": { "strategy": "noMetrics" }
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -3118,7 +3161,6 @@ mod tests {
     fn scoring_policy_kv_cache_pressure_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": { "strategy": "kvCachePressure" }
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -3134,7 +3176,6 @@ mod tests {
     fn scoring_policy_rejects_removed_profile_shape() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": { "profile": "balanced" }
         });
         let result = serde_json::from_value::<GridNetworkSpec>(json);
@@ -3143,7 +3184,7 @@ mod tests {
 
     #[test]
     fn scoring_policy_absent_not_serialized() {
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -3280,7 +3321,6 @@ mod tests {
     fn scoring_policy_rejects_unknown_strategy() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": { "strategy": "prefixAware" }
         });
         let result = serde_json::from_value::<GridNetworkSpec>(json);
@@ -3290,7 +3330,6 @@ mod tests {
     #[test]
     fn selection_policy_round_trips_and_rejects_unknown_mode() {
         let spec: GridNetworkSpec = serde_json::from_value(serde_json::json!({
-            "seeds": [],
             "selectionPolicy": { "mode": "roundRobin" }
         }))
         .unwrap_or_else(|_| std::process::abort());
@@ -3300,7 +3339,6 @@ mod tests {
         );
 
         let result = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({
-            "seeds": [],
             "selectionPolicy": { "mode": "not-a-mode" }
         }));
         let Err(error) = result else {
@@ -3340,16 +3378,14 @@ mod tests {
 
     #[test]
     fn peer_trust_round_trips_and_rejects_unknown_mode() {
-        let spec: GridNetworkSpec =
-            serde_json::from_value(serde_json::json!({"seeds": [], "peerTrust": {"mode": "spiffe"}}))
-                .unwrap_or_else(|_| std::process::abort());
+        let spec: GridNetworkSpec = serde_json::from_value(serde_json::json!({"peerTrust": {"mode": "spiffe"}}))
+            .unwrap_or_else(|_| std::process::abort());
         assert_eq!(spec.peer_trust.map(|trust| trust.mode), Some(PeerTrustMode::Spiffe));
         let bare: GridNetworkSpec =
-            serde_json::from_value(serde_json::json!({"seeds": []})).unwrap_or_else(|_| std::process::abort());
+            serde_json::from_value(serde_json::json!({})).unwrap_or_else(|_| std::process::abort());
         assert!(bare.peer_trust.is_none(), "absent stays absent");
         assert_eq!(PeerTrustMode::default(), PeerTrustMode::Pin);
-        let Err(_unknown) =
-            serde_json::from_value::<GridNetworkSpec>(serde_json::json!({"seeds": [], "peerTrust": {"mode": "x"}}))
+        let Err(_unknown) = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({"peerTrust": {"mode": "x"}}))
         else {
             std::process::abort();
         };
@@ -3358,7 +3394,7 @@ mod tests {
     #[test]
     fn signed_state_is_off_unless_enforced() {
         let parse = |peer_trust: serde_json::Value| {
-            serde_json::from_value::<GridNetworkSpec>(serde_json::json!({"seeds": [], "peerTrust": peer_trust}))
+            serde_json::from_value::<GridNetworkSpec>(serde_json::json!({"peerTrust": peer_trust}))
                 .map(|spec| spec.peer_trust.map(|trust| trust.signed_state))
         };
 
@@ -3383,7 +3419,6 @@ mod tests {
     #[test]
     fn signal_transport_round_trips_and_rejects_unknown_mode() {
         let spec: GridNetworkSpec = serde_json::from_value(serde_json::json!({
-            "seeds": [],
             "signalTransport": { "mode": "poll" }
         }))
         .unwrap_or_else(|_| std::process::abort());
@@ -3391,12 +3426,11 @@ mod tests {
 
         // Absent policy resolves to the gossip default.
         let bare: GridNetworkSpec =
-            serde_json::from_value(serde_json::json!({ "seeds": [] })).unwrap_or_else(|_| std::process::abort());
+            serde_json::from_value(serde_json::json!({})).unwrap_or_else(|_| std::process::abort());
         assert!(bare.signal_transport.is_none());
         assert_eq!(SignalMode::default(), SignalMode::Gossip);
 
         let Err(unknown_mode) = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({
-            "seeds": [],
             "signalTransport": { "mode": "not-a-mode" }
         })) else {
             std::process::abort();
@@ -3406,7 +3440,6 @@ mod tests {
         // deny_unknown_fields: an extra key is rejected.
         assert!(
             serde_json::from_value::<GridNetworkSpec>(serde_json::json!({
-                "seeds": [],
                 "signalTransport": { "mode": "poll", "extra": true }
             }))
             .is_err(),
@@ -3427,7 +3460,6 @@ mod tests {
     fn scoring_policy_rejects_removed_weights_field() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": {
                 "strategy": "queueDepth",
                 "weights": { "locality": 1.0 }
@@ -3723,14 +3755,14 @@ mod tests {
 
     #[test]
     fn budget_policy_absent_defaults_to_none() {
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert!(spec.budget_policy.is_none(), "absent budgetPolicy must default to None");
     }
 
     #[test]
     fn budget_policy_absent_not_serialized() {
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -3743,7 +3775,6 @@ mod tests {
     fn budget_policy_with_tenants_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "budgetPolicy": {
                 "tenants": [
                     { "tenantId": "tenant-a", "capUsd": 100.0 },
@@ -3791,7 +3822,6 @@ mod tests {
     fn budget_policy_rejects_unknown_shape() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "budgetPolicy": { "caps": [] }
         });
         let result = serde_json::from_value::<GridNetworkSpec>(json);
@@ -3929,7 +3959,6 @@ mod tests {
     fn legacy_spec_json() -> serde_json::Value {
         serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "gatewayRefs": [{
                 "name": "consumer-gw",
                 "namespace": "praxis-system",
@@ -3939,7 +3968,6 @@ mod tests {
                     "credentialMountBase": "/run/secrets/legacy-provider"
                 }
             }],
-            "swim": {},
             "tls": {
                 "swimKeyRef": { "name": "legacy-swim-key", "namespace": "praxis-system" }
             }

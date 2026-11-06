@@ -43,8 +43,10 @@ tests:
           path: spec
           value:
             gridId: lab
-            membership: {mode: Swim}
-            seeds: ["192.0.2.10:7946"]
+            membership:
+              mode: Swim
+              swim:
+                seeds: ["192.0.2.10:7946"]
             signalTransport: {mode: poll}
             peerTrust: {mode: spiffe}
             consumerGateways:
@@ -277,7 +279,7 @@ tests:
     asserts:
       - template: templates/gridnetwork.yaml
         equal:
-          path: spec.seeds
+          path: spec.membership.swim.seeds
           value: ["swim-a.example.com:7946", "192.0.2.10:7946"]
       - template: templates/deployment.yaml
         contains:
@@ -293,7 +295,7 @@ tests:
     asserts:
       - template: templates/gridnetwork.yaml
         equal:
-          path: spec.seeds
+          path: spec.membership.swim.seeds
           value: ["[2001:db8::1]:7947", "[2001:db8::2]:7948"]
       - template: templates/deployment.yaml
         contains:

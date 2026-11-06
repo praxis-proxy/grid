@@ -17,6 +17,7 @@ pub(crate) mod kubectl;
 pub(crate) mod llmd_pool_metrics_demo;
 pub(crate) mod operator;
 pub(crate) mod operator_overlay;
+pub(crate) mod operator_routing_qualification;
 pub(crate) mod provider_drain;
 pub(crate) mod provider_traffic_qualification;
 pub(crate) mod providers;
@@ -461,18 +462,18 @@ pub(crate) enum Action {
         site: Option<String>,
     },
 
-    /// Prove that `GridNetwork.spec.seeds` drives SWIM mesh formation.
+    /// Prove that `GridNetwork.spec.membership.swim.seeds` drives SWIM mesh formation.
     ///
     /// Starts two out-of-cluster operator processes with
     /// `GRID_SWIM_SEEDS=""` (env-var seeds intentionally empty).  Applies a
-    /// `GridNetwork` with `spec.seeds` containing the primary operator's UDP
+    /// `GridNetwork` with `membership.swim.seeds` containing the primary operator's UDP
     /// address.  Both operators reconcile the `GridNetwork`, the secondary
-    /// reads `spec.seeds` and announces to the primary via the CRD-driven
+    /// reads `membership.swim.seeds` and announces to the primary via the CRD-driven
     /// seed path, and SWIM gossip converges.
     ///
     /// Asserts:
     /// - Both operators started with `GRID_SWIM_SEEDS=""`.
-    /// - `GridNetwork.spec.seeds` contains the primary's address.
+    /// - `GridNetwork.spec.membership.swim.seeds` contains the primary's address.
     /// - `status.phase = Active` and `status.connectedSites >= 1`.
     ///
     /// This proves that CRD-sourced seeds alone are sufficient for mesh
@@ -1110,6 +1111,22 @@ pub(crate) enum Action {
         evidence_dir: Option<PathBuf>,
     },
 
+    /// Qualify operator-derived local dials through the embedded Grid Gateway.
+    RunGridOperatorRoutingQualification {
+        /// Forge topology to deploy.
+        #[arg(long, default_value = "tests/e2e/topologies/grid-operator-routing/forge.yaml")]
+        forge_config: PathBuf,
+        /// Delete only this run's Kind cluster after the qualification.
+        #[arg(long)]
+        teardown: bool,
+        /// With `--teardown`, retain the run-owned cluster on failure for diagnosis.
+        #[arg(long, requires = "teardown")]
+        keep_on_failure: bool,
+        /// Evidence directory. Defaults to a timestamped path under the topology.
+        #[arg(long)]
+        evidence_dir: Option<PathBuf>,
+    },
+
     /// Run the distributed token-rate-limit topology with structured evidence.
     RunGridTokenRateLimitQualification {
         /// Path to the Forge environment config file.
@@ -1355,6 +1372,17 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
                 evidence_dir: evidence_dir.clone(),
             },
         ),
+        Action::RunGridOperatorRoutingQualification {
+            forge_config,
+            teardown,
+            keep_on_failure,
+            evidence_dir,
+        } => operator_routing_qualification::run(&operator_routing_qualification::Options {
+            forge_config: forge_config.clone(),
+            teardown: *teardown,
+            keep_on_failure: *keep_on_failure,
+            evidence_dir: evidence_dir.clone(),
+        }),
         Action::RunGridTokenRateLimitQualification {
             forge_config,
             evidence_dir,
@@ -2484,12 +2512,12 @@ fn env_verify_swim_membership(config: &Path, site: Option<&str>) -> Result<(), B
     Ok(())
 }
 
-/// Prove that `GridNetwork.spec.seeds` drives SWIM peer discovery without env-var seeds.
+/// Prove that `GridNetwork.spec.membership.swim.seeds` drives SWIM peer discovery without env-var seeds.
 ///
 /// **Why this proves the CRD path:**
 ///
 /// Both operators start with `GRID_SWIM_SEEDS=""`, so no startup seeds at all.
-/// After the `GridNetwork` fixture is applied with `spec.seeds = [bind1]`,
+/// After the `GridNetwork` fixture is applied with `membership.swim.seeds = [bind1]`,
 /// each operator resolves the resource and calls `announce_crd_seeds`; the
 /// local address is filtered and the secondary announces to the primary.
 ///
@@ -2508,6 +2536,7 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
     // Step 1: install Grid CRDs and remove any stale CRD-seed test resources.
     operator::install_grid_crds(&context)?;
     operator::cleanup_swim_crd_seeds_test_resources(&context)?;
+    operator::verify_swim_membership_crd_admission(&context)?;
 
     let (bind1, bind2) = reserve_swim_bind_addrs()?;
     let bind1_addr: std::net::SocketAddr = bind1
@@ -2515,19 +2544,21 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
         .map_err(|e| format!("failed to parse bind1 addr {bind1:?}: {e}"))?;
 
     // Step 2: start primary operator with NO GRID_SWIM_SEEDS, no peer at startup.
-    // The primary will self-filter bind1 when it reads spec.seeds later.
+    // The primary will self-filter bind1 when it reads membership.swim.seeds later.
     let op1 = operator::spawn_operator_with_swim(&context, &bind1, &bind1, SWIM_NODE_PRIMARY_NAME, "", None)?;
     let mut op1_guard = ProcGuard(Some(op1), "operator-primary-crd");
 
     // Step 3: start secondary operator with NO GRID_SWIM_SEEDS, no peer at startup.
-    // The secondary will announce to bind1 only after reading spec.seeds from the CRD.
+    // The secondary will announce to bind1 only after reading membership.swim.seeds from the CRD.
     let op2 = operator::spawn_operator_with_swim(&context, &bind2, &bind2, SWIM_NODE_SECONDARY_NAME, "", None)?;
     let mut op2_guard = ProcGuard(Some(op2), "operator-secondary-crd");
 
-    // Step 4: Apply the GridNetwork fixture with an EMPTY spec.seeds.
+    // Step 4: Apply the GridNetwork fixture with an EMPTY membership.swim.seeds.
     // This proves that without seeds, both operators remain isolated (connectedSites = 0).
     operator::apply_swim_test_network_with_seeds(&context, &[])?;
-    eprintln!("  GridNetwork {CRD_SEEDS_TEST_NETWORK} applied with empty spec.seeds; verifying isolation...");
+    eprintln!(
+        "  GridNetwork {CRD_SEEDS_TEST_NETWORK} applied with empty membership.swim.seeds; verifying isolation..."
+    );
     // Allow one reconcile cycle to fire (operators are running and will reconcile the new CRD).
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
     // With empty seeds, the network must stay Pending or have connectedSites=0 (no SWIM join).
@@ -2543,7 +2574,7 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
         }
         operator::cleanup_swim_crd_seeds_test_resources(&context)?;
         return Err(format!(
-            "verify-swim-crd-seeds: expected connectedSites=0 with empty spec.seeds, \
+            "verify-swim-crd-seeds: expected connectedSites=0 with empty membership.swim.seeds, \
              got connectedSites={}; SWIM must not auto-join without seeds",
             isolated_status.connected_sites
         )
@@ -2555,12 +2586,12 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
         isolated_status.phase, isolated_status.connected_sites
     );
 
-    // Step 5: Live-additive proof: patch spec.seeds to [bind1] while operators are running.
+    // Step 5: Live-additive proof: patch membership.swim.seeds to [bind1] while operators are running.
     // This is the core runtime update contract: adding a seed while the operator is live
     // causes SWIM join on the next reconcile cycle without operator restart.
     operator::apply_swim_test_network_with_seeds(&context, &[bind1_addr])?;
     eprintln!(
-        "  spec.seeds patched to [{bind1}] while operators are running; \
+        "  membership.swim.seeds patched to [{bind1}] while operators are running; \
          awaiting CRD-driven SWIM convergence..."
     );
 
@@ -2586,7 +2617,7 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
     eprintln!(
         "verify-swim-crd-seeds: PASS (connectedSites={connected_sites}; \
          CRD seed path proven: both operators started with no GRID_SWIM_SEEDS; \
-         live-additive: spec.seeds added {bind1} while running, SWIM converged without restart)"
+         live-additive: membership.swim.seeds added {bind1} while running, SWIM converged without restart)"
     );
     Ok(())
 }
@@ -7693,5 +7724,97 @@ mod demo_root_tests {
         );
 
         drop(fs::remove_dir_all(&tmp));
+    }
+}
+
+#[cfg(test)]
+mod operator_routing_qualification_cli_tests {
+    use std::{error::Error, io, path::PathBuf};
+
+    use clap::Parser as _;
+
+    use super::Action;
+    use crate::{Cli, Command};
+
+    fn parse_env_action(args: &[&str]) -> Result<Action, Box<dyn Error>> {
+        let cli = Cli::try_parse_from(args)?;
+        if let Command::Env { action } = cli.command {
+            Ok(action)
+        } else {
+            Err(io::Error::other("parsed command was not the env command").into())
+        }
+    }
+
+    fn operator_routing_config(action: Action) -> Result<PathBuf, Box<dyn Error>> {
+        if let Action::RunGridOperatorRoutingQualification { forge_config, .. } = action {
+            Ok(forge_config)
+        } else {
+            Err(io::Error::other("parsed env action was not operator routing qualification").into())
+        }
+    }
+
+    #[test]
+    fn operator_routing_command_defaults_to_its_dedicated_topology() -> Result<(), Box<dyn Error>> {
+        let action = parse_env_action(&["xtask", "env", "run-grid-operator-routing-qualification"])?;
+        assert_eq!(
+            operator_routing_config(action)?,
+            PathBuf::from("tests/e2e/topologies/grid-operator-routing/forge.yaml"),
+            "the default command must use the operator-routing topology"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn another_env_action_is_not_accepted_as_operator_routing() -> Result<(), Box<dyn Error>> {
+        let action = parse_env_action(&["xtask", "env", "run-grid-static-weighted-qualification"])?;
+        assert!(
+            operator_routing_config(action).is_err(),
+            "the CLI test helper must reject a successfully parsed but unexpected action"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn keep_on_failure_requires_explicit_teardown() {
+        let result = Cli::try_parse_from([
+            "xtask",
+            "env",
+            "run-grid-operator-routing-qualification",
+            "--keep-on-failure",
+        ]);
+        assert!(result.is_err(), "--keep-on-failure without --teardown must be rejected");
+    }
+
+    #[test]
+    fn operator_routing_command_accepts_custom_config_and_scoped_teardown() -> Result<(), Box<dyn Error>> {
+        let action = parse_env_action(&[
+            "xtask",
+            "env",
+            "run-grid-operator-routing-qualification",
+            "--forge-config",
+            "custom/forge.yaml",
+            "--teardown",
+            "--keep-on-failure",
+        ])?;
+        let Action::RunGridOperatorRoutingQualification {
+            forge_config,
+            teardown,
+            keep_on_failure,
+            ..
+        } = action
+        else {
+            return Err(io::Error::other("parsed action was not operator routing qualification").into());
+        };
+        assert_eq!(
+            forge_config,
+            PathBuf::from("custom/forge.yaml"),
+            "custom Forge path must be preserved"
+        );
+        assert!(teardown, "the explicit teardown option must be preserved");
+        assert!(
+            keep_on_failure,
+            "keep-on-failure must be preserved when teardown is enabled"
+        );
+        Ok(())
     }
 }

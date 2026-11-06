@@ -385,10 +385,6 @@ spec:
               seeds:
                 - "{{ captures.central.swim-lb-ip }}:7946"
                 - "{{ captures.east.swim-lb-ip }}:7946"
-              swim:
-                probeInterval: "5s"
-                suspicionTimeout: "15s"
-                gossipNodes: 3
               tls:
                 caSecretRef:
                   name: consumer-gateway-tls
@@ -459,10 +455,6 @@ spec:
               seeds:
                 - "{{ captures.west.swim-lb-ip }}:7946"
                 - "{{ captures.east.swim-lb-ip }}:7946"
-              swim:
-                probeInterval: "5s"
-                suspicionTimeout: "15s"
-                gossipNodes: 3
               tls:
                 caSecretRef:
                   name: consumer-gateway-tls
@@ -530,10 +522,6 @@ spec:
               seeds:
                 - "{{ captures.west.swim-lb-ip }}:7946"
                 - "{{ captures.central.swim-lb-ip }}:7946"
-              swim:
-                probeInterval: "5s"
-                suspicionTimeout: "15s"
-                gossipNodes: 3
               tls:
                 caSecretRef:
                   name: consumer-gateway-tls

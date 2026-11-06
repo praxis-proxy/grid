@@ -2603,7 +2603,7 @@ fn check_gridnetwork_seeds() -> Result<String, Box<dyn std::error::Error>> {
                 "gridnetwork",
                 GRID_NETWORK_NAME,
                 "-o",
-                "jsonpath={.spec.seeds[*]}",
+                "jsonpath={.spec.membership.swim.seeds[*]}",
             ])
             .output()?;
         let seeds_raw = String::from_utf8(output.stdout)?.trim().to_owned();

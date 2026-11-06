@@ -1022,7 +1022,8 @@ pub struct SwimHandle {
 
     /// Address this runtime advertises to SWIM peers.
     ///
-    /// Callers may use this to filter the local address from `spec.seeds`
+    /// Callers may use this to filter the local address from
+    /// `GridNetwork.spec.membership.swim.seeds`
     /// before calling [`SwimHandle::announce_seeds`].
     advertise_addr: SocketAddr,
 
@@ -1139,7 +1140,8 @@ impl SwimHandle {
 
     /// Return the address this runtime advertises to SWIM peers.
     ///
-    /// Use this to filter the local address from `spec.seeds` before
+    /// Use this to filter the local address from
+    /// `GridNetwork.spec.membership.swim.seeds` before
     /// calling [`SwimHandle::announce_seeds`]; announcing to self is harmless but
     /// generates unnecessary noise.
     #[must_use]
