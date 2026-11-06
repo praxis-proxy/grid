@@ -29,7 +29,7 @@ use tokio::{
 };
 use tokio_rustls::{
     TlsAcceptor,
-    rustls::{ServerConfig, crypto::CryptoProvider},
+    rustls::{Error as TlsError, ServerConfig, crypto::CryptoProvider},
 };
 use tracing::{debug, info, warn};
 
@@ -305,7 +305,12 @@ async fn authorize_request(authorizer: &KubernetesAuthorizer, token: &str) -> Re
         },
         Err(AuthorizationError::Unavailable(err)) => {
             record_authorization_result("api_error");
-            warn!(error = %err, "metrics authorization API unavailable");
+            let diagnostic = auth_api_diagnostic(&err);
+            warn!(
+                failure = diagnostic.category,
+                http_status = diagnostic.http_status,
+                "metrics authorization API unavailable"
+            );
             Reply::ServiceUnavailable
         },
     }
@@ -595,6 +600,64 @@ where
     io::Error::other(source)
 }
 
+/// Credential-free fields logged for a failed Kubernetes authorization request.
+#[derive(Debug)]
+struct AuthorizationApiDiagnostic {
+    /// Fixed failure category, never derived from request or error text.
+    category: &'static str,
+    /// Kubernetes HTTP status, when a response was received.
+    http_status: Option<u16>,
+}
+
+/// Classify preserved failures without logging URLs, headers, bodies, or source text.
+fn auth_api_diagnostic(error: &io::Error) -> AuthorizationApiDiagnostic {
+    let request = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<reqwest::Error>());
+    let category = if let Some(request) = request {
+        if request.is_timeout() {
+            "timeout"
+        } else if auth_api_tls_error(request) {
+            "tls"
+        } else if request.is_status() {
+            "http_status"
+        } else if request.is_decode() {
+            "decode"
+        } else if request.is_connect() {
+            "connection"
+        } else {
+            "request"
+        }
+    } else if error
+        .get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<io::Error>)
+    {
+        "credential_read"
+    } else {
+        "configuration"
+    };
+    AuthorizationApiDiagnostic {
+        category,
+        http_status: request.and_then(reqwest::Error::status).map(|status| status.as_u16()),
+    }
+}
+
+/// Recognize TLS failures by type in the source chain rather than error message text.
+fn auth_api_tls_error(root: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(root);
+    while let Some(error) = source {
+        if error.is::<TlsError>() {
+            return true;
+        }
+        if let Some(inner) = error.downcast_ref::<io::Error>().and_then(io::Error::get_ref) {
+            source = Some(inner);
+            continue;
+        }
+        source = error.source();
+    }
+    false
+}
+
 /// `TokenReview` response data used to construct the `SubjectAccessReview`.
 #[derive(Deserialize)]
 struct TokenReview {
@@ -820,6 +883,89 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    /// A mock API response with credentials deliberately present in the request.
+    async fn diagnostic_request(
+        tls: bool,
+        delay: Duration,
+        response: &'static [u8],
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        praxis_tls::provider::install();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _read = stream.read(&mut request).await;
+            tokio::time::sleep(delay).await;
+            let _written = stream.write_all(response).await;
+        });
+        let scheme = if tls { "https" } else { "http" };
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap()
+            .get(format!("{scheme}://{address}/?token=diagnostic-secret"))
+            .bearer_auth("diagnostic-secret")
+            .send()
+            .await
+    }
+
+    /// Check the exact safe fields used by the authorization warning log.
+    fn assert_api_diagnostic(error: &io::Error, category: &str, status: Option<u16>) {
+        let diagnostic = auth_api_diagnostic(error);
+        assert_eq!(diagnostic.category, category);
+        assert_eq!(diagnostic.http_status, status);
+        assert!(error.get_ref().is_some(), "underlying error is preserved");
+        assert!(
+            !format!("{diagnostic:?}").contains("diagnostic-secret"),
+            "diagnostics must not expose credentials from URLs, headers, or source text"
+        );
+    }
+
+    /// Distinguish a real request timeout from a failed TLS handshake.
+    #[tokio::test]
+    async fn authorization_api_diagnostics_distinguish_timeout_and_tls() {
+        let timeout = diagnostic_request(false, Duration::from_secs(2), b"")
+            .await
+            .unwrap_err();
+        assert_api_diagnostic(&auth_api_error(timeout), "timeout", None);
+        let tls = diagnostic_request(true, Duration::ZERO, b"HTTP/1.1 200 OK\r\n\r\n")
+            .await
+            .unwrap_err();
+        assert_api_diagnostic(&auth_api_error(tls), "tls", None);
+    }
+
+    /// Retain API status and decode categories while excluding request credentials.
+    #[tokio::test]
+    async fn authorization_api_diagnostics_distinguish_status_and_decode() {
+        let status = diagnostic_request(
+            false,
+            Duration::ZERO,
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap_err();
+        assert_api_diagnostic(&auth_api_error(status), "http_status", Some(403));
+        let decode = diagnostic_request(false, Duration::ZERO, b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx")
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_err();
+        assert_api_diagnostic(&auth_api_error(decode), "decode", None);
+    }
+
+    /// Keep credential and configuration failure details out of warning fields.
+    #[test]
+    fn authorization_api_diagnostics_do_not_log_source_text() {
+        let credential = io::Error::new(io::ErrorKind::PermissionDenied, "diagnostic-secret");
+        assert_api_diagnostic(&auth_api_error(credential), "credential_read", None);
+        assert_api_diagnostic(&io::Error::other("diagnostic-secret"), "configuration", None);
+    }
 
     /// Build a lookup closure for deterministic environment configuration tests.
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
