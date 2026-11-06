@@ -68,6 +68,16 @@ pub(crate) enum ExternalProvider {
     OpenAi,
 }
 
+/// How the combined-site sites learn their peers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Membership {
+    /// SWIM gossip discovers each peer.
+    #[default]
+    Swim,
+    /// Each site declares its peers as `GridSite` objects and polls their catalogs and signals.
+    Local,
+}
+
 /// Scenario-selection options shared by GLB demo commands.
 #[derive(Debug, clap::Args)]
 #[expect(
@@ -1036,6 +1046,9 @@ pub(crate) enum Action {
         /// Path to the source Forge environment config file.
         #[arg(long, default_value = "tests/e2e/topologies/grid-combined-site/forge.yaml")]
         forge_config: PathBuf,
+        /// How the sites learn their peers.
+        #[arg(long, value_enum, default_value_t = Membership::Swim)]
+        membership: Membership,
         /// Demo mode and lifecycle options.
         #[command(flatten)]
         options: GlbDemoOptions,
@@ -1313,7 +1326,11 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
             glb_demo::setup(forge_config, ingress_mode).map(|_| ())
         },
         Action::RunGridGlbDemo { forge_config, options } => glb_demo::run(forge_config, options),
-        Action::RunGridCombinedSiteDemo { forge_config, options } => combined_site_demo::run(forge_config, options),
+        Action::RunGridCombinedSiteDemo {
+            forge_config,
+            membership,
+            options,
+        } => combined_site_demo::run(forge_config, *membership, options),
         Action::RunGridLlmdPoolMetricsDemo {
             forge_config,
             options,
@@ -5814,21 +5831,32 @@ fn rbac_negative_checks(context: &str) -> Result<(), Box<dyn std::error::Error>>
 /// Runtime VAP check for the `protect-config` policy.
 ///
 /// Tries to patch `grid-operator-config` as the operator `ServiceAccount` and verifies
-/// the admission policy denies it.
+/// the admission policy denies it. Creates the fixture only when the `ConfigMap` is absent,
+/// and deletes it only when this check created it, so an existing operator `ConfigMap` is preserved.
 fn rbac_vap_configmap_checks(context: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let cm = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": { "name": "grid-operator-config", "namespace": "grid-system" },
-        "data": {}
-    });
-    kubectl::apply_manifest(context, &serde_json::to_string_pretty(&cm)?)?;
+    let created_fixture = !kubectl::resource_exists(context, "grid-system", "configmap", "grid-operator-config")?;
+    if created_fixture {
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "grid-operator-config", "namespace": "grid-system" },
+            "data": {}
+        });
+        kubectl::apply_manifest(context, &serde_json::to_string_pretty(&cm)?)?;
+    }
 
     let patch_result = kubectl::patch_as_operator_sa(context, "grid-system", "configmap", "grid-operator-config");
-    kubectl::delete_ignoring_not_found(context, "grid-system", "configmap", "grid-operator-config")?;
-    let denied = !patch_result?;
-    if !denied {
-        return Err("VAP check failed: operator should NOT be able to patch grid-operator-config".into());
+    if created_fixture {
+        kubectl::delete_ignoring_not_found(context, "grid-system", "configmap", "grid-operator-config")?;
+    }
+    match patch_result? {
+        kubectl::SaOutcome::DeniedByPolicy => {},
+        kubectl::SaOutcome::Allowed => {
+            return Err("VAP check failed: operator should NOT be able to patch grid-operator-config".into());
+        },
+        kubectl::SaOutcome::OtherFailure(msg) => {
+            return Err(format!("unexpected failure patching grid-operator-config: {msg}").into());
+        },
     }
     eprintln!("  [PASS] operator cannot patch grid-operator-config (VAP denied)");
     Ok(())
@@ -5856,14 +5884,20 @@ fn rbac_vap_endpointslice_checks(context: &str) -> Result<(), Box<dyn std::error
     });
     kubectl::apply_manifest(context, &serde_json::to_string_pretty(&decoy_slice)?)?;
 
-    let denied = !kubectl::delete_as_operator_sa(context, "grid-system", "endpointslice", "e2e-vap-decoy")?;
+    let decoy_outcome = kubectl::delete_as_operator_sa(context, "grid-system", "endpointslice", "e2e-vap-decoy");
     kubectl::delete_ignoring_not_found(context, "grid-system", "endpointslice", "e2e-vap-decoy")?;
-    if !denied {
-        return Err(
-            "VAP check failed: operator should NOT be able to delete an EndpointSlice \
-             belonging to an unrelated Service"
-                .into(),
-        );
+    match decoy_outcome? {
+        kubectl::SaOutcome::DeniedByPolicy => {},
+        kubectl::SaOutcome::Allowed => {
+            return Err(
+                "VAP check failed: operator should NOT be able to delete an EndpointSlice \
+                 belonging to an unrelated Service"
+                    .into(),
+            );
+        },
+        kubectl::SaOutcome::OtherFailure(msg) => {
+            return Err(format!("unexpected failure deleting e2e-vap-decoy: {msg}").into());
+        },
     }
     eprintln!("  [PASS] operator cannot delete an EndpointSlice of an unrelated Service (VAP denied)");
 
@@ -5883,14 +5917,20 @@ fn rbac_vap_endpointslice_checks(context: &str) -> Result<(), Box<dyn std::error
     });
     kubectl::apply_manifest(context, &serde_json::to_string_pretty(&swim_slice)?)?;
 
-    let allowed = kubectl::delete_as_operator_sa(context, "grid-system", "endpointslice", "e2e-vap-swim-ctrl")?;
+    let swim_outcome = kubectl::delete_as_operator_sa(context, "grid-system", "endpointslice", "e2e-vap-swim-ctrl");
     kubectl::delete_ignoring_not_found(context, "grid-system", "endpointslice", "e2e-vap-swim-ctrl")?;
-    if !allowed {
-        return Err(
-            "VAP check failed: operator should be able to delete a controller-managed \
-             EndpointSlice on its own SWIM Service"
-                .into(),
-        );
+    match swim_outcome? {
+        kubectl::SaOutcome::Allowed => {},
+        kubectl::SaOutcome::DeniedByPolicy => {
+            return Err(
+                "VAP check failed: operator should be able to delete a controller-managed \
+                 EndpointSlice on its own SWIM Service"
+                    .into(),
+            );
+        },
+        kubectl::SaOutcome::OtherFailure(msg) => {
+            return Err(format!("unexpected failure deleting e2e-vap-swim-ctrl: {msg}").into());
+        },
     }
     eprintln!("  [PASS] operator can delete a controller-managed EndpointSlice on its own SWIM Service (VAP allowed)");
     Ok(())
@@ -5933,7 +5973,7 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     operator::override_operator_image_for_kind(&context)?;
     eprintln!("  [OK] install manifests applied");
 
-    // Steps 4-6: RBAC can-i checks (positive, negative) and VAP runtime checks.
+    // Steps 4-7: RBAC can-i checks (positive, negative) and VAP runtime checks.
     eprintln!("verify-operator-install-rbac: [4/13] positive RBAC checks...");
     rbac_can_i_checks(&context)?;
     eprintln!("verify-operator-install-rbac: [5/13] negative RBAC checks...");

@@ -38,5 +38,9 @@ metadata:
 spec:
   policyName: {{ $fullname }}-endpointslice-cleanup
   validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Release.Namespace }}
 {{- end }}
 {{- end }}

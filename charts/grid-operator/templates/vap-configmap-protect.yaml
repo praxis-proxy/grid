@@ -38,4 +38,8 @@ metadata:
 spec:
   policyName: {{ $fullname }}-protect-config
   validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Release.Namespace }}
 {{- end }}

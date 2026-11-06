@@ -466,8 +466,8 @@ spec:
                           sovereignty:
                             description: |-
                               The sovereignty fence `gridSiteRoute` applies: the header naming the zones a request
-                              may be served in, and whether it refuses or only audits. Under any other router the
-                              config is not rendered, and the status names `SovereigntyWithoutGridSiteRoute`.
+                              may be served in, and whether it refuses or only audits. Admission rejects it under
+                              any other router.
 
                               Default: unset, no fence.
                             nullable: true
@@ -576,6 +576,8 @@ spec:
                             type: string
                         type: object
                         x-kubernetes-validations:
+                          - message: sovereignty is applied only by siteRouter gridSiteRoute
+                            rule: '!has(self.sovereignty) || (has(self.siteRouter) && self.siteRouter == ''gridSiteRoute'')'
                           - message: set only `enabled` or `generate`, not both
                             rule: '!(has(self.enabled) && has(self.generate))'
                           - message: set only `credentialMountBase` or `credentialMountPath`, not both
@@ -914,8 +916,8 @@ spec:
                           sovereignty:
                             description: |-
                               The sovereignty fence `gridSiteRoute` applies: the header naming the zones a request
-                              may be served in, and whether it refuses or only audits. Under any other router the
-                              config is not rendered, and the status names `SovereigntyWithoutGridSiteRoute`.
+                              may be served in, and whether it refuses or only audits. Admission rejects it under
+                              any other router.
 
                               Default: unset, no fence.
                             nullable: true
@@ -1420,8 +1422,8 @@ spec:
                           sovereignty:
                             description: |-
                               The sovereignty fence `gridSiteRoute` applies: the header naming the zones a request
-                              may be served in, and whether it refuses or only audits. Under any other router the
-                              config is not rendered, and the status names `SovereigntyWithoutGridSiteRoute`.
+                              may be served in, and whether it refuses or only audits. Admission rejects it under
+                              any other router.
 
                               Default: unset, no fence.
                             nullable: true
@@ -1530,6 +1532,8 @@ spec:
                             type: string
                         type: object
                         x-kubernetes-validations:
+                          - message: sovereignty is applied only by siteRouter gridSiteRoute
+                            rule: '!has(self.sovereignty) || (has(self.siteRouter) && self.siteRouter == ''gridSiteRoute'')'
                           - message: set only `enabled` or `generate`, not both
                             rule: '!(has(self.enabled) && has(self.generate))'
                           - message: set only `credentialMountBase` or `credentialMountPath`, not both
@@ -1852,8 +1856,8 @@ spec:
                           sovereignty:
                             description: |-
                               The sovereignty fence `gridSiteRoute` applies: the header naming the zones a request
-                              may be served in, and whether it refuses or only audits. Under any other router the
-                              config is not rendered, and the status names `SovereigntyWithoutGridSiteRoute`.
+                              may be served in, and whether it refuses or only audits. Admission rejects it under
+                              any other router.
 
                               Default: unset, no fence.
                             nullable: true
@@ -1962,6 +1966,8 @@ spec:
                             type: string
                         type: object
                         x-kubernetes-validations:
+                          - message: sovereignty is applied only by siteRouter gridSiteRoute
+                            rule: '!has(self.sovereignty) || (has(self.siteRouter) && self.siteRouter == ''gridSiteRoute'')'
                           - message: set only `enabled` or `generate`, not both
                             rule: '!(has(self.enabled) && has(self.generate))'
                           - message: set only `credentialMountBase` or `credentialMountPath`, not both
@@ -2529,7 +2535,7 @@ spec:
                         description: Original wire flag, retained to verify exact duplicates.
                         type: boolean
                       sequence:
-                        description: Last durably accepted sequence.
+                        description: Last durably recorded sequence; live sequence watermarks are process-local.
                         format: int64
                         minimum: 1.0
                         type: integer

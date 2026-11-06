@@ -10,6 +10,9 @@ use std::{io::Write as _, process::Command};
 // Constants
 // ---------------------------------------------------------------------------
 
+/// `--as` identity used to impersonate the operator `ServiceAccount` in RBAC and VAP checks.
+const OPERATOR_SA_IMPERSONATION: &str = "system:serviceaccount:grid-system:grid-operator";
+
 /// Kubernetes namespace targeted by all env subcommand rollout checks.
 ///
 /// Provider, consumer, and mock-backend deployments all target the
@@ -175,6 +178,39 @@ pub(crate) fn get_configmap_yaml(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Return `true` if the named namespaced resource exists, `false` if it is absent.
+///
+/// Uses `--ignore-not-found` so kubectl exits zero in both cases; non-empty output means found.
+pub(crate) fn resource_exists(
+    context: &str,
+    namespace: &str,
+    resource: &str,
+    name: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "-n",
+            namespace,
+            "get",
+            resource,
+            name,
+            "--ignore-not-found",
+            "-o",
+            "name",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "kubectl get {resource} {name} in {namespace} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(!output.stdout.trim_ascii().is_empty())
+}
+
 /// Delete a namespaced resource, ignoring absence.
 ///
 /// Returns an error only if `kubectl` itself cannot be spawned.
@@ -199,10 +235,38 @@ pub(crate) fn delete_ignoring_not_found(
     Ok(())
 }
 
+/// Outcome of an impersonated admission request, distinguishing policy denials from other failures.
+#[derive(Debug)]
+pub(crate) enum SaOutcome {
+    /// The request was accepted.
+    Allowed,
+    /// A `ValidatingAdmissionPolicy` denied the request.
+    DeniedByPolicy,
+    /// kubectl exited non-zero for a reason unrelated to VAP (e.g. RBAC Forbidden, `NotFound`,
+    /// or a connection error). The captured stderr is included for diagnosis.
+    OtherFailure(String),
+}
+
+impl SaOutcome {
+    /// Map a raw kubectl output to the appropriate outcome variant.
+    fn classify(output: &std::process::Output) -> Self {
+        if output.status.success() {
+            return Self::Allowed;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("ValidatingAdmissionPolicy") {
+            Self::DeniedByPolicy
+        } else {
+            Self::OtherFailure(stderr.into_owned())
+        }
+    }
+}
+
 /// Try to merge-patch a namespaced resource impersonating the `grid-operator` `ServiceAccount`.
 ///
-/// Returns `true` if the patch was accepted, `false` if it was denied (exit code non-zero).
 /// Sends an empty merge-patch `{}` which is a no-op in content but still goes through admission.
+/// Returns [`SaOutcome::DeniedByPolicy`] when kubectl stderr contains `ValidatingAdmissionPolicy`,
+/// so callers can distinguish a VAP denial from an RBAC rejection or a connection failure.
 ///
 /// # Errors
 ///
@@ -212,7 +276,7 @@ pub(crate) fn patch_as_operator_sa(
     namespace: &str,
     resource: &str,
     name: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<SaOutcome, Box<dyn std::error::Error>> {
     let output = Command::new("kubectl")
         .args([
             "--context",
@@ -224,17 +288,17 @@ pub(crate) fn patch_as_operator_sa(
             name,
             "--type=merge",
             "--patch={}",
-            "--as=system:serviceaccount:grid-system:grid-operator",
+            &format!("--as={OPERATOR_SA_IMPERSONATION}"),
         ])
         .output()?;
-    Ok(output.status.success())
+    Ok(SaOutcome::classify(&output))
 }
 
 /// Try to delete a namespaced resource impersonating the `grid-operator` `ServiceAccount`.
 ///
-/// Returns `true` if the delete succeeded, `false` if it was denied (exit code non-zero).
-/// Does **not** pass `--ignore-not-found`: a 404 returns `false`, but the caller creates the
-/// resource immediately before calling this so that case should not arise.
+/// Does **not** pass `--ignore-not-found`. Returns [`SaOutcome::DeniedByPolicy`] when kubectl
+/// stderr contains `ValidatingAdmissionPolicy`, so callers can distinguish a VAP denial from an
+/// RBAC rejection, a 404, or a connection failure.
 ///
 /// # Errors
 ///
@@ -244,7 +308,7 @@ pub(crate) fn delete_as_operator_sa(
     namespace: &str,
     resource: &str,
     name: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<SaOutcome, Box<dyn std::error::Error>> {
     let output = Command::new("kubectl")
         .args([
             "--context",
@@ -254,8 +318,8 @@ pub(crate) fn delete_as_operator_sa(
             "delete",
             resource,
             name,
-            "--as=system:serviceaccount:grid-system:grid-operator",
+            &format!("--as={OPERATOR_SA_IMPERSONATION}"),
         ])
         .output()?;
-    Ok(output.status.success())
+    Ok(SaOutcome::classify(&output))
 }

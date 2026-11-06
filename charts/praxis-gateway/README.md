@@ -160,6 +160,50 @@ A few things to keep in mind:
   renders and running `helm upgrade` rolls the pods onto the new configuration
   without refusing requests (see `shutdownDelaySeconds`).
 
+### Templated inline config
+
+Set `praxisConfig.byo.tpl: true` to render `praxisConfig.byo.inline` with Helm's
+`tpl` against this chart's context. This lets a parent chart that depends on
+`praxis-gateway` fill the config from its own values through `global`:
+
+```yaml
+global:
+  backendHost: api.openai.com
+praxis-gateway:
+  praxisConfig:
+    byo:
+      tpl: true
+      inline: |
+        listeners:
+          - name: default
+            address: "0.0.0.0:8080"
+            filter_chains: [default]
+        filter_chains:
+          - name: default
+            filters:
+              - filter: load_balancer
+                clusters:
+                  - name: backend
+                    endpoints: ["{{ .Values.global.backendHost }}:443"]
+```
+
+Validation, probe detection, and the config checksum use the rendered result.
+Escape a literal `{{` in the Praxis config as `{{ "{{" }}`.
+
+`envTpl: true` does the same for `env`, so a parent chart can set Secret names
+or values from `global`:
+
+```yaml
+praxis-gateway:
+  envTpl: true
+  env:
+    - name: OPENAI_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: "{{ .Values.global.openaiSecret }}"
+          key: api-key
+```
+
 ### Bring your own ConfigMap
 
 ```bash
@@ -261,9 +305,12 @@ Praxis AI image; these values may advance independently.
 | `imageUser.gid` | int | `101` | Numeric group of the official Praxis images. |
 | `command` | list | `[]` | Container command, replacing the image entrypoint. Empty keeps the entrypoint. |
 | `args` | list | `["--config", "/etc/praxis/praxis.yaml"]` | Container arguments. |
+| `env` | list | `[]` | Environment variables for the Praxis container. Use `valueFrom.secretKeyRef` for credentials. |
+| `envTpl` | bool | `false` | Render `env` with `tpl` against this chart's context. |
 | `praxisConfig.source` | string | `byo` | Source that writes `praxis.yaml`: `byo`, `operator`, or `render`. Set `render` explicitly for chart-generated Grid routing config. |
 | `praxisConfig.byo.configMapName` | string | `""` | ConfigMap with the Praxis config. Empty serves `praxisConfig.byo.inline`. Editing it does not restart the pods. |
 | `praxisConfig.byo.key` | string | `praxis.yaml` | Key in the BYO ConfigMap. |
+| `praxisConfig.byo.tpl` | bool | `false` | Render `praxisConfig.byo.inline` with `tpl` against this chart's context. |
 | `praxisConfig.byo.inline` | string | answers `GET /` with a JSON status, else 404 | Praxis config stored in a chart-managed ConfigMap when `praxisConfig.byo.configMapName` is empty. Changing it rolls the pods. |
 | `praxisConfig.operator.configMapName` | string | `""` | Operator-created ConfigMap. Empty uses `praxis-consumer-config`. |
 | `praxisConfig.operator.allowUnauthenticatedExposure` | bool | `false` | Allow a LoadBalancer or NodePort Service for the operator's unauthenticated `praxis.yaml`. |
@@ -673,13 +720,37 @@ Check gateway logs and
 `grid_serving_config_reload_total{result="applied"}` for acceptance; the
 `grid.praxis.fast/serving-digest` annotation records publication, not acceptance.
 
-Upgrade order across the operator and this gateway: under SPIFFE peer trust roll
+For sovereignty zones, upgrade every gateway replica at every site before the
+operator that publishes `sovereignty_zones`, including when the fence is still
+disabled or in audit mode. An older gateway rejects the zone map and keeps its
+last accepted config while running; if it restarts with the new file, parsing
+fails at startup. Before enabling `enforce`, use a controlled verification
+window: hold serving-config publication and mounted config/identity changes
+stable, check the exact zone-bearing file at each replica's active
+`GRID_SERVING_CONFIG` path, and restart each gateway against that unchanged
+file. Require successful data-plane startup and confirm the file still matches
+afterward. Inspect per-replica logs and check that
+`grid_serving_config_reload_total{result="rejected"}` does not increase during
+verification. An `applied` increase or absence of rejections alone does not
+identify the accepted config; identity rotation can reapply an old one. Do not
+enable enforcement while acceptance is uncertain.
+The map is omitted when empty; the rollout constraint is waived only when no
+`GridSite` sets `spec.sovereigntyZone`, including sites not yet serving. See
+[the sovereignty rollout procedure][sovereignty-rollout].
+
+[sovereignty-rollout]:
+  ../../docs/architecture/routing.md#gateway-first-rollout
+
+For the separate peer-trust format upgrade: under SPIFFE peer trust roll
 the gateway first, since a new gateway reads an old operator's serving config.
 Under pin trust roll the operator first and the gateway right after it: an old
 operator renders `pins` the new gateway refuses, and an old gateway holds its last
 accepted config only while its pod keeps running. A gateway pod that restarts
 between the two rollouts exits at startup and crash-loops until the gateway
 rolls, so do not leave the two rollouts apart.
+Complete that legacy pin-format migration without sovereignty zones before
+following the gateway-first sovereignty rollout above.
+
 The same watcher detects changes to the mounted CA, client certificate, and
 key, and rebuilds the signals pollers. This refreshes their mTLS identity; it
 does not renew certificates or change provider-listener TLS settings. Older

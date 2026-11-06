@@ -10,7 +10,7 @@ publish = false
 [features]
 default = ["tls-rustls"]
 tls-rustls = [
-  "swim/ring-signing",
+  "swim/rust-crypto",
   "certs/rcgen",
   "grid-client/rcgen",
   "rmcp/reqwest-tls-no-provider",
@@ -54,6 +54,7 @@ grid-signals = { path = "../signals" }
 site-invite-api = { path = "../site-invite-api" }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
+kube-runtime = { workspace = true }
 percent-encoding = { workspace = true }
 pem = { workspace = true }
 prometheus = { workspace = true }
