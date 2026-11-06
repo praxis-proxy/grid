@@ -62,3 +62,8 @@ KIND_CREATE_PREFIX="systemd-run --scope --user -p Delegate=yes" KEEP=1 make prax
 
 CI runs the same script in the `gateway-standalone` job of the Helm workflow
 on pull requests, pushes to `main`, and the merge queue.
+
+To run only the metrics listener checks, use `make gateway-metrics-e2e`. This
+creates the same Kind cluster and local gateway image, then applies only the
+metrics stack; it is useful on ARM64 hosts where the published Praxis image
+used by the proxy configuration stages is unavailable.

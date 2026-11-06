@@ -250,6 +250,8 @@ spec:
     gateway-metrics:
       description: grid-gateway serves TLS metrics only to a token-authorized scraper without a NetworkPolicy
       steps:
+        - type: manifest
+          path: resources/namespaces.yaml
         - type: exec
           command: [bash, verify.sh, metrics-cert]
           env:

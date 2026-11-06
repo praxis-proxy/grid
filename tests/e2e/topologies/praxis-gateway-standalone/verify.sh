@@ -209,7 +209,7 @@ EOF
   pass "chart scraper identity is authorized to scrape over verified TLS"
 
   kinds=$(helm --kube-context "$CTX" -n "$NS" get manifest "$release" \
-    | awk '$1 == "kind:" {print $2}' | sort -u | paste -sd ' ')
+    | awk '$1 == "kind:" {print $2}' | sort -u | tr '\n' ' ')
   case " $kinds " in
     *" NetworkPolicy "*) fail "metrics listener rendered a NetworkPolicy even though networkPolicy.enabled is false" ;;
   esac
@@ -221,7 +221,7 @@ stage_release() {
   pass "helm test passes under the restricted pod security standard"
 
   local kinds crds namespaces notes description
-  kinds=$(h get manifest "$RELEASE" | awk '$1 == "kind:" {print $2}' | sort -u | paste -sd ' ')
+  kinds=$(h get manifest "$RELEASE" | awk '$1 == "kind:" {print $2}' | sort -u | tr '\n' ' ')
   [ "$kinds" = "ConfigMap Deployment Service" ] || fail "release manifest kinds are [$kinds], want [ConfigMap Deployment Service]"
   pass "the release holds only a ConfigMap, Deployment, and Service"
 

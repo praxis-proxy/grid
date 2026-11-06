@@ -8,6 +8,7 @@
 # Env: FORGE_BIN           explicit executable override (default: pinned upstream Forge)
 #      STATE_DIR           Forge state directory
 #                          (default target/forge/praxis-gateway-standalone)
+#      E2E_STACK           optional Forge stack to apply (for example gateway-metrics)
 #      KEEP=1              leave the cluster running afterwards
 #      KIND_CREATE_PREFIX  command prefix for cluster creation, e.g. the rootless
 #                          podman wrapper: systemd-run --scope --user -p Delegate=yes
@@ -81,13 +82,21 @@ if [ "$status" = 0 ]; then
   build_and_load_grid_gateway || status=$?
 fi
 if [ "$status" = 0 ]; then
-  forge apply gateway || status=$?
+  if [ -n "${E2E_STACK:-}" ]; then
+    forge apply gateway "$E2E_STACK" || status=$?
+  else
+    forge apply gateway || status=$?
+  fi
 fi
 cat "$PRAXIS_GATEWAY_E2E_LOG"
 # A stack that never ran leaves no checks behind, so require the last stage's,
 # and Forge keeps applying later stacks after one fails, so look for failures too.
+required_stage=release
+if [ "${E2E_STACK:-}" = gateway-metrics ]; then
+  required_stage=metrics-authorization
+fi
 if [ "$status" = 0 ] && { grep -q 'FAIL \[' "$PRAXIS_GATEWAY_E2E_LOG" \
-  || ! grep -q 'PASS \[release\]' "$PRAXIS_GATEWAY_E2E_LOG"; }; then
+  || ! grep -Fq "PASS [$required_stage]" "$PRAXIS_GATEWAY_E2E_LOG"; }; then
   echo "a stage failed or never ran" >&2
   status=1
 fi
