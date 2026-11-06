@@ -123,6 +123,9 @@ struct AppState {
 /// Top-level error for the sidecar binary.
 #[derive(Debug)]
 enum StartupError {
+    /// The FIPS build cannot establish the required runtime configuration.
+    #[cfg(feature = "fips")]
+    Fips(grid_fips::FipsError),
     /// Cannot create a Kubernetes client.
     KubeClient(kube::Error),
 }
@@ -130,6 +133,8 @@ enum StartupError {
 impl std::fmt::Display for StartupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(feature = "fips")]
+            Self::Fips(error) => write!(f, "{error}"),
             Self::KubeClient(e) => write!(f, "cannot create Kubernetes client: {e}"),
         }
     }
@@ -144,6 +149,12 @@ async fn main() -> Result<(), StartupError> {
     let cli = Cli::parse();
     init_tracing();
     version::get().log_startup("grid-overlay-sync");
+    #[cfg(feature = "fips")]
+    grid_fips::verify()
+        .inspect_err(|error| {
+            tracing::error!(%error, "refusing to start the FIPS overlay-sync");
+        })
+        .map_err(StartupError::Fips)?;
     run(cli).await
 }
 

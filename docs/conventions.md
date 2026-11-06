@@ -201,8 +201,11 @@ The workspace lint policy catches unsafe and error-prone coding patterns.
 See `[workspace.lints]` in both workspace manifests for the full set. Passing
 lints does not establish the correctness of a trust or protocol boundary.
 
-- `#![deny(unsafe_code)]` in all crate roots (no
-  exceptions; unsafe belongs upstream)
+- Unsafe code is forbidden by the workspace lints. One documented exception
+  lives in `crates/fips/openssl`, a separate leaf crate containing only the
+  read-only OpenSSL 3 FIPS-state query missing from the safe upstream API.
+  Its function documents the safety argument and replacement plan; see
+  [FIPS startup verification](fips.md#startup-verification).
 - Clippy runs with `-D warnings` (zero tolerance)
 - Errors via `thiserror`
 - Logging via `tracing`
