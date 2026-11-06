@@ -28,6 +28,7 @@ serde_json = "1.0.151"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
 metrics = "0.24.6"
 time = "0.3.0"
+openssl = "0.10.0"
 
 # Praxis #1516: PPE 0.6.0 and granular Policy FIPS features.
 # Keep every Praxis crate on the same feature-forwarding revision. The AI
@@ -376,7 +377,7 @@ serde_yaml.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
 metrics = { workspace = true }
-sha2 = "0.11.0"
+openssl.workspace = true
 
 [dev-dependencies]
 # The reload test runs a real mTLS signals peer against the binary.
