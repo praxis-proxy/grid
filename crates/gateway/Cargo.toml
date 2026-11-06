@@ -29,15 +29,16 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "r
 metrics = "0.24.6"
 time = "0.3.0"
 
+# Praxis #1516: PPE 0.6.0 and granular Policy FIPS features.
 # Keep every Praxis crate on the same feature-forwarding revision. The AI
 # filter dependency also uses these crates, so patch the registry packages to
 # prevent a second, unconfigured copy from entering the gateway.
 [patch.crates-io]
-praxis-proxy = { git = "https://github.com/evacchi/praxis", rev = "ed47f771" }
-praxis-proxy-core = { git = "https://github.com/evacchi/praxis", rev = "ed47f771" }
-praxis-proxy-filter = { git = "https://github.com/evacchi/praxis", rev = "ed47f771" }
-praxis-proxy-protocol = { git = "https://github.com/evacchi/praxis", rev = "ed47f771" }
-praxis-proxy-tls = { git = "https://github.com/evacchi/praxis", rev = "ed47f771" }
+praxis-proxy = { git = "https://github.com/praxis-proxy/praxis", rev = "908b5a7d279b0b74d5b582ea124bb2d44514c235" }
+praxis-proxy-core = { git = "https://github.com/praxis-proxy/praxis", rev = "908b5a7d279b0b74d5b582ea124bb2d44514c235" }
+praxis-proxy-filter = { git = "https://github.com/praxis-proxy/praxis", rev = "908b5a7d279b0b74d5b582ea124bb2d44514c235" }
+praxis-proxy-protocol = { git = "https://github.com/praxis-proxy/praxis", rev = "908b5a7d279b0b74d5b582ea124bb2d44514c235" }
+praxis-proxy-tls = { git = "https://github.com/praxis-proxy/praxis", rev = "908b5a7d279b0b74d5b582ea124bb2d44514c235" }
 
 [workspace.lints.rust]
 dead_code = "deny"
@@ -342,7 +343,9 @@ path = "src/main.rs"
 [features]
 default = ["policy-builtins"]
 policy-builtins = ["praxis-proxy/policy-builtins"]
-fips = ["praxis-proxy/policy-api-key", "praxis-proxy/policy-crypto-fips"]
+# Disable defaults when selecting a FIPS backend.
+fips = ["praxis-proxy/policy-api-key-fips"]
+policy-jwt-fips = ["praxis-proxy/policy-jwt-fips"]
 
 [dependencies]
 version = { path = "../version" }
