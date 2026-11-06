@@ -68,6 +68,16 @@ pub(crate) enum ExternalProvider {
     OpenAi,
 }
 
+/// How the combined-site sites learn their peers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Membership {
+    /// SWIM gossip discovers each peer.
+    #[default]
+    Swim,
+    /// Each site declares its peers as `GridSite` objects and polls their catalogs and signals.
+    Local,
+}
+
 /// Scenario-selection options shared by GLB demo commands.
 #[derive(Debug, clap::Args)]
 #[expect(
@@ -1036,6 +1046,9 @@ pub(crate) enum Action {
         /// Path to the source Forge environment config file.
         #[arg(long, default_value = "tests/e2e/topologies/grid-combined-site/forge.yaml")]
         forge_config: PathBuf,
+        /// How the sites learn their peers.
+        #[arg(long, value_enum, default_value_t = Membership::Swim)]
+        membership: Membership,
         /// Demo mode and lifecycle options.
         #[command(flatten)]
         options: GlbDemoOptions,
@@ -1313,7 +1326,11 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
             glb_demo::setup(forge_config, ingress_mode).map(|_| ())
         },
         Action::RunGridGlbDemo { forge_config, options } => glb_demo::run(forge_config, options),
-        Action::RunGridCombinedSiteDemo { forge_config, options } => combined_site_demo::run(forge_config, options),
+        Action::RunGridCombinedSiteDemo {
+            forge_config,
+            membership,
+            options,
+        } => combined_site_demo::run(forge_config, *membership, options),
         Action::RunGridLlmdPoolMetricsDemo {
             forge_config,
             options,

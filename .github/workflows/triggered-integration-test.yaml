@@ -33,6 +33,7 @@ on:
           - glb-full
           - static-weighted
           - combined-site
+          - combined-site-local
           - llmd-pool-metrics-quick
           - llmd-pool-metrics-full
   workflow_call:
@@ -134,6 +135,7 @@ jobs:
       release_qualification: ${{ steps.selection.outputs.release_qualification }}
       qualification: ${{ steps.mode.outputs.qualification }}
       mode: ${{ steps.mode.outputs.mode }}
+      membership: ${{ steps.mode.outputs.membership }}
     steps:
       - name: Select release qualification
         id: selection
@@ -168,6 +170,7 @@ jobs:
           RELEASE_QUALIFICATION: ${{ steps.selection.outputs.release_qualification }}
         run: |
           set -euo pipefail
+          MEMBERSHIP=swim
           case "${RELEASE_QUALIFICATION}" in
             glb-quick)
               QUALIFICATION=glb
@@ -185,6 +188,11 @@ jobs:
               QUALIFICATION=combined-site
               MODE=full
               ;;
+            combined-site-local)
+              QUALIFICATION=combined-site
+              MODE=full
+              MEMBERSHIP=local
+              ;;
             llmd-pool-metrics-quick)
               QUALIFICATION=llmd-pool-metrics
               MODE=quick
@@ -201,6 +209,7 @@ jobs:
           {
             echo "qualification=${QUALIFICATION}"
             echo "mode=${MODE}"
+            echo "membership=${MEMBERSHIP}"
           } >> "${GITHUB_OUTPUT}"
           echo "Release qualification: ${RELEASE_QUALIFICATION} -> ${QUALIFICATION} (${MODE})"
 
@@ -437,6 +446,7 @@ jobs:
       BRANCH_NAME: ${{ needs.resolve-source.outputs.branch_name }}
       QUALIFICATION: ${{ needs.resolve-source.outputs.qualification }}
       MODE: ${{ needs.resolve-source.outputs.mode }}
+      MEMBERSHIP: ${{ needs.resolve-source.outputs.membership }}
       EVIDENCE_DIR: ${{ github.workspace }}/evidence/${{ needs.resolve-source.outputs.release_qualification }}
       DIAGNOSTICS_DIR: ${{ github.workspace }}/diagnostics/${{ needs.resolve-source.outputs.release_qualification }}
     steps:
@@ -663,6 +673,7 @@ jobs:
             echo "docker=$(docker version --format '{{.Server.Version}}')"
             echo "kind=$(kind version)"
             echo "kubectl=$(kubectl version --client -o json | jq -r '.clientVersion.gitVersion')"
+            echo "helm=$(helm version --template '{{.Version}}')"
             echo "openssl=$(openssl version)"
             echo "curl=$(curl --version | head -1)"
             echo "jq=$(jq --version)"
@@ -1222,6 +1233,7 @@ jobs:
               GRID_XTASK_IMAGE_PULL_POLICY=Never \
               timeout --signal=TERM --kill-after=30s 75m cargo xtask env run-grid-combined-site-demo \
                 --forge-config tests/e2e/topologies/grid-combined-site/forge.yaml \
+                --membership "${MEMBERSHIP}" \
                 --full --teardown --keep-on-failure --evidence-dir "${EVIDENCE_DIR}" \
                 2>&1 | tee "${GITHUB_WORKSPACE}/run-${QUALIFICATION}.log"
               ;;
@@ -1834,7 +1846,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ${{ steps.tags.outputs.artifact_prefix || format('grid-{0}-{1}', needs.resolve-source.outputs.source_kind, needs.resolve-source.outputs.tested_sha) }}-${{ env.QUALIFICATION }}-${{ env.MODE }}
+          name: ${{ steps.tags.outputs.artifact_prefix || format('grid-{0}-{1}', needs.resolve-source.outputs.source_kind, needs.resolve-source.outputs.tested_sha) }}-${{ env.QUALIFICATION }}-${{ env.MODE }}-${{ env.MEMBERSHIP }}
           path: |
             ${{ env.EVIDENCE_DIR }}/
             ${{ env.DIAGNOSTICS_DIR }}/
@@ -1926,6 +1938,7 @@ jobs:
             if [[ "${QUALIFICATION}" == "combined-site" ]]; then
               echo "| **Operator crypto backend** | OpenSSL (`fips` feature) |"
             fi
+            echo "| **Membership** | \`${MEMBERSHIP}\` |"
             echo "| **Qualification result** | ${QUALIFICATION_DISPLAY_RESULT} |"
             echo "| **Cleanup** | ${CLEANUP_RESULT} |"
             if [[ "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
@@ -1952,5 +1965,5 @@ jobs:
             echo ""
             echo "### Artifact"
             echo ""
-            echo "\`${ARTIFACT_PREFIX}-${QUALIFICATION}-${MODE}\`"
+            echo "\`${ARTIFACT_PREFIX}-${QUALIFICATION}-${MODE}-${MEMBERSHIP}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
