@@ -252,7 +252,9 @@ signals:
     loadBalancerSourceRanges: []
     # -- Empty keeps Local for a LoadBalancer.
     externalTrafficPolicy: ""
-  # -- Signals endpoint gossiped to peers (ip:port, [ipv6]:port, or dns-name:port). Set it when swim.advertiseAddress is set or the Service is not a LoadBalancer.
+  # -- Signals endpoint gossiped to peers (ip:port, [ipv6]:port, or dns-name:port). Empty is the
+  # Route host on 443 when a signals Route renders. Set it when swim.advertiseAddress is set or
+  # the Service is neither behind a Route nor a LoadBalancer.
   advertiseAddress: ""
   # -- An OpenShift Route in front of the signals Service, so peers reach this site through
   # the cluster's router rather than a load balancer of its own. Required when signals are

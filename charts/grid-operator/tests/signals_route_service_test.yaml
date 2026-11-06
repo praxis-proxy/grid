@@ -3,6 +3,7 @@ templates:
   - templates/service-signals.yaml
   - templates/service-swim.yaml
   - templates/route-signals.yaml
+  - templates/deployment.yaml
 capabilities:
   apiVersions:
     - route.openshift.io/v1
@@ -81,3 +82,14 @@ tests:
       - equal:
           path: spec.type
           value: LoadBalancer
+
+  - it: gossips the Route host once the signals Service moves behind the Route
+    template: templates/deployment.yaml
+    set:
+      site.name: east
+      grid.id: g
+      grid.signals: poll
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: GRID_SIGNALS_ADVERTISE_ADDR, value: "east-signals.grid.internal:443" }

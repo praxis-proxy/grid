@@ -207,7 +207,10 @@ spec:
             - name: GRID_SIGNALS_SERVICE_NAME
               value: {{ printf "%s-signals" (include "grid-operator.fullname" .) | quote }}
             {{- end }}
-            {{- with .Values.signals.advertiseAddress }}
+            {{- /* Behind a Route the Service is a ClusterIP with no ingress to discover, so the
+                   gossiped endpoint is the Route host on the router's TLS port. */}}
+            {{- $routeAdvertise := ternary (printf "%s:443" (include "grid-operator.signalsRoute.host" .)) "" (eq (include "grid-operator.signalsRoute.enabled" .) "true") }}
+            {{- with .Values.signals.advertiseAddress | default $routeAdvertise }}
             - name: GRID_SIGNALS_ADVERTISE_ADDR
               value: {{ . | quote }}
             {{- end }}
