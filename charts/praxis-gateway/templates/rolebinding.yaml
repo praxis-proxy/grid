@@ -12,6 +12,10 @@ roleRef:
   name: {{ include "praxis-gateway.fullname" . }}-overlay-sync
 subjects:
   - kind: ServiceAccount
+    {{- if .Values.metricsListener.enabled }}
+    name: {{ printf "%s-metrics-auth" (include "praxis-gateway.fullname" . | trunc 49 | trimSuffix "-") }}
+    {{- else }}
     name: {{ include "praxis-gateway.fullname" . }}-overlay-sync
+    {{- end }}
     namespace: {{ .Release.Namespace }}
 {{- end }}

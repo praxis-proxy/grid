@@ -773,9 +773,9 @@ RUST_LOG for the gateway and overlay-sync: log.filter when set, else log.level, 
 
 {{/*
 Resolve metricsListener.enabled and serviceMonitor.enabled to booleans. auto turns the
-listener on for the grid-gateway image on OpenShift with the NetworkPolicy on, and fills
-each unset value from the platform: a service serving cert, user workload monitoring, and
-the service CA. Off OpenShift no cert source exists by default, so auto stays off.
+listener on for the grid-gateway image when OpenShift can issue its serving cert or when
+the user supplies a TLS Secret. OpenShift fills unset TLS, NetworkPolicy, and ServiceMonitor
+CA values from the platform.
 */}}
 {{- define "praxis-gateway.resolveMetricsListener" -}}
 {{- $v := .Values }}
@@ -783,12 +783,13 @@ the service CA. Off OpenShift no cert source exists by default, so auto stays of
 {{- if eq (toString $m.enabled) "auto" }}
 {{- $openshift := include "praxis-gateway.openshift" . }}
 {{- $grid := eq $v.image.flavor "grid-gateway" }}
-{{- $on := and $grid $openshift $v.networkPolicy.enabled }}
+{{- $on := and $grid (or $openshift $m.existingSecret) }}
 {{- $_ := set $m "enabled" (not (empty $on)) }}
-{{- if and $grid $openshift (not $v.networkPolicy.enabled) }}
-{{- $_ := set $m "skipped" "networkPolicy.enabled is false" }}
+{{- if and $grid (not $on) }}
+{{- $_ := set $m "skipped" "no metrics TLS certificate source is configured" }}
 {{- end }}
 {{- if $m.enabled }}
+{{- $openshift := include "praxis-gateway.openshift" . }}
 {{- if not $m.existingSecret }}
 {{- $annotations := $m.service.annotations | default dict }}
 {{- /* The annotation names the Secret the platform creates, so the mount follows it. */}}
@@ -798,10 +799,10 @@ the service CA. Off OpenShift no cert source exists by default, so auto stays of
 {{- $_ := set $annotations "service.beta.openshift.io/serving-cert-secret-name" $secret }}
 {{- $_ := set $m.service "annotations" $annotations }}
 {{- end }}
-{{- if not $m.fromNamespaces }}
+{{- if and $openshift (not $m.fromNamespaces) }}
 {{- $_ := set $m "fromNamespaces" (list "openshift-user-workload-monitoring") }}
 {{- end }}
-{{- if not $m.serviceMonitor.caConfigMap.name }}
+{{- if and $openshift (not $m.serviceMonitor.caConfigMap.name) }}
 {{- $_ := set $m.serviceMonitor "caConfigMap" (dict "name" "openshift-service-ca.crt" "key" "service-ca.crt") }}
 {{- end }}
 {{- end }}
@@ -817,8 +818,9 @@ the service CA. Off OpenShift no cert source exists by default, so auto stays of
 {{- end }}
 
 {{/*
-The metrics listener needs the grid-gateway image, a cert, and the NetworkPolicy that
-limits its port; without the policy any pod could scrape it.
+The metrics listener needs the grid-gateway image and a serving certificate. Kubernetes
+TokenReview and SubjectAccessReview authorize each scrape; NetworkPolicy is optional
+additional ingress hardening.
 */}}
 {{- define "praxis-gateway.validateMetricsListener" -}}
 {{- $m := .Values.metricsListener }}
@@ -829,11 +831,10 @@ limits its port; without the policy any pod could scrape it.
 {{- if not $m.existingSecret }}
 {{- fail "metricsListener.existingSecret is required: the listener serves TLS only" }}
 {{- end }}
-{{- if not .Values.networkPolicy.enabled }}
-{{- fail "metricsListener needs networkPolicy.enabled, which limits the metrics port to metricsListener.fromNamespaces" }}
-{{- end }}
 {{- if not $m.fromNamespaces }}
+{{- if .Values.networkPolicy.enabled }}
 {{- fail "metricsListener.fromNamespaces needs at least one namespace" }}
+{{- end }}
 {{- end }}
 {{- $taken := list (int .Values.port.containerPort) }}
 {{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled }}{{ $taken = append $taken 9091 }}{{ end }}

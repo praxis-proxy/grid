@@ -78,7 +78,9 @@ spec:
       {{- fail (printf "terminationGracePeriodSeconds must be at least %d: the operator-generated config drains for 30 seconds after the %d second shutdownDelaySeconds" (add 30 $delay) $delay) }}
       {{- end }}
       terminationGracePeriodSeconds: {{ $grace }}
-      {{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled }}
+      {{- if .Values.metricsListener.enabled }}
+      serviceAccountName: {{ printf "%s-metrics-auth" (include "praxis-gateway.fullname" . | trunc 49 | trimSuffix "-") }}
+      {{- else if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled }}
       serviceAccountName: {{ include "praxis-gateway.fullname" . }}-overlay-sync
       {{- end }}
       {{- with .Values.imagePullSecrets }}
@@ -250,6 +252,10 @@ spec:
               value: {{ printf "%s/tls.crt" .mountPath | quote }}
             - name: GRID_METRICS_TLS_KEY
               value: {{ printf "%s/tls.key" .mountPath | quote }}
+            - name: GRID_METRICS_AUTH_NAMESPACE
+              value: {{ $.Release.Namespace | quote }}
+            - name: GRID_METRICS_AUTH_RESOURCE_NAME
+              value: {{ include "praxis-gateway.fullname" $ | quote }}
             {{- end }}
             {{- end }}
           {{- end }}
@@ -342,6 +348,9 @@ spec:
             {{- if .Values.metricsListener.enabled }}
             - name: metrics-tls
               mountPath: {{ .Values.metricsListener.mountPath | quote }}
+              readOnly: true
+            - name: metrics-api-auth
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               readOnly: true
             {{- end }}
             {{- if $withCA }}
@@ -475,6 +484,17 @@ spec:
         - name: metrics-tls
           secret:
             secretName: {{ .Values.metricsListener.existingSecret | quote }}
+        - name: metrics-api-auth
+          projected:
+            sources:
+              - serviceAccountToken:
+                  expirationSeconds: 3600
+                  path: token
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
         {{- end }}
         {{- range $i, $credential := .Values.providerCredentials }}
         {{- if or (not $.Values.mountReconciliation.enabled) (not $.Values.mountReconciliation.releaseHelmMounts) (not (has $credential.secretName $.Values.mountReconciliation.managedCredentialNames)) }}

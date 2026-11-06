@@ -6,7 +6,7 @@ components expose Prometheus endpoints and they answer different questions.
 | Endpoint | Component | Serves |
 |---|---|---|
 | `/metrics` on `GRID_METRICS_ADDR`, default `0.0.0.0:9090` | Site operator | Reconciliation, probing, peer polling, and the provider readings this site publishes |
-| `/metrics` on the gateway metrics listener, `metricsListener.enabled` in the gateway chart, port 9443, TLS only | Grid gateway | Site selection, shedding, serving-config reloads, and its poll of the local operator |
+| `/metrics` on the gateway metrics listener, `metricsListener.enabled` in the gateway chart, port 9443, TLS with Kubernetes bearer-token authorization | Grid gateway | Site selection, shedding, serving-config reloads, and its poll of the local operator |
 | `/metrics` on `OVERLAY_SYNC_HEALTH_ADDR`, default `0.0.0.0:9091` | Overlay-sync sidecar, when `overlay.sidecar.enabled` | Delivery of the serving overlay from its ConfigMap to the gateway |
 
 The `grid-gateway` operand built with Praxis 0.7.4 serves `/metrics`, `/healthy`,

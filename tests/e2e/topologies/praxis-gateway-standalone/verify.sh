@@ -117,6 +117,105 @@ stage_core_image() {
   expect "the core Praxis image proxies / to backend-b" / 'HTTP/1\.1 200' 'backend-b' 'x-config-version: core'
 }
 
+stage_metrics_cert() {
+  local release=${METRICS_RELEASE:?METRICS_RELEASE is required for metrics-cert}
+  local service="${release}-metrics" workdir cert key
+  workdir=$(mktemp -d)
+  cert="$workdir/tls.crt"
+  key="$workdir/tls.key"
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$key" -out "$cert" -days 2 \
+    -subj "/CN=${service}.${NS}.svc" \
+    -addext "subjectAltName=DNS:${service}.${NS}.svc" \
+    -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1 \
+    || fail "could not generate the metrics serving certificate"
+  kubectl --context "$CTX" -n "$NS" create secret tls metrics-server-cert \
+    --cert="$cert" --key="$key" --dry-run=client -o yaml \
+    | kubectl --context "$CTX" apply -f - >/dev/null \
+    || fail "could not apply the metrics serving certificate"
+  rm -rf "$workdir"
+  pass "created a serving certificate for ${service}.${NS}.svc"
+}
+
+stage_metrics_authorization() {
+  local release=${METRICS_RELEASE:?METRICS_RELEASE is required for metrics authorization}
+  local service="${release}-metrics" token_secret="${release}-metrics-token"
+  local url="https://${service}.${NS}.svc:9443/metrics" token_data="" code kinds i
+  for i in $(seq 1 60); do
+    token_data=$(k get secret "$token_secret" -o jsonpath='{.data.token}' 2>/dev/null || true)
+    [ -n "$token_data" ] && break
+    sleep 1
+  done
+  [ -n "$token_data" ] || fail "the scraper ServiceAccount token Secret was not populated"
+  pass "the chart-created scraper token Secret is populated"
+
+  k delete pod metrics-auth-probe --ignore-not-found --wait=true >/dev/null
+  cat <<EOF | kubectl --context "$CTX" apply -f - >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: metrics-auth-probe
+  namespace: $NS
+spec:
+  automountServiceAccountToken: true
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: curl
+      image: curlimages/curl:8.12.1
+      command: [sh, -c, "sleep 2147483647"]
+      env:
+        - name: SCRAPER_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: $token_secret
+              key: token
+      volumeMounts:
+        - name: metrics-ca
+          mountPath: /var/run/metrics-ca
+          readOnly: true
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]
+        readOnlyRootFilesystem: true
+  volumes:
+    - name: metrics-ca
+      secret:
+        secretName: metrics-server-cert
+EOF
+  k wait --for=condition=Ready pod/metrics-auth-probe --timeout=180s >/dev/null \
+    || fail "metrics authorization probe pod did not become ready"
+
+  code=$(k exec metrics-auth-probe -- curl -sS -o /dev/null -w '%{http_code}' \
+    --cacert /var/run/metrics-ca/tls.crt "$url" 2>&1 || true)
+  [ "$code" = 401 ] || fail "missing bearer token got HTTP $code, want 401"
+  pass "TLS scrape without a bearer token is rejected with 401"
+
+  code=$(k exec metrics-auth-probe -- sh -c \
+    'curl -sS -o /dev/null -w "%{http_code}" --cacert /var/run/metrics-ca/tls.crt -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" "$1"' \
+    sh "$url" 2>&1 || true)
+  [ "$code" = 403 ] || fail "default ServiceAccount token got HTTP $code, want 403"
+  pass "authenticated but unauthorized ServiceAccount is rejected with 403"
+
+  code=$(k exec metrics-auth-probe -- sh -c \
+    'curl -sS -o /dev/null -w "%{http_code}" --cacert /var/run/metrics-ca/tls.crt -H "Authorization: Bearer $SCRAPER_TOKEN" "$1"' \
+    sh "$url" 2>&1 || true)
+  [ "$code" = 200 ] || fail "chart scraper token got HTTP $code, want 200"
+  pass "chart scraper identity is authorized to scrape over verified TLS"
+
+  kinds=$(helm --kube-context "$CTX" -n "$NS" get manifest "$release" \
+    | awk '$1 == "kind:" {print $2}' | sort -u | paste -sd ' ')
+  case " $kinds " in
+    *" NetworkPolicy "*) fail "metrics listener rendered a NetworkPolicy even though networkPolicy.enabled is false" ;;
+  esac
+  pass "the metrics listener is reachable without a NetworkPolicy"
+}
+
 stage_release() {
   h test "$RELEASE" --timeout 3m >/dev/null || fail "helm test $RELEASE failed"
   pass "helm test passes under the restricted pod security standard"
@@ -152,6 +251,8 @@ case "$STAGE" in
   inline-v2) stage_inline_v2 ;;
   existing) stage_existing ;;
   core-image) stage_core_image ;;
+  metrics-cert) stage_metrics_cert ;;
+  metrics-authorization) stage_metrics_authorization ;;
   release) stage_release ;;
   *) fail "unknown stage" ;;
 esac

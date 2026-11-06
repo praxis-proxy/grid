@@ -28,6 +28,11 @@ spec:
           configMap:
             name: {{ .serviceMonitor.caConfigMap.name | quote }}
             key: {{ .serviceMonitor.caConfigMap.key | quote }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ printf "%s-metrics-token" (include "praxis-gateway.fullname" $ | trunc 45 | trimSuffix "-") }}
+          key: token
       metricRelabelings:
         # Reserve "cluster" for the managed cluster; Praxis uses it for the backend.
         - sourceLabels: [cluster]

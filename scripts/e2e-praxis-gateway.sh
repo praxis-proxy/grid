@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # praxis-gateway standalone e2e. Forge creates a Kind cluster with no Grid
 # components, installs charts/praxis-gateway with no values, reconfigures it
-# through praxisConfig.byo.inline, an existing ConfigMap, and the core Praxis image, and
-# checks real requests after every change. The topology and its stages live in
+# through praxisConfig.byo.inline, an existing ConfigMap, and the core Praxis image, then
+# builds grid-gateway and checks its TLS metrics authorization. The topology and its stages live in
 # tests/e2e/topologies/praxis-gateway-standalone.
 #
 # Env: FORGE_BIN           explicit executable override (default: pinned upstream Forge)
@@ -17,12 +17,32 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 CONFIG=tests/e2e/topologies/praxis-gateway-standalone/forge.yaml
 STATE_DIR=${STATE_DIR:-$ROOT/target/forge/praxis-gateway-standalone}
-CONTEXT=kind-praxis-standalone-gateway
+CLUSTER_NAME=praxis-standalone-gateway
+CONTEXT=kind-$CLUSTER_NAME
+GRID_GATEWAY_IMAGE=grid-gateway:latest
 
 FORGE_BIN=$("$ROOT/scripts/forge.sh" path)
 
 forge() {
   "$FORGE_BIN" --config "$CONFIG" --state-dir "$STATE_DIR" --non-interactive "$@"
+}
+
+build_and_load_grid_gateway() {
+  local engine archive
+  engine=${CONTAINER_ENGINE:-$(command -v podman || command -v docker || true)}
+  [ -n "$engine" ] || { echo "No container engine found. Install podman or docker." >&2; return 1; }
+  make CONTAINER_ENGINE="$engine" gateway-image || return 1
+  if [ "$(basename "$engine")" = podman ]; then
+    archive=$(mktemp)
+    if ! "$engine" save -o "$archive" "$GRID_GATEWAY_IMAGE" \
+      || ! kind load image-archive "$archive" --name "$CLUSTER_NAME"; then
+      rm -f "$archive"
+      return 1
+    fi
+    rm -f "$archive"
+  else
+    kind load docker-image "$GRID_GATEWAY_IMAGE" --name "$CLUSTER_NAME"
+  fi
 }
 
 diagnostics() {
@@ -57,6 +77,9 @@ trap teardown EXIT
 status=0
 # shellcheck disable=SC2086 # KIND_CREATE_PREFIX is a command prefix and must word-split
 ${KIND_CREATE_PREFIX:-} "$FORGE_BIN" --config "$CONFIG" --state-dir "$STATE_DIR" --non-interactive up || status=$?
+if [ "$status" = 0 ]; then
+  build_and_load_grid_gateway || status=$?
+fi
 if [ "$status" = 0 ]; then
   forge apply gateway || status=$?
 fi

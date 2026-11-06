@@ -1058,7 +1058,7 @@
     "metricsListener": {
       "type": "object",
       "additionalProperties": false,
-      "description": "TLS listener serving only GET /metrics.",
+      "description": "TLS listener serving only Kubernetes-authorized GET /metrics requests.",
       "properties": {
         "enabled": {
           "enum": [
@@ -1068,7 +1068,7 @@
             "false",
             "auto"
           ],
-          "description": "auto serves the listener for the grid-gateway image on OpenShift with networkPolicy.enabled and fills unset values from the platform. true needs each value set."
+          "description": "auto serves the listener for grid-gateway on OpenShift or when an existingSecret is supplied. OpenShift fills serving certificate and CA values from the platform."
         },
         "port": {
           "type": "integer",
@@ -1134,7 +1134,7 @@
               "additionalProperties": {
                 "type": "string"
               },
-              "description": "Additional labels on the ServiceMonitor, for a collector that selects by label."
+              "description": "Labels on the ServiceMonitor for collectors that select by label. OpenShift AI's observability collector uses monitoring.opendatahub.io/scrape: true."
             }
           }
         }
