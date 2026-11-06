@@ -281,6 +281,21 @@ The chart uses [Semantic Versioning](https://semver.org/). Its `version`
 identifies the chart package, while `appVersion` identifies the default
 Praxis AI image; these values may advance independently.
 
+## Names across charts
+
+The Grid operator finds this gateway by name, so the release fullname must match what the
+operator expects.
+
+| Object | Expected name | Set it with |
+|--------|---------------|-------------|
+| This gateway's Service and Deployment | The grid-operator release's `gateway.serviceName`. Empty there with `grid.id` or `enrollment.enabled` set: `grid-gateway`. Empty otherwise: `provider-gateway`. It is also the GridNetwork `consumerGateways[].name`. | `fullnameOverride`. |
+| Operator ServiceAccount | The grid-operator release's `serviceAccount.name`, else its fullname: `grid-operator` for a release named `grid-operator`. | `mountReconciliation.operator.serviceAccount` and `namespace`. |
+
+`metricsListener.fromNamespaces` takes namespace names and on OpenShift defaults to
+`openshift-user-workload-monitoring` only. The grid-operator chart's
+`networkPolicy.metricsFrom` takes NetworkPolicyPeer entries and on OpenShift also admits
+`openshift-monitoring`. Set both when one Prometheus scrapes both.
+
 ## Values
 
 | Key | Type | Default | Description |
@@ -348,7 +363,7 @@ Praxis AI image; these values may advance independently.
 | `mountReconciliation.releaseHelmMounts` | bool | `false` | Second handoff phase. After Grid reports `Ready`, set this true to release selected Helm credential mounts and the chart TLS mount. |
 | `mountReconciliation.managedCredentialNames` | list | `[]` | Credential Secret names to release from Helm in the second handoff phase. Other entries in `providerCredentials` remain Helm-managed. |
 | `mountReconciliation.rbac.create` | bool | `true` | Render a Role and RoleBinding in the release namespace that let the operator ServiceAccount `get` and `patch` this chart's Deployment and no other. `false` leaves the Role to you; see below. |
-| `mountReconciliation.operator.serviceAccount` | string | `grid-operator` | Operator ServiceAccount the Role binds. Blank fails the render while `rbac.create` is true. |
+| `mountReconciliation.operator.serviceAccount` | string | `grid-operator` | Operator ServiceAccount the Role binds. Blank fails the render while `rbac.create` is true. The grid-operator chart names it after its release, so the default matches a release named `grid-operator`. |
 | `mountReconciliation.operator.namespace` | string | required | Namespace of that ServiceAccount. Blank fails the render while `rbac.create` is true. |
 | `networkPolicy.enabled` | bool | `false` | Render a NetworkPolicy that limits which pods can reach the listener port, where the CNI enforces NetworkPolicy. It is not authentication. Node and host-network traffic handling is CNI-specific (OVN-Kubernetes: the `policy-group.network.openshift.io/host-network` label), and a LoadBalancer with `externalTrafficPolicy: Cluster` can SNAT clients to node IPs. |
 | `networkPolicy.from` | list | `[]` | NetworkPolicyPeer entries allowed in. Required when enabled. With `auth.mode: none`, list only the authenticating front. `{podSelector: {}}` admits every pod in this namespace. An empty `namespaceSelector` and an `ipBlock` of `0.0.0.0/0` or `::/0` admit everyone and fail the render. An all-address `ipBlock` with `except` entries is allowed. The check reads selector emptiness and the cidr only, so `matchExpressions` that happen to select every pod pass. A provider gateway behind a LoadBalancer that SNATs clients to node IPs needs `ipBlock` peers for those node addresses. |

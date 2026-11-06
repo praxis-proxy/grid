@@ -309,8 +309,9 @@ gateway:
   # NodePort Services; the own GridSite uses it when gatewayEndpoint is absent.
   address: ""
   # -- Site gateway Kubernetes Service name for the operator to discover. Defaults
-  # to grid-gateway with enrollment enabled or grid.id set; it also names the
-  # gateway in GridNetwork spec.consumerGateways. Maps to GRID_GATEWAY_SERVICE_NAME.
+  # to grid-gateway with enrollment enabled or grid.id set, else to the operator's
+  # provider-gateway; it also names the gateway in GridNetwork spec.consumerGateways.
+  # Set the praxis-gateway release's fullnameOverride to it. Maps to GRID_GATEWAY_SERVICE_NAME.
   serviceName: ""
   # -- Namespace of the site gateway Service. Empty uses the release
   # namespace. Maps to GRID_GATEWAY_NAMESPACE.

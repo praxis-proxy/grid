@@ -184,6 +184,28 @@ With an older Helm, mark them as owned by the release, then upgrade as usual:
 RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders gridnetworks gridsites inferenceproviders; do kubectl label crd "${crd}.grid.praxis.fast" app.kubernetes.io/managed-by=Helm --overwrite; kubectl annotate crd "${crd}.grid.praxis.fast" meta.helm.sh/release-name="${RELEASE}" meta.helm.sh/release-namespace="${NAMESPACE}" --overwrite; done
 ```
 
+## Names across charts
+
+Each chart names its objects after its own release, so a default install works only when
+the release names line up. These are the names another chart or the operator expects.
+
+| Object | Expected name | Set it with |
+|--------|---------------|-------------|
+| Site gateway Service and Deployment | `gateway.serviceName`. Empty with `grid.id` or `enrollment.enabled` set: `grid-gateway`. Empty otherwise: `provider-gateway`, the operator's own default, which the RBAC also names. | praxis-gateway `fullnameOverride` set to that name. |
+| Operator ServiceAccount | `serviceAccount.name`, else this release's fullname: `grid-operator` for a release named `grid-operator`. | praxis-gateway `mountReconciliation.operator.serviceAccount` and `namespace`. |
+| Enrollment Service | `enrollment.hubService` (default `grid-enrollment`) in `rbac.enrollmentNamespace` (default `grid-enrollment`), on port `enrollment.hubPort`. | Install grid-enrollment as release `grid-enrollment` in namespace `grid-enrollment`, or set `hubService` to that release's fullname. |
+
+The GridNetwork this chart renders carries no `admissionPolicy` or `selectionPolicy`, so
+it takes the CRD and gateway defaults: instantaneous admission and deterministic selection.
+The grid-site chart renders stabilized admission and roundRobin selection by default. A
+network keeps whichever policies the chart that renders it writes, so render each
+GridNetwork from one chart, and use grid-site when you want its policies.
+
+The NetworkPolicy peers in `networkPolicy.metricsFrom` are full NetworkPolicyPeer entries.
+The praxis-gateway chart takes namespace names in `metricsListener.fromNamespaces`, and on
+OpenShift defaults to `openshift-user-workload-monitoring` only. This chart adds
+`openshift-monitoring` on OpenShift.
+
 ## Values
 
 | Key | Type | Default | Description |
@@ -214,7 +236,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `podLabels` | object | `{}` | Labels on the operator pod. |
 | `podAnnotations` | object | `{}` | Annotations on the operator pod. |
 | `serviceAccount.create` | bool | `true` | Create a ServiceAccount. |
-| `serviceAccount.name` | string | `""` | ServiceAccount name. Defaults to fullname when `create` is true, `"default"` when false. |
+| `serviceAccount.name` | string | `""` | ServiceAccount name. Defaults to fullname when `create` is true, `"default"` when false. The praxis-gateway chart's `mountReconciliation.operator.serviceAccount` defaults to `grid-operator`, the fullname of a release named `grid-operator`. |
 | `serviceAccount.annotations` | object | `{}` | ServiceAccount annotations (e.g. IAM role binding). |
 | `rbac.create` | bool | `true` | Create RBAC resources. |
 | `resourceNamespaces` | list | `[]` | Additional namespaces for resource access. The release namespace is always included. |
@@ -263,7 +285,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `signals.peerIntervalSeconds` | int or string | `""` | Seconds between peer signal polls, 1 to 99999, as `GRID_SIGNALS_PEER_INTERVAL_SECS`. Every site polls every other alive site, so a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator's own default. |
 | `signals.scrapeIntervalSeconds` | int or string | `""` | Seconds between scrapes of this site's own EPPs. Empty keeps the operator's 1s. |
 | `gateway.address` | string | `""` | Advertised site gateway `host:port` override. Use it when the site gateway Service is not a LoadBalancer. Maps to `GRID_GATEWAY_ADDRESS`. |
-| `gateway.serviceName` | string | `""` | Site gateway Service name the operator resolves and advertises to remote sites. Maps to `GRID_GATEWAY_SERVICE_NAME`. |
+| `gateway.serviceName` | string | `""` | Site gateway Service and Deployment name the operator resolves, advertises to remote sites, and rolls on a rotation. Maps to `GRID_GATEWAY_SERVICE_NAME`. Empty defaults to `grid-gateway` with `grid.id` or `enrollment.enabled` set, else to `provider-gateway`, the operator's own default. Set the praxis-gateway release's `fullnameOverride` to this name. |
 | `gateway.namespace` | string | `""` | Namespace of the site gateway Service. Empty uses the release namespace. Outside the resource namespaces, the operator gets only `get` on that one Service there. Maps to `GRID_GATEWAY_NAMESPACE`. |
 | `gateway.allowSystemNamespace` | bool | `false` | Allow `gateway.namespace` to be `default`, `kube-*`, or `openshift-*`. |
 | `gateway.port` | string | `""` | Site gateway Service port override. Empty uses the first Service `spec.ports` entry, with `8080` as the fallback if no usable port exists. Maps to `GRID_GATEWAY_PORT`. |
@@ -295,7 +317,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `enrollment.enabled` | bool | `false` | This site enrolls: turns on the SWIM LoadBalancer Service, site-identity metrics TLS and the enrollment namespace guard, and renders the signer and the invite into the operator config's `site` section. |
 | `enrollment.url` | string | `""` | Signer base URL (https), `site.signerEndpoint.url`. Required unless `enrollment.hub` is set. Set alone on a hub whose identity bootstrap issued, it renders a `site` section that renews only. |
 | `enrollment.hub` | bool | `false` | The grid-enrollment release runs on this cluster, so `enrollment.url` defaults to its Service in `rbac.enrollmentNamespace`. |
-| `enrollment.hubService` | string | `grid-enrollment` | With `hub` set and no `url`, the grid-enrollment release's full name: its Service and the in-cluster name its serving certificate carries. Must match that release. |
+| `enrollment.hubService` | string | `grid-enrollment` | With `hub` set and no `url`, the grid-enrollment release's full name: its Service and the in-cluster name its serving certificate carries. Must match that release. The default matches a release named `grid-enrollment`, in the default `rbac.enrollmentNamespace`, `grid-enrollment`. |
 | `enrollment.hubPort` | int | `8443` | With `hub` set and no `url`, the grid-enrollment Service's port. Must match that release, whose Service port derives from its `listenAddr`. The `GRID_SIGNER_HOSTS` default follows it. |
 | `enrollment.siteName` | string | `""` | Site name the token pins, at most 51 characters, and the GridSite's name: `site.name`. Defaults to `swim.siteName`. |
 | `enrollment.caBundle` | object | `{secret: "", key: ca.crt}` | `site.signerEndpoint.caBundleRef`, a Secret, since anyone who can edit a ConfigMap could pin a signer of their own. Unset, Secret `grid-ca-bundle` when `enabled`. Pin the issuing intermediate or the signer's serving certificate, never a public root. |

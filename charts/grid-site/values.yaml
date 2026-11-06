@@ -25,6 +25,7 @@ gridNetwork:
       recoveryHoldDown: 30s
     missingMetrics: existingOnly
   # -- Local selection mode. Set to null to leave it to the gateway default, deterministic.
+  # A GridNetwork the grid-operator chart renders carries neither this nor admissionPolicy.
   selectionPolicy:
     mode: roundRobin
   # -- Grid-wide signal propagation mode: gossip (default) or poll. Omit for
