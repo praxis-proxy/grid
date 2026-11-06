@@ -108,6 +108,10 @@ args:
 # -- credentials and other deployment-managed secrets.
 env: []
 
+# -- Render env as a Helm template (tpl) against this chart's context, so a parent chart
+# can set values or Secret names from {{ .Values.global.* }}. Escape literal {{ as {{ "{{" }}.
+envTpl: false
+
 # -- Logging, rendered as RUST_LOG on the gateway and overlay-sync containers. An env
 # entry named RUST_LOG takes precedence on the gateway. Praxis adds config.runtime.log_overrides
 # per module on top, and its admin listener can change the level at runtime without a restart.

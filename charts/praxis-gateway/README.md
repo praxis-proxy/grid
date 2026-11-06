@@ -190,6 +190,20 @@ praxis-gateway:
 Validation, probe detection, and the config checksum use the rendered result.
 Escape a literal `{{` in the Praxis config as `{{ "{{" }}`.
 
+`envTpl: true` does the same for `env`, so a parent chart can set Secret names
+or values from `global`:
+
+```yaml
+praxis-gateway:
+  envTpl: true
+  env:
+    - name: OPENAI_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: "{{ .Values.global.openaiSecret }}"
+          key: api-key
+```
+
 ### Bring your own ConfigMap
 
 ```bash
@@ -291,6 +305,8 @@ Praxis AI image; these values may advance independently.
 | `imageUser.gid` | int | `101` | Numeric group of the official Praxis images. |
 | `command` | list | `[]` | Container command, replacing the image entrypoint. Empty keeps the entrypoint. |
 | `args` | list | `["--config", "/etc/praxis/praxis.yaml"]` | Container arguments. |
+| `env` | list | `[]` | Environment variables for the Praxis container. Use `valueFrom.secretKeyRef` for credentials. |
+| `envTpl` | bool | `false` | Render `env` with `tpl` against this chart's context. |
 | `praxisConfig.source` | string | `byo` | Source that writes `praxis.yaml`: `byo`, `operator`, or `render`. Set `render` explicitly for chart-generated Grid routing config. |
 | `praxisConfig.byo.configMapName` | string | `""` | ConfigMap with the Praxis config. Empty serves `praxisConfig.byo.inline`. Editing it does not restart the pods. |
 | `praxisConfig.byo.key` | string | `praxis.yaml` | Key in the BYO ConfigMap. |

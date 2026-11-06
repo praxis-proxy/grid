@@ -312,3 +312,46 @@ tests:
             filter_chains: [default]
     asserts:
       - notFailedTemplate: {}
+
+  - it: envTpl renders env against chart values
+    template: templates/deployment.yaml
+    set:
+      global.secret: my-openai
+      envTpl: true
+      env:
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef: {name: "{{ .Values.global.secret }}", key: api-key}
+        - {name: RELEASE, value: "{{ .Release.Name }}"}
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name == "praxis")].env
+          content:
+            name: OPENAI_API_KEY
+            valueFrom:
+              secretKeyRef: {name: my-openai, key: api-key}
+      - contains:
+          path: spec.template.spec.containers[?(@.name == "praxis")].env
+          content: {name: RELEASE, value: praxis-gateway}
+
+  - it: env is not templated by default
+    template: templates/deployment.yaml
+    set:
+      env:
+        - {name: RELEASE, value: "{{ .Release.Name }}"}
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name == "praxis")].env
+          content: {name: RELEASE, value: "{{ .Release.Name }}"}
+
+  - it: envTpl keeps rendered values with YAML special characters intact
+    template: templates/deployment.yaml
+    set:
+      global.v: "it's: \"x\""
+      envTpl: true
+      env:
+        - {name: A, value: "{{ .Values.global.v }}"}
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name == "praxis")].env
+          content: {name: A, value: "it's: \"x\""}

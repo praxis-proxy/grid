@@ -1317,6 +1317,10 @@
         }
       }
     },
+    "envTpl": {
+      "type": "boolean",
+      "description": "Render env with tpl against the chart's context."
+    },
     "env": {
       "type": "array",
       "items": {

@@ -314,6 +314,27 @@ praxisConfig.byo.tpl is true.
 {{- end }}
 
 {{/*
+env as a YAML list, with each string field rendered with tpl when envTpl is true.
+*/}}
+{{- define "praxis-gateway.env" -}}
+{{- $root := . -}}
+{{- $out := list -}}
+{{- range .Values.env -}}
+{{- $e := deepCopy . -}}
+{{- if $root.Values.envTpl -}}
+{{- $_ := set $e "name" (tpl $e.name $root) -}}
+{{- if hasKey $e "value" }}{{ $_ := set $e "value" (tpl (toString $e.value) $root) }}{{ end -}}
+{{- with ($e.valueFrom).secretKeyRef -}}
+{{- $_ := set . "name" (tpl .name $root) -}}
+{{- $_ := set . "key" (tpl .key $root) -}}
+{{- end -}}
+{{- end -}}
+{{- $out = append $out $e -}}
+{{- end -}}
+{{- toYaml $out -}}
+{{- end }}
+
+{{/*
 Fail early on a blank or unparseable praxisConfig.byo.inline, or one with no listener on
 port.containerPort, instead of a pod that crash-loops or never turns ready.
 */}}
