@@ -188,6 +188,8 @@ swim:
   advertiseAddress: ""
   # -- Hold SWIM traffic until the GridNetwork key loads or the network declares none. false opts out.
   requireKey: true
+  # -- Seconds a dead member stays tracked before eviction. Empty keeps the operator's 300s.
+  deadMemberTtlSeconds: ""
   # -- Bootstrap SWIM site name. Defaults to enrollment.siteName when enrollment is on.
   siteName: ""
   # -- Bootstrap SWIM seed endpoints, separated by spaces or commas, as grid.seeds.
@@ -295,6 +297,11 @@ signals:
   # -- Seconds between scrapes of this site's own EPPs. Local and unicast, so it costs
   # one request per provider per interval. Empty keeps the operator's 1s.
   scrapeIntervalSeconds: ""
+
+  # -- Seconds a published site signal is served before it expires. Half of it is the
+  # default readiness window, so it applies with signals off too. Empty keeps the
+  # operator's 30s.
+  ttlSeconds: ""
 # -- Advertised site gateway address configuration.
 gateway:
   # -- Discover a LoadBalancer address for SWIM and the own GridSite.
@@ -322,6 +329,12 @@ gateway:
 
 # -- Served-model discovery from this site's providers.
 modelDiscovery:
+  # -- Seconds between discovery rounds. Empty keeps the operator's 60s.
+  intervalSeconds: ""
+  # -- Seconds one provider poll may take. Empty keeps the operator's 5s.
+  timeoutSeconds: ""
+  # -- Providers polled at once. Empty keeps the operator's 8.
+  concurrency: ""
   # -- Seconds a discovered model set stays routable without a fresh poll. The
   # operator raises it to cover one poll round. Empty keeps the operator's 180s.
   ttlSeconds: ""

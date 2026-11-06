@@ -38,6 +38,10 @@ pub struct Cli {
     #[command(flatten)]
     pub leader: LeaderArgs,
 
+    /// Served-model discovery options.
+    #[command(flatten)]
+    pub model_discovery: ModelDiscoveryArgs,
+
     /// The `ConfigMap` in the operator namespace holding this operator's own settings.
     #[arg(
         long = "operator-config",
@@ -190,6 +194,64 @@ pub struct SwimArgs {
     /// This site's name, read once and used for SWIM, the certificate, and provider placement.
     #[arg(id = "swim_site_name", long = "swim-site-name", env = "GRID_SWIM_SITE_NAME")]
     pub site_name: Option<String>,
+
+    /// How long a dead member stays tracked before it is evicted, seconds.
+    #[arg(
+        id = "swim_dead_member_ttl_secs",
+        long = "swim-dead-member-ttl-secs",
+        env = "GRID_SWIM_DEAD_MEMBER_TTL_SECS",
+        default_value_t = crate::swim_runtime::DEFAULT_DEAD_MEMBER_TTL.as_secs()
+    )]
+    pub dead_member_ttl_secs: u64,
+}
+
+impl SwimArgs {
+    /// Dead member lifetime.
+    #[must_use]
+    pub const fn dead_member_ttl(&self) -> Duration {
+        Duration::from_secs(self.dead_member_ttl_secs)
+    }
+}
+
+/// Served-model discovery cadence. Interval, timeout and TTL are bounded where they are used.
+#[derive(Args, Debug, Clone)]
+#[group(id = "model_discovery")]
+pub struct ModelDiscoveryArgs {
+    /// Time between discovery rounds, seconds.
+    #[arg(
+        id = "model_discovery_interval_secs",
+        long = "model-discovery-interval-secs",
+        env = "GRID_MODEL_DISCOVERY_INTERVAL_SECS",
+        default_value_t = crate::served_models::DiscoveryConfig::default().interval.as_secs()
+    )]
+    pub interval_secs: u64,
+
+    /// Bound on one provider poll, seconds.
+    #[arg(
+        id = "model_discovery_timeout_secs",
+        long = "model-discovery-timeout-secs",
+        env = "GRID_MODEL_DISCOVERY_TIMEOUT_SECS",
+        default_value_t = crate::served_models::DiscoveryConfig::default().timeout.as_secs()
+    )]
+    pub timeout_secs: u64,
+
+    /// How long a discovered set is held without a successful poll, seconds.
+    #[arg(
+        id = "model_discovery_ttl_secs",
+        long = "model-discovery-ttl-secs",
+        env = "GRID_MODEL_DISCOVERY_TTL_SECS",
+        default_value_t = crate::served_models::DiscoveryConfig::default().ttl.as_secs()
+    )]
+    pub ttl_secs: u64,
+
+    /// Providers polled at once.
+    #[arg(
+        id = "model_discovery_concurrency",
+        long = "model-discovery-concurrency",
+        env = "GRID_MODEL_DISCOVERY_CONCURRENCY",
+        default_value_t = crate::served_models::DiscoveryConfig::default().concurrency
+    )]
+    pub concurrency: usize,
 }
 
 /// Signals serving and peer polling options, used under signalTransport poll.
@@ -321,6 +383,15 @@ pub struct SignalsArgs {
     )]
     pub peer_slow_ms: u64,
 
+    /// How long a published site signal is served, seconds.
+    #[arg(
+        id = "signals_ttl_secs",
+        long = "signals-ttl-secs",
+        env = "GRID_SIGNALS_TTL_SECS",
+        default_value_t = crate::controller::grid_network::DEFAULT_SITE_SIGNALS_TTL.as_secs()
+    )]
+    pub ttl_secs: u64,
+
     /// How long a polled peer signal is served, seconds.
     #[arg(
         long = "signals-peer-ttl-secs",
@@ -359,6 +430,12 @@ impl SignalsArgs {
         Duration::from_millis(ms.max(50))
     }
 
+    /// Site signal lifetime, at least one second.
+    #[must_use]
+    pub fn site_ttl(&self) -> Duration {
+        Duration::from_secs(self.ttl_secs.max(1))
+    }
+
     /// Peer signal lifetime, at least one second.
     #[must_use]
     pub fn peer_ttl(&self) -> Duration {
@@ -394,7 +471,7 @@ mod tests {
         }
     }
 
-    use std::collections::HashSet;
+    use std::{collections::HashSet, time::Duration};
 
     use clap::{CommandFactory as _, Parser as _};
 
@@ -454,6 +531,39 @@ mod tests {
             parse(&["--signals-max-handshakes-per-source", "0"]).is_err(),
             "zero is refused"
         );
+    }
+
+    /// Settings that once fell back to a default on a bad value keep that default and refuse
+    /// the bad value.
+    #[test]
+    fn ttl_and_discovery_settings_keep_defaults_and_refuse_garbage() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["grid-operator"])?;
+        assert_eq!(cli.signals.site_ttl(), Duration::from_secs(30));
+        assert_eq!(cli.swim.dead_member_ttl(), Duration::from_secs(300));
+        let discovery = &cli.model_discovery;
+        assert_eq!(
+            (
+                discovery.interval_secs,
+                discovery.timeout_secs,
+                discovery.ttl_secs,
+                discovery.concurrency
+            ),
+            (60, 5, 180, 8)
+        );
+        for flag in [
+            "--signals-ttl-secs",
+            "--swim-dead-member-ttl-secs",
+            "--model-discovery-interval-secs",
+            "--model-discovery-timeout-secs",
+            "--model-discovery-ttl-secs",
+            "--model-discovery-concurrency",
+        ] {
+            assert!(
+                Cli::try_parse_from(["grid-operator", flag, "30s"]).is_err(),
+                "{flag} refuses an unreadable value"
+            );
+        }
+        Ok(())
     }
 
     /// The peer endpoint port is a real port.

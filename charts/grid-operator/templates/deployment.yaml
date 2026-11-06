@@ -108,6 +108,10 @@ spec:
             - name: GRID_SWIM_REQUIRE_KEY
               value: "false"
             {{- end }}
+            {{- with .Values.swim.deadMemberTtlSeconds }}
+            - name: GRID_SWIM_DEAD_MEMBER_TTL_SECS
+              value: {{ . | quote }}
+            {{- end }}
             {{- $podAdvertise := printf "$(POD_IP):%s" (splitList ":" .Values.swim.bindAddress | last) }}
             - name: GRID_SWIM_ADVERTISE_ADDR
               value: {{ .Values.swim.advertiseAddress | default $podAdvertise | quote }}
@@ -160,8 +164,24 @@ spec:
             {{- end }}
             - name: GRID_GATEWAY_DISCOVERY_ENABLED
               value: {{ (ne (toString .Values.gateway.discoveryEnabled) "false") | quote }}
+            {{- with (.Values.modelDiscovery).intervalSeconds }}
+            - name: GRID_MODEL_DISCOVERY_INTERVAL_SECS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with (.Values.modelDiscovery).timeoutSeconds }}
+            - name: GRID_MODEL_DISCOVERY_TIMEOUT_SECS
+              value: {{ . | quote }}
+            {{- end }}
             {{- with (.Values.modelDiscovery).ttlSeconds }}
             - name: GRID_MODEL_DISCOVERY_TTL_SECS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with (.Values.modelDiscovery).concurrency }}
+            - name: GRID_MODEL_DISCOVERY_CONCURRENCY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with (.Values.signals).ttlSeconds }}
+            - name: GRID_SIGNALS_TTL_SECS
               value: {{ . | quote }}
             {{- end }}
             {{- /* Start in the modes the install declares, so its GridNetwork appearing restarts nothing. */}}

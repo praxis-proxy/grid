@@ -35,3 +35,56 @@ tests:
       modelDiscovery.ttlSeconds: 31536001
     asserts:
       - failedTemplate: {}
+
+  - it: sets each discovery setting only when asked
+    set:
+      modelDiscovery.intervalSeconds: 30
+      modelDiscovery.timeoutSeconds: 10
+      modelDiscovery.concurrency: 4
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_MODEL_DISCOVERY_INTERVAL_SECS, value: "30"}
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_MODEL_DISCOVERY_TIMEOUT_SECS, value: "10"}
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_MODEL_DISCOVERY_CONCURRENCY, value: "4"}
+
+  - it: refuses a discovery timeout past the operator's one-hour cap
+    set:
+      modelDiscovery.timeoutSeconds: 3601
+    asserts:
+      - failedTemplate: {}
+
+  - it: sets the signal and dead member TTLs only when asked
+    set:
+      signals.ttlSeconds: 60
+      swim.deadMemberTtlSeconds: 600
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_SIGNALS_TTL_SECS, value: "60"}
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_SWIM_DEAD_MEMBER_TTL_SECS, value: "600"}
+
+  - it: leaves the signal and dead member TTLs to the operator when unset
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SIGNALS_TTL_SECS
+          any: true
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SWIM_DEAD_MEMBER_TTL_SECS
+          any: true
+
+  - it: refuses a zero signal TTL
+    set:
+      signals.ttlSeconds: 0
+    asserts:
+      - failedTemplate: {}

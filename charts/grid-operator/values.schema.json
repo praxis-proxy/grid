@@ -453,6 +453,20 @@
           "type": "boolean",
           "description": "Hold SWIM traffic until the GridNetwork key loads or the network declares none. false opts out."
         },
+        "deadMemberTtlSeconds": {
+          "description": "Seconds a dead SWIM member stays tracked before eviction, 1 to 99999. Empty keeps the operator default.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 99999
+            },
+            {
+              "type": "string",
+              "pattern": "^$|^[1-9][0-9]{0,4}$"
+            }
+          ]
+        },
         "siteName": {
           "type": "string",
           "description": "Bootstrap SWIM site name override."
@@ -615,6 +629,20 @@
             }
           ]
         },
+        "ttlSeconds": {
+          "description": "Seconds a published site signal is served before it expires, 1 to 99999. Also sets the default readiness window, half of it. Empty keeps the operator default.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 99999
+            },
+            {
+              "type": "string",
+              "pattern": "^$|^[1-9][0-9]{0,4}$"
+            }
+          ]
+        },
         "scrapeIntervalSeconds": {
           "description": "Seconds between scrapes of this site's own EPPs, 1 to 99999. Local and unicast, so it costs one request per provider per interval. Empty keeps the operator default.",
           "oneOf": [
@@ -724,6 +752,48 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "intervalSeconds": {
+          "description": "Seconds between discovery rounds, 1 to 2592000. Empty keeps the operator default.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2592000
+            },
+            {
+              "type": "string",
+              "pattern": "^$|^[1-9][0-9]{0,6}$"
+            }
+          ]
+        },
+        "timeoutSeconds": {
+          "description": "Seconds one provider poll may take, 1 to 3600. Empty keeps the operator default.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3600
+            },
+            {
+              "type": "string",
+              "pattern": "^$|^[1-9][0-9]{0,3}$"
+            }
+          ]
+        },
+        "concurrency": {
+          "description": "Providers polled at once, 1 to 999. Empty keeps the operator default.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 999
+            },
+            {
+              "type": "string",
+              "pattern": "^$|^[1-9][0-9]{0,2}$"
+            }
+          ]
+        },
         "ttlSeconds": {
           "description": "Seconds a discovered model set stays routable without a fresh poll, 1 to 31536000. Empty keeps the operator default.",
           "oneOf": [

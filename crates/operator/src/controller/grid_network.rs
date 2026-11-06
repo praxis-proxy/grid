@@ -161,6 +161,9 @@ pub struct OperatorCtx {
     /// How often the signals loop scrapes providers; a readiness window is at least two.
     scrape_interval: Duration,
 
+    /// How long a published site signal is served before it expires.
+    site_signals_ttl: Duration,
+
     /// Duration of each network's latest provider-scrape pass.
     ///
     /// Used to widen the readiness window when a pass takes longer than one
@@ -415,6 +418,7 @@ impl OperatorCtx {
             served_models: served_models::ServedModelStore::new(),
             readiness: readiness::ReadinessStore::default(),
             scrape_interval: Duration::ZERO,
+            site_signals_ttl: DEFAULT_SITE_SIGNALS_TTL,
             last_scrape_passes: std::sync::Mutex::new(HashMap::new()),
             signal_mode,
             serving_writes: WriteGate::default(),
@@ -543,6 +547,13 @@ impl OperatorCtx {
         self
     }
 
+    /// Record how long a published site signal is served.
+    #[must_use]
+    pub const fn with_site_signals_ttl(mut self, ttl: Duration) -> Self {
+        self.site_signals_ttl = ttl;
+        self
+    }
+
     /// Record how long one network's latest provider-scrape pass took.
     fn record_scrape_pass(&self, network: &str, duration: Duration) {
         let mut passes = self
@@ -649,17 +660,11 @@ impl OperatorCtx {
 // Signals (poll mode)
 // ---------------------------------------------------------------------------
 
-/// How long a published site signal is served before it expires.
+/// How long a published site signal is served before it expires, by default.
 ///
 /// Several scrape intervals, so a couple of missed scrapes do not erase what is
 /// known; absence, not a stale flag, is what tells a reader a writer stopped.
-fn site_signals_ttl() -> Duration {
-    let secs = std::env::var("GRID_SIGNALS_TTL_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(30);
-    Duration::from_secs(secs.max(1))
-}
+pub const DEFAULT_SITE_SIGNALS_TTL: Duration = Duration::from_secs(30);
 
 /// Scrape this site's providers once, write their readiness conditions, and, in Poll mode,
 /// publish the coarse signals observed.
@@ -952,7 +957,7 @@ fn readiness_stale_after(ctx: &OperatorCtx, provider: &InferenceProvider) -> Dur
         .as_ref()
         .and_then(|mc| mc.stale_metrics_seconds)
         .filter(|secs| *secs > 0)
-        .map_or_else(|| site_signals_ttl() / 2, |secs| Duration::from_secs(secs.into()))
+        .map_or_else(|| ctx.site_signals_ttl / 2, |secs| Duration::from_secs(secs.into()))
         .max(floor)
 }
 
@@ -1430,7 +1435,7 @@ fn publish_signals(ctx: &OperatorCtx, collected: HashMap<String, Vec<signals::Ob
             (provider, attributed)
         })
         .collect();
-    ctx.signals.refresh(attributed, site_signals_ttl());
+    ctx.signals.refresh(attributed, ctx.site_signals_ttl);
 }
 
 /// Client TLS for polling peer operators, built from the network's own trust.

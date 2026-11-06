@@ -97,7 +97,7 @@ annotation, which `crds.keep` set at that time.
 - Peers learn each site's signals endpoint over SWIM, and dial port 9091 on a
   site that advertises none.
 - The signals listener binds `[::]:9091`, or `0.0.0.0:9091` without IPv6.
-- Unparseable `GRID_SIGNALS_*` settings fail at startup.
+- Unparseable `GRID_SIGNALS_*`, `GRID_SWIM_DEAD_MEMBER_TTL_SECS` and `GRID_MODEL_DISCOVERY_*` settings fail at startup.
 
 ### Metrics over TLS
 
@@ -255,6 +255,7 @@ namespace names in `metricsListener.fromNamespaces`, and on OpenShift defaults t
 | `swim.bindAddress` | string | `0.0.0.0:7946` | SWIM protocol bind address. |
 | `swim.advertiseAddress` | string | `""` | Externally reachable SWIM address. Defaults to the SWIM Service LoadBalancer address, else Pod IP. |
 | `swim.requireKey` | bool | `true` | Hold SWIM traffic until the GridNetwork key loads or the network declares none. |
+| `swim.deadMemberTtlSeconds` | int or string | `""` | Seconds a dead SWIM member stays tracked before eviction, 1 to 99999, as `GRID_SWIM_DEAD_MEMBER_TTL_SECS`. Empty keeps the operator's 300s. |
 | `swim.siteName` | string | `""` | Bootstrap SWIM site name. |
 | `swim.seeds` | string | `""` | Bootstrap SWIM seed endpoints, separated by spaces or commas. A bare host or address gets `swim.service.port`; `host:port` and `[ipv6]:port` are taken as given. |
 | `swim.service.enabled` | bool | `false` | Create a SWIM Service. |
@@ -284,6 +285,7 @@ namespace names in `metricsListener.fromNamespaces`, and on OpenShift defaults t
 | `signals.route.rateLimit.enabled` | bool | `true` | Render the router's per-source connection limits. Required when signals are exposed through a Route: without them the listener is open to anyone who can reach the router. |
 | `signals.route.rateLimit.concurrentTcp` | int | `10` | Concurrent TCP connections per source IP, in the router. |
 | `signals.route.rateLimit.rateTcp` | int | `20` | TCP connection rate per source IP, in the router's rate window. |
+| `signals.ttlSeconds` | int or string | `""` | Seconds a published site signal is served before it expires, 1 to 99999, as `GRID_SIGNALS_TTL_SECS`. Half of it is the default readiness window, so it applies with signals off too. Empty keeps the operator's 30s. |
 | `signals.peerIntervalSeconds` | int or string | `""` | Seconds between peer signal polls, 1 to 99999, as `GRID_SIGNALS_PEER_INTERVAL_SECS`. Every site polls every other alive site, so a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator's own default. |
 | `signals.scrapeIntervalSeconds` | int or string | `""` | Seconds between scrapes of this site's own EPPs. Empty keeps the operator's 1s. |
 | `gateway.address` | string | `""` | Advertised site gateway `host:port` override. Use it when the site gateway Service is not a LoadBalancer. Maps to `GRID_GATEWAY_ADDRESS`. |
@@ -293,6 +295,9 @@ namespace names in `metricsListener.fromNamespaces`, and on OpenShift defaults t
 | `gateway.port` | string | `""` | Site gateway Service port override. Empty uses the first Service `spec.ports` entry, with `8080` as the fallback if no usable port exists. Maps to `GRID_GATEWAY_PORT`. |
 | `gateway.praxisConfig` | object | `{}` | `consumerGateways[].praxisConfig` for the site gateway on the rendered GridNetwork, as the CRD takes it. Empty renders no block. |
 | `gateway.discoveryEnabled` | bool | `true` | Discover and advertise a LoadBalancer address for the site gateway. Maps to `GRID_GATEWAY_DISCOVERY_ENABLED`. |
+| `modelDiscovery.intervalSeconds` | int or string | `""` | Seconds between discovery rounds, 1 to 2592000, as `GRID_MODEL_DISCOVERY_INTERVAL_SECS`. Empty keeps the operator's 60s. |
+| `modelDiscovery.timeoutSeconds` | int or string | `""` | Seconds one provider poll may take, 1 to 3600, as `GRID_MODEL_DISCOVERY_TIMEOUT_SECS`. Empty keeps the operator's 5s. |
+| `modelDiscovery.concurrency` | int or string | `""` | Providers polled at once, 1 to 999, as `GRID_MODEL_DISCOVERY_CONCURRENCY`. Empty keeps the operator's 8. |
 | `modelDiscovery.ttlSeconds` | int or string | `""` | Seconds a discovered model set stays routable without a fresh poll, 1 to 31536000, as `GRID_MODEL_DISCOVERY_TTL_SECS`. The operator raises it to cover one poll round. Empty keeps the operator's 180s. |
 | `health.liveness.initialDelaySeconds` | int | `5` | Liveness probe initial delay. |
 | `health.liveness.periodSeconds` | int | `10` | Liveness probe period. |
