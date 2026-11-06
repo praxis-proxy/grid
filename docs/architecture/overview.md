@@ -308,7 +308,7 @@ modes and full exchange.
 
 SWIM membership is **site-granular**: each AGN Operator is a single SWIM node
 carrying its site's identity, and SWIM members are *other sites'* operators - not
-the gateways, providers, or pods inside a site. Seeds (`GridNetwork.spec.seeds`)
+the gateways, providers, or pods inside a site. Seeds (`GridNetwork.spec.membership.swim.seeds`)
 point at other sites, and the operator filters out its own address, so a lone
 site legitimately forms a **single-node mesh with zero peers**.
 

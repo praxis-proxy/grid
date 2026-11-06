@@ -1,10 +1,10 @@
 # 0.3.x CRD Field Migration
 
-The 0.3.x release accepts both the previous and current names for CRD spec
-fields. The `grid-site` and `grid-operator` charts also translate previous
-value names when they render resources. The previous names are deprecated and
-will be removed in a later release. Migrate custom resources and Helm values before
-upgrading to 0.3.x.
+The 0.3.x release accepts both the previous and current names for the aliased
+CRD spec fields below. The `grid-site` and `grid-operator` charts also translate
+previous value names when they render resources. The SWIM field move is a
+breaking change in 0.3.0 and is documented separately below. Migrate custom
+resources and Helm values before upgrading to 0.3.x.
 
 Do not set both names for one field. The API schema and chart reject conflicting
 old and new names.
@@ -45,8 +45,28 @@ old and new names.
 
 ## Upgrade to 0.3.x
 
-Existing CRD spec field names and chart values remain accepted in 0.3.x.
-Update manifests and Helm values to the current names when convenient.
+Existing aliased CRD spec field names and chart values remain accepted in 0.3.x.
+Update manifests and Helm values to the current names when convenient. For the
+breaking SWIM field move, update manifests before applying the 0.3.0 CRD:
+
+```yaml
+spec:
+  membership:
+    mode: Swim
+    swim:
+      seeds:
+        - east.example:7946
+```
+
+Move the old `spec.seeds` list to `spec.membership.swim.seeds` and declare
+`membership.mode: Swim`. The old top-level `spec.seeds` and `spec.swim` fields
+are removed without aliases. The old `spec.swim` tuning values were not wired
+to the SWIM runtime and are no longer supported. For `membership.mode: Local`,
+remove the seed and tuning fields; Local does not use SWIM configuration.
+
+The `grid-site` chart continues to accept `gridNetwork.seeds` and renders it at
+the new field path. Remove any `gridNetwork.swim` tuning values from chart
+values.
 
 Status fields and reasons change in 0.3.x without legacy aliases. Update scripts
 and dashboards that read them during the 0.3.x upgrade, including
