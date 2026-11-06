@@ -7,6 +7,9 @@ admin, and what each hop trusts. [Site Enrollment](../installation/enrollment.md
 the install procedure. [Authentication and Access Policy](auth.md) covers what
 the certificate is used for once a site has one.
 
+See the [certificate lifecycle reference](certificates/README.md) for ownership,
+validity periods, rotation triggers, and installation dependencies.
+
 ## Personas
 
 | Persona | Who | Part in enrollment |
