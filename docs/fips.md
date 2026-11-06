@@ -75,6 +75,86 @@ digest. Setup-time certificate generation uses rcgen in the environment setup
 tooling, not the operator runtime. Neither is identity, authentication, or a
 signature.
 
-The binary inherits FIPS mode from the host and does not enable it. A build is
-FIPS only when it runs on a host with the OpenSSL FIPS provider active (kernel
-`fips=1` and the system crypto policy set to FIPS).
+## Startup verification
+
+The operator, overlay-sync, and enrollment binaries built with `fips` refuse
+normal startup unless all of the following hold:
+
+- The process's default OpenSSL library context has `fips=yes` enabled.
+- The FIPS provider can supply SHA-256, and a SHA-256 known-answer check passes
+  through the default context used by the binaries.
+- `/proc/sys/crypto/fips_enabled` reports `1`.
+
+The container-visible `/etc/crypto-policies/config` is logged for diagnostics
+only. Its contents or absence do not determine startup eligibility; the
+effective OpenSSL configuration and kernel flag do.
+
+The checks run before Kubernetes clients, listeners, database connections, or
+certificate operations. Enrollment's bootstrap and invite commands also check
+before accessing state. Existing informational commands such as `--version`
+and the Clap-based `--help` commands remain available on ordinary build hosts.
+Default non-FIPS builds are unchanged. There is no runtime bypass for a FIPS
+binary, and `PRAXIS_REQUIRE_FIPS` is a separate gateway/Praxis setting.
+
+The verifier initializes OpenSSL's configured providers and reads the host
+configuration. It does not explicitly load providers, enable FIPS properties,
+or change the host crypto policy. Configure the host and
+container before starting a FIPS binary; a missing or disabled provider is a
+startup error, rather than a fallback to the default provider. Merely setting
+`fips=yes` without an available FIPS provider is also insufficient.
+
+This verifies startup prerequisites, not complete FIPS compliance. It does not
+prove every crypto path is within a validated module, nor replace qualification
+on a FIPS-enabled RHEL host. In particular, the separate SWIM crypto work in
+[#163] and real-host gateway qualification in [#507] remain relevant. Unit and
+subprocess tests on ordinary hosts establish refusal behavior, not successful
+operation in an approved environment.
+
+### Container crypto-policy diagnostics
+
+The kernel flag comes from the host, while `/etc/crypto-policies/config` is
+read from the container filesystem. A valid OpenShift FIPS node can expose
+`DEFAULT` there inside a container. The pinned UBI 9 minimal amd64 image also
+ships that value. This file alone does not describe the process's effective
+OpenSSL configuration, so it is not a startup requirement. Missing or
+unreadable policy files produce a diagnostic warning and do not refuse startup.
+
+Configure every FIPS runtime container according to its platform's supported
+FIPS deployment procedure, including overlay-sync sidecars and enrollment
+Jobs/init containers. See [Red Hat's container FIPS guidance][container-fips].
+The verifier does not modify crypto policies or compensate for an unavailable
+provider. A `FIPS` policy-file value cannot bypass the mandatory kernel and
+effective OpenSSL checks.
+
+Successful operation on an approved RHEL/OpenShift FIPS host has not been
+validated locally and remains part of deployment qualification.
+
+### Unsafe-code exception for review
+
+`grid-fips` retains the workspace's `unsafe_code = "forbid"` policy. Its tiny
+`grid-openssl-fips` dependency (`crates/fips/openssl`) is deliberately excluded
+from workspace lint inheritance, so the exception does not relax other crates.
+That leaf crate denies unsafe code except for one documented, read-only call
+to `EVP_default_properties_is_fips_enabled(NULL)`. The safe Rust OpenSSL 3 API
+does not currently expose this [OpenSSL getter][fips-property-query].
+Checking an `openssl` subprocess would
+not establish the configuration of the running binary's library context.
+
+The wrapper initializes OpenSSL first and passes the documented null selector
+for the default context. It retains no pointers or buffers and changes no
+properties. Binaries call it during startup, before their application tasks;
+they do not concurrently modify OpenSSL default properties. The leaf crate's
+`runtime` feature requires OpenSSL 3 or newer and uses the same system
+`openssl-sys` dependency as the safe OpenSSL calls.
+Without that feature, default workspace builds do not link or probe OpenSSL
+through either startup-helper crate.
+
+Replace the wrapper and remove this exception when an upstream safe getter is
+available. Do not extend the leaf crate with unrelated FFI.
+
+[#163]: https://github.com/praxis-proxy/grid/issues/163
+[#507]: https://github.com/praxis-proxy/grid/issues/507
+[fips-property-query]:
+  https://docs.openssl.org/3.0/man3/EVP_set_default_properties/
+[container-fips]:
+  https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/security_hardening/switching-rhel-to-fips-mode_security-hardening
