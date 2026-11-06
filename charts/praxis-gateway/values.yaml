@@ -138,6 +138,10 @@ praxisConfig:
     configMapName: ""
     # -- Key within configMapName that holds praxis.yaml.
     key: "praxis.yaml"
+    # -- Render inline as a Helm template (tpl) against this chart's context, so it can
+    # reference values such as {{ .Release.Name }} or {{ .Values.global.* }} from a parent
+    # chart. Escape literal {{ as {{ "{{" }}.
+    tpl: false
     # -- Praxis configuration the chart stores in its own ConfigMap when configMapName
     # is empty. Changing it rolls the pods. One listener must bind port.containerPort,
     # or the install fails. The default answers GET / with a small JSON status and

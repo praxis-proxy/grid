@@ -160,6 +160,36 @@ A few things to keep in mind:
   renders and running `helm upgrade` rolls the pods onto the new configuration
   without refusing requests (see `shutdownDelaySeconds`).
 
+### Templated inline config
+
+Set `praxisConfig.byo.tpl: true` to render `praxisConfig.byo.inline` with Helm's
+`tpl` against this chart's context. This lets a parent chart that depends on
+`praxis-gateway` fill the config from its own values through `global`:
+
+```yaml
+global:
+  backendHost: api.openai.com
+praxis-gateway:
+  praxisConfig:
+    byo:
+      tpl: true
+      inline: |
+        listeners:
+          - name: default
+            address: "0.0.0.0:8080"
+            filter_chains: [default]
+        filter_chains:
+          - name: default
+            filters:
+              - filter: load_balancer
+                clusters:
+                  - name: backend
+                    endpoints: ["{{ .Values.global.backendHost }}:443"]
+```
+
+Validation, probe detection, and the config checksum use the rendered result.
+Escape a literal `{{` in the Praxis config as `{{ "{{" }}`.
+
 ### Bring your own ConfigMap
 
 ```bash
@@ -264,6 +294,7 @@ Praxis AI image; these values may advance independently.
 | `praxisConfig.source` | string | `byo` | Source that writes `praxis.yaml`: `byo`, `operator`, or `render`. Set `render` explicitly for chart-generated Grid routing config. |
 | `praxisConfig.byo.configMapName` | string | `""` | ConfigMap with the Praxis config. Empty serves `praxisConfig.byo.inline`. Editing it does not restart the pods. |
 | `praxisConfig.byo.key` | string | `praxis.yaml` | Key in the BYO ConfigMap. |
+| `praxisConfig.byo.tpl` | bool | `false` | Render `praxisConfig.byo.inline` with `tpl` against this chart's context. |
 | `praxisConfig.byo.inline` | string | answers `GET /` with a JSON status, else 404 | Praxis config stored in a chart-managed ConfigMap when `praxisConfig.byo.configMapName` is empty. Changing it rolls the pods. |
 | `praxisConfig.operator.configMapName` | string | `""` | Operator-created ConfigMap. Empty uses `praxis-consumer-config`. |
 | `praxisConfig.operator.allowUnauthenticatedExposure` | bool | `false` | Allow a LoadBalancer or NodePort Service for the operator's unauthenticated `praxis.yaml`. |

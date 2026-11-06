@@ -301,11 +301,24 @@ byoInline
 {{- end }}
 
 {{/*
+praxisConfig.byo.inline, rendered with tpl against the chart's root context when
+praxisConfig.byo.tpl is true.
+*/}}
+{{- define "praxis-gateway.byoInline" -}}
+{{- $inline := toString (.Values.praxisConfig.byo.inline | default "") -}}
+{{- if .Values.praxisConfig.byo.tpl -}}
+{{- tpl $inline . -}}
+{{- else -}}
+{{- $inline -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Fail early on a blank or unparseable praxisConfig.byo.inline, or one with no listener on
 port.containerPort, instead of a pod that crash-loops or never turns ready.
 */}}
 {{- define "praxis-gateway.validateInlineConfig" -}}
-{{- $inline := toString (.Values.praxisConfig.byo.inline | default "") }}
+{{- $inline := include "praxis-gateway.byoInline" . }}
 {{- if not (trim $inline) }}
 {{- fail "praxisConfig.byo.inline is empty: set it to a Praxis configuration, or set praxisConfig.byo.configMapName" }}
 {{- end }}
@@ -594,7 +607,7 @@ or nothing.
 {{- $v := .Values -}}
 {{- if or (and (eq $v.praxisConfig.source "render") $v.praxisConfig.render.backends) (include "praxis-gateway.gridServing" . | fromYaml).enabled -}}
 true
-{{- else if and (eq $v.praxisConfig.source "byo") (not $v.praxisConfig.byo.configMapName) ((fromYaml ($v.praxisConfig.byo.inline | default "")).clusters) -}}
+{{- else if and (eq $v.praxisConfig.source "byo") (not $v.praxisConfig.byo.configMapName) ((fromYaml (include "praxis-gateway.byoInline" .)).clusters) -}}
 true
 {{- end -}}
 {{- end }}
@@ -652,7 +665,7 @@ nothing. Emits "true" or nothing.
 {{- define "praxis-gateway.maybeTLSListener" -}}
 {{- $v := .Values -}}
 {{- if and (eq $v.praxisConfig.source "byo") (not $v.praxisConfig.byo.configMapName) -}}
-{{- range ((fromYaml ($v.praxisConfig.byo.inline | default "")).listeners | default list) -}}
+{{- range ((fromYaml (include "praxis-gateway.byoInline" .)).listeners | default list) -}}
 {{- if .tls }}true{{ end -}}
 {{- end -}}
 {{- end -}}
@@ -675,7 +688,7 @@ config, else praxisConfig.byo.inline. A BYO ConfigMap is opaque, so it yields no
 {{- if eq $v.praxisConfig.source "render" -}}
 {{- $addr = include "praxis-gateway.renderedAdminAddress" . -}}
 {{- else if and (eq $v.praxisConfig.source "byo") (not $v.praxisConfig.byo.configMapName) -}}
-{{- $admin := ((fromYaml ($v.praxisConfig.byo.inline | default "")).admin | default dict) -}}
+{{- $admin := ((fromYaml (include "praxis-gateway.byoInline" .)).admin | default dict) -}}
 {{- $addr = ($admin.metrics_address | default $admin.address | default "") | toString -}}
 {{- end -}}
 {{- if regexMatch "^(127\\.0\\.0\\.1|localhost|0\\.0\\.0\\.0):[0-9]+$" $addr -}}

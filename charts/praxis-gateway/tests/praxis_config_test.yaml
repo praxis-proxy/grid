@@ -259,3 +259,56 @@ tests:
     asserts:
       - matchRegexRaw:
           pattern: no caller authentication
+
+  - it: byo tpl renders inline against chart values
+    template: templates/configmap.yaml
+    set:
+      global.backend: api.example.com
+      praxisConfig.byo.tpl: true
+      praxisConfig.byo.inline: |
+        listeners:
+          - name: default
+            address: "0.0.0.0:8080"
+            filter_chains: [default]
+        filter_chains:
+          - name: default
+            filters:
+              - filter: load_balancer
+                clusters:
+                  - name: backend
+                    endpoints: ["{{ .Values.global.backend }}:443"]
+        # {{ .Release.Name }}
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'endpoints: \["api\.example\.com:443"\]'
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: '# praxis-gateway'
+
+  - it: byo inline is not templated by default
+    template: templates/configmap.yaml
+    set:
+      praxisConfig.byo.inline: |
+        listeners:
+          - name: default
+            address: "0.0.0.0:8080"
+            filter_chains: [default]
+        # {{ .Release.Name }}
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: '# \{\{ \.Release\.Name \}\}'
+
+  - it: byo tpl validates the rendered listener port
+    template: templates/deployment.yaml
+    set:
+      global.port: 8080
+      praxisConfig.byo.tpl: true
+      praxisConfig.byo.inline: |
+        listeners:
+          - name: default
+            address: "0.0.0.0:{{ .Values.global.port }}"
+            filter_chains: [default]
+    asserts:
+      - notFailedTemplate: {}

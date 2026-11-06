@@ -51,7 +51,7 @@ spec:
       {{- /* A changed chart-rendered config must reach new pods: the hash rolls the Deployment. */}}
       {{- if eq $configSource "byoInline" }}
       {{- /* A changed praxisConfig.byo.inline must reach new pods: the hash rolls the Deployment. */}}
-      {{- $_ := set $podAnnotations "checksum/config" (toString .Values.praxisConfig.byo.inline | sha256sum) }}
+      {{- $_ := set $podAnnotations "checksum/config" (include "praxis-gateway.byoInline" . | sha256sum) }}
       {{- else if eq $configSource "render" }}
       {{- $_ := set $podAnnotations "checksum/config" (include "praxis-gateway.gatewayConfigData" . | sha256sum) }}
       {{- end }}
