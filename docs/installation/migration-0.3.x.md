@@ -3,9 +3,10 @@
 The 0.3.x release accepts both the previous and current names for the aliased
 CRD spec fields below. The `grid-site` and `grid-operator` charts also translate
 previous value names when they render resources. The SWIM field move is a
-breaking change in 0.3.0 and is documented separately below. Migrate custom
-resources before applying the 0.3.0 CRD. Update the aliased names below during
-the 0.3.x compatibility window.
+breaking change in 0.3.0 and is documented separately below. Save existing
+SWIM seeds before applying the 0.3.0 CRD, then move them to the new field as
+soon as the CRD is applied. Update the aliased names below during the 0.3.x
+compatibility window.
 
 Do not set both names for one field. The API schema and chart reject conflicting
 old and new names.
@@ -48,7 +49,11 @@ old and new names.
 
 Existing aliased CRD spec field names and chart values remain accepted in 0.3.x.
 Update manifests and Helm values to the current names when convenient. For the
-breaking SWIM field move, update manifests before applying the 0.3.0 CRD:
+breaking SWIM field move, record each existing `spec.seeds` list before
+applying the 0.3.0 CRD. Do not move the seeds beforehand: the old CRD prunes
+`membership.swim`, so the update would be discarded. Applying the new CRD
+prunes `spec.seeds`, so restore the saved list at the new path immediately
+after the CRD is applied:
 
 ```yaml
 spec:
@@ -59,11 +64,12 @@ spec:
         - east.example:7946
 ```
 
-Move the old `spec.seeds` list to `spec.membership.swim.seeds` and declare
-`membership.mode: Swim`. The old top-level `spec.seeds` and `spec.swim` fields
-are removed without aliases. The old `spec.swim` tuning values were not wired
-to the SWIM runtime and are no longer supported. For `membership.mode: Local`,
-remove the seed and tuning fields; Local does not use SWIM configuration.
+Set `membership.mode: Swim` and restore the saved list at
+`spec.membership.swim.seeds` immediately after applying the new CRD. The old
+top-level `spec.seeds` and `spec.swim` fields are removed without aliases. The
+old `spec.swim` tuning values were not wired to the SWIM runtime and are no
+longer supported. For `membership.mode: Local`, remove the seed and tuning
+fields; Local does not use SWIM configuration.
 
 The `grid-site` chart continues to accept `gridNetwork.seeds` and renders it at
 the new field path. Remove any `gridNetwork.swim` tuning values from chart
@@ -91,13 +97,17 @@ as an additional prerequisite to the operator upgrade below.
 
 [sovereignty-rollout]: ../architecture/routing.md#gateway-first-rollout
 
-Upgrade CRDs and charts in this order:
+Upgrade CRDs, custom resources, and charts in this order:
 
-1. Apply the 0.3.x CRDs first. When the platform owns the CRDs, apply the
-   chart's CRD templates before installing the charts with `crds.enabled=false`.
-2. Upgrade `grid-operator`.
-3. Upgrade `grid-site`.
-4. Apply custom resources and Helm values using the current field names.
+1. Record existing `spec.seeds` lists, then apply the 0.3.x CRDs. When the
+   platform owns the CRDs, apply the chart's CRD templates before installing
+   the charts with `crds.enabled=false`.
+2. Immediately apply Swim `GridNetwork` resources with the saved seeds at
+   `spec.membership.swim.seeds`; do this before upgrading either chart.
+3. Upgrade `grid-operator`.
+4. Upgrade `grid-site`.
+5. Apply remaining custom resources and Helm values using the current field
+   names.
 
 For a rollback, roll back `grid-site` before `grid-operator` so the older
 operator does not receive current field names. Restore custom resources and
