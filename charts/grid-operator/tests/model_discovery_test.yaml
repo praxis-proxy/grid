@@ -124,3 +124,37 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].env
           content: {name: GRID_MODEL_DISCOVERY_TTL_SECS, value: "1000000"}
+
+  - it: refuses a quoted value past each maximum, as it refuses the bare one
+    set:
+      modelDiscovery.timeoutSeconds: "3601"
+    asserts:
+      - failedTemplate: {}
+
+  - it: refuses a quoted interval past the maximum
+    set:
+      modelDiscovery.intervalSeconds: "2592001"
+    asserts:
+      - failedTemplate: {}
+
+  - it: refuses a quoted model TTL past the maximum
+    set:
+      modelDiscovery.ttlSeconds: "31536001"
+    asserts:
+      - failedTemplate: {}
+
+  - it: renders each quoted maximum
+    set:
+      modelDiscovery.intervalSeconds: "2592000"
+      modelDiscovery.timeoutSeconds: "3600"
+      modelDiscovery.ttlSeconds: "31536000"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_MODEL_DISCOVERY_INTERVAL_SECS, value: "2592000"}
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_MODEL_DISCOVERY_TIMEOUT_SECS, value: "3600"}
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_MODEL_DISCOVERY_TTL_SECS, value: "31536000"}
