@@ -2150,7 +2150,7 @@ jobs:
             echo "| **Topology** | \`${TOPOLOGY}\` at tested Grid SHA |"
             echo "| **Mode** | \`${MODE}\` |"
             if [[ "${QUALIFICATION}" == "combined-site" ]]; then
-              echo "| **Operator crypto backend** | OpenSSL (`fips` feature) |"
+              echo "| **Operator crypto backend** | OpenSSL (\`fips\` feature) |"
             fi
             echo "| **Membership** | \`${MEMBERSHIP}\` |"
             echo "| **Qualification result** | ${QUALIFICATION_DISPLAY_RESULT} |"
