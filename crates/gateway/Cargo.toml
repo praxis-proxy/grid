@@ -35,11 +35,11 @@ openssl = "0.10.0"
 # filter dependency also uses these crates, so patch the registry packages to
 # prevent a second, unconfigured copy from entering the gateway.
 [patch.crates-io]
-praxis-proxy = { git = "https://github.com/praxis-proxy/praxis", rev = "908b5a7d279b0b74d5b582ea124bb2d44514c235" }
-praxis-proxy-core = { git = "https://github.com/praxis-proxy/praxis", rev = "908b5a7d279b0b74d5b582ea124bb2d44514c235" }
-praxis-proxy-filter = { git = "https://github.com/praxis-proxy/praxis", rev = "908b5a7d279b0b74d5b582ea124bb2d44514c235" }
-praxis-proxy-protocol = { git = "https://github.com/praxis-proxy/praxis", rev = "908b5a7d279b0b74d5b582ea124bb2d44514c235" }
-praxis-proxy-tls = { git = "https://github.com/praxis-proxy/praxis", rev = "908b5a7d279b0b74d5b582ea124bb2d44514c235" }
+praxis-proxy = { git = "https://github.com/praxis-proxy/praxis", rev = "8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6" }
+praxis-proxy-core = { git = "https://github.com/praxis-proxy/praxis", rev = "8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6" }
+praxis-proxy-filter = { git = "https://github.com/praxis-proxy/praxis", rev = "8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6" }
+praxis-proxy-protocol = { git = "https://github.com/praxis-proxy/praxis", rev = "8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6" }
+praxis-proxy-tls = { git = "https://github.com/praxis-proxy/praxis", rev = "8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6" }
 
 [workspace.lints.rust]
 dead_code = "deny"
