@@ -413,7 +413,8 @@ The metrics listener serves the Praxis registry, including the grid gateway's ow
 |--------|--------|---------|
 | `grid_metrics_auth_total` | `result` | Gateway metrics scrape outcomes: `missing`, `allowed`, `unauthenticated`, `forbidden`, `overloaded`, and `api_error`. |
 | `grid_metrics_auth_in_flight` | | Kubernetes TokenReview and SubjectAccessReview requests currently running for scrapes. |
-| `grid_route_decisions_total` | `site`, `reason` | Requests `grid_site_route` decided. `site` is a site name from the serving config, or empty for a refusal. No label comes from the request. |
+| `grid_route_decisions_total` | `site`, `cluster`, `reason` | Requests `grid_site_route` decided. `site` and `cluster` come from the serving config, and both are empty for a refusal. No label comes from the request. |
+| `grid_route_candidate_info` | `site`, `cluster`, `model` | 1 while `grid_site_route` routes the model to that site's cluster, 0 once it no longer does. Join on `site` and `cluster` to name a per-site series. |
 | `grid_route_site_score` | `site`, `cluster` | The queue depth the last route order used for each candidate, lower first. `inf` when unmeasured, `NaN` when excluded or demoted, or when the pair left the topology. |
 | `grid_route_site_score_unavailable` | `site`, `cluster`, `reason` | One-hot reason an otherwise routable load-publishing site has no queue score: `absent`, `stale`, or `unreadable`. Metric names are not labels. |
 
