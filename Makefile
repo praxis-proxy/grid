@@ -79,7 +79,7 @@ gateway-lint:
 
 # Compile and assess Policy profiles; runtime validation needs a FIPS provider.
 gateway-fips-check:
-	@set -eu; for features in fips fips,policy-jwt-fips; do \
+	@set -eu; for features in fips fips,policy-jwt-fips policy-jwt-fips; do \
 	  cargo check --locked --manifest-path crates/gateway/Cargo.toml --workspace --all-targets --no-default-features --features "$$features"; \
 	  cargo test --locked --manifest-path crates/gateway/Cargo.toml --no-default-features --features "$$features" --test policy_build_contract; \
 	  tree="$$(cargo tree --locked --manifest-path crates/gateway/Cargo.toml -p gateway --no-default-features --features "$$features" -e normal,build --target all --prefix none --format '{p}')"; \
