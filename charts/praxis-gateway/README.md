@@ -309,6 +309,7 @@ operator expects.
 | `imagePullSecrets` | list | `[]` | Pull secrets for private registries. |
 | `log.level` | string | `""` | Level for every module, rendered as RUST_LOG on the gateway and overlay-sync: off, error, warn, info, debug, or trace, in any case. Empty leaves RUST_LOG unset, so the binaries use their info default. An `env` entry named RUST_LOG takes precedence on the gateway. |
 | `log.filter` | string | `""` | Full RUST_LOG directive, such as `info,praxis_filter=debug`. When set, it replaces `log.level`. |
+| `fips.required` | bool | `false` | Set `PRAXIS_REQUIRE_FIPS=1` on the gateway container. Requires a FIPS-safe Gateway build and a FIPS host. If a custom `env` entry sets `PRAXIS_REQUIRE_FIPS`, it must set the value to `"1"`. |
 | `nameOverride` | string | `""` | Override chart name. |
 | `fullnameOverride` | string | `""` | Override the fully qualified app name. Set it to the GridNetwork `consumerGateways[].name` when the operator targets this Service by name. |
 | `commonLabels` | object | `{}` | Labels added to all resources. |
@@ -470,6 +471,17 @@ authorization reviews. Its ServiceAccount can create `TokenReview` and
 overlay-sync are enabled, the overlay-sync RoleBinding grants that same
 ServiceAccount read access to the configured overlay ConfigMap. The Praxis
 container mounts the delivered overlay directory read-only.
+
+## FIPS startup enforcement
+
+Set `fips.required: true` to set `PRAXIS_REQUIRE_FIPS=1` on the Praxis
+container. The image must use a FIPS-safe Policy feature profile, and the host
+must have the kernel FIPS flag and system OpenSSL FIPS provider enabled. See
+[Grid FIPS support](../../docs/fips.md) for the supported Gateway build
+profiles and their limits. Grid does not yet publish a dedicated FIPS Gateway
+image; provide an image built with the required profile. A user `env` entry
+may repeat `PRAXIS_REQUIRE_FIPS=1`; other values and `valueFrom` are refused
+when `fips.required` is true.
 
 ## Optional uses
 
