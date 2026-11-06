@@ -1472,6 +1472,47 @@ mod tests {
     }
 
 
+    /// The same growth for a site that publishes no fullness, so it is read by learned bounds:
+    /// a hard bound the two-unit pool taught from a sustained backlog must not hold the
+    /// four-unit pool it became.
+    #[test]
+    fn a_learned_site_that_gained_units_drops_the_hard_bound_the_smaller_one_taught() {
+        let sites = EQUAL_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        grid.set_units(2.0);
+
+        // Carrying the site's capacity across two units with nothing waiting teaches the soft bound.
+        let taught = grid.refresh(&sites, NOW_MS, |spec| spec.capacity / 2.0, 0.0);
+        let soft: Vec<f64> = taught.candidates.iter().filter_map(|site| site.capacity).collect();
+
+        // Then it queues at half that for longer than the spell, which teaches a hard bound below.
+        let spell = AvailabilitySettings::default().full_after_ms.max(MIN_BACKLOG_SPELL_MS);
+        let mut bounded = taught;
+        for nth in 1..=(spell / REFRESH_MS + 5) {
+            bounded = grid.refresh(&sites, NOW_MS + nth * REFRESH_MS, |spec| spec.capacity / 4.0, 2.0);
+        }
+        let small: Vec<f64> = bounded.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert!(
+            small.iter().zip(&soft).all(|(bound, carried)| bound < carried),
+            "a sustained backlog at half what it carried holds the site below its soft bound: \
+             {small:?} against {soft:?}"
+        );
+
+        // It doubles and stays busy at the same count, so nothing queue-free retires the bound.
+        grid.set_units(4.0);
+        let start = spell / REFRESH_MS + 6;
+        let mut grown = bounded;
+        for nth in start..=(start + WINDOW_MS / REFRESH_MS + 4) {
+            grown = grid.refresh(&sites, NOW_MS + nth * REFRESH_MS, |spec| spec.capacity / 4.0, 2.0);
+        }
+        let large: Vec<f64> = grown.candidates.iter().filter_map(|site| site.capacity).collect();
+        assert!(
+            large.iter().zip(&small).all(|(after, before)| after > before),
+            "a learned site with twice the units is weighed above the bound the smaller one \
+             taught: {large:?} against {small:?}"
+        );
+    }
+
     /// Two congested samples are two observations, not one made of the worst of each.
     ///
     /// Both have a backlog, so filtering on that is not enough: the highest count among them

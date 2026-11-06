@@ -159,7 +159,7 @@ state, so two replicas agree only in steady state.
 | `grid_route_decisions_total` | counter | `site`, `cluster`, `reason` | Requests the gateway decided, by outcome. A refusal records an empty site and cluster. |
 | `grid_route_selections_total` | counter | `path` | Decisions by the path that produced them. |
 | `grid_route_site_rho` | gauge | `site`, `cluster` | Smoothed saturation used by the draw: the comparator for an llm-d site, otherwise in-flight over the learned ceiling. |
-| `grid_route_site_rho_reported` | gauge | `site`, `cluster` | The EPP's own pool saturation, published with flow control on; uncapped; `NaN` when absent. |
+| `grid_route_site_rho_reported` | gauge | `site`, `cluster` | The EPP's own pool saturation, published with flow control on. For a site without an in-flight count, the comparator it is read by. Uncapped; `NaN` where neither exists. |
 | `grid_route_site_rho_derived` | gauge | `site`, `cluster` | The gateway's approximation from pool averages: the larger of KV share widened by spread over 0.8 and waiting plus held per unit over 5; uncapped; `NaN` without a KV share. |
 | `grid_route_site_rho_published` | gauge | `site`, `cluster` | 1 when the comparator is the EPP's published value, 0 when it is the gateway's approximation; the two use different thresholds. |
 | `grid_route_site_capacity_implied` | gauge | `site`, `cluster` | Running over KV share at queue-free instants, for the dashboard only; `NaN` below a 0.15 share. |
