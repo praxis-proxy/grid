@@ -130,7 +130,24 @@ tests:
       signals.service.type: LoadBalancer
     asserts:
       - failedTemplate:
-          errorMessage: "signals.service.type LoadBalancer beside signals.route publishes the listener twice, on two addresses with different limits: pick the Route or the load balancer"
+          errorMessage: "signals.service.type LoadBalancer, set or inherited from swim.service.type, beside signals.route publishes the listener twice, on two addresses with different limits: pick the Route or the load balancer"
+
+  - it: refuses a LoadBalancer the signals Service inherits from swim.service.type
+    template: templates/route-signals.yaml
+    set:
+      swim.service.type: LoadBalancer
+    asserts:
+      - failedTemplate:
+          errorMessage: "signals.service.type LoadBalancer, set or inherited from swim.service.type, beside signals.route publishes the listener twice, on two addresses with different limits: pick the Route or the load balancer"
+
+  - it: renders the Route when signals.service.type overrides an inherited LoadBalancer
+    template: templates/route-signals.yaml
+    set:
+      swim.service.type: LoadBalancer
+      signals.service.type: ClusterIP
+    asserts:
+      - isKind:
+          of: Route
 
   - it: raises the handshake cap to the listener's share behind the router
     template: templates/deployment.yaml

@@ -490,7 +490,7 @@
               "additionalProperties": {
                 "type": "string"
               },
-              "description": "Annotations on the SWIM Service."
+              "description": "Annotations on the signals Service."
             },
             "loadBalancerIP": {
               "type": "string",
@@ -523,13 +523,13 @@
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Serve the mTLS signals endpoint, expose it on the SWIM Service, and set GRID_SIGNALS_LOCAL_ADDR. For signalTransport poll."
+          "description": "Serve the mTLS signals endpoint, expose it on the signals Service, and set GRID_SIGNALS_LOCAL_ADDR. For signalTransport poll."
         },
         "port": {
           "type": "integer",
           "minimum": 1,
           "maximum": 65535,
-          "description": "Signals TCP port on the SWIM Service, gossiped to peers with its LoadBalancer address."
+          "description": "Signals TCP port on the signals Service, gossiped to peers with its LoadBalancer address."
         },
         "advertiseAddress": {
           "type": "string",

@@ -30,7 +30,7 @@ grid:
   # set. Empty keeps its default, off. Set enforce at every site together; an enforcing
   # site refuses unsigned peers.
   signedState: ""
-  # -- Signal transport, gossip or poll. poll also serves signals on the SWIM Service.
+  # -- Signal transport, gossip or poll. poll also serves signals on the signals Service.
   # Empty keeps the GridNetwork default, gossip. The operator also starts in it before any
   # GridNetwork exists, so a poll install never restarts once its network appears.
   signals: ""
@@ -143,9 +143,6 @@ log:
   level: "info"
   # -- Full RUST_LOG directive, such as "info,operator=debug". When set, it replaces level.
   filter: ""
-
-# Signal propagation mode is grid-wide configuration, set on the GridNetwork
-# via the grid-site chart's signalTransport value, not on the operator.
 
 # -- Metrics and health server configuration.
 metrics:

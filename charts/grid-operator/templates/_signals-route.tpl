@@ -43,9 +43,10 @@ true
 {{- if not (include "grid-operator.signalsRoute.host" .) }}
 {{- fail "signals.route.host needs site.name to default, or set it: peers dial the site's own name and the router picks this backend by it" }}
 {{- end }}
-{{- $type := dig "service" "type" "" (.Values.signals | default dict) }}
+{{- /* Resolved as service-signals.yaml resolves it: empty follows swim.service.type. */}}
+{{- $type := dig "service" "type" "" (.Values.signals | default dict) | default .Values.swim.service.type }}
 {{- if eq $type "LoadBalancer" }}
-{{- fail "signals.service.type LoadBalancer beside signals.route publishes the listener twice, on two addresses with different limits: pick the Route or the load balancer" }}
+{{- fail "signals.service.type LoadBalancer, set or inherited from swim.service.type, beside signals.route publishes the listener twice, on two addresses with different limits: pick the Route or the load balancer" }}
 {{- end }}
 {{- end }}
 {{- end }}

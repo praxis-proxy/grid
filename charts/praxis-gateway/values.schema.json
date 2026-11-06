@@ -85,7 +85,7 @@
                 "gatewayRefName": {
                   "type": "string",
                   "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$",
-                  "description": "This gateway's name in GridNetwork gatewayRefs. Defaults to mountReconciliation.gatewayRef, then the release fullname."
+                  "description": "This gateway's name in GridNetwork consumerGateways. Defaults to mountReconciliation.gatewayRef, then the release fullname."
                 },
                 "configMapName": {
                   "type": "string",
@@ -834,7 +834,7 @@
                 "gatewayRefName": {
                   "type": "string",
                   "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$",
-                  "description": "This gateway's name in GridNetwork gatewayRefs. Defaults to the release fullname."
+                  "description": "This gateway's name in GridNetwork consumerGateways. Defaults to the release fullname."
                 },
                 "configMapName": {
                   "type": "string",
@@ -1574,7 +1574,7 @@
         "gatewayRef": {
           "type": "string",
           "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$",
-          "description": "GridNetwork gatewayRefs name. Defaults to the Deployment name."
+          "description": "GridNetwork consumerGateways name. Defaults to the Deployment name."
         },
         "releaseHelmMounts": {
           "type": "boolean",
