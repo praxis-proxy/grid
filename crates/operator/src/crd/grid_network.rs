@@ -217,6 +217,17 @@ pub struct MembershipConfig {
     pub swim: Option<SwimConfig>,
 }
 
+impl MembershipConfig {
+    /// Whether this membership mode permits a SWIM configuration block.
+    #[must_use]
+    pub const fn swim_config_matches_mode(&self) -> bool {
+        match self.mode {
+            MembershipMode::Swim => true,
+            MembershipMode::Local => self.swim.is_none(),
+        }
+    }
+}
+
 /// How signals propagate across the sites of a grid.
 ///
 /// SWIM membership can use either path; Local membership requires polling.
@@ -1865,11 +1876,11 @@ mod tests {
         let membership = spec_properties
             .get("membership")
             .unwrap_or_else(|| std::process::abort());
-        let swim = membership
+        let swim_schema = membership
             .pointer("/properties/swim")
             .unwrap_or_else(|| std::process::abort());
         assert!(
-            swim.get("default").is_none(),
+            swim_schema.get("default").is_none(),
             "membership.swim must not have a schema default"
         );
         assert!(
@@ -1889,6 +1900,24 @@ mod tests {
                     == Some("!has(self.membership) || self.membership.mode == 'Swim' || !has(self.membership.swim)")
             }),
             "CRD must reject membership.swim for Local mode"
+        );
+        let configured_swim = serde_json::from_value::<MembershipConfig>(serde_json::json!({
+            "mode": "Swim",
+            "swim": {"seeds": ["peer.example:7946"]}
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            configured_swim.swim_config_matches_mode(),
+            "Swim mode must accept membership.swim"
+        );
+        let local = serde_json::from_value::<MembershipConfig>(serde_json::json!({
+            "mode": "Local",
+            "swim": {"seeds": ["peer.example:7946"]}
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            !local.swim_config_matches_mode(),
+            "Local mode must reject membership.swim"
         );
         assert!(
             serde_json::from_value::<MembershipConfig>(serde_json::json!({

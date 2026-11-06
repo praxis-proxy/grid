@@ -2295,6 +2295,16 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         trust: ctx.peer_settings.trust,
     };
     let declared = GridModes::of(&network, ctx.membership_fallback);
+    if network
+        .spec
+        .membership
+        .as_ref()
+        .is_some_and(|membership| !membership.swim_config_matches_mode())
+    {
+        return Err(OperatorError::InvalidResource(
+            "membership.swim is only valid when membership.mode is Swim".to_owned(),
+        ));
+    }
     if declared.membership == MembershipMode::Local && declared.signal != SignalMode::Poll {
         return Err(OperatorError::InvalidResource(
             "Local membership requires signalTransport.mode poll".to_owned(),

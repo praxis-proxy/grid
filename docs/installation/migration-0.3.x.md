@@ -4,7 +4,8 @@ The 0.3.x release accepts both the previous and current names for the aliased
 CRD spec fields below. The `grid-site` and `grid-operator` charts also translate
 previous value names when they render resources. The SWIM field move is a
 breaking change in 0.3.0 and is documented separately below. Migrate custom
-resources and Helm values before upgrading to 0.3.x.
+resources before applying the 0.3.0 CRD. Update the aliased names below during
+the 0.3.x compatibility window.
 
 Do not set both names for one field. The API schema and chart reject conflicting
 old and new names.

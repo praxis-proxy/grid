@@ -1799,7 +1799,10 @@ pub(crate) fn apply_swim_test_network_with_seeds(
         "apiVersion": "grid.praxis.fast/v1alpha1",
         "kind": "GridNetwork",
         "metadata": { "name": CRD_SEEDS_TEST_NETWORK },
-        "spec": { "membership": { "mode": "Swim", "swim": { "seeds": seeds_json } } }
+        "spec": {
+            "gridId": "crd-seeds-grid",
+            "membership": { "mode": "Swim", "swim": { "seeds": seeds_json } }
+        }
     }))
     .unwrap_or_else(|e| {
         eprintln!("CRD-seeds test network serialization failed: {e}");
