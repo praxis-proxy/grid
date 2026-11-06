@@ -2508,6 +2508,7 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
     // Step 1: install Grid CRDs and remove any stale CRD-seed test resources.
     operator::install_grid_crds(&context)?;
     operator::cleanup_swim_crd_seeds_test_resources(&context)?;
+    operator::verify_swim_membership_crd_admission(&context)?;
 
     let (bind1, bind2) = reserve_swim_bind_addrs()?;
     let bind1_addr: std::net::SocketAddr = bind1

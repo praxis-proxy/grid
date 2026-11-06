@@ -1771,6 +1771,50 @@ pub(crate) fn apply_swim_test_network(context: &str) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// Verify API-server admission for SWIM configuration under both membership modes.
+///
+/// # Errors
+///
+/// Returns an error if Swim mode is rejected, Local mode with SWIM config is
+/// accepted, or the Local rejection does not come from the expected CRD rule.
+pub(crate) fn verify_swim_membership_crd_admission(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = |mode: &str| {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": "swim-membership-admission-test" },
+            "spec": {
+                "gridId": "swim-membership-admission-test",
+                "membership": {
+                    "mode": mode,
+                    "swim": { "seeds": ["peer.example:7946"] }
+                }
+            }
+        }))
+    };
+
+    let accepted = kubectl::server_side_dry_run(context, &manifest("Swim")?)?;
+    if !accepted.status.success() {
+        return Err(format!(
+            "API server rejected membership.swim for Swim mode: {}",
+            String::from_utf8_lossy(&accepted.stderr)
+        )
+        .into());
+    }
+
+    let rejected = kubectl::server_side_dry_run(context, &manifest("Local")?)?;
+    if rejected.status.success() {
+        return Err("API server accepted membership.swim for Local mode".into());
+    }
+    let rejection = String::from_utf8_lossy(&rejected.stderr);
+    if !rejection.contains("membership.swim is only valid when membership.mode is Swim") {
+        return Err(format!("Local mode was rejected for an unexpected reason: {rejection}").into());
+    }
+
+    eprintln!("  [PASS] API server admits membership.swim for Swim and rejects it for Local");
+    Ok(())
+}
+
 /// Apply the `GridNetwork` fixture for the CRD-seed SWIM validation.
 ///
 /// Unlike [`apply_swim_test_network`], this fixture sets `membership.swim.seeds` to the
