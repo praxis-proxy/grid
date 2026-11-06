@@ -27,8 +27,8 @@ type BoxError = Box<dyn Error + Send + Sync>;
 #[expect(clippy::struct_excessive_bools, reason = "independent clap switches")]
 #[command(name = "bootstrap", about = "Mint or load the Grid CA and write it as Secrets")]
 struct BootstrapArgs {
-    /// Namespace to read and write Secrets in. Defaults to `POD_NAMESPACE`, then
-    /// `default`.
+    /// Namespace to read and write Secrets in. Defaults to `POD_NAMESPACE`; with neither,
+    /// bootstrap refuses to run.
     #[arg(long)]
     namespace: Option<String>,
     /// Persist the grid ID once in this `ConfigMap`, independently of CA rotation.
@@ -140,7 +140,7 @@ async fn bootstrap(args: &BootstrapArgs) -> Result<(), BoxError> {
     use k8s_openapi::api::core::v1::Secret;
     use kube::api::Api;
 
-    let namespace = resolve_namespace(args);
+    let namespace = crate::work_namespace(args.namespace.as_deref(), std::env::var("POD_NAMESPACE").ok())?;
     check_site_args(args)?;
     let client = kube::Client::try_default().await?;
     if let Some(name) = &args.grid_id_config_map {
@@ -248,14 +248,6 @@ async fn create_key_secret(
         Err(kube::Error::Api(response)) if response.code == 409 => Ok(Some(Box::pin(held_key(secrets, name)).await?)),
         Err(error) => Err(error.into()),
     }
-}
-
-/// The namespace to work in: the flag, then `POD_NAMESPACE`, then `default`.
-fn resolve_namespace(args: &BootstrapArgs) -> String {
-    args.namespace
-        .clone()
-        .or_else(|| std::env::var("POD_NAMESPACE").ok())
-        .unwrap_or_else(|| "default".to_owned())
 }
 
 /// A Secret no allowlist in this chart carries, so admitting it means nothing is enforcing.

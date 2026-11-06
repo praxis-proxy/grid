@@ -49,7 +49,8 @@ use crate::{
     resources::{
         consumer_config::{self, ConsumerConfigError, SiteRoutePrerequisite},
         derived_topology, gateway_mounts, overlay_envelope, provider_admission, provider_config, provider_metrics,
-        routing_overlay, secret,
+        routing_overlay::{self, MAX_TOOLS_PER_PROVIDER},
+        secret,
         serving_config::{self, ServingInputs, WriteDecision, WriteGate},
         tls_backend::ServerTlsConfig,
         trust_bundle::{self, CertPemStatus},
@@ -159,6 +160,9 @@ pub struct OperatorCtx {
 
     /// How often the signals loop scrapes providers; a readiness window is at least two.
     scrape_interval: Duration,
+
+    /// How long a published site signal is served before it expires.
+    site_signals_ttl: Duration,
 
     /// Duration of each network's latest provider-scrape pass.
     ///
@@ -414,6 +418,7 @@ impl OperatorCtx {
             served_models: served_models::ServedModelStore::new(),
             readiness: readiness::ReadinessStore::default(),
             scrape_interval: Duration::ZERO,
+            site_signals_ttl: DEFAULT_SITE_SIGNALS_TTL,
             last_scrape_passes: std::sync::Mutex::new(HashMap::new()),
             signal_mode,
             serving_writes: WriteGate::default(),
@@ -542,6 +547,13 @@ impl OperatorCtx {
         self
     }
 
+    /// Record how long a published site signal is served.
+    #[must_use]
+    pub const fn with_site_signals_ttl(mut self, ttl: Duration) -> Self {
+        self.site_signals_ttl = ttl;
+        self
+    }
+
     /// Record how long one network's latest provider-scrape pass took.
     fn record_scrape_pass(&self, network: &str, duration: Duration) {
         let mut passes = self
@@ -648,17 +660,11 @@ impl OperatorCtx {
 // Signals (poll mode)
 // ---------------------------------------------------------------------------
 
-/// How long a published site signal is served before it expires.
+/// How long a published site signal is served before it expires, by default.
 ///
 /// Several scrape intervals, so a couple of missed scrapes do not erase what is
 /// known; absence, not a stale flag, is what tells a reader a writer stopped.
-fn site_signals_ttl() -> Duration {
-    let secs = std::env::var("GRID_SIGNALS_TTL_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(30);
-    Duration::from_secs(secs.max(1))
-}
+pub const DEFAULT_SITE_SIGNALS_TTL: Duration = Duration::from_secs(30);
 
 /// Scrape this site's providers once, write their readiness conditions, and, in Poll mode,
 /// publish the coarse signals observed.
@@ -951,7 +957,7 @@ fn readiness_stale_after(ctx: &OperatorCtx, provider: &InferenceProvider) -> Dur
         .as_ref()
         .and_then(|mc| mc.stale_metrics_seconds)
         .filter(|secs| *secs > 0)
-        .map_or_else(|| site_signals_ttl() / 2, |secs| Duration::from_secs(secs.into()))
+        .map_or_else(|| ctx.site_signals_ttl / 2, |secs| Duration::from_secs(secs.into()))
         .max(floor)
 }
 
@@ -1429,7 +1435,7 @@ fn publish_signals(ctx: &OperatorCtx, collected: HashMap<String, Vec<signals::Ob
             (provider, attributed)
         })
         .collect();
-    ctx.signals.refresh(attributed, site_signals_ttl());
+    ctx.signals.refresh(attributed, ctx.site_signals_ttl);
 }
 
 /// Client TLS for polling peer operators, built from the network's own trust.
@@ -2351,6 +2357,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // List providers and tools once; shared between the catalog, the overlay and CRDT publishing.
     let providers = list_all_inference_providers(client).await?;
     let tool_providers = list_all_agent_tool_providers(client).await?;
+    record_tool_cuts(&tool_providers);
 
     // Published before any hold or render, so peers can read this site while it waits for
     // theirs, and two sites restarting together do not wait out the grace on each other.
@@ -6277,13 +6284,6 @@ fn tool_provider_state_from_kube(
     })
 }
 
-/// Maximum number of tool names retained per [`AgentToolProvider`].
-///
-/// Large MCP catalogs can inflate both the SWIM broadcast byte budget and
-/// the routing overlay size. Excess tools are truncated and a warning is
-/// logged.
-const MAX_TOOLS_PER_PROVIDER: usize = 128;
-
 /// Maximum encoded length of one MCP tool name accepted by the routing path.
 const MAX_TOOL_NAME_LEN: usize = 256;
 
@@ -6308,13 +6308,20 @@ fn current_tool_status(
 /// Results are capped at [`MAX_TOOLS_PER_PROVIDER`] to bound SWIM byte
 /// budget and overlay size.
 pub(crate) fn tool_names_from_agent_tool_provider(provider: &AgentToolProvider) -> Vec<String> {
+    let mut tools = routable_tool_names(provider);
+    tools.truncate(MAX_TOOLS_PER_PROVIDER);
+    tools
+}
+
+/// Discovered tools that pass the allowlist and name checks, before the per-provider cap.
+fn routable_tool_names(provider: &AgentToolProvider) -> Vec<String> {
     let Some(status) = current_tool_status(provider) else {
         return Vec::new();
     };
 
     let allowed: std::collections::HashSet<&str> = provider.spec.tools.iter().map(|tool| tool.name.as_str()).collect();
     let mut seen = std::collections::HashSet::new();
-    let mut tools: Vec<String> = status
+    status
         .discovered_tools
         .iter()
         .filter(|tool| {
@@ -6324,19 +6331,36 @@ pub(crate) fn tool_names_from_agent_tool_provider(provider: &AgentToolProvider) 
                 && seen.insert((*tool).clone())
         })
         .cloned()
-        .collect();
+        .collect()
+}
 
-    if tools.len() > MAX_TOOLS_PER_PROVIDER {
-        tracing::warn!(
-            provider = provider.metadata.name.as_deref().unwrap_or("?"),
-            total = tools.len(),
-            cap = MAX_TOOLS_PER_PROVIDER,
-            "tool provider exceeds per-provider tool cap; truncating"
-        );
-        tools.truncate(MAX_TOOLS_PER_PROVIDER);
-    }
+/// Count each provider's tools the cap leaves out, dropping the series of providers gone from the list.
+pub(crate) fn record_tool_cuts(tool_providers: &[AgentToolProvider]) {
+    crate::metrics::set_agent_tool_provider_tools_cut(tool_cuts(tool_providers));
+}
 
-    tools
+/// Each provider's namespace, name, and the tools the cap leaves out of routing.
+pub(crate) fn tool_cuts(tool_providers: &[AgentToolProvider]) -> Vec<(String, String, usize)> {
+    tool_providers
+        .iter()
+        .map(|provider| {
+            let total = routable_tool_names(provider).len();
+            let cut = total.saturating_sub(MAX_TOOLS_PER_PROVIDER);
+            if cut > 0 {
+                tracing::warn!(
+                    provider = provider.metadata.name.as_deref().unwrap_or("?"),
+                    total,
+                    cap = MAX_TOOLS_PER_PROVIDER,
+                    "tool provider exceeds per-provider tool cap; truncating"
+                );
+            }
+            (
+                provider.metadata.namespace.clone().unwrap_or_default(),
+                provider.metadata.name.clone().unwrap_or_default(),
+                cut,
+            )
+        })
+        .collect()
 }
 
 /// Publish real provider records as a CRDT state broadcast over SWIM.

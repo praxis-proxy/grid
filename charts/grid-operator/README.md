@@ -97,7 +97,7 @@ annotation, which `crds.keep` set at that time.
 - Peers learn each site's signals endpoint over SWIM, and dial port 9091 on a
   site that advertises none.
 - The signals listener binds `[::]:9091`, or `0.0.0.0:9091` without IPv6.
-- Unparseable `GRID_SIGNALS_*` settings fail at startup.
+- Unparseable `GRID_SIGNALS_*`, `GRID_SWIM_DEAD_MEMBER_TTL_SECS` and `GRID_MODEL_DISCOVERY_*` settings fail at startup.
 
 ### Metrics over TLS
 
@@ -184,12 +184,43 @@ With an older Helm, mark them as owned by the release, then upgrade as usual:
 RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders gridnetworks gridsites inferenceproviders; do kubectl label crd "${crd}.grid.praxis.fast" app.kubernetes.io/managed-by=Helm --overwrite; kubectl annotate crd "${crd}.grid.praxis.fast" meta.helm.sh/release-name="${RELEASE}" meta.helm.sh/release-namespace="${NAMESPACE}" --overwrite; done
 ```
 
+## Names across charts
+
+Each chart names its objects after its own release, so a default install works only when
+the release names line up. These are the names another chart or the operator expects.
+
+| Object | Expected name | Set it with |
+|--------|---------------|-------------|
+| Site gateway Service and Deployment | `gateway.serviceName`. Empty with `grid.id` or `enrollment.enabled` set: `grid-gateway`. Empty otherwise: `provider-gateway`, the operator's own default, which the RBAC also names. | praxis-gateway `fullnameOverride` set to that name. |
+| Operator ServiceAccount | `serviceAccount.name`, else this release's fullname: `grid-operator` for a release named `grid-operator`. | praxis-gateway `mountReconciliation.operator.serviceAccount` and `namespace`. |
+| Gateway namespace | `gateway.namespace`, else the operator's namespace. | Install praxis-gateway in the operator's namespace, or set `gateway.namespace`. |
+| Enrollment Service | `enrollment.hubService` (default `grid-enrollment`) in `rbac.enrollmentNamespace` (default `grid-enrollment`), on port `enrollment.hubPort`. | Install grid-enrollment as release `grid-enrollment` in namespace `grid-enrollment`, or set `hubService` to that release's fullname. |
+
+The GridNetwork this chart renders carries the same `admissionPolicy` and `selectionPolicy`
+as the grid-site chart's default: stabilized admission and roundRobin selection, from
+`grid.admissionPolicy` and `grid.selectionPolicy`. Set either to null for the CRD and
+gateway defaults, instantaneous admission and deterministic selection. A network keeps
+whichever policies the chart that renders it writes, so render each GridNetwork from one chart.
+
+The NetworkPolicy peers in `networkPolicy.metricsFrom` are full NetworkPolicyPeer entries.
+Empty, they default to `openshift-user-workload-monitoring` and `openshift-monitoring`,
+which admit no Prometheus off OpenShift. A list replaces both, so an install that still
+needs them names them beside its own. The praxis-gateway chart takes
+namespace names in `metricsListener.fromNamespaces`, and on OpenShift defaults to
+`openshift-user-workload-monitoring` only. Set both when one Prometheus scrapes both.
+
 ## Values
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `crds.enabled` | bool | `true` | Install and upgrade the Grid CRDs. `false` when a platform owns them. |
 | `crds.keep` | bool | `true` | Keep the CRDs on `helm uninstall` and an Argo CD delete or prune. |
+| `site.name` | string | `""` | This site's name, a DNS label. Defaults `swim.siteName`, and through it `enrollment.siteName`. |
+| `site.region` | string | `""` | Region on the rendered GridSite. Empty leaves it out. |
+| `site.zone` | string | `""` | Availability zone on the rendered GridSite. Empty leaves it out. |
+| `grid.membership.source` | string | `Swim` | Where this site learns its members. `Swim` learns them over SWIM gossip. `Local` reads the GridSites this site's configuration lists and polls each peer's signals at the endpoint derived from its gateway. Local runs no SWIM, so `swim.service.enabled`, the seeds and `swim.advertiseAddress` fail the render, and `grid.signals` renders `poll`. Also writes `GridNetwork.spec.membership.mode` when `grid.id` is set. |
+| `grid.admissionPolicy` | object | stabilized, as grid-site | GridNetwork `admissionPolicy`, the grid-site chart's default. `null` leaves the CRD default, instantaneous admission. Pressure transitions need a `scoringPolicy` and matching provider `signalNames`. |
+| `grid.selectionPolicy.mode` | string | `roundRobin` | Local selection mode the gateway uses, the grid-site chart's default. `null` on `grid.selectionPolicy` leaves the gateway default, `deterministic`. |
 | `grid.providers` | object | `{}` | InferenceProviders this site serves, keyed by name. `model` defaults to the name, `providerKind` to `vllm`, `backendKind` to `local_model`. |
 | `rbac.enrollmentNamespace` | string | `""` | The grid-enrollment namespace. The render fails if the operator would get Secret access there. |
 | `rbac.metricsScraper` | bool | `true` | Create the metrics scraper ServiceAccount, allowed only GET on the nonResourceURL /metrics, and let the operator mint short-lived tokens for it. An llm-d EPP serving bearer-authenticated metrics (the default) admits a scrape with that token (metricsConfig.auth type serviceAccountToken). The operator never sends its own token. |
@@ -210,7 +241,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `podLabels` | object | `{}` | Labels on the operator pod. |
 | `podAnnotations` | object | `{}` | Annotations on the operator pod. |
 | `serviceAccount.create` | bool | `true` | Create a ServiceAccount. |
-| `serviceAccount.name` | string | `""` | ServiceAccount name. Defaults to fullname when `create` is true, `"default"` when false. |
+| `serviceAccount.name` | string | `""` | ServiceAccount name. Defaults to fullname when `create` is true, `"default"` when false. The praxis-gateway chart's `mountReconciliation.operator.serviceAccount` defaults to `grid-operator`, the fullname of a release named `grid-operator`. |
 | `serviceAccount.annotations` | object | `{}` | ServiceAccount annotations (e.g. IAM role binding). |
 | `rbac.create` | bool | `true` | Create RBAC resources. |
 | `resourceNamespaces` | list | `[]` | Additional namespaces for resource access. The release namespace is always included. |
@@ -227,6 +258,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `swim.bindAddress` | string | `0.0.0.0:7946` | SWIM protocol bind address. |
 | `swim.advertiseAddress` | string | `""` | Externally reachable SWIM address. Defaults to the SWIM Service LoadBalancer address, else Pod IP. |
 | `swim.requireKey` | bool | `true` | Hold SWIM traffic until the GridNetwork key loads or the network declares none. |
+| `swim.deadMemberTtlSeconds` | int or string | `""` | Seconds a dead SWIM member stays tracked before eviction, 1 to 99999, as `GRID_SWIM_DEAD_MEMBER_TTL_SECS`. Empty keeps the operator's 300s. |
 | `swim.siteName` | string | `""` | Bootstrap SWIM site name. |
 | `swim.seeds` | string | `""` | Bootstrap SWIM seed endpoints, separated by spaces or commas. A bare host or address gets `swim.service.port`; `host:port` and `[ipv6]:port` are taken as given. |
 | `swim.service.enabled` | bool | `false` | Create a SWIM Service. |
@@ -239,22 +271,36 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `platform` | string | `""` | Cloud whose load balancer settings LoadBalancer Services get: `aws` (an NLB, since the default carries no UDP, with cross-zone on the operator Services), `azure`, `gcp` (internal with global access), or `any` for all three. Each cloud reads only its own keys. |
 | `loadBalancerScope` | string | `internal` | Reach of the SWIM and signals load balancers on a cloud platform. `internal` keeps them on the private network, so sites need private connectivity between them. `external` makes them internet-facing. AWS fixes the scope when it creates the load balancer, so changing it means recreating the Service. |
 | `peers` | string | `""` | The grid's other sites, separated by spaces or commas. Each is a SWIM seed unless `grid.seeds` or `swim.seeds` is set, and each bare IPv4 address a host route in both Services' source ranges unless they set their own. That fits a peer that listens on the address it egresses from; on AWS with internet-facing load balancers, list the NAT addresses here and the SWIM Service hostnames in `grid.seeds`. Internal load balancers see peers' private addresses: leave this empty and set `swim.service.loadBalancerSourceRanges` to their machine networks. |
-| `signals.enabled` | bool | `false` | For signalTransport poll. Adds a TCP port named `signals` to the SWIM Service and points this site's gateway at it. Needs `swim.service.enabled`. A LoadBalancer must support mixed UDP and TCP ports. |
-| `signals.port` | int | `9091` | Signals port on the SWIM Service. Peers learn the LoadBalancer address and this port over gossip. |
-| `signals.advertiseAddress` | string | `""` | Signals endpoint gossiped to peers. Set it with `swim.advertiseAddress` or a NodePort Service, where the operator discovers no LoadBalancer address. |
-| `signals.route.enabled` | string or bool | `auto` | `auto` renders an OpenShift Route in front of the signals Service where the cluster serves `route.openshift.io/v1`; `true` or `false` forces it. An offline render without `--api-versions` renders `auto` as off. |
+| `signals.enabled` | bool | `false` | For signalTransport poll. Serves the signals listener on the signals Service, `<fullname>-signals`, and points this site's gateway at it. Under Swim membership it needs `swim.service.enabled`, because peers learn the signals endpoint over SWIM gossip. The signals Service is TCP only, so a load balancer needs no mixed UDP and TCP support. |
+| `signals.port` | int | `9091` | Signals port on the signals Service. Peers learn its address and this port over gossip. |
+| `signals.service.enabled` | bool | `true` | Render the signals Service. Local membership requires it. |
+| `signals.service.type` | string | `""` | Signals Service type. Empty is `ClusterIP` when a signals Route renders, and follows `swim.service.type` otherwise. A NodePort or LoadBalancer set here stops `auto` from rendering the Route, and refuses to render beside `signals.route.enabled: true`. |
+| `signals.service.loadBalancerIP` | string | `""` | Static LoadBalancer IP for the signals Service. |
+| `signals.service.annotations` | object | `{}` | Signals Service annotations. The `platform` annotations merge under them. |
+| `signals.service.loadBalancerSourceRanges` | list | `[]` | CIDRs allowed to poll signals. Empty inherits `swim.service.loadBalancerSourceRanges`, else the `peers` host routes. |
+| `signals.service.externalTrafficPolicy` | string | `""` | External traffic policy. Empty keeps `Local` for a LoadBalancer. |
+| `signals.maxHandshakesPerSource` | int or string | `""` | Concurrent handshakes one source address may hold, as `GRID_SIGNALS_MAX_HANDSHAKES_PER_SOURCE`. Empty keeps the operator's 8, or 32 when a signals Route renders, since every peer then arrives as the router. |
+| `signals.peerEndpointPort` | int or string | `""` | Under Local membership, the port each peer serves signals on at its gateway endpoint's host. Empty dials the gateway's own port with server name `<site>-signals.grid.internal`. |
+| `signals.advertiseAddress` | string | `""` | Signals endpoint gossiped to peers. Empty is the Route host on port 443 when a signals Route renders, since the Service behind it has no address to discover. Set it with `swim.advertiseAddress` or a NodePort Service, where the operator discovers no LoadBalancer address. |
+| `signals.route.enabled` | string or bool | `auto` | `auto` renders an OpenShift Route in front of the signals Service where the cluster serves `route.openshift.io/v1`; `auto` also needs `signals.enabled`, `signals.service.enabled`, and an empty or `ClusterIP` `signals.service.type`, and renders nothing otherwise. `true` or `false` forces it. An offline render without `--api-versions` renders `auto` as off. |
 | `signals.route.host` | string | `""` | External hostname peers dial, the name the router matches the SNI against. The convention is `<site>-signals.<domain>`. Required when a Route renders. |
 | `signals.route.annotations` | object | `{}` | Extra Route annotations. They override `rateLimit`'s on a key clash. |
 | `signals.route.rateLimit.enabled` | bool | `true` | Render the router's per-source connection limits. Required when signals are exposed through a Route: without them the listener is open to anyone who can reach the router. |
 | `signals.route.rateLimit.concurrentTcp` | int | `10` | Concurrent TCP connections per source IP, in the router. |
 | `signals.route.rateLimit.rateTcp` | int | `20` | TCP connection rate per source IP, in the router's rate window. |
+| `signals.ttlSeconds` | int or string | `""` | Seconds a published site signal is served before it expires, 1 to 99999, as `GRID_SIGNALS_TTL_SECS`. Half of it is the default readiness window, so it applies with signals off too. Empty keeps the operator's 30s. |
 | `signals.peerIntervalSeconds` | int or string | `""` | Seconds between peer signal polls, 1 to 99999, as `GRID_SIGNALS_PEER_INTERVAL_SECS`. Every site polls every other alive site, so a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator's own default. |
+| `signals.scrapeIntervalSeconds` | int or string | `""` | Seconds between scrapes of this site's own EPPs. Empty keeps the operator's 1s. |
 | `gateway.address` | string | `""` | Advertised site gateway `host:port` override. Use it when the site gateway Service is not a LoadBalancer. Maps to `GRID_GATEWAY_ADDRESS`. |
-| `gateway.serviceName` | string | `""` | Site gateway Service name the operator resolves and advertises to remote sites. Maps to `GRID_GATEWAY_SERVICE_NAME`. |
+| `gateway.serviceName` | string | `""` | Site gateway Service and Deployment name the operator resolves, advertises to remote sites, and rolls on a rotation. Maps to `GRID_GATEWAY_SERVICE_NAME`. Empty defaults to `grid-gateway` with `grid.id` or `enrollment.enabled` set, else to `provider-gateway`, the operator's own default. Set the praxis-gateway release's `fullnameOverride` to this name. |
 | `gateway.namespace` | string | `""` | Namespace of the site gateway Service. Empty uses the release namespace. Outside the resource namespaces, the operator gets only `get` on that one Service there. Maps to `GRID_GATEWAY_NAMESPACE`. |
 | `gateway.allowSystemNamespace` | bool | `false` | Allow `gateway.namespace` to be `default`, `kube-*`, or `openshift-*`. |
 | `gateway.port` | string | `""` | Site gateway Service port override. Empty uses the first Service `spec.ports` entry, with `8080` as the fallback if no usable port exists. Maps to `GRID_GATEWAY_PORT`. |
+| `gateway.praxisConfig` | object | `{}` | `consumerGateways[].praxisConfig` for the site gateway on the rendered GridNetwork, as the CRD takes it. Empty renders no block. |
 | `gateway.discoveryEnabled` | bool | `true` | Discover and advertise a LoadBalancer address for the site gateway. Maps to `GRID_GATEWAY_DISCOVERY_ENABLED`. |
+| `modelDiscovery.intervalSeconds` | int or string | `""` | Seconds between discovery rounds, 1 to 2592000, as `GRID_MODEL_DISCOVERY_INTERVAL_SECS`. Empty keeps the operator's 60s. |
+| `modelDiscovery.timeoutSeconds` | int or string | `""` | Seconds one provider poll may take, 1 to 3600, as `GRID_MODEL_DISCOVERY_TIMEOUT_SECS`. Empty keeps the operator's 5s. |
+| `modelDiscovery.concurrency` | int or string | `""` | Providers polled at once, 1 to 999, as `GRID_MODEL_DISCOVERY_CONCURRENCY`. Empty keeps the operator's 8. |
 | `modelDiscovery.ttlSeconds` | int or string | `""` | Seconds a discovered model set stays routable without a fresh poll, 1 to 31536000, as `GRID_MODEL_DISCOVERY_TTL_SECS`. The operator raises it to cover one poll round. Empty keeps the operator's 180s. |
 | `health.liveness.initialDelaySeconds` | int | `5` | Liveness probe initial delay. |
 | `health.liveness.periodSeconds` | int | `10` | Liveness probe period. |
@@ -268,7 +314,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `serviceMonitor.interval` | string | `30s` | Prometheus scrape interval. Empty leaves the Prometheus default. |
 | `serviceMonitor.scrapeTimeout` | string | `10s` | Prometheus scrape timeout. Empty leaves the Prometheus default. |
 | `networkPolicy.enabled` | bool or `auto` | `auto` | Render a NetworkPolicy for the operator pod. `auto` turns it on where OpenShift runs. SWIM and signals stay open to every peer. |
-| `networkPolicy.metricsFrom` | list | the OpenShift user-workload and platform monitoring namespaces | NetworkPolicyPeer entries allowed to reach the metrics and health port. Kubelet probes are unaffected on OpenShift. Must not be empty. |
+| `networkPolicy.metricsFrom` | list | `[]` | NetworkPolicyPeer entries allowed to reach the metrics and health port. Empty admits the OpenShift user-workload and platform monitoring namespaces. Off OpenShift, set it when `networkPolicy.enabled` is `true`. The install notes warn when it is empty. Kubelet probes are unaffected on OpenShift. |
 | `serviceMonitor.tlsConfig` | object | `{}` | Scrape TLS settings when `metrics.tls` is on. Empty: the OpenShift service CA and the Service DNS name for `serviceCA`, or the grid CA Secret and `<site>.grid.internal` for `siteIdentity`. Required with `existingSecret`. |
 | `resources` | object | `{}` | Container resource requests and limits. |
 | `nodeSelector` | object | `{}` | Node selector for scheduling. |
@@ -281,7 +327,7 @@ RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders grid
 | `enrollment.enabled` | bool | `false` | This site enrolls: turns on the SWIM LoadBalancer Service, site-identity metrics TLS and the enrollment namespace guard, and renders the signer and the invite into the operator config's `site` section. |
 | `enrollment.url` | string | `""` | Signer base URL (https), `site.signerEndpoint.url`. Required unless `enrollment.hub` is set. Set alone on a hub whose identity bootstrap issued, it renders a `site` section that renews only. |
 | `enrollment.hub` | bool | `false` | The grid-enrollment release runs on this cluster, so `enrollment.url` defaults to its Service in `rbac.enrollmentNamespace`. |
-| `enrollment.hubService` | string | `grid-enrollment` | With `hub` set and no `url`, the grid-enrollment release's full name: its Service and the in-cluster name its serving certificate carries. Must match that release. |
+| `enrollment.hubService` | string | `grid-enrollment` | With `hub` set and no `url`, the grid-enrollment release's full name: its Service and the in-cluster name its serving certificate carries. Must match that release. The default matches a release named `grid-enrollment`, in the default `rbac.enrollmentNamespace`, `grid-enrollment`. |
 | `enrollment.hubPort` | int | `8443` | With `hub` set and no `url`, the grid-enrollment Service's port. Must match that release, whose Service port derives from its `listenAddr`. The `GRID_SIGNER_HOSTS` default follows it. |
 | `enrollment.siteName` | string | `""` | Site name the token pins, at most 51 characters, and the GridSite's name: `site.name`. Defaults to `swim.siteName`. |
 | `enrollment.caBundle` | object | `{secret: "", key: ca.crt}` | `site.signerEndpoint.caBundleRef`, a Secret, since anyone who can edit a ConfigMap could pin a signer of their own. Unset, Secret `grid-ca-bundle` when `enabled`. Pin the issuing intermediate or the signer's serving certificate, never a public root. |
@@ -334,7 +380,7 @@ The chart's upgrade test cannot cover this, because it pauses the operator and s
 an operator-created record to adopt.
 
 `site.name` and `grid.seeds` default `swim.siteName` and `swim.seeds`, which win when set,
-and `grid.signals: poll` serves signals on the SWIM Service. `grid.seeds` also takes one
+and `grid.signals: poll` serves signals on the signals Service. `grid.seeds` also takes one
 string separated by spaces or commas, as `swim.seeds` does. The CRs need the grid CRDs
 first. Argo CD applies them a sync wave after the CRDs. Plain Helm cannot map them on the
 first install, so set `grid.id` on an upgrade after it, or install the grid-site chart.
@@ -451,8 +497,10 @@ LoadBalancer IP with an annotation such as `metallb.io/loadBalancerIPs`.
 The SWIM LoadBalancer Service publishes not-ready addresses, because some
 implementations, such as k3s servicelb, publish an address only for an endpoint.
 
-Signals on a LoadBalancer require `externalTrafficPolicy: Local`, the chart
-default. The listener caps handshakes per source address, and `Cluster` SNAT
+Signals have their own TCP Service, `<fullname>-signals`, because AWS refuses a
+Service that mixes UDP and TCP. Its type is `ClusterIP` behind a signals Route, and
+follows `swim.service.type` otherwise, unless `signals.service.type` is set. Signals on a LoadBalancer require
+`externalTrafficPolicy: Local`, the chart default. The listener caps handshakes per source address, and `Cluster` SNAT
 gives many peers one source. Set `swim.service.loadBalancerSourceRanges` to the peers'
 egress CIDRs where the implementation enforces it.
 

@@ -50,10 +50,10 @@ The explicit modes are:
    leave it empty to serve `praxisConfig.byo.inline`, which the chart stores
    in its own ConfigMap.
 2. `operator` mounts the ConfigMap the Grid operator writes for this gateway
-   (GridNetwork `gatewayRefs[].consumerConfig.enabled: true`).
+   (GridNetwork `consumerGateways[].praxisConfig.generate: true`).
    `praxisConfig.operator.configMapName` defaults to `praxis-consumer-config`,
    the operator's default. Set it when the GridNetwork sets another
-   `consumerConfig.configMapName`. The chart always mounts the `praxis.yaml`
+   `praxisConfig.configMapName`. The chart always mounts the `praxis.yaml`
    key, and the pod starts once the ConfigMap exists. The operator's
    `praxis.yaml` has no caller authentication and no listener TLS, so a
    LoadBalancer or NodePort Service needs
@@ -78,8 +78,8 @@ These values do not add TLS settings to `praxis.yaml`.
   write those file paths into `praxis.yaml`. Set `gridIdentity.tlsSecretName` to the
   site identity Secret and set `gridIdentity.caSecretName` only when the Grid CA is
   separate.
-  `gridIdentity.mountPath` must equal
-  `consumerConfig.tlsCertMountPath`
+  `gridIdentity.mountPath` must equal the GridNetwork
+  `consumerGateways[].praxisConfig.tlsCertMountPath`
   (default: `/etc/praxis/tls`).
 - **Render:** Set `gridIdentity.tlsSecretName` to use mTLS. Set
   `gridIdentity.caSecretName` only when the CA is separate. A remote-site backend without
@@ -281,6 +281,21 @@ The chart uses [Semantic Versioning](https://semver.org/). Its `version`
 identifies the chart package, while `appVersion` identifies the default
 Praxis AI image; these values may advance independently.
 
+## Names across charts
+
+The Grid operator finds this gateway by name, so the release fullname must match what the
+operator expects.
+
+| Object | Expected name | Set it with |
+|--------|---------------|-------------|
+| This gateway's Service and Deployment | The grid-operator release's `gateway.serviceName`. Empty there with `grid.id` or `enrollment.enabled` set: `grid-gateway`. Empty otherwise: `provider-gateway`. It is also the GridNetwork `consumerGateways[].name`. | `fullnameOverride`. |
+| Operator ServiceAccount | The grid-operator release's `serviceAccount.name`. Empty there: its fullname when `serviceAccount.create` is true, `grid-operator` for a release named `grid-operator`, else `default`. | `mountReconciliation.operator.serviceAccount` and `namespace`. |
+
+`metricsListener.fromNamespaces` takes namespace names and on OpenShift defaults to
+`openshift-user-workload-monitoring` only. The grid-operator chart's
+`networkPolicy.metricsFrom` takes NetworkPolicyPeer entries and on OpenShift also admits
+`openshift-monitoring`. Set both when one Prometheus scrapes both.
+
 ## Values
 
 | Key | Type | Default | Description |
@@ -295,7 +310,7 @@ Praxis AI image; these values may advance independently.
 | `log.level` | string | `""` | Level for every module, rendered as RUST_LOG on the gateway and overlay-sync: off, error, warn, info, debug, or trace, in any case. Empty leaves RUST_LOG unset, so the binaries use their info default. An `env` entry named RUST_LOG takes precedence on the gateway. |
 | `log.filter` | string | `""` | Full RUST_LOG directive, such as `info,praxis_filter=debug`. When set, it replaces `log.level`. |
 | `nameOverride` | string | `""` | Override chart name. |
-| `fullnameOverride` | string | `""` | Override the fully qualified app name. Set it to the GridNetwork `gatewayRefs[].name` when the operator targets this Service by name. |
+| `fullnameOverride` | string | `""` | Override the fully qualified app name. Set it to the GridNetwork `consumerGateways[].name` when the operator targets this Service by name. |
 | `commonLabels` | object | `{}` | Labels added to all resources. |
 | `podLabels` | object | `{}` | Additional pod labels. Selector labels cannot be overridden. |
 | `podAnnotations` | object | `{}` | Pod annotations. |
@@ -342,13 +357,13 @@ Praxis AI image; these values may advance independently.
 | `praxisConfig.render.auth.validateUrl` | string | **required** for `api-key` | https validate endpoint. |
 | `praxisConfig.render.auth.allowPrivateEndpoint` | bool | `false` | Sets `allow_private_idp`, which is engine-wide: every policy callout in this gateway, not only `validateUrl`, may then reach private, loopback, link-local, and cloud metadata addresses. Turn it on only when every policy in the gateway is yours. |
 | `praxisConfig.render.auth.validateCA` | object | empty | CA for the validate call (`configMapName` or `secretName`, `key`). Set as `SSL_CERT_FILE`, which replaces the platform trust store for the validate call and https backends without a per-backend CA or `upstreamCA`. mutual_tls backends and `upstreamCA` are unaffected. See the recipe below. |
-| `mountReconciliation.enabled` | bool | `false` | Explicitly delegate generated consumer Secret mounts and rollouts to the AGN Operator. Requires `mountReconciliation.network`; with `praxisConfig.source: byo`, `praxisConfig.byo.configMapName` must match `consumerConfig.configMapName`. Supported for the consumer role; `source: render` is rejected. |
+| `mountReconciliation.enabled` | bool | `false` | Explicitly delegate generated consumer Secret mounts and rollouts to the AGN Operator. Requires `mountReconciliation.network`; with `praxisConfig.source: byo`, `praxisConfig.byo.configMapName` must match the GridNetwork `consumerGateways[].praxisConfig.configMapName`. Supported for the consumer role; `source: render` is rejected. |
 | `mountReconciliation.network` | string | `""` | GridNetwork name. Required when delegation is enabled. |
 | `mountReconciliation.gatewayRef` | string | release fullname | `GatewayRef.name` to bind the Deployment opt-in to. |
 | `mountReconciliation.releaseHelmMounts` | bool | `false` | Second handoff phase. After Grid reports `Ready`, set this true to release selected Helm credential mounts and the chart TLS mount. |
 | `mountReconciliation.managedCredentialNames` | list | `[]` | Credential Secret names to release from Helm in the second handoff phase. Other entries in `providerCredentials` remain Helm-managed. |
 | `mountReconciliation.rbac.create` | bool | `true` | Render a Role and RoleBinding in the release namespace that let the operator ServiceAccount `get` and `patch` this chart's Deployment and no other. `false` leaves the Role to you; see below. |
-| `mountReconciliation.operator.serviceAccount` | string | `grid-operator` | Operator ServiceAccount the Role binds. Blank fails the render while `rbac.create` is true. |
+| `mountReconciliation.operator.serviceAccount` | string | `grid-operator` | Operator ServiceAccount the Role binds. Blank fails the render while `rbac.create` is true. The grid-operator chart names the ServiceAccount it creates after its release, so the default matches a release named `grid-operator`; with `serviceAccount.create` false there it is `default`. |
 | `mountReconciliation.operator.namespace` | string | required | Namespace of that ServiceAccount. Blank fails the render while `rbac.create` is true. |
 | `networkPolicy.enabled` | bool | `false` | Render a NetworkPolicy that limits which pods can reach the listener port, where the CNI enforces NetworkPolicy. It is not authentication. Node and host-network traffic handling is CNI-specific (OVN-Kubernetes: the `policy-group.network.openshift.io/host-network` label), and a LoadBalancer with `externalTrafficPolicy: Cluster` can SNAT clients to node IPs. |
 | `networkPolicy.from` | list | `[]` | NetworkPolicyPeer entries allowed in. Required when enabled. With `auth.mode: none`, list only the authenticating front. `{podSelector: {}}` admits every pod in this namespace. An empty `namespaceSelector` and an `ipBlock` of `0.0.0.0/0` or `::/0` admit everyone and fail the render. An all-address `ipBlock` with `except` entries is allowed. The check reads selector emptiness and the cidr only, so `matchExpressions` that happen to select every pod pass. A provider gateway behind a LoadBalancer that SNATs clients to node IPs needs `ipBlock` peers for those node addresses. |
@@ -382,7 +397,7 @@ Praxis AI image; these values may advance independently.
 | `overlay.sidecar.resources` | object | small requests and limits | Resources for both the one-shot init container and continuous sidecar. |
 | `praxisConfig.render.gridServing.enabled` | bool | `false` | Mount the operator's serving config, set `GRID_SERVING_CONFIG`, and route with `grid_site_route`. On a provider, mount it optionally, set `GRID_PROVIDER_CONFIG` and serve peers with `grid_provider` (see [Providers from the provider file](#providers-from-the-provider-file)). Needs `image.flavor: grid-gateway` and `gridIdentity.tlsSecretName`; its CA defaults to that Secret. |
 | `praxisConfig.render.gridServing.networkName` | string | `""` | GridNetwork name, which with `gatewayRefName` names the operator's ConfigMap. |
-| `praxisConfig.render.gridServing.gatewayRefName` | string | release fullname | This gateway's name in the GridNetwork `gatewayRefs`. |
+| `praxisConfig.render.gridServing.gatewayRefName` | string | release fullname | This gateway's name in the GridNetwork `consumerGateways`. |
 | `praxisConfig.render.gridServing.configMapName` | string | `""` | Overrides `grid-serving-<networkName>-<gatewayRefName>`. Needed when that name passes 63 characters. |
 | `praxisConfig.render.gridServing.mountPath` | string | `/etc/praxis/grid-serving` | Mount directory for the ConfigMap. |
 | `praxisConfig.render.gridServing.backendCAs` | list | `[]` | CA bundles for the operator's `tls` dials, each `{secretName or configMapName, key}` (`key` defaults to `ca.crt`), mounted read-only at `/run/secrets/grid-backend-ca/<name>/<key>`, where a dial's `ca_path` points. One entry per Secret or ConfigMap. Needs `gridServing.enabled`, and refused with `mountReconciliation`, which mounts them itself. |
@@ -391,7 +406,7 @@ Praxis AI image; these values may advance independently.
 | `praxisConfig.render.gridServing.siteRoute.prefixAffinity` | object | `{}` | Prefix affinity tuning rendered as the filter's `prefix_affinity` (`enabled`, `threshold`, `exploration`, `capacity`, `ttl_secs`, `prefill_tokens_per_second`, `queued_request_seconds`, `tag_key_path`). Cache limits default to 16384 entries per backend cluster and a 600-second lifetime after confirmation; both require positive integers. |
 | `gridIdentity.tlsSecretName` | string | `""` | Secret with `tls.crt` and `tls.key`. Non-empty mounts the identity and makes implicit render transports use mTLS. |
 | `gridIdentity.caSecretName` | string | `""` | Secret with public `ca.crt`. Empty uses `gridIdentity.tlsSecretName`; set it when the CA is separate. |
-| `gridIdentity.mountPath` | string | `/etc/praxis/tls` | Directory where the identity and CA keys are projected. For operator mTLS, match `consumerConfig.tlsCertMountPath`. |
+| `gridIdentity.mountPath` | string | `/etc/praxis/tls` | Directory where the identity and CA keys are projected. For operator mTLS, match the GridNetwork `consumerGateways[].praxisConfig.tlsCertMountPath`. |
 | `providerCredentials` | list | `[]` | Provider credential Secrets (`secretName`, optional `mountPath`, `optional`). Without `mountPath`, the chart uses `/run/secrets/grid-credentials/<sanitized-secretName>`, matching the operator. The name is lowercased, runs of characters other than letters and digits become `-`, and the result is cut to 63 characters. |
 | `health.readiness` | object | admin `/ready`, else TCP on the listener port | Readiness probe. A `tcpSocket` without a port runs an HTTP check against the admin listener when the chart sees a loopback admin listener in its rendered config or `praxisConfig.byo.inline`, and otherwise targets the listener port. It asks `/healthy` when the gateway forwards to backends (rendered backends, `praxisConfig.render.gridServing`, or inline clusters), since `/ready` fails while any backend is down, and `/ready` otherwise. The check runs `/bin/sh` with `curl` or `wget`, whichever the image has; set `health.adminProbeCommand` for an image with neither. The chart refuses that fallback when a BYO inline listener serves TLS, since a TCP connect fails a TLS handshake on every probe. With a BYO ConfigMap the chart cannot see the listener, so give the probes an `httpGet` or `exec` handler when it serves TLS. Give `tcpSocket` a port or another handler to keep your own probe. Set to null to disable. |
 | `health.liveness` | object | admin `/healthy`, else TCP on the listener port | Liveness probe, chosen the same way against `/healthy`. Set to null to disable. |
@@ -796,7 +811,7 @@ set `overlay_file` to
 `/etc/praxis/routing/routing-overlay.json`. `overlay.configMapName` turns
 delivery on. With the sidecar on (the default), set `grid.networkName` and
 `grid.siteName`; the chart fullname must match the GridNetwork's
-`gatewayRefs[].name`, so set `fullnameOverride` when needed. Otherwise the
+`consumerGateways[].name`, so set `fullnameOverride` when needed. Otherwise the
 sidecar refuses the overlay and the pod does not start. `operator` and `render`
 sources do not read the overlay file and reject `overlay.configMapName`.
 
@@ -945,10 +960,10 @@ Behavior changes:
 - An overlay is BYO-only. `overlay.sidecar.enabled` now defaults to `true`,
   previously `false`. The sidecar requires `grid.networkName` and `grid.siteName`
   and creates a ServiceAccount, Role, and RoleBinding. Set `fullnameOverride` to
-  the GridNetwork `gatewayRefs[].name`. Set `overlay.sidecar.enabled: false` for a direct,
+  the GridNetwork `consumerGateways[].name`. Set `overlay.sidecar.enabled: false` for a direct,
   unvalidated ConfigMap mount.
 - Grid gateways no longer take the Helm release name automatically. Set
-  `fullnameOverride` to the GridNetwork `gatewayRefs[].name` when the operator
+  `fullnameOverride` to the GridNetwork `consumerGateways[].name` when the operator
   targets the gateway Service by name.
 - Before upgrading a provider, or a consumer with site backends, that was
   installed without `fullnameOverride`, set `fullnameOverride` to its current

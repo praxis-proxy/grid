@@ -19,7 +19,8 @@ spec:
     swim:
       seeds: []
 
-  # Consumer gateway reference
+  # Consumer gateway reference. name is the gateway's Service and Deployment, so the
+  # praxis-gateway release sets fullnameOverride to it.
   consumerGateways:
     - name: consumer-gateway
       namespace: default
