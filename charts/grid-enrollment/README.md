@@ -73,9 +73,9 @@ RBAC also remains after `helm uninstall`. This keeps it available for retries
 and avoids Helm 3.19 and later deleting earlier successful hooks when a later
 hook fails. If you uninstall the release and want to remove the privileged
 bootstrap identity, delete the `ServiceAccount`, `Role`, and `RoleBinding`
-named `<fullname>-ca-bootstrap` in the release namespace. When
-`hubSite.name` is set, delete the matching `-hub-site` `Role` and `RoleBinding`
-in the hub-site namespace on every uninstall, before deleting the release
+named `<fullname>-ca-bootstrap`, cut to 63 characters, in the release namespace.
+When `hubSite.name` is set, delete the `Role` and `RoleBinding` of that name with
+`-hub-site` appended in the hub-site namespace on every uninstall, before deleting the release
 namespace: they name the ServiceAccount only by namespace and name, so
 whoever creates that namespace again inherits their access. Retry a failed
 bootstrap with
