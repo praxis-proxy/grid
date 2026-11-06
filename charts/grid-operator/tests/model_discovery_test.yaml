@@ -88,3 +88,39 @@ tests:
       signals.ttlSeconds: 0
     asserts:
       - failedTemplate: {}
+
+  - it: renders each setting at its schema maximum as an integer the operator reads
+    set:
+      modelDiscovery.intervalSeconds: 2592000
+      modelDiscovery.timeoutSeconds: 3600
+      modelDiscovery.ttlSeconds: 31536000
+      modelDiscovery.concurrency: 999
+      signals.ttlSeconds: 99999
+      swim.deadMemberTtlSeconds: 99999
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_MODEL_DISCOVERY_INTERVAL_SECS, value: "2592000"}
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_MODEL_DISCOVERY_TIMEOUT_SECS, value: "3600"}
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_MODEL_DISCOVERY_TTL_SECS, value: "31536000"}
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_MODEL_DISCOVERY_CONCURRENCY, value: "999"}
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_SIGNALS_TTL_SECS, value: "99999"}
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_SWIM_DEAD_MEMBER_TTL_SECS, value: "99999"}
+
+  - it: renders a quoted number the same as a bare one
+    set:
+      modelDiscovery.ttlSeconds: "1000000"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: {name: GRID_MODEL_DISCOVERY_TTL_SECS, value: "1000000"}

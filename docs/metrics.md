@@ -132,7 +132,7 @@ already did. Both fire above four fifths of a cap for five minutes:
 | `grid_site_phase` | gauge | `site`, `phase` | GridSite phase: 1 for the current phase, 0 for the others. |
 | `grid_site_phase_transition_total` | counter | `from_phase`, `to_phase`, `reason` | GridSite phase transitions. |
 | `grid_agent_tool_provider_phase_transition_total` | counter | `from_phase`, `to_phase`, `reason` | AgentToolProvider phase transitions. |
-| `grid_agent_tool_provider_tools_cut` | gauge | `namespace`, `provider` | Discovered tools past the 128-per-provider routing cap, which status lists but routing leaves out. Absent while a provider is within the cap. |
+| `grid_agent_tool_provider_tools_cut` | gauge | `namespace`, `provider` | Discovered tools past the 128-per-provider routing cap, which status lists but routing leaves out. Absent while a provider is within the cap, and removed when the provider is deleted. |
 | `grid_gateway_probe_total` | counter | `outcome`, `tls_mode` | Total gateway probe attempts. |
 | `grid_gateway_probe_duration_seconds` | histogram | | Gateway probe duration. |
 | `grid_mcp_probe_total` | counter | `outcome` | Total AgentToolProvider MCP tools/list probe attempts. |

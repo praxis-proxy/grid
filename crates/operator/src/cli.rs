@@ -200,6 +200,7 @@ pub struct SwimArgs {
         id = "swim_dead_member_ttl_secs",
         long = "swim-dead-member-ttl-secs",
         env = "GRID_SWIM_DEAD_MEMBER_TTL_SECS",
+        value_parser = clap::value_parser!(u64).range(1..=99_999),
         default_value_t = crate::swim_runtime::DEFAULT_DEAD_MEMBER_TTL.as_secs()
     )]
     pub dead_member_ttl_secs: u64,
@@ -222,6 +223,7 @@ pub struct ModelDiscoveryArgs {
         id = "model_discovery_interval_secs",
         long = "model-discovery-interval-secs",
         env = "GRID_MODEL_DISCOVERY_INTERVAL_SECS",
+        value_parser = clap::value_parser!(u64).range(1..=2_592_000),
         default_value_t = crate::served_models::DiscoveryConfig::default().interval.as_secs()
     )]
     pub interval_secs: u64,
@@ -231,6 +233,7 @@ pub struct ModelDiscoveryArgs {
         id = "model_discovery_timeout_secs",
         long = "model-discovery-timeout-secs",
         env = "GRID_MODEL_DISCOVERY_TIMEOUT_SECS",
+        value_parser = clap::value_parser!(u64).range(1..=3_600),
         default_value_t = crate::served_models::DiscoveryConfig::default().timeout.as_secs()
     )]
     pub timeout_secs: u64,
@@ -240,6 +243,7 @@ pub struct ModelDiscoveryArgs {
         id = "model_discovery_ttl_secs",
         long = "model-discovery-ttl-secs",
         env = "GRID_MODEL_DISCOVERY_TTL_SECS",
+        value_parser = clap::value_parser!(u64).range(1..=31_536_000),
         default_value_t = crate::served_models::DiscoveryConfig::default().ttl.as_secs()
     )]
     pub ttl_secs: u64,
@@ -249,6 +253,7 @@ pub struct ModelDiscoveryArgs {
         id = "model_discovery_concurrency",
         long = "model-discovery-concurrency",
         env = "GRID_MODEL_DISCOVERY_CONCURRENCY",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=999),
         default_value_t = crate::served_models::DiscoveryConfig::default().concurrency
     )]
     pub concurrency: usize,
@@ -388,6 +393,7 @@ pub struct SignalsArgs {
         id = "signals_ttl_secs",
         long = "signals-ttl-secs",
         env = "GRID_SIGNALS_TTL_SECS",
+        value_parser = clap::value_parser!(u64).range(1..=99_999),
         default_value_t = crate::controller::grid_network::DEFAULT_SITE_SIGNALS_TTL.as_secs()
     )]
     pub ttl_secs: u64,
@@ -564,6 +570,37 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// Each setting takes the chart schema's range, so a value past it fails at startup, not at first use.
+    #[test]
+    fn ttl_and_discovery_settings_take_the_chart_range() {
+        for (flag, max) in [
+            ("--signals-ttl-secs", "99999"),
+            ("--swim-dead-member-ttl-secs", "99999"),
+            ("--model-discovery-interval-secs", "2592000"),
+            ("--model-discovery-timeout-secs", "3600"),
+            ("--model-discovery-ttl-secs", "31536000"),
+            ("--model-discovery-concurrency", "999"),
+        ] {
+            assert!(
+                Cli::try_parse_from(["grid-operator", flag, max]).is_ok(),
+                "{flag} takes {max}"
+            );
+            assert!(
+                Cli::try_parse_from(["grid-operator", flag, "0"]).is_err(),
+                "{flag} refuses 0"
+            );
+            let past = (max.parse::<u64>().unwrap_or_default() + 1).to_string();
+            assert!(
+                Cli::try_parse_from(["grid-operator", flag, past.as_str()]).is_err(),
+                "{flag} refuses {past}"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["grid-operator", "--signals-ttl-secs", &u64::MAX.to_string()]).is_err(),
+            "a TTL that would overflow the expiry is refused at startup"
+        );
     }
 
     /// The peer endpoint port is a real port.

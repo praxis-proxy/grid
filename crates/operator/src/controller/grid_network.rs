@@ -2357,6 +2357,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // List providers and tools once; shared between the catalog, the overlay and CRDT publishing.
     let providers = list_all_inference_providers(client).await?;
     let tool_providers = list_all_agent_tool_providers(client).await?;
+    record_tool_cuts(&tool_providers);
 
     // Published before any hold or render, so peers can read this site while it waits for
     // theirs, and two sites restarting together do not wait out the grace on each other.
@@ -6307,13 +6308,20 @@ fn current_tool_status(
 /// Results are capped at [`MAX_TOOLS_PER_PROVIDER`] to bound SWIM byte
 /// budget and overlay size.
 pub(crate) fn tool_names_from_agent_tool_provider(provider: &AgentToolProvider) -> Vec<String> {
+    let mut tools = routable_tool_names(provider);
+    tools.truncate(MAX_TOOLS_PER_PROVIDER);
+    tools
+}
+
+/// Discovered tools that pass the allowlist and name checks, before the per-provider cap.
+fn routable_tool_names(provider: &AgentToolProvider) -> Vec<String> {
     let Some(status) = current_tool_status(provider) else {
         return Vec::new();
     };
 
     let allowed: std::collections::HashSet<&str> = provider.spec.tools.iter().map(|tool| tool.name.as_str()).collect();
     let mut seen = std::collections::HashSet::new();
-    let mut tools: Vec<String> = status
+    status
         .discovered_tools
         .iter()
         .filter(|tool| {
@@ -6323,25 +6331,36 @@ pub(crate) fn tool_names_from_agent_tool_provider(provider: &AgentToolProvider) 
                 && seen.insert((*tool).clone())
         })
         .cloned()
-        .collect();
+        .collect()
+}
 
-    let cut = tools.len().saturating_sub(MAX_TOOLS_PER_PROVIDER);
-    crate::metrics::set_agent_tool_provider_tools_cut(
-        provider.metadata.namespace.as_deref().unwrap_or_default(),
-        provider.metadata.name.as_deref().unwrap_or_default(),
-        cut,
-    );
-    if cut > 0 {
-        tracing::warn!(
-            provider = provider.metadata.name.as_deref().unwrap_or("?"),
-            total = tools.len(),
-            cap = MAX_TOOLS_PER_PROVIDER,
-            "tool provider exceeds per-provider tool cap; truncating"
-        );
-        tools.truncate(MAX_TOOLS_PER_PROVIDER);
-    }
+/// Count each provider's tools the cap leaves out, dropping the series of providers gone from the list.
+pub(crate) fn record_tool_cuts(tool_providers: &[AgentToolProvider]) {
+    crate::metrics::set_agent_tool_provider_tools_cut(tool_cuts(tool_providers));
+}
 
-    tools
+/// Each provider's namespace, name, and the tools the cap leaves out of routing.
+pub(crate) fn tool_cuts(tool_providers: &[AgentToolProvider]) -> Vec<(String, String, usize)> {
+    tool_providers
+        .iter()
+        .map(|provider| {
+            let total = routable_tool_names(provider).len();
+            let cut = total.saturating_sub(MAX_TOOLS_PER_PROVIDER);
+            if cut > 0 {
+                tracing::warn!(
+                    provider = provider.metadata.name.as_deref().unwrap_or("?"),
+                    total,
+                    cap = MAX_TOOLS_PER_PROVIDER,
+                    "tool provider exceeds per-provider tool cap; truncating"
+                );
+            }
+            (
+                provider.metadata.namespace.clone().unwrap_or_default(),
+                provider.metadata.name.clone().unwrap_or_default(),
+                cut,
+            )
+        })
+        .collect()
 }
 
 /// Publish real provider records as a CRDT state broadcast over SWIM.

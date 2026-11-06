@@ -8753,19 +8753,11 @@ mod tests {
             candidates_from_tool_provider(&provider, &[&site]).len(),
             MAX_TOOLS_PER_PROVIDER
         );
-        let cut = crate::metrics::gather_metrics()
-            .into_iter()
-            .find(|family| family.name() == "grid_agent_tool_provider_tools_cut")
-            .and_then(|family| {
-                family.get_metric().iter().find_map(|metric| {
-                    metric
-                        .get_label()
-                        .iter()
-                        .any(|label| label.name() == "provider" && label.value() == "wide-catalog")
-                        .then(|| metric.get_gauge().value())
-                })
-            });
-        assert_eq!(cut, Some(3.0), "the cut is counted, not only logged");
+        let cuts = crate::controller::grid_network::tool_cuts(std::slice::from_ref(&provider));
+        assert_eq!(
+            cuts.first().map(|(_, name, cut)| (name.as_str(), *cut)),
+            Some(("wide-catalog", 3))
+        );
     }
 
     #[test]
