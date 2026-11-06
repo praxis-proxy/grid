@@ -461,18 +461,18 @@ pub(crate) enum Action {
         site: Option<String>,
     },
 
-    /// Prove that `GridNetwork.spec.seeds` drives SWIM mesh formation.
+    /// Prove that `GridNetwork.spec.membership.swim.seeds` drives SWIM mesh formation.
     ///
     /// Starts two out-of-cluster operator processes with
     /// `GRID_SWIM_SEEDS=""` (env-var seeds intentionally empty).  Applies a
-    /// `GridNetwork` with `spec.seeds` containing the primary operator's UDP
+    /// `GridNetwork` with `membership.swim.seeds` containing the primary operator's UDP
     /// address.  Both operators reconcile the `GridNetwork`, the secondary
-    /// reads `spec.seeds` and announces to the primary via the CRD-driven
+    /// reads `membership.swim.seeds` and announces to the primary via the CRD-driven
     /// seed path, and SWIM gossip converges.
     ///
     /// Asserts:
     /// - Both operators started with `GRID_SWIM_SEEDS=""`.
-    /// - `GridNetwork.spec.seeds` contains the primary's address.
+    /// - `GridNetwork.spec.membership.swim.seeds` contains the primary's address.
     /// - `status.phase = Active` and `status.connectedSites >= 1`.
     ///
     /// This proves that CRD-sourced seeds alone are sufficient for mesh
@@ -2484,12 +2484,12 @@ fn env_verify_swim_membership(config: &Path, site: Option<&str>) -> Result<(), B
     Ok(())
 }
 
-/// Prove that `GridNetwork.spec.seeds` drives SWIM peer discovery without env-var seeds.
+/// Prove that `GridNetwork.spec.membership.swim.seeds` drives SWIM peer discovery without env-var seeds.
 ///
 /// **Why this proves the CRD path:**
 ///
 /// Both operators start with `GRID_SWIM_SEEDS=""`, so no startup seeds at all.
-/// After the `GridNetwork` fixture is applied with `spec.seeds = [bind1]`,
+/// After the `GridNetwork` fixture is applied with `membership.swim.seeds = [bind1]`,
 /// each operator resolves the resource and calls `announce_crd_seeds`; the
 /// local address is filtered and the secondary announces to the primary.
 ///
@@ -2515,19 +2515,21 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
         .map_err(|e| format!("failed to parse bind1 addr {bind1:?}: {e}"))?;
 
     // Step 2: start primary operator with NO GRID_SWIM_SEEDS, no peer at startup.
-    // The primary will self-filter bind1 when it reads spec.seeds later.
+    // The primary will self-filter bind1 when it reads membership.swim.seeds later.
     let op1 = operator::spawn_operator_with_swim(&context, &bind1, &bind1, SWIM_NODE_PRIMARY_NAME, "", None)?;
     let mut op1_guard = ProcGuard(Some(op1), "operator-primary-crd");
 
     // Step 3: start secondary operator with NO GRID_SWIM_SEEDS, no peer at startup.
-    // The secondary will announce to bind1 only after reading spec.seeds from the CRD.
+    // The secondary will announce to bind1 only after reading membership.swim.seeds from the CRD.
     let op2 = operator::spawn_operator_with_swim(&context, &bind2, &bind2, SWIM_NODE_SECONDARY_NAME, "", None)?;
     let mut op2_guard = ProcGuard(Some(op2), "operator-secondary-crd");
 
-    // Step 4: Apply the GridNetwork fixture with an EMPTY spec.seeds.
+    // Step 4: Apply the GridNetwork fixture with an EMPTY membership.swim.seeds.
     // This proves that without seeds, both operators remain isolated (connectedSites = 0).
     operator::apply_swim_test_network_with_seeds(&context, &[])?;
-    eprintln!("  GridNetwork {CRD_SEEDS_TEST_NETWORK} applied with empty spec.seeds; verifying isolation...");
+    eprintln!(
+        "  GridNetwork {CRD_SEEDS_TEST_NETWORK} applied with empty membership.swim.seeds; verifying isolation..."
+    );
     // Allow one reconcile cycle to fire (operators are running and will reconcile the new CRD).
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
     // With empty seeds, the network must stay Pending or have connectedSites=0 (no SWIM join).
@@ -2543,7 +2545,7 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
         }
         operator::cleanup_swim_crd_seeds_test_resources(&context)?;
         return Err(format!(
-            "verify-swim-crd-seeds: expected connectedSites=0 with empty spec.seeds, \
+            "verify-swim-crd-seeds: expected connectedSites=0 with empty membership.swim.seeds, \
              got connectedSites={}; SWIM must not auto-join without seeds",
             isolated_status.connected_sites
         )
@@ -2555,12 +2557,12 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
         isolated_status.phase, isolated_status.connected_sites
     );
 
-    // Step 5: Live-additive proof: patch spec.seeds to [bind1] while operators are running.
+    // Step 5: Live-additive proof: patch membership.swim.seeds to [bind1] while operators are running.
     // This is the core runtime update contract: adding a seed while the operator is live
     // causes SWIM join on the next reconcile cycle without operator restart.
     operator::apply_swim_test_network_with_seeds(&context, &[bind1_addr])?;
     eprintln!(
-        "  spec.seeds patched to [{bind1}] while operators are running; \
+        "  membership.swim.seeds patched to [{bind1}] while operators are running; \
          awaiting CRD-driven SWIM convergence..."
     );
 
@@ -2586,7 +2588,7 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
     eprintln!(
         "verify-swim-crd-seeds: PASS (connectedSites={connected_sites}; \
          CRD seed path proven: both operators started with no GRID_SWIM_SEEDS; \
-         live-additive: spec.seeds added {bind1} while running, SWIM converged without restart)"
+         live-additive: membership.swim.seeds added {bind1} while running, SWIM converged without restart)"
     );
     Ok(())
 }
