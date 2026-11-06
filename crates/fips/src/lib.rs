@@ -24,9 +24,6 @@ pub enum FipsError {
     /// The kernel did not explicitly report FIPS mode.
     #[error("FIPS startup verification failed: /proc/sys/crypto/fips_enabled must be 1")]
     Kernel,
-    /// The system policy is absent or permits algorithms outside the supported boundary.
-    #[error("FIPS startup verification failed: system crypto policy must be FIPS or FIPS:OSPP")]
-    Policy,
     /// The process's OpenSSL default properties do not require approved algorithms.
     #[error("FIPS startup verification failed: OpenSSL default properties do not enable FIPS")]
     OpenSslDisabled,
@@ -44,13 +41,14 @@ pub enum FipsError {
 /// Requires the default OpenSSL context to select FIPS-approved algorithms and
 /// the FIPS provider to supply SHA-256. A known-answer digest exercises the
 /// default context actually used by the control-plane TLS and identity code.
-/// Host requirements match the supported UBI/RHEL deployment and Praxis's
-/// kernel/policy checks. OpenSSL initializes its configured providers; this
-/// function does not explicitly load providers or enable FIPS properties.
+/// The kernel must report FIPS mode. The container-visible crypto policy is
+/// logged for diagnostics only: it may differ from the effective host policy.
+/// OpenSSL initializes its configured providers; this function does not
+/// explicitly load providers or enable FIPS properties.
 ///
 /// # Errors
 ///
-/// Refuses missing or non-FIPS host indicators, disabled FIPS properties, or
+/// Refuses a missing or non-FIPS kernel flag, disabled FIPS properties, or
 /// failure of the approved digest check. This is configuration verification,
 /// not a claim that all cryptography in the binary is inside a validated module.
 #[cfg(feature = "runtime")]
@@ -71,26 +69,26 @@ pub fn verify() -> Result<(), FipsError> {
     let read = |path| std::fs::read_to_string(path).map_err(|source| FipsError::HostFile { path, source });
     check_host(
         &read("/proc/sys/crypto/fips_enabled")?,
-        &read("/etc/crypto-policies/config")?,
+        std::fs::read_to_string("/etc/crypto-policies/config"),
     )?;
     Ok(())
 }
 
-/// Validate the host indicators independently of OpenSSL initialization.
+/// Require the kernel FIPS flag and report the container policy for diagnostics.
 #[cfg(any(feature = "runtime", test))]
-fn check_host(kernel: &str, policy: &str) -> Result<(), FipsError> {
+fn check_host(kernel: &str, policy: std::io::Result<String>) -> Result<(), FipsError> {
     if kernel.trim() != "1" {
         return Err(FipsError::Kernel);
     }
-    let normalized = policy
-        .lines()
-        .map(|line| line.split_once('#').map_or(line, |(kept, _)| kept).trim())
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(":")
-        .to_ascii_uppercase();
-    if !matches!(normalized.as_str(), "FIPS" | "FIPS:OSPP") {
-        return Err(FipsError::Policy);
+    match policy {
+        Ok(policy) => tracing::info!(
+            policy = policy.trim(),
+            "container crypto policy is diagnostic only; effective OpenSSL FIPS checks passed"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            "cannot read container crypto policy; diagnostic only, effective OpenSSL FIPS checks passed"
+        ),
     }
     Ok(())
 }
@@ -103,32 +101,41 @@ mod tests {
     fn only_an_explicit_kernel_fips_flag_is_accepted() {
         for kernel in ["", "0", "true", "2", "1 extra"] {
             assert!(
-                matches!(check_host(kernel, "FIPS"), Err(FipsError::Kernel)),
+                matches!(check_host(kernel, Ok("FIPS".to_owned())), Err(FipsError::Kernel)),
                 "kernel value {kernel:?} must be refused"
             );
         }
         assert!(
-            matches!(check_host("1\n", "FIPS"), Ok(())),
+            matches!(check_host("1\n", Ok("FIPS".to_owned())), Ok(())),
             "kernel flag 1 with a trailing newline must be accepted"
         );
     }
 
     #[test]
-    fn fips_policy_allows_only_the_ospp_restriction() {
-        for policy in ["FIPS", "FIPS:OSPP", "fips\n# restriction\nospp", "FIPS # enabled\n"] {
-            assert!(matches!(check_host("1", policy), Ok(())), "{policy}");
+    fn container_policy_content_is_diagnostic_only() {
+        for policy in ["FIPS", "FIPS:OSPP", "DEFAULT", "", "UNKNOWN", "FIPS:SHA1"] {
+            assert!(
+                check_host("1", Ok(policy.to_owned())).is_ok(),
+                "container policy {policy:?} must not reject a FIPS kernel"
+            );
+            assert!(
+                matches!(check_host("0", Ok(policy.to_owned())), Err(FipsError::Kernel)),
+                "container policy {policy:?} must not bypass the kernel check"
+            );
         }
-        for policy in [
-            "",
-            "DEFAULT",
-            "FIPS:NO-ENFORCE-EMS",
-            "FIPS:SHA1",
-            "FIPS:",
-            "FIPS:UNKNOWN",
-            "FIPS:OSPP:OSPP",
-            "FIPS\nOSPP\nOSPP",
-        ] {
-            assert!(matches!(check_host("1", policy), Err(FipsError::Policy)), "{policy}");
+    }
+
+    #[test]
+    fn missing_or_unreadable_container_policy_is_diagnostic_only() {
+        for kind in [std::io::ErrorKind::NotFound, std::io::ErrorKind::PermissionDenied] {
+            assert!(
+                check_host("1", Err(std::io::Error::from(kind))).is_ok(),
+                "policy read error {kind:?} must not reject a FIPS kernel"
+            );
+            assert!(
+                matches!(check_host("0", Err(std::io::Error::from(kind))), Err(FipsError::Kernel)),
+                "policy read error {kind:?} must not bypass the kernel check"
+            );
         }
     }
 }

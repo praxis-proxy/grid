@@ -15,6 +15,7 @@ runtime = ["dep:openssl", "dep:grid-openssl-fips"]
 openssl = { workspace = true, optional = true }
 grid-openssl-fips = { workspace = true, optional = true, features = ["runtime"] }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true

@@ -84,9 +84,10 @@ normal startup unless all of the following hold:
 - The FIPS provider can supply SHA-256, and a SHA-256 known-answer check passes
   through the default context used by the binaries.
 - `/proc/sys/crypto/fips_enabled` reports `1`.
-- `/etc/crypto-policies/config` selects `FIPS` or `FIPS:OSPP`. Missing files,
-  unknown policies, and subpolicies that relax FIPS are refused. This matches
-  the supported UBI/RHEL deployment and Praxis's host-policy requirements.
+
+The container-visible `/etc/crypto-policies/config` is logged for diagnostics
+only. Its contents or absence do not determine startup eligibility; the
+effective OpenSSL configuration and kernel flag do.
 
 The checks run before Kubernetes clients, listeners, database connections, or
 certificate operations. Enrollment's bootstrap and invite commands also check
@@ -109,44 +110,24 @@ on a FIPS-enabled RHEL host. In particular, the separate SWIM crypto work in
 subprocess tests on ordinary hosts establish refusal behavior, not successful
 operation in an approved environment.
 
-### Providing the container crypto policy
+### Container crypto-policy diagnostics
 
-The kernel flag comes from the host, but the verifier reads the policy visible
-inside each container. The pinned UBI 9 minimal base's amd64 image ships
-`DEFAULT` in `/etc/crypto-policies/config`; installing the provider packages
-alone does not select FIPS policy. This requirement applies to every container
-running the FIPS operator, overlay-sync, enrollment service, or enrollment
-bootstrap/invite command, including init containers and one-shot Jobs.
+The kernel flag comes from the host, while `/etc/crypto-policies/config` is
+read from the container filesystem. A valid OpenShift FIPS node can expose
+`DEFAULT` there inside a container. The pinned UBI 9 minimal amd64 image also
+ships that value. This file alone does not describe the process's effective
+OpenSSL configuration, so it is not a startup requirement. Missing or
+unreadable policy files produce a diagnostic warning and do not refuse startup.
 
-On a FIPS-enabled RHEL 9 host, supported Podman containers receive automatic
-FIPS configuration from the runtime. Verify that the policy is visible inside
-the actual container; do not assume the image's file or the host's file alone
-describes that runtime. Other deployment runtimes must also provide the
-required container policy before starting the binary. See
-[Red Hat's container FIPS guidance][container-fips].
+Configure every FIPS runtime container according to its platform's supported
+FIPS deployment procedure, including overlay-sync sidecars and enrollment
+Jobs/init containers. See [Red Hat's container FIPS guidance][container-fips].
+The verifier does not modify crypto policies or compensate for an unavailable
+provider. A `FIPS` policy-file value cannot bypass the mandatory kernel and
+effective OpenSSL checks.
 
-If the runtime does not supply it, the deployer must prepare a custom FIPS
-runtime image using Red Hat's `crypto-policies-scripts` package and run
-`update-crypto-policies --no-reload --set FIPS` during image preparation, before
-switching to the non-root application user. Use the distribution's package
-manager to install missing tooling. Do not merely write `FIPS` into the config
-file: the policy command must generate the matching backend configuration.
-Repeat this setup for each FIPS runtime image, including custom enrollment
-images; setting the policy on the operator container does not configure its
-sidecars or Jobs. Image preparation does not enable FIPS on the host.
-
-Before launching each FIPS container's application, inspect the kernel flag
-and policy in that container's filesystem:
-
-```console
-cat /proc/sys/crypto/fips_enabled
-cat /etc/crypto-policies/config
-```
-
-The flag must be `1`, and the policy must select `FIPS` or `FIPS:OSPP`. The
-binary still verifies OpenSSL's effective selection and provider availability;
-these file checks alone do not establish compliance. Successful operation on
-an approved host remains part of deployment qualification.
+Successful operation on an approved RHEL/OpenShift FIPS host has not been
+validated locally and remains part of deployment qualification.
 
 ### Unsafe-code exception for review
 
@@ -169,8 +150,7 @@ Without that feature, default workspace builds do not link or probe OpenSSL
 through either startup-helper crate.
 
 Replace the wrapper and remove this exception when an upstream safe getter is
-available. Do not extend the leaf crate with unrelated FFI. Whether to pursue
-that upstream API before merging this exception remains a review decision.
+available. Do not extend the leaf crate with unrelated FFI.
 
 [#163]: https://github.com/praxis-proxy/grid/issues/163
 [#507]: https://github.com/praxis-proxy/grid/issues/507
