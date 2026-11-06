@@ -79,7 +79,7 @@ spec:
       {{- end }}
       terminationGracePeriodSeconds: {{ $grace }}
       {{- if .Values.metricsListener.enabled }}
-      serviceAccountName: {{ printf "%s-metrics-auth" (include "praxis-gateway.fullname" . | trunc 49 | trimSuffix "-") }}
+      serviceAccountName: {{ include "praxis-gateway.metricsAuthSA" . }}
       {{- else if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled }}
       serviceAccountName: {{ include "praxis-gateway.fullname" . }}-overlay-sync
       {{- end }}

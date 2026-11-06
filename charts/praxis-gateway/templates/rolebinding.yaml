@@ -13,7 +13,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     {{- if .Values.metricsListener.enabled }}
-    name: {{ printf "%s-metrics-auth" (include "praxis-gateway.fullname" . | trunc 49 | trimSuffix "-") }}
+    name: {{ include "praxis-gateway.metricsAuthSA" . }}
     {{- else }}
     name: {{ include "praxis-gateway.fullname" . }}-overlay-sync
     {{- end }}

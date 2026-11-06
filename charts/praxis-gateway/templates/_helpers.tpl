@@ -72,6 +72,34 @@ Fully qualified app name.
 {{- end }}
 
 {{/*
+ServiceAccount used by the gateway metrics listener for Kubernetes reviews.
+*/}}
+{{- define "praxis-gateway.metricsAuthSA" -}}
+{{- printf "%s-metrics-auth" (include "praxis-gateway.fullname" . | trunc 49 | trimSuffix "-") -}}
+{{- end }}
+
+{{/*
+ServiceAccount whose token Prometheus uses to scrape gateway metrics.
+*/}}
+{{- define "praxis-gateway.metricsScraperSA" -}}
+{{- printf "%s-metrics-scraper" (include "praxis-gateway.fullname" . | trunc 45 | trimSuffix "-") -}}
+{{- end }}
+
+{{/*
+ServiceAccount token Secret used by the metrics ServiceMonitor.
+*/}}
+{{- define "praxis-gateway.metricsTokenSecret" -}}
+{{- printf "%s-metrics-token" (include "praxis-gateway.fullname" . | trunc 45 | trimSuffix "-") -}}
+{{- end }}
+
+{{/*
+Namespaced Role authorizing the metrics scraper identity.
+*/}}
+{{- define "praxis-gateway.metricsScrapeRole" -}}
+{{- printf "%s-metrics-scrape" (include "praxis-gateway.fullname" . | trunc 45 | trimSuffix "-") -}}
+{{- end }}
+
+{{/*
 Chart label value: name-version.
 */}}
 {{- define "praxis-gateway.chart" -}}

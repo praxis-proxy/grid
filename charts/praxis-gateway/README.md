@@ -445,11 +445,15 @@ The chart enforces Kubernetes restricted security defaults:
 - `seccompProfile.type: RuntimeDefault`
 - `automountServiceAccountToken: false`
 
-When overlay-sync is enabled, the pod uses a dedicated ServiceAccount, but
-automatic token mounting remains disabled. A short-lived projected token is
-mounted only into the overlay-sync init and sidecar containers. The Praxis
-container has no Kubernetes API credential and mounts the delivered overlay
-directory read-only.
+Automatic ServiceAccount token mounting remains disabled. When overlay-sync is
+enabled, its short-lived projected token is mounted only into the overlay-sync
+init and sidecar containers. When `metricsListener.enabled` is true, the Praxis
+container receives a separate short-lived projected token for its metrics
+authorization reviews. Its ServiceAccount can create `TokenReview` and
+`SubjectAccessReview` objects cluster-wide. When both metrics authorization and
+overlay-sync are enabled, the overlay-sync RoleBinding grants that same
+ServiceAccount read access to the configured overlay ConfigMap. The Praxis
+container mounts the delivered overlay directory read-only.
 
 ## Optional uses
 

@@ -22,6 +22,7 @@ STATE_DIR=${STATE_DIR:-$ROOT/target/forge/praxis-gateway-standalone}
 CLUSTER_NAME=praxis-standalone-gateway
 CONTEXT=kind-$CLUSTER_NAME
 GRID_GATEWAY_IMAGE=grid-gateway:latest
+CHART_GATEWAY_IMAGE=docker.io/library/grid-gateway:latest
 
 FORGE_BIN=$("$ROOT/scripts/forge.sh" path)
 
@@ -66,7 +67,8 @@ build_and_load_grid_gateway() {
   engine=${CONTAINER_ENGINE:-$(command -v podman || command -v docker || true)}
   [ -n "$engine" ] || { echo "No container engine found. Install podman or docker." >&2; return 1; }
   make CONTAINER_ENGINE="$engine" gateway-image || return 1
-  load_image_to_kind "$engine" "$GRID_GATEWAY_IMAGE"
+  "$engine" tag "$GRID_GATEWAY_IMAGE" "$CHART_GATEWAY_IMAGE" || return 1
+  load_image_to_kind "$engine" "$CHART_GATEWAY_IMAGE"
 }
 
 diagnostics() {
@@ -119,12 +121,16 @@ fi
 cat "$PRAXIS_GATEWAY_E2E_LOG"
 # A stack that never ran leaves no checks behind, so require the last stage's,
 # and Forge keeps applying later stacks after one fails, so look for failures too.
-required_stage=release
-if [ "${E2E_STACK:-}" = gateway-metrics ]; then
-  required_stage=metrics-authorization
+required_stages=(metrics-authorization)
+if [ "${E2E_STACK:-}" != gateway-metrics ]; then
+  required_stages+=(release)
 fi
+missing_stage=0
+for required_stage in "${required_stages[@]}"; do
+  grep -Fq "PASS [$required_stage]" "$PRAXIS_GATEWAY_E2E_LOG" || missing_stage=1
+done
 if [ "$status" = 0 ] && { grep -q 'FAIL \[' "$PRAXIS_GATEWAY_E2E_LOG" \
-  || ! grep -Fq "PASS [$required_stage]" "$PRAXIS_GATEWAY_E2E_LOG"; }; then
+  || [ "$missing_stage" = 1 ]; }; then
   echo "a stage failed or never ran" >&2
   status=1
 fi

@@ -462,7 +462,7 @@ impl KubernetesAuthorizer {
     ///
     /// Returns an I/O error when credentials, transport, API status, or response data fail.
     async fn post<T: serde::de::DeserializeOwned>(&self, path: &str, body: &serde_json::Value) -> io::Result<T> {
-        let api_token = std::fs::read_to_string(API_TOKEN_PATH).map_err(|_error| auth_api_error())?;
+        let api_token = std::fs::read_to_string(API_TOKEN_PATH).map_err(auth_api_error)?;
         let response = self
             .client
             .post(format!("{API_URL}{path}"))
@@ -470,10 +470,10 @@ impl KubernetesAuthorizer {
             .json(&body)
             .send()
             .await
-            .map_err(|_error| auth_api_error())?
+            .map_err(auth_api_error)?
             .error_for_status()
-            .map_err(|_error| auth_api_error())?;
-        response.json().await.map_err(|_error| auth_api_error())
+            .map_err(auth_api_error)?;
+        response.json().await.map_err(auth_api_error)
     }
 }
 
@@ -561,8 +561,13 @@ enum Authorization {
 }
 
 /// A failure to consult the Kubernetes authorization API.
-fn auth_api_error() -> io::Error {
-    io::Error::other("Kubernetes metrics authorization check failed")
+///
+/// The source error is retained for operator diagnostics without exposing request headers.
+fn auth_api_error<E>(source: E) -> io::Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    io::Error::other(source)
 }
 
 /// `TokenReview` response data used to construct the `SubjectAccessReview`.
@@ -791,6 +796,7 @@ mod tests {
 
     use super::*;
 
+    /// Build a lookup closure for deterministic environment configuration tests.
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let pairs: Vec<(String, String)> = pairs
             .iter()
@@ -804,6 +810,7 @@ mod tests {
         }
     }
 
+    /// Confirm that an absent or empty listener address disables the listener.
     #[test]
     fn an_unset_address_leaves_the_listener_off() {
         assert!(MetricsListener::from_env(env(&[])).unwrap().is_none(), "unset");
@@ -813,6 +820,7 @@ mod tests {
         );
     }
 
+    /// Require a complete listener address and both TLS files.
     #[test]
     fn an_address_without_a_cert_or_key_is_refused() {
         let no_key = MetricsListener::from_env(env(&[(ADDR_ENV, "0.0.0.0:9443"), (CERT_ENV, "/c")])).unwrap_err();
@@ -823,6 +831,7 @@ mod tests {
         assert!(hostname.contains("ip:port"), "{hostname}");
     }
 
+    /// Prevent the metrics listener from colliding with Praxis listeners.
     #[test]
     fn a_port_praxis_binds_is_refused() {
         let listener = MetricsListener::from_env(env(&[(ADDR_ENV, "0.0.0.0:9443"), (CERT_ENV, "/c"), (KEY_ENV, "/k")]))
@@ -851,11 +860,66 @@ mod tests {
         );
     }
 
+    /// Parse one request and return its routing response.
     async fn reply_to(request: &[u8]) -> Reply {
         let mut reader = request;
         read_request(&mut reader).await.unwrap()
     }
 
+    /// Parse a bearer token from one raw HTTP request.
+    async fn token_of(request: &[u8]) -> Option<String> {
+        let mut reader = request;
+        read_request_details(&mut reader).await.ok()?.bearer_token
+    }
+
+    /// Reject malformed, duplicate, or non-Bearer authorization headers.
+    #[tokio::test]
+    async fn bearer_token_requires_one_well_formed_authorization_header() {
+        assert_eq!(
+            token_of(b"GET /metrics HTTP/1.1\r\nauthorization: bearer abc\r\n\r\n")
+                .await
+                .as_deref(),
+            Some("abc"),
+            "scheme is case-insensitive"
+        );
+        assert!(
+            token_of(b"GET /metrics HTTP/1.1\r\nAuthorization: Bearer a\r\nAuthorization: Bearer b\r\n\r\n")
+                .await
+                .is_none(),
+            "duplicate authorization headers are rejected"
+        );
+        assert!(
+            token_of(b"GET /metrics HTTP/1.1\r\nAuthorization: Bearer  abc\r\n\r\n")
+                .await
+                .is_none(),
+            "extra spaces are rejected"
+        );
+        assert!(
+            token_of(b"GET /metrics HTTP/1.1\r\nAuthorization: Basic abc\r\n\r\n")
+                .await
+                .is_none(),
+            "non-Bearer schemes are rejected"
+        );
+    }
+
+    /// Return the documented status and challenge for authorization failures.
+    #[test]
+    fn authorization_replies_have_the_expected_status_and_challenge() {
+        let (unauthorized, _) = Reply::Unauthorized.into_parts();
+        assert!(unauthorized.starts_with("HTTP/1.1 401 "), "{unauthorized}");
+        assert!(
+            unauthorized.contains("\r\nWWW-Authenticate: Bearer\r\n"),
+            "{unauthorized}"
+        );
+
+        let (forbidden, _) = Reply::Forbidden.into_parts();
+        assert!(forbidden.starts_with("HTTP/1.1 403 "), "{forbidden}");
+
+        let (unavailable, _) = Reply::ServiceUnavailable.into_parts();
+        assert!(unavailable.starts_with("HTTP/1.1 503 "), "{unavailable}");
+    }
+
+    /// Serve only GET requests for the metrics path and reject other routes and methods.
     #[tokio::test]
     async fn only_get_metrics_is_served() {
         assert_eq!(
@@ -878,6 +942,7 @@ mod tests {
         assert_eq!(reply_to(b"\x00garbage\r\n\r\n").await, Reply::BadRequest);
     }
 
+    /// Reject request heads exceeding either parser limit.
     #[tokio::test]
     async fn an_oversized_head_gets_431_without_reading_past_the_cap() {
         let mut long = b"GET /metrics HTTP/1.1\r\nX: ".to_vec();
@@ -890,6 +955,7 @@ mod tests {
         assert_eq!(reply_to(many.as_bytes()).await, Reply::HeadTooLarge);
     }
 
+    /// Keep allow decisions longer than denials and expire both at their TTL.
     #[test]
     fn authorization_cache_uses_shorter_lifetimes_for_denials() {
         let now = Instant::now();
@@ -921,6 +987,7 @@ mod tests {
         );
     }
 
+    /// Keep the decision cache at or below its configured entry limit.
     #[test]
     fn authorization_cache_does_not_exceed_its_capacity() {
         let now = Instant::now();
@@ -933,6 +1000,7 @@ mod tests {
         assert_eq!(cache.entries.len(), MAX_CACHED_AUTHORIZATIONS, "bounded cache");
     }
 
+    /// Return an error when a client closes before completing the request head.
     #[tokio::test]
     async fn a_peer_closing_mid_head_is_an_error() {
         let mut reader: &[u8] = b"GET /metrics HTTP/1.1\r\n";
@@ -940,6 +1008,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
     }
 
+    /// Require the TLS configuration used by the listener to enforce EMS.
     #[test]
     fn the_tls_config_requires_extended_master_secret() {
         praxis_tls::provider::install();
@@ -960,6 +1029,7 @@ mod tests {
         assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()], "HTTP/1.1 only");
     }
 
+    /// Advertise allowed methods and close each response connection.
     #[test]
     fn a_405_names_get_and_every_reply_closes() {
         let (response, _) = Reply::MethodNotAllowed.into_parts();

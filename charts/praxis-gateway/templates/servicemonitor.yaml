@@ -31,7 +31,7 @@ spec:
       authorization:
         type: Bearer
         credentials:
-          name: {{ printf "%s-metrics-token" (include "praxis-gateway.fullname" $ | trunc 45 | trimSuffix "-") }}
+          name: {{ include "praxis-gateway.metricsTokenSecret" $ }}
           key: token
       metricRelabelings:
         # Reserve "cluster" for the managed cluster; Praxis uses it for the backend.
