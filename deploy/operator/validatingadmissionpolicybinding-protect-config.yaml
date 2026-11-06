@@ -9,3 +9,7 @@ metadata:
 spec:
   policyName: grid-operator-protect-config
   validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: grid-system

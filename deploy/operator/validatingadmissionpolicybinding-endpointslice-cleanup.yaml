@@ -9,3 +9,7 @@ metadata:
 spec:
   policyName: grid-operator-endpointslice-cleanup
   validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: grid-system
