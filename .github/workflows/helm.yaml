@@ -552,7 +552,7 @@ jobs:
   # ----------------------------------------------------------------------------
   # Standalone praxis-gateway e2e: Forge brings up a Kind cluster with no Grid
   # components, installs the chart with no values, reconfigures it several
-  # ways, and checks real requests through Praxis after every change.
+  # ways, and checks real requests plus metrics scrape authorization.
   # ----------------------------------------------------------------------------
 
   gateway-standalone:
