@@ -9,7 +9,6 @@ gridNetwork:
   region: ""
   zone: ""
   seeds: []
-  swim: {}
   tls: {}
   # New chart installations use stabilized admission parameters. Pressure
   # transitions require an active scoringPolicy and matching provider metrics

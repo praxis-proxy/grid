@@ -224,11 +224,11 @@ in `grid.seeds`.
 ```bash
 oc get gridsites                 # every site, on the hub
 oc get svc -n grid               # swim UDP and signals TCP, each with an address
-oc get gridnetworks -o custom-columns=NAME:.metadata.name,SEEDS:.spec.seeds,SITES:.status.connectedSites
+oc get gridnetworks -o custom-columns=NAME:.metadata.name,SEEDS:.spec.membership.swim.seeds,SITES:.status.connectedSites
 ```
 
 On every cluster, `SEEDS` must list the other sites' SWIM Service endpoints and
-`SITES` must become nonzero. Empty `spec.seeds` is valid for a standalone site
+`SITES` must become nonzero. Empty `membership.swim.seeds` is valid for a standalone site
 and can report `Active`, so the phase alone does not prove the second pass
 finished.
 
