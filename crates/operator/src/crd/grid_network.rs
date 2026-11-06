@@ -903,6 +903,10 @@ impl GatewayRef {
     }
 }
 
+/// Admission rule refusing a sovereignty fence under any router but `gridSiteRoute`.
+pub(crate) const SOVEREIGNTY_REQUIRES_GRID_SITE_ROUTE: &str =
+    "!has(self.sovereignty) || (has(self.siteRouter) && self.siteRouter == 'gridSiteRoute')";
+
 /// Opt-in configuration for operator-generated consumer Praxis config.
 ///
 /// When `generate` is `true` on a [`GatewayRef`], the `GridNetwork` controller
@@ -927,7 +931,7 @@ impl GatewayRef {
 )]
 #[schemars(transform = add_consumer_config_legacy_fields)]
 #[schemars(extend("x-kubernetes-validations" = [{
-    "rule": "!has(self.sovereignty) || (has(self.siteRouter) && self.siteRouter == 'gridSiteRoute')",
+    "rule": SOVEREIGNTY_REQUIRES_GRID_SITE_ROUTE,
     "message": "sovereignty is applied only by siteRouter gridSiteRoute"
 }]))]
 #[serde(rename_all = "camelCase")]
@@ -1052,8 +1056,8 @@ pub struct ConsumerConfig {
     pub site_router: SiteRouter,
 
     /// The sovereignty fence `gridSiteRoute` applies: the header naming the zones a request
-    /// may be served in, and whether it refuses or only audits. Under any other router the
-    /// config is not rendered, and the status names `SovereigntyWithoutGridSiteRoute`.
+    /// may be served in, and whether it refuses or only audits. Admission rejects it under
+    /// any other router.
     ///
     /// Default: unset, no fence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2185,6 +2189,37 @@ mod tests {
                     .any(|validation| validation.get("rule").and_then(serde_json::Value::as_str) == Some(rule)),
                 "legacy schema must keep nested validation {rule:?}: {validations:?}"
             );
+        }
+    }
+
+    #[test]
+    fn every_consumer_config_path_refuses_sovereignty_without_grid_site_route() {
+        let crd = crd_json();
+        let spec = "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties";
+        for gateways in ["consumerGateways", "gatewayRefs"] {
+            for config in ["praxisConfig", "consumerConfig"] {
+                let path = format!("{spec}/{gateways}/items/properties/{config}");
+                let schema = crd.pointer(&path).unwrap_or_else(|| std::process::abort());
+                let rules = schema
+                    .get("x-kubernetes-validations")
+                    .and_then(serde_json::Value::as_array)
+                    .unwrap_or_else(|| std::process::abort());
+                assert!(
+                    rules.iter().any(|rule| {
+                        rule.get("rule").and_then(serde_json::Value::as_str)
+                            == Some(SOVEREIGNTY_REQUIRES_GRID_SITE_ROUTE)
+                    }),
+                    "{path} must refuse sovereignty without gridSiteRoute: {rules:?}"
+                );
+                let description = schema
+                    .pointer("/properties/sovereignty/description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                assert!(
+                    description.contains("Admission rejects it under"),
+                    "{path} sovereignty description must name admission rejection: {description:?}"
+                );
+            }
         }
     }
 
