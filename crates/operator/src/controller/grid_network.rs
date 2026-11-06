@@ -49,7 +49,8 @@ use crate::{
     resources::{
         consumer_config::{self, ConsumerConfigError, SiteRoutePrerequisite},
         derived_topology, gateway_mounts, overlay_envelope, provider_admission, provider_config, provider_metrics,
-        routing_overlay, secret,
+        routing_overlay::{self, MAX_TOOLS_PER_PROVIDER},
+        secret,
         serving_config::{self, ServingInputs, WriteDecision, WriteGate},
         tls_backend::ServerTlsConfig,
         trust_bundle::{self, CertPemStatus},
@@ -6277,13 +6278,6 @@ fn tool_provider_state_from_kube(
     })
 }
 
-/// Maximum number of tool names retained per [`AgentToolProvider`].
-///
-/// Large MCP catalogs can inflate both the SWIM broadcast byte budget and
-/// the routing overlay size. Excess tools are truncated and a warning is
-/// logged.
-const MAX_TOOLS_PER_PROVIDER: usize = 128;
-
 /// Maximum encoded length of one MCP tool name accepted by the routing path.
 const MAX_TOOL_NAME_LEN: usize = 256;
 
@@ -6326,7 +6320,13 @@ pub(crate) fn tool_names_from_agent_tool_provider(provider: &AgentToolProvider) 
         .cloned()
         .collect();
 
-    if tools.len() > MAX_TOOLS_PER_PROVIDER {
+    let cut = tools.len().saturating_sub(MAX_TOOLS_PER_PROVIDER);
+    crate::metrics::set_agent_tool_provider_tools_cut(
+        provider.metadata.namespace.as_deref().unwrap_or_default(),
+        provider.metadata.name.as_deref().unwrap_or_default(),
+        cut,
+    );
+    if cut > 0 {
         tracing::warn!(
             provider = provider.metadata.name.as_deref().unwrap_or("?"),
             total = tools.len(),

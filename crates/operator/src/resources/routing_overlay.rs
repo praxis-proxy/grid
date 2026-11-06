@@ -82,8 +82,13 @@ pub(crate) const MAX_OVERLAY_CANDIDATES: usize = 1_024;
 /// Maximum identifier length accepted by the downstream routing filters.
 const MAX_CANDIDATE_IDENTIFIER_LEN: usize = 256;
 
-/// Maximum tool records accepted from one remote provider.
-const MAX_TOOLS_PER_PROVIDER: usize = 128;
+/// Tools one provider routes, local or remote.
+///
+/// Below the discovered-tools bound on purpose: status keeps up to that many so the
+/// `spec.tools` allowlist can pick from the whole catalog, then routing keeps this many to
+/// bound the SWIM broadcast and the overlay. The cut is counted by
+/// `grid_agent_tool_provider_tools_cut`.
+pub(crate) const MAX_TOOLS_PER_PROVIDER: usize = 128;
 
 /// Fallback locality score when `backend_kind` is absent or unrecognised.
 ///
@@ -8736,6 +8741,31 @@ mod tests {
             2,
             "empty spec.tools must pass all discovered tools through"
         );
+    }
+
+    #[test]
+    fn a_tool_catalog_past_the_routing_cap_is_cut_and_counted() {
+        let discovered: Vec<String> = (0..MAX_TOOLS_PER_PROVIDER + 3).map(|n| format!("t{n:03}")).collect();
+        let discovered: Vec<&str> = discovered.iter().map(String::as_str).collect();
+        let provider = test_tool_provider_with_discovered("wide-catalog", "net", &[], &discovered);
+        let site = test_site("site-a", "net");
+        assert_eq!(
+            candidates_from_tool_provider(&provider, &[&site]).len(),
+            MAX_TOOLS_PER_PROVIDER
+        );
+        let cut = crate::metrics::gather_metrics()
+            .into_iter()
+            .find(|family| family.name() == "grid_agent_tool_provider_tools_cut")
+            .and_then(|family| {
+                family.get_metric().iter().find_map(|metric| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == "provider" && label.value() == "wide-catalog")
+                        .then(|| metric.get_gauge().value())
+                })
+            });
+        assert_eq!(cut, Some(3.0), "the cut is counted, not only logged");
     }
 
     #[test]

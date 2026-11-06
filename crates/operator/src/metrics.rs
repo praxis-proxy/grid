@@ -33,6 +33,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(AGENT_TOOL_PROVIDER_PHASE_TRANSITIONS.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(AGENT_TOOL_PROVIDER_TOOLS_CUT.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(MCP_PROBE_TOTAL.clone()))
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(MCP_PROBE_DURATION.clone()))
@@ -796,6 +798,20 @@ static AGENT_TOOL_PROVIDER_PHASE_TRANSITIONS: LazyLock<IntCounterVec> = LazyLock
     .unwrap_or_else(|_| std::process::abort())
 });
 
+/// Discovered tools left out of routing by the per-provider cap, by provider.
+///
+/// Status keeps the larger discovered list, so without this the cut shows only in a log.
+static AGENT_TOOL_PROVIDER_TOOLS_CUT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "grid_agent_tool_provider_tools_cut",
+            "Discovered tools the per-provider cap leaves out of routing",
+        ),
+        &["namespace", "provider"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
 /// Total `AgentToolProvider` MCP `tools/list` probe attempts by outcome.
 ///
 /// The `outcome` label comes from
@@ -903,6 +919,20 @@ pub(crate) fn record_agent_tool_provider_phase_transition(from: &str, to: &str, 
     AGENT_TOOL_PROVIDER_PHASE_TRANSITIONS
         .with_label_values(&[from, to, reason])
         .inc();
+}
+
+/// Set how many of a provider's tools the per-provider cap leaves out of routing.
+///
+/// A provider within the cap has no series, so a deleted one leaves none behind unless it was
+/// cut when it went.
+pub(crate) fn set_agent_tool_provider_tools_cut(namespace: &str, provider: &str, cut: usize) {
+    if cut == 0 {
+        drop(AGENT_TOOL_PROVIDER_TOOLS_CUT.remove_label_values(&[namespace, provider]));
+    } else {
+        AGENT_TOOL_PROVIDER_TOOLS_CUT
+            .with_label_values(&[namespace, provider])
+            .set(i64::try_from(cut).unwrap_or(i64::MAX));
+    }
 }
 
 /// Record a completed `AgentToolProvider` MCP `tools/list` probe attempt.
