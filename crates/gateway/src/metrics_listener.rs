@@ -163,14 +163,14 @@ impl MetricsListener {
     ///
     /// # Errors
     ///
-    /// Returns a message when the cert or Kubernetes API CA does not load, no
-    /// crypto provider is installed, or the address does not bind.
+    /// Returns a message when the serving certificate does not load, no crypto
+    /// provider is installed, or the address does not bind.
     pub(crate) fn spawn(self) -> Result<JoinHandle<()>, String> {
         let resolver = ReloadableCertResolver::new(&self.pair)
             .map_err(|err| format!("metrics listener certificate {}: {err}", self.pair.cert_path))?;
         let current = resolver.arc();
         let acceptor = TlsAcceptor::from(Arc::new(server_config(resolver)?));
-        let authorizer = KubernetesAuthorizer::new()?;
+        let authorizer = KubernetesAuthorizer::new();
         let listener = StdTcpListener::bind(self.addr)
             .and_then(|listener| listener.set_nonblocking(true).map(|()| listener))
             .map_err(|err| format!("metrics listener bind {}: {err}", self.addr))?;
@@ -336,12 +336,8 @@ impl Drop for AuthorizationReviewGuard {
 /// Kubernetes API client for the metrics listener's authentication checks.
 #[derive(Clone)]
 struct KubernetesAuthorizer {
-    /// API client trusting the in-cluster CA bundle.
-    client: reqwest::Client,
-    /// Namespace containing the gateway's synthetic scrape permission.
-    namespace: String,
-    /// Release-specific name of the scrape permission.
-    resource_name: String,
+    /// Validated Kubernetes client and scope, or the reason they are unavailable.
+    config: Result<KubernetesAuthorizationConfig, String>,
     /// Bounded cache of token hashes and their recent review decisions.
     cache: Arc<Mutex<AuthorizationCache>>,
     /// Limit concurrent API review work independently of accepted connections.
@@ -349,34 +345,17 @@ struct KubernetesAuthorizer {
 }
 
 impl KubernetesAuthorizer {
-    /// Build a client using the projected service-account CA.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message when the CA, authorization scope, or HTTP client cannot be loaded.
-    fn new() -> Result<Self, String> {
-        let namespace = std::env::var(AUTH_NAMESPACE_ENV)
-            .ok()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| format!("metrics listener needs {AUTH_NAMESPACE_ENV}"))?;
-        let resource_name = std::env::var(AUTH_RESOURCE_NAME_ENV)
-            .ok()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| format!("metrics listener needs {AUTH_RESOURCE_NAME_ENV}"))?;
-        let ca = std::fs::read(API_CA_PATH).map_err(|err| format!("metrics listener Kubernetes CA: {err}"))?;
-        let certificate = Certificate::from_pem(&ca).map_err(|err| format!("metrics listener Kubernetes CA: {err}"))?;
-        let client = reqwest::Client::builder()
-            .tls_certs_only([certificate])
-            .timeout(Duration::from_secs(2))
-            .build()
-            .map_err(|err| format!("metrics listener Kubernetes API client: {err}"))?;
-        Ok(Self {
-            client,
-            namespace,
-            resource_name,
+    /// Build an authorizer, retaining setup failures for fail-closed scrape responses.
+    fn new() -> Self {
+        let config = KubernetesAuthorizationConfig::new().map_err(|error| {
+            warn!(%error, "metrics authorization configuration unavailable");
+            error
+        });
+        Self {
+            config,
             cache: Arc::new(Mutex::new(AuthorizationCache::default())),
             review_slots: Arc::new(Semaphore::new(MAX_AUTHORIZATION_REVIEWS)),
-        })
+        }
     }
 
     /// Authenticate a scraper token and authorize `GET /metrics` for its user.
@@ -406,18 +385,20 @@ impl KubernetesAuthorizer {
     ///
     /// # Errors
     ///
-    /// Returns an I/O error when the Kubernetes API cannot complete either review.
+    /// Returns an I/O error when authorization configuration or either Kubernetes
+    /// API review fails.
     async fn review(&self, token: &str) -> io::Result<Authorization> {
-        let token_review: TokenReview = self
-            .post(
-                "/apis/authentication.k8s.io/v1/tokenreviews",
-                &serde_json::json!({
-                    "apiVersion": "authentication.k8s.io/v1",
-                    "kind": "TokenReview",
-                    "spec": {"token": token}
-                }),
-            )
-            .await?;
+        let config = self.config.as_ref().map_err(|error| io::Error::other(error.clone()))?;
+        let token_review: TokenReview = Self::post(
+            &config.client,
+            "/apis/authentication.k8s.io/v1/tokenreviews",
+            &serde_json::json!({
+                "apiVersion": "authentication.k8s.io/v1",
+                "kind": "TokenReview",
+                "spec": {"token": token}
+            }),
+        )
+        .await?;
         if !token_review.status.authenticated {
             return Ok(Authorization::Unauthenticated);
         }
@@ -429,26 +410,26 @@ impl KubernetesAuthorizer {
             "groups": user.groups,
             "extra": user.extra,
             "resourceAttributes": {
-                "namespace": self.namespace.as_str(),
+                "namespace": config.namespace.as_str(),
                 "verb": "get",
                 "group": "metrics.grid.praxis-proxy.io",
                 "resource": "scrapes",
-                "name": self.resource_name.as_str()
+                "name": config.resource_name.as_str()
             }
         });
         if let (Some(uid), Some(spec)) = (user.uid, spec.as_object_mut()) {
             spec.insert("uid".to_owned(), serde_json::Value::String(uid));
         }
-        let authorization_review: SubjectAccessReview = self
-            .post(
-                "/apis/authorization.k8s.io/v1/subjectaccessreviews",
-                &serde_json::json!({
-                    "apiVersion": "authorization.k8s.io/v1",
-                    "kind": "SubjectAccessReview",
-                    "spec": spec
-                }),
-            )
-            .await?;
+        let authorization_review: SubjectAccessReview = Self::post(
+            &config.client,
+            "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+            &serde_json::json!({
+                "apiVersion": "authorization.k8s.io/v1",
+                "kind": "SubjectAccessReview",
+                "spec": spec
+            }),
+        )
+        .await?;
         Ok(if authorization_review.status.allowed {
             Authorization::Allowed
         } else {
@@ -461,10 +442,13 @@ impl KubernetesAuthorizer {
     /// # Errors
     ///
     /// Returns an I/O error when credentials, transport, API status, or response data fail.
-    async fn post<T: serde::de::DeserializeOwned>(&self, path: &str, body: &serde_json::Value) -> io::Result<T> {
+    async fn post<T: serde::de::DeserializeOwned>(
+        client: &reqwest::Client,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> io::Result<T> {
         let api_token = std::fs::read_to_string(API_TOKEN_PATH).map_err(auth_api_error)?;
-        let response = self
-            .client
+        let response = client
             .post(format!("{API_URL}{path}"))
             .bearer_auth(api_token.trim())
             .json(&body)
@@ -474,6 +458,47 @@ impl KubernetesAuthorizer {
             .error_for_status()
             .map_err(auth_api_error)?;
         response.json().await.map_err(auth_api_error)
+    }
+}
+
+/// Kubernetes client and release scope needed to review a scraper token.
+#[derive(Clone)]
+struct KubernetesAuthorizationConfig {
+    /// API client trusting the in-cluster CA bundle.
+    client: reqwest::Client,
+    /// Namespace containing the gateway's synthetic scrape permission.
+    namespace: String,
+    /// Release-specific name of the scrape permission.
+    resource_name: String,
+}
+
+impl KubernetesAuthorizationConfig {
+    /// Build a client using the projected service-account CA.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the CA, authorization scope, or HTTP client cannot be loaded.
+    fn new() -> Result<Self, String> {
+        let namespace = std::env::var(AUTH_NAMESPACE_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("metrics listener needs {AUTH_NAMESPACE_ENV}"))?;
+        let resource_name = std::env::var(AUTH_RESOURCE_NAME_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("metrics listener needs {AUTH_RESOURCE_NAME_ENV}"))?;
+        let ca = std::fs::read(API_CA_PATH).map_err(|err| format!("metrics listener Kubernetes CA: {err}"))?;
+        let certificate = Certificate::from_pem(&ca).map_err(|err| format!("metrics listener Kubernetes CA: {err}"))?;
+        let client = reqwest::Client::builder()
+            .tls_certs_only([certificate])
+            .timeout(Duration::from_secs(2))
+            .build()
+            .map_err(|err| format!("metrics listener Kubernetes API client: {err}"))?;
+        Ok(Self {
+            client,
+            namespace,
+            resource_name,
+        })
     }
 }
 
