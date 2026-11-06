@@ -40,19 +40,16 @@ filter. The run resolves a unique Kind cluster prefix and a Forge state
 directory under `EVIDENCE_DIR`; do not share Forge state between simultaneous
 runs.
 
-Full mode also runs a separate learned-ceiling lifecycle proof after the
-cross-site signal, stale-signal, wrong-pin, and partition proofs have restored
-their state. It teaches a high `(pool-b, llmd-pool-b-provider)` ceiling from
-running-request metrics only while EPP and operator evidence reports zero
-waiting and held work. It then proves the ceiling persists while idle, removes
-that exact pair from the operator-published and Gateway-mounted serving
-topology and verifies the Gateway accepted the removal, then restores the same
-pair under lower load and requires a newly learned ceiling below the old one.
-The proof records the serving revisions and mounted JSON, EPP and relayed
-operator signals, live Gateway metrics and pod UID, actual image identities,
-and attributed responses. It restores the provider policy, simulator replica
-counts and settings, and run-owned reconcile annotations on both success and
-failure.
+Full mode also runs a site saturation proof after the cross-site proof. It
+requires each llm-d site's Gateway weight to equal its EPP's ready endpoints and
+to follow a pool-B replica change. Pool-B's EPP runs flow control, so the
+Gateway must read pool-B by the EPP's published pool saturation; pool-A's does
+not, so the Gateway must read pool-A by its own comparator, and that value must
+match the one computed from pool-A's EPP gauges. A spent cache with nothing
+waiting must read above 1 yet stay not full and unshed; a queue past depth 5
+must make both sites full and recover when it drains. Neither site may publish
+a learned ceiling. The proof restores simulator load and replica counts on
+success and failure.
 
 For pressure-driven routing, the full-mode cross-site proof checks the live
 Gateway queue-score order and compares attributed responses with its measured
@@ -65,79 +62,23 @@ leaving both providers eligible, so the proof exercises the weighted two-site
 selector rather than the single-eligible-provider fallback. For this proof only,
 the embedded test Gateway sets `availability.queue_full` to three: the queue of
 two stays below the inclusive backlog threshold and below EPP capacity. The
-normal threshold of one is restored before the learned-ceiling proof, which
-depends on a one-request queue being recognized as backlog.
+normal threshold of one is restored afterwards.
 
-The queue-depth scoring flavor also reports KV-cache saturation of `0.95` for
-the pressured site's endpoints. EPP queue depth remains the Grid score/rank
-stimulus; the separate saturation reading gives the Gateway's capacity-weighted
-selector a measurable `rho` preference. The KV-cache scoring flavor already
-uses that same saturation stimulus. Both sites remain eligible, and the
-attributed request sample still has to match the Gateway's observed weighted
-share.
-
-It also raises the returned pair's queue-free soft ceiling and records a
-2,048-request low-KV routing baseline. It lowers pool-B running load to two
-requests per endpoint, keeps waiting and held work at zero, and sets endpoint
-KV-cache values to `1.0` and `0.0`. The pinned EPP must publish
-their mean (`0.5`) and sample standard deviation (`0.71`). The deployed operator
-signal path must deliver those values to the Gateway, which must report the
-resulting saturation (`1.0`) and combined route `rho` near full while its hard
-ceiling and counted-saturation gauge remain absent. The effective ceiling must
-remain the soft value. A matched 2,048-request sample must reduce pool-B's traffic share by
-at least eight percentage points, proving that provider KV saturation affects
-routing without queue pressure or a count-derived hard bound.
-
-The proof then configures the pinned simulator for eight running requests and
-one waiting request per endpoint, with zero flow-control-held work and the same
-asymmetric KV-cache values. In-flight counts must match the simulator stimulus:
-18 across two ready endpoints. A hard ceiling at that saturated count must fall
-below the queue-free soft ceiling, and the effective ceiling and
-counted-saturation gauges must use the new hard bound; retaining the old soft
-ceiling as the effective bound fails. Pool B must receive at least 75% of the
-soft-baseline traffic, then at most 65% under the hard bound, with a reduction
-of at least 15 percentage points. This checks a real routing shift while
-allowing Grid's weighted selection to continue sending some traffic to a site
-whose smoothed `rho` is still below 1; it does not require every individual
-request to move to pool A.
-
-While the KV-cache saturation and one-request-per-endpoint backlog remain
-active, full mode scales down `vcr-2`, the zero-cache endpoint, leaving the
-high-cache `vcr-1` endpoint. It requires the pinned EPP readiness count,
-mean/spread, and both operator signal views to reflect the smaller pool, then
-waits through the Gateway load window. The Gateway must clear the old
-queue-free soft ceiling and relearn the hard/effective ceiling as 9 for the
-reduced endpoint count. The runner restores the original simulator replica
-counts, both endpoint ConfigMaps, and pod-template annotations on success and
-failure.
-
-Full mode then removes the exact provider pair again, confirms the Gateway has
-cleared both learned bounds, and publishes a full KV-cache signal with eight
-running requests, one waiting request, and no flow-control-held work while the
-pair is absent. Re-adding the pair under that sustained signal must teach a
-finite hard/effective ceiling while the soft ceiling remains absent. This
-covers the hard-bound path for a site that has never supplied a queue-free
-capacity sample. The separate low-count KV-routing phase remains queue-free,
-so the test distinguishes provider-reported saturation from the backlog needed
-to learn a hard request-count bound.
+In the cross-site proof, both scoring flavors report KV-cache usage of `0.6`
+for the pressured site's endpoints. EPP queue depth remains the Grid score/rank
+stimulus; the KV reading gives the Gateway's capacity-weighted selector a
+measurable `rho` of `0.75`, below the `0.8` share at which a pool reads full, so
+both sites remain eligible and the attributed request sample still has to match
+the Gateway's observed weighted share.
 
 The qualification uses upstream `llm-d-inference-sim` as the inference
 backend. Each simulator's startup `fake-metrics` values are mounted from its own
 ConfigMap. The runner updates those persistent configurations and normally
-rolls the simulator pods, so a restart cannot lose the requested values. For
-the learned-ceiling idle-retention and reported-only KV-cache phases, it updates
-`fake-metrics` through the simulator's `/admin/config` API and verifies that
-pod UIDs and Deployment generations stay unchanged. This avoids endpoint
-readiness churn while proving that idle ceilings persist and provider-reported
-KV pressure changes routing without a topology change. The later endpoint-shrink
-phase still scales a simulator Deployment explicitly.
-Existing quick and full proofs use
-the deterministic state sequence `0 -> 9 -> 0` for queue depth and
-`0.0 -> 0.95 -> 0.0` for KV-cache pressure. The new full-mode lifecycle proof
-also changes `running-requests` while keeping waiting requests and KV-cache
-pressure at zero. Pool-B's pinned EPP enables its `flowControl` feature gate so
-the proof can require an explicit zero held-capacity observation; a missing
-held-work metric fails closed.
+rolls the simulator pods, so a restart cannot lose the requested values.
+The local scoring proofs use the deterministic state sequence `0 -> 9 -> 0`
+for queue depth and `0.0 -> 0.95 -> 0.0` for KV-cache pressure. Pool-B's pinned
+EPP enables its `flowControl` feature gate, so it publishes its own pool
+saturation; pool-A's does not, so the Gateway derives pool-A's.
 
 The permanent **Triggered Integration Test** workflow offers this topology as
 `llmd-pool-metrics-quick` and `llmd-pool-metrics-full`. Full mode builds the
@@ -186,15 +127,6 @@ by this topology. For local development, set
 - Full-mode network partition with both sites' operators and the Gateway
   running, traffic probes during loss, stale remote-route exclusion, and
   reconvergence after the run-owned network link is restored
-- Full-mode learned-ceiling persistence while idle, exact published-pair
-  removal and Gateway acceptance, and lower relearning after that same pair
-  returns
-- Full-mode provider-reported KV-cache saturation teaching a hard ceiling below
-  a previously measured queue-free soft ceiling, including EPP, relay, Gateway
-  metric, and attributed-response evidence
-- Full-mode reduction of one simulator endpoint while KV pressure remains live,
-  proving the old soft ceiling retires and the hard/effective ceiling is measured
-  against the reduced ready-endpoint count
 
 ## Coverage boundaries
 

@@ -7,7 +7,7 @@
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     /// Names `describe_metrics` documents, which a scrape must explain.
-    const DOCUMENTED: [&str; 38] = [
+    const DOCUMENTED: [&str; 41] = [
         "grid_route_decisions_total",
         "grid_route_fenced_total",
         "grid_route_selections_total",
@@ -26,6 +26,9 @@ mod tests {
         "grid_route_site_rho",
         "grid_route_site_rho_reported",
         "grid_route_site_rho_counted",
+        "grid_route_site_rho_derived",
+        "grid_route_site_rho_published",
+        "grid_route_site_capacity_implied",
         "grid_route_site_weight",
         "grid_route_site_ceiling",
         "grid_route_site_ceiling_soft",
@@ -49,10 +52,13 @@ mod tests {
     ];
 
     /// The per-site gauges, set once each so their help text renders.
-    const SITE_GAUGES: [&str; 14] = [
+    const SITE_GAUGES: [&str; 17] = [
         "grid_route_site_rho",
         "grid_route_site_rho_reported",
         "grid_route_site_rho_counted",
+        "grid_route_site_rho_derived",
+        "grid_route_site_rho_published",
+        "grid_route_site_capacity_implied",
         "grid_route_site_weight",
         "grid_route_site_ceiling",
         "grid_route_site_ceiling_soft",

@@ -158,15 +158,18 @@ state, so two replicas agree only in steady state.
 |---|---|---|---|
 | `grid_route_decisions_total` | counter | `site`, `cluster`, `reason` | Requests the gateway decided, by outcome. A refusal records an empty site and cluster. |
 | `grid_route_selections_total` | counter | `path` | Decisions by the path that produced them. |
-| `grid_route_site_rho` | gauge | `site`, `cluster` | Smoothed saturation used by the draw: the nearer of the reported and counted limits. |
-| `grid_route_site_rho_reported` | gauge | `site`, `cluster` | KV-cache mean plus spread, joined per scrape; `NaN` when absent. |
+| `grid_route_site_rho` | gauge | `site`, `cluster` | Smoothed saturation used by the draw: the comparator for an llm-d site, otherwise in-flight over the learned ceiling. |
+| `grid_route_site_rho_reported` | gauge | `site`, `cluster` | The EPP's own pool saturation, published with flow control on; uncapped; `NaN` when absent. |
+| `grid_route_site_rho_derived` | gauge | `site`, `cluster` | The gateway's approximation from pool averages: the larger of KV share widened by spread over 0.8 and waiting plus held per unit over 5; uncapped; `NaN` without a KV share. |
+| `grid_route_site_rho_published` | gauge | `site`, `cluster` | 1 when the comparator is the EPP's published value, 0 when it is the gateway's approximation; the two use different thresholds. |
+| `grid_route_site_capacity_implied` | gauge | `site`, `cluster` | Running over KV share at queue-free instants, for the dashboard only; `NaN` below a 0.15 share. |
 | `grid_route_site_rho_counted` | gauge | `site`, `cluster` | In-flight over the learned ceiling; `NaN` until a hard bound makes it a reading. |
 | `grid_route_site_weight` | gauge | `site`, `cluster` | Capacity the draw weights the site by. |
 | `grid_route_site_ceiling` | gauge | `site`, `cluster` | Lesser of the learned soft and hard bounds, never below the floor. |
 | `grid_route_site_ceiling_soft` | gauge | `site`, `cluster` | Most requests the current site size carried with nothing waiting; `NaN` until observed. |
 | `grid_route_site_ceiling_hard` | gauge | `site`, `cluster` | Fewest requests held at a demonstrated limit; `NaN` until observed. |
 | `grid_route_site_in_flight` | gauge | `site`, `cluster` | Requests held in the reading used by the decision. |
-| `grid_route_site_full` | gauge | `site`, `cluster` | 1 after a backlog at the ceiling spans `full_after_ms`, 0 otherwise, `NaN` without a queue signal. |
+| `grid_route_site_full` | gauge | `site`, `cluster` | 1 after a backlog at the comparator's full point, or at the learned ceiling, spans `full_after_ms`; 0 otherwise; `NaN` without a queue signal. |
 | `grid_route_site_reading_age_seconds` | gauge | `site`, `cluster` | Age of the newest sample used by the decision. |
 | `grid_route_site_silent` | gauge | `site`, `cluster` | 1 while a site that has published has sent nothing within the freshness window, until it sends two new samples; it takes no request while a live site can. 0 otherwise. |
 | `grid_route_site_silent_transitions_total` | counter | `site`, `cluster`, `to` | Sites entering (`silent`) or leaving (`live`) silence. A steady rate is a flapping link. |
