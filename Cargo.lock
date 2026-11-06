@@ -961,6 +961,7 @@ dependencies = [
  "clap",
  "futures",
  "grid-client",
+ "grid-fips",
  "http-body-util",
  "k8s-openapi",
  "kube",
@@ -976,6 +977,7 @@ dependencies = [
  "socket2",
  "sqlx",
  "status-harness",
+ "tempfile",
  "thiserror 2.0.21",
  "time",
  "tokio",
@@ -1400,12 +1402,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "grid-fips"
+version = "0.3.0-rc.4"
+dependencies = [
+ "grid-openssl-fips",
+ "openssl",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "grid-openssl-fips"
+version = "0.3.0-rc.4"
+dependencies = [
+ "openssl-sys",
+]
+
+[[package]]
 name = "grid-overlay-sync"
 version = "0.3.0-rc.4"
 dependencies = [
  "axum",
  "clap",
  "futures",
+ "grid-fips",
  "http",
  "hyper",
  "hyper-util",
@@ -2516,6 +2536,7 @@ dependencies = [
  "crdt",
  "futures",
  "grid-client",
+ "grid-fips",
  "grid-signals",
  "http",
  "http-body-util",
@@ -2546,6 +2567,7 @@ dependencies = [
  "socket2",
  "status-harness",
  "swim",
+ "tempfile",
  "thiserror 2.0.21",
  "time",
  "tokio",

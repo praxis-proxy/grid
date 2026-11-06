@@ -124,6 +124,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "bootstrap"))]
     reject_bootstrap_without_feature(std::env::args_os())?;
 
+    #[cfg(feature = "fips")]
+    grid_fips::verify().map_err(|error| error.to_string())?;
+
     let ca_cert_path = std::env::var(CA_CERT_PATH).map_err(|error| format!("{CA_CERT_PATH}: {error}"))?;
     let ca_key_path = std::env::var(CA_KEY_PATH).map_err(|error| format!("{CA_KEY_PATH}: {error}"))?;
     let common_name = std::env::var(CA_COMMON_NAME).unwrap_or_else(|_unset| "grid-ca".to_owned());

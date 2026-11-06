@@ -58,6 +58,8 @@ struct InviteArgs {
 /// Run the `invite` subcommand.
 pub(crate) async fn run() -> Result<(), BoxError> {
     let args = InviteArgs::parse_from(std::env::args_os().skip(1));
+    #[cfg(feature = "fips")]
+    grid_fips::verify().map_err(|error| error.to_string())?;
     let invites = parse_invites(&args.invites).map_err(|err| format!("ENROLLMENT_INVITES: {err}"))?;
     #[cfg(not(feature = "fips"))]
     if rustls::crypto::ring::default_provider().install_default().is_err() {

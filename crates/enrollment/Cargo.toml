@@ -27,6 +27,7 @@ tls-rustls = [
 ]
 # sqlx still links sha2/md-5 for Postgres password auth, unused under the client-cert auth fips uses.
 fips = [
+  "dep:grid-fips",
   "certs/fips",
   "dep:tokio-openssl",
   "dep:openssl",
@@ -45,6 +46,7 @@ bootstrap = ["dep:clap", "dep:kube", "dep:k8s-openapi", "dep:reqwest", "dep:grid
 site-invite-controller = ["dep:kube", "dep:k8s-openapi", "dep:pem", "dep:site-invite-api"]
 
 [dependencies]
+grid-fips = { workspace = true, features = ["runtime"], optional = true }
 version.workspace = true
 axum = { workspace = true }
 certs = { path = "../certs", default-features = false }
@@ -78,6 +80,7 @@ zeroize = { workspace = true, optional = true }
 workspace = true
 
 [dev-dependencies]
+tempfile = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-no-provider"] }
 rustls = { workspace = true, features = ["ring"] }
 uuid = { workspace = true, features = ["serde"] }

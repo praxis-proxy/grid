@@ -21,6 +21,7 @@ tls-rustls = [
   "dep:tokio-rustls",
 ]
 fips = [
+  "dep:grid-fips",
   "swim/fips",
   "certs/fips",
   "grid-client/fips",
@@ -33,6 +34,7 @@ fips = [
 ]
 
 [dependencies]
+grid-fips = { workspace = true, features = ["runtime"], optional = true }
 version.workspace = true
 axum = { workspace = true }
 bytes = { workspace = true }
@@ -82,6 +84,7 @@ uuid = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 # Server-side rmcp features, only for the mcp_probe integration tests, which
 # spin up a real Streamable HTTP MCP server to probe against.
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
