@@ -12,17 +12,19 @@ use std::{
     net::{SocketAddr, TcpListener as StdTcpListener},
     sync::Arc,
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use metrics::{counter, gauge};
 use praxis_core::config::Config;
 use praxis_tls::{CertKeyPair, reload::ReloadableCertResolver, watcher::CertWatcher};
 use reqwest::Certificate;
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{Mutex, Semaphore},
     time::timeout,
 };
 use tokio_rustls::{
@@ -55,8 +57,26 @@ const AUTH_NAMESPACE_ENV: &str = "GRID_METRICS_AUTH_NAMESPACE";
 /// Release-specific synthetic scrape permission name.
 const AUTH_RESOURCE_NAME_ENV: &str = "GRID_METRICS_AUTH_RESOURCE_NAME";
 
-/// Concurrent connections. A scraper needs one, and extras are closed on accept.
-const MAX_CONNECTIONS: usize = 4;
+/// Concurrent connections accepted by the metrics listener.
+const MAX_CONNECTIONS: usize = 16;
+
+/// Concurrent uncached Kubernetes authorization reviews.
+const MAX_AUTHORIZATION_REVIEWS: usize = 8;
+
+/// Maximum cached token decisions held by this gateway process.
+const MAX_CACHED_AUTHORIZATIONS: usize = 1024;
+
+/// Lifetime for an allowed token decision.
+const ALLOWED_AUTHORIZATION_TTL: Duration = Duration::from_secs(60);
+
+/// Lifetime for a denied token decision.
+const DENIED_AUTHORIZATION_TTL: Duration = Duration::from_secs(10);
+
+/// Authorization request outcomes exposed on the metrics registry.
+const AUTHORIZATION_METRIC: &str = "grid_metrics_auth_total";
+
+/// Concurrent Kubernetes authorization reviews exposed on the metrics registry.
+const AUTHORIZATION_IN_FLIGHT_METRIC: &str = "grid_metrics_auth_in_flight";
 
 /// Deadline for the TLS handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -248,16 +268,11 @@ async fn handle(stream: TcpStream, acceptor: &TlsAcceptor, authorizer: &Kubernet
             let mut tls = within(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await?;
             let request = read_request_details(&mut tls).await?;
             let reply = match (request.reply, request.bearer_token) {
-                (Reply::Metrics, Some(token)) => match Box::pin(authorizer.authorize(&token)).await {
-                    Ok(Authorization::Allowed) => Reply::Metrics,
-                    Ok(Authorization::Unauthenticated) => Reply::Unauthorized,
-                    Ok(Authorization::Forbidden) => Reply::Forbidden,
-                    Err(err) => {
-                        warn!(error = %err, "metrics authorization API unavailable");
-                        Reply::ServiceUnavailable
-                    },
+                (Reply::Metrics, Some(token)) => authorize_request(authorizer, &token).await,
+                (Reply::Metrics, None) => {
+                    record_authorization_result("missing");
+                    Reply::Unauthorized
                 },
-                (Reply::Metrics, None) => Reply::Unauthorized,
                 (reply, _) => reply,
             };
             let (head, body) = reply.into_parts();
@@ -269,6 +284,55 @@ async fn handle(stream: TcpStream, acceptor: &TlsAcceptor, authorizer: &Kubernet
     .await
 }
 
+/// Resolve one scrape credential to an HTTP response and record its outcome.
+async fn authorize_request(authorizer: &KubernetesAuthorizer, token: &str) -> Reply {
+    match Box::pin(authorizer.authorize(token)).await {
+        Ok(Authorization::Allowed) => {
+            record_authorization_result("allowed");
+            Reply::Metrics
+        },
+        Ok(Authorization::Unauthenticated) => {
+            record_authorization_result("unauthenticated");
+            Reply::Unauthorized
+        },
+        Ok(Authorization::Forbidden) => {
+            record_authorization_result("forbidden");
+            Reply::Forbidden
+        },
+        Err(AuthorizationError::Overloaded) => {
+            record_authorization_result("overloaded");
+            Reply::ServiceUnavailable
+        },
+        Err(AuthorizationError::Unavailable(err)) => {
+            record_authorization_result("api_error");
+            warn!(error = %err, "metrics authorization API unavailable");
+            Reply::ServiceUnavailable
+        },
+    }
+}
+
+/// Record a bounded authorization outcome label.
+fn record_authorization_result(result: &'static str) {
+    counter!(AUTHORIZATION_METRIC, "result" => result).increment(1);
+}
+
+/// Keep the authorization review gauge balanced on every return and cancellation path.
+struct AuthorizationReviewGuard;
+
+impl AuthorizationReviewGuard {
+    /// Increment the in-flight review gauge.
+    fn new() -> Self {
+        gauge!(AUTHORIZATION_IN_FLIGHT_METRIC).increment(1.0);
+        Self
+    }
+}
+
+impl Drop for AuthorizationReviewGuard {
+    fn drop(&mut self) {
+        gauge!(AUTHORIZATION_IN_FLIGHT_METRIC).decrement(1.0);
+    }
+}
+
 /// Kubernetes API client for the metrics listener's authentication checks.
 #[derive(Clone)]
 struct KubernetesAuthorizer {
@@ -278,6 +342,10 @@ struct KubernetesAuthorizer {
     namespace: String,
     /// Release-specific name of the scrape permission.
     resource_name: String,
+    /// Bounded cache of token hashes and their recent review decisions.
+    cache: Arc<Mutex<AuthorizationCache>>,
+    /// Limit concurrent API review work independently of accepted connections.
+    review_slots: Arc<Semaphore>,
 }
 
 impl KubernetesAuthorizer {
@@ -306,6 +374,8 @@ impl KubernetesAuthorizer {
             client,
             namespace,
             resource_name,
+            cache: Arc::new(Mutex::new(AuthorizationCache::default())),
+            review_slots: Arc::new(Semaphore::new(MAX_AUTHORIZATION_REVIEWS)),
         })
     }
 
@@ -314,7 +384,30 @@ impl KubernetesAuthorizer {
     /// # Errors
     ///
     /// Returns an I/O error when the Kubernetes API cannot complete either review.
-    async fn authorize(&self, token: &str) -> io::Result<Authorization> {
+    async fn authorize(&self, token: &str) -> Result<Authorization, AuthorizationError> {
+        let token_hash = token_hash(token);
+        let cached = self.cache.lock().await.get(token_hash, Instant::now());
+        if let Some(cached) = cached {
+            return Ok(cached);
+        }
+        let _permit = Arc::clone(&self.review_slots)
+            .try_acquire_owned()
+            .map_err(|_error| AuthorizationError::Overloaded)?;
+        let _in_flight = AuthorizationReviewGuard::new();
+        let authorization = self.review(token).await.map_err(AuthorizationError::Unavailable)?;
+        self.cache
+            .lock()
+            .await
+            .insert(token_hash, authorization, Instant::now());
+        Ok(authorization)
+    }
+
+    /// Authenticate a scraper token and authorize its user with Kubernetes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the Kubernetes API cannot complete either review.
+    async fn review(&self, token: &str) -> io::Result<Authorization> {
         let token_review: TokenReview = self
             .post(
                 "/apis/authentication.k8s.io/v1/tokenreviews",
@@ -384,7 +477,80 @@ impl KubernetesAuthorizer {
     }
 }
 
+/// A bounded cache of authorization decisions keyed only by a token digest.
+#[derive(Default)]
+struct AuthorizationCache {
+    /// Cached decisions, each expiring after its allow or deny TTL.
+    entries: HashMap<[u8; 32], CachedAuthorization>,
+}
+
+impl AuthorizationCache {
+    /// Return a cached decision and discard it when its lifetime has elapsed.
+    fn get(&mut self, token_hash: [u8; 32], now: Instant) -> Option<Authorization> {
+        let cached = self
+            .entries
+            .get(&token_hash)
+            .filter(|entry| entry.expires_at > now)
+            .map(|entry| entry.authorization);
+        if cached.is_none() {
+            self.entries.remove(&token_hash);
+        }
+        cached
+    }
+
+    /// Insert a decision while expiring old entries and keeping the map bounded.
+    fn insert(&mut self, token_hash: [u8; 32], authorization: Authorization, now: Instant) {
+        self.entries.retain(|_hash, entry| entry.expires_at > now);
+        if self.entries.len() >= MAX_CACHED_AUTHORIZATIONS {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_hash, entry)| entry.expires_at)
+                .map(|(hash, _entry)| *hash);
+            if let Some(hash) = oldest {
+                self.entries.remove(&hash);
+            }
+        }
+        let ttl = match authorization {
+            Authorization::Allowed => ALLOWED_AUTHORIZATION_TTL,
+            Authorization::Unauthenticated | Authorization::Forbidden => DENIED_AUTHORIZATION_TTL,
+        };
+        let Some(expires_at) = now.checked_add(ttl) else {
+            return;
+        };
+        self.entries.insert(
+            token_hash,
+            CachedAuthorization {
+                authorization,
+                expires_at,
+            },
+        );
+    }
+}
+
+/// A cached decision with its expiration instant.
+struct CachedAuthorization {
+    /// Authentication and authorization decision.
+    authorization: Authorization,
+    /// Instant after which the decision must be reviewed again.
+    expires_at: Instant,
+}
+
+/// SHA-256 digest for a bearer token, so the cache never retains credentials.
+fn token_hash(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+/// Failure to authorize a scrape because checks are busy or Kubernetes is unavailable.
+enum AuthorizationError {
+    /// The bounded concurrent review limit has been reached.
+    Overloaded,
+    /// A Kubernetes authentication or authorization review failed.
+    Unavailable(io::Error),
+}
+
 /// The result of the authentication and authorization reviews.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Authorization {
     /// The scraper token is valid and may read metrics.
     Allowed,
@@ -722,6 +888,49 @@ mod tests {
             .chain(std::iter::once("\r\n".to_owned()))
             .collect();
         assert_eq!(reply_to(many.as_bytes()).await, Reply::HeadTooLarge);
+    }
+
+    #[test]
+    fn authorization_cache_uses_shorter_lifetimes_for_denials() {
+        let now = Instant::now();
+        let allowed_hash = token_hash("allowed-token");
+        let denied_hash = token_hash("denied-token");
+        let mut cache = AuthorizationCache::default();
+        cache.insert(allowed_hash, Authorization::Allowed, now);
+        cache.insert(denied_hash, Authorization::Forbidden, now);
+
+        assert_eq!(
+            cache.get(allowed_hash, now + Duration::from_secs(59)),
+            Some(Authorization::Allowed),
+            "allow remains cached for 60 seconds"
+        );
+        assert_eq!(
+            cache.get(denied_hash, now + Duration::from_secs(9)),
+            Some(Authorization::Forbidden),
+            "deny remains cached for 10 seconds"
+        );
+        assert_eq!(
+            cache.get(denied_hash, now + Duration::from_secs(10)),
+            None,
+            "deny expires at 10 seconds"
+        );
+        assert_eq!(
+            cache.get(allowed_hash, now + Duration::from_secs(60)),
+            None,
+            "allow expires at 60 seconds"
+        );
+    }
+
+    #[test]
+    fn authorization_cache_does_not_exceed_its_capacity() {
+        let now = Instant::now();
+        let mut cache = AuthorizationCache::default();
+        for index in 0..=MAX_CACHED_AUTHORIZATIONS {
+            let hash: [u8; 32] = Sha256::digest(index.to_be_bytes()).into();
+            cache.insert(hash, Authorization::Unauthenticated, now);
+        }
+
+        assert_eq!(cache.entries.len(), MAX_CACHED_AUTHORIZATIONS, "bounded cache");
     }
 
     #[tokio::test]

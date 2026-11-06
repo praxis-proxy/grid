@@ -252,6 +252,17 @@ spec:
       steps:
         - type: manifest
           path: resources/namespaces.yaml
+        - type: manifest
+          path: resources/servicemonitor-crd.yaml
+        - type: exec
+          command:
+            - kubectl
+            - --context
+            - "{{ cluster.properties.kubeContext }}"
+            - wait
+            - --for=condition=Established
+            - crd/servicemonitors.monitoring.coreos.com
+            - --timeout=60s
         - type: exec
           command: [bash, verify.sh, metrics-cert]
           env:
@@ -273,7 +284,10 @@ spec:
               enabled: true
               existingSecret: metrics-server-cert
               serviceMonitor:
-                enabled: false
+                enabled: true
+                caConfigMap:
+                  name: metrics-server-ca
+                  key: ca.crt
         - type: wait
           resource: deployment/praxis-gateway-metrics
           namespace: praxis

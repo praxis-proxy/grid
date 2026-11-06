@@ -428,7 +428,8 @@ networkPolicy:
 
 # -- TLS listener serving only authorized GET /metrics requests, for an in-cluster
 # Prometheus. Kubernetes TokenReview and SubjectAccessReview authorize the scrape.
-# NetworkPolicy can further limit ingress but is not required for access control.
+# NetworkPolicy is recommended to limit which pods can reach the listener and trigger
+# authorization API requests, even though token authorization protects the metrics data.
 metricsListener:
   # -- Serve the listener. auto serves it for grid-gateway on OpenShift, or when an
   # existingSecret is supplied. OpenShift requests the serving cert in <fullname>-metrics-tls

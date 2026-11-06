@@ -819,8 +819,8 @@ CA values from the platform.
 
 {{/*
 The metrics listener needs the grid-gateway image and a serving certificate. Kubernetes
-TokenReview and SubjectAccessReview authorize each scrape; NetworkPolicy is optional
-additional ingress hardening.
+TokenReview and SubjectAccessReview authorize each scrape. NetworkPolicy is recommended to
+limit which pods can trigger those API reviews.
 */}}
 {{- define "praxis-gateway.validateMetricsListener" -}}
 {{- $m := .Values.metricsListener }}

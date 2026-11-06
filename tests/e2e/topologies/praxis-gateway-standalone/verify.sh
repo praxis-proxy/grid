@@ -132,21 +132,44 @@ stage_metrics_cert() {
     --cert="$cert" --key="$key" --dry-run=client -o yaml \
     | kubectl --context "$CTX" apply -f - >/dev/null \
     || fail "could not apply the metrics serving certificate"
+  kubectl --context "$CTX" -n "$NS" create configmap metrics-server-ca \
+    --from-file=ca.crt="$cert" --dry-run=client -o yaml \
+    | kubectl --context "$CTX" apply -f - >/dev/null \
+    || fail "could not apply the metrics CA ConfigMap"
   rm -rf "$workdir"
-  pass "created a serving certificate for ${service}.${NS}.svc"
+  pass "created serving certificate and CA ConfigMap for ${service}.${NS}.svc"
 }
 
 stage_metrics_authorization() {
   local release=${METRICS_RELEASE:?METRICS_RELEASE is required for metrics authorization}
-  local service="${release}-metrics" token_secret="${release}-metrics-token"
-  local url="https://${service}.${NS}.svc:9443/metrics" token_data="" code kinds i
+  local service="${release}-metrics" service_monitor="${release}-metrics"
+  local auth_secret auth_key ca_configmap ca_key server_name url
+  local token_data="" code kinds response i
+  auth_secret=$(k get servicemonitor "$service_monitor" \
+    -o jsonpath='{.spec.endpoints[0].authorization.credentials.name}' 2>/dev/null || true)
+  auth_key=$(k get servicemonitor "$service_monitor" \
+    -o jsonpath='{.spec.endpoints[0].authorization.credentials.key}' 2>/dev/null || true)
+  ca_configmap=$(k get servicemonitor "$service_monitor" \
+    -o jsonpath='{.spec.endpoints[0].tlsConfig.ca.configMap.name}' 2>/dev/null || true)
+  ca_key=$(k get servicemonitor "$service_monitor" \
+    -o jsonpath='{.spec.endpoints[0].tlsConfig.ca.configMap.key}' 2>/dev/null || true)
+  server_name=$(k get servicemonitor "$service_monitor" \
+    -o jsonpath='{.spec.endpoints[0].tlsConfig.serverName}' 2>/dev/null || true)
+  [ -n "$auth_secret" ] || fail "the ServiceMonitor has no bearer-token Secret reference"
+  [ -n "$auth_key" ] || fail "the ServiceMonitor has no bearer-token Secret key"
+  [ -n "$ca_configmap" ] || fail "the ServiceMonitor has no TLS CA ConfigMap reference"
+  [ -n "$ca_key" ] || fail "the ServiceMonitor has no TLS CA key"
+  [ -n "$server_name" ] || fail "the ServiceMonitor has no TLS server name"
+  url="https://${server_name}:9443/metrics"
+  pass "read bearer-token and TLS settings from the rendered ServiceMonitor"
+
   for i in $(seq 1 60); do
-    token_data=$(k get secret "$token_secret" -o jsonpath='{.data.token}' 2>/dev/null || true)
+    token_data=$(k get secret "$auth_secret" -o "jsonpath={.data.$auth_key}" 2>/dev/null || true)
     [ -n "$token_data" ] && break
     sleep 1
   done
-  [ -n "$token_data" ] || fail "the scraper ServiceAccount token Secret was not populated"
-  pass "the chart-created scraper token Secret is populated"
+  [ -n "$token_data" ] || fail "the ServiceMonitor bearer-token Secret was not populated"
+  pass "the ServiceMonitor bearer-token Secret is populated"
 
   k delete pod metrics-auth-probe --ignore-not-found --wait=true >/dev/null
   cat <<EOF | kubectl --context "$CTX" apply -f - >/dev/null
@@ -172,8 +195,8 @@ spec:
         - name: SCRAPER_TOKEN
           valueFrom:
             secretKeyRef:
-              name: $token_secret
-              key: token
+              name: $auth_secret
+              key: $auth_key
       volumeMounts:
         - name: metrics-ca
           mountPath: /var/run/metrics-ca
@@ -185,28 +208,33 @@ spec:
         readOnlyRootFilesystem: true
   volumes:
     - name: metrics-ca
-      secret:
-        secretName: metrics-server-cert
+      configMap:
+        name: $ca_configmap
 EOF
   k wait --for=condition=Ready pod/metrics-auth-probe --timeout=180s >/dev/null \
     || fail "metrics authorization probe pod did not become ready"
 
   code=$(k exec metrics-auth-probe -- curl -sS -o /dev/null -w '%{http_code}' \
-    --cacert /var/run/metrics-ca/tls.crt "$url" 2>&1 || true)
+    --cacert "/var/run/metrics-ca/$ca_key" "$url" 2>&1 || true)
   [ "$code" = 401 ] || fail "missing bearer token got HTTP $code, want 401"
   pass "TLS scrape without a bearer token is rejected with 401"
 
   code=$(k exec metrics-auth-probe -- sh -c \
-    'curl -sS -o /dev/null -w "%{http_code}" --cacert /var/run/metrics-ca/tls.crt -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" "$1"' \
-    sh "$url" 2>&1 || true)
+    'curl -sS -o /dev/null -w "%{http_code}" --cacert "$2" -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" "$1"' \
+    sh "$url" "/var/run/metrics-ca/$ca_key" 2>&1 || true)
   [ "$code" = 403 ] || fail "default ServiceAccount token got HTTP $code, want 403"
   pass "authenticated but unauthorized ServiceAccount is rejected with 403"
 
-  code=$(k exec metrics-auth-probe -- sh -c \
-    'curl -sS -o /dev/null -w "%{http_code}" --cacert /var/run/metrics-ca/tls.crt -H "Authorization: Bearer $SCRAPER_TOKEN" "$1"' \
-    sh "$url" 2>&1 || true)
+  response=$(k exec metrics-auth-probe -- sh -c \
+    'curl -sS -w "\n%{http_code}" --cacert "$2" -H "Authorization: Bearer $SCRAPER_TOKEN" "$1"' \
+    sh "$url" "/var/run/metrics-ca/$ca_key" 2>&1 || true)
+  code=$(tail -n 1 <<<"$response")
   [ "$code" = 200 ] || fail "chart scraper token got HTTP $code, want 200"
-  pass "chart scraper identity is authorized to scrape over verified TLS"
+  grep -qE '^grid_metrics_auth_total\{result="allowed"\} [1-9][0-9]*$' <<<"$response" \
+    || fail "ServiceMonitor-authorized scrape did not expose grid_metrics_auth_total"
+  grep -qE '^grid_metrics_auth_in_flight 0$' <<<"$response" \
+    || fail "ServiceMonitor-authorized scrape did not expose a zero in-flight review gauge"
+  pass "ServiceMonitor bearer credentials scrape metrics and expose auth outcomes"
 
   kinds=$(helm --kube-context "$CTX" -n "$NS" get manifest "$release" \
     | awk '$1 == "kind:" {print $2}' | sort -u | tr '\n' ' ')

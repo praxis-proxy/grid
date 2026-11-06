@@ -1058,7 +1058,7 @@
     "metricsListener": {
       "type": "object",
       "additionalProperties": false,
-      "description": "TLS listener serving only Kubernetes-authorized GET /metrics requests.",
+      "description": "TLS listener serving only Kubernetes-authorized GET /metrics requests. NetworkPolicy is recommended to limit pods that can trigger authorization API reviews.",
       "properties": {
         "enabled": {
           "enum": [

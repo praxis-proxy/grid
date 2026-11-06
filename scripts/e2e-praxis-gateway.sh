@@ -9,6 +9,7 @@
 #      STATE_DIR           Forge state directory
 #                          (default target/forge/praxis-gateway-standalone)
 #      E2E_STACK           optional Forge stack to apply (for example gateway-metrics)
+#      CORE_IMAGE_PLATFORM override the platform used for the published Praxis test images
 #      KEEP=1              leave the cluster running afterwards
 #      KIND_CREATE_PREFIX  command prefix for cluster creation, e.g. the rootless
 #                          podman wrapper: systemd-run --scope --user -p Delegate=yes
@@ -28,22 +29,44 @@ forge() {
   "$FORGE_BIN" --config "$CONFIG" --state-dir "$STATE_DIR" --non-interactive "$@"
 }
 
-build_and_load_grid_gateway() {
-  local engine archive
-  engine=${CONTAINER_ENGINE:-$(command -v podman || command -v docker || true)}
-  [ -n "$engine" ] || { echo "No container engine found. Install podman or docker." >&2; return 1; }
-  make CONTAINER_ENGINE="$engine" gateway-image || return 1
+load_image_to_kind() {
+  local engine=$1 image=$2 archive
   if [ "$(basename "$engine")" = podman ]; then
     archive=$(mktemp)
-    if ! "$engine" save -o "$archive" "$GRID_GATEWAY_IMAGE" \
+    if ! "$engine" save -o "$archive" "$image" \
       || ! kind load image-archive "$archive" --name "$CLUSTER_NAME"; then
       rm -f "$archive"
       return 1
     fi
     rm -f "$archive"
   else
-    kind load docker-image "$GRID_GATEWAY_IMAGE" --name "$CLUSTER_NAME"
+    kind load docker-image "$image" --name "$CLUSTER_NAME"
   fi
+}
+
+prepare_core_images() {
+  local engine platform image
+  engine=${CONTAINER_ENGINE:-$(command -v podman || command -v docker || true)}
+  [ -n "$engine" ] || { echo "No container engine found. Install podman or docker." >&2; return 1; }
+  platform=${CORE_IMAGE_PLATFORM:-}
+  if [ -z "$platform" ]; then
+    case "$(uname -m)" in
+      arm64|aarch64) platform=linux/amd64 ;;
+      *) return 0 ;;
+    esac
+  fi
+  for image in ghcr.io/praxis-proxy/ai:0.7.0 ghcr.io/praxis-proxy/praxis:0.7.1; do
+    "$engine" pull --platform "$platform" "$image" || return 1
+    load_image_to_kind "$engine" "$image" || return 1
+  done
+}
+
+build_and_load_grid_gateway() {
+  local engine
+  engine=${CONTAINER_ENGINE:-$(command -v podman || command -v docker || true)}
+  [ -n "$engine" ] || { echo "No container engine found. Install podman or docker." >&2; return 1; }
+  make CONTAINER_ENGINE="$engine" gateway-image || return 1
+  load_image_to_kind "$engine" "$GRID_GATEWAY_IMAGE"
 }
 
 diagnostics() {
@@ -78,6 +101,11 @@ trap teardown EXIT
 status=0
 # shellcheck disable=SC2086 # KIND_CREATE_PREFIX is a command prefix and must word-split
 ${KIND_CREATE_PREFIX:-} "$FORGE_BIN" --config "$CONFIG" --state-dir "$STATE_DIR" --non-interactive up || status=$?
+if [ "$status" = 0 ]; then
+  if [ -z "${E2E_STACK:-}" ]; then
+    prepare_core_images || status=$?
+  fi
+fi
 if [ "$status" = 0 ]; then
   build_and_load_grid_gateway || status=$?
 fi

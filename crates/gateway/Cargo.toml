@@ -351,6 +351,8 @@ serde.workspace = true
 serde_yaml.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
+metrics = { workspace = true }
+sha2 = "0.11.0"
 
 [dev-dependencies]
 # The reload test runs a real mTLS signals peer against the binary.
@@ -358,8 +360,6 @@ certs = { path = "../certs", default-features = false, features = ["verifier"] }
 httpdate = { workspace = true }
 rustls = { version = "0.23.46", features = ["ring"] }
 tokio = { version = "1.53.1", features = ["macros"] }
-# The help-text test emits one sample per documented metric.
-metrics = { workspace = true }
 
 # machete can't see these: used as `praxis` / `praxis_core` / `praxis_filter`, not their package names.
 [package.metadata.cargo-machete]

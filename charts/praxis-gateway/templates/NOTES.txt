@@ -71,7 +71,7 @@ tls.crt and tls.key to enable it outside OpenShift.
 {{- if .Values.metricsListener.enabled }}
 
 The metrics listener authorizes scrapes with Kubernetes TokenReview and SubjectAccessReview.
-NetworkPolicy is optional additional ingress hardening. Set
+Enable NetworkPolicy to limit which pods can reach the listener and trigger API reviews. Set
 metricsListener.serviceMonitor.labels to the labels required by your collector; OpenShift
 AI's observability collector uses monitoring.opendatahub.io/scrape: "true".
 {{- end }}
