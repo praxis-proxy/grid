@@ -13,11 +13,11 @@ spec:
   #   strategy: noMetrics  # "noMetrics" | "queueDepth" | "kvCachePressure"
   # metricsRefreshInterval: "30s"  # optional, minimum 1s; defaults to 300s, or 60s with TLS metrics
 
-  # SWIM protocol settings (defaults)
-  swim:
-    probeInterval: "5s"
-    suspicionTimeout: "10s"
-    gossipNodes: 3
+  # SWIM seed peers are optional and apply only to Swim membership.
+  membership:
+    mode: Swim
+    swim:
+      seeds: []
 
   # Consumer gateway reference
   consumerGateways:

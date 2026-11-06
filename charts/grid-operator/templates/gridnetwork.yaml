@@ -18,8 +18,9 @@ spec:
   membership:
     mode: {{ dig "membership" "source" "Swim" . | quote }}
   {{- with .seeds }}
-  seeds:
-    {{- toYaml . | nindent 4 }}
+    swim:
+      seeds:
+        {{- toYaml . | nindent 8 }}
   {{- end }}
   {{- with .signals }}
   signalTransport:

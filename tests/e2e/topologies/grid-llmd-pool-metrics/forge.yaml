@@ -247,10 +247,6 @@ spec:
               # Ten seconds is the periodic fallback. The harness also forces
               # reconciles while waiting for deterministic pressure transitions.
               metricsRefreshInterval: "10s"
-              swim:
-                probeInterval: "5s"
-                suspicionTimeout: "15s"
-                gossipNodes: 3
               tls:
                 caSecretRef:
                   name: consumer-gateway-tls
@@ -324,10 +320,6 @@ spec:
               # Ten seconds is the periodic fallback. The harness also forces
               # reconciles while waiting for deterministic pressure transitions.
               metricsRefreshInterval: "10s"
-              swim:
-                probeInterval: "5s"
-                suspicionTimeout: "15s"
-                gossipNodes: 3
               tls:
                 caSecretRef:
                   name: consumer-gateway-tls
