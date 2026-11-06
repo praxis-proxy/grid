@@ -339,22 +339,70 @@ fn weight_matching_units(port: u16, site: &str, cluster: &str, mtls: bool) -> Re
     Ok(weight)
 }
 
-/// Require both sites to stay not full and the model unshed through `NOT_FULL_SPAN`.
+/// Newest sample the hold accepts: five of the gateway's one-second signal polls.
+const MAX_READING_AGE_SECONDS: f64 = 5.0;
+
+/// Require an unbroken `NOT_FULL_SPAN` of fresh readings at or above 1 with both sites not full
+/// and the model unshed; a gap restarts the span, going full or shed fails.
 fn hold_not_full(port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let until = Instant::now() + NOT_FULL_SPAN;
-    while Instant::now() < until {
-        let gateway = read_gateway_metrics(port)?;
-        for (site, cluster) in SITES {
-            if gauge(&gateway, "grid_route_site_full", site, cluster).is_some_and(|full| full >= 1.0) {
-                return Err(format!("{site} went full with a spent cache and nothing waiting").into());
-            }
-        }
-        if sample_value(&gateway, "grid_route_shedding", &[("model", VCR_MODEL)]).is_some_and(|shed| shed >= 1.0) {
-            return Err("the model was shed with a spent cache and nothing waiting".into());
+    let deadline = Instant::now() + TRANSITION_TIMEOUT + NOT_FULL_SPAN;
+    let mut since = Instant::now();
+    let mut last = String::from("not checked");
+    while Instant::now() < deadline {
+        match not_full_now(port)? {
+            None if since.elapsed() >= NOT_FULL_SPAN => return Ok(()),
+            None => {},
+            Some(gap) => {
+                last = gap;
+                since = Instant::now();
+            },
         }
         std::thread::sleep(POLL);
     }
-    Ok(())
+    Err(format!(
+        "no unbroken {}s of fresh not-full readings within the deadline; last gap: {last}",
+        NOT_FULL_SPAN.as_secs()
+    )
+    .into())
+}
+
+/// One poll of the hold: `Err` when a site went full or the model shed, `Some` gap when a
+/// reading is missing, stale or below 1, else `None`.
+fn not_full_now(port: u16) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match read_gateway_metrics(port) {
+        Ok(gateway) => not_full_in(&gateway),
+        Err(error) => Ok(Some(format!("gateway metrics unreadable: {error}"))),
+    }
+}
+
+/// `not_full_now` over one scrape of the gateway's metrics.
+fn not_full_in(gateway: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    for (site, cluster) in SITES {
+        let Some(full) = gauge(gateway, "grid_route_site_full", site, cluster) else {
+            return Ok(Some(format!("{site} publishes no finite grid_route_site_full")));
+        };
+        if full >= 1.0 {
+            return Err(format!("{site} went full with a spent cache and nothing waiting").into());
+        }
+        match gauge(gateway, "grid_route_site_reading_age_seconds", site, cluster) {
+            Some(age) if age <= MAX_READING_AGE_SECONDS => {},
+            age => {
+                return Ok(Some(format!(
+                    "{site} reading age {age:?}, over {MAX_READING_AGE_SECONDS}s"
+                )));
+            },
+        }
+        match gauge(gateway, "grid_route_site_rho", site, cluster) {
+            Some(rho) if rho >= 1.0 => {},
+            rho => return Ok(Some(format!("{site} rho {rho:?}, not at or above 1"))),
+        }
+    }
+    // The gauge exists only once a model has been shed, so absent reads as never shed.
+    match sample_value(gateway, "grid_route_shedding", &[("model", VCR_MODEL)]) {
+        Some(shed) if shed >= 1.0 => Err("the model was shed with a spent cache and nothing waiting".into()),
+        Some(shed) if !shed.is_finite() => Ok(Some(format!("grid_route_shedding reads {shed}"))),
+        _ => Ok(None),
+    }
 }
 
 /// Poll `check` until it succeeds or `TRANSITION_TIMEOUT` passes, reporting the last reason.
@@ -467,6 +515,72 @@ mod tests {
             matches!(expected_derived("llm_d_epp_ready_endpoints 2\n"), Err(error) if error.to_string().contains("kv_cache")),
             "a missing KV share is an error, not a zero"
         );
+    }
+
+    /// A scrape where both sites read fresh, at or above 1, and not full.
+    fn held_scrape(replace: &[(&str, &str)]) -> String {
+        let mut text: String = SITES
+            .iter()
+            .flat_map(|(site, cluster)| {
+                [
+                    ("grid_route_site_full", "0"),
+                    ("grid_route_site_reading_age_seconds", "1"),
+                    ("grid_route_site_rho", "1.1"),
+                ]
+                .map(|(name, value)| format!("{name}{{site=\"{site}\",cluster=\"{cluster}\"}} {value}\n"))
+            })
+            .collect();
+        for (from, to) in replace {
+            text = text.replacen(from, to, 1);
+        }
+        text
+    }
+
+    #[test]
+    fn the_hold_restarts_on_any_gap_and_fails_on_full() {
+        assert!(
+            matches!(not_full_in(&held_scrape(&[])), Ok(None)),
+            "a fresh, full-reading, not-full scrape holds"
+        );
+        for (from, to, why) in [
+            (
+                "grid_route_site_full{site=\"pool-a\"",
+                "other_full{site=\"pool-a\"",
+                "a missing full gauge",
+            ),
+            (
+                "grid_route_site_full{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 0",
+                "grid_route_site_full{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} NaN",
+                "a NaN full gauge",
+            ),
+            (
+                "grid_route_site_reading_age_seconds{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 1",
+                "grid_route_site_reading_age_seconds{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 30",
+                "a stale reading",
+            ),
+            (
+                "grid_route_site_rho{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 1.1",
+                "grid_route_site_rho{site=\"pool-b\",cluster=\"llmd-pool-b-provider\"} 0.4",
+                "rho below 1",
+            ),
+        ] {
+            let scrape = held_scrape(&[(from, to)]);
+            assert!(
+                scrape != held_scrape(&[]),
+                "the fixture for {why} must change the scrape"
+            );
+            assert!(
+                matches!(not_full_in(&scrape), Ok(Some(_))),
+                "{why} restarts the span instead of passing"
+            );
+        }
+        let full = held_scrape(&[(
+            "grid_route_site_full{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 0",
+            "grid_route_site_full{site=\"pool-a\",cluster=\"llmd-pool-a-provider\"} 1",
+        )]);
+        assert!(not_full_in(&full).is_err(), "a site that went full fails the proof");
+        let shed = format!("{}grid_route_shedding{{model=\"{VCR_MODEL}\"}} 1\n", held_scrape(&[]));
+        assert!(not_full_in(&shed).is_err(), "a shed model fails the proof");
     }
 
     #[test]

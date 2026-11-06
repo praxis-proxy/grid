@@ -260,6 +260,7 @@ impl Mapped<'_> {
         let backlog = |queued: Option<f64>, held: Option<f64>| {
             queued.is_some_and(|queued| queued >= queue_full) || held.is_some_and(|held| held >= 1.0)
         };
+        let published_saturation = self.published_saturation(key, now_ms, window_ms, |_, _| true);
         SiteReading {
             in_flight: self.in_flight(key, now_ms, window_ms, |_, _| true),
             congested_in_flight: self.in_flight(key, now_ms, window_ms, backlog),
@@ -271,22 +272,52 @@ impl Mapped<'_> {
             unready: self.unready(key, sampled_at),
             sampled_at,
             units: self.units(key),
-            // Per sample, so one non-finite sample does not lose the window.
-            published_saturation: self.store.window_worst_of(
-                key,
-                [self.series.pool_saturation],
-                now_ms,
-                window_ms,
-                LOWER_IS_BETTER,
-                |[saturation]| saturation.and_then(as_count),
-            ),
-            derived_saturation: self.derived_saturation(key, now_ms, window_ms),
+            published_saturation,
+            derived_saturation: self.derived_saturation(key, now_ms, window_ms, |_, _| true),
+            congested_saturation: if published_saturation.is_some() {
+                self.published_saturation(key, now_ms, window_ms, backlog)
+            } else {
+                self.derived_saturation(key, now_ms, window_ms, backlog)
+            },
         }
+    }
+
+    /// The EPP's published reading, per sample so one non-finite sample does not lose the
+    /// window, over the instants `at` admits by that instant's waiting and held readings.
+    fn published_saturation(
+        &self,
+        key: &str,
+        now_ms: i64,
+        window_ms: i64,
+        at: impl Fn(Option<f64>, Option<f64>) -> bool,
+    ) -> Option<f64> {
+        self.store.window_worst_of(
+            key,
+            [
+                self.series.pool_saturation,
+                self.published(key, self.series.queued),
+                self.series.held,
+            ],
+            now_ms,
+            window_ms,
+            LOWER_IS_BETTER,
+            |[saturation, queued, held]| {
+                at(queued.and_then(as_count), held.and_then(as_count)).then_some(())?;
+                saturation.and_then(as_count)
+            },
+        )
     }
 
     /// The detector's rule at its default thresholds over pool averages; needs a KV share, so a
     /// queue-only provider still learns. Held work counts per unit, so the gate cannot move it.
-    fn derived_saturation(&self, key: &str, now_ms: i64, window_ms: i64) -> Option<f64> {
+    /// Over the instants `at` admits by that instant's waiting and held readings.
+    fn derived_saturation(
+        &self,
+        key: &str,
+        now_ms: i64,
+        window_ms: i64,
+        at: impl Fn(Option<f64>, Option<f64>) -> bool,
+    ) -> Option<f64> {
         self.store.window_worst_of(
             key,
             [
@@ -300,12 +331,14 @@ impl Mapped<'_> {
             window_ms,
             LOWER_IS_BETTER,
             |[share, spread, queued, endpoints, held]| {
+                let queued = queued.and_then(as_count);
+                let held = held.and_then(as_count);
+                at(queued, held).then_some(())?;
                 let cache = joined_share(share, spread)? / SATURATION_KV_SHARE;
                 let held = held
-                    .and_then(as_count)
                     .zip(endpoints.and_then(as_count).filter(|units| *units > 0.0))
                     .map_or(0.0, |(held, units)| held / units);
-                let waiting = queued.and_then(as_count).map_or(held, |queued| queued + held);
+                let waiting = queued.map_or(held, |queued| queued + held);
                 Some(cache.max(waiting / SATURATION_QUEUE_DEPTH))
             },
         )
@@ -488,6 +521,7 @@ mod tests {
             // No KV share and no published saturation, so no comparator: this site is learned.
             published_saturation: None,
             derived_saturation: None,
+            congested_saturation: None,
         };
         assert_eq!(mapped.read("a", "pool-a", over(1_000, 30_000, 1.0)), expected);
         // The llm-d names see the sample stamp and nothing else.

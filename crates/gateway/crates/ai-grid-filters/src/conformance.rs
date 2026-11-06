@@ -1712,6 +1712,60 @@ mod tests {
         );
     }
 
+    /// Refreshes alternating a spent cache with no queue and a cool cache with one waiting.
+    fn alternating(grid: &mut Harness, sites: &[SiteSpec], refreshes: i64, both_at_once: bool) -> RouteSnapshot {
+        let mut snapshot = None;
+        for nth in 0..refreshes {
+            let queued = if both_at_once || nth % 2 == 1 { 1.0 } else { 0.0 };
+            let share = if both_at_once || nth % 2 == 0 { 0.85 } else { 0.2 };
+            snapshot = Some(grid.refresh_with_saturation(
+                sites,
+                NOW_MS + nth * REFRESH_MS,
+                |spec| spec.capacity,
+                queued,
+                |_| Some(share),
+            ));
+        }
+        snapshot.expect("at least one refresh")
+    }
+
+    /// A full instant and a queued instant are not one congested instant, for the comparator too.
+    #[test]
+    fn a_spent_cache_and_a_queue_at_different_instants_never_shed() {
+        let sites = EQUAL_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        let spell = AvailabilitySettings::default().full_after_ms.max(MIN_BACKLOG_SPELL_MS);
+        let snapshot = alternating(&mut grid, &sites, spell / REFRESH_MS + 6, false);
+        assert!(
+            snapshot.candidates.iter().all(|site| site.full == Some(false)),
+            "no instant was both full and queued, so no site is full past the spell"
+        );
+        let availability = AvailabilitySettings {
+            shedding: true,
+            ..grid.availability
+        };
+        assert!(
+            snapshot
+                .shed(&[Arc::from(MODEL)].into(), &availability)
+                .shedding
+                .is_empty(),
+            "and the model is not shed"
+        );
+    }
+
+    /// The same readings at one instant are congestion, held for the spell.
+    #[test]
+    fn a_spent_cache_with_a_queue_at_one_instant_goes_full() {
+        let sites = EQUAL_CAPACITY;
+        let mut grid = Harness::new(WINDOW_MS);
+        let spell = AvailabilitySettings::default().full_after_ms.max(MIN_BACKLOG_SPELL_MS);
+        let snapshot = alternating(&mut grid, &sites, spell / REFRESH_MS + 6, true);
+        assert!(
+            snapshot.candidates.iter().all(|site| site.full == Some(true)),
+            "full and queued at once, past the spell, is full"
+        );
+    }
+
     /// Sustained pressure must affect routing without proving why capacity changed.
     ///
     /// Keep provider identity, ready units, held work and KV use unchanged. Only one

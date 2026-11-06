@@ -311,7 +311,7 @@ impl RouteSnapshot {
         let by_count = (in_flight / ceiling.read_against).clamp(0.0, 1.0);
         let raw = comparator.unwrap_or(by_count);
         let rho = smoothed(previous, sample_at, raw, inputs.availability.smoothing);
-        let (congested, full_since) = congestion(previous, &readings.recent, candidate.backlog, learned, inputs);
+        let (congested, full_since) = congestion(previous, &readings.recent, learned, inputs);
         let reset = reset_pairs.contains(&key);
         let full = (!reset)
             .then(|| full_for(candidate, full_since, inputs.now_ms, inputs.availability.full_after_ms))
@@ -994,13 +994,12 @@ fn read_against(low: Option<f64>, high: Option<f64>) -> f64 {
 fn congestion<S: SiteSignals>(
     prior: Option<SiteLearned>,
     recent: &SiteReading,
-    backlog: Option<bool>,
     ceiling: Option<f64>,
     inputs: &Inputs<'_, S>,
 ) -> (bool, Option<i64>) {
     let congested = match (recent.comparator(), ceiling) {
-        // A full reading without work waiting is a site working flat out, not one that cannot take more.
-        (Some(saturation), _) => saturation >= 1.0 && backlog == Some(true),
+        // Full and waiting at one instant: a full reading alone is a site working flat out.
+        (Some(_), _) => recent.congested_saturation.is_some_and(|saturation| saturation >= 1.0),
         (None, Some(ceiling)) => recent.congested_in_flight.is_some_and(|held| held >= ceiling),
         // A comparator site with no reading in the settling time is not judged on a ceiling.
         (None, None) => false,
@@ -1090,14 +1089,19 @@ fn weighed(reading: &SiteReading) -> Option<f64> {
 }
 
 /// Puts each model's measured sites on one scale, since one draw spans one model: ready units
-/// when all have them, learned ceilings when all have one, else an equal weight each.
+/// when all have them, learned ceilings when all have one, else an equal weight each. Only
+/// sites admitted for new requests enter a draw, so only they choose the scale.
 fn weigh_alike(ranked: &mut [ResolvedCandidate]) {
     let models: BTreeSet<Arc<str>> = ranked
         .iter()
         .map(|resolved| Arc::clone(&resolved.candidate.name))
         .collect();
     for model in models {
-        let in_draw = |resolved: &ResolvedCandidate| resolved.measured && resolved.candidate.name == model;
+        let in_draw = |resolved: &ResolvedCandidate| {
+            resolved.measured
+                && resolved.candidate.name == model
+                && resolved.candidate.admission_state == AdmissionState::NewAndExisting
+        };
         let drawn = || ranked.iter().filter(|resolved| in_draw(resolved));
         let by_units = drawn().all(|resolved| resolved.units.is_some());
         let by_learned = drawn().all(|resolved| resolved.units.is_none() && resolved.candidate.capacity.is_some());
@@ -3053,6 +3057,38 @@ mod tests {
             Some(10.0),
             "a learned site serving another model does not flatten m1"
         );
+    }
+
+    #[test]
+    fn a_site_not_admitted_for_new_requests_does_not_choose_the_scale() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        let mut learned = Learned::default();
+        let availability = AvailabilitySettings::default();
+        // First line at an instant wins, so the unit counts go in before the helper's one.
+        with_series(&store, "a", "llm_d_epp_ready_endpoints", 8.0, 1_000);
+        with_series(&store, "b", "llm_d_epp_ready_endpoints", 2.0, 1_000);
+        for site in ["a", "b", "c"] {
+            with_in_flight(&store, site, 10.0, 1_000);
+            with_queue(&store, site, 0.0, 1_000);
+        }
+        for site in ["a", "b"] {
+            with_series(&store, site, "llm_d_epp_average_kv_cache_utilization", 0.2, 1_000);
+        }
+        let mut draining = cand("m", "c", "pool-c");
+        draining.admission = AdmissionState::ExistingOnly;
+        let candidates =
+            validate_candidates(vec![cand("m", "a", "pool-a"), cand("m", "b", "pool-b"), draining]).unwrap();
+        let snapshot = RouteSnapshot::from_store(
+            candidates,
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut learned, 1_000, 1_000),
+        );
+        assert_eq!(
+            site_in(&snapshot, "a").capacity,
+            Some(8.0),
+            "a draining count-only site cannot flatten the draw"
+        );
+        assert_eq!(site_in(&snapshot, "b").capacity, Some(2.0));
     }
 
     #[test]

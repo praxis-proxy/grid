@@ -44,6 +44,9 @@ pub struct SiteReading {
     pub published_saturation: Option<f64>,
     /// The gateway's approximation of that reading from pool averages, worst in the window.
     pub derived_saturation: Option<f64>,
+    /// The comparator's reading at instants that also had a backlog, from the same source as
+    /// [`Self::comparator`], worst within the window. Absent when no such instant had one.
+    pub congested_saturation: Option<f64>,
 }
 
 impl SiteReading {
