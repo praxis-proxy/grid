@@ -196,8 +196,11 @@ only through test dependencies, including the certificate and mock TLS fixtures.
 These checks do not prove runtime provider readiness or FIPS host compliance.
 
 The standard `deploy/gateway/Containerfile` builds the default profile with
-static OpenSSL on Alpine. It is not a FIPS runtime image. This change does not
-add a Gateway FIPS release image or validate traffic on a FIPS host.
+static OpenSSL on Alpine. It is not a FIPS runtime image. The chart
+`fips.required` value sets `PRAXIS_REQUIRE_FIPS=1` on the Praxis container and
+refuses overrides that disable it, but a deployment must supply a Gateway image
+built with one of the FIPS profiles above. Grid does not yet publish a dedicated
+Gateway FIPS image, and this change does not validate traffic on a FIPS host.
 
 [Praxis #1516]: https://github.com/praxis-proxy/praxis/pull/1516
 [Policy FIPS]: https://github.com/praxis-proxy/policy/blob/main/docs/content/fips.md

@@ -1729,6 +1729,17 @@
     "priorityClassName": {
       "type": "string",
       "description": "Priority class for the gateway pod."
+    },
+    "fips": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "FIPS mode for the gateway container.",
+      "properties": {
+        "required": {
+          "type": "boolean",
+          "description": "Require startup validation of the kernel, system crypto policy, and OpenSSL FIPS provider. Needs a FIPS-safe Gateway build and a FIPS host."
+        }
+      }
     }
   }
 }
