@@ -77,7 +77,7 @@ those targets.
 | `make lint-extra` | Spelling, TOML formatting, pre-commit-hook ShellCheck, actionlint. | No aggregate extra-lint job yet. |
 | `make doc` | Root rustdoc, including private items, with warnings denied. | Documentation / rustdoc, including documentation-only PRs. |
 | `make test` | Root workspace tests; ignored tests stay excluded. | Tests / test; separate FIPS and Gateway jobs cover their configurations. |
-| `make gateway-fips-check` | Gateway API-key and combined JWT Policy FIPS builds, capability assessment and normal/build crypto graph. | Gateway / gateway-fips-check; runtime FIPS host validation remains separate. |
+| `make gateway-fips-check` | Gateway API-key, JWT-only and combined Policy FIPS builds, capability assessment and normal/build crypto graph. | Gateway / gateway-fips-check; runtime FIPS host validation remains separate. |
 | `make audit` | Root lockfile audit and dependency/license policy. | Supply Chain; Gateway policy is checked in its own workflow. |
 | `make codegen-check`, `make crds-check` | Compare generated enrollment types and CRDs with their source definitions. | Tests / lint. |
 | `make go-types-check` | Regenerate Go API types from `deploy/crds/` and fail if the committed files differ. Rewrites `go/api/v1alpha1/zz_generated_*.go` in place — run before staging. | Check Go API types match the CRD schemas. |
