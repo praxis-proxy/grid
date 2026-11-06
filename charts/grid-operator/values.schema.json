@@ -110,6 +110,21 @@
           "additionalProperties": {
             "type": "object"
           }
+        },
+        "admissionPolicy": {
+          "description": "GridNetwork admissionPolicy, the grid-site chart's default. null leaves the CRD default.",
+          "type": ["object", "null"]
+        },
+        "selectionPolicy": {
+          "description": "GridNetwork selectionPolicy. null leaves it to the gateway default.",
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["deterministic", "roundRobin", "random", "weightedRandom"]
+            }
+          }
         }
       }
     },

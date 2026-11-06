@@ -26,6 +26,16 @@ spec:
   signalTransport:
     mode: {{ . | quote }}
   {{- end }}
+  {{- with .admissionPolicy }}
+  admissionPolicy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .selectionPolicy }}
+  {{- if .mode }}
+  selectionPolicy:
+    mode: {{ .mode | quote }}
+  {{- end }}
+  {{- end }}
   {{- if or .peerTrust .signedState }}
   peerTrust:
     mode: {{ .peerTrust | default "pin" | quote }}

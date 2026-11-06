@@ -34,6 +34,23 @@ grid:
   # Empty keeps the GridNetwork default, gossip. The operator also starts in it before any
   # GridNetwork exists, so a poll install never restarts once its network appears.
   signals: ""
+  # -- GridNetwork admission policy, the grid-site chart's default. null leaves the CRD
+  # default, instantaneous admission. Pressure transitions need a scoringPolicy and matching
+  # provider signalNames; without them admission stays new_and_existing.
+  admissionPolicy:
+    mode: stabilized
+    pressure:
+      enterThreshold: 0.85
+      exitThreshold: 0.70
+      failureThreshold: 2
+      successThreshold: 3
+      minimumStateDuration: 10s
+      recoveryHoldDown: 30s
+    missingMetrics: existingOnly
+  # -- Local selection mode, the grid-site chart's default. null leaves it to the gateway
+  # default, deterministic.
+  selectionPolicy:
+    mode: roundRobin
   # -- SWIM seed endpoints, where each peer's SWIM Service listens: a list, or one string
   # separated by spaces or commas. A bare host or address gets swim.service.port, and
   # host:port or [ipv6]:port is taken as given. Defaults swim.seeds.

@@ -196,15 +196,16 @@ the release names line up. These are the names another chart or the operator exp
 | Gateway namespace | `gateway.namespace`, else the operator's namespace. | Install praxis-gateway in the operator's namespace, or set `gateway.namespace`. |
 | Enrollment Service | `enrollment.hubService` (default `grid-enrollment`) in `rbac.enrollmentNamespace` (default `grid-enrollment`), on port `enrollment.hubPort`. | Install grid-enrollment as release `grid-enrollment` in namespace `grid-enrollment`, or set `hubService` to that release's fullname. |
 
-The GridNetwork this chart renders carries no `admissionPolicy` or `selectionPolicy`, so
-it takes the CRD and gateway defaults: instantaneous admission and deterministic selection.
-The grid-site chart renders stabilized admission and roundRobin selection by default. A
-network keeps whichever policies the chart that renders it writes, so render each
-GridNetwork from one chart, and use grid-site when you want its policies.
+The GridNetwork this chart renders carries the same `admissionPolicy` and `selectionPolicy`
+as the grid-site chart's default: stabilized admission and roundRobin selection, from
+`grid.admissionPolicy` and `grid.selectionPolicy`. Set either to null for the CRD and
+gateway defaults, instantaneous admission and deterministic selection. A network keeps
+whichever policies the chart that renders it writes, so render each GridNetwork from one chart.
 
 The NetworkPolicy peers in `networkPolicy.metricsFrom` are full NetworkPolicyPeer entries.
 Empty, they default to `openshift-user-workload-monitoring` and `openshift-monitoring`,
-which admit no Prometheus off OpenShift. The praxis-gateway chart takes
+which admit no Prometheus off OpenShift. A list replaces both, so an install that still
+needs them names them beside its own. The praxis-gateway chart takes
 namespace names in `metricsListener.fromNamespaces`, and on OpenShift defaults to
 `openshift-user-workload-monitoring` only. Set both when one Prometheus scrapes both.
 
@@ -218,6 +219,8 @@ namespace names in `metricsListener.fromNamespaces`, and on OpenShift defaults t
 | `site.region` | string | `""` | Region on the rendered GridSite. Empty leaves it out. |
 | `site.zone` | string | `""` | Availability zone on the rendered GridSite. Empty leaves it out. |
 | `grid.membership.source` | string | `Swim` | Where this site learns its members. `Swim` learns them over SWIM gossip. `Local` reads the GridSites this site's configuration lists and polls each peer's signals at the endpoint derived from its gateway. Local runs no SWIM, so `swim.service.enabled`, the seeds and `swim.advertiseAddress` fail the render, and `grid.signals` renders `poll`. Also writes `GridNetwork.spec.membership.mode` when `grid.id` is set. |
+| `grid.admissionPolicy` | object | stabilized, as grid-site | GridNetwork `admissionPolicy`, the grid-site chart's default. `null` leaves the CRD default, instantaneous admission. Pressure transitions need a `scoringPolicy` and matching provider `signalNames`. |
+| `grid.selectionPolicy.mode` | string | `roundRobin` | Local selection mode the gateway uses, the grid-site chart's default. `null` on `grid.selectionPolicy` leaves the gateway default, `deterministic`. |
 | `grid.providers` | object | `{}` | InferenceProviders this site serves, keyed by name. `model` defaults to the name, `providerKind` to `vllm`, `backendKind` to `local_model`. |
 | `rbac.enrollmentNamespace` | string | `""` | The grid-enrollment namespace. The render fails if the operator would get Secret access there. |
 | `rbac.metricsScraper` | bool | `true` | Create the metrics scraper ServiceAccount, allowed only GET on the nonResourceURL /metrics, and let the operator mint short-lived tokens for it. An llm-d EPP serving bearer-authenticated metrics (the default) admits a scrape with that token (metricsConfig.auth type serviceAccountToken). The operator never sends its own token. |
