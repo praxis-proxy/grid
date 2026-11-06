@@ -4,7 +4,10 @@
 //! invocations with no cluster-state knowledge and no orchestration logic.
 //! Call sites remain responsible for error context and sequencing.
 
-use std::{io::Write as _, process::Command};
+use std::{
+    io::Write as _,
+    process::{Command, Output, Stdio},
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -38,7 +41,7 @@ const ROLLOUT_TIMEOUT: &str = "120s";
 pub(crate) fn apply_manifest(context: &str, manifest: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut child = Command::new("kubectl")
         .args(["--context", context, "apply", "-f", "-"])
-        .stdin(std::process::Stdio::piped())
+        .stdin(Stdio::piped())
         .spawn()?;
     if let Some(stdin) = child.stdin.as_mut() {
         stdin.write_all(manifest.as_bytes())?;
@@ -48,6 +51,25 @@ pub(crate) fn apply_manifest(context: &str, manifest: &str) -> Result<(), Box<dy
         return Err(format!("kubectl apply failed: {status}").into());
     }
     Ok(())
+}
+
+/// Ask the API server to admit a manifest without persisting it.
+///
+/// # Errors
+///
+/// Returns an error if the `kubectl` process cannot be spawned or its input
+/// cannot be written. The returned [`Output`] contains the admission result.
+pub(crate) fn server_side_dry_run(context: &str, manifest: &str) -> Result<Output, Box<dyn std::error::Error>> {
+    let mut child = Command::new("kubectl")
+        .args(["--context", context, "apply", "--dry-run=server", "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(manifest.as_bytes())?;
+    }
+    Ok(child.wait_with_output()?)
 }
 
 // ---------------------------------------------------------------------------

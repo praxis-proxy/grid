@@ -3,7 +3,9 @@
 This Forge topology proves that `charts/praxis-gateway` deploys a working
 Praxis proxy on its own. It creates one Kind cluster with no AGN Operator, no
 Grid CRDs, and no Grid values, then installs and reconfigures the chart and
-sends real requests through the gateway after every change.
+sends real requests through the gateway after every change. The final metrics
+stage also builds `grid-gateway` from this checkout and exercises its TLS scrape
+authorization against the real Kind API server.
 
 ```mermaid
 flowchart LR
@@ -30,6 +32,7 @@ and `verify.sh` checks the result before the next stage starts.
 | `existing` | `praxisConfig.byo.configMapName` with key `gateway.yaml` | `GET /` reaches backend-a with `existing`, the chart's ConfigMap is gone |
 | `core-image` | core `ghcr.io/praxis-proxy/praxis` image with `command: [praxis]` | the core build serves its config |
 | `release` | none | `helm test` passes, the release holds only a ConfigMap, Deployment, and Service, no Grid CRDs or other workloads exist, and the notes and description do not assume Grid |
+| `gateway-metrics` | local `grid-gateway` image, supplied TLS Secret, ServiceMonitor enabled, no NetworkPolicy | uses the rendered ServiceMonitor's token and TLS settings to scrape; checks 401 without a token, 403 for an unauthorized ServiceAccount, 200 for the chart scraper, and the auth metrics |
 
 Every traffic check waits for the rollout, then needs six matching responses
 in a row so no pod still serves an older configuration. A request that gets no
@@ -46,7 +49,11 @@ make praxis-gateway-e2e
 Install the [pinned upstream Forge](../../../../docs/developing/forge.md) with
 `./scripts/forge.sh install` first. `scripts/e2e-praxis-gateway.sh` then
 runs `praxis-forge up` to create the cluster and `praxis-forge apply gateway`
-to run the stages, prints every check, and tears the cluster down. It fails
+to run the stages. It builds and loads `grid-gateway:latest` for the metrics
+stage, prints every check, and tears the cluster down. On ARM64 hosts it also
+loads the published Praxis test images as `linux/amd64`; the container runtime
+VM must have amd64 emulation enabled. Set `CORE_IMAGE_PLATFORM` to override
+that platform. It fails
 unless the last stage reports a pass, so a stage that never ran cannot look
 like success. Set
 `KEEP=1` to keep the cluster (context `kind-praxis-standalone-gateway`) for
@@ -58,3 +65,8 @@ KIND_CREATE_PREFIX="systemd-run --scope --user -p Delegate=yes" KEEP=1 make prax
 
 CI runs the same script in the `gateway-standalone` job of the Helm workflow
 on pull requests, pushes to `main`, and the merge queue.
+
+To run only the metrics listener checks, use `make gateway-metrics-e2e`. This
+creates the same Kind cluster and local gateway image, then applies only the
+metrics stack, including a probe driven by the chart's ServiceMonitor token and
+TLS settings.

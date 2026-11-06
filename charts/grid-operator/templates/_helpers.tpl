@@ -78,13 +78,13 @@ repository@digest and ignores tag. Otherwise renders repository:tag
 {{- end }}
 
 {{/*
-Signals are reached through the SWIM Service.
+Signals under Swim membership: peers learn the signals endpoint over SWIM gossip.
 */}}
 {{- define "grid-operator.validateSignals" -}}
 {{- /* Local membership serves signals on its own Service, which normalize requires. */}}
 {{- if eq (dig "membership" "source" "Swim" .Values.grid) "Local" }}
 {{- else if and (.Values.signals).enabled (not .Values.swim.service.enabled) }}
-{{- fail "signals.enabled needs swim.service.enabled: peers and the local gateway reach signals through the SWIM Service" }}
+{{- fail "signals.enabled needs swim.service.enabled under Swim membership: peers learn the signals endpoint over SWIM gossip" }}
 {{- end }}
 {{- /* Under Cluster every peer arrives from a node address and shares its handshake cap, so
 it needs the cap raised from the default 8. */}}
@@ -418,4 +418,14 @@ The Services carrying SWIM that route to the lease holder alone.
 */}}
 {{- define "grid-operator.holderSwimServices" -}}
 {{- if .Values.swim.service.enabled }}{{ include "grid-operator.fullname" . }}-swim{{ end }}
+{{- end }}
+
+{{/* The OpenShift monitoring namespaces metricsFrom falls back to when empty. */}}
+{{- define "grid-operator.networkPolicy.openshiftMonitoring" -}}
+- namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: openshift-user-workload-monitoring
+- namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: openshift-monitoring
 {{- end }}

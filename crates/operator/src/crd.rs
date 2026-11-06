@@ -55,7 +55,11 @@ fn add_legacy_field(
     }))
 }
 
-/// Remove nested CEL rules except mutual-exclusion rules from a legacy alias schema.
+/// Constant-cost CEL rules a legacy alias keeps, since serde reads the alias like the field.
+const ALIAS_KEPT_RULES: &[&str] = &[grid_network::SOVEREIGNTY_REQUIRES_GRID_SITE_ROUTE];
+
+/// Remove nested CEL rules from a legacy alias schema, except mutual-exclusion rules and
+/// [`ALIAS_KEPT_RULES`].
 ///
 /// The canonical field retains the validation rules. Copying every nested rule
 /// into every legacy alias can exceed Kubernetes' CRD validation-cost budget,
@@ -74,7 +78,7 @@ fn strip_validation_rules(value: &mut serde_json::Value) {
                 .get_mut("x-kubernetes-validations")
                 .and_then(serde_json::Value::as_array_mut)
             {
-                rules.retain(is_mutual_exclusion_rule);
+                rules.retain(survives_alias_copy);
             }
             let remove_empty_rules = object
                 .get("x-kubernetes-validations")
@@ -94,11 +98,15 @@ fn strip_validation_rules(value: &mut serde_json::Value) {
     }
 }
 
-/// Whether a CEL rule rejects two mutually exclusive fields.
-fn is_mutual_exclusion_rule(rule: &serde_json::Value) -> bool {
+/// Whether a nested CEL rule stays in a legacy alias copy: a mutual-exclusion rule or one
+/// of [`ALIAS_KEPT_RULES`].
+fn survives_alias_copy(rule: &serde_json::Value) -> bool {
     rule.get("rule")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|expression| expression.starts_with("!(has(self.") && expression.contains(") && has(self."))
+        .is_some_and(|expression| {
+            ALIAS_KEPT_RULES.contains(&expression)
+                || (expression.starts_with("!(has(self.") && expression.contains(") && has(self."))
+        })
 }
 
 /// Append alias validation rules without duplicating existing expressions.

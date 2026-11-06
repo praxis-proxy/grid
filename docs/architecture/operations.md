@@ -555,8 +555,11 @@ kind: GridNetwork
 metadata:
   name: production
 spec:
-  seeds:
-    - "10.0.0.5:7946"
+  membership:
+    mode: Swim
+    swim:
+      seeds:
+        - "10.0.0.5:7946"
   consumerGateways:
     - name: inference-gw
       namespace: praxis-system
@@ -579,7 +582,7 @@ The GridNetwork controller:
 
 ### CRD-driven seeds
 
-`spec.seeds` is **operator-consumed**: on every `GridNetwork` reconcile the
+`spec.membership.swim.seeds` is **operator-consumed**: on every `GridNetwork` reconcile the
 controller parses and resolves each entry independently, logs invalid or
 temporarily unresolvable entries at `warn`, retains successful addresses,
 removes the local advertise address to prevent self-announce noise,
@@ -595,7 +598,7 @@ reconcile, so dynamically added addresses take effect without an operator restar
 
 **Runtime update contract**
 
-| Change to `spec.seeds` | Effect |
+| Change to `spec.membership.swim.seeds` | Effect |
 |---|---|
 | Seed added | Announced to SWIM on the next reconcile; join initiated |
 | Seed removed | Logged; no active disconnect (SWIM failure detection ages the peer out naturally) |
@@ -612,7 +615,7 @@ membership until it stops responding to probes and is declared `Suspect` then
 
 The SWIM runtime is process-global: one UDP listener per operator process,
 shared across all `GridNetwork` reconciles.  Seeds from any
-`GridNetwork.spec.seeds` are announced to the same SWIM membership node.
+`GridNetwork.spec.membership.swim.seeds` are announced to the same SWIM membership node.
 This is site-membership bootstrap, not per-network membership isolation.
 CRDT provider records remain network-scoped separately.
 

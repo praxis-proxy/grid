@@ -564,6 +564,9 @@ pub struct PeerRecord {
 
     /// Where this peer serves its signals, derived from the local object's gateway endpoint.
     pub signals: Option<DeclaredSignals>,
+
+    /// The local object's `spec.sovereigntyZone`, normalized; `None` when unset or invalid.
+    pub sovereignty_zone: Option<String>,
 }
 
 /// The server name `site`'s gateway is reached and verified under, the DNS name its leaf carries.
@@ -2056,7 +2059,7 @@ fn with_query(url: &str, query: &str) -> Option<String> {
 /// Names a hub keeps from a peer: the cross-site contract, plus the EPP pool averages and
 /// ready counts the gateway routes on until it routes on saturation. A peer's custom
 /// `signalNames` are dropped here.
-const PEER_SIGNAL_NAMES: [&str; 20] = [
+const PEER_SIGNAL_NAMES: [&str; 21] = [
     grid_signals::revision::METRIC,
     crate::readiness::READY_SIGNAL,
     crate::readiness::READY_ENDPOINTS_SIGNAL,
@@ -2081,6 +2084,9 @@ const PEER_SIGNAL_NAMES: [&str; 20] = [
     "llm_d_epp_flow_control_queue_size",
     "inference_pool_per_pod_queue_size",
     "llm_d_epp_per_endpoint_queue_size",
+    // The EPP's own detector reading, published only with flow control on, preferred by the
+    // gateway over its own approximation. Not a share: it reads above one when oversubscribed.
+    "llm_d_epp_flow_control_pool_saturation",
 ];
 
 /// Most providers a hub keeps from one peer, so a peer cannot grow the hub's series without
@@ -4147,6 +4153,7 @@ mod tests {
                 labels: gold(),
                 pins: Vec::new(),
                 signals: None,
+                sovereignty_zone: None,
             },
         )]));
         assert_eq!(
@@ -4166,6 +4173,7 @@ mod tests {
                 labels: gold(),
                 pins: vec!["ab".repeat(32)],
                 signals: None,
+                sovereignty_zone: None,
             },
         )]));
         assert_eq!(
@@ -4190,6 +4198,7 @@ mod tests {
                     labels: gold(),
                     pins: vec!["cc".repeat(32)],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
             (
@@ -4198,6 +4207,7 @@ mod tests {
                     labels: BTreeMap::from([("tier".to_owned(), "silver".to_owned())]),
                     pins: vec!["bb".repeat(32)],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
         ]));
@@ -4226,6 +4236,7 @@ mod tests {
                 labels: gold(),
                 pins: vec!["ab".repeat(32), "cd".repeat(32)],
                 signals: None,
+                sovereignty_zone: None,
             },
         )]));
         assert_eq!(identities.resolve_by_key(&"ab".repeat(32)), Some(gold()), "the old key");
@@ -4251,6 +4262,7 @@ mod tests {
                     labels: gold(),
                     pins: Vec::new(),
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
             (
@@ -4259,6 +4271,7 @@ mod tests {
                     labels: gold(),
                     pins: vec!["cd".repeat(32)],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
         ]));
@@ -4308,6 +4321,7 @@ mod tests {
             labels: BTreeMap::from([("tier".to_owned(), "gold".to_owned())]),
             pins: vec![canonical_fingerprint(&declared)],
             signals: None,
+            sovereignty_zone: None,
         };
         let identities = PeerIdentities::new();
         identities.set(BTreeMap::from([("peer".to_owned(), record)]));
@@ -4607,6 +4621,21 @@ q{pool=\"d\"} 0.35
                 "{name} is a share the gateway refuses above one, but a hub accepts any value"
             );
         }
+    }
+
+    #[test]
+    fn the_epp_pool_saturation_the_gateway_prefers_is_relayed_unbounded() {
+        const GATEWAY: &str = include_str!("../../gateway/crates/ai-grid-filters/src/signals/llm_d.rs");
+        let name = "llm_d_epp_flow_control_pool_saturation";
+        assert!(GATEWAY.contains(name), "the gateway no longer reads {name}");
+        assert!(
+            PEER_SIGNAL_NAMES.contains(&name),
+            "{name} is read by the gateway but never relayed"
+        );
+        assert!(
+            in_range(&peer_sample(name, "pool-b", 2.5)),
+            "an oversubscribed pool reads above one and must survive the hub"
+        );
     }
 
     #[test]

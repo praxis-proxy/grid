@@ -7,10 +7,14 @@
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     /// Names `describe_metrics` documents, which a scrape must explain.
-    const DOCUMENTED: [&str; 34] = [
+    const DOCUMENTED: [&str; 42] = [
         "grid_route_decisions_total",
+        "grid_route_fenced_total",
         "grid_route_selections_total",
         "grid_route_prefix_affinity_total",
+        "grid_route_prefix_index_entries",
+        "grid_route_prefix_index_capacity",
+        "grid_route_prefix_index_evictions_total",
         "grid_serving_config_reload_total",
         "grid_serving_unbound_provider_hops",
         "grid_serving_undialable_clusters",
@@ -22,6 +26,9 @@ mod tests {
         "grid_route_site_rho",
         "grid_route_site_rho_reported",
         "grid_route_site_rho_counted",
+        "grid_route_site_rho_derived",
+        "grid_route_site_rho_published",
+        "grid_route_site_capacity_implied",
         "grid_route_site_weight",
         "grid_route_site_ceiling",
         "grid_route_site_ceiling_soft",
@@ -35,6 +42,7 @@ mod tests {
         "grid_route_site_score",
         "grid_route_site_score_unavailable",
         "grid_route_shedding",
+        "grid_route_candidate_info",
         "grid_signals_poll_total",
         "grid_signals_ingest_dropped_total",
         "grid_signals_feedback_failures_total",
@@ -45,10 +53,13 @@ mod tests {
     ];
 
     /// The per-site gauges, set once each so their help text renders.
-    const SITE_GAUGES: [&str; 14] = [
+    const SITE_GAUGES: [&str; 17] = [
         "grid_route_site_rho",
         "grid_route_site_rho_reported",
         "grid_route_site_rho_counted",
+        "grid_route_site_rho_derived",
+        "grid_route_site_rho_published",
+        "grid_route_site_capacity_implied",
         "grid_route_site_weight",
         "grid_route_site_ceiling",
         "grid_route_site_ceiling_soft",
@@ -68,8 +79,13 @@ mod tests {
         ai_grid_filters::describe_metrics();
 
         metrics::counter!("grid_route_decisions_total").increment(1);
+        metrics::counter!("grid_route_fenced_total", "cause" => "zone_required", "enforced" => "true").increment(1);
         metrics::counter!("grid_route_selections_total", "path" => "cross_site").increment(1);
         metrics::counter!("grid_route_prefix_affinity_total", "outcome" => "hit").increment(1);
+        metrics::gauge!("grid_route_prefix_index_entries", "cluster" => "east").set(1.0);
+        metrics::gauge!("grid_route_prefix_index_capacity", "cluster" => "east").set(1.0);
+        metrics::counter!("grid_route_prefix_index_evictions_total", "cluster" => "east", "reason" => "capacity")
+            .increment(1);
         metrics::counter!("grid_serving_config_reload_total", "result" => "ok").increment(1);
         metrics::counter!("grid_route_site_silent_transitions_total", "to" => "silent").increment(1);
         for name in SITE_GAUGES {
@@ -83,6 +99,8 @@ mod tests {
         )
         .set(1.0);
         metrics::gauge!("grid_route_shedding", "model" => "llama").set(0.0);
+        metrics::gauge!("grid_route_candidate_info", "site" => "east", "cluster" => "pool-east", "model" => "llama")
+            .set(1.0);
         metrics::counter!("grid_signals_poll_total", "result" => "ok").increment(1);
         metrics::counter!("grid_signals_ingest_dropped_total", "reason" => "skew").increment(1);
         metrics::counter!("grid_signals_feedback_failures_total", "reason" => "status").increment(1);
@@ -117,7 +135,7 @@ mod tests {
     /// emit sites out of the source instead.
     #[test]
     fn every_emitted_grid_metric_is_documented() {
-        const SOURCES: [&str; 7] = [
+        const SOURCES: [&str; 9] = [
             include_str!("../crates/ai-grid-filters/src/snapshot.rs"),
             include_str!("../crates/ai-grid-filters/src/signals.rs"),
             include_str!("../crates/ai-grid-filters/src/decisions.rs"),
@@ -125,6 +143,8 @@ mod tests {
             include_str!("../crates/ai-grid-filters/src/dial.rs"),
             include_str!("../crates/ai-grid-filters/src/health.rs"),
             include_str!("../crates/ai-grid-filters/src/provider.rs"),
+            include_str!("../crates/ai-grid-filters/src/prefix/affinity.rs"),
+            include_str!("../crates/ai-grid-filters/src/prefix/index.rs"),
         ];
 
         let mut emitted: Vec<&str> = SOURCES

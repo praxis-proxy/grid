@@ -30,10 +30,27 @@ grid:
   # set. Empty keeps its default, off. Set enforce at every site together; an enforcing
   # site refuses unsigned peers.
   signedState: ""
-  # -- Signal transport, gossip or poll. poll also serves signals on the SWIM Service.
+  # -- Signal transport, gossip or poll. poll also serves signals on the signals Service.
   # Empty keeps the GridNetwork default, gossip. The operator also starts in it before any
   # GridNetwork exists, so a poll install never restarts once its network appears.
   signals: ""
+  # -- GridNetwork admission policy, the grid-site chart's default. null leaves the CRD
+  # default, instantaneous admission. Pressure transitions need a scoringPolicy and matching
+  # provider signalNames; without them admission stays new_and_existing.
+  admissionPolicy:
+    mode: stabilized
+    pressure:
+      enterThreshold: 0.85
+      exitThreshold: 0.70
+      failureThreshold: 2
+      successThreshold: 3
+      minimumStateDuration: 10s
+      recoveryHoldDown: 30s
+    missingMetrics: existingOnly
+  # -- Local selection mode, the grid-site chart's default. null leaves it to the gateway
+  # default, deterministic.
+  selectionPolicy:
+    mode: roundRobin
   # -- SWIM seed endpoints, where each peer's SWIM Service listens: a list, or one string
   # separated by spaces or commas. A bare host or address gets swim.service.port, and
   # host:port or [ipv6]:port is taken as given. Defaults swim.seeds.
@@ -144,9 +161,6 @@ log:
   # -- Full RUST_LOG directive, such as "info,operator=debug". When set, it replaces level.
   filter: ""
 
-# Signal propagation mode is grid-wide configuration, set on the GridNetwork
-# via the grid-site chart's signalTransport value, not on the operator.
-
 # -- Metrics and health server configuration.
 metrics:
   # -- Metrics server bind address (host:port).
@@ -178,14 +192,10 @@ metrics:
 networkPolicy:
   # -- auto: on where OpenShift runs. true or false forces it.
   enabled: auto
-  # -- NetworkPolicyPeer entries allowed to reach the metrics port. Must not be empty.
-  metricsFrom:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: openshift-user-workload-monitoring
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: openshift-monitoring
+  # -- NetworkPolicyPeer entries allowed to reach the metrics port. Empty admits the
+  # openshift-user-workload-monitoring and openshift-monitoring namespaces. Off OpenShift,
+  # set it when enabling the policy.
+  metricsFrom: []
 
 # -- SWIM protocol configuration.
 swim:
@@ -195,6 +205,8 @@ swim:
   advertiseAddress: ""
   # -- Hold SWIM traffic until the GridNetwork key loads or the network declares none. false opts out.
   requireKey: true
+  # -- Seconds a dead member stays tracked before eviction. Empty keeps the operator's 300s.
+  deadMemberTtlSeconds: ""
   # -- Bootstrap SWIM site name. Defaults to enrollment.siteName when enrollment is on.
   siteName: ""
   # -- Bootstrap SWIM seed endpoints, separated by spaces or commas, as grid.seeds.
@@ -257,15 +269,18 @@ signals:
     loadBalancerSourceRanges: []
     # -- Empty keeps Local for a LoadBalancer.
     externalTrafficPolicy: ""
-  # -- Signals endpoint gossiped to peers (ip:port, [ipv6]:port, or dns-name:port). Set it when swim.advertiseAddress is set or the Service is not a LoadBalancer.
+  # -- Signals endpoint gossiped to peers (ip:port, [ipv6]:port, or dns-name:port). Empty is the
+  # Route host on 443 when a signals Route renders. Set it when swim.advertiseAddress is set or
+  # the Service is neither behind a Route nor a LoadBalancer.
   advertiseAddress: ""
   # -- An OpenShift Route in front of the signals Service, so peers reach this site through
   # the cluster's router rather than a load balancer of its own. Required when signals are
   # exposed through a Route: without the rate limits below, the listener is open to anyone
   # who can reach the router.
   route:
-    # -- auto renders the Route where the cluster serves route.openshift.io/v1; true or
-    # false forces it. An offline render without --api-versions renders auto as off.
+    # -- auto renders the Route where the cluster serves route.openshift.io/v1, signals and
+    # the signals Service are on, and signals.service.type is empty or ClusterIP. Set true
+    # or false to force it. An offline render without --api-versions renders auto as off.
     enabled: auto
     # -- External hostname peers dial, the name the router matches the SNI against. The
     # convention is <site>-signals.<domain>. Required when a Route renders.
@@ -301,6 +316,11 @@ signals:
   # -- Seconds between scrapes of this site's own EPPs. Local and unicast, so it costs
   # one request per provider per interval. Empty keeps the operator's 1s.
   scrapeIntervalSeconds: ""
+
+  # -- Seconds a published site signal is served before it expires. Half of it is the
+  # default readiness window, so it applies with signals off too. Empty keeps the
+  # operator's 30s.
+  ttlSeconds: ""
 # -- Advertised site gateway address configuration.
 gateway:
   # -- Discover a LoadBalancer address for SWIM and the own GridSite.
@@ -312,8 +332,9 @@ gateway:
   # NodePort Services; the own GridSite uses it when gatewayEndpoint is absent.
   address: ""
   # -- Site gateway Kubernetes Service name for the operator to discover. Defaults
-  # to grid-gateway with enrollment enabled or grid.id set; it also names the
-  # gateway in GridNetwork spec.consumerGateways. Maps to GRID_GATEWAY_SERVICE_NAME.
+  # to grid-gateway with enrollment enabled or grid.id set, else to the operator's
+  # provider-gateway; it also names the gateway in GridNetwork spec.consumerGateways.
+  # Set the praxis-gateway release's fullnameOverride to it. Maps to GRID_GATEWAY_SERVICE_NAME.
   serviceName: ""
   # -- Namespace of the site gateway Service. Empty uses the release
   # namespace. Maps to GRID_GATEWAY_NAMESPACE.
@@ -324,6 +345,18 @@ gateway:
   # Service's declared port; if several are present, the first spec.ports entry
   # is used. Maps to GRID_GATEWAY_PORT.
   port: ""
+
+# -- Served-model discovery from this site's providers.
+modelDiscovery:
+  # -- Seconds between discovery rounds. Empty keeps the operator's 60s.
+  intervalSeconds: ""
+  # -- Seconds one provider poll may take. Empty keeps the operator's 5s.
+  timeoutSeconds: ""
+  # -- Providers polled at once. Empty keeps the operator's 8.
+  concurrency: ""
+  # -- Seconds a discovered model set stays routable without a fresh poll. The
+  # operator raises it to cover one poll round. Empty keeps the operator's 180s.
+  ttlSeconds: ""
 
 # -- Probe timing configuration.
 health:

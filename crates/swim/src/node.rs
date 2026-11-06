@@ -295,6 +295,10 @@ impl SwimNode {
 
     /// Pin a site's signing key within one `GridNetwork` trust domain.
     ///
+    /// First pinning or removing a previously accepted key clears only this
+    /// peer's provider and inventory state in the grid, plus unverified provider
+    /// values. Other grids' verified state and origin-wide metadata are retained.
+    ///
     /// # Errors
     ///
     /// Returns [`TooManyPinnedKeys`] when more than
@@ -318,7 +322,7 @@ impl SwimNode {
                 .as_ref()
                 .is_some_and(|previous| previous.iter().any(|old| !keys.contains(old)));
         if purge || keys.is_empty() {
-            self.evict_origin(&origin);
+            self.origin_state.remove_grid(grid_id, Some(&origin));
         }
         self.trust_store_tx.send_modify(|store| {
             store.set_pin(key, keys);
@@ -326,24 +330,23 @@ impl SwimNode {
         Ok(())
     }
 
-    /// Require a verified pin before accepting state in `grid_id`.
-    pub fn enforce_signed_grid(&self, grid_id: &str) {
+    /// Require signed state and authorize only the locally declared provider network.
+    ///
+    /// A new or changed binding clears this grid's providers and inventory state,
+    /// plus provider values admitted without a grid-specific verified identity.
+    /// It also clears this grid's signing-key pins, which must be reverified.
+    /// Unchanged policy preserves state and pins. Peers republish after a purge.
+    pub fn enforce_signed_grid(&self, grid_id: &str, network_name: &str) {
         let store = self.trust_store_tx.borrow();
-        if store.is_strict(grid_id) {
+        if store.is_strict(grid_id) && store.provider_network(grid_id) == Some(network_name) {
             return;
         }
-        let unpinned = self
-            .origin_state
-            .known_origins()
-            .into_iter()
-            .filter(|origin| store.pin(&PinKey::grid(grid_id, origin)).is_none_or(Vec::is_empty))
-            .collect::<Vec<_>>();
         drop(store);
-        for origin in unpinned {
-            self.evict_origin(&origin);
-        }
+        self.origin_state.remove_grid(grid_id, None);
         self.trust_store_tx.send_modify(|pins| {
+            pins.forget_grid(grid_id);
             pins.enforce(grid_id);
+            pins.bind_provider_network(grid_id, network_name);
         });
     }
 
@@ -364,9 +367,9 @@ impl SwimNode {
         self.trust_store_tx.send_modify(|store| store.forget_grid(grid_id));
     }
 
-    /// Revoke a site identity in one `GridNetwork` and purge its retained state.
+    /// Revoke a site identity and clear only its grid's provider and inventory state.
     pub fn unpin_origin_for_grid(&self, grid_id: &str, origin: &str) {
-        self.evict_origin(origin);
+        self.origin_state.remove_grid(grid_id, Some(origin));
         self.trust_store_tx.send_modify(|store| {
             store.set_pin(PinKey::grid(grid_id, origin), Vec::new());
         });
@@ -378,7 +381,7 @@ impl SwimNode {
     /// the declared trust policy. Ordinary grid state remains blocked until a
     /// newly validated pin is installed.
     pub fn clear_origin_pin_for_grid(&self, grid_id: &str, origin: &str) {
-        self.evict_origin(origin);
+        self.origin_state.remove_grid(grid_id, Some(origin));
         self.trust_store_tx.send_modify(|store| {
             store.remove_pin(&PinKey::grid(grid_id, origin));
         });
@@ -891,7 +894,7 @@ mod tests {
     fn relaxing_a_grid_drops_only_that_grids_policy_and_pins() {
         let (node, _) = make_node("site-local", 19_232);
         for grid in ["grid-a", "grid-b"] {
-            node.enforce_signed_grid(grid);
+            node.enforce_signed_grid(grid, "net");
             node.pin_origin_for_grid(grid, "site-peer".to_owned(), vec![vec![1]])
                 .unwrap_or_else(|_| std::process::abort());
         }
@@ -900,6 +903,12 @@ mod tests {
 
         let pins = node.trust_store_tx.borrow().clone();
         assert!(!pins.is_strict("grid-a"), "a relaxed grid stops requiring signed state");
+        assert_eq!(
+            pins.provider_network("grid-a"),
+            None,
+            "relaxation removes network authorization"
+        );
+        assert_eq!(pins.provider_network("grid-b"), Some("net"), "other bindings survive");
         assert!(
             pins.pin(&PinKey::grid("grid-a", "site-peer")).is_none(),
             "a relaxed grid keeps no peer pins"
@@ -921,7 +930,7 @@ mod tests {
         node_a
             .pin_origin_for_grid("grid-a", "site-a".to_owned(), vec![public_key.clone()])
             .unwrap_or_else(|_| std::process::abort());
-        node_b.enforce_signed_grid("grid-a");
+        node_b.enforce_signed_grid("grid-a", "net");
 
         let unsigned_bootstrap = StateBroadcast::new(
             "site-a".to_owned(),
@@ -1003,7 +1012,7 @@ mod tests {
     #[test]
     fn clearing_a_grid_pin_leaves_strict_bootstrap_policy_enabled() {
         let (node, _) = make_node("site-local", 19_231);
-        node.enforce_signed_grid("grid-a");
+        node.enforce_signed_grid("grid-a", "net");
         node.pin_origin_for_grid("grid-a", "site-peer".to_owned(), vec![vec![1]])
             .unwrap_or_else(|_| std::process::abort());
 
@@ -1450,6 +1459,8 @@ mod tests {
         let (mut node_b, _) = make_node("site-b", 19_251);
         establish_membership(&mut node_a, &mut node_b, &id_a, &id_b);
         let (private_key, public_key) = generate_signing_key_and_pubkey();
+        node_a.enforce_signed_grid("grid-a", "net");
+        node_b.enforce_signed_grid("grid-a", "net");
         node_a.pin_origin_for_grid("grid-a", "site-a".to_owned(), vec![public_key.clone()])?;
         node_b.pin_origin_for_grid("grid-a", "site-a".to_owned(), vec![public_key])?;
         let mut snapshot = provider_snap("site-a", 0.2);
@@ -1519,6 +1530,183 @@ mod tests {
             }
         }
         assert_eq!(node_b.model_inventories(), [expected]);
+        let before = node_b.state_snapshot();
+        node_b.enforce_signed_grid("grid-a", "net");
+        assert_eq!(
+            node_b.state_snapshot(),
+            before,
+            "identical policy preserves provider state"
+        );
+        assert_eq!(
+            node_b.model_inventories().len(),
+            1,
+            "identical policy preserves inventory"
+        );
+        node_b.enforce_signed_grid("grid-a", "replacement-network");
+        assert!(
+            node_b.state_snapshot().providers.is_empty(),
+            "changed policy purges old provider state"
+        );
+        assert!(
+            node_b.model_inventories().is_empty(),
+            "changed policy purges old inventory and UID history"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn signed_provider_network_isolation_crosses_foca() -> Result<(), Box<dyn std::error::Error>> {
+        let id_a = local_id("site-a", 19_260);
+        let id_b = local_id("site-b", 19_261);
+        let (mut source, _) = make_node("site-a", 19_260);
+        let (mut receiver, _) = make_node("site-b", 19_261);
+        establish_membership(&mut source, &mut receiver, &id_a, &id_b);
+        let (private_key, public_key) = generate_signing_key_and_pubkey();
+        for (grid, network) in [("grid-a", "network-a"), ("grid-b", "network-b")] {
+            receiver.enforce_signed_grid(grid, network);
+            receiver.pin_origin_for_grid(grid, "site-a".to_owned(), vec![public_key.clone()])?;
+        }
+        let subscribed = receiver.state_rx.clone();
+        for (grid, network, revision, accepted) in [
+            ("grid-b", "network-b", 1, true),
+            ("grid-a", "network-a", 1, true),
+            ("grid-a", "network-b", 2, false),
+            ("grid-a", "network-a", 3, true),
+        ] {
+            let mut snapshot = provider_snap("site-a", 0.2);
+            for mut provider in std::mem::take(&mut snapshot.providers).into_values() {
+                network.clone_into(&mut provider.network_id);
+                snapshot.upsert_provider(provider);
+            }
+            let mut state = StateBroadcast::new("site-a".to_owned(), revision, snapshot, None)
+                .with_grid_id(Some(grid.to_owned()))
+                .with_authoritative_provider_state()
+                .with_signed_at(Some(now_ms()));
+            state.signature = Some(crate::signing::sign_ecdsa_p256(&private_key, &state.signable_bytes()?)?);
+            let before = subscribed.borrow().clone();
+            source.publish_state_broadcast(&state)?;
+            for message in source.broadcast().messages {
+                drop(receiver.handle_data(&message.data));
+            }
+            if accepted {
+                assert_eq!(
+                    subscribed
+                        .borrow()
+                        .provider(network, "site-a", "provider-1")
+                        .map(|provider| provider.revision),
+                    Some(revision),
+                    "a correctly scoped signature reaches the subscribed state"
+                );
+            } else {
+                assert_eq!(
+                    *subscribed.borrow(),
+                    before,
+                    "a valid signature cannot cross provider-network scopes"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn grid_trust_changes_preserve_other_grids_routes_inventories_and_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for change in ["binding", "rotation", "revoke", "clear", "new-grid"] {
+            let (mut node, _) = make_node("local", 19_270);
+            let (private_key, public_key) = generate_signing_key_and_pubkey();
+            for (grid, network) in [("grid-a", "network-a"), ("grid-b", "network-b")] {
+                node.enforce_signed_grid(grid, network);
+                node.pin_origin_for_grid(grid, "site-a".to_owned(), vec![public_key.clone()])?;
+                let state = signed_grid_provider(grid, network, 10, &private_key)?;
+                node.publish_state_broadcast(&state)?;
+                let inventory = grid_provider_inventory(grid, network);
+                for frame in inventory.frames()? {
+                    node.publish_model_inventory_broadcast(&ModelInventoryBroadcast::new(
+                        "site-a".to_owned(),
+                        grid.to_owned(),
+                        frame.sign("site-a", grid, &private_key, now_ms())?,
+                    ))?;
+                }
+            }
+            assert_eq!(
+                node.state_snapshot().providers.len(),
+                2,
+                "installing B's binding and pin preserves A"
+            );
+            assert_eq!(node.model_inventories().len(), 2);
+            let other = node
+                .state_snapshot()
+                .provider("network-b", "site-a", "provider-1")
+                .cloned();
+            let other_inventory: Vec<_> = node
+                .model_inventories()
+                .into_iter()
+                .filter(|inventory| inventory.grid_id == "grid-b")
+                .collect();
+
+            match change {
+                "binding" => node.enforce_signed_grid("grid-a", "replacement"),
+                "rotation" => {
+                    let (_, replacement_key) = generate_signing_key_and_pubkey();
+                    node.pin_origin_for_grid("grid-a", "site-a".to_owned(), vec![replacement_key])?;
+                },
+                "revoke" => node.unpin_origin_for_grid("grid-a", "site-a"),
+                "clear" => node.clear_origin_pin_for_grid("grid-a", "site-a"),
+                _ => node.enforce_signed_grid("grid-c", "network-c"),
+            }
+
+            assert_eq!(
+                node.state_snapshot().provider("network-b", "site-a", "provider-1"),
+                other.as_ref(),
+                "{change}: B's route survives"
+            );
+            assert_eq!(
+                node.model_inventories()
+                    .into_iter()
+                    .filter(|inventory| inventory.grid_id == "grid-b")
+                    .collect::<Vec<_>>(),
+                other_inventory,
+                "{change}: B's inventory survives"
+            );
+            assert_eq!(
+                node.gateway_addrs().get("site-a").map(String::as_str),
+                Some("site-a:8443")
+            );
+            assert_eq!(
+                node.signals_addrs().get("site-a").map(String::as_str),
+                Some("site-a:9091")
+            );
+            assert_eq!(node.cert_pems().get("site-a").map(String::as_str), Some("public-cert"));
+            assert_eq!(
+                node.state_snapshot()
+                    .provider("network-a", "site-a", "provider-1")
+                    .is_some(),
+                change == "new-grid"
+            );
+            if change == "binding" {
+                assert!(
+                    node.publish_state_broadcast(&signed_grid_provider("grid-a", "replacement", 1, &private_key)?)
+                        .is_err(),
+                    "old pins cannot authorize a rebound grid"
+                );
+                node.pin_origin_for_grid("grid-a", "site-a".to_owned(), vec![public_key.clone()])?;
+                node.publish_state_broadcast(&signed_grid_provider("grid-a", "replacement", 1, &private_key)?)?;
+                assert_eq!(
+                    node.state_snapshot()
+                        .provider("replacement", "site-a", "provider-1")
+                        .map(|provider| provider.revision),
+                    Some(1),
+                    "A's provider revision guard was cleared"
+                );
+            }
+            let stale = signed_grid_provider("grid-b", "network-b", 1, &private_key)?;
+            node.publish_state_broadcast(&stale)?;
+            assert_eq!(
+                node.state_snapshot().provider("network-b", "site-a", "provider-1"),
+                other.as_ref(),
+                "{change}: B's provider guard survives"
+            );
+        }
         Ok(())
     }
 
@@ -1728,5 +1916,52 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("99"), "error message must include the actual version");
+    }
+
+    // Test Utilities
+
+    /// An inventory matching the signed provider test advertisement.
+    fn grid_provider_inventory(grid: &str, network: &str) -> ModelInventory {
+        ModelInventory {
+            origin_site: "site-a".to_owned(),
+            grid_id: grid.to_owned(),
+            network_id: network.to_owned(),
+            provider_id: "provider-1".to_owned(),
+            provider_uid: "uid".to_owned(),
+            revision: 10,
+            expires_at_ms: now_ms().saturating_add(60_000),
+            models: vec!["model-a".to_owned()],
+        }
+    }
+
+    /// A signed provider and UID advertisement with shared origin metadata.
+    fn signed_grid_provider(
+        grid: &str,
+        network: &str,
+        revision: u64,
+        private_key: &[u8],
+    ) -> Result<StateBroadcast, Box<dyn std::error::Error>> {
+        let mut snapshot = provider_snap("site-a", 0.2);
+        for mut provider in std::mem::take(&mut snapshot.providers).into_values() {
+            network.clone_into(&mut provider.network_id);
+            provider.models.clear();
+            snapshot.upsert_provider(provider);
+        }
+        let mut state = StateBroadcast::new("site-a".to_owned(), revision, snapshot, Some("site-a:8443".to_owned()))
+            .with_grid_id(Some(grid.to_owned()))
+            .with_signals_address(Some("site-a:9091".to_owned()))
+            .with_cert(Some("public-cert".to_owned()))
+            .with_provider_uids(vec![crate::ProviderUid {
+                identity: crate::ProviderIdentity {
+                    network: network.to_owned(),
+                    site: "site-a".to_owned(),
+                    provider: "provider-1".to_owned(),
+                },
+                uid: "uid".to_owned(),
+            }])
+            .with_authoritative_provider_state()
+            .with_signed_at(Some(now_ms()));
+        state.signature = Some(crate::signing::sign_ecdsa_p256(private_key, &state.signable_bytes()?)?);
+        Ok(state)
     }
 }

@@ -8,13 +8,12 @@ spec:
   gridId: grid-combined-site-v1
   region: west
   zone: west-1
-  seeds:
-    - "{{ captures.central.swim-lb-ip }}:7946"
-    - "{{ captures.east.swim-lb-ip }}:7946"
-  swim:
-    probeInterval: "5s"
-    suspicionTimeout: "15s"
-    gossipNodes: 3
+  membership:
+    mode: Swim
+    swim:
+      seeds:
+        - "{{ captures.central.swim-lb-ip }}:7946"
+        - "{{ captures.east.swim-lb-ip }}:7946"
   tls:
     caSecretRef: null
     siteSecretRef:

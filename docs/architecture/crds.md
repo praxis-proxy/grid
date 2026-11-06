@@ -128,8 +128,11 @@ metadata:
   name: production
 spec:
   gridId: "production-grid"     # the stable ID supplied by bootstrap
-  seeds:
-    - "10.0.0.5:7946"
+  membership:
+    mode: Swim
+    swim:
+      seeds:
+        - "10.0.0.5:7946"
   consumerGateways:
     - name: inference-gw
       namespace: praxis-system
@@ -162,10 +165,6 @@ spec:
                 # key: ca.crt          # optional; defaults to ca.crt
   region: us-east-1
   zone: us-east-1a
-  swim:
-    probeInterval: 5s           # WAN probe interval
-    suspicionTimeout: 10s       # before declaring dead
-    gossipNodes: 3              # indirect probe fanout
   peerTrust:
     mode: pin                    # pin (default) or spiffe
     signedState: "off"           # off (default) or enforce
@@ -370,15 +369,21 @@ gateway process has unresolved rejected ages. `False` requires genuine newer
 clean evidence from every recorded rejecting process. `Unknown` means the
 remaining evidence is stale, predates the operator restart, or reporter
 capacity was exceeded. Conditions never change network phase or routing.
+The primary `GridNetwork` watch filters status-only changes; spec generation
+and watched related-resource changes still trigger routing reconciliation.
 
 `gatewayAgeReports[]` retains at most 128 records keyed by random process epoch:
-replica label, sequence, cumulative skew count, original report flag, effective
-rejection state, and receipt timestamp. Live freshness uses a five-minute
-monotonic receipt window. Expiration is evaluated when another report arrives;
-if reporting stops entirely, the last condition remains until a report arrives.
-After an operator restart, persisted rejected epochs have unknown freshness
-until that same epoch submits a strictly newer observation. Wall-clock changes
-and duplicate reports cannot establish recovery or renew freshness.
+replica label, last durably recorded sequence, cumulative skew count, original
+report flag, effective rejection state, and receipt timestamp. The operator
+keeps the latest accepted sequence and freshness on its monotonic clock in
+memory, so routine reports with unchanged evidence do not write status. It
+refreshes the durable row at most once per five-minute freshness window and
+writes evidence transitions immediately. Expiration is evaluated when another
+report arrives; if reporting stops entirely, the last condition remains until
+a report arrives. After an operator restart, persisted rejected epochs have
+unknown freshness until that same epoch submits a strictly newer observation.
+Wall-clock changes and duplicate reports cannot establish recovery or renew
+freshness.
 
 A clean report from another replica or replacement process never clears an
 older rejected epoch. The listener identifies the site, not authoritative pod
@@ -495,8 +500,10 @@ status:
 
 ### CRD-driven SWIM seeds
 
-`spec.seeds` is a list of SWIM endpoints (`host:port`) used to bootstrap
-SWIM mesh formation. Each entry may be a literal IPv4 address, a bracketed IPv6
+`spec.membership.swim` is optional and has no schema default. Set it only when
+`spec.membership.mode` is `Swim`; the API rejects it for `Local`. Its `seeds`
+field is a list of SWIM endpoints (`host:port`) used to bootstrap SWIM mesh
+formation. Each entry may be a literal IPv4 address, a bracketed IPv6
 address, or a DNS hostname. Hostnames are resolved with a bounded lookup before
 they are announced to the running SWIM runtime on every
 `GridNetwork` reconcile.  Re-announcing to an existing peer is idempotent: foca
@@ -506,22 +513,22 @@ ignores redundant joins.
 
 | Change | Effect |
 |---|---|
-| Seed added to `spec.seeds` | Announced to the SWIM runtime on the next reconcile (~300 s default); SWIM join initiated |
-| Seed removed from `spec.seeds` | No active disconnect; SWIM failure detection ages out the peer naturally |
-| `spec.seeds` unchanged | Re-announced on every reconcile; idempotent, no side effects |
+| Seed added to `membership.swim.seeds` | Announced to the SWIM runtime on the next reconcile (~300 s default); SWIM join initiated |
+| Seed removed from `membership.swim.seeds` | No active disconnect; SWIM failure detection ages out the peer naturally |
+| `membership.swim.seeds` unchanged | Re-announced on every reconcile; idempotent, no side effects |
 
 **Channel-full behavior:** If the SWIM announce channel is temporarily full
 (capacity 16 batches), the announce is silently retried on the next reconcile.
 Seeds are not guaranteed to be joined within one reconcile cycle under heavy
 broadcast load, but the retry is automatic.
 
-**Scope:** `spec.seeds` targets the SWIM site-membership layer.  The SWIM runtime
+**Scope:** `spec.membership.swim.seeds` targets the SWIM site-membership layer. The SWIM runtime
 is process-global: all `GridNetwork` resources in the operator process share the
 same SWIM node.  Seeds from any `GridNetwork` reach the shared SWIM membership
 table.  Provider CRDT state remains scoped per network.
 
 **Self-filtering:** The operator removes its own SWIM bind address from
-`spec.seeds` before announcing, preventing self-join loops.
+`membership.swim.seeds` before announcing, preventing self-join loops.
 
 **`spec.tls.swimKeySecretRef`:** References a Kubernetes Secret containing the 32-byte
 AES-256-GCM key for SWIM transport authentication.  When configured, the
@@ -1512,6 +1519,9 @@ Discovered sets are held in memory per provider:
 | `GRID_MODEL_DISCOVERY_TIMEOUT_SECS` | `5` | bound on one provider poll |
 | `GRID_MODEL_DISCOVERY_TTL_SECS` | `180` | how long a set survives without a successful poll; at least interval + timeout |
 | `GRID_MODEL_DISCOVERY_CONCURRENCY` | `8` | providers polled at once |
+
+Each is also a `--model-discovery-*` flag. A value that does not parse stops the operator at
+startup.
 
 Each poll increments `grid_model_discovery_total{provider,outcome}`, where
 `outcome` is one of `ok`, `credential`, `tls`, `config`, `unreachable`,

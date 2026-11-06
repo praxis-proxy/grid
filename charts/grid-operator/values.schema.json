@@ -110,6 +110,21 @@
           "additionalProperties": {
             "type": "object"
           }
+        },
+        "admissionPolicy": {
+          "description": "GridNetwork admissionPolicy, the grid-site chart's default. null leaves the CRD default.",
+          "type": ["object", "null"]
+        },
+        "selectionPolicy": {
+          "description": "GridNetwork selectionPolicy. null leaves it to the gateway default.",
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["deterministic", "roundRobin", "random", "weightedRandom"]
+            }
+          }
         }
       }
     },
@@ -430,11 +445,10 @@
         },
         "metricsFrom": {
           "type": "array",
-          "minItems": 1,
           "items": {
             "type": "object"
           },
-          "description": "NetworkPolicyPeer entries allowed to reach the metrics port."
+          "description": "NetworkPolicyPeer entries allowed to reach the metrics port. Empty admits the OpenShift monitoring namespaces. Off OpenShift, set it when the policy renders."
         }
       }
     },
@@ -453,6 +467,20 @@
         "requireKey": {
           "type": "boolean",
           "description": "Hold SWIM traffic until the GridNetwork key loads or the network declares none. false opts out."
+        },
+        "deadMemberTtlSeconds": {
+          "description": "Seconds a dead SWIM member stays tracked before eviction, 1 to 99999. Empty keeps the operator default.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 99999
+            },
+            {
+              "type": "string",
+              "pattern": "^$|^[1-9][0-9]{0,4}$"
+            }
+          ]
         },
         "siteName": {
           "type": "string",
@@ -490,7 +518,7 @@
               "additionalProperties": {
                 "type": "string"
               },
-              "description": "Annotations on the SWIM Service."
+              "description": "Annotations on the signals Service."
             },
             "loadBalancerIP": {
               "type": "string",
@@ -523,13 +551,13 @@
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Serve the mTLS signals endpoint, expose it on the SWIM Service, and set GRID_SIGNALS_LOCAL_ADDR. For signalTransport poll."
+          "description": "Serve the mTLS signals endpoint, expose it on the signals Service, and set GRID_SIGNALS_LOCAL_ADDR. For signalTransport poll."
         },
         "port": {
           "type": "integer",
           "minimum": 1,
           "maximum": 65535,
-          "description": "Signals TCP port on the SWIM Service, gossiped to peers with its LoadBalancer address."
+          "description": "Signals TCP port on the signals Service, gossiped to peers with its LoadBalancer address."
         },
         "advertiseAddress": {
           "type": "string",
@@ -604,6 +632,20 @@
         },
         "peerIntervalSeconds": {
           "description": "Seconds between peer signal polls, 1 to 99999. Every site polls every other alive site, so a grid of N sites makes N*(N-1) polls each interval. Empty keeps the operator default.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 99999
+            },
+            {
+              "type": "string",
+              "pattern": "^$|^[1-9][0-9]{0,4}$"
+            }
+          ]
+        },
+        "ttlSeconds": {
+          "description": "Seconds a published site signal is served before it expires, 1 to 99999. Also sets the default readiness window, half of it. Empty keeps the operator default.",
           "oneOf": [
             {
               "type": "integer",
@@ -718,6 +760,68 @@
         "praxisConfig": {
           "type": "object",
           "description": "GridNetwork consumerGateways[].praxisConfig for the site gateway, validated by the CRD."
+        }
+      }
+    },
+    "modelDiscovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "intervalSeconds": {
+          "description": "Seconds between discovery rounds, 1 to 2592000. Empty keeps the operator default.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2592000
+            },
+            {
+              "type": "string",
+              "pattern": "^$|^([1-9][0-9]{0,5}|1[0-9]{6}|2[0-4][0-9]{5}|25[0-8][0-9]{4}|259[01][0-9]{3}|2592000)$"
+            }
+          ]
+        },
+        "timeoutSeconds": {
+          "description": "Seconds one provider poll may take, 1 to 3600. Empty keeps the operator default.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3600
+            },
+            {
+              "type": "string",
+              "pattern": "^$|^([1-9][0-9]{0,2}|[1-2][0-9]{3}|3[0-5][0-9]{2}|3600)$"
+            }
+          ]
+        },
+        "concurrency": {
+          "description": "Providers polled at once, 1 to 999. Empty keeps the operator default.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 999
+            },
+            {
+              "type": "string",
+              "pattern": "^$|^[1-9][0-9]{0,2}$"
+            }
+          ]
+        },
+        "ttlSeconds": {
+          "description": "Seconds a discovered model set stays routable without a fresh poll, 1 to 31536000. Empty keeps the operator default.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 31536000
+            },
+            {
+              "type": "string",
+              "pattern": "^$|^([1-9][0-9]{0,6}|[1-2][0-9]{7}|30[0-9]{6}|31[0-4][0-9]{5}|315[0-2][0-9]{4}|3153[0-5][0-9]{3}|31536000)$"
+            }
+          ]
         }
       }
     },

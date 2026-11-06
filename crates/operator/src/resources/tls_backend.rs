@@ -292,7 +292,9 @@ pub fn init_process_crypto() {
 
 /// Install the process-wide crypto provider the TLS stack requires.
 ///
-/// OpenSSL needs no process-wide provider, so this is a no-op under `fips`.
+/// Under `fips`, host configuration selects OpenSSL's providers. The binary
+/// verifies that configuration through `grid_fips::verify` before this hook;
+/// this function does not change provider selection.
 #[cfg(feature = "fips")]
 pub fn init_process_crypto() {}
 

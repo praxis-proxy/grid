@@ -182,6 +182,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Check default startup helpers without OpenSSL
+        env:
+          OPENSSL_LIB_DIR: /nonexistent
+          OPENSSL_INCLUDE_DIR: /nonexistent
+        run: cargo check --locked -p grid-fips -p grid-openssl-fips --target-dir /tmp/grid-startup-without-openssl
+
       - name: Unit tests
         run: make test-unit
 
@@ -258,23 +264,28 @@ jobs:
       # operator tls_probe.rs.
       - name: Clippy (fips)
         run: |
+          cargo clippy -p grid-fips --features runtime --all-targets -- -D warnings
+          cargo clippy -p grid-openssl-fips --features runtime -- -D warnings
           cargo clippy -p certs --no-default-features --features fips --all-targets -- -D warnings
           cargo clippy -p enrollment --no-default-features --features fips --all-targets -- -D warnings
-          cargo clippy -p enrollment --no-default-features --features fips,sar,bootstrap --bins -- -D warnings
-          cargo clippy --manifest-path crates/operator/Cargo.toml --no-default-features --features fips --lib --bins -- -D warnings
-          cargo clippy --manifest-path crates/overlay-sync/Cargo.toml --no-default-features --features fips --bins -- -D warnings
+          cargo clippy -p enrollment --no-default-features --features fips,sar,bootstrap --bins --test fips_startup -- -D warnings
+          cargo clippy -p swim --no-default-features --features fips --all-targets -- -D warnings
+          cargo clippy --manifest-path crates/operator/Cargo.toml --no-default-features --features fips --lib --bins --test fips_startup -- -D warnings
+          cargo clippy --manifest-path crates/overlay-sync/Cargo.toml --no-default-features --features fips --bins --test fips_startup -- -D warnings
 
       - name: Unit tests (fips)
         run: |
+          cargo test -p grid-fips --features runtime
           cargo test -p certs --no-default-features --features fips
           cargo test -p enrollment --no-default-features --features fips
-          cargo test -p enrollment --no-default-features --features fips,sar,bootstrap --bins
+          cargo test -p enrollment --no-default-features --features fips,sar,bootstrap --bins --test fips_startup
+          cargo test -p swim --no-default-features --features fips
           cargo test --manifest-path crates/operator/Cargo.toml --no-default-features --features fips
           cargo test --manifest-path crates/overlay-sync/Cargo.toml --no-default-features --features fips
 
-      # fips must exclude rustls: TLS routes through system OpenSSL. ring stays
-      # present at the operator level (swim gossip), outside the TLS boundary, so
-      # it is asserted per-crate for certs, not operator-wide.
+      # fips must exclude rustls: TLS routes through system OpenSSL. ring and
+      # the RustCrypto AEAD/hashing crates stay out of swim's fips build (asserted
+      # per-crate below), so nothing pulls them into the operator tree either.
       # Asserted on the printed tree, not on `-i rustls` exiting non-zero: that
       # matches a declared-but-inactive optional dependency, and exits 0 either
       # way on a current cargo. The openssl check is the positive control that
@@ -294,6 +305,25 @@ jobs:
             }
           done
           echo "no rustls in fips builds"
+
+      # swim is the gossip transport: its fips build routes the AES-256-GCM AEAD
+      # and the ECDSA signing through system openssl, so it must carry no ring,
+      # no aes-gcm and no sha2. Dev-deps (rcgen, x509-parser) keep them in the
+      # resolve, hence `-e no-dev` and matching on tree content.
+      - name: Assert fips build of swim excludes ring, aes-gcm and sha2
+        run: |
+          for pkg in ring aes-gcm sha2; do
+            if cargo tree -p swim --no-default-features --features fips -e no-dev 2>/dev/null | grep -q "$pkg v"; then
+              echo "fips build of swim unexpectedly links $pkg"
+              cargo tree -p swim --no-default-features --features fips -e no-dev -i "$pkg"
+              exit 1
+            fi
+          done
+          cargo tree -p swim --no-default-features --features fips -e no-dev 2>/dev/null | grep -q 'openssl v' || {
+            echo "positive control failed: openssl is not in the swim fips tree" >&2
+            exit 1
+          }
+          echo "no ring, aes-gcm or sha2 in swim fips build"
 
       # certs is the crypto identity crate: its fips build must carry no ring and
       # no sha2 (EVP keygen/sign, no rcgen, x509-parser verify off, OpenSSL EVP
@@ -353,7 +383,7 @@ jobs:
       # absent from every fips build.
       - name: Assert fips builds link no vendored openssl
         run: |
-          for pkg in certs enrollment; do
+          for pkg in certs enrollment swim; do
             if cargo tree -p "$pkg" --no-default-features --features fips -e no-dev 2>/dev/null | grep -q 'openssl-src'; then
               echo "fips build of $pkg unexpectedly vendors openssl (openssl-src)"
               exit 1

@@ -623,6 +623,19 @@ func (in *GridNetworkConsumerGatewaysItemPraxisConfigMountReconciliation) DeepCo
 	return out
 }
 
+func (in *GridNetworkConsumerGatewaysItemPraxisConfigSovereignty) DeepCopyInto(out *GridNetworkConsumerGatewaysItemPraxisConfigSovereignty) {
+	*out = *in
+}
+
+func (in *GridNetworkConsumerGatewaysItemPraxisConfigSovereignty) DeepCopy() *GridNetworkConsumerGatewaysItemPraxisConfigSovereignty {
+	if in == nil {
+		return nil
+	}
+	out := new(GridNetworkConsumerGatewaysItemPraxisConfigSovereignty)
+	in.DeepCopyInto(out)
+	return out
+}
+
 func (in *GridNetworkConsumerGatewaysItemPraxisConfigTelemetry) DeepCopyInto(out *GridNetworkConsumerGatewaysItemPraxisConfigTelemetry) {
 	*out = *in
 	if in.BatchIntervalSecs != nil {
@@ -691,6 +704,10 @@ func (in *GridNetworkConsumerGatewaysItemPraxisConfig) DeepCopyInto(out *GridNet
 	if in.MountReconciliation != nil {
 		out.MountReconciliation = new(GridNetworkConsumerGatewaysItemPraxisConfigMountReconciliation)
 		in.MountReconciliation.DeepCopyInto(out.MountReconciliation)
+	}
+	if in.Sovereignty != nil {
+		out.Sovereignty = new(GridNetworkConsumerGatewaysItemPraxisConfigSovereignty)
+		in.Sovereignty.DeepCopyInto(out.Sovereignty)
 	}
 	if in.Telemetry != nil {
 		out.Telemetry = new(GridNetworkConsumerGatewaysItemPraxisConfigTelemetry)
@@ -768,8 +785,29 @@ func (in *GridNetworkConsumerGatewaysItem) DeepCopy() *GridNetworkConsumerGatewa
 	return out
 }
 
+func (in *GridNetworkMembershipSWIM) DeepCopyInto(out *GridNetworkMembershipSWIM) {
+	*out = *in
+	if in.Seeds != nil {
+		out.Seeds = make([]string, len(in.Seeds))
+		copy(out.Seeds, in.Seeds)
+	}
+}
+
+func (in *GridNetworkMembershipSWIM) DeepCopy() *GridNetworkMembershipSWIM {
+	if in == nil {
+		return nil
+	}
+	out := new(GridNetworkMembershipSWIM)
+	in.DeepCopyInto(out)
+	return out
+}
+
 func (in *GridNetworkMembership) DeepCopyInto(out *GridNetworkMembership) {
 	*out = *in
+	if in.SWIM != nil {
+		out.SWIM = new(GridNetworkMembershipSWIM)
+		in.SWIM.DeepCopyInto(out.SWIM)
+	}
 }
 
 func (in *GridNetworkMembership) DeepCopy() *GridNetworkMembership {
@@ -842,31 +880,6 @@ func (in *GridNetworkSignalTransport) DeepCopy() *GridNetworkSignalTransport {
 		return nil
 	}
 	out := new(GridNetworkSignalTransport)
-	in.DeepCopyInto(out)
-	return out
-}
-
-func (in *GridNetworkSWIM) DeepCopyInto(out *GridNetworkSWIM) {
-	*out = *in
-	if in.GossipNodes != nil {
-		x := *in.GossipNodes
-		out.GossipNodes = &x
-	}
-	if in.ProbeInterval != nil {
-		x := *in.ProbeInterval
-		out.ProbeInterval = &x
-	}
-	if in.SuspicionTimeout != nil {
-		x := *in.SuspicionTimeout
-		out.SuspicionTimeout = &x
-	}
-}
-
-func (in *GridNetworkSWIM) DeepCopy() *GridNetworkSWIM {
-	if in == nil {
-		return nil
-	}
-	out := new(GridNetworkSWIM)
 	in.DeepCopyInto(out)
 	return out
 }
@@ -944,10 +957,6 @@ func (in *GridNetworkSpec) DeepCopyInto(out *GridNetworkSpec) {
 		out.ScoringPolicy = new(GridNetworkScoringPolicy)
 		in.ScoringPolicy.DeepCopyInto(out.ScoringPolicy)
 	}
-	if in.Seeds != nil {
-		out.Seeds = make([]string, len(in.Seeds))
-		copy(out.Seeds, in.Seeds)
-	}
 	if in.SelectionPolicy != nil {
 		out.SelectionPolicy = new(GridNetworkSelectionPolicy)
 		in.SelectionPolicy.DeepCopyInto(out.SelectionPolicy)
@@ -959,10 +968,6 @@ func (in *GridNetworkSpec) DeepCopyInto(out *GridNetworkSpec) {
 	if in.StaleCandidateTTLSeconds != nil {
 		x := *in.StaleCandidateTTLSeconds
 		out.StaleCandidateTTLSeconds = &x
-	}
-	if in.SWIM != nil {
-		out.SWIM = new(GridNetworkSWIM)
-		in.SWIM.DeepCopyInto(out.SWIM)
 	}
 	if in.TLS != nil {
 		out.TLS = new(GridNetworkTLS)

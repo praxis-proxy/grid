@@ -13,7 +13,7 @@ metadata:
     {{- $ann | nindent 4 }}
   {{- end }}
 spec:
-  {{- $type := .Values.signals.service.type | default .Values.swim.service.type }}
+  {{- $type := include "grid-operator.signalsService.type" . }}
   type: {{ $type | quote }}
   {{- if and (eq $type "LoadBalancer") .Values.signals.service.loadBalancerIP }}
   loadBalancerIP: {{ .Values.signals.service.loadBalancerIP | quote }}
