@@ -45,6 +45,10 @@
               "minLength": 1,
               "description": "Key within configMapName that holds praxis.yaml."
             },
+            "tpl": {
+              "type": "boolean",
+              "description": "Render inline with tpl against the chart's context."
+            },
             "inline": {
               "type": "string",
               "description": "Praxis configuration stored in a chart-managed ConfigMap when configMapName is empty."
@@ -1312,6 +1316,10 @@
           "description": "Full RUST_LOG directive, such as info,praxis_filter=debug. When set, it replaces level."
         }
       }
+    },
+    "envTpl": {
+      "type": "boolean",
+      "description": "Render env with tpl against the chart's context."
     },
     "env": {
       "type": "array",
