@@ -249,7 +249,7 @@ stage_release() {
   pass "helm test passes under the restricted pod security standard"
 
   local kinds crds namespaces notes description
-  kinds=$(h get manifest "$RELEASE" | awk '$1 == "kind:" {print $2}' | sort -u | tr '\n' ' ')
+  kinds=$(h get manifest "$RELEASE" | awk '$1 == "kind:" {print $2}' | sort -u | tr '\n' ' ' | sed 's/ $//')
   [ "$kinds" = "ConfigMap Deployment Service" ] || fail "release manifest kinds are [$kinds], want [ConfigMap Deployment Service]"
   pass "the release holds only a ConfigMap, Deployment, and Service"
 
