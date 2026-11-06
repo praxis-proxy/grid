@@ -419,3 +419,13 @@ The Services carrying SWIM that route to the lease holder alone.
 {{- define "grid-operator.holderSwimServices" -}}
 {{- if .Values.swim.service.enabled }}{{ include "grid-operator.fullname" . }}-swim{{ end }}
 {{- end }}
+
+{{/* The OpenShift monitoring namespaces metricsFrom falls back to when empty. */}}
+{{- define "grid-operator.networkPolicy.openshiftMonitoring" -}}
+- namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: openshift-user-workload-monitoring
+- namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: openshift-monitoring
+{{- end }}

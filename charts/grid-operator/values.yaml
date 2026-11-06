@@ -175,9 +175,9 @@ metrics:
 networkPolicy:
   # -- auto: on where OpenShift runs. true or false forces it.
   enabled: auto
-  # -- NetworkPolicyPeer entries allowed to reach the metrics port. Empty on OpenShift admits
-  # the openshift-user-workload-monitoring and openshift-monitoring namespaces. Off
-  # OpenShift there is no default, so enabling the policy requires it.
+  # -- NetworkPolicyPeer entries allowed to reach the metrics port. Empty admits the
+  # openshift-user-workload-monitoring and openshift-monitoring namespaces. Off OpenShift,
+  # set it when enabling the policy.
   metricsFrom: []
 
 # -- SWIM protocol configuration.
@@ -257,8 +257,9 @@ signals:
   # exposed through a Route: without the rate limits below, the listener is open to anyone
   # who can reach the router.
   route:
-    # -- auto renders the Route where the cluster serves route.openshift.io/v1; true or
-    # false forces it. An offline render without --api-versions renders auto as off.
+    # -- auto renders the Route where the cluster serves route.openshift.io/v1, signals and
+    # the signals Service are on, and signals.service.type is empty or ClusterIP. Set true
+    # or false to force it. An offline render without --api-versions renders auto as off.
     enabled: auto
     # -- External hostname peers dial, the name the router matches the SNI against. The
     # convention is <site>-signals.<domain>. Required when a Route renders.

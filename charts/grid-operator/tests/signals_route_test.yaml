@@ -124,21 +124,47 @@ tests:
       - failedTemplate:
           errorMessage: "signals.route.host needs site.name to default, or set it: peers dial the site's own name and the router picks this backend by it"
 
-  - it: refuses a LoadBalancer beside the Route
+  - it: refuses a forced Route beside a LoadBalancer
+    template: templates/route-signals.yaml
+    set:
+      signals.route.enabled: true
+      signals.service.type: LoadBalancer
+    asserts:
+      - failedTemplate:
+          errorMessage: "signals.service.type beside signals.route must be ClusterIP: a NodePort or LoadBalancer publishes the listener a second time, past the router's limits; pick the Route or the Service"
+
+  - it: refuses a forced Route beside a NodePort
+    template: templates/route-signals.yaml
+    set:
+      signals.route.enabled: true
+      signals.service.type: NodePort
+    asserts:
+      - failedTemplate:
+          errorMessage: "signals.service.type beside signals.route must be ClusterIP: a NodePort or LoadBalancer publishes the listener a second time, past the router's limits; pick the Route or the Service"
+
+  - it: renders no Route on auto when the install asks for a LoadBalancer
     template: templates/route-signals.yaml
     set:
       signals.service.type: LoadBalancer
     asserts:
-      - failedTemplate:
-          errorMessage: "signals.service.type LoadBalancer, set or inherited from swim.service.type, beside signals.route publishes the listener twice, on two addresses with different limits: pick the Route or the load balancer"
+      - hasDocuments:
+          count: 0
 
-  - it: refuses a LoadBalancer the signals Service inherits from swim.service.type
+  - it: renders no Route on auto when the install asks for a NodePort
+    template: templates/route-signals.yaml
+    set:
+      signals.service.type: NodePort
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders the Route when the signals Service would inherit a LoadBalancer
     template: templates/route-signals.yaml
     set:
       swim.service.type: LoadBalancer
     asserts:
-      - failedTemplate:
-          errorMessage: "signals.service.type LoadBalancer, set or inherited from swim.service.type, beside signals.route publishes the listener twice, on two addresses with different limits: pick the Route or the load balancer"
+      - isKind:
+          of: Route
 
   - it: renders the Route when signals.service.type overrides an inherited LoadBalancer
     template: templates/route-signals.yaml
@@ -165,18 +191,39 @@ tests:
           path: spec.template.spec.containers[0].env
           content: { name: GRID_SIGNALS_MAX_HANDSHAKES_PER_SOURCE, value: "12" }
 
-  - it: refuses a Route to a site that serves no signals
+  - it: renders no Route on auto for a site that serves no signals
     template: templates/route-signals.yaml
     set:
+      signals.enabled: false
+      grid.membership.source: Swim
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: refuses a forced Route to a site that serves no signals
+    template: templates/route-signals.yaml
+    set:
+      signals.route.enabled: true
       signals.enabled: false
       grid.membership.source: Swim
     asserts:
       - failedTemplate:
           errorMessage: "signals.route needs signals.enabled: a Route to a site that serves no signals answers nothing"
 
-  - it: refuses a Route with no Service behind it
+  - it: renders no Route on auto with no Service behind it
     template: templates/route-signals.yaml
     set:
+      grid.membership.source: Swim
+      swim.service.enabled: true
+      signals.service.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: refuses a forced Route with no Service behind it
+    template: templates/route-signals.yaml
+    set:
+      signals.route.enabled: true
       grid.membership.source: Swim
       swim.service.enabled: true
       signals.service.enabled: false

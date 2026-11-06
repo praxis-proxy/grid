@@ -193,6 +193,7 @@ the release names line up. These are the names another chart or the operator exp
 |--------|---------------|-------------|
 | Site gateway Service and Deployment | `gateway.serviceName`. Empty with `grid.id` or `enrollment.enabled` set: `grid-gateway`. Empty otherwise: `provider-gateway`, the operator's own default, which the RBAC also names. | praxis-gateway `fullnameOverride` set to that name. |
 | Operator ServiceAccount | `serviceAccount.name`, else this release's fullname: `grid-operator` for a release named `grid-operator`. | praxis-gateway `mountReconciliation.operator.serviceAccount` and `namespace`. |
+| Gateway namespace | `gateway.namespace`, else the operator's namespace. | Install praxis-gateway in the operator's namespace, or set `gateway.namespace`. |
 | Enrollment Service | `enrollment.hubService` (default `grid-enrollment`) in `rbac.enrollmentNamespace` (default `grid-enrollment`), on port `enrollment.hubPort`. | Install grid-enrollment as release `grid-enrollment` in namespace `grid-enrollment`, or set `hubService` to that release's fullname. |
 
 The GridNetwork this chart renders carries no `admissionPolicy` or `selectionPolicy`, so
@@ -202,8 +203,8 @@ network keeps whichever policies the chart that renders it writes, so render eac
 GridNetwork from one chart, and use grid-site when you want its policies.
 
 The NetworkPolicy peers in `networkPolicy.metricsFrom` are full NetworkPolicyPeer entries.
-On OpenShift they default to `openshift-user-workload-monitoring` and
-`openshift-monitoring`; off OpenShift there is no default. The praxis-gateway chart takes
+Empty, they default to `openshift-user-workload-monitoring` and `openshift-monitoring`,
+which admit no Prometheus off OpenShift. The praxis-gateway chart takes
 namespace names in `metricsListener.fromNamespaces`, and on OpenShift defaults to
 `openshift-user-workload-monitoring` only. Set both when one Prometheus scrapes both.
 
@@ -269,7 +270,7 @@ namespace names in `metricsListener.fromNamespaces`, and on OpenShift defaults t
 | `signals.enabled` | bool | `false` | For signalTransport poll. Serves the signals listener on the signals Service, `<fullname>-signals`, and points this site's gateway at it. Under Swim membership it needs `swim.service.enabled`, because peers learn the signals endpoint over SWIM gossip. The signals Service is TCP only, so a load balancer needs no mixed UDP and TCP support. |
 | `signals.port` | int | `9091` | Signals port on the signals Service. Peers learn its address and this port over gossip. |
 | `signals.service.enabled` | bool | `true` | Render the signals Service. Local membership requires it. |
-| `signals.service.type` | string | `""` | Signals Service type. Empty follows `swim.service.type`. A LoadBalancer, set or inherited, refuses to render beside a signals Route. |
+| `signals.service.type` | string | `""` | Signals Service type. Empty is `ClusterIP` when a signals Route renders, and follows `swim.service.type` otherwise. A NodePort or LoadBalancer set here stops `auto` from rendering the Route, and refuses to render beside `signals.route.enabled: true`. |
 | `signals.service.loadBalancerIP` | string | `""` | Static LoadBalancer IP for the signals Service. |
 | `signals.service.annotations` | object | `{}` | Signals Service annotations. The `platform` annotations merge under them. |
 | `signals.service.loadBalancerSourceRanges` | list | `[]` | CIDRs allowed to poll signals. Empty inherits `swim.service.loadBalancerSourceRanges`, else the `peers` host routes. |
@@ -277,7 +278,7 @@ namespace names in `metricsListener.fromNamespaces`, and on OpenShift defaults t
 | `signals.maxHandshakesPerSource` | int or string | `""` | Concurrent handshakes one source address may hold, as `GRID_SIGNALS_MAX_HANDSHAKES_PER_SOURCE`. Empty keeps the operator's 8, or 32 when a signals Route renders, since every peer then arrives as the router. |
 | `signals.peerEndpointPort` | int or string | `""` | Under Local membership, the port each peer serves signals on at its gateway endpoint's host. Empty dials the gateway's own port with server name `<site>-signals.grid.internal`. |
 | `signals.advertiseAddress` | string | `""` | Signals endpoint gossiped to peers. Set it with `swim.advertiseAddress` or a NodePort Service, where the operator discovers no LoadBalancer address. |
-| `signals.route.enabled` | string or bool | `auto` | `auto` renders an OpenShift Route in front of the signals Service where the cluster serves `route.openshift.io/v1`; `true` or `false` forces it. An offline render without `--api-versions` renders `auto` as off. |
+| `signals.route.enabled` | string or bool | `auto` | `auto` renders an OpenShift Route in front of the signals Service where the cluster serves `route.openshift.io/v1`; `auto` also needs `signals.enabled`, `signals.service.enabled`, and an empty or `ClusterIP` `signals.service.type`, and renders nothing otherwise. `true` or `false` forces it. An offline render without `--api-versions` renders `auto` as off. |
 | `signals.route.host` | string | `""` | External hostname peers dial, the name the router matches the SNI against. The convention is `<site>-signals.<domain>`. Required when a Route renders. |
 | `signals.route.annotations` | object | `{}` | Extra Route annotations. They override `rateLimit`'s on a key clash. |
 | `signals.route.rateLimit.enabled` | bool | `true` | Render the router's per-source connection limits. Required when signals are exposed through a Route: without them the listener is open to anyone who can reach the router. |
@@ -305,7 +306,7 @@ namespace names in `metricsListener.fromNamespaces`, and on OpenShift defaults t
 | `serviceMonitor.interval` | string | `30s` | Prometheus scrape interval. Empty leaves the Prometheus default. |
 | `serviceMonitor.scrapeTimeout` | string | `10s` | Prometheus scrape timeout. Empty leaves the Prometheus default. |
 | `networkPolicy.enabled` | bool or `auto` | `auto` | Render a NetworkPolicy for the operator pod. `auto` turns it on where OpenShift runs. SWIM and signals stay open to every peer. |
-| `networkPolicy.metricsFrom` | list | `[]` | NetworkPolicyPeer entries allowed to reach the metrics and health port. Empty on OpenShift admits the user-workload and platform monitoring namespaces. Off OpenShift there is no default, so `networkPolicy.enabled: true` fails the render until this names the Prometheus namespace. Kubelet probes are unaffected on OpenShift. |
+| `networkPolicy.metricsFrom` | list | `[]` | NetworkPolicyPeer entries allowed to reach the metrics and health port. Empty admits the OpenShift user-workload and platform monitoring namespaces. Off OpenShift, set it when `networkPolicy.enabled` is `true`. The install notes warn when it is empty. Kubelet probes are unaffected on OpenShift. |
 | `serviceMonitor.tlsConfig` | object | `{}` | Scrape TLS settings when `metrics.tls` is on. Empty: the OpenShift service CA and the Service DNS name for `serviceCA`, or the grid CA Secret and `<site>.grid.internal` for `siteIdentity`. Required with `existingSecret`. |
 | `resources` | object | `{}` | Container resource requests and limits. |
 | `nodeSelector` | object | `{}` | Node selector for scheduling. |
@@ -489,8 +490,8 @@ The SWIM LoadBalancer Service publishes not-ready addresses, because some
 implementations, such as k3s servicelb, publish an address only for an endpoint.
 
 Signals have their own TCP Service, `<fullname>-signals`, because AWS refuses a
-Service that mixes UDP and TCP. Its type follows `swim.service.type` unless
-`signals.service.type` is set. Signals on a LoadBalancer require
+Service that mixes UDP and TCP. Its type is `ClusterIP` behind a signals Route, and
+follows `swim.service.type` otherwise, unless `signals.service.type` is set. Signals on a LoadBalancer require
 `externalTrafficPolicy: Local`, the chart default. The listener caps handshakes per source address, and `Cluster` SNAT
 gives many peers one source. Set `swim.service.loadBalancerSourceRanges` to the peers'
 egress CIDRs where the implementation enforces it.

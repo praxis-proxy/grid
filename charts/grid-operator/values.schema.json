@@ -433,7 +433,7 @@
           "items": {
             "type": "object"
           },
-          "description": "NetworkPolicyPeer entries allowed to reach the metrics port. Empty on OpenShift admits the OpenShift monitoring namespaces; off OpenShift it is required when the policy renders."
+          "description": "NetworkPolicyPeer entries allowed to reach the metrics port. Empty admits the OpenShift monitoring namespaces. Off OpenShift, set it when the policy renders."
         }
       }
     },

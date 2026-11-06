@@ -1,0 +1,83 @@
+suite: signals Service type beside a Route
+templates:
+  - templates/service-signals.yaml
+  - templates/service-swim.yaml
+  - templates/route-signals.yaml
+capabilities:
+  apiVersions:
+    - route.openshift.io/v1
+    - security.openshift.io/v1
+tests:
+  - it: renders the default install on OpenShift with no Route, since signals are off
+    template: templates/route-signals.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: joins a grid on OpenShift with the signals Service behind the Route
+    template: templates/service-signals.yaml
+    set:
+      site.name: east
+      grid.id: g
+      grid.signals: poll
+    asserts:
+      - equal:
+          path: spec.type
+          value: ClusterIP
+
+  - it: renders that Route
+    template: templates/route-signals.yaml
+    set:
+      site.name: east
+      grid.id: g
+      grid.signals: poll
+    asserts:
+      - isKind:
+          of: Route
+
+  - it: keeps the SWIM load balancer when the signals Service moves behind the Route
+    template: templates/service-swim.yaml
+    set:
+      site.name: east
+      grid.id: g
+      grid.signals: poll
+    asserts:
+      - equal:
+          path: spec.type
+          value: LoadBalancer
+
+  - it: enrolls on OpenShift with the signals Service behind the Route
+    template: templates/service-signals.yaml
+    set:
+      site.name: east
+      enrollment.enabled: true
+      enrollment.url: https://hub.example.com
+      signals.enabled: true
+    asserts:
+      - equal:
+          path: spec.type
+          value: ClusterIP
+
+  - it: keeps an explicit LoadBalancer and drops the Route on auto
+    template: templates/service-signals.yaml
+    set:
+      site.name: east
+      grid.id: g
+      grid.signals: poll
+      signals.service.type: LoadBalancer
+    asserts:
+      - equal:
+          path: spec.type
+          value: LoadBalancer
+
+  - it: inherits the SWIM type when no Route renders
+    template: templates/service-signals.yaml
+    set:
+      site.name: east
+      grid.id: g
+      grid.signals: poll
+      signals.route.enabled: false
+    asserts:
+      - equal:
+          path: spec.type
+          value: LoadBalancer
