@@ -1797,6 +1797,10 @@ async fn publish_signed_site_cert(
 
 
 /// Collect the currently verified peer certificates as a complete trust snapshot.
+///
+/// Retain the lexicographically smallest verified public keys per site, up to
+/// SWIM's pin limit, so excess certificates cannot exclude a peer and resource
+/// iteration order cannot change the selected keys.
 async fn collect_gossip_peer_pins(
     network: &GridNetwork,
     client: &Client,
@@ -1828,8 +1832,9 @@ async fn collect_gossip_peer_pins(
         match verified_peer_gossip_key(site, ca, trust) {
             Ok(Some(key)) => {
                 let keys = verified.entry(site_name).or_default();
-                if !keys.contains(&key) {
-                    keys.push(key);
+                if let Err(index) = keys.binary_search(&key) {
+                    keys.insert(index, key);
+                    keys.truncate(swim::MAX_PINNED_KEYS_PER_ORIGIN);
                 }
             },
             Ok(None) => {},
@@ -10154,6 +10159,83 @@ mod tests {
                 && keys.contains(&first_key) && keys.contains(&second_key)),
             "both distinct certificates are retained once: {pins:?}"
         );
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "certificate fixture")]
+    async fn peer_gossip_pins_bound_excess_keys_independently_of_resource_order() {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let mut items = Vec::new();
+        let mut expected = Vec::new();
+        for index in 0..swim::MAX_PINNED_KEYS_PER_ORIGIN + 2 {
+            let leaf = certs::generate_site_cert(&ca, "site-peer").expect("peer certificate");
+            let fingerprint = certs::canonical_fingerprint(&leaf.cert_pem).expect("fingerprint");
+            expected.push(certs::verify_site_cert(&ca.cert_pem, &leaf.cert_pem, "site-peer").expect("key"));
+            items.push(serde_json::json!({
+                "apiVersion": "grid.praxis.fast/v1alpha1",
+                "kind": "GridSite",
+                "metadata": {
+                    "name": format!("peer-{index}"),
+                    "labels": { "grid.praxis.fast/auto-discovered": "true" },
+                    "annotations": { "grid.praxis.fast/site-id": "site-peer" }
+                },
+                "spec": {
+                    "gridNetworkRef": "glb-demo",
+                    "trust": { "canonicalFingerprints": [fingerprint] }
+                },
+                "status": { "publicCertPem": leaf.cert_pem }
+            }));
+        }
+        expected.sort();
+        expected.truncate(swim::MAX_PINNED_KEYS_PER_ORIGIN);
+        let duplicate = items.first().expect("peer fixture").clone();
+        items.push(duplicate);
+        let ca_secret = serde_json::to_value(crate::resources::test_doubles::secret_with_key(
+            "ca.crt",
+            ca.cert_pem.as_bytes(),
+        ))
+        .expect("CA secret");
+        let mut network = network_with_endpoint_transport("plaintext", None);
+        network.spec.peer_trust = Some(crate::crd::grid_network::PeerTrustConfig {
+            mode: PeerTrustMode::Pin,
+            signed_state: SignedStateMode::Enforce,
+        });
+        let node = swim::SwimNode::new(swim::NodeId::with_generation(
+            "site-local".to_owned(),
+            "127.0.0.1:7946".parse().expect("local address"),
+            1,
+        ));
+        for reversed in [false, true] {
+            if reversed {
+                items.reverse();
+            }
+            for _ in 0..items.len() {
+                let sites = serde_json::json!({
+                    "apiVersion": "grid.praxis.fast/v1alpha1",
+                    "kind": "GridSiteList",
+                    "metadata": { "resourceVersion": "1" },
+                    "items": items
+                });
+                let client = crate::resources::test_doubles::mock_kube_client_with_json(HashMap::from([
+                    ("ca", ca_secret.clone()),
+                    ("gridsites", sites),
+                ]));
+                let pins = collect_gossip_peer_pins(&network, &client, "site-local")
+                    .await
+                    .expect("verified peer pins");
+
+                assert_eq!(
+                    pins.get("site-peer"),
+                    Some(&expected),
+                    "excess and duplicate certificates retain the same bounded keys for every ordering"
+                );
+                for (origin, keys) in pins {
+                    let result = node.pin_origin_for_grid("grid-a", origin, keys);
+                    assert!(result.is_ok(), "SWIM must accept the bounded peer pin: {result:?}");
+                }
+                items.rotate_left(1);
+            }
+        }
     }
 
     #[tokio::test]
