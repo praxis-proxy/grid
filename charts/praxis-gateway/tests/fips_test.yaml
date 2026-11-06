@@ -1,0 +1,69 @@
+suite: fips mode
+templates:
+  - templates/deployment.yaml
+release:
+  name: praxis-gateway
+  namespace: praxis
+tests:
+  - it: leaves the gateway env unset by default
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[?(@.name == "praxis")].env
+
+  - it: renders PRAXIS_REQUIRE_FIPS when required
+    set:
+      fips.required: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name == "praxis")].env
+          content: {name: PRAXIS_REQUIRE_FIPS, value: "1"}
+
+  - it: accepts an explicit matching user value without duplicating it
+    set:
+      fips.required: true
+      env:
+        - {name: PRAXIS_REQUIRE_FIPS, value: "1"}
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[?(@.name == "praxis")].env
+          value:
+            - name: PRAXIS_REQUIRE_FIPS
+              value: "1"
+
+  - it: refuses a user value that disables required FIPS mode
+    set:
+      fips.required: true
+      env:
+        - {name: PRAXIS_REQUIRE_FIPS, value: "0"}
+    asserts:
+      - failedTemplate: {}
+
+  - it: refuses an unresolved user value when FIPS mode is required
+    set:
+      fips.required: true
+      env:
+        - name: PRAXIS_REQUIRE_FIPS
+          valueFrom:
+            secretKeyRef: {name: fips-setting, key: required}
+    asserts:
+      - failedTemplate: {}
+
+  - it: sets the variable only on the praxis container
+    set:
+      fips.required: true
+      grid: {networkName: grid, siteName: a}
+      overlay: {configMapName: ov, sidecar: {enabled: true}}
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name == "praxis")].env
+          content: {name: PRAXIS_REQUIRE_FIPS, value: "1"}
+      - notExists:
+          path: spec.template.spec.containers[?(@.name == "overlay-sync")].env
+      - notExists:
+          path: spec.template.spec.initContainers[?(@.name == "overlay-sync-init")].env
+
+  - it: rejects a value that is not a boolean
+    set:
+      fips.required: maybe
+    asserts:
+      - failedTemplate: {}

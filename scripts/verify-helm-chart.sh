@@ -714,6 +714,7 @@ try_reject_msg "$GW_DIR" "praxisConfig.byo.inline not a mapping" "praxisConfig.b
   --set-string praxisConfig.byo.inline=not-a-mapping --namespace praxis
 try_reject "$GW_DIR" "invalid digest (gw)" "${GW_REQ[@]}" --set image.digest=invalid
 try_reject "$GW_DIR" "invalid service type (gw)" "${GW_REQ[@]}" --set service.type=ExternalName
+try_reject "$GW_DIR" "fips.required not a boolean (gw)" "${GW_REQ[@]}" --set fips.required=maybe
 try_reject "$GW_DIR" "unknown key (gw)" "${GW_REQ[@]}" --set typoField=true
 try_template "$GW_DIR" "subchart keys (gw)" "${GW_REQ[@]}" --set enabled=true --set global.foo=bar
 try_reject "$GW_DIR" "runAsNonRoot override" "${GW_REQ[@]}" --set podSecurityContext.runAsNonRoot=false
