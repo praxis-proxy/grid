@@ -48,6 +48,17 @@ tests:
               swim:
                 seeds: ["192.0.2.10:7946"]
             signalTransport: {mode: poll}
+            admissionPolicy:
+              mode: stabilized
+              pressure:
+                enterThreshold: 0.85
+                exitThreshold: 0.70
+                failureThreshold: 2
+                successThreshold: 3
+                minimumStateDuration: 10s
+                recoveryHoldDown: 30s
+              missingMetrics: existingOnly
+            selectionPolicy: {mode: roundRobin}
             peerTrust: {mode: spiffe}
             consumerGateways:
               - {name: grid-gateway, namespace: grid, siteName: east}
@@ -55,6 +66,28 @@ tests:
               siteSecretRef: {name: grid-site-identity, namespace: grid}
               caSecretRef: {name: grid-ca, namespace: grid}
               swimKeySecretRef: {name: grid-swim-key, namespace: grid}
+
+  - it: leaves the policies to the CRD and the gateway when set to null
+    template: templates/gridnetwork.yaml
+    set:
+      site.name: east
+      grid.id: lab
+      grid.admissionPolicy: null
+      grid.selectionPolicy: null
+    asserts:
+      - notExists:
+          path: spec.admissionPolicy
+      - notExists:
+          path: spec.selectionPolicy
+
+  - it: refuses a selection mode the CRD does not know
+    template: templates/gridnetwork.yaml
+    set:
+      site.name: east
+      grid.id: lab
+      grid.selectionPolicy.mode: roulette
+    asserts:
+      - failedTemplate: {}
 
   - it: enforces signed gossip under the default peer trust
     template: templates/gridnetwork.yaml

@@ -24,7 +24,7 @@ imagePullSecrets: []
 # -- Override the chart name used in resource names.
 nameOverride: ""
 # -- Override the fully qualified app name, which also names the Service. Set this to
-# the GridNetwork gatewayRefs[].name when using the overlay sidecar.
+# the GridNetwork consumerGateways[].name when using the overlay sidecar.
 fullnameOverride: ""
 # -- Labels added to all chart-managed resources.
 commonLabels: {}
@@ -41,7 +41,7 @@ mountReconciliation:
   enabled: false
   # -- GridNetwork name that delegates this gateway's generated mounts.
   network: ""
-  # -- GridNetwork gatewayRefs name. Defaults to this chart's Deployment name.
+  # -- GridNetwork consumerGateways name. Defaults to this chart's Deployment name.
   gatewayRef: ""
   # -- Release selected Helm-managed credential mounts and TLS mounts after
   # Grid reports the generated config Ready.
@@ -191,7 +191,7 @@ praxisConfig:
       enabled: false
       # -- GridNetwork name. Empty uses mountReconciliation.network.
       networkName: ""
-      # -- This gateway's name in the GridNetwork gatewayRefs. Empty uses mountReconciliation.gatewayRef.
+      # -- This gateway's name in the GridNetwork consumerGateways. Empty uses mountReconciliation.gatewayRef.
       gatewayRefName: ""
       # -- Override the derived serving ConfigMap name grid-serving-<networkName>-<gatewayRefName>.
       configMapName: ""
@@ -345,7 +345,7 @@ praxisConfig:
       enabled: false
       # -- GridNetwork name, which with gatewayRefName names the operator's ConfigMap. Empty uses grid.networkName.
       networkName: ""
-      # -- This gateway's name in the GridNetwork gatewayRefs. Defaults to the release fullname.
+      # -- This gateway's name in the GridNetwork consumerGateways. Defaults to the release fullname.
       gatewayRefName: ""
       # -- Override the derived serving ConfigMap name grid-serving-<networkName>-<gatewayRefName>.
       configMapName: ""

@@ -35,7 +35,7 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 #[derive(Parser)]
 #[command(name = "invite", about = "Mint site tokens and store them as invite Secrets")]
 struct InviteArgs {
-    /// Namespace for invite Secrets, else `POD_NAMESPACE` or `default`.
+    /// Namespace for invite Secrets, else `POD_NAMESPACE`; with neither, invite refuses to run.
     #[arg(long)]
     namespace: Option<String>,
     /// Enrollment service base URL (https).
@@ -61,6 +61,7 @@ pub(crate) async fn run() -> Result<(), BoxError> {
     #[cfg(feature = "fips")]
     grid_fips::verify().map_err(|error| error.to_string())?;
     let invites = parse_invites(&args.invites).map_err(|err| format!("ENROLLMENT_INVITES: {err}"))?;
+    let namespace = crate::work_namespace(args.namespace.as_deref(), std::env::var("POD_NAMESPACE").ok())?;
     #[cfg(not(feature = "fips"))]
     if rustls::crypto::ring::default_provider().install_default().is_err() {
         tracing::debug!("a rustls crypto provider was already installed");
@@ -73,10 +74,6 @@ pub(crate) async fn run() -> Result<(), BoxError> {
         admin_token_file: args.admin_token_file,
         retry: Retry::new(BACKOFF),
     };
-    let namespace = args
-        .namespace
-        .or_else(|| std::env::var("POD_NAMESPACE").ok())
-        .unwrap_or_else(|| "default".to_owned());
     let secrets = KubeInvites(Api::namespaced(kube::Client::try_default().await?, &namespace));
     invite_all(&secrets, &mut minter, &args.secret_prefix, &invites).await
 }

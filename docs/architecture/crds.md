@@ -1520,6 +1520,9 @@ Discovered sets are held in memory per provider:
 | `GRID_MODEL_DISCOVERY_TTL_SECS` | `180` | how long a set survives without a successful poll; at least interval + timeout |
 | `GRID_MODEL_DISCOVERY_CONCURRENCY` | `8` | providers polled at once |
 
+Each is also a `--model-discovery-*` flag. A value that does not parse stops the operator at
+startup.
+
 Each poll increments `grid_model_discovery_total{provider,outcome}`, where
 `outcome` is one of `ok`, `credential`, `tls`, `config`, `unreachable`,
 `timeout`, `http_status`, `invalid_response`. Failures are also logged.

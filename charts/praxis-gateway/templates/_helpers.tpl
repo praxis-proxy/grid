@@ -499,7 +499,7 @@ Validate enabled mounts have a non-empty resource name.
 {{- fail "mount reconciliation requires the operator-generated consumer ConfigMap, not praxisConfig.source render" }}
 {{- end }}
 {{- if and (eq $source "byo") (not .Values.praxisConfig.byo.configMapName) }}
-{{- fail "praxisConfig.byo.configMapName must name consumerConfig.configMapName when mount reconciliation is enabled" }}
+{{- fail "praxisConfig.byo.configMapName must name the GridNetwork consumerGateways[].praxisConfig.configMapName when mount reconciliation is enabled" }}
 {{- end }}
 {{- if and (eq $source "byo") (ne .Values.praxisConfig.byo.key "praxis.yaml") }}
 {{- fail "praxisConfig.byo.key must be praxis.yaml when mount reconciliation is enabled" }}
