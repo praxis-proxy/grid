@@ -7,7 +7,7 @@
 //! model gets 404; one naming no model, or with no healthy site, gets 503 with Retry-After;
 //! one for a shed model gets 429 with Retry-After. Each carries an OpenAI-style error,
 //! logged at debug. Every outcome counts in
-//! `grid_route_decisions_total` by site and reason. A routed response names the
+//! `grid_route_decisions_total` by site, cluster and reason. A routed response names the
 //! chosen site and cluster in `x-grid-site` and `x-grid-backend`.
 
 //! Among two or more sites with room, prefix affinity first narrows to the sites holding the
