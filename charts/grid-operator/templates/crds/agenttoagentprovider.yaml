@@ -1,0 +1,808 @@
+{{- $experimental := .Values.experimental | default dict -}}
+{{- $a2aEnabled := dig "a2a" "enabled" false $experimental -}}
+{{- if and .Values.crds.enabled $a2aEnabled }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: agenttoagentproviders.grid.praxis.fast
+  annotations:
+    {{- if .Values.crds.keep }}
+    helm.sh/resource-policy: keep
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false,ServerSideApply=true
+    {{- else }}
+    argocd.argoproj.io/sync-options: ServerSideApply=true
+    {{- end }}
+spec:
+  group: grid.praxis.fast
+  names:
+    kind: AgentToAgentProvider
+    plural: agenttoagentproviders
+    shortNames:
+      - a2ap
+    singular: agenttoagentprovider
+  scope: Cluster
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .spec.binding
+          name: Binding
+          type: string
+        - jsonPath: .status.phase
+          name: Phase
+          type: string
+        - jsonPath: .status.reason
+          name: Reason
+          priority: 1
+          type: string
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: Auto-generated derived type for AgentToAgentProviderSpec via `CustomResource`
+          properties:
+            spec:
+              description: Specification for an [`AgentToAgentProvider`].
+              properties:
+                accessPolicy:
+                  default:
+                    siteSelector:
+                      matchLabels: {}
+                  description: Which sites can consume this agent.
+                  properties:
+                    siteSelector:
+                      default:
+                        matchLabels: {}
+                      description: Which sites can route to this provider.
+                      properties:
+                        matchLabels:
+                          additionalProperties:
+                            type: string
+                          default: {}
+                          description: Label key-value pairs that must match.
+                          type: object
+                      type: object
+                  type: object
+                agentCard:
+                  description: |-
+                    Agent Card discovery settings.
+
+                    When omitted, discovery requests `/.well-known/agent-card.json` from
+                    the origin of `spec.endpoint`. Card data returned by the endpoint is
+                    never trusted to replace the configured endpoint.
+
+                    Discovery follows no redirects and rejects loopback, link-local,
+                    unspecified, unique-local, and cloud-metadata addresses using the
+                    `AgentToolProvider` probe's SSRF policy. Authentication and TLS client
+                    identity are sent only to the HTTPS origin of `spec.endpoint`; an
+                    explicit URL on another origin is fetched without those credentials.
+                    A discovered card never changes the final data-plane authority.
+                  nullable: true
+                  properties:
+                    path:
+                      description: |-
+                        Relative Agent Card path on the origin of `spec.endpoint`.
+
+                        The path must have one leading slash and is not appended to any path
+                        component already present in `spec.endpoint`.
+                      maxLength: 512
+                      minLength: 1
+                      nullable: true
+                      pattern: ^/(?:[^/?#\s\\][^?#\s\\]*)?$
+                      type: string
+                    skillAllowlist:
+                      default: []
+                      description: |-
+                        Optional allowlist of Agent Card skill IDs. Empty accepts every valid
+                        discovered skill; skill IDs, not display names, are authoritative.
+                      items:
+                        maxLength: 128
+                        minLength: 1
+                        pattern: ^.*\S.*$
+                        type: string
+                      maxItems: 128
+                      type: array
+                      x-kubernetes-list-type: set
+                    url:
+                      description: |-
+                        Fully qualified HTTPS or HTTP URL for the Agent Card. This is a
+                        discovery-only URL; it cannot change the final data-plane authority,
+                        and credentials are not sent when it points at another origin.
+                      maxLength: 2048
+                      minLength: 1
+                      nullable: true
+                      pattern: ^https?://[^/?#@\s]+(:[0-9]+)?(?:/[^\s?#]*)?$
+                      type: string
+                  type: object
+                  x-kubernetes-validations:
+                    - message: set at most one of agentCard.url and agentCard.path
+                      rule: '!(has(self.url) && has(self.path))'
+                auth:
+                  description: |-
+                    Authentication for the private agent hop and same-origin HTTPS Agent
+                    Card discovery. Credentials are never sent to a different card URL
+                    origin.
+                  nullable: true
+                  properties:
+                    credentialsManagedExternally:
+                      description: |-
+                        Whether the user manages credentials manually.
+
+                        When true, the operator does not inject credentials
+                        and the user is responsible for configuring auth.
+                      type: boolean
+                    manual:
+                      description: |-
+                        Deprecated in favor of `credentialsManagedExternally`; this legacy field will be removed in a future release. Whether the user manages credentials manually.
+
+                        When true, the operator does not inject credentials
+                        and the user is responsible for configuring auth.
+                      type: boolean
+                    secretRef:
+                      description: Reference to a Secret containing the credential.
+                      nullable: true
+                      properties:
+                        key:
+                          description: |-
+                            Key within the Secret's `data` map.
+
+                            Required when the Secret holds multiple keys (e.g. credential references
+                            in `InferenceProvider.spec.auth.secretRef`).  Omit only when the entire
+                            Secret is consumed (e.g. TLS `ca_secret_ref`).
+                          minLength: 1
+                          nullable: true
+                          type: string
+                        name:
+                          description: Secret name.
+                          minLength: 1
+                          type: string
+                        namespace:
+                          description: Secret namespace.
+                          minLength: 1
+                          type: string
+                      required:
+                        - name
+                        - namespace
+                      type: object
+                    strategy:
+                      description: How credentials are presented to the provider.
+                      enum:
+                        - api_key
+                        - bearer_token
+                        - custom
+                        - mtls_only
+                        - oauth2
+                        - service_account
+                        - sigv4
+                      type: string
+                  required:
+                    - strategy
+                  type: object
+                  x-kubernetes-validations:
+                    - message: set only `manual` or `credentialsManagedExternally`, not both
+                      rule: '!(has(self.manual) && has(self.credentialsManagedExternally))'
+                binding:
+                  default: JSONRPC
+                  description: |-
+                    A2A protocol binding accepted by the data plane.
+
+                    JSON-RPC over HTTP(S) is the only binding currently supported. The
+                    typed field deliberately rejects future or misspelled bindings at API
+                    admission until their request classifiers exist.
+                  enum:
+                    - JSONRPC
+                  type: string
+                capacityWeight:
+                  description: Relative capacity used by an opt-in placement policy.
+                  format: uint32
+                  maximum: 1000.0
+                  minimum: 1.0
+                  nullable: true
+                  type: integer
+                endpoint:
+                  description: |-
+                    HTTP(S) authority of the A2A agent.
+
+                    This remains the configured routing authority even when a discovered
+                    Agent Card contains another interface URL.
+                  maxLength: 2048
+                  minLength: 1
+                  pattern: ^https?://[^/?#@\s]+(:[0-9]+)?(?:/[^\s?#]*)?$
+                  type: string
+                gridNetworkRef:
+                  description: |-
+                    Name of the [`GridNetwork`] this provider belongs to.
+
+                    [`GridNetwork`]: crate::crd::grid_network::GridNetwork
+                  maxLength: 253
+                  minLength: 1
+                  pattern: ^.*\S.*$
+                  type: string
+                metricsConfig:
+                  description: Optional Prometheus signals used by later A2A candidate scoring.
+                  nullable: true
+                  properties:
+                    auth:
+                      description: |-
+                        How the scraper authenticates to the metrics endpoint. Absent sends no
+                        credential.
+                      nullable: true
+                      properties:
+                        allowPlaintext:
+                          description: |-
+                            Send the credential over plain `http://`. Off by default, because a
+                            bearer token on an unencrypted connection can be read off the network.
+                            For a lab only.
+                          type: boolean
+                        type:
+                          description: The credential to send.
+                          enum:
+                            - serviceAccountToken
+                          type: string
+                      required:
+                        - type
+                      type: object
+                    endpoint:
+                      description: |-
+                        Base URL for the metrics endpoint, independent of `spec.endpoint`.
+
+                        When set, the scrape URL is `{endpoint}{path}` instead of
+                        `{spec.endpoint}{path}`.  This allows scraping metrics from a separate
+                        service (such as an llm-d EPP) while the provider inference endpoint
+                        points at the pool's request path.
+
+                        When absent, the scrape URL uses `spec.endpoint` as before.
+                      minLength: 1
+                      nullable: true
+                      type: string
+                    metricsEndpoint:
+                      description: |-
+                        Deprecated in favor of `endpoint`; this legacy field will be removed in a future release. Base URL for the metrics endpoint, independent of `spec.endpoint`.
+
+                        When set, the scrape URL is `{endpoint}{path}` instead of
+                        `{spec.endpoint}{path}`.  This allows scraping metrics from a separate
+                        service (such as an llm-d EPP) while the provider inference endpoint
+                        points at the pool's request path.
+
+                        When absent, the scrape URL uses `spec.endpoint` as before.
+                      minLength: 1
+                      nullable: true
+                      type: string
+                    path:
+                      default: /metrics
+                      description: |-
+                        HTTP path for the Prometheus metrics endpoint.
+
+                        Appended to `endpoint` (when set) or `spec.endpoint`.
+                        Defaults to `"/metrics"` when absent.
+                      type: string
+                    poolName:
+                      description: |-
+                        Expected Prometheus `name` label value for pool-level metric selection.
+
+                        When set, the parser only matches metric samples whose `name` label
+                        equals this value.  This is required when scraping an endpoint that
+                        exposes metrics for multiple pools (such as an llm-d EPP), ensuring
+                        the configured pool is selected deterministically.
+
+                        The parser rejects the scrape when the expected pool series is absent
+                        or when a metric sample has no `name` label and this field is set.
+
+                        When absent, labels are stripped before matching as in v1 (backward
+                        compatible).
+                      minLength: 1
+                      nullable: true
+                      type: string
+                    queueCapacity:
+                      description: |-
+                        Maximum queue slot count for normalising a raw queue-size metric to
+                        the 0.0 to 1.0 range.
+
+                        When set, the `queue_depth` signal value is divided by this capacity
+                        and clamped to `[0.0, 1.0]` before scoring.  This allows consuming raw
+                        average queue-size metrics (such as `llm_d_epp_average_queue_size`)
+                        without requiring the exporter to pre-normalise.
+
+                        When absent, the `queue_depth` signal must already be normalised to
+                        the 0.0 to 1.0 range by the exporter (backward compatible).
+                      format: uint32
+                      minimum: 1.0
+                      nullable: true
+                      type: integer
+                    signalNames:
+                      default: {}
+                      description: |-
+                        Mapping from scoring signal names to Prometheus metric names.
+
+                        Signals without a configured name are skipped during parsing and receive the
+                        neutral default value (`0.5`) in scoring.
+                      properties:
+                        errorRate:
+                          description: Metric name for normalised error rate (0.0 to 1.0).
+                          nullable: true
+                          type: string
+                        healthy:
+                          description: Metric name for a health gauge (any positive value = healthy).
+                          nullable: true
+                          type: string
+                        kvCacheUtilization:
+                          description: Metric name for KV-cache utilisation (0.0 to 1.0).
+                          nullable: true
+                          type: string
+                        latencyP99Ms:
+                          description: Metric name for P99 request latency in milliseconds (pre-computed gauge).
+                          nullable: true
+                          type: string
+                        prefixCacheHitRatio:
+                          description: Metric name for prefix-cache hit ratio (0.0 to 1.0).
+                          nullable: true
+                          type: string
+                        queueDepth:
+                          description: Metric name for normalised queue depth (0.0 to 1.0).
+                          nullable: true
+                          type: string
+                        readyEndpoints:
+                          description: |-
+                            Metric name counting the pool's ready endpoints, read for the `Ready` condition.
+
+                            Defaults to `llm_d_epp_ready_endpoints`, then `inference_pool_ready_pods`.
+                            Filtered by `poolName` when set. Zero marks the provider not ready.
+                          nullable: true
+                          type: string
+                      type: object
+                    staleMetricsSeconds:
+                      description: |-
+                        Maximum age in seconds for which a previously-scraped metric sample may be
+                        used when the current scrape fails.
+
+                        When a Prometheus scrape fails (connection refused, timeout, HTTP error),
+                        setting this field enables a grace period: if the last *successful* scrape
+                        is no older than `stale_metrics_seconds`, that cached sample is reused.
+
+                        For plaintext metrics, after the grace period expires or before any
+                        successful scrape, metrics fall back to neutral scoring. When TLS is
+                        configured, the same condition marks the provider unhealthy and excludes
+                        it from routing.
+
+                        **Default (absent):** no grace period. Plaintext scrape failures immediately
+                        produce neutral scoring; TLS-configured failures without a cached sample
+                        fail closed.
+
+                        **Minimum value:** `1` second.  The schema rejects `0`; the operator also
+                        treats zero defensively as absent.
+                      format: uint32
+                      minimum: 1.0
+                      nullable: true
+                      type: integer
+                    timeout:
+                      default: 2s
+                      description: |-
+                        Per-request scrape timeout (e.g. `"2s"`, `"500ms"`).
+
+                        Defaults to `"2s"`.  Only `s` and `ms` suffixes are recognised; unrecognised
+                        values fall back to the default.
+                      type: string
+                    tls:
+                      description: |-
+                        Optional TLS override for the metrics endpoint.
+
+                        When absent, `InferenceProvider.spec.tls` is used when configured;
+                        otherwise, the scraper uses system root certificates. Set this only
+                        when the metrics endpoint requires different trust material or a
+                        different client identity.
+
+                        **Fail-closed:** when configured but the referenced Secrets cannot be
+                        resolved or contain invalid material, the scrape is skipped entirely.
+                        The scraper never falls back to system roots or plain HTTP.
+                      nullable: true
+                      properties:
+                        caConfigMapRef:
+                          description: |-
+                            Reference to a `ConfigMap` holding the CA certificate PEM, such as the
+                            platform service CA (`openshift-service-ca.crt`, key `service-ca.crt`).
+
+                            A CA bundle is public, so it may live in a `ConfigMap`. Like
+                            `ca_secret_ref`, it is the only trust consulted when set.
+                          nullable: true
+                          properties:
+                            key:
+                              description: Key within the `ConfigMap`'s `data`. Defaults to `ca.crt`.
+                              nullable: true
+                              type: string
+                            name:
+                              description: '`ConfigMap` name.'
+                              type: string
+                            namespace:
+                              description: '`ConfigMap` namespace.'
+                              type: string
+                          required:
+                            - name
+                            - namespace
+                          type: object
+                        caSecretRef:
+                          description: |-
+                            Reference to a Secret containing the CA certificate PEM for server
+                            verification.
+
+                            The Secret must contain the PEM-encoded CA certificate under the key
+                            `ca.crt` (or the key specified by `key`).  When this CA is
+                            set, the scraper trusts **only** this CA; system root certificates
+                            are not consulted. Exactly one of this and `ca_config_map_ref` is set.
+                          nullable: true
+                          properties:
+                            key:
+                              description: |-
+                                Key within the Secret's `data` map.
+
+                                Required when the Secret holds multiple keys (e.g. credential references
+                                in `InferenceProvider.spec.auth.secretRef`).  Omit only when the entire
+                                Secret is consumed (e.g. TLS `ca_secret_ref`).
+                              minLength: 1
+                              nullable: true
+                              type: string
+                            name:
+                              description: Secret name.
+                              minLength: 1
+                              type: string
+                            namespace:
+                              description: Secret namespace.
+                              minLength: 1
+                              type: string
+                          required:
+                            - name
+                            - namespace
+                          type: object
+                        clientCertificateSecretRef:
+                          description: |-
+                            Reference to a Secret containing the client certificate and private
+                            key for mutual TLS.
+
+                            When set, the scraper presents this identity during the TLS handshake.
+                            The Secret must contain `tls.crt` (or `certificate_key`) and
+                            `tls.key` (or `private_key_key`) in PEM format.
+
+                            When absent, the scraper performs one-way TLS only (server verification
+                            with the CA from `ca_secret_ref`, no client certificate).
+                          nullable: true
+                          properties:
+                            certificateKey:
+                              default: tls.crt
+                              description: Key within `Secret.data` holding the PEM-encoded client certificate.
+                              minLength: 1
+                              type: string
+                            name:
+                              description: Secret name.
+                              minLength: 1
+                              type: string
+                            namespace:
+                              description: Secret namespace.
+                              minLength: 1
+                              type: string
+                            privateKeyKey:
+                              default: tls.key
+                              description: Key within `Secret.data` holding the PEM-encoded private key.
+                              minLength: 1
+                              type: string
+                          required:
+                            - name
+                            - namespace
+                          type: object
+                      type: object
+                      x-kubernetes-validations:
+                        - message: set exactly one of caSecretRef and caConfigMapRef
+                          rule: has(self.caSecretRef) != has(self.caConfigMapRef)
+                  type: object
+                  x-kubernetes-validations:
+                    - message: set only `metricsEndpoint` or `endpoint`, not both
+                      rule: '!(has(self.metricsEndpoint) && has(self.endpoint))'
+                siteSelector:
+                  default:
+                    matchLabels: {}
+                  description: Which sites host this provider.
+                  properties:
+                    matchLabels:
+                      additionalProperties:
+                        type: string
+                      default: {}
+                      description: Label key-value pairs that must match.
+                      type: object
+                  type: object
+                tls:
+                  description: |-
+                    TLS trust and client identity for the private agent hop and same-origin
+                    HTTPS Agent Card discovery. Client identity material is never sent to
+                    a different card URL origin.
+
+                    Secret values are resolved by the operator and never enter status,
+                    SWIM state, or routing overlays.
+                  nullable: true
+                  properties:
+                    caConfigMapRef:
+                      description: |-
+                        Reference to a `ConfigMap` holding the CA certificate PEM, such as the
+                        platform service CA (`openshift-service-ca.crt`, key `service-ca.crt`).
+
+                        A CA bundle is public, so it may live in a `ConfigMap`. Like
+                        `ca_secret_ref`, it is the only trust consulted when set.
+                      nullable: true
+                      properties:
+                        key:
+                          description: Key within the `ConfigMap`'s `data`. Defaults to `ca.crt`.
+                          nullable: true
+                          type: string
+                        name:
+                          description: '`ConfigMap` name.'
+                          type: string
+                        namespace:
+                          description: '`ConfigMap` namespace.'
+                          type: string
+                      required:
+                        - name
+                        - namespace
+                      type: object
+                    caSecretRef:
+                      description: |-
+                        Reference to a Secret containing the CA certificate PEM for server
+                        verification.
+
+                        The Secret must contain the PEM-encoded CA certificate under the key
+                        `ca.crt` (or the key specified by `key`).  When this CA is
+                        set, the scraper trusts **only** this CA; system root certificates
+                        are not consulted. Exactly one of this and `ca_config_map_ref` is set.
+                      nullable: true
+                      properties:
+                        key:
+                          description: |-
+                            Key within the Secret's `data` map.
+
+                            Required when the Secret holds multiple keys (e.g. credential references
+                            in `InferenceProvider.spec.auth.secretRef`).  Omit only when the entire
+                            Secret is consumed (e.g. TLS `ca_secret_ref`).
+                          minLength: 1
+                          nullable: true
+                          type: string
+                        name:
+                          description: Secret name.
+                          minLength: 1
+                          type: string
+                        namespace:
+                          description: Secret namespace.
+                          minLength: 1
+                          type: string
+                      required:
+                        - name
+                        - namespace
+                      type: object
+                    clientCertificateSecretRef:
+                      description: |-
+                        Reference to a Secret containing the client certificate and private
+                        key for mutual TLS.
+
+                        When set, the scraper presents this identity during the TLS handshake.
+                        The Secret must contain `tls.crt` (or `certificate_key`) and
+                        `tls.key` (or `private_key_key`) in PEM format.
+
+                        When absent, the scraper performs one-way TLS only (server verification
+                        with the CA from `ca_secret_ref`, no client certificate).
+                      nullable: true
+                      properties:
+                        certificateKey:
+                          default: tls.crt
+                          description: Key within `Secret.data` holding the PEM-encoded client certificate.
+                          minLength: 1
+                          type: string
+                        name:
+                          description: Secret name.
+                          minLength: 1
+                          type: string
+                        namespace:
+                          description: Secret namespace.
+                          minLength: 1
+                          type: string
+                        privateKeyKey:
+                          default: tls.key
+                          description: Key within `Secret.data` holding the PEM-encoded private key.
+                          minLength: 1
+                          type: string
+                      required:
+                        - name
+                        - namespace
+                      type: object
+                  type: object
+                  x-kubernetes-validations:
+                    - message: set exactly one of caSecretRef and caConfigMapRef
+                      rule: has(self.caSecretRef) != has(self.caConfigMapRef)
+                trafficPolicy:
+                  description: Optional administrative traffic policy.
+                  nullable: true
+                  properties:
+                    drain:
+                      default: false
+                      description: Stop new sessions while preserving existing affinity sessions.
+                      type: boolean
+                  type: object
+              required:
+                - endpoint
+                - gridNetworkRef
+              type: object
+            status:
+              description: Observed status of an [`AgentToAgentProvider`].
+              nullable: true
+              properties:
+                discoveredCard:
+                  description: Bounded subset of the most recently discovered Agent Card.
+                  nullable: true
+                  properties:
+                    defaultInputModes:
+                      default: []
+                      description: Card-level default input MIME modes.
+                      items:
+                        maxLength: 128
+                        minLength: 1
+                        pattern: ^[!-~]+$
+                        type: string
+                      maxItems: 8
+                      type: array
+                      x-kubernetes-list-type: set
+                    defaultOutputModes:
+                      default: []
+                      description: Card-level default output MIME modes.
+                      items:
+                        maxLength: 128
+                        minLength: 1
+                        pattern: ^[!-~]+$
+                        type: string
+                      maxItems: 8
+                      type: array
+                      x-kubernetes-list-type: set
+                    interfaces:
+                      default: []
+                      description: Supported protocol interfaces reduced to bounded routing metadata.
+                      items:
+                        description: Bounded protocol-interface metadata observed from an Agent Card.
+                        properties:
+                          binding:
+                            description: Protocol binding exposed by this interface.
+                            enum:
+                              - JSONRPC
+                            type: string
+                          protocolVersion:
+                            description: Protocol version exposed by this interface, when present.
+                            maxLength: 128
+                            minLength: 1
+                            nullable: true
+                            pattern: ^.*\S.*$
+                            type: string
+                        required:
+                          - binding
+                        type: object
+                      maxItems: 8
+                      type: array
+                    name:
+                      description: Agent Card display name.
+                      maxLength: 128
+                      minLength: 1
+                      pattern: ^.*\S.*$
+                      type: string
+                    protocolVersion:
+                      description: A2A protocol version, when advertised by the card.
+                      maxLength: 128
+                      minLength: 1
+                      nullable: true
+                      pattern: ^.*\S.*$
+                      type: string
+                    skills:
+                      default: []
+                      description: |-
+                        Skills discovered on the card after the configured allowlist was
+                        applied.
+                      items:
+                        description: Bounded routing metadata for one A2A Agent Card skill.
+                        properties:
+                          id:
+                            description: |-
+                              Stable Agent Card skill identifier. This, rather than `name`, is the
+                              identity used by routing and task affinity.
+                            maxLength: 128
+                            minLength: 1
+                            pattern: ^.*\S.*$
+                            type: string
+                          inputModes:
+                            default: []
+                            description: |-
+                              Effective input MIME modes after applying the skill override, or the
+                              card-level `defaultInputModes` when the skill omits an override.
+                            items:
+                              maxLength: 128
+                              minLength: 1
+                              pattern: ^[!-~]+$
+                              type: string
+                            maxItems: 8
+                            type: array
+                            x-kubernetes-list-type: set
+                          name:
+                            description: Human-readable skill name.
+                            maxLength: 128
+                            minLength: 1
+                            pattern: ^.*\S.*$
+                            type: string
+                          outputModes:
+                            default: []
+                            description: |-
+                              Effective output MIME modes after applying the skill override, or the
+                              card-level `defaultOutputModes` when the skill omits an override.
+                            items:
+                              maxLength: 128
+                              minLength: 1
+                              pattern: ^[!-~]+$
+                              type: string
+                            maxItems: 8
+                            type: array
+                            x-kubernetes-list-type: set
+                        required:
+                          - id
+                          - name
+                        type: object
+                      maxItems: 128
+                      type: array
+                    streaming:
+                      default: false
+                      description: Whether the agent advertises streaming support.
+                      type: boolean
+                    version:
+                      description: Agent implementation version, when advertised.
+                      maxLength: 128
+                      minLength: 1
+                      nullable: true
+                      pattern: ^.*\S.*$
+                      type: string
+                  required:
+                    - name
+                  type: object
+                matchingSites:
+                  default: []
+                  description: Sites matched by the site selector.
+                  items:
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$
+                    type: string
+                  maxItems: 256
+                  type: array
+                observedGeneration:
+                  default: 0
+                  description: Last observed generation.
+                  format: int64
+                  type: integer
+                phase:
+                  default: Pending
+                  description: Current phase.
+                  enum:
+                    - Pending
+                    - Available
+                    - Degraded
+                    - Unavailable
+                  type: string
+                reason:
+                  description: |-
+                    Machine-readable reason for the current phase, `None` when healthy or
+                    when the controller has not yet published a reason.
+
+                    Stable values include `ProviderConfigInvalid`, `GridNetworkNotFound`,
+                    `UnsupportedAuthStrategy`, `CredentialSecretRefInvalid`,
+                    `CredentialSecretMissing`, `CredentialSecretKeyMissing`,
+                    `CredentialSecretValueInvalid`, `EndpointTlsSecretMissing`,
+                    `EndpointTlsKeyMissing`, `EndpointTlsMaterialInvalid`,
+                    `AgentCardUnreachable`, `AgentCardInvalid`,
+                    `AgentCardUnsupportedBinding`, and `AgentCardNoRoutableSkills`.
+                  maxLength: 128
+                  nullable: true
+                  pattern: ^.*\S.*$
+                  type: string
+              type: object
+          required:
+            - spec
+          title: AgentToAgentProvider
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}
+{{- end }}

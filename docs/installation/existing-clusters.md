@@ -851,9 +851,18 @@ monitoring namespaces to that port. A Prometheus elsewhere needs its namespace i
 Helm does not remove CRDs on uninstall. To remove them:
 
 ```bash
-kubectl delete crd gridnetworks.grid.praxis.fast \
+kubectl delete crd agenttoolproviders.grid.praxis.fast \
+  gridnetworks.grid.praxis.fast \
   gridsites.grid.praxis.fast \
-  inferenceproviders.grid.praxis.fast
+  inferenceproviders.grid.praxis.fast \
+  siteinvites.grid.praxis.fast \
+  --context "$CONTEXT"
+```
+
+If the experimental A2A profile was enabled, remove its CRD separately:
+
+```bash
+kubectl delete crd agenttoagentproviders.grid.praxis.fast --context "$CONTEXT"
 ```
 
 ## Troubleshooting
