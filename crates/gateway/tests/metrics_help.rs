@@ -7,11 +7,14 @@
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     /// Names `describe_metrics` documents, which a scrape must explain.
-    const DOCUMENTED: [&str; 35] = [
+    const DOCUMENTED: [&str; 38] = [
         "grid_route_decisions_total",
         "grid_route_fenced_total",
         "grid_route_selections_total",
         "grid_route_prefix_affinity_total",
+        "grid_route_prefix_index_entries",
+        "grid_route_prefix_index_capacity",
+        "grid_route_prefix_index_evictions_total",
         "grid_serving_config_reload_total",
         "grid_serving_unbound_provider_hops",
         "grid_serving_undialable_clusters",
@@ -72,6 +75,10 @@ mod tests {
         metrics::counter!("grid_route_fenced_total", "cause" => "zone_required", "enforced" => "true").increment(1);
         metrics::counter!("grid_route_selections_total", "path" => "cross_site").increment(1);
         metrics::counter!("grid_route_prefix_affinity_total", "outcome" => "hit").increment(1);
+        metrics::gauge!("grid_route_prefix_index_entries", "cluster" => "east").set(1.0);
+        metrics::gauge!("grid_route_prefix_index_capacity", "cluster" => "east").set(1.0);
+        metrics::counter!("grid_route_prefix_index_evictions_total", "cluster" => "east", "reason" => "capacity")
+            .increment(1);
         metrics::counter!("grid_serving_config_reload_total", "result" => "ok").increment(1);
         metrics::counter!("grid_route_site_silent_transitions_total", "to" => "silent").increment(1);
         for name in SITE_GAUGES {
@@ -119,7 +126,7 @@ mod tests {
     /// emit sites out of the source instead.
     #[test]
     fn every_emitted_grid_metric_is_documented() {
-        const SOURCES: [&str; 7] = [
+        const SOURCES: [&str; 9] = [
             include_str!("../crates/ai-grid-filters/src/snapshot.rs"),
             include_str!("../crates/ai-grid-filters/src/signals.rs"),
             include_str!("../crates/ai-grid-filters/src/decisions.rs"),
@@ -127,6 +134,8 @@ mod tests {
             include_str!("../crates/ai-grid-filters/src/dial.rs"),
             include_str!("../crates/ai-grid-filters/src/health.rs"),
             include_str!("../crates/ai-grid-filters/src/provider.rs"),
+            include_str!("../crates/ai-grid-filters/src/prefix/affinity.rs"),
+            include_str!("../crates/ai-grid-filters/src/prefix/index.rs"),
         ];
 
         let mut emitted: Vec<&str> = SOURCES

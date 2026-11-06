@@ -9,7 +9,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet as StdHashSet},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     path::Path,
     sync::Arc,
@@ -209,7 +209,7 @@ pub struct OperatorCtx {
     started: Instant,
 }
 
-/// The last value logged per key, so INFO fires on a change rather than on every pass.
+/// The last value logged per key, so transition messages fire on change rather than every pass.
 #[derive(Debug, Default)]
 pub(crate) struct ChangeLog(std::sync::Mutex<HashMap<String, String>>);
 
@@ -229,6 +229,12 @@ impl ChangeLog {
         let mut held = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         held.retain(|key, _| !key.starts_with(prefix) || keep.contains(key));
     }
+}
+
+/// Retain each gateway's prior empty state so repeated reconciles do not repeat no-route warnings.
+fn should_warn_empty_overlay(logged: &ChangeLog, key: &str, no_candidates: bool) -> bool {
+    let changed = logged.changed(key, no_candidates.to_string());
+    changed && no_candidates
 }
 
 /// Send `declared` to `sender`, returning whether it changed, so a repeat wakes nobody.
@@ -1699,18 +1705,23 @@ async fn apply_signed_state(
 
     let client = &ctx.client;
 
-    // Peers that cannot be re-verified keep their pins: a transient read failure must not drop all state.
+    // Failed verification preserves cached pins only while the provider-network binding is unchanged.
     let peer_pins = match collect_gossip_peer_pins(network, client, swim.site_name()).await {
         Ok(peer_pins) => Some(peer_pins),
         Err(error) => {
-            tracing::warn!(%grid_id, %error, "keeping installed SWIM peer pins: peers could not be re-verified");
+            tracing::warn!(%grid_id, %error, "SWIM peer pins could not be re-verified; retaining pins only for an unchanged provider-network binding");
             None
         },
     };
     let local_signing_key = load_gossip_signing_identity(network, client, swim.site_name()).await;
     let signing_ready = local_signing_key.is_some();
-    swim.set_grid_trust_snapshot(grid_id.to_owned(), local_signing_key, peer_pins)
-        .map_err(|error| OperatorError::InvalidResource(error.to_string()))?;
+    swim.set_grid_trust_snapshot(
+        grid_id.to_owned(),
+        grid_network_name(network)?.to_owned(),
+        local_signing_key,
+        peer_pins,
+    )
+    .map_err(|error| OperatorError::InvalidResource(error.to_string()))?;
     Ok(signing_ready)
 }
 
@@ -1849,7 +1860,7 @@ const MOUNT_RECONCILIATION_REQUEUE: Duration = Duration::from_secs(60);
 const FIELD_MANAGER: &str = "grid-operator";
 
 /// Finalizer that keeps a `GridNetwork` present until its SWIM scope withdraws.
-const GRID_NETWORK_WITHDRAWAL_FINALIZER: &str = "grid.praxis.fast/gridnetwork-withdrawal";
+pub const GRID_NETWORK_WITHDRAWAL_FINALIZER: &str = "grid.praxis.fast/gridnetwork-withdrawal";
 
 /// Bound retries when another reconcile updates a `GridNetwork` finalizer at the same time.
 const FINALIZER_PATCH_ATTEMPTS: usize = 4;
@@ -2462,6 +2473,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     } = Box::pin(reconcile_routing_overlay_inner(
         &network,
         &grid_id,
+        &ctx.logged,
         client,
         &providers,
         &tool_providers,
@@ -3271,6 +3283,7 @@ fn site_phases(sites: &[GridSite]) -> impl Iterator<Item = (&str, &'static str)>
 async fn reconcile_routing_overlay_inner(
     network: &GridNetwork,
     grid_id: &str,
+    logged: &ChangeLog,
     client: &Client,
     providers: &[InferenceProvider],
     tool_providers: &[AgentToolProvider],
@@ -3305,19 +3318,32 @@ async fn reconcile_routing_overlay_inner(
     let mut consumer_statuses: Vec<ConsumerConfigStatus> = Vec::new();
     let mut mount_statuses: Vec<MountReconciliationStatus> = Vec::new();
     let mut overlay_statuses: Vec<OverlayRevisionStatus> = Vec::new();
+    let empty_overlay_prefix = format!("empty-overlay/{network_name}/");
+    let mut logged_empty_overlays = StdHashSet::new();
     let mut serving_retry: Option<Duration> = None;
     let mut inventory_expiry_deadline: Option<time::OffsetDateTime> = None;
+    let eligible_remote_owned: Vec<crdt::ProviderState> =
+        filter_eligible_remote_crdt_providers(network_name, &sites, remote_crdt_providers, signal)
+            .into_iter()
+            .cloned()
+            .collect();
+    let filtered_count = remote_crdt_providers.len() - eligible_remote_owned.len();
+    if filtered_count > 0 {
+        tracing::debug!(
+            network = network_name,
+            total_remote = remote_crdt_providers.len(),
+            filtered = filtered_count,
+            eligible = eligible_remote_owned.len(),
+            "filtered remote CRDT providers: source GridSite not Active"
+        );
+    }
+
     // Peer records are the same for every gateway; only Local reads them from verified peers.
-    let peer_catalog = member_catalogs.then(|| {
-        derived_topology::peer_catalog(filter_eligible_remote_crdt_providers(
-            network_name,
-            &sites,
-            remote_crdt_providers,
-            signal,
-        ))
-    });
+    let peer_catalog = member_catalogs.then(|| derived_topology::peer_catalog(&eligible_remote_owned));
 
     for gw_ref in &network.spec.consumer_gateways {
+        let empty_overlay_key = format!("{}{}/{}", empty_overlay_prefix, gw_ref.namespace, gw_ref.name);
+        logged_empty_overlays.insert(empty_overlay_key.clone());
         // Each gateway identifies its own local site.  Fall back to the
         // network name for single-site deployments where the two are equal.
         let local_site = gw_ref.site_name.as_deref().unwrap_or(network_name);
@@ -3325,26 +3351,6 @@ async fn reconcile_routing_overlay_inner(
         // Before anything that can skip this gateway, so a removed site never outlives a failed render.
         if serving.is_some() {
             revoke_provider_admission(network_name, gw_ref, &admitted, client).await;
-        }
-
-        // Filter remote CRDT providers to those whose source GridSite is Active.
-        // Providers from sites in any other phase (Discovered, Connecting, Pending,
-        // Unreachable, Left, or missing) are excluded before the overlay is rendered.
-        // This is the routing eligibility gate: SWIM membership alone does not
-        // make a remote site routable.
-        let eligible_remote: Vec<&crdt::ProviderState> =
-            filter_eligible_remote_crdt_providers(network_name, &sites, remote_crdt_providers, signal);
-        let eligible_remote_owned: Vec<crdt::ProviderState> = eligible_remote.into_iter().cloned().collect();
-        let filtered_count = remote_crdt_providers.len() - eligible_remote_owned.len();
-        if filtered_count > 0 {
-            tracing::debug!(
-                network = network_name,
-                gateway = %gw_ref.name,
-                total_remote = remote_crdt_providers.len(),
-                filtered = filtered_count,
-                eligible = eligible_remote_owned.len(),
-                "filtered remote CRDT providers: source GridSite not Active"
-            );
         }
 
         let timestamp = rfc3339_now();
@@ -3470,7 +3476,7 @@ async fn reconcile_routing_overlay_inner(
             },
         };
         let no_candidates = overlay.candidates.is_empty();
-        if no_candidates {
+        if should_warn_empty_overlay(logged, &empty_overlay_key, no_candidates) {
             tracing::warn!(
                 network = network_name,
                 gateway = %gw_ref.name,
@@ -3700,6 +3706,7 @@ async fn reconcile_routing_overlay_inner(
             consumer_statuses.push(consumer_config_status_disabled(gw_ref, cc, observed_generation));
         }
     }
+    logged.retain_under(&empty_overlay_prefix, &logged_empty_overlays);
     Ok(OverlayOutcome {
         consumer_statuses,
         mount_statuses,
@@ -3708,10 +3715,6 @@ async fn reconcile_routing_overlay_inner(
         inventory_expiry_deadline,
     })
 }
-
-/// Legacy status reason used by retained-status compatibility tests.
-#[cfg(test)]
-const EMPTY_CANDIDATES: &str = "EmptyCandidates";
 
 /// What one routing overlay pass produced, per gateway.
 struct OverlayOutcome {
@@ -4194,16 +4197,6 @@ async fn apply_serving_config(
     source.gate.record(&key, now);
     info!(cm_name = %name, digest = %serving_config::digest(&text), "applied grid serving config");
     Ok(None)
-}
-
-/// Whether the last recorded status for this gateway already had no candidates.
-#[cfg(test)]
-fn already_empty(network: &GridNetwork, gw_ref: &GatewayRef) -> bool {
-    network.status.as_ref().is_some_and(|status| {
-        status.routing_map_status.iter().any(|entry| {
-            entry.gateway_name == gw_ref.name && entry.namespace == gw_ref.namespace && entry.reason == EMPTY_CANDIDATES
-        })
-    })
 }
 
 /// Find the last successfully distributed overlay status for a gateway.
@@ -8454,28 +8447,24 @@ mod tests {
     }
 
     #[test]
-    fn empty_overlay_warns_only_on_entering_the_state() {
-        let gw: GatewayRef = serde_json::from_value(serde_json::json!({"name": "gw", "namespace": "ns"}))
-            .unwrap_or_else(|_| std::process::abort());
-        let with_reason = |reason: &str| {
-            let mut network = base_network();
-            network.status = Some(
-                serde_json::from_value(serde_json::json!({"routingMapStatus": [{
-                    "gatewayName": "gw", "namespace": "ns", "configMapName": "c", "schemaVersion": "v",
-                    "renderedRevision": "r", "distributedRevision": "r", "contentDigest": "r", "reason": reason,
-                }]}))
-                .unwrap_or_else(|_| std::process::abort()),
-            );
-            network
-        };
-        let cases = [
-            ("no status yet", base_network(), false),
-            ("was distributed", with_reason(""), false),
-            ("was already empty", with_reason("EmptyCandidates"), true),
-        ];
-        for (label, network, want) in cases {
-            assert_eq!(already_empty(&network, &gw), want, "{label}");
-        }
+    fn empty_overlay_warns_only_on_state_transitions() {
+        let logged = ChangeLog::default();
+        assert!(
+            should_warn_empty_overlay(&logged, "net/ns/gw", true),
+            "initial empty state warns"
+        );
+        assert!(
+            !should_warn_empty_overlay(&logged, "net/ns/gw", true),
+            "repeated empty state is quiet"
+        );
+        assert!(
+            !should_warn_empty_overlay(&logged, "net/ns/gw", false),
+            "leaving empty state is quiet"
+        );
+        assert!(
+            should_warn_empty_overlay(&logged, "net/ns/gw", true),
+            "reentering empty state warns"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -10194,6 +10183,22 @@ mod tests {
                 "{reconcile} reconcile carries the site certificate for late joiners"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn signed_state_scope_comes_from_the_local_network_even_without_signer_or_pins() -> Result<(), OperatorError>
+    {
+        let client = crate::resources::test_doubles::mock_kube_client_with_secrets(HashMap::new());
+        let ctx = OperatorCtx::new(client, None, SignalMode::default());
+        let (swim, mut runtime) = SwimHandle::detached("site-a");
+        let network = network_with_endpoint_transport("plaintext", None);
+        apply_signed_state(&network, &ctx, &swim, "authenticated-grid-id", SignedStateMode::Enforce).await?;
+        assert_eq!(
+            runtime.network_scopes_sent(),
+            [("authenticated-grid-id".to_owned(), "glb-demo".to_owned())],
+            "resource metadata.name authorizes provider networks independently of signer and peer-pin readiness"
+        );
+        Ok(())
     }
 
     #[tokio::test]
