@@ -1,12 +1,17 @@
 # cargo-deny policy for the gateway workspace. Mirrors the root deny.toml
-# (licenses, bans, registry sources) with two gateway-specific deltas: the
-# gateway depends on praxis-ai via git, and its rustls stack pulls an
-# unmaintained transitive crate the root graph does not.
+# (licenses, bans, registry sources), plus pinned Praxis git sources and
+# documented transitive advisory exceptions for the Gateway graph.
 
 [advisories]
 unmaintained = "all"
 maximum-db-staleness = "P30D"
 ignore = [
+  # PPE 0.6.0's default builtin bundle includes Limitador 0.14, which pulls
+  # atomic-polyfill through postcard/heapless and paste through CEL 0.12.
+  # Both are unmaintained with no patched versions; replacement needs an
+  # upstream dependency change. Neither is in the Policy FIPS profiles.
+  { id = "RUSTSEC-2023-0089", reason = "unmaintained atomic-polyfill via Limitador/postcard/heapless; no patched version" },
+  { id = "RUSTSEC-2024-0436", reason = "unmaintained paste via Limitador/CEL 0.12; no patched version" },
   # rustls-pemfile is unmaintained (RUSTSEC-2025-0134); it is a transitive
   # dependency of the gateway's rustls/Pingora TLS stack with no upstream
   # replacement wired yet.
@@ -49,4 +54,8 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # The gateway consumes praxis-ai (apis + filters) as a pinned git dependency;
 # this is the workspace split that took the gateway out of the root graph.
-allow-git = ["https://github.com/praxis-proxy/ai.git"]
+allow-git = [
+  "https://github.com/praxis-proxy/ai.git",
+  # Temporary pin to Praxis #1516 until its Policy FIPS features are released.
+  "https://github.com/praxis-proxy/praxis",
+]

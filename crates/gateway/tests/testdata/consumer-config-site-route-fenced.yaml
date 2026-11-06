@@ -26,14 +26,6 @@ filter_chains:
           - name: "local-llama"
             endpoints:
               - "10.96.0.20:8000"
-            health_check:
-              type: tcp
-              interval_ms: 5000
-              timeout_ms: 2000
-              healthy_threshold: 2
-              unhealthy_threshold: 3
-              passive_unhealthy_threshold: 2
-              passive_healthy_threshold: 2
           - name: "site-b"
             tls:
               ca:
@@ -53,14 +45,6 @@ filter_chains:
               max_retries: 1
               retriable_conditions: [connect_failure]
               allow_non_idempotent: true
-            health_check:
-              type: tcp
-              interval_ms: 3000
-              timeout_ms: 2000
-              healthy_threshold: 2
-              unhealthy_threshold: 3
-              passive_unhealthy_threshold: 2
-              passive_healthy_threshold: 2
 clusters:
           - name: "local-llama"
             endpoints:

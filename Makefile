@@ -14,7 +14,7 @@ ifneq ($(V),)
 endif
 
 .PHONY: all build release check clean \
-	test test-unit lint gateway-lint lint-extra fmt doc audit \
+	test test-unit lint gateway-lint gateway-fips-check lint-extra fmt doc audit \
 	generate-api-types codegen-check generate-crds crds-check generate-deploy deploy-check \
 	generate-go-types go-types-check \
 	coverage coverage-check \
@@ -76,6 +76,16 @@ gateway-lint:
 	  tree="$$(cargo tree --manifest-path crates/gateway/Cargo.toml -p gateway -e normal --target all --prefix none --format '{p}')"; \
 	  printf '%s\n' "$$tree" | grep -q '^openssl-sys ' || { echo "positive control failed: openssl-sys is not in the tree" >&2; exit 1; }; \
 	  if printf '%s\n' "$$tree" | grep -q '^ring '; then echo "ring is in the gateway's normal dependency tree" >&2; exit 1; fi
+
+# Compile and assess Policy profiles; runtime validation needs a FIPS provider.
+gateway-fips-check:
+	@set -eu; for features in fips fips,policy-jwt-fips; do \
+	  cargo check --locked --manifest-path crates/gateway/Cargo.toml --workspace --all-targets --no-default-features --features "$$features"; \
+	  cargo test --locked --manifest-path crates/gateway/Cargo.toml --no-default-features --features "$$features" --test policy_build_contract; \
+	  tree="$$(cargo tree --locked --manifest-path crates/gateway/Cargo.toml -p gateway --no-default-features --features "$$features" -e normal,build --target all --prefix none --format '{p}')"; \
+	  printf '%s\n' "$$tree" | grep -q '^openssl-sys ' || { echo "positive control failed: openssl-sys is not in the tree" >&2; exit 1; }; \
+	  if printf '%s\n' "$$tree" | grep -E '^(ring|aws-lc-rs|aws-lc-sys|sha2|hmac|openssl-src) '; then echo "non-FIPS crypto is in the gateway's dependency tree" >&2; exit 1; fi; \
+	done
 
 fmt:
 	cargo +$(NIGHTLY_RUSTFMT) fmt --all
@@ -309,6 +319,7 @@ help:
 	@echo "Quality:"
 	@echo "  lint             root checks + gateway-lint"
 	@echo "  gateway-lint     Gateway Clippy + rustfmt + machete + no-ring check"
+	@echo "  gateway-fips-check  Gateway Policy FIPS build + capability + dependency checks"
 	@echo "  lint-extra       typos + taplo + shellcheck + actionlint"
 	@echo "  fmt              format root + Gateway with nightly rustfmt"
 	@echo "  doc              build docs with warnings denied"
