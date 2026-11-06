@@ -175,14 +175,10 @@ metrics:
 networkPolicy:
   # -- auto: on where OpenShift runs. true or false forces it.
   enabled: auto
-  # -- NetworkPolicyPeer entries allowed to reach the metrics port. Must not be empty.
-  metricsFrom:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: openshift-user-workload-monitoring
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: openshift-monitoring
+  # -- NetworkPolicyPeer entries allowed to reach the metrics port. Empty on OpenShift admits
+  # the openshift-user-workload-monitoring and openshift-monitoring namespaces. Off
+  # OpenShift there is no default, so enabling the policy requires it.
+  metricsFrom: []
 
 # -- SWIM protocol configuration.
 swim:

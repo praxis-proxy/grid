@@ -107,3 +107,23 @@ tests:
       networkPolicy.metricsFrom: []
     asserts:
       - failedTemplate: {}
+
+  - it: has no OpenShift default off OpenShift, so a forced policy needs metricsFrom
+    set:
+      networkPolicy.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: "networkPolicy.metricsFrom must name the Prometheus namespace off OpenShift: an empty list would admit every pod, and there is no default to guess"
+
+  - it: keeps a custom selector on OpenShift instead of the default
+    capabilities:
+      apiVersions: [security.openshift.io/v1]
+    set:
+      networkPolicy.metricsFrom:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } }
+    asserts:
+      - equal:
+          path: spec.ingress[1].from
+          value:
+            - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } }
+            - podSelector: { matchLabels: { app.kubernetes.io/instance: gop, app.kubernetes.io/component: helm-test } }

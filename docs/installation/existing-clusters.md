@@ -844,7 +844,8 @@ That creates a new CA, so peers that pin this site need its new certificate.
 
 On OpenShift a NetworkPolicy also admits only the user-workload and platform
 monitoring namespaces to that port. A Prometheus elsewhere needs its namespace in
-`networkPolicy.metricsFrom`.
+`networkPolicy.metricsFrom`. Off OpenShift the policy is off by default, and turning it
+on requires `networkPolicy.metricsFrom`.
 
 ### CRD Retention
 

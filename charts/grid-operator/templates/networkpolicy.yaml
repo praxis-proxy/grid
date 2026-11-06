@@ -1,7 +1,12 @@
 {{- include "grid-operator.normalize" . }}
 {{- if include "grid-operator.networkPolicy.enabled" . }}
-{{- if not .Values.networkPolicy.metricsFrom }}
-{{- fail "networkPolicy.metricsFrom must name at least one peer; an empty list would admit every pod" }}
+{{- $metricsFrom := .Values.networkPolicy.metricsFrom }}
+{{- /* Only OpenShift has known monitoring namespaces to default to. */}}
+{{- if and (not $metricsFrom) (.Capabilities.APIVersions.Has "security.openshift.io/v1") }}
+{{- $metricsFrom = list (dict "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" "openshift-user-workload-monitoring"))) (dict "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" "openshift-monitoring"))) }}
+{{- end }}
+{{- if not $metricsFrom }}
+{{- fail "networkPolicy.metricsFrom must name the Prometheus namespace off OpenShift: an empty list would admit every pod, and there is no default to guess" }}
 {{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -27,7 +32,7 @@ spec:
           protocol: TCP
         {{- end }}
     - from:
-        {{- toYaml .Values.networkPolicy.metricsFrom | nindent 8 }}
+        {{- toYaml $metricsFrom | nindent 8 }}
         # This release's helm test checks /readyz.
         - podSelector:
             matchLabels:

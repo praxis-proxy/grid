@@ -202,9 +202,10 @@ network keeps whichever policies the chart that renders it writes, so render eac
 GridNetwork from one chart, and use grid-site when you want its policies.
 
 The NetworkPolicy peers in `networkPolicy.metricsFrom` are full NetworkPolicyPeer entries.
-The praxis-gateway chart takes namespace names in `metricsListener.fromNamespaces`, and on
-OpenShift defaults to `openshift-user-workload-monitoring` only. This chart adds
-`openshift-monitoring` on OpenShift.
+On OpenShift they default to `openshift-user-workload-monitoring` and
+`openshift-monitoring`; off OpenShift there is no default. The praxis-gateway chart takes
+namespace names in `metricsListener.fromNamespaces`, and on OpenShift defaults to
+`openshift-user-workload-monitoring` only. Set both when one Prometheus scrapes both.
 
 ## Values
 
@@ -304,7 +305,7 @@ OpenShift defaults to `openshift-user-workload-monitoring` only. This chart adds
 | `serviceMonitor.interval` | string | `30s` | Prometheus scrape interval. Empty leaves the Prometheus default. |
 | `serviceMonitor.scrapeTimeout` | string | `10s` | Prometheus scrape timeout. Empty leaves the Prometheus default. |
 | `networkPolicy.enabled` | bool or `auto` | `auto` | Render a NetworkPolicy for the operator pod. `auto` turns it on where OpenShift runs. SWIM and signals stay open to every peer. |
-| `networkPolicy.metricsFrom` | list | the OpenShift user-workload and platform monitoring namespaces | NetworkPolicyPeer entries allowed to reach the metrics and health port. Kubelet probes are unaffected on OpenShift. Must not be empty. |
+| `networkPolicy.metricsFrom` | list | `[]` | NetworkPolicyPeer entries allowed to reach the metrics and health port. Empty on OpenShift admits the user-workload and platform monitoring namespaces. Off OpenShift there is no default, so `networkPolicy.enabled: true` fails the render until this names the Prometheus namespace. Kubelet probes are unaffected on OpenShift. |
 | `serviceMonitor.tlsConfig` | object | `{}` | Scrape TLS settings when `metrics.tls` is on. Empty: the OpenShift service CA and the Service DNS name for `serviceCA`, or the grid CA Secret and `<site>.grid.internal` for `siteIdentity`. Required with `existingSecret`. |
 | `resources` | object | `{}` | Container resource requests and limits. |
 | `nodeSelector` | object | `{}` | Node selector for scheduling. |
