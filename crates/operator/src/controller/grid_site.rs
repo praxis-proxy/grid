@@ -2105,10 +2105,7 @@ mod tests {
 
     #[test]
     fn event_type_endpoints_declared_is_normal() {
-        assert!(matches!(
-            event_type_for_reason("EndpointsDeclared"),
-            EventType::Normal
-        ));
+        assert!(matches!(event_type_for_reason("EndpointsDeclared"), EventType::Normal));
     }
 
     #[test]
