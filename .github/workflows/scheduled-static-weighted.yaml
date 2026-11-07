@@ -3,6 +3,7 @@ name: Scheduled Static-Weighted Qualification
 on:
   schedule:
     - cron: "0 1 * * *"
+      timezone: Etc/UTC
 
 permissions:
   contents: read

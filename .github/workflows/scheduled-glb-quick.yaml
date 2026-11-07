@@ -3,6 +3,7 @@ name: Scheduled GLB Quick Qualification
 on:
   schedule:
     - cron: "0 0 * * *"
+      timezone: Etc/UTC
 
 permissions:
   contents: read
