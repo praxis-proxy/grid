@@ -31,6 +31,23 @@ filters used by this topology. For local development, set
 - Provider boundary with organization-only trust
 - External provider integration (optional)
 
+## Operator crypto profile
+
+The Triggered Integration Test has an `operator_image_mode` choice. `standard`
+is the default for manual runs and is selected explicitly by the nightly
+schedule. It builds and uses the standard Grid operator image on an ordinary
+GitHub-hosted runner.
+
+The optional `fips` mode builds and selects the FIPS operator image, and stops
+before deployment unless it is running on the self-hosted `linux`/`fips` runner
+and its kernel reports `/proc/sys/crypto/fips_enabled` as `1`. FIPS mode is
+restricted to trusted repository branches, not PR merge code. The operator
+startup check also requires OpenSSL's default properties to enable FIPS;
+installing the provider package alone is not sufficient. A successful FIPS run
+therefore requires a FIPS-configured host. The standard nightly result does not
+qualify FIPS startup or a FIPS-mode deployment. The separate FIPS image build
+and packaging checks remain in the image CI workflows.
+
 ## Public quickstarts
 
 User-facing AGN demos with full documentation are maintained in the

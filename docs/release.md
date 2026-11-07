@@ -147,6 +147,17 @@ time); consequently, `glb-quick` also has that legacy run.
 | `Scheduled Static-Weighted Qualification` | `static-weighted` | 01:00 |
 | `Scheduled llm-d Pool-Metrics Quick Qualification` | `llmd-pool-metrics-quick` | 02:00 |
 
+The manual and reusable workflow also accept `operator_image_mode` (`standard`
+or `fips`). It defaults to `standard`, and scheduled runs use `standard`. The
+optional `fips` mode builds and selects the FIPS operator image
+on a self-hosted `linux`/`fips` runner, whose kernel must report
+`/proc/sys/crypto/fips_enabled=1`; the operator's startup verification
+additionally checks OpenSSL's effective FIPS properties. FIPS mode refuses PR
+merge sources because it runs on a self-hosted runner. The image mode is
+included in the uploaded artifact name, image manifest, and job summary. FIPS
+image build/packaging checks remain separate from the standard nightly Kind
+runtime qualification.
+
 The scheduled workflows call the same reusable Triggered Integration Test
 workflow as manual runs, so source resolution, image selection, evidence
 upload, cleanup, and failure diagnostics stay shared.
