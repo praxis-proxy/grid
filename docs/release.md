@@ -150,8 +150,13 @@ optional `fips` mode builds and selects the FIPS operator image
 on a self-hosted `linux`/`fips` runner, whose kernel must report
 `/proc/sys/crypto/fips_enabled=1`; the operator's startup verification
 additionally checks OpenSSL's effective FIPS properties. FIPS mode refuses PR
-merge sources because it runs on a self-hosted runner. The image mode is
-included in the uploaded artifact name, image manifest, and job summary. FIPS
+merge sources because it runs on a self-hosted runner, but it does not assess
+whether a repository branch is trusted; operators must select a trusted branch.
+The destructive disk-pruning step runs only in standard mode, so the self-hosted
+FIPS runner must be provisioned with sufficient free disk. A successful FIPS
+combined-site run qualifies Grid operator startup only, not the Praxis AI
+gateway, overlay-sync, or the whole deployment as FIPS-compliant. The image mode
+is included in the uploaded artifact name, image manifest, and job summary. FIPS
 image build/packaging checks remain separate from the standard nightly Kind
 runtime qualification.
 

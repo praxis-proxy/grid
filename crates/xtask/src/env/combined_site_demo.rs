@@ -8683,7 +8683,10 @@ mod tests {
             "ready": true
         })];
 
-        assert!(operator_restart_state_converged(&before, &deployment, &after));
+        assert!(
+            operator_restart_state_converged(&before, &deployment, &after),
+            "a current Deployment generation with a distinct Ready pod and no old pod must converge"
+        );
 
         let stale_deployment = serde_json::json!({
             "metadata": {"generation": 5},
@@ -8695,7 +8698,10 @@ mod tests {
                 "availableReplicas": 1
             }
         });
-        assert!(!operator_restart_state_converged(&before, &stale_deployment, &after));
+        assert!(
+            !operator_restart_state_converged(&before, &stale_deployment, &after),
+            "a stale observed Deployment generation must not count as restart convergence"
+        );
     }
 
     #[test]
@@ -8722,11 +8728,23 @@ mod tests {
 
         assert_eq!(
             summary.get("name").and_then(serde_json::Value::as_str),
-            Some("grid-operator-new-abcde")
+            Some("grid-operator-new-abcde"),
+            "the Kubernetes Pod name must be retained in its summary"
         );
-        assert_eq!(summary.get("uid").and_then(serde_json::Value::as_str), Some("new-uid"));
-        assert_eq!(summary.get("ready").and_then(serde_json::Value::as_bool), Some(true));
-        assert!(operator_pod_is_ready(&summary));
+        assert_eq!(
+            summary.get("uid").and_then(serde_json::Value::as_str),
+            Some("new-uid"),
+            "the Kubernetes Pod UID must be retained for restart identity checks"
+        );
+        assert_eq!(
+            summary.get("ready").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "a Pod with Ready=True must be summarized as ready"
+        );
+        assert!(
+            operator_pod_is_ready(&summary),
+            "a Ready, non-terminating Pod must pass the readiness predicate"
+        );
     }
 
     #[test]
@@ -8754,13 +8772,15 @@ mod tests {
             operator_pod_summary(&unready)
                 .get("ready")
                 .and_then(serde_json::Value::as_bool),
-            Some(false)
+            Some(false),
+            "a Pod with Ready=False must not be summarized as ready"
         );
         assert_eq!(
             operator_pod_summary(&terminating)
                 .get("ready")
                 .and_then(serde_json::Value::as_bool),
-            Some(false)
+            Some(false),
+            "a terminating Pod must not be summarized as ready"
         );
     }
 
@@ -8797,9 +8817,18 @@ mod tests {
             }),
         ];
 
-        assert!(operator_has_new_ready_pod(&before, &after));
-        assert!(!operator_old_pods_terminated(&before, &after));
-        assert!(!operator_restart_state_converged(&before, &deployment, &after));
+        assert!(
+            operator_has_new_ready_pod(&before, &after),
+            "the replacement Pod must be Ready and have a UID not present before restart"
+        );
+        assert!(
+            !operator_old_pods_terminated(&before, &after),
+            "a terminating pre-restart Pod must still count as present"
+        );
+        assert!(
+            !operator_restart_state_converged(&before, &deployment, &after),
+            "restart convergence must wait until every pre-restart Pod disappears"
+        );
     }
 
     #[test]
@@ -8821,17 +8850,23 @@ mod tests {
             }
         });
 
-        assert!(!operator_restart_state_converged(&before, &deployment, &[]));
-        assert!(!operator_restart_state_converged(
-            &before,
-            &deployment,
-            &[serde_json::json!({
+        assert!(
+            !operator_restart_state_converged(&before, &deployment, &[]),
+            "an empty post-restart Pod snapshot cannot prove a Ready replacement"
+        );
+        assert!(
+            !operator_restart_state_converged(
+                &before,
+                &deployment,
+                &[serde_json::json!({
                 "uid": "new-uid",
                 "phase": "Running",
                 "deletion_timestamp": null,
                 "ready": false
-            })]
-        ));
+                })]
+            ),
+            "an unready post-restart Pod cannot prove convergence"
+        );
     }
 
     fn test_overlay(sites: &[&str]) -> OverlayData {
