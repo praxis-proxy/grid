@@ -238,6 +238,7 @@ means no polled peer has a rejected timestamp; `False` means at least one does.
 |---|---|---|
 | `False` | `TimestampOutOfRange` | A polled peer's latest answer carried a row stamped more than a second past its `Date`, or more than a day before it. The message names those peers (the first ten, then a count): check their clocks. |
 | `True` | `PeerTimestampsValid` | No polled peer's latest answer was rejected for its age. |
+| `Unknown` | `NoDeclaredPeers` | Under Local membership, no peer `GridSite` is declared, so none is polled. Nothing degrades the network. |
 
 Under Local membership the poller also writes three conditions, each under its own field
 manager. Which peers, and why, is on each peer's `GridSite`, as described in
@@ -251,6 +252,7 @@ round had no time for are not counted.
 |---|---|---|
 | `False` | `PeersUnreachable` | A checked peer's signals endpoint did not answer. The message counts them, for example `2 of 5 peers unreachable`. |
 | `True` | `PeerSignalsReachable` | Every polled peer's signals endpoint answered. |
+| `Unknown` | `NoDeclaredPeers` | Under Local membership, no peer `GridSite` is declared, so none is polled. Nothing degrades the network. |
 
 `PeerCatalogsAccepted` (`grid-operator-peer-catalogs`) counts the peers whose catalog,
 or part of it, was refused, out of the peers whose catalog is held.
@@ -259,6 +261,7 @@ or part of it, was refused, out of the peers whose catalog is held.
 |---|---|---|
 | `False` | `CatalogsRefused` | A peer's catalog was refused. The message counts them, for example `1 of 5 peers' catalogs refused`. |
 | `True` | `PeerCatalogsAccepted` | Every peer catalog read is accepted. |
+| `Unknown` | `NoDeclaredPeers` | Under Local membership, no peer `GridSite` is declared, so none is polled. Nothing degrades the network. |
 
 `PeerPollsComplete` (`grid-operator-peer-polls`) says whether each round had time to poll
 every peer. A peer the round had no time for keeps its last `SignalsReachable` verdict, so
@@ -268,6 +271,7 @@ the overrun is this site's, never the peer's.
 |---|---|---|
 | `False` | `PollRoundOverrun` | The last round ran out before it polled some peers. The message counts them, for example `2 of 40 peers not polled within the round`. |
 | `True` | `PeerPollsComplete` | The last round polled every peer. |
+| `Unknown` | `NoDeclaredPeers` | Under Local membership, no peer `GridSite` is declared, so none is polled. Nothing degrades the network. |
 
 A `Swim` condition, under its own field manager (`grid-operator-swim`), reads `True`
 with reason `Swim` while SWIM runs, and `False` when it is configured but cannot start,
@@ -335,6 +339,7 @@ until every site names one source.
 |---|---|---|
 | `False` | `PeerMembershipMismatch` | A polled peer names a different membership source. The message names those peers and their sources: set `grid.membership.source` alike on every site. |
 | `True` | `PeerMembership` | Every polled peer that names a mode names this site's. |
+| `Unknown` | `NoDeclaredPeers` | Under Local membership, no peer `GridSite` is declared, so none is polled. Nothing degrades the network. |
 
 A relayed age survives a clock step on every hop, so a step alone never makes
 this condition false: it points at a peer whose clock or stamping is wrong.
@@ -806,11 +811,12 @@ A discovered SWIM peer is not automatically authorized for routing.
 
 | Reason | Phase | Meaning |
 |---|---|---|
-| `AwaitingDiscovery` | Pending | Site record exists; SWIM has not yet observed the peer as Alive |
+| `AwaitingDiscovery` | Pending | Site record exists; SWIM has not yet observed the peer as Alive, or an auto-discovered record waits for discovery |
 | `SWIMDiscovered` | Discovered | Peer observed as Alive in SWIM membership; gateway address propagating |
 | `GatewayAddressKnown` | Connecting | Gateway address received; advancing to Connecting |
 | `EndpointsDeclared` | Connecting | Declared site names a dialable gateway endpoint, which also gives its signals endpoint; advancing without discovery |
-| `GatewayAddressMissing` | Pending, Discovered, Connecting, or Unreachable | No usable gateway address is known: the own site's endpoint and configured address are absent, or a peer has not announced an address |
+| `GatewayAddressMissing` | Pending, Discovered, Connecting, or Unreachable | No usable gateway address is known: the own site's endpoint and configured address are absent, a declared site under Local membership sets no `spec.gatewayEndpoint.address`, or a peer has not announced an address |
+| `SignalsAddressMissing` | Pending | A declared site under Local membership has a gateway address but no dialable signals endpoint: set `spec.signalsEndpoint`, or a dialable `spec.gatewayEndpoint.address` |
 | `TlsVerified` | Active | TLS handshake succeeded; certificate chain, identity, and configured pin verified |
 | `IdentityVerificationRequired` | Connecting | TCP endpoint is reachable, but plaintext cannot establish the gateway identity |
 | `PlaintextUnreachable` | Connecting or Unreachable | TCP probe failed (explicit Plaintext mode) |
@@ -942,10 +948,12 @@ time by provider gateway filters.
 **Single-site / combined-site deployments:** Site discovery is driven by *remote*
 SWIM peers - the `Pending -> Discovered` transition above requires a remote peer
 observed Alive. A single or combined cluster has no peers, so its own `GridSite`
-stays `Pending` with reason `AwaitingDiscovery` when a usable gateway address is
-available. If its endpoint is undeclared and gateway discovery has no address,
-reconciliation uses `GatewayAddressMissing` under both Swim and Local
-membership; this reason is emitted as a `Warning` event. **Either reason is
+stays `Pending` with reason `AwaitingDiscovery` under Swim when a usable gateway
+address is available. Under Local membership it advances to `Connecting` with reason
+`EndpointsDeclared` once its gateway and signals endpoints are known, and otherwise
+stays `Pending` naming the one that is missing. If its endpoint is undeclared and
+gateway discovery has no address, reconciliation uses `GatewayAddressMissing` under
+both Swim and Local membership; this reason is emitted as a `Warning` event. **Either reason is
 expected and does not block local serving:** local `InferenceProvider`s are
 eligible regardless of `GridSite.status.phase`; only *remote* CRDT provider
 records are phase-gated (see
