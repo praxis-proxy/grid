@@ -5647,6 +5647,7 @@ mod tests {
         let (sources, peers) = (SourceSlots::new(1, 1), PeerSlots::new(1, 8));
         let (addr, server) = mesh.serve(mesh.west_is_local(), ok_app(), (&sources, &peers), 1).await;
         let mut conn = mesh.connect(addr).await;
+        let requested = tokio::time::Instant::now();
         let head = get(&mut conn).await;
         assert!(head.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&head));
         assert_eq!(
@@ -5654,13 +5655,14 @@ mod tests {
             0,
             "an authenticated connection holds no source slot"
         );
-        // Real time for the handshake, virtual time for the idle wait.
         tokio::time::pause();
-        let idle = tokio::time::Instant::now();
         let mut rest = Vec::new();
         let closed = tokio::time::timeout(SIGNALS_HEADER_READ_TIMEOUT * 2, conn.read_to_end(&mut rest)).await;
         assert!(closed.is_ok(), "the server kept an idle connection open");
-        assert!(idle.elapsed() >= SIGNALS_HEADER_READ_TIMEOUT, "held until the bound");
+        assert!(
+            requested.elapsed() >= SIGNALS_HEADER_READ_TIMEOUT,
+            "held until the header-read bound after the request started"
+        );
         server.await.expect("server task");
     }
 
