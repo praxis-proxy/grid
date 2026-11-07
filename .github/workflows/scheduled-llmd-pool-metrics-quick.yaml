@@ -3,7 +3,6 @@ name: Scheduled llm-d Pool-Metrics Quick Qualification
 on:
   schedule:
     - cron: "0 2 * * *"
-      timezone: Etc/UTC
 
 permissions:
   contents: read

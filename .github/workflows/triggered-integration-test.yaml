@@ -54,12 +54,10 @@ on:
         type: string
         default: ""
   schedule:
-    # Nightly GLB quick, preserving 18:00 New York standard time.
-    - cron: "0 23 * * *"
-      timezone: Etc/UTC
-    # Nightly combined-site full, preserving 19:00 New York standard time.
-    - cron: "0 0 * * *"
-      timezone: Etc/UTC
+    # Nightly GLB quick qualification.
+    - cron: "0 18 * * *"
+    # Nightly combined-site qualification (mapped to full mode below).
+    - cron: "0 19 * * *"
 
 concurrency:
   group: grid-triggered-integration-${{ github.workflow }}-${{ inputs.release_qualification || 'scheduled' }}-${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.branch != '' && format('branch-{0}', inputs.branch) || 'main' }}-${{ github.event_name }}-${{ github.event_name == 'schedule' && github.event.schedule || '' }}
@@ -148,10 +146,10 @@ jobs:
           set -euo pipefail
           if [[ "${EVENT_NAME}" == "schedule" ]]; then
             case "${SCHEDULE}" in
-              "0 23 * * *")
+              "0 18 * * *")
                 RELEASE_QUALIFICATION=glb-quick
                 ;;
-              "0 0 * * *")
+              "0 19 * * *")
                 RELEASE_QUALIFICATION=combined-site
                 ;;
               *)

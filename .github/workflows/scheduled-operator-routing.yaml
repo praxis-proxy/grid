@@ -3,7 +3,6 @@ name: Scheduled Operator-Routing Qualification
 on:
   schedule:
     - cron: "0 3 * * *"
-      timezone: Etc/UTC
 
 permissions:
   contents: read
