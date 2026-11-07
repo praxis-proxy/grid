@@ -1,0 +1,55 @@
+suite: ConfigMap protect ValidatingAdmissionPolicy
+templates:
+  - templates/vap-configmap-protect.yaml
+capabilities:
+  apiVersions:
+    - admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy
+release:
+  name: grid-operator
+  namespace: grid-system
+tests:
+  - it: renders no policy when rbac.create is false
+    set:
+      rbac.create: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders a policy and binding when rbac.create is true
+    asserts:
+      - hasDocuments:
+          count: 2
+
+  - it: pre-filters to the operator ServiceAccount in the ConfigMap namespace
+    asserts:
+      - equal:
+          path: spec.matchConditions[0].expression
+          value: 'request.userInfo.username == "system:serviceaccount:" + request.namespace + ":grid-operator"'
+        documentIndex: 0
+
+  - it: pre-filters to the default config name when operatorConfig.name is unset
+    asserts:
+      - equal:
+          path: spec.matchConditions[1].expression
+          value: 'request.name == "grid-operator-config"'
+        documentIndex: 0
+
+  - it: pre-filters to a custom config name when operatorConfig.name is set
+    set:
+      operatorConfig.name: my-custom-config
+    asserts:
+      - equal:
+          path: spec.matchConditions[1].expression
+          value: 'request.name == "my-custom-config"'
+        documentIndex: 0
+
+  - it: rejects with expression false and a clear message
+    asserts:
+      - equal:
+          path: spec.validations[0].expression
+          value: "false"
+        documentIndex: 0
+      - equal:
+          path: spec.validations[0].message
+          value: "the operator ServiceAccount may not update grid-operator-config"
+        documentIndex: 0

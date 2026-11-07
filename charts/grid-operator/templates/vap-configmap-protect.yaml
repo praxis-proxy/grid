@@ -1,0 +1,45 @@
+{{- if and .Values.rbac.create (.Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy") }}
+{{- $fullname := include "grid-operator.fullname" . }}
+{{- $saName := include "grid-operator.serviceAccountName" . }}
+{{- $configName := include "grid-operator.operatorConfig.name" . }}
+# Prevents the operator ServiceAccount from modifying its own configuration ConfigMap.
+# create is left open: the ClusterRole grants unscoped create on configmaps.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $fullname }}-protect-config
+  labels:
+    {{- include "grid-operator.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      resources: ["configmaps"]
+      operations: ["UPDATE"]
+  matchConditions:
+  - name: is-operator-sa
+    expression: >-
+      request.userInfo.username == "system:serviceaccount:" + request.namespace + ":{{ $saName }}"
+  - name: is-protected-configmap
+    expression: >-
+      request.name == "{{ $configName }}"
+  validations:
+  - expression: "false"
+    message: "the operator ServiceAccount may not update {{ $configName }}"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $fullname }}-protect-config
+  labels:
+    {{- include "grid-operator.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $fullname }}-protect-config
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Release.Namespace }}
+{{- end }}

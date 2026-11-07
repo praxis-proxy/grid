@@ -5809,6 +5809,8 @@ fn rbac_can_i_checks(context: &str) -> Result<(), Box<dyn std::error::Error>> {
         ("patch", "secrets", Some("default")),
         ("create", "configmaps", Some("default")),
         ("patch", "configmaps", Some("default")),
+        ("update", "configmaps", Some("default")),
+        ("delete", "configmaps/grid-operator-local-records", Some("grid-system")),
     ];
     for (verb, resource, ns) in checks {
         let allowed = operator::kubectl_auth_can_i(context, verb, resource, *ns)?;
@@ -5837,6 +5839,8 @@ fn rbac_negative_checks(context: &str) -> Result<(), Box<dyn std::error::Error>>
         ("delete", "gridnetworks.grid.praxis.fast", None),
         ("get", "secrets", Some("kube-system")),
         ("patch", "configmaps", Some("kube-system")),
+        ("delete", "configmaps", Some("default")),
+        ("delete", "configmaps/grid-operator-config", Some("grid-system")),
     ];
     for (verb, resource, ns) in checks {
         let allowed = operator::kubectl_auth_can_i(context, verb, resource, *ns)?;
@@ -5855,6 +5859,114 @@ fn rbac_negative_checks(context: &str) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+/// Runtime VAP check for the `protect-config` policy.
+///
+/// Tries to patch `grid-operator-config` as the operator `ServiceAccount` and verifies
+/// the admission policy denies it. Creates the fixture only when the `ConfigMap` is absent,
+/// and deletes it only when this check created it, so an existing operator `ConfigMap` is preserved.
+fn rbac_vap_configmap_checks(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let created_fixture = !kubectl::resource_exists(context, "grid-system", "configmap", "grid-operator-config")?;
+    if created_fixture {
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "grid-operator-config", "namespace": "grid-system" },
+            "data": {}
+        });
+        kubectl::apply_manifest(context, &serde_json::to_string_pretty(&cm)?)?;
+    }
+
+    let patch_result = kubectl::patch_as_operator_sa(context, "grid-system", "configmap", "grid-operator-config");
+    if created_fixture {
+        kubectl::delete_ignoring_not_found(context, "grid-system", "configmap", "grid-operator-config")?;
+    }
+    match patch_result? {
+        kubectl::SaOutcome::DeniedByPolicy => {},
+        kubectl::SaOutcome::Allowed => {
+            return Err("VAP check failed: operator should NOT be able to patch grid-operator-config".into());
+        },
+        kubectl::SaOutcome::OtherFailure(msg) => {
+            return Err(format!("unexpected failure patching grid-operator-config: {msg}").into());
+        },
+    }
+    eprintln!("  [PASS] operator cannot patch grid-operator-config (VAP denied)");
+    Ok(())
+}
+
+/// Runtime VAP checks for the `endpointslice-cleanup` policy.
+///
+/// Creates `EndpointSlice` resources and tries to delete them as the operator
+/// `ServiceAccount`, verifying that the policy allows only controller-managed
+/// slices on the operator's own Services and denies everything else.
+fn rbac_vap_endpointslice_checks(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let decoy_slice = serde_json::json!({
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "metadata": {
+            "name": "e2e-vap-decoy",
+            "namespace": "grid-system",
+            "labels": {
+                "kubernetes.io/service-name": "some-other-service",
+                "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io"
+            }
+        },
+        "addressType": "IPv4",
+        "endpoints": []
+    });
+    kubectl::apply_manifest(context, &serde_json::to_string_pretty(&decoy_slice)?)?;
+
+    let decoy_outcome = kubectl::delete_as_operator_sa(context, "grid-system", "endpointslice", "e2e-vap-decoy");
+    kubectl::delete_ignoring_not_found(context, "grid-system", "endpointslice", "e2e-vap-decoy")?;
+    match decoy_outcome? {
+        kubectl::SaOutcome::DeniedByPolicy => {},
+        kubectl::SaOutcome::Allowed => {
+            return Err(
+                "VAP check failed: operator should NOT be able to delete an EndpointSlice \
+                 belonging to an unrelated Service"
+                    .into(),
+            );
+        },
+        kubectl::SaOutcome::OtherFailure(msg) => {
+            return Err(format!("unexpected failure deleting e2e-vap-decoy: {msg}").into());
+        },
+    }
+    eprintln!("  [PASS] operator cannot delete an EndpointSlice of an unrelated Service (VAP denied)");
+
+    let swim_slice = serde_json::json!({
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "metadata": {
+            "name": "e2e-vap-swim-ctrl",
+            "namespace": "grid-system",
+            "labels": {
+                "kubernetes.io/service-name": "grid-operator-swim",
+                "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io"
+            }
+        },
+        "addressType": "IPv4",
+        "endpoints": []
+    });
+    kubectl::apply_manifest(context, &serde_json::to_string_pretty(&swim_slice)?)?;
+
+    let swim_outcome = kubectl::delete_as_operator_sa(context, "grid-system", "endpointslice", "e2e-vap-swim-ctrl");
+    kubectl::delete_ignoring_not_found(context, "grid-system", "endpointslice", "e2e-vap-swim-ctrl")?;
+    match swim_outcome? {
+        kubectl::SaOutcome::Allowed => {},
+        kubectl::SaOutcome::DeniedByPolicy => {
+            return Err(
+                "VAP check failed: operator should be able to delete a controller-managed \
+                 EndpointSlice on its own SWIM Service"
+                    .into(),
+            );
+        },
+        kubectl::SaOutcome::OtherFailure(msg) => {
+            return Err(format!("unexpected failure deleting e2e-vap-swim-ctrl: {msg}").into());
+        },
+    }
+    eprintln!("  [PASS] operator can delete a controller-managed EndpointSlice on its own SWIM Service (VAP allowed)");
+    Ok(())
+}
+
 /// Validate operator install manifests, RBAC, and in-cluster reconcile.
 #[expect(
     clippy::too_many_lines,
@@ -5868,12 +5980,12 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     eprintln!("verify-operator-install-rbac: context={context}");
 
     // Step 1: preflight (CRDs + cleanup).
-    eprintln!("verify-operator-install-rbac: [1/11] preflight, CRDs, cleanup...");
+    eprintln!("verify-operator-install-rbac: [1/13] preflight, CRDs, cleanup...");
     operator::install_grid_crds(&context)?;
     operator::cleanup_install_rbac_test_resources(&context)?;
 
     // Step 2: prepare the selected local or registry-backed operator image.
-    eprintln!("verify-operator-install-rbac: [2/11] preparing operator image...");
+    eprintln!("verify-operator-install-rbac: [2/13] preparing operator image...");
     if image_overrides::should_skip_kind_image_loading() {
         eprintln!(
             "  [OK] using registry-backed operator image {} with pull policy {}",
@@ -5887,26 +5999,30 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     }
 
     // Step 3: apply install manifests.
-    eprintln!("verify-operator-install-rbac: [3/11] applying install manifests...");
+    eprintln!("verify-operator-install-rbac: [3/13] applying install manifests...");
     operator::apply_install_manifests(&context)?;
     operator::override_operator_image_for_kind(&context)?;
     eprintln!("  [OK] install manifests applied");
 
-    // Steps 4-5: RBAC can-i checks (positive + negative).
-    eprintln!("verify-operator-install-rbac: [4/11] positive RBAC checks...");
+    // Steps 4-7: RBAC can-i checks (positive, negative) and VAP runtime checks.
+    eprintln!("verify-operator-install-rbac: [4/13] positive RBAC checks...");
     rbac_can_i_checks(&context)?;
-    eprintln!("verify-operator-install-rbac: [5/11] negative RBAC checks...");
+    eprintln!("verify-operator-install-rbac: [5/13] negative RBAC checks...");
     rbac_negative_checks(&context)?;
+    eprintln!("verify-operator-install-rbac: [6/13] VAP EndpointSlice delete checks...");
+    rbac_vap_endpointslice_checks(&context)?;
+    eprintln!("verify-operator-install-rbac: [7/13] VAP ConfigMap protect checks...");
+    rbac_vap_configmap_checks(&context)?;
 
-    // Step 6: patch Deployment env vars + wait for rollout.
-    eprintln!("verify-operator-install-rbac: [6/11] starting in-cluster operator...");
+    // Step 8: patch Deployment env vars + wait for rollout.
+    eprintln!("verify-operator-install-rbac: [8/13] starting in-cluster operator...");
     let test_site_name = "rbac-test-site";
     operator::patch_operator_deployment_env(&context, test_site_name)?;
     kubectl::wait_for_rollout_ns(&context, "grid-operator", "grid-system", &cluster_name)?;
     eprintln!("  [OK] grid-operator Deployment available");
 
-    // Step 7: apply fixtures with TLS Secret refs.
-    eprintln!("verify-operator-install-rbac: [7/11] applying test fixtures...");
+    // Step 9: apply fixtures with TLS Secret refs.
+    eprintln!("verify-operator-install-rbac: [9/13] applying test fixtures...");
     let network_name = "op-e2e-rbac-net";
     let gw_name = "op-e2e-rbac-gw";
     let provider_name = "op-e2e-rbac-prov";
@@ -5963,8 +6079,8 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     kubectl::apply_manifest(&context, &provider_manifest)?;
     eprintln!("  [OK] InferenceProvider {provider_name} applied");
 
-    // Step 8: wait for in-cluster operator to reconcile.
-    eprintln!("verify-operator-install-rbac: [8/11] waiting for in-cluster reconcile...");
+    // Step 10: wait for in-cluster operator to reconcile.
+    eprintln!("verify-operator-install-rbac: [10/13] waiting for in-cluster reconcile...");
     let snap = operator::wait_for_gridnetwork_status(&context, network_name, operator::SWIM_STATUS_POLL_TIMEOUT)?;
     eprintln!(
         "  [PASS] GridNetwork {network_name} reconciled by in-cluster operator \
@@ -5972,8 +6088,8 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
         snap.phase, snap.connected_sites
     );
 
-    // Step 9: verify actual Secret writes (TLS CA + site cert).
-    eprintln!("verify-operator-install-rbac: [9/11] verifying Secret writes...");
+    // Step 11: verify actual Secret writes (TLS CA + site cert).
+    eprintln!("verify-operator-install-rbac: [11/13] verifying Secret writes...");
     if !kind::kubectl_secret_exists(&context, "default", ca_secret_name)? {
         return Err(format!("Secret {ca_secret_name} not found in default; operator failed to write CA Secret").into());
     }
@@ -5987,8 +6103,8 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     }
     eprintln!("  [PASS] Secret {site_secret_name} exists (site cert written by in-cluster operator)");
 
-    // Step 10: verify overlay ConfigMap write.
-    eprintln!("verify-operator-install-rbac: [10/11] verifying overlay ConfigMap write...");
+    // Step 12: verify overlay ConfigMap write.
+    eprintln!("verify-operator-install-rbac: [12/13] verifying overlay ConfigMap write...");
     match kubectl::get_configmap_yaml(&context, "default", &overlay_cm_name) {
         Ok(_) => {
             eprintln!("  [PASS] ConfigMap {overlay_cm_name} exists (overlay written by in-cluster operator)");
@@ -6001,8 +6117,8 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
         },
     }
 
-    // Step 11: cleanup.
-    eprintln!("verify-operator-install-rbac: [11/11] cleanup...");
+    // Step 13: cleanup.
+    eprintln!("verify-operator-install-rbac: [13/13] cleanup...");
     operator::cleanup_install_rbac_test_resources(&context)?;
     operator::cleanup_install_manifests(&context)?;
 
