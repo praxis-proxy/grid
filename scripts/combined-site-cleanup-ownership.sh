@@ -13,6 +13,8 @@ COMBINED_SITE_OWNED_CLUSTERS=()
 # shellcheck disable=SC2034
 COMBINED_SITE_OWNED_NETWORKS=()
 # shellcheck disable=SC2034
+COMBINED_SITE_OWNED_KIND_TEMP_DIRS=()
+# shellcheck disable=SC2034
 COMBINED_SITE_CLEANUP_RESULT=success
 
 combined_site_inventory_is_valid() {
@@ -52,6 +54,37 @@ combined_site_inventory_contains() {
   grep -Fxq -- "${resource_name}" "${inventory_file}"
 }
 
+# Record only fixed-name Kind temp paths, including symlinks and non-directory
+# entries, so pre-existing paths make the workflow refuse to start.
+combined_site_record_kind_temp_inventory() {
+  local temporary_root="$1"
+  local output_file="$2"
+  [[ "${temporary_root}" == /* && -d "${temporary_root}" && ! -L "${temporary_root}" ]] || return 1
+  [[ ! -e "${output_file}" && ! -L "${output_file}" ]] || return 1
+  : > "${output_file}"
+
+  local cluster temporary_path
+  for cluster in "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}"; do
+    temporary_path="${temporary_root%/}/kind-${cluster}"
+    if [[ -e "${temporary_path}" || -L "${temporary_path}" ]]; then
+      printf '%s\n' "${cluster}" >> "${output_file}"
+    fi
+  done
+}
+
+combined_site_kind_temp_inventory_is_valid() {
+  local inventory_file="$1"
+  combined_site_inventory_is_valid "${inventory_file}" || return 1
+
+  local cluster
+  while IFS= read -r cluster || [[ -n "${cluster}" ]]; do
+    case " ${COMBINED_SITE_EXPECTED_CLUSTERS[*]} " in
+      *" ${cluster} "*) ;;
+      *) return 1 ;;
+    esac
+  done < "${inventory_file}"
+}
+
 # Populate owned-resource arrays only when both inventories and this run's Forge
 # state agree. An uncertain resource is preserved and makes cleanup partial.
 combined_site_cleanup_plan() {
@@ -59,17 +92,22 @@ combined_site_cleanup_plan() {
   local state_file="$2"
   local current_clusters_file="$3"
   local current_networks_file="$4"
+  local current_kind_temps_file="$5"
   local before_clusters_file="${evidence_dir}/kind-clusters-before.txt"
   local before_networks_file="${evidence_dir}/docker-networks-before.txt"
+  local before_kind_temps_file="${evidence_dir}/kind-temporary-paths-before.txt"
 
   COMBINED_SITE_OWNED_CLUSTERS=()
   COMBINED_SITE_OWNED_NETWORKS=()
+  COMBINED_SITE_OWNED_KIND_TEMP_DIRS=()
   COMBINED_SITE_CLEANUP_RESULT=success
 
   if ! combined_site_inventory_is_valid "${before_clusters_file}" \
     || ! combined_site_inventory_is_valid "${before_networks_file}" \
     || ! combined_site_inventory_is_valid "${current_clusters_file}" \
-    || ! combined_site_inventory_is_valid "${current_networks_file}"; then
+    || ! combined_site_inventory_is_valid "${current_networks_file}" \
+    || ! combined_site_kind_temp_inventory_is_valid "${before_kind_temps_file}" \
+    || ! combined_site_kind_temp_inventory_is_valid "${current_kind_temps_file}"; then
     echo "::warning::Combined-site ownership inventory is absent or malformed; preserving fixed-name resources"
     COMBINED_SITE_CLEANUP_RESULT=partial
     return 0
@@ -88,6 +126,12 @@ combined_site_cleanup_plan() {
       echo "::warning::Current combined-site network has no valid run ownership record; preserving it"
       COMBINED_SITE_CLEANUP_RESULT=partial
     fi
+    while IFS= read -r cluster || [[ -n "${cluster}" ]]; do
+      if ! combined_site_inventory_contains "${before_kind_temps_file}" "${cluster}"; then
+        echo "::warning::Current Kind temp path for '${cluster}' has no valid run ownership record; preserving it"
+        COMBINED_SITE_CLEANUP_RESULT=partial
+      fi
+    done < "${current_kind_temps_file}"
     if [[ "${COMBINED_SITE_CLEANUP_RESULT}" == success ]]; then
       echo "::notice::No newly created combined-site resources need cleanup"
     fi
@@ -113,6 +157,17 @@ combined_site_cleanup_plan() {
     fi
   done
 
+  while IFS= read -r cluster || [[ -n "${cluster}" ]]; do
+    if ! combined_site_inventory_contains "${before_kind_temps_file}" "${cluster}"; then
+      if printf '%s\n' "${recorded_clusters[@]}" | grep -Fxq -- "${cluster}"; then
+        COMBINED_SITE_OWNED_KIND_TEMP_DIRS+=("${cluster}")
+      else
+        echo "::warning::Current Kind temp path for '${cluster}' is absent from run Forge state; preserving it"
+        COMBINED_SITE_CLEANUP_RESULT=partial
+      fi
+    fi
+  done < "${current_kind_temps_file}"
+
   if ! combined_site_inventory_contains "${before_networks_file}" "${COMBINED_SITE_EXPECTED_NETWORK}" \
     && combined_site_inventory_contains "${current_networks_file}" "${COMBINED_SITE_EXPECTED_NETWORK}"; then
     if jq -e '.networkCreatedByForge == true' "${state_file}" > /dev/null 2>&1; then
@@ -129,8 +184,10 @@ combined_site_cleanup_plan() {
 # verified by the caller. The root is injectable so tests never touch /tmp.
 combined_site_remove_kind_temporary_files() {
   local temporary_root="$1"
-  shift
+  local current_clusters_file="$2"
+  shift 2
   [[ "${temporary_root}" == /* && -d "${temporary_root}" && ! -L "${temporary_root}" ]] || return 1
+  combined_site_inventory_is_valid "${current_clusters_file}" || return 1
 
   local cluster temporary_dir
   for cluster in "$@"; do
@@ -138,6 +195,10 @@ combined_site_remove_kind_temporary_files() {
       *" ${cluster} "*) ;;
       *) return 1 ;;
     esac
+    if combined_site_inventory_contains "${current_clusters_file}" "${cluster}"; then
+      echo "::warning::Kind cluster '${cluster}' still exists; preserving its temporary files"
+      return 1
+    fi
     temporary_dir="${temporary_root%/}/kind-${cluster}"
     if [[ -L "${temporary_dir}" ]]; then
       return 1

@@ -1287,6 +1287,8 @@ jobs:
 
       - name: Record combined-site cleanup baseline
         if: env.QUALIFICATION == 'combined-site'
+        env:
+          GRID_REPO: ${{ github.workspace }}/grid
         run: |
           set -euo pipefail
           mkdir -p "${EVIDENCE_DIR}"
@@ -1294,10 +1296,17 @@ jobs:
           docker network ls --format '{{.Name}}' > "${EVIDENCE_DIR}/docker-networks-before.txt.tmp"
           mv "${EVIDENCE_DIR}/kind-clusters-before.txt.tmp" "${EVIDENCE_DIR}/kind-clusters-before.txt"
           mv "${EVIDENCE_DIR}/docker-networks-before.txt.tmp" "${EVIDENCE_DIR}/docker-networks-before.txt"
+          source "${GRID_REPO}/scripts/combined-site-cleanup-ownership.sh"
+          combined_site_record_kind_temp_inventory \
+            "/tmp" "${EVIDENCE_DIR}/kind-temporary-paths-before.txt"
 
           for cluster in grid-combined-west grid-combined-central grid-combined-east; do
             if grep -Fxq -- "${cluster}" "${EVIDENCE_DIR}/kind-clusters-before.txt"; then
               echo "::error::Refusing combined-site qualification because fixed-name cluster '${cluster}' already exists on this runner. Preserve it and use a clean runner."
+              exit 1
+            fi
+            if grep -Fxq -- "${cluster}" "${EVIDENCE_DIR}/kind-temporary-paths-before.txt"; then
+              echo "::error::Refusing combined-site qualification because temporary Kind path for '${cluster}' already exists on this runner. Preserve it and use a clean runner."
               exit 1
             fi
           done
@@ -1807,7 +1816,6 @@ jobs:
           STATE_FILE="${GRID_REPO}/.forge/state.json"
           OWNED_CLUSTERS=()
           OWNED_NETWORKS=()
-          CLEANED_CLUSTERS=()
           COMBINED_SITE_HELPER_LOADED=false
           NETWORK_OWNER=""
           RUN_PREFIX=""
@@ -1910,6 +1918,7 @@ jobs:
               resolve_run_forge_state "grid-combined-site"
               COMBINED_CURRENT_CLUSTERS="${EVIDENCE_DIR}/kind-clusters-at-cleanup.txt"
               COMBINED_CURRENT_NETWORKS="${EVIDENCE_DIR}/docker-networks-at-cleanup.txt"
+              COMBINED_CURRENT_KIND_TEMPS="${EVIDENCE_DIR}/kind-temporary-paths-at-cleanup.txt"
               mkdir -p "${EVIDENCE_DIR}"
               if ! kind get clusters > "${COMBINED_CURRENT_CLUSTERS}"; then
                 rm -f -- "${COMBINED_CURRENT_CLUSTERS}"
@@ -1921,9 +1930,15 @@ jobs:
                 echo "::warning::Unable to capture current Docker network inventory; preserving combined-site resources"
                 CLEANUP_RESULT="partial"
               fi
+              if ! combined_site_record_kind_temp_inventory "/tmp" "${COMBINED_CURRENT_KIND_TEMPS}"; then
+                rm -f -- "${COMBINED_CURRENT_KIND_TEMPS}"
+                echo "::warning::Unable to capture current Kind temporary paths; preserving them"
+                CLEANUP_RESULT="partial"
+              fi
               if [[ "${COMBINED_SITE_HELPER_LOADED}" == true ]]; then
                 combined_site_cleanup_plan "${EVIDENCE_DIR}" "${STATE_FILE}" \
-                  "${COMBINED_CURRENT_CLUSTERS}" "${COMBINED_CURRENT_NETWORKS}"
+                  "${COMBINED_CURRENT_CLUSTERS}" "${COMBINED_CURRENT_NETWORKS}" \
+                  "${COMBINED_CURRENT_KIND_TEMPS}"
                 OWNED_CLUSTERS=("${COMBINED_SITE_OWNED_CLUSTERS[@]}")
                 OWNED_NETWORKS=("${COMBINED_SITE_OWNED_NETWORKS[@]}")
                 if [[ "${COMBINED_SITE_CLEANUP_RESULT}" != "success" ]]; then
@@ -2172,8 +2187,16 @@ jobs:
 
           if [[ "${QUALIFICATION}" == "combined-site" ]]; then
             if [[ "${COMBINED_SITE_HELPER_LOADED}" == true ]]; then
-              if ! combined_site_remove_kind_temporary_files "/tmp" "${CLEANED_CLUSTERS[@]}"; then
-                echo "::warning::Unable to remove temporary Kind files for verified deleted combined-site clusters"
+              REMAINING_KIND_CLUSTERS="${EVIDENCE_DIR}/kind-clusters-after-delete.txt"
+              if ! kind get clusters > "${REMAINING_KIND_CLUSTERS}"; then
+                rm -f -- "${REMAINING_KIND_CLUSTERS}"
+                echo "::warning::Unable to verify cluster removal; preserving combined-site Kind temporary files"
+                if [[ -s "${EVIDENCE_DIR}/kind-temporary-paths-at-cleanup.txt" ]]; then
+                  CLEANUP_RESULT="partial"
+                fi
+              elif ! combined_site_remove_kind_temporary_files "/tmp" "${REMAINING_KIND_CLUSTERS}" \
+                "${COMBINED_SITE_OWNED_KIND_TEMP_DIRS[@]}"; then
+                echo "::warning::Unable to safely remove temporary Kind files for verified run-owned clusters"
                 CLEANUP_RESULT="partial"
               fi
             fi

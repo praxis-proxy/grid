@@ -34,8 +34,10 @@ new_case() {
   mkdir -p "${CASE_DIR}"
   : > "${CASE_DIR}/kind-clusters-before.txt"
   : > "${CASE_DIR}/docker-networks-before.txt"
+  : > "${CASE_DIR}/kind-temporary-paths-before.txt"
   : > "${CASE_DIR}/kind-clusters-now.txt"
   : > "${CASE_DIR}/docker-networks-now.txt"
+  : > "${CASE_DIR}/kind-temporary-paths-now.txt"
   STATE_FILE="${CASE_DIR}/state.json"
 }
 
@@ -52,13 +54,33 @@ EOF
 
 # Fresh baseline: only resources recorded by this run are eligible for cleanup.
 new_case no-preexisting
+TEMP_ROOT="${CASE_DIR}/kind-temp"
+mkdir -p "${TEMP_ROOT}"
+rm "${CASE_DIR}/kind-temporary-paths-before.txt"
+combined_site_record_kind_temp_inventory "${TEMP_ROOT}" "${CASE_DIR}/kind-temporary-paths-before.txt"
 printf '%s\n' "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}" > "${CASE_DIR}/kind-clusters-now.txt"
 printf '%s\n' "${COMBINED_SITE_EXPECTED_NETWORK}" > "${CASE_DIR}/docker-networks-now.txt"
+for cluster in "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}"; do
+  mkdir -p "${TEMP_ROOT}/kind-${cluster}"
+done
+rm "${CASE_DIR}/kind-temporary-paths-now.txt"
+combined_site_record_kind_temp_inventory "${TEMP_ROOT}" "${CASE_DIR}/kind-temporary-paths-now.txt"
 write_full_state true
 combined_site_cleanup_plan "${CASE_DIR}" "${STATE_FILE}" \
-  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt"
+  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt" \
+  "${CASE_DIR}/kind-temporary-paths-now.txt"
 assert_plan success $'grid-combined-west\ngrid-combined-central\ngrid-combined-east' \
   "${COMBINED_SITE_EXPECTED_NETWORK}"
+[[ "$(printf '%s\n' "${COMBINED_SITE_OWNED_KIND_TEMP_DIRS[@]}")" == \
+  $'grid-combined-west\ngrid-combined-central\ngrid-combined-east' ]] || fail \
+  "current-run temporary paths should require matching Forge state"
+: > "${CASE_DIR}/kind-clusters-after-delete.txt"
+combined_site_remove_kind_temporary_files "${TEMP_ROOT}" \
+  "${CASE_DIR}/kind-clusters-after-delete.txt" "${COMBINED_SITE_OWNED_KIND_TEMP_DIRS[@]}"
+for cluster in "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}"; do
+  [[ ! -e "${TEMP_ROOT}/kind-${cluster}" ]] || fail \
+    "temporary files should be removed only after the run-owned cluster is absent"
+done
 
 # A prior fixed-name cluster and network are preserved, while verified new
 # resources from this run remain eligible for cleanup.
@@ -69,7 +91,8 @@ printf '%s\n' "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}" > "${CASE_DIR}/kind-cluste
 printf '%s\n' "${COMBINED_SITE_EXPECTED_NETWORK}" > "${CASE_DIR}/docker-networks-now.txt"
 write_full_state true
 combined_site_cleanup_plan "${CASE_DIR}" "${STATE_FILE}" \
-  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt"
+  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt" \
+  "${CASE_DIR}/kind-temporary-paths-now.txt"
 assert_plan success $'grid-combined-central\ngrid-combined-east' ""
 
 # Cluster ownership is independent of network ownership. Preserve an uncertain
@@ -77,9 +100,11 @@ assert_plan success $'grid-combined-central\ngrid-combined-east' ""
 new_case uncertain-network-ownership
 printf '%s\n' "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}" > "${CASE_DIR}/kind-clusters-now.txt"
 printf '%s\n' "${COMBINED_SITE_EXPECTED_NETWORK}" > "${CASE_DIR}/docker-networks-now.txt"
+printf '%s\n' "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}" > "${CASE_DIR}/kind-temporary-paths-now.txt"
 write_full_state false
 combined_site_cleanup_plan "${CASE_DIR}" "${STATE_FILE}" \
-  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt"
+  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt" \
+  "${CASE_DIR}/kind-temporary-paths-now.txt"
 assert_plan partial $'grid-combined-west\ngrid-combined-central\ngrid-combined-east' ""
 
 # Missing and malformed inventories fail closed; the currently present
@@ -90,7 +115,8 @@ printf '%s\n' "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}" > "${CASE_DIR}/kind-cluste
 printf '%s\n' "${COMBINED_SITE_EXPECTED_NETWORK}" > "${CASE_DIR}/docker-networks-now.txt"
 write_full_state true
 combined_site_cleanup_plan "${CASE_DIR}" "${STATE_FILE}" \
-  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt"
+  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt" \
+  "${CASE_DIR}/kind-temporary-paths-now.txt"
 assert_plan partial "" ""
 
 new_case malformed-inventory
@@ -98,14 +124,26 @@ printf '%s\n' grid-combined-west grid-combined-west > "${CASE_DIR}/kind-clusters
 printf '%s\n' "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}" > "${CASE_DIR}/kind-clusters-now.txt"
 write_full_state true
 combined_site_cleanup_plan "${CASE_DIR}" "${STATE_FILE}" \
-  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt"
+  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt" \
+  "${CASE_DIR}/kind-temporary-paths-now.txt"
 assert_plan partial "" ""
+
+new_case malformed-temp-inventory
+printf '%s\n' grid-combined-west grid-combined-west > "${CASE_DIR}/kind-temporary-paths-before.txt"
+printf '%s\n' grid-combined-west > "${CASE_DIR}/kind-temporary-paths-now.txt"
+combined_site_cleanup_plan "${CASE_DIR}" "" \
+  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt" \
+  "${CASE_DIR}/kind-temporary-paths-now.txt"
+assert_plan partial "" ""
+[[ -z "${COMBINED_SITE_OWNED_KIND_TEMP_DIRS[*]}" ]] || fail \
+  "malformed temp inventory must not authorize deletion"
 
 new_case malformed-state
 printf '%s\n' "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}" > "${CASE_DIR}/kind-clusters-now.txt"
 printf '%s\n' '{broken json' > "${STATE_FILE}"
 combined_site_cleanup_plan "${CASE_DIR}" "${STATE_FILE}" \
-  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt"
+  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt" \
+  "${CASE_DIR}/kind-temporary-paths-now.txt"
 assert_plan partial "" ""
 
 # Failure before the qualification begins has no state. Known pre-existing
@@ -116,34 +154,65 @@ printf '%s\n' "${COMBINED_SITE_EXPECTED_NETWORK}" > "${CASE_DIR}/docker-networks
 printf '%s\n' grid-combined-west > "${CASE_DIR}/kind-clusters-now.txt"
 printf '%s\n' "${COMBINED_SITE_EXPECTED_NETWORK}" > "${CASE_DIR}/docker-networks-now.txt"
 combined_site_cleanup_plan "${CASE_DIR}" "" \
-  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt"
+  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt" \
+  "${CASE_DIR}/kind-temporary-paths-now.txt"
 assert_plan success "" ""
 
 new_case before-qualification-uncertain
 printf '%s\n' grid-combined-west > "${CASE_DIR}/kind-clusters-now.txt"
+printf '%s\n' grid-combined-west > "${CASE_DIR}/kind-temporary-paths-now.txt"
 combined_site_cleanup_plan "${CASE_DIR}" "" \
-  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt"
+  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt" \
+  "${CASE_DIR}/kind-temporary-paths-now.txt"
 assert_plan partial "" ""
+
+# A stale temporary path is pre-existing even if its Kind cluster is gone.
+new_case preexisting-temp-path
+TEMP_ROOT="${CASE_DIR}/kind-temp"
+mkdir -p "${TEMP_ROOT}/kind-grid-combined-west"
+rm "${CASE_DIR}/kind-temporary-paths-before.txt"
+combined_site_record_kind_temp_inventory "${TEMP_ROOT}" "${CASE_DIR}/kind-temporary-paths-before.txt"
+rm "${CASE_DIR}/kind-temporary-paths-now.txt"
+combined_site_record_kind_temp_inventory "${TEMP_ROOT}" "${CASE_DIR}/kind-temporary-paths-now.txt"
+combined_site_cleanup_plan "${CASE_DIR}" "" \
+  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt" \
+  "${CASE_DIR}/kind-temporary-paths-now.txt"
+assert_plan success "" ""
+[[ -d "${TEMP_ROOT}/kind-grid-combined-west" ]] || fail \
+  "a pre-existing temporary path must remain untouched"
+[[ -z "${COMBINED_SITE_OWNED_KIND_TEMP_DIRS[*]}" ]] || fail \
+  "a pre-existing temporary path must not become run-owned"
 
 # If this run created resources and then failed, its unique Forge state and the
 # empty pre-run inventory still authorize cleanup after diagnostics are saved.
 new_case failed-after-create
+TEMP_ROOT="${CASE_DIR}/kind-temp"
+mkdir -p "${TEMP_ROOT}"
 printf '%s\n' "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}" > "${CASE_DIR}/kind-clusters-now.txt"
 printf '%s\n' "${COMBINED_SITE_EXPECTED_NETWORK}" > "${CASE_DIR}/docker-networks-now.txt"
+for cluster in "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}"; do
+  mkdir -p "${TEMP_ROOT}/kind-${cluster}"
+done
+rm "${CASE_DIR}/kind-temporary-paths-now.txt"
+combined_site_record_kind_temp_inventory "${TEMP_ROOT}" "${CASE_DIR}/kind-temporary-paths-now.txt"
 write_full_state true
 combined_site_cleanup_plan "${CASE_DIR}" "${STATE_FILE}" \
-  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt"
+  "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt" \
+  "${CASE_DIR}/kind-temporary-paths-now.txt"
 assert_plan success $'grid-combined-west\ngrid-combined-central\ngrid-combined-east' \
   "${COMBINED_SITE_EXPECTED_NETWORK}"
+[[ "$(printf '%s\n' "${COMBINED_SITE_OWNED_KIND_TEMP_DIRS[@]}")" == \
+  $'grid-combined-west\ngrid-combined-central\ngrid-combined-east' ]] || fail \
+  "failure-after-create cleanup must require run-owned temp paths"
 
-# Temporary Kind files follow the verified deleted-cluster list, not the
-# topology's fixed names. The pre-existing west fixture remains untouched.
-TEMP_ROOT="${ROOT}/kind-temp"
-mkdir -p "${TEMP_ROOT}/kind-grid-combined-west" "${TEMP_ROOT}/kind-grid-combined-central"
-combined_site_remove_kind_temporary_files "${TEMP_ROOT}" grid-combined-central
-[[ -d "${TEMP_ROOT}/kind-grid-combined-west" ]] || fail \
-  "pre-existing cluster temporary files must be preserved"
-[[ ! -e "${TEMP_ROOT}/kind-grid-combined-central" ]] || fail \
-  "temporary files for a verified deleted cluster must be removed"
+# A cluster still present after cleanup blocks removal of its temporary path.
+mkdir -p "${TEMP_ROOT}/kind-grid-combined-central"
+printf '%s\n' grid-combined-central > "${CASE_DIR}/kind-clusters-still-present.txt"
+if combined_site_remove_kind_temporary_files "${TEMP_ROOT}" \
+  "${CASE_DIR}/kind-clusters-still-present.txt" grid-combined-central; then
+  fail "temporary files must not be removed while the Kind cluster still exists"
+fi
+[[ -d "${TEMP_ROOT}/kind-grid-combined-central" ]] || fail \
+  "temporary files must remain while their cluster is present"
 
 printf 'PASS: combined-site cleanup ownership cases\n'
