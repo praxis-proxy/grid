@@ -760,7 +760,9 @@ fn connected_verdict<'step>(
         "TlsVerified" | "AdvertisedCertMismatch" => {
             return ((ConditionStatus::True, CONNECTED.to_owned(), String::new()), None);
         },
-        "GatewayAddressKnown" => (ConditionStatus::Unknown, "AwaitingFirstCheck", probing),
+        // EndpointsDeclared is Local membership's GatewayAddressKnown: the endpoints are
+        // known and the first probe has not run, which is Unknown rather than a refusal.
+        "GatewayAddressKnown" | "EndpointsDeclared" => (ConditionStatus::Unknown, "AwaitingFirstCheck", probing),
         // The probe on the edited address failed to connect, and the next probe retries it.
         "SpecUnverified" => (ConditionStatus::False, "Unreachable", probing),
         "GatewayAddressMissing" => (ConditionStatus::False, "AddressMissing", None),
@@ -840,9 +842,12 @@ fn conditions_patch(conditions: &[crate::crd::inference_provider::Condition]) ->
 fn event_type_for_reason(reason: &str) -> EventType {
     match reason {
         // AdvertisedCertMismatch is a success path, so Warning would be false alarm.
-        "TlsVerified" | "AwaitingDiscovery" | "GatewayAddressKnown" | "Left" | "AdvertisedCertMismatch" => {
-            EventType::Normal
-        },
+        "TlsVerified"
+        | "AwaitingDiscovery"
+        | "GatewayAddressKnown"
+        | "EndpointsDeclared"
+        | "Left"
+        | "AdvertisedCertMismatch" => EventType::Normal,
         _ => EventType::Warning,
     }
 }
@@ -1050,6 +1055,8 @@ mod tests {
     fn probing_moves_without_a_person() {
         let awaiting = connected_for("GatewayAddressKnown");
         assert_eq!(awaiting, ("Unknown", "AwaitingFirstCheck".to_owned(), Some("Probing")));
+        // Local membership's own first-check reason, or a declared site reads Connected False.
+        assert_eq!(connected_for("EndpointsDeclared"), awaiting);
         assert_eq!(
             connected_for("SpecUnverified"),
             ("False", "Unreachable".to_owned(), Some("Probing"))
@@ -2094,6 +2101,11 @@ mod tests {
             event_type_for_reason("GatewayAddressKnown"),
             EventType::Normal
         ));
+    }
+
+    #[test]
+    fn event_type_endpoints_declared_is_normal() {
+        assert!(matches!(event_type_for_reason("EndpointsDeclared"), EventType::Normal));
     }
 
     #[test]

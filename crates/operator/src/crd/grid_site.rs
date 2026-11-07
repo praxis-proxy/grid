@@ -796,6 +796,9 @@ mod tests {
             .and_then(serde_json::Value::as_array)
             .cloned()
             .unwrap_or_default();
-        assert!(!required.iter().any(|field| field == "signalsEndpoint"));
+        assert!(
+            !required.iter().any(|field| field == "signalsEndpoint"),
+            "a site that derives its endpoint from its gateway declares none"
+        );
     }
 }

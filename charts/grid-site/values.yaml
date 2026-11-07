@@ -60,7 +60,7 @@ gridSite:
 # verifying serverName, which must be <name>.grid.internal, the default. The peer's signals are polled at
 # the same host, under server name <name>-signals.grid.internal, so each site puts its
 # gateway and signals behind one router or one load balancer, unless signalsEndpoint
-# says otherwise: address (host:port), serverName and port, each optional.
+# says otherwise: address (host:port) and serverName, each optional.
 # digest pins the peer's leaf. To rotate, set nextDigest to the new digest, then move
 # it to digest once the peer is Active.
 peers: {}
