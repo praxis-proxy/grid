@@ -134,21 +134,15 @@ modes above. The GLB `--no-ingress` variant is also omitted because the
 Triggered Integration Test does not expose that topology selector.
 
 The quick-mode qualifications have daily scheduled workflows. The Triggered
-Integration Test also runs `combined-site` in full mode each day at 19:00
-`America/New_York`, using the standard operator image. Its direct `glb-quick`
-schedule remains at 18:00 `America/New_York`. The separate quick-mode starts
-are UTC and spaced one hour apart.
+Integration Test also runs `combined-site` in full mode each day at 19:00 UTC,
+using the standard operator image. Its direct `glb-quick` schedule runs at
+18:00 UTC. The separate quick-mode starts are spaced one hour apart.
 
 | Scheduled workflow | Release qualification | Daily UTC start |
 |---|---|---:|
 | `Scheduled GLB Quick Qualification` | `glb-quick` | 00:00 |
 | `Scheduled Static-Weighted Qualification` | `static-weighted` | 01:00 |
 | `Scheduled llm-d Pool-Metrics Quick Qualification` | `llmd-pool-metrics-quick` | 02:00 |
-
-The Triggered Integration Test's `combined-site` schedule runs at 23:00 UTC
-during New York daylight time and 00:00 UTC during standard time. Its direct
-`glb-quick` schedule runs at 22:00 UTC during daylight time and 23:00 UTC during
-standard time.
 
 The manual and reusable workflow also accept `operator_image_mode` (`standard`
 or `fips`). It defaults to `standard`, and scheduled runs use `standard`. The

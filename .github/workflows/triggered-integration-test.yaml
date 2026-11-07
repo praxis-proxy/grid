@@ -69,10 +69,8 @@ on:
   schedule:
     # Nightly GLB quick qualification.
     - cron: "0 18 * * *"
-      timezone: America/New_York
     # Nightly combined-site qualification (mapped to full mode below).
     - cron: "0 19 * * *"
-      timezone: America/New_York
 
 concurrency:
   group: grid-triggered-integration-${{ github.workflow }}-${{ inputs.release_qualification || 'scheduled' }}-${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.branch != '' && format('branch-{0}', inputs.branch) || 'main' }}-${{ github.event_name }}-${{ github.event_name == 'schedule' && github.event.schedule || '' }}
