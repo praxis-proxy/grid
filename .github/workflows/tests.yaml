@@ -59,6 +59,72 @@ jobs:
           fi
 
   # ----------------------------------------------------------------------------
+  # Extra lint (typos + taplo + shellcheck + actionlint)
+  #
+  # Not gated on runtime changes: these cover prose, TOML and workflows, so a
+  # documentation-only pull request can still break them. Tools are pinned and
+  # checksum-verified rather than installed from a registry, so the check does
+  # not follow upstream releases.
+  # ----------------------------------------------------------------------------
+
+  lint-extra:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install typos
+        env:
+          TYPOS_VERSION: v1.51.1
+          TYPOS_SHA256: 93c301fd4120ff076e2cc2a6d6a61cab4a4bdb81899287c0938b452e56d1f454
+        run: |
+          curl -fsSL -o /tmp/typos.tar.gz \
+            "https://github.com/crate-ci/typos/releases/download/${TYPOS_VERSION}/typos-${TYPOS_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          echo "${TYPOS_SHA256}  /tmp/typos.tar.gz" | sha256sum -c
+          tar -xzf /tmp/typos.tar.gz -C /tmp ./typos
+          sudo install -m 0755 /tmp/typos /usr/local/bin/typos
+
+      - name: Install taplo
+        env:
+          TAPLO_VERSION: 0.10.0
+          TAPLO_SHA256: 8fe196b894ccf9072f98d4e1013a180306e17d244830b03986ee5e8eabeb6156
+        run: |
+          curl -fsSL -o /tmp/taplo.gz \
+            "https://github.com/tamasfe/taplo/releases/download/${TAPLO_VERSION}/taplo-linux-x86_64.gz"
+          echo "${TAPLO_SHA256}  /tmp/taplo.gz" | sha256sum -c
+          gunzip -c /tmp/taplo.gz > /tmp/taplo
+          sudo install -m 0755 /tmp/taplo /usr/local/bin/taplo
+
+      - name: Install shellcheck
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+        run: |
+          curl -fsSL -o /tmp/shellcheck.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  /tmp/shellcheck.tar.xz" | sha256sum -c
+          tar -xJf /tmp/shellcheck.tar.xz -C /tmp "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
+          sudo install -m 0755 "/tmp/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          curl -fsSL -o /tmp/actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tar.gz" | sha256sum -c
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          sudo install -m 0755 /tmp/actionlint /usr/local/bin/actionlint
+
+      - name: Extra lint
+        run: make lint-extra
+
+  # ----------------------------------------------------------------------------
   # Lint (fmt + clippy + machete)
   # ----------------------------------------------------------------------------
 

@@ -4182,7 +4182,7 @@ struct ServingTarget<'target> {
     bootstrap: bool,
 }
 
-/// Fold one serving write into the soonest retry, requeueing a failed one.
+/// Fold one serving write into the soonest retry, requeuing a failed one.
 fn fold_serving_write(
     retry: &mut Option<Duration>,
     written: Result<Option<Duration>, OperatorError>,
