@@ -226,7 +226,7 @@ jobs:
         run: cargo build --locked --manifest-path crates/gateway/Cargo.toml --workspace --release
 
   # ----------------------------------------------------------------------------
-  # FIPS build (operator + overlay-sync under system OpenSSL)
+  # FIPS build (operator, overlay-sync, and gateway under system OpenSSL)
   # ----------------------------------------------------------------------------
 
   fips:
@@ -245,7 +245,7 @@ jobs:
       - name: Install system OpenSSL headers
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+          sudo apt-get install -y --no-install-recommends binutils libssl-dev pkg-config
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
@@ -272,6 +272,36 @@ jobs:
           cargo clippy -p swim --no-default-features --features fips --all-targets -- -D warnings
           cargo clippy --manifest-path crates/operator/Cargo.toml --no-default-features --features fips --lib --bins --test fips_startup -- -D warnings
           cargo clippy --manifest-path crates/overlay-sync/Cargo.toml --no-default-features --features fips --bins --test fips_startup -- -D warnings
+          cargo clippy --locked --manifest-path crates/gateway/Cargo.toml -p gateway --no-default-features --features fips --all-targets -- -D warnings
+
+      - name: Build gateway (fips)
+        run: cargo build --locked --manifest-path crates/gateway/Cargo.toml -p gateway --no-default-features --features fips
+
+      - name: Build release gateway (fips)
+        run: cargo build --locked --manifest-path crates/gateway/Cargo.toml -p gateway --no-default-features --features fips --release
+
+      - name: Verify release gateway binary rejects AWS-LC and links system OpenSSL
+        env:
+          GATEWAY_BINARY: crates/gateway/target/release/grid-gateway
+        run: |
+          set -euo pipefail
+          known_bad="${RUNNER_TEMP}/grid-gateway-known-bad"
+          cp "${GATEWAY_BINARY}" "${known_bad}"
+          printf '\naws_lc_known_bad AWS-LC\n' >> "${known_bad}"
+
+          set +e
+          check_output="$(scripts/check-fips-gateway-binary.sh "${known_bad}" 2>&1)"
+          check_status=$?
+          set -e
+
+          if [[ "${check_status}" -eq 0 ]] || ! grep -Fq 'contains forbidden AWS-LC marker' <<<"${check_output}"; then
+            echo "::error::FIPS binary check did not reject the known-bad control for its AWS-LC marker"
+            printf '%s\n' "${check_output}"
+            exit 1
+          fi
+
+          echo "FIPS binary check rejected the known-bad AWS-LC control"
+          scripts/check-fips-gateway-binary.sh "${GATEWAY_BINARY}"
 
       - name: Unit tests (fips)
         run: |
@@ -282,6 +312,7 @@ jobs:
           cargo test -p swim --no-default-features --features fips
           cargo test --manifest-path crates/operator/Cargo.toml --no-default-features --features fips
           cargo test --manifest-path crates/overlay-sync/Cargo.toml --no-default-features --features fips
+          cargo test --locked --manifest-path crates/gateway/Cargo.toml -p gateway --no-default-features --features fips
 
       # fips must exclude rustls: TLS routes through system OpenSSL. ring and
       # the RustCrypto AEAD/hashing crates stay out of swim's fips build (asserted
@@ -389,7 +420,7 @@ jobs:
               exit 1
             fi
           done
-          for m in crates/operator/Cargo.toml crates/overlay-sync/Cargo.toml; do
+          for m in crates/operator/Cargo.toml crates/overlay-sync/Cargo.toml crates/gateway/Cargo.toml; do
             if cargo tree --manifest-path "$m" --no-default-features --features fips -e no-dev 2>/dev/null | grep -q 'openssl-src'; then
               echo "fips build of $m unexpectedly vendors openssl (openssl-src)"
               exit 1
