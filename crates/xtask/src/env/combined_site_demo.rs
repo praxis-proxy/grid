@@ -3374,7 +3374,7 @@ fn operator_pod_snapshot(context: &str) -> Result<Vec<serde_json::Value>, Box<dy
             "-n",
             "grid-system",
             "-l",
-            "app.kubernetes.io/name=grid-operator",
+            "app.kubernetes.io/name=grid-operator,app.kubernetes.io/instance=grid-operator",
             "-o",
             "json",
         ])
@@ -3522,10 +3522,19 @@ fn operator_has_new_ready_pod(before: &[serde_json::Value], after: &[serde_json:
     })
 }
 
-/// Require all pod UIDs present before restart to be absent from the current pod list.
+/// Ignore completed pods because rollout restart does not remove them.
+fn operator_pod_is_terminal(pod: &serde_json::Value) -> bool {
+    matches!(
+        pod.get("phase").and_then(serde_json::Value::as_str),
+        Some("Succeeded" | "Failed")
+    )
+}
+
+/// Require all pre-restart nonterminal pod UIDs to disappear, including terminating pods.
 fn operator_old_pods_terminated(before: &[serde_json::Value], after: &[serde_json::Value]) -> bool {
-    !before.is_empty()
-        && before.iter().all(|previous| {
+    let mut live = before.iter().filter(|pod| !operator_pod_is_terminal(pod)).peekable();
+    live.peek().is_some()
+        && live.all(|previous| {
             operator_pod_uid(previous).is_some_and(|uid| after.iter().all(|pod| operator_pod_uid(pod) != Some(uid)))
         })
 }
@@ -8829,6 +8838,35 @@ mod tests {
             !operator_restart_state_converged(&before, &deployment, &after),
             "restart convergence must wait until every pre-restart Pod disappears"
         );
+    }
+
+    #[test]
+    fn restart_recovery_ignores_retained_terminal_pods() {
+        for phase in ["Failed", "Succeeded"] {
+            let terminal = serde_json::json!({"uid": "terminal-uid", "phase": phase, "ready": false});
+            let terminal_only = vec![terminal.clone()];
+            let before = vec![
+                terminal.clone(),
+                serde_json::json!({"uid": "old-uid", "phase": "Running", "ready": true}),
+            ];
+            let after = vec![
+                terminal,
+                serde_json::json!({"uid": "new-uid", "phase": "Running", "ready": true}),
+            ];
+            let deployment = serde_json::json!({
+                "metadata": {"generation": 4}, "spec": {"replicas": 1},
+                "status": {"observedGeneration": 4, "updatedReplicas": 1, "readyReplicas": 1, "availableReplicas": 1}
+            });
+
+            assert!(
+                operator_restart_state_converged(&before, &deployment, &after),
+                "a retained {phase} pod must not block convergence after the live old pod disappears"
+            );
+            assert!(
+                !operator_old_pods_terminated(&terminal_only, &after),
+                "terminal-only history must not prove replacement of a live operator pod"
+            );
+        }
     }
 
     #[test]
