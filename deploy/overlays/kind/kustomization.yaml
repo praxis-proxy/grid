@@ -24,9 +24,13 @@ resources:
   - service-swim.yaml
   - serviceaccount-metrics-scraper.yaml
   - serviceaccount.yaml
+  - validatingadmissionpolicy-endpointslice-cleanup.yaml
+  - validatingadmissionpolicy-protect-config.yaml
+  - validatingadmissionpolicybinding-endpointslice-cleanup.yaml
+  - validatingadmissionpolicybinding-protect-config.yaml
 
 labels:
   - pairs:
       app.kubernetes.io/name: grid-operator
       app.kubernetes.io/managed-by: kustomize
-      app.kubernetes.io/version: "v0.3.0-rc.3"
+      app.kubernetes.io/version: "v0.3.0"

@@ -61,7 +61,11 @@ use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use kube::{
     Api, Client,
     api::{ObjectMeta, Patch, PatchParams, PostParams},
-    runtime::{controller::Controller, watcher},
+    runtime::{WatchStreamExt as _, reflector, watcher},
+};
+use kube_runtime::{
+    Controller,
+    controller::{applier, trigger_self},
 };
 use operator::{
     cli::{Cli, Membership},
@@ -98,11 +102,17 @@ use operator::{
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    let mut config = Cli::parse();
+    #[cfg(feature = "fips")]
+    if let Err(error) = grid_fips::verify() {
+        tracing::error!(%error, "refusing to start the FIPS operator");
+        std::process::exit(1);
+    }
+
     // Install the process-wide crypto provider the TLS stack requires, once,
     // up front, before any reconciler builds a client.
     operator::init_process_crypto();
 
-    let mut config = Cli::parse();
     version::get().log_startup("grid-operator");
     // A Local install names its site without the SWIM prefix; either name serves.
     if let Some(site_name) = config.grid.site_name.take() {
@@ -314,6 +324,7 @@ async fn main() {
             .with_membership(config.grid.membership)
             .with_membership_fallback(install_modes.membership)
             .with_scrape_interval(config.signals.scrape_interval())
+            .with_site_signals_ttl(config.signals.site_ttl())
             .hold_membership(),
     );
     // This site's providers first, then what its peers publish, on /metrics.
@@ -334,6 +345,7 @@ async fn main() {
     let writer_site_name = ctx.site_name().map(str::to_owned);
     // Every mode scrapes for readiness; only Poll mode publishes what it scrapes.
     let writer_scrape_interval = config.signals.scrape_interval();
+    let writer_discovery = model_discovery_config(&config.model_discovery);
     let (gateway_address_tx, gateway_address_rx) =
         tokio::sync::watch::channel(gateway::configured_address(&config.gateway));
     let (swim_handle_tx, swim_handle_rx) = tokio::sync::watch::channel(None);
@@ -357,7 +369,8 @@ async fn main() {
             run_provider_controller(writer_client.clone(), writer_site_name),
             run_agent_tool_provider_controller(writer_client.clone()),
             run_local_scraper(writer_scrape_interval, Arc::clone(&writer_ctx), writer_client.clone()),
-            run_model_discovery(writer_ctx, writer_client),
+            run_model_discovery(writer_discovery, writer_ctx, writer_client.clone()),
+            run_grid_network_rollup_watch(writer_client.clone()),
         )
         .map(|_joined| ())
     };
@@ -926,6 +939,7 @@ async fn maybe_start_swim(
         } else {
             swim_runtime::Departed::Evict
         },
+        dead_member_ttl: cli.swim.dead_member_ttl(),
     };
     match swim_runtime::start(cfg).await {
         Ok(handle) => {
@@ -1803,11 +1817,48 @@ async fn create_local_records(
 // Controller Setup
 // ---------------------------------------------------------------------------
 
+/// Boxed `GridNetwork` watch after filtering status-only and lifecycle-irrelevant updates.
+type GridNetworkWatch = std::pin::Pin<Box<dyn futures::Stream<Item = Result<GridNetwork, watcher::Error>> + Send>>;
+
+/// Boxed watch that refreshes only the network's gateway-age roll-up.
+type GridNetworkRollupWatch = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Keep the primary watch construction out of the controller's async stack frame.
+fn filtered_grid_network_watch(api: Api<GridNetwork>) -> (reflector::Store<GridNetwork>, GridNetworkWatch) {
+    let (reader, primary) =
+        operator::network_watch::routing_watch(watcher(api, watcher::Config::default()).default_backoff());
+    (reader, Box::pin(primary))
+}
+
+/// Watch `GatewayAgesRejected` transitions without routing unrelated status updates.
+fn filtered_grid_network_rollup_watch(client: Client) -> GridNetworkRollupWatch {
+    let api = Api::<GridNetwork>::all(client.clone());
+    Box::pin(
+        operator::network_watch::rollup_updates(watcher(api, watcher::Config::default()).default_backoff()).for_each(
+            move |result| {
+                let client = client.clone();
+                async move {
+                    match result {
+                        Ok(network) => grid_network::apply_rollup(&client, &network).await,
+                        Err(error) => tracing::warn!(%error, "GridNetwork roll-up watch failed"),
+                    }
+                }
+            },
+        ),
+    )
+}
+
+/// Run the status-only `GridNetwork` roll-up watch as a state writer.
+async fn run_grid_network_rollup_watch(client: Client) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    filtered_grid_network_rollup_watch(client).await;
+    Ok(())
+}
+
 /// Run the [`GridNetwork`] controller.
 ///
 /// In addition to watching `GridNetwork` resources, this controller watches
-/// `InferenceProvider`, `GridSite`, and `Secret` resources.  Secret changes
-/// trigger reconciliation of affected `GridNetwork`s when providers change.
+/// `InferenceProvider`, `AgentToolProvider`, and `GridSite` resources. Their changes
+/// trigger reconciliation of affected `GridNetwork`s.
 ///
 /// Metrics TLS rotation is detected by bounded requeue rather than a
 /// cluster-wide Secret watch; the operator only reads referenced
@@ -1818,42 +1869,47 @@ async fn run_network_controller(
     swim: SwimStartup,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api = Api::<GridNetwork>::all(client.clone());
-    let provider_api = Api::<InferenceProvider>::all(client.clone());
-    let tool_provider_api = Api::<AgentToolProvider>::all(client.clone());
-    let site_api = Api::<GridSite>::all(client.clone());
 
-    let controller = Controller::new(api, watcher::Config::default())
-        .watches(
-            provider_api,
-            watcher::Config::default(),
-            grid_network::network_refs_from_inference_provider,
-        )
-        .watches(
-            tool_provider_api,
-            watcher::Config::default(),
-            grid_network::network_refs_from_agent_tool_provider,
-        )
-        .watches(
-            site_api,
-            watcher::Config::default(),
-            grid_network::network_refs_from_grid_site,
-        );
+    let (reader, primary) = filtered_grid_network_watch(api);
+    let mut requests = futures::stream::SelectAll::new();
+    requests.push(trigger_self(primary, ()).boxed());
+    requests.push(operator::network_watch::related_requests(
+        Api::<InferenceProvider>::all(client.clone()),
+        grid_network::network_refs_from_inference_provider,
+    ));
+    requests.push(operator::network_watch::related_requests(
+        Api::<AgentToolProvider>::all(client.clone()),
+        grid_network::network_refs_from_agent_tool_provider,
+    ));
+    requests.push(operator::network_watch::related_requests(
+        Api::<GridSite>::all(client.clone()),
+        grid_network::network_refs_from_grid_site,
+    ));
     // Reconcile everything once SWIM starts, then on every membership change.
     let swim_events = futures::stream::once(swim_settled(swim))
         .filter_map(std::future::ready)
         .flat_map(|handle| futures::stream::once(std::future::ready(())).chain(handle.reconciliation_events()));
     // And whenever a polled peer's catalog changes, which no watched object reflects.
     let catalog_events = ctx.peer_providers().changes();
-    controller
-        .reconcile_all_on(futures::stream::select(swim_events, catalog_events))
-        .run(grid_network::reconcile, grid_network::error_policy, ctx)
-        .for_each(|result| async {
-            match result {
-                Ok((obj, _action)) => tracing::debug!(%obj, "reconciled GridNetwork"),
-                Err(e) => log_controller_error("GridNetwork", &e),
-            }
-        })
-        .await;
+    requests.push(
+        operator::network_watch::bulk_requests(futures::stream::select(swim_events, catalog_events), reader.clone())
+            .boxed(),
+    );
+    applier(
+        |network, ctx| Box::pin(grid_network::reconcile(network, ctx)),
+        grid_network::error_policy,
+        ctx,
+        reader,
+        requests.default_backoff(),
+        kube_runtime::controller::Config::default(),
+    )
+    .for_each(|result| async {
+        match result {
+            Ok((obj, _action)) => tracing::debug!(%obj, "reconciled GridNetwork"),
+            Err(e) => log_controller_error("GridNetwork", &e),
+        }
+    })
+    .await;
 
     Ok(())
 }
@@ -2913,20 +2969,21 @@ fn site_by_spiffe(leaf: &[u8], identity: &SignalsIdentity) -> Option<(String, BT
 /// Whether `tcp` sent anything within [`SIGNALS_SILENT_TIMEOUT`].
 ///
 /// A connection that never speaks costs a slot and proves nothing, and opening many of them
-/// is the cheapest way to hold the handshake share. `readable()` does not consume, so the
-/// handshake that follows still sees the `ClientHello`. False also covers shutdown, where the
-/// caller stops for its own reasons.
+/// is the cheapest way to hold the handshake share. Require at least one byte before the
+/// deadline; `peek()` does not consume it, so the TLS handshake still sees the `ClientHello`.
+/// Returns `false` if shutdown wins the race.
 async fn spoke_in_time(
     tcp: &tokio::net::TcpStream,
     remote: SocketAddr,
     shutdown: &operator::shutdown::Shutdown,
 ) -> bool {
+    let mut first_byte = [0_u8; 1];
     let ready = tokio::select! {
         biased;
         () = shutdown.triggered() => return false,
-        ready = tokio::time::timeout(SIGNALS_SILENT_TIMEOUT, tcp.readable()) => ready,
+        ready = tokio::time::timeout(SIGNALS_SILENT_TIMEOUT, tcp.peek(&mut first_byte)) => ready,
     };
-    if matches!(ready, Ok(Ok(()))) {
+    if matches!(ready, Ok(Ok(bytes_read)) if bytes_read > 0) {
         return true;
     }
     operator::metrics::record_signals_shed("silent");
@@ -3406,10 +3463,10 @@ async fn run_local_scraper(
 ///
 /// Separate from reconcile: a served set must expire on its own cadence.
 async fn run_model_discovery(
+    config: served_models::DiscoveryConfig,
     ctx: Arc<OperatorCtx>,
     client: Client,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let config = model_discovery_config();
     tracing::info!(
         interval_secs = config.interval.as_secs(),
         ttl_secs = config.ttl.as_secs(),
@@ -3439,29 +3496,28 @@ const MAX_MODEL_DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::f
 /// Maximum time allowed for one model-discovery request.
 const MAX_MODEL_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-/// Discovery cadence from `GRID_MODEL_DISCOVERY_*`.
+/// Discovery cadence from `--model-discovery-*`.
 ///
 /// Interval and timeout are bounded; the TTL covers both and is capped at one
 /// year.
-fn model_discovery_config() -> served_models::DiscoveryConfig {
-    let defaults = served_models::DiscoveryConfig::default();
+fn model_discovery_config(args: &operator::cli::ModelDiscoveryArgs) -> served_models::DiscoveryConfig {
     let interval = bounded_discovery_duration(
         "GRID_MODEL_DISCOVERY_INTERVAL_SECS",
-        defaults.interval,
+        args.interval_secs,
         MAX_MODEL_DISCOVERY_INTERVAL,
     );
     let timeout = bounded_discovery_duration(
         "GRID_MODEL_DISCOVERY_TIMEOUT_SECS",
-        defaults.timeout,
+        args.timeout_secs,
         MAX_MODEL_DISCOVERY_TIMEOUT,
     );
-    let ttl = bounded_model_discovery_ttl(interval, timeout, defaults.ttl);
+    let ttl = bounded_model_discovery_ttl(interval, timeout, args.ttl_secs);
 
     served_models::DiscoveryConfig {
         interval,
         timeout,
         ttl,
-        concurrency: parse_env_or("GRID_MODEL_DISCOVERY_CONCURRENCY", defaults.concurrency),
+        concurrency: args.concurrency,
     }
 }
 
@@ -3469,10 +3525,9 @@ fn model_discovery_config() -> served_models::DiscoveryConfig {
 fn bounded_model_discovery_ttl(
     interval: std::time::Duration,
     timeout: std::time::Duration,
-    default: std::time::Duration,
+    requested_secs: u64,
 ) -> std::time::Duration {
-    let requested_ttl =
-        std::time::Duration::from_secs(parse_env_or("GRID_MODEL_DISCOVERY_TTL_SECS", default.as_secs()).max(1));
+    let requested_ttl = std::time::Duration::from_secs(requested_secs.max(1));
     let minimum_ttl = minimum_model_discovery_ttl(interval, timeout);
     let unclamped_ttl = requested_ttl.max(minimum_ttl);
     let ttl = unclamped_ttl.min(MAX_MODEL_DISCOVERY_TTL);
@@ -3497,13 +3552,9 @@ fn minimum_model_discovery_ttl(interval: std::time::Duration, timeout: std::time
         ))
 }
 
-/// Parse one discovery duration, enforcing a positive value and maximum.
-fn bounded_discovery_duration(
-    name: &str,
-    default: std::time::Duration,
-    maximum: std::time::Duration,
-) -> std::time::Duration {
-    let requested = std::time::Duration::from_secs(parse_env_or(name, default.as_secs()).max(1));
+/// One discovery duration, at least a second and at most `maximum`.
+fn bounded_discovery_duration(name: &str, requested_secs: u64, maximum: std::time::Duration) -> std::time::Duration {
+    let requested = std::time::Duration::from_secs(requested_secs.max(1));
     if requested > maximum {
         tracing::warn!(
             setting = name,
@@ -3513,14 +3564,6 @@ fn bounded_discovery_duration(
         );
     }
     requested.min(maximum)
-}
-
-/// Parse an environment variable, using `default` when it is absent or invalid.
-fn parse_env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
 }
 
 /// Poll every alive peer's signals endpoint on a coarse interval, fail closed.
@@ -4377,6 +4420,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grid_network_filter_suppresses_status_only_updates_and_tracks_lifecycle() {
+        let network = |generation: i64,
+                       resource_version: &str,
+                       remote_provider_count: u32,
+                       finalizer: Option<&str>,
+                       deletion_timestamp: Option<&str>|
+         -> GridNetwork {
+            let finalizers = finalizer.map(|value| vec![value]);
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "grid.praxis.fast/v1alpha1",
+                "kind": "GridNetwork",
+                "metadata": {
+                    "name": "net",
+                    "generation": generation,
+                    "resourceVersion": resource_version,
+                    "finalizers": finalizers,
+                    "deletionTimestamp": deletion_timestamp
+                },
+                "spec": { "seeds": [], "gridId": "grid" },
+                "status": { "remoteProviderCount": remote_provider_count }
+            }))
+            .expect("GridNetwork fixture")
+        };
+        let updates = Box::pin(
+            operator::network_watch::routing_updates(
+                futures::stream::iter([
+                    Ok::<_, watcher::Error>(network(1, "1", 0, None, None)),
+                    Ok(network(1, "2", 1, None, None)),
+                    Ok(network(
+                        1,
+                        "3",
+                        1,
+                        Some(grid_network::GRID_NETWORK_WITHDRAWAL_FINALIZER),
+                        None,
+                    )),
+                    Ok(network(
+                        1,
+                        "4",
+                        1,
+                        Some(grid_network::GRID_NETWORK_WITHDRAWAL_FINALIZER),
+                        Some("2026-01-01T00:00:00Z"),
+                    )),
+                    Ok(network(
+                        2,
+                        "5",
+                        1,
+                        Some(grid_network::GRID_NETWORK_WITHDRAWAL_FINALIZER),
+                        Some("2026-01-01T00:00:00Z"),
+                    )),
+                ])
+                .map(|result| result.map(watcher::Event::Apply)),
+            )
+            .collect::<Vec<_>>(),
+        )
+        .await;
+        assert_eq!(
+            updates.len(),
+            4,
+            "status, finalizer, deletion, and spec changes are filtered independently"
+        );
+        assert!(
+            updates
+                .get(1)
+                .expect("finalizer update")
+                .as_ref()
+                .expect("watch result")
+                .metadata
+                .finalizers
+                .as_ref()
+                .is_some_and(|finalizers| {
+                    finalizers
+                        .iter()
+                        .any(|finalizer| finalizer == grid_network::GRID_NETWORK_WITHDRAWAL_FINALIZER)
+                }),
+            "adding the withdrawal finalizer produces a watch trigger"
+        );
+        assert!(
+            updates
+                .get(2)
+                .expect("deletion update")
+                .as_ref()
+                .expect("watch result")
+                .metadata
+                .deletion_timestamp
+                .is_some(),
+            "deletion timestamp changes produce a watch trigger"
+        );
+        assert_eq!(
+            updates
+                .get(3)
+                .expect("spec update")
+                .as_ref()
+                .expect("watch result")
+                .metadata
+                .generation,
+            Some(2),
+            "spec generation changes still produce watch triggers"
+        );
+    }
+
+    #[tokio::test]
+    async fn grid_network_rollup_filter_tracks_only_gateway_rejection_condition_changes() {
+        let network = |resource_version, sequence, status, reason, message| -> GridNetwork {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "grid.praxis.fast/v1alpha1",
+                "kind": "GridNetwork",
+                "metadata": { "name": "net", "generation": 1, "resourceVersion": resource_version },
+                "spec": { "seeds": [], "gridId": "grid" },
+                "status": {
+                    "gatewayAgeReports": [{
+                        "replica": "gateway",
+                        "epoch": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "sequence": sequence,
+                        "skew": 1,
+                        "rejected": true,
+                        "reportedRejected": true,
+                        "receivedAt": "2026-01-01T00:00:00Z"
+                    }],
+                    "conditions": [{
+                        "type": "GatewayAgesRejected",
+                        "status": status,
+                        "reason": reason,
+                        "message": message,
+                        "lastTransitionTime": "2026-01-01T00:00:00Z"
+                    }]
+                }
+            }))
+            .expect("GridNetwork fixture")
+        };
+        let updates = Box::pin(
+            operator::network_watch::rollup_updates(
+                futures::stream::iter([
+                    Ok::<_, watcher::Error>(network("1", 1, "True", "SkewRejected", "gateway age rejected")),
+                    Ok(network("2", 2, "True", "SkewRejected", "gateway age rejected")),
+                    Ok(network("3", 2, "False", "Recovered", "gateway age recovered")),
+                ])
+                .map(|result| result.map(watcher::Event::Apply)),
+            )
+            .collect::<Vec<_>>(),
+        )
+        .await;
+        assert_eq!(
+            updates.len(),
+            2,
+            "gateway report churn is filtered but condition transitions pass"
+        );
+        assert_eq!(
+            updates
+                .get(1)
+                .expect("condition transition")
+                .as_ref()
+                .expect("watch result")
+                .status
+                .as_ref()
+                .and_then(|status| status.conditions.first())
+                .map(|condition| condition.status),
+            Some(ConditionStatus::False),
+            "the recovered gateway rejection reaches roll-up handling"
+        );
+    }
+
+    #[tokio::test]
     async fn startup_reads_network_membership_before_selecting_the_swim_listener() -> Result<(), String> {
         let install = GridModes::without_network(Some(SignalMode::Poll), Some(operator::signals::PeerTrustMode::Pin));
         for (spec, expected, declared) in [
@@ -4707,6 +4912,7 @@ mod tests {
             labels: gpu(),
             pins,
             signals: None,
+            sovereignty_zone: None,
         };
         let peers = operator::signals::PeerIdentities::new();
         peers.set(BTreeMap::from([
@@ -4960,6 +5166,7 @@ mod tests {
                     labels: gpu(),
                     pins: vec![operator::signals::leaf_fingerprint(&pem_der(&self.west.cert_pem))],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             )]));
             SignalsIdentity {
@@ -5341,6 +5548,7 @@ mod tests {
                     labels: gpu(),
                     pins: Vec::new(),
                     signals: None,
+                    sovereignty_zone: None,
                 },
             )]));
             SignalsIdentity {
@@ -5824,6 +6032,7 @@ mod tests {
             labels: BTreeMap::new(),
             pins: vec!["aa".to_owned()],
             signals: None,
+            sovereignty_zone: None,
         };
         let heard = operator::signals::LoadHeard::default();
         let nothing = crdt::GridStateSnapshot::new("hub".to_owned());
@@ -6096,6 +6305,7 @@ mod tests {
                     labels: gpu(),
                     pins: vec!["bb".to_owned()],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
             (
@@ -6104,6 +6314,7 @@ mod tests {
                     labels: gpu(),
                     pins: vec!["aa".to_owned()],
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
             (
@@ -6112,6 +6323,7 @@ mod tests {
                     labels: gpu(),
                     pins: Vec::new(),
                     signals: None,
+                    sovereignty_zone: None,
                 },
             ),
         ]));
@@ -6151,6 +6363,7 @@ mod tests {
                 endpoint: operator::signals::SignalsEndpoint::parse(address).expect("endpoint"),
                 server_name: server_name.map(str::to_owned),
             }),
+            sovereignty_zone: None,
         };
         let pinned = || vec!["aa".to_owned()];
         let identities = operator::signals::PeerIdentities::new();
@@ -6283,6 +6496,7 @@ mod tests {
                     server_name: None,
                 }
             }),
+            sovereignty_zone: None,
         };
         let identities = operator::signals::PeerIdentities::new();
         identities.set(BTreeMap::from([
@@ -6334,6 +6548,7 @@ mod tests {
             labels: BTreeMap::new(),
             pins: vec!["aa".to_owned()],
             signals: None,
+            sovereignty_zone: None,
         };
         let identities = operator::signals::PeerIdentities::new();
         identities.set(BTreeMap::from([
@@ -6522,6 +6737,7 @@ mod tests {
                 labels: gpu(),
                 pins: Vec::new(),
                 signals: None,
+                sovereignty_zone: None,
             },
         )]));
         Serving {

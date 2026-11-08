@@ -144,6 +144,10 @@ pub struct CandidateConfig {
     /// gateways. Older/static configs may omit it and retain the derived ID.
     #[serde(default)]
     pub stable_id: Option<String>,
+
+    /// Declared capacity weight from the provider's `capacityWeight` CRD field.
+    #[serde(default)]
+    pub weight: Option<u32>,
 }
 
 /// Default freshness state for candidates.
@@ -228,12 +232,18 @@ pub struct RouteCandidate {
     /// Site that owns this capability.
     pub site: Arc<str>,
 
+    /// The owning site's sovereignty zone, from the serving config's `sovereignty_zones`. `None` never passes a fence.
+    pub sovereignty_zone: Option<Arc<str>>,
+
     /// Deterministic identifier for session affinity binding.
     pub stable_id: Arc<str>,
 
     /// The upstream the gateway built for this cluster from the serving config, sent to
     /// directly instead of a `load_balancer` cluster.
     pub dial: Option<Arc<Dialed>>,
+
+    /// Declared capacity weight from the provider CRD, defaulting to 1.
+    pub weight: u32,
 }
 
 impl RouteCandidate {
@@ -297,6 +307,9 @@ fn validate_candidates_with_empty(
                 format!("grid: candidates[{index}].selection_group exceeds maximum of {MAX_SELECTION_GROUP}").into(),
             );
         }
+        if cand.weight == Some(0) {
+            return Err(format!("grid: candidates[{index}].weight must not be zero").into());
+        }
 
         if !seen.insert((cand.kind, cand.name.clone(), cand.site.clone(), cand.cluster.clone())) {
             return Err(format!(
@@ -335,8 +348,10 @@ fn validate_candidates_with_empty(
             selection_tier: None,
             selection_group: cand.selection_group,
             site: Arc::from(cand.site.as_str()),
+            sovereignty_zone: None,
             stable_id,
             dial: None,
+            weight: cand.weight.unwrap_or(1),
         });
     }
 
@@ -486,6 +501,7 @@ mod tests {
             selection_group: 0,
             site: site.to_owned(),
             stable_id: None,
+            weight: None,
         }
     }
 
@@ -701,5 +717,18 @@ mod tests {
 
         let error = validate_candidates(vec![candidate]).expect_err("out-of-range selection group is rejected");
         assert!(error.to_string().contains("selection_group exceeds maximum"), "{error}");
+    }
+
+    #[test]
+    fn zero_weight_is_rejected() {
+        let raw = vec![CandidateConfig {
+            weight: Some(0),
+            ..candidate("inference_model", "m", "s", "c")
+        }];
+        let err = validate_candidates(raw).expect_err("zero weight must be rejected");
+        assert!(
+            err.to_string().contains("weight must not be zero"),
+            "unexpected error: {err}"
+        );
     }
 }

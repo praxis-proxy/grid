@@ -67,8 +67,10 @@ fn snapshot(sites: u32, shape: Shape) -> RouteSnapshot {
                 selection_tier: None,
                 selection_group: 0,
                 site: Arc::clone(&site),
+                sovereignty_zone: None,
                 stable_id: site,
                 dial: None,
+                weight: 1,
             }
         })
         .collect();

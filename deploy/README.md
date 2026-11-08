@@ -27,7 +27,7 @@ direction as a separate `praxis-forge` CLI.
 
 Custom Resource Definitions are generated from the operator source code:
 
-```bash
+```console
 # Regenerate CRDs after schema changes (writes deploy/crds and charts/grid-operator/templates/crds)
 make generate-crds
 
@@ -70,7 +70,7 @@ Services.
   NetworkPolicy, its own `grid-system` Namespace, and the resources RoleBinding in the
   `default` namespace that the install qualification checks.
 
-```bash
+```console
 # Regenerate after a chart change (writes the base and overlays with values.yaml)
 make generate-deploy
 
@@ -85,12 +85,21 @@ Services.
 
 ### Install Steps
 
+These manifests include `ValidatingAdmissionPolicy` resources and require
+Kubernetes >= 1.30 (OpenShift >= 4.17). Earlier clusters must remove these entries
+from the relevant `kustomization.yaml` before applying:
+
+- `validatingadmissionpolicy-endpointslice-cleanup.yaml`
+- `validatingadmissionpolicy-protect-config.yaml`
+- `validatingadmissionpolicybinding-endpointslice-cleanup.yaml`
+- `validatingadmissionpolicybinding-protect-config.yaml`
+
 The CRDs and the namespace are the shared prerequisites. The base and the OpenShift
 overlay target the grid-system namespace without creating it, so a fresh cluster
 needs it first.
 The kind overlay creates its own.
 
-```bash
+```console
 kubectl apply -k deploy/crds/
 kubectl create namespace grid-system --dry-run=client -o yaml | kubectl apply -f -
 ```
@@ -99,7 +108,7 @@ Then pick one install variant. The base is the portable path and the overlays ar
 flavors of it, so applying more than one to a cluster layers a flavor's settings over
 the same operator resources.
 
-```bash
+```console
 # Portable, in its default namespace (a platform sets its own)
 kubectl apply -k deploy/operator/ -n grid-system
 
@@ -115,7 +124,7 @@ images transformer in that kustomization's directory. Merging a second
 grid-operator-parameters ConfigMap does nothing, because the base's replacement has
 already run by the time the merge applies.
 
-```bash
+```console
 (cd path/to/consumer-kustomization && kustomize edit set image ghcr.io/praxis-proxy/grid-operator=ghcr.io/praxis-proxy/grid-operator:sha-<commit>)
 ```
 
@@ -123,7 +132,7 @@ A Deployment another installer created, the chart or the hand-maintained manifes
 before they were generated, may carry a different selector. A selector is immutable, so
 delete that Deployment first only when it differs from the target:
 
-```bash
+```console
 kubectl get deployment grid-operator -n grid-system \
   -o jsonpath='{.spec.selector.matchLabels}'
 kubectl kustomize deploy/operator/ |
@@ -132,6 +141,7 @@ kubectl kustomize deploy/operator/ |
 
 Matching selectors apply in place and need no delete.
 
+```console
 # Verify operator is running
 kubectl get pods -n grid-system
 kubectl logs -n grid-system deployment/grid-operator
@@ -149,7 +159,7 @@ Secret mounts grants `get` and `patch` on its own Deployment, as described under
 [Deployment access](../docs/architecture/operations.md#deployment-access).
 To grant access to another namespace without regenerating:
 
-```bash
+```console
 kubectl create rolebinding grid-operator-resources \
   --clusterrole=grid-operator-resources \
   --serviceaccount=grid-system:grid-operator \
@@ -193,7 +203,7 @@ The recommended production installation path is the Helm chart at
 [`charts/grid-operator/`](../charts/grid-operator/). The Kustomize manifests
 in this directory are retained for development and raw-manifest users.
 
-```bash
+```console
 helm install grid-operator \
   oci://ghcr.io/praxis-proxy/charts/grid-operator \
   --version 0.1.1 \

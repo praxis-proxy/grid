@@ -9,7 +9,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet as StdHashSet},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     path::Path,
     sync::Arc,
@@ -53,7 +53,8 @@ use crate::{
     resources::{
         consumer_config::{self, ConsumerConfigError, SiteRoutePrerequisite},
         derived_topology, gateway_mounts, overlay_envelope, provider_admission, provider_config, provider_metrics,
-        routing_overlay, secret,
+        routing_overlay::{self, MAX_TOOLS_PER_PROVIDER},
+        secret,
         serving_config::{self, ServingInputs, WriteDecision, WriteGate},
         tls_backend::ServerTlsConfig,
         trust_bundle::{self, CertPemStatus},
@@ -164,6 +165,9 @@ pub struct OperatorCtx {
     /// How often the signals loop scrapes providers; a readiness window is at least two.
     scrape_interval: Duration,
 
+    /// How long a published site signal is served before it expires.
+    site_signals_ttl: Duration,
+
     /// Duration of each network's latest provider-scrape pass.
     ///
     /// Used to widen the readiness window when a pass takes longer than one
@@ -213,7 +217,7 @@ pub struct OperatorCtx {
     started: Instant,
 }
 
-/// The last value logged per key, so INFO fires on a change rather than on every pass.
+/// The last value logged per key, so transition messages fire on change rather than every pass.
 #[derive(Debug, Default)]
 pub(crate) struct ChangeLog(std::sync::Mutex<HashMap<String, String>>);
 
@@ -233,6 +237,12 @@ impl ChangeLog {
         let mut held = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         held.retain(|key, _| !key.starts_with(prefix) || keep.contains(key));
     }
+}
+
+/// Retain each gateway's prior empty state so repeated reconciles do not repeat no-route warnings.
+fn should_warn_empty_overlay(logged: &ChangeLog, key: &str, no_candidates: bool) -> bool {
+    let changed = logged.changed(key, no_candidates.to_string());
+    changed && no_candidates
 }
 
 /// Send `declared` to `sender`, returning whether it changed, so a repeat wakes nobody.
@@ -412,6 +422,7 @@ impl OperatorCtx {
             served_models: served_models::ServedModelStore::new(),
             readiness: readiness::ReadinessStore::default(),
             scrape_interval: Duration::ZERO,
+            site_signals_ttl: DEFAULT_SITE_SIGNALS_TTL,
             last_scrape_passes: std::sync::Mutex::new(HashMap::new()),
             signal_mode,
             serving_writes: WriteGate::default(),
@@ -540,6 +551,13 @@ impl OperatorCtx {
         self
     }
 
+    /// Record how long a published site signal is served.
+    #[must_use]
+    pub const fn with_site_signals_ttl(mut self, ttl: Duration) -> Self {
+        self.site_signals_ttl = ttl;
+        self
+    }
+
     /// Record how long one network's latest provider-scrape pass took.
     fn record_scrape_pass(&self, network: &str, duration: Duration) {
         let mut passes = self
@@ -646,17 +664,11 @@ impl OperatorCtx {
 // Signals (poll mode)
 // ---------------------------------------------------------------------------
 
-/// How long a published site signal is served before it expires.
+/// How long a published site signal is served before it expires, by default.
 ///
 /// Several scrape intervals, so a couple of missed scrapes do not erase what is
 /// known; absence, not a stale flag, is what tells a reader a writer stopped.
-fn site_signals_ttl() -> Duration {
-    let secs = std::env::var("GRID_SIGNALS_TTL_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(30);
-    Duration::from_secs(secs.max(1))
-}
+pub const DEFAULT_SITE_SIGNALS_TTL: Duration = Duration::from_secs(30);
 
 /// Scrape this site's providers once, write their readiness conditions, and, in Poll mode,
 /// publish the coarse signals observed.
@@ -949,7 +961,7 @@ fn readiness_stale_after(ctx: &OperatorCtx, provider: &InferenceProvider) -> Dur
         .as_ref()
         .and_then(|mc| mc.stale_metrics_seconds)
         .filter(|secs| *secs > 0)
-        .map_or_else(|| site_signals_ttl() / 2, |secs| Duration::from_secs(secs.into()))
+        .map_or_else(|| ctx.site_signals_ttl / 2, |secs| Duration::from_secs(secs.into()))
         .max(floor)
 }
 
@@ -1230,7 +1242,7 @@ enum ModelInventoryPublicationError {
 }
 
 /// Refresh who may read from the currently approved sites.
-async fn register_peers(ctx: &OperatorCtx, client: &Client) -> Result<(), OperatorError> {
+async fn register_peers(ctx: &OperatorCtx, client: &Client) -> Result<Vec<GridSite>, OperatorError> {
     let sites = list_all_grid_sites(client).await?;
     let identities = peer_identities(&sites, ctx.peer_settings.trust, derived_signals(ctx));
     // The overlay's ceiling is shared among the declared peers, this site left out.
@@ -1238,7 +1250,25 @@ async fn register_peers(ctx: &OperatorCtx, client: &Client) -> Result<(), Operat
     let peers = identities.keys().filter(|site| own != Some(site.as_str())).count();
     ctx.peer_providers.declare(peers);
     ctx.peer_identities.set(identities);
-    Ok(())
+    Ok(sites)
+}
+
+/// Each of `network`'s sites' zone, from its own `GridSite` objects, ranked as trust ranks them.
+fn network_zones(
+    sites: &[GridSite],
+    network: &str,
+    trust: PeerTrustMode,
+    signals_at: SignalsAt,
+) -> BTreeMap<String, String> {
+    let own: Vec<GridSite> = sites
+        .iter()
+        .filter(|site| site.spec.grid_network_ref == network)
+        .cloned()
+        .collect();
+    peer_identities(&own, trust, signals_at)
+        .into_iter()
+        .filter_map(|(site, record)| Some((site, record.sovereignty_zone?)))
+        .collect()
 }
 
 /// Where a peer's signals are polled.
@@ -1291,6 +1321,13 @@ fn peer_identities(
                 SignalsAt::Derived(signals_port) => declared_signals(site, &key, signals_port),
                 SignalsAt::Advertised => None,
             },
+            sovereignty_zone: site.spec.sovereignty_zone.as_deref().and_then(|zone| {
+                let normalized = grid_signals::zone::sovereignty_zone(zone);
+                if normalized.is_none() {
+                    tracing::warn!(site = %key, zone, "GridSite sovereigntyZone is not a valid zone; the site is in none");
+                }
+                normalized
+            }),
         };
         let rank = (!record.pins.is_empty(), enrolled);
         if ranked.get(&key).is_none_or(|(held, _)| rank > *held) {
@@ -1402,7 +1439,7 @@ fn publish_signals(ctx: &OperatorCtx, collected: HashMap<String, Vec<signals::Ob
             (provider, attributed)
         })
         .collect();
-    ctx.signals.refresh(attributed, site_signals_ttl());
+    ctx.signals.refresh(attributed, ctx.site_signals_ttl);
 }
 
 /// Client TLS for polling peer operators, built from the network's own trust.
@@ -1607,8 +1644,20 @@ async fn load_gossip_signing_identity(
     }
 }
 
+/// A trusted signing key and its certificate's authenticated issuance ordering.
+struct VerifiedPeerGossipKey {
+    /// Uncompressed P-256 public key.
+    key: Vec<u8>,
+    /// Certificate start time used to prefer newer rotation identities.
+    not_before: time::OffsetDateTime,
+}
+
 /// Validate one peer certificate against this `GridNetwork`'s CA and trust mode.
-fn verified_peer_gossip_key(site: &GridSite, ca_pem: &str, trust: PeerTrustMode) -> Result<Option<Vec<u8>>, String> {
+fn verified_peer_gossip_key(
+    site: &GridSite,
+    ca_pem: &str,
+    trust: PeerTrustMode,
+) -> Result<Option<VerifiedPeerGossipKey>, String> {
     let Some((site_name, _)) = peer_site_key(site) else {
         return Ok(None);
     };
@@ -1634,7 +1683,11 @@ fn verified_peer_gossip_key(site: &GridSite, ca_pem: &str, trust: PeerTrustMode)
     {
         return Err("peer certificate does not match a declared canonical fingerprint".to_owned());
     }
-    Ok(Some(public_key))
+    let (not_before, _) = certs::cert_validity(cert_pem).map_err(|error| error.to_string())?;
+    Ok(Some(VerifiedPeerGossipKey {
+        key: public_key,
+        not_before,
+    }))
 }
 
 /// Whether `site` declares this certificate's canonical SHA-256 fingerprint.
@@ -1678,18 +1731,23 @@ async fn apply_signed_state(
 
     let client = &ctx.client;
 
-    // Peers that cannot be re-verified keep their pins: a transient read failure must not drop all state.
+    // Failed verification preserves cached pins only while the provider-network binding is unchanged.
     let peer_pins = match collect_gossip_peer_pins(network, client, swim.site_name()).await {
         Ok(peer_pins) => Some(peer_pins),
         Err(error) => {
-            tracing::warn!(%grid_id, %error, "keeping installed SWIM peer pins: peers could not be re-verified");
+            tracing::warn!(%grid_id, %error, "SWIM peer pins could not be re-verified; retaining pins only for an unchanged provider-network binding");
             None
         },
     };
     let local_signing_key = load_gossip_signing_identity(network, client, swim.site_name()).await;
     let signing_ready = local_signing_key.is_some();
-    swim.set_grid_trust_snapshot(grid_id.to_owned(), local_signing_key, peer_pins)
-        .map_err(|error| OperatorError::InvalidResource(error.to_string()))?;
+    swim.set_grid_trust_snapshot(
+        grid_id.to_owned(),
+        grid_network_name(network)?.to_owned(),
+        local_signing_key,
+        peer_pins,
+    )
+    .map_err(|error| OperatorError::InvalidResource(error.to_string()))?;
     Ok(signing_ready)
 }
 
@@ -1765,6 +1823,10 @@ async fn publish_signed_site_cert(
 
 
 /// Collect the currently verified peer certificates as a complete trust snapshot.
+///
+/// Prefer the newest verified certificates by `notBefore`, breaking ties by
+/// public key bytes, up to SWIM's pin limit. Excess certificates cannot exclude
+/// a peer and resource iteration order cannot change the selected keys.
 async fn collect_gossip_peer_pins(
     network: &GridNetwork,
     client: &Client,
@@ -1781,7 +1843,7 @@ async fn collect_gossip_peer_pins(
     let network_name = network.metadata.name.as_deref().unwrap_or_default();
     // The declared mode, not the startup one: a trust change under gossip does not restart.
     let trust = GridModes::of(network, MembershipMode::Swim).trust;
-    let mut verified = PeerPins::new();
+    let mut verified = BTreeMap::<String, BTreeMap<Vec<u8>, time::OffsetDateTime>>::new();
     for site in list_all_grid_sites(client)
         .await?
         .iter()
@@ -1796,15 +1858,32 @@ async fn collect_gossip_peer_pins(
         match verified_peer_gossip_key(site, ca, trust) {
             Ok(Some(key)) => {
                 let keys = verified.entry(site_name).or_default();
-                if !keys.contains(&key) {
-                    keys.push(key);
-                }
+                keys.entry(key.key)
+                    .and_modify(|not_before| *not_before = (*not_before).max(key.not_before))
+                    .or_insert(key.not_before);
             },
             Ok(None) => {},
             Err(reason) => tracing::warn!(site = %site_name, %reason, "peer gossip signing pin refused"),
         }
     }
-    Ok(verified)
+    Ok(verified
+        .into_iter()
+        .map(|(site, keys)| {
+            let mut keys: Vec<_> = keys.into_iter().collect();
+            keys.sort_by(|(key_a, date_a), (key_b, date_b)| date_b.cmp(date_a).then_with(|| key_a.cmp(key_b)));
+            let limit = swim::MAX_PINNED_KEYS_PER_ORIGIN;
+            if keys.len() > limit {
+                tracing::warn!(
+                    network = network_name,
+                    %site,
+                    dropped = keys.len() - limit,
+                    limit,
+                    "peer gossip key limit exceeded; keeping newest certificates, clean up extra GridSites"
+                );
+            }
+            (site, keys.into_iter().take(limit).map(|(key, _)| key).collect())
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1828,7 +1907,7 @@ const MOUNT_RECONCILIATION_REQUEUE: Duration = Duration::from_secs(60);
 const FIELD_MANAGER: &str = "grid-operator";
 
 /// Finalizer that keeps a `GridNetwork` present until its SWIM scope withdraws.
-const GRID_NETWORK_WITHDRAWAL_FINALIZER: &str = "grid.praxis.fast/gridnetwork-withdrawal";
+pub const GRID_NETWORK_WITHDRAWAL_FINALIZER: &str = "grid.praxis.fast/gridnetwork-withdrawal";
 
 /// Bound retries when another reconcile updates a `GridNetwork` finalizer at the same time.
 const FINALIZER_PATCH_ATTEMPTS: usize = 4;
@@ -2234,6 +2313,16 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         trust: ctx.peer_settings.trust,
     };
     let declared = GridModes::of(&network, ctx.membership_fallback);
+    if network
+        .spec
+        .membership
+        .as_ref()
+        .is_some_and(|membership| !membership.swim_config_matches_mode())
+    {
+        return Err(OperatorError::InvalidResource(
+            "membership.swim is only valid when membership.mode is Swim".to_owned(),
+        ));
+    }
     if declared.membership == MembershipMode::Local && declared.signal != SignalMode::Poll {
         return Err(OperatorError::InvalidResource(
             "Local membership requires signalTransport.mode poll".to_owned(),
@@ -2280,6 +2369,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     // List providers and tools once; shared between the catalog, the overlay and CRDT publishing.
     let providers = list_all_inference_providers(client).await?;
     let tool_providers = list_all_agent_tool_providers(client).await?;
+    record_tool_cuts(&tool_providers);
 
     // Published before any hold or render, so peers can read this site while it waits for
     // theirs, and two sites restarting together do not wait out the grace on each other.
@@ -2431,7 +2521,14 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let remote_crdt_providers = membership_staleness(&network, remote_crdt_providers, membership.as_ref());
 
     let scoring_weights = crate::crd::grid_network::resolve_scoring_weights(network.spec.scoring_policy.as_ref());
-    let serving = serving_source(&ctx, &providers);
+    // Read before the render, so a GridSite edit reaches the render it triggers.
+    let zones = if ctx.signal_mode == SignalMode::Poll {
+        let sites = Box::pin(register_peers(&ctx, client)).await?;
+        network_zones(&sites, name, ctx.peer_settings.trust, derived_signals(&ctx))
+    } else {
+        BTreeMap::new()
+    };
+    let serving = serving_source(&ctx, &providers, zones);
 
     let OverlayOutcome {
         consumer_statuses: consumer_config_statuses,
@@ -2442,6 +2539,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     } = Box::pin(reconcile_routing_overlay_inner(
         &network,
         &grid_id,
+        &ctx.logged,
         client,
         &providers,
         &tool_providers,
@@ -2850,15 +2948,15 @@ pub(crate) fn diff_seed_sets(previous: &[SocketAddr], desired: &[SocketAddr]) ->
     (added, removed)
 }
 
-/// Announce `network.spec.seeds` to the live SWIM runtime.
+/// Announce `network.spec.membership.swim.seeds` to the live SWIM runtime.
 ///
 /// Called once per reconcile.  Re-announcing to existing members is
 /// idempotent: foca ignores redundant joins.
 ///
 /// # Runtime update semantics
 ///
-/// Seeds added to `spec.seeds` since the last reconcile are logged as
-/// additions via [`diff_seed_sets`].  Seeds removed from `spec.seeds` are
+/// Seeds added to `membership.swim.seeds` since the last reconcile are logged
+/// as additions via [`diff_seed_sets`]. Seeds removed from that list are
 /// logged as removals but are **not actively disconnected**; the SWIM
 /// protocol's own failure detection handles peers that stop responding.
 /// The full current seed set is always announced to ensure resilience against
@@ -2868,8 +2966,8 @@ pub(crate) fn diff_seed_sets(previous: &[SocketAddr], desired: &[SocketAddr]) ->
 ///
 /// The SWIM runtime is **process-global**: one UDP listener per operator
 /// process, shared by all `GridNetwork` reconciles in that process.  Seeds
-/// from any `GridNetwork.spec.seeds` are announced to the same SWIM node.
-/// This makes `spec.seeds` a site-membership bootstrap mechanism, not a
+/// from any `GridNetwork.spec.membership.swim.seeds` are announced to the same SWIM node.
+/// This makes `membership.swim.seeds` a site-membership bootstrap mechanism, not a
 /// per-network membership isolation control.  CRDT provider records remain
 /// network-scoped separately (filtered by `network_id` in `collect_remote_crdt_providers`).
 ///
@@ -2901,7 +2999,8 @@ async fn announce_crd_seeds(
         .get(name)
         .cloned()
         .unwrap_or_default();
-    let resolution = resolve_endpoint_list_partial(&network.spec.seeds, "GridNetwork.spec.seeds").await;
+    let resolution =
+        resolve_endpoint_list_partial(swim_seed_list(network), "GridNetwork.spec.membership.swim.seeds").await;
     for failure in &resolution.failures {
         tracing::warn!(
             network = name,
@@ -3253,6 +3352,7 @@ fn site_phases(sites: &[GridSite]) -> impl Iterator<Item = (&str, &'static str)>
 async fn reconcile_routing_overlay_inner(
     network: &GridNetwork,
     grid_id: &str,
+    logged: &ChangeLog,
     client: &Client,
     providers: &[InferenceProvider],
     tool_providers: &[AgentToolProvider],
@@ -3287,19 +3387,32 @@ async fn reconcile_routing_overlay_inner(
     let mut consumer_statuses: Vec<ConsumerConfigStatus> = Vec::new();
     let mut mount_statuses: Vec<MountReconciliationStatus> = Vec::new();
     let mut overlay_statuses: Vec<OverlayRevisionStatus> = Vec::new();
+    let empty_overlay_prefix = format!("empty-overlay/{network_name}/");
+    let mut logged_empty_overlays = StdHashSet::new();
     let mut serving_retry: Option<Duration> = None;
     let mut inventory_expiry_deadline: Option<time::OffsetDateTime> = None;
+    let eligible_remote_owned: Vec<crdt::ProviderState> =
+        filter_eligible_remote_crdt_providers(network_name, &sites, remote_crdt_providers, signal)
+            .into_iter()
+            .cloned()
+            .collect();
+    let filtered_count = remote_crdt_providers.len() - eligible_remote_owned.len();
+    if filtered_count > 0 {
+        tracing::debug!(
+            network = network_name,
+            total_remote = remote_crdt_providers.len(),
+            filtered = filtered_count,
+            eligible = eligible_remote_owned.len(),
+            "filtered remote CRDT providers: source GridSite not Active"
+        );
+    }
+
     // Peer records are the same for every gateway; only Local reads them from verified peers.
-    let peer_catalog = member_catalogs.then(|| {
-        derived_topology::peer_catalog(filter_eligible_remote_crdt_providers(
-            network_name,
-            &sites,
-            remote_crdt_providers,
-            signal,
-        ))
-    });
+    let peer_catalog = member_catalogs.then(|| derived_topology::peer_catalog(&eligible_remote_owned));
 
     for gw_ref in &network.spec.consumer_gateways {
+        let empty_overlay_key = format!("{}{}/{}", empty_overlay_prefix, gw_ref.namespace, gw_ref.name);
+        logged_empty_overlays.insert(empty_overlay_key.clone());
         // Each gateway identifies its own local site.  Fall back to the
         // network name for single-site deployments where the two are equal.
         let local_site = gw_ref.site_name.as_deref().unwrap_or(network_name);
@@ -3307,26 +3420,6 @@ async fn reconcile_routing_overlay_inner(
         // Before anything that can skip this gateway, so a removed site never outlives a failed render.
         if serving.is_some() {
             revoke_provider_admission(network_name, gw_ref, &admitted, client).await;
-        }
-
-        // Filter remote CRDT providers to those whose source GridSite is Active.
-        // Providers from sites in any other phase (Discovered, Connecting, Pending,
-        // Unreachable, Left, or missing) are excluded before the overlay is rendered.
-        // This is the routing eligibility gate: SWIM membership alone does not
-        // make a remote site routable.
-        let eligible_remote: Vec<&crdt::ProviderState> =
-            filter_eligible_remote_crdt_providers(network_name, &sites, remote_crdt_providers, signal);
-        let eligible_remote_owned: Vec<crdt::ProviderState> = eligible_remote.into_iter().cloned().collect();
-        let filtered_count = remote_crdt_providers.len() - eligible_remote_owned.len();
-        if filtered_count > 0 {
-            tracing::debug!(
-                network = network_name,
-                gateway = %gw_ref.name,
-                total_remote = remote_crdt_providers.len(),
-                filtered = filtered_count,
-                eligible = eligible_remote_owned.len(),
-                "filtered remote CRDT providers: source GridSite not Active"
-            );
         }
 
         let timestamp = rfc3339_now();
@@ -3453,7 +3546,7 @@ async fn reconcile_routing_overlay_inner(
             },
         };
         let no_candidates = overlay.candidates.is_empty();
-        if no_candidates {
+        if should_warn_empty_overlay(logged, &empty_overlay_key, no_candidates) {
             tracing::warn!(
                 network = network_name,
                 gateway = %gw_ref.name,
@@ -3684,6 +3777,7 @@ async fn reconcile_routing_overlay_inner(
             consumer_statuses.push(consumer_config_status_disabled(gw_ref, cc, observed_generation));
         }
     }
+    logged.retain_under(&empty_overlay_prefix, &logged_empty_overlays);
     Ok(OverlayOutcome {
         consumer_statuses,
         mount_statuses,
@@ -3836,10 +3930,16 @@ struct ServingSource<'src> {
     load_heard: &'src signals::LoadHeard,
     /// This site's provider clusters with no metrics to scrape.
     quiet_local: BTreeSet<String>,
+    /// Each of the network's sites' `sovereigntyZone`, read this reconcile.
+    zones: BTreeMap<String, String>,
 }
 
 /// Build the serving source, `None` outside poll mode.
-fn serving_source<'ctx>(ctx: &'ctx OperatorCtx, providers: &[InferenceProvider]) -> Option<ServingSource<'ctx>> {
+fn serving_source<'ctx>(
+    ctx: &'ctx OperatorCtx,
+    providers: &[InferenceProvider],
+    zones: BTreeMap<String, String>,
+) -> Option<ServingSource<'ctx>> {
     if ctx.signal_mode != SignalMode::Poll {
         return None;
     }
@@ -3858,6 +3958,7 @@ fn serving_source<'ctx>(ctx: &'ctx OperatorCtx, providers: &[InferenceProvider])
         refused_dials: &ctx.refused_dials,
         load_heard: &ctx.load_heard,
         quiet_local,
+        zones,
     })
 }
 
@@ -4103,6 +4204,7 @@ fn render_serving_config(
         peer_budget: source.settings.peer_budget,
         heard: &heard,
         quiet_local: &source.quiet_local,
+        zones: &source.zones,
         inject_local_credentials: matches!(hops, HopSource::Rendered(_)),
     };
     Ok(serving_config::render(overlay, &inputs))
@@ -4279,16 +4381,6 @@ async fn apply_serving_config(
     source.gate.record(&key, now);
     info!(cm_name = %name, digest = %serving_config::digest(&text), "applied grid serving config");
     Ok(None)
-}
-
-/// Whether the last recorded status for this gateway already had no candidates.
-#[cfg(test)]
-fn already_empty(network: &GridNetwork, gw_ref: &GatewayRef) -> bool {
-    network.status.as_ref().is_some_and(|status| {
-        status.routing_map_status.iter().any(|entry| {
-            entry.gateway_name == gw_ref.name && entry.namespace == gw_ref.namespace && entry.reason == EMPTY_CANDIDATES
-        })
-    })
 }
 
 /// Find the last successfully distributed overlay status for a gateway.
@@ -4648,6 +4740,7 @@ async fn apply_consumer_config_for_gateway(
         cc.enable_projected_credentials,
         cc.mount_reconciliation.as_ref().is_some_and(|mounts| mounts.enabled),
         cc.site_router,
+        cc.sovereignty.as_ref(),
     )?;
     if let Some(mounts) = cc.mount_reconciliation.as_ref().filter(|mounts| mounts.enabled) {
         let mut attempts = 0;
@@ -6102,11 +6195,22 @@ fn determine_phase(
     // snapshot stays `Initializing` until at least one peer is observed (handled
     // by `phase_hint` above). `membership.is_none()` means the SWIM runtime is
     // not up yet, which also stays `Initializing`.
-    if membership.is_some() && network.spec.seeds.is_empty() {
+    if membership.is_some() && swim_seed_list(network).is_empty() {
         GridNetworkPhase::Active
     } else {
         GridNetworkPhase::Initializing
     }
+}
+
+/// Return configured seeds only for an explicitly Swim membership declaration.
+fn swim_seed_list(network: &GridNetwork) -> &[String] {
+    network
+        .spec
+        .membership
+        .as_ref()
+        .filter(|membership| membership.mode == MembershipMode::Swim)
+        .and_then(|membership| membership.swim.as_ref())
+        .map_or(&[], |swim| swim.seeds.as_slice())
 }
 
 // ---------------------------------------------------------------------------
@@ -6309,13 +6413,6 @@ fn tool_provider_state_from_kube(
     })
 }
 
-/// Maximum number of tool names retained per [`AgentToolProvider`].
-///
-/// Large MCP catalogs can inflate both the SWIM broadcast byte budget and
-/// the routing overlay size. Excess tools are truncated and a warning is
-/// logged.
-const MAX_TOOLS_PER_PROVIDER: usize = 128;
-
 /// Maximum encoded length of one MCP tool name accepted by the routing path.
 const MAX_TOOL_NAME_LEN: usize = 256;
 
@@ -6340,13 +6437,20 @@ fn current_tool_status(
 /// Results are capped at [`MAX_TOOLS_PER_PROVIDER`] to bound SWIM byte
 /// budget and overlay size.
 pub(crate) fn tool_names_from_agent_tool_provider(provider: &AgentToolProvider) -> Vec<String> {
+    let mut tools = routable_tool_names(provider);
+    tools.truncate(MAX_TOOLS_PER_PROVIDER);
+    tools
+}
+
+/// Discovered tools that pass the allowlist and name checks, before the per-provider cap.
+fn routable_tool_names(provider: &AgentToolProvider) -> Vec<String> {
     let Some(status) = current_tool_status(provider) else {
         return Vec::new();
     };
 
     let allowed: std::collections::HashSet<&str> = provider.spec.tools.iter().map(|tool| tool.name.as_str()).collect();
     let mut seen = std::collections::HashSet::new();
-    let mut tools: Vec<String> = status
+    status
         .discovered_tools
         .iter()
         .filter(|tool| {
@@ -6356,19 +6460,36 @@ pub(crate) fn tool_names_from_agent_tool_provider(provider: &AgentToolProvider) 
                 && seen.insert((*tool).clone())
         })
         .cloned()
-        .collect();
+        .collect()
+}
 
-    if tools.len() > MAX_TOOLS_PER_PROVIDER {
-        tracing::warn!(
-            provider = provider.metadata.name.as_deref().unwrap_or("?"),
-            total = tools.len(),
-            cap = MAX_TOOLS_PER_PROVIDER,
-            "tool provider exceeds per-provider tool cap; truncating"
-        );
-        tools.truncate(MAX_TOOLS_PER_PROVIDER);
-    }
+/// Count each provider's tools the cap leaves out, dropping the series of providers gone from the list.
+pub(crate) fn record_tool_cuts(tool_providers: &[AgentToolProvider]) {
+    crate::metrics::set_agent_tool_provider_tools_cut(tool_cuts(tool_providers));
+}
 
-    tools
+/// Each provider's namespace, name, and the tools the cap leaves out of routing.
+pub(crate) fn tool_cuts(tool_providers: &[AgentToolProvider]) -> Vec<(String, String, usize)> {
+    tool_providers
+        .iter()
+        .map(|provider| {
+            let total = routable_tool_names(provider).len();
+            let cut = total.saturating_sub(MAX_TOOLS_PER_PROVIDER);
+            if cut > 0 {
+                tracing::warn!(
+                    provider = provider.metadata.name.as_deref().unwrap_or("?"),
+                    total,
+                    cap = MAX_TOOLS_PER_PROVIDER,
+                    "tool provider exceeds per-provider tool cap; truncating"
+                );
+            }
+            (
+                provider.metadata.namespace.clone().unwrap_or_default(),
+                provider.metadata.name.clone().unwrap_or_default(),
+                cut,
+            )
+        })
+        .collect()
 }
 
 /// Publish real provider records as a CRDT state broadcast over SWIM.
@@ -7043,6 +7164,9 @@ pub(crate) fn consumer_config_status_error(
             "ProjectedCredentialsUnsupported"
         },
         OperatorError::ConsumerConfigRender(ConsumerConfigError::SiteRouteUnsupported(_)) => "SiteRouteUnsupported",
+        OperatorError::ConsumerConfigRender(ConsumerConfigError::SovereigntyWithoutGridSiteRoute) => {
+            "SovereigntyWithoutGridSiteRoute"
+        },
         OperatorError::ConsumerConfigRender(_) => "PraxisConfigRenderFailed",
         OperatorError::MountReconciliation(failure) => failure.reason,
         OperatorError::Kube(_) => "PraxisConfigApplyFailed",
@@ -8288,12 +8412,40 @@ mod tests {
     }
 
     #[test]
+    fn configured_crd_seeds_are_read_from_swim_membership_only() {
+        let mut network = base_network();
+        network.spec.membership = Some(crate::crd::grid_network::MembershipConfig {
+            mode: MembershipMode::Swim,
+            swim: Some(crate::crd::grid_network::SwimConfig {
+                seeds: vec!["peer.example:7946".to_owned()],
+            }),
+        });
+        let expected_seeds = vec!["peer.example:7946".to_owned()];
+        assert_eq!(
+            swim_seed_list(&network),
+            expected_seeds.as_slice(),
+            "Swim mode exposes declared SWIM seeds to reconcile"
+        );
+
+        network.spec.membership = Some(crate::crd::grid_network::MembershipConfig {
+            mode: MembershipMode::Local,
+            swim: Some(crate::crd::grid_network::SwimConfig {
+                seeds: vec!["peer.example:7946".to_owned()],
+            }),
+        });
+        assert!(
+            swim_seed_list(&network).is_empty(),
+            "Local mode must never announce SWIM seeds"
+        );
+    }
+
+    #[test]
     fn crd_seed_resolution_retains_last_known_good_when_all_current_lookups_fail() {
         let resolution = SeedResolution {
             configured: true,
             addresses: Vec::new(),
             failures: vec![EndpointResolutionFailure {
-                source: "GridNetwork.spec.seeds".to_owned(),
+                source: "GridNetwork.spec.membership.swim.seeds".to_owned(),
                 endpoint: "missing.example:7946".to_owned(),
                 reason: "DNS resolution failed".to_owned(),
             }],
@@ -8535,28 +8687,24 @@ mod tests {
     }
 
     #[test]
-    fn empty_overlay_warns_only_on_entering_the_state() {
-        let gw: GatewayRef = serde_json::from_value(serde_json::json!({"name": "gw", "namespace": "ns"}))
-            .unwrap_or_else(|_| std::process::abort());
-        let with_reason = |reason: &str| {
-            let mut network = base_network();
-            network.status = Some(
-                serde_json::from_value(serde_json::json!({"routingMapStatus": [{
-                    "gatewayName": "gw", "namespace": "ns", "configMapName": "c", "schemaVersion": "v",
-                    "renderedRevision": "r", "distributedRevision": "r", "contentDigest": "r", "reason": reason,
-                }]}))
-                .unwrap_or_else(|_| std::process::abort()),
-            );
-            network
-        };
-        let cases = [
-            ("no status yet", base_network(), false),
-            ("was distributed", with_reason(""), false),
-            ("was already empty", with_reason("EmptyCandidates"), true),
-        ];
-        for (label, network, want) in cases {
-            assert_eq!(already_empty(&network, &gw), want, "{label}");
-        }
+    fn empty_overlay_warns_only_on_state_transitions() {
+        let logged = ChangeLog::default();
+        assert!(
+            should_warn_empty_overlay(&logged, "net/ns/gw", true),
+            "initial empty state warns"
+        );
+        assert!(
+            !should_warn_empty_overlay(&logged, "net/ns/gw", true),
+            "repeated empty state is quiet"
+        );
+        assert!(
+            !should_warn_empty_overlay(&logged, "net/ns/gw", false),
+            "leaving empty state is quiet"
+        );
+        assert!(
+            should_warn_empty_overlay(&logged, "net/ns/gw", true),
+            "reentering empty state warns"
+        );
     }
 
     #[test]
@@ -8776,6 +8924,7 @@ mod tests {
                 labels: BTreeMap::new(),
                 pins: vec!["previous-pin".to_owned()],
                 signals: None,
+                sovereignty_zone: None,
             },
         )]));
         assert!(
@@ -8958,7 +9107,12 @@ mod tests {
             ("some-id", true, MembershipMode::Swim, GridNetworkPhase::Initializing),
         ] {
             let mut network = base_network();
-            network.spec.seeds = vec!["legacy-peer:7946".to_owned()];
+            network.spec.membership = Some(crate::crd::grid_network::MembershipConfig {
+                mode: MembershipMode::Swim,
+                swim: Some(crate::crd::grid_network::SwimConfig {
+                    seeds: vec!["legacy-peer:7946".to_owned()],
+                }),
+            });
             network.spec.tls.ca_secret_ref = trust.then(|| crate::crd::grid_network::SecretRef {
                 name: "ca".to_owned(),
                 namespace: "default".to_owned(),
@@ -9051,7 +9205,10 @@ mod tests {
             namespace: "default".to_owned(),
             key: None,
         });
-        network.spec.seeds.clear();
+        network.spec.membership = Some(crate::crd::grid_network::MembershipConfig {
+            mode: MembershipMode::Swim,
+            swim: None,
+        });
         let empty = MembershipSnapshot::default();
         let phase = determine_phase(&network, "some-id", Some(&empty), MembershipMode::Swim);
         assert_eq!(
@@ -9071,7 +9228,12 @@ mod tests {
             namespace: "default".to_owned(),
             key: None,
         });
-        network.spec.seeds = vec!["grid.peer:7946".to_owned()];
+        network.spec.membership = Some(crate::crd::grid_network::MembershipConfig {
+            mode: MembershipMode::Swim,
+            swim: Some(crate::crd::grid_network::SwimConfig {
+                seeds: vec!["grid.peer:7946".to_owned()],
+            }),
+        });
         let empty = MembershipSnapshot::default();
         let phase = determine_phase(&network, "some-id", Some(&empty), MembershipMode::Swim);
         assert_eq!(
@@ -10326,6 +10488,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_gossip_pins_bound_tied_certificates_independently_of_resource_order() {
+        Box::pin(assert_bounded_peer_gossip_pins(false)).await;
+    }
+
+    #[tokio::test]
+    async fn peer_gossip_pins_prefer_newer_certificates_independently_of_resource_order() {
+        Box::pin(assert_bounded_peer_gossip_pins(true)).await;
+    }
+
+    #[tokio::test]
     #[expect(clippy::expect_used, reason = "certificate fixture")]
     async fn signed_cert_bootstrap_republishes_on_every_reconcile() {
         let ca = certs::generate_ca("grid-ca").expect("ca");
@@ -10352,6 +10524,22 @@ mod tests {
                 "{reconcile} reconcile carries the site certificate for late joiners"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn signed_state_scope_comes_from_the_local_network_even_without_signer_or_pins() -> Result<(), OperatorError>
+    {
+        let client = crate::resources::test_doubles::mock_kube_client_with_secrets(HashMap::new());
+        let ctx = OperatorCtx::new(client, None, SignalMode::default());
+        let (swim, mut runtime) = SwimHandle::detached("site-a");
+        let network = network_with_endpoint_transport("plaintext", None);
+        apply_signed_state(&network, &ctx, &swim, "authenticated-grid-id", SignedStateMode::Enforce).await?;
+        assert_eq!(
+            runtime.network_scopes_sent(),
+            [("authenticated-grid-id".to_owned(), "glb-demo".to_owned())],
+            "resource metadata.name authorizes provider networks independently of signer and peer-pin readiness"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -11053,6 +11241,38 @@ mod tests {
         .unwrap_or_else(|_| std::process::abort())
     }
 
+    /// `site` declaring `zone` as its `sovereigntyZone`.
+    fn zoned_site(mut site: GridSite, zone: &str) -> GridSite {
+        site.spec.sovereignty_zone = Some(zone.to_owned());
+        site
+    }
+
+    #[test]
+    fn a_sites_zone_comes_from_its_own_networks_record_trust_ranks_first() {
+        let in_net = |mut site: GridSite| {
+            site.spec.grid_network_ref = "net".to_owned();
+            site
+        };
+        let mut other = zoned_site(peer_grid_site("site-c", None, &["pin-c", "pin-c2"]), "us");
+        other.spec.grid_network_ref = "other-net".to_owned();
+        let sites = [
+            in_net(zoned_site(peer_grid_site("site-a", None, &["pin-a"]), " EU ")),
+            in_net(zoned_site(peer_grid_site("net-site-a", Some("site-a"), &[]), "us")),
+            in_net(zoned_site(peer_grid_site("site-b", None, &["pin-b"]), "eu west")),
+            in_net(zoned_site(peer_grid_site("site-c", None, &[]), "eu")),
+            other,
+            in_net(peer_grid_site("site-d", None, &["pin-d"])),
+        ];
+        assert_eq!(
+            network_zones(&sites, "net", PeerTrustMode::Pin, SignalsAt::Advertised),
+            BTreeMap::from([
+                ("site-a".to_owned(), "eu".to_owned()),
+                ("site-c".to_owned(), "eu".to_owned()),
+            ]),
+            "the pinned record wins over a stub; another network's record never counts; invalid or unset is none"
+        );
+    }
+
     #[test]
     fn peer_identities_keys_auto_discovered_by_site_id_annotation() {
         let sites = [peer_grid_site("net-remote", Some("remote"), &["pin-a"])];
@@ -11077,6 +11297,23 @@ mod tests {
         assert!(
             peer_identities(&sites, PeerTrustMode::Pin, SignalsAt::Advertised).contains_key("remote"),
             "under Swim it still counts"
+        );
+    }
+
+    #[test]
+    fn under_local_a_consumer_only_member_is_admitted_and_never_polled() {
+        let sites = [peer_grid_site("consumer", None, &[])];
+        let identities = peer_identities(&sites, PeerTrustMode::Spiffe, SignalsAt::Derived(None));
+        // A declared member with no endpoints is a peer.
+        let record = identities.get("consumer").unwrap_or_else(|| std::process::abort());
+        assert!(record.signals.is_none(), "with no endpoint there is nothing to poll");
+        let held = signals::PeerIdentities::new();
+        held.set(identities);
+        assert!(held.knows("consumer"), "its calls are admitted");
+        assert_eq!(
+            held.without_endpoint("local"),
+            ["consumer"],
+            "and it is left out of polls"
         );
     }
 
@@ -13434,6 +13671,7 @@ mod tests {
                 false,
                 false,
                 cc.site_router,
+                cc.sovereignty.as_ref(),
             );
             assert!(render.is_ok(), "{live:?}: the render must succeed: {render:?}");
             let rendered = render.unwrap_or_else(|_| std::process::abort());
@@ -15232,5 +15470,103 @@ mod tests {
             broadcast.provider_uids.is_empty(),
             "the complete UID is omitted rather than truncated"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test Utilities
+    // ---------------------------------------------------------------------------
+
+    /// Verify stable selection for tied issuance dates and for rotated identities.
+    #[expect(clippy::expect_used, reason = "certificate fixture")]
+    async fn assert_bounded_peer_gossip_pins(newer_keys: bool) {
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let mut items = Vec::new();
+        let mut expected = Vec::new();
+        let now = time::OffsetDateTime::now_utc();
+        let mut requests = Vec::new();
+        for _ in 0..swim::MAX_PINNED_KEYS_PER_ORIGIN + 2 {
+            let csr = certs::generate_csr("site-peer").expect("CSR");
+            let leaf = certs::sign_csr(&ca, "site-peer", &csr.csr_pem, certs::Validity::default()).expect("leaf");
+            let key = certs::verify_site_cert(&ca.cert_pem, &leaf.cert_pem, "site-peer").expect("key");
+            requests.push((key, csr));
+        }
+        requests.sort_by(|(key_a, _), (key_b, _)| key_a.cmp(key_b));
+        for (index, (_, csr)) in requests.iter().enumerate() {
+            let age = if newer_keys { requests.len() - index } else { 1 };
+            let validity = certs::Validity {
+                not_before: now - time::Duration::hours(i64::try_from(age).expect("small fixture")),
+                not_after: now + time::Duration::days(1),
+            };
+            let leaf = certs::sign_csr(&ca, "site-peer", &csr.csr_pem, validity).expect("peer certificate");
+            let fingerprint = certs::canonical_fingerprint(&leaf.cert_pem).expect("fingerprint");
+            expected.push(certs::verify_site_cert(&ca.cert_pem, &leaf.cert_pem, "site-peer").expect("key"));
+            items.push(serde_json::json!({
+                "apiVersion": "grid.praxis.fast/v1alpha1",
+                "kind": "GridSite",
+                "metadata": {
+                    "name": format!("peer-{index}"),
+                    "labels": { "grid.praxis.fast/auto-discovered": "true" },
+                    "annotations": { "grid.praxis.fast/site-id": "site-peer" }
+                },
+                "spec": {
+                    "gridNetworkRef": "glb-demo",
+                    "trust": { "canonicalFingerprints": [fingerprint] }
+                },
+                "status": { "publicCertPem": leaf.cert_pem }
+            }));
+        }
+        expected.sort();
+        if newer_keys {
+            expected.reverse();
+        }
+        expected.truncate(swim::MAX_PINNED_KEYS_PER_ORIGIN);
+        let duplicate = items.first().expect("peer fixture").clone();
+        items.push(duplicate);
+        let ca_secret = serde_json::to_value(crate::resources::test_doubles::secret_with_key(
+            "ca.crt",
+            ca.cert_pem.as_bytes(),
+        ))
+        .expect("CA secret");
+        let mut network = network_with_endpoint_transport("plaintext", None);
+        network.spec.peer_trust = Some(crate::crd::grid_network::PeerTrustConfig {
+            mode: PeerTrustMode::Pin,
+            signed_state: SignedStateMode::Enforce,
+        });
+        let node = swim::SwimNode::new(swim::NodeId::with_generation(
+            "site-local".to_owned(),
+            "127.0.0.1:7946".parse().expect("local address"),
+            1,
+        ));
+        for reversed in [false, true] {
+            if reversed {
+                items.reverse();
+            }
+            for _ in 0..items.len() {
+                let sites = serde_json::json!({
+                    "apiVersion": "grid.praxis.fast/v1alpha1",
+                    "kind": "GridSiteList",
+                    "metadata": { "resourceVersion": "1" },
+                    "items": items
+                });
+                let client = crate::resources::test_doubles::mock_kube_client_with_json(HashMap::from([
+                    ("ca", ca_secret.clone()),
+                    ("gridsites", sites),
+                ]));
+                let pins = collect_gossip_peer_pins(&network, &client, "site-local")
+                    .await
+                    .expect("verified peer pins");
+
+                assert_eq!(
+                    pins.get("site-peer"),
+                    Some(&expected),
+                    "excess and duplicate certificates retain the same bounded keys for every ordering"
+                );
+                for (origin, keys) in pins {
+                    let result = node.pin_origin_for_grid("grid-a", origin, keys);
+                    assert!(result.is_ok(), "SWIM must accept the bounded peer pin: {result:?}");
+                }
+                items.rotate_left(1);
+            }
+        }
     }
 }

@@ -656,7 +656,7 @@ Replace images in an override file:
 # operator-overrides.yaml
 image:
   repository: my-registry.example.com/grid-operator
-  tag: v0.3.0-rc.3
+  tag: v0.3.0
   pullPolicy: Always
 ```
 
@@ -844,7 +844,9 @@ That creates a new CA, so peers that pin this site need its new certificate.
 
 On OpenShift a NetworkPolicy also admits only the user-workload and platform
 monitoring namespaces to that port. A Prometheus elsewhere needs its namespace in
-`networkPolicy.metricsFrom`.
+`networkPolicy.metricsFrom`, which replaces both OpenShift selectors: list every
+namespace that still scrapes. Off OpenShift the policy is off by default. Turning it on
+needs `networkPolicy.metricsFrom` set to your Prometheus namespace.
 
 ### CRD Retention
 

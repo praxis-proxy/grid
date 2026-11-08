@@ -1,0 +1,14 @@
+# Fixed test-only SWIM gossip key, shared by every cluster in this topology.
+# The value is 32 random bytes (base64), safe to commit like the test
+# certificates: it never leaves the kind test clusters. The operator
+# fail-closes while a GridNetwork references this secret and it is missing.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grid-swim-key
+  namespace: grid-system
+  labels:
+    app.kubernetes.io/part-of: grid-combined-site
+type: Opaque
+data:
+  key: KLTaEd5DorFIVn2/RJ5q5jMjXhIBdane46DWput/tQo=

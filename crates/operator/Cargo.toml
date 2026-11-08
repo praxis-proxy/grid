@@ -10,7 +10,7 @@ publish = false
 [features]
 default = ["tls-rustls"]
 tls-rustls = [
-  "swim/ring-signing",
+  "swim/rust-crypto",
   "certs/rcgen",
   "grid-client/rcgen",
   "rmcp/reqwest-tls-no-provider",
@@ -21,6 +21,7 @@ tls-rustls = [
   "dep:tokio-rustls",
 ]
 fips = [
+  "dep:grid-fips",
   "swim/fips",
   "certs/fips",
   "grid-client/fips",
@@ -33,6 +34,7 @@ fips = [
 ]
 
 [dependencies]
+grid-fips = { workspace = true, features = ["runtime"], optional = true }
 version.workspace = true
 axum = { workspace = true }
 bytes = { workspace = true }
@@ -54,6 +56,7 @@ grid-signals = { path = "../signals" }
 site-invite-api = { path = "../site-invite-api" }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
+kube-runtime = { workspace = true }
 percent-encoding = { workspace = true }
 pem = { workspace = true }
 prometheus = { workspace = true }
@@ -81,6 +84,7 @@ uuid = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 # Server-side rmcp features, only for the mcp_probe integration tests, which
 # spin up a real Streamable HTTP MCP server to probe against.
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }

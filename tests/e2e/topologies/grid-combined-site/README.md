@@ -21,6 +21,11 @@ filters used by this topology. For local development, set
 
 - Three-cluster combined topology (consumer and provider roles colocated)
 - SWIM auto-discovery across all sites
+- Encrypted SWIM gossip: every site's `GridNetwork` references the shared
+  `grid-swim-key` Secret, so membership, state broadcasts, and model
+  inventory frames are AES-256-GCM encrypted on the wire; convergence
+  assertions prove the key path end to end (the operator fail-closes if the
+  key is missing or invalid)
 - Local-preference routing (each site prefers its own provider)
 - Dynamic provider lifecycle (secondary provider add/remove)
 - Provider boundary with organization-only trust

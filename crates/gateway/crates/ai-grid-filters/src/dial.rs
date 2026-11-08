@@ -1147,10 +1147,12 @@ mod tests {
                     selection_group: 0,
                     site: dial.site.clone(),
                     stable_id: Some(format!("candidate-{cluster}")),
+                    weight: None,
                 })
                 .collect(),
             provider_hop_clusters: Vec::new(),
             provider_hop_sni: BTreeMap::new(),
+            sovereignty_zones: BTreeMap::new(),
             peers: Vec::new(),
         };
         let dial = DialConfig {

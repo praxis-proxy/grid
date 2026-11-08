@@ -13,6 +13,7 @@ mod descriptor;
 mod dial;
 #[cfg(test)]
 mod flow;
+mod geo;
 mod health;
 mod metadata;
 mod pin;
@@ -55,7 +56,7 @@ pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;
 
 /// Grid counters the gateway emits, with the help text a scrape shows.
-const COUNTER_HELP: [(&str, &str); 11] = [
+const COUNTER_HELP: [(&str, &str); 13] = [
     (
         "grid_route_decisions_total",
         "Requests the gateway decided, by outcome. A refusal records an empty site and cluster.",
@@ -65,8 +66,16 @@ const COUNTER_HELP: [(&str, &str); 11] = [
         "Decisions by the path that produced them.",
     ),
     (
+        "grid_route_fenced_total",
+        "Requests the sovereignty fence refused, or would have when it only logs, by cause.",
+    ),
+    (
         "grid_route_prefix_affinity_total",
         "Prefix-affinity decisions by outcome.",
+    ),
+    (
+        "grid_route_prefix_index_evictions_total",
+        "Prefix keys that left a backend cluster's index, by reason: capacity for a live key a full index displaced, ttl for a confirmed key past its lifetime, pending for an expired key a request still waited on, forgotten for a failed or refused request's.",
     ),
     ("grid_serving_config_reload_total", "Serving-config reloads by result."),
     (
@@ -97,7 +106,7 @@ const COUNTER_HELP: [(&str, &str); 11] = [
 ];
 
 /// Grid gauges the gateway emits.
-const GAUGE_HELP: [(&str, &str); 23] = [
+const GAUGE_HELP: [(&str, &str); 29] = [
     (
         "grid_serving_unbound_provider_hops",
         "Provider hops the applied serving config declares that no startup-verified backend binds. Their candidates take no traffic until a serving config names the SNI that backend verified at startup, or, for a backend not verified at startup, until the gateway restarts.",
@@ -124,7 +133,7 @@ const GAUGE_HELP: [(&str, &str); 23] = [
     ),
     (
         "grid_route_site_rho_reported",
-        "Saturation the site reports about itself, as its KV cache utilization plus the spread across its pods. NaN where it reports none.",
+        "The EPP's own pool saturation, published with flow control on; for a site without an in-flight count, the comparator it is read by. Uncapped. NaN where neither exists.",
     ),
     (
         "grid_route_site_rho_counted",
@@ -141,6 +150,18 @@ const GAUGE_HELP: [(&str, &str); 23] = [
     (
         "grid_route_site_ceiling_soft",
         "Most requests the current site size has carried with nothing waiting. NaN until it is seen queue-free; retired after a sustained loss of serving units.",
+    ),
+    (
+        "grid_route_site_rho_derived",
+        "Gateway approximation of the EPP's pool saturation from pool averages at the detector's default thresholds. Uncapped. NaN without a KV share.",
+    ),
+    (
+        "grid_route_site_rho_published",
+        "1 when the comparator is the EPP's published pool saturation, 0 when it is the gateway's approximation; the two use different thresholds, the EPP's configured ones and the detector defaults. NaN without one.",
+    ),
+    (
+        "grid_route_site_capacity_implied",
+        "Requests the site would run at a full cache, running over KV share at queue-free instants. NaN below a 0.15 share or without one.",
     ),
     (
         "grid_route_site_ceiling_hard",
@@ -179,8 +200,20 @@ const GAUGE_HELP: [(&str, &str); 23] = [
         "1 when an otherwise routable load-publishing site has no queue score, by bounded reason: absent, stale, or unreadable. 0 otherwise.",
     ),
     (
+        "grid_route_candidate_info",
+        "1 while the gateway lists the model as a candidate at the site's backend cluster, 0 once it no longer does. Join a per-site series on site and cluster with == 1; a cluster serving more than one model has one series per model.",
+    ),
+    (
         "grid_route_shedding",
         "1 while the gateway sheds this model, 0 otherwise.",
+    ),
+    (
+        "grid_route_prefix_index_entries",
+        "Prefix keys this replica holds for a backend cluster, expired ones included until displaced.",
+    ),
+    (
+        "grid_route_prefix_index_capacity",
+        "Prefix keys this replica may hold for a backend cluster. 0 once the cluster leaves the serving config.",
     ),
     (
         "grid_signals_last_success_timestamp_seconds",

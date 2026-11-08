@@ -1,29 +1,35 @@
-//! Opt-in TLS listener that serves only `GET /metrics`.
+//! Opt-in TLS listener that serves only Kubernetes-authorized `GET /metrics`.
 //!
 //! The Praxis admin listener also serves kv, pipelines, and log-level with no
 //! auth, and refuses a non-loopback `Host`, so an in-cluster scraper cannot use
-//! it. This listener renders the same Prometheus registry on its own port.
+//! it. This listener renders the same Prometheus registry on its own port and checks each
+//! scraper token with Kubernetes `TokenReview` and `SubjectAccessReview`.
 
 use std::{
     borrow::Cow,
+    collections::HashMap,
     io,
     net::{SocketAddr, TcpListener as StdTcpListener},
     sync::Arc,
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use metrics::{counter, gauge};
 use praxis_core::config::Config;
 use praxis_tls::{CertKeyPair, reload::ReloadableCertResolver, watcher::CertWatcher};
+use reqwest::Certificate;
+use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{Mutex, Semaphore},
     time::timeout,
 };
 use tokio_rustls::{
     TlsAcceptor,
-    rustls::{ServerConfig, crypto::CryptoProvider},
+    rustls::{Error as TlsError, ServerConfig, crypto::CryptoProvider},
 };
 use tracing::{debug, info, warn};
 
@@ -36,8 +42,41 @@ const CERT_ENV: &str = "GRID_METRICS_TLS_CERT";
 /// Env var naming the serving key (PEM).
 const KEY_ENV: &str = "GRID_METRICS_TLS_KEY";
 
-/// Concurrent connections. A scraper needs one, and extras are closed on accept.
-const MAX_CONNECTIONS: usize = 4;
+/// Mounted projected Kubernetes API token for `TokenReview` and `SubjectAccessReview`.
+const API_TOKEN_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+
+/// Mounted Kubernetes API CA bundle.
+const API_CA_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+
+/// Kubernetes API endpoint used for in-cluster authorization reviews.
+const API_URL: &str = "https://kubernetes.default.svc";
+
+/// Namespace whose synthetic scrape permission is checked by `SubjectAccessReview`.
+const AUTH_NAMESPACE_ENV: &str = "GRID_METRICS_AUTH_NAMESPACE";
+
+/// Release-specific synthetic scrape permission name.
+const AUTH_RESOURCE_NAME_ENV: &str = "GRID_METRICS_AUTH_RESOURCE_NAME";
+
+/// Concurrent connections accepted by the metrics listener.
+const MAX_CONNECTIONS: usize = 16;
+
+/// Concurrent uncached Kubernetes authorization reviews.
+const MAX_AUTHORIZATION_REVIEWS: usize = 8;
+
+/// Maximum cached token decisions held by this gateway process.
+const MAX_CACHED_AUTHORIZATIONS: usize = 1024;
+
+/// Lifetime for an allowed token decision.
+const ALLOWED_AUTHORIZATION_TTL: Duration = Duration::from_secs(60);
+
+/// Lifetime for a denied token decision.
+const DENIED_AUTHORIZATION_TTL: Duration = Duration::from_secs(10);
+
+/// Authorization request outcomes exposed on the metrics registry.
+const AUTHORIZATION_METRIC: &str = "grid_metrics_auth_total";
+
+/// Concurrent Kubernetes authorization reviews exposed on the metrics registry.
+const AUTHORIZATION_IN_FLIGHT_METRIC: &str = "grid_metrics_auth_in_flight";
 
 /// Deadline for the TLS handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -124,13 +163,14 @@ impl MetricsListener {
     ///
     /// # Errors
     ///
-    /// Returns a message when the cert does not load, no crypto provider is
-    /// installed, or the address does not bind.
+    /// Returns a message when the serving certificate does not load, no crypto
+    /// provider is installed, or the address does not bind.
     pub(crate) fn spawn(self) -> Result<JoinHandle<()>, String> {
         let resolver = ReloadableCertResolver::new(&self.pair)
             .map_err(|err| format!("metrics listener certificate {}: {err}", self.pair.cert_path))?;
         let current = resolver.arc();
         let acceptor = TlsAcceptor::from(Arc::new(server_config(resolver)?));
+        let authorizer = KubernetesAuthorizer::new();
         let listener = StdTcpListener::bind(self.addr)
             .and_then(|listener| listener.set_nonblocking(true).map(|()| listener))
             .map_err(|err| format!("metrics listener bind {}: {err}", self.addr))?;
@@ -149,7 +189,7 @@ impl MetricsListener {
                     },
                 };
                 info!(%addr, "metrics listener serving");
-                runtime.block_on(serve(listener, acceptor));
+                runtime.block_on(serve(listener, acceptor, authorizer));
             })
             .map_err(|err| format!("metrics listener thread: {err}"))
     }
@@ -179,16 +219,16 @@ fn server_config(resolver: ReloadableCertResolver) -> Result<ServerConfig, Strin
 }
 
 /// Register the bound socket with the runtime and serve it.
-async fn serve(listener: StdTcpListener, acceptor: TlsAcceptor) {
+async fn serve(listener: StdTcpListener, acceptor: TlsAcceptor, authorizer: KubernetesAuthorizer) {
     match TcpListener::from_std(listener) {
-        Ok(listener) => accept_loop(&listener, &acceptor).await,
+        Ok(listener) => accept_loop(&listener, &acceptor, &authorizer).await,
         Err(err) => warn!(error = %err, "metrics listener failed to register its socket"),
     }
 }
 
 /// Accept connections forever, closing any beyond [`MAX_CONNECTIONS`].
 #[expect(clippy::infinite_loop, reason = "serves for the life of the process")]
-async fn accept_loop(listener: &TcpListener, acceptor: &TlsAcceptor) {
+async fn accept_loop(listener: &TcpListener, acceptor: &TlsAcceptor, authorizer: &KubernetesAuthorizer) {
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -205,8 +245,9 @@ async fn accept_loop(listener: &TcpListener, acceptor: &TlsAcceptor) {
             continue;
         };
         let acceptor = acceptor.clone();
+        let authorizer = authorizer.clone();
         drop(tokio::spawn(async move {
-            if let Err(err) = Box::pin(handle(stream, &acceptor)).await {
+            if let Err(err) = Box::pin(handle(stream, &acceptor, &authorizer)).await {
                 debug!(%peer, error = %err, "metrics connection failed");
             }
             drop(permit);
@@ -219,19 +260,448 @@ async fn accept_loop(listener: &TcpListener, acceptor: &TlsAcceptor) {
 /// # Errors
 ///
 /// Returns the I/O error or timeout that ended the connection.
-async fn handle(stream: TcpStream, acceptor: &TlsAcceptor) -> io::Result<()> {
+async fn handle(stream: TcpStream, acceptor: &TlsAcceptor, authorizer: &KubernetesAuthorizer) -> io::Result<()> {
     // Boxed: the TLS stream makes this future several KiB.
     within(
         CONNECTION_TIMEOUT,
         Box::pin(async {
             let mut tls = within(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await?;
-            let (head, body) = read_request(&mut tls).await?.into_parts();
+            let request = read_request_details(&mut tls).await?;
+            let reply = match (request.reply, request.bearer_token) {
+                (Reply::Metrics, Some(token)) => authorize_request(authorizer, &token).await,
+                (Reply::Metrics, None) => {
+                    record_authorization_result("missing");
+                    Reply::Unauthorized
+                },
+                (reply, _) => reply,
+            };
+            let (head, body) = reply.into_parts();
             tls.write_all(head.as_bytes()).await?;
             tls.write_all(body.as_bytes()).await?;
             tls.shutdown().await
         }),
     )
     .await
+}
+
+/// Resolve one scrape credential to an HTTP response and record its outcome.
+async fn authorize_request(authorizer: &KubernetesAuthorizer, token: &str) -> Reply {
+    match Box::pin(authorizer.authorize(token)).await {
+        Ok(Authorization::Allowed) => {
+            record_authorization_result("allowed");
+            Reply::Metrics
+        },
+        Ok(Authorization::Unauthenticated) => {
+            record_authorization_result("unauthenticated");
+            Reply::Unauthorized
+        },
+        Ok(Authorization::Forbidden) => {
+            record_authorization_result("forbidden");
+            Reply::Forbidden
+        },
+        Err(AuthorizationError::Overloaded) => {
+            record_authorization_result("overloaded");
+            Reply::ServiceUnavailable
+        },
+        Err(AuthorizationError::Unavailable(err)) => {
+            record_authorization_result("api_error");
+            let diagnostic = auth_api_diagnostic(&err);
+            warn!(
+                failure = diagnostic.category,
+                http_status = diagnostic.http_status,
+                "metrics authorization API unavailable"
+            );
+            Reply::ServiceUnavailable
+        },
+    }
+}
+
+/// Record a bounded authorization outcome label.
+fn record_authorization_result(result: &'static str) {
+    counter!(AUTHORIZATION_METRIC, "result" => result).increment(1);
+}
+
+/// Keep the authorization review gauge balanced on every return and cancellation path.
+struct AuthorizationReviewGuard;
+
+impl AuthorizationReviewGuard {
+    /// Increment the in-flight review gauge.
+    fn new() -> Self {
+        gauge!(AUTHORIZATION_IN_FLIGHT_METRIC).increment(1.0);
+        Self
+    }
+}
+
+impl Drop for AuthorizationReviewGuard {
+    fn drop(&mut self) {
+        gauge!(AUTHORIZATION_IN_FLIGHT_METRIC).decrement(1.0);
+    }
+}
+
+/// Kubernetes API client for the metrics listener's authentication checks.
+#[derive(Clone)]
+struct KubernetesAuthorizer {
+    /// Validated Kubernetes client and scope, or the reason they are unavailable.
+    config: Result<KubernetesAuthorizationConfig, String>,
+    /// Bounded cache of token hashes and their recent review decisions.
+    cache: Arc<Mutex<AuthorizationCache>>,
+    /// Limit concurrent API review work independently of accepted connections.
+    review_slots: Arc<Semaphore>,
+}
+
+impl KubernetesAuthorizer {
+    /// Build an authorizer, retaining setup failures for fail-closed scrape responses.
+    fn new() -> Self {
+        let config = KubernetesAuthorizationConfig::new().map_err(|error| {
+            warn!(%error, "metrics authorization configuration unavailable");
+            error
+        });
+        Self {
+            config,
+            cache: Arc::new(Mutex::new(AuthorizationCache::default())),
+            review_slots: Arc::new(Semaphore::new(MAX_AUTHORIZATION_REVIEWS)),
+        }
+    }
+
+    /// Authenticate a scraper token and authorize `GET /metrics` for its user.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the Kubernetes API cannot complete either review.
+    async fn authorize(&self, token: &str) -> Result<Authorization, AuthorizationError> {
+        let token_hash = token_hash(token);
+        let cached = self.cache.lock().await.get(token_hash, Instant::now());
+        if let Some(cached) = cached {
+            return Ok(cached);
+        }
+        let _permit = Arc::clone(&self.review_slots)
+            .try_acquire_owned()
+            .map_err(|_error| AuthorizationError::Overloaded)?;
+        let _in_flight = AuthorizationReviewGuard::new();
+        let authorization = self.review(token).await.map_err(AuthorizationError::Unavailable)?;
+        self.cache
+            .lock()
+            .await
+            .insert(token_hash, authorization, Instant::now());
+        Ok(authorization)
+    }
+
+    /// Authenticate a scraper token and authorize its user with Kubernetes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when authorization configuration or either Kubernetes
+    /// API review fails.
+    async fn review(&self, token: &str) -> io::Result<Authorization> {
+        let config = self.config.as_ref().map_err(|error| io::Error::other(error.clone()))?;
+        let token_review: TokenReview = Self::post(
+            &config.client,
+            "/apis/authentication.k8s.io/v1/tokenreviews",
+            &serde_json::json!({
+                "apiVersion": "authentication.k8s.io/v1",
+                "kind": "TokenReview",
+                "spec": {"token": token}
+            }),
+        )
+        .await?;
+        if !token_review.status.authenticated {
+            return Ok(Authorization::Unauthenticated);
+        }
+        let Some(user) = token_review.status.user else {
+            return Ok(Authorization::Unauthenticated);
+        };
+        let mut spec = serde_json::json!({
+            "user": user.username,
+            "groups": user.groups,
+            "extra": user.extra,
+            "resourceAttributes": {
+                "namespace": config.namespace.as_str(),
+                "verb": "get",
+                "group": "metrics.grid.praxis-proxy.io",
+                "resource": "scrapes",
+                "name": config.resource_name.as_str()
+            }
+        });
+        if let (Some(uid), Some(spec)) = (user.uid, spec.as_object_mut()) {
+            spec.insert("uid".to_owned(), serde_json::Value::String(uid));
+        }
+        let authorization_review: SubjectAccessReview = Self::post(
+            &config.client,
+            "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+            &serde_json::json!({
+                "apiVersion": "authorization.k8s.io/v1",
+                "kind": "SubjectAccessReview",
+                "spec": spec
+            }),
+        )
+        .await?;
+        Ok(if authorization_review.status.allowed {
+            Authorization::Allowed
+        } else {
+            Authorization::Forbidden
+        })
+    }
+
+    /// Post a review request using the gateway's projected API token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when credentials, transport, API status, or response data fail.
+    async fn post<T: serde::de::DeserializeOwned>(
+        client: &reqwest::Client,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> io::Result<T> {
+        let api_token = std::fs::read_to_string(API_TOKEN_PATH).map_err(auth_api_error)?;
+        let response = client
+            .post(format!("{API_URL}{path}"))
+            .bearer_auth(api_token.trim())
+            .json(&body)
+            .send()
+            .await
+            .map_err(auth_api_error)?
+            .error_for_status()
+            .map_err(auth_api_error)?;
+        response.json().await.map_err(auth_api_error)
+    }
+}
+
+/// Kubernetes client and release scope needed to review a scraper token.
+#[derive(Clone)]
+struct KubernetesAuthorizationConfig {
+    /// API client trusting the in-cluster CA bundle.
+    client: reqwest::Client,
+    /// Namespace containing the gateway's synthetic scrape permission.
+    namespace: String,
+    /// Release-specific name of the scrape permission.
+    resource_name: String,
+}
+
+impl KubernetesAuthorizationConfig {
+    /// Build a client using the projected service-account CA.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the CA, authorization scope, or HTTP client cannot be loaded.
+    fn new() -> Result<Self, String> {
+        let namespace = std::env::var(AUTH_NAMESPACE_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("metrics listener needs {AUTH_NAMESPACE_ENV}"))?;
+        let resource_name = std::env::var(AUTH_RESOURCE_NAME_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("metrics listener needs {AUTH_RESOURCE_NAME_ENV}"))?;
+        let ca = std::fs::read(API_CA_PATH).map_err(|err| format!("metrics listener Kubernetes CA: {err}"))?;
+        let certificate = Certificate::from_pem(&ca).map_err(|err| format!("metrics listener Kubernetes CA: {err}"))?;
+        let client = reqwest::Client::builder()
+            .tls_certs_only([certificate])
+            .timeout(Duration::from_secs(2))
+            .build()
+            .map_err(|err| format!("metrics listener Kubernetes API client: {err}"))?;
+        Ok(Self {
+            client,
+            namespace,
+            resource_name,
+        })
+    }
+}
+
+/// A bounded cache of authorization decisions keyed only by a token digest.
+#[derive(Default)]
+struct AuthorizationCache {
+    /// Cached decisions, each expiring after its allow or deny TTL.
+    entries: HashMap<[u8; 32], CachedAuthorization>,
+}
+
+impl AuthorizationCache {
+    /// Return a cached decision and discard it when its lifetime has elapsed.
+    fn get(&mut self, token_hash: [u8; 32], now: Instant) -> Option<Authorization> {
+        let cached = self
+            .entries
+            .get(&token_hash)
+            .filter(|entry| entry.expires_at > now)
+            .map(|entry| entry.authorization);
+        if cached.is_none() {
+            self.entries.remove(&token_hash);
+        }
+        cached
+    }
+
+    /// Insert a decision while expiring old entries and keeping the map bounded.
+    fn insert(&mut self, token_hash: [u8; 32], authorization: Authorization, now: Instant) {
+        self.entries.retain(|_hash, entry| entry.expires_at > now);
+        if self.entries.len() >= MAX_CACHED_AUTHORIZATIONS {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_hash, entry)| entry.expires_at)
+                .map(|(hash, _entry)| *hash);
+            if let Some(hash) = oldest {
+                self.entries.remove(&hash);
+            }
+        }
+        let ttl = match authorization {
+            Authorization::Allowed => ALLOWED_AUTHORIZATION_TTL,
+            Authorization::Unauthenticated | Authorization::Forbidden => DENIED_AUTHORIZATION_TTL,
+        };
+        let Some(expires_at) = now.checked_add(ttl) else {
+            return;
+        };
+        self.entries.insert(
+            token_hash,
+            CachedAuthorization {
+                authorization,
+                expires_at,
+            },
+        );
+    }
+}
+
+/// A cached decision with its expiration instant.
+struct CachedAuthorization {
+    /// Authentication and authorization decision.
+    authorization: Authorization,
+    /// Instant after which the decision must be reviewed again.
+    expires_at: Instant,
+}
+
+/// SHA-256 digest for a bearer token, so the cache never retains credentials.
+fn token_hash(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+/// Failure to authorize a scrape because checks are busy or Kubernetes is unavailable.
+enum AuthorizationError {
+    /// The bounded concurrent review limit has been reached.
+    Overloaded,
+    /// A Kubernetes authentication or authorization review failed.
+    Unavailable(io::Error),
+}
+
+/// The result of the authentication and authorization reviews.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Authorization {
+    /// The scraper token is valid and may read metrics.
+    Allowed,
+    /// The scraper did not present a valid Kubernetes token.
+    Unauthenticated,
+    /// The token is valid but is not authorized for `/metrics`.
+    Forbidden,
+}
+
+/// A failure to consult the Kubernetes authorization API.
+///
+/// The source error is retained for operator diagnostics without exposing request headers.
+fn auth_api_error<E>(source: E) -> io::Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    io::Error::other(source)
+}
+
+/// Credential-free fields logged for a failed Kubernetes authorization request.
+#[derive(Debug)]
+struct AuthorizationApiDiagnostic {
+    /// Fixed failure category, never derived from request or error text.
+    category: &'static str,
+    /// Kubernetes HTTP status, when a response was received.
+    http_status: Option<u16>,
+}
+
+/// Classify preserved failures without logging URLs, headers, bodies, or source text.
+fn auth_api_diagnostic(error: &io::Error) -> AuthorizationApiDiagnostic {
+    let request = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<reqwest::Error>());
+    let category = if let Some(request) = request {
+        if request.is_timeout() {
+            "timeout"
+        } else if auth_api_tls_error(request) {
+            "tls"
+        } else if request.is_status() {
+            "http_status"
+        } else if request.is_decode() {
+            "decode"
+        } else if request.is_connect() {
+            "connection"
+        } else {
+            "request"
+        }
+    } else if error
+        .get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<io::Error>)
+    {
+        "credential_read"
+    } else {
+        "configuration"
+    };
+    AuthorizationApiDiagnostic {
+        category,
+        http_status: request.and_then(reqwest::Error::status).map(|status| status.as_u16()),
+    }
+}
+
+/// Recognize TLS failures by type in the source chain rather than error message text.
+fn auth_api_tls_error(root: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(root);
+    while let Some(error) = source {
+        if error.is::<TlsError>() {
+            return true;
+        }
+        if let Some(inner) = error.downcast_ref::<io::Error>().and_then(io::Error::get_ref) {
+            source = Some(inner);
+            continue;
+        }
+        source = error.source();
+    }
+    false
+}
+
+/// `TokenReview` response data used to construct the `SubjectAccessReview`.
+#[derive(Deserialize)]
+struct TokenReview {
+    /// Authentication result.
+    status: TokenReviewStatus,
+}
+
+/// `TokenReview` authentication status.
+#[derive(Deserialize)]
+struct TokenReviewStatus {
+    /// Whether the token has a valid identity.
+    authenticated: bool,
+    /// The authenticated Kubernetes identity.
+    user: Option<KubernetesUser>,
+}
+
+/// Kubernetes identity returned by `TokenReview`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KubernetesUser {
+    /// User name.
+    username: String,
+    /// Optional stable user identifier.
+    uid: Option<String>,
+    /// Groups associated with the identity.
+    #[serde(default)]
+    groups: Vec<String>,
+    /// Additional identity attributes.
+    #[serde(default)]
+    extra: HashMap<String, Vec<String>>,
+}
+
+/// `SubjectAccessReview` response data.
+#[derive(Deserialize)]
+struct SubjectAccessReview {
+    /// Authorization decision.
+    status: SubjectAccessReviewStatus,
+}
+
+/// `SubjectAccessReview` authorization decision.
+#[derive(Deserialize)]
+struct SubjectAccessReviewStatus {
+    /// Whether the identity may get `/metrics`.
+    allowed: bool,
 }
 
 /// `future`'s result, or a `TimedOut` error after `limit`.
@@ -250,12 +720,33 @@ async fn within<T, F: Future<Output = io::Result<T>>>(limit: Duration, future: F
 /// # Errors
 ///
 /// Returns the read error, or `UnexpectedEof` when the peer closes mid-head.
+#[cfg(test)]
 async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Reply> {
+    Ok(read_request_details(stream).await?.reply)
+}
+
+/// The parsed route and optional bearer credential from one HTTP request.
+struct RequestDetails {
+    /// The route result before authentication.
+    reply: Reply,
+    /// Valid bearer token from a single Authorization header.
+    bearer_token: Option<String>,
+}
+
+/// Read a request head and retain its bearer credential for authorization.
+///
+/// # Errors
+///
+/// Returns the read error, or `UnexpectedEof` when the peer closes mid-head.
+async fn read_request_details<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<RequestDetails> {
     let mut head = vec![0_u8; MAX_HEAD];
     let mut filled = 0_usize;
     loop {
         let Some(spare) = head.get_mut(filled..).filter(|spare| !spare.is_empty()) else {
-            return Ok(Reply::HeadTooLarge);
+            return Ok(RequestDetails {
+                reply: Reply::HeadTooLarge,
+                bearer_token: None,
+            });
         };
         let read = stream.read(spare).await?;
         if read == 0 {
@@ -265,12 +756,47 @@ async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Reply>
         let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
         let mut request = httparse::Request::new(&mut headers);
         match request.parse(head.get(..filled).unwrap_or_default()) {
-            Ok(httparse::Status::Complete(_)) => return Ok(Reply::route(request.method, request.path)),
+            Ok(httparse::Status::Complete(_)) => {
+                return Ok(RequestDetails {
+                    reply: Reply::route(request.method, request.path),
+                    bearer_token: bearer_token(request.headers),
+                });
+            },
             Ok(httparse::Status::Partial) => {},
-            Err(httparse::Error::TooManyHeaders) => return Ok(Reply::HeadTooLarge),
-            Err(_) => return Ok(Reply::BadRequest),
+            Err(httparse::Error::TooManyHeaders) => {
+                return Ok(RequestDetails {
+                    reply: Reply::HeadTooLarge,
+                    bearer_token: None,
+                });
+            },
+            Err(_) => {
+                return Ok(RequestDetails {
+                    reply: Reply::BadRequest,
+                    bearer_token: None,
+                });
+            },
         }
     }
+}
+
+/// Parse one unambiguous RFC-style bearer authorization value.
+fn bearer_token(headers: &[httparse::Header<'_>]) -> Option<String> {
+    let mut authorization = None;
+    for header in headers {
+        if header.name.eq_ignore_ascii_case("authorization") {
+            if authorization.is_some() {
+                return None;
+            }
+            authorization = Some(header.value);
+        }
+    }
+    let value = std::str::from_utf8(authorization?).ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer") || token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return None;
+    }
+    Some(token.to_owned())
 }
 
 /// The listener's possible answers.
@@ -282,6 +808,12 @@ enum Reply {
     NotFound,
     /// 405 for `/metrics` with a method other than GET.
     MethodNotAllowed,
+    /// 401 when no valid bearer token is presented.
+    Unauthorized,
+    /// 403 when the authenticated identity is not authorized to scrape.
+    Forbidden,
+    /// 503 when Kubernetes authorization reviews cannot be completed.
+    ServiceUnavailable,
     /// 400 for an unparsable head.
     BadRequest,
     /// 431 for a head over [`MAX_HEAD`] or [`MAX_HEADERS`].
@@ -315,15 +847,23 @@ impl Reply {
             },
             Self::NotFound => ("404 Not Found", "not found\n"),
             Self::MethodNotAllowed => ("405 Method Not Allowed", "method not allowed\n"),
+            Self::Unauthorized => ("401 Unauthorized", "unauthorized\n"),
+            Self::Forbidden => ("403 Forbidden", "forbidden\n"),
+            Self::ServiceUnavailable => ("503 Service Unavailable", "authorization unavailable\n"),
             Self::BadRequest => ("400 Bad Request", "bad request\n"),
             Self::HeadTooLarge => ("431 Request Header Fields Too Large", "request head too large\n"),
         };
-        let allow = if self == Self::MethodNotAllowed {
-            "Allow: GET\r\n"
-        } else {
-            ""
+        let extra = match self {
+            Self::MethodNotAllowed => "Allow: GET\r\n",
+            Self::Unauthorized => "WWW-Authenticate: Bearer\r\n",
+            Self::Metrics
+            | Self::NotFound
+            | Self::Forbidden
+            | Self::ServiceUnavailable
+            | Self::BadRequest
+            | Self::HeadTooLarge => "",
         };
-        response(status, allow, "text/plain", body.into())
+        response(status, extra, "text/plain", body.into())
     }
 }
 
@@ -344,6 +884,90 @@ mod tests {
 
     use super::*;
 
+    /// A mock API response with credentials deliberately present in the request.
+    async fn diagnostic_request(
+        tls: bool,
+        delay: Duration,
+        response: &'static [u8],
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        praxis_tls::provider::install();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _read = stream.read(&mut request).await;
+            tokio::time::sleep(delay).await;
+            let _written = stream.write_all(response).await;
+        });
+        let scheme = if tls { "https" } else { "http" };
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap()
+            .get(format!("{scheme}://{address}/?token=diagnostic-secret"))
+            .bearer_auth("diagnostic-secret")
+            .send()
+            .await
+    }
+
+    /// Check the exact safe fields used by the authorization warning log.
+    fn assert_api_diagnostic(error: &io::Error, category: &str, status: Option<u16>) {
+        let diagnostic = auth_api_diagnostic(error);
+        assert_eq!(diagnostic.category, category);
+        assert_eq!(diagnostic.http_status, status);
+        assert!(error.get_ref().is_some(), "underlying error is preserved");
+        assert!(
+            !format!("{diagnostic:?}").contains("diagnostic-secret"),
+            "diagnostics must not expose credentials from URLs, headers, or source text"
+        );
+    }
+
+    /// Distinguish a real request timeout from a failed TLS handshake.
+    #[tokio::test]
+    async fn authorization_api_diagnostics_distinguish_timeout_and_tls() {
+        let timeout = diagnostic_request(false, Duration::from_secs(2), b"")
+            .await
+            .unwrap_err();
+        assert_api_diagnostic(&auth_api_error(timeout), "timeout", None);
+        let tls = diagnostic_request(true, Duration::ZERO, b"HTTP/1.1 200 OK\r\n\r\n")
+            .await
+            .unwrap_err();
+        assert_api_diagnostic(&auth_api_error(tls), "tls", None);
+    }
+
+    /// Retain API status and decode categories while excluding request credentials.
+    #[tokio::test]
+    async fn authorization_api_diagnostics_distinguish_status_and_decode() {
+        let status = diagnostic_request(
+            false,
+            Duration::ZERO,
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap_err();
+        assert_api_diagnostic(&auth_api_error(status), "http_status", Some(403));
+        let decode = diagnostic_request(false, Duration::ZERO, b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx")
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_err();
+        assert_api_diagnostic(&auth_api_error(decode), "decode", None);
+    }
+
+    /// Keep credential and configuration failure details out of warning fields.
+    #[test]
+    fn authorization_api_diagnostics_do_not_log_source_text() {
+        let credential = io::Error::new(io::ErrorKind::PermissionDenied, "diagnostic-secret");
+        assert_api_diagnostic(&auth_api_error(credential), "credential_read", None);
+        assert_api_diagnostic(&io::Error::other("diagnostic-secret"), "configuration", None);
+    }
+
+    /// Build a lookup closure for deterministic environment configuration tests.
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let pairs: Vec<(String, String)> = pairs
             .iter()
@@ -357,6 +981,7 @@ mod tests {
         }
     }
 
+    /// Confirm that an absent or empty listener address disables the listener.
     #[test]
     fn an_unset_address_leaves_the_listener_off() {
         assert!(MetricsListener::from_env(env(&[])).unwrap().is_none(), "unset");
@@ -366,6 +991,7 @@ mod tests {
         );
     }
 
+    /// Require a complete listener address and both TLS files.
     #[test]
     fn an_address_without_a_cert_or_key_is_refused() {
         let no_key = MetricsListener::from_env(env(&[(ADDR_ENV, "0.0.0.0:9443"), (CERT_ENV, "/c")])).unwrap_err();
@@ -376,6 +1002,7 @@ mod tests {
         assert!(hostname.contains("ip:port"), "{hostname}");
     }
 
+    /// Prevent the metrics listener from colliding with Praxis listeners.
     #[test]
     fn a_port_praxis_binds_is_refused() {
         let listener = MetricsListener::from_env(env(&[(ADDR_ENV, "0.0.0.0:9443"), (CERT_ENV, "/c"), (KEY_ENV, "/k")]))
@@ -404,11 +1031,66 @@ mod tests {
         );
     }
 
+    /// Parse one request and return its routing response.
     async fn reply_to(request: &[u8]) -> Reply {
         let mut reader = request;
         read_request(&mut reader).await.unwrap()
     }
 
+    /// Parse a bearer token from one raw HTTP request.
+    async fn token_of(request: &[u8]) -> Option<String> {
+        let mut reader = request;
+        read_request_details(&mut reader).await.ok()?.bearer_token
+    }
+
+    /// Reject malformed, duplicate, or non-Bearer authorization headers.
+    #[tokio::test]
+    async fn bearer_token_requires_one_well_formed_authorization_header() {
+        assert_eq!(
+            token_of(b"GET /metrics HTTP/1.1\r\nauthorization: bearer abc\r\n\r\n")
+                .await
+                .as_deref(),
+            Some("abc"),
+            "scheme is case-insensitive"
+        );
+        assert!(
+            token_of(b"GET /metrics HTTP/1.1\r\nAuthorization: Bearer a\r\nAuthorization: Bearer b\r\n\r\n")
+                .await
+                .is_none(),
+            "duplicate authorization headers are rejected"
+        );
+        assert!(
+            token_of(b"GET /metrics HTTP/1.1\r\nAuthorization: Bearer  abc\r\n\r\n")
+                .await
+                .is_none(),
+            "extra spaces are rejected"
+        );
+        assert!(
+            token_of(b"GET /metrics HTTP/1.1\r\nAuthorization: Basic abc\r\n\r\n")
+                .await
+                .is_none(),
+            "non-Bearer schemes are rejected"
+        );
+    }
+
+    /// Return the documented status and challenge for authorization failures.
+    #[test]
+    fn authorization_replies_have_the_expected_status_and_challenge() {
+        let (unauthorized, _) = Reply::Unauthorized.into_parts();
+        assert!(unauthorized.starts_with("HTTP/1.1 401 "), "{unauthorized}");
+        assert!(
+            unauthorized.contains("\r\nWWW-Authenticate: Bearer\r\n"),
+            "{unauthorized}"
+        );
+
+        let (forbidden, _) = Reply::Forbidden.into_parts();
+        assert!(forbidden.starts_with("HTTP/1.1 403 "), "{forbidden}");
+
+        let (unavailable, _) = Reply::ServiceUnavailable.into_parts();
+        assert!(unavailable.starts_with("HTTP/1.1 503 "), "{unavailable}");
+    }
+
+    /// Serve only GET requests for the metrics path and reject other routes and methods.
     #[tokio::test]
     async fn only_get_metrics_is_served() {
         assert_eq!(
@@ -431,6 +1113,7 @@ mod tests {
         assert_eq!(reply_to(b"\x00garbage\r\n\r\n").await, Reply::BadRequest);
     }
 
+    /// Reject request heads exceeding either parser limit.
     #[tokio::test]
     async fn an_oversized_head_gets_431_without_reading_past_the_cap() {
         let mut long = b"GET /metrics HTTP/1.1\r\nX: ".to_vec();
@@ -443,6 +1126,52 @@ mod tests {
         assert_eq!(reply_to(many.as_bytes()).await, Reply::HeadTooLarge);
     }
 
+    /// Keep allow decisions longer than denials and expire both at their TTL.
+    #[test]
+    fn authorization_cache_uses_shorter_lifetimes_for_denials() {
+        let now = Instant::now();
+        let allowed_hash = token_hash("allowed-token");
+        let denied_hash = token_hash("denied-token");
+        let mut cache = AuthorizationCache::default();
+        cache.insert(allowed_hash, Authorization::Allowed, now);
+        cache.insert(denied_hash, Authorization::Forbidden, now);
+
+        assert_eq!(
+            cache.get(allowed_hash, now + Duration::from_secs(59)),
+            Some(Authorization::Allowed),
+            "allow remains cached for 60 seconds"
+        );
+        assert_eq!(
+            cache.get(denied_hash, now + Duration::from_secs(9)),
+            Some(Authorization::Forbidden),
+            "deny remains cached for 10 seconds"
+        );
+        assert_eq!(
+            cache.get(denied_hash, now + Duration::from_secs(10)),
+            None,
+            "deny expires at 10 seconds"
+        );
+        assert_eq!(
+            cache.get(allowed_hash, now + Duration::from_secs(60)),
+            None,
+            "allow expires at 60 seconds"
+        );
+    }
+
+    /// Keep the decision cache at or below its configured entry limit.
+    #[test]
+    fn authorization_cache_does_not_exceed_its_capacity() {
+        let now = Instant::now();
+        let mut cache = AuthorizationCache::default();
+        for index in 0..=MAX_CACHED_AUTHORIZATIONS {
+            let hash: [u8; 32] = Sha256::digest(index.to_be_bytes()).into();
+            cache.insert(hash, Authorization::Unauthenticated, now);
+        }
+
+        assert_eq!(cache.entries.len(), MAX_CACHED_AUTHORIZATIONS, "bounded cache");
+    }
+
+    /// Return an error when a client closes before completing the request head.
     #[tokio::test]
     async fn a_peer_closing_mid_head_is_an_error() {
         let mut reader: &[u8] = b"GET /metrics HTTP/1.1\r\n";
@@ -450,6 +1179,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
     }
 
+    /// Require the TLS configuration used by the listener to enforce EMS.
     #[test]
     fn the_tls_config_requires_extended_master_secret() {
         praxis_tls::provider::install();
@@ -470,6 +1200,7 @@ mod tests {
         assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()], "HTTP/1.1 only");
     }
 
+    /// Advertise allowed methods and close each response connection.
     #[test]
     fn a_405_names_get_and_every_reply_closes() {
         let (response, _) = Reply::MethodNotAllowed.into_parts();

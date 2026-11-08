@@ -2,8 +2,8 @@ name: Triggered Integration Test
 
 # ------------------------------------------------------------------------------
 # Maintainer-triggered integration test of Grid main, a pull request, or a branch,
-# plus a nightly quick GLB run against main. Manual runs can select one of the
-# release qualifications below; scheduled runs intentionally remain GLB.
+# plus nightly GLB quick and combined-site full runs against main. Manual runs
+# and reusable workflow calls can select a supported release qualification.
 #
 # Runs the selected qualification against the tested revision. GLB verifies
 # multi-cluster routing, SWIM discovery, mTLS, overlay hot-reload, and provider
@@ -23,30 +23,46 @@ on:
         required: false
         default: ""
         type: string
-      qualification:
-        description: Release qualification to run
+      release_qualification:
+        description: Release qualification and supported mode to run
         required: true
-        default: glb
+        default: glb-quick
         type: choice
         options:
-          - glb
+          - glb-quick
+          - glb-full
           - static-weighted
           - combined-site
-          - llmd-pool-metrics
-      mode:
-        description: Demo execution mode
+          - combined-site-local
+          - llmd-pool-metrics-quick
+          - llmd-pool-metrics-full
+          - operator-routing
+  workflow_call:
+    inputs:
+      release_qualification:
+        description: Release qualification and supported mode to run
         required: true
-        default: quick
-        type: choice
-        options:
-          - quick
-          - full
+        type: string
+      pr_number:
+        description: Grid pull-request number; mutually exclusive with branch
+        required: false
+        type: string
+        default: ""
+      branch:
+        description: Branch in this repository to test; leave blank for a PR or main
+        required: false
+        type: string
+        default: ""
   schedule:
+    # Nightly GLB quick qualification.
     - cron: "0 18 * * *"
+      timezone: America/New_York
+    # Nightly combined-site qualification (mapped to full mode below).
+    - cron: "0 19 * * *"
       timezone: America/New_York
 
 concurrency:
-  group: grid-triggered-integration-${{ inputs.qualification || 'glb' }}-${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.branch != '' && format('branch-{0}', inputs.branch) || 'main' }}-${{ inputs.mode || 'quick' }}-${{ github.event_name }}
+  group: grid-triggered-integration-${{ github.workflow }}-${{ inputs.release_qualification || 'scheduled' }}-${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.branch != '' && format('branch-{0}', inputs.branch) || 'main' }}-${{ github.event_name }}-${{ github.event_name == 'schedule' && github.event.schedule || '' }}
   cancel-in-progress: true
 
 permissions: {}
@@ -117,41 +133,89 @@ jobs:
       head_branch: ${{ steps.pr.outputs.head_branch }}
       head_sha: ${{ steps.pr.outputs.head_sha }}
       base_sha: ${{ steps.source.outputs.base_sha }}
+      release_qualification: ${{ steps.selection.outputs.release_qualification }}
+      qualification: ${{ steps.mode.outputs.qualification }}
+      mode: ${{ steps.mode.outputs.mode }}
+      membership: ${{ steps.mode.outputs.membership }}
     steps:
-      - name: Validate qualification and mode
+      - name: Select release qualification
+        id: selection
         env:
-          QUALIFICATION: ${{ inputs.qualification || 'glb' }}
-          MODE: ${{ inputs.mode || 'quick' }}
           EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_RELEASE_QUALIFICATION: ${{ inputs.release_qualification }}
         run: |
           set -euo pipefail
-          case "${QUALIFICATION}" in
-            glb)
+          if [[ "${EVENT_NAME}" == "schedule" ]]; then
+            case "${SCHEDULE}" in
+              "0 18 * * *")
+                RELEASE_QUALIFICATION=glb-quick
+                ;;
+              "0 19 * * *")
+                RELEASE_QUALIFICATION=combined-site
+                ;;
+              *)
+                echo "::error::No release qualification is mapped for schedule '${SCHEDULE}'"
+                exit 1
+                ;;
+            esac
+          else
+            RELEASE_QUALIFICATION="${INPUT_RELEASE_QUALIFICATION:-glb-quick}"
+          fi
+          echo "release_qualification=${RELEASE_QUALIFICATION}" >> "${GITHUB_OUTPUT}"
+          echo "Release qualification: ${RELEASE_QUALIFICATION}"
+
+      - name: Resolve qualification mode
+        id: mode
+        env:
+          RELEASE_QUALIFICATION: ${{ steps.selection.outputs.release_qualification }}
+        run: |
+          set -euo pipefail
+          MEMBERSHIP=swim
+          case "${RELEASE_QUALIFICATION}" in
+            glb-quick)
+              QUALIFICATION=glb
+              MODE=quick
+              ;;
+            glb-full)
+              QUALIFICATION=glb
+              MODE=full
               ;;
             static-weighted)
-              if [[ "${MODE}" != "quick" ]]; then
-                echo "::error::static-weighted is a fixed quick release qualification; select mode=quick"
-                exit 1
-              fi
+              QUALIFICATION=static-weighted
+              MODE=quick
               ;;
             combined-site)
-              if [[ "${MODE}" != "full" ]]; then
-                echo "::error::combined-site is a fixed full release qualification; select mode=full"
-                exit 1
-              fi
+              QUALIFICATION=combined-site
+              MODE=full
               ;;
-            llmd-pool-metrics)
+            combined-site-local)
+              QUALIFICATION=combined-site
+              MODE=full
+              MEMBERSHIP=local
+              ;;
+            llmd-pool-metrics-quick)
+              QUALIFICATION=llmd-pool-metrics
+              MODE=quick
+              ;;
+            llmd-pool-metrics-full)
+              QUALIFICATION=llmd-pool-metrics
+              MODE=full
+              ;;
+            operator-routing)
+              QUALIFICATION=operator-routing MODE=quick
               ;;
             *)
-              echo "::error::Unknown qualification '${QUALIFICATION}'; expected glb, static-weighted, combined-site, or llmd-pool-metrics"
+              echo "::error::Unknown release qualification '${RELEASE_QUALIFICATION}'"
               exit 1
               ;;
           esac
-          if [[ "${EVENT_NAME}" == "schedule" && "${QUALIFICATION}" != "glb" ]]; then
-            echo "::error::Scheduled runs must use the GLB qualification"
-            exit 1
-          fi
-          echo "Qualification: ${QUALIFICATION} (${MODE})"
+          {
+            echo "qualification=${QUALIFICATION}"
+            echo "mode=${MODE}"
+            echo "membership=${MEMBERSHIP}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Release qualification: ${RELEASE_QUALIFICATION} -> ${QUALIFICATION} (${MODE})"
 
       - name: Validate source selector
         env:
@@ -369,7 +433,7 @@ jobs:
   # ============================================================================
 
   qualification-e2e:
-    name: ${{ needs.resolve-source.outputs.source_label }} ${{ inputs.qualification || 'glb' }} E2E
+    name: ${{ needs.resolve-source.outputs.source_label }} ${{ needs.resolve-source.outputs.release_qualification }} E2E
     needs: resolve-source
     runs-on: ubuntu-24.04
     permissions:
@@ -384,10 +448,11 @@ jobs:
       HEAD_SHA: ${{ needs.resolve-source.outputs.head_sha }}
       BASE_SHA: ${{ needs.resolve-source.outputs.base_sha }}
       BRANCH_NAME: ${{ needs.resolve-source.outputs.branch_name }}
-      QUALIFICATION: ${{ inputs.qualification || 'glb' }}
-      MODE: ${{ inputs.mode || 'quick' }}
-      EVIDENCE_DIR: ${{ github.workspace }}/evidence/${{ inputs.qualification || 'glb' }}
-      DIAGNOSTICS_DIR: ${{ github.workspace }}/diagnostics/${{ inputs.qualification || 'glb' }}
+      QUALIFICATION: ${{ needs.resolve-source.outputs.qualification }}
+      MODE: ${{ needs.resolve-source.outputs.mode }}
+      MEMBERSHIP: ${{ needs.resolve-source.outputs.membership }}
+      EVIDENCE_DIR: ${{ github.workspace }}/evidence/${{ needs.resolve-source.outputs.release_qualification }}
+      DIAGNOSTICS_DIR: ${{ github.workspace }}/diagnostics/${{ needs.resolve-source.outputs.release_qualification }}
     steps:
       # ----------------------------------------------------------------------
       # Checkout
@@ -525,6 +590,26 @@ jobs:
                 "${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-${QUALIFICATION}/configs/provider/praxis.yaml"
               )
               ;;
+            operator-routing)
+              TOPOLOGY="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-operator-routing/forge.yaml"
+              MOCK_PROVIDER_MANIFEST="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-operator-routing/resources/mock-providers.yaml"
+              QUALIFICATION_SOURCE="${GITHUB_WORKSPACE}/grid/crates/xtask/src/env/operator_routing_qualification.rs"
+              for endpoint in \
+                'endpoint: "http://provider-a.grid-system.svc:8080"' \
+                'endpoint: "http://provider-b-old.grid-system.svc:8080"'; do
+                if ! grep -Fq "${endpoint}" "${TOPOLOGY}"; then
+                  echo "::error::Operator-routing topology is missing expected local Service endpoint ${endpoint}"
+                  exit 1
+                fi
+              done
+              if ! grep -Fq 'name: provider-b-replacement' "${MOCK_PROVIDER_MANIFEST}" \
+                || ! grep -Fq 'http://provider-b-replacement.grid-system.svc:8080' "${QUALIFICATION_SOURCE}"; then
+                echo "::error::Operator-routing replacement endpoint is missing its run-owned Service or runtime spec update"
+                exit 1
+              fi
+              echo "Validated operator-routing uses only the run-owned cluster-local provider Services"
+              CONFIGS=()
+              ;;
             *)
               echo "::error::No private-backend validation mapping for ${QUALIFICATION}"
               exit 1
@@ -546,6 +631,7 @@ jobs:
           done
 
       - name: Validate immutable gateway input
+        if: env.QUALIFICATION != 'operator-routing'
         run: |
           set -euo pipefail
           if ! [[ "${GATEWAY_IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -612,6 +698,7 @@ jobs:
             echo "docker=$(docker version --format '{{.Server.Version}}')"
             echo "kind=$(kind version)"
             echo "kubectl=$(kubectl version --client -o json | jq -r '.clientVersion.gitVersion')"
+            echo "helm=$(helm version --template '{{.Version}}')"
             echo "openssl=$(openssl version)"
             echo "curl=$(curl --version | head -1)"
             echo "jq=$(jq --version)"
@@ -653,17 +740,25 @@ jobs:
             ARTIFACT_PREFIX="grid-main-${SHORT_SHA}"
           fi
           TAG="${TAG}-${QUALIFICATION}"
+          if [[ "${QUALIFICATION}" == "combined-site" ]]; then
+            OPERATOR_IMAGE="grid-operator-fips:${TAG}"
+          else
+            OPERATOR_IMAGE="grid-operator:${TAG}"
+          fi
           {
             echo "tag=${TAG}"
+            echo "operator_image=${OPERATOR_IMAGE}"
             echo "short_sha=${SHORT_SHA}"
             echo "artifact_prefix=${ARTIFACT_PREFIX}"
           } >> "${GITHUB_OUTPUT}"
           echo "Image tag: ${TAG}"
+          echo "Operator image: ${OPERATOR_IMAGE}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build Grid Operator image
+        if: env.QUALIFICATION != 'combined-site'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: grid
@@ -675,8 +770,23 @@ jobs:
           cache-from: type=gha,scope=triggered-e2e-operator
           cache-to: type=gha,mode=max,scope=triggered-e2e-operator
 
+      - name: Build Grid Operator FIPS image
+        # The shared-key combined-site topology then exercises SWIM packets
+        # through the OpenSSL backend. Hosted runners are not FIPS-mode hosts.
+        if: env.QUALIFICATION == 'combined-site'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: grid
+          file: grid/deploy/operator/Containerfile.fips
+          push: false
+          load: true
+          tags: grid-operator-fips:${{ steps.tags.outputs.tag }}
+          labels: org.opencontainers.image.revision=${{ env.TESTED_SHA }}
+          cache-from: type=gha,scope=triggered-e2e-operator-fips
+          cache-to: type=gha,mode=max,scope=triggered-e2e-operator-fips
+
       - name: Build source-matched Grid Gateway image
-        if: env.QUALIFICATION == 'llmd-pool-metrics' && env.MODE == 'full'
+        if: (env.QUALIFICATION == 'llmd-pool-metrics' && env.MODE == 'full') || env.QUALIFICATION == 'operator-routing'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: grid
@@ -687,6 +797,19 @@ jobs:
           labels: org.opencontainers.image.revision=${{ env.TESTED_SHA }}
           cache-from: type=gha,scope=triggered-e2e-grid-gateway
           cache-to: type=gha,mode=max,scope=triggered-e2e-grid-gateway
+
+      - name: Build Grid mock-provider image
+        if: env.QUALIFICATION == 'operator-routing'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: grid
+          file: grid/crates/mock-providers/Containerfile
+          push: false
+          load: true
+          tags: grid-mock-providers:${{ steps.tags.outputs.tag }}
+          labels: org.opencontainers.image.revision=${{ env.TESTED_SHA }}
+          cache-from: type=gha,scope=triggered-e2e-mock-providers
+          cache-to: type=gha,mode=max,scope=triggered-e2e-mock-providers
 
       - name: Build Grid overlay-sync image
         if: env.QUALIFICATION == 'static-weighted' || env.QUALIFICATION == 'combined-site' || env.QUALIFICATION == 'llmd-pool-metrics'
@@ -702,6 +825,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=triggered-e2e-overlay-sync
 
       - name: Pull pinned gateway image
+        if: env.QUALIFICATION != 'operator-routing'
         id: gateway
         env:
           GH_TOKEN: ${{ github.token }}
@@ -848,12 +972,13 @@ jobs:
 
       - name: Verify locally built images
         env:
+          OPERATOR_IMAGE: ${{ steps.tags.outputs.operator_image }}
           TAG: ${{ steps.tags.outputs.tag }}
         run: |
           set -euo pipefail
           FAILED=0
 
-          operator_img="grid-operator:${TAG}"
+          operator_img="${OPERATOR_IMAGE}"
           if ! docker image inspect "${operator_img}" > /dev/null 2>&1; then
             echo "::error::Required locally-built image missing: ${operator_img}"
             FAILED=1
@@ -862,6 +987,13 @@ jobs:
             echo "${operator_img}: revision label ${IMAGE_REVISION}"
             if [[ "${IMAGE_REVISION}" != "${TESTED_SHA}" ]]; then
               echo "::error::${operator_img} was not built from verified source ${TESTED_SHA}"
+              FAILED=1
+            fi
+          fi
+          if [[ "${QUALIFICATION}" == "combined-site" ]]; then
+            IMAGE_DESCRIPTION=$(docker image inspect --format='{{index .Config.Labels "org.opencontainers.image.description"}}' "${operator_img}")
+            if [[ "${IMAGE_DESCRIPTION}" != *"FIPS build"* ]]; then
+              echo "::error::Combined-site operator image is not labeled as a FIPS build: ${operator_img}"
               FAILED=1
             fi
           fi
@@ -885,7 +1017,7 @@ jobs:
             fi
           fi
 
-          if [[ "${QUALIFICATION}" == "llmd-pool-metrics" && "${MODE}" == "full" ]]; then
+          if [[ ( "${QUALIFICATION}" == "llmd-pool-metrics" && "${MODE}" == "full" ) || "${QUALIFICATION}" == "operator-routing" ]]; then
             img="grid-gateway:${TAG}"
             if ! docker image inspect "${img}" > /dev/null 2>&1; then
               echo "::error::Required source-built Grid Gateway image missing: ${img}"
@@ -900,7 +1032,22 @@ jobs:
             fi
           fi
 
-          if ! docker image inspect "${GATEWAY_IMAGE_REF}" > /dev/null 2>&1; then
+          if [[ "${QUALIFICATION}" == "operator-routing" ]]; then
+            img="grid-mock-providers:${TAG}"
+            if ! docker image inspect "${img}" > /dev/null 2>&1; then
+              echo "::error::Required source-built mock-provider image missing: ${img}"
+              FAILED=1
+            else
+              IMAGE_REVISION=$(docker image inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' "${img}")
+              echo "${img}: revision label ${IMAGE_REVISION}"
+              if [[ "${IMAGE_REVISION}" != "${TESTED_SHA}" ]]; then
+                echo "::error::${img} was not built from verified source ${TESTED_SHA}"
+                FAILED=1
+              fi
+            fi
+          fi
+
+          if [[ "${QUALIFICATION}" != "operator-routing" ]] && ! docker image inspect "${GATEWAY_IMAGE_REF}" > /dev/null 2>&1; then
             echo "::error::Pinned gateway image missing: ${GATEWAY_IMAGE_REF}"
             FAILED=1
           fi
@@ -926,6 +1073,7 @@ jobs:
 
       - name: Write image manifest
         env:
+          OPERATOR_IMAGE: ${{ steps.tags.outputs.operator_image }}
           TAG: ${{ steps.tags.outputs.tag }}
           RESOLVED_DIGEST: ${{ steps.gateway.outputs.digest }}
           STATIC_SIMULATOR_DIGESTS: ${{ steps.static-simulator.outputs.repo_digests || 'unknown' }}
@@ -959,6 +1107,12 @@ jobs:
               SIMULATOR_DESCRIPTION="llm-d simulator materialized from its pinned digest"
               SIMULATOR_DIGESTS="${LLMD_SIMULATOR_DIGESTS}"
               ;;
+            operator-routing)
+              SIMULATOR_REF=""
+              SIMULATOR_SOURCE_REF=""
+              SIMULATOR_DESCRIPTION="not used; dedicated mock-provider image is source-built"
+              SIMULATOR_DIGESTS=""
+              ;;
             *)
               echo "::error::Unknown qualification '${QUALIFICATION}' while writing image manifest"
               exit 1
@@ -967,9 +1121,13 @@ jobs:
           {
             echo "=== Image Manifest ==="
             echo ""
-            echo "grid-operator:${TAG}"
-            docker inspect --format='  ID: {{.Id}}' "grid-operator:${TAG}"
-            docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "grid-operator:${TAG}"
+            echo "${OPERATOR_IMAGE}"
+            docker inspect --format='  ID: {{.Id}}' "${OPERATOR_IMAGE}"
+            docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "${OPERATOR_IMAGE}"
+            if [[ "${QUALIFICATION}" == "combined-site" ]]; then
+              echo "  Build: deploy/operator/Containerfile.fips"
+              echo "  Crypto backend: OpenSSL (fips feature; host FIPS mode is not asserted)"
+            fi
             echo ""
             if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" || "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
               echo "grid-overlay-sync:${TAG}"
@@ -977,21 +1135,30 @@ jobs:
               docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "grid-overlay-sync:${TAG}"
               echo ""
             fi
-            if [[ "${QUALIFICATION}" == "llmd-pool-metrics" && "${MODE}" == "full" ]]; then
+            if [[ ( "${QUALIFICATION}" == "llmd-pool-metrics" && "${MODE}" == "full" ) || "${QUALIFICATION}" == "operator-routing" ]]; then
               echo "grid-gateway:${TAG}  (built from tested Grid source)"
               docker inspect --format='  ID: {{.Id}}' "grid-gateway:${TAG}"
               docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "grid-gateway:${TAG}"
               echo ""
             fi
-            echo "${GATEWAY_IMAGE_REF}  (pinned gateway; not built by Grid)"
-            docker inspect --format='  ID: {{.Id}}' "${GATEWAY_IMAGE_REF}"
-            echo "  Digest: ${RESOLVED_DIGEST}"
-            echo ""
-            echo "${SIMULATOR_REF}  (${SIMULATOR_DESCRIPTION})"
-            docker inspect --format='  ID: {{.Id}}' "${SIMULATOR_REF}"
-            echo "  Pinned source: ${SIMULATOR_SOURCE_REF}"
-            echo "  Repository digests: ${SIMULATOR_DIGESTS}"
-            echo ""
+            if [[ "${QUALIFICATION}" == "operator-routing" ]]; then
+              echo "grid-mock-providers:${TAG}  (built from tested Grid source)"
+              docker inspect --format='  ID: {{.Id}}' "grid-mock-providers:${TAG}"
+              docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "grid-mock-providers:${TAG}"
+              echo ""
+            else
+              echo "${GATEWAY_IMAGE_REF}  (pinned gateway; not built by Grid)"
+              docker inspect --format='  ID: {{.Id}}' "${GATEWAY_IMAGE_REF}"
+              echo "  Digest: ${RESOLVED_DIGEST}"
+              echo ""
+            fi
+            if [[ "${QUALIFICATION}" != "operator-routing" ]]; then
+              echo "${SIMULATOR_REF}  (${SIMULATOR_DESCRIPTION})"
+              docker inspect --format='  ID: {{.Id}}' "${SIMULATOR_REF}"
+              echo "  Pinned source: ${SIMULATOR_SOURCE_REF}"
+              echo "  Repository digests: ${SIMULATOR_DIGESTS}"
+              echo ""
+            fi
             if [[ "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
               echo "${LLMD_EPP_IMAGE_TAG}  (llm-d endpoint picker materialized from its pinned digest)"
               docker inspect --format='  ID: {{.Id}}' "${LLMD_EPP_IMAGE_TAG}"
@@ -1003,14 +1170,18 @@ jobs:
             docker inspect --format='  ID: {{.Id}}' "${PROBE_IMAGE_TAG}"
             echo ""
             echo "=== Override Environment ==="
-            echo "GRID_XTASK_OPERATOR_IMAGE=grid-operator:${TAG}"
+            echo "GRID_XTASK_OPERATOR_IMAGE=${OPERATOR_IMAGE}"
             if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" || "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
               echo "GRID_XTASK_OVERLAY_SYNC_IMAGE=grid-overlay-sync:${TAG}"
             else
               echo "GRID_XTASK_OVERLAY_SYNC_IMAGE=<unset>"
             fi
-            echo "GRID_XTASK_GATEWAY_IMAGE=${GATEWAY_IMAGE_REF}"
-            if [[ "${QUALIFICATION}" == "llmd-pool-metrics" && "${MODE}" == "full" ]]; then
+            if [[ "${QUALIFICATION}" == "operator-routing" ]]; then
+              echo "GRID_XTASK_GATEWAY_IMAGE=<unset> (uses the source-built Grid Gateway)"
+            else
+              echo "GRID_XTASK_GATEWAY_IMAGE=${GATEWAY_IMAGE_REF}"
+            fi
+            if [[ ( "${QUALIFICATION}" == "llmd-pool-metrics" && "${MODE}" == "full" ) || "${QUALIFICATION}" == "operator-routing" ]]; then
               echo "GRID_XTASK_GRID_GATEWAY_IMAGE=grid-gateway:${TAG}"
             else
               echo "GRID_XTASK_GRID_GATEWAY_IMAGE=<unset>"
@@ -1020,7 +1191,14 @@ jobs:
             else
               echo "GRID_XTASK_EPP_IMAGE=<unset>"
             fi
-            if [[ "${QUALIFICATION}" == "combined-site" ]]; then
+            if [[ "${QUALIFICATION}" == "operator-routing" ]]; then
+              echo "GRID_XTASK_MOCK_PROVIDER_IMAGE=grid-mock-providers:${TAG}"
+            else
+              echo "GRID_XTASK_MOCK_PROVIDER_IMAGE=<unset>"
+            fi
+            if [[ "${QUALIFICATION}" == "operator-routing" ]]; then
+              echo "GRID_XTASK_SIM_IMAGE=<unset> (not used by operator-routing)"
+            elif [[ "${QUALIFICATION}" == "combined-site" ]]; then
               echo "GRID_XTASK_SIM_IMAGE=<unset> (xtask default ${COMBINED_SITE_SIM_IMAGE_TAG}, materialized from ${COMBINED_SITE_SIM_IMAGE_REF})"
             else
               echo "GRID_XTASK_SIM_IMAGE=${SIMULATOR_REF}"
@@ -1040,7 +1218,10 @@ jobs:
 
       - name: Create evidence and diagnostics directories
         run: |
-          mkdir -p "${EVIDENCE_DIR}" "${DIAGNOSTICS_DIR}"
+          mkdir -p "${DIAGNOSTICS_DIR}"
+          if [[ "${QUALIFICATION}" != "operator-routing" ]]; then
+            mkdir -p "${EVIDENCE_DIR}"
+          fi
 
       - name: Record llm-d cleanup baseline
         if: env.QUALIFICATION == 'llmd-pool-metrics'
@@ -1084,7 +1265,8 @@ jobs:
         id: qualification
         env:
           GRID_REPO: ${{ github.workspace }}/grid
-          GRID_XTASK_OPERATOR_IMAGE: grid-operator:${{ steps.tags.outputs.tag }}
+          TAG: ${{ steps.tags.outputs.tag }}
+          GRID_XTASK_OPERATOR_IMAGE: ${{ steps.tags.outputs.operator_image }}
           GRID_XTASK_GATEWAY_IMAGE: ${{ env.GATEWAY_IMAGE_REF }}
           GRID_GATEWAY_IMAGE: grid-gateway:${{ steps.tags.outputs.tag }}
           LLMD_EPP_IMAGE: ${{ env.LLMD_EPP_IMAGE_TAG }}
@@ -1106,7 +1288,12 @@ jobs:
           fi
           echo "Grid source:    ${GRID_REPO} (${SOURCE_LABEL})"
           echo "Operator image: ${GRID_XTASK_OPERATOR_IMAGE} (revision ${TESTED_SHA})"
-          echo "Gateway image:  ${GRID_XTASK_GATEWAY_IMAGE}@${GATEWAY_IMAGE_DIGEST}"
+          if [[ "${QUALIFICATION}" == "operator-routing" ]]; then
+            unset GRID_XTASK_GATEWAY_IMAGE
+            echo "Grid Gateway image: ${GRID_GATEWAY_IMAGE} (revision ${TESTED_SHA})"
+          else
+            echo "AI Gateway image: ${GRID_XTASK_GATEWAY_IMAGE}@${GATEWAY_IMAGE_DIGEST}"
+          fi
           echo "Qualification:  ${QUALIFICATION} (${MODE})"
           echo "Evidence:       ${EVIDENCE_DIR}"
           cd "${GRID_REPO}"
@@ -1135,6 +1322,7 @@ jobs:
               GRID_XTASK_IMAGE_PULL_POLICY=Never \
               timeout --signal=TERM --kill-after=30s 75m cargo xtask env run-grid-combined-site-demo \
                 --forge-config tests/e2e/topologies/grid-combined-site/forge.yaml \
+                --membership "${MEMBERSHIP}" \
                 --full --teardown --keep-on-failure --evidence-dir "${EVIDENCE_DIR}" \
                 2>&1 | tee "${GITHUB_WORKSPACE}/run-${QUALIFICATION}.log"
               ;;
@@ -1161,6 +1349,31 @@ jobs:
               fi
               if [[ "${tee_status}" -ne 0 ]]; then
                 echo "::error::llm-d pool-metrics tee exited with status ${tee_status}"
+                exit "${tee_status}"
+              fi
+              ;;
+            operator-routing)
+              set +e
+              GRID_XTASK_GRID_GATEWAY_IMAGE="${GRID_GATEWAY_IMAGE}" \
+              GRID_XTASK_MOCK_PROVIDER_IMAGE="grid-mock-providers:${TAG}" \
+              GRID_XTASK_IMAGE_PULL_POLICY=Never \
+              timeout --signal=TERM --kill-after=30s 45m cargo xtask env run-grid-operator-routing-qualification \
+                --forge-config tests/e2e/topologies/grid-operator-routing/forge.yaml \
+                --teardown --keep-on-failure --evidence-dir "${EVIDENCE_DIR}" \
+                2>&1 | tee "${GITHUB_WORKSPACE}/run-${QUALIFICATION}.log"
+              pipeline_status=("${PIPESTATUS[@]}")
+              set -e
+              qualification_status=${pipeline_status[0]}
+              tee_status=${pipeline_status[1]}
+              mkdir -p "${EVIDENCE_DIR}"
+              printf '%s\n' "${qualification_status}" > "${EVIDENCE_DIR}/xtask-exit-status.txt"
+              printf '%s\n' "${tee_status}" > "${EVIDENCE_DIR}/tee-exit-status.txt"
+              if [[ "${qualification_status}" -ne 0 ]]; then
+                echo "::error::Operator-routing xtask exited with status ${qualification_status}"
+                exit "${qualification_status}"
+              fi
+              if [[ "${tee_status}" -ne 0 ]]; then
+                echo "::error::Operator-routing tee exited with status ${tee_status}"
                 exit "${tee_status}"
               fi
               ;;
@@ -1206,6 +1419,7 @@ jobs:
             static-weighted) DEMO_DIR="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-static-weighted" ;;
             combined-site) DEMO_DIR="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-combined-site" ;;
             llmd-pool-metrics) DEMO_DIR="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-llmd-pool-metrics" ;;
+            operator-routing) DEMO_DIR="${GITHUB_WORKSPACE}/grid/tests/e2e/topologies/grid-operator-routing" ;;
             *)
               echo "::warning::Unknown qualification '${QUALIFICATION}'; skipping Forge diagnostics"
               DEMO_DIR=""
@@ -1512,6 +1726,10 @@ jobs:
           OWNED_NETWORKS=()
           NETWORK_OWNER=""
           RUN_PREFIX=""
+          RUN_CLUSTER=""
+          RUN_NETWORK=""
+          RESOLVED_CONFIG=""
+          OPERATOR_ROUTING_STATE_DIR=""
 
           resolve_run_forge_state() {
             local topology_dir="$1"
@@ -1647,6 +1865,75 @@ jobs:
                 fi
               fi
               ;;
+            operator-routing)
+              for _ in operator-routing-cleanup-identity; do
+                EVIDENCE_FILE="${EVIDENCE_DIR}/evidence.json"
+                if [[ ! -f "${EVIDENCE_FILE}" ]]; then
+                  if kind get clusters 2>/dev/null | grep -Eq '^grid-operator-routing-[0-9]+-[0-9]+-local$' \
+                    || docker network ls --format '{{.Name}}' | grep -Eq '^grid-operator-routing-[0-9]+-[0-9]+-net$'; then
+                    echo "::warning::Operator-routing evidence is absent while a matching resource exists; preserving it"
+                    CLEANUP_RESULT="partial"
+                  fi
+                  break
+                fi
+                if ! RUN_CLUSTER=$(jq -er '.cluster_name' "${EVIDENCE_FILE}") \
+                  || ! RESOLVED_CONFIG=$(jq -er '.observations.forge_working_config' "${EVIDENCE_FILE}") \
+                  || ! OPERATOR_ROUTING_STATE_DIR=$(jq -er '.observations.forge_state_dir' "${EVIDENCE_FILE}") \
+                  || ! RUN_NETWORK=$(jq -er '.observations.forge_network_name' "${EVIDENCE_FILE}"); then
+                  echo "::warning::Operator-routing evidence lacks exact cleanup identities; preserving resources"
+                  CLEANUP_RESULT="partial"
+                  break
+                fi
+                RUN_SUFFIX="${RUN_CLUSTER#grid-operator-routing-}"
+                RUN_SUFFIX="${RUN_SUFFIX%-local}"
+                RUN_PREFIX="grid-operator-routing-${RUN_SUFFIX}"
+                if ! [[ "${RUN_SUFFIX}" =~ ^[0-9]+-[0-9]+$ ]] \
+                  || [[ "${RUN_CLUSTER}" != "${RUN_PREFIX}-local" ]] \
+                  || [[ "${RUN_NETWORK}" != "${RUN_PREFIX}-net" ]]; then
+                  echo "::warning::Operator-routing run identity is malformed; refusing cleanup"
+                  CLEANUP_RESULT="partial"
+                  break
+                fi
+                if [[ "${RESOLVED_CONFIG}" != /* ]]; then
+                  RESOLVED_CONFIG="${GRID_REPO}/${RESOLVED_CONFIG}"
+                fi
+                EXPECTED_TOPOLOGY_DIR="${GRID_REPO}/tests/e2e/topologies/grid-operator-routing"
+                EXPECTED_CONFIG="${EXPECTED_TOPOLOGY_DIR}/.forge.resolved-${RUN_SUFFIX}.yaml"
+                EXPECTED_STATE_DIR="${EXPECTED_TOPOLOGY_DIR}/.forge/.forge.resolved-${RUN_SUFFIX}"
+                if [[ "$(realpath -m "${RESOLVED_CONFIG}")" != "$(realpath -m "${EXPECTED_CONFIG}")" ]] \
+                  || [[ "$(realpath -m "${OPERATOR_ROUTING_STATE_DIR}")" != "$(realpath -m "${EXPECTED_STATE_DIR}")" ]]; then
+                  echo "::warning::Operator-routing cleanup paths do not match the exact run identity; refusing cleanup"
+                  CLEANUP_RESULT="partial"
+                  break
+                fi
+                STATE_FILE="${OPERATOR_ROUTING_STATE_DIR}/state.json"
+                if [[ -f "${STATE_FILE}" ]]; then
+                  if ! jq -e --arg cluster "${RUN_CLUSTER}" --arg network "${RUN_NETWORK}" '
+                    (.clusters | length <= 1)
+                    and ([.clusters[]? | select(.name != "local" or .kindName != $cluster or .context != ("kind-" + $cluster))] | length == 0)
+                    and (.network == null or .network.name == $network)
+                  ' "${STATE_FILE}" > /dev/null; then
+                    echo "::warning::Operator-routing Forge state does not match its unique cluster/network identity; refusing cleanup"
+                    CLEANUP_RESULT="partial"
+                    STATE_FILE=""
+                    break
+                  fi
+                  OWNED_CLUSTERS=("${RUN_CLUSTER}")
+                  if jq -e '.networkCreatedByForge == true' "${STATE_FILE}" > /dev/null \
+                    && jq -e --arg network "${RUN_NETWORK}" '.network.name == $network' "${STATE_FILE}" > /dev/null; then
+                    OWNED_NETWORKS=("${RUN_NETWORK}")
+                    NETWORK_OWNER="${RUN_PREFIX}"
+                  elif docker network inspect "${RUN_NETWORK}" > /dev/null 2>&1; then
+                    echo "::warning::Operator-routing network exists but Forge state does not prove ownership; preserving it"
+                    CLEANUP_RESULT="partial"
+                  fi
+                elif kind get clusters 2>/dev/null | grep -Fxq "${RUN_CLUSTER}" \
+                  || docker network inspect "${RUN_NETWORK}" > /dev/null 2>&1; then
+                  echo "::warning::Operator-routing resources exist without matching Forge state; preserving them"
+                  CLEANUP_RESULT="partial"
+                fi
+              done
+              ;;
             *)
               echo "::warning::Unknown qualification '${QUALIFICATION}'; refusing cleanup"
               CLEANUP_RESULT="partial"
@@ -1699,6 +1986,27 @@ jobs:
             fi
           done
 
+          if [[ "${QUALIFICATION}" == "operator-routing" && -n "${RUN_CLUSTER}" \
+            && "${CLEANUP_RESULT}" == "success" ]]; then
+            if kind get clusters 2>/dev/null | grep -Fxq "${RUN_CLUSTER}"; then
+              echo "::warning::Run-owned operator-routing cluster remains after cleanup: ${RUN_CLUSTER}"
+              CLEANUP_RESULT="partial"
+            elif docker network inspect "${RUN_NETWORK}" > /dev/null 2>&1; then
+              echo "::warning::Run-owned operator-routing network remains after cleanup: ${RUN_NETWORK}"
+              CLEANUP_RESULT="partial"
+            else
+              if [[ -d "${OPERATOR_ROUTING_STATE_DIR}" ]] \
+                && ! rm -rf -- "${OPERATOR_ROUTING_STATE_DIR}"; then
+                echo "::warning::Could not remove run-owned operator-routing Forge state"
+                CLEANUP_RESULT="partial"
+              fi
+              if [[ -f "${RESOLVED_CONFIG}" ]] && ! rm -f -- "${RESOLVED_CONFIG}"; then
+                echo "::warning::Could not remove run-owned resolved Forge config"
+                CLEANUP_RESULT="partial"
+              fi
+            fi
+          fi
+
           if [[ "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
             kind get clusters | sort > "${DIAGNOSTICS_DIR}/llmd-kind-after-cleanup.txt" 2>&1 || true
             docker network ls --format '{{.Name}} {{.ID}}' | sort > "${DIAGNOSTICS_DIR}/llmd-networks-after-cleanup.txt"
@@ -1747,10 +2055,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ${{ steps.tags.outputs.artifact_prefix || format('grid-{0}-{1}', needs.resolve-source.outputs.source_kind, needs.resolve-source.outputs.tested_sha) }}-${{ env.QUALIFICATION }}-${{ env.MODE }}
+          name: ${{ steps.tags.outputs.artifact_prefix || format('grid-{0}-{1}', needs.resolve-source.outputs.source_kind, needs.resolve-source.outputs.tested_sha) }}-${{ env.QUALIFICATION }}-${{ env.MODE }}-${{ env.MEMBERSHIP }}
           path: |
-            ${{ github.workspace }}/evidence/${{ env.QUALIFICATION }}/
-            ${{ github.workspace }}/diagnostics/${{ env.QUALIFICATION }}/
+            ${{ env.EVIDENCE_DIR }}/
+            ${{ env.DIAGNOSTICS_DIR }}/
             ${{ github.workspace }}/run-${{ env.QUALIFICATION }}.log
             ${{ github.workspace }}/image-manifest.txt
             ${{ github.workspace }}/source-metadata.json
@@ -1766,6 +2074,7 @@ jobs:
         if: always()
         env:
           TAG: ${{ steps.tags.outputs.tag || 'unknown' }}
+          OPERATOR_IMAGE: ${{ steps.tags.outputs.operator_image || 'unknown' }}
           ARTIFACT_PREFIX: ${{ steps.tags.outputs.artifact_prefix || format('grid-{0}-{1}', needs.resolve-source.outputs.source_kind, needs.resolve-source.outputs.tested_sha) }}
           QUALIFICATION_RESULT: ${{ steps.qualification.outcome }}
           CLEANUP_RESULT: ${{ steps.cleanup.outputs.result || 'unknown' }}
@@ -1795,6 +2104,11 @@ jobs:
               QUALIFICATION_DISPLAY="llm-d pool-metrics and signal lifecycle"
               TOPOLOGY="tests/e2e/topologies/grid-llmd-pool-metrics"
               SIMULATOR="${LLMD_SIM_IMAGE_TAG} (pinned from ${LLMD_SIM_IMAGE_REF})"
+              ;;
+            operator-routing)
+              QUALIFICATION_DISPLAY="Operator-derived local routing and passive-health recovery"
+              TOPOLOGY="tests/e2e/topologies/grid-operator-routing"
+              SIMULATOR="not used; source-built mock-provider fixture"
               ;;
             *)
               QUALIFICATION_DISPLAY="Unknown (${QUALIFICATION})"
@@ -1835,9 +2149,19 @@ jobs:
 
             echo "| **Topology** | \`${TOPOLOGY}\` at tested Grid SHA |"
             echo "| **Mode** | \`${MODE}\` |"
+            if [[ "${QUALIFICATION}" == "combined-site" ]]; then
+              echo "| **Operator crypto backend** | OpenSSL (\`fips\` feature) |"
+            fi
+            echo "| **Membership** | \`${MEMBERSHIP}\` |"
             echo "| **Qualification result** | ${QUALIFICATION_DISPLAY_RESULT} |"
             echo "| **Cleanup** | ${CLEANUP_RESULT} |"
             if [[ "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
+              XTASK_EXIT="unknown"
+              if [[ -f "${EVIDENCE_DIR}/xtask-exit-status.txt" ]]; then
+                XTASK_EXIT=$(cat "${EVIDENCE_DIR}/xtask-exit-status.txt")
+              fi
+              echo "| **xtask exit status** | ${XTASK_EXIT} |"
+            elif [[ "${QUALIFICATION}" == "operator-routing" ]]; then
               XTASK_EXIT="unknown"
               if [[ -f "${EVIDENCE_DIR}/xtask-exit-status.txt" ]]; then
                 XTASK_EXIT=$(cat "${EVIDENCE_DIR}/xtask-exit-status.txt")
@@ -1849,9 +2173,15 @@ jobs:
             echo ""
             echo "| Image | Reference |"
             echo "|-------|-----------|"
-            echo "| Grid Operator | \`grid-operator:${TAG}\` |"
-            echo "| Gateway (pinned) | \`${GATEWAY_IMAGE_REF}\` (\`${RESOLVED_DIGEST}\`) |"
-            echo "| Simulator | \`${SIMULATOR}\` |"
+            echo "| Grid Operator | \`${OPERATOR_IMAGE}\` |"
+            if [[ "${QUALIFICATION}" == "operator-routing" ]]; then
+              echo "| Grid Gateway | \`grid-gateway:${TAG}\` (built from tested Grid SHA) |"
+              echo "| Mock providers | \`grid-mock-providers:${TAG}\` (built from tested Grid SHA) |"
+              echo "| Qualification client | \`${PROBE_IMAGE_REF}\` (pinned digest) |"
+            else
+              echo "| Gateway (pinned) | \`${GATEWAY_IMAGE_REF}\` (\`${RESOLVED_DIGEST}\`) |"
+              echo "| Simulator | \`${SIMULATOR}\` |"
+            fi
             if [[ "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
               echo "| llm-d EPP | \`${LLMD_EPP_IMAGE_TAG}\` (pinned from \`${LLMD_EPP_IMAGE_REF}\`) |"
               if [[ "${MODE}" == "full" ]]; then
@@ -1861,5 +2191,5 @@ jobs:
             echo ""
             echo "### Artifact"
             echo ""
-            echo "\`${ARTIFACT_PREFIX}-${QUALIFICATION}-${MODE}\`"
+            echo "\`${ARTIFACT_PREFIX}-${QUALIFICATION}-${MODE}-${MEMBERSHIP}\`"
           } >> "${GITHUB_STEP_SUMMARY}"

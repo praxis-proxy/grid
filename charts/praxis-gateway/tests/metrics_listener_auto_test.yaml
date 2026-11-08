@@ -16,7 +16,7 @@ set:
   networkPolicy.from:
     - podSelector: {matchLabels: {app: front}}
 tests:
-  - it: stays off away from OpenShift, where no cert source exists by default
+  - it: stays off when no serving certificate source or Secret is available
     asserts:
       - hasDocuments:
           count: 0
@@ -114,7 +114,7 @@ tests:
             values: ["prometheus"]
         template: templates/networkpolicy.yaml
 
-  - it: stays off for the ai image on OpenShift instead of failing
+  - it: auto stays off for the non-grid-gateway image
     capabilities:
       apiVersions: [security.openshift.io/v1]
     set:
@@ -125,18 +125,22 @@ tests:
           count: 0
         template: templates/service-metrics.yaml
 
-  - it: stays off without the NetworkPolicy and says why
-    capabilities:
-      apiVersions: [security.openshift.io/v1]
+  - it: auto serves with a supplied TLS Secret when NetworkPolicy is disabled
     set:
       networkPolicy.enabled: false
+      metricsListener.existingSecret: metrics-cert
     asserts:
       - hasDocuments:
-          count: 0
+          count: 1
         template: templates/service-metrics.yaml
-      - matchRegexRaw:
-          pattern: "The metrics listener is off: networkPolicy.enabled is false"
-        template: templates/NOTES.txt
+      - equal:
+          path: spec.template.spec.containers[?(@.name == "praxis")].env[?(@.name == "GRID_METRICS_ADDR")].value
+          value: "0.0.0.0:9443"
+        template: templates/deployment.yaml
+      - equal:
+          path: spec.template.spec.volumes[?(@.name == "metrics-tls")].secret.secretName
+          value: metrics-cert
+        template: templates/deployment.yaml
 
   - it: stays off when set false
     capabilities:

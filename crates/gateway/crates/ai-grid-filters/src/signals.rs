@@ -28,17 +28,6 @@ pub struct SiteReading {
     /// `queue_full` per unit, or anything held before scheduling), worst within the window.
     /// Absent when no instant in the window had one.
     pub congested_in_flight: Option<f64>,
-    /// The site's own reading of how full it is, 0 to 1, worst within the window. The
-    /// provider divides by its own capacity, so this needs no ceiling and does not depend on
-    /// how much the gateway has sent. An llm-d site derives it from its KV-cache mean widened
-    /// by the spread across units; a provider that knows its own limit by other means reports
-    /// the same joined reading.
-    pub saturation: Option<f64>,
-    /// The most it held at an instant that had a backlog and reported itself full. One sample
-    /// decides both, because every series here is the worst in its window: maximised apart, the
-    /// count from one congested sample pairs with the fullness of another, and a limit is
-    /// recorded for a state the site was never in.
-    pub full_in_flight: Option<f64>,
     /// When the newest sample itself had a backlog. Unlike the windowed backlog fields, this
     /// advances only when another backlogged sample arrives, so refreshes cannot age one burst
     /// into a sustained backlog.
@@ -50,6 +39,32 @@ pub struct SiteReading {
     /// Serving units the site last reported. Not a capacity: it says nothing about how much
     /// one unit carries, only that the site is a different size than it was.
     pub units: Option<f64>,
+    /// The EPP's own saturation reading, worst in the window, uncapped; only with flow control on.
+    /// After flow control turns off, the last published value can outrank the derived one for up to `window_ms`.
+    pub published_saturation: Option<f64>,
+    /// The gateway's approximation of that reading from pool averages, worst in the window.
+    pub derived_saturation: Option<f64>,
+    /// The comparator's reading at instants that also had a backlog, from the same source as
+    /// [`Self::comparator`], worst within the window. Absent when no such instant had one.
+    pub congested_saturation: Option<f64>,
+}
+
+impl SiteReading {
+    /// How full the site is by one rule for every site: the EPP's own reading where published.
+    #[must_use]
+    pub fn comparator(&self) -> Option<f64> {
+        self.published_saturation.or(self.derived_saturation)
+    }
+
+    /// Which reading `comparator` took.
+    #[must_use]
+    pub(crate) fn comparator_source(&self) -> Option<ComparatorSource> {
+        match (self.published_saturation, self.derived_saturation) {
+            (Some(_), _) => Some(ComparatorSource::Published),
+            (None, Some(_)) => Some(ComparatorSource::Derived),
+            (None, None) => None,
+        }
+    }
 }
 
 /// What a reading covers: the clock, how old a site's newest sample may be, how far behind
@@ -64,8 +79,15 @@ pub struct Over {
     pub horizon_ms: i64,
     /// Waiting work per serving unit at which an instant has a backlog.
     pub queue_full: f64,
-    /// The fullness a site reports at which that reading alone marks a limit.
-    pub reported_full: f64,
+}
+
+/// Where a site's comparator reading came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComparatorSource {
+    /// The EPP's own detector, published with flow control on.
+    Published,
+    /// The gateway's approximation from the EPP's pool averages.
+    Derived,
 }
 
 /// A source of site readings. Dispatch is static: the snapshot is generic over it.
@@ -81,4 +103,9 @@ pub trait SiteSignals {
 
     /// When the operator's last poll round that tried `site` ended, `None` if it reports none.
     fn round_ms(&self, site: &str) -> Option<i64>;
+
+    /// Requests the site would run at a full cache, for the dashboard only; read once per refresh.
+    fn implied_capacity(&self, _site: &str, _cluster: &str, _over: Over) -> Option<f64> {
+        None
+    }
 }

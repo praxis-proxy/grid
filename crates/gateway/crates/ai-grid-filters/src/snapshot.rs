@@ -17,18 +17,10 @@ use crate::{
     decisions::SiteDecisions,
     descriptor::{AdmissionState, CapabilityKind, RouteCandidate},
     serving::AvailabilitySettings,
-    signals::{Over, SiteReading, SiteSignals},
+    signals::{ComparatorSource, Over, SiteReading, SiteSignals},
 };
 
-/// The reading at which a site is treated as having little room left, matching the threshold
-/// the EPP's own utilization detector uses over KV.
-///
-/// A routing threshold, not an engine limit: vLLM runs its cache to about 1.0 and preempts
-/// rather than refusing, so this says prefer elsewhere rather than out of room.
-const REPORTED_FULL: f64 = 0.8;
-
-/// Minimum duration required before concluding any backlog-based limit, even when the site
-/// reports saturation. A sample marked full through `full_in_flight` bypasses this spell.
+/// Minimum duration required before concluding any backlog-based limit.
 pub(crate) const MIN_BACKLOG_SPELL_MS: i64 = 5_000;
 
 /// Score of a candidate whose cluster has no healthy endpoint: after every healthy one,
@@ -128,13 +120,14 @@ impl RouteSnapshot {
         // Score each candidate once, then sort the pairs: load_of allocates a
         // store key and scans a window, too costly to repeat inside sort_by.
         let mut reset_pairs = BTreeSet::new();
-        let ranked = candidates
+        let mut ranked: Vec<_> = candidates
             .into_iter()
             .map(|candidate| {
                 let local = *candidate.site == *local_site;
                 Self::resolve(candidate, local, inputs, &mut reset_pairs)
             })
             .collect();
+        weigh_alike(&mut ranked);
         Self::ranked(
             Self::explore_floor(ranked, inputs.availability.explore_floor),
             local_site,
@@ -170,13 +163,13 @@ impl RouteSnapshot {
         };
         let measured = Self::measured(&candidate, &readings, inputs, reset_pairs);
         if let Some(measured) = &measured {
-            candidate.capacity = Some(measured.ceiling);
+            candidate.capacity = measured.ceiling;
             candidate.rho = Some(measured.rho);
             candidate.full = measured.full;
             candidate.relieved = measured.relieved;
         } else {
             // Direct pressure remains useful without a count or a learned ceiling.
-            candidate.rho = reported_limit(reading);
+            candidate.rho = reading.comparator();
         }
         // Ordered by queue depth; a site publishing none sorts after every site that does.
         let load = if candidate.admission_state == AdmissionState::NewAndExisting {
@@ -188,6 +181,8 @@ impl RouteSnapshot {
             candidate,
             load,
             measured: measured.is_some(),
+            units: measured.and_then(|measured| measured.units),
+            floored: false,
             score_unavailable,
         }
     }
@@ -208,7 +203,6 @@ impl RouteSnapshot {
             window_ms: inputs.window_ms,
             horizon_ms,
             queue_full: inputs.availability.queue_full,
-            reported_full: REPORTED_FULL,
         };
         let reading = inputs
             .signals
@@ -229,7 +223,7 @@ impl RouteSnapshot {
         }
     }
 
-    /// Lift every measured site's weight to at least `share` of the largest ceiling.
+    /// Lift every measured site's weighted capacity to at least `share` of the largest weighted ceiling.
     ///
     /// A soft bound only grows when a site carries queue-free load, and a site weighted by a
     /// small ceiling carries little. Without a floor an unproven site would never prove more.
@@ -241,8 +235,13 @@ impl RouteSnapshot {
     ) -> Vec<(f64, RouteCandidate, Option<ScoreUnavailable>)> {
         let largest = ranked
             .iter()
-            .filter(|resolved| resolved.measured)
-            .filter_map(|resolved| resolved.candidate.capacity)
+            .filter(|resolved| resolved.measured && resolved.floored)
+            .filter_map(|resolved| {
+                resolved
+                    .candidate
+                    .capacity
+                    .map(|capacity| capacity * f64::from(resolved.candidate.weight))
+            })
             .fold(0.0_f64, f64::max);
         let floor = largest * share;
         ranked
@@ -252,10 +251,15 @@ impl RouteSnapshot {
                     mut candidate,
                     load,
                     measured,
+                    floored,
                     score_unavailable,
+                    ..
                 } = resolved;
-                if measured {
-                    candidate.capacity = candidate.capacity.map(|ceiling| ceiling.max(floor));
+                // Units and equal weights are not unproven, so only learned ceilings are lifted.
+                if measured && floored {
+                    candidate.capacity = candidate
+                        .capacity
+                        .map(|ceiling| ceiling.max(floor / f64::from(candidate.weight)));
                 }
                 (load, candidate, score_unavailable)
             })
@@ -267,9 +271,9 @@ impl RouteSnapshot {
     ///
     /// The soft bound is the most held queue-free; the hard bound is the least held at a
     /// demonstrated limit. A count is read against the lesser, floored. Saturation is the
-    /// nearer of that counted limit and the provider's own fullness, smoothed so one new sample
-    /// moves it by `smoothing`; a refresh with no new sample leaves it alone. Full is at the
-    /// resulting ceiling with a backlog for `full_after_ms`; room is no such sample in `recent`.
+    /// site's comparator where it has one, else that count, smoothed so one new sample moves it
+    /// by `smoothing`; a refresh with no new sample leaves it alone. Full is the comparator at 1,
+    /// or the ceiling with a backlog, for `full_after_ms`; room is no such sample in `recent`.
     ///
     /// The smoothing, and reading an absent sample as absent rather than as zero load, follow
     /// Brent Salisbury's pressure-weighted placement. The learned ceiling in place of a
@@ -288,12 +292,26 @@ impl RouteSnapshot {
         let in_flight = reading.in_flight?;
         // The newest sample at or before now is the epoch a smoothing step belongs to.
         let sample_at = reading.sampled_at.map(|at| at.min(inputs.now_ms));
-        let previous = inputs.learned.load.get(&key).copied();
-        let ceiling = ceiling(previous, reading, inputs.now_ms, inputs.window_ms, inputs.availability);
+        // A ceiling learned from offered load draws more to the site already sent more, so a
+        // site with a comparator is read only from it.
+        let comparator = reading.comparator();
+        // State from another source is on another scale, so a site that switched starts fresh.
+        let source = reading.comparator_source();
+        let previous = inputs
+            .learned
+            .load
+            .get(&key)
+            .copied()
+            .filter(|previous| previous.source == source);
+        let ceiling = match comparator {
+            Some(_) => Ceiling::unlearned(),
+            None => ceiling(previous, reading, inputs.now_ms, inputs.window_ms, inputs.availability),
+        };
+        let learned = comparator.is_none().then_some(ceiling.read_against);
         let by_count = (in_flight / ceiling.read_against).clamp(0.0, 1.0);
-        let raw = nearest_limit(reading, by_count, ceiling.hard.is_some());
+        let raw = comparator.unwrap_or(by_count);
         let rho = smoothed(previous, sample_at, raw, inputs.availability.smoothing);
-        let (congested, full_since) = congestion(previous, &readings.recent, ceiling.read_against, inputs);
+        let (congested, full_since) = congestion(previous, &readings.recent, learned, inputs);
         let reset = reset_pairs.contains(&key);
         let full = (!reset)
             .then(|| full_for(candidate, full_since, inputs.now_ms, inputs.availability.full_after_ms))
@@ -301,12 +319,27 @@ impl RouteSnapshot {
         let age_ms = sample_at.map(|at| inputs.now_ms.saturating_sub(at));
         let limits = Limits::read(in_flight, &ceiling, by_count, full, age_ms);
         publish_limits(&key, &ceiling, reading, &limits);
+        let horizon = Over {
+            now_ms: inputs.now_ms,
+            window_ms: inputs.window_ms,
+            horizon_ms: inputs.horizon_ms,
+            queue_full: inputs.availability.queue_full,
+        };
+        site_gauge(
+            "grid_route_site_capacity_implied",
+            &key,
+            inputs
+                .signals
+                .implied_capacity(&candidate.site, &candidate.cluster, horizon)
+                .unwrap_or(f64::NAN),
+        );
         inputs.learned.load.insert(
             key,
-            SiteLearned::at(&ceiling, rho, inputs.now_ms, sample_at, full_since, epoch),
+            SiteLearned::at(&ceiling, rho, inputs.now_ms, sample_at, full_since, epoch, source),
         );
         Some(Measured {
-            ceiling: ceiling.read_against,
+            ceiling: learned,
+            units: weighed(reading),
             rho,
             full,
             relieved: candidate.backlog.filter(|_| !reset).map(|_| !congested),
@@ -316,8 +349,9 @@ impl RouteSnapshot {
     /// This snapshot with the models to shed, given the set `previous` shed.
     ///
     /// A model sheds when every admitted, healthy site serving it has been full for
-    /// `full_after_ms`: at its learned ceiling with work waiting. It routes again once any
-    /// site has room: its queue emptied, or it has been below its ceiling for `room_after_ms`.
+    /// `full_after_ms`: at its limit with work waiting, the comparator at 1 or its learned
+    /// ceiling. It routes again once any site has room: its queue emptied, or it has been below
+    /// that limit for `room_after_ms`.
     /// Between the two it keeps its previous state, so a site hovering at the ceiling does not
     /// flap. A model with any healthy site of unknown saturation or unknown queue never sheds:
     /// that site takes the overflow.
@@ -402,7 +436,11 @@ impl RouteSnapshot {
     /// snapshot's pairs.
     #[must_use]
     pub(crate) fn published(self, gauged: &mut Gauged) -> Self {
-        let Gauged { published, learned } = gauged;
+        let Gauged {
+            published,
+            named,
+            learned,
+        } = gauged;
         let unavailable_by_pair: BTreeMap<SitePair, ScoreUnavailable> = self
             .candidates
             .iter()
@@ -412,8 +450,13 @@ impl RouteSnapshot {
             })
             .collect();
         let mut current = BTreeSet::new();
+        let mut naming: BTreeSet<SiteModel> = BTreeSet::new();
         for (candidate, score) in self.candidates.iter().zip(&self.scores) {
             let key = (Arc::clone(&candidate.site), Arc::clone(&candidate.cluster));
+            // Only inference models name a `model`; a tool with the same name is not one.
+            if candidate.kind == CapabilityKind::InferenceModel {
+                naming.insert((Arc::clone(&key.0), Arc::clone(&key.1), Arc::clone(&candidate.name)));
+            }
             // The front entry for a pair is its best; later ones are other models.
             if current.insert(key.clone()) {
                 site_score(&key, *score);
@@ -429,6 +472,13 @@ impl RouteSnapshot {
                 }
             }
         }
+        for (site, cluster, model) in &naming {
+            candidate_info(site, cluster, model, 1.0);
+        }
+        for (site, cluster, model) in named.difference(&naming) {
+            candidate_info(site, cluster, model, 0.0);
+        }
+        *named = naming;
         for gone in published.difference(&current) {
             site_score(gone, f64::NAN);
             publish_score_unavailable(gone, |_| f64::NAN);
@@ -481,6 +531,8 @@ pub(crate) fn decisions_for(candidates: &[RouteCandidate]) -> Vec<SiteDecisions>
 
 /// A candidate's site and cluster, the labels of its score gauge.
 type SitePair = (Arc<str>, Arc<str>);
+/// A `(site, cluster, model)` triple: one inference model a site's cluster serves.
+type SiteModel = (Arc<str>, Arc<str>, Arc<str>);
 
 /// A candidate resolved against one consistent set of signal readings.
 struct ResolvedCandidate {
@@ -490,6 +542,10 @@ struct ResolvedCandidate {
     load: f64,
     /// Whether the readings produced learned capacity and saturation.
     measured: bool,
+    /// Ready units to weigh by, when every measured candidate has them.
+    units: Option<f64>,
+    /// Whether the weight is a learned ceiling, the only scale the explore floor lifts.
+    floored: bool,
     /// Why the candidate lacks a queue score, when applicable.
     score_unavailable: Option<ScoreUnavailable>,
 }
@@ -568,6 +624,8 @@ struct SiteLearned {
     units: Option<f64>,
     /// When it first reported fewer than that, so a late scrape is not read as a smaller site.
     shrunk_since: Option<i64>,
+    /// Which comparator the site was read from; `None` where it was learned.
+    source: Option<ComparatorSource>,
 }
 
 /// A site's two bounds at one refresh, and the denominator they give.
@@ -680,6 +738,18 @@ fn lost_units(now: Option<f64>, learned: Option<f64>) -> bool {
 }
 
 impl Ceiling {
+    /// No bounds, for a site read only from the comparator: nothing is taught or kept.
+    const fn unlearned() -> Self {
+        Self {
+            soft: None,
+            hard: None,
+            backlog_since: None,
+            read_against: f64::NAN,
+            units: None,
+            shrunk_since: None,
+        }
+    }
+
     /// Set the ceiling gauges, so an operator can tell a bound that moved because the site
     /// carried more from one that moved because it queued.
     fn publish(&self, key: &SitePair) {
@@ -702,6 +772,7 @@ impl SiteLearned {
         sample_at: Option<i64>,
         full_since: Option<i64>,
         epoch: u64,
+        source: Option<ComparatorSource>,
     ) -> Self {
         Self {
             epoch,
@@ -714,6 +785,7 @@ impl SiteLearned {
             backlog_since: ceiling.backlog_since,
             units: ceiling.units,
             shrunk_since: ceiling.shrunk_since,
+            source,
         }
     }
 }
@@ -733,8 +805,11 @@ struct Readings {
 
 /// What one refresh measured about a site.
 struct Measured {
-    /// The denominator produced by the learned soft and hard bounds.
-    ceiling: f64,
+    /// The denominator produced by the learned soft and hard bounds; `None` for a site read
+    /// only from the comparator.
+    ceiling: Option<f64>,
+    /// Ready units, where the site publishes the comparator's inputs.
+    units: Option<f64>,
     /// Smoothed saturation at the nearer provider-reported or counted limit.
     rho: f64,
     /// At the ceiling with a backlog for `full_after_ms`; `None` without a queue reading.
@@ -774,6 +849,8 @@ const RETURN_SAMPLES: u8 = 2;
 pub(crate) struct Gauged {
     /// `(site, cluster)` pairs with a published score.
     pub(crate) published: BTreeSet<SitePair>,
+    /// `(site, cluster, model)` triples with a published candidate info series.
+    pub(crate) named: BTreeSet<SiteModel>,
     /// Learned ceilings and smoothed saturation per site.
     pub(crate) learned: Learned,
 }
@@ -847,8 +924,6 @@ fn ceiling(
             kept,
             reading,
             Backlog {
-                held: 0.0,
-                soft,
                 since: backlog_since,
                 now_ms: reading.backlogged_at.unwrap_or(now_ms),
             },
@@ -891,69 +966,30 @@ fn hard_bound(
     backlog: Backlog,
     availability: &AvailabilitySettings,
 ) -> Option<f64> {
-    // Two ways a sample shows a limit, each carrying the count it was holding then: one the
-    // site reported full, one the gateway concluded from a settled backlog at its ceiling.
-    let concluded = reading
-        .congested_in_flight
-        .filter(|held| at_limit(reading, Backlog { held: *held, ..backlog }, availability));
-    let seen = [reading.full_in_flight, concluded]
-        .into_iter()
-        .flatten()
-        .reduce(f64::min);
+    // A limit the gateway concluded from a settled backlog at its ceiling.
+    let seen = reading.congested_in_flight.filter(|_| at_limit(backlog, availability));
     match (kept, seen) {
         (Some(held), Some(seen)) => Some(held.min(seen)),
         (held, seen) => held.or(seen),
     }
 }
 
-/// What one backlog observation carries: how much the site held at a congested instant, the
-/// most it has carried queue-free, when the spell began, and now.
+/// When a backlog spell began, and now.
 #[derive(Clone, Copy, Debug)]
 struct Backlog {
-    /// What the site held at a congested instant in the window.
-    held: f64,
-    /// The most it has carried with nothing waiting.
-    soft: Option<f64>,
     /// When the current backlog spell began.
     since: Option<i64>,
     /// Now, milliseconds.
     now_ms: i64,
 }
 
-/// Whether a backlog is the site's limit rather than a burst of arrivals.
-///
-/// Three shapes look alike from a count of in-flight requests, and the site's own reading is
-/// what separates them. Queueing below the most it has carried, with the cache nearly spent, is
-/// a site that shrank. Queueing at or above that, with a cool cache, is a site out of sequence
-/// slots, which is the one request-denominated limit the engine really has. Queueing below that
-/// with a cool cache is neither: the site is taking arrivals in bursts and nothing about its
-/// capacity has been shown.
-///
-/// Time alone cannot tell the third from the second, because a standing queue at a quarter of
-/// the load lasts as long as anyone cares to wait. A clock on its own reads burstiness as a
-/// limit and ratchets the bound down to whatever the site held when the queue first appeared.
-///
-/// A preempted request returns to the front of the waiting queue rather than leaving the
-/// engine, so a cache-limited backlog is visible as a queue at the moment it happens and the
-/// in-flight count is unchanged by the preemption. Block pressure shows near a full cache
-/// rather than at `REPORTED_FULL`, so a bound is learned where pressure begins rather than
-/// where the engine gave up.
-///
-/// The floor on the spell matters because `full_after_ms` can be set to zero, and at zero even
-/// a slot-bound site would latch on its first congested instant.
-fn at_limit(reading: &SiteReading, backlog: Backlog, availability: &AvailabilitySettings) -> bool {
-    let Backlog {
-        held,
-        soft,
-        since,
-        now_ms,
-    } = backlog;
-    let settled =
-        since.is_some_and(|since| now_ms.saturating_sub(since) >= availability.full_after_ms.max(MIN_BACKLOG_SPELL_MS));
-    match reading.saturation {
-        Some(_) => settled && soft.is_none_or(|soft| held >= soft),
-        None => settled,
-    }
+/// Whether a backlog has lasted long enough to be the site's limit rather than a burst. Only a
+/// site without a KV share learns, so a count over time is all there is to go on; the floor
+/// keeps a zero `full_after_ms` from latching on the first congested instant.
+fn at_limit(backlog: Backlog, availability: &AvailabilitySettings) -> bool {
+    backlog.since.is_some_and(|since| {
+        backlog.now_ms.saturating_sub(since) >= availability.full_after_ms.max(MIN_BACKLOG_SPELL_MS)
+    })
 }
 
 /// The denominator saturation is read against, before the floor.
@@ -970,17 +1006,24 @@ fn read_against(low: Option<f64>, high: Option<f64>) -> f64 {
     }
 }
 
-/// Whether the site is at `ceiling` with a backlog, and when that spell began.
+/// Whether the site is at its limit with a backlog, and when that spell began: the comparator
+/// at 1 where the site publishes it, else in-flight at the learned `ceiling`.
 ///
 /// Both read from `recent`, the settling time rather than the horizon, and from one instant, so
 /// a full moment and a queued moment are not crossed into congestion.
 fn congestion<S: SiteSignals>(
     prior: Option<SiteLearned>,
     recent: &SiteReading,
-    ceiling: f64,
+    ceiling: Option<f64>,
     inputs: &Inputs<'_, S>,
 ) -> (bool, Option<i64>) {
-    let congested = recent.congested_in_flight.is_some_and(|held| held >= ceiling);
+    let congested = match (recent.comparator(), ceiling) {
+        // Full and waiting at one instant: a full reading alone is a site working flat out.
+        (Some(_), _) => recent.congested_saturation.is_some_and(|saturation| saturation >= 1.0),
+        (None, Some(ceiling)) => recent.congested_in_flight.is_some_and(|held| held >= ceiling),
+        // A comparator site with no reading in the settling time is not judged on a ceiling.
+        (None, None) => false,
+    };
     let since = spell_since(
         prior.map(|prior| (prior.at_ms, prior.full_since)),
         congested,
@@ -1034,7 +1077,19 @@ fn publish_limits(key: &SitePair, ceiling: &Ceiling, reading: &SiteReading, limi
     site_gauge(
         "grid_route_site_rho_reported",
         key,
-        reported_limit(reading).unwrap_or(f64::NAN),
+        reading.published_saturation.unwrap_or(f64::NAN),
+    );
+    site_gauge(
+        "grid_route_site_rho_derived",
+        key,
+        reading.derived_saturation.unwrap_or(f64::NAN),
+    );
+    site_gauge(
+        "grid_route_site_rho_published",
+        key,
+        reading.comparator_source().map_or(f64::NAN, |source| {
+            f64::from(u8::from(source == ComparatorSource::Published))
+        }),
     );
     site_gauge(
         "grid_route_site_full",
@@ -1048,51 +1103,44 @@ fn publish_limits(key: &SitePair, ceiling: &Ceiling, reading: &SiteReading, limi
     );
 }
 
-/// How close the site is to the nearest limit it is up against.
-///
-/// Two limits, grouped by who worked them out. What the provider reports about itself is one:
-/// its own fullness, and the backlog behind it, both already relative to its own capacity. What
-/// the gateway has to work out is the other: a count of requests over a ceiling learned from
-/// the site's own load. The first needs nothing learned and arrives wherever the provider
-/// publishes it; the second needs the ceiling and arrives only where a per-request count does.
-///
-/// The nearest, not a blend. Each limit is a necessary condition for having room, so the larger
-/// reading is the binding one. These are limits rather than scores, which is why no weight sits
-/// between them: a weighted sum of necessary conditions is not one, and a site at 0.95 of its
-/// own reading and 0.05 of its counted ceiling would read half full while it is about to
-/// preempt. The EPP weighs its KV and queue scorers against each other because it only ranks
-/// endpoints; this reading also answers whether a site has room at all.
-///
-/// They bind in different regimes and neither knows which regime it is in, because request size
-/// decides that and nothing here sees a request: at a full context a site holds one or two
-/// requests while its cache is spent, and at small ones the slots fill while the cache is
-/// barely touched.
-fn nearest_limit(reading: &SiteReading, by_count: f64, at_a_known_limit: bool) -> f64 {
-    match reported_limit(reading) {
-        // The site says something about itself. Its count is admissible beside that only once
-        // a backlog has shown where its limit is, because until then the ceiling is a lower
-        // bound on capacity and the count over it is an upper bound on saturation, not a
-        // reading. Taking the larger of a reading and an upper bound gives the upper bound,
-        // which is how a site that has never been pushed reads as full while idle.
-        Some(reported) if at_a_known_limit => reported.max(by_count),
-        Some(reported) => reported,
-        // The site says nothing, so its count is all there is, upper bound and all.
-        None => by_count,
+/// Ready units for a site read by its comparator: what routing cannot move.
+fn weighed(reading: &SiteReading) -> Option<f64> {
+    reading.comparator().and(reading.units).filter(|units| *units > 0.0)
+}
+
+/// Puts each model's measured sites on one scale, since one draw spans one model: ready units
+/// when all have them, learned ceilings when all have one, else an equal weight each. Only
+/// sites admitted for new requests enter a draw, so only they choose the scale.
+fn weigh_alike(ranked: &mut [ResolvedCandidate]) {
+    let models: BTreeSet<Arc<str>> = ranked
+        .iter()
+        .map(|resolved| Arc::clone(&resolved.candidate.name))
+        .collect();
+    for model in models {
+        let in_draw = |resolved: &ResolvedCandidate| {
+            resolved.measured
+                && resolved.candidate.name == model
+                && resolved.candidate.admission_state == AdmissionState::NewAndExisting
+        };
+        let drawn = || ranked.iter().filter(|resolved| in_draw(resolved));
+        let by_units = drawn().all(|resolved| resolved.units.is_some());
+        let by_learned = drawn().all(|resolved| resolved.units.is_none() && resolved.candidate.capacity.is_some());
+        for resolved in ranked.iter_mut().filter(|resolved| in_draw(resolved)) {
+            resolved.floored = !by_units && by_learned;
+            resolved.candidate.capacity = if by_units {
+                resolved.units
+            } else if by_learned {
+                resolved.candidate.capacity
+            } else {
+                Some(EQUAL_WEIGHT)
+            };
+        }
     }
 }
 
-/// What the site reports about its own fullness, already joined across its units by the signal
-/// mapping.
-///
-/// The backlog is deliberately not folded in here. A queue is evidence that the site has
-/// reached a limit, which is what `at_limit` reads it for, and not a measure of how full the
-/// site is: a site at its ceiling with a queue is exactly where its own count should bind, and
-/// treating the queue as a reading would suppress that count instead.
-///
-/// Absent when the site reports nothing, which is when its count is all there is.
-fn reported_limit(reading: &SiteReading) -> Option<f64> {
-    reading.saturation
-}
+/// The weight each measured site carries when the sites share no scale. Present rather than
+/// absent, because an absent capacity marks a site as unmeasured.
+const EQUAL_WEIGHT: f64 = 1.0;
 
 /// When the site's current spell of `on` began, if it is `on` at `now_ms`: carried from
 /// `prior`, that refresh's clock and the spell it held, while the site was measured within the
@@ -1148,7 +1196,10 @@ where
 /// The gauges only a measured refresh sets. A pair that is still a candidate but published no
 /// in-flight sample never reaches that refresh, so each has to be cleared by name: the exporter
 /// keeps a series until restart, and a frozen ceiling beside a NaN one reads as a healthy site.
-const MEASURED_GAUGES: [&str; 8] = [
+const MEASURED_GAUGES: [&str; 11] = [
+    "grid_route_site_rho_derived",
+    "grid_route_site_rho_published",
+    "grid_route_site_capacity_implied",
     "grid_route_site_ceiling",
     "grid_route_site_ceiling_soft",
     "grid_route_site_ceiling_hard",
@@ -1301,6 +1352,19 @@ fn clear_measured(key: &SitePair) {
     }
 }
 
+/// `grid_route_candidate_info`: 1 while the snapshot lists `model` as a candidate at `cluster` on
+/// `site`, 0 once it no longer does. The 0 is a tombstone the exporter keeps until restart, so a
+/// join filters on `== 1`.
+fn candidate_info(site: &Arc<str>, cluster: &Arc<str>, model: &Arc<str>, value: f64) {
+    metrics::gauge!(
+        "grid_route_candidate_info",
+        "site" => Arc::clone(site),
+        "cluster" => Arc::clone(cluster),
+        "model" => Arc::clone(model)
+    )
+    .set(value);
+}
+
 /// Set a per-site gauge: a limit, the ceiling it is read against, or the weight.
 fn site_gauge(name: &'static str, (site, cluster): &SitePair, value: f64) {
     metrics::gauge!(name, "site" => Arc::clone(site), "cluster" => Arc::clone(cluster)).set(value);
@@ -1345,6 +1409,7 @@ mod tests {
             selection_group: 0,
             site: site.to_owned(),
             stable_id: None,
+            weight: None,
         }
     }
 
@@ -2384,6 +2449,104 @@ mod tests {
         assert_eq!(sites.len(), 2, "both stay in the draw, as when nothing is published");
     }
 
+    /// Each candidate's labels, keyed `site,cluster,model`, as the info gauge publishes them.
+    #[derive(Default)]
+    struct Named(std::sync::Mutex<BTreeMap<String, Arc<metrics::atomics::AtomicU64>>>);
+
+    impl Named {
+        fn get(&self, site: &str, cluster: &str, model: &str) -> Option<f64> {
+            self.0
+                .lock()
+                .unwrap()
+                .get(&format!("{site},{cluster},{model}"))
+                .map(|value| f64::from_bits(value.load(std::sync::atomic::Ordering::Relaxed)))
+        }
+    }
+
+    impl metrics::Recorder for Named {
+        fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn register_counter(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+
+        fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            if key.name() != "grid_route_candidate_info" {
+                return metrics::Gauge::noop();
+            }
+            let label = |name: &str| {
+                key.labels()
+                    .find(|label| label.key() == name)
+                    .map_or("", |label| label.value())
+                    .to_owned()
+            };
+            let name = format!("{},{},{}", label("site"), label("cluster"), label("model"));
+            metrics::Gauge::from_arc(Arc::clone(self.0.lock().unwrap().entry(name).or_default()))
+        }
+
+        fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn every_candidate_publishes_its_model_and_one_that_leaves_reads_zero() {
+        let recorder = Named::default();
+        metrics::with_local_recorder(&recorder, || {
+            let mut gauged = Gauged::new();
+            let tool = CandidateConfig {
+                kind: CapabilityKind::McpTool,
+                ..cand("llama", "north", "tools-north")
+            };
+            let candidates = validate_candidates(vec![
+                cand("llama", "east", "pool-east"),
+                cand("qwen", "east", "pool-east"),
+                cand("llama", "west", "pool-west"),
+                tool,
+            ])
+            .unwrap();
+            drop(RouteSnapshot::from_static(candidates, Arc::from("hub")).published(&mut gauged));
+            for (site, cluster, model) in [
+                ("east", "pool-east", "llama"),
+                ("east", "pool-east", "qwen"),
+                ("west", "pool-west", "llama"),
+            ] {
+                assert_eq!(
+                    recorder.get(site, cluster, model),
+                    Some(1.0),
+                    "{model} on {cluster} at {site}, including a second model on one cluster"
+                );
+            }
+            assert_eq!(
+                recorder.get("north", "tools-north", "llama"),
+                None,
+                "a tool sharing a model's name names no series"
+            );
+
+            let remaining = validate_candidates(vec![cand("llama", "east", "pool-east")]).unwrap();
+            drop(RouteSnapshot::from_static(remaining, Arc::from("hub")).published(&mut gauged));
+            assert_eq!(
+                recorder.get("east", "pool-east", "llama"),
+                Some(1.0),
+                "a kept candidate stays"
+            );
+            assert_eq!(
+                recorder.get("east", "pool-east", "qwen"),
+                Some(0.0),
+                "a model the cluster stopped serving reads zero"
+            );
+            assert_eq!(
+                recorder.get("west", "pool-west", "llama"),
+                Some(0.0),
+                "a site that left reads zero"
+            );
+        });
+    }
+
     #[test]
     fn unready_site_does_not_publish_score_unavailable_reason() {
         let recorder = Captured::default();
@@ -2672,12 +2835,21 @@ mod tests {
     }
 
     #[test]
-    fn reported_fullness_uses_the_joined_cache_reading() {
-        let reading = SiteReading {
-            saturation: Some(0.85),
+    fn the_comparator_prefers_the_epps_own_reading() {
+        let both = SiteReading {
+            published_saturation: Some(1.3),
+            derived_saturation: Some(0.6),
             ..SiteReading::default()
         };
-        assert_eq!(reported_limit(&reading), Some(0.85));
+        assert_eq!(both.comparator(), Some(1.3));
+        assert_eq!(both.comparator_source(), Some(ComparatorSource::Published));
+        let derived = SiteReading {
+            derived_saturation: Some(0.6),
+            ..SiteReading::default()
+        };
+        assert_eq!(derived.comparator(), Some(0.6));
+        assert_eq!(derived.comparator_source(), Some(ComparatorSource::Derived));
+        assert_eq!(SiteReading::default().comparator_source(), None);
     }
 
     #[test]
@@ -2701,8 +2873,9 @@ mod tests {
                 let reported = f64::from_bits(recorder.0.load(Ordering::Relaxed));
                 assert_eq!(candidate.capacity, None);
                 if now_ms == 1_000 {
-                    assert_eq!(candidate.rho, Some(0.85));
-                    assert_eq!(reported.to_bits(), 0.85_f64.to_bits());
+                    let comparator = 0.85 / crate::signals::llm_d::SATURATION_KV_SHARE;
+                    assert_eq!(candidate.rho, Some(comparator));
+                    assert_eq!(reported.to_bits(), comparator.to_bits());
                     drop(RouteSnapshot::from_static(Vec::new(), Arc::from("hub")).published(&mut gauged));
                     assert!(f64::from_bits(recorder.0.load(Ordering::Relaxed)).is_nan());
                     drop(snapshot.published(&mut gauged));
@@ -2930,6 +3103,151 @@ mod tests {
         }
     }
 
+    /// The resolved candidate for `site` in `snapshot`.
+    fn site_in<'snap>(snapshot: &'snap RouteSnapshot, site: &str) -> &'snap RouteCandidate {
+        snapshot
+            .candidates
+            .iter()
+            .find(|candidate| candidate.site.as_ref() == site)
+            .expect("site present")
+    }
+
+    #[test]
+    fn a_site_that_switches_between_comparator_and_learning_starts_fresh() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        let mut learned = Learned::default();
+        let availability = AvailabilitySettings {
+            smoothing: 0.5,
+            ..AvailabilitySettings::default()
+        };
+        with_in_flight(&store, "a", 10.0, 1_000);
+        with_queue(&store, "a", 0.0, 1_000);
+        with_series(&store, "a", "llm_d_epp_flow_control_pool_saturation", 2.0, 1_000);
+        let comparator = RouteSnapshot::from_store(
+            one("a"),
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut learned, 1_000, 1_000),
+        );
+        assert_eq!(comparator.candidates[0].rho, Some(2.0));
+        // Past the horizon the site publishes no comparator inputs, so it learns.
+        with_in_flight(&store, "a", 10.0, 5_000);
+        with_queue(&store, "a", 0.0, 5_000);
+        let learning = RouteSnapshot::from_store(
+            one("a"),
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut learned, 5_000, 1_000),
+        );
+        assert_eq!(
+            learning.candidates[0].rho,
+            Some(1.0),
+            "the count against a fresh soft bound, not smoothed with the comparator's 2.0"
+        );
+        with_in_flight(&store, "a", 10.0, 9_000);
+        with_queue(&store, "a", 0.0, 9_000);
+        with_series(&store, "a", "llm_d_epp_average_kv_cache_utilization", 0.08, 9_000);
+        let back = RouteSnapshot::from_store(
+            one("a"),
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut learned, 9_000, 1_000),
+        );
+        assert_eq!(
+            back.candidates[0].rho,
+            Some(0.08 / crate::signals::llm_d::SATURATION_KV_SHARE),
+            "the comparator, not smoothed with the learned 1.0"
+        );
+    }
+
+    #[test]
+    fn each_models_sites_are_weighed_on_their_own_scale() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        let mut learned = Learned::default();
+        let availability = AvailabilitySettings::default();
+        // First line at an instant wins, so a's two units go in before the helper's one.
+        with_series(&store, "a", "llm_d_epp_ready_endpoints", 2.0, 1_000);
+        for site in ["a", "b", "c"] {
+            with_in_flight(&store, site, 10.0, 1_000);
+            with_queue(&store, site, 0.0, 1_000);
+        }
+        for site in ["a", "b"] {
+            with_series(&store, site, "llm_d_epp_average_kv_cache_utilization", 0.2, 1_000);
+        }
+        let candidates = validate_candidates(vec![
+            cand("m1", "a", "pool-a"),
+            cand("m1", "b", "pool-b"),
+            cand("m2", "c", "pool-c"),
+        ])
+        .unwrap();
+        let snapshot = RouteSnapshot::from_store(
+            candidates,
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut learned, 1_000, 1_000),
+        );
+        assert_eq!(site_in(&snapshot, "a").capacity, Some(2.0), "m1 weighs by units");
+        assert_eq!(site_in(&snapshot, "b").capacity, Some(1.0));
+        assert_eq!(
+            site_in(&snapshot, "c").capacity,
+            Some(10.0),
+            "a learned site serving another model does not flatten m1"
+        );
+    }
+
+    #[test]
+    fn a_site_not_admitted_for_new_requests_does_not_choose_the_scale() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        let mut learned = Learned::default();
+        let availability = AvailabilitySettings::default();
+        // First line at an instant wins, so the unit counts go in before the helper's one.
+        with_series(&store, "a", "llm_d_epp_ready_endpoints", 8.0, 1_000);
+        with_series(&store, "b", "llm_d_epp_ready_endpoints", 2.0, 1_000);
+        for site in ["a", "b", "c"] {
+            with_in_flight(&store, site, 10.0, 1_000);
+            with_queue(&store, site, 0.0, 1_000);
+        }
+        for site in ["a", "b"] {
+            with_series(&store, site, "llm_d_epp_average_kv_cache_utilization", 0.2, 1_000);
+        }
+        let mut draining = cand("m", "c", "pool-c");
+        draining.admission = AdmissionState::ExistingOnly;
+        let candidates =
+            validate_candidates(vec![cand("m", "a", "pool-a"), cand("m", "b", "pool-b"), draining]).unwrap();
+        let snapshot = RouteSnapshot::from_store(
+            candidates,
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut learned, 1_000, 1_000),
+        );
+        assert_eq!(
+            site_in(&snapshot, "a").capacity,
+            Some(8.0),
+            "a draining count-only site cannot flatten the draw"
+        );
+        assert_eq!(site_in(&snapshot, "b").capacity, Some(2.0));
+    }
+
+    #[test]
+    fn the_explore_floor_does_not_lift_unit_weights() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        let mut learned = Learned::default();
+        let availability = AvailabilitySettings::default();
+        with_series(&store, "a", "llm_d_epp_ready_endpoints", 10.0, 1_000);
+        for site in ["a", "b"] {
+            with_in_flight(&store, site, 10.0, 1_000);
+            with_queue(&store, site, 0.0, 1_000);
+            with_series(&store, site, "llm_d_epp_average_kv_cache_utilization", 0.2, 1_000);
+        }
+        let candidates = validate_candidates(vec![cand("m", "a", "pool-a"), cand("m", "b", "pool-b")]).unwrap();
+        let snapshot = RouteSnapshot::from_store(
+            candidates,
+            Arc::from("hub"),
+            &mut at(&store, &availability, &mut learned, 1_000, 1_000),
+        );
+        assert_eq!(site_in(&snapshot, "a").capacity, Some(10.0));
+        assert_eq!(
+            site_in(&snapshot, "b").capacity,
+            Some(1.0),
+            "a ready unit is not an unproven ceiling, so the floor leaves it"
+        );
+    }
+
     #[test]
     fn a_queued_sample_teaches_no_ceiling_and_reads_as_full() {
         let store = LoadStore::new(Duration::from_secs(60));
@@ -3058,6 +3376,8 @@ mod tests {
         );
     }
 
+    /// A pod replaced under load drops a ready unit. A comparator site is weighed by the units it
+    /// has and teaches no bound from the saturated sample, so nothing outlives the replacement.
     #[test]
     fn a_transient_endpoint_shrink_cannot_teach_a_smaller_hard_ceiling() {
         let store = LoadStore::new(Duration::from_secs(60));
@@ -3093,25 +3413,31 @@ mod tests {
 
         sample(1_000, 20.0, 0.0, 2.0, 0.0);
         let baseline = refresh(1_000, &mut learned);
-        assert_eq!(baseline.candidates[0].capacity, Some(40.0));
+        assert_eq!(
+            baseline.candidates[0].capacity,
+            Some(2.0),
+            "weighed by its two ready units"
+        );
 
         // While one simulator pod is being replaced, the remaining endpoint is saturated and
-        // queued. That transient nine-request sample must not become the two-endpoint site's
-        // hard bound.
+        // queued. A site read by the comparator is weighed by the unit left and learns nothing.
         sample(2_000, 8.0, 1.0, 1.0, 1.0);
         let transient = refresh(2_000, &mut learned);
         assert_eq!(
             transient.candidates[0].capacity,
-            Some(40.0),
-            "the stable two-endpoint ceiling remains while one endpoint is briefly absent"
+            Some(1.0),
+            "the unit left while one is replaced"
         );
 
         sample(3_000, 8.0, 1.0, 2.0, 1.0);
         let restored = refresh(3_000, &mut learned);
-        assert_eq!(
-            restored.candidates[0].capacity,
-            Some(18.0),
-            "the restored two-endpoint sample teaches its actual saturated in-flight count"
+        assert_eq!(restored.candidates[0].capacity, Some(2.0), "both units back");
+        assert!(
+            learned
+                .load
+                .values()
+                .all(|site| site.soft.is_none() && site.hard.is_none()),
+            "no bound is taught from any sample"
         );
     }
 
@@ -3247,6 +3573,43 @@ mod tests {
             Some(AvailabilitySettings::default().ceiling_floor),
             "a site that rejoins starts untaught, at the floor"
         );
+    }
+
+    #[test]
+    fn exploration_floor_applies_after_declared_weights() {
+        for share in [0.0_f64, 0.1, 0.25, 1.0] {
+            let candidates = validate_candidates(vec![cand("m", "a", "pool-a"), cand("m", "b", "pool-b")])
+                .unwrap_or_else(|_| std::process::abort());
+            let resolved = candidates
+                .into_iter()
+                .map(|mut candidate| {
+                    candidate.capacity = Some(10.0);
+                    candidate.weight = if candidate.site.as_ref() == "a" { 1_000 } else { 1 };
+                    ResolvedCandidate {
+                        candidate,
+                        load: 0.0,
+                        measured: true,
+                        units: None,
+                        floored: true,
+                        score_unavailable: None,
+                    }
+                })
+                .collect();
+            let floored = RouteSnapshot::explore_floor(resolved, share);
+            for (_, candidate, _) in floored {
+                let effective = candidate.capacity.unwrap_or(0.0) * f64::from(candidate.weight);
+                let expected = if candidate.site.as_ref() == "a" {
+                    10_000.0
+                } else {
+                    (10_000.0 * share).max(10.0)
+                };
+                assert!(
+                    (effective - expected).abs() < 1e-9,
+                    "site {} has effective capacity {effective}, expected {expected} at floor {share}",
+                    candidate.site
+                );
+            }
+        }
     }
 
     #[test]

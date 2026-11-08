@@ -247,16 +247,26 @@ from what already decides who may serve:
 
 - A local candidate derives from the `InferenceProvider` of the network on this
   cluster that carries its routing identity (`clusterName`, else
-  `metadata.name`). Creating a cluster-scoped `InferenceProvider` takes cluster
-  RBAC; on RHOAI the model controller writes one only for a namespace an admin
-  labelled `grid.opendatahub.io/allowed=true`, with the serving Gateway's own
-  address.
+  `metadata.name`). Because `gridNetworkRef` and `spec.endpoint` are
+  self-asserted, anyone who can create an `InferenceProvider` can add an
+  upstream the generated gateway dials. RBAC on `InferenceProvider` create is
+  the admission trust control. On RHOAI the model controller writes one only
+  for a namespace an admin labelled `grid.opendatahub.io/allowed=true`, with the
+  serving Gateway's own address. The ambiguous-identity refusal
+  (`derived_topology::local_providers`) covers only a clash with an existing
+  identity, not a new one.
 - Under Local membership, a remote candidate derives when that member's own
   catalog offers it. The operator reads each catalog from the peer over mutual
   TLS and stamps its records with that peer's site, and the hop address and
   server name come from the `GridSite` an admin declared.
 - Under SWIM membership no catalog is read from a verified peer, so a remote
   candidate derives only when `deriveTopology.fromProviders` names it.
+
+For generated `grid_site_route` clusters, hostname endpoints are listed in
+`trusted_private_endpoints`, allowing them to resolve to private addresses.
+Literal private IP endpoints require `insecure_options.allow_private_endpoints`.
+The generated TCP `health_check` tests reachability separately from endpoint
+trust; a successful check does not authorize an endpoint.
 
 An explicit entry wins whole, never field by field. A candidate with no
 explicit entry that cannot be derived is withdrawn from this gateway's routes
