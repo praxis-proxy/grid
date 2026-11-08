@@ -2,6 +2,20 @@
 
 Two files the grid gateway reads, with a different author each.
 
+## regional-policy.yaml
+
+The `GridNetwork` and `GridSite` fragment for per-gateway regional policy. The
+operator, not the caller, resolves `region` and `sovereigntyZone` from trusted
+`GridSite` objects. `affinity` keeps new work in a preferred region and permits
+cross-region fallback only when explicitly enabled; `locked` makes
+`allowedRegions` a hard boundary. `allowedSovereigntyZones` is a second,
+independent hard boundary in both modes.
+
+This is a topology-only example: keep the normal TLS, seed, provider, and
+endpoint configuration from the deployment. Apply the policy only after the
+gateway image understands serving-config `selection_group`, because it is how
+Grid preserves an affinity fallback boundary before request-time scoring.
+
 ## grid-site-route.yaml
 
 The `grid_site_route` filter block in the gateway's praxis config, with the `load_balancer`

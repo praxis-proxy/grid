@@ -107,6 +107,8 @@ pub struct RegionalPolicy {
     ///
     /// When absent, the operator derives the preferred region from the trusted
     /// [`GridSite`] resolved through [`GatewayRef::site_name`].
+    ///
+    /// [`GridSite`]: crate::crd::grid_site::GridSite
     #[schemars(
         length(min = 1, max = 64),
         inner(length(min = 1, max = 253), regex(pattern = r"^\S+$")),

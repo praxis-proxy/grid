@@ -1733,10 +1733,8 @@ pub(crate) mod tests {
         let mut fallback = one("llama", "west", "pool-west", AdmissionState::ExistingOnly);
         preferred[0].selection_group = 0;
         fallback[0].selection_group = 1;
-        let bound = RouteSnapshot::from_static(
-            [preferred, fallback].into_iter().flatten().collect(),
-            Arc::from("east"),
-        );
+        let bound =
+            RouteSnapshot::from_static([preferred, fallback].into_iter().flatten().collect(), Arc::from("east"));
         let fallback_holder = holder("west", Some("pool-west"));
 
         assert!(matches!(

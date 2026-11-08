@@ -1,0 +1,51 @@
+# Regional policy configuration for one edge-local consumer gateway.
+#
+# This example is intentionally topology-only: retain the TLS, seeds,
+# provider definitions, and endpoint configuration required by the deployment.
+# Regions and sovereignty zones are trusted GridSite metadata, never request
+# headers supplied by callers.
+---
+apiVersion: grid.praxis.fast/v1alpha1
+kind: GridNetwork
+metadata:
+  name: regional-example
+spec:
+  gridId: regional-example-grid
+  consumerGateways:
+    - name: east-edge
+      namespace: ai
+      siteName: east
+      regionalPolicy:
+        mode: affinity
+        preferredRegions: [us-east]
+        crossRegionFallback: allow
+        allowedSovereigntyZones: [us]
+
+    # A separate gateway can enforce hard residency instead of affinity.
+    - name: eu-locked-edge
+      namespace: ai
+      siteName: eu-west
+      regionalPolicy:
+        mode: locked
+        allowedRegions: [eu-west]
+        allowedSovereigntyZones: [eu]
+---
+apiVersion: grid.praxis.fast/v1alpha1
+kind: GridSite
+metadata:
+  name: east
+spec:
+  gridNetworkRef: regional-example
+  region: us-east
+  zone: us-east-1a
+  sovereigntyZone: us
+---
+apiVersion: grid.praxis.fast/v1alpha1
+kind: GridSite
+metadata:
+  name: eu-west
+spec:
+  gridNetworkRef: regional-example
+  region: eu-west
+  zone: eu-west-1a
+  sovereigntyZone: eu

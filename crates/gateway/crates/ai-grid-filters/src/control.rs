@@ -1000,6 +1000,7 @@ fn apply_file(
                 dial_bytes.map_or_else(|| Ok(DialConfig::default()), |dial| parse_dial_config(dial_path, dial))?;
             Ok((config, dial))
         });
+    let candidate_count = parsed.as_ref().ok().map(|(config, _)| config.candidates.len());
     let (result, settled) = match parsed {
         Ok((config, dial)) => {
             let mut control = control.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1017,7 +1018,31 @@ fn apply_file(
         Err(error) => (Err(error), true),
     };
     report(&result, tally, "grid: serving config reloaded");
+    // Record every valid content revision, including a semantically reused config. A
+    // projected ConfigMap can rewrite equivalent YAML with a new content digest; the
+    // control plane correctly keeps its pollers, but qualification and operators still
+    // need evidence that this revision was accepted by the gateway.
+    if result.is_ok()
+        && let Some(candidate_count) = candidate_count
+    {
+        report_serving_revision(bytes, candidate_count);
+    }
     settled
+}
+
+/// Report one serving revision after it has been accepted by the control plane.
+pub(crate) fn report_serving_revision(bytes: &[u8], candidate_count: usize) {
+    let mut revision = String::with_capacity(64);
+    for byte in certs::sha256(bytes) {
+        for nibble in [byte >> 4, byte & 0x0F] {
+            revision.push(char::from_digit(u32::from(nibble), 16).unwrap_or('0'));
+        }
+    }
+    tracing::info!(
+        revision = %revision,
+        candidate_count,
+        "grid_serving_revision_serving"
+    );
 }
 
 /// Re-apply the last good config, which restarts the pollers once its identity files change.

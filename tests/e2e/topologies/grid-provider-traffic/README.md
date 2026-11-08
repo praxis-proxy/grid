@@ -137,6 +137,8 @@ docker build -f deploy/operator/Containerfile \
   -t grid-operator:provider-traffic-qualification .
 docker build -f deploy/gateway/Containerfile \
   -t grid-gateway:provider-traffic-qualification .
+docker build -f crates/overlay-sync/Containerfile \
+  -t grid-overlay-sync:provider-traffic-qualification .
 
 # From the Praxis AI repository.
 docker build -f Containerfile \
@@ -157,6 +159,7 @@ cargo test -p xtask provider_traffic --locked
 export GRID_XTASK_OPERATOR_IMAGE=grid-operator:provider-traffic-qualification
 export GRID_XTASK_GATEWAY_IMAGE=praxis-ai:provider-traffic-qualification
 export GRID_XTASK_GRID_GATEWAY_IMAGE=grid-gateway:provider-traffic-qualification
+export GRID_XTASK_OVERLAY_SYNC_IMAGE=grid-overlay-sync:provider-traffic-qualification
 export GRID_XTASK_SIM_IMAGE=ghcr.io/neuralmagic/vllm-vcr:vllm0.23
 export GRID_XTASK_IMAGE_PULL_POLICY=Never
 
@@ -168,10 +171,17 @@ cargo xtask env run-grid-provider-traffic-qualification \
 
 Both modes preserve the original six scenarios, including the 60-request
 round-robin proof. `--full` additionally exercises the generated
-`consumerConfig`, the embedded `grid-gateway` serving-config consumer, and the
-provider-withdrawal lifecycle (fallback, a valid empty/no-route revision,
-backend non-contact, and restoration). `--quick` runs only the original six
-scenarios.
+`consumerConfig`, the embedded `grid-gateway` serving-config consumer, and a
+`regional_policy_consumers` qualification before the general
+provider-withdrawal lifecycle. It temporarily applies trusted geography to the
+three `GridSite` objects and the same `regionalPolicy` to both consumers:
+Provider A is preferred, Provider B is the permitted fallback, and Provider C
+is excluded by sovereignty zone. It proves affinity, fallback only after A
+cannot accept work, recovery for new work, `locked` no-route behavior,
+invalid-update rejection without a revision change, session invalidation on a
+restrictive empty revision, and backend non-contact. Each transition waits for
+operator publication and embedded-gateway serving acceptance. `--quick` runs
+only the original six scenarios.
 
 The qualification builds both consumers from compatible source under test.
 Deployments must upgrade and roll out every consumer before using this Grid
@@ -208,6 +218,14 @@ A qualifying run demonstrates:
 - each provider serves exactly 20 requests;
 - the semantic overlay revision remains stable during traffic;
 - in full mode, a partial withdrawal serves only the remaining providers;
+- in full mode, `regional_policy_consumers` proves that both the overlay-backed
+  `intelligent_route` consumer and embedded `grid_site_route` consumer use
+  Provider A while its preferred group is viable, then use only Provider B
+  after A becomes unavailable and fallback is allowed; Provider C is never
+  eligible because its sovereignty zone is disallowed;
+- in full mode, a locked policy admits only Provider A; after A is withdrawn,
+  an authoritative empty overlay and serving config invalidate previously
+  bound sessions without provider or backend contact;
 - in full mode, last-route withdrawal publishes a new empty revision that the
   overlay-backed and embedded Grid gateway consumers both accept and serve;
 - in full mode, new and previously bound overlay-backed requests and, when

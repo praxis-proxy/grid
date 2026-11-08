@@ -8249,6 +8249,112 @@ mod tests {
         );
     }
 
+    /// Assert that a locked regional boundary removes a candidate before its
+    /// dynamic score can influence `scoreFirst` ordering.
+    fn assert_locked_policy_filters_better_scored_candidate(
+        weights: &scoring::ScoringWeights,
+        east_metrics: scoring::BackendMetrics,
+        west_metrics: scoring::BackendMetrics,
+    ) {
+        let network = test_network_score_first("net");
+        let gateway = test_gateway_with_regional_policy(
+            "east-site",
+            &serde_json::json!({
+                "mode": "locked",
+                "allowedRegions": ["east"],
+            }),
+        );
+        let east = test_site_with_regional_policy_metadata("east-site", "net", Some("east"), Some("eu"));
+        let west = test_site_with_regional_policy_metadata("west-site", "net", Some("west"), Some("eu"));
+        let providers = [
+            test_provider_on_site("east-provider", "net", "east-site", "local", &["model"]),
+            test_provider_on_site("west-provider", "net", "west-site", "local", &["model"]),
+        ];
+        let metrics = HashMap::from([("east-provider", east_metrics), ("west-provider", west_metrics)]);
+
+        let unrestricted = render_routing_overlay_with_admission(
+            &network,
+            &[east.clone(), west.clone()],
+            &providers,
+            &[],
+            &[],
+            &[],
+            "grid-id",
+            "east-site",
+            None,
+            Some("east-site"),
+            Some(&metrics),
+            None,
+            weights,
+            None,
+            &ServedModelStore::new(),
+            CandidateExpirySupport::Supported,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            unrestricted.candidates[0].cluster, "west-provider",
+            "the test precondition requires the out-of-region provider to have the better dynamic score"
+        );
+
+        let locked = render_routing_overlay_with_admission(
+            &network,
+            &[east, west],
+            &providers,
+            &[],
+            &[],
+            &[],
+            "grid-id",
+            "east-site",
+            Some(&gateway),
+            Some("east-site"),
+            Some(&metrics),
+            None,
+            weights,
+            None,
+            &ServedModelStore::new(),
+            CandidateExpirySupport::Supported,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            locked
+                .candidates
+                .iter()
+                .map(|candidate| candidate.cluster.as_str())
+                .collect::<Vec<_>>(),
+            vec!["east-provider"],
+            "allowedRegions must remove a better-scored out-of-region candidate"
+        );
+        assert_eq!(
+            locked.candidates[0].regional_policy_group,
+            Some(RegionalPolicyGroup::Permitted)
+        );
+        assert!(
+            locked.excluded.is_empty(),
+            "a policy-rejected candidate must not remain available through the excluded route"
+        );
+    }
+
+    #[test]
+    fn locked_regional_policy_filters_better_scored_queue_candidate() {
+        let weights = crate::crd::grid_network::ScoringStrategy::QueueDepth.weights();
+        assert_locked_policy_filters_better_scored_candidate(
+            &weights,
+            scoring::BackendMetrics::new(0.0, true, 0.5, 2_500.0, 0.5, 0.9),
+            scoring::BackendMetrics::new(0.0, true, 0.5, 2_500.0, 0.5, 0.1),
+        );
+    }
+
+    #[test]
+    fn locked_regional_policy_filters_better_scored_kv_candidate() {
+        let weights = crate::crd::grid_network::ScoringStrategy::KvCachePressure.weights();
+        assert_locked_policy_filters_better_scored_candidate(
+            &weights,
+            scoring::BackendMetrics::new(0.0, true, 0.9, 2_500.0, 0.5, 0.5),
+            scoring::BackendMetrics::new(0.0, true, 0.1, 2_500.0, 0.5, 0.5),
+        );
+    }
+
     #[test]
     fn affinity_policy_keeps_preferred_candidates_ahead_of_higher_scored_fallbacks() {
         let network = test_network_score_first("net");

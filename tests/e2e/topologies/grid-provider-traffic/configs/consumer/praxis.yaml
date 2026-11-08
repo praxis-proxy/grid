@@ -17,7 +17,7 @@ filter_chains:
       - filter: headers
         response_set:
           - name: X-Grid-Provider-Traffic-Consumer-Gateway
-            value: "{{ cluster.name }}"
+            value: "CONSUMER_SITE_PLACEHOLDER"
       - filter: intelligent_route
         overlay_file: /etc/praxis/routing/routing-overlay.json
         model_header: X-Model
@@ -29,7 +29,7 @@ filter_chains:
           network: grid-provider-traffic
           gateway: consumer-gateway
           namespace: grid-system
-          local_site: "{{ cluster.name }}"
+          local_site: "CONSUMER_SITE_PLACEHOLDER"
         reload:
           enabled: true
           debounce_ms: 500
@@ -49,7 +49,7 @@ filter_chains:
               sni: provider-a.grid.internal
               verify: true
             endpoints:
-              - "{{ captures.provider-a.provider-gateway-ip }}:8443"
+              - "PROVIDER_A_ENDPOINT"
           - name: vcr-provider-b-provider
             tls:
               ca:
@@ -60,7 +60,7 @@ filter_chains:
               sni: provider-b.grid.internal
               verify: true
             endpoints:
-              - "{{ captures.provider-b.provider-gateway-ip }}:8443"
+              - "PROVIDER_B_ENDPOINT"
           - name: vcr-provider-c-provider
             tls:
               ca:
@@ -71,7 +71,7 @@ filter_chains:
               sni: provider-c.grid.internal
               verify: true
             endpoints:
-              - "{{ captures.provider-c.provider-gateway-ip }}:8443"
+              - "PROVIDER_C_ENDPOINT"
 
 admin:
   metrics_address: "127.0.0.1:9901"

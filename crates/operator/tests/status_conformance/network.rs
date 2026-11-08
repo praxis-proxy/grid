@@ -28,17 +28,22 @@ fn seeded(grid_id: &str) -> (FakeApi, String) {
 
 /// One network reconcile.
 async fn reconcile(api: &FakeApi, path: &str) {
-    reconcile_under(api, path, Snapshot::absent()).await;
+    reconcile_under(api, path, ConfigWatch::fixed(Snapshot::absent())).await;
 }
 
 /// One network reconcile, under the operator config `config`.
-async fn reconcile_under(api: &FakeApi, path: &str, config: Snapshot) {
-    let network: GridNetwork = fixtures::stored(api, path);
-    let ctx = OperatorCtx::new(api.client("default"), None, SignalMode::Gossip)
-        .with_operator_config(ConfigWatch::fixed(config));
-    grid_network::reconcile(Arc::new(network), Arc::new(ctx))
+async fn reconcile_under(api: &FakeApi, path: &str, config: ConfigWatch) {
+    let network = stored_network(api, path);
+    let ctx = OperatorCtx::new(api.client("default"), None, SignalMode::Gossip).with_operator_config(config);
+    grid_network::reconcile(network, Arc::new(ctx))
         .await
         .expect("network reconcile succeeds");
+}
+
+/// Read the test resource into heap-owned controller input before entering the async future.
+#[inline(never)]
+fn stored_network(api: &FakeApi, path: &str) -> Arc<GridNetwork> {
+    Arc::new(fixtures::stored(api, path))
 }
 
 /// Add every gate `True` to `path`'s status, as the enrollment step and renewal loop write them.
@@ -190,7 +195,7 @@ async fn invariant_3_status_mirrors_the_id_delivered_by_bootstrap() {
     api.edit(&path, true, |network| {
         network["spec"]["gridId"] = serde_json::json!("dagobah");
     });
-    reconcile_under(&api, &path, named_site()).await;
+    reconcile_under(&api, &path, ConfigWatch::fixed(named_site())).await;
     assert_eq!(
         status_grid_id(&api, &path),
         "dagobah",
@@ -200,7 +205,7 @@ async fn invariant_3_status_mirrors_the_id_delivered_by_bootstrap() {
 
 #[tokio::test]
 async fn invariant_3_without_a_grid_id_the_runtime_waits_regardless_of_site_configuration() {
-    for config in [Snapshot::absent(), named_site()] {
+    for config in [ConfigWatch::fixed(Snapshot::absent()), ConfigWatch::fixed(named_site())] {
         let (api, path) = seeded("");
         naming_secrets(&api, &path);
         for _round in 0..2 {
@@ -248,7 +253,7 @@ async fn invariant_6_a_config_deleted_after_it_named_a_site_never_lets_the_contr
     let mut deleted = Snapshot::absent();
     deleted.site_seen = true;
     for _round in 0..2 {
-        reconcile_under(&api, &path, deleted.clone()).await;
+        reconcile_under(&api, &path, ConfigWatch::fixed(deleted.clone())).await;
     }
     assert!(
         !created_a_secret(&api),

@@ -185,7 +185,14 @@ fn record_scrape(
         .filter_map(|(o, republishable)| republishable.then_some(o))
         .filter(|o| relayed(&o.metric))
         .filter(|o| o.metric != grid_signals::revision::METRIC)
-        .filter(|o| pool.is_none_or(|pool| o.labels.get("name").or_else(|| o.labels.get(crate::signals::POOL_LABEL)).is_some_and(|name| name == pool)))
+        .filter(|o| {
+            pool.is_none_or(|pool| {
+                o.labels
+                    .get("name")
+                    .or_else(|| o.labels.get(crate::signals::POOL_LABEL))
+                    .is_some_and(|name| name == pool)
+            })
+        })
         // A local sample's freshness is its collection time, so drop any trailing
         // timestamp. Only relayed peer samples carry a per-sample stamp.
         .map(|mut o| {
