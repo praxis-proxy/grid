@@ -77,13 +77,17 @@ pub(crate) struct TimestampedMetrics {
     pub(crate) scraped_at: Instant,
     /// Monotonic scrape generation assigned when this sample was collected.
     pub(crate) generation: u64,
+    /// Provider UID and scrape configuration that produced this observation.
+    source: serde_json::Value,
 }
 
 /// Cross-reconcile cache for recently-scraped provider metrics.
 ///
 /// Keyed by `(network_name, provider_routing_identity)`.  Entries are updated on
 /// every successful scrape and consulted when a subsequent scrape fails and the
-/// provider has `metricsConfig.stale_metrics_seconds` set.
+/// provider has `metricsConfig.stale_metrics_seconds` set. Samples are reusable
+/// only for the same provider UID and scrape configuration; departed providers'
+/// entries are pruned when their network is collected.
 pub(crate) struct MetricsCache {
     /// Per-provider cached metrics keyed by `(network_name, routing_identity)`.
     entries: HashMap<(String, String), TimestampedMetrics>,
@@ -481,11 +485,20 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
     refresh_interval: Duration,
     client: Option<&kube::Client>,
 ) -> CollectedMetrics {
+    let sources: HashMap<_, _> = providers
+        .iter()
+        .filter(|provider| provider.spec.grid_network_ref == network_name && provider.spec.metrics_config.is_some())
+        .filter_map(|provider| routing_identity(provider).map(|id| (id.to_owned(), metrics_source(provider))))
+        .collect();
+
     // Snapshot the relevant cache entries and allocate a generation for this
     // refresh cycle. Cached samples reused below retain their own generation.
     // The lock is held for microseconds rather than across network I/O.
     let (cache_snapshot, scrape_generation) = {
         let mut guard = cache.lock().await;
+        guard.entries.retain(|(net, id), sample| {
+            net != network_name || sources.get(id).is_some_and(|source| *source == sample.source)
+        });
         let generation = guard.next_generation;
         guard.next_generation = generation.wrapping_add(1);
         let snapshot: HashMap<String, TimestampedMetrics> = guard
@@ -540,8 +553,10 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
         let names = metric_names_from_config(&mc.signal_names, mc.pool_name.as_deref(), mc.queue_capacity);
         let tls_settings = mc.tls.as_ref().or(provider.spec.tls.as_ref());
 
+        let source = metrics_source(provider);
+        let cached = cache_snapshot.get(identity).filter(|sample| sample.source == source);
         if refresh_interval > Duration::ZERO
-            && let Some(cached) = cache_snapshot.get(identity)
+            && let Some(cached) = cached
             && now.saturating_duration_since(cached.scraped_at) < refresh_interval
         {
             result.insert(identity.to_owned(), cached.metrics);
@@ -555,7 +570,7 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
                 let used_cache = try_cached_metrics(
                     identity,
                     mc.stale_metrics_seconds,
-                    &cache_snapshot,
+                    cached,
                     now,
                     &mut result,
                     &mut generations,
@@ -601,6 +616,7 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
                         metrics: bm,
                         scraped_at: now,
                         generation: scrape_generation,
+                        source,
                     },
                 ));
                 result.insert(identity.to_owned(), bm);
@@ -614,7 +630,7 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
                 let used_cache = try_cached_metrics(
                     identity,
                     mc.stale_metrics_seconds,
-                    &cache_snapshot,
+                    cached,
                     now,
                     &mut result,
                     &mut generations,
@@ -666,6 +682,27 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
     }
 }
 
+/// Describe the provider and configuration that give a cached sample meaning.
+///
+/// Keep the complete metrics configuration so new scrape options invalidate old
+/// observations automatically. Only credential references are retained, never
+/// resolved Secret contents. TLS settings follow the scraper's override rule.
+fn metrics_source(provider: &InferenceProvider) -> serde_json::Value {
+    let tls = provider
+        .spec
+        .metrics_config
+        .as_ref()
+        .and_then(|config| config.tls.as_ref())
+        .or(provider.spec.tls.as_ref());
+    serde_json::json!({
+        "uid": provider.metadata.uid,
+        "namespace": provider.metadata.namespace,
+        "endpoint": provider.spec.endpoint,
+        "metrics": provider.spec.metrics_config,
+        "tls": tls,
+    })
+}
+
 /// Attempt to populate `result` with a cached metric sample for `identity`.
 ///
 /// Returns `true` if a valid cached sample was found and inserted; `false` if
@@ -678,7 +715,7 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
 fn try_cached_metrics(
     identity: &str,
     stale_metrics_seconds: Option<u32>,
-    cache_snapshot: &HashMap<String, TimestampedMetrics>,
+    cached: Option<&TimestampedMetrics>,
     now: Instant,
     result: &mut HashMap<String, scoring::BackendMetrics>,
     generations: &mut HashMap<String, u64>,
@@ -687,7 +724,7 @@ fn try_cached_metrics(
         return false;
     };
     let ttl = Duration::from_secs(u64::from(ttl_secs));
-    let Some(cached) = cache_snapshot.get(identity) else {
+    let Some(cached) = cached else {
         return false;
     };
     let age = now.saturating_duration_since(cached.scraped_at);
@@ -1685,6 +1722,201 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
     }
 
     #[tokio::test]
+    async fn refresh_interval_metadata_changes_preserve_the_observation() {
+        let (url, requests) = refresh_metrics_server().await;
+        let mut provider = provider_fixture("prov-a", &url, Some(mc_with_queue("q")));
+        let cache = empty_cache();
+        let now = Instant::now();
+        let first = Box::pin(collect_cached_provider(&provider, &cache, now)).await;
+        provider.metadata.resource_version = Some("new-version".to_owned());
+        provider.metadata.labels = Some(std::collections::BTreeMap::from([(
+            "team".to_owned(),
+            "inference".to_owned(),
+        )]));
+        let second = Box::pin(collect_cached_provider(&provider, &cache, now + Duration::from_secs(1))).await;
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "unrelated metadata must not force a new scrape"
+        );
+        assert_eq!(
+            first.generations.get("prov-a"),
+            second.generations.get("prov-a"),
+            "one observation keeps its generation"
+        );
+        assert!(
+            second
+                .metrics
+                .get("prov-a")
+                .is_some_and(|metrics| (metrics.queue_depth - 0.9).abs() < f64::EPSILON),
+            "unchanged source retains its sample"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_interval_removing_metrics_config_prunes_the_observation() {
+        let url = start_test_server(ok_response("q 0.9\n")).await;
+        let mut provider = provider_fixture("prov-a", &url, Some(mc_with_queue("q")));
+        let cache = empty_cache();
+        let now = Instant::now();
+        let first = Box::pin(collect_cached_provider(&provider, &cache, now)).await;
+        provider.spec.metrics_config = None;
+        let second = Box::pin(collect_cached_provider(&provider, &cache, now + Duration::from_secs(1))).await;
+
+        assert!(first.metrics.contains_key("prov-a"), "fixture must seed an observation");
+        assert!(
+            second.metrics.is_empty(),
+            "providers without metrics config have no observation"
+        );
+        assert!(
+            cache.lock().await.entries.is_empty(),
+            "disabled collection must discard old samples"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_interval_replacement_requires_a_fresh_sample() {
+        let (url, requests) = refresh_metrics_server().await;
+        let mut provider = provider_fixture("prov-a", &url, Some(mc_with_queue_and_ttl("q", 60)));
+        provider.metadata.uid = Some("uid-a".to_owned());
+        let cache = empty_cache();
+        let now = Instant::now();
+        let first = Box::pin(collect_cached_provider(&provider, &cache, now)).await;
+        provider.metadata.uid = Some("uid-b".to_owned());
+        let second = Box::pin(collect_cached_provider(&provider, &cache, now + Duration::from_secs(1))).await;
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "replacement UID requires another scrape"
+        );
+        assert_fresh_low_pressure(&first, &second);
+    }
+
+    #[tokio::test]
+    async fn refresh_interval_endpoint_changes_require_current_observations() {
+        for separate_metrics_endpoint in [false, true] {
+            let old = start_test_server(ok_response("q 0.9\n")).await;
+            let new = start_test_server(ok_response("q 0.1\n")).await;
+            let mut provider = provider_fixture("prov-a", &old, Some(mc_with_queue_and_ttl("q", 60)));
+            let cache = empty_cache();
+            let now = Instant::now();
+            let first = Box::pin(collect_cached_provider(&provider, &cache, now)).await;
+            if separate_metrics_endpoint {
+                if let Some(config) = provider.spec.metrics_config.as_mut() {
+                    config.endpoint = Some(new);
+                }
+            } else {
+                provider.spec.endpoint = new;
+            }
+            let second = Box::pin(collect_cached_provider(&provider, &cache, now + Duration::from_secs(1))).await;
+
+            assert_fresh_low_pressure(&first, &second);
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_interval_scrape_configuration_changes_force_a_new_request() {
+        for change in ["path", "pool", "signal", "capacity", "auth", "timeout"] {
+            let (url, requests) = refresh_metrics_server().await;
+            let mut provider = provider_fixture("prov-a", &url, Some(mc_with_queue_and_ttl("q", 60)));
+            let cache = empty_cache();
+            let now = Instant::now();
+            let first = Box::pin(collect_cached_provider(&provider, &cache, now)).await;
+            let config = provider
+                .spec
+                .metrics_config
+                .as_mut()
+                .unwrap_or_else(|| std::process::abort());
+            match change {
+                "path" => config.path = "/custom".to_owned(),
+                "pool" => config.pool_name = Some("pool-a".to_owned()),
+                "signal" => config.signal_names.queue_depth = Some("other_q".to_owned()),
+                "capacity" => config.queue_capacity = Some(1),
+                "auth" => {
+                    config.auth = Some(crate::crd::inference_provider::MetricsAuth {
+                        kind: crate::crd::inference_provider::MetricsAuthType::ServiceAccountToken,
+                        allow_plaintext: true,
+                    });
+                },
+                _ => config.timeout = "1s".to_owned(),
+            }
+            let second = Box::pin(collect_cached_provider(&provider, &cache, now + Duration::from_secs(1))).await;
+
+            assert_eq!(requests.load(Ordering::SeqCst), 2, "{change} must force a fresh scrape");
+            assert_fresh_low_pressure(&first, &second);
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_interval_changed_sources_cannot_use_stale_fallback() {
+        for change in ["uid", "endpoint", "tls", "metrics_tls", "auth"] {
+            let url = start_test_server(ok_response("q 0.9\n")).await;
+            let mut provider = provider_fixture("prov-a", &url, Some(mc_with_queue_and_ttl("q", 60)));
+            provider.metadata.uid = Some("uid-a".to_owned());
+            let cache = empty_cache();
+            let now = Instant::now();
+            let first = Box::pin(collect_cached_provider(&provider, &cache, now)).await;
+            match change {
+                "uid" => provider.metadata.uid = Some("uid-b".to_owned()),
+                "endpoint" => provider.spec.endpoint = "http://127.0.0.1:1".to_owned(),
+                "tls" => provider.spec.tls = Some(crate::resources::test_doubles::endpoint_tls_for_ca("new-ca")),
+                _ => {
+                    let config = provider
+                        .spec
+                        .metrics_config
+                        .as_mut()
+                        .unwrap_or_else(|| std::process::abort());
+                    if change == "metrics_tls" {
+                        config.tls = Some(crate::resources::test_doubles::endpoint_tls_for_ca("new-ca"));
+                    } else {
+                        config.auth = Some(crate::crd::inference_provider::MetricsAuth {
+                            kind: crate::crd::inference_provider::MetricsAuthType::ServiceAccountToken,
+                            allow_plaintext: true,
+                        });
+                    }
+                },
+            }
+            let second = Box::pin(collect_cached_provider(&provider, &cache, now + Duration::from_secs(1))).await;
+
+            assert!(
+                first.metrics.contains_key("prov-a"),
+                "fixture must seed a successful sample"
+            );
+            assert!(
+                second.metrics.get("prov-a").is_none_or(|metrics| !metrics.healthy),
+                "{change}: failed refresh must not return a healthy sample from the previous source"
+            );
+            assert!(
+                cache.lock().await.entries.is_empty(),
+                "{change}: invalidated data must be removed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_interval_prunes_only_departed_entries_in_the_collected_network() {
+        let url = start_test_server(ok_response("q 0.9\n")).await;
+        let mut provider = provider_fixture("prov-a", &url, Some(mc_with_queue("q")));
+        let cache = empty_cache();
+        let now = Instant::now();
+        let _first = Box::pin(collect_cached_provider(&provider, &cache, now)).await;
+        let other_url = start_test_server(ok_response("q 0.2\n")).await;
+        provider.spec.endpoint = other_url;
+        provider.spec.grid_network_ref = "other-net".to_owned();
+        let _other = collect_provider_metrics("other-net", &[provider], &cache, now, None).await;
+        let _removed = collect_provider_metrics("net", &[], &cache, now, None).await;
+        let entries = &cache.lock().await.entries;
+
+        assert_eq!(entries.len(), 1, "only the other network's sample must remain");
+        assert!(
+            entries.contains_key(&("other-net".to_owned(), "prov-a".to_owned())),
+            "other networks retain their cache"
+        );
+    }
+
+    #[tokio::test]
     async fn collect_metrics_skips_providers_from_other_networks() {
         let body = "my_queue 0.2\n";
         let base_url = start_test_server(ok_response(body)).await;
@@ -1722,6 +1954,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
                     },
                     scraped_at: t0,
                     generation: 0,
+                    source: metrics_source(&provider),
                 },
             );
         }
@@ -1764,6 +1997,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
                     },
                     scraped_at: t0,
                     generation: 0,
+                    source: metrics_source(&provider),
                 },
             );
         }
@@ -1794,6 +2028,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
                     },
                     scraped_at: Instant::now(),
                     generation: 0,
+                    source: metrics_source(&provider),
                 },
             );
         }
@@ -1848,6 +2083,7 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
                     },
                     scraped_at: Instant::now(),
                     generation: 0,
+                    source: metrics_source(&provider),
                 },
             );
         }
@@ -1959,5 +2195,72 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
             "MetricsScrapeError",
             "invalid URL has no specific failure category"
         );
+    }
+    // ---------------------------------------------------------------------------
+    // Cache Regression Test Utilities
+    // ---------------------------------------------------------------------------
+
+    /// Collect one provider inside the normal refresh interval.
+    async fn collect_cached_provider(
+        provider: &InferenceProvider,
+        cache: &Mutex<MetricsCache>,
+        now: Instant,
+    ) -> CollectedMetrics {
+        collect_provider_metrics_with_refresh_interval(
+            "net",
+            std::slice::from_ref(provider),
+            cache,
+            now,
+            Duration::from_secs(300),
+            None,
+        )
+        .await
+    }
+
+    /// Require a fresh generation and the low-pressure sample after a change.
+    fn assert_fresh_low_pressure(first: &CollectedMetrics, second: &CollectedMetrics) {
+        assert!(
+            first
+                .metrics
+                .get("prov-a")
+                .is_some_and(|metrics| (metrics.queue_depth - 0.9).abs() < f64::EPSILON),
+            "the first scrape must observe the old high pressure"
+        );
+        assert!(
+            second
+                .metrics
+                .get("prov-a")
+                .is_some_and(|metrics| (metrics.queue_depth - 0.1).abs() < f64::EPSILON),
+            "the changed source must return its current low pressure"
+        );
+        assert_ne!(
+            first.generations.get("prov-a"),
+            second.generations.get("prov-a"),
+            "a fresh scrape needs a new generation"
+        );
+    }
+
+    /// Serve a high-pressure sample once, then low pressure, counting requests.
+    async fn refresh_metrics_server() -> (String, std::sync::Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|_| std::process::abort());
+        let address = listener.local_addr().unwrap_or_else(|_| std::process::abort());
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0_u8; 4096];
+                drop(stream.read(&mut buf).await);
+                let value = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    0.9
+                } else {
+                    0.1
+                };
+                let body = format!("q{{name=\"pool-a\"}} {value}\nother_q{{name=\"pool-a\"}} {value}\n");
+                drop(stream.write_all(&ok_response(&body)).await);
+            }
+        });
+        (format!("http://{address}"), requests)
     }
 }
