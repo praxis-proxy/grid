@@ -46,6 +46,19 @@ jobs:
       - name: Install cargo-audit
         run: command -v cargo-audit || cargo install cargo-audit --locked
 
+      - name: Verify the SQLite audit exception remains inactive
+        run: |
+          cargo tree --locked --workspace --all-features \
+            --target all --prefix none --format '{p}' > /tmp/grid-audit-dependencies.txt
+          if ! grep -q '^sqlx-postgres v' /tmp/grid-audit-dependencies.txt; then
+            echo 'PostgreSQL positive control missing from the workspace dependency graph'
+            exit 1
+          fi
+          if grep -E '^(sqlx-sqlite|libsqlite3-sys) v' /tmp/grid-audit-dependencies.txt; then
+            echo 'SQLite is active; remove the audit exception and resolve RUSTSEC-2026-0459'
+            exit 1
+          fi
+
       - name: Run cargo audit
         run: cargo audit
 

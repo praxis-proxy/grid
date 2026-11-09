@@ -7,6 +7,13 @@
 # dependency-check (cargo deny) correctly does not. No fixed rsa release exists.
 ignore = [
   "RUSTSEC-2023-0071",
+  # SQLite is an inactive optional SQLx driver: Grid enables PostgreSQL only.
+  # SQLx 0.9.0 requires libsqlite3-sys >=0.30.1,<0.38.0; the patched release
+  # for this advisory is >=0.39.0, outside that range. No SQLite code is built.
+  # Supply Chain checks the all-features/targets workspace graph to enforce
+  # this exception. Remove it when SQLx accepts the fixed dependency; do not
+  # enable SQLite without removing the exception and resolving the advisory.
+  "RUSTSEC-2026-0459",
   # zstd 0.13.3 / zstd-safe 7.3.0 are pinned through the gateway's
   # upstream Pingora header-serde dependency, which has no release with
   # compatible requirements for the fixed zstd 0.14 / zstd-safe 8 APIs.
