@@ -619,6 +619,10 @@ async fn probe_agent_tool_provider_unbounded(kube_client: &kube::Client, request
 /// Connect to the MCP server over Streamable HTTP and call `tools/list`,
 /// bounding both steps by `timeout`.
 ///
+/// rmcp also bounds non-streaming response bodies before parsing: successful
+/// JSON responses to 16 MiB and error responses to 64 KiB. Oversized responses
+/// fail the probe without accepting a partial tool catalog.
+///
 /// Split out of [`probe_agent_tool_provider`] purely to keep both functions
 /// within the project's complexity/line lints; this is the
 /// connect-and-call half of what was previously one larger function.
@@ -1803,6 +1807,71 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn probe_rejects_oversized_json_before_its_timeout() {
+        for (method, expected) in [
+            ("initialize", McpProbeOutcome::Unreachable),
+            ("tools/list", McpProbeOutcome::InvalidResponse),
+        ] {
+            let endpoint = spawn_oversized_mcp_server(method, http::StatusCode::OK, 16 * 1024 * 1024).await;
+            let kube_client = unused_kube_client();
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                probe_via_pipeline_for_tests(
+                    &kube_client,
+                    ProbeRequest {
+                        endpoint: &endpoint,
+                        timeout: std::time::Duration::from_secs(60),
+                        tls_config: None,
+                        provider_identity: "oversized-json",
+                        auth_token: None,
+                    },
+                ),
+            )
+            .await;
+
+            assert!(
+                outcome.is_ok(),
+                "{method}: the byte cap must reject an open body before the probe timeout"
+            );
+            assert_eq!(
+                outcome.unwrap_or_else(|_| std::process::abort()),
+                expected,
+                "{method}: no partial response can be accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_oversized_error_body_before_its_timeout() {
+        let endpoint = spawn_oversized_mcp_server("initialize", http::StatusCode::SERVICE_UNAVAILABLE, 64 * 1024).await;
+        let kube_client = unused_kube_client();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            probe_via_pipeline_for_tests(
+                &kube_client,
+                ProbeRequest {
+                    endpoint: &endpoint,
+                    timeout: std::time::Duration::from_secs(60),
+                    tls_config: None,
+                    provider_identity: "oversized-error",
+                    auth_token: None,
+                },
+            ),
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "an oversized open error body must be rejected before the probe timeout"
+        );
+        assert_eq!(
+            outcome.unwrap_or_else(|_| std::process::abort()),
+            McpProbeOutcome::Unreachable,
+            "oversized handshake errors must fail the probe"
+        );
+    }
+
+    #[tokio::test]
     async fn probe_against_real_server_discovers_tools_sorted() {
         let endpoint = spawn_mcp_server(&["read_file", "list_directory"], None).await;
         let kube_client = unused_kube_client();
@@ -1904,5 +1973,61 @@ mod integration_tests {
             "an MCP-level error response (no HTTP-status-coded rejection) classifies as InvalidResponse, \
              not AuthRejected; that distinction is covered at the unit tier by classify_list_tools_failure"
         );
+    }
+    // ---------------------------------------------------------------------------
+    // Test Utilities
+    // ---------------------------------------------------------------------------
+
+    /// Replace one MCP response with over-limit chunks, never completing its body.
+    async fn spawn_oversized_mcp_server(method: &'static str, status: http::StatusCode, limit: usize) -> String {
+        let handler = FixedToolsServer {
+            tools: vec!["search".to_owned()],
+            required_bearer: None,
+        };
+        let service: StreamableHttpService<FixedToolsServer, LocalSessionManager> = StreamableHttpService::new(
+            move || Ok(handler.clone()),
+            std::sync::Arc::default(),
+            StreamableHttpServerConfig::default(),
+        );
+        let router = axum::Router::new()
+            .nest_service("/mcp", service)
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                    use futures::StreamExt as _;
+
+                    let (parts, body) = request.into_parts();
+                    let body = axum::body::to_bytes(body, 64 * 1024)
+                        .await
+                        .unwrap_or_else(|_| std::process::abort());
+                    let message: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                    if message.get("method").and_then(serde_json::Value::as_str) == Some(method) {
+                        let chunk = bytes::Bytes::from(vec![b' '; 64 * 1024]);
+                        let chunk_count = limit / chunk.len() + 1;
+                        let chunks = futures::stream::iter(
+                            std::iter::repeat_with(move || Ok::<_, std::convert::Infallible>(chunk.clone()))
+                                .take(chunk_count),
+                        )
+                        .chain(futures::stream::pending());
+                        let mut response = http::Response::new(axum::body::Body::from_stream(chunks));
+                        *response.status_mut() = status;
+                        response.headers_mut().insert(
+                            http::header::CONTENT_TYPE,
+                            http::HeaderValue::from_static("application/json"),
+                        );
+                        response
+                    } else {
+                        next.run(http::Request::from_parts(parts, axum::body::Body::from(body)))
+                            .await
+                    }
+                },
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|_| std::process::abort());
+        let address = listener.local_addr().unwrap_or_else(|_| std::process::abort());
+        tokio::spawn(async move {
+            drop(axum::serve(listener, router).await);
+        });
+        format!("http://{address}/mcp")
     }
 }
