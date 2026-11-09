@@ -1,0 +1,42 @@
+suite: gateway body limits
+templates:
+  - templates/gateway-config.yaml
+tests:
+  - it: renders body_limits from the set ceilings only
+    template: templates/gateway-config.yaml
+    set:
+      praxisConfig.source: render
+      grid.siteName: edge
+      praxisConfig.render.model: test-model
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.backends:
+        site-a:
+          endpoint: 203.0.113.20:8080
+          transport:
+            mode: plaintext
+      praxisConfig.render.bodyLimits.maxRequestBytes: 52428800
+      praxisConfig.render.bodyLimits.maxBufferBytes: 67108864
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'body_limits:\n\s+max_request_bytes: 52428800\n\s+max_buffer_bytes: 67108864\n'
+      - notMatchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'max_response_bytes'
+
+  - it: renders no body_limits block by default, keeping the Praxis ceilings
+    template: templates/gateway-config.yaml
+    set:
+      praxisConfig.source: render
+      grid.siteName: edge
+      praxisConfig.render.model: test-model
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.backends:
+        site-a:
+          endpoint: 203.0.113.20:8080
+          transport:
+            mode: plaintext
+    asserts:
+      - notMatchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'body_limits'

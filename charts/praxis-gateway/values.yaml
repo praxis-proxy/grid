@@ -229,6 +229,16 @@ praxisConfig:
       batchIntervalSecs: null
       # -- Maximum spans per export batch; must be positive.
       batchSize: null
+    # -- Praxis body size ceilings in bytes, rendered as body_limits when set. Each
+    # defaults in Praxis: a 10 MiB request and response ceiling, and a 64 MiB cap on
+    # any body a filter buffers. A request over the ceiling gets a 413 at this gateway.
+    # The grid_site_route filter buffers the body to read its prompt and sets no cap of
+    # its own, so maxRequestBytes is the one request size limit; raising it past
+    # 64 MiB also needs maxBufferBytes.
+    bodyLimits:
+      maxRequestBytes: null
+      maxResponseBytes: null
+      maxBufferBytes: null
     # -- consumer routes callers. provider serves grid peers on the grid identity and forwards to one backend.
     role: consumer
     # -- Grid peers a provider accepts, each with a Grid-CA client certificate.

@@ -15,6 +15,10 @@ health checks. A user sets it through the chart's
 the block may be empty. The example enables `shedding` and shows the default
 affinity cache limits. A change is a chart value and a rollout.
 
+The filter sets no request size limit of its own. Praxis buffers the body it reads under
+`body_limits.max_request_bytes`, 10 MiB unless set, and answers 413 past it; the chart renders
+that from `praxisConfig.render.bodyLimits`.
+
 `availability` governs how a site's availability is measured from its in-flight count, learned
 soft and hard capacity bounds, and provider-reported KV-cache fullness. The fields other than
 `shedding` are for a symptom in

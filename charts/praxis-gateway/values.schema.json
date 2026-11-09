@@ -256,6 +256,28 @@
             }
           ],
           "properties": {
+            "bodyLimits": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Praxis body size ceilings in bytes, rendered as body_limits when set. Unset keeps the Praxis defaults: 10 MiB request and response ceilings, 64 MiB buffered-body cap.",
+              "properties": {
+                "maxRequestBytes": {
+                  "type": ["integer", "null"],
+                  "minimum": 1,
+                  "description": "Request body ceiling; the one request size limit on a grid gateway."
+                },
+                "maxResponseBytes": {
+                  "type": ["integer", "null"],
+                  "minimum": 1,
+                  "description": "Response body ceiling."
+                },
+                "maxBufferBytes": {
+                  "type": ["integer", "null"],
+                  "minimum": 1,
+                  "description": "Cap on any body a filter buffers; raise it with a maxRequestBytes above 64 MiB."
+                }
+              }
+            },
             "telemetry": {
               "type": "object",
               "additionalProperties": false,

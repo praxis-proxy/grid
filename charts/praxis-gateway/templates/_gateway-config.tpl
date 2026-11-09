@@ -16,6 +16,20 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
     runtime:
       upstream_ca_file: {{ printf "%s/%s" $.Values.upstreamCA.mountPath ($.Values.upstreamCA.key | default "ca.crt") | quote }}
     {{- end }}
+    {{- with $cfg.bodyLimits }}
+    {{- if or .maxRequestBytes .maxResponseBytes .maxBufferBytes }}
+    body_limits:
+      {{- with .maxRequestBytes }}
+      max_request_bytes: {{ . | int64 }}
+      {{- end }}
+      {{- with .maxResponseBytes }}
+      max_response_bytes: {{ . | int64 }}
+      {{- end }}
+      {{- with .maxBufferBytes }}
+      max_buffer_bytes: {{ . | int64 }}
+      {{- end }}
+    {{- end }}
+    {{- end }}
     {{- if $telemetry.enabled }}
     telemetry:
       {{- if not $hasTelemetryValues }}
