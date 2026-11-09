@@ -72,6 +72,38 @@ combined_site_record_kind_temp_inventory() {
   done
 }
 
+combined_site_baseline_is_clean() {
+  local evidence_dir="$1"
+  local clusters_file="${evidence_dir}/kind-clusters-before.txt"
+  local networks_file="${evidence_dir}/docker-networks-before.txt"
+  local temporary_paths_file="${evidence_dir}/kind-temporary-paths-before.txt"
+
+  if ! combined_site_inventory_is_valid "${clusters_file}" \
+    || ! combined_site_inventory_is_valid "${networks_file}" \
+    || ! combined_site_kind_temp_inventory_is_valid "${temporary_paths_file}"; then
+    echo "::error::Combined-site baseline inventory is absent or malformed; refusing to start"
+    return 1
+  fi
+
+  local cluster
+  for cluster in "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}"; do
+    if combined_site_inventory_contains "${clusters_file}" "${cluster}"; then
+      echo "::error::Refusing combined-site qualification because fixed-name cluster '${cluster}' already exists on this runner. Preserve it and use a clean runner."
+      return 1
+    fi
+    if combined_site_inventory_contains "${temporary_paths_file}" "${cluster}"; then
+      echo "::error::Refusing combined-site qualification because temporary Kind path for '${cluster}' already exists on this runner. Preserve it and use a clean runner."
+      return 1
+    fi
+  done
+
+  if combined_site_inventory_contains "${networks_file}" "${COMBINED_SITE_EXPECTED_NETWORK}"; then
+    echo "::error::Refusing combined-site qualification because fixed-name network '${COMBINED_SITE_EXPECTED_NETWORK}' already exists on this runner. Preserve it and use a clean runner."
+    return 1
+  fi
+  return 0
+}
+
 combined_site_kind_temp_inventory_is_valid() {
   local inventory_file="$1"
   combined_site_inventory_is_valid "${inventory_file}" || return 1
@@ -85,8 +117,9 @@ combined_site_kind_temp_inventory_is_valid() {
   done < "${inventory_file}"
 }
 
-# Populate owned-resource arrays only when both inventories and this run's Forge
-# state agree. An uncertain resource is preserved and makes cleanup partial.
+# Populate owned-resource arrays from this run's Forge state. Baseline inventories
+# prove the preflight ran; when Forge state is unavailable, only unchanged
+# pre-existing resources are considered safe to leave alone.
 combined_site_cleanup_plan() {
   local evidence_dir="$1"
   local state_file="$2"
@@ -141,9 +174,6 @@ combined_site_cleanup_plan() {
   local -a recorded_clusters=()
   mapfile -t recorded_clusters < <(jq -r '.clusters[].kindName' "${state_file}")
   for cluster in "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}"; do
-    if combined_site_inventory_contains "${before_clusters_file}" "${cluster}"; then
-      continue
-    fi
     if combined_site_inventory_contains "${current_clusters_file}" "${cluster}"; then
       if printf '%s\n' "${recorded_clusters[@]}" | grep -Fxq -- "${cluster}"; then
         COMBINED_SITE_OWNED_CLUSTERS+=("${cluster}")
@@ -158,18 +188,15 @@ combined_site_cleanup_plan() {
   done
 
   while IFS= read -r cluster || [[ -n "${cluster}" ]]; do
-    if ! combined_site_inventory_contains "${before_kind_temps_file}" "${cluster}"; then
-      if printf '%s\n' "${recorded_clusters[@]}" | grep -Fxq -- "${cluster}"; then
-        COMBINED_SITE_OWNED_KIND_TEMP_DIRS+=("${cluster}")
-      else
-        echo "::warning::Current Kind temp path for '${cluster}' is absent from run Forge state; preserving it"
-        COMBINED_SITE_CLEANUP_RESULT=partial
-      fi
+    if printf '%s\n' "${recorded_clusters[@]}" | grep -Fxq -- "${cluster}"; then
+      COMBINED_SITE_OWNED_KIND_TEMP_DIRS+=("${cluster}")
+    else
+      echo "::warning::Current Kind temp path for '${cluster}' is absent from run Forge state; preserving it"
+      COMBINED_SITE_CLEANUP_RESULT=partial
     fi
   done < "${current_kind_temps_file}"
 
-  if ! combined_site_inventory_contains "${before_networks_file}" "${COMBINED_SITE_EXPECTED_NETWORK}" \
-    && combined_site_inventory_contains "${current_networks_file}" "${COMBINED_SITE_EXPECTED_NETWORK}"; then
+  if combined_site_inventory_contains "${current_networks_file}" "${COMBINED_SITE_EXPECTED_NETWORK}"; then
     if jq -e '.networkCreatedByForge == true' "${state_file}" > /dev/null 2>&1; then
       # shellcheck disable=SC2034
       COMBINED_SITE_OWNED_NETWORKS=("${COMBINED_SITE_EXPECTED_NETWORK}")

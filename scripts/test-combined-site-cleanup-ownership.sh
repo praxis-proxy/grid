@@ -58,6 +58,7 @@ TEMP_ROOT="${CASE_DIR}/kind-temp"
 mkdir -p "${TEMP_ROOT}"
 rm "${CASE_DIR}/kind-temporary-paths-before.txt"
 combined_site_record_kind_temp_inventory "${TEMP_ROOT}" "${CASE_DIR}/kind-temporary-paths-before.txt"
+combined_site_baseline_is_clean "${CASE_DIR}"
 printf '%s\n' "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}" > "${CASE_DIR}/kind-clusters-now.txt"
 printf '%s\n' "${COMBINED_SITE_EXPECTED_NETWORK}" > "${CASE_DIR}/docker-networks-now.txt"
 for cluster in "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}"; do
@@ -82,18 +83,20 @@ for cluster in "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}"; do
     "temporary files should be removed only after the run-owned cluster is absent"
 done
 
-# A prior fixed-name cluster and network are preserved, while verified new
-# resources from this run remain eligible for cleanup.
+# A pre-existing fixed-name resource stops the workflow before Forge creates
+# run state; cleanup therefore leaves the pre-existing cluster and network.
 new_case preexisting
 printf '%s\n' grid-combined-west > "${CASE_DIR}/kind-clusters-before.txt"
 printf '%s\n' "${COMBINED_SITE_EXPECTED_NETWORK}" > "${CASE_DIR}/docker-networks-before.txt"
-printf '%s\n' "${COMBINED_SITE_EXPECTED_CLUSTERS[@]}" > "${CASE_DIR}/kind-clusters-now.txt"
+printf '%s\n' grid-combined-west > "${CASE_DIR}/kind-clusters-now.txt"
 printf '%s\n' "${COMBINED_SITE_EXPECTED_NETWORK}" > "${CASE_DIR}/docker-networks-now.txt"
-write_full_state true
+if combined_site_baseline_is_clean "${CASE_DIR}" > /dev/null 2>&1; then
+  fail "a pre-existing fixed-name cluster must stop setup before Forge runs"
+fi
 combined_site_cleanup_plan "${CASE_DIR}" "${STATE_FILE}" \
   "${CASE_DIR}/kind-clusters-now.txt" "${CASE_DIR}/docker-networks-now.txt" \
   "${CASE_DIR}/kind-temporary-paths-now.txt"
-assert_plan success $'grid-combined-central\ngrid-combined-east' ""
+assert_plan success "" ""
 
 # Cluster ownership is independent of network ownership. Preserve an uncertain
 # network while still allowing deletion of clusters proven new by this run.

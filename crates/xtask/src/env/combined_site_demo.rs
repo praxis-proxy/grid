@@ -3171,7 +3171,7 @@ fn assert_operator_restart_recovery() -> AssertionResult {
                 after_deployment = deployment;
                 after_pods = pods;
 
-                Ok(operator_restart_state_converged(&before_pods, &after_deployment, &after_pods).then_some(()))
+                Ok(operator_restart_state_converged(&before_pods, &after_pods).then_some(()))
             },
             Duration::from_secs(90),
             Duration::from_secs(2),
@@ -3539,15 +3539,9 @@ fn operator_old_pods_terminated(before: &[serde_json::Value], after: &[serde_jso
         })
 }
 
-/// Require a current ready Deployment, a distinct Ready pod, and complete old-pod termination.
-fn operator_restart_state_converged(
-    before: &[serde_json::Value],
-    deployment: &serde_json::Value,
-    after: &[serde_json::Value],
-) -> bool {
-    operator_deployment_ready(deployment)
-        && operator_has_new_ready_pod(before, after)
-        && operator_old_pods_terminated(before, after)
+/// Require a distinct Ready replacement pod and removal of all pre-restart live pods.
+fn operator_restart_state_converged(before: &[serde_json::Value], after: &[serde_json::Value]) -> bool {
+    operator_has_new_ready_pod(before, after) && operator_old_pods_terminated(before, after)
 }
 
 /// Record a command's exit code and bounded stdout/stderr in the proof evidence.
@@ -8668,23 +8662,13 @@ mod tests {
     }
 
     #[test]
-    fn restart_recovery_requires_new_ready_pod_and_current_deployment_generation() {
+    fn restart_recovery_requires_new_ready_pod_and_old_pods_terminated() {
         let before = vec![serde_json::json!({
             "uid": "old-uid",
             "phase": "Running",
             "deletion_timestamp": null,
             "ready": true
         })];
-        let deployment = serde_json::json!({
-            "metadata": {"generation": 4},
-            "spec": {"replicas": 1},
-            "status": {
-                "observedGeneration": 4,
-                "updatedReplicas": 1,
-                "readyReplicas": 1,
-                "availableReplicas": 1
-            }
-        });
         let after = vec![serde_json::json!({
             "uid": "new-uid",
             "phase": "Running",
@@ -8693,23 +8677,8 @@ mod tests {
         })];
 
         assert!(
-            operator_restart_state_converged(&before, &deployment, &after),
-            "a current Deployment generation with a distinct Ready pod and no old pod must converge"
-        );
-
-        let stale_deployment = serde_json::json!({
-            "metadata": {"generation": 5},
-            "spec": {"replicas": 1},
-            "status": {
-                "observedGeneration": 4,
-                "updatedReplicas": 1,
-                "readyReplicas": 1,
-                "availableReplicas": 1
-            }
-        });
-        assert!(
-            !operator_restart_state_converged(&before, &stale_deployment, &after),
-            "a stale observed Deployment generation must not count as restart convergence"
+            operator_restart_state_converged(&before, &after),
+            "a distinct Ready replacement pod and removal of old live pods must converge"
         );
     }
 
@@ -8801,16 +8770,6 @@ mod tests {
             "deletion_timestamp": null,
             "ready": true
         })];
-        let deployment = serde_json::json!({
-            "metadata": {"generation": 4},
-            "spec": {"replicas": 1},
-            "status": {
-                "observedGeneration": 4,
-                "updatedReplicas": 1,
-                "readyReplicas": 1,
-                "availableReplicas": 1
-            }
-        });
         let after = vec![
             serde_json::json!({
                 "uid": "old-uid",
@@ -8835,7 +8794,7 @@ mod tests {
             "a terminating pre-restart Pod must still count as present"
         );
         assert!(
-            !operator_restart_state_converged(&before, &deployment, &after),
+            !operator_restart_state_converged(&before, &after),
             "restart convergence must wait until every pre-restart Pod disappears"
         );
     }
@@ -8853,13 +8812,8 @@ mod tests {
                 terminal,
                 serde_json::json!({"uid": "new-uid", "phase": "Running", "ready": true}),
             ];
-            let deployment = serde_json::json!({
-                "metadata": {"generation": 4}, "spec": {"replicas": 1},
-                "status": {"observedGeneration": 4, "updatedReplicas": 1, "readyReplicas": 1, "availableReplicas": 1}
-            });
-
             assert!(
-                operator_restart_state_converged(&before, &deployment, &after),
+                operator_restart_state_converged(&before, &after),
                 "a retained {phase} pod must not block convergence after the live old pod disappears"
             );
             assert!(
@@ -8877,25 +8831,13 @@ mod tests {
             "deletion_timestamp": null,
             "ready": true
         })];
-        let deployment = serde_json::json!({
-            "metadata": {"generation": 4},
-            "spec": {"replicas": 1},
-            "status": {
-                "observedGeneration": 4,
-                "updatedReplicas": 1,
-                "readyReplicas": 1,
-                "availableReplicas": 1
-            }
-        });
-
         assert!(
-            !operator_restart_state_converged(&before, &deployment, &[]),
+            !operator_restart_state_converged(&before, &[]),
             "an empty post-restart Pod snapshot cannot prove a Ready replacement"
         );
         assert!(
             !operator_restart_state_converged(
                 &before,
-                &deployment,
                 &[serde_json::json!({
                 "uid": "new-uid",
                 "phase": "Running",

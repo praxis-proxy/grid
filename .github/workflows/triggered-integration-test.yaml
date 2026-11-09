@@ -1299,19 +1299,7 @@ jobs:
           source "${GRID_REPO}/scripts/combined-site-cleanup-ownership.sh"
           combined_site_record_kind_temp_inventory \
             "/tmp" "${EVIDENCE_DIR}/kind-temporary-paths-before.txt"
-
-          for cluster in grid-combined-west grid-combined-central grid-combined-east; do
-            if grep -Fxq -- "${cluster}" "${EVIDENCE_DIR}/kind-clusters-before.txt"; then
-              echo "::error::Refusing combined-site qualification because fixed-name cluster '${cluster}' already exists on this runner. Preserve it and use a clean runner."
-              exit 1
-            fi
-            if grep -Fxq -- "${cluster}" "${EVIDENCE_DIR}/kind-temporary-paths-before.txt"; then
-              echo "::error::Refusing combined-site qualification because temporary Kind path for '${cluster}' already exists on this runner. Preserve it and use a clean runner."
-              exit 1
-            fi
-          done
-          if grep -Fxq -- grid-combined-site-net "${EVIDENCE_DIR}/docker-networks-before.txt"; then
-            echo "::error::Refusing combined-site qualification because fixed-name network 'grid-combined-site-net' already exists on this runner. Preserve it and use a clean runner."
+          if ! combined_site_baseline_is_clean "${EVIDENCE_DIR}"; then
             exit 1
           fi
 
