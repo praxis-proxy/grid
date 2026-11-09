@@ -3829,28 +3829,30 @@ fn regional_policy_transition_events(
     network: &GridNetwork,
     current: &[OverlayRevisionStatus],
 ) -> Vec<RegionalPolicyEvent> {
-    let policy_gateways: BTreeSet<&str> = network
+    // A GatewayRef is namespaced. Keep the namespace in the transition key so
+    // two gateways with the same name cannot suppress each other's Events.
+    let policy_gateways: BTreeSet<(&str, &str)> = network
         .spec
         .consumer_gateways
         .iter()
         .filter(|gateway| gateway.regional_policy.is_some())
-        .map(|gateway| gateway.name.as_str())
+        .map(|gateway| (gateway.namespace.as_str(), gateway.name.as_str()))
         .collect();
     if policy_gateways.is_empty() {
         return Vec::new();
     }
 
-    let prior_empty: BTreeSet<&str> = network.status.as_ref().map_or_else(BTreeSet::new, |status| {
+    let prior_empty: BTreeSet<(&str, &str)> = network.status.as_ref().map_or_else(BTreeSet::new, |status| {
         status
             .routing_map_status
             .iter()
             .filter(|entry| entry.reason == "RegionalPolicyNoEligibleCandidates")
-            .map(|entry| entry.gateway_name.as_str())
+            .map(|entry| (entry.namespace.as_str(), entry.gateway_name.as_str()))
             .collect()
     });
-    let current_by_gateway: BTreeMap<&str, &OverlayRevisionStatus> = current
+    let current_by_gateway: BTreeMap<(&str, &str), &OverlayRevisionStatus> = current
         .iter()
-        .map(|entry| (entry.gateway_name.as_str(), entry))
+        .map(|entry| ((entry.namespace.as_str(), entry.gateway_name.as_str()), entry))
         .collect();
 
     policy_gateways
@@ -8746,9 +8748,9 @@ mod tests {
 
     #[test]
     fn regional_policy_events_are_bounded_and_transition_only() {
-        let entry = |reason: &str, candidate_count: u32| {
+        let entry = |namespace: &str, reason: &str, candidate_count: u32| {
             serde_json::from_value::<OverlayRevisionStatus>(serde_json::json!({
-                "gatewayName": "gw", "namespace": "ns", "configMapName": "overlay", "schemaVersion": "1.0.0",
+                "gatewayName": "gw", "namespace": namespace, "configMapName": "overlay", "schemaVersion": "1.0.0",
                 "renderedRevision": "revision", "distributedRevision": "revision", "contentDigest": "revision",
                 "phase": "Distributed", "reason": reason, "candidateCount": candidate_count,
             }))
@@ -8766,7 +8768,7 @@ mod tests {
         network.spec.consumer_gateways = vec![gateway];
 
         let mut entered_events =
-            regional_policy_transition_events(&network, &[entry("RegionalPolicyNoEligibleCandidates", 0)]);
+            regional_policy_transition_events(&network, &[entry("ns", "RegionalPolicyNoEligibleCandidates", 0)]);
         assert_eq!(entered_events.len(), 1, "entering no-route state emits one Event");
         let entered = entered_events.remove(0);
         assert_eq!(entered.reason, "RegionalPolicyNoEligibleCandidates");
@@ -8783,14 +8785,62 @@ mod tests {
             .unwrap_or_else(|_| std::process::abort()),
         );
         assert!(
-            regional_policy_transition_events(&network, &[entry("RegionalPolicyNoEligibleCandidates", 0)]).is_empty(),
+            regional_policy_transition_events(&network, &[entry("ns", "RegionalPolicyNoEligibleCandidates", 0)])
+                .is_empty(),
             "an unchanged no-route revision must not spam Events"
         );
-        let mut recovered_events = regional_policy_transition_events(&network, &[entry("", 1)]);
+        let mut recovered_events = regional_policy_transition_events(&network, &[entry("ns", "", 1)]);
         assert_eq!(recovered_events.len(), 1, "recovery emits one Event");
         let recovered = recovered_events.remove(0);
         assert_eq!(recovered.reason, "RegionalPolicyRecovered");
         assert!(matches!(recovered.type_, EventType::Normal));
+    }
+
+    #[test]
+    fn regional_policy_events_keep_same_named_gateways_in_separate_namespaces_distinct() {
+        let entry = |namespace: &str, reason: &str, candidate_count: u32| {
+            serde_json::from_value::<OverlayRevisionStatus>(serde_json::json!({
+                "gatewayName": "gw", "namespace": namespace, "configMapName": "overlay", "schemaVersion": "1.0.0",
+                "renderedRevision": "revision", "distributedRevision": "revision", "contentDigest": "revision",
+                "phase": "Distributed", "reason": reason, "candidateCount": candidate_count,
+            }))
+            .unwrap_or_else(|_| std::process::abort())
+        };
+        let policy = || {
+            serde_json::from_value(serde_json::json!({
+                "mode": "locked",
+                "allowedRegions": ["east"],
+            }))
+            .unwrap_or_else(|_| std::process::abort())
+        };
+        let mut network = base_network();
+        let mut namespace_a = make_gw_ref("gw", "namespace-a");
+        namespace_a.regional_policy = Some(policy());
+        let mut namespace_b = make_gw_ref("gw", "namespace-b");
+        namespace_b.regional_policy = Some(policy());
+        network.spec.consumer_gateways = vec![namespace_a, namespace_b];
+        network.status = Some(
+            serde_json::from_value(serde_json::json!({
+                "routingMapStatus": [{
+                    "gatewayName": "gw", "namespace": "namespace-a", "configMapName": "overlay", "schemaVersion": "1.0.0",
+                    "renderedRevision": "old", "distributedRevision": "old", "contentDigest": "old",
+                    "phase": "Distributed", "reason": "RegionalPolicyNoEligibleCandidates", "candidateCount": 0,
+                }]
+            }))
+            .unwrap_or_else(|_| std::process::abort()),
+        );
+
+        let events = regional_policy_transition_events(
+            &network,
+            &[
+                entry("namespace-a", "RegionalPolicyNoEligibleCandidates", 0),
+                entry("namespace-b", "RegionalPolicyNoEligibleCandidates", 0),
+            ],
+        );
+        assert_eq!(events.len(), 1, "namespace-b must enter no-route independently");
+        let event = events.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(event.reason, "RegionalPolicyNoEligibleCandidates");
+        assert!(matches!(event.type_, EventType::Warning));
     }
 
     // -----------------------------------------------------------------------
