@@ -1884,6 +1884,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
+name = "humantime"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
+
+[[package]]
+name = "humantime-serde"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57a3db5ea5923d99402c94e9feb261dc5ee9b4efa158b0315f788cf549cc200c"
+dependencies = [
+ "humantime",
+ "serde",
+]
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3261,8 +3277,8 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-apis"
-version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.8.0#c39f7198932d408b12f35cd57a2457067e67d0cf"
+version = "0.10.0"
+source = "git+https://github.com/praxis-proxy/ai.git?rev=4a6749f7f7be2c3a446fc9e58216c98659e66188#4a6749f7f7be2c3a446fc9e58216c98659e66188"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3271,6 +3287,7 @@ dependencies = [
  "crc32fast",
  "futures",
  "http",
+ "humantime-serde",
  "metrics",
  "notify",
  "openssl",
@@ -3293,8 +3310,8 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-filters"
-version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.8.0#c39f7198932d408b12f35cd57a2457067e67d0cf"
+version = "0.10.0"
+source = "git+https://github.com/praxis-proxy/ai.git?rev=4a6749f7f7be2c3a446fc9e58216c98659e66188#4a6749f7f7be2c3a446fc9e58216c98659e66188"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3302,6 +3319,7 @@ dependencies = [
  "bytes",
  "chrono",
  "dashmap",
+ "futures",
  "http",
  "metrics",
  "notify",
@@ -3324,11 +3342,12 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-store"
-version = "0.8.0"
-source = "git+https://github.com/praxis-proxy/ai.git?tag=v0.8.0#c39f7198932d408b12f35cd57a2457067e67d0cf"
+version = "0.10.0"
+source = "git+https://github.com/praxis-proxy/ai.git?rev=4a6749f7f7be2c3a446fc9e58216c98659e66188#4a6749f7f7be2c3a446fc9e58216c98659e66188"
 dependencies = [
  "async-trait",
  "dashmap",
+ "humantime-serde",
  "serde",
  "serde_json",
 ]
@@ -3476,8 +3495,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy"
-version = "0.7.5"
-source = "git+https://github.com/praxis-proxy/praxis?rev=8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6#8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "679704b99eaf94186b434f762e71676eff8194000de879182a7be88b4107609b"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -3497,8 +3517,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-core"
-version = "0.7.5"
-source = "git+https://github.com/praxis-proxy/praxis?rev=8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6#8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6fdbdddaea5d23868729aa8a314fa3a9ba22f7da836e16f47336a16f57575a5"
 dependencies = [
  "bytes",
  "chrono",
@@ -3527,8 +3548,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-filter"
-version = "0.7.5"
-source = "git+https://github.com/praxis-proxy/praxis?rev=8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6#8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9077d3bbe1506e63f1f4599496190f8231d6d84340a551d64caed877b90e157a"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3563,8 +3585,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-protocol"
-version = "0.7.5"
-source = "git+https://github.com/praxis-proxy/praxis?rev=8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6#8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69767ac4ddc99631de4fb4a1fc70f3635f3d027faf78599d855bccbf980e964b"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3594,8 +3617,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-tls"
-version = "0.7.5"
-source = "git+https://github.com/praxis-proxy/praxis?rev=8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6#8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85f714e194d42c841c5464cc5efabbde3461a7f0640c5d8134dd83d3fbb7547e"
 dependencies = [
  "arc-swap",
  "notify",
@@ -4450,7 +4474,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4652,9 +4676,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json_canonicalizer"
-version = "0.3.2"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe52319a927259afbfa5180c5157cd8167edfd3e8c254f9558c7fef44c5649f2"
+checksum = "87f7bb64f8c7e9f783fdfe883b5fe93a90bee1597c63705baa91842c5f698620"
 dependencies = [
  "ryu-js",
  "serde",

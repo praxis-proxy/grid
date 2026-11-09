@@ -16,11 +16,11 @@ rust-version = "1.96"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-praxis-proxy = { version = "0.7.5", default-features = false }
-praxis-core = { version = "0.7.5", package = "praxis-proxy-core", default-features = false }
-praxis-filter = { version = "0.7.5", package = "praxis-proxy-filter", default-features = false }
-praxis-protocol = { version = "0.7.5", package = "praxis-proxy-protocol", default-features = false }
-praxis-tls = { version = "0.7.5", package = "praxis-proxy-tls", default-features = false }
+praxis-proxy = { version = "0.8.0", default-features = false }
+praxis-core = { version = "0.8.0", package = "praxis-proxy-core", default-features = false }
+praxis-filter = { version = "0.8.0", package = "praxis-proxy-filter", default-features = false }
+praxis-protocol = { version = "0.8.0", package = "praxis-proxy-protocol", default-features = false }
+praxis-tls = { version = "0.8.0", package = "praxis-proxy-tls", default-features = false }
 httpdate = "1.0.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { version = "0.10.7", package = "yaml_serde" }
@@ -29,17 +29,6 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "r
 metrics = "0.24.6"
 time = "0.3.0"
 openssl = "0.10.0"
-
-# Praxis #1516: PPE 0.6.0 and granular Policy FIPS features.
-# Keep every Praxis crate on the same feature-forwarding revision. The AI
-# filter dependency also uses these crates, so patch the registry packages to
-# prevent a second, unconfigured copy from entering the gateway.
-[patch.crates-io]
-praxis-proxy = { git = "https://github.com/praxis-proxy/praxis", rev = "8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6" }
-praxis-proxy-core = { git = "https://github.com/praxis-proxy/praxis", rev = "8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6" }
-praxis-proxy-filter = { git = "https://github.com/praxis-proxy/praxis", rev = "8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6" }
-praxis-proxy-protocol = { git = "https://github.com/praxis-proxy/praxis", rev = "8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6" }
-praxis-proxy-tls = { git = "https://github.com/praxis-proxy/praxis", rev = "8a74b7b95f255aa6293a136fb1e1e0d2d4d6b4c6" }
 
 [workspace.lints.rust]
 dead_code = "deny"
@@ -362,7 +351,7 @@ praxis-core.workspace = true
 opentelemetry-otlp = { version = "0.33.0", default-features = false, features = [
   "tls-provider-agnostic",
 ] }
-praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.8.0", default-features = false, features = [
+praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "4a6749f7f7be2c3a446fc9e58216c98659e66188", default-features = false, features = [
   "opentelemetry",
 ] }
 ai-grid-filters = { path = "crates/ai-grid-filters" }

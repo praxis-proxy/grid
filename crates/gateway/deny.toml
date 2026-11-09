@@ -54,8 +54,4 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # The gateway consumes praxis-ai (apis + filters) as a pinned git dependency;
 # this is the workspace split that took the gateway out of the root graph.
-allow-git = [
-  "https://github.com/praxis-proxy/ai.git",
-  # Temporary pin to Praxis #1516 until its Policy FIPS features are released.
-  "https://github.com/praxis-proxy/praxis",
-]
+allow-git = ["https://github.com/praxis-proxy/ai.git"]
