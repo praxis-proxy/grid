@@ -122,6 +122,12 @@ log:
   # -- Full RUST_LOG directive, such as "info,praxis_filter=debug". When set, it replaces level.
   filter: ""
 
+# -- Require host and OpenSSL FIPS verification at startup. Use a gateway image built
+# -- with a FIPS-safe Policy profile on a FIPS host.
+fips:
+  # -- Render PRAXIS_REQUIRE_FIPS=1 for the Praxis container.
+  required: false
+
 # -- GridNetwork and local site used by render and the overlay sidecar.
 grid:
   # -- GridNetwork name. Required when the overlay sidecar is enabled.

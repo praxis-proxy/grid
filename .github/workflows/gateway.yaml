@@ -18,6 +18,7 @@ on:
       - 'crates/signals/**'
       - 'crates/client/**'
       - 'Cargo.toml'
+      - 'Makefile'
       - '.cargo/**'
       - 'rust-toolchain.toml'
       - 'rustfmt.toml'
@@ -33,6 +34,7 @@ on:
       - 'crates/signals/**'
       - 'crates/client/**'
       - 'Cargo.toml'
+      - 'Makefile'
       - '.cargo/**'
       - 'rust-toolchain.toml'
       - 'rustfmt.toml'
@@ -130,6 +132,29 @@ jobs:
 
       - name: Unit tests
         run: cargo test --manifest-path crates/gateway/Cargo.toml --workspace
+
+  # Checks compiled Policy profiles; the runner is not a FIPS host.
+  gateway-fips-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: crates/gateway -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check Gateway Policy FIPS profiles
+        run: make gateway-fips-check
 
   # ----------------------------------------------------------------------------
   # Security audit, gateway lockfile
