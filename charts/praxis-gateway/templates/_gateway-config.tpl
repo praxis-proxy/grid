@@ -12,9 +12,15 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
 {{- $hasBatchSize := and (hasKey $telemetry "batchSize") (ne $telemetry.batchSize nil) }}
 {{- $hasTelemetryValues := or $telemetry.otlpEndpoint $hasSamplingRate $telemetry.serviceName $telemetry.serviceVersion $telemetry.environment $hasBatchInterval $hasBatchSize }}
   praxis.yaml: |
-    {{- with $.Values.upstreamCA.secretName }}
+    {{- $runtime := $cfg.runtime | default dict }}
+    {{- if or $.Values.upstreamCA.secretName $runtime.upstreamKeepalivePoolSize }}
     runtime:
+      {{- with $.Values.upstreamCA.secretName }}
       upstream_ca_file: {{ printf "%s/%s" $.Values.upstreamCA.mountPath ($.Values.upstreamCA.key | default "ca.crt") | quote }}
+      {{- end }}
+      {{- with $runtime.upstreamKeepalivePoolSize }}
+      upstream_keepalive_pool_size: {{ . | int64 }}
+      {{- end }}
     {{- end }}
     {{- with $cfg.bodyLimits }}
     {{- if or .maxRequestBytes .maxResponseBytes .maxBufferBytes }}

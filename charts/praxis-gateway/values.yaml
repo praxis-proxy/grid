@@ -239,6 +239,14 @@ praxisConfig:
       maxRequestBytes: null
       maxResponseBytes: null
       maxBufferBytes: null
+    # -- Praxis runtime settings rendered when set.
+    runtime:
+      # -- Idle upstream connections each worker thread keeps, across every cluster;
+      # Praxis defaults to 64. Past it, a finished connection closes instead of
+      # returning to the pool, and the next request to that backend pays a new
+      # connect and TLS handshake. Size it to the in-flight requests one replica
+      # sends a backend divided by its worker threads. At most 10000.
+      upstreamKeepalivePoolSize: null
     # -- consumer routes callers. provider serves grid peers on the grid identity and forwards to one backend.
     role: consumer
     # -- Grid peers a provider accepts, each with a Grid-CA client certificate.

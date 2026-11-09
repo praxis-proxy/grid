@@ -278,6 +278,19 @@
                 }
               }
             },
+            "runtime": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Praxis runtime settings rendered when set.",
+              "properties": {
+                "upstreamKeepalivePoolSize": {
+                  "type": ["integer", "null"],
+                  "minimum": 1,
+                  "maximum": 10000,
+                  "description": "Idle upstream connections kept per worker thread across every cluster; Praxis defaults to 64."
+                }
+              }
+            },
             "telemetry": {
               "type": "object",
               "additionalProperties": false,
