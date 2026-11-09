@@ -48,6 +48,9 @@ tests:
       - matchRegex:
           path: data["policy.yaml"]
           pattern: 'kind: identity/api-key'
+      - matchRegex:
+          path: data["policy.yaml"]
+          pattern: 'credential:\n\s+kind: header\n\s+name: Authorization'
 
   - it: still renders declared backends, which dials of the same name override
     template: templates/gateway-config.yaml
