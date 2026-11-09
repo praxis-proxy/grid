@@ -38,6 +38,17 @@ impl RegionalPolicyGroup {
             Self::Permitted => "permitted",
         }
     }
+
+    /// Selection boundary exported to consumers that enforce regional policy.
+    ///
+    /// Only affinity fallback must be delayed behind another group. A locked
+    /// policy makes every eligible candidate equally permitted.
+    pub(crate) const fn selection_group(self) -> u32 {
+        match self {
+            Self::Fallback => 1,
+            Self::Preferred | Self::Permitted => 0,
+        }
+    }
 }
 
 /// Regional-policy metadata field that could not be resolved.

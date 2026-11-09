@@ -1147,6 +1147,18 @@ pub struct RoutingOverlay {
     pub generated_at: Option<String>,
 }
 
+/// Result of rendering an overlay with internal eligibility evidence.
+///
+/// The evidence never crosses the overlay wire contract. It lets the
+/// controller report a regional-policy no-route state only when the policy,
+/// rather than admission or later validation, removed every candidate.
+pub(crate) struct RenderedRoutingOverlay {
+    /// Rendered overlay for publication.
+    pub(crate) overlay: RoutingOverlay,
+    /// Whether regional policy removed every collected candidate.
+    pub(crate) regional_policy_removed_all_candidates: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Admission and enrichment
 // ---------------------------------------------------------------------------
@@ -1268,12 +1280,17 @@ fn regional_policy_sort_key(group: Option<RegionalPolicyGroup>) -> u8 {
 /// [`RoutingOverlay::excluded`]. That list feeds `grid_site_route`; retaining
 /// a policy-disallowed candidate there would let a later consumer reintroduce
 /// a route outside the declared policy boundary.
+///
+/// Returns whether an active policy removed every candidate collected before
+/// admission, health, or downstream consumer validation. Callers use this
+/// evidence to distinguish a policy no-route decision from a later empty
+/// overlay.
 fn apply_regional_policy(
     candidates: &mut Vec<RoutingCandidate>,
     evaluator: &RegionalPolicyEvaluator<'_, '_>,
     sites: &[GridSite],
     network_name: &str,
-) {
+) -> bool {
     let before = candidates.len();
     candidates.retain_mut(|candidate| {
         let metadata = resolve_regional_policy_site_metadata(&candidate.site, sites, network_name);
@@ -1308,6 +1325,7 @@ fn apply_regional_policy(
             "regional policy filtered routing candidates before admission and scoring"
         );
     }
+    before > 0 && candidates.is_empty()
 }
 
 /// Assign deterministic priority groups after the existing candidate sort.
@@ -1563,14 +1581,6 @@ fn truncate_candidate_count(candidates: &mut Vec<RoutingCandidate>, network_name
     clippy::too_many_arguments,
     reason = "gateway policy, admission states, tool providers, and discovery inventory are distinct control-plane inputs"
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential render steps: ordering, collect, enrich, filter, sort, dedup, rank; splitting would hide the pipeline"
-)]
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "the renderer's ordered control-plane stages are intentionally co-located to preserve eligibility and scoring boundaries"
-)]
 pub fn render_routing_overlay_with_admission(
     network: &GridNetwork,
     sites: &[GridSite],
@@ -1589,6 +1599,59 @@ pub fn render_routing_overlay_with_admission(
     served_model_store: &ServedModelStore,
     candidate_expiry_support: CandidateExpirySupport,
 ) -> Result<RoutingOverlay, String> {
+    render_routing_overlay_with_admission_evidence(
+        network,
+        sites,
+        providers,
+        tool_providers,
+        remote_crdt_providers,
+        remote_model_inventories,
+        grid_id,
+        local_site,
+        gateway,
+        owning_site,
+        metrics,
+        generated_at,
+        weights,
+        precomputed_admission,
+        served_model_store,
+        candidate_expiry_support,
+    )
+    .map(|rendered| rendered.overlay)
+}
+
+/// Render a routing overlay and retain internal regional-policy evidence for
+/// the controller's status reporting.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "gateway policy, admission states, tool providers, and discovery inventory are distinct control-plane inputs"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential render steps: ordering, collect, enrich, filter, sort, dedup, rank; splitting would hide the pipeline"
+)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "the renderer's ordered control-plane stages are intentionally co-located to preserve eligibility and scoring boundaries"
+)]
+pub(crate) fn render_routing_overlay_with_admission_evidence(
+    network: &GridNetwork,
+    sites: &[GridSite],
+    providers: &[InferenceProvider],
+    tool_providers: &[AgentToolProvider],
+    remote_crdt_providers: &[crdt::ProviderState],
+    remote_model_inventories: &[swim::ModelInventory],
+    grid_id: &str,
+    local_site: &str,
+    gateway: Option<&GatewayRef>,
+    owning_site: Option<&str>,
+    metrics: Option<&HashMap<&str, scoring::BackendMetrics>>,
+    generated_at: Option<&str>,
+    weights: &scoring::ScoringWeights,
+    precomputed_admission: Option<&HashMap<String, AdmissionState>>,
+    served_model_store: &ServedModelStore,
+    candidate_expiry_support: CandidateExpirySupport,
+) -> Result<RenderedRoutingOverlay, String> {
     let network_name = network
         .metadata
         .name
@@ -1681,9 +1744,10 @@ pub fn render_routing_overlay_with_admission(
         }
     }
 
-    if let Some(evaluator) = regional_policy_evaluator.as_ref() {
-        apply_regional_policy(&mut candidates, evaluator, sites, network_name);
-    }
+    let regional_policy_removed_all_candidates = match regional_policy_evaluator.as_ref() {
+        Some(evaluator) => apply_regional_policy(&mut candidates, evaluator, sites, network_name),
+        None => false,
+    };
 
     enrich_candidates(&mut candidates, local_site, sites, network_name, &admission_map);
     let (excluded, mut candidates): (Vec<_>, Vec<_>) = candidates
@@ -1767,13 +1831,16 @@ pub fn render_routing_overlay_with_admission(
         }
     }
 
-    Ok(RoutingOverlay {
-        network: network_name.to_owned(),
-        local_site: local_site.to_owned(),
-        candidates,
-        excluded,
-        selection_policy,
-        generated_at: generated_at.map(str::to_owned),
+    Ok(RenderedRoutingOverlay {
+        overlay: RoutingOverlay {
+            network: network_name.to_owned(),
+            local_site: local_site.to_owned(),
+            candidates,
+            excluded,
+            selection_policy,
+            generated_at: generated_at.map(str::to_owned),
+        },
+        regional_policy_removed_all_candidates,
     })
 }
 
@@ -8211,6 +8278,86 @@ mod tests {
         assert!(
             overlay.excluded.is_empty(),
             "policy-rejected candidates must not remain routable through the excluded set"
+        );
+    }
+
+    #[test]
+    fn regional_policy_evidence_distinguishes_policy_rejection_from_admission_exclusion() {
+        let network = test_network("net");
+        let gateway = test_gateway_with_regional_policy(
+            "east-site",
+            &serde_json::json!({
+                "mode": "locked",
+                "allowedRegions": ["east"],
+            }),
+        );
+        let east = test_site_with_regional_policy_metadata("east-site", "net", Some("east"), Some("eu"));
+        let west = test_site_with_regional_policy_metadata("west-site", "net", Some("west"), Some("us"));
+        let admission = HashMap::from([("east-provider".to_owned(), AdmissionState::Excluded)]);
+        let admitted_then_excluded = render_routing_overlay_with_admission_evidence(
+            &network,
+            &[east.clone(), west.clone()],
+            &[test_provider_on_site(
+                "east-provider",
+                "net",
+                "east-site",
+                "local",
+                &["model"],
+            )],
+            &[],
+            &[],
+            &[],
+            "grid-id",
+            "east-site",
+            Some(&gateway),
+            Some("east-site"),
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+            Some(&admission),
+            &ServedModelStore::new(),
+            CandidateExpirySupport::Supported,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert!(admitted_then_excluded.overlay.candidates.is_empty());
+        assert_eq!(admitted_then_excluded.overlay.excluded.len(), 1);
+        assert!(
+            !admitted_then_excluded.regional_policy_removed_all_candidates,
+            "an eligible candidate removed by admission must not be reported as a policy rejection"
+        );
+
+        let policy_excluded = render_routing_overlay_with_admission_evidence(
+            &network,
+            &[east, west],
+            &[test_provider_on_site(
+                "west-provider",
+                "net",
+                "west-site",
+                "local",
+                &["model"],
+            )],
+            &[],
+            &[],
+            &[],
+            "grid-id",
+            "east-site",
+            Some(&gateway),
+            Some("east-site"),
+            None,
+            None,
+            &scoring::ScoringWeights::default(),
+            None,
+            &ServedModelStore::new(),
+            CandidateExpirySupport::Supported,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert!(policy_excluded.overlay.candidates.is_empty());
+        assert!(policy_excluded.overlay.excluded.is_empty());
+        assert!(
+            policy_excluded.regional_policy_removed_all_candidates,
+            "only a candidate rejected by the policy itself creates policy no-route evidence"
         );
     }
 

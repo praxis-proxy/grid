@@ -3423,7 +3423,7 @@ async fn reconcile_routing_overlay_inner(
         }
 
         let timestamp = rfc3339_now();
-        let mut overlay = match routing_overlay::render_routing_overlay_with_admission(
+        let rendered_overlay = match routing_overlay::render_routing_overlay_with_admission_evidence(
             network,
             &sites,
             providers,
@@ -3445,7 +3445,7 @@ async fn reconcile_routing_overlay_inner(
                 routing_overlay::CandidateExpirySupport::Unsupported
             },
         ) {
-            Ok(overlay) => overlay,
+            Ok(rendered) => rendered,
             Err(error) => {
                 tracing::warn!(
                     network = network_name,
@@ -3464,6 +3464,8 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
+        let regional_policy_removed_all_candidates = rendered_overlay.regional_policy_removed_all_candidates;
+        let mut overlay = rendered_overlay.overlay;
         if let Some(deadline) = next_discovered_model_expiry(&overlay) {
             inventory_expiry_deadline =
                 Some(inventory_expiry_deadline.map_or(deadline, |current| current.min(deadline)));
@@ -3694,7 +3696,8 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
-        let (reason, message) = regional_policy_empty_overlay_status(gw_ref, no_candidates);
+        let (reason, message) =
+            regional_policy_empty_overlay_status(gw_ref, no_candidates, regional_policy_removed_all_candidates);
         overlay_statuses.push(OverlayRevisionStatus {
             gateway_name: gw_ref.name.clone(),
             namespace: gw_ref.namespace.clone(),
@@ -3792,8 +3795,12 @@ async fn reconcile_routing_overlay_inner(
 ///
 /// A valid policy that permits no candidates is intentionally distributed; it
 /// is not an invalid update and must not retain a prior cross-region route.
-fn regional_policy_empty_overlay_status(gw_ref: &GatewayRef, no_candidates: bool) -> (String, String) {
-    if no_candidates && gw_ref.regional_policy.is_some() {
+fn regional_policy_empty_overlay_status(
+    gw_ref: &GatewayRef,
+    no_candidates: bool,
+    regional_policy_removed_all_candidates: bool,
+) -> (String, String) {
+    if no_candidates && gw_ref.regional_policy.is_some() && regional_policy_removed_all_candidates {
         (
             "RegionalPolicyNoEligibleCandidates".to_owned(),
             "regional policy permits no eligible candidates; authoritative empty overlay distributed".to_owned(),
@@ -3895,10 +3902,6 @@ async fn publish_regional_policy_events(
         }
     }
 }
-
-/// Legacy status reason used by retained-status compatibility tests.
-#[cfg(test)]
-const EMPTY_CANDIDATES: &str = "EmptyCandidates";
 
 /// What one routing overlay pass produced, per gateway.
 struct OverlayOutcome {
@@ -8708,7 +8711,7 @@ mod tests {
     }
 
     #[test]
-    fn active_regional_policy_marks_an_empty_overlay_as_authoritative() {
+    fn regional_policy_status_requires_policy_eligibility_evidence() {
         let mut gateway = make_gw_ref("gw", "grid-system");
         gateway.regional_policy = Some(
             serde_json::from_value(serde_json::json!({
@@ -8719,19 +8722,24 @@ mod tests {
         );
 
         assert_eq!(
-            regional_policy_empty_overlay_status(&gateway, true),
+            regional_policy_empty_overlay_status(&gateway, true, true),
             (
                 "RegionalPolicyNoEligibleCandidates".to_owned(),
                 "regional policy permits no eligible candidates; authoritative empty overlay distributed".to_owned(),
             )
         );
         assert_eq!(
-            regional_policy_empty_overlay_status(&gateway, false),
+            regional_policy_empty_overlay_status(&gateway, false, true),
             (String::new(), String::new())
+        );
+        assert_eq!(
+            regional_policy_empty_overlay_status(&gateway, true, false),
+            (String::new(), String::new()),
+            "admission, health, or downstream consumer validation must not be reported as a policy rejection"
         );
         gateway.regional_policy = None;
         assert_eq!(
-            regional_policy_empty_overlay_status(&gateway, true),
+            regional_policy_empty_overlay_status(&gateway, true, true),
             (String::new(), String::new())
         );
     }

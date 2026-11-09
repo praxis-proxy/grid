@@ -288,6 +288,19 @@ const fn selection_group_zero(selection_group: &u32) -> bool {
     *selection_group == 0
 }
 
+/// Translate only a regional-policy boundary into the gateway contract.
+///
+/// `RoutingCandidate::selection_group` also carries generic locality,
+/// admission, and freshness boundaries for the overlay consumer. Passing that
+/// field to `grid_site_route` would change its behavior when no
+/// `regionalPolicy` is configured.
+const fn regional_selection_group(candidate: &RoutingCandidate) -> u32 {
+    match candidate.regional_policy_group {
+        Some(group) => group.selection_group(),
+        None => 0,
+    }
+}
+
 /// Whether `admission` is the default, which the gateway assumes when absent.
 #[expect(clippy::trivially_copy_pass_by_ref, reason = "serde skip_serializing_if signature")]
 fn admits_new(admission: &AdmissionState) -> bool {
@@ -478,7 +491,7 @@ fn dedup<'overlay>(
             candidate.cluster.as_str(),
         );
         let admission = candidate.admission_state.unwrap_or(AdmissionState::NewAndExisting);
-        let selection_group = candidate.selection_group.unwrap_or(0);
+        let selection_group = regional_selection_group(candidate);
         // Seeded with the identities of both folds, so the first candidate and every
         // duplicate after it take the same path: fresh only if all are, admission as
         // restricted as the most restricted.
@@ -752,6 +765,7 @@ impl WriteGate {
 #[expect(clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
+    use crate::resources::regional_policy::RegionalPolicyGroup;
 
     /// Contract fixture the gateway crate parses with its own types.
     const GOLDEN: &str = include_str!("../../../gateway/crates/ai-grid-filters/testdata/serving-config.json");
@@ -1138,13 +1152,13 @@ mod tests {
             (0..MAX_CANDIDATES)
                 .map(|i| {
                     let mut fallback = cand("llama", "site-b", &format!("fallback-{i:04}"), None);
-                    fallback.selection_group = Some(1);
+                    fallback.regional_policy_group = Some(RegionalPolicyGroup::Fallback);
                     fallback
                 })
                 .collect(),
         );
         let mut preferred = cand("llama", "site-z", "preferred", None);
-        preferred.selection_group = Some(0);
+        preferred.regional_policy_group = Some(RegionalPolicyGroup::Preferred);
         source.candidates.push(preferred);
 
         let rendered = render(&source, &INPUTS);
@@ -1253,34 +1267,40 @@ mod tests {
     }
 
     #[test]
-    fn regional_selection_group_reaches_the_serving_config_and_duplicates_keep_the_earliest_group() {
-        let default = cand("llama", "site-a", "pool-a", None);
-        let mut preferred = cand("llama", "site-b", "pool-b", None);
-        preferred.selection_group = Some(1);
-        let mut fallback = cand("llama", "site-b", "pool-b", None);
-        fallback.selection_group = Some(2);
+    fn serving_config_exports_only_regional_selection_boundaries() {
+        let mut generic = cand("llama", "site-a", "generic", None);
+        generic.selection_group = Some(4);
+        let mut preferred = cand("llama", "site-b", "preferred", None);
+        preferred.regional_policy_group = Some(RegionalPolicyGroup::Preferred);
+        let mut fallback = cand("llama", "site-c", "fallback", None);
+        fallback.regional_policy_group = Some(RegionalPolicyGroup::Fallback);
+        let mut permitted = cand("llama", "site-d", "permitted", None);
+        permitted.regional_policy_group = Some(RegionalPolicyGroup::Permitted);
 
-        let rendered = render(&overlay(vec![default, fallback, preferred]), &INPUTS);
+        let rendered = render(&overlay(vec![generic, preferred, fallback, permitted]), &INPUTS);
         let text = to_text(&rendered).expect("serving JSON");
         let wire: serde_json::Value = serde_json::from_str(&text).expect("valid serving JSON");
-        let preferred_wire = wire["candidates"]
-            .as_array()
-            .expect("candidates")
+        let candidates = wire["candidates"].as_array().expect("candidates");
+        let fallback_wire = candidates
             .iter()
-            .find(|candidate| candidate["cluster"] == "pool-b")
-            .expect("remote candidate");
-
-        assert_eq!(preferred_wire["selection_group"], 1, "the lowest duplicate group wins");
+            .find(|candidate| candidate["cluster"] == "fallback")
+            .expect("fallback candidate");
+        assert_eq!(fallback_wire["selection_group"], 1, "only affinity fallback is delayed");
         assert!(
-            wire["candidates"]
-                .as_array()
-                .expect("candidates")
+            candidates
                 .iter()
-                .find(|candidate| candidate["cluster"] == "pool-a")
-                .expect("default candidate")
+                .filter(|candidate| candidate["cluster"] != "fallback")
+                .all(|candidate| candidate.get("selection_group").is_none()),
+            "generic overlay groups and the default regional group must not alter grid_site_route selection"
+        );
+        assert!(
+            candidates
+                .iter()
+                .find(|candidate| candidate["cluster"] == "generic")
+                .expect("candidate without regional policy")
                 .get("selection_group")
                 .is_none(),
-            "zero stays omitted so gateways with older serving configs retain their default"
+            "a generic overlay selection group must never enter the serving config"
         );
     }
 
