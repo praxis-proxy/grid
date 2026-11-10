@@ -2473,10 +2473,10 @@ mod tests {
                 .and_then(serde_json::Value::as_array)
                 .unwrap_or_else(|| std::process::abort());
             for expected_rule in [
-                REGIONAL_POLICY_AFFINITY_FORBIDS_ALLOWED_REGIONS,
-                REGIONAL_POLICY_LOCKED_REQUIRES_ALLOWED_REGIONS,
-                REGIONAL_POLICY_LOCKED_FORBIDS_PREFERRED_REGIONS,
-                REGIONAL_POLICY_LOCKED_FORBIDS_CROSS_REGION_FALLBACK,
+                "self.mode != 'affinity' || !has(self.allowedRegions)",
+                "self.mode != 'locked' || has(self.allowedRegions)",
+                "self.mode != 'locked' || !has(self.preferredRegions)",
+                "self.mode != 'locked' || !has(self.crossRegionFallback)",
             ] {
                 assert!(
                     rules.iter().any(|validation| {
