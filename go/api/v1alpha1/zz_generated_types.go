@@ -176,6 +176,14 @@ const (
 	GridNetworkConsumerGatewaysItemPraxisConfigSiteRouterGridSiteRoute    GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter = "gridSiteRoute"
 )
 
+// GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode is a string enumeration.
+type GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode string
+
+const (
+	GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyModeEnforce GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode = "enforce"
+	GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyModeAudit   GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode = "audit"
+)
+
 // GridNetworkConsumerGatewaysItemRegionalPolicyCrossRegionFallback is a string enumeration.
 type GridNetworkConsumerGatewaysItemRegionalPolicyCrossRegionFallback string
 
@@ -190,14 +198,6 @@ type GridNetworkConsumerGatewaysItemRegionalPolicyMode string
 const (
 	GridNetworkConsumerGatewaysItemRegionalPolicyModeAffinity GridNetworkConsumerGatewaysItemRegionalPolicyMode = "affinity"
 	GridNetworkConsumerGatewaysItemRegionalPolicyModeLocked   GridNetworkConsumerGatewaysItemRegionalPolicyMode = "locked"
-)
-
-// GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode is a string enumeration.
-type GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode string
-
-const (
-	GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyModeEnforce GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode = "enforce"
-	GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyModeAudit   GridNetworkConsumerGatewaysItemPraxisConfigSovereigntyMode = "audit"
 )
 
 // GridNetworkMembershipMode is a string enumeration.
@@ -657,6 +657,7 @@ type GridNetworkConsumerGatewaysItemRegionalPolicy struct {
 	Mode GridNetworkConsumerGatewaysItemRegionalPolicyMode `json:"mode"`
 	// Unordered preferred-region set for affinity mode.
 	// When absent, the operator derives the preferred region from the trusted [GridSite] resolved through [GatewayRef::site_name].
+	// [GridSite]: crate::crd::grid_site::GridSite
 	PreferredRegions []string `json:"preferredRegions,omitempty"`
 }
 
