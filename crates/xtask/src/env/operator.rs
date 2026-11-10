@@ -268,7 +268,7 @@ pub(crate) const SWIM_NODE_SECONDARY_NAME: &str = "swim-node-s";
 /// `GridNetwork` resource name used by the CRD-seed SWIM validation.
 ///
 /// Kept distinct from [`SWIM_TEST_NETWORK`] so both validations can coexist.
-/// The CRD-seed test uses `spec.seeds` instead of `GRID_SWIM_SEEDS` to drive
+/// The CRD-seed test uses `membership.swim.seeds` instead of `GRID_SWIM_SEEDS` to drive
 /// peer discovery, proving the CRD path rather than the env-var path.
 pub(crate) const CRD_SEEDS_TEST_NETWORK: &str = "op-e2e-swim-crd-seeds-net";
 
@@ -1889,7 +1889,7 @@ pub(crate) fn apply_swim_test_network(context: &str) -> Result<(), Box<dyn std::
         "apiVersion": "grid.praxis.fast/v1alpha1",
         "kind": "GridNetwork",
         "metadata": { "name": SWIM_TEST_NETWORK },
-        "spec": { "seeds": [] }
+        "spec": { "membership": { "mode": "Swim" } }
     }))
     .unwrap_or_else(|e| {
         eprintln!("SWIM test network serialization failed: {e}");
@@ -1900,9 +1900,53 @@ pub(crate) fn apply_swim_test_network(context: &str) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// Verify API-server admission for SWIM configuration under both membership modes.
+///
+/// # Errors
+///
+/// Returns an error if Swim mode is rejected, Local mode with SWIM config is
+/// accepted, or the Local rejection does not come from the expected CRD rule.
+pub(crate) fn verify_swim_membership_crd_admission(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = |mode: &str| {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "GridNetwork",
+            "metadata": { "name": "swim-membership-admission-test" },
+            "spec": {
+                "gridId": "swim-membership-admission-test",
+                "membership": {
+                    "mode": mode,
+                    "swim": { "seeds": ["peer.example:7946"] }
+                }
+            }
+        }))
+    };
+
+    let accepted = kubectl::server_side_dry_run(context, &manifest("Swim")?)?;
+    if !accepted.status.success() {
+        return Err(format!(
+            "API server rejected membership.swim for Swim mode: {}",
+            String::from_utf8_lossy(&accepted.stderr)
+        )
+        .into());
+    }
+
+    let rejected = kubectl::server_side_dry_run(context, &manifest("Local")?)?;
+    if rejected.status.success() {
+        return Err("API server accepted membership.swim for Local mode".into());
+    }
+    let rejection = String::from_utf8_lossy(&rejected.stderr);
+    if !rejection.contains("membership.swim is only valid when membership.mode is Swim") {
+        return Err(format!("Local mode was rejected for an unexpected reason: {rejection}").into());
+    }
+
+    eprintln!("  [PASS] API server admits membership.swim for Swim and rejects it for Local");
+    Ok(())
+}
+
 /// Apply the `GridNetwork` fixture for the CRD-seed SWIM validation.
 ///
-/// Unlike [`apply_swim_test_network`], this fixture sets `spec.seeds` to the
+/// Unlike [`apply_swim_test_network`], this fixture sets `membership.swim.seeds` to the
 /// supplied list of socket addresses so the operator reconcile loop can announce
 /// those peers via `SwimHandle::announce_seeds` without any `GRID_SWIM_SEEDS`
 /// env var.
@@ -1911,7 +1955,7 @@ pub(crate) fn apply_swim_test_network(context: &str) -> Result<(), Box<dyn std::
 ///
 /// Both operators are started with `GRID_SWIM_SEEDS=""`.  The secondary operator
 /// has no peer at startup.  After this fixture is applied, the secondary's
-/// `GridNetwork` reconcile resolves and normalizes `spec.seeds`, filters out
+/// `GridNetwork` reconcile resolves and normalizes `membership.swim.seeds`, filters out
 /// the local address, and announces to the primary via the SWIM runtime
 /// channel.  SWIM gossip then converges and the `GridNetwork`
 /// reaches `Active`.
@@ -1928,7 +1972,10 @@ pub(crate) fn apply_swim_test_network_with_seeds(
         "apiVersion": "grid.praxis.fast/v1alpha1",
         "kind": "GridNetwork",
         "metadata": { "name": CRD_SEEDS_TEST_NETWORK },
-        "spec": { "seeds": seeds_json }
+        "spec": {
+            "gridId": "crd-seeds-grid",
+            "membership": { "mode": "Swim", "swim": { "seeds": seeds_json } }
+        }
     }))
     .unwrap_or_else(|e| {
         eprintln!("CRD-seeds test network serialization failed: {e}");

@@ -6,7 +6,14 @@ components expose Prometheus endpoints and they answer different questions.
 | Endpoint | Component | Serves |
 |---|---|---|
 | `/metrics` on `GRID_METRICS_ADDR`, default `0.0.0.0:9090` | Site operator | Reconciliation, probing, peer polling, and the provider readings this site publishes |
-| `/metrics` on the gateway metrics listener, `metricsListener.enabled` in the gateway chart, port 9443, TLS only | Grid gateway | Site selection, shedding, serving-config reloads, and its poll of the local operator |
+| `/metrics` on the gateway metrics listener, `metricsListener.enabled` in the gateway chart, port 9443, TLS with Kubernetes bearer-token authorization | Grid gateway | Site selection, shedding, serving-config reloads, and its poll of the local operator |
+
+The gateway listener validates bearer tokens with TokenReview and checks scrape
+permission with SubjectAccessReview. A NetworkPolicy is recommended to limit
+which pods can reach the listener and cause those API reviews. The listener also
+exports `grid_metrics_auth_total{result}` for `missing`, `allowed`,
+`unauthenticated`, `forbidden`, `overloaded`, and `api_error` outcomes, plus
+`grid_metrics_auth_in_flight` for concurrent Kubernetes reviews.
 | `/metrics` on `OVERLAY_SYNC_HEALTH_ADDR`, default `0.0.0.0:9091` | Overlay-sync sidecar, when `overlay.sidecar.enabled` | Delivery of the serving overlay from its ConfigMap to the gateway |
 
 The `grid-gateway` operand built with Praxis 0.7.4 serves `/metrics`, `/healthy`,
@@ -125,6 +132,7 @@ already did. Both fire above four fifths of a cap for five minutes:
 | `grid_site_phase` | gauge | `site`, `phase` | GridSite phase: 1 for the current phase, 0 for the others. |
 | `grid_site_phase_transition_total` | counter | `from_phase`, `to_phase`, `reason` | GridSite phase transitions. |
 | `grid_agent_tool_provider_phase_transition_total` | counter | `from_phase`, `to_phase`, `reason` | AgentToolProvider phase transitions. |
+| `grid_agent_tool_provider_tools_cut` | gauge | `namespace`, `provider` | Discovered tools past the 128-per-provider routing cap, which status lists but routing leaves out. Absent while a provider is within the cap, and removed when the provider is deleted. |
 | `grid_gateway_probe_total` | counter | `outcome`, `tls_mode` | Total gateway probe attempts. |
 | `grid_gateway_probe_duration_seconds` | histogram | | Gateway probe duration. |
 | `grid_mcp_probe_total` | counter | `outcome` | Total AgentToolProvider MCP tools/list probe attempts. |
@@ -156,6 +164,8 @@ state, so two replicas agree only in steady state.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
+| `grid_metrics_auth_total` | counter | `result` | Gateway metrics scrape outcomes: `missing`, `allowed`, `unauthenticated`, `forbidden`, `overloaded`, and `api_error`. |
+| `grid_metrics_auth_in_flight` | gauge | | Kubernetes TokenReview and SubjectAccessReview requests currently running for scrapes. |
 | `grid_route_decisions_total` | counter | `site`, `cluster`, `reason` | Requests the gateway decided, by outcome. A refusal records an empty site and cluster. |
 | `grid_route_selections_total` | counter | `path` | Decisions by the path that produced them. |
 | `grid_route_site_rho` | gauge | `site`, `cluster` | Smoothed saturation used by the draw: the comparator for an llm-d site, otherwise in-flight over the learned ceiling. |
@@ -177,6 +187,7 @@ state, so two replicas agree only in steady state.
 | `grid_route_site_round_age_seconds` | gauge | `site`, `cluster` | Seconds since the operator's last poll round that tried this peer; a peer's silence is judged at that round. `NaN` for this site or when the operator reports no rounds. A growing value with the poller running is a stalled poller, under which no peer goes silent. |
 | `grid_route_site_score` | gauge | `site`, `cluster` | Score the site ranks by in the current snapshot. |
 | `grid_route_site_score_unavailable` | gauge | `site`, `cluster`, `reason` | One-hot reason an otherwise routable load-publishing site has no queue score: `absent`, `stale`, or `unreadable`. The current reason is 1 and the others are 0. |
+| `grid_route_candidate_info` | gauge | `site`, `cluster`, `model` | 1 while the gateway lists the model as a candidate at the site's backend cluster, 0 once it no longer does. The 0 is a tombstone the exporter keeps until restart, so join with `== 1`. A cluster serving more than one model has one series per model, so the join is `<per-site series> * on (site, cluster) group_right() (grid_route_candidate_info == 1)`, one row per model. The praxis-gateway chart's ServiceMonitor renames `cluster` to `backend`, so a dashboard behind it joins on `site` and `backend`. The `model` label puts every peer's model catalog on /metrics, readable by anyone who can query the scraping Prometheus. |
 | `grid_route_shedding` | gauge | `model` | 1 while the gateway sheds this model, 0 otherwise. |
 | `grid_route_prefix_affinity_total` | counter | `outcome` | Prefix-affinity decisions by outcome. |
 | `grid_route_prefix_index_entries` | gauge | `cluster` | Prefix keys this replica holds for the backend cluster. An expired key counts until a new key displaces it or its prompt is sent again. |

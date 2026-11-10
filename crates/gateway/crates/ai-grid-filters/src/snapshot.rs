@@ -436,7 +436,11 @@ impl RouteSnapshot {
     /// snapshot's pairs.
     #[must_use]
     pub(crate) fn published(self, gauged: &mut Gauged) -> Self {
-        let Gauged { published, learned } = gauged;
+        let Gauged {
+            published,
+            named,
+            learned,
+        } = gauged;
         let unavailable_by_pair: BTreeMap<SitePair, ScoreUnavailable> = self
             .candidates
             .iter()
@@ -446,8 +450,13 @@ impl RouteSnapshot {
             })
             .collect();
         let mut current = BTreeSet::new();
+        let mut naming: BTreeSet<SiteModel> = BTreeSet::new();
         for (candidate, score) in self.candidates.iter().zip(&self.scores) {
             let key = (Arc::clone(&candidate.site), Arc::clone(&candidate.cluster));
+            // Only inference models name a `model`; a tool with the same name is not one.
+            if candidate.kind == CapabilityKind::InferenceModel {
+                naming.insert((Arc::clone(&key.0), Arc::clone(&key.1), Arc::clone(&candidate.name)));
+            }
             // The front entry for a pair is its best; later ones are other models.
             if current.insert(key.clone()) {
                 site_score(&key, *score);
@@ -463,6 +472,13 @@ impl RouteSnapshot {
                 }
             }
         }
+        for (site, cluster, model) in &naming {
+            candidate_info(site, cluster, model, 1.0);
+        }
+        for (site, cluster, model) in named.difference(&naming) {
+            candidate_info(site, cluster, model, 0.0);
+        }
+        *named = naming;
         for gone in published.difference(&current) {
             site_score(gone, f64::NAN);
             publish_score_unavailable(gone, |_| f64::NAN);
@@ -515,6 +531,8 @@ pub(crate) fn decisions_for(candidates: &[RouteCandidate]) -> Vec<SiteDecisions>
 
 /// A candidate's site and cluster, the labels of its score gauge.
 type SitePair = (Arc<str>, Arc<str>);
+/// A `(site, cluster, model)` triple: one inference model a site's cluster serves.
+type SiteModel = (Arc<str>, Arc<str>, Arc<str>);
 
 /// A candidate resolved against one consistent set of signal readings.
 struct ResolvedCandidate {
@@ -831,6 +849,8 @@ const RETURN_SAMPLES: u8 = 2;
 pub(crate) struct Gauged {
     /// `(site, cluster)` pairs with a published score.
     pub(crate) published: BTreeSet<SitePair>,
+    /// `(site, cluster, model)` triples with a published candidate info series.
+    pub(crate) named: BTreeSet<SiteModel>,
     /// Learned ceilings and smoothed saturation per site.
     pub(crate) learned: Learned,
 }
@@ -1330,6 +1350,19 @@ fn clear_measured(key: &SitePair) {
     for name in MEASURED_GAUGES {
         site_gauge(name, key, f64::NAN);
     }
+}
+
+/// `grid_route_candidate_info`: 1 while the snapshot lists `model` as a candidate at `cluster` on
+/// `site`, 0 once it no longer does. The 0 is a tombstone the exporter keeps until restart, so a
+/// join filters on `== 1`.
+fn candidate_info(site: &Arc<str>, cluster: &Arc<str>, model: &Arc<str>, value: f64) {
+    metrics::gauge!(
+        "grid_route_candidate_info",
+        "site" => Arc::clone(site),
+        "cluster" => Arc::clone(cluster),
+        "model" => Arc::clone(model)
+    )
+    .set(value);
 }
 
 /// Set a per-site gauge: a limit, the ceiling it is read against, or the weight.
@@ -2413,6 +2446,104 @@ mod tests {
         );
         let sites: BTreeSet<Arc<str>> = picks(&snapshot).into_iter().map(|(site, _)| site).collect();
         assert_eq!(sites.len(), 2, "both stay in the draw, as when nothing is published");
+    }
+
+    /// Each candidate's labels, keyed `site,cluster,model`, as the info gauge publishes them.
+    #[derive(Default)]
+    struct Named(std::sync::Mutex<BTreeMap<String, Arc<metrics::atomics::AtomicU64>>>);
+
+    impl Named {
+        fn get(&self, site: &str, cluster: &str, model: &str) -> Option<f64> {
+            self.0
+                .lock()
+                .unwrap()
+                .get(&format!("{site},{cluster},{model}"))
+                .map(|value| f64::from_bits(value.load(std::sync::atomic::Ordering::Relaxed)))
+        }
+    }
+
+    impl metrics::Recorder for Named {
+        fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn register_counter(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+
+        fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            if key.name() != "grid_route_candidate_info" {
+                return metrics::Gauge::noop();
+            }
+            let label = |name: &str| {
+                key.labels()
+                    .find(|label| label.key() == name)
+                    .map_or("", |label| label.value())
+                    .to_owned()
+            };
+            let name = format!("{},{},{}", label("site"), label("cluster"), label("model"));
+            metrics::Gauge::from_arc(Arc::clone(self.0.lock().unwrap().entry(name).or_default()))
+        }
+
+        fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn every_candidate_publishes_its_model_and_one_that_leaves_reads_zero() {
+        let recorder = Named::default();
+        metrics::with_local_recorder(&recorder, || {
+            let mut gauged = Gauged::new();
+            let tool = CandidateConfig {
+                kind: CapabilityKind::McpTool,
+                ..cand("llama", "north", "tools-north")
+            };
+            let candidates = validate_candidates(vec![
+                cand("llama", "east", "pool-east"),
+                cand("qwen", "east", "pool-east"),
+                cand("llama", "west", "pool-west"),
+                tool,
+            ])
+            .unwrap();
+            drop(RouteSnapshot::from_static(candidates, Arc::from("hub")).published(&mut gauged));
+            for (site, cluster, model) in [
+                ("east", "pool-east", "llama"),
+                ("east", "pool-east", "qwen"),
+                ("west", "pool-west", "llama"),
+            ] {
+                assert_eq!(
+                    recorder.get(site, cluster, model),
+                    Some(1.0),
+                    "{model} on {cluster} at {site}, including a second model on one cluster"
+                );
+            }
+            assert_eq!(
+                recorder.get("north", "tools-north", "llama"),
+                None,
+                "a tool sharing a model's name names no series"
+            );
+
+            let remaining = validate_candidates(vec![cand("llama", "east", "pool-east")]).unwrap();
+            drop(RouteSnapshot::from_static(remaining, Arc::from("hub")).published(&mut gauged));
+            assert_eq!(
+                recorder.get("east", "pool-east", "llama"),
+                Some(1.0),
+                "a kept candidate stays"
+            );
+            assert_eq!(
+                recorder.get("east", "pool-east", "qwen"),
+                Some(0.0),
+                "a model the cluster stopped serving reads zero"
+            );
+            assert_eq!(
+                recorder.get("west", "pool-west", "llama"),
+                Some(0.0),
+                "a site that left reads zero"
+            );
+        });
     }
 
     #[test]

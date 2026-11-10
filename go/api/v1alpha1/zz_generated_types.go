@@ -659,10 +659,18 @@ type GridNetworkConsumerGatewaysItem struct {
 	LocalSiteName *string `json:"localSiteName,omitempty"`
 }
 
+// GridNetworkMembershipSWIM SWIM seed peers used when mode is Swim.
+type GridNetworkMembershipSWIM struct {
+	// SWIM peer endpoints in host:port form. Literal IPv4, bracketed IPv6, and DNS hostnames are accepted.
+	Seeds []string `json:"seeds,omitempty"`
+}
+
 // GridNetworkMembership Grid-wide membership source. When absent, the install's startup setting applies. A change causes the operator to restart gracefully into the declared mode.
 type GridNetworkMembership struct {
 	// Membership source. Local requires signalTransport.mode: poll.
 	Mode GridNetworkMembershipMode `json:"mode"`
+	// SWIM seed peers used when mode is Swim.
+	SWIM *GridNetworkMembershipSWIM `json:"swim,omitempty"`
 }
 
 // GridNetworkPeerTrust Grid-wide peer trust: signals-path mode, pin when absent, read at operator start; signed state, read each reconcile.
@@ -703,16 +711,6 @@ type GridNetworkSignalTransport struct {
 	Mode SignalMode `json:"mode"`
 }
 
-// GridNetworkSWIM SWIM protocol configuration.
-type GridNetworkSWIM struct {
-	// Fanout for indirect probes.
-	GossipNodes *int64 `json:"gossipNodes,omitempty"`
-	// WAN probe interval (e.g. "5s").
-	ProbeInterval *string `json:"probeInterval,omitempty"`
-	// Suspicion timeout before declaring dead (e.g. "10s").
-	SuspicionTimeout *string `json:"suspicionTimeout,omitempty"`
-}
-
 // GridNetworkTLS TLS secret references for grid certificate management.
 type GridNetworkTLS struct {
 	// Secret storing the grid CA certificate and key.
@@ -726,7 +724,7 @@ type GridNetworkTLS struct {
 }
 
 // GridNetworkSpec Specification for a [GridNetwork].
-// Defines the grid's seed peers, gateway associations, SWIM tuning, and TLS secret references.
+// Defines the grid's gateway associations, membership, and TLS secret references.
 type GridNetworkSpec struct {
 	// Provider admission and pressure-recovery policy.
 	// When omitted, Grid preserves the historical instantaneous admission behaviour and providers without metrics remain eligible. Stabilized pressure transitions require an active metrics scoring strategy and a matching provider signal name. Without those, the observation is NotConfigured and the provider remains new_and_existing; the missingMetrics policy applies only after a configured signal is missing or stale.
@@ -758,8 +756,6 @@ type GridNetworkSpec struct {
 	// **Default (absent):** the noMetrics strategy is used.
 	// See [ScoringStrategy] for the available provider-level strategies.
 	ScoringPolicy *GridNetworkScoringPolicy `json:"scoringPolicy,omitempty"`
-	// Initial SWIM seed peer endpoints in host:port form. Literal IPv4, bracketed IPv6, and DNS hostnames are accepted.
-	Seeds []string `json:"seeds,omitempty"`
 	// Local request distribution policy for the active selection group.
 	// This is independent of scoring. When absent, the overlay carries no selection override and Praxis uses deterministic selection.
 	SelectionPolicy *GridNetworkSelectionPolicy `json:"selectionPolicy,omitempty"`
@@ -774,8 +770,6 @@ type GridNetworkSpec struct {
 	// **Minimum value:** 1 second. The generated CRD schema rejects 0. The controller still treats an internally observed 0 as absent defensively, avoiding accidental immediate eviction if malformed data is deserialized outside the Kubernetes API path.
 	// A conservative starting value for production is 3600 (one hour), which allows short failures to recover without overlay churn while still bounding accumulation of truly dead peers.
 	StaleCandidateTTLSeconds *int64 `json:"staleCandidateTtlSeconds,omitempty"`
-	// SWIM protocol configuration.
-	SWIM *GridNetworkSWIM `json:"swim,omitempty"`
 	// TLS secret references for grid certificate management.
 	TLS *GridNetworkTLS `json:"tls,omitempty"`
 	// Availability zone.

@@ -1,8 +1,6 @@
 {{- include "grid-operator.normalize" . }}
 {{- if include "grid-operator.networkPolicy.enabled" . }}
-{{- if not .Values.networkPolicy.metricsFrom }}
-{{- fail "networkPolicy.metricsFrom must name at least one peer; an empty list would admit every pod" }}
-{{- end }}
+{{- $metricsFrom := .Values.networkPolicy.metricsFrom | default (include "grid-operator.networkPolicy.openshiftMonitoring" . | fromYamlArray) }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -27,7 +25,7 @@ spec:
           protocol: TCP
         {{- end }}
     - from:
-        {{- toYaml .Values.networkPolicy.metricsFrom | nindent 8 }}
+        {{- toYaml $metricsFrom | nindent 8 }}
         # This release's helm test checks /readyz.
         - podSelector:
             matchLabels:

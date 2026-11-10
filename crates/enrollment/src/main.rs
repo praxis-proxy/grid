@@ -22,6 +22,20 @@ mod bootstrap;
 #[cfg(feature = "bootstrap")]
 mod invite;
 
+/// The namespace a one-shot command works in: the flag, else `pod_namespace`, the value
+/// of `POD_NAMESPACE`.
+///
+/// Refuses to guess, since a fallback to `default` would write the CA or invites where no
+/// reader looks.
+#[cfg(feature = "bootstrap")]
+fn work_namespace(flag: Option<&str>, pod_namespace: Option<String>) -> Result<String, String> {
+    flag.map(str::to_owned)
+        .or(pod_namespace)
+        .map(|namespace| namespace.trim().to_owned())
+        .filter(|namespace| !namespace.is_empty())
+        .ok_or_else(|| "no namespace: pass --namespace or set POD_NAMESPACE".to_owned())
+}
+
 /// How long in-flight requests are given to finish once a shutdown signal lands.
 /// Kept below the Kubernetes default 30s termination grace period, so the drain
 /// has margin before SIGKILL rather than racing it.
@@ -774,5 +788,24 @@ mod tests {
         ] {
             assert!(require_db_tls(url).is_ok(), "{url} fully verifies the server");
         }
+    }
+
+    #[cfg(feature = "bootstrap")]
+    #[test]
+    fn a_one_shot_command_needs_a_namespace() {
+        let namespace = |flag: Option<&str>, pod: Option<&str>| super::work_namespace(flag, pod.map(str::to_owned));
+        assert_eq!(namespace(Some(" grid-system "), None).as_deref(), Ok("grid-system"));
+        assert_eq!(namespace(None, Some(" grid-system ")).as_deref(), Ok("grid-system"));
+        assert_eq!(
+            namespace(Some("flagged"), Some("pod")).as_deref(),
+            Ok("flagged"),
+            "the flag wins over POD_NAMESPACE"
+        );
+        assert!(namespace(None, None).is_err(), "no flag and no POD_NAMESPACE");
+        assert!(namespace(Some(" "), None).is_err(), "a blank flag is not a namespace");
+        assert!(
+            namespace(None, Some(" ")).is_err(),
+            "a blank POD_NAMESPACE is not a namespace"
+        );
     }
 }

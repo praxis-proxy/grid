@@ -72,6 +72,34 @@ Fully qualified app name.
 {{- end }}
 
 {{/*
+ServiceAccount used by the gateway metrics listener for Kubernetes reviews.
+*/}}
+{{- define "praxis-gateway.metricsAuthSA" -}}
+{{- printf "%s-metrics-auth" (include "praxis-gateway.fullname" . | trunc 49 | trimSuffix "-") -}}
+{{- end }}
+
+{{/*
+ServiceAccount whose token Prometheus uses to scrape gateway metrics.
+*/}}
+{{- define "praxis-gateway.metricsScraperSA" -}}
+{{- printf "%s-metrics-scraper" (include "praxis-gateway.fullname" . | trunc 45 | trimSuffix "-") -}}
+{{- end }}
+
+{{/*
+ServiceAccount token Secret used by the metrics ServiceMonitor.
+*/}}
+{{- define "praxis-gateway.metricsTokenSecret" -}}
+{{- printf "%s-metrics-token" (include "praxis-gateway.fullname" . | trunc 45 | trimSuffix "-") -}}
+{{- end }}
+
+{{/*
+Namespaced Role authorizing the metrics scraper identity.
+*/}}
+{{- define "praxis-gateway.metricsScrapeRole" -}}
+{{- printf "%s-metrics-scrape" (include "praxis-gateway.fullname" . | trunc 45 | trimSuffix "-") -}}
+{{- end }}
+
+{{/*
 Chart label value: name-version.
 */}}
 {{- define "praxis-gateway.chart" -}}
@@ -159,6 +187,11 @@ Validate praxisConfig: the source, and that each source gets only the settings i
 {{- $validateCA := $auth.validateCA | default dict }}
 {{- $gridServing := $render.gridServing | default dict }}
 {{- $telemetry := $render.telemetry | default dict }}
+{{- $bodyLimits := $render.bodyLimits | default dict }}
+{{- $runtime := $render.runtime | default dict }}
+{{- if and $bodyLimits.maxBufferBytes (ne .Values.image.flavor "grid-gateway") }}
+{{- fail "praxisConfig.render.bodyLimits.maxBufferBytes needs image.flavor grid-gateway: the Praxis AI image predates body_limits.max_buffer_bytes and refuses the key" }}
+{{- end }}
 {{- if $telemetry.enabled }}
 {{- if ne .Values.image.flavor "grid-gateway" }}
 {{- fail "praxisConfig.render.telemetry.enabled needs image.flavor grid-gateway, whose Grid gateway build includes the OTLP and AI routing span features" }}
@@ -176,7 +209,7 @@ Validate praxisConfig: the source, and that each source gets only the settings i
 {{- fail (printf "praxisConfig.render.%s is set but praxisConfig.source is %s, which ignores it: set praxisConfig.source to render, or unset it" $key $source) }}
 {{- end }}
 {{- end }}
-{{- if or $render.backends $auth.mode $telemetry.enabled $provider $gridServing.enabled $gridServing.backendCAs $peerTrust.certDigests $auth.validateUrl $validateCA.configMapName $validateCA.secretName }}
+{{- if or $render.backends $auth.mode $telemetry.enabled $provider $gridServing.enabled $gridServing.backendCAs $peerTrust.certDigests $auth.validateUrl $validateCA.configMapName $validateCA.secretName $bodyLimits.maxRequestBytes $bodyLimits.maxResponseBytes $bodyLimits.maxBufferBytes $runtime.upstreamKeepalivePoolSize }}
 {{- fail (printf "praxisConfig.render settings are set but praxisConfig.source is %s, which ignores them: set praxisConfig.source to render, or unset them" $source) }}
 {{- end }}
 {{- end }}
@@ -471,7 +504,7 @@ Validate enabled mounts have a non-empty resource name.
 {{- fail "mount reconciliation requires the operator-generated consumer ConfigMap, not praxisConfig.source render" }}
 {{- end }}
 {{- if and (eq $source "byo") (not .Values.praxisConfig.byo.configMapName) }}
-{{- fail "praxisConfig.byo.configMapName must name consumerConfig.configMapName when mount reconciliation is enabled" }}
+{{- fail "praxisConfig.byo.configMapName must name the GridNetwork consumerGateways[].praxisConfig.configMapName when mount reconciliation is enabled" }}
 {{- end }}
 {{- if and (eq $source "byo") (ne .Values.praxisConfig.byo.key "praxis.yaml") }}
 {{- fail "praxisConfig.byo.key must be praxis.yaml when mount reconciliation is enabled" }}
@@ -773,9 +806,9 @@ RUST_LOG for the gateway and overlay-sync: log.filter when set, else log.level, 
 
 {{/*
 Resolve metricsListener.enabled and serviceMonitor.enabled to booleans. auto turns the
-listener on for the grid-gateway image on OpenShift with the NetworkPolicy on, and fills
-each unset value from the platform: a service serving cert, user workload monitoring, and
-the service CA. Off OpenShift no cert source exists by default, so auto stays off.
+listener on for the grid-gateway image when OpenShift can issue its serving cert or when
+the user supplies a TLS Secret. OpenShift fills unset TLS, NetworkPolicy, and ServiceMonitor
+CA values from the platform.
 */}}
 {{- define "praxis-gateway.resolveMetricsListener" -}}
 {{- $v := .Values }}
@@ -783,12 +816,13 @@ the service CA. Off OpenShift no cert source exists by default, so auto stays of
 {{- if eq (toString $m.enabled) "auto" }}
 {{- $openshift := include "praxis-gateway.openshift" . }}
 {{- $grid := eq $v.image.flavor "grid-gateway" }}
-{{- $on := and $grid $openshift $v.networkPolicy.enabled }}
+{{- $on := and $grid (or $openshift $m.existingSecret) }}
 {{- $_ := set $m "enabled" (not (empty $on)) }}
-{{- if and $grid $openshift (not $v.networkPolicy.enabled) }}
-{{- $_ := set $m "skipped" "networkPolicy.enabled is false" }}
+{{- if and $grid (not $on) }}
+{{- $_ := set $m "skipped" "no metrics TLS certificate source is configured" }}
 {{- end }}
 {{- if $m.enabled }}
+{{- $openshift := include "praxis-gateway.openshift" . }}
 {{- if not $m.existingSecret }}
 {{- $annotations := $m.service.annotations | default dict }}
 {{- /* The annotation names the Secret the platform creates, so the mount follows it. */}}
@@ -798,10 +832,10 @@ the service CA. Off OpenShift no cert source exists by default, so auto stays of
 {{- $_ := set $annotations "service.beta.openshift.io/serving-cert-secret-name" $secret }}
 {{- $_ := set $m.service "annotations" $annotations }}
 {{- end }}
-{{- if not $m.fromNamespaces }}
+{{- if and $openshift (not $m.fromNamespaces) }}
 {{- $_ := set $m "fromNamespaces" (list "openshift-user-workload-monitoring") }}
 {{- end }}
-{{- if not $m.serviceMonitor.caConfigMap.name }}
+{{- if and $openshift (not $m.serviceMonitor.caConfigMap.name) }}
 {{- $_ := set $m.serviceMonitor "caConfigMap" (dict "name" "openshift-service-ca.crt" "key" "service-ca.crt") }}
 {{- end }}
 {{- end }}
@@ -817,8 +851,9 @@ the service CA. Off OpenShift no cert source exists by default, so auto stays of
 {{- end }}
 
 {{/*
-The metrics listener needs the grid-gateway image, a cert, and the NetworkPolicy that
-limits its port; without the policy any pod could scrape it.
+The metrics listener needs the grid-gateway image and a serving certificate. Kubernetes
+TokenReview and SubjectAccessReview authorize each scrape. NetworkPolicy is recommended to
+limit which pods can trigger those API reviews.
 */}}
 {{- define "praxis-gateway.validateMetricsListener" -}}
 {{- $m := .Values.metricsListener }}
@@ -829,11 +864,10 @@ limits its port; without the policy any pod could scrape it.
 {{- if not $m.existingSecret }}
 {{- fail "metricsListener.existingSecret is required: the listener serves TLS only" }}
 {{- end }}
-{{- if not .Values.networkPolicy.enabled }}
-{{- fail "metricsListener needs networkPolicy.enabled, which limits the metrics port to metricsListener.fromNamespaces" }}
-{{- end }}
 {{- if not $m.fromNamespaces }}
+{{- if .Values.networkPolicy.enabled }}
 {{- fail "metricsListener.fromNamespaces needs at least one namespace" }}
+{{- end }}
 {{- end }}
 {{- $taken := list (int .Values.port.containerPort) }}
 {{- if and .Values.overlay.configMapName .Values.overlay.sidecar.enabled }}{{ $taken = append $taken 9091 }}{{ end }}

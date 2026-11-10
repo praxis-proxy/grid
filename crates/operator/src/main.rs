@@ -324,6 +324,7 @@ async fn main() {
             .with_membership(config.grid.membership)
             .with_membership_fallback(install_modes.membership)
             .with_scrape_interval(config.signals.scrape_interval())
+            .with_site_signals_ttl(config.signals.site_ttl())
             .hold_membership(),
     );
     // This site's providers first, then what its peers publish, on /metrics.
@@ -344,6 +345,7 @@ async fn main() {
     let writer_site_name = ctx.site_name().map(str::to_owned);
     // Every mode scrapes for readiness; only Poll mode publishes what it scrapes.
     let writer_scrape_interval = config.signals.scrape_interval();
+    let writer_discovery = model_discovery_config(&config.model_discovery);
     let (gateway_address_tx, gateway_address_rx) =
         tokio::sync::watch::channel(gateway::configured_address(&config.gateway));
     let (swim_handle_tx, swim_handle_rx) = tokio::sync::watch::channel(None);
@@ -367,7 +369,7 @@ async fn main() {
             run_provider_controller(writer_client.clone(), writer_site_name),
             run_agent_tool_provider_controller(writer_client.clone()),
             run_local_scraper(writer_scrape_interval, Arc::clone(&writer_ctx), writer_client.clone()),
-            run_model_discovery(writer_ctx, writer_client.clone()),
+            run_model_discovery(writer_discovery, writer_ctx, writer_client.clone()),
             run_grid_network_rollup_watch(writer_client.clone()),
         )
         .map(|_joined| ())
@@ -937,6 +939,7 @@ async fn maybe_start_swim(
         } else {
             swim_runtime::Departed::Evict
         },
+        dead_member_ttl: cli.swim.dead_member_ttl(),
     };
     match swim_runtime::start(cfg).await {
         Ok(handle) => {
@@ -3460,10 +3463,10 @@ async fn run_local_scraper(
 ///
 /// Separate from reconcile: a served set must expire on its own cadence.
 async fn run_model_discovery(
+    config: served_models::DiscoveryConfig,
     ctx: Arc<OperatorCtx>,
     client: Client,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let config = model_discovery_config();
     tracing::info!(
         interval_secs = config.interval.as_secs(),
         ttl_secs = config.ttl.as_secs(),
@@ -3493,29 +3496,28 @@ const MAX_MODEL_DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::f
 /// Maximum time allowed for one model-discovery request.
 const MAX_MODEL_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-/// Discovery cadence from `GRID_MODEL_DISCOVERY_*`.
+/// Discovery cadence from `--model-discovery-*`.
 ///
 /// Interval and timeout are bounded; the TTL covers both and is capped at one
 /// year.
-fn model_discovery_config() -> served_models::DiscoveryConfig {
-    let defaults = served_models::DiscoveryConfig::default();
+fn model_discovery_config(args: &operator::cli::ModelDiscoveryArgs) -> served_models::DiscoveryConfig {
     let interval = bounded_discovery_duration(
         "GRID_MODEL_DISCOVERY_INTERVAL_SECS",
-        defaults.interval,
+        args.interval_secs,
         MAX_MODEL_DISCOVERY_INTERVAL,
     );
     let timeout = bounded_discovery_duration(
         "GRID_MODEL_DISCOVERY_TIMEOUT_SECS",
-        defaults.timeout,
+        args.timeout_secs,
         MAX_MODEL_DISCOVERY_TIMEOUT,
     );
-    let ttl = bounded_model_discovery_ttl(interval, timeout, defaults.ttl);
+    let ttl = bounded_model_discovery_ttl(interval, timeout, args.ttl_secs);
 
     served_models::DiscoveryConfig {
         interval,
         timeout,
         ttl,
-        concurrency: parse_env_or("GRID_MODEL_DISCOVERY_CONCURRENCY", defaults.concurrency),
+        concurrency: args.concurrency,
     }
 }
 
@@ -3523,10 +3525,9 @@ fn model_discovery_config() -> served_models::DiscoveryConfig {
 fn bounded_model_discovery_ttl(
     interval: std::time::Duration,
     timeout: std::time::Duration,
-    default: std::time::Duration,
+    requested_secs: u64,
 ) -> std::time::Duration {
-    let requested_ttl =
-        std::time::Duration::from_secs(parse_env_or("GRID_MODEL_DISCOVERY_TTL_SECS", default.as_secs()).max(1));
+    let requested_ttl = std::time::Duration::from_secs(requested_secs.max(1));
     let minimum_ttl = minimum_model_discovery_ttl(interval, timeout);
     let unclamped_ttl = requested_ttl.max(minimum_ttl);
     let ttl = unclamped_ttl.min(MAX_MODEL_DISCOVERY_TTL);
@@ -3551,13 +3552,9 @@ fn minimum_model_discovery_ttl(interval: std::time::Duration, timeout: std::time
         ))
 }
 
-/// Parse one discovery duration, enforcing a positive value and maximum.
-fn bounded_discovery_duration(
-    name: &str,
-    default: std::time::Duration,
-    maximum: std::time::Duration,
-) -> std::time::Duration {
-    let requested = std::time::Duration::from_secs(parse_env_or(name, default.as_secs()).max(1));
+/// One discovery duration, at least a second and at most `maximum`.
+fn bounded_discovery_duration(name: &str, requested_secs: u64, maximum: std::time::Duration) -> std::time::Duration {
+    let requested = std::time::Duration::from_secs(requested_secs.max(1));
     if requested > maximum {
         tracing::warn!(
             setting = name,
@@ -3567,14 +3564,6 @@ fn bounded_discovery_duration(
         );
     }
     requested.min(maximum)
-}
-
-/// Parse an environment variable, using `default` when it is absent or invalid.
-fn parse_env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
 }
 
 /// Poll every alive peer's signals endpoint on a coarse interval, fail closed.
@@ -5742,6 +5731,7 @@ mod tests {
         let (sources, peers) = (SourceSlots::new(1, 1), PeerSlots::new(1, 8));
         let (addr, server) = mesh.serve(mesh.west_is_local(), ok_app(), (&sources, &peers), 1).await;
         let mut conn = mesh.connect(addr).await;
+        let requested = tokio::time::Instant::now();
         let head = get(&mut conn).await;
         assert!(head.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&head));
         assert_eq!(
@@ -5749,13 +5739,14 @@ mod tests {
             0,
             "an authenticated connection holds no source slot"
         );
-        // Real time for the handshake, virtual time for the idle wait.
         tokio::time::pause();
-        let idle = tokio::time::Instant::now();
         let mut rest = Vec::new();
         let closed = tokio::time::timeout(SIGNALS_HEADER_READ_TIMEOUT * 2, conn.read_to_end(&mut rest)).await;
         assert!(closed.is_ok(), "the server kept an idle connection open");
-        assert!(idle.elapsed() >= SIGNALS_HEADER_READ_TIMEOUT, "held until the bound");
+        assert!(
+            requested.elapsed() >= SIGNALS_HEADER_READ_TIMEOUT,
+            "held until the header-read bound after the request started"
+        );
         server.await.expect("server task");
     }
 

@@ -16,16 +16,19 @@ rust-version = "1.96"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-praxis-proxy = "0.7.5"
-praxis-core = { version = "0.7.5", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.7.5", package = "praxis-proxy-filter" }
-praxis-protocol = { version = "0.7.5", package = "praxis-proxy-protocol" }
-praxis-tls = { version = "0.7.5", package = "praxis-proxy-tls" }
+praxis-proxy = { version = "0.8.0", default-features = false }
+praxis-core = { version = "0.8.0", package = "praxis-proxy-core", default-features = false }
+praxis-filter = { version = "0.8.0", package = "praxis-proxy-filter", default-features = false }
+praxis-protocol = { version = "0.8.0", package = "praxis-proxy-protocol", default-features = false }
+praxis-tls = { version = "0.8.0", package = "praxis-proxy-tls", default-features = false }
 httpdate = "1.0.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { version = "0.10.7", package = "yaml_serde" }
+serde_json = "1.0.151"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
 metrics = "0.24.6"
 time = "0.3.0"
+openssl = "0.10.0"
 
 [workspace.lints.rust]
 dead_code = "deny"
@@ -327,15 +330,28 @@ publish = false
 name = "grid-gateway"
 path = "src/main.rs"
 
+[features]
+default = ["policy-builtins"]
+policy-builtins = ["praxis-proxy/policy-builtins"]
+# Disable defaults when selecting a FIPS backend.
+fips = ["praxis-proxy/policy-api-key-fips"]
+policy-jwt-fips = ["praxis-proxy/policy-jwt-fips"]
+
 [dependencies]
 version = { path = "../version" }
-praxis-proxy = { workspace = true, features = ["otel", "spiffe"] }
+praxis-proxy = { workspace = true, features = [
+  "pingora",
+  "config-reload",
+  "admin-api",
+  "otel",
+  "spiffe",
+] }
 praxis-filter.workspace = true
 praxis-core.workspace = true
 opentelemetry-otlp = { version = "0.33.0", default-features = false, features = [
   "tls-provider-agnostic",
 ] }
-praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.8.0", default-features = false, features = [
+praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "4a6749f7f7be2c3a446fc9e58216c98659e66188", default-features = false, features = [
   "opentelemetry",
 ] }
 ai-grid-filters = { path = "crates/ai-grid-filters" }
@@ -347,6 +363,10 @@ tokio-rustls = { version = "0.26.5", default-features = false, features = ["logg
 httparse = "1.10.1"
 serde.workspace = true
 serde_yaml.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+metrics = { workspace = true }
+openssl.workspace = true
 
 [dev-dependencies]
 # The reload test runs a real mTLS signals peer against the binary.
@@ -354,8 +374,6 @@ certs = { path = "../certs", default-features = false, features = ["verifier"] }
 httpdate = { workspace = true }
 rustls = { version = "0.23.46", features = ["ring"] }
 tokio = { version = "1.53.1", features = ["macros"] }
-# The help-text test emits one sample per documented metric.
-metrics = { workspace = true }
 
 # machete can't see these: used as `praxis` / `praxis_core` / `praxis_filter`, not their package names.
 [package.metadata.cargo-machete]

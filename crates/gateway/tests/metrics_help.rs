@@ -7,7 +7,7 @@
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     /// Names `describe_metrics` documents, which a scrape must explain.
-    const DOCUMENTED: [&str; 41] = [
+    const DOCUMENTED: [&str; 42] = [
         "grid_route_decisions_total",
         "grid_route_fenced_total",
         "grid_route_selections_total",
@@ -42,6 +42,7 @@ mod tests {
         "grid_route_site_score",
         "grid_route_site_score_unavailable",
         "grid_route_shedding",
+        "grid_route_candidate_info",
         "grid_signals_poll_total",
         "grid_signals_ingest_dropped_total",
         "grid_signals_feedback_failures_total",
@@ -98,6 +99,8 @@ mod tests {
         )
         .set(1.0);
         metrics::gauge!("grid_route_shedding", "model" => "llama").set(0.0);
+        metrics::gauge!("grid_route_candidate_info", "site" => "east", "cluster" => "pool-east", "model" => "llama")
+            .set(1.0);
         metrics::counter!("grid_signals_poll_total", "result" => "ok").increment(1);
         metrics::counter!("grid_signals_ingest_dropped_total", "reason" => "skew").increment(1);
         metrics::counter!("grid_signals_feedback_failures_total", "reason" => "status").increment(1);

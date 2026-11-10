@@ -113,6 +113,9 @@ pub struct SwimConfig {
 
     /// What a departed site's gossiped state does once its member record expires.
     pub departed: Departed,
+
+    /// How long a dead member stays tracked before it is evicted.
+    pub dead_member_ttl: Duration,
 }
 
 /// What a departed site's gossiped state does once its member record expires.
@@ -272,6 +275,7 @@ impl std::fmt::Debug for SwimConfig {
             .field("revision_lease", &self.revision_lease)
             .field("revision_renewer", &self.revision_renewer.is_some())
             .field("departed", &self.departed)
+            .field("dead_member_ttl", &self.dead_member_ttl)
             .finish()
     }
 }
@@ -657,7 +661,7 @@ const STATE_REPUBLISH_INTERVAL: Duration = Duration::from_secs(30);
 /// 300 seconds = 10 * foca's WAN `suspect_to_down_after` (30 s), giving
 /// ample time for the full Alive -> Suspect -> Dead lifecycle and peer
 /// convergence before cleanup.  Override with `GRID_SWIM_DEAD_MEMBER_TTL_SECS`.
-const DEFAULT_DEAD_MEMBER_TTL_SECS: u64 = 300;
+pub const DEFAULT_DEAD_MEMBER_TTL: Duration = Duration::from_secs(300);
 /// Maximum membership records retained by the operator-side mirror.
 const MAX_TRACKED_MEMBERS: usize = 1_024;
 /// Maximum dead records retained inside the total member bound.
@@ -1022,7 +1026,8 @@ pub struct SwimHandle {
 
     /// Address this runtime advertises to SWIM peers.
     ///
-    /// Callers may use this to filter the local address from `spec.seeds`
+    /// Callers may use this to filter the local address from
+    /// `GridNetwork.spec.membership.swim.seeds`
     /// before calling [`SwimHandle::announce_seeds`].
     advertise_addr: SocketAddr,
 
@@ -1139,7 +1144,8 @@ impl SwimHandle {
 
     /// Return the address this runtime advertises to SWIM peers.
     ///
-    /// Use this to filter the local address from `spec.seeds` before
+    /// Use this to filter the local address from
+    /// `GridNetwork.spec.membership.swim.seeds` before
     /// calling [`SwimHandle::announce_seeds`]; announcing to self is harmless but
     /// generates unnecessary noise.
     #[must_use]
@@ -1758,12 +1764,7 @@ async fn run_loop(
     let mut pending_withdrawals = PendingWithdrawals::new();
     let mut trust = GridTrust::default();
     let mut next_state_republish_at = Instant::now() + STATE_REPUBLISH_INTERVAL;
-    let dead_member_ttl = Duration::from_secs(
-        std::env::var("GRID_SWIM_DEAD_MEMBER_TTL_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_DEAD_MEMBER_TTL_SECS),
-    );
+    let dead_member_ttl = config.dead_member_ttl;
 
     publish_address_broadcast(
         &mut node,
@@ -2991,6 +2992,7 @@ mod tests {
             revision_lease: test_revision_lease(seed),
             revision_renewer: None,
             departed: Departed::Evict,
+            dead_member_ttl: DEFAULT_DEAD_MEMBER_TTL,
         }
     }
 
@@ -4083,6 +4085,7 @@ mod tests {
             revision_lease: test_revision_lease(1),
             revision_renewer: None,
             departed: Departed::Evict,
+            dead_member_ttl: DEFAULT_DEAD_MEMBER_TTL,
         };
         let handle = start(cfg).await;
         assert!(handle.is_ok(), "start must succeed with an available port");
@@ -4109,6 +4112,7 @@ mod tests {
             revision_lease: test_revision_lease(20_000),
             revision_renewer: None,
             departed: Departed::Evict,
+            dead_member_ttl: DEFAULT_DEAD_MEMBER_TTL,
         };
         let result = start(cfg).await;
         assert!(result.is_err(), "start on an already-bound port must fail");
@@ -4132,6 +4136,7 @@ mod tests {
             revision_lease: test_revision_lease(40_000),
             revision_renewer: None,
             departed: Departed::Evict,
+            dead_member_ttl: DEFAULT_DEAD_MEMBER_TTL,
         };
         let handle1 = start(cfg1).await.unwrap_or_else(|_| std::process::abort());
 
@@ -4146,6 +4151,7 @@ mod tests {
             revision_lease: test_revision_lease(60_000),
             revision_renewer: None,
             departed: Departed::Evict,
+            dead_member_ttl: DEFAULT_DEAD_MEMBER_TTL,
         };
         let handle2 = start(cfg2).await.unwrap_or_else(|_| std::process::abort());
 
