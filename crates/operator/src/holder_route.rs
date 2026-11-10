@@ -275,10 +275,14 @@ impl HolderRoutes {
                 return;
             },
         };
-        let (uid, version) = match legacy_endpoints(service, &live, &self.namespace) {
+        let identity = match legacy_endpoints(service, &live, &self.namespace) {
             Ok(identity) => identity,
             Err(why) => {
-                self.warn_bounded(&name, "Endpoints object on a holder Service left alone", why);
+                self.warn_bounded(
+                    &name,
+                    "Endpoints object on a holder Service left alone",
+                    &why.to_string(),
+                );
                 return;
             },
         };
@@ -287,8 +291,8 @@ impl HolderRoutes {
         }
         let params = DeleteParams {
             preconditions: Some(Preconditions {
-                uid: Some(uid),
-                resource_version: Some(version),
+                uid: Some(identity.uid),
+                resource_version: Some(identity.resource_version),
             }),
             ..DeleteParams::default()
         };
@@ -439,19 +443,60 @@ fn same(live: &EndpointSlice, desired: &EndpointSlice) -> bool {
         && live.metadata.labels == desired.metadata.labels
 }
 
-/// The uid and resourceVersion of `live`, when it has the shape the endpoints controller leaves
-/// on `service` once the selector goes: unowned; the skip-mirror label not at `"true"`, the one
-/// value that keeps the mirroring controller away; every ready or not-ready address a named Pod
-/// in `namespace`; every subset with addresses carrying ports whose names and protocols are the
+/// Why a v1 `Endpoints` object on a holder Service is left alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+enum NotLegacy {
+    /// Still written by the endpoints controller.
+    #[error("the Service has a selector, so the endpoints controller still manages the object")]
+    ServiceHasSelector,
+    /// Carries an owner reference.
+    #[error("the object has an owner")]
+    Owned,
+    /// Excluded from `EndpointSlice` mirroring by its label.
+    #[error("the object is labelled skip-mirror, so the mirroring controller leaves it alone")]
+    SkipMirror,
+    /// Missing the uid or resourceVersion required by legacy cleanup.
+    #[error("the object has no uid or resourceVersion to precondition a delete on")]
+    NoIdentity,
+    /// An address without a `targetRef`.
+    #[error("an address names no object")]
+    AddressWithoutTarget,
+    /// An address that is not a named Pod here.
+    #[error("an address names something other than a named Pod in the operator's namespace")]
+    AddressNotLocalPod,
+    /// Addresses that serve no port.
+    #[error("a subset lists addresses but no ports")]
+    SubsetWithoutPorts,
+    /// A port the Service does not carry.
+    #[error("a port is none of the Service's")]
+    ForeignPort,
+    /// Nothing stale is routed.
+    #[error("the object lists no addresses, so nothing stale is routed")]
+    NoAddresses,
+}
+
+/// What a delete of a legacy `Endpoints` object is preconditioned on.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LegacyIdentity {
+    /// The object's resourceVersion as read.
+    resource_version: String,
+    /// The object's uid.
+    uid: String,
+}
+
+/// The identity of `live`, when it has the shape the endpoints controller leaves on `service`
+/// once the selector goes: unowned; the skip-mirror label not at `"true"`, the one value that
+/// keeps the mirroring controller away; every ready or not-ready address a named Pod in
+/// `namespace`; every subset with addresses carrying ports whose names and protocols are the
 /// Service's, their numbers uncompared, since the target port may have moved since the object was
 /// written. Otherwise why it is left alone. A shape, not proof of who wrote the object.
-fn legacy_endpoints(service: &Service, live: &Endpoints, namespace: &str) -> Result<(String, String), &'static str> {
+fn legacy_endpoints(service: &Service, live: &Endpoints, namespace: &str) -> Result<LegacyIdentity, NotLegacy> {
     let spec = service.spec.as_ref();
     if spec
         .and_then(|spec| spec.selector.as_ref())
         .is_some_and(|selector| !selector.is_empty())
     {
-        return Err("the Service has a selector, so the endpoints controller still manages the object");
+        return Err(NotLegacy::ServiceHasSelector);
     }
     let metadata = &live.metadata;
     if metadata
@@ -459,7 +504,7 @@ fn legacy_endpoints(service: &Service, live: &Endpoints, namespace: &str) -> Res
         .as_ref()
         .is_some_and(|owners| !owners.is_empty())
     {
-        return Err("the object has an owner");
+        return Err(NotLegacy::Owned);
     }
     if metadata
         .labels
@@ -467,13 +512,13 @@ fn legacy_endpoints(service: &Service, live: &Endpoints, namespace: &str) -> Res
         .and_then(|labels| labels.get(SKIP_MIRROR))
         .is_some_and(|value| value == "true")
     {
-        return Err("the object is labelled skip-mirror, so the mirroring controller leaves it alone");
+        return Err(NotLegacy::SkipMirror);
     }
     let (Some(uid), Some(version)) = (
         metadata.uid.clone().filter(|uid| !uid.is_empty()),
         metadata.resource_version.clone().filter(|version| !version.is_empty()),
     ) else {
-        return Err("the object has no uid or resourceVersion to precondition a delete on");
+        return Err(NotLegacy::NoIdentity);
     };
     let service_ports: Vec<(Option<&str>, &str)> = spec
         .and_then(|spec| spec.ports.as_ref())
@@ -493,29 +538,32 @@ fn legacy_endpoints(service: &Service, live: &Endpoints, namespace: &str) -> Res
             any_address = true;
             subset_addresses = true;
             let Some(target) = address.target_ref.as_ref() else {
-                return Err("an address names no object");
+                return Err(NotLegacy::AddressWithoutTarget);
             };
             if target.kind.as_deref() != Some("Pod")
                 || target.name.as_deref().is_none_or(str::is_empty)
                 || target.namespace.as_deref().is_some_and(|other| other != namespace)
             {
-                return Err("an address names something other than a named Pod in the operator's namespace");
+                return Err(NotLegacy::AddressNotLocalPod);
             }
         }
         if subset_addresses && subset.ports.as_ref().is_none_or(Vec::is_empty) {
-            return Err("a subset lists addresses but no ports");
+            return Err(NotLegacy::SubsetWithoutPorts);
         }
         for port in subset.ports.iter().flatten() {
             let key = (port.name.as_deref(), port.protocol.as_deref().unwrap_or("TCP"));
             if !service_ports.contains(&key) {
-                return Err("a port is none of the Service's");
+                return Err(NotLegacy::ForeignPort);
             }
         }
     }
     if !any_address {
-        return Err("the object lists no addresses, so nothing stale is routed");
+        return Err(NotLegacy::NoAddresses);
     }
-    Ok((uid, version))
+    Ok(LegacyIdentity {
+        resource_version: version,
+        uid,
+    })
 }
 
 #[cfg(test)]
@@ -530,7 +578,7 @@ mod tests {
 
     use k8s_openapi::api::discovery::v1::EndpointSlice;
 
-    use super::{HolderRoutes, Me, slice_name};
+    use super::{HolderRoutes, LegacyIdentity, Me, NotLegacy, slice_name};
 
     /// An apiserver holding objects by path, refusing a stale `PUT` with 409, listing a
     /// collection by label and deleting by name, an `Endpoints` object only with matching
@@ -1077,7 +1125,11 @@ mod tests {
         objects.insert(LEGACY_PATH, legacy_object(&owned, &legacy_subsets("grid")));
         route(&routes(&objects, "10.0.0.1", "a")).await;
         assert!(objects.has(LEGACY_PATH), "an owned object is somebody's");
-        assert_eq!(addresses(&objects), vec!["10.0.0.1".to_owned()]);
+        assert_eq!(
+            addresses(&objects),
+            vec!["10.0.0.1".to_owned()],
+            "leaving an owned Endpoints object alone does not stop holder routing"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1167,7 +1219,10 @@ mod tests {
             })
             .await,
         );
-        assert!(!objects.has(LEGACY_PATH));
+        assert!(
+            !objects.has(LEGACY_PATH),
+            "a stale delete is retried with a fresh version on a later recheck"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1270,7 +1325,10 @@ mod tests {
             tokio::join!(routing, withdrawn)
         })
         .await?;
-        assert!(objects.has(LEGACY_PATH));
+        assert!(
+            objects.has(LEGACY_PATH),
+            "withdrawal prevents timed-out cleanup from resuming or running again"
+        );
         Ok(())
     }
 
@@ -1278,7 +1336,11 @@ mod tests {
     fn the_shape_selector_based_routing_leaves_is_recognised() -> Result<(), serde_json::Error> {
         assert_eq!(
             judged(&serde_json::json!({}), &legacy_subsets("grid"))?,
-            Ok(("ep-uid".to_owned(), "7".to_owned()))
+            Ok(LegacyIdentity {
+                resource_version: "7".to_owned(),
+                uid: "ep-uid".to_owned(),
+            }),
+            "an unowned object naming a local Pod on the Service's port is the legacy shape"
         );
         Ok(())
     }
@@ -1287,7 +1349,8 @@ mod tests {
     fn an_endpoints_object_without_addresses_is_not_legacy() -> Result<(), serde_json::Error> {
         assert_eq!(
             judged(&serde_json::json!({}), &serde_json::json!([]))?,
-            Err("the object lists no addresses, so nothing stale is routed")
+            Err(NotLegacy::NoAddresses),
+            "an object without addresses routes nothing stale, so it is left alone"
         );
         Ok(())
     }
@@ -1297,7 +1360,8 @@ mod tests {
         let labelled = serde_json::json!({"labels": {"endpointslice.kubernetes.io/skip-mirror": "true"}});
         assert_eq!(
             judged(&labelled, &legacy_subsets("grid"))?,
-            Err("the object is labelled skip-mirror, so the mirroring controller leaves it alone")
+            Err(NotLegacy::SkipMirror),
+            "skip-mirror at true means the mirroring controller never mirrors it"
         );
         Ok(())
     }
@@ -1307,7 +1371,11 @@ mod tests {
         let labelled = serde_json::json!({"labels": {"endpointslice.kubernetes.io/skip-mirror": "false"}});
         assert_eq!(
             judged(&labelled, &legacy_subsets("grid"))?,
-            Ok(("ep-uid".to_owned(), "7".to_owned()))
+            Ok(LegacyIdentity {
+                resource_version: "7".to_owned(),
+                uid: "ep-uid".to_owned(),
+            }),
+            "only the value true keeps the mirroring controller away"
         );
         Ok(())
     }
@@ -1320,7 +1388,8 @@ mod tests {
         }]);
         assert_eq!(
             judged(&serde_json::json!({}), &subsets)?,
-            Err("a port is none of the Service's")
+            Err(NotLegacy::ForeignPort),
+            "a port the Service does not carry is not this Service's traffic"
         );
         Ok(())
     }
@@ -1333,7 +1402,8 @@ mod tests {
         }]);
         assert_eq!(
             judged(&serde_json::json!({}), &subsets)?,
-            Err("an address names something other than a named Pod in the operator's namespace")
+            Err(NotLegacy::AddressNotLocalPod),
+            "a Pod reference without a name is not a recognised target"
         );
         Ok(())
     }
@@ -1345,7 +1415,8 @@ mod tests {
         }]);
         assert_eq!(
             judged(&serde_json::json!({}), &subsets)?,
-            Err("a subset lists addresses but no ports")
+            Err(NotLegacy::SubsetWithoutPorts),
+            "addresses without ports are not the shape selector-based routing leaves"
         );
         Ok(())
     }
@@ -1354,7 +1425,8 @@ mod tests {
     fn a_missing_version_blocks_the_delete_precondition() -> Result<(), serde_json::Error> {
         assert_eq!(
             judged(&serde_json::json!({"resourceVersion": ""}), &legacy_subsets("grid"))?,
-            Err("the object has no uid or resourceVersion to precondition a delete on")
+            Err(NotLegacy::NoIdentity),
+            "legacy cleanup requires a nonempty resourceVersion to reject stale reads"
         );
         Ok(())
     }
@@ -1404,7 +1476,7 @@ mod tests {
     fn judged(
         extra: &serde_json::Value,
         subsets: &serde_json::Value,
-    ) -> Result<Result<(String, String), &'static str>, serde_json::Error> {
+    ) -> Result<Result<LegacyIdentity, NotLegacy>, serde_json::Error> {
         let live: k8s_openapi::api::core::v1::Endpoints = serde_json::from_value(legacy_object(extra, subsets))?;
         Ok(super::legacy_endpoints(&service_without_selector()?, &live, "grid"))
     }
