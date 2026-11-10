@@ -1957,7 +1957,7 @@ pub(crate) mod tests {
         assert_eq!(
             filter.request_body_mode(),
             BodyMode::StreamBuffer { max_bytes: None },
-            "the one request size limit is praxis's body_limits.max_request_bytes"
+            "praxis's body_limits clamp the buffer, not the filter"
         );
     }
 

@@ -1,10 +1,12 @@
 suite: gateway body limits
 templates:
   - templates/gateway-config.yaml
+  - templates/deployment.yaml
 tests:
   - it: renders body_limits from the set ceilings only
     template: templates/gateway-config.yaml
     set:
+      image.flavor: grid-gateway
       praxisConfig.source: render
       grid.siteName: edge
       praxisConfig.render.model: test-model
@@ -40,3 +42,30 @@ tests:
       - notMatchRegex:
           path: data["praxis.yaml"]
           pattern: 'body_limits'
+
+  - it: refuses a buffer cap on the Praxis AI image, which predates the key
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.source: render
+      grid.siteName: edge
+      praxisConfig.render.model: test-model
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.backends:
+        site-a:
+          endpoint: 203.0.113.20:8080
+          transport:
+            mode: plaintext
+      praxisConfig.render.bodyLimits.maxBufferBytes: 67108864
+    asserts:
+      - failedTemplate:
+          errorPattern: "maxBufferBytes needs image.flavor grid-gateway"
+
+  - it: refuses body limits a byo config never reads
+    template: templates/deployment.yaml
+    set:
+      praxisConfig.source: byo
+      praxisConfig.byo.configMapName: my-praxis
+      praxisConfig.render.bodyLimits.maxRequestBytes: 52428800
+    asserts:
+      - failedTemplate:
+          errorPattern: "praxisConfig.render settings are set but praxisConfig.source is byo"

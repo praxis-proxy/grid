@@ -187,6 +187,11 @@ Validate praxisConfig: the source, and that each source gets only the settings i
 {{- $validateCA := $auth.validateCA | default dict }}
 {{- $gridServing := $render.gridServing | default dict }}
 {{- $telemetry := $render.telemetry | default dict }}
+{{- $bodyLimits := $render.bodyLimits | default dict }}
+{{- $runtime := $render.runtime | default dict }}
+{{- if and $bodyLimits.maxBufferBytes (ne .Values.image.flavor "grid-gateway") }}
+{{- fail "praxisConfig.render.bodyLimits.maxBufferBytes needs image.flavor grid-gateway: the Praxis AI image predates body_limits.max_buffer_bytes and refuses the key" }}
+{{- end }}
 {{- if $telemetry.enabled }}
 {{- if ne .Values.image.flavor "grid-gateway" }}
 {{- fail "praxisConfig.render.telemetry.enabled needs image.flavor grid-gateway, whose Grid gateway build includes the OTLP and AI routing span features" }}
@@ -204,7 +209,7 @@ Validate praxisConfig: the source, and that each source gets only the settings i
 {{- fail (printf "praxisConfig.render.%s is set but praxisConfig.source is %s, which ignores it: set praxisConfig.source to render, or unset it" $key $source) }}
 {{- end }}
 {{- end }}
-{{- if or $render.backends $auth.mode $telemetry.enabled $provider $gridServing.enabled $gridServing.backendCAs $peerTrust.certDigests $auth.validateUrl $validateCA.configMapName $validateCA.secretName }}
+{{- if or $render.backends $auth.mode $telemetry.enabled $provider $gridServing.enabled $gridServing.backendCAs $peerTrust.certDigests $auth.validateUrl $validateCA.configMapName $validateCA.secretName $bodyLimits.maxRequestBytes $bodyLimits.maxResponseBytes $bodyLimits.maxBufferBytes $runtime.upstreamKeepalivePoolSize }}
 {{- fail (printf "praxisConfig.render settings are set but praxisConfig.source is %s, which ignores them: set praxisConfig.source to render, or unset them" $source) }}
 {{- end }}
 {{- end }}

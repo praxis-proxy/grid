@@ -264,7 +264,7 @@
                 "maxRequestBytes": {
                   "type": ["integer", "null"],
                   "minimum": 1,
-                  "description": "Request body ceiling; the one request size limit on a grid gateway."
+                  "description": "Request body ceiling; with gridServing the request limit is the smaller of this and maxBufferBytes."
                 },
                 "maxResponseBytes": {
                   "type": ["integer", "null"],
@@ -274,7 +274,7 @@
                 "maxBufferBytes": {
                   "type": ["integer", "null"],
                   "minimum": 1,
-                  "description": "Cap on any body a filter buffers; raise it with a maxRequestBytes above 64 MiB."
+                  "description": "Cap on any body a filter buffers; raise it with a maxRequestBytes above 64 MiB. Needs image.flavor grid-gateway."
                 }
               }
             },
