@@ -56,10 +56,8 @@ on:
   schedule:
     # Nightly GLB quick qualification.
     - cron: "0 18 * * *"
-      timezone: America/New_York
     # Nightly combined-site qualification (mapped to full mode below).
     - cron: "0 19 * * *"
-      timezone: America/New_York
 
 concurrency:
   group: grid-triggered-integration-${{ github.workflow }}-${{ inputs.release_qualification || 'scheduled' }}-${{ inputs.pr_number != '' && format('pr-{0}', inputs.pr_number) || inputs.branch != '' && format('branch-{0}', inputs.branch) || 'main' }}-${{ github.event_name }}-${{ github.event_name == 'schedule' && github.event.schedule || '' }}
@@ -146,7 +144,9 @@ jobs:
           INPUT_RELEASE_QUALIFICATION: ${{ inputs.release_qualification }}
         run: |
           set -euo pipefail
-          if [[ "${EVENT_NAME}" == "schedule" ]]; then
+          if [[ -n "${INPUT_RELEASE_QUALIFICATION}" ]]; then
+            RELEASE_QUALIFICATION="${INPUT_RELEASE_QUALIFICATION}"
+          elif [[ "${EVENT_NAME}" == "schedule" ]]; then
             case "${SCHEDULE}" in
               "0 18 * * *")
                 RELEASE_QUALIFICATION=glb-quick
@@ -160,7 +160,7 @@ jobs:
                 ;;
             esac
           else
-            RELEASE_QUALIFICATION="${INPUT_RELEASE_QUALIFICATION:-glb-quick}"
+            RELEASE_QUALIFICATION=glb-quick
           fi
           echo "release_qualification=${RELEASE_QUALIFICATION}" >> "${GITHUB_OUTPUT}"
           echo "Release qualification: ${RELEASE_QUALIFICATION}"
