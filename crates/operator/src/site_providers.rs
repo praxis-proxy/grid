@@ -10,6 +10,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::resources::model_discovery::ServedModels;
+
 /// Header carrying [`LocalProviders::version`] on every signals answer.
 pub const VERSION_HEADER: &str = "x-grid-providers-version";
 
@@ -104,6 +106,9 @@ impl From<crdt::ProviderState> for WireProvider {
 
 impl WireProvider {
     /// The provider state `site` serves, `None` for a record no candidate can use.
+    ///
+    /// Model lists follow local discovery validation; one invalid name refuses
+    /// the whole record without preventing valid sibling records from routing.
     #[must_use]
     pub fn into_state(self, site: &str) -> Option<crdt::ProviderState> {
         // Both names travel as header values at the gateway, so a bad one is dropped here
@@ -112,16 +117,23 @@ impl WireProvider {
         if !header_safe(&self.provider_id)
             || !header_safe(&self.routing_cluster)
             || !crdt::is_valid_capacity_weight(self.capacity_weight)
-            || self.models.len() > MAX_MODELS_PER_RECORD
         {
             return None;
         }
+        let models = match ServedModels::try_from_names(self.models) {
+            Ok(models) => models.into_names(),
+            Err(error) => {
+                crate::metrics::record_peer_model_catalog_rejection(&error);
+                tracing::warn!(peer = site, "peer provider has invalid model names; record refused");
+                return None;
+            },
+        };
         Some(crdt::ProviderState {
             network_id: self.network_id,
             site_id: site.to_owned(),
             provider_id: self.provider_id,
             routing_cluster: self.routing_cluster,
-            models: self.models,
+            models,
             tools: self.tools,
             backend_kind: self.backend_kind,
             capacity_weight: self.capacity_weight,
@@ -1073,6 +1085,110 @@ mod tests {
     }
 
     #[test]
+    fn peer_models_reject_embedded_control_characters() {
+        for control in ['\n', '\r', '\t', '\0', '\u{1b}', '\u{7f}', '\u{85}', '\u{9f}'] {
+            let mut record = wire("invalid", &[]);
+            record.models = vec!["valid-model".to_owned(), format!("model{control}name")];
+            let before = peer_model_rejections("control_char");
+
+            assert!(
+                record.into_state("east").is_none(),
+                "embedded control {control:?} must reject the record"
+            );
+            assert!(
+                peer_model_rejections("control_char") >= before + 1.0,
+                "refusal must count the bounded control_char reason"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_model_catalogs_share_local_discovery_validation() {
+        for (models, reason) in [
+            (vec!["   ".to_owned()], "blank"),
+            (vec!["m".repeat(257)], "too_long"),
+            (vec!["model".to_owned(), " model ".to_owned()], "duplicate"),
+            (
+                (0..=MAX_MODELS_PER_RECORD)
+                    .map(|index| format!("model-{index}"))
+                    .collect(),
+                "too_many",
+            ),
+        ] {
+            let mut record = wire("invalid", &[]);
+            record.models = models;
+            let before = peer_model_rejections(reason);
+
+            assert!(
+                record.into_state("east").is_none(),
+                "{reason} must reject the entire model list"
+            );
+            assert!(
+                peer_model_rejections(reason) >= before + 1.0,
+                "refusal must count {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_models_preserve_valid_names_and_normalize_surrounding_whitespace() {
+        let mut record = wire("valid", &[]);
+        record.models = vec![
+            " \torg/model\n ".to_owned(),
+            "模型/模型".to_owned(),
+            "model\"quoted".to_owned(),
+            "model\\path".to_owned(),
+            "é".repeat(128),
+        ];
+        let expected = vec![
+            "org/model".to_owned(),
+            "模型/模型".to_owned(),
+            "model\"quoted".to_owned(),
+            "model\\path".to_owned(),
+            "é".repeat(128),
+        ];
+        let state = record.into_state("east");
+
+        assert_eq!(
+            state.map(|state| state.models),
+            Some(expected),
+            "peer names follow local normalization without rejecting valid punctuation or Unicode"
+        );
+        let mut tools_only = wire("tools", &[]);
+        tools_only.models.clear();
+        assert!(
+            tools_only.into_state("east").is_some(),
+            "tool providers may have no models"
+        );
+    }
+
+    #[test]
+    fn peer_catalog_admission_keeps_valid_records_beside_invalid_model_names() {
+        let mut invalid = wire("invalid", &[]);
+        invalid.models = vec!["valid-model".to_owned(), "bad\nmodel".to_owned()];
+        let body = serde_json::to_string(&Body {
+            providers: vec![invalid, wire("valid", &[])],
+            truncated: false,
+        })
+        .unwrap_or_else(|_| std::process::abort());
+        let peer = PeerProviders::default();
+        peer.replace("east", parse(&body).unwrap_or_else(|| std::process::abort()));
+        let states = peer.remote_for("net", &HashSet::new());
+
+        assert_eq!(
+            states.len(),
+            1,
+            "a malformed model list must not discard valid sibling records"
+        );
+        assert!(
+            states
+                .iter()
+                .all(|state| state.provider_id == "valid" && state.models == ["m"]),
+            "invalid peer model names must not enter the routing snapshot"
+        );
+    }
+
+    #[test]
     fn an_oversized_or_overfull_body_is_refused() {
         let overfull = Body {
             providers: (0..=MAX_PROVIDERS)
@@ -1546,5 +1662,25 @@ mod tests {
             ["west"],
             "a departed peer's providers go with it"
         );
+    }
+    // ---------------------------------------------------------------------------
+    // Model Validation Test Utilities
+    // ---------------------------------------------------------------------------
+
+    /// Read the registered rejection counter without putting model names in labels.
+    fn peer_model_rejections(reason: &str) -> f64 {
+        crate::metrics::gather_metrics()
+            .into_iter()
+            .filter(|family| family.name() == "grid_peer_model_catalog_rejected_total")
+            .flat_map(|family| family.metric)
+            .inspect(|metric| {
+                assert!(
+                    metric.label.iter().all(|label| label.name() == "reason"),
+                    "rejection metrics must use only the bounded reason label"
+                );
+            })
+            .filter(|metric| metric.label.iter().any(|label| label.value() == reason))
+            .map(|metric| metric.counter.as_ref().map_or(0.0, prometheus::proto::Counter::value))
+            .sum()
     }
 }
