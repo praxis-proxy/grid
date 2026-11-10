@@ -232,10 +232,11 @@ praxisConfig:
     # -- Praxis body size ceilings in bytes, rendered as body_limits when set. Each
     # defaults in Praxis: a 10 MiB request and response ceiling, and a 64 MiB cap on
     # any body a filter buffers. A request over the ceiling gets a 413 at this gateway.
-    # With gridServing, grid_site_route buffers the body to read its prompt and sets no
-    # cap of its own, so the request limit is the smaller of maxRequestBytes and
-    # maxBufferBytes. Without gridServing, model_to_header keeps its own 10 MiB buffer,
-    # so the request limit stays at 10 MiB. maxBufferBytes needs image.flavor grid-gateway.
+    # A provider buffers no request body, so maxRequestBytes is its limit. On a consumer
+    # with gridServing, grid_site_route buffers the body to read its prompt and sets no
+    # cap of its own, so the limit is the smaller of maxRequestBytes and maxBufferBytes.
+    # On a consumer without gridServing, model_to_header keeps its own 10 MiB buffer, so
+    # the limit stays at 10 MiB. maxBufferBytes needs image.flavor grid-gateway.
     bodyLimits:
       maxRequestBytes: null
       maxResponseBytes: null
