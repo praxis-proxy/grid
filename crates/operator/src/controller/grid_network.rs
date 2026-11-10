@@ -981,10 +981,6 @@ pub(crate) fn provider_readiness(
 }
 
 /// Write the provider's `Ready` condition when its status or reason changed.
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the Kubernetes status patch future carries a full InferenceProvider response"
-)]
 async fn apply_ready_condition(
     client: &Client,
     provider: &InferenceProvider,
@@ -1578,9 +1574,9 @@ async fn load_gossip_signing_key(
         .site_secret_ref
         .as_ref()
         .ok_or_else(|| "site identity Secret is not configured".to_owned())?;
-    let ca = read_signals_pem(client, ca_ref, "ca.crt").await?;
-    let cert = read_signals_pem(client, site_ref, "tls.crt").await?;
-    let key = zeroize::Zeroizing::new(read_signals_pem(client, site_ref, "tls.key").await?);
+    let ca = Box::pin(read_signals_pem(client, ca_ref, "ca.crt")).await?;
+    let cert = Box::pin(read_signals_pem(client, site_ref, "tls.crt")).await?;
+    let key = zeroize::Zeroizing::new(Box::pin(read_signals_pem(client, site_ref, "tls.key")).await?);
     validated_gossip_key(&ca, &cert, &key, site)
 }
 

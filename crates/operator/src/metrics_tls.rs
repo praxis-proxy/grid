@@ -47,7 +47,7 @@ pub enum MetricsTls {
     /// The site identity Secret, waited for until enrollment writes it.
     SiteIdentity {
         /// Secrets in the operator namespace.
-        secrets: Api<Secret>,
+        secrets: Box<Api<Secret>>,
         /// The identity Secret's name.
         name: String,
     },
@@ -71,7 +71,7 @@ impl MetricsTls {
         match (cert, key, site_secret) {
             (Some(cert), Some(key), None) => Ok(Some(Self::Files { cert, key })),
             (None, None, Some(name)) => Ok(Some(Self::SiteIdentity {
-                secrets: Api::default_namespaced(client.clone()),
+                secrets: Box::new(Api::default_namespaced(client.clone())),
                 name,
             })),
             (None, None, None) => Ok(None),
