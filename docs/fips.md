@@ -158,3 +158,49 @@ available. Do not extend the leaf crate with unrelated FFI.
   https://docs.openssl.org/3.0/man3/EVP_set_default_properties/
 [container-fips]:
   https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/security_hardening/switching-rhel-to-fips-mode_security-hardening
+
+## Grid gateway Policy profiles
+
+The separate Gateway workspace pins all Praxis crates to the same revision of
+[Praxis #1516]. That revision uses Policy 0.6.0 and forwards its granular
+crypto features. Replace the pin with a released version when available.
+
+The default Gateway build selects `policy-builtins`, including non-FIPS
+crypto and the experimental rate limiter. Build the chart's API-key profile
+with defaults disabled:
+
+```console
+cargo build --locked --manifest-path crates/gateway/Cargo.toml --no-default-features --features fips
+```
+
+`fips` selects Praxis's `policy-api-key-fips`: the Policy engine and API-key
+hashing use system OpenSSL. For API-key plus JWT/DPoP, select
+`--features fips,policy-jwt-fips`. JWT-only deployments can select
+`--features policy-jwt-fips` with defaults disabled. Combining either profile
+with `policy-builtins` selects incompatible crypto backends and fails to build.
+The Helm API-key render uses Policy's typed `credential` header location.
+
+These are compiled Policy profiles. A deployment also needs dynamically linked
+system OpenSSL, an active FIPS provider and FIPS default properties. Set
+`PRAXIS_REQUIRE_FIPS=1` to require the host/provider checks at startup. Policy
+validates its provider at construction and refuses startup or reload on crypto
+failure; a failed reload retains the previous policy. JWT/DPoP requires approved
+asymmetric algorithms and keys; HMAC JWTs are refused. See [Policy FIPS] for
+provider setup, algorithm restrictions and the host's responsibilities.
+
+Run `make gateway-fips-check` for the API-key, JWT-only and combined profiles.
+Gateway CI runs the same target: compile all targets, check the registry's Policy
+capability assessment, and reject ring, AWS-LC, SHA-2/HMAC crates and vendored
+OpenSSL in normal/build dependencies. In these profiles, ring and AWS-LC appear
+only through test dependencies, including the certificate and mock TLS fixtures.
+These checks do not prove runtime provider readiness or FIPS host compliance.
+
+The standard `deploy/gateway/Containerfile` builds the default profile with
+static OpenSSL on Alpine. It is not a FIPS runtime image. The chart
+`fips.required` value sets `PRAXIS_REQUIRE_FIPS=1` on the Praxis container and
+refuses overrides that disable it, but a deployment must supply a Gateway image
+built with one of the FIPS profiles above. Grid does not yet publish a dedicated
+Gateway FIPS image, and this change does not validate traffic on a FIPS host.
+
+[Praxis #1516]: https://github.com/praxis-proxy/praxis/pull/1516
+[Policy FIPS]: https://github.com/praxis-proxy/policy/blob/main/docs/content/fips.md
