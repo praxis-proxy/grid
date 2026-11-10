@@ -76,6 +76,22 @@ pub enum CrossRegionFallback {
     Deny,
 }
 
+/// Admission rule refusing `allowedRegions` in affinity mode.
+pub(crate) const REGIONAL_POLICY_AFFINITY_FORBIDS_ALLOWED_REGIONS: &str =
+    "self.mode != 'affinity' || !has(self.allowedRegions)";
+
+/// Admission rule requiring `allowedRegions` in locked mode.
+pub(crate) const REGIONAL_POLICY_LOCKED_REQUIRES_ALLOWED_REGIONS: &str =
+    "self.mode != 'locked' || has(self.allowedRegions)";
+
+/// Admission rule refusing `preferredRegions` in locked mode.
+pub(crate) const REGIONAL_POLICY_LOCKED_FORBIDS_PREFERRED_REGIONS: &str =
+    "self.mode != 'locked' || !has(self.preferredRegions)";
+
+/// Admission rule refusing `crossRegionFallback` in locked mode.
+pub(crate) const REGIONAL_POLICY_LOCKED_FORBIDS_CROSS_REGION_FALLBACK: &str =
+    "self.mode != 'locked' || !has(self.crossRegionFallback)";
+
 /// Per-gateway regional routing contract.
 ///
 /// The policy applies to every capability in the containing [`GatewayRef`]'s
@@ -87,16 +103,16 @@ pub enum CrossRegionFallback {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 #[schemars(extend("x-kubernetes-validations" = [{
-    "rule": "self.mode != 'affinity' || !has(self.allowedRegions)",
+    "rule": REGIONAL_POLICY_AFFINITY_FORBIDS_ALLOWED_REGIONS,
     "message": "allowedRegions is not valid in affinity mode"
 }, {
-    "rule": "self.mode != 'locked' || has(self.allowedRegions)",
+    "rule": REGIONAL_POLICY_LOCKED_REQUIRES_ALLOWED_REGIONS,
     "message": "allowedRegions is required in locked mode"
 }, {
-    "rule": "self.mode != 'locked' || !has(self.preferredRegions)",
+    "rule": REGIONAL_POLICY_LOCKED_FORBIDS_PREFERRED_REGIONS,
     "message": "preferredRegions is not valid in locked mode"
 }, {
-    "rule": "self.mode != 'locked' || !has(self.crossRegionFallback)",
+    "rule": REGIONAL_POLICY_LOCKED_FORBIDS_CROSS_REGION_FALLBACK,
     "message": "crossRegionFallback is not valid in locked mode"
 }]))]
 pub struct RegionalPolicy {
@@ -2429,53 +2445,55 @@ mod tests {
     #[test]
     fn regional_policy_schema_encodes_bounds_sets_and_mode_rules() {
         let crd = crd_json();
-        let policy_schema = crd
-            .pointer(
-                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/consumerGateways/items/properties/regionalPolicy",
-            )
-            .unwrap_or_else(|| std::process::abort());
-        for field in ["preferredRegions", "allowedRegions", "allowedSovereigntyZones"] {
-            let field_schema = policy_schema
-                .pointer(&format!("/properties/{field}"))
+        for gateways in ["consumerGateways", "gatewayRefs"] {
+            let policy_schema = crd
+                .pointer(&format!(
+                    "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/{gateways}/items/properties/regionalPolicy"
+                ))
                 .unwrap_or_else(|| std::process::abort());
-            assert_eq!(field_schema.get("minItems"), Some(&serde_json::json!(1)));
-            assert_eq!(field_schema.get("maxItems"), Some(&serde_json::json!(64)));
+            for field in ["preferredRegions", "allowedRegions", "allowedSovereigntyZones"] {
+                let field_schema = policy_schema
+                    .pointer(&format!("/properties/{field}"))
+                    .unwrap_or_else(|| std::process::abort());
+                assert_eq!(field_schema.get("minItems"), Some(&serde_json::json!(1)));
+                assert_eq!(field_schema.get("maxItems"), Some(&serde_json::json!(64)));
+                assert_eq!(
+                    field_schema.get("x-kubernetes-list-type"),
+                    Some(&serde_json::json!("set"))
+                );
+                assert_eq!(field_schema.pointer("/items/minLength"), Some(&serde_json::json!(1)));
+                assert_eq!(field_schema.pointer("/items/maxLength"), Some(&serde_json::json!(253)));
+                assert_eq!(
+                    field_schema.pointer("/items/pattern"),
+                    Some(&serde_json::json!(r"^\S+$"))
+                );
+            }
+            let rules = policy_schema
+                .get("x-kubernetes-validations")
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| std::process::abort());
+            for expected_rule in [
+                REGIONAL_POLICY_AFFINITY_FORBIDS_ALLOWED_REGIONS,
+                REGIONAL_POLICY_LOCKED_REQUIRES_ALLOWED_REGIONS,
+                REGIONAL_POLICY_LOCKED_FORBIDS_PREFERRED_REGIONS,
+                REGIONAL_POLICY_LOCKED_FORBIDS_CROSS_REGION_FALLBACK,
+            ] {
+                assert!(
+                    rules.iter().any(|validation| {
+                        validation.get("rule").and_then(serde_json::Value::as_str) == Some(expected_rule)
+                    }),
+                    "{gateways} regionalPolicy schema must contain rule {expected_rule:?}"
+                );
+            }
             assert_eq!(
-                field_schema.get("x-kubernetes-list-type"),
-                Some(&serde_json::json!("set"))
+                policy_schema.pointer("/properties/mode/enum"),
+                Some(&serde_json::json!(["affinity", "locked"]))
             );
-            assert_eq!(field_schema.pointer("/items/minLength"), Some(&serde_json::json!(1)));
-            assert_eq!(field_schema.pointer("/items/maxLength"), Some(&serde_json::json!(253)));
             assert_eq!(
-                field_schema.pointer("/items/pattern"),
-                Some(&serde_json::json!(r"^\S+$"))
+                policy_schema.pointer("/properties/crossRegionFallback/enum"),
+                Some(&serde_json::json!(["allow", "deny"]))
             );
         }
-        let rules = policy_schema
-            .get("x-kubernetes-validations")
-            .and_then(serde_json::Value::as_array)
-            .unwrap_or_else(|| std::process::abort());
-        for expected_rule in [
-            "self.mode != 'affinity' || !has(self.allowedRegions)",
-            "self.mode != 'locked' || has(self.allowedRegions)",
-            "self.mode != 'locked' || !has(self.preferredRegions)",
-            "self.mode != 'locked' || !has(self.crossRegionFallback)",
-        ] {
-            assert!(
-                rules.iter().any(|validation| {
-                    validation.get("rule").and_then(serde_json::Value::as_str) == Some(expected_rule)
-                }),
-                "regionalPolicy schema must contain rule {expected_rule:?}"
-            );
-        }
-        assert_eq!(
-            policy_schema.pointer("/properties/mode/enum"),
-            Some(&serde_json::json!(["affinity", "locked"]))
-        );
-        assert_eq!(
-            policy_schema.pointer("/properties/crossRegionFallback/enum"),
-            Some(&serde_json::json!(["allow", "deny"]))
-        );
     }
 
     #[test]

@@ -56,7 +56,13 @@ fn add_legacy_field(
 }
 
 /// Constant-cost CEL rules a legacy alias keeps, since serde reads the alias like the field.
-const ALIAS_KEPT_RULES: &[&str] = &[grid_network::SOVEREIGNTY_REQUIRES_GRID_SITE_ROUTE];
+const ALIAS_KEPT_RULES: &[&str] = &[
+    grid_network::SOVEREIGNTY_REQUIRES_GRID_SITE_ROUTE,
+    grid_network::REGIONAL_POLICY_AFFINITY_FORBIDS_ALLOWED_REGIONS,
+    grid_network::REGIONAL_POLICY_LOCKED_REQUIRES_ALLOWED_REGIONS,
+    grid_network::REGIONAL_POLICY_LOCKED_FORBIDS_PREFERRED_REGIONS,
+    grid_network::REGIONAL_POLICY_LOCKED_FORBIDS_CROSS_REGION_FALLBACK,
+];
 
 /// Remove nested CEL rules from a legacy alias schema, except mutual-exclusion rules and
 /// [`ALIAS_KEPT_RULES`].

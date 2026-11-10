@@ -1156,6 +1156,8 @@ spec:
 
                               When absent, the operator derives the preferred region from the trusted
                               [`GridSite`] resolved through [`GatewayRef::site_name`].
+
+                              [`GridSite`]: crate::crd::grid_site::GridSite
                             items:
                               maxLength: 253
                               minLength: 1
@@ -2165,6 +2167,8 @@ spec:
 
                               When absent, the operator derives the preferred region from the trusted
                               [`GridSite`] resolved through [`GatewayRef::site_name`].
+
+                              [`GridSite`]: crate::crd::grid_site::GridSite
                             items:
                               maxLength: 253
                               minLength: 1
@@ -2178,6 +2182,15 @@ spec:
                         required:
                           - mode
                         type: object
+                        x-kubernetes-validations:
+                          - message: allowedRegions is not valid in affinity mode
+                            rule: self.mode != 'affinity' || !has(self.allowedRegions)
+                          - message: allowedRegions is required in locked mode
+                            rule: self.mode != 'locked' || has(self.allowedRegions)
+                          - message: preferredRegions is not valid in locked mode
+                            rule: self.mode != 'locked' || !has(self.preferredRegions)
+                          - message: crossRegionFallback is not valid in locked mode
+                            rule: self.mode != 'locked' || !has(self.crossRegionFallback)
                       siteName:
                         description: |-
                           Local site name for the `intelligent_route` overlay generated for this gateway.
