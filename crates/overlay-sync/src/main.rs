@@ -171,7 +171,9 @@ async fn run(cli: Cli) -> Result<(), StartupError> {
     let (watcher_config, metrics, status) = build_config(&cli);
     ensure_output_dir(&cli.output);
     watcher::restore_last_known_good(&watcher_config, &status, &metrics);
-    let client = kube::Client::try_default().await.map_err(StartupError::KubeClient)?;
+    let client = Box::pin(kube::Client::try_default())
+        .await
+        .map_err(StartupError::KubeClient)?;
 
     if cli.once {
         watcher::initial_fetch_until_ready(&client, &watcher_config, &status, &metrics).await;

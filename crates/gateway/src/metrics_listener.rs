@@ -16,11 +16,11 @@ use std::{
 };
 
 use metrics::{counter, gauge};
+use openssl::{error::ErrorStack, hash::MessageDigest};
 use praxis_core::config::Config;
 use praxis_tls::{CertKeyPair, reload::ReloadableCertResolver, watcher::CertWatcher};
 use reqwest::Certificate;
 use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpStream},
@@ -367,9 +367,9 @@ impl KubernetesAuthorizer {
     ///
     /// # Errors
     ///
-    /// Returns an I/O error when the Kubernetes API cannot complete either review.
+    /// Returns an I/O error when SHA-256 or a Kubernetes review fails.
     async fn authorize(&self, token: &str) -> Result<Authorization, AuthorizationError> {
-        let token_hash = token_hash(token);
+        let token_hash = token_hash(token).map_err(|error| AuthorizationError::Unavailable(io::Error::other(error)))?;
         let cached = self.cache.lock().await.get(token_hash, Instant::now());
         if let Some(cached) = cached {
             return Ok(cached);
@@ -567,8 +567,16 @@ struct CachedAuthorization {
 }
 
 /// SHA-256 digest for a bearer token, so the cache never retains credentials.
-fn token_hash(token: &str) -> [u8; 32] {
-    Sha256::digest(token.as_bytes()).into()
+fn token_hash(token: &str) -> Result<[u8; 32], ErrorStack> {
+    sha256(token.as_bytes())
+}
+
+/// Compute SHA-256 through the active OpenSSL provider.
+fn sha256(data: &[u8]) -> Result<[u8; 32], ErrorStack> {
+    let digest = openssl::hash::hash(MessageDigest::sha256(), data)?;
+    let mut output = [0; 32];
+    output.copy_from_slice(&digest);
+    Ok(output)
 }
 
 /// Failure to authorize a scrape because checks are busy or Kubernetes is unavailable.
@@ -1128,10 +1136,10 @@ mod tests {
 
     /// Keep allow decisions longer than denials and expire both at their TTL.
     #[test]
-    fn authorization_cache_uses_shorter_lifetimes_for_denials() {
+    fn authorization_cache_uses_shorter_lifetimes_for_denials() -> Result<(), ErrorStack> {
         let now = Instant::now();
-        let allowed_hash = token_hash("allowed-token");
-        let denied_hash = token_hash("denied-token");
+        let allowed_hash = token_hash("allowed-token")?;
+        let denied_hash = token_hash("denied-token")?;
         let mut cache = AuthorizationCache::default();
         cache.insert(allowed_hash, Authorization::Allowed, now);
         cache.insert(denied_hash, Authorization::Forbidden, now);
@@ -1156,19 +1164,21 @@ mod tests {
             None,
             "allow expires at 60 seconds"
         );
+        Ok(())
     }
 
     /// Keep the decision cache at or below its configured entry limit.
     #[test]
-    fn authorization_cache_does_not_exceed_its_capacity() {
+    fn authorization_cache_does_not_exceed_its_capacity() -> Result<(), ErrorStack> {
         let now = Instant::now();
         let mut cache = AuthorizationCache::default();
         for index in 0..=MAX_CACHED_AUTHORIZATIONS {
-            let hash: [u8; 32] = Sha256::digest(index.to_be_bytes()).into();
+            let hash = sha256(&index.to_be_bytes())?;
             cache.insert(hash, Authorization::Unauthenticated, now);
         }
 
         assert_eq!(cache.entries.len(), MAX_CACHED_AUTHORIZATIONS, "bounded cache");
+        Ok(())
     }
 
     /// Return an error when a client closes before completing the request head.

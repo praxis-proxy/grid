@@ -1474,6 +1474,71 @@ mod tests {
         let _cleaned = std::fs::remove_dir_all(&work);
     }
 
+    #[test]
+    fn the_configured_request_ceiling_is_the_one_body_limit_on_the_chart_chain() {
+        const MIB: usize = 1024 * 1024;
+        let work = fresh_work("body-ceiling");
+        let backend = Plain::start();
+        let mut serving = Mount::new(work.join("serving"));
+        serving.write(&[(
+            "serving-config.json",
+            br#"{"local_site":"local","window_secs":60,"load_window_ms":30000,"candidates":[{"kind":"inference_model","name":"llama","site":"east","cluster":"pool-east"}],"peers":[]}"#,
+        )]);
+        let (listen, admin) = (free_port(), free_port());
+        // The chart's chain: model_to_header buffers 10 MiB by itself, grid_site_route sets no cap.
+        let praxis = format!(
+            "insecure_options:\n  allow_private_endpoints: true\nbody_limits:\n  max_request_bytes: {ceiling}\nadmin:\n  metrics_address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: model_to_header\n        header: X-Gateway-Model-Name\n      - filter: grid_site_route\n        model_header: X-Gateway-Model-Name\n      - filter: load_balancer\n        clusters:\n          - name: pool-east\n            endpoints: [\"{endpoint}\"]\n",
+            ceiling = 32 * MIB,
+            endpoint = backend.addr,
+        );
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
+        gateway.eventually("the gateway listens", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok()
+        });
+
+        let body = format!(
+            r#"{{"model":"llama","messages":[],"padding":"{}"}}"#,
+            "x".repeat(12 * MIB)
+        );
+        assert_eq!(
+            post(listen, &body, ""),
+            200,
+            "a body past 10 MiB and under the ceiling routes"
+        );
+        assert_eq!(
+            backend.request_body_bytes_read.load(Ordering::SeqCst),
+            body.len(),
+            "the backend received the whole body"
+        );
+
+        let mut stream = TcpStream::connect(("127.0.0.1", listen)).expect("connect gateway");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        stream
+            .write_all(
+                format!(
+                    "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+                    len = 40 * MIB
+                )
+                .as_bytes(),
+            )
+            .expect("send head");
+        let mut response = String::new();
+        let _read = stream.read_to_string(&mut response);
+        assert!(
+            response.starts_with("HTTP/1.1 413"),
+            "a body declared past the ceiling gets a 413: {response}"
+        );
+        assert_eq!(
+            backend.requests.load(Ordering::SeqCst),
+            1,
+            "the oversized body never reached the backend"
+        );
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
     /// The operator's bootstrap config, written before a delegated gateway's first rollout.
     const BOOTSTRAP_PRAXIS: &str = include_str!("testdata/consumer-config-bootstrap.yaml");
 

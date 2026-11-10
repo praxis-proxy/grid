@@ -511,10 +511,15 @@ trait RouterRender {
     /// The filter promoting the body's `model` to the `X-Model` header the router reads.
     const MODEL_FILTER: &'static str;
 
+    /// Connection bounds applied to inline and top-level cluster declarations.
+    fn connection_limits(_endpoint: &ClusterEndpointConfig) -> String {
+        String::new()
+    }
+
     /// The router's filter block.
     fn filter(inputs: &RouterInputs<'_>) -> Result<String, ConsumerConfigError>;
 
-    /// What a cluster carries beside its endpoints for this router, `None` when nothing.
+    /// Health checks run only on top-level cluster declarations.
     fn probe(_endpoint: &ClusterEndpointConfig) -> Option<String> {
         None
     }
@@ -567,6 +572,18 @@ impl RouterRender for GridSiteRouteRender {
     // model_to_header drops a caller's own X-Model, which grid_site_route would otherwise read first.
     const MODEL_FILTER: &'static str = "      - filter: model_to_header\n        header: X-Model\n";
 
+    fn connection_limits(endpoint: &ClusterEndpointConfig) -> String {
+        if endpoint
+            .transport
+            .as_ref()
+            .is_some_and(|transport| transport.mode == TransportMode::MutualTls)
+        {
+            peer_limits()
+        } else {
+            String::new()
+        }
+    }
+
     fn filter(inputs: &RouterInputs<'_>) -> Result<String, ConsumerConfigError> {
         let clusters = inputs
             .endpoints
@@ -580,8 +597,7 @@ impl RouterRender for GridSiteRouteRender {
         ))
     }
 
-    /// Bounded connects, reads and retries for another site's gateway, and a probe that
-    /// `grid_site_route` demotes on.
+    /// A probe that `grid_site_route` demotes on.
     ///
     /// The probe is tcp for every transport. Praxis's http probe is plaintext, so it cannot
     /// reach a mutual TLS peer, and the passive thresholds live in the same block. Behind a
@@ -593,10 +609,8 @@ impl RouterRender for GridSiteRouteRender {
             .transport
             .as_ref()
             .is_some_and(|transport| transport.mode == TransportMode::MutualTls);
-        let timeouts = if peer { peer_limits() } else { String::new() };
         Some(format!(
             concat!(
-                "{timeouts}",
                 "\n            health_check:",
                 "\n              type: tcp",
                 "\n              interval_ms: {interval}",
@@ -606,7 +620,6 @@ impl RouterRender for GridSiteRouteRender {
                 "\n              passive_unhealthy_threshold: 2",
                 "\n              passive_healthy_threshold: 2",
             ),
-            timeouts = timeouts,
             interval = if peer {
                 PEER_PROBE_INTERVAL_MS
             } else {
@@ -715,15 +728,15 @@ impl Pipeline<'_> {
         }
         let mut endpoints = self.cluster_endpoints.iter().collect::<Vec<_>>();
         endpoints.sort_by(|left, right| left.cluster.cmp(&right.cluster));
-        let mut probed = false;
+        let mut top_clusters = Vec::new();
         let clusters = endpoints
             .iter()
             .map(|endpoint| {
                 let mut entry =
                     render_cluster_entry(&yaml_scalar(&endpoint.cluster)?, endpoint, self.tls_cert_mount_path)?;
+                entry.push_str(&R::connection_limits(endpoint));
                 if let Some(probe) = R::probe(endpoint) {
-                    entry.push_str(&probe);
-                    probed = true;
+                    top_clusters.push(format!("{entry}{probe}"));
                 }
                 Ok(entry)
             })
@@ -767,10 +780,9 @@ impl Pipeline<'_> {
         });
         config.push_str("\n      - filter: load_balancer\n        clusters:\n");
         config.push_str(&clusters);
-        if probed {
-            // Praxis health-checks only top-level clusters.
+        if !top_clusters.is_empty() {
             config.push_str("\nclusters:\n");
-            config.push_str(&clusters);
+            config.push_str(&top_clusters.join("\n"));
         }
         if let Some(telemetry) = self.telemetry {
             config.push_str(&render_telemetry(telemetry)?);
@@ -2166,6 +2178,12 @@ mod tests {
             .filter_map(|c| c["name"].as_str())
             .collect();
         assert_eq!(top, dialed, "every dialed cluster is health-checked");
+        for cluster in filters[3]["clusters"].as_sequence().expect("lb clusters") {
+            assert!(
+                cluster["health_check"].is_null(),
+                "inline health checks never run and Praxis refuses them: {cluster:?}"
+            );
+        }
         for cluster in doc["clusters"].as_sequence().expect("clusters") {
             assert_eq!(cluster["health_check"]["type"].as_str(), Some("tcp"), "{cluster:?}");
         }

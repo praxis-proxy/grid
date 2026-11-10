@@ -256,6 +256,41 @@
             }
           ],
           "properties": {
+            "bodyLimits": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Praxis body size ceilings in bytes, rendered as body_limits when set. Unset keeps the Praxis defaults: 10 MiB request and response ceilings, 64 MiB buffered-body cap.",
+              "properties": {
+                "maxRequestBytes": {
+                  "type": ["integer", "null"],
+                  "minimum": 1,
+                  "description": "Request body ceiling; with gridServing the request limit is the smaller of this and maxBufferBytes."
+                },
+                "maxResponseBytes": {
+                  "type": ["integer", "null"],
+                  "minimum": 1,
+                  "description": "Response body ceiling."
+                },
+                "maxBufferBytes": {
+                  "type": ["integer", "null"],
+                  "minimum": 1,
+                  "description": "Cap on any body a filter buffers; raise it with a maxRequestBytes above 64 MiB. Needs image.flavor grid-gateway."
+                }
+              }
+            },
+            "runtime": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Praxis runtime settings rendered when set.",
+              "properties": {
+                "upstreamKeepalivePoolSize": {
+                  "type": ["integer", "null"],
+                  "minimum": 1,
+                  "maximum": 10000,
+                  "description": "Idle upstream connections kept per worker thread across every cluster; Praxis defaults to 64."
+                }
+              }
+            },
             "telemetry": {
               "type": "object",
               "additionalProperties": false,
@@ -1729,6 +1764,17 @@
     "priorityClassName": {
       "type": "string",
       "description": "Priority class for the gateway pod."
+    },
+    "fips": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "FIPS mode for the gateway container.",
+      "properties": {
+        "required": {
+          "type": "boolean",
+          "description": "Require startup validation of the kernel, system crypto policy, and OpenSSL FIPS provider. Needs a FIPS-safe Gateway build and a FIPS host."
+        }
+      }
     }
   }
 }

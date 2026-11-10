@@ -122,6 +122,12 @@ log:
   # -- Full RUST_LOG directive, such as "info,praxis_filter=debug". When set, it replaces level.
   filter: ""
 
+# -- Require host and OpenSSL FIPS verification at startup. Use a gateway image built
+# -- with a FIPS-safe Policy profile on a FIPS host.
+fips:
+  # -- Render PRAXIS_REQUIRE_FIPS=1 for the Praxis container.
+  required: false
+
 # -- GridNetwork and local site used by render and the overlay sidecar.
 grid:
   # -- GridNetwork name. Required when the overlay sidecar is enabled.
@@ -223,6 +229,26 @@ praxisConfig:
       batchIntervalSecs: null
       # -- Maximum spans per export batch; must be positive.
       batchSize: null
+    # -- Praxis body size ceilings in bytes, rendered as body_limits when set. Each
+    # defaults in Praxis: a 10 MiB request and response ceiling, and a 64 MiB cap on
+    # any body a filter buffers. A request over the ceiling gets a 413 at this gateway.
+    # A provider buffers no request body, so maxRequestBytes is its limit. On a consumer
+    # with gridServing, grid_site_route buffers the body to read its prompt and sets no
+    # cap of its own, so the limit is the smaller of maxRequestBytes and maxBufferBytes.
+    # On a consumer without gridServing, model_to_header keeps its own 10 MiB buffer, so
+    # the limit stays at 10 MiB. maxBufferBytes needs image.flavor grid-gateway.
+    bodyLimits:
+      maxRequestBytes: null
+      maxResponseBytes: null
+      maxBufferBytes: null
+    # -- Praxis runtime settings rendered when set.
+    runtime:
+      # -- Idle upstream connections each worker thread keeps, across every cluster;
+      # Praxis defaults to 64. Past it, a finished connection closes instead of
+      # returning to the pool, and the next request to that backend pays a new
+      # connect and TLS handshake. Size it to the in-flight requests one replica
+      # sends a backend divided by its worker threads. At most 10000.
+      upstreamKeepalivePoolSize: null
     # -- consumer routes callers. provider serves grid peers on the grid identity and forwards to one backend.
     role: consumer
     # -- Grid peers a provider accepts, each with a Grid-CA client certificate.

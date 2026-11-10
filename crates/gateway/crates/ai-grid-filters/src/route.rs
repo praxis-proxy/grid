@@ -800,9 +800,8 @@ impl HttpFilter for GridSiteRouteFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
-        BodyMode::StreamBuffer {
-            max_bytes: Some(BODY_LIMIT),
-        }
+        // No cap of its own: praxis clamps the buffer to `body_limits.max_request_bytes`.
+        BodyMode::StreamBuffer { max_bytes: None }
     }
 
     fn needs_request_context(&self) -> bool {
@@ -954,9 +953,6 @@ impl HttpFilter for GridSiteRouteFilter {
         Ok(FilterAction::Continue)
     }
 }
-
-/// Most of a request body the filter buffers to read its prompt, as `model_to_header` does.
-const BODY_LIMIT: usize = 10 << 20;
 
 /// Largest body keyed on the request worker. Keying one this size takes under a
 /// millisecond; 10 MiB of tiny messages takes about 30.
@@ -2024,6 +2020,16 @@ pub(crate) mod tests {
         );
         assert_eq!(cfg.prefix_affinity, AffinitySettings::default());
         assert_eq!(cfg.model_header, "X-Gateway-Model-Name");
+    }
+
+    #[test]
+    fn the_filter_caps_no_request_body_itself() {
+        let filter = build_tuned_filter("{}", &Tuning::default()).expect("an empty block builds");
+        assert_eq!(
+            filter.request_body_mode(),
+            BodyMode::StreamBuffer { max_bytes: None },
+            "praxis's body_limits clamp the buffer, not the filter"
+        );
     }
 
     #[test]

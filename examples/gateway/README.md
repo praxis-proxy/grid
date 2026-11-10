@@ -19,12 +19,19 @@ Grid preserves an affinity fallback boundary before request-time scoring.
 ## grid-site-route.yaml
 
 The `grid_site_route` filter block in the gateway's praxis config, with the `load_balancer`
-block that always follows it: the filter sets the cluster, the load balancer dials it and runs
-the health checks selection demotes on. A user sets it through the chart's
+block that always follows it: the filter sets the cluster and the load balancer
+dials it. Health checks belong on the matching top-level `clusters` in
+`praxis.yaml`, where Praxis runs the probes that selection demotes on. The
+chart renders those declarations; inline load-balancer clusters cannot run
+health checks. A user sets it through the chart's
 `praxisConfig.render.gridServing.siteRoute` values (`availability` and `prefixAffinity`, rendered as
 `availability` and `prefix_affinity`). Nothing needs setting: every field has a default and
 the block may be empty. The example enables `shedding` and shows the default
 affinity cache limits. A change is a chart value and a rollout.
+
+The filter sets no request size limit of its own. Praxis holds the body it reads under
+`body_limits.max_request_bytes`, 10 MiB unless set, and refuses a larger request with a 413.
+The chart renders that limit from `praxisConfig.render.bodyLimits`.
 
 `availability` governs how a site's availability is measured from its in-flight count, learned
 soft and hard capacity bounds, and provider-reported KV-cache fullness. The fields other than
