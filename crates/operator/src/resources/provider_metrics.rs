@@ -78,7 +78,7 @@ pub(crate) struct TimestampedMetrics {
     /// Monotonic scrape generation assigned when this sample was collected.
     pub(crate) generation: u64,
     /// Provider UID and scrape configuration that produced this observation.
-    source: serde_json::Value,
+    source: std::sync::Arc<serde_json::Value>,
 }
 
 /// Cross-reconcile cache for recently-scraped provider metrics.
@@ -485,11 +485,12 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
     refresh_interval: Duration,
     client: Option<&kube::Client>,
 ) -> CollectedMetrics {
-    let sources: HashMap<_, _> = providers
+    let prepared: Vec<_> = providers
         .iter()
         .filter(|provider| provider.spec.grid_network_ref == network_name && provider.spec.metrics_config.is_some())
-        .filter_map(|provider| routing_identity(provider).map(|id| (id.to_owned(), metrics_source(provider))))
+        .filter_map(|provider| routing_identity(provider).map(|id| (provider, id, metrics_source(provider))))
         .collect();
+    let sources: HashMap<_, _> = prepared.iter().map(|(_, id, source)| (*id, source)).collect();
 
     // Snapshot the relevant cache entries and allocate a generation for this
     // refresh cycle. Cached samples reused below retain their own generation.
@@ -497,7 +498,7 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
     let (cache_snapshot, scrape_generation) = {
         let mut guard = cache.lock().await;
         guard.entries.retain(|(net, id), sample| {
-            net != network_name || sources.get(id).is_some_and(|source| *source == sample.source)
+            net != network_name || sources.get(id.as_str()).is_some_and(|source| *source == &sample.source)
         });
         let generation = guard.next_generation;
         guard.next_generation = generation.wrapping_add(1);
@@ -515,14 +516,8 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
     let mut generations: HashMap<String, u64> = HashMap::new();
     let mut cache_updates: Vec<((String, String), TimestampedMetrics)> = Vec::new();
 
-    for provider in providers {
-        if provider.spec.grid_network_ref != network_name {
-            continue;
-        }
+    for (provider, identity, source) in prepared {
         let Some(mc) = &provider.spec.metrics_config else {
-            continue;
-        };
-        let Some(identity) = routing_identity(provider) else {
             continue;
         };
         let endpoint = provider.spec.endpoint.trim();
@@ -553,7 +548,6 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
         let names = metric_names_from_config(&mc.signal_names, mc.pool_name.as_deref(), mc.queue_capacity);
         let tls_settings = mc.tls.as_ref().or(provider.spec.tls.as_ref());
 
-        let source = metrics_source(provider);
         let cached = cache_snapshot.get(identity).filter(|sample| sample.source == source);
         if refresh_interval > Duration::ZERO
             && let Some(cached) = cached
@@ -687,20 +681,20 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
 /// Keep the complete metrics configuration so new scrape options invalidate old
 /// observations automatically. Only credential references are retained, never
 /// resolved Secret contents. TLS settings follow the scraper's override rule.
-fn metrics_source(provider: &InferenceProvider) -> serde_json::Value {
+fn metrics_source(provider: &InferenceProvider) -> std::sync::Arc<serde_json::Value> {
     let tls = provider
         .spec
         .metrics_config
         .as_ref()
         .and_then(|config| config.tls.as_ref())
         .or(provider.spec.tls.as_ref());
-    serde_json::json!({
+    std::sync::Arc::new(serde_json::json!({
         "uid": provider.metadata.uid,
         "namespace": provider.metadata.namespace,
         "endpoint": provider.spec.endpoint,
         "metrics": provider.spec.metrics_config,
         "tls": tls,
-    })
+    }))
 }
 
 /// Attempt to populate `result` with a cached metric sample for `identity`.
