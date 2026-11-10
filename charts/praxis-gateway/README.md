@@ -309,6 +309,7 @@ operator expects.
 | `imagePullSecrets` | list | `[]` | Pull secrets for private registries. |
 | `log.level` | string | `""` | Level for every module, rendered as RUST_LOG on the gateway and overlay-sync: off, error, warn, info, debug, or trace, in any case. Empty leaves RUST_LOG unset, so the binaries use their info default. An `env` entry named RUST_LOG takes precedence on the gateway. |
 | `log.filter` | string | `""` | Full RUST_LOG directive, such as `info,praxis_filter=debug`. When set, it replaces `log.level`. |
+| `fips.required` | bool | `false` | Set `PRAXIS_REQUIRE_FIPS=1` on the gateway container. Requires a FIPS-safe Gateway build and a FIPS host. If a custom `env` entry sets `PRAXIS_REQUIRE_FIPS`, it must set the value to `"1"`. |
 | `nameOverride` | string | `""` | Override chart name. |
 | `fullnameOverride` | string | `""` | Override the fully qualified app name. Set it to the GridNetwork `consumerGateways[].name` when the operator targets this Service by name. |
 | `commonLabels` | object | `{}` | Labels added to all resources. |
@@ -329,11 +330,13 @@ operator expects.
 | `praxisConfig.byo.inline` | string | answers `GET /` with a JSON status, else 404 | Praxis config stored in a chart-managed ConfigMap when `praxisConfig.byo.configMapName` is empty. Changing it rolls the pods. |
 | `praxisConfig.operator.configMapName` | string | `""` | Operator-created ConfigMap. Empty uses `praxis-consumer-config`. |
 | `praxisConfig.operator.allowUnauthenticatedExposure` | bool | `false` | Allow a LoadBalancer or NodePort Service for the operator's unauthenticated `praxis.yaml`. |
+| `praxisConfig.render.runtime.upstreamKeepalivePoolSize` | int | unset | Idle upstream connections each worker thread keeps, across every cluster, rendered as `runtime.upstream_keepalive_pool_size`. Praxis defaults to 64. Past the pool a finished connection closes instead of returning, so the next request to that backend pays a new connect and TLS handshake. Size it to the in-flight requests one replica sends a backend divided by its worker threads, at most 10000. Changing it rolls the pods. |
 | `praxisConfig.render.telemetry.enabled` | bool | `false` | Enable OTLP/gRPC export and W3C header propagation in generated `praxis.yaml`. Requires `praxisConfig.source: render` and `image.flavor: grid-gateway`. Configuration changes roll the pods. The tracked Grid build uses Praxis 0.7.3, which exports local HTTP and AI routing spans while forwarding W3C headers. Cross-gateway exported parentage requires the follow-up Praxis framework release described in [OpenTelemetry for Grid gateways](../../docs/architecture/opentelemetry.md). |
 | `praxisConfig.render.telemetry.otlpEndpoint` | string | `""` | OTLP endpoint without URL userinfo, query, or fragment credentials. Omitted or empty uses `OTEL_EXPORTER_OTLP_ENDPOINT` from the container environment. If configured or generic/trace-specific exporter headers are present, the endpoint must explicitly use `https://`; scheme-less endpoints are rejected. |
 | `praxisConfig.render.telemetry.samplingRate` | number | unset | Root sampling probability, from `0.0` through `1.0`. |
 | `praxisConfig.render.telemetry.serviceName` / `serviceVersion` / `environment` | string | unset | OpenTelemetry resource attributes. |
 | `praxisConfig.render.telemetry.batchIntervalSecs` / `batchSize` | int | unset | OTLP batch export interval from 1 through 300 seconds and maximum batch size from 1 through 65,536 spans. |
+| `praxisConfig.render.bodyLimits.maxRequestBytes` / `maxResponseBytes` / `maxBufferBytes` | int | unset | Praxis `body_limits` in bytes. Unset keeps the Praxis defaults: a 10 MiB request and response ceiling, and a 64 MiB cap on any body a filter buffers. A request over the ceiling gets a 413 at this gateway. A provider buffers no request body, so `maxRequestBytes` is its limit. On a consumer with gridServing, `grid_site_route` buffers the body to read its prompt and sets no cap of its own, so the limit is the smaller of `maxRequestBytes` and `maxBufferBytes`. On a consumer without gridServing, `model_to_header` keeps its own 10 MiB buffer, so the limit stays at 10 MiB. `maxBufferBytes` needs `image.flavor` grid-gateway. Changing them rolls the pods. |
 | `praxisConfig.render.model` | string | **required** for a consumer without `praxisConfig.render.gridServing` | Model advertised on the routing candidates. |
 | `praxisConfig.render.backends` | map | **required** when rendered | Backends keyed by site, each with `endpoint` and optional `healthCheck` and `transport`. A consumer's key is the site it reaches over mutual TLS. A provider's `local` key is its one plaintext backend. The older list of `cluster`, `endpoints` entries still renders. |
 | `praxisConfig.render.backends[].site` | string | `grid.siteName` | Grid site the backend serves. A consumer's remote `mutual_tls` backend must name it, and it must differ from `grid.siteName`. Its `transport.sni` defaults to `<site>.grid.internal`. |
@@ -470,6 +473,17 @@ authorization reviews. Its ServiceAccount can create `TokenReview` and
 overlay-sync are enabled, the overlay-sync RoleBinding grants that same
 ServiceAccount read access to the configured overlay ConfigMap. The Praxis
 container mounts the delivered overlay directory read-only.
+
+## FIPS startup enforcement
+
+Set `fips.required: true` to set `PRAXIS_REQUIRE_FIPS=1` on the Praxis
+container. The image must use a FIPS-safe Policy feature profile, and the host
+must have the kernel FIPS flag and system OpenSSL FIPS provider enabled. See
+[Grid FIPS support](../../docs/fips.md) for the supported Gateway build
+profiles and their limits. Grid does not yet publish a dedicated FIPS Gateway
+image; provide an image built with the required profile. A user `env` entry
+may repeat `PRAXIS_REQUIRE_FIPS=1`; other values and `valueFrom` are refused
+when `fips.required` is true.
 
 ## Optional uses
 
