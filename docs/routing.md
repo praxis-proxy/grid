@@ -151,11 +151,13 @@ Grid does not silently rebind it across the policy boundary.
 
 Every semantically changed policy produces a new content-addressed overlay
 revision. A valid policy with zero candidates publishes an authoritative empty
-revision. Invalid policy or serving-config updates are rejected by the
-consumer, which keeps its last-known-good revision. The `GridNetwork` status
-uses `RegionalPolicyNoEligibleCandidates` for a valid policy that has no
-permitted candidates; Grid emits a transition-only Kubernetes Warning Event
-with the same reason and a Normal `RegionalPolicyRecovered` Event on recovery.
+revision. The Kubernetes API server rejects schema-invalid policy updates before
+they reach the controller, leaving the published revision unchanged. Separately,
+a consumer rejects an invalid serving-config or overlay document and keeps its
+last-known-good revision. The `GridNetwork` status uses
+`RegionalPolicyNoEligibleCandidates` for a valid policy that has no permitted
+candidates; Grid emits a transition-only Kubernetes Warning Event with the same
+reason and a Normal `RegionalPolicyRecovered` Event on recovery.
 
 The bounded metric is:
 

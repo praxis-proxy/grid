@@ -14,6 +14,7 @@ use std::{
 
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::{DemoMode, GlbDemoOptions, certs, glb, kubectl, operator, safe_truncate_str};
 
@@ -740,44 +741,6 @@ fn strip_ansi_csi(input: &str) -> String {
         }
     }
     String::from_utf8_lossy(&output).into_owned()
-}
-
-/// Return every exact serving-revision log observation after normalizing ANSI styling.
-fn embedded_serving_revision_lines(logs: &str, digest: &str, count: u64) -> Vec<String> {
-    let clean = strip_ansi_csi(logs);
-    clean
-        .lines()
-        .filter(|line| {
-            line.contains("grid_serving_revision_serving")
-                && line.contains(digest)
-                && line.contains(&format!("candidate_count={count}"))
-        })
-        .map(str::to_owned)
-        .collect()
-}
-
-/// Require an exact serving event beyond those already observed for this digest.
-fn has_new_embedded_serving_revision_observation(
-    logs: &str,
-    digest: &str,
-    count: u64,
-    prior_matching_observations: usize,
-) -> bool {
-    embedded_serving_revision_lines(logs, digest, count).len() > prior_matching_observations
-}
-
-/// Return an exact serving receipt that appeared after the caller's log snapshot.
-fn embedded_serving_revision_receipt_after<'line>(
-    lines: &'line [String],
-    prior_observations: usize,
-    digest: &str,
-    count: u64,
-) -> Option<&'line str> {
-    lines
-        .iter()
-        .skip(prior_observations)
-        .find(|line| line.contains(digest) && line.contains(&format!("candidate_count={count}")))
-        .map(String::as_str)
 }
 
 /// Wait for the demo environment to be ready.
@@ -3295,7 +3258,7 @@ fn activate_embedded_serving_gateway() -> AssertionResult {
 
     install_embedded_gateway(repository_root, &image, &endpoints)?;
     wait_for_deployment(GRID_SERVING_GATEWAY, GRID_SYSTEM_NS, &cluster_context("provider-a"))?;
-    let serving_log = wait_for_embedded_serving_log(&initial_serving, &cluster_context("provider-a"), 0, TIMEOUT)?;
+    let serving_log = wait_for_embedded_serving_log(&initial_serving, &cluster_context("provider-a"), TIMEOUT)?;
     let baseline = send_embedded_lifecycle_request(None)?;
     if baseline.status != 200 || baseline.provider.is_none() {
         return Err(
@@ -3696,11 +3659,35 @@ fn serving_snapshot_digest(snapshot: &serde_json::Value) -> Result<String, Box<d
         .ok_or_else(|| "serving snapshot has no digest".into())
 }
 
-/// Wait for the embedded gateway process to log acceptance of one exact serving digest.
+/// Capture a UTC boundary before a serving-config mutation.
+fn embedded_serving_log_boundary() -> Result<String, Box<dyn std::error::Error>> {
+    Ok(OffsetDateTime::now_utc().format(&Rfc3339)?)
+}
+
+/// Wait for the embedded Gateway to log acceptance of a serving revision already in effect.
 fn wait_for_embedded_serving_log(
     snapshot: &serde_json::Value,
     context: &str,
-    prior_matching_observations: usize,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
+    wait_for_embedded_serving_log_since(snapshot, context, None, timeout)
+}
+
+/// Wait for an exact serving receipt emitted after a caller's UTC mutation boundary.
+fn wait_for_embedded_serving_log_after(
+    snapshot: &serde_json::Value,
+    context: &str,
+    boundary: &str,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
+    wait_for_embedded_serving_log_since(snapshot, context, Some(boundary), timeout)
+}
+
+/// Wait for a serving receipt, optionally restricted to logs emitted after `boundary`.
+fn wait_for_embedded_serving_log_since(
+    snapshot: &serde_json::Value,
+    context: &str,
+    boundary: Option<&str>,
     timeout: Duration,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let digest = snapshot
@@ -3712,34 +3699,21 @@ fn wait_for_embedded_serving_log(
         .and_then(serde_json::Value::as_u64)
         .ok_or("serving snapshot evidence has no candidate count")?;
     let deadline = Instant::now() + timeout;
-    let mut last_logs = String::new();
+    let boundary_description = boundary.map_or_else(
+        || "in the available Gateway logs".to_owned(),
+        |value| format!("after UTC boundary {value}"),
+    );
     loop {
-        let output = Command::new("kubectl")
-            .args([
-                "--context",
-                context,
-                "-n",
-                GRID_SYSTEM_NS,
-                "logs",
-                &format!("deployment/{GRID_SERVING_GATEWAY}"),
-                "--all-containers",
-                "--tail=400",
-            ])
-            .output()?;
-        if output.status.success() {
-            let raw_logs = String::from_utf8_lossy(&output.stdout);
-            let matches = embedded_serving_revision_lines(&raw_logs, digest, count);
-            if has_new_embedded_serving_revision_observation(&raw_logs, digest, count, prior_matching_observations) {
-                let matched_line = matches.last().ok_or("serving log match disappeared")?;
-                return Ok(safe_truncate_str(matched_line.trim(), 1_000));
-            }
-            last_logs = strip_ansi_csi(&raw_logs);
+        let lines = embedded_serving_revision_logs(context, boundary)?;
+        if let Some(line) = embedded_serving_revision_receipt(&lines, digest, count) {
+            return Ok(safe_truncate_str(line.trim(), 1_000));
         }
+        let logs = lines.join("\n");
         if Instant::now() >= deadline {
             return Err(format!(
-                "embedded gateway did not log serving digest {} with candidate_count={count}: {}",
+                "embedded gateway did not log serving digest {} with candidate_count={count} {boundary_description}: {}",
                 safe_truncate_str(digest, 16),
-                safe_truncate_str(&last_logs, 1_000)
+                safe_truncate_str(&logs, 1_000)
             )
             .into());
         }
@@ -3747,42 +3721,25 @@ fn wait_for_embedded_serving_log(
     }
 }
 
-/// Count existing exact serving-log observations so a repeated digest must be newly accepted.
-fn embedded_serving_log_observation_count(
-    snapshot: &serde_json::Value,
-    context: &str,
-) -> Result<usize, Box<dyn std::error::Error>> {
-    let digest = snapshot
-        .get("digest")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("serving snapshot evidence has no digest")?;
-    let count = snapshot
-        .get("candidate_count")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or("serving snapshot evidence has no candidate count")?;
-    Ok(embedded_serving_revision_logs(context)?
+/// Return the exact serving receipt for a digest and candidate count.
+fn embedded_serving_revision_receipt<'line>(lines: &'line [String], digest: &str, count: u64) -> Option<&'line str> {
+    lines
         .iter()
-        .filter(|line| line.contains(digest) && line.contains(&format!("candidate_count={count}")))
-        .count())
+        .find(|line| line.contains(digest) && line.contains(&format!("candidate_count={count}")))
+        .map(String::as_str)
 }
 
-/// Read the Gateway's ordered serving-revision receipts.
-fn embedded_serving_revision_logs(context: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+/// Read timestamped Gateway serving-revision receipts, optionally since a UTC boundary.
+fn embedded_serving_revision_logs(
+    context: &str,
+    boundary: Option<&str>,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let output = Command::new("kubectl")
-        .args([
-            "--context",
-            context,
-            "-n",
-            GRID_SYSTEM_NS,
-            "logs",
-            &format!("deployment/{GRID_SERVING_GATEWAY}"),
-            "--all-containers",
-            "--tail=400",
-        ])
+        .args(embedded_serving_log_args(context, boundary))
         .output()?;
     if !output.status.success() {
         return Err(format!(
-            "could not read existing embedded serving logs: {}",
+            "could not read embedded serving logs: {}",
             safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 500)
         )
         .into());
@@ -3795,42 +3752,28 @@ fn embedded_serving_revision_logs(context: &str) -> Result<Vec<String>, Box<dyn 
         .collect())
 }
 
-/// Wait for an exact serving receipt emitted after a caller's previously observed receipts.
-///
-/// A content-addressed empty revision can recur later in the same qualification. Requiring a
-/// receipt after `prior_observations` distinguishes the new `ConfigMap` transition from an older
-/// log line that names the same digest.
-fn wait_for_embedded_serving_log_after(
-    snapshot: &serde_json::Value,
-    context: &str,
-    prior_observations: usize,
-    timeout: Duration,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let digest = snapshot
-        .get("digest")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("serving snapshot evidence has no digest")?;
-    let count = snapshot
-        .get("candidate_count")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or("serving snapshot evidence has no candidate count")?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        let lines = embedded_serving_revision_logs(context)?;
-        if let Some(line) = embedded_serving_revision_receipt_after(&lines, prior_observations, digest, count) {
-            return Ok(safe_truncate_str(line, 1_000));
-        }
-        let logs = lines.join("\n");
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "embedded gateway did not newly log serving digest {} with candidate_count={count} after {prior_observations} prior receipts: {}",
-                safe_truncate_str(digest, 16),
-                safe_truncate_str(&logs, 1_000)
-            )
-            .into());
-        }
-        std::thread::park_timeout(Duration::from_secs(2));
+/// Build the timestamped `kubectl logs` invocation for serving receipts.
+fn embedded_serving_log_args(context: &str, boundary: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "--context".to_owned(),
+        context.to_owned(),
+        "-n".to_owned(),
+        GRID_SYSTEM_NS.to_owned(),
+        "logs".to_owned(),
+        format!("deployment/{GRID_SERVING_GATEWAY}"),
+        "--all-containers".to_owned(),
+        "--timestamps".to_owned(),
+    ];
+    if let Some(boundary) = boundary {
+        args.push("--since-time".to_owned());
+        args.push(boundary.to_owned());
     }
+    args
+}
+
+/// Whether Kubernetes rejected the exact invalid locked-policy contract probe.
+fn is_invalid_locked_policy_rejection(output: &str) -> bool {
+    output.contains("Invalid") && output.contains("allowedRegions is required in locked mode")
 }
 
 /// Send one request through the embedded `grid-gateway` Service and retain status plus provider attribution.
@@ -4460,7 +4403,7 @@ fn require_no_route(response: &LifecycleRequest, step: &str) -> Result<(), Box<d
 fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResult {
     let started = Instant::now();
     let mut facts = BTreeMap::new();
-    let mut original_geography = None;
+    let mut original_geography = Vec::new();
     let mut original_policies = None;
     let mut provider_a = None;
     let mut provider_a_withdrawn = false;
@@ -4490,8 +4433,9 @@ fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResu
             .and_then(serde_json::Value::as_str)
             .ok_or("baseline serving snapshot has no digest")?
             .to_owned();
-        original_geography = Some(set_regional_policy_geography()?);
+        set_regional_policy_geography(&mut original_geography)?;
         let affinity_policy = qualification_affinity_policy();
+        let affinity_receipt_boundary = embedded_serving_log_boundary()?;
         original_policies = Some(set_regional_policy(Some(&affinity_policy))?);
         provider_a = Some(read_provider_selector("provider-a", "vcr-provider-a-provider")?);
 
@@ -4504,14 +4448,12 @@ fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResu
             Duration::from_secs(180),
         )?;
         require_serving_affinity_groups(&affinity_serving)?;
-        let affinity_serving_log = wait_for_embedded_serving_log(
+        let affinity_serving_log = wait_for_embedded_serving_log_after(
             &affinity_serving,
             &cluster_context(CONSUMER_SITE),
-            0,
+            &affinity_receipt_boundary,
             Duration::from_secs(90),
         )?;
-        let affinity_serving_logs =
-            embedded_serving_log_observation_count(&affinity_serving, &cluster_context(CONSUMER_SITE))?;
         facts.insert("affinity_overlay".to_owned(), serde_json::json!(affinity.candidates));
         facts.insert(
             "affinity_revision".to_owned(),
@@ -4557,6 +4499,7 @@ fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResu
         )?;
 
         let provider_a_state = provider_a.as_ref().ok_or("provider A selector was not captured")?;
+        let fallback_receipt_boundary = embedded_serving_log_boundary()?;
         patch_provider_selector(provider_a_state, "grid258-regional-withdrawn-provider-a")?;
         provider_a_withdrawn = true;
         let fallback = wait_for_overlay_clusters(&fallback_clusters, Some(&affinity.semantic_revision))?;
@@ -4567,10 +4510,10 @@ fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResu
             .ok_or("affinity serving snapshot has no digest")?;
         let fallback_serving =
             wait_for_grid_serving_snapshot(&fallback_clusters, Some(affinity_digest), Duration::from_secs(180))?;
-        let fallback_serving_log = wait_for_embedded_serving_log(
+        let fallback_serving_log = wait_for_embedded_serving_log_after(
             &fallback_serving,
             &cluster_context(CONSUMER_SITE),
-            0,
+            &fallback_receipt_boundary,
             Duration::from_secs(90),
         )?;
         let fallback_request = send_lifecycle_request(None)?;
@@ -4611,10 +4554,9 @@ fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResu
             serde_json::json!(bound_after_loss),
         );
 
-        // Recovery restores the affinity digest. Require one additional log
-        // observation beyond the original affinity publication, rather than
-        // comparing it with the unrelated baseline digest's observations.
-        let prior_recovery_logs = affinity_serving_logs;
+        // Recovery restores the affinity digest. Its receipt must be newer than
+        // the restoration mutation, not merely another observation of that digest.
+        let recovery_receipt_boundary = embedded_serving_log_boundary()?;
         patch_provider_selector(provider_a_state, &provider_a_state.selector_value)?;
         provider_a_withdrawn = false;
         let recovered = wait_for_overlay_clusters(&affinity_clusters, Some(&fallback.semantic_revision))?;
@@ -4622,10 +4564,10 @@ fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResu
         let fallback_digest = serving_snapshot_digest(&fallback_serving)?;
         let recovered_serving =
             wait_for_grid_serving_snapshot(&affinity_clusters, Some(&fallback_digest), Duration::from_secs(180))?;
-        let recovered_serving_log = wait_for_embedded_serving_log(
+        let recovered_serving_log = wait_for_embedded_serving_log_after(
             &recovered_serving,
             &cluster_context(CONSUMER_SITE),
-            prior_recovery_logs,
+            &recovery_receipt_boundary,
             Duration::from_secs(90),
         )?;
         let recovered_request = send_lifecycle_request(None)?;
@@ -4646,15 +4588,16 @@ fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResu
 
         let recovered_digest = serving_snapshot_digest(&recovered_serving)?;
         let locked_policy = qualification_locked_policy();
+        let locked_receipt_boundary = embedded_serving_log_boundary()?;
         let locked_previous = set_regional_policy(Some(&locked_policy))?;
         let locked = wait_for_overlay_clusters(&locked_clusters, Some(&recovered.semantic_revision))?;
         wait_for_consumer_gateway_revision(&locked.semantic_revision)?;
         let locked_serving =
             wait_for_grid_serving_snapshot(&locked_clusters, Some(&recovered_digest), Duration::from_secs(180))?;
-        let locked_serving_log = wait_for_embedded_serving_log(
+        let locked_serving_log = wait_for_embedded_serving_log_after(
             &locked_serving,
             &cluster_context(CONSUMER_SITE),
-            0,
+            &locked_receipt_boundary,
             Duration::from_secs(90),
         )?;
         facts.insert("locked_overlay".to_owned(), serde_json::json!(locked.candidates));
@@ -4716,13 +4659,25 @@ fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResu
         if invalid.status.success() {
             return Err("Kubernetes accepted an invalid locked policy without allowedRegions".into());
         }
+        let invalid_output = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&invalid.stdout),
+            String::from_utf8_lossy(&invalid.stderr)
+        );
+        if !is_invalid_locked_policy_rejection(&invalid_output) {
+            return Err(format!(
+                "invalid locked policy was rejected for an unexpected reason: {}",
+                safe_truncate_str(invalid_output.trim(), 500)
+            )
+            .into());
+        }
         let after_invalid = read_cluster_overlay(CONSUMER_SITE)?;
         if after_invalid.semantic_revision != locked.semantic_revision {
             return Err("invalid policy update changed the serving overlay revision".into());
         }
         facts.insert(
             "invalid_policy_update_rejected".to_owned(),
-            serde_json::json!(safe_truncate_str(String::from_utf8_lossy(&invalid.stderr).trim(), 500)),
+            serde_json::json!(safe_truncate_str(invalid_output.trim(), 500)),
         );
         facts.insert(
             "revision_after_invalid_policy".to_owned(),
@@ -4733,6 +4688,7 @@ fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResu
             .iter()
             .map(|(site, _)| Ok(((*site).to_owned(), read_backend_success_count(site)?)))
             .collect::<Result<_, Box<dyn std::error::Error>>>()?;
+        let empty_receipt_boundary = embedded_serving_log_boundary()?;
         patch_provider_selector(provider_a_state, "grid258-regional-locked-withdrawn")?;
         provider_a_withdrawn = true;
         let empty = wait_for_overlay_clusters(&empty_clusters, Some(&locked.semantic_revision))?;
@@ -4740,10 +4696,10 @@ fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResu
         let locked_digest = serving_snapshot_digest(&locked_serving)?;
         let empty_serving =
             wait_for_grid_serving_snapshot(&empty_clusters, Some(&locked_digest), Duration::from_secs(180))?;
-        let empty_serving_log = wait_for_embedded_serving_log(
+        let empty_serving_log = wait_for_embedded_serving_log_after(
             &empty_serving,
             &cluster_context(CONSUMER_SITE),
-            0,
+            &empty_receipt_boundary,
             Duration::from_secs(90),
         )?;
         let no_route_requests = [
@@ -4794,6 +4750,7 @@ fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResu
     // assertion treats the restored topology as its baseline.
     let policy_restore_overlay = read_cluster_overlay(CONSUMER_SITE).ok();
     let policy_restore_serving = read_grid_serving_snapshot(&cluster_context(CONSUMER_SITE)).ok();
+    let policy_restore_receipt_boundary = embedded_serving_log_boundary();
     let mut restoration_error = None;
     if provider_a_withdrawn
         && let Some(provider_a) = provider_a.as_ref()
@@ -4806,8 +4763,8 @@ fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResu
     {
         restoration_error.get_or_insert_with(|| format!("regional policies: {error}"));
     }
-    if let Some(original_geography) = original_geography.as_ref()
-        && let Err(error) = restore_regional_policy_geography(original_geography)
+    if !original_geography.is_empty()
+        && let Err(error) = restore_regional_policy_geography(&original_geography)
     {
         restoration_error.get_or_insert_with(|| format!("regional geography: {error}"));
     }
@@ -4827,8 +4784,15 @@ fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResu
                 .and_then(|snapshot| snapshot.get("digest"))
                 .and_then(serde_json::Value::as_str);
             let serving = wait_for_grid_serving_snapshot(&all_clusters, previous_digest, Duration::from_secs(180))?;
-            let log =
-                wait_for_embedded_serving_log(&serving, &cluster_context(CONSUMER_SITE), 0, Duration::from_secs(90))?;
+            let receipt_boundary = policy_restore_receipt_boundary
+                .as_ref()
+                .map_err(|error| format!("could not capture regional policy restoration receipt boundary: {error}"))?;
+            let log = wait_for_embedded_serving_log_after(
+                &serving,
+                &cluster_context(CONSUMER_SITE),
+                receipt_boundary,
+                Duration::from_secs(90),
+            )?;
             facts.insert(
                 "regional_policy_restored_overlay".to_owned(),
                 serde_json::json!(overlay.candidates),
@@ -5194,8 +5158,8 @@ fn regional_policy_grid_site_resource(site_id: &str) -> Result<String, Box<dyn s
         .ok_or_else(|| format!("could not find GridSite representing site id {site_id:?}").into())
 }
 
-/// Set the synthetic trusted geography used to prove regional and sovereignty enforcement.
-fn set_regional_policy_geography() -> Result<Vec<RegionalSiteState>, Box<dyn std::error::Error>> {
+/// Set synthetic trusted geography, recording each original site state before its patch.
+fn set_regional_policy_geography(original: &mut Vec<RegionalSiteState>) -> Result<(), Box<dyn std::error::Error>> {
     let context = cluster_context(CONSUMER_SITE);
     let desired = [
         (
@@ -5214,7 +5178,6 @@ fn set_regional_policy_geography() -> Result<Vec<RegionalSiteState>, Box<dyn std
             QUALIFICATION_OTHER_SOVEREIGNTY_ZONE,
         ),
     ];
-    let mut original = Vec::with_capacity(desired.len());
     for (site_id, region, sovereignty_zone) in desired {
         let resource = regional_policy_grid_site_resource(site_id)?;
         let site = kubectl_get_json(&context, &format!("gridsite/{resource}"))?;
@@ -5234,7 +5197,7 @@ fn set_regional_policy_geography() -> Result<Vec<RegionalSiteState>, Box<dyn std
             }),
         )?;
     }
-    Ok(original)
+    Ok(())
 }
 
 /// Restore the exact trusted geography that existed before qualification.
@@ -5588,7 +5551,6 @@ fn assert_provider_withdrawal_lifecycle(
     let mut original_selectors = Vec::new();
     let mut original_consumer_endpoint_mode = None;
     let mut original_provider_hop_endpoints = None;
-    let mut embedded_restore_prior_log_observations = 0;
     let body = (|| -> Result<(), Box<dyn std::error::Error>> {
         for (site, resource) in PROVIDER_RESOURCES {
             wait_for_deployment("provider-gateway", GRID_SYSTEM_NS, &cluster_context(site))?;
@@ -5622,15 +5584,15 @@ fn assert_provider_withdrawal_lifecycle(
         wait_for_consumer_gateway_revision(&baseline.semantic_revision)?;
         let mut embedded_serving_digest = if embedded_gateway_enabled {
             let embedded_baseline = wait_for_grid_serving_snapshot(&all_clusters, None, Duration::from_secs(180))?;
-            embedded_restore_prior_log_observations =
-                embedded_serving_log_observation_count(&embedded_baseline, &cluster_context(CONSUMER_SITE))?;
-            if embedded_restore_prior_log_observations == 0 {
-                return Err("embedded gateway has not logged acceptance of its baseline serving revision".into());
-            }
+            let embedded_baseline_log = wait_for_embedded_serving_log(
+                &embedded_baseline,
+                &cluster_context(CONSUMER_SITE),
+                Duration::from_secs(90),
+            )?;
             facts.insert("embedded_baseline_serving_config".to_owned(), embedded_baseline.clone());
             facts.insert(
-                "embedded_baseline_log_observation_count".to_owned(),
-                serde_json::json!(embedded_restore_prior_log_observations),
+                "embedded_baseline_serving_log".to_owned(),
+                serde_json::json!(embedded_baseline_log),
             );
             Some(
                 embedded_baseline
@@ -5669,6 +5631,7 @@ fn assert_provider_withdrawal_lifecycle(
             .iter()
             .find(|selector| selector.site == "provider-a")
             .ok_or("missing captured provider A selector")?;
+        let embedded_fallback_receipt_boundary = embedded_serving_log_boundary()?;
         patch_provider_selector(a, "grid258-withdrawn-provider-a")?;
         facts.insert(
             "withdrawn_provider_a_selector".to_owned(),
@@ -5698,8 +5661,12 @@ fn assert_provider_withdrawal_lifecycle(
                 embedded_serving_digest.as_deref(),
                 Duration::from_secs(180),
             )?;
-            let log =
-                wait_for_embedded_serving_log(&serving, &cluster_context(CONSUMER_SITE), 0, Duration::from_secs(90))?;
+            let log = wait_for_embedded_serving_log_after(
+                &serving,
+                &cluster_context(CONSUMER_SITE),
+                &embedded_fallback_receipt_boundary,
+                Duration::from_secs(90),
+            )?;
             for attempt in 0..6 {
                 let response = send_embedded_lifecycle_request(Some(&format!("grid258-embedded-fallback-{attempt}")))?;
                 if response.status != 200 || response.provider.as_deref() == Some("provider-a") {
@@ -5745,14 +5712,9 @@ fn assert_provider_withdrawal_lifecycle(
         facts.insert("fallback_attribution".to_owned(), serde_json::json!(fallback_providers));
         write_lifecycle_evidence(context, &facts)?;
 
-        // An empty serving document can recur after Scenario 8. Record all revision receipts
-        // before this withdrawal so the later acceptance wait cannot mistake that old empty
-        // document's log line for this lifecycle's transition.
-        let embedded_empty_prior_log_observations = if embedded_gateway_enabled {
-            embedded_serving_revision_logs(&cluster_context(CONSUMER_SITE))?.len()
-        } else {
-            0
-        };
+        // An empty serving document can recur after Scenario 8. Capture a time boundary before
+        // withdrawal so the later acceptance wait cannot mistake an old receipt for this transition.
+        let embedded_empty_receipt_boundary = embedded_serving_log_boundary()?;
         for state in original_selectors.iter().filter(|state| state.site != "provider-a") {
             patch_provider_selector(state, &format!("grid258-withdrawn-{}", state.site))?;
         }
@@ -5823,7 +5785,7 @@ fn assert_provider_withdrawal_lifecycle(
             let log = wait_for_embedded_serving_log_after(
                 &serving,
                 &cluster_context(CONSUMER_SITE),
-                embedded_empty_prior_log_observations,
+                &embedded_empty_receipt_boundary,
                 Duration::from_secs(90),
             )?;
             let warning = wait_for_empty_overlay_invalid_hop_warning(Duration::from_secs(45))?;
@@ -5985,6 +5947,7 @@ fn assert_provider_withdrawal_lifecycle(
         );
         write_lifecycle_evidence(context, &facts)?;
 
+        let embedded_restore_receipt_boundary = embedded_serving_log_boundary()?;
         for state in &original_selectors {
             patch_provider_selector(state, &state.selector_value)?;
         }
@@ -6001,10 +5964,10 @@ fn assert_provider_withdrawal_lifecycle(
                 embedded_serving_digest.as_deref(),
                 Duration::from_secs(180),
             )?;
-            let log = wait_for_embedded_serving_log(
+            let log = wait_for_embedded_serving_log_after(
                 &serving,
                 &cluster_context(CONSUMER_SITE),
-                embedded_restore_prior_log_observations,
+                &embedded_restore_receipt_boundary,
                 Duration::from_secs(90),
             )?;
             facts.insert("embedded_restored_serving_config".to_owned(), serving);
@@ -7258,40 +7221,36 @@ mod tests {
     #[test]
     fn serving_revision_matcher_handles_colored_tracing_fields() {
         let logs = "\x1b[2mINFO\x1b[0m grid_serving_revision_serving revision=abc123 \x1b[3m candidate_count\x1b[0m\x1b[3m=\x1b[0m3";
-        let line = embedded_serving_revision_lines(logs, "abc123", 3)
-            .into_iter()
-            .next()
-            .unwrap_or_default();
+        let receipts = strip_ansi_csi(logs).lines().map(str::to_owned).collect::<Vec<_>>();
+        let line = embedded_serving_revision_receipt(&receipts, "abc123", 3).unwrap_or_default();
         assert!(line.contains("candidate_count=3"));
-        assert!(embedded_serving_revision_lines(logs, "wrong", 3).is_empty());
-        assert!(embedded_serving_revision_lines(logs, "abc123", 2).is_empty());
+        assert!(embedded_serving_revision_receipt(&receipts, "wrong", 3).is_none());
+        assert!(embedded_serving_revision_receipt(&receipts, "abc123", 2).is_none());
     }
 
     #[test]
-    fn restored_revision_wait_requires_a_new_acceptance_after_its_old_log() {
-        let old = "INFO grid_serving_revision_serving revision=abc123 candidate_count=3";
-        assert!(!has_new_embedded_serving_revision_observation(old, "abc123", 3, 1));
-        let updated = format!("{old}\nINFO grid_serving_revision_serving revision=abc123 candidate_count=3");
-        assert!(has_new_embedded_serving_revision_observation(&updated, "abc123", 3, 1));
-        assert!(!has_new_embedded_serving_revision_observation(&updated, "abc123", 2, 1));
-    }
-
-    #[test]
-    fn lifecycle_empty_receipt_requires_a_log_after_unrelated_old_empty_receipts() {
-        let empty = "INFO grid_serving_revision_serving revision=empty candidate_count=0";
-        let old_receipts = vec![
-            "INFO grid_serving_revision_serving revision=baseline candidate_count=3".to_owned(),
-            empty.to_owned(),
-        ];
-        let prior_observations = old_receipts.len();
-        assert!(embedded_serving_revision_receipt_after(&old_receipts, prior_observations, "empty", 0).is_none());
-
-        let mut receipts = old_receipts;
-        receipts.push(empty.to_owned());
+    fn serving_receipt_log_args_use_timestamped_time_boundary() {
+        let boundary = "2026-11-10T12:34:56.123456789Z";
+        let args = embedded_serving_log_args("kind-provider-a", Some(boundary));
+        assert!(args.contains(&"--timestamps".to_owned()));
         assert_eq!(
-            embedded_serving_revision_receipt_after(&receipts, prior_observations, "empty", 0),
-            Some(empty)
+            args.windows(2)
+                .find(|pair| pair.first().is_some_and(|value| value == "--since-time")),
+            Some(["--since-time".to_owned(), boundary.to_owned()].as_slice())
         );
+    }
+
+    #[test]
+    fn invalid_locked_policy_probe_requires_the_expected_admission_rejection() {
+        assert!(is_invalid_locked_policy_rejection(
+            "The GridNetwork \"grid\" is invalid: spec.consumerGateways[0].regionalPolicy: Invalid value: object: allowedRegions is required in locked mode"
+        ));
+        assert!(!is_invalid_locked_policy_rejection(
+            "Error from server (Forbidden): cannot patch gridnetworks"
+        ));
+        assert!(!is_invalid_locked_policy_rejection(
+            "The GridNetwork \"grid\" is invalid: another field is invalid"
+        ));
     }
 
     #[test]
