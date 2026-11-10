@@ -631,6 +631,58 @@ pub(crate) const STALE_GC_TTL_SECS: u32 = 5;
 pub(crate) const STALE_GC_ABSENT_POLL_TIMEOUT: Duration = Duration::from_secs(45);
 
 // ---------------------------------------------------------------------------
+// Local-site status validation constants (issue #485)
+// ---------------------------------------------------------------------------
+
+/// `GridNetwork` used by the local-site status validation.
+pub(crate) const LOCAL_STATUS_NETWORK: &str = "op-e2e-local-status-net";
+
+/// The operator's own site name in the local-site status validation.
+pub(crate) const LOCAL_STATUS_OWN_SITE: &str = "local-status-site";
+
+/// A declared peer site name in the local-site status validation.
+pub(crate) const LOCAL_STATUS_PEER_SITE: &str = "local-status-peer";
+
+/// How long to wait for a `GridSite` phase/reason transition.
+pub(crate) const LOCAL_STATUS_POLL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// DNS SAN used for the mTLS certificate generated in the local-site status validation.
+pub(crate) const LOCAL_STATUS_DNS_SAN: &str = "local-status-site.grid.internal";
+
+/// Name of the CA `Secret` created for the local-site status validation.
+pub(crate) const LOCAL_STATUS_CA_SECRET: &str = "local-status-ca";
+
+/// Name of the site TLS `Secret` created for the local-site status validation.
+pub(crate) const LOCAL_STATUS_TLS_SECRET: &str = "local-status-tls";
+
+/// `GridNetwork` condition type for peer signals reachability.
+pub(crate) const PEER_SIGNALS_REACHABLE: &str = "PeerSignalsReachable";
+
+/// `GridNetwork` condition type for peer catalog acceptance.
+pub(crate) const PEER_CATALOGS_ACCEPTED: &str = "PeerCatalogsAccepted";
+
+/// `GridNetwork` condition type for whether poll rounds completed.
+pub(crate) const PEER_POLLS_COMPLETE: &str = "PeerPollsComplete";
+
+/// `GridNetwork` condition type for peer timestamp validity.
+pub(crate) const PEER_TIME_VALID: &str = "PeerTimeValid";
+
+/// `GridNetwork` condition type for peer membership consistency.
+pub(crate) const PEER_MEMBERSHIP: &str = "PeerMembership";
+
+/// Reason every peer condition carries while no peer `GridSite` is declared.
+pub(crate) const NO_DECLARED_PEERS: &str = "NoDeclaredPeers";
+
+/// `PeerTimeValid` reason when no relayed peer age is rejected.
+pub(crate) const PEER_TIMESTAMPS_VALID: &str = "PeerTimestampsValid";
+
+/// `GridSite` phase reason when the gateway endpoint is set but its address is not dialable.
+pub(crate) const SIGNALS_ADDRESS_MISSING: &str = "SignalsAddressMissing";
+
+/// `GridNetwork` `Degraded` reason when no concern holds.
+pub(crate) const AS_EXPECTED: &str = "AsExpected";
+
+// ---------------------------------------------------------------------------
 // CRD installation
 // ---------------------------------------------------------------------------
 
@@ -1294,6 +1346,55 @@ pub(crate) fn spawn_operator(context: &str) -> Result<Child, Box<dyn std::error:
     Ok(child)
 }
 
+/// Spawn a Local-membership operator with an isolated kubeconfig and signals listener.
+///
+/// `temp` must outlive the process. Each site uses its own kubeconfig so a second
+/// operator cannot race with changes to the global current context.
+pub(crate) fn spawn_local_operator(
+    context: &str,
+    site_name: &str,
+    signals_addr: &str,
+    temp: &std::path::Path,
+) -> Result<Child, Box<dyn std::error::Error>> {
+    ensure_operator_binary_built()?;
+    let kubeconfig_path = temp.join(format!("kubeconfig-{site_name}.yaml"));
+    let output = Command::new("kubectl")
+        .args(["config", "view", "--minify", "--flatten", "--context", context])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "kubectl config view --minify failed for context {context}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    std::fs::write(&kubeconfig_path, &output.stdout)?;
+    let metrics_addr = reserve_metrics_addr()?;
+    let log_path = format!("/tmp/grid-operator-{site_name}.log");
+    let log_file = std::fs::File::create(&log_path)?;
+    eprintln!(
+        "  spawning operator (Local membership, site={site_name}, context={context}, \
+         signals={signals_addr}, metrics={metrics_addr}, log={log_path})..."
+    );
+    let child = Command::new(operator_binary_path())
+        .env("KUBECONFIG", &kubeconfig_path)
+        .env("GRID_METRICS_ADDR", &metrics_addr)
+        .env("GRID_SIGNALS_ADDR", signals_addr)
+        .env("GRID_SIGNALS_PEER_INTERVAL_SECS", "2")
+        .env("GRID_MODEL_DISCOVERY_INTERVAL_SECS", "1")
+        .env("GRID_MODEL_DISCOVERY_TIMEOUT_SECS", "2")
+        .env("GRID_MODEL_DISCOVERY_TTL_SECS", "5")
+        .env("GRID_MEMBERSHIP_SOURCE", "Local")
+        .env("GRID_SITE_NAME", site_name)
+        .env("GRID_CREATE_LOCAL_RECORDS", "false")
+        .env("RUST_LOG", "info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file.try_clone()?))
+        .stderr(Stdio::from(log_file))
+        .spawn()?;
+    Ok(child)
+}
+
 /// Spawn a SWIM-enabled operator against a specific kind cluster without relying on
 /// the global kubeconfig current-context.
 ///
@@ -1414,6 +1515,34 @@ pub(crate) fn reserve_metrics_addr() -> Result<String, Box<dyn std::error::Error
     let addr = listener.local_addr()?.to_string();
     drop(listener);
     Ok(addr)
+}
+
+/// Reserve a host IPv4 TCP address that declared peers are permitted to dial.
+///
+/// A UDP connect selects the default-route interface without sending a packet.
+/// Both operators run on the host, so no pod-to-host or Docker gateway routing is needed.
+/// Like the other address reservations, the port is released before the child binds it.
+pub(crate) fn reserve_local_signals_addr() -> Result<String, Box<dyn std::error::Error>> {
+    let route = UdpSocket::bind("0.0.0.0:0")?;
+    route.connect("192.0.2.1:9")?;
+    let std::net::IpAddr::V4(ip) = route.local_addr()?.ip() else {
+        return Err("local-status peer requires a host IPv4 address".into());
+    };
+    if !local_status_ip_is_dialable(ip) {
+        return Err(format!("local-status peer cannot use host address {ip}").into());
+    }
+    let listener = std::net::TcpListener::bind((ip, 0))?;
+    Ok(listener.local_addr()?.to_string())
+}
+
+/// Exclude local and metadata addresses rejected by the operator's signals poller.
+fn local_status_ip_is_dialable(ip: std::net::Ipv4Addr) -> bool {
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ip == std::net::Ipv4Addr::new(100, 100, 100, 200))
 }
 
 /// Assert that a child process is still alive (non-blocking).
@@ -6368,6 +6497,34 @@ pub(crate) fn read_gridsite_phase(context: &str, site_name: &str) -> Result<Stri
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
+/// Assert that `GridSite` `site_name` does not exist in `context`.
+///
+/// Returns `Ok(())` when the API server responds with `NotFound`. Returns `Err` when
+/// the site exists (reports its phase) or when `kubectl` fails for any other reason
+/// (wrong context, unreachable API server, etc.).
+pub(crate) fn assert_gridsite_absent(context: &str, site_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let out = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
+            "get",
+            "gridsites",
+            site_name,
+            "-o",
+            "jsonpath={.status.phase}",
+        ])
+        .output()?;
+    if out.status.success() {
+        let phase = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        return Err(format!("GridSite {site_name:?} already exists (phase={phase:?})").into());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("NotFound") {
+        return Ok(());
+    }
+    Err(format!("kubectl get gridsites/{site_name} failed: {stderr}").into())
+}
+
 /// Poll until `GridSite` `site_name` reaches `expected_phase`, or return `Err` on timeout.
 ///
 /// The polling interval is 2 seconds, matching the pattern used by
@@ -7649,6 +7806,137 @@ pub(crate) fn cleanup_stale_gc_west_resources(context: &str) -> Result<(), Box<d
     Ok(())
 }
 
+/// Remove all resources the local-site status validation created.
+pub(crate) fn cleanup_local_status_resources(context: &str) {
+    drop(delete_cluster_resource(context, "gridsite", LOCAL_STATUS_PEER_SITE));
+    drop(delete_cluster_resource(context, "gridsite", LOCAL_STATUS_OWN_SITE));
+    drop(delete_cluster_resource(context, "gridnetwork", LOCAL_STATUS_NETWORK));
+    drop(delete_namespaced_resource(
+        context,
+        "default",
+        "secret",
+        LOCAL_STATUS_CA_SECRET,
+    ));
+    drop(delete_namespaced_resource(
+        context,
+        "default",
+        "secret",
+        LOCAL_STATUS_TLS_SECRET,
+    ));
+}
+
+/// Poll until `GridNetwork` `network`'s condition `type_` shows `status` and `reason`.
+///
+/// Bumps the network on each iteration so the controller reconciles.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each parameter is a distinct field of the K8s condition object"
+)]
+pub(crate) fn wait_for_network_condition(
+    context: &str,
+    network: &str,
+    type_: &str,
+    expected_status: &str,
+    expected_reason: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    wait_for_resource_condition(
+        context,
+        network,
+        (&format!("gridnetworks/{network}"), type_),
+        ConditionExpectation::Exact(expected_status, expected_reason),
+        timeout,
+    )
+}
+
+/// Require a real verdict after declaring an endpoint-less peer, not proof of health.
+pub(crate) fn wait_for_network_condition_to_leave_no_peers(
+    context: &str,
+    network: &str,
+    type_: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    wait_for_resource_condition(
+        context,
+        network,
+        (&format!("gridnetworks/{network}"), type_),
+        ConditionExpectation::Leaves(NO_DECLARED_PEERS),
+        timeout,
+    )
+}
+
+/// Require positive per-peer evidence of a signals response or accepted catalog.
+pub(crate) fn wait_for_local_status_peer_condition(
+    context: &str,
+    type_: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    wait_for_resource_condition(
+        context,
+        LOCAL_STATUS_NETWORK,
+        (&format!("gridsites/{LOCAL_STATUS_PEER_SITE}"), type_),
+        ConditionExpectation::Exact("True", type_),
+        timeout,
+    )
+}
+
+/// What a condition must say before a bounded status wait can finish.
+#[derive(Clone, Copy, Debug)]
+enum ConditionExpectation<'condition> {
+    /// An exact status and reason pair.
+    Exact(&'condition str, &'condition str),
+    /// A definite verdict replacing the named reason, which need not be healthy.
+    Leaves(&'condition str),
+}
+
+impl ConditionExpectation<'_> {
+    /// Reject absent conditions as well as stale or still-unknown verdicts.
+    fn matches(&self, status: &str, reason: &str) -> bool {
+        match self {
+            Self::Exact(expected_status, expected_reason) => status == *expected_status && reason == *expected_reason,
+            Self::Leaves(previous_reason) => {
+                matches!(status, "True" | "False") && !reason.is_empty() && reason != *previous_reason
+            },
+        }
+    }
+}
+
+/// Poll a network or site condition while giving network reconciliation a bounded nudge.
+#[expect(clippy::disallowed_methods, reason = "synchronous poll loop in xtask harness")]
+fn wait_for_resource_condition(
+    context: &str,
+    network: &str,
+    (resource, type_): (&str, &str),
+    expected: ConditionExpectation<'_>,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    let jsonpath = format!(
+        "{{.status.conditions[?(@.type==\"{type_}\")].status}}:{{.status.conditions[?(@.type==\"{type_}\")].reason}}"
+    );
+    loop {
+        drop(bump_gridnetwork(context, network));
+        let raw = kubectl_jsonpath(context, resource, &jsonpath).unwrap_or_default();
+        let (status, reason) = raw.split_once(':').unwrap_or(("", ""));
+        if expected.matches(status, reason) {
+            eprintln!("  [OK] {resource} condition {type_:?}: {status}/{reason}");
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timeout waiting for {resource} condition {type_:?} {expected:?}; \
+                 last: {status:?}/{reason:?}"
+            )
+            .into());
+        }
+        eprintln!(
+            "  waiting for {resource} {type_:?} {expected:?} \
+             (current: {status:?}/{reason:?})..."
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // API-provider credential helpers
 // ---------------------------------------------------------------------------
@@ -8457,6 +8745,61 @@ mod tests {
             SWIM_NODE_PRIMARY_NAME, SWIM_NODE_SECONDARY_NAME,
             "SWIM node site names must be distinct"
         );
+    }
+
+    #[test]
+    fn local_status_transition_rejects_missing_unknown_and_stale_conditions() {
+        let expected = ConditionExpectation::Leaves(NO_DECLARED_PEERS);
+        for (status, reason) in [
+            ("", ""),
+            ("True", ""),
+            ("Unknown", NO_DECLARED_PEERS),
+            ("True", NO_DECLARED_PEERS),
+            ("False", NO_DECLARED_PEERS),
+            ("Unknown", "AwaitingFirstCheck"),
+        ] {
+            assert!(!expected.matches(status, reason), "{status}/{reason}");
+        }
+    }
+
+    #[test]
+    fn local_status_transition_does_not_require_a_healthy_verdict() {
+        let expected = ConditionExpectation::Leaves(NO_DECLARED_PEERS);
+        assert!(expected.matches("True", PEER_SIGNALS_REACHABLE));
+        assert!(expected.matches("False", "PeersUnreachable"));
+    }
+
+    #[test]
+    fn local_status_health_requires_both_status_and_reason() {
+        let expected = ConditionExpectation::Exact("True", "SignalsReachable");
+        assert!(expected.matches("True", "SignalsReachable"));
+        assert!(!expected.matches("False", "SignalsReachable"));
+        assert!(!expected.matches("True", "EgressOnly"));
+        assert!(!expected.matches("", ""));
+    }
+
+    #[test]
+    fn local_status_host_address_excludes_undialable_and_metadata_ips() {
+        for address in [
+            "127.0.0.1",
+            "127.1.2.3",
+            "0.0.0.0",
+            "169.254.169.254",
+            "100.100.100.200",
+            "224.0.0.1",
+            "255.255.255.255",
+        ] {
+            assert!(
+                !local_status_ip_is_dialable(address.parse().unwrap_or_else(|_| std::process::abort())),
+                "{address}"
+            );
+        }
+        for address in ["10.0.0.2", "172.18.0.1", "192.168.1.2"] {
+            assert!(
+                local_status_ip_is_dialable(address.parse().unwrap_or_else(|_| std::process::abort())),
+                "{address}"
+            );
+        }
     }
 
     #[test]
