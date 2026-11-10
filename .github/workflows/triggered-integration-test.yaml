@@ -158,7 +158,9 @@ jobs:
           INPUT_RELEASE_QUALIFICATION: ${{ inputs.release_qualification }}
         run: |
           set -euo pipefail
-          if [[ "${EVENT_NAME}" == "schedule" ]]; then
+          if [[ -n "${INPUT_RELEASE_QUALIFICATION}" ]]; then
+            RELEASE_QUALIFICATION="${INPUT_RELEASE_QUALIFICATION}"
+          elif [[ "${EVENT_NAME}" == "schedule" ]]; then
             case "${SCHEDULE}" in
               "0 18 * * *")
                 RELEASE_QUALIFICATION=glb-quick
@@ -172,7 +174,7 @@ jobs:
                 ;;
             esac
           else
-            RELEASE_QUALIFICATION="${INPUT_RELEASE_QUALIFICATION:-glb-quick}"
+            RELEASE_QUALIFICATION=glb-quick
           fi
           echo "release_qualification=${RELEASE_QUALIFICATION}" >> "${GITHUB_OUTPUT}"
           echo "Release qualification: ${RELEASE_QUALIFICATION}"
