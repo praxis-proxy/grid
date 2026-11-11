@@ -7,7 +7,10 @@
 //! A Service that once had a selector keeps what the built-in controllers wrote for it: the
 //! `EndpointSlice` controller's slices and the endpoints controller's v1 `Endpoints` object,
 //! which the mirroring controller mirrors into a slice of its own once the selector is gone.
-//! Both would route peers to pods that no longer serve, so the holder removes them.
+//! Both would route peers to pods that no longer serve, so the holder removes them. The v1 object
+//! is read on every pass until a read finds it gone; those reads then stop until a pass sees the
+//! Service with a selector again, under a new uid or without a confirmed slice, or a new holder starts.
+//! An object recreated after that read waits until then.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -75,6 +78,10 @@ pub struct HolderRoutes {
     ports: BTreeMap<String, i32>,
     /// Where routing stands, held across each write so a withdrawal cannot interleave with one.
     state: tokio::sync::Mutex<Routing>,
+    /// Services whose legacy `Endpoints` object a pass found absent, by name, with the Service's
+    /// uid as read then; locked only briefly. Dropped when a pass sees the Service with a selector,
+    /// under another uid or without a confirmed slice.
+    legacy_absent: std::sync::Mutex<HashMap<String, String>>,
     /// When each Service's legacy `Endpoints` object was last warned about, locked only briefly.
     warned: std::sync::Mutex<HashMap<String, tokio::time::Instant>>,
 }
@@ -88,6 +95,18 @@ enum Routing {
     Routed,
     /// Stood down: never routed to again.
     Withdrawn,
+}
+
+/// What a pass established about a Service's legacy `Endpoints` object.
+#[derive(Debug, Eq, PartialEq)]
+enum LegacyCleanup {
+    /// Not found absent; a later pass reads again.
+    Pending,
+    /// A read found no object while the Service had no selector.
+    Absent {
+        /// The Service's uid as read in this pass.
+        service_uid: String,
+    },
 }
 
 impl std::fmt::Debug for HolderRoutes {
@@ -113,6 +132,7 @@ impl HolderRoutes {
             me,
             ports,
             state: tokio::sync::Mutex::new(Routing::Waiting),
+            legacy_absent: std::sync::Mutex::new(HashMap::new()),
             warned: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -177,29 +197,39 @@ impl HolderRoutes {
     /// Write every Service's slice: naming this replica while `holding` holds, checked before
     /// each write so none lands once the lease has lapsed; with `None`, clearing what names it.
     /// A routed pass then removes, best effort and within one more [`WRITE_TIMEOUT`] in all, the
-    /// legacy `Endpoints` object of each Service it published, so a withdrawal waiting on the
-    /// routing state is delayed by at most that much.
+    /// legacy `Endpoints` object of each Service it published and has not yet found absent, so a
+    /// withdrawal waiting on the routing state is delayed by at most that much.
     async fn write_all(&self, holding: Option<&crate::leader::Holding>) {
-        let mut published = Vec::new();
+        let mut candidates = Vec::new();
         for name in &self.names {
             if holding.is_some_and(|holding| !holding.holds()) {
                 tracing::warn!(service = %name, "lease lapsed mid-write; not routing to this replica");
                 return;
             }
-            if let Some(service) = Box::pin(self.write_logged(name, holding.is_some())).await {
-                published.push(service);
+            match Box::pin(self.write_logged(name, holding.is_some())).await {
+                Some(service) => {
+                    if self.legacy_check_needed(&service) {
+                        candidates.push(service);
+                    }
+                },
+                None if holding.is_some() => self.forget_legacy_absence(name),
+                None => {},
             }
         }
         let Some(holding) = holding else {
             return;
         };
         let cleanup = async {
-            for service in &published {
+            for service in &candidates {
                 if !holding.holds() {
                     tracing::debug!("lease lapsed after publishing; legacy Endpoints cleanup waits for a later pass");
                     return;
                 }
-                Box::pin(self.clear_legacy_endpoints(service, holding)).await;
+                if let LegacyCleanup::Absent { service_uid } =
+                    Box::pin(self.clear_legacy_endpoints(service, holding)).await
+                {
+                    self.remember_legacy_absence(&service.name_any(), service_uid);
+                }
             }
         };
         if tokio::time::timeout(WRITE_TIMEOUT, cleanup).await.is_err() {
@@ -264,15 +294,17 @@ impl HolderRoutes {
     /// selector goes, and the mirroring controller then mirrors it into a slice beside the
     /// holder's. Only the shape that history leaves is removed, see [`legacy_endpoints`];
     /// anything else stays and is reported once per [`WARN_EVERY`]. Absence is established by a
-    /// later read, never by the delete's answer, since finalizers may hold the object.
-    async fn clear_legacy_endpoints(&self, service: &Service, holding: &crate::leader::Holding) {
+    /// later read, never by the delete's answer, since finalizers may hold the object: a read
+    /// finding none, for a Service without a selector and with a uid, while the lease holds, is
+    /// what [`LegacyCleanup::Absent`] reports.
+    async fn clear_legacy_endpoints(&self, service: &Service, holding: &crate::leader::Holding) -> LegacyCleanup {
         let name = service.name_any();
         let live = match Box::pin(self.endpoints.get_opt(&name)).await {
             Ok(Some(live)) => live,
-            Ok(None) => return,
+            Ok(None) => return absence(service, holding),
             Err(error) => {
                 self.warn_bounded(&name, "legacy Endpoints object not read", &error.to_string());
-                return;
+                return LegacyCleanup::Pending;
             },
         };
         let identity = match legacy_endpoints(service, &live, &self.namespace) {
@@ -283,11 +315,11 @@ impl HolderRoutes {
                     "Endpoints object on a holder Service left alone",
                     &why.to_string(),
                 );
-                return;
+                return LegacyCleanup::Pending;
             },
         };
         if !holding.holds() {
-            return;
+            return LegacyCleanup::Pending;
         }
         let params = DeleteParams {
             preconditions: Some(Preconditions {
@@ -307,6 +339,40 @@ impl HolderRoutes {
             },
             Err(error) => self.warn_bounded(&name, "legacy Endpoints object not deleted", &error.to_string()),
         }
+        LegacyCleanup::Pending
+    }
+
+    /// Whether `service`'s legacy `Endpoints` object is still to be read: not once this holder found
+    /// it absent for this Service, by uid, without a selector. Any other record of the Service is
+    /// dropped, so a selector restored or a Service replaced under its name is read again.
+    fn legacy_check_needed(&self, service: &Service) -> bool {
+        let name = service.name_any();
+        let mut absent = self
+            .legacy_absent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let unchanged = !has_selector(service) && service.uid().is_some_and(|uid| absent.get(&name) == Some(&uid));
+        if !unchanged {
+            absent.remove(&name);
+        }
+        !unchanged
+    }
+
+    /// Forget that `service`'s legacy object was found absent: its slice was not confirmed this
+    /// pass, so nothing about it is known.
+    fn forget_legacy_absence(&self, service: &str) {
+        self.legacy_absent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(service);
+    }
+
+    /// Record that `service`, at `uid`, had no legacy object.
+    fn remember_legacy_absence(&self, service: &str, uid: String) {
+        self.legacy_absent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(service.to_owned(), uid);
     }
 
     /// Warn `what` about `service` at most once per [`WARN_EVERY`], so a standing condition such
@@ -443,6 +509,28 @@ fn same(live: &EndpointSlice, desired: &EndpointSlice) -> bool {
         && live.metadata.labels == desired.metadata.labels
 }
 
+/// What a read finding no legacy object on `service` establishes: [`LegacyCleanup::Absent`] for a
+/// Service without a selector and with a uid, while `holding` still holds; otherwise nothing.
+fn absence(service: &Service, holding: &crate::leader::Holding) -> LegacyCleanup {
+    let uid = service.uid().filter(|uid| !uid.is_empty());
+    match uid {
+        Some(service_uid) if !has_selector(service) && holding.holds() => {
+            tracing::debug!(service = %service.name_any(), "no legacy Endpoints object; not read again until the record is dropped");
+            LegacyCleanup::Absent { service_uid }
+        },
+        _ => LegacyCleanup::Pending,
+    }
+}
+
+/// Whether `service` carries a nonempty selector, so the endpoints controller manages its object.
+fn has_selector(service: &Service) -> bool {
+    service
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.selector.as_ref())
+        .is_some_and(|selector| !selector.is_empty())
+}
+
 /// Why a v1 `Endpoints` object on a holder Service is left alone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 enum NotLegacy {
@@ -491,13 +579,10 @@ struct LegacyIdentity {
 /// Service's, their numbers uncompared, since the target port may have moved since the object was
 /// written. Otherwise why it is left alone. A shape, not proof of who wrote the object.
 fn legacy_endpoints(service: &Service, live: &Endpoints, namespace: &str) -> Result<LegacyIdentity, NotLegacy> {
-    let spec = service.spec.as_ref();
-    if spec
-        .and_then(|spec| spec.selector.as_ref())
-        .is_some_and(|selector| !selector.is_empty())
-    {
+    if has_selector(service) {
         return Err(NotLegacy::ServiceHasSelector);
     }
+    let spec = service.spec.as_ref();
     let metadata = &live.metadata;
     if metadata
         .owner_references
@@ -584,15 +669,17 @@ mod tests {
     /// collection by label and deleting by name, an `Endpoints` object only with matching
     /// preconditions and once its Service's holder slice is stored. The next write or the next
     /// read of a path can be delayed; a path may refuse deletes with 403; one path's next read may
-    /// leave the stored version moved on, as a write in flight does.
+    /// leave the stored version moved on, as a write in flight does. Every request is recorded as
+    /// it arrives, before any delay.
     #[derive(Clone, Default)]
-    struct Objects(
-        Arc<Mutex<BTreeMap<String, serde_json::Value>>>,
-        Arc<Mutex<Option<(String, Duration)>>>,
-        Arc<Mutex<Vec<String>>>,
-        Arc<Mutex<Option<String>>>,
-        Arc<Mutex<Option<(String, Duration)>>>,
-    );
+    struct Objects {
+        forbidden: Arc<Mutex<Vec<String>>>,
+        held: Arc<Mutex<BTreeMap<String, serde_json::Value>>>,
+        moves_on: Arc<Mutex<Option<String>>>,
+        requests: Arc<Mutex<Vec<(http::Method, String)>>>,
+        slow_read: Arc<Mutex<Option<(String, Duration)>>>,
+        slow_write: Arc<Mutex<Option<(String, Duration)>>>,
+    }
 
     /// The apiserver's answer to reading `path`: the object, its stored version moved on afterwards
     /// when `moves_on`, or 404.
@@ -700,12 +787,17 @@ mod tests {
                     let status = |code: u16, reason: &str| serde_json::json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":reason,"code":code});
                     let method = request.method().clone();
                     let path = request.uri().path().to_owned();
+                    objects
+                        .requests
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((method.clone(), path.clone()));
                     let query = request.uri().query().unwrap_or_default().to_owned();
                     let bytes = request.into_body().collect().await.expect("body").to_bytes();
                     if let Some(delay) = objects.delay(&method, &path) {
                         tokio::time::sleep(delay).await;
                     }
-                    let mut held = objects.0.lock().unwrap_or_else(PoisonError::into_inner);
+                    let mut held = objects.held.lock().unwrap_or_else(PoisonError::into_inner);
                     let selector = query
                         .split('&')
                         .find_map(|pair| pair.strip_prefix("labelSelector="))
@@ -725,7 +817,7 @@ mod tests {
                         )
                     } else if method == http::Method::GET {
                         let moves_on = objects
-                            .3
+                            .moves_on
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
                             .take_if(|on| *on == path)
@@ -733,7 +825,11 @@ mod tests {
                         let (code, body) = get_reply(&mut held, &path, moves_on);
                         respond(code, body)
                     } else if method == http::Method::DELETE {
-                        let forbidden = objects.2.lock().unwrap_or_else(PoisonError::into_inner).contains(&path);
+                        let forbidden = objects
+                            .forbidden
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .contains(&path);
                         let (code, body) = delete_reply(&mut held, &path, &bytes, forbidden);
                         respond(code, body)
                     } else {
@@ -778,7 +874,7 @@ mod tests {
         }
 
         fn insert(&self, path: &str, object: serde_json::Value) {
-            self.0
+            self.held
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(path.to_owned(), object);
@@ -788,13 +884,13 @@ mod tests {
         /// of a path.
         fn delay(&self, method: &http::Method, path: &str) -> Option<Duration> {
             let write = self
-                .1
+                .slow_write
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .take_if(|(on, _)| *method != http::Method::GET && path.contains(on.as_str()))
                 .map(|(_, delay)| delay);
             let read = self
-                .4
+                .slow_read
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .take_if(|(on, _)| *method == http::Method::GET && path.contains(on.as_str()))
@@ -803,50 +899,75 @@ mod tests {
         }
 
         fn slow_next_write(&self, on: &str, delay: Duration) {
-            *self.1.lock().unwrap_or_else(PoisonError::into_inner) = Some((on.to_owned(), delay));
+            *self.slow_write.lock().unwrap_or_else(PoisonError::into_inner) = Some((on.to_owned(), delay));
         }
 
         fn slow_next_read(&self, on: &str, delay: Duration) {
-            *self.4.lock().unwrap_or_else(PoisonError::into_inner) = Some((on.to_owned(), delay));
+            *self.slow_read.lock().unwrap_or_else(PoisonError::into_inner) = Some((on.to_owned(), delay));
         }
 
         fn forbid_delete(&self, path: &str) {
-            self.2
+            self.forbidden
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(path.to_owned());
         }
 
         fn move_on_after_read(&self, path: &str) {
-            *self.3.lock().unwrap_or_else(PoisonError::into_inner) = Some(path.to_owned());
+            *self.moves_on.lock().unwrap_or_else(PoisonError::into_inner) = Some(path.to_owned());
+        }
+
+        /// How many requests with `method` named exactly `path`.
+        fn count(&self, method: &http::Method, path: &str) -> usize {
+            self.requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|(got, at)| got == method && at == path)
+                .count()
+        }
+
+        /// How many reads named exactly `path`.
+        fn reads(&self, path: &str) -> usize {
+            self.count(&http::Method::GET, path)
+        }
+
+        /// How many deletes named exactly `path`.
+        fn deletes(&self, path: &str) -> usize {
+            self.count(&http::Method::DELETE, path)
+        }
+
+        /// Empty the stored holder slice of `service`, as a write by another hand would.
+        fn empty_slice(&self, service: &str) {
+            let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(slice) = held.get_mut(&slice_path(service)) {
+                slice["endpoints"] = serde_json::json!([]);
+            }
+        }
+
+        /// Remove the stored object at exactly `path`.
+        fn remove(&self, path: &str) {
+            self.held.lock().unwrap_or_else(PoisonError::into_inner).remove(path);
         }
 
         fn has(&self, path: &str) -> bool {
-            self.0.lock().unwrap_or_else(PoisonError::into_inner).contains_key(path)
+            self.held
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(path)
         }
 
         fn slice(&self, service: &str) -> Option<EndpointSlice> {
-            let path = format!(
-                "/apis/discovery.k8s.io/v1/namespaces/grid/endpointslices/{}",
-                slice_name(service)
-            );
-            let held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-            held.get(&path)
+            let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+            held.get(&slice_path(service))
                 .map(|object| serde_json::from_value(object.clone()).expect("slice"))
         }
     }
 
-    /// A store holding the signals Service, its target port named.
+    /// A store holding the signals Service.
     fn with_service() -> Objects {
         let objects = Objects::default();
-        objects.insert(
-            "/api/v1/namespaces/grid/services/grid-signals",
-            serde_json::json!({
-                "apiVersion": "v1", "kind": "Service",
-                "metadata": {"name": "grid-signals", "namespace": "grid", "uid": "svc-uid", "resourceVersion": "1"},
-                "spec": {"ports": [{"name": "signals", "port": 9091, "targetPort": "signals", "protocol": "TCP"}]}
-            }),
-        );
+        objects.insert(SERVICE_PATH, signals_service("svc-uid", "1", None));
         objects
     }
 
@@ -1036,7 +1157,7 @@ mod tests {
     }
 
     fn stored(objects: &Objects, name: &str) -> bool {
-        let held = objects.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let held = objects.held.lock().unwrap_or_else(PoisonError::into_inner);
         held.contains_key(&format!(
             "/apis/discovery.k8s.io/v1/namespaces/grid/endpointslices/{name}"
         ))
@@ -1064,25 +1185,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn no_service_is_routed_once_the_lease_lapses_mid_pass() {
         let objects = with_service();
-        objects.insert(
-            "/api/v1/namespaces/grid/services/grid-swim",
-            serde_json::json!({
-                "apiVersion": "v1", "kind": "Service",
-                "metadata": {"name": "grid-swim", "namespace": "grid", "uid": "swim-uid", "resourceVersion": "1"},
-                "spec": {"ports": [{"name": "swim-udp", "port": 7946, "targetPort": 7946, "protocol": "UDP"}]}
-            }),
-        );
-        let me = Me {
-            address: "10.0.0.1".parse().expect("address"),
-            pod: "a".to_owned(),
-            node: None,
-        };
-        let routes = HolderRoutes::new(
-            &objects.client(),
-            vec!["grid-signals".to_owned(), "grid-swim".to_owned()],
-            me,
-            BTreeMap::from([("signals".to_owned(), 19091)]),
-        );
+        let routes = with_swim(&objects);
         let holding = crate::leader::Holding::renewed_now();
         // The pass starts with a little lease left, and its first write outlasts it.
         tokio::time::advance(crate::leader::RENEW_DEADLINE.saturating_sub(Duration::from_millis(500))).await;
@@ -1226,29 +1329,309 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_recreated_endpoints_object_is_removed_on_a_later_recheck() {
+    async fn the_legacy_read_stops_once_a_pass_finds_the_object_gone() {
         let objects = with_service();
         objects.insert(
             LEGACY_PATH,
             legacy_object(&serde_json::json!({}), &legacy_subsets("grid")),
         );
-        let routes = routes(&objects, "10.0.0.1", "a");
-        let routing = routes.route_when(std::future::ready("test"), crate::leader::Holding::unelected());
-        let checked = async {
+        let holder = routes(&objects, "10.0.0.1", "a");
+        observe(&holder, 10, async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!objects.has(LEGACY_PATH), "deleted on the first pass");
+            tokio::time::sleep(super::RECHECK_EVERY.saturating_mul(2)).await;
+            assert_eq!(
+                objects.reads(LEGACY_PATH),
+                2,
+                "one read found and deleted it, the next confirmed it gone"
+            );
+            let service_reads = objects.reads(SERVICE_PATH);
+            objects.empty_slice("grid-signals");
+            tokio::time::sleep(super::RECHECK_EVERY.saturating_mul(6)).await;
+            assert_eq!(
+                objects.reads(LEGACY_PATH),
+                2,
+                "no pass reads it after the confirming one"
+            );
+            assert!(
+                objects.reads(SERVICE_PATH) > service_reads,
+                "the passes go on without it"
+            );
+            assert_eq!(
+                addresses(&objects),
+                vec!["10.0.0.1".to_owned()],
+                "a later pass repaired the emptied slice"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_service_without_a_legacy_object_is_read_once() {
+        let objects = with_service();
+        let holder = routes(&objects, "10.0.0.1", "a");
+        observe(&holder, 8, async {
+            tokio::time::sleep(super::RECHECK_EVERY.saturating_mul(6)).await;
+            assert_eq!(
+                objects.reads(LEGACY_PATH),
+                1,
+                "the first read finds nothing and is the last"
+            );
+            assert_eq!(objects.deletes(LEGACY_PATH), 0, "nothing to delete");
+            assert!(objects.reads(SERVICE_PATH) > 1, "the passes go on without it");
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_object_recreated_before_the_confirming_read_is_removed() {
+        let objects = with_service();
+        objects.insert(
+            LEGACY_PATH,
+            legacy_object(&serde_json::json!({}), &legacy_subsets("grid")),
+        );
+        let holder = routes(&objects, "10.0.0.1", "a");
+        observe(&holder, 10, async {
             tokio::time::sleep(Duration::from_millis(50)).await;
             assert!(!objects.has(LEGACY_PATH), "gone after the first pass");
+            objects.insert(
+                LEGACY_PATH,
+                legacy_object(
+                    &serde_json::json!({"uid": "ep-uid-2", "resourceVersion": "9"}),
+                    &legacy_subsets("grid"),
+                ),
+            );
+            tokio::time::sleep(super::RECHECK_EVERY.saturating_mul(2)).await;
+            assert!(
+                !objects.has(LEGACY_PATH),
+                "the confirming read met the replacement and deleted it"
+            );
+            assert_eq!(
+                objects.deletes(LEGACY_PATH),
+                2,
+                "each object was deleted under its own identity"
+            );
+            tokio::time::sleep(super::RECHECK_EVERY.saturating_mul(6)).await;
+            assert_eq!(
+                objects.reads(LEGACY_PATH),
+                3,
+                "the read after the second delete confirmed absence and was the last"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_object_recreated_after_the_confirming_read_waits_for_new_routes() {
+        let objects = with_service();
+        objects.insert(
+            LEGACY_PATH,
+            legacy_object(&serde_json::json!({}), &legacy_subsets("grid")),
+        );
+        let holder = routes(&objects, "10.0.0.1", "a");
+        observe(
+            &holder,
+            12,
+            Box::pin(async {
+                tokio::time::sleep(super::RECHECK_EVERY.saturating_mul(2)).await;
+                assert_eq!(objects.reads(LEGACY_PATH), 2, "deleted, then confirmed gone");
+                objects.insert(
+                    LEGACY_PATH,
+                    legacy_object(&serde_json::json!({}), &legacy_subsets("grid")),
+                );
+                tokio::time::sleep(super::RECHECK_EVERY.saturating_mul(6)).await;
+                assert!(objects.has(LEGACY_PATH), "this holder no longer reads the object");
+                assert_eq!(objects.reads(LEGACY_PATH), 2, "the recreation goes unread");
+                holder.withdraw().await;
+                route(&routes(&objects, "10.0.0.2", "b")).await;
+                assert!(!objects.has(LEGACY_PATH), "a new holder reads once more and removes it");
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_object_left_alone_is_read_again_each_pass() {
+        let objects = with_service();
+        let owned = serde_json::json!({"ownerReferences": [{"apiVersion": "v1", "kind": "Service", "name": "grid-signals", "uid": "svc-uid"}]});
+        objects.insert(LEGACY_PATH, legacy_object(&owned, &legacy_subsets("grid")));
+        let holder = routes(&objects, "10.0.0.1", "a");
+        observe(&holder, 4, async {
+            tokio::time::sleep(Duration::from_secs(35)).await;
+            assert!(objects.has(LEGACY_PATH), "still somebody's");
+            assert_eq!(
+                (objects.reads(SERVICE_PATH), objects.reads(LEGACY_PATH)),
+                (4, 4),
+                "a present object is read on every one of the four passes"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_delete_is_retried_on_the_next_pass() {
+        let objects = with_service();
+        objects.insert(
+            LEGACY_PATH,
+            legacy_object(&serde_json::json!({}), &legacy_subsets("grid")),
+        );
+        objects.forbid_delete(LEGACY_PATH);
+        let holder = routes(&objects, "10.0.0.1", "a");
+        observe(&holder, 4, async {
+            tokio::time::sleep(Duration::from_secs(35)).await;
+            assert!(objects.has(LEGACY_PATH), "left for a chart that grants the delete");
+            assert_eq!(
+                (objects.reads(LEGACY_PATH), objects.deletes(LEGACY_PATH)),
+                (4, 4),
+                "a refused delete is tried again on every one of the four passes"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_service_completes_its_cleanup_independently() {
+        let objects = with_service();
+        let holder = with_swim(&objects);
+        let owned = serde_json::json!({"ownerReferences": [{"apiVersion": "v1", "kind": "Service", "name": "grid-swim", "uid": "swim-uid"}]});
+        objects.insert(
+            SWIM_PATH,
+            legacy_object_of("grid-swim", &owned, &legacy_subsets("grid")),
+        );
+        observe(&holder, 4, async {
+            tokio::time::sleep(Duration::from_secs(35)).await;
+            assert_eq!(
+                objects.reads(LEGACY_PATH),
+                1,
+                "the signals object was found absent once"
+            );
+            assert_eq!(
+                (objects.reads(SWIM_SERVICE_PATH), objects.reads(SWIM_PATH)),
+                (4, 4),
+                "the SWIM object is present and read on every one of the four passes"
+            );
+            assert!(
+                objects.slice("grid-signals").is_some() && objects.slice("grid-swim").is_some(),
+                "both slices stand"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_confirmed_absence_survives_the_other_services_timeout() {
+        let objects = with_service();
+        let holder = with_swim(&objects);
+        objects.slow_next_read(SWIM_PATH, super::WRITE_TIMEOUT.saturating_mul(2));
+        observe(&holder, 4, async {
+            tokio::time::sleep(super::WRITE_TIMEOUT.saturating_add(Duration::from_millis(50))).await;
+            assert_eq!(
+                (objects.reads(LEGACY_PATH), objects.reads(SWIM_PATH)),
+                (1, 1),
+                "both were read; the SWIM read outlasted the cleanup budget"
+            );
+            tokio::time::sleep(super::RECHECK_EVERY.saturating_mul(2)).await;
+            assert_eq!(
+                objects.reads(LEGACY_PATH),
+                1,
+                "the signals absence recorded before the timeout stands"
+            );
+            assert_eq!(objects.reads(SWIM_PATH), 2, "the SWIM read is retried");
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_selector_seen_restored_rearms_the_cleanup() {
+        let objects = with_service();
+        let holder = routes(&objects, "10.0.0.1", "a");
+        observe(&holder, 10, async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(objects.reads(LEGACY_PATH), 1, "found absent");
+            objects.insert(
+                SERVICE_PATH,
+                signals_service("svc-uid", "2", Some(serde_json::json!({"app": "grid"}))),
+            );
+            tokio::time::sleep(super::RECHECK_EVERY.saturating_mul(2)).await;
+            assert!(
+                objects.reads(LEGACY_PATH) >= 2,
+                "a Service with its selector back is read again"
+            );
+            objects.insert(SERVICE_PATH, signals_service("svc-uid", "3", None));
             objects.insert(
                 LEGACY_PATH,
                 legacy_object(&serde_json::json!({}), &legacy_subsets("grid")),
             );
             tokio::time::sleep(super::RECHECK_EVERY.saturating_mul(2)).await;
-            assert!(!objects.has(LEGACY_PATH), "no pass trusts an earlier absence");
-        };
-        drop(
-            tokio::time::timeout(super::RECHECK_EVERY.saturating_mul(3), async {
-                tokio::join!(routing, checked)
-            })
-            .await,
+            assert!(
+                !objects.has(LEGACY_PATH),
+                "the object the selector's return left is removed without a restart"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_service_replaced_under_its_name_rearms_the_cleanup() {
+        let objects = with_service();
+        let holder = routes(&objects, "10.0.0.1", "a");
+        observe(&holder, 6, async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(objects.reads(LEGACY_PATH), 1, "found absent");
+            objects.insert(SERVICE_PATH, signals_service("svc-uid-2", "1", None));
+            objects.insert(
+                LEGACY_PATH,
+                legacy_object(&serde_json::json!({}), &legacy_subsets("grid")),
+            );
+            tokio::time::sleep(super::RECHECK_EVERY.saturating_mul(2)).await;
+            assert!(
+                !objects.has(LEGACY_PATH),
+                "a new Service under the old name is read again and its object removed"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_without_a_confirmed_slice_rearms_the_cleanup() {
+        let objects = with_service();
+        let holder = routes(&objects, "10.0.0.1", "a");
+        observe(&holder, 8, async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(objects.reads(LEGACY_PATH), 1, "found absent");
+            objects.remove(SERVICE_PATH);
+            tokio::time::sleep(super::RECHECK_EVERY.saturating_mul(2)).await;
+            objects.insert(SERVICE_PATH, signals_service("svc-uid", "2", None));
+            objects.insert(
+                LEGACY_PATH,
+                legacy_object(&serde_json::json!({}), &legacy_subsets("grid")),
+            );
+            tokio::time::sleep(super::RECHECK_EVERY.saturating_mul(2)).await;
+            assert!(
+                !objects.has(LEGACY_PATH),
+                "a pass that could not confirm the slice forgot the absence, so the object is read and removed"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lease_lost_during_the_confirming_read_records_nothing() {
+        let objects = with_service();
+        let holder = routes(&objects, "10.0.0.1", "a");
+        let holding = crate::leader::Holding::renewed_now();
+        tokio::time::advance(crate::leader::RENEW_DEADLINE.saturating_sub(Duration::from_millis(500))).await;
+        objects.slow_next_read(LEGACY_PATH, Duration::from_secs(1));
+        let routing = holder.route_when(std::future::ready("test"), holding);
+        drop(tokio::time::timeout(Duration::from_secs(5), routing).await);
+        assert_eq!(objects.reads(LEGACY_PATH), 1, "the read ran while the lease held");
+        assert!(
+            holder
+                .legacy_absent
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "an absence read that outlasted the lease is not remembered"
         );
     }
 
@@ -1435,14 +1818,87 @@ mod tests {
     // Test Utilities
     // ---------------------------------------------------------------------------
 
+    /// The signals Service at `uid` and `version`, its target port named, with `selector` when given.
+    fn signals_service(uid: &str, version: &str, selector: Option<serde_json::Value>) -> serde_json::Value {
+        let mut service = serde_json::json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "grid-signals", "namespace": "grid", "uid": uid, "resourceVersion": version},
+            "spec": {"ports": [{"name": "signals", "port": 9091, "targetPort": "signals", "protocol": "TCP"}]}
+        });
+        if let (Some(spec), Some(selector)) = (
+            service.get_mut("spec").and_then(serde_json::Value::as_object_mut),
+            selector,
+        ) {
+            spec.insert("selector".to_owned(), selector);
+        }
+        service
+    }
+
+    /// Add the SWIM Service to `objects`: routes for it and the signals Service.
+    fn with_swim(objects: &Objects) -> HolderRoutes {
+        objects.insert(
+            SWIM_SERVICE_PATH,
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "Service",
+                "metadata": {"name": "grid-swim", "namespace": "grid", "uid": "swim-uid", "resourceVersion": "1"},
+                "spec": {"ports": [{"name": "swim-udp", "port": 7946, "targetPort": 7946, "protocol": "UDP"}]}
+            }),
+        );
+        let me = Me {
+            address: "10.0.0.1".parse().expect("address"),
+            pod: "a".to_owned(),
+            node: None,
+        };
+        HolderRoutes::new(
+            &objects.client(),
+            vec!["grid-signals".to_owned(), "grid-swim".to_owned()],
+            me,
+            BTreeMap::from([("signals".to_owned(), 19091)]),
+        )
+    }
+
+    /// Run `routes` as the holder, unelected, while `checked` observes it, for `rechecks` at most;
+    /// the observations must all finish within that.
+    async fn observe<Checked: Future<Output = ()>>(routes: &HolderRoutes, rechecks: u32, checked: Checked) {
+        let routing = routes.route_when(std::future::ready("test"), crate::leader::Holding::unelected());
+        let mut observed = false;
+        let observation = async {
+            checked.await;
+            observed = true;
+        };
+        drop(
+            tokio::time::timeout(super::RECHECK_EVERY.saturating_mul(rechecks), async {
+                tokio::join!(routing, observation)
+            })
+            .await,
+        );
+        assert!(observed, "every observation finished before the deadline");
+    }
+
+    /// The path of `service`'s holder slice.
+    fn slice_path(service: &str) -> String {
+        format!(
+            "/apis/discovery.k8s.io/v1/namespaces/grid/endpointslices/{}",
+            slice_name(service)
+        )
+    }
+
     /// Where the signals Service's v1 `Endpoints` object lives.
     const LEGACY_PATH: &str = "/api/v1/namespaces/grid/endpoints/grid-signals";
+    const SWIM_PATH: &str = "/api/v1/namespaces/grid/endpoints/grid-swim";
+    const SERVICE_PATH: &str = "/api/v1/namespaces/grid/services/grid-signals";
+    const SWIM_SERVICE_PATH: &str = "/api/v1/namespaces/grid/services/grid-swim";
 
     /// A v1 `Endpoints` object named like the signals Service, `extra` merged into its metadata.
     fn legacy_object(extra: &serde_json::Value, subsets: &serde_json::Value) -> serde_json::Value {
+        legacy_object_of("grid-signals", extra, subsets)
+    }
+
+    /// A v1 `Endpoints` object named like the Service `name`, `extra` merged into its metadata.
+    fn legacy_object_of(name: &str, extra: &serde_json::Value, subsets: &serde_json::Value) -> serde_json::Value {
         let mut object = serde_json::json!({
             "apiVersion": "v1", "kind": "Endpoints",
-            "metadata": {"name": "grid-signals", "namespace": "grid", "uid": "ep-uid", "resourceVersion": "7"},
+            "metadata": {"name": name, "namespace": "grid", "uid": "ep-uid", "resourceVersion": "7"},
             "subsets": subsets
         });
         if let (Some(metadata), Some(extra)) = (
