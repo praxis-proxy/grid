@@ -58,7 +58,7 @@ use crate::{
     },
     resources::{
         geography::{AdmissionState, LocalityTier, resolve_regional_policy_site_metadata},
-        regional_policy::{RegionalPolicyEvaluator, RegionalPolicyGroup},
+        regional_policy::{RegionalPolicyDecision, RegionalPolicyEvaluator, RegionalPolicyGroup},
     },
     served_models::{ModelInventory, ServedModelStore},
     swim::{MemberStatus, MembershipSnapshot},
@@ -1284,7 +1284,8 @@ fn regional_policy_sort_key(group: Option<RegionalPolicyGroup>) -> u8 {
 /// Returns whether an active policy removed every candidate collected before
 /// admission, health, or downstream consumer validation. Callers use this
 /// evidence to distinguish a policy no-route decision from a later empty
-/// overlay.
+/// overlay. Candidates from one site share a cached policy decision while
+/// retaining per-candidate metrics and diagnostics.
 fn apply_regional_policy(
     candidates: &mut Vec<RoutingCandidate>,
     evaluator: &RegionalPolicyEvaluator<'_, '_>,
@@ -1292,15 +1293,19 @@ fn apply_regional_policy(
     network_name: &str,
 ) -> bool {
     let before = candidates.len();
+    let mut decisions_by_site: HashMap<String, RegionalPolicyDecision> = HashMap::new();
     candidates.retain_mut(|candidate| {
-        let metadata = resolve_regional_policy_site_metadata(&candidate.site, sites, network_name);
-        match evaluator.evaluate(metadata) {
-            crate::resources::regional_policy::RegionalPolicyDecision::Permitted { group } => {
+        let decision = *decisions_by_site.entry(candidate.site.clone()).or_insert_with(|| {
+            let metadata = resolve_regional_policy_site_metadata(&candidate.site, sites, network_name);
+            evaluator.evaluate(metadata)
+        });
+        match decision {
+            RegionalPolicyDecision::Permitted { group } => {
                 crate::metrics::record_regional_policy_candidate(evaluator.mode_label(), "permitted", group.as_label());
                 candidate.regional_policy_group = Some(group);
                 true
             },
-            crate::resources::regional_policy::RegionalPolicyDecision::Excluded { reason } => {
+            RegionalPolicyDecision::Excluded { reason } => {
                 crate::metrics::record_regional_policy_candidate(
                     evaluator.mode_label(),
                     "excluded",
