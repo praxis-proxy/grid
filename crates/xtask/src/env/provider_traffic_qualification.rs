@@ -3827,24 +3827,47 @@ fn send_embedded_lifecycle_request(session_id: Option<&str>) -> Result<Lifecycle
 /// revision restores candidates. The serving `ConfigMap` and watcher log can
 /// converge before provider-gateway endpoints become usable again.
 fn wait_for_embedded_attributed_request(timeout: Duration) -> Result<LifecycleRequest, Box<dyn std::error::Error>> {
+    wait_for_attributed_request(
+        timeout,
+        || send_embedded_lifecycle_request(None),
+        || std::thread::park_timeout(Duration::from_secs(2)),
+    )
+    .map_err(Into::into)
+}
+
+/// Poll until a request reaches an expected provider, retaining transient
+/// probe failures as convergence evidence until the deadline.
+fn wait_for_attributed_request<F, E, P>(
+    timeout: Duration,
+    mut request: F,
+    mut pause: P,
+) -> Result<LifecycleRequest, String>
+where
+    F: FnMut() -> Result<LifecycleRequest, E>,
+    E: std::fmt::Display,
+    P: FnMut(),
+{
     let deadline = Instant::now() + timeout;
-    let mut response = send_embedded_lifecycle_request(None)?;
     loop {
-        if response.status == 200
-            && response
-                .provider
-                .as_deref()
-                .is_some_and(|provider| expected_provider_attributions().contains(provider))
-        {
-            return Ok(response);
-        }
+        let latest = match request() {
+            Ok(response)
+                if response.status == 200
+                    && response
+                        .provider
+                        .as_deref()
+                        .is_some_and(|provider| expected_provider_attributions().contains(provider)) =>
+            {
+                return Ok(response);
+            },
+            Ok(response) => format!("response {response:?}"),
+            Err(error) => format!("probe error: {error}"),
+        };
         if Instant::now() >= deadline {
-            return Err(
-                format!("embedded gateway did not resume attributed traffic before timeout: {response:?}").into(),
-            );
+            return Err(format!(
+                "embedded gateway did not resume attributed traffic before timeout: {latest}"
+            ));
         }
-        std::thread::park_timeout(Duration::from_secs(2));
-        response = send_embedded_lifecycle_request(None)?;
+        pause();
     }
 }
 
@@ -7216,6 +7239,42 @@ mod tests {
             curl_http_status(b"curl: (7) connection refused"),
             Err("curl output did not contain its HTTP status marker".to_owned())
         );
+    }
+
+    #[test]
+    fn attributed_request_wait_retries_a_transient_probe_error() {
+        let mut attempts = [
+            Err("connection reset"),
+            Ok(LifecycleRequest {
+                status: 200,
+                provider: Some("provider-a".to_owned()),
+            }),
+        ]
+        .into_iter();
+        let mut pauses = 0;
+
+        let response = wait_for_attributed_request(
+            Duration::from_secs(1),
+            || attempts.next().unwrap_or(Err("probe exhausted")),
+            || pauses += 1,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(response.provider.as_deref(), Some("provider-a"));
+        assert_eq!(pauses, 1, "one transient failure is retried");
+    }
+
+    #[test]
+    fn attributed_request_wait_reports_the_last_probe_error_at_timeout() {
+        let Err(error) = wait_for_attributed_request(
+            Duration::ZERO,
+            || Err::<LifecycleRequest, _>("connection refused"),
+            || std::process::abort(),
+        ) else {
+            std::process::abort();
+        };
+
+        assert!(error.contains("probe error: connection refused"));
     }
 
     #[test]

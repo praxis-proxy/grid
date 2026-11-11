@@ -55,6 +55,9 @@ pub const REGIONAL_POLICY_MAX_VALUES: usize = 64;
 /// Maximum length of one region or sovereignty-zone identifier.
 pub const REGIONAL_POLICY_MAX_VALUE_LENGTH: usize = 253;
 
+/// Maximum length of a canonical sovereignty-zone token.
+pub const REGIONAL_POLICY_MAX_SOVEREIGNTY_ZONE_LENGTH: usize = grid_signals::zone::MAX_ZONE_LEN;
+
 /// Regional eligibility and preference mode for a consumer gateway.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -151,7 +154,7 @@ pub struct RegionalPolicy {
     /// Independent hard sovereignty-zone allowlist for either mode.
     #[schemars(
         length(min = 1, max = 64),
-        inner(length(min = 1, max = 253), regex(pattern = r"^\S+$")),
+        inner(length(min = 1, max = 63), regex(pattern = "^[A-Za-z0-9._-]+$")),
         extend("x-kubernetes-list-type" = "set")
     )]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,7 +195,7 @@ impl RegionalPolicy {
                 validate_regional_policy_set("allowedRegions", self.allowed_regions.as_deref())?;
             },
         }
-        validate_regional_policy_set("allowedSovereigntyZones", self.allowed_sovereignty_zones.as_deref())
+        validate_regional_policy_sovereignty_zone_set(self.allowed_sovereignty_zones.as_deref())
     }
 }
 
@@ -221,6 +224,20 @@ fn validate_regional_policy_set(field: &'static str, values: Option<&[String]>) 
         }
         if !seen.insert(value.as_str()) {
             return Err(format!("{field} contains duplicate value {value:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the canonical token set used by the sovereignty routing fence.
+fn validate_regional_policy_sovereignty_zone_set(values: Option<&[String]>) -> Result<(), String> {
+    validate_regional_policy_set("allowedSovereigntyZones", values)?;
+    let Some(values) = values else {
+        return Ok(());
+    };
+    for value in values {
+        if grid_signals::zone::sovereignty_zone(value).is_none() {
+            return Err("allowedSovereigntyZones contains an invalid sovereignty-zone token".to_owned());
         }
     }
     Ok(())
@@ -2443,6 +2460,21 @@ mod tests {
     }
 
     #[test]
+    fn regional_policy_rejects_invalid_sovereignty_zone_values() {
+        let policy = RegionalPolicy {
+            mode: RegionalPolicyMode::Locked,
+            preferred_regions: None,
+            allowed_regions: Some(vec!["east".to_owned()]),
+            cross_region_fallback: None,
+            allowed_sovereignty_zones: Some(vec!["eu,us".to_owned()]),
+        };
+        assert_eq!(
+            policy.validate(),
+            Err("allowedSovereigntyZones contains an invalid sovereignty-zone token".to_owned())
+        );
+    }
+
+    #[test]
     fn regional_policy_schema_encodes_bounds_sets_and_mode_rules() {
         let crd = crd_json();
         for gateways in ["consumerGateways", "gatewayRefs"] {
@@ -2451,7 +2483,7 @@ mod tests {
                     "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/{gateways}/items/properties/regionalPolicy"
                 ))
                 .unwrap_or_else(|| std::process::abort());
-            for field in ["preferredRegions", "allowedRegions", "allowedSovereigntyZones"] {
+            for field in ["preferredRegions", "allowedRegions"] {
                 let field_schema = policy_schema
                     .pointer(&format!("/properties/{field}"))
                     .unwrap_or_else(|| std::process::abort());
@@ -2468,6 +2500,27 @@ mod tests {
                     Some(&serde_json::json!(r"^\S+$"))
                 );
             }
+            let sovereignty_schema = policy_schema
+                .pointer("/properties/allowedSovereigntyZones")
+                .unwrap_or_else(|| std::process::abort());
+            assert_eq!(sovereignty_schema.get("minItems"), Some(&serde_json::json!(1)));
+            assert_eq!(sovereignty_schema.get("maxItems"), Some(&serde_json::json!(64)));
+            assert_eq!(
+                sovereignty_schema.get("x-kubernetes-list-type"),
+                Some(&serde_json::json!("set"))
+            );
+            assert_eq!(
+                sovereignty_schema.pointer("/items/minLength"),
+                Some(&serde_json::json!(1))
+            );
+            assert_eq!(
+                sovereignty_schema.pointer("/items/maxLength"),
+                Some(&serde_json::json!(REGIONAL_POLICY_MAX_SOVEREIGNTY_ZONE_LENGTH))
+            );
+            assert_eq!(
+                sovereignty_schema.pointer("/items/pattern"),
+                Some(&serde_json::json!("^[A-Za-z0-9._-]+$"))
+            );
             let rules = policy_schema
                 .get("x-kubernetes-validations")
                 .and_then(serde_json::Value::as_array)

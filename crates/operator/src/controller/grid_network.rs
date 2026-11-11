@@ -4564,19 +4564,33 @@ fn retained_overlay_status(
 ) -> OverlayRevisionStatus {
     let prior = find_prior_overlay(network, gw_ref);
     let has_prior = prior.is_some();
+    // A retained status keeps the previous distributed revision. Preserve the
+    // regional-policy no-route marker while that authoritative empty revision
+    // remains the serving revision, so a later successful distribution can
+    // emit the corresponding recovery Event.
+    let retains_regional_policy_no_route = prior.is_some_and(|entry| {
+        entry.reason == REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON
+            && matches!(entry.phase, OverlayPhase::Distributed | OverlayPhase::Retained)
+    });
     let fallback_cm =
         routing_overlay::overlay_configmap_name(network.metadata.name.as_deref().unwrap_or("unknown"), &gw_ref.name);
     let mut status = resolve_overlay_evidence(render, prior, fallback_cm);
     status.gateway_name.clone_from(&gw_ref.name);
     status.namespace.clone_from(&gw_ref.namespace);
     status.observed_generation = observed_generation;
-    reason.clone_into(&mut status.reason);
+    if retains_regional_policy_no_route {
+        REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON.clone_into(&mut status.reason);
+    } else {
+        reason.clone_into(&mut status.reason);
+    }
     status.phase = if has_prior {
         OverlayPhase::Retained
     } else {
         OverlayPhase::Error
     };
-    status.message = if has_prior {
+    status.message = if retains_regional_policy_no_route {
+        format!("{failure_message}; authoritative regional-policy no-route revision retained")
+    } else if has_prior {
         format!("{failure_message}; previous valid overlay retained")
     } else {
         format!("{failure_message}; no valid overlay has been distributed")
@@ -8797,6 +8811,54 @@ mod tests {
         let recovered = recovered_events.remove(0);
         assert_eq!(recovered.reason, "RegionalPolicyRecovered");
         assert!(matches!(recovered.type_, EventType::Normal));
+    }
+
+    #[test]
+    fn regional_policy_recovery_event_survives_a_retained_no_route_revision() {
+        let entry = |reason: &str, candidate_count: u32| {
+            serde_json::from_value::<OverlayRevisionStatus>(serde_json::json!({
+                "gatewayName": "gw", "namespace": "ns", "configMapName": "overlay", "schemaVersion": "1.0.0",
+                "renderedRevision": "revision", "distributedRevision": "revision", "contentDigest": "revision",
+                "phase": "Distributed", "reason": reason, "candidateCount": candidate_count,
+            }))
+            .unwrap_or_else(|_| std::process::abort())
+        };
+        let mut network = base_network();
+        let mut gateway = make_gw_ref("gw", "ns");
+        gateway.regional_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "mode": "locked",
+                "allowedRegions": ["east"],
+            }))
+            .unwrap_or_else(|_| std::process::abort()),
+        );
+        network.spec.consumer_gateways = vec![gateway.clone()];
+        network.status = Some(GridNetworkStatus {
+            routing_map_status: vec![entry(REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON, 0)],
+            ..GridNetworkStatus::default()
+        });
+
+        let retained = retained_overlay_status(
+            &network,
+            &gateway,
+            2,
+            None,
+            "GatewayMountsNotReady",
+            "gateway rollout is pending",
+        );
+        assert_eq!(retained.phase, OverlayPhase::Retained);
+        assert_eq!(retained.reason, REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON);
+        assert!(retained.message.contains("gateway rollout is pending"));
+        network.status = Some(GridNetworkStatus {
+            routing_map_status: vec![retained],
+            ..GridNetworkStatus::default()
+        });
+
+        let mut events = regional_policy_transition_events(&network, &[entry("", 1)]);
+        assert_eq!(events.len(), 1, "recovery must survive a retained no-route revision");
+        let event = events.remove(0);
+        assert_eq!(event.reason, REGIONAL_POLICY_RECOVERED_REASON);
+        assert!(matches!(event.type_, EventType::Normal));
     }
 
     #[test]

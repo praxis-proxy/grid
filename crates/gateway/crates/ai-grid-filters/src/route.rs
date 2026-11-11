@@ -1055,14 +1055,14 @@ fn pinned_site(
                 Ok((Some(holder), Some(rewrite)))
             },
         )),
-        // A new conversation has no model to route by: keep it local when the local site can take it.
+        // A new conversation has no model to route by: keep it local only when the local site
+        // accepts new work. Otherwise leave it unpinned so normal new-work selection applies.
         Some(StatePath::Create(Collection::Conversations)) => {
             let local = Holder {
                 site: Arc::clone(&snapshot.local_site),
                 mark: None,
             };
-            let admits = pinned_target(snapshot, Some(&local), None, now_ms).found().is_some();
-            Some(Ok((admits.then_some(local), None)))
+            site_admits_new_work(snapshot, &local, None, now_ms).then(|| Ok((Some(local), None)))
         },
         _ => Some(Ok((Some(ctx.get_filter_state::<RouteState>()?.pinned.clone()?), None))),
     }
@@ -1076,16 +1076,6 @@ enum Target<'snap> {
     Gone,
     /// The site is in the grid but admits no existing request now.
     Unavailable,
-}
-
-impl<'snap> Target<'snap> {
-    /// The candidate, when found.
-    fn found(self) -> Option<&'snap RouteCandidate> {
-        match self {
-            Self::Found(candidate) => Some(candidate),
-            Self::Gone | Self::Unavailable => None,
-        }
-    }
 }
 
 /// The front candidate at `holder`, anywhere when `None`, that admits a pinned
@@ -1117,6 +1107,25 @@ fn pinned_target<'snap>(
     at_site
         .find(|candidate| is_admitted_for_existing_request(candidate.admission_state) && !candidate.expired_at(now_ms))
         .map_or(Target::Unavailable, Target::Found)
+}
+
+/// Whether one site can start new work for an optionally named model.
+///
+/// New conversation creation has no stored state, so an `ExistingOnly`
+/// candidate must leave it unpinned for normal new-work selection rather than
+/// treating it as a local pin.
+fn site_admits_new_work(snapshot: &RouteSnapshot, holder: &Holder, model: Option<&str>, now_ms: i64) -> bool {
+    snapshot.candidates.iter().any(|candidate| {
+        *candidate.site == *holder.site
+            && holder
+                .mark
+                .as_deref()
+                .is_none_or(|mark| pin::cluster_mark(&candidate.cluster) == mark)
+            && candidate.kind == CapabilityKind::InferenceModel
+            && model.is_none_or(|model| &*candidate.name == model)
+            && is_admitted_for_new_request(candidate.admission_state)
+            && !candidate.expired_at(now_ms)
+    })
 }
 
 /// Count and answer a request no candidate took.
@@ -3461,6 +3470,28 @@ pub(crate) mod tests {
             "the pin sends to the built upstream"
         );
         assert!(ctx.retry_policy.is_some(), "with its retry policy");
+    }
+
+    #[tokio::test]
+    async fn a_new_conversation_does_not_pin_to_an_existing_only_local_site() {
+        let mut candidates = dialed("local", "local-pool", Some("10.0.0.7:8000"));
+        candidates[0].admission_state = AdmissionState::ExistingOnly;
+        candidates.extend(dialed("remote", "remote-pool", Some("10.0.0.8:8000")));
+        let filter = dial_filter(candidates, "local", Some(&[]));
+        let request = llama_request("/v1/conversations");
+        let mut ctx = context(&request);
+
+        let action = filter.on_request(&mut ctx).await.expect("routes");
+
+        assert!(matches!(action, FilterAction::Continue), "the remote site admits new work");
+        assert_eq!(ctx.cluster.as_deref(), Some("remote-pool"));
+
+        let mut only_local = dialed("local", "local-pool", Some("10.0.0.7:8000"));
+        only_local[0].admission_state = AdmissionState::ExistingOnly;
+        let only_local = dial_filter(only_local, "local", Some(&[]));
+        let mut local_ctx = context(&request);
+        let local_action = only_local.on_request(&mut local_ctx).await.expect("answers");
+        assert_eq!(refusal(&local_action).map(|(status, _)| status), Some(503));
     }
 
     #[test]

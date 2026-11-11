@@ -83,7 +83,7 @@ pub enum AdmissionState {
 /// closed with bounded, machine-readable reasons.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RegionalPolicyMetadataResolution<'site> {
-    /// Every matching `GridSite` declares the same valid exact value.
+    /// Every matching `GridSite` declares the same valid value.
     Resolved(&'site str),
     /// Matching `GridSite` records exist but all omit the field.
     Missing,
@@ -166,9 +166,10 @@ fn resolve_site_geography<'site>(
 ///
 /// Matching is network-scoped and uses the same routing identity as candidates
 /// and peers: a declared site's object name or an auto-discovered site's
-/// `site_id`. Duplicate matches resolve only when every record declares the
-/// same exact valid value. Missing, malformed, and differing observations are
-/// never normalized or selected by inventory order.
+/// `site_id`. Regions remain exact values. Sovereignty zones use the shared
+/// canonical form consumed by the sovereignty fence, so casing and surrounding
+/// whitespace do not create a second routing meaning. Missing, malformed, and
+/// differing observations are never selected by inventory order.
 pub(crate) fn resolve_regional_policy_site_metadata<'site>(
     site_name: &str,
     sites: &'site [GridSite],
@@ -176,9 +177,7 @@ pub(crate) fn resolve_regional_policy_site_metadata<'site>(
 ) -> RegionalPolicySiteMetadata<'site> {
     RegionalPolicySiteMetadata {
         region: resolve_regional_policy_field(site_name, sites, network_name, |site| site.spec.region.as_deref()),
-        sovereignty_zone: resolve_regional_policy_field(site_name, sites, network_name, |site| {
-            site.spec.sovereignty_zone.as_deref()
-        }),
+        sovereignty_zone: resolve_regional_policy_sovereignty_zone(site_name, sites, network_name),
     }
 }
 
@@ -225,6 +224,40 @@ fn resolve_regional_policy_field<'site>(
     }
 }
 
+/// Resolve sovereignty metadata with the canonicalization shared by the
+/// existing sovereignty fence.
+///
+/// The returned value borrows the trusted `GridSite` text; consumers compare
+/// it using the same normalization. Normalized observations are used only to
+/// decide whether duplicate records agree and whether a value is malformed.
+fn resolve_regional_policy_sovereignty_zone<'site>(
+    site_name: &str,
+    sites: &'site [GridSite],
+    network_name: &str,
+) -> RegionalPolicyMetadataResolution<'site> {
+    let mut matching_sites = sites.iter().filter(|site| {
+        site.spec.grid_network_ref == network_name
+            && crate::controller::grid_network::peer_site_key(site).is_some_and(|(key, _)| key == site_name)
+    });
+    let Some(first_site) = matching_sites.next() else {
+        return RegionalPolicyMetadataResolution::Unknown;
+    };
+    let first_value = first_site.spec.sovereignty_zone.as_deref();
+    let first = observe_regional_policy_sovereignty_zone(first_value);
+    if matching_sites
+        .any(|site| observe_regional_policy_sovereignty_zone(site.spec.sovereignty_zone.as_deref()) != first)
+    {
+        return RegionalPolicyMetadataResolution::Conflicting;
+    }
+    match (first_value, first) {
+        (None, RegionalPolicySovereigntyObservation::Missing) => RegionalPolicyMetadataResolution::Missing,
+        (Some(value), RegionalPolicySovereigntyObservation::Resolved(_)) => {
+            RegionalPolicyMetadataResolution::Resolved(value)
+        },
+        _ => RegionalPolicyMetadataResolution::Malformed,
+    }
+}
+
 /// Classify a declared regional metadata value without normalization.
 fn observe_regional_policy_field(value: Option<&str>) -> RegionalPolicyFieldObservation<'_> {
     match value {
@@ -237,6 +270,28 @@ fn observe_regional_policy_field(value: Option<&str>) -> RegionalPolicyFieldObse
             RegionalPolicyFieldObservation::Malformed
         },
         Some(value) => RegionalPolicyFieldObservation::Resolved(value),
+    }
+}
+
+/// Canonicalized observation for a sovereignty-zone declaration.
+#[derive(Debug, Eq, PartialEq)]
+enum RegionalPolicySovereigntyObservation {
+    /// The field is absent.
+    Missing,
+    /// The field cannot be parsed as a sovereignty-zone token.
+    Malformed,
+    /// The field is valid under the canonical sovereignty-zone representation.
+    Resolved(String),
+}
+
+/// Validate and canonicalize one sovereignty-zone declaration.
+fn observe_regional_policy_sovereignty_zone(value: Option<&str>) -> RegionalPolicySovereigntyObservation {
+    match value {
+        None => RegionalPolicySovereigntyObservation::Missing,
+        Some(value) => grid_signals::zone::sovereignty_zone(value).map_or(
+            RegionalPolicySovereigntyObservation::Malformed,
+            RegionalPolicySovereigntyObservation::Resolved,
+        ),
     }
 }
 
@@ -404,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn regional_policy_metadata_rejects_malformed_values_without_normalizing() {
+    fn regional_policy_metadata_rejects_malformed_values() {
         let sites = [test_site_with_metadata(
             "site-a",
             "net",
@@ -418,6 +473,35 @@ mod tests {
                 region: RegionalPolicyMetadataResolution::Malformed,
                 sovereignty_zone: RegionalPolicyMetadataResolution::Malformed,
             }
+        );
+    }
+
+    #[test]
+    fn regional_policy_sovereignty_metadata_uses_the_shared_canonical_form() {
+        let first = with_site_id(
+            test_site_with_metadata("grid-a", "net", Some("east"), Some(" EU "), None),
+            "shared",
+        );
+        let second = with_site_id(
+            test_site_with_metadata("grid-b", "net", Some("east"), Some("eu"), None),
+            "shared",
+        );
+        let sites = [first, second];
+        assert_eq!(
+            resolve_regional_policy_site_metadata("shared", &sites, "net").sovereignty_zone,
+            RegionalPolicyMetadataResolution::Resolved(" EU ")
+        );
+
+        let malformed = [test_site_with_metadata(
+            "site-a",
+            "net",
+            Some("east"),
+            Some("eu west"),
+            None,
+        )];
+        assert_eq!(
+            resolve_regional_policy_site_metadata("site-a", &malformed, "net").sovereignty_zone,
+            RegionalPolicyMetadataResolution::Malformed
         );
     }
 

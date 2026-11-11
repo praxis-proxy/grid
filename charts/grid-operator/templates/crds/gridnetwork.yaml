@@ -1136,9 +1136,9 @@ spec:
                           allowedSovereigntyZones:
                             description: Independent hard sovereignty-zone allowlist for either mode.
                             items:
-                              maxLength: 253
+                              maxLength: 63
                               minLength: 1
-                              pattern: ^\S+$
+                              pattern: ^[A-Za-z0-9._-]+$
                               type: string
                             maxItems: 64
                             minItems: 1
@@ -2147,9 +2147,9 @@ spec:
                           allowedSovereigntyZones:
                             description: Independent hard sovereignty-zone allowlist for either mode.
                             items:
-                              maxLength: 253
+                              maxLength: 63
                               minLength: 1
-                              pattern: ^\S+$
+                              pattern: ^[A-Za-z0-9._-]+$
                               type: string
                             maxItems: 64
                             minItems: 1

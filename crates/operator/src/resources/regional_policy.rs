@@ -281,7 +281,7 @@ impl<'policy, 'site> RegionalPolicyEvaluator<'policy, 'site> {
                     };
                 },
             };
-            if !contains_exact(allowed_zones, sovereignty_zone) {
+            if !contains_sovereignty_zone(allowed_zones, sovereignty_zone) {
                 return RegionalPolicyDecision::Excluded {
                     reason: RegionalPolicyExclusionReason::SovereigntyZoneNotAllowed,
                 };
@@ -362,6 +362,21 @@ fn resolve_metadata<'site>(
 /// Exact, case-sensitive membership in a bounded policy set.
 fn contains_exact(values: &[String], candidate: &str) -> bool {
     values.iter().any(|value| value == candidate)
+}
+
+/// Match a sovereignty zone through the canonical form shared with the
+/// sovereignty fence.
+///
+/// Both trusted site metadata and configured allowlist entries are normalized
+/// before comparison. A policy value with no canonical form cannot permit a
+/// trusted candidate and therefore fails closed.
+fn contains_sovereignty_zone(values: &[String], candidate: &str) -> bool {
+    let Some(candidate) = grid_signals::zone::sovereignty_zone(candidate) else {
+        return false;
+    };
+    values
+        .iter()
+        .any(|value| grid_signals::zone::sovereignty_zone(value).is_some_and(|value| value == candidate))
 }
 
 // ---------------------------------------------------------------------------
@@ -513,6 +528,21 @@ mod tests {
         );
         assert_eq!(
             evaluator.evaluate(resolved_candidate("east", Some("us"))),
+            excluded(RegionalPolicyExclusionReason::SovereigntyZoneNotAllowed)
+        );
+    }
+
+    #[test]
+    fn sovereignty_allowlist_uses_the_shared_canonical_zone_form() {
+        let policy = locked_policy(&["east"], Some(&["EU"]));
+        let evaluator = evaluator(&policy, RegionalPolicyMetadataResolution::Unknown);
+
+        assert_eq!(
+            evaluator.evaluate(resolved_candidate("east", Some(" eu "))),
+            permitted(RegionalPolicyGroup::Permitted)
+        );
+        assert_eq!(
+            evaluator.evaluate(resolved_candidate("east", Some("eu west"))),
             excluded(RegionalPolicyExclusionReason::SovereigntyZoneNotAllowed)
         );
     }

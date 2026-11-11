@@ -617,12 +617,15 @@ change policy eligibility with a request header.
 |---|---|---|
 | `mode: affinity` | affinity | Use `preferredRegions`, or the region of the trusted `siteName` `GridSite` when it is omitted. `crossRegionFallback` defaults to `deny`; `allow` creates a fallback group used only when no preferred candidate admits new work. |
 | `mode: locked` | locked | Requires non-empty `allowedRegions`; candidates outside the set never enter routing. `preferredRegions` and `crossRegionFallback` are invalid in this mode. |
-| `allowedSovereigntyZones` | both modes | Optional independent hard allowlist. A candidate must pass both this set and its regional rule. |
+| `allowedSovereigntyZones` | both modes | Optional independent hard allowlist. A candidate must pass both this set and its regional rule; comparison uses the shared sovereignty-zone canonical form (trimmed, lowercased tokens). |
 
-Every supplied list is an unordered Kubernetes set of 1–64 non-blank values,
-each at most 253 characters. A valid policy with unresolved required site
-metadata, or with no permitted candidate, publishes an authoritative empty
-revision and fails closed. An invalid policy update is rejected before it can
+`preferredRegions` and `allowedRegions` are unordered Kubernetes sets of 1–64
+non-blank values, each at most 253 characters. `allowedSovereigntyZones` uses
+the shared sovereignty-zone token grammar: ASCII letters, digits, `.`, `_`, or
+`-`, at most 63 characters; values are compared case-insensitively, so `EU`
+and `eu` denote the same zone. A valid policy with unresolved required site metadata, or with no
+permitted candidate, publishes an authoritative empty revision and fails
+closed. An invalid policy update is rejected before it can
 replace the last-known-good revision. See the
 [regional-policy example](../../examples/gateway/regional-policy.yaml) and
 [routing guide](../routing.md#regional-policy-affinity-locking-and-sovereignty)
