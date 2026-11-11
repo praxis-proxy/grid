@@ -910,11 +910,11 @@ impl HttpFilter for GridSiteRouteFilter {
         let (pick, admitted) = match admission(pick.candidate) {
             // Another request probes this down dial: pick elsewhere when anywhere else routes.
             Admission::Busy => match self.choose(&snapshot, model, scope, Some(&pick.candidate.cluster)) {
-                Ok(other) => {
+                Ok(other) if other.candidate.selection_group == pick.candidate.selection_group => {
                     let admitted = admission(other.candidate);
                     (other, admitted)
                 },
-                Err(_) => (pick, Admission::Busy),
+                Ok(_) | Err(_) => (pick, Admission::Busy),
             },
             admitted @ (Admission::Open | Admission::Probe) => (pick, admitted),
         };
@@ -3546,6 +3546,30 @@ pub(crate) mod tests {
             probed.admit_at(crate::health::monotonic_ms()),
             Admission::Probe,
             "the settled probe is handed back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_busy_preferred_dial_does_not_retry_in_the_affinity_fallback() {
+        let mut candidates = dialed("east", "east", Some("10.0.0.9:8443"));
+        candidates[0].selection_group = 0;
+        let mut fallback = dialed("west", "west", Some("10.0.0.10:8443"));
+        fallback[0].selection_group = 1;
+        candidates.extend(fallback);
+        let east = Arc::clone(candidates[0].dial.as_ref().expect("dialed").health());
+        east.record(false, 0);
+        east.record(false, 0);
+        let filter = dial_filter(candidates, "local", Some(&[]));
+        let request = llama_request("/v1/chat/completions");
+        let mut probe = context(&request);
+        drop(filter.on_request(&mut probe).await.expect("routes"));
+        let mut busy = context(&request);
+        drop(filter.on_request(&mut busy).await.expect("routes"));
+
+        assert_eq!(
+            busy.cluster.as_deref(),
+            Some("east"),
+            "a busy preferred dial does not use the affinity fallback"
         );
     }
 
