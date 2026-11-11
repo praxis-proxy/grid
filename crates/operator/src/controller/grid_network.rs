@@ -3786,6 +3786,12 @@ async fn reconcile_routing_overlay_inner(
     })
 }
 
+/// Status reason for an authoritative regional-policy no-route overlay.
+const REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON: &str = "RegionalPolicyNoEligibleCandidates";
+
+/// Event reason for a regional-policy recovery that restores eligible candidates.
+const REGIONAL_POLICY_RECOVERED_REASON: &str = "RegionalPolicyRecovered";
+
 /// Bounded status evidence for an authoritative no-route overlay under an
 /// active regional policy.
 ///
@@ -3798,7 +3804,7 @@ fn regional_policy_empty_overlay_status(
 ) -> (String, String) {
     if no_candidates && gw_ref.regional_policy.is_some() && regional_policy_removed_all_candidates {
         (
-            "RegionalPolicyNoEligibleCandidates".to_owned(),
+            REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON.to_owned(),
             "regional policy permits no eligible candidates; authoritative empty overlay distributed".to_owned(),
         )
     } else {
@@ -3842,7 +3848,7 @@ fn regional_policy_transition_events(
         status
             .routing_map_status
             .iter()
-            .filter(|entry| entry.reason == "RegionalPolicyNoEligibleCandidates")
+            .filter(|entry| entry.reason == REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON)
             .map(|entry| (entry.namespace.as_str(), entry.gateway_name.as_str()))
             .collect()
     });
@@ -3856,18 +3862,19 @@ fn regional_policy_transition_events(
         .filter_map(|gateway| {
             let was_empty = prior_empty.contains(gateway);
             let current_status = current_by_gateway.get(gateway).copied();
-            let is_empty = current_status.is_some_and(|entry| entry.reason == "RegionalPolicyNoEligibleCandidates");
+            let is_empty =
+                current_status.is_some_and(|entry| entry.reason == REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON);
             let recovered = current_status
                 .is_some_and(|entry| entry.phase == OverlayPhase::Distributed && entry.candidate_count > 0);
             match (was_empty, is_empty, recovered) {
                 (false, true, _) => Some(RegionalPolicyEvent {
                     type_: EventType::Warning,
-                    reason: "RegionalPolicyNoEligibleCandidates",
+                    reason: REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON,
                     note: "regional policy distributed an authoritative no-route revision",
                 }),
                 (true, false, true) => Some(RegionalPolicyEvent {
                     type_: EventType::Normal,
-                    reason: "RegionalPolicyRecovered",
+                    reason: REGIONAL_POLICY_RECOVERED_REASON,
                     note: "regional policy distributed a revision with eligible candidates",
                 }),
                 _ => None,
