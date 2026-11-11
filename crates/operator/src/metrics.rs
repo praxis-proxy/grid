@@ -335,7 +335,17 @@ fn note_peer(peer: &str, series: Option<(PeerSeries, &str)>) {
 }
 
 /// Count a refused peer provider record without labeling peer-supplied model names.
-pub(crate) fn record_peer_model_catalog_rejection(error: &crate::resources::model_discovery::ServedModelsError) {
+pub(crate) fn record_peer_model_catalog_rejection(
+    error: &crate::resources::model_discovery::ServedModelsError,
+) -> &'static str {
+    count_peer_model_catalog_rejection(&PEER_MODEL_CATALOG_REJECTED, error)
+}
+
+/// Count a rejection on `counter`, returning the same bounded reason for diagnostics.
+pub(crate) fn count_peer_model_catalog_rejection(
+    counter: &IntCounterVec,
+    error: &crate::resources::model_discovery::ServedModelsError,
+) -> &'static str {
     use crate::resources::model_discovery::ServedModelsError;
 
     let reason = match error {
@@ -345,7 +355,8 @@ pub(crate) fn record_peer_model_catalog_rejection(error: &crate::resources::mode
         ServedModelsError::Duplicate(_) => "duplicate",
         ServedModelsError::TooMany => "too_many",
     };
-    PEER_MODEL_CATALOG_REJECTED.with_label_values(&[reason]).inc();
+    counter.with_label_values(&[reason]).inc();
+    reason
 }
 
 /// Count one read of `peer`'s catalog: `replaced` when a catalog landed, `failed` when not.
