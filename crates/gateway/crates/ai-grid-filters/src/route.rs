@@ -3483,7 +3483,10 @@ pub(crate) mod tests {
 
         let action = filter.on_request(&mut ctx).await.expect("routes");
 
-        assert!(matches!(action, FilterAction::Continue), "the remote site admits new work");
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "the remote site admits new work"
+        );
         assert_eq!(ctx.cluster.as_deref(), Some("remote-pool"));
 
         let mut only_local = dialed("local", "local-pool", Some("10.0.0.7:8000"));
