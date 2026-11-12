@@ -31,6 +31,27 @@ tests:
       - hasDocuments:
           count: 2
 
+  - it: grants no Endpoints access without holder Services
+    template: templates/role-leader-election.yaml
+    set:
+      signals.service.enabled: false
+      swim.service.enabled: false
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [endpoints]
+          any: true
+        documentIndex: 0
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [services]
+          any: true
+        documentIndex: 0
+
   - it: drops the signals selector at one replica, since the holder writes its endpoints
     template: templates/service-signals.yaml
     set:
@@ -106,6 +127,10 @@ tests:
               resources: [services]
               resourceNames: [grid-grid-operator-signals, grid-grid-operator-swim]
               verbs: [get]
+            - apiGroups: [""]
+              resources: [endpoints]
+              resourceNames: [grid-grid-operator-signals, grid-grid-operator-swim]
+              verbs: [get, delete]
             - apiGroups: [discovery.k8s.io]
               resources: [endpointslices]
               verbs: [create, list, delete]
