@@ -273,6 +273,7 @@ fn start_grid_routing(
         });
     // The grid TLS mount, never the serving config: a dial presents only the identity mounted for it.
     let binding = ai_grid_filters::Binding {
+        backend_ca_base: backend_ca_base(),
         credential_base: credential_base(),
         grid_identity: grid_identity(),
         ..binding
@@ -304,6 +305,7 @@ fn start_provider(
     registry: &mut praxis_filter::FilterRegistry,
 ) -> Result<(ai_grid_filters::ProviderRuntime, String), praxis_filter::FilterError> {
     let binding = ai_grid_filters::Binding {
+        backend_ca_base: backend_ca_base(),
         credential_base: credential_base(),
         grid_identity: grid_identity(),
         // Captured once: praxis applies insecure options only at startup.
@@ -316,6 +318,11 @@ fn start_provider(
         .map_err(|err| -> praxis_filter::FilterError { format!("grid: watching {}: {err}", path.display()).into() })?;
     ai_grid_filters::register_provider_filter(registry, runtime.snapshot())?;
     Ok((runtime, grid_ca))
+}
+
+/// Where backend CA bundles are mounted: `GRID_BACKEND_CA_DIR`, else the default mount.
+fn backend_ca_base() -> std::path::PathBuf {
+    std::env::var_os("GRID_BACKEND_CA_DIR").map_or_else(|| ai_grid_filters::BACKEND_CA_BASE.into(), Into::into)
 }
 
 /// Where dial credentials are mounted: `GRID_CREDENTIAL_DIR`, else the default mount.

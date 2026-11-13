@@ -192,6 +192,9 @@ pub enum DialTransport {
         /// The CA bundle the server is verified with; absent, the system roots.
         #[serde(default)]
         ca_path: Option<String>,
+        /// Whether this site's grid certificate is presented to the server.
+        #[serde(default)]
+        present_identity: bool,
         /// The name the server is verified by.
         sni: String,
     },
@@ -206,6 +209,15 @@ impl DialTransport {
         match self {
             Self::MutualTls { sni, .. } | Self::Tls { sni, .. } => Some(sni),
             Self::Plaintext => None,
+        }
+    }
+
+    /// Whether the dial presents this site's grid certificate.
+    pub(crate) const fn presents_identity(&self) -> bool {
+        match self {
+            Self::MutualTls { .. } => true,
+            Self::Tls { present_identity, .. } => *present_identity,
+            Self::Plaintext => false,
         }
     }
 
