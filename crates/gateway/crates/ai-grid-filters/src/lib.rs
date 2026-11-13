@@ -28,6 +28,11 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 pub use control::{Binding, ReloadOutcome, Tuning};
+
+/// Report the initial serving revision after the gateway has accepted its mounted file.
+pub fn report_serving_revision(bytes: &[u8], candidate_count: usize) {
+    control::report_serving_revision(bytes, candidate_count);
+}
 pub use decisions::SiteDecisions;
 // The routing model and the snapshot builder are the crate's control-plane API:
 // the gateway's refresh step orders candidates by live load and swaps the
@@ -45,7 +50,7 @@ pub use provider::{
 pub use serving::{
     AvailabilitySettings, CredentialStrategy, DIAL_FILE, DialConfig, DialCredential, DialSpec, DialTransport,
     DialVersion, GridRuntime, GridServingConfig, PeerServingConfig, dial_config_path, load_dial_config,
-    load_serving_config, spawn_grid_routing,
+    load_serving_config, load_serving_config_with_bytes, spawn_grid_routing,
 };
 pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;

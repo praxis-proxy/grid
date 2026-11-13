@@ -234,6 +234,7 @@ fn config(spec: &SiteSpec) -> CandidateConfig {
         kind: CapabilityKind::InferenceModel,
         name: MODEL.to_owned(),
         publishes_load: true,
+        selection_group: 0,
         site: spec.site.to_owned(),
         stable_id: None,
         weight: None,

@@ -21,6 +21,12 @@ use crate::{
 /// Maximum number of route candidates.
 const MAX_CANDIDATES: usize = 1024;
 
+/// Highest accepted operator-assigned selection group.
+///
+/// A valid serving revision contains at most [`MAX_CANDIDATES`] candidates,
+/// so it never needs more distinct ordered groups than this bound.
+const MAX_SELECTION_GROUP: u32 = 1023;
+
 /// Maximum length for identifier strings.
 const MAX_NAME_LEN: usize = 256;
 
@@ -124,6 +130,13 @@ pub struct CandidateConfig {
     #[serde(default = "default_fresh")]
     pub publishes_load: bool,
 
+    /// Grid-assigned priority boundary for new-session selection.
+    ///
+    /// Absent defaults to `0` for older serving configurations. A higher
+    /// group is considered only after no lower group can admit new work.
+    #[serde(default)]
+    pub selection_group: u32,
+
     /// Site that owns this capability.
     pub site: String,
 
@@ -146,7 +159,8 @@ fn default_fresh() -> bool {
 ///
 /// Created by `validate_candidates` from raw config entries. All string
 /// fields are bounded and non-blank. The Grid-owned fields (`admission_state`,
-/// `rank`, `selection_tier`) are populated after validation from live signals.
+/// `rank`, `selection_tier`, `selection_group`) are populated from the serving
+/// revision or live signals after validation.
 ///
 /// `Clone` is cheap: every owned field is reference counted. The refresh step clones
 /// the base set each poll cycle to re-order it by live load.
@@ -211,6 +225,9 @@ pub struct RouteCandidate {
 
     /// Grid-operator locality tier (e.g. `"same_region"`).
     pub selection_tier: Option<Arc<str>>,
+
+    /// Grid-operator priority boundary for new-session selection.
+    pub selection_group: u32,
 
     /// Site that owns this capability.
     pub site: Arc<str>,
@@ -285,6 +302,11 @@ fn validate_candidates_with_empty(
         validate_name(&format!("candidates[{index}].cluster"), &cand.cluster)?;
         validate_header_value(&format!("candidates[{index}].cluster"), &cand.cluster)?;
         validate_credential(index, cand.credential.as_ref())?;
+        if cand.selection_group > MAX_SELECTION_GROUP {
+            return Err(
+                format!("grid: candidates[{index}].selection_group exceeds maximum of {MAX_SELECTION_GROUP}").into(),
+            );
+        }
         if cand.weight == Some(0) {
             return Err(format!("grid: candidates[{index}].weight must not be zero").into());
         }
@@ -324,6 +346,7 @@ fn validate_candidates_with_empty(
             publishes_load: cand.publishes_load,
             rank: None,
             selection_tier: None,
+            selection_group: cand.selection_group,
             site: Arc::from(cand.site.as_str()),
             sovereignty_zone: None,
             stable_id,
@@ -475,6 +498,7 @@ mod tests {
             kind,
             name: name.to_owned(),
             publishes_load: true,
+            selection_group: 0,
             site: site.to_owned(),
             stable_id: None,
             weight: None,
@@ -670,6 +694,29 @@ mod tests {
         let base = r#""kind":"inference_model","name":"m","site":"s","cluster":"c""#;
         assert!(parse(&format!("{{{base}}}")).unwrap());
         assert!(!parse(&format!(r#"{{{base},"publishes_load":false}}"#)).unwrap());
+    }
+
+    #[test]
+    fn selection_group_defaults_for_older_configs_and_preserves_operator_priority() {
+        let parse = |json: &str| serde_yaml::from_str::<CandidateConfig>(json);
+        let base = r#""kind":"inference_model","name":"m","site":"s","cluster":"c""#;
+
+        assert_eq!(parse(&format!("{{{base}}}")).unwrap().selection_group, 0);
+        let configured = parse(&format!(r#"{{{base},"selection_group":2}}"#)).unwrap();
+        assert_eq!(
+            validate_candidates(vec![configured]).unwrap()[0].selection_group,
+            2,
+            "the route selector must receive the operator's regional boundary"
+        );
+    }
+
+    #[test]
+    fn selection_group_is_bounded() {
+        let mut candidate = candidate("inference_model", "m", "s", "c");
+        candidate.selection_group = MAX_SELECTION_GROUP.saturating_add(1);
+
+        let error = validate_candidates(vec![candidate]).expect_err("out-of-range selection group is rejected");
+        assert!(error.to_string().contains("selection_group exceeds maximum"), "{error}");
     }
 
     #[test]

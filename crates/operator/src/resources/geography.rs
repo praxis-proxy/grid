@@ -13,7 +13,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::crd::grid_site::GridSite;
+use crate::crd::{
+    grid_network::{GatewayRef, REGIONAL_POLICY_MAX_VALUE_LENGTH},
+    grid_site::GridSite,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -74,6 +77,44 @@ pub enum AdmissionState {
     Excluded,
 }
 
+/// Resolution of one trusted regional metadata field.
+///
+/// The states are intentionally distinct so later policy decisions can fail
+/// closed with bounded, machine-readable reasons.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegionalPolicyMetadataResolution<'site> {
+    /// Every matching `GridSite` declares the same valid value.
+    Resolved(&'site str),
+    /// Matching `GridSite` records exist but all omit the field.
+    Missing,
+    /// No `GridSite` in the network matches the requested routing site key.
+    Unknown,
+    /// Matching records agree that the field is present but malformed.
+    Malformed,
+    /// Matching records disagree on the field's value or presence.
+    Conflicting,
+}
+
+/// Trusted regional metadata resolved independently for one routing site key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RegionalPolicySiteMetadata<'site> {
+    /// Trusted deployment region resolution.
+    pub(crate) region: RegionalPolicyMetadataResolution<'site>,
+    /// Trusted sovereignty-zone resolution.
+    pub(crate) sovereignty_zone: RegionalPolicyMetadataResolution<'site>,
+}
+
+/// Internal observation used while reconciling duplicate site-key matches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegionalPolicyFieldObservation<'site> {
+    /// The field is absent.
+    Missing,
+    /// The field is present but invalid for policy matching.
+    Malformed,
+    /// The field contains a valid exact value.
+    Resolved(&'site str),
+}
+
 // ---------------------------------------------------------------------------
 // Derivation functions
 // ---------------------------------------------------------------------------
@@ -119,6 +160,139 @@ fn resolve_site_geography<'site>(
         .filter(|s| s.spec.grid_network_ref == network_name)
         .find(|s| crate::controller::grid_network::peer_site_key(s).is_some_and(|(key, _)| key == site_name))
         .map_or((None, None), |s| (s.spec.region.as_deref(), s.spec.zone.as_deref()))
+}
+
+/// Resolve trusted region and sovereignty metadata for a routing site key.
+///
+/// Matching is network-scoped and uses the same routing identity as candidates
+/// and peers: a declared site's object name or an auto-discovered site's
+/// `site_id`. Regions remain exact values. Sovereignty zones use the shared
+/// canonical form consumed by the sovereignty fence, so casing and surrounding
+/// whitespace do not create a second routing meaning. Missing, malformed, and
+/// differing observations are never selected by inventory order.
+pub(crate) fn resolve_regional_policy_site_metadata<'site>(
+    site_name: &str,
+    sites: &'site [GridSite],
+    network_name: &str,
+) -> RegionalPolicySiteMetadata<'site> {
+    RegionalPolicySiteMetadata {
+        region: resolve_regional_policy_field(site_name, sites, network_name, |site| site.spec.region.as_deref()),
+        sovereignty_zone: resolve_regional_policy_sovereignty_zone(site_name, sites, network_name),
+    }
+}
+
+/// Resolve the trusted metadata used by a gateway's default affinity context.
+///
+/// The explicit [`GatewayRef::site_name`] wins. When it is absent, the current
+/// single-site compatibility fallback uses the [`GridNetwork`] name.
+///
+/// [`GridNetwork`]: crate::crd::grid_network::GridNetwork
+pub(crate) fn resolve_gateway_regional_policy_metadata<'site>(
+    gateway: &GatewayRef,
+    sites: &'site [GridSite],
+    network_name: &str,
+) -> RegionalPolicySiteMetadata<'site> {
+    resolve_regional_policy_site_metadata(
+        gateway.site_name.as_deref().unwrap_or(network_name),
+        sites,
+        network_name,
+    )
+}
+
+/// Resolve one field across all records matching a routing site key.
+fn resolve_regional_policy_field<'site>(
+    site_name: &str,
+    sites: &'site [GridSite],
+    network_name: &str,
+    field: impl Fn(&'site GridSite) -> Option<&'site str>,
+) -> RegionalPolicyMetadataResolution<'site> {
+    let mut sites = sites.iter().filter(|site| {
+        site.spec.grid_network_ref == network_name
+            && crate::controller::grid_network::peer_site_key(site).is_some_and(|(key, _)| key == site_name)
+    });
+    let Some(first_site) = sites.next() else {
+        return RegionalPolicyMetadataResolution::Unknown;
+    };
+    let first = observe_regional_policy_field(field(first_site));
+    if sites.any(|site| observe_regional_policy_field(field(site)) != first) {
+        return RegionalPolicyMetadataResolution::Conflicting;
+    }
+    match first {
+        RegionalPolicyFieldObservation::Missing => RegionalPolicyMetadataResolution::Missing,
+        RegionalPolicyFieldObservation::Malformed => RegionalPolicyMetadataResolution::Malformed,
+        RegionalPolicyFieldObservation::Resolved(value) => RegionalPolicyMetadataResolution::Resolved(value),
+    }
+}
+
+/// Resolve sovereignty metadata with the canonicalization shared by the
+/// existing sovereignty fence.
+///
+/// The returned value borrows the trusted `GridSite` text; consumers compare
+/// it using the same normalization. Normalized observations are used only to
+/// decide whether duplicate records agree and whether a value is malformed.
+fn resolve_regional_policy_sovereignty_zone<'site>(
+    site_name: &str,
+    sites: &'site [GridSite],
+    network_name: &str,
+) -> RegionalPolicyMetadataResolution<'site> {
+    let mut matching_sites = sites.iter().filter(|site| {
+        site.spec.grid_network_ref == network_name
+            && crate::controller::grid_network::peer_site_key(site).is_some_and(|(key, _)| key == site_name)
+    });
+    let Some(first_site) = matching_sites.next() else {
+        return RegionalPolicyMetadataResolution::Unknown;
+    };
+    let first_value = first_site.spec.sovereignty_zone.as_deref();
+    let first = observe_regional_policy_sovereignty_zone(first_value);
+    if matching_sites
+        .any(|site| observe_regional_policy_sovereignty_zone(site.spec.sovereignty_zone.as_deref()) != first)
+    {
+        return RegionalPolicyMetadataResolution::Conflicting;
+    }
+    match (first_value, first) {
+        (None, RegionalPolicySovereigntyObservation::Missing) => RegionalPolicyMetadataResolution::Missing,
+        (Some(value), RegionalPolicySovereigntyObservation::Resolved(_)) => {
+            RegionalPolicyMetadataResolution::Resolved(value)
+        },
+        _ => RegionalPolicyMetadataResolution::Malformed,
+    }
+}
+
+/// Classify a declared regional metadata value without normalization.
+fn observe_regional_policy_field(value: Option<&str>) -> RegionalPolicyFieldObservation<'_> {
+    match value {
+        None => RegionalPolicyFieldObservation::Missing,
+        Some(value)
+            if value.is_empty()
+                || value.chars().any(char::is_whitespace)
+                || value.chars().count() > REGIONAL_POLICY_MAX_VALUE_LENGTH =>
+        {
+            RegionalPolicyFieldObservation::Malformed
+        },
+        Some(value) => RegionalPolicyFieldObservation::Resolved(value),
+    }
+}
+
+/// Canonicalized observation for a sovereignty-zone declaration.
+#[derive(Debug, Eq, PartialEq)]
+enum RegionalPolicySovereigntyObservation {
+    /// The field is absent.
+    Missing,
+    /// The field cannot be parsed as a sovereignty-zone token.
+    Malformed,
+    /// The field is valid under the canonical sovereignty-zone representation.
+    Resolved(String),
+}
+
+/// Validate and canonicalize one sovereignty-zone declaration.
+fn observe_regional_policy_sovereignty_zone(value: Option<&str>) -> RegionalPolicySovereigntyObservation {
+    match value {
+        None => RegionalPolicySovereigntyObservation::Missing,
+        Some(value) => grid_signals::zone::sovereignty_zone(value).map_or(
+            RegionalPolicySovereigntyObservation::Malformed,
+            RegionalPolicySovereigntyObservation::Resolved,
+        ),
+    }
 }
 
 /// Derive admission state from provider health and capacity metrics.
@@ -211,10 +385,247 @@ mod tests {
         assert_eq!(resolve_site_geography("grid-retail", &sites, "net"), (None, None));
     }
 
+    // -----------------------------------------------------------------------
+    // Regional policy metadata resolution
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn regional_policy_metadata_resolves_region_and_sovereignty_independently() {
+        let sites = [test_site_with_metadata(
+            "site-a",
+            "net",
+            Some("us-east"),
+            Some("regulated-us"),
+            Some("a"),
+        )];
+        assert_eq!(
+            resolve_regional_policy_site_metadata("site-a", &sites, "net"),
+            RegionalPolicySiteMetadata {
+                region: RegionalPolicyMetadataResolution::Resolved("us-east"),
+                sovereignty_zone: RegionalPolicyMetadataResolution::Resolved("regulated-us"),
+            }
+        );
+    }
+
+    #[test]
+    fn regional_policy_metadata_distinguishes_unknown_site_from_missing_fields() {
+        let sites = [test_site_with_metadata("site-a", "net", None, None, None)];
+        assert_eq!(
+            resolve_regional_policy_site_metadata("unknown", &sites, "net"),
+            RegionalPolicySiteMetadata {
+                region: RegionalPolicyMetadataResolution::Unknown,
+                sovereignty_zone: RegionalPolicyMetadataResolution::Unknown,
+            }
+        );
+        assert_eq!(
+            resolve_regional_policy_site_metadata("site-a", &sites, "net"),
+            RegionalPolicySiteMetadata {
+                region: RegionalPolicyMetadataResolution::Missing,
+                sovereignty_zone: RegionalPolicyMetadataResolution::Missing,
+            }
+        );
+    }
+
+    #[test]
+    fn regional_policy_metadata_is_network_scoped() {
+        let sites = [
+            test_site_with_metadata("site-a", "net-a", Some("east"), Some("eu"), None),
+            test_site_with_metadata("site-a", "net-b", Some("west"), Some("us"), None),
+        ];
+        assert_eq!(
+            resolve_regional_policy_site_metadata("site-a", &sites, "net-a"),
+            RegionalPolicySiteMetadata {
+                region: RegionalPolicyMetadataResolution::Resolved("east"),
+                sovereignty_zone: RegionalPolicyMetadataResolution::Resolved("eu"),
+            }
+        );
+    }
+
+    #[test]
+    fn regional_policy_metadata_uses_discovered_site_id() {
+        let site = with_site_id(
+            test_site_with_metadata("grid-retail", "net", Some("us-east"), Some("regulated-us"), None),
+            "retail",
+        );
+        let sites = [site];
+        assert_eq!(
+            resolve_regional_policy_site_metadata("retail", &sites, "net").region,
+            RegionalPolicyMetadataResolution::Resolved("us-east")
+        );
+        assert_eq!(
+            resolve_regional_policy_site_metadata("grid-retail", &sites, "net").region,
+            RegionalPolicyMetadataResolution::Unknown
+        );
+    }
+
+    #[test]
+    fn regional_policy_metadata_rejects_malformed_values() {
+        let sites = [test_site_with_metadata(
+            "site-a",
+            "net",
+            Some("us east"),
+            Some(&"x".repeat(REGIONAL_POLICY_MAX_VALUE_LENGTH + 1)),
+            None,
+        )];
+        assert_eq!(
+            resolve_regional_policy_site_metadata("site-a", &sites, "net"),
+            RegionalPolicySiteMetadata {
+                region: RegionalPolicyMetadataResolution::Malformed,
+                sovereignty_zone: RegionalPolicyMetadataResolution::Malformed,
+            }
+        );
+    }
+
+    #[test]
+    fn regional_policy_sovereignty_metadata_uses_the_shared_canonical_form() {
+        let first = with_site_id(
+            test_site_with_metadata("grid-a", "net", Some("east"), Some(" EU "), None),
+            "shared",
+        );
+        let second = with_site_id(
+            test_site_with_metadata("grid-b", "net", Some("east"), Some("eu"), None),
+            "shared",
+        );
+        let sites = [first, second];
+        assert_eq!(
+            resolve_regional_policy_site_metadata("shared", &sites, "net").sovereignty_zone,
+            RegionalPolicyMetadataResolution::Resolved(" EU ")
+        );
+
+        let malformed = [test_site_with_metadata(
+            "site-a",
+            "net",
+            Some("east"),
+            Some("eu west"),
+            None,
+        )];
+        assert_eq!(
+            resolve_regional_policy_site_metadata("site-a", &malformed, "net").sovereignty_zone,
+            RegionalPolicyMetadataResolution::Malformed
+        );
+    }
+
+    #[test]
+    fn duplicate_site_keys_resolve_only_when_metadata_agrees() {
+        let site_a = with_site_id(
+            test_site_with_metadata("grid-a", "net", Some("east"), Some("eu"), None),
+            "shared",
+        );
+        let site_b = with_site_id(
+            test_site_with_metadata("grid-b", "net", Some("east"), Some("eu"), None),
+            "shared",
+        );
+        let sites = [site_a, site_b];
+        assert_eq!(
+            resolve_regional_policy_site_metadata("shared", &sites, "net"),
+            RegionalPolicySiteMetadata {
+                region: RegionalPolicyMetadataResolution::Resolved("east"),
+                sovereignty_zone: RegionalPolicyMetadataResolution::Resolved("eu"),
+            }
+        );
+    }
+
+    #[test]
+    fn duplicate_site_keys_report_conflicting_fields_independently() {
+        let site_a = with_site_id(
+            test_site_with_metadata("grid-a", "net", Some("east"), Some("eu"), None),
+            "shared",
+        );
+        let site_b = with_site_id(
+            test_site_with_metadata("grid-b", "net", Some("EAST"), Some("eu"), None),
+            "shared",
+        );
+        let sites = [site_a, site_b];
+        assert_eq!(
+            resolve_regional_policy_site_metadata("shared", &sites, "net"),
+            RegionalPolicySiteMetadata {
+                region: RegionalPolicyMetadataResolution::Conflicting,
+                sovereignty_zone: RegionalPolicyMetadataResolution::Resolved("eu"),
+            },
+            "case differences must not be normalized"
+        );
+    }
+
+    #[test]
+    fn duplicate_site_key_presence_disagreement_is_conflicting() {
+        let site_a = with_site_id(
+            test_site_with_metadata("grid-a", "net", Some("east"), Some("eu"), None),
+            "shared",
+        );
+        let site_b = with_site_id(
+            test_site_with_metadata("grid-b", "net", None, Some("eu"), None),
+            "shared",
+        );
+        let sites = [site_a, site_b];
+        assert_eq!(
+            resolve_regional_policy_site_metadata("shared", &sites, "net").region,
+            RegionalPolicyMetadataResolution::Conflicting
+        );
+    }
+
+    #[test]
+    fn duplicate_site_key_valid_and_malformed_values_are_conflicting() {
+        let valid = with_site_id(
+            test_site_with_metadata("grid-a", "net", Some("east"), Some("eu"), None),
+            "shared",
+        );
+        let malformed = with_site_id(
+            test_site_with_metadata("grid-b", "net", Some("east west"), Some("eu"), None),
+            "shared",
+        );
+        for sites in [[valid.clone(), malformed.clone()], [malformed, valid]] {
+            assert_eq!(
+                resolve_regional_policy_site_metadata("shared", &sites, "net").region,
+                RegionalPolicyMetadataResolution::Conflicting,
+                "conflict detection must not depend on inventory order"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_metadata_prefers_site_name_and_falls_back_to_network_name() {
+        let sites = [
+            test_site_with_metadata("net", "net", Some("default"), Some("global"), None),
+            test_site_with_metadata("edge-east", "net", Some("east"), Some("eu"), None),
+        ];
+        let explicit: GatewayRef = serde_json::from_value(serde_json::json!({
+            "name": "gw-east",
+            "namespace": "grid-system",
+            "siteName": "edge-east"
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let fallback: GatewayRef = serde_json::from_value(serde_json::json!({
+            "name": "gw-default",
+            "namespace": "grid-system"
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            resolve_gateway_regional_policy_metadata(&explicit, &sites, "net").region,
+            RegionalPolicyMetadataResolution::Resolved("east")
+        );
+        assert_eq!(
+            resolve_gateway_regional_policy_metadata(&fallback, &sites, "net").region,
+            RegionalPolicyMetadataResolution::Resolved("default")
+        );
+    }
+
     fn test_site_with_geography(name: &str, network: &str, region: Option<&str>, zone: Option<&str>) -> GridSite {
+        test_site_with_metadata(name, network, region, None, zone)
+    }
+
+    fn test_site_with_metadata(
+        name: &str,
+        network: &str,
+        region: Option<&str>,
+        sovereignty_zone: Option<&str>,
+        zone: Option<&str>,
+    ) -> GridSite {
         let mut spec = serde_json::json!({ "gridNetworkRef": network });
         if let Some(r) = region {
             spec["region"] = serde_json::json!(r);
+        }
+        if let Some(sovereignty_zone) = sovereignty_zone {
+            spec["sovereigntyZone"] = serde_json::json!(sovereignty_zone);
         }
         if let Some(z) = zone {
             spec["zone"] = serde_json::json!(z);
@@ -226,6 +637,26 @@ mod tests {
             "spec": spec
         }))
         .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn with_site_id(mut site: GridSite, site_id: &str) -> GridSite {
+        site.metadata.labels = Some(
+            [(
+                crate::controller::grid_network::LABEL_AUTO_DISCOVERED.to_owned(),
+                "true".to_owned(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        site.metadata.annotations = Some(
+            [(
+                crate::controller::grid_network::ANNOTATION_SITE_ID.to_owned(),
+                site_id.to_owned(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        site
     }
 
     // -----------------------------------------------------------------------

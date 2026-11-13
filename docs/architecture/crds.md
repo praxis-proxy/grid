@@ -605,6 +605,32 @@ This field is independent of `praxisConfig`; absent or disabled generated
 consumer Praxis config cannot make embedded serving fail validation or change
 its provider-hop allowlist.
 
+### GatewayRef.regionalPolicy
+
+`spec.consumerGateways[].regionalPolicy` is an optional per-gateway contract
+for regional eligibility. It applies to every candidate in that gateway's
+overlay; omitting it preserves the existing routing behavior. Grid reads
+region and sovereignty only from trusted `GridSite` metadata. A caller cannot
+change policy eligibility with a request header.
+
+| Field | Applies to | Meaning |
+|---|---|---|
+| `mode: affinity` | affinity | Use `preferredRegions`, or the region of the trusted `siteName` `GridSite` when it is omitted. `crossRegionFallback` defaults to `deny`; `allow` creates a fallback group used only when no preferred candidate admits new work. |
+| `mode: locked` | locked | Requires non-empty `allowedRegions`; candidates outside the set never enter routing. `preferredRegions` and `crossRegionFallback` are invalid in this mode. |
+| `allowedSovereigntyZones` | both modes | Optional independent hard allowlist. A candidate must pass both this set and its regional rule; comparison uses the shared sovereignty-zone canonical form (trimmed, lowercased tokens). |
+
+`preferredRegions` and `allowedRegions` are unordered Kubernetes sets of 1–64
+non-blank values, each at most 253 characters. `allowedSovereigntyZones` uses
+the shared sovereignty-zone token grammar: ASCII letters, digits, `.`, `_`, or
+`-`, at most 63 characters; values are compared case-insensitively, so `EU`
+and `eu` denote the same zone. A valid policy with unresolved required site metadata, or with no
+permitted candidate, publishes an authoritative empty revision and fails
+closed. An invalid policy update is rejected before it can
+replace the last-known-good revision. See the
+[regional-policy example](../../examples/gateway/regional-policy.yaml) and
+[routing guide](../routing.md#regional-policy-affinity-locking-and-sovereignty)
+for complete behavior, updates, sessions, and observability.
+
 ### GatewayRef.modelDiscoveryContractVersion
 
 Set `spec.consumerGateways[].modelDiscoveryContractVersion: v1` only after the

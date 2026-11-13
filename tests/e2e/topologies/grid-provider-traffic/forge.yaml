@@ -15,7 +15,7 @@ spec:
 
   clusters:
     - name: provider-a
-      stacks: [metallb, provider-a-operator-base, vcr-backend, provider-a-site, provider-gateway, consumer-gateway]
+      stacks: [provider-a-operator-base, vcr-backend, provider-a-site, provider-gateway, consumer-gateway]
       properties:
         region: provider-a
         role: combined
@@ -30,7 +30,7 @@ spec:
         operatorImageTag: "v0.1.4"
 
     - name: provider-b
-      stacks: [metallb, provider-b-operator-base, vcr-backend, provider-b-site, provider-gateway]
+      stacks: [provider-b-operator-base, vcr-backend, provider-b-site, provider-gateway]
       properties:
         region: provider-b
         role: combined
@@ -45,7 +45,7 @@ spec:
         operatorImageTag: "v0.1.4"
 
     - name: provider-c
-      stacks: [metallb, provider-c-operator-base, vcr-backend, provider-c-site, provider-gateway]
+      stacks: [provider-c-operator-base, vcr-backend, provider-c-site, provider-gateway]
       properties:
         region: provider-c
         role: combined
@@ -60,22 +60,8 @@ spec:
         operatorImageTag: "v0.1.4"
 
   stacks:
-    metallb:
-      description: MetalLB load balancer with auto-configured address pool
-      steps:
-        - type: url
-          url: https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
-          sha256: 951065e85692aa106f1bb5d5a487d9306154923a794ab1d82122881cbaf588e4
-        - type: wait
-          resource: deployment/controller
-          namespace: metallb-system
-          condition: available
-          timeout: "180s"
-        - type: metallb-auto-pool
-          name: forge-pool
-
     provider-a-operator-base:
-      description: West Grid operator initial deployment with SWIM LoadBalancer
+      description: West Grid operator initial deployment with SWIM NodePort
       steps:
         - type: helm
           release: grid-operator
@@ -92,7 +78,7 @@ spec:
               seeds: ""
               service:
                 enabled: true
-                type: "LoadBalancer"
+                type: "NodePort"
             gateway:
               serviceName: "provider-gateway"
               port: "8443"
@@ -101,16 +87,8 @@ spec:
           namespace: grid-system
           condition: available
           timeout: "120s"
-        - type: capture
-          resource: svc/grid-operator-swim
-          namespace: grid-system
-          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
-          key: swim-lb-ip
-          timeout: "60s"
-          interval: "2s"
-
     provider-b-operator-base:
-      description: Central Grid operator initial deployment with SWIM LoadBalancer
+      description: Central Grid operator initial deployment with SWIM NodePort
       steps:
         - type: helm
           release: grid-operator
@@ -127,7 +105,7 @@ spec:
               seeds: ""
               service:
                 enabled: true
-                type: "LoadBalancer"
+                type: "NodePort"
             gateway:
               serviceName: "provider-gateway"
               port: "8443"
@@ -136,16 +114,8 @@ spec:
           namespace: grid-system
           condition: available
           timeout: "120s"
-        - type: capture
-          resource: svc/grid-operator-swim
-          namespace: grid-system
-          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
-          key: swim-lb-ip
-          timeout: "60s"
-          interval: "2s"
-
     provider-c-operator-base:
-      description: East Grid operator initial deployment with SWIM LoadBalancer
+      description: East Grid operator initial deployment with SWIM NodePort
       steps:
         - type: helm
           release: grid-operator
@@ -162,7 +132,7 @@ spec:
               seeds: ""
               service:
                 enabled: true
-                type: "LoadBalancer"
+                type: "NodePort"
             gateway:
               serviceName: "provider-gateway"
               port: "8443"
@@ -171,14 +141,6 @@ spec:
           namespace: grid-system
           condition: available
           timeout: "120s"
-        - type: capture
-          resource: svc/grid-operator-swim
-          namespace: grid-system
-          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
-          key: swim-lb-ip
-          timeout: "60s"
-          interval: "2s"
-
     vcr-backend:
       description: vllm-vcr inference backend for demo scenarios
       steps:
@@ -208,6 +170,7 @@ spec:
             gridNetwork:
               name: grid-provider-traffic
               gridId: grid-provider-traffic-v1
+              autoDiscoverSites: true
               region: provider-a
               zone: provider-a-1
               routingPolicy: scoreFirst
@@ -267,6 +230,7 @@ spec:
             gridNetwork:
               name: grid-provider-traffic
               gridId: grid-provider-traffic-v1
+              autoDiscoverSites: true
               region: provider-b
               zone: provider-b-1
               routingPolicy: scoreFirst
@@ -326,6 +290,7 @@ spec:
             gridNetwork:
               name: grid-provider-traffic
               gridId: grid-provider-traffic-v1
+              autoDiscoverSites: true
               region: provider-c
               zone: provider-c-1
               routingPolicy: scoreFirst
@@ -402,7 +367,7 @@ spec:
               containerPort: 8443
               name: "https-mtls"
             service:
-              type: "LoadBalancer"
+              type: "NodePort"
               port: 8443
             health:
               readiness:
@@ -429,30 +394,9 @@ spec:
           namespace: grid-system
           condition: available
           timeout: "120s"
-        - type: capture
-          resource: svc/provider-gateway
-          namespace: grid-system
-          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
-          key: provider-gateway-ip
-          timeout: "60s"
-          interval: "2s"
-
     consumer-gateway:
       description: Praxis consumer gateway with operator-managed overlay
       steps:
-        - type: template-file
-          source: configs/consumer/praxis.yaml
-          target: .forge/runtime/{{ cluster.name }}/consumer/praxis.yaml
-        - type: exec
-          command:
-            - bash
-            - -c
-            - >-
-              kubectl --context kind-grid-provider-traffic-{{ cluster.name }} -n grid-system
-              create configmap consumer-gateway-config
-              --from-file=praxis.yaml=.forge/runtime/{{ cluster.name }}/consumer/praxis.yaml
-              --dry-run=client -o yaml |
-              kubectl --context kind-grid-provider-traffic-{{ cluster.name }} apply -f -
         - type: helm
           release: consumer-gateway
           chart: charts/praxis-gateway
@@ -478,12 +422,17 @@ spec:
               byo:
                 configMapName: "consumer-gateway-config"
             service:
-              type: "LoadBalancer"
+              type: "ClusterIP"
             grid:
               networkName: grid-provider-traffic
               siteName: "{{ cluster.name }}"
             overlay:
               configMapName: "grid-overlay-grid-provider-traffic-consumer-gateway"
+              sidecar:
+                image:
+                  repository: "{{ cluster.properties.overlaySyncImageRepo }}"
+                  tag: "{{ cluster.properties.overlaySyncImageTag }}"
+                  pullPolicy: "{{ cluster.properties.imagePullPolicy }}"
             providerCredentials:
               - secretName: "vcr-inference-credential"
                 mountPath: "/run/secrets/grid-credentials/grid-system/vcr-inference-credential"
@@ -497,10 +446,3 @@ spec:
           namespace: grid-system
           condition: available
           timeout: "120s"
-        - type: capture
-          resource: svc/consumer-gateway
-          namespace: grid-system
-          jsonpath: "{.status.loadBalancer.ingress[0].ip}"
-          key: consumer-gateway-ip
-          timeout: "60s"
-          interval: "2s"

@@ -14,6 +14,7 @@ use std::{
 
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::{DemoMode, GlbDemoOptions, certs, glb, kubectl, operator, safe_truncate_str};
 
@@ -73,7 +74,7 @@ const PROVIDER_GATEWAY_SERVICE: &str = "provider-gateway";
 const PROVIDER_GATEWAY_PORT: &str = "8443";
 
 /// Label used by the run-owned `InferenceProvider` selectors.
-const PROVIDER_SITE_LABEL: &str = "grid.praxis-proxy.io/provider-site";
+const PROVIDER_SITE_LABEL: &str = "grid.praxis.fast/provider-site";
 
 /// Provider `InferenceProvider` resources created by this topology, in origin-cluster order.
 const PROVIDER_RESOURCES: &[(&str, &str)] = &[
@@ -81,6 +82,18 @@ const PROVIDER_RESOURCES: &[(&str, &str)] = &[
     ("provider-b", "vcr-provider-b-provider"),
     ("provider-c", "vcr-provider-c-provider"),
 ];
+
+/// Gateway references that must receive identical regional policy in the qualification.
+const REGIONAL_POLICY_GATEWAYS: &[&str] = &["consumer-gateway", GRID_SERVING_GATEWAY];
+
+/// Synthetic trusted geography used only by the Kind qualification.
+const QUALIFICATION_PREFERRED_REGION: &str = "qualification-east";
+/// Permitted non-preferred region used only after affinity fallback is enabled.
+const QUALIFICATION_FALLBACK_REGION: &str = "qualification-west";
+/// Sovereignty zone that the qualification policy explicitly permits.
+const QUALIFICATION_SOVEREIGNTY_ZONE: &str = "qualification-sovereignty";
+/// Sovereignty zone used to prove that an otherwise regional fallback is excluded.
+const QUALIFICATION_OTHER_SOVEREIGNTY_ZONE: &str = "qualification-other";
 
 /// Provider gateway identity Secret name (matches Helm `gridIdentity.tlsSecretName`).
 const PROVIDER_TLS_SECRET: &str = "provider-gateway-tls";
@@ -90,6 +103,9 @@ const WRONG_ORG_TLS_SECRET: &str = "wrong-org-client-tls";
 
 /// Number of environment setup phases shown to the user.
 const SETUP_PHASES: usize = 14;
+
+/// Local overlay-sync image built by the provider-traffic preparation script.
+const PROVIDER_TRAFFIC_OVERLAY_SYNC_IMAGE: &str = "grid-overlay-sync:provider-traffic-qualification";
 
 /// Makes retry probe names unique while retaining a recognizable prefix.
 static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -727,30 +743,6 @@ fn strip_ansi_csi(input: &str) -> String {
     String::from_utf8_lossy(&output).into_owned()
 }
 
-/// Return every exact serving-revision log observation after normalizing ANSI styling.
-fn embedded_serving_revision_lines(logs: &str, digest: &str, count: u64) -> Vec<String> {
-    let clean = strip_ansi_csi(logs);
-    clean
-        .lines()
-        .filter(|line| {
-            line.contains("grid_serving_revision_serving")
-                && line.contains(digest)
-                && line.contains(&format!("candidate_count={count}"))
-        })
-        .map(str::to_owned)
-        .collect()
-}
-
-/// Require an exact serving event beyond those already observed for this digest.
-fn has_new_embedded_serving_revision_observation(
-    logs: &str,
-    digest: &str,
-    count: u64,
-    prior_matching_observations: usize,
-) -> bool {
-    embedded_serving_revision_lines(logs, digest, count).len() > prior_matching_observations
-}
-
 /// Wait for the demo environment to be ready.
 fn wait_for_environment_ready() -> Result<String, Box<dyn std::error::Error>> {
     // Wait for Grid operators to converge
@@ -1035,10 +1027,6 @@ fn assert_swim_convergence() -> AssertionResult {
 ///
 /// The locally declared placement site is not a remote SWIM discovery result
 /// and is excluded from this assertion.
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "The assertion framework requires a fallible, named proof boundary."
-)]
 fn assert_site_auto_discovery() -> AssertionResult {
     let start = Instant::now();
     let mut observed_facts = BTreeMap::new();
@@ -1047,6 +1035,11 @@ fn assert_site_auto_discovery() -> AssertionResult {
 
     for cluster in CLUSTERS {
         let context = cluster_context(cluster);
+        let expected_remote_addresses = CLUSTERS
+            .iter()
+            .filter(|remote| **remote != *cluster)
+            .map(|remote| read_provider_gateway_address(remote))
+            .collect::<Result<BTreeSet<_>, _>>()?;
 
         let result = poll_until(
             || {
@@ -1064,7 +1057,6 @@ fn assert_site_auto_discovery() -> AssertionResult {
                 }
                 let body = String::from_utf8_lossy(&output.stdout);
                 let mut verified = Vec::new();
-                let port_suffix = format!(":{PROVIDER_GATEWAY_PORT}");
                 for line in body.lines() {
                     let fields: Vec<&str> = line.trim().split('\t').collect();
                     let [name, phase, reason, addr, server_name, fingerprints, ..] = fields.as_slice() else {
@@ -1072,7 +1064,7 @@ fn assert_site_auto_discovery() -> AssertionResult {
                     };
                     if *phase == "Active"
                         && *reason == "TlsVerified"
-                        && addr.ends_with(&port_suffix)
+                        && expected_remote_addresses.contains(*addr)
                         && !server_name.is_empty()
                         && !fingerprints.is_empty()
                     {
@@ -1114,7 +1106,7 @@ fn assert_site_auto_discovery() -> AssertionResult {
 
     if all_ok {
         Ok(proof_success(
-            "Every cluster has two Active/TlsVerified remote `GridSites` with :8443 addresses and trust configuration",
+            "Every cluster has two Active/TlsVerified remote `GridSites` with expected NodeIP:NodePort gateway addresses and trust configuration",
             observed_facts,
             start.elapsed(),
         ))
@@ -1296,6 +1288,13 @@ fn require_local_image(image: &str) -> Result<(), Box<dyn std::error::Error>> {
     .into())
 }
 
+/// Return the provider-traffic overlay-sync image, allowing an explicit
+/// qualification override while keeping the direct command self-consistent
+/// with the documented local build tag.
+fn provider_traffic_overlay_sync_image() -> String {
+    std::env::var("GRID_XTASK_OVERLAY_SYNC_IMAGE").unwrap_or_else(|_| PROVIDER_TRAFFIC_OVERLAY_SYNC_IMAGE.to_owned())
+}
+
 /// Load local container images into all Kind clusters.
 ///
 /// Reads image references from the `GRID_XTASK_*_IMAGE` environment variables
@@ -1313,7 +1312,7 @@ fn load_images_into_clusters() -> Result<(), Box<dyn std::error::Error>> {
     let operator = std::env::var("GRID_XTASK_OPERATOR_IMAGE")
         .unwrap_or_else(|_| "grid-operator:provider-traffic-qualification".to_owned());
     let vcr = crate::env::image_overrides::sim_image();
-    let overlay_sync = crate::env::image_overrides::overlay_sync_image();
+    let overlay_sync = provider_traffic_overlay_sync_image();
 
     for image in [&gateway, &operator, &vcr, &overlay_sync] {
         require_local_image(image)?;
@@ -2076,46 +2075,17 @@ fn collect_overlay_diagnostics() {
 
     eprintln!("  [DIAG] 10. Cross-cluster SWIM connectivity check");
     for cluster in CLUSTERS {
-        let context = cluster_context(cluster);
         for target in CLUSTERS {
             if *target == *cluster {
                 continue;
             }
-            let target_context = cluster_context(target);
-            if let Ok(output) = Command::new("kubectl")
-                .args([
-                    "--context",
-                    &target_context,
-                    "-n",
-                    GRID_SYSTEM_NS,
-                    "get",
-                    "svc",
-                    "grid-operator-swim",
-                    "-o",
-                    "jsonpath={.status.loadBalancer.ingress[0].ip}",
-                ])
-                .output()
-            {
-                let ip = String::from_utf8_lossy(&output.stdout);
-                eprintln!("  [DIAG] {cluster} -> {target} (SWIM LB {ip}): testing TCP 7946");
-                drop(
-                    Command::new("kubectl")
-                        .args([
-                            "--context",
-                            &context,
-                            "-n",
-                            GRID_SYSTEM_NS,
-                            "exec",
-                            "deployment/grid-operator",
-                            "--",
-                            "sh",
-                            "-c",
-                            &format!(
-                                "timeout 3 sh -c 'echo | nc -w 2 {ip} 7946' && echo REACHABLE || echo UNREACHABLE"
-                            ),
-                        ])
-                        .status(),
-                );
+            match read_swim_endpoint(target) {
+                Ok(endpoint) => {
+                    eprintln!("  [DIAG] {cluster} -> {target}: configured SWIM UDP NodePort endpoint {endpoint}");
+                },
+                Err(error) => {
+                    eprintln!("  [DIAG] {cluster} -> {target}: could not read SWIM NodePort endpoint: {error}");
+                },
             }
         }
     }
@@ -2187,6 +2157,79 @@ fn materialize_provider_config(
     }
 
     Ok(())
+}
+
+/// Materialize the consumer Gateway configuration with cross-Kind `NodePort`
+/// endpoints before Forge deploys the consumer Gateway.
+///
+/// The static template expresses its endpoint identities and TLS settings, but
+/// the endpoint addresses belong to the run-created Kind clusters. Rendering
+/// them here avoids coupling this topology to `MetalLB`'s cluster-local VIPs.
+fn materialize_consumer_config(demo_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let template_path = demo_root.join("configs/consumer/praxis.yaml");
+    let template = fs::read_to_string(template_path)
+        .map_err(|error| format!("failed to read consumer config template: {error}"))?;
+
+    let mut provider_endpoints = BTreeMap::new();
+    for cluster in CLUSTERS {
+        provider_endpoints.insert(*cluster, read_provider_gateway_address(cluster)?);
+    }
+    let rendered = render_consumer_config(&template, &provider_endpoints)?;
+    let context = cluster_context(CONSUMER_SITE);
+
+    let create = Command::new("kubectl")
+        .args([
+            "--context",
+            &context,
+            "-n",
+            GRID_SYSTEM_NS,
+            "create",
+            "configmap",
+            "consumer-gateway-config",
+            &format!("--from-literal=praxis.yaml={rendered}"),
+            "--dry-run=client",
+            "-o",
+            "yaml",
+        ])
+        .output()?;
+
+    if !create.status.success() {
+        return Err(format!(
+            "failed to render consumer-gateway-config for {CONSUMER_SITE}: {}",
+            String::from_utf8_lossy(&create.stderr).trim()
+        )
+        .into());
+    }
+
+    kubectl::apply_manifest(&context, &String::from_utf8(create.stdout)?)?;
+    eprintln!("  [OK] {CONSUMER_SITE}: consumer-gateway-config created with NodePort provider endpoints");
+    Ok(())
+}
+
+/// Render the consumer template with the fixed consumer site and run-specific
+/// provider endpoints.
+fn render_consumer_config(
+    template: &str,
+    provider_endpoints: &BTreeMap<&str, String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut rendered = template.replace("CONSUMER_SITE_PLACEHOLDER", CONSUMER_SITE);
+
+    for provider in CLUSTERS {
+        let endpoint = provider_endpoints
+            .get(provider)
+            .ok_or_else(|| format!("missing NodePort endpoint for {provider}"))?;
+        let placeholder = format!("{}_ENDPOINT", provider.replace('-', "_").to_ascii_uppercase());
+        if !rendered.contains(&placeholder) {
+            return Err(format!("consumer template is missing {placeholder}").into());
+        }
+        rendered = rendered.replace(&placeholder, endpoint);
+    }
+
+    if rendered.contains("PLACEHOLDER") || rendered.contains("_ENDPOINT") {
+        return Err("consumer template still contains an unresolved endpoint placeholder".into());
+    }
+
+    Ok(rendered)
 }
 
 /// Materialize a run-owned Forge config beside its source so topology-relative
@@ -2331,7 +2374,7 @@ fn apply_image_overrides(config: &mut serde_yaml::Value) -> Result<(), Box<dyn s
             .unwrap_or_else(|_| "praxis-ai:provider-traffic-qualification".to_owned()),
         operator: std::env::var("GRID_XTASK_OPERATOR_IMAGE")
             .unwrap_or_else(|_| "grid-operator:provider-traffic-qualification".to_owned()),
-        overlay_sync: crate::env::image_overrides::overlay_sync_image(),
+        overlay_sync: provider_traffic_overlay_sync_image(),
         vcr: crate::env::image_overrides::sim_image(),
         pull_policy: std::env::var("GRID_XTASK_IMAGE_PULL_POLICY").unwrap_or_else(|_| "Never".to_owned()),
     };
@@ -2504,9 +2547,6 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
     };
 
     for cluster in CLUSTERS {
-        apply_stack(cluster, "metallb")?;
-    }
-    for cluster in CLUSTERS {
         let op_stack = format!("{cluster}-operator-base");
         apply_stack(cluster, &op_stack)?;
     }
@@ -2579,6 +2619,7 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
         total_phases
     );
 
+    materialize_consumer_config(&context.demo_root)?;
     apply_stack(CONSUMER_SITE, "consumer-gateway")?;
     eprintln!("  [OK] Consumer gateway deployed in {CONSUMER_SITE}");
 
@@ -2614,15 +2655,18 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
 fn capture_stack_failure(cluster: &str, stack: &str) {
     let context = cluster_context(cluster);
     eprintln!("  [DIAG] {stack} failed on {cluster}; capturing Kubernetes state");
+    let namespace = GRID_SYSTEM_NS;
+    let log_target = "deployment/provider-gateway";
+    let describe_target = stack;
     for args in [
         vec!["get", "pods", "-o", "wide"],
         vec!["get", "deployments", "-o", "wide"],
-        vec!["describe", "deployment", stack],
+        vec!["describe", describe_target],
         vec!["get", "events", "--sort-by=.lastTimestamp"],
-        vec!["logs", "deployment/provider-gateway", "--all-containers", "--tail=100"],
+        vec!["logs", log_target, "--all-containers", "--tail=100"],
     ] {
         let output = Command::new("kubectl")
-            .args(["--context", &context, "-n", GRID_SYSTEM_NS, "--request-timeout=10s"])
+            .args(["--context", &context, "-n", namespace, "--request-timeout=10s"])
             .args(&args)
             .output();
         match output {
@@ -2655,43 +2699,69 @@ fn provider_traffic_scenario_names(mode: DemoMode) -> Vec<&'static str> {
     if mode == DemoMode::Full {
         names.push("generated_consumer_config_convergence");
         names.push("embedded_serving_gateway_convergence");
+        names.push("regional_policy_consumers");
         names.push("provider_withdrawal_lifecycle");
     }
     names
 }
 
-/// Read the provider gateway's run-owned `LoadBalancer` IP for the generated
+/// Read the provider gateway's reachable `NodePort` endpoint for the generated
 /// consumer endpoint inventory.
+///
+/// `MetalLB`'s L2 VIPs are local to each Kind cluster and are not routable from
+/// the other Kind nodes on Forge's shared Docker bridge.  The node IP and
+/// allocated `NodePort` are routable across that bridge.
 fn read_provider_gateway_address(site: &str) -> Result<String, Box<dyn std::error::Error>> {
     let context = cluster_context(site);
-    let output = Command::new("kubectl")
+    read_nodeport_endpoint(&context, site, "provider-gateway", "https-mtls")
+}
+
+/// Read a Service's node IP plus named `NodePort` as a cross-Kind endpoint.
+fn read_nodeport_endpoint(
+    context: &str,
+    site: &str,
+    service: &str,
+    port_name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let node = Command::new("kubectl")
         .args([
             "--context",
-            &context,
+            context,
+            "get",
+            "nodes",
+            "-o",
+            "jsonpath={.items[0].status.addresses[?(@.type==\"InternalIP\")].address}",
+        ])
+        .output()?;
+    if !node.status.success() {
+        return Err(format!("{site}: could not read Kind node address").into());
+    }
+    let node_ip = String::from_utf8(node.stdout)?.trim().to_owned();
+    if node_ip.is_empty() {
+        return Err(format!("{site}: Kind node has no InternalIP").into());
+    }
+
+    let service_info = Command::new("kubectl")
+        .args([
+            "--context",
+            context,
             "-n",
             GRID_SYSTEM_NS,
             "get",
             "service",
-            "provider-gateway",
+            service,
             "-o",
-            "json",
+            &format!("jsonpath={{.spec.ports[?(@.name==\"{port_name}\")].nodePort}}"),
         ])
         .output()?;
-    if !output.status.success() {
-        return Err(format!("{site}: could not read provider-gateway Service address").into());
+    if !service_info.status.success() {
+        return Err(format!("{site}: could not read {service} Service NodePort").into());
     }
-    let service: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    let address = service
-        .pointer("/status/loadBalancer/ingress/0/ip")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            service
-                .pointer("/status/loadBalancer/ingress/0/hostname")
-                .and_then(serde_json::Value::as_str)
-        })
-        .filter(|address| !address.trim().is_empty())
-        .ok_or_else(|| format!("{site}: provider-gateway Service has no LoadBalancer address"))?;
-    Ok(format!("{address}:{PROVIDER_GATEWAY_PORT}"))
+    let node_port = String::from_utf8(service_info.stdout)?.trim().to_owned();
+    if node_port.is_empty() {
+        return Err(format!("{site}: {service} Service has no NodePort for {port_name}").into());
+    }
+    Ok(format!("{node_ip}:{node_port}"))
 }
 
 /// Build the endpoint list for all providers while retaining the topology's
@@ -3188,7 +3258,7 @@ fn activate_embedded_serving_gateway() -> AssertionResult {
 
     install_embedded_gateway(repository_root, &image, &endpoints)?;
     wait_for_deployment(GRID_SERVING_GATEWAY, GRID_SYSTEM_NS, &cluster_context("provider-a"))?;
-    let serving_log = wait_for_embedded_serving_log(&initial_serving, &cluster_context("provider-a"), 0, TIMEOUT)?;
+    let serving_log = wait_for_embedded_serving_log(&initial_serving, &cluster_context("provider-a"), TIMEOUT)?;
     let baseline = send_embedded_lifecycle_request(None)?;
     if baseline.status != 200 || baseline.provider.is_none() {
         return Err(
@@ -3555,7 +3625,7 @@ fn read_grid_serving_snapshot(context: &str) -> Result<serde_json::Value, Box<dy
         .and_then(serde_json::Value::as_str)
         .ok_or("Grid serving ConfigMap has no serving-config.json")?;
     let digest = config_map
-        .pointer("/metadata/annotations/grid.praxis-proxy.io~1serving-digest")
+        .pointer("/metadata/annotations/grid.praxis.fast~1serving-digest")
         .and_then(serde_json::Value::as_str)
         .ok_or("Grid serving ConfigMap has no serving digest annotation")?;
     let actual_digest = hex::encode(Sha256::digest(text.as_bytes()));
@@ -3580,11 +3650,44 @@ fn read_grid_serving_snapshot(context: &str) -> Result<serde_json::Value, Box<dy
     }))
 }
 
-/// Wait for the embedded gateway process to log acceptance of one exact serving digest.
+/// Extract the content-addressed serving digest used to prove a later revision is new.
+fn serving_snapshot_digest(snapshot: &serde_json::Value) -> Result<String, Box<dyn std::error::Error>> {
+    snapshot
+        .get("digest")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "serving snapshot has no digest".into())
+}
+
+/// Capture a UTC boundary before a serving-config mutation.
+fn embedded_serving_log_boundary() -> Result<String, Box<dyn std::error::Error>> {
+    Ok(OffsetDateTime::now_utc().format(&Rfc3339)?)
+}
+
+/// Wait for the embedded Gateway to log acceptance of a serving revision already in effect.
 fn wait_for_embedded_serving_log(
     snapshot: &serde_json::Value,
     context: &str,
-    prior_matching_observations: usize,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
+    wait_for_embedded_serving_log_since(snapshot, context, None, timeout)
+}
+
+/// Wait for an exact serving receipt emitted after a caller's UTC mutation boundary.
+fn wait_for_embedded_serving_log_after(
+    snapshot: &serde_json::Value,
+    context: &str,
+    boundary: &str,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
+    wait_for_embedded_serving_log_since(snapshot, context, Some(boundary), timeout)
+}
+
+/// Wait for a serving receipt, optionally restricted to logs emitted after `boundary`.
+fn wait_for_embedded_serving_log_since(
+    snapshot: &serde_json::Value,
+    context: &str,
+    boundary: Option<&str>,
     timeout: Duration,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let digest = snapshot
@@ -3596,34 +3699,21 @@ fn wait_for_embedded_serving_log(
         .and_then(serde_json::Value::as_u64)
         .ok_or("serving snapshot evidence has no candidate count")?;
     let deadline = Instant::now() + timeout;
-    let mut last_logs = String::new();
+    let boundary_description = boundary.map_or_else(
+        || "in the available Gateway logs".to_owned(),
+        |value| format!("after UTC boundary {value}"),
+    );
     loop {
-        let output = Command::new("kubectl")
-            .args([
-                "--context",
-                context,
-                "-n",
-                GRID_SYSTEM_NS,
-                "logs",
-                &format!("deployment/{GRID_SERVING_GATEWAY}"),
-                "--all-containers",
-                "--tail=400",
-            ])
-            .output()?;
-        if output.status.success() {
-            let raw_logs = String::from_utf8_lossy(&output.stdout);
-            let matches = embedded_serving_revision_lines(&raw_logs, digest, count);
-            if has_new_embedded_serving_revision_observation(&raw_logs, digest, count, prior_matching_observations) {
-                let matched_line = matches.last().ok_or("serving log match disappeared")?;
-                return Ok(safe_truncate_str(matched_line.trim(), 1_000));
-            }
-            last_logs = strip_ansi_csi(&raw_logs);
+        let lines = embedded_serving_revision_logs(context, boundary)?;
+        if let Some(line) = embedded_serving_revision_receipt(&lines, digest, count) {
+            return Ok(safe_truncate_str(line.trim(), 1_000));
         }
+        let logs = lines.join("\n");
         if Instant::now() >= deadline {
             return Err(format!(
-                "embedded gateway did not log serving digest {} with candidate_count={count}: {}",
+                "embedded gateway did not log serving digest {} with candidate_count={count} {boundary_description}: {}",
                 safe_truncate_str(digest, 16),
-                safe_truncate_str(&last_logs, 1_000)
+                safe_truncate_str(&logs, 1_000)
             )
             .into());
         }
@@ -3631,39 +3721,59 @@ fn wait_for_embedded_serving_log(
     }
 }
 
-/// Count existing exact serving-log observations so a repeated digest must be newly accepted.
-fn embedded_serving_log_observation_count(
-    snapshot: &serde_json::Value,
+/// Return the exact serving receipt for a digest and candidate count.
+fn embedded_serving_revision_receipt<'line>(lines: &'line [String], digest: &str, count: u64) -> Option<&'line str> {
+    lines
+        .iter()
+        .find(|line| line.contains(digest) && line.contains(&format!("candidate_count={count}")))
+        .map(String::as_str)
+}
+
+/// Read timestamped Gateway serving-revision receipts, optionally since a UTC boundary.
+fn embedded_serving_revision_logs(
     context: &str,
-) -> Result<usize, Box<dyn std::error::Error>> {
-    let digest = snapshot
-        .get("digest")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("serving snapshot evidence has no digest")?;
-    let count = snapshot
-        .get("candidate_count")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or("serving snapshot evidence has no candidate count")?;
+    boundary: Option<&str>,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let output = Command::new("kubectl")
-        .args([
-            "--context",
-            context,
-            "-n",
-            GRID_SYSTEM_NS,
-            "logs",
-            &format!("deployment/{GRID_SERVING_GATEWAY}"),
-            "--all-containers",
-            "--tail=400",
-        ])
+        .args(embedded_serving_log_args(context, boundary))
         .output()?;
     if !output.status.success() {
         return Err(format!(
-            "could not read existing embedded serving logs: {}",
+            "could not read embedded serving logs: {}",
             safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 500)
         )
         .into());
     }
-    Ok(embedded_serving_revision_lines(&String::from_utf8_lossy(&output.stdout), digest, count).len())
+    let clean = strip_ansi_csi(&String::from_utf8_lossy(&output.stdout));
+    Ok(clean
+        .lines()
+        .filter(|line| line.contains("grid_serving_revision_serving"))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Build the timestamped `kubectl logs` invocation for serving receipts.
+fn embedded_serving_log_args(context: &str, boundary: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "--context".to_owned(),
+        context.to_owned(),
+        "-n".to_owned(),
+        GRID_SYSTEM_NS.to_owned(),
+        "logs".to_owned(),
+        format!("deployment/{GRID_SERVING_GATEWAY}"),
+        "--all-containers".to_owned(),
+        "--timestamps".to_owned(),
+    ];
+    if let Some(boundary) = boundary {
+        args.push("--since-time".to_owned());
+        args.push(boundary.to_owned());
+    }
+    args
+}
+
+/// Whether Kubernetes rejected the exact invalid locked-policy contract probe.
+fn is_invalid_locked_policy_rejection(output: &str) -> bool {
+    output.contains("Invalid") && output.contains("allowedRegions is required in locked mode")
 }
 
 /// Send one request through the embedded `grid-gateway` Service and retain status plus provider attribution.
@@ -3711,6 +3821,54 @@ fn send_embedded_lifecycle_request(session_id: Option<&str>) -> Result<Lifecycle
     })?;
     let provider = response_header(&output.stdout, "x-grid-provider-traffic-provider-gateway");
     Ok(LifecycleRequest { status, provider })
+}
+
+/// Wait for the embedded gateway to resume attributed traffic after a serving
+/// revision restores candidates. The serving `ConfigMap` and watcher log can
+/// converge before provider-gateway endpoints become usable again.
+fn wait_for_embedded_attributed_request(timeout: Duration) -> Result<LifecycleRequest, Box<dyn std::error::Error>> {
+    wait_for_attributed_request(
+        timeout,
+        || send_embedded_lifecycle_request(None),
+        || std::thread::park_timeout(Duration::from_secs(2)),
+    )
+    .map_err(Into::into)
+}
+
+/// Poll until a request reaches an expected provider, retaining transient
+/// probe failures as convergence evidence until the deadline.
+fn wait_for_attributed_request<F, E, P>(
+    timeout: Duration,
+    mut request: F,
+    mut pause: P,
+) -> Result<LifecycleRequest, String>
+where
+    F: FnMut() -> Result<LifecycleRequest, E>,
+    E: std::fmt::Display,
+    P: FnMut(),
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        let latest = match request() {
+            Ok(response)
+                if response.status == 200
+                    && response
+                        .provider
+                        .as_deref()
+                        .is_some_and(|provider| expected_provider_attributions().contains(provider)) =>
+            {
+                return Ok(response);
+            },
+            Ok(response) => format!("response {response:?}"),
+            Err(error) => format!("probe error: {error}"),
+        };
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "embedded gateway did not resume attributed traffic before timeout: {latest}"
+            ));
+        }
+        pause();
+    }
 }
 
 /// Get one run-cluster namespaced object as JSON.
@@ -4035,7 +4193,7 @@ fn enable_provider_a_credential_candidate() -> Result<serde_json::Value, Box<dyn
             "--context",
             &context,
             "patch",
-            "inferenceproviders.grid.praxis-proxy.io",
+            "inferenceproviders.grid.praxis.fast",
             "vcr-provider-a-provider",
             "--type=merge",
             "--patch",
@@ -4086,6 +4244,10 @@ fn enable_provider_a_credential_candidate() -> Result<serde_json::Value, Box<dyn
 }
 
 /// Run the original six proofs and append lifecycle coverage in full mode.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the visible execution order is the auditable qualification contract"
+)]
 fn run_provider_traffic_scenarios(mode: DemoMode, context: &ProviderTrafficContext) -> BTreeMap<String, ProofResult> {
     let mut results = BTreeMap::new();
     let mut scenario_num: usize = 0;
@@ -4159,13 +4321,37 @@ fn run_provider_traffic_scenarios(mode: DemoMode, context: &ProviderTrafficConte
 
         eprintln!();
         eprintln!(
+            "[SCENARIO {}] Prove regional affinity, sovereignty lock, serving revisions, and backend non-contact",
+            scenario()
+        );
+        let regional_policy_result = run_assertion("regional_policy_consumers", || {
+            Ok(assert_regional_policy_consumers(embedded_ready))
+        });
+        match regional_policy_result {
+            Ok(proof) => {
+                results.insert("regional_policy_consumers".to_owned(), proof);
+            },
+            Err(error) => {
+                results.insert(
+                    "regional_policy_consumers".to_owned(),
+                    proof_failure(
+                        &format!("regional-policy consumer qualification failed: {error}"),
+                        BTreeMap::new(),
+                        Duration::ZERO,
+                    ),
+                );
+            },
+        }
+
+        eprintln!();
+        eprintln!(
             "[SCENARIO {}] Prove provider withdrawal, no-route serving, and restoration",
             scenario()
         );
-        let proof = run_assertion("provider_withdrawal_lifecycle", || {
+        let withdrawal_result = run_assertion("provider_withdrawal_lifecycle", || {
             Ok(assert_provider_withdrawal_lifecycle(context, embedded_ready))
         });
-        match proof {
+        match withdrawal_result {
             Ok(proof) => {
                 results.insert("provider_withdrawal_lifecycle".to_owned(), proof);
             },
@@ -4183,6 +4369,494 @@ fn run_provider_traffic_scenarios(mode: DemoMode, context: &ProviderTrafficConte
     }
 
     results
+}
+
+/// The approved affinity contract used by the runtime qualification.
+fn qualification_affinity_policy() -> serde_json::Value {
+    serde_json::json!({
+        "mode": "affinity",
+        "preferredRegions": [QUALIFICATION_PREFERRED_REGION],
+        "crossRegionFallback": "allow",
+        "allowedSovereigntyZones": [QUALIFICATION_SOVEREIGNTY_ZONE],
+    })
+}
+
+/// The approved hard-lock contract used by the runtime qualification.
+fn qualification_locked_policy() -> serde_json::Value {
+    serde_json::json!({
+        "mode": "locked",
+        "allowedRegions": [QUALIFICATION_PREFERRED_REGION],
+        "allowedSovereigntyZones": [QUALIFICATION_SOVEREIGNTY_ZONE],
+    })
+}
+
+/// A successful request must be attributed to exactly `provider`.
+fn require_provider(response: &LifecycleRequest, provider: &str, step: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if response.status == 200 && response.provider.as_deref() == Some(provider) {
+        Ok(())
+    } else {
+        Err(format!("{step}: expected HTTP 200 from {provider}, got {response:?}").into())
+    }
+}
+
+/// A no-route request must not contact a provider gateway or backend.
+fn require_no_route(response: &LifecycleRequest, step: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if response.status == 404 && response.provider.is_none() {
+        Ok(())
+    } else {
+        Err(format!("{step}: expected unattributed HTTP 404, got {response:?}").into())
+    }
+}
+
+/// Prove the policy contract in the same Kind topology for both routing consumers.
+///
+/// The topology has three independent backends. Provider A is trusted as the
+/// preferred region, B is the permitted cross-region fallback, and C has the
+/// same fallback region but a sovereignty zone explicitly rejected by policy.
+/// Every transition waits for operator publication *and* the relevant gateway
+/// serving revision before traffic is measured.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the qualification intentionally keeps policy changes, receipt evidence, and cleanup in one auditable flow"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the bounded runtime evidence and restoration snapshots share one synchronous qualification"
+)]
+fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResult {
+    let started = Instant::now();
+    let mut facts = BTreeMap::new();
+    let mut original_geography = Vec::new();
+    let mut original_policies = None;
+    let mut provider_a = None;
+    let mut provider_a_withdrawn = false;
+
+    let body = (|| -> Result<(), Box<dyn std::error::Error>> {
+        if !embedded_gateway_enabled {
+            return Err("embedded grid-gateway must be available to qualify both routing consumers".into());
+        }
+
+        let all_clusters = BTreeSet::from([
+            "vcr-provider-a-provider".to_owned(),
+            "vcr-provider-b-provider".to_owned(),
+            "vcr-provider-c-provider".to_owned(),
+        ]);
+        let affinity_clusters = BTreeSet::from([
+            "vcr-provider-a-provider".to_owned(),
+            "vcr-provider-b-provider".to_owned(),
+        ]);
+        let fallback_clusters = BTreeSet::from(["vcr-provider-b-provider".to_owned()]);
+        let locked_clusters = BTreeSet::from(["vcr-provider-a-provider".to_owned()]);
+        let empty_clusters = BTreeSet::new();
+
+        let baseline_overlay = wait_for_overlay_clusters(&all_clusters, None)?;
+        let baseline_serving = read_grid_serving_snapshot(&cluster_context(CONSUMER_SITE))?;
+        let baseline_serving_digest = baseline_serving
+            .get("digest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("baseline serving snapshot has no digest")?
+            .to_owned();
+        set_regional_policy_geography(&mut original_geography)?;
+        let affinity_policy = qualification_affinity_policy();
+        let affinity_receipt_boundary = embedded_serving_log_boundary()?;
+        original_policies = Some(set_regional_policy(Some(&affinity_policy))?);
+        provider_a = Some(read_provider_selector("provider-a", "vcr-provider-a-provider")?);
+
+        let affinity = wait_for_overlay_clusters(&affinity_clusters, Some(&baseline_overlay.semantic_revision))?;
+        require_affinity_groups(&affinity)?;
+        wait_for_consumer_gateway_revision(&affinity.semantic_revision)?;
+        let affinity_serving = wait_for_grid_serving_snapshot(
+            &affinity_clusters,
+            Some(&baseline_serving_digest),
+            Duration::from_secs(180),
+        )?;
+        require_serving_affinity_groups(&affinity_serving)?;
+        let affinity_serving_log = wait_for_embedded_serving_log_after(
+            &affinity_serving,
+            &cluster_context(CONSUMER_SITE),
+            &affinity_receipt_boundary,
+            Duration::from_secs(90),
+        )?;
+        facts.insert("affinity_overlay".to_owned(), serde_json::json!(affinity.candidates));
+        facts.insert(
+            "affinity_revision".to_owned(),
+            serde_json::json!(affinity.semantic_revision),
+        );
+        facts.insert("affinity_serving_config".to_owned(), affinity_serving.clone());
+        facts.insert(
+            "affinity_serving_log".to_owned(),
+            serde_json::json!(affinity_serving_log),
+        );
+
+        let mut affinity_requests = Vec::new();
+        for request in 0..3 {
+            let response = send_lifecycle_request(None)?;
+            require_provider(
+                &response,
+                "provider-a",
+                &format!("affinity intelligent_route request {request}"),
+            )?;
+            affinity_requests.push(response);
+        }
+        let mut embedded_affinity_requests = Vec::new();
+        for request in 0..3 {
+            let response = send_embedded_lifecycle_request(None)?;
+            require_provider(
+                &response,
+                "provider-a",
+                &format!("affinity grid_site_route request {request}"),
+            )?;
+            embedded_affinity_requests.push(response);
+        }
+        facts.insert("affinity_requests".to_owned(), serde_json::json!(affinity_requests));
+        facts.insert(
+            "embedded_affinity_requests".to_owned(),
+            serde_json::json!(embedded_affinity_requests),
+        );
+
+        let bound_session = "grid258-regional-bound-preferred";
+        require_provider(
+            &send_lifecycle_request(Some(bound_session))?,
+            "provider-a",
+            "affinity session establishment",
+        )?;
+
+        let provider_a_state = provider_a.as_ref().ok_or("provider A selector was not captured")?;
+        let fallback_receipt_boundary = embedded_serving_log_boundary()?;
+        patch_provider_selector(provider_a_state, "grid258-regional-withdrawn-provider-a")?;
+        provider_a_withdrawn = true;
+        let fallback = wait_for_overlay_clusters(&fallback_clusters, Some(&affinity.semantic_revision))?;
+        wait_for_consumer_gateway_revision(&fallback.semantic_revision)?;
+        let affinity_digest = affinity_serving
+            .get("digest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("affinity serving snapshot has no digest")?;
+        let fallback_serving =
+            wait_for_grid_serving_snapshot(&fallback_clusters, Some(affinity_digest), Duration::from_secs(180))?;
+        let fallback_serving_log = wait_for_embedded_serving_log_after(
+            &fallback_serving,
+            &cluster_context(CONSUMER_SITE),
+            &fallback_receipt_boundary,
+            Duration::from_secs(90),
+        )?;
+        let fallback_request = send_lifecycle_request(None)?;
+        require_provider(
+            &fallback_request,
+            "provider-b",
+            "affinity fallback through intelligent_route",
+        )?;
+        let embedded_fallback_request = send_embedded_lifecycle_request(None)?;
+        require_provider(
+            &embedded_fallback_request,
+            "provider-b",
+            "affinity fallback through grid_site_route",
+        )?;
+        let bound_after_loss = send_lifecycle_request(Some(bound_session))?;
+        if bound_after_loss.provider.as_deref() == Some("provider-a") {
+            return Err(format!("excluded session binding still reached provider A: {bound_after_loss:?}").into());
+        }
+        facts.insert(
+            "affinity_fallback_overlay".to_owned(),
+            serde_json::json!(fallback.candidates),
+        );
+        facts.insert("affinity_fallback_serving_config".to_owned(), fallback_serving.clone());
+        facts.insert(
+            "affinity_fallback_serving_log".to_owned(),
+            serde_json::json!(fallback_serving_log),
+        );
+        facts.insert(
+            "affinity_fallback_request".to_owned(),
+            serde_json::json!(fallback_request),
+        );
+        facts.insert(
+            "affinity_fallback_embedded_request".to_owned(),
+            serde_json::json!(embedded_fallback_request),
+        );
+        facts.insert(
+            "bound_session_after_policy_loss".to_owned(),
+            serde_json::json!(bound_after_loss),
+        );
+
+        // Recovery restores the affinity digest. Its receipt must be newer than
+        // the restoration mutation, not merely another observation of that digest.
+        let recovery_receipt_boundary = embedded_serving_log_boundary()?;
+        patch_provider_selector(provider_a_state, &provider_a_state.selector_value)?;
+        provider_a_withdrawn = false;
+        let recovered = wait_for_overlay_clusters(&affinity_clusters, Some(&fallback.semantic_revision))?;
+        wait_for_consumer_gateway_revision(&recovered.semantic_revision)?;
+        let fallback_digest = serving_snapshot_digest(&fallback_serving)?;
+        let recovered_serving =
+            wait_for_grid_serving_snapshot(&affinity_clusters, Some(&fallback_digest), Duration::from_secs(180))?;
+        let recovered_serving_log = wait_for_embedded_serving_log_after(
+            &recovered_serving,
+            &cluster_context(CONSUMER_SITE),
+            &recovery_receipt_boundary,
+            Duration::from_secs(90),
+        )?;
+        let recovered_request = send_lifecycle_request(None)?;
+        require_provider(&recovered_request, "provider-a", "affinity recovery for new work")?;
+        facts.insert(
+            "affinity_recovery_revision".to_owned(),
+            serde_json::json!(recovered.semantic_revision),
+        );
+        facts.insert("affinity_recovery_serving_config".to_owned(), recovered_serving.clone());
+        facts.insert(
+            "affinity_recovery_serving_log".to_owned(),
+            serde_json::json!(recovered_serving_log),
+        );
+        facts.insert(
+            "affinity_recovery_request".to_owned(),
+            serde_json::json!(recovered_request),
+        );
+
+        let recovered_digest = serving_snapshot_digest(&recovered_serving)?;
+        let locked_policy = qualification_locked_policy();
+        let locked_receipt_boundary = embedded_serving_log_boundary()?;
+        let locked_previous = set_regional_policy(Some(&locked_policy))?;
+        let locked = wait_for_overlay_clusters(&locked_clusters, Some(&recovered.semantic_revision))?;
+        wait_for_consumer_gateway_revision(&locked.semantic_revision)?;
+        let locked_serving =
+            wait_for_grid_serving_snapshot(&locked_clusters, Some(&recovered_digest), Duration::from_secs(180))?;
+        let locked_serving_log = wait_for_embedded_serving_log_after(
+            &locked_serving,
+            &cluster_context(CONSUMER_SITE),
+            &locked_receipt_boundary,
+            Duration::from_secs(90),
+        )?;
+        facts.insert("locked_overlay".to_owned(), serde_json::json!(locked.candidates));
+        facts.insert("locked_serving_config".to_owned(), locked_serving.clone());
+        facts.insert("locked_serving_log".to_owned(), serde_json::json!(locked_serving_log));
+        require_provider(
+            &send_lifecycle_request(None)?,
+            "provider-a",
+            "locked intelligent_route request",
+        )?;
+        require_provider(
+            &send_embedded_lifecycle_request(None)?,
+            "provider-a",
+            "locked grid_site_route request",
+        )?;
+
+        // Bind one session through each consumer before making the lock empty.
+        // The subsequent empty revision must invalidate those bindings rather
+        // than retain an otherwise excluded provider for existing work.
+        let locked_session = "grid258-regional-locked-session";
+        require_provider(
+            &send_lifecycle_request(Some(locked_session))?,
+            "provider-a",
+            "locked intelligent_route session establishment",
+        )?;
+        require_provider(
+            &send_embedded_lifecycle_request(Some(locked_session))?,
+            "provider-a",
+            "locked grid_site_route session establishment",
+        )?;
+
+        // Kubernetes rejects an invalid public policy update; its currently serving revision must remain intact.
+        let context = cluster_context(CONSUMER_SITE);
+        let network = kubectl_get_json(&context, &format!("gridnetwork/{GRID_NETWORK_NAME}"))?;
+        let mut invalid_gateways = network
+            .pointer("/spec/consumerGateways")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .ok_or("GridNetwork has no consumerGateways array for invalid policy probe")?;
+        let invalid_gateway = invalid_gateways
+            .iter_mut()
+            .find(|gateway| gateway.get("name").and_then(serde_json::Value::as_str) == Some("consumer-gateway"))
+            .ok_or("consumer gateway disappeared before invalid policy probe")?;
+        invalid_gateway["regionalPolicy"] = serde_json::json!({"mode": "locked"});
+        let invalid = Command::new("kubectl")
+            .args([
+                "--context",
+                &context,
+                "-n",
+                GRID_SYSTEM_NS,
+                "patch",
+                "gridnetwork",
+                GRID_NETWORK_NAME,
+                "--type=merge",
+                "--patch",
+                &serde_json::json!({"spec": {"consumerGateways": invalid_gateways}}).to_string(),
+            ])
+            .output()?;
+        if invalid.status.success() {
+            return Err("Kubernetes accepted an invalid locked policy without allowedRegions".into());
+        }
+        let invalid_output = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&invalid.stdout),
+            String::from_utf8_lossy(&invalid.stderr)
+        );
+        if !is_invalid_locked_policy_rejection(&invalid_output) {
+            return Err(format!(
+                "invalid locked policy was rejected for an unexpected reason: {}",
+                safe_truncate_str(invalid_output.trim(), 500)
+            )
+            .into());
+        }
+        let after_invalid = read_cluster_overlay(CONSUMER_SITE)?;
+        if after_invalid.semantic_revision != locked.semantic_revision {
+            return Err("invalid policy update changed the serving overlay revision".into());
+        }
+        facts.insert(
+            "invalid_policy_update_rejected".to_owned(),
+            serde_json::json!(safe_truncate_str(invalid_output.trim(), 500)),
+        );
+        facts.insert(
+            "revision_after_invalid_policy".to_owned(),
+            serde_json::json!(after_invalid.semantic_revision),
+        );
+
+        let metrics_before: BTreeMap<String, u64> = PROVIDER_RESOURCES
+            .iter()
+            .map(|(site, _)| Ok(((*site).to_owned(), read_backend_success_count(site)?)))
+            .collect::<Result<_, Box<dyn std::error::Error>>>()?;
+        let empty_receipt_boundary = embedded_serving_log_boundary()?;
+        patch_provider_selector(provider_a_state, "grid258-regional-locked-withdrawn")?;
+        provider_a_withdrawn = true;
+        let empty = wait_for_overlay_clusters(&empty_clusters, Some(&locked.semantic_revision))?;
+        wait_for_consumer_gateway_revision(&empty.semantic_revision)?;
+        let locked_digest = serving_snapshot_digest(&locked_serving)?;
+        let empty_serving =
+            wait_for_grid_serving_snapshot(&empty_clusters, Some(&locked_digest), Duration::from_secs(180))?;
+        let empty_serving_log = wait_for_embedded_serving_log_after(
+            &empty_serving,
+            &cluster_context(CONSUMER_SITE),
+            &empty_receipt_boundary,
+            Duration::from_secs(90),
+        )?;
+        let no_route_requests = [
+            send_lifecycle_request(None)?,
+            send_lifecycle_request(Some(locked_session))?,
+            send_embedded_lifecycle_request(None)?,
+            send_embedded_lifecycle_request(Some(locked_session))?,
+        ];
+        for (index, response) in no_route_requests.iter().enumerate() {
+            require_no_route(response, &format!("locked no-route request {index}"))?;
+        }
+        let metrics_after: BTreeMap<String, u64> = PROVIDER_RESOURCES
+            .iter()
+            .map(|(site, _)| Ok(((*site).to_owned(), read_backend_success_count(site)?)))
+            .collect::<Result<_, Box<dyn std::error::Error>>>()?;
+        if metrics_before != metrics_after {
+            return Err(format!(
+                "a locked no-route request reached a backend: before={metrics_before:?}, after={metrics_after:?}"
+            )
+            .into());
+        }
+        facts.insert("locked_empty_overlay".to_owned(), serde_json::json!(empty.candidates));
+        facts.insert("locked_empty_serving_config".to_owned(), empty_serving);
+        facts.insert(
+            "locked_empty_serving_log".to_owned(),
+            serde_json::json!(empty_serving_log),
+        );
+        facts.insert(
+            "locked_no_route_requests".to_owned(),
+            serde_json::json!(no_route_requests),
+        );
+        facts.insert(
+            "locked_backend_counts_before".to_owned(),
+            serde_json::json!(metrics_before),
+        );
+        facts.insert(
+            "locked_backend_counts_after".to_owned(),
+            serde_json::json!(metrics_after),
+        );
+
+        // `locked_previous` must be the affinity policy applied just before the lock.
+        replace_regional_policies(&locked_previous)?;
+        Ok(())
+    })();
+
+    // Scenario 9 starts immediately after this assertion. Capture the current revisions so
+    // cleanup can prove both consumers have left the locked, empty state before that next
+    // assertion treats the restored topology as its baseline.
+    let policy_restore_overlay = read_cluster_overlay(CONSUMER_SITE).ok();
+    let policy_restore_serving = read_grid_serving_snapshot(&cluster_context(CONSUMER_SITE)).ok();
+    let policy_restore_receipt_boundary = embedded_serving_log_boundary();
+    let mut restoration_error = None;
+    if provider_a_withdrawn
+        && let Some(provider_a) = provider_a.as_ref()
+        && let Err(error) = patch_provider_selector(provider_a, &provider_a.selector_value)
+    {
+        restoration_error = Some(format!("provider A selector: {error}"));
+    }
+    if let Some(original_policies) = original_policies.as_ref()
+        && let Err(error) = replace_regional_policies(original_policies)
+    {
+        restoration_error.get_or_insert_with(|| format!("regional policies: {error}"));
+    }
+    if !original_geography.is_empty()
+        && let Err(error) = restore_regional_policy_geography(&original_geography)
+    {
+        restoration_error.get_or_insert_with(|| format!("regional geography: {error}"));
+    }
+    if body.is_ok() && restoration_error.is_none() {
+        let settled = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let all_clusters: BTreeSet<String> = PROVIDER_RESOURCES
+                .iter()
+                .map(|(_, resource)| (*resource).to_owned())
+                .collect();
+            let previous_overlay = policy_restore_overlay
+                .as_ref()
+                .map(|overlay| overlay.semantic_revision.as_str());
+            let overlay = wait_for_overlay_clusters(&all_clusters, previous_overlay)?;
+            wait_for_consumer_gateway_revision(&overlay.semantic_revision)?;
+            let previous_digest = policy_restore_serving
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("digest"))
+                .and_then(serde_json::Value::as_str);
+            let serving = wait_for_grid_serving_snapshot(&all_clusters, previous_digest, Duration::from_secs(180))?;
+            let receipt_boundary = policy_restore_receipt_boundary
+                .as_ref()
+                .map_err(|error| format!("could not capture regional policy restoration receipt boundary: {error}"))?;
+            let log = wait_for_embedded_serving_log_after(
+                &serving,
+                &cluster_context(CONSUMER_SITE),
+                receipt_boundary,
+                Duration::from_secs(90),
+            )?;
+            facts.insert(
+                "regional_policy_restored_overlay".to_owned(),
+                serde_json::json!(overlay.candidates),
+            );
+            facts.insert("regional_policy_restored_serving_config".to_owned(), serving);
+            facts.insert(
+                "regional_policy_restored_serving_log".to_owned(),
+                serde_json::json!(log),
+            );
+            Ok(())
+        })();
+        if let Err(error) = settled {
+            restoration_error = Some(format!("regional policy serving convergence: {error}"));
+        }
+    }
+    facts.insert(
+        "regional_policy_restoration_error".to_owned(),
+        serde_json::json!(restoration_error),
+    );
+    facts.insert(
+        "regional_policy_error".to_owned(),
+        serde_json::json!(body.as_ref().err().map(ToString::to_string)),
+    );
+
+    match (body, restoration_error) {
+        (Ok(()), None) => proof_success(
+            "affinity, sovereignty, hard lock, revision acceptance, session safety, and backend non-contact passed for both consumers",
+            facts,
+            started.elapsed(),
+        ),
+        (Err(error), _) => proof_failure(
+            &format!("regional-policy qualification failed: {error}"),
+            facts,
+            started.elapsed(),
+        ),
+        (Ok(()), Some(error)) => proof_failure(
+            &format!("regional-policy qualification passed but restoration failed: {error}"),
+            facts,
+            started.elapsed(),
+        ),
+    }
 }
 
 /// Send serial, unbound requests through one consumer gateway and verify that
@@ -4477,6 +5151,192 @@ fn patch_provider_selector(
     Ok(())
 }
 
+/// The trusted geography fields temporarily changed by the regional-policy qualification.
+#[derive(Clone, Debug)]
+struct RegionalSiteState {
+    /// Kubernetes object name in the consumer cluster.
+    resource: String,
+    /// Original optional region value.
+    region: Option<serde_json::Value>,
+    /// Original optional sovereignty-zone value.
+    sovereignty_zone: Option<serde_json::Value>,
+}
+
+/// Resolve the local or auto-discovered `GridSite` object that represents `site_id`.
+fn regional_policy_grid_site_resource(site_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let context = cluster_context(CONSUMER_SITE);
+    let sites = kubectl_get_json(&context, "gridsites")?;
+    sites
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| {
+            items.iter().find_map(|site| {
+                let name = site.pointer("/metadata/name").and_then(serde_json::Value::as_str)?;
+                let discovered_id = site
+                    .pointer("/metadata/annotations/grid.praxis.fast~1site-id")
+                    .and_then(serde_json::Value::as_str);
+                (name == site_id || discovered_id == Some(site_id)).then(|| name.to_owned())
+            })
+        })
+        .ok_or_else(|| format!("could not find GridSite representing site id {site_id:?}").into())
+}
+
+/// Set synthetic trusted geography, recording each original site state before its patch.
+fn set_regional_policy_geography(original: &mut Vec<RegionalSiteState>) -> Result<(), Box<dyn std::error::Error>> {
+    let context = cluster_context(CONSUMER_SITE);
+    let desired = [
+        (
+            CONSUMER_SITE,
+            QUALIFICATION_PREFERRED_REGION,
+            QUALIFICATION_SOVEREIGNTY_ZONE,
+        ),
+        (
+            "provider-b",
+            QUALIFICATION_FALLBACK_REGION,
+            QUALIFICATION_SOVEREIGNTY_ZONE,
+        ),
+        (
+            "provider-c",
+            QUALIFICATION_FALLBACK_REGION,
+            QUALIFICATION_OTHER_SOVEREIGNTY_ZONE,
+        ),
+    ];
+    for (site_id, region, sovereignty_zone) in desired {
+        let resource = regional_policy_grid_site_resource(site_id)?;
+        let site = kubectl_get_json(&context, &format!("gridsite/{resource}"))?;
+        original.push(RegionalSiteState {
+            resource: resource.clone(),
+            region: site.pointer("/spec/region").cloned(),
+            sovereignty_zone: site.pointer("/spec/sovereigntyZone").cloned(),
+        });
+        kubectl_patch_merge(
+            &context,
+            &format!("gridsite/{resource}"),
+            &serde_json::json!({
+                "spec": {
+                    "region": region,
+                    "sovereigntyZone": sovereignty_zone,
+                }
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+/// Restore the exact trusted geography that existed before qualification.
+fn restore_regional_policy_geography(original: &[RegionalSiteState]) -> Result<(), Box<dyn std::error::Error>> {
+    let context = cluster_context(CONSUMER_SITE);
+    for site in original {
+        let mut spec = serde_json::Map::new();
+        spec.insert(
+            "region".to_owned(),
+            site.region.clone().unwrap_or(serde_json::Value::Null),
+        );
+        spec.insert(
+            "sovereigntyZone".to_owned(),
+            site.sovereignty_zone.clone().unwrap_or(serde_json::Value::Null),
+        );
+        kubectl_patch_merge(
+            &context,
+            &format!("gridsite/{}", site.resource),
+            &serde_json::json!({"spec": spec}),
+        )?;
+    }
+    Ok(())
+}
+
+/// Replace the policy on both routing consumers and return their exact prior values.
+fn replace_regional_policies(
+    desired: &BTreeMap<String, Option<serde_json::Value>>,
+) -> Result<BTreeMap<String, Option<serde_json::Value>>, Box<dyn std::error::Error>> {
+    let context = cluster_context(CONSUMER_SITE);
+    let network = kubectl_get_json(&context, &format!("gridnetwork/{GRID_NETWORK_NAME}"))?;
+    let mut gateways = network
+        .pointer("/spec/consumerGateways")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .ok_or("GridNetwork has no consumerGateways array")?;
+    let mut prior = BTreeMap::new();
+    for (name, policy) in desired {
+        let gateway = gateways
+            .iter_mut()
+            .find(|gateway| gateway.get("name").and_then(serde_json::Value::as_str) == Some(name.as_str()))
+            .ok_or_else(|| format!("GridNetwork has no regional-policy gateway {name:?}"))?;
+        prior.insert(name.clone(), gateway.get("regionalPolicy").cloned());
+        if let Some(policy) = policy {
+            gateway["regionalPolicy"] = policy.clone();
+        } else if let Some(object) = gateway.as_object_mut() {
+            object.remove("regionalPolicy");
+        }
+    }
+    kubectl_patch_merge(
+        &context,
+        &format!("gridnetwork/{GRID_NETWORK_NAME}"),
+        &serde_json::json!({"spec": {"consumerGateways": gateways}}),
+    )?;
+    Ok(prior)
+}
+
+/// Apply one policy consistently to the overlay-backed and embedded consumers.
+fn set_regional_policy(
+    policy: Option<&serde_json::Value>,
+) -> Result<BTreeMap<String, Option<serde_json::Value>>, Box<dyn std::error::Error>> {
+    let desired = REGIONAL_POLICY_GATEWAYS
+        .iter()
+        .map(|name| ((*name).to_owned(), policy.cloned()))
+        .collect();
+    replace_regional_policies(&desired)
+}
+
+/// Expected priority boundary for an affinity revision.
+fn require_affinity_groups(overlay: &OverlayData) -> Result<(), Box<dyn std::error::Error>> {
+    let group_for = |cluster: &str| {
+        overlay
+            .candidates
+            .iter()
+            .find(|candidate| candidate.cluster == cluster)
+            .and_then(|candidate| candidate.selection_group)
+    };
+    let preferred = group_for("vcr-provider-a-provider").ok_or("preferred candidate has no selection group")?;
+    let fallback = group_for("vcr-provider-b-provider").ok_or("fallback candidate has no selection group")?;
+    if preferred != 0 || fallback <= preferred || group_for("vcr-provider-c-provider").is_some() {
+        return Err(format!(
+            "affinity overlay groups do not prove preferred/fallback/sovereignty behavior: {:?}",
+            overlay.candidates
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Require the same affinity boundary in the embedded serving configuration.
+fn require_serving_affinity_groups(snapshot: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+    let candidates = snapshot
+        .pointer("/serving_config/candidates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("embedded serving snapshot has no candidates")?;
+    let group_for = |cluster: &str| {
+        candidates.iter().find_map(|candidate| {
+            (candidate.get("cluster").and_then(serde_json::Value::as_str) == Some(cluster)).then(|| {
+                candidate
+                    .get("selection_group")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            })
+        })
+    };
+    let preferred =
+        group_for("vcr-provider-a-provider").ok_or("embedded preferred candidate has no selection group")?;
+    let fallback = group_for("vcr-provider-b-provider").ok_or("embedded fallback candidate has no selection group")?;
+    let has_disallowed_sovereignty = candidates.iter().any(|candidate| {
+        candidate.get("cluster").and_then(serde_json::Value::as_str) == Some("vcr-provider-c-provider")
+    });
+    if preferred != 0 || fallback <= preferred || has_disallowed_sovereignty {
+        return Err("embedded serving config does not preserve affinity and sovereignty groups".into());
+    }
+    Ok(())
+}
+
 /// Wait for a stable overlay containing exactly the requested clusters.
 fn wait_for_overlay_clusters(
     expected: &BTreeSet<String>,
@@ -4714,7 +5574,6 @@ fn assert_provider_withdrawal_lifecycle(
     let mut original_selectors = Vec::new();
     let mut original_consumer_endpoint_mode = None;
     let mut original_provider_hop_endpoints = None;
-    let mut embedded_restore_prior_log_observations = 0;
     let body = (|| -> Result<(), Box<dyn std::error::Error>> {
         for (site, resource) in PROVIDER_RESOURCES {
             wait_for_deployment("provider-gateway", GRID_SYSTEM_NS, &cluster_context(site))?;
@@ -4747,16 +5606,16 @@ fn assert_provider_withdrawal_lifecycle(
         }
         wait_for_consumer_gateway_revision(&baseline.semantic_revision)?;
         let mut embedded_serving_digest = if embedded_gateway_enabled {
-            let embedded_baseline = read_grid_serving_snapshot(&cluster_context(CONSUMER_SITE))?;
-            embedded_restore_prior_log_observations =
-                embedded_serving_log_observation_count(&embedded_baseline, &cluster_context(CONSUMER_SITE))?;
-            if embedded_restore_prior_log_observations == 0 {
-                return Err("embedded gateway has not logged acceptance of its baseline serving revision".into());
-            }
+            let embedded_baseline = wait_for_grid_serving_snapshot(&all_clusters, None, Duration::from_secs(180))?;
+            let embedded_baseline_log = wait_for_embedded_serving_log(
+                &embedded_baseline,
+                &cluster_context(CONSUMER_SITE),
+                Duration::from_secs(90),
+            )?;
             facts.insert("embedded_baseline_serving_config".to_owned(), embedded_baseline.clone());
             facts.insert(
-                "embedded_baseline_log_observation_count".to_owned(),
-                serde_json::json!(embedded_restore_prior_log_observations),
+                "embedded_baseline_serving_log".to_owned(),
+                serde_json::json!(embedded_baseline_log),
             );
             Some(
                 embedded_baseline
@@ -4795,6 +5654,7 @@ fn assert_provider_withdrawal_lifecycle(
             .iter()
             .find(|selector| selector.site == "provider-a")
             .ok_or("missing captured provider A selector")?;
+        let embedded_fallback_receipt_boundary = embedded_serving_log_boundary()?;
         patch_provider_selector(a, "grid258-withdrawn-provider-a")?;
         facts.insert(
             "withdrawn_provider_a_selector".to_owned(),
@@ -4824,8 +5684,12 @@ fn assert_provider_withdrawal_lifecycle(
                 embedded_serving_digest.as_deref(),
                 Duration::from_secs(180),
             )?;
-            let log =
-                wait_for_embedded_serving_log(&serving, &cluster_context(CONSUMER_SITE), 0, Duration::from_secs(90))?;
+            let log = wait_for_embedded_serving_log_after(
+                &serving,
+                &cluster_context(CONSUMER_SITE),
+                &embedded_fallback_receipt_boundary,
+                Duration::from_secs(90),
+            )?;
             for attempt in 0..6 {
                 let response = send_embedded_lifecycle_request(Some(&format!("grid258-embedded-fallback-{attempt}")))?;
                 if response.status != 200 || response.provider.as_deref() == Some("provider-a") {
@@ -4871,6 +5735,9 @@ fn assert_provider_withdrawal_lifecycle(
         facts.insert("fallback_attribution".to_owned(), serde_json::json!(fallback_providers));
         write_lifecycle_evidence(context, &facts)?;
 
+        // An empty serving document can recur after Scenario 8. Capture a time boundary before
+        // withdrawal so the later acceptance wait cannot mistake an old receipt for this transition.
+        let embedded_empty_receipt_boundary = embedded_serving_log_boundary()?;
         for state in original_selectors.iter().filter(|state| state.site != "provider-a") {
             patch_provider_selector(state, &format!("grid258-withdrawn-{}", state.site))?;
         }
@@ -4938,8 +5805,12 @@ fn assert_provider_withdrawal_lifecycle(
                 Duration::from_secs(180),
             )?;
             require_empty_serving_provider_hops(&serving)?;
-            let log =
-                wait_for_embedded_serving_log(&serving, &cluster_context(CONSUMER_SITE), 0, Duration::from_secs(90))?;
+            let log = wait_for_embedded_serving_log_after(
+                &serving,
+                &cluster_context(CONSUMER_SITE),
+                &embedded_empty_receipt_boundary,
+                Duration::from_secs(90),
+            )?;
             let warning = wait_for_empty_overlay_invalid_hop_warning(Duration::from_secs(45))?;
             facts.insert("embedded_empty_serving_config".to_owned(), serving);
             facts.insert("embedded_empty_serving_log".to_owned(), serde_json::json!(log));
@@ -4955,48 +5826,6 @@ fn assert_provider_withdrawal_lifecycle(
                     .to_owned(),
             );
         }
-        if let Some(previous) = original_provider_hop_endpoints.take() {
-            let prior = if previous.is_null() { None } else { Some(&previous) };
-            let injected = patch_embedded_provider_hop_endpoints(prior)?;
-            if injected
-                != serde_json::json!([{
-                    "cluster": "vcr-provider-a-provider",
-                    "transport": {
-                        "mode": "plaintext",
-                        "sni": "provider-a.grid.internal"
-                    }
-                }])
-            {
-                return Err("embedded provider-hop declaration changed unexpectedly before restoration".into());
-            }
-            facts.insert(
-                "provider_hop_metadata_restored_before_provider_restore".to_owned(),
-                serde_json::json!(true),
-            );
-        }
-        write_lifecycle_evidence(context, &facts)?;
-
-        let restored_mode = set_generated_consumer_provider_a_transport_mode(
-            original_consumer_endpoint_mode
-                .as_deref()
-                .ok_or("negative consumer-config probe lost its original transport mode")?,
-        )?;
-        if restored_mode != "plaintext" {
-            return Err(
-                format!("consumer-config probe expected plaintext before restore, got {restored_mode:?}").into(),
-            );
-        }
-        original_consumer_endpoint_mode = None;
-        let restored_consumer_config = wait_for_generated_consumer_config()?;
-        facts.insert(
-            "consumer_config_restored_after_negative_probe".to_owned(),
-            serde_json::json!({
-                "phase": restored_consumer_config.pointer("/status/phase"),
-                "observed_generation": restored_consumer_config.pointer("/status/observedGeneration")
-            }),
-        );
-        write_lifecycle_evidence(context, &facts)?;
-
         for (site, _) in PROVIDER_RESOURCES {
             wait_for_deployment("provider-gateway", GRID_SYSTEM_NS, &cluster_context(site))?;
             wait_for_deployment(&format!("vcr-inference-{site}"), GRID_SYSTEM_NS, &cluster_context(site))?;
@@ -5097,6 +5926,51 @@ fn assert_provider_withdrawal_lifecycle(
         }
         write_lifecycle_evidence(context, &facts)?;
 
+        // The empty revision is authoritative until providers recover. Restore the injected
+        // configuration only after both consumers have proved that exact revision refuses new
+        // and bound traffic; either patch is itself a new reconciliation trigger.
+        if let Some(previous) = original_provider_hop_endpoints.take() {
+            let prior = if previous.is_null() { None } else { Some(&previous) };
+            let injected = patch_embedded_provider_hop_endpoints(prior)?;
+            if injected
+                != serde_json::json!([{
+                    "cluster": "vcr-provider-a-provider",
+                    "transport": {
+                        "mode": "plaintext",
+                        "sni": "provider-a.grid.internal"
+                    }
+                }])
+            {
+                return Err("embedded provider-hop declaration changed unexpectedly before restoration".into());
+            }
+            facts.insert(
+                "provider_hop_metadata_restored_before_provider_restore".to_owned(),
+                serde_json::json!(true),
+            );
+        }
+
+        let restored_mode = set_generated_consumer_provider_a_transport_mode(
+            original_consumer_endpoint_mode
+                .as_deref()
+                .ok_or("negative consumer-config probe lost its original transport mode")?,
+        )?;
+        if restored_mode != "plaintext" {
+            return Err(
+                format!("consumer-config probe expected plaintext before restore, got {restored_mode:?}").into(),
+            );
+        }
+        original_consumer_endpoint_mode = None;
+        let restored_consumer_config = wait_for_generated_consumer_config()?;
+        facts.insert(
+            "consumer_config_restored_after_negative_probe".to_owned(),
+            serde_json::json!({
+                "phase": restored_consumer_config.pointer("/status/phase"),
+                "observed_generation": restored_consumer_config.pointer("/status/observedGeneration")
+            }),
+        );
+        write_lifecycle_evidence(context, &facts)?;
+
+        let embedded_restore_receipt_boundary = embedded_serving_log_boundary()?;
         for state in &original_selectors {
             patch_provider_selector(state, &state.selector_value)?;
         }
@@ -5113,10 +5987,10 @@ fn assert_provider_withdrawal_lifecycle(
                 embedded_serving_digest.as_deref(),
                 Duration::from_secs(180),
             )?;
-            let log = wait_for_embedded_serving_log(
+            let log = wait_for_embedded_serving_log_after(
                 &serving,
                 &cluster_context(CONSUMER_SITE),
-                embedded_restore_prior_log_observations,
+                &embedded_restore_receipt_boundary,
                 Duration::from_secs(90),
             )?;
             facts.insert("embedded_restored_serving_config".to_owned(), serving);
@@ -5130,14 +6004,7 @@ fn assert_provider_withdrawal_lifecycle(
         }
         facts.insert("restored_request".to_owned(), serde_json::json!(response));
         if embedded_gateway_enabled {
-            let embedded_response = send_embedded_lifecycle_request(None)?;
-            if embedded_response.status != 200
-                || !expected_provider_attributions().contains(embedded_response.provider.as_deref().unwrap_or_default())
-            {
-                return Err(
-                    format!("embedded gateway did not restore attributed traffic: {embedded_response:?}").into(),
-                );
-            }
+            let embedded_response = wait_for_embedded_attributed_request(Duration::from_secs(90))?;
             facts.insert(
                 "embedded_restored_request".to_owned(),
                 serde_json::json!(embedded_response),
@@ -5252,29 +6119,32 @@ fn run_and_insert(results: &mut BTreeMap<String, ProofResult>, name: &str, asser
     }
 }
 
-/// Configure SWIM peer discovery by updating each operator with peer seed addresses.
+/// Configure SWIM peer discovery by updating each operator with peer `NodePort` endpoints.
 fn configure_swim_peers(_forge_bin: &Path, _resolved_config: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let mut swim_ips = BTreeMap::new();
+    let mut swim_endpoints = BTreeMap::new();
 
     for cluster in CLUSTERS {
-        let ip = read_swim_lb_ip(cluster)?;
-        eprintln!("  {cluster}: SWIM LB IP = {ip}");
-        swim_ips.insert(*cluster, ip);
+        let endpoint = read_swim_endpoint(cluster)?;
+        eprintln!("  {cluster}: SWIM endpoint = {endpoint}");
+        swim_endpoints.insert(*cluster, endpoint);
     }
 
     for cluster in CLUSTERS {
-        let this_ip = swim_ips
+        let this_endpoint = swim_endpoints
             .get(cluster)
-            .ok_or_else(|| format!("{cluster}: missing SWIM IP"))?;
+            .ok_or_else(|| format!("{cluster}: missing SWIM endpoint"))?;
         let mut peer_parts = Vec::new();
         for c in CLUSTERS {
             if *c != *cluster {
-                let ip = swim_ips.get(c).ok_or_else(|| format!("{c}: missing SWIM IP"))?;
-                peer_parts.push(format!("{ip}:7946"));
+                let endpoint = swim_endpoints
+                    .get(c)
+                    .ok_or_else(|| format!("{c}: missing SWIM endpoint"))?;
+                peer_parts.push(endpoint.clone());
             }
         }
         let peer_seeds = peer_parts.join(",");
-        update_operator_swim_config(cluster, this_ip, &peer_seeds)?;
+        let gateway_endpoint = read_provider_gateway_address(cluster)?;
+        update_operator_swim_config(cluster, this_endpoint, &peer_seeds, &gateway_endpoint)?;
     }
 
     for cluster in CLUSTERS {
@@ -5286,44 +6156,18 @@ fn configure_swim_peers(_forge_bin: &Path, _resolved_config: &Path) -> Result<()
     Ok(())
 }
 
-/// Read the SWIM `LoadBalancer` IP for a cluster directly from Kubernetes.
-fn read_swim_lb_ip(cluster: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// Read the SWIM `NodePort` endpoint for a cluster directly from Kubernetes.
+fn read_swim_endpoint(cluster: &str) -> Result<String, Box<dyn std::error::Error>> {
     let context = cluster_context(cluster);
-    let output = Command::new("kubectl")
-        .args([
-            "--context",
-            &context,
-            "-n",
-            GRID_SYSTEM_NS,
-            "get",
-            "svc",
-            "grid-operator-swim",
-            "-o",
-            "jsonpath={.status.loadBalancer.ingress[0].ip}",
-        ])
-        .output()?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "{cluster}: cannot read SWIM service: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-
-    let ip = String::from_utf8(output.stdout)?.trim().to_owned();
-    if ip.is_empty() {
-        return Err(format!("{cluster}: SWIM LoadBalancer has no ingress IP").into());
-    }
-
-    Ok(ip)
+    read_nodeport_endpoint(&context, cluster, "grid-operator-swim", "swim-udp")
 }
 
 /// Update a single operator's SWIM configuration with peer addresses.
 fn update_operator_swim_config(
     cluster: &str,
-    advertise_ip: &str,
+    advertise_endpoint: &str,
     seeds: &str,
+    gateway_endpoint: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let context = cluster_context(cluster);
 
@@ -5355,13 +6199,15 @@ fn update_operator_swim_config(
             "--set",
             &format!("swim.siteName={cluster}"),
             "--set",
-            &format!("swim.advertiseAddress={advertise_ip}:7946"),
+            &format!("swim.advertiseAddress={advertise_endpoint}"),
             "--set",
             &format!("swim.seeds={seeds_escaped}"),
+            "--set-string",
+            &format!("gateway.address={gateway_endpoint}"),
             "--set",
             "swim.service.enabled=true",
             "--set",
-            "swim.service.type=LoadBalancer",
+            "swim.service.type=NodePort",
             "--set",
             &format!("gateway.serviceName={PROVIDER_GATEWAY_SERVICE}"),
             "--set-string",
@@ -5781,6 +6627,21 @@ fn pod_image_id_matches_config_digest(pod_image_id: &str, expected: &str) -> boo
     pod_image_config_digest(pod_image_id) == Some(expected)
 }
 
+/// Kind/containerd gives images imported from a local Docker archive a synthetic
+/// immutable `import-<timestamp>@<manifest-digest>` identity. It identifies the
+/// imported archive, but it is not the OCI config digest used by Docker locally.
+fn is_kind_import_image_id(image_id: &str) -> bool {
+    let reference = ["docker-pullable://", "containerd://", "docker://"]
+        .iter()
+        .find_map(|prefix| image_id.strip_prefix(prefix))
+        .unwrap_or(image_id);
+    reference
+        .split('@')
+        .next()
+        .and_then(|name| name.rsplit('/').next())
+        .is_some_and(|name| name.starts_with("import-"))
+}
+
 /// Prefer the inspected config digest, but compare the Pod's immutable imageID when CRI omits it.
 fn ready_pod_image_matches_config_digest(expected: &str, pod_image_id: &str, node_config_digest: Option<&str>) -> bool {
     match node_config_digest.filter(|digest| !digest.is_empty()) {
@@ -5968,6 +6829,7 @@ pub(super) fn deployment_runtime_image_evidence(
                     .flatten();
                 let pod_config_digest = expected.and_then(|_| pod_image_config_digest(image_id));
                 let pod_image_id_matches_expected = expected.is_some_and(|expected| pod_config_digest == Some(expected));
+                let mut runtime_verification = "config_digest";
                 if let Some(expected) = expected
                     && !ready_pod_image_matches_config_digest(
                         expected,
@@ -5980,13 +6842,23 @@ pub(super) fn deployment_runtime_image_evidence(
                         .filter(|digest| !digest.is_empty())
                         .or(pod_config_digest);
                     if observed.is_none() {
+                        if is_kind_import_image_id(image_id) {
+                            // containerd's synthetic import identity is immutable and is
+                            // produced only by the local archive import above. It cannot be
+                            // compared byte-for-byte with Docker's config digest, so retain
+                            // the immutable runtime identity and record the weaker evidence.
+                            runtime_verification = "kind_import_manifest";
+                        } else {
+                            return Err(format!(
+                                "pod {pod_name} on Kind node {node_name}: config digest unavailable for imageID {image_id}; cannot compare it with local config digest {expected}"
+                            ));
+                        }
+                    }
+                    if runtime_verification == "config_digest" {
                         return Err(format!(
-                            "pod {pod_name} on Kind node {node_name}: config digest unavailable for imageID {image_id}; cannot compare it with local config digest {expected}"
+                            "pod {pod_name} on Kind node {node_name} runs imageID {image_id} with config digest {observed:?}, but the requested image {requested_image} resolves locally to config digest {expected}"
                         ));
                     }
-                    return Err(format!(
-                        "pod {pod_name} on Kind node {node_name} runs imageID {image_id} with config digest {observed:?}, but the requested image {requested_image} resolves locally to config digest {expected}"
-                    ));
                 }
                 Ok(serde_json::json!({
                     "name": name,
@@ -5996,6 +6868,7 @@ pub(super) fn deployment_runtime_image_evidence(
                     "expectedLocalConfigDigest": expected,
                     "nodeConfigDigest": node_config_digest.filter(|digest| !digest.is_empty()),
                     "podImageIdMatchedExpectedLocalConfig": pod_image_id_matches_expected,
+                    "runtimeVerification": runtime_verification,
                     "sourceMatched": expected.is_some(),
                 }))
             })
@@ -6037,6 +6910,28 @@ mod tests {
             let deployments = image_evidence_deployments(site);
             assert!(!deployments.iter().any(|(key, _)| *key == "consumer_gateway"));
         }
+    }
+
+    #[test]
+    fn consumer_config_uses_run_specific_nodeport_endpoints() {
+        let template =
+            include_str!("../../../../tests/e2e/topologies/grid-provider-traffic/configs/consumer/praxis.yaml");
+        let endpoints = BTreeMap::from([
+            ("provider-a", "172.20.0.2:30443".to_owned()),
+            ("provider-b", "172.20.0.3:30443".to_owned()),
+            ("provider-c", "172.20.0.4:30443".to_owned()),
+        ]);
+
+        let rendered = render_consumer_config(template, &endpoints).unwrap_or_else(|_| std::process::abort());
+
+        assert!(rendered.contains("value: \"provider-a\""));
+        assert!(rendered.contains("local_site: \"provider-a\""));
+        for endpoint in endpoints.values() {
+            assert!(rendered.contains(endpoint));
+        }
+        assert!(!rendered.contains("PLACEHOLDER"));
+        assert!(!rendered.contains("_ENDPOINT"));
+        let _parsed = serde_yaml::from_str::<serde_yaml::Value>(&rendered).unwrap_or_else(|_| std::process::abort());
     }
 
     #[test]
@@ -6119,6 +7014,18 @@ mod tests {
                 .map(|error| error.to_string()),
             Some("pod imageID is not an immutable CRI image identity: grid-operator:mutable-tag".to_owned())
         );
+    }
+
+    #[test]
+    fn kind_import_image_ids_are_manifest_evidence_when_config_digest_is_unavailable() {
+        assert!(is_kind_import_image_id(
+            "docker.io/library/import-2026-11-05@sha256:manifest"
+        ));
+        assert!(is_kind_import_image_id(
+            "docker-pullable://docker.io/library/import-2026-11-05@sha256:manifest"
+        ));
+        assert!(!is_kind_import_image_id("docker.io/library/grid-operator:latest"));
+        assert!(!is_kind_import_image_id("docker.io/library/grid@sha256:manifest"));
     }
 
     #[test]
@@ -6335,35 +7242,86 @@ mod tests {
     }
 
     #[test]
+    fn attributed_request_wait_retries_a_transient_probe_error() {
+        let mut attempts = [
+            Err("connection reset"),
+            Ok(LifecycleRequest {
+                status: 200,
+                provider: Some("provider-a".to_owned()),
+            }),
+        ]
+        .into_iter();
+        let mut pauses = 0;
+
+        let response = wait_for_attributed_request(
+            Duration::from_secs(1),
+            || attempts.next().unwrap_or(Err("probe exhausted")),
+            || pauses += 1,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(response.provider.as_deref(), Some("provider-a"));
+        assert_eq!(pauses, 1, "one transient failure is retried");
+    }
+
+    #[test]
+    fn attributed_request_wait_reports_the_last_probe_error_at_timeout() {
+        let Err(error) = wait_for_attributed_request(
+            Duration::ZERO,
+            || Err::<LifecycleRequest, _>("connection refused"),
+            || std::process::abort(),
+        ) else {
+            std::process::abort();
+        };
+
+        assert!(error.contains("probe error: connection refused"));
+    }
+
+    #[test]
     fn serving_revision_matcher_handles_colored_tracing_fields() {
         let logs = "\x1b[2mINFO\x1b[0m grid_serving_revision_serving revision=abc123 \x1b[3m candidate_count\x1b[0m\x1b[3m=\x1b[0m3";
-        let line = embedded_serving_revision_lines(logs, "abc123", 3)
-            .into_iter()
-            .next()
-            .unwrap_or_default();
+        let receipts = strip_ansi_csi(logs).lines().map(str::to_owned).collect::<Vec<_>>();
+        let line = embedded_serving_revision_receipt(&receipts, "abc123", 3).unwrap_or_default();
         assert!(line.contains("candidate_count=3"));
-        assert!(embedded_serving_revision_lines(logs, "wrong", 3).is_empty());
-        assert!(embedded_serving_revision_lines(logs, "abc123", 2).is_empty());
+        assert!(embedded_serving_revision_receipt(&receipts, "wrong", 3).is_none());
+        assert!(embedded_serving_revision_receipt(&receipts, "abc123", 2).is_none());
     }
 
     #[test]
-    fn restored_revision_wait_requires_a_new_acceptance_after_its_old_log() {
-        let old = "INFO grid_serving_revision_serving revision=abc123 candidate_count=3";
-        assert!(!has_new_embedded_serving_revision_observation(old, "abc123", 3, 1));
-        let updated = format!("{old}\nINFO grid_serving_revision_serving revision=abc123 candidate_count=3");
-        assert!(has_new_embedded_serving_revision_observation(&updated, "abc123", 3, 1));
-        assert!(!has_new_embedded_serving_revision_observation(&updated, "abc123", 2, 1));
+    fn serving_receipt_log_args_use_timestamped_time_boundary() {
+        let boundary = "2026-11-10T12:34:56.123456789Z";
+        let args = embedded_serving_log_args("kind-provider-a", Some(boundary));
+        assert!(args.contains(&"--timestamps".to_owned()));
+        assert_eq!(
+            args.windows(2)
+                .find(|pair| pair.first().is_some_and(|value| value == "--since-time")),
+            Some(["--since-time".to_owned(), boundary.to_owned()].as_slice())
+        );
     }
 
     #[test]
-    fn full_mode_appends_lifecycle_without_changing_the_six_existing_scenarios() {
+    fn invalid_locked_policy_probe_requires_the_expected_admission_rejection() {
+        assert!(is_invalid_locked_policy_rejection(
+            "The GridNetwork \"grid\" is invalid: spec.consumerGateways[0].regionalPolicy: Invalid value: object: allowedRegions is required in locked mode"
+        ));
+        assert!(!is_invalid_locked_policy_rejection(
+            "Error from server (Forbidden): cannot patch gridnetworks"
+        ));
+        assert!(!is_invalid_locked_policy_rejection(
+            "The GridNetwork \"grid\" is invalid: another field is invalid"
+        ));
+    }
+
+    #[test]
+    fn full_mode_appends_regional_policy_before_lifecycle_without_changing_the_six_existing_scenarios() {
         let quick = provider_traffic_scenario_names(DemoMode::Quick);
         let full = provider_traffic_scenario_names(DemoMode::Full);
         assert_eq!(quick.len(), 6);
-        assert_eq!(full.len(), 9);
+        assert_eq!(full.len(), 10);
         assert_eq!(full.get(..6), Some(quick.as_slice()));
         assert_eq!(full.get(6), Some(&"generated_consumer_config_convergence"));
         assert_eq!(full.get(7), Some(&"embedded_serving_gateway_convergence"));
+        assert_eq!(full.get(8), Some(&"regional_policy_consumers"));
         assert_eq!(full.last(), Some(&"provider_withdrawal_lifecycle"));
     }
 

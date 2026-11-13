@@ -604,7 +604,7 @@ impl GridSiteRouteFilter {
                 return Ok(Some(FilterAction::Reject(Rejection::status(404))));
             },
             Target::Unavailable => {
-                tracing::debug!(site = ?site, "grid_site_route: the cluster holding the state admits no new request");
+                tracing::debug!(site = ?site, "grid_site_route: the cluster holding the state admits no existing request");
                 return Ok(Some(FilterAction::Reject(
                     Rejection::status(503).with_header("retry-after", RETRY_AFTER_SECS),
                 )));
@@ -917,11 +917,11 @@ impl HttpFilter for GridSiteRouteFilter {
         let (pick, admitted) = match admission(pick.candidate) {
             // Another request probes this down dial: pick elsewhere when anywhere else routes.
             Admission::Busy => match self.choose(&snapshot, model, scope, Some(&pick.candidate.cluster)) {
-                Ok(other) => {
+                Ok(other) if other.candidate.selection_group == pick.candidate.selection_group => {
                     let admitted = admission(other.candidate);
                     (other, admitted)
                 },
-                Err(_) => (pick, Admission::Busy),
+                Ok(_) | Err(_) => (pick, Admission::Busy),
             },
             admitted @ (Admission::Open | Admission::Probe) => (pick, admitted),
         };
@@ -1062,14 +1062,14 @@ fn pinned_site(
                 Ok((Some(holder), Some(rewrite)))
             },
         )),
-        // A new conversation has no model to route by: keep it local when the local site can take it.
+        // A new conversation has no model to route by: keep it local only when the local site
+        // accepts new work. Otherwise leave it unpinned so normal new-work selection applies.
         Some(StatePath::Create(Collection::Conversations)) => {
             let local = Holder {
                 site: Arc::clone(&snapshot.local_site),
                 mark: None,
             };
-            let admits = pinned_target(snapshot, Some(&local), None, now_ms).found().is_some();
-            Some(Ok((admits.then_some(local), None)))
+            site_admits_new_work(snapshot, &local, None, now_ms).then(|| Ok((Some(local), None)))
         },
         _ => Some(Ok((Some(ctx.get_filter_state::<RouteState>()?.pinned.clone()?), None))),
     }
@@ -1081,18 +1081,8 @@ enum Target<'snap> {
     Found(&'snap RouteCandidate),
     /// The site serves nothing that matches: it left the grid.
     Gone,
-    /// The site is in the grid but admits no new request now.
+    /// The site is in the grid but admits no existing request now.
     Unavailable,
-}
-
-impl<'snap> Target<'snap> {
-    /// The candidate, when found.
-    fn found(self) -> Option<&'snap RouteCandidate> {
-        match self {
-            Self::Found(candidate) => Some(candidate),
-            Self::Gone | Self::Unavailable => None,
-        }
-    }
 }
 
 /// The front candidate at `holder`, anywhere when `None`, that admits a pinned
@@ -1122,8 +1112,27 @@ fn pinned_target<'snap>(
         return Target::Gone;
     }
     at_site
-        .find(|candidate| is_admitted_for_new_request(candidate.admission_state) && !candidate.expired_at(now_ms))
+        .find(|candidate| is_admitted_for_existing_request(candidate.admission_state) && !candidate.expired_at(now_ms))
         .map_or(Target::Unavailable, Target::Found)
+}
+
+/// Whether one site can start new work for an optionally named model.
+///
+/// New conversation creation has no stored state, so an `ExistingOnly`
+/// candidate must leave it unpinned for normal new-work selection rather than
+/// treating it as a local pin.
+fn site_admits_new_work(snapshot: &RouteSnapshot, holder: &Holder, model: Option<&str>, now_ms: i64) -> bool {
+    snapshot.candidates.iter().any(|candidate| {
+        *candidate.site == *holder.site
+            && holder
+                .mark
+                .as_deref()
+                .is_none_or(|mark| pin::cluster_mark(&candidate.cluster) == mark)
+            && candidate.kind == CapabilityKind::InferenceModel
+            && model.is_none_or(|model| &*candidate.name == model)
+            && is_admitted_for_new_request(candidate.admission_state)
+            && !candidate.expired_at(now_ms)
+    })
 }
 
 /// Count and answer a request no candidate took.
@@ -1378,9 +1387,12 @@ impl<'snap> Sites<'snap> {
 
 /// Choose a site for `name` among the admitted, `routable` matches.
 ///
-/// Choose a pressure tier before affinity, keeping entirely missing telemetry as fallback.
-/// Spread observed room by pressure. Unknown capacity uses mean-known weights.
-/// Queue-only and saturated tiers retain least-queue routing.
+/// The lowest operator-assigned selection group with a candidate that can
+/// accept new work is an eligibility boundary. Within that group, choose a
+/// pressure tier before affinity, keeping entirely missing telemetry as
+/// fallback. Spread observed room by pressure. Unknown capacity uses
+/// mean-known weights. Queue-only and saturated tiers retain least-queue
+/// routing.
 #[expect(
     clippy::too_many_arguments,
     reason = "the request path passes its inputs directly rather than build a struct per request"
@@ -1394,6 +1406,8 @@ pub(crate) fn select_spread<'snap>(
     narrow: &impl Narrow,
 ) -> Option<Pick<'snap>> {
     let matches = matching(snapshot, kind, name, &routable);
+    let selection_group = matches.clone().map(|(candidate, ..)| candidate.selection_group).min()?;
+    let matches = matches.filter(move |(candidate, ..)| candidate.selection_group == selection_group);
     let (front, front_score, front_decisions) = matches.clone().next()?;
     let site = |(candidate, score, decisions): Scored<'snap>| (candidate, decisions, score);
     let healthy = Sites::gather(matches.filter(|(_, score, _)| !score.is_nan()).map(site));
@@ -1628,6 +1642,11 @@ fn is_admitted_for_new_request(state: AdmissionState) -> bool {
     matches!(state, AdmissionState::NewAndExisting)
 }
 
+/// Whether a candidate in this admission state accepts work bound to an existing session.
+fn is_admitted_for_existing_request(state: AdmissionState) -> bool {
+    matches!(state, AdmissionState::NewAndExisting | AdmissionState::ExistingOnly)
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
@@ -1670,6 +1689,7 @@ pub(crate) mod tests {
             kind: CapabilityKind::InferenceModel,
             name: model.to_owned(),
             publishes_load: true,
+            selection_group: 0,
             site: site.to_owned(),
             stable_id: None,
             weight: None,
@@ -1677,6 +1697,40 @@ pub(crate) mod tests {
         .unwrap();
         candidates[0].admission_state = admission;
         candidates
+    }
+
+    #[test]
+    fn selection_groups_hold_fallback_until_preferred_cannot_accept_new_work() {
+        let mut preferred = one("llama", "east", "pool-east", AdmissionState::NewAndExisting);
+        let mut fallback = one("llama", "west", "pool-west", AdmissionState::NewAndExisting);
+        preferred[0].selection_group = 0;
+        fallback[0].selection_group = 1;
+
+        assert_eq!(
+            front(
+                vec![fallback.pop().unwrap(), preferred.pop().unwrap()],
+                CapabilityKind::InferenceModel,
+                "llama",
+            ),
+            Some("pool-east".to_owned()),
+            "fallback load ordering must not bypass the preferred group"
+        );
+
+        let existing_only_preferred = one("llama", "east", "pool-east", AdmissionState::ExistingOnly);
+        let mut fallback_after_preferred = one("llama", "west", "pool-west", AdmissionState::NewAndExisting);
+        fallback_after_preferred[0].selection_group = 1;
+        assert_eq!(
+            front(
+                vec![
+                    existing_only_preferred.into_iter().next().unwrap(),
+                    fallback_after_preferred.pop().unwrap(),
+                ],
+                CapabilityKind::InferenceModel,
+                "llama",
+            ),
+            Some("pool-west".to_owned()),
+            "new work may use the fallback only after the preferred group no longer admits it"
+        );
     }
 
     /// A filter over `snapshot` with affinity at `settings`.
@@ -1824,6 +1878,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn existing_sessions_keep_an_eligible_fallback_binding_without_being_pulled_back() {
+        let mut preferred = one("llama", "east", "pool-east", AdmissionState::NewAndExisting);
+        let mut fallback = one("llama", "west", "pool-west", AdmissionState::ExistingOnly);
+        preferred[0].selection_group = 0;
+        fallback[0].selection_group = 1;
+        let bound =
+            RouteSnapshot::from_static([preferred, fallback].into_iter().flatten().collect(), Arc::from("east"));
+        let fallback_holder = holder("west", Some("pool-west"));
+
+        assert!(matches!(
+            pinned_target(&bound, Some(&fallback_holder), Some("llama"), TEST_NOW_MS),
+            Target::Found(candidate) if &*candidate.cluster == "pool-west"
+        ));
+
+        let policy_loss = RouteSnapshot::from_static(
+            one("llama", "east", "pool-east", AdmissionState::NewAndExisting),
+            Arc::from("east"),
+        );
+        assert!(matches!(
+            pinned_target(&policy_loss, Some(&fallback_holder), Some("llama"), TEST_NOW_MS),
+            Target::Gone
+        ));
+    }
+
+    #[test]
     fn discovered_candidates_stop_routing_before_expiry_with_clock_skew_margin() {
         let mut candidates = one("llama", "a", "pool-a", AdmissionState::NewAndExisting);
         let now_ms = grid_signals::now_ms();
@@ -1884,6 +1963,7 @@ pub(crate) mod tests {
                     kind: CapabilityKind::InferenceModel,
                     name: name.to_owned(),
                     publishes_load: true,
+                    selection_group: 0,
                     site: "a".to_owned(),
                     weight: None,
                 })
@@ -3451,6 +3531,31 @@ pub(crate) mod tests {
         assert!(ctx.retry_policy.is_some(), "with its retry policy");
     }
 
+    #[tokio::test]
+    async fn a_new_conversation_does_not_pin_to_an_existing_only_local_site() {
+        let mut candidates = dialed("local", "local-pool", Some("10.0.0.7:8000"));
+        candidates[0].admission_state = AdmissionState::ExistingOnly;
+        candidates.extend(dialed("remote", "remote-pool", Some("10.0.0.8:8000")));
+        let filter = dial_filter(candidates, "local", Some(&[]));
+        let request = llama_request("/v1/conversations");
+        let mut ctx = context(&request);
+
+        let action = filter.on_request(&mut ctx).await.expect("routes");
+
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "the remote site admits new work"
+        );
+        assert_eq!(ctx.cluster.as_deref(), Some("remote-pool"));
+
+        let mut only_local = dialed("local", "local-pool", Some("10.0.0.7:8000"));
+        only_local[0].admission_state = AdmissionState::ExistingOnly;
+        let only_local = dial_filter(only_local, "local", Some(&[]));
+        let mut local_ctx = context(&request);
+        let local_action = only_local.on_request(&mut local_ctx).await.expect("answers");
+        assert_eq!(refusal(&local_action).map(|(status, _)| status), Some(503));
+    }
+
     #[test]
     fn a_dial_outcome_counts_only_a_failure_to_connect() {
         let budget = Duration::from_secs(9);
@@ -3534,6 +3639,30 @@ pub(crate) mod tests {
             probed.admit_at(crate::health::monotonic_ms()),
             Admission::Probe,
             "the settled probe is handed back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_busy_preferred_dial_does_not_retry_in_the_affinity_fallback() {
+        let mut candidates = dialed("east", "east", Some("10.0.0.9:8443"));
+        candidates[0].selection_group = 0;
+        let mut fallback = dialed("west", "west", Some("10.0.0.10:8443"));
+        fallback[0].selection_group = 1;
+        candidates.extend(fallback);
+        let east = Arc::clone(candidates[0].dial.as_ref().expect("dialed").health());
+        east.record(false, 0);
+        east.record(false, 0);
+        let filter = dial_filter(candidates, "local", Some(&[]));
+        let request = llama_request("/v1/chat/completions");
+        let mut probe = context(&request);
+        drop(filter.on_request(&mut probe).await.expect("routes"));
+        let mut busy = context(&request);
+        drop(filter.on_request(&mut busy).await.expect("routes"));
+
+        assert_eq!(
+            busy.cluster.as_deref(),
+            Some("east"),
+            "a busy preferred dial does not use the affinity fallback"
         );
     }
 

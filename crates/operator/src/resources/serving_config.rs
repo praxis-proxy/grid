@@ -264,6 +264,12 @@ pub(crate) struct ServingCandidate {
     /// operator has heard load for. Omitted when it does, as the gateway assumes when absent.
     #[serde(skip_serializing_if = "publishes")]
     pub(crate) publishes_load: bool,
+    /// Operator-assigned priority boundary for new-session selection.
+    ///
+    /// `0` preserves the pre-regional-policy behavior. Higher groups are only
+    /// considered when no candidate in a lower group can accept new work.
+    #[serde(skip_serializing_if = "selection_group_zero")]
+    pub(crate) selection_group: u32,
     /// A local candidate's credential locator, which `grid_site_route` selects for `credential_inject`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) credential: Option<ProjectedCredential>,
@@ -277,6 +283,25 @@ pub(crate) struct ServingCandidate {
 #[expect(clippy::trivially_copy_pass_by_ref, reason = "serde skip_serializing_if signature")]
 const fn publishes(publishes_load: &bool) -> bool {
     *publishes_load
+}
+
+/// Whether a candidate belongs to the default priority group.
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde skip_serializing_if signature")]
+const fn selection_group_zero(selection_group: &u32) -> bool {
+    *selection_group == 0
+}
+
+/// Translate only a regional-policy boundary into the gateway contract.
+///
+/// `RoutingCandidate::selection_group` also carries generic locality,
+/// admission, and freshness boundaries for the overlay consumer. Passing that
+/// field to `grid_site_route` would change its behavior when no
+/// `regionalPolicy` is configured.
+const fn regional_selection_group(candidate: &RoutingCandidate) -> u32 {
+    match candidate.regional_policy_group {
+        Some(group) => group.selection_group(),
+        None => 0,
+    }
 }
 
 /// Whether `admission` is the default, which the gateway assumes when absent.
@@ -431,6 +456,8 @@ struct Folded {
     credential: Option<ProjectedCredential>,
     /// The earliest discovered inventory deadline among duplicates.
     expires_at_ms: Option<u64>,
+    /// Earliest active routing priority boundary among duplicates.
+    selection_group: u32,
     /// The largest declared weight across duplicates.
     weight: u32,
 }
@@ -467,6 +494,7 @@ fn dedup<'overlay>(
             candidate.cluster.as_str(),
         );
         let admission = candidate.admission_state.unwrap_or(AdmissionState::NewAndExisting);
+        let selection_group = regional_selection_group(candidate);
         // Seeded with the identities of both folds, so the first candidate and every
         // duplicate after it take the same path: fresh only if all are, admission as
         // restricted as the most restricted.
@@ -476,10 +504,12 @@ fn dedup<'overlay>(
             stable_id: None,
             credential: None,
             expires_at_ms,
+            selection_group,
             weight: candidate.capacity_weight,
         });
         folded.fresh &= candidate.fresh;
         folded.admission = folded.admission.max(admission);
+        folded.selection_group = folded.selection_group.min(selection_group);
         if folded.stable_id.is_none() {
             folded.stable_id.clone_from(&candidate.stable_id);
         }
@@ -498,7 +528,8 @@ fn dedup<'overlay>(
 
 /// Inference candidates within gateway limits, deduplicated and ordered.
 ///
-/// Past the cap, candidates taking new requests are kept before the rest.
+/// Past the cap, lower selection groups and candidates taking new requests are
+/// kept before the rest.
 fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<ServingCandidate> {
     if overlay.candidates.is_empty() {
         return Vec::new();
@@ -511,7 +542,13 @@ fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<Servi
             candidates = kept.len(),
             "serving config: dropping candidates past the gateway cap"
         );
-        kept.sort_by_key(|(key, folded)| (folded.admission != AdmissionState::NewAndExisting, *key));
+        kept.sort_by_key(|(key, folded)| {
+            (
+                folded.selection_group,
+                folded.admission != AdmissionState::NewAndExisting,
+                *key,
+            )
+        });
         kept.truncate(MAX_CANDIDATES);
         kept.sort_by_key(|(key, _)| *key);
     }
@@ -525,6 +562,7 @@ fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<Servi
             fresh: folded.fresh,
             admission: folded.admission,
             publishes_load: publishes_load(inputs, remote, site, cluster),
+            selection_group: folded.selection_group,
             // Never on another site's cluster or a provider hop, so the secret stays on this site.
             credential: folded.credential.filter(|_| {
                 inputs.inject_local_credentials && !remote && !inputs.provider_hop_clusters.contains(cluster)
@@ -730,6 +768,7 @@ impl WriteGate {
 #[expect(clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
     use super::*;
+    use crate::resources::regional_policy::RegionalPolicyGroup;
 
     /// Contract fixture the gateway crate parses with its own types.
     const GOLDEN: &str = include_str!("../../../gateway/crates/ai-grid-filters/testdata/serving-config.json");
@@ -1111,6 +1150,32 @@ mod tests {
     }
 
     #[test]
+    fn past_the_cap_keeps_the_preferred_regional_group() {
+        let mut source = overlay(
+            (0..MAX_CANDIDATES)
+                .map(|i| {
+                    let mut fallback = cand("llama", "site-b", &format!("fallback-{i:04}"), None);
+                    fallback.regional_policy_group = Some(RegionalPolicyGroup::Fallback);
+                    fallback
+                })
+                .collect(),
+        );
+        let mut preferred = cand("llama", "site-z", "preferred", None);
+        preferred.regional_policy_group = Some(RegionalPolicyGroup::Preferred);
+        source.candidates.push(preferred);
+
+        let rendered = render(&source, &INPUTS);
+        assert_eq!(rendered.candidates.len(), MAX_CANDIDATES);
+        assert!(
+            rendered
+                .candidates
+                .iter()
+                .any(|candidate| candidate.cluster == "preferred"),
+            "a preferred-region candidate must survive the serving-config cap before fallback candidates"
+        );
+    }
+
+    #[test]
     fn a_candidate_not_taking_new_requests_stays_in_with_its_admission() {
         let rendered = render(
             &overlay(vec![
@@ -1202,6 +1267,44 @@ mod tests {
                 "{label}: one cluster, so a duplicate calling it unservable closes it"
             );
         }
+    }
+
+    #[test]
+    fn serving_config_exports_only_regional_selection_boundaries() {
+        let mut generic = cand("llama", "site-a", "generic", None);
+        generic.selection_group = Some(4);
+        let mut preferred = cand("llama", "site-b", "preferred", None);
+        preferred.regional_policy_group = Some(RegionalPolicyGroup::Preferred);
+        let mut fallback = cand("llama", "site-c", "fallback", None);
+        fallback.regional_policy_group = Some(RegionalPolicyGroup::Fallback);
+        let mut permitted = cand("llama", "site-d", "permitted", None);
+        permitted.regional_policy_group = Some(RegionalPolicyGroup::Permitted);
+
+        let rendered = render(&overlay(vec![generic, preferred, fallback, permitted]), &INPUTS);
+        let text = to_text(&rendered).expect("serving JSON");
+        let wire: serde_json::Value = serde_json::from_str(&text).expect("valid serving JSON");
+        let candidates = wire["candidates"].as_array().expect("candidates");
+        let fallback_wire = candidates
+            .iter()
+            .find(|candidate| candidate["cluster"] == "fallback")
+            .expect("fallback candidate");
+        assert_eq!(fallback_wire["selection_group"], 1, "only affinity fallback is delayed");
+        assert!(
+            candidates
+                .iter()
+                .filter(|candidate| candidate["cluster"] != "fallback")
+                .all(|candidate| candidate.get("selection_group").is_none()),
+            "generic overlay groups and the default regional group must not alter grid_site_route selection"
+        );
+        assert!(
+            candidates
+                .iter()
+                .find(|candidate| candidate["cluster"] == "generic")
+                .expect("candidate without regional policy")
+                .get("selection_group")
+                .is_none(),
+            "a generic overlay selection group must never enter the serving config"
+        );
     }
 
     #[test]

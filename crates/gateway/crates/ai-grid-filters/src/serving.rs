@@ -451,9 +451,19 @@ impl GridRuntime {
 ///
 /// Returns [`FilterError`] if the file cannot be read or does not parse.
 pub fn load_serving_config(path: &str) -> Result<GridServingConfig, FilterError> {
-    let text =
-        fs::read_to_string(path).map_err(|error| -> FilterError { format!("grid: reading {path}: {error}").into() })?;
-    serde_yaml::from_str(&text).map_err(|error| -> FilterError { format!("grid: parsing {path}: {error}").into() })
+    load_serving_config_with_bytes(path).map(|(config, _)| config)
+}
+
+/// Read and parse a grid serving config file, retaining the exact accepted bytes.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if the file cannot be read or does not parse.
+pub fn load_serving_config_with_bytes(path: &str) -> Result<(GridServingConfig, Vec<u8>), FilterError> {
+    let bytes = fs::read(path).map_err(|error| -> FilterError { format!("grid: reading {path}: {error}").into() })?;
+    let config = serde_yaml::from_slice(&bytes)
+        .map_err(|error| -> FilterError { format!("grid: parsing {path}: {error}").into() })?;
+    Ok((config, bytes))
 }
 
 /// The dial file beside the serving config at `serving`.

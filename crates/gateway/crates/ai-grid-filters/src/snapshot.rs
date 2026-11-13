@@ -1406,6 +1406,7 @@ mod tests {
             kind: CapabilityKind::InferenceModel,
             name: name.to_owned(),
             publishes_load: true,
+            selection_group: 0,
             site: site.to_owned(),
             stable_id: None,
             weight: None,
