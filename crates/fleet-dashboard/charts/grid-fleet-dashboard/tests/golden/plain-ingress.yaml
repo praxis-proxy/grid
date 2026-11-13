@@ -134,7 +134,7 @@ spec:
         app.kubernetes.io/name: grid-fleet-dashboard
         app.kubernetes.io/instance: grid-fleet-dashboard
       annotations:
-        checksum/config: 4e4b5b3ee61957b22aa3872236d84635ae1fd39ff1817723903a1c72adba95a2
+        checksum/config: 51a555aac7c5d8128394e5c8b3c252267f18dcc8ef356bb8c53e21b9bff61539
     spec:
       serviceAccountName: grid-fleet-dashboard
       securityContext:
