@@ -187,6 +187,7 @@ jobs:
           - {name: operator, repo: operator, tag: ci, file: deploy/operator/Containerfile}
           - {name: operator-fips, repo: operator, tag: ci-fips, profile: release, file: deploy/operator/Containerfile.fips}
           - {name: gateway, repo: gateway, tag: ci, file: deploy/gateway/Containerfile}
+          - {name: gateway-fips, repo: gateway, tag: ci-fips, profile: release, file: deploy/gateway/Containerfile.ubi9}
           - {name: enrollment, repo: enrollment, tag: ci, file: deploy/enrollment/Containerfile}
           - {name: mock-providers, repo: mock-providers, tag: ci, file: crates/mock-providers/Containerfile}
           - {name: overlay-sync, repo: overlay-sync, tag: ci, file: crates/overlay-sync/Containerfile}

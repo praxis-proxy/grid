@@ -1,0 +1,100 @@
+# syntax=docker/dockerfile:1
+
+# ------------------------------------------------------------------------------
+# FIPS build of the grid gateway on Red Hat Universal Base Image 9
+# ------------------------------------------------------------------------------
+#
+# The build links the system OpenSSL dynamically. The runtime uses the matching
+# UBI 9 libraries and FIPS provider, so the image can run on a FIPS-enabled host.
+
+ARG UBI9_DIGEST=sha256:a4b9ec09b1e790a53ef25b7777c539976abe519248264298e5194dcbceac8c31
+ARG UBI9_MINIMAL_DIGEST=sha256:8ebe2ad8fdf3cab3e5a53c1edc69194c98209cfadab24b884f4ad9ebcf7bbbfc
+
+# ------------------------------------------------------------------------------
+# Stage 1: Red Hat's toolchain
+# ------------------------------------------------------------------------------
+
+FROM registry.access.redhat.com/ubi9/ubi@${UBI9_DIGEST} AS toolchain
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+        rust-toolset openssl-devel gcc gcc-c++ cmake make \
+    && dnf clean all
+
+# Never vendor OpenSSL; this image must use UBI's validated system libraries.
+ENV OPENSSL_NO_VENDOR=1 \
+    CARGO_HOME=/cargo
+
+WORKDIR /src
+
+# ------------------------------------------------------------------------------
+# Stage 2: FIPS gateway build
+# ------------------------------------------------------------------------------
+
+FROM toolchain AS builder
+
+COPY . .
+
+# The Helm image workflow uses dev for faster CI builds. Release builds use the
+# release profile unless the caller explicitly selects another profile.
+ARG CARGO_FEATURES=fips
+ARG CARGO_PROFILE=release
+
+# The build context excludes .git, so the workflows pass the source facts in.
+ARG GRID_GIT_COMMIT=unknown
+ARG GRID_GIT_VERSION=unknown
+ARG GRID_GIT_TREE_STATE=unknown
+ARG GRID_BUILD_DATE=unknown
+ENV GRID_GIT_COMMIT=${GRID_GIT_COMMIT} \
+    GRID_GIT_VERSION=${GRID_GIT_VERSION} \
+    GRID_GIT_TREE_STATE=${GRID_GIT_TREE_STATE} \
+    GRID_BUILD_DATE=${GRID_BUILD_DATE}
+
+RUN --mount=type=cache,id=grid-gateway-fips-registry,target=/cargo/registry \
+    --mount=type=cache,id=grid-gateway-fips-git,target=/cargo/git \
+    --mount=type=cache,id=grid-gateway-fips-target,target=/src/crates/gateway/target \
+    set -eu; \
+    case "${CARGO_PROFILE}" in \
+        dev) profile_dir=debug ;; \
+        *) profile_dir="${CARGO_PROFILE}" ;; \
+    esac; \
+    cargo build \
+        --manifest-path crates/gateway/Cargo.toml \
+        --bin grid-gateway \
+        --locked \
+        --no-default-features \
+        --features "${CARGO_FEATURES}" \
+        --profile "${CARGO_PROFILE}" \
+        --ignore-rust-version \
+    && ldd "crates/gateway/target/${profile_dir}/grid-gateway" | grep -q 'libcrypto.so.3' \
+    && ldd "crates/gateway/target/${profile_dir}/grid-gateway" | grep -q 'libssl.so.3' \
+    && install -D -m 0555 \
+        "crates/gateway/target/${profile_dir}/grid-gateway" \
+        /fips/grid-gateway
+
+# ------------------------------------------------------------------------------
+# Stage 3: FIPS runtime
+# ------------------------------------------------------------------------------
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal@${UBI9_MINIMAL_DIGEST} AS runtime
+
+ARG GRID_GIT_COMMIT=unknown
+ARG GRID_GIT_VERSION=unknown
+
+LABEL org.opencontainers.image.revision="${GRID_GIT_COMMIT}" \
+    org.opencontainers.image.version="${GRID_GIT_VERSION}" \
+    org.opencontainers.image.source="https://github.com/praxis-proxy/grid" \
+    org.opencontainers.image.description="Praxis-based grid data-plane gateway (FIPS build on UBI 9)" \
+    org.opencontainers.image.licenses="Apache-2.0"
+
+# The pinned UBI minimal image supplies both the OpenSSL libraries and FIPS
+# provider from Red Hat. Fail the build if a base-image update removes either.
+RUN rpm -q openssl-libs openssl-fips-provider-so ca-certificates \
+    && echo 'grid:x:1001:1001:grid:/nonexistent:/sbin/nologin' >> /etc/passwd \
+    && echo 'grid:x:1001:' >> /etc/group
+
+COPY --from=builder --chown=root:root --chmod=0555 \
+    /fips/grid-gateway /usr/local/bin/grid-gateway
+
+USER 1001:1001
+
+ENTRYPOINT ["grid-gateway"]
