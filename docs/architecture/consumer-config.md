@@ -659,7 +659,12 @@ credential mount.
 A `mutual_tls` dial carries only its `sni`. The gateway presents the grid identity
 it fixed at startup, the `ca.crt`, `tls.crt` and `tls.key` its signals peers use,
 and re-reads those files on rotation. A `tls` dial may name a `ca_path`, which must
-be under `/run/secrets/grid-backend-ca`. A dial file that breaks a trust rule is
+be under `/run/secrets/grid-backend-ca`. A `tls` dial with `present_identity: true`
+also presents the grid certificate, while the server is still verified by its own
+name and CA. The operator writes it for a local `https` provider whose
+`auth.strategy` is `mtls_only`, so a local backend can authorize this site by its
+certificate. Such a dial stays on this site, and a routed request drops the caller's
+credential headers and query parameters. A dial file that breaks a trust rule is
 refused whole and the last good one stays. At startup the gateway serves without
 dials until a good one lands. A single dial praxis refuses, such as an untrusted
 `.internal` or loopback host, takes only its own cluster out of routing.
