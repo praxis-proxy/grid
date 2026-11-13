@@ -17,6 +17,8 @@
 //! independently.
 
 use kube::CustomResourceExt as _;
+#[cfg(feature = "a2a")]
+use operator::crd::agent_to_agent_provider::AgentToAgentProvider;
 use operator::crd::{
     agent_tool_provider::AgentToolProvider, grid_network::GridNetwork, grid_site::GridSite,
     inference_provider::InferenceProvider, site_invite::SiteInvite,
@@ -24,6 +26,8 @@ use operator::crd::{
 
 fn main() {
     let crds = [
+        #[cfg(feature = "a2a")]
+        serde_json::to_value(AgentToAgentProvider::crd()),
         serde_json::to_value(AgentToolProvider::crd()),
         serde_json::to_value(GridNetwork::crd()),
         serde_json::to_value(GridSite::crd()),
