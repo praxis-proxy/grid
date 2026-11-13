@@ -3902,6 +3902,11 @@ fn gateway_dials(
         if let serving_config::DialTransport::Tls { present_identity, .. } = &mut dial.transport {
             *present_identity = identified.contains(cluster);
         }
+        // The gateway refuses the whole dial file for one such entry, so drop it here.
+        if presents_identity_to_grid_name(dial) {
+            refused.insert(format!("{cluster}: presents the grid identity to a grid name"));
+            return false;
+        }
         let path = paths.get(cluster).and_then(Option::as_deref);
         match dial_request_shape(cluster, dial, path, overlay, gw_ref) {
             Ok((base_path, credential)) => {
@@ -3916,6 +3921,19 @@ fn gateway_dials(
         }
     });
     (dials, refused)
+}
+
+/// Whether `dial` presents the grid certificate to a grid name, which the gateway's dial
+/// validation refuses.
+fn presents_identity_to_grid_name(dial: &serving_config::DialSpec) -> bool {
+    matches!(
+        dial.transport,
+        serving_config::DialTransport::Tls {
+            present_identity: true,
+            ..
+        }
+    ) && (dial.transport.sni().is_some_and(certs::is_grid_name)
+        || certs::is_grid_name(grid_client::address_host(&dial.address)))
 }
 
 /// The base path and credential `dial` sends for `cluster`, or why it cannot be dialed.
@@ -13018,6 +13036,60 @@ mod tests {
         assert!(
             gateway_dials(&unconfigured, &overlay, &declarations).0.is_empty(),
             "nothing admitted, no entries"
+        );
+    }
+
+    #[test]
+    fn only_the_dial_presenting_identity_to_a_grid_name_is_dropped() {
+        let mtls_only = |name: &str, endpoint: &str| {
+            let mut provider = make_provider(name, "net", "local", 1);
+            provider.spec.endpoint = endpoint.to_owned();
+            provider.spec.auth = serde_json::from_value(json!({ "strategy": "mtls_only" })).ok();
+            provider
+        };
+        let providers = vec![
+            mtls_only(
+                "prov-serving",
+                "https://inference.openshift-ingress.svc.cluster.local:8443/publishers/p/models/m",
+            ),
+            mtls_only("prov-grid", "https://east.grid.internal:8443"),
+        ];
+        let overlay = dial_overlay(vec![
+            topology_candidate("prov-serving", "site-a"),
+            topology_candidate("prov-grid", "site-a"),
+        ]);
+        let mut gw = make_gw_ref("inference-gw", "praxis-system");
+        gw.praxis_config = Some(ConsumerConfig {
+            derive_topology: Some(crate::crd::grid_network::DeriveTopology {
+                from_providers: Vec::new(),
+                transport: None,
+            }),
+            ..make_consumer_config("praxis-consumer-config")
+        });
+        let declarations = derived_topology::Declarations {
+            providers: &providers,
+            ..empty_declarations()
+        };
+        let (dials, refused) = gateway_dials(&gw, &overlay, &declarations);
+        assert_eq!(
+            dials.keys().collect::<Vec<_>>(),
+            ["prov-serving"],
+            "the valid dial survives the invalid one, so the gateway accepts the file"
+        );
+        assert!(
+            matches!(
+                dials.get("prov-serving").map(|dial| &dial.transport),
+                Some(serving_config::DialTransport::Tls {
+                    present_identity: true,
+                    ..
+                })
+            ),
+            "the serving gateway dial still presents the grid certificate: {dials:?}"
+        );
+        assert_eq!(
+            refused,
+            BTreeSet::from(["prov-grid: presents the grid identity to a grid name".to_owned()]),
+            "the grid-name dial is refused with why"
         );
     }
 
