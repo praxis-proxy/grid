@@ -146,11 +146,17 @@ audit:
 	cargo audit
 	cargo deny check
 
+# actionlint's shellcheck pass does not return on this workflow's largest run: blocks.
+ACTIONLINT_NO_SHELLCHECK := .github/workflows/triggered-integration-test.yaml
+# Naming the files replaces actionlint's own discovery, which accepts both extensions.
+ACTIONLINT_WORKFLOWS := $(wildcard .github/workflows/*.yaml) $(wildcard .github/workflows/*.yml)
+
 lint-extra:
 	typos
 	taplo fmt --check
 	shellcheck .hooks/pre-commit
-	actionlint
+	actionlint $(filter-out $(ACTIONLINT_NO_SHELLCHECK),$(ACTIONLINT_WORKFLOWS))
+	actionlint -shellcheck= $(ACTIONLINT_NO_SHELLCHECK)
 
 mutants:
 	cargo mutants --workspace
