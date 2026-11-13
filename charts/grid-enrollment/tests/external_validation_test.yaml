@@ -66,6 +66,22 @@ tests:
   - failedTemplate:
       errorMessage: external.delivery.identitySecretName and caSecretName must differ
     template: templates/external-validation.yaml
+- it: refuses a trust bundle copy over the delivered identity
+  set:
+    mode: external
+    external.sites.site-a.secretName: provided-site-a
+    external.sites.site-a.cluster: managed-a
+    external.trustBundleSecretRef: provided-trust
+    external.delivery.enabled: true
+    external.delivery.namespace: grid-system
+    external.delivery.trustBundleCopies:
+    - namespace: grid-system
+      secretName: grid-site-identity
+      key: tls.key
+  asserts:
+  - failedTemplate:
+      errorMessage: external.delivery.trustBundleCopies must not name the delivered identity or CA Secret
+    template: templates/external-validation.yaml
 - it: refuses two identities targeting one cluster
   set:
     mode: external

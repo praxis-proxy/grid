@@ -674,6 +674,7 @@ mod tests {
             ("a TLS dial verifying a grid name", "names a grid gateway", |config| {
                 dial_mut(config).transport = DialTransport::Tls {
                     ca_path: None,
+                    present_identity: false,
                     sni: "site-b.grid.internal.".to_owned(),
                 };
             }),
@@ -686,6 +687,7 @@ mod tests {
             ("a CA outside the backend CA mount", "outside", |config| {
                 dial_mut(config).transport = DialTransport::Tls {
                     ca_path: Some("/etc/praxis/tls/ca.crt".to_owned()),
+                    present_identity: false,
                     sni: "llama.models.svc".to_owned(),
                 };
             }),

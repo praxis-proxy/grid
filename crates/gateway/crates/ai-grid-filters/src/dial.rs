@@ -198,6 +198,14 @@ impl Dialed {
         self.credential.as_ref()
     }
 
+    /// Whether the server authenticates this site by its grid certificate.
+    pub(crate) fn identified(&self) -> bool {
+        self.upstream
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.client_cert().is_some())
+    }
+
     /// The dial's passive health.
     pub(crate) fn health(&self) -> &Arc<DialState> {
         &self.health
@@ -285,7 +293,7 @@ impl Dials {
 /// credentialed candidate, a mutual TLS dial to a name other than its site's, anything but grid
 /// mutual TLS off this site, a private IP literal trusted off this site, a provider hop dialed under
 /// a name other than the one it declares, a dial without the identity of the verified `load_balancer`
-/// cluster it shadows, a CA outside the backend CA mount, or peers presenting an identity mutual TLS dials do not.
+/// cluster it shadows, a CA outside the backend CA mount, or peers presenting an identity the presenting dials do not.
 ///
 /// # Errors
 ///
@@ -324,11 +332,8 @@ pub(crate) fn validate_dials(
             .into());
         }
     }
-    let mutual = dials
-        .dial
-        .values()
-        .any(|dial| matches!(dial.transport, DialTransport::MutualTls { .. }));
-    if mutual
+    let presented = dials.dial.values().any(|dial| dial.transport.presents_identity());
+    if presented
         && let Some(peer) = config.peers.iter().find(|peer| {
             [
                 peer.grid_ca_path.as_str(),
@@ -338,7 +343,7 @@ pub(crate) fn validate_dials(
         })
     {
         return Err(format!(
-            "grid: peer '{}' presents an identity other than the grid TLS mount every mutual TLS dial presents",
+            "grid: peer '{}' presents an identity other than the grid TLS mount every dial presenting it presents",
             peer.site
         )
         .into());
@@ -397,8 +402,20 @@ pub(crate) fn validate_dials(
 // ---------------------------------------------------------------------------
 
 /// Refuse a credential on a dial that is off this site or grid mutual TLS, or read outside the
-/// credential mount, and a base path that is not clean.
+/// credential mount, a base path that is not clean, and the grid identity presented to a grid name.
 fn validate_request_shape(cluster: &str, dial: &DialSpec, local: bool, binding: &Binding) -> Result<(), FilterError> {
+    // A certificate presented outside the hop rules never reaches another grid gateway.
+    if matches!(
+        dial.transport,
+        DialTransport::Tls {
+            present_identity: true,
+            ..
+        }
+    ) && (dial.transport.sni().is_some_and(certs::is_grid_name)
+        || certs::is_grid_name(grid_client::address_host(&dial.address)))
+    {
+        return Err(format!("grid: dial for cluster '{cluster}' presents the grid identity to a grid gateway").into());
+    }
     if let Some(credential) = &dial.credential {
         if !local || matches!(dial.transport, DialTransport::MutualTls { .. }) {
             return Err(format!("grid: dial for cluster '{cluster}' would send a credential off this site").into());
@@ -465,22 +482,31 @@ fn tls(transport: &DialTransport, identity: &GridIdentity) -> Option<ClusterTls>
     match transport {
         DialTransport::MutualTls { sni } => Some(ClusterTls {
             ca: Some(ca(&identity.ca)),
-            client_cert: Some(CertKeyPair {
-                cert_path: identity.cert.clone(),
-                default: false,
-                key_path: identity.key.clone(),
-                server_names: Vec::new(),
-            }),
+            client_cert: Some(client_cert(identity)),
             sni: Some(sni.clone()),
             verify: true,
         }),
-        DialTransport::Tls { ca_path, sni } => Some(ClusterTls {
+        DialTransport::Tls {
+            ca_path,
+            present_identity,
+            sni,
+        } => Some(ClusterTls {
             ca: ca_path.as_ref().map(ca),
-            client_cert: None,
+            client_cert: present_identity.then(|| client_cert(identity)),
             sni: Some(sni.clone()),
             verify: true,
         }),
         DialTransport::Plaintext => None,
+    }
+}
+
+/// The certificate and key `identity` presents.
+fn client_cert(identity: &GridIdentity) -> CertKeyPair {
+    CertKeyPair {
+        cert_path: identity.cert.clone(),
+        default: false,
+        key_path: identity.key.clone(),
+        server_names: Vec::new(),
     }
 }
 
@@ -565,6 +591,7 @@ mod tests {
         let mut backend = spec("local", tls("granite.models.svc"), true);
         backend.transport = DialTransport::Tls {
             ca_path: Some(format!("{BACKEND_CA_BASE}/models-ca/ca.crt")),
+            present_identity: false,
             sni: "granite.models.svc".to_owned(),
         };
         let config = config(&[
@@ -710,6 +737,7 @@ mod tests {
             let mut dial = spec("local", tls("granite.models.svc"), true);
             dial.transport = DialTransport::Tls {
                 ca_path: Some(ca_path.to_owned()),
+                present_identity: false,
                 sni: "granite.models.svc".to_owned(),
             };
             config(&[("local-tls", dial)])
@@ -942,6 +970,104 @@ mod tests {
     }
 
     #[test]
+    fn a_local_tls_dial_presents_the_present_identity_only_when_told() {
+        let dir = pem_dir("identified");
+        let identity = dir.identity();
+        let server_only = |present_identity| DialTransport::Tls {
+            ca_path: Some(identity.ca.clone()),
+            present_identity,
+            sni: "serving.models.svc".to_owned(),
+        };
+        let dials = Dials::build(
+            &config(&[
+                ("anonymous", spec("local", server_only(false), true)),
+                ("identified", spec("local", server_only(true), true)),
+            ])
+            .dial,
+            &InsecureOptions::default(),
+            &identity,
+            &DialHealth::default(),
+        );
+        let tls = |cluster: &str| {
+            let built = dials.get(cluster).expect("the dial is built");
+            built.upstream().tls.clone().expect("TLS")
+        };
+        assert!(tls("anonymous").client_cert().is_none(), "server-only by default");
+        let identified = tls("identified");
+        assert!(
+            identified.client_cert().is_some(),
+            "this site's certificate is presented"
+        );
+        assert_eq!(
+            identified.sni(),
+            Some("serving.models.svc"),
+            "the server keeps its own name"
+        );
+        assert!(identified.verify(), "verification is always on");
+        assert!(dials.get("identified").expect("built").identified());
+        assert!(!dials.get("anonymous").expect("built").identified());
+    }
+
+    #[test]
+    fn the_identity_flag_parses_and_a_dial_file_without_it_presents_nothing() {
+        let parse = |transport: &str| serde_json::from_str::<DialTransport>(transport).expect("parses");
+        assert_eq!(
+            parse(r#"{"mode":"tls","sni":"a","present_identity":true}"#),
+            DialTransport::Tls {
+                ca_path: None,
+                present_identity: true,
+                sni: "a".to_owned(),
+            }
+        );
+        assert_eq!(parse(r#"{"mode":"tls","sni":"a"}"#), tls("a"));
+    }
+
+    #[test]
+    fn a_tls_dial_presenting_the_identity_is_local_and_binds_the_mounted_one() {
+        let identified = DialTransport::Tls {
+            ca_path: None,
+            present_identity: true,
+            sni: "serving.models.svc".to_owned(),
+        };
+        let local = config(&[("local-plain", spec("local", identified.clone(), true))]);
+        validate_dials(&local.serving, &local.dial, &Binding::default()).expect("a local dial may present it");
+        assert!(
+            refused(&config(&[("east", spec("east", identified, false))]))
+                .contains("leaves this site without grid mutual TLS"),
+            "the flag never takes a server-only dial off this site"
+        );
+        for (sni, address) in [
+            ("east.grid.internal", "serving.models.svc:8443"),
+            ("serving.models.svc", "east.grid.internal:8443"),
+        ] {
+            let mut hop = spec("local", DialTransport::Plaintext, true);
+            hop.address = address.to_owned();
+            hop.transport = DialTransport::Tls {
+                ca_path: None,
+                present_identity: true,
+                sni: sni.to_owned(),
+            };
+            assert!(
+                refused(&config(&[("local-plain", hop)])).contains("presents the grid identity to a grid gateway"),
+                "{sni} at {address} is a hop, which only mutual TLS makes"
+            );
+        }
+        let mounted = GridIdentity::default();
+        let mut other = local;
+        other.serving.peers = vec![
+            serde_yaml::from_str(&format!(
+                "{{site: east, addr: 'east.example.com:9443', server_name: east.grid.internal, authority: east.grid.internal, grid_ca_path: /etc/other/ca.crt, client_cert_path: {}, client_key_path: {}}}",
+                mounted.cert, mounted.key
+            ))
+            .expect("a peer"),
+        ];
+        assert!(
+            refused(&other).contains("presents an identity other than the grid TLS mount"),
+            "the dial presents the mount, so the peers must too"
+        );
+    }
+
+    #[test]
     fn a_dial_naming_no_timeouts_gets_bounded_connects_and_long_reads() {
         let dials = build(
             &config(&[("local-plain", spec("local", DialTransport::Plaintext, true))]).dial,
@@ -1116,6 +1242,7 @@ mod tests {
     fn tls(sni: &str) -> DialTransport {
         DialTransport::Tls {
             ca_path: None,
+            present_identity: false,
             sni: sni.to_owned(),
         }
     }

@@ -60,7 +60,7 @@ deployments must use a Praxis AI image that includes `credential_inject`.
 | `service_account` | Extension point | Kubernetes service-account token injection when implemented. |
 | `sigv4` | Extension point | Per-request signing when implemented. |
 | `oauth2` | Extension point | Refresh-on-expiry token handling when implemented. |
-| `mtls_only` | Extension point | No HTTP credential injection; authentication is certificate-based. |
+| `mtls_only` | Implemented for a derived local `https` endpoint | No HTTP credential injection. The gateway presents its grid certificate on the dial and drops the caller's credentials. |
 
 ## Implemented request path
 
