@@ -1270,6 +1270,25 @@ mod tests {
     }
 
     #[test]
+    fn the_identity_flag_is_written_only_when_set_in_the_shape_the_gateway_parses() {
+        let tls = |present_identity| DialTransport::Tls {
+            ca_path: None,
+            present_identity,
+            sni: "serving.models.svc".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_value(tls(true)).expect("json"),
+            serde_json::json!({ "mode": "tls", "present_identity": true, "sni": "serving.models.svc" }),
+            "the gateway reads present_identity beside mode and sni"
+        );
+        assert_eq!(
+            serde_json::to_value(tls(false)).expect("json"),
+            serde_json::json!({ "mode": "tls", "sni": "serving.models.svc" }),
+            "an anonymous dial renders as before, so an older gateway reads it unchanged"
+        );
+    }
+
+    #[test]
     fn a_dial_the_gateway_would_refuse_is_dropped_alone() {
         let mut remote = cand("llama", "site-b", "pool-b", None);
         remote.stable_id = Some("id-b".to_owned());

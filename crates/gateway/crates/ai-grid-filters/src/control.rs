@@ -2462,6 +2462,52 @@ mod tests {
     }
 
     #[test]
+    fn a_local_tls_dial_presenting_the_identity_follows_a_rotated_identity() {
+        let dir = temp_dir("rotated-local");
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let first = write_identity(&dir, &ca);
+        let mut config = config(&["local"]);
+        config.peers.clear();
+        let mut dial = DialConfig::default();
+        dial.dial.insert(
+            "pool-local".to_owned(),
+            dial_spec(
+                "local",
+                DialTransport::Tls {
+                    ca_path: None,
+                    present_identity: true,
+                    sni: "serving.models.svc".to_owned(),
+                },
+            ),
+        );
+        let mut control = dial_control(&config, &dir);
+        control.apply_joined(&config, &dial).expect("applies");
+        let snapshot = control.snapshot();
+        let leaf = |pem: &str| {
+            rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes())
+                .next()
+                .expect("a leaf")
+                .expect("parses")
+                .to_vec()
+        };
+        assert_eq!(
+            presented(&snapshot.load(), "pool-local"),
+            Some(leaf(&first)),
+            "a server TLS dial told to present the identity presents this site's leaf"
+        );
+
+        let renewed = write_identity(&dir, &ca);
+        let control = Mutex::new(control);
+        renew_identity(&control, &WatchCounts::default());
+        assert_eq!(
+            presented(&snapshot.load(), "pool-local"),
+            Some(leaf(&renewed)),
+            "with no mutual TLS dial in the file, the identity is still watched and the renewed leaf presented"
+        );
+        let _cleaned = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_dial_violating_a_trust_rule_keeps_the_last_good_config() {
         let dir = temp_dir("violation");
         write_identity(&dir, &certs::generate_ca("grid-ca").expect("ca"));
