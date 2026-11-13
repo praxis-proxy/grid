@@ -303,18 +303,27 @@ echo "== no enrollment anywhere =="
 # The claim the mode rests on: nothing enrolls, no signer is named, and SWIM does not run.
 # assert_no_enrollment <site>...
 assert_no_enrollment() {
-  local site config
+  local site config deployments swim
   for site in "$@"; do
-    if k "${site}" get deployments -A -o name 2>/dev/null | grep -q grid-enrollment; then
+    # A failed query proves nothing absent, so it fails the check and keeps kubectl's error.
+    if ! deployments=$(k "${site}" get deployments -A -o name); then
+      fail "${site}: cannot list Deployments to look for grid-enrollment"
+    elif grep -q grid-enrollment <<<"${deployments}"; then
       fail "${site}: a grid-enrollment Deployment is installed"
     else
       pass "${site}: no grid-enrollment Deployment in the cluster"
     fi
     # Without enrollment values the chart renders no operator config, which names no signer either.
-    config=$(ns "${site}" get configmap grid-operator-config --ignore-not-found -o jsonpath='{.data.config\.yaml}')
-    grep -q signerEndpoint <<<"${config}" && fail "${site}: the operator config names a signer" \
-      || pass "${site}: the operator config names no signer"
-    if ns "${site}" get svc grid-operator-swim >/dev/null 2>&1; then
+    if ! config=$(ns "${site}" get configmap grid-operator-config --ignore-not-found -o jsonpath='{.data.config\.yaml}'); then
+      fail "${site}: cannot read the operator config"
+    elif grep -q signerEndpoint <<<"${config}"; then
+      fail "${site}: the operator config names a signer"
+    else
+      pass "${site}: the operator config names no signer"
+    fi
+    if ! swim=$(ns "${site}" get svc grid-operator-swim --ignore-not-found -o name); then
+      fail "${site}: cannot read the SWIM Service"
+    elif [[ -n ${swim} ]]; then
       fail "${site}: a SWIM Service renders under Local membership"
     else
       pass "${site}: no SWIM Service under Local membership"
@@ -362,25 +371,30 @@ hold_identity() {
 }
 
 # read_catalog <reader> <member>: the status <member> answers <reader> with, then one
-# "provider model" line per model it offers, sorted.
+# "provider model" line per model it offers, sorted. A failed request returns curl's exit
+# status, and a 200 whose body is not a providers catalog returns 97.
 read_catalog() {
-  local reader=$1 member=$2 port=${ENDPOINT[$2]##*:} body status
+  local reader=$1 member=$2 port=${ENDPOINT[$2]##*:} body status models
   body=$(node "${reader}" curl -sS -m 10 --cacert /tmp/reader-ca.crt \
     --cert /tmp/reader-tls.crt --key /tmp/reader-tls.key \
     --resolve "${member}.grid.internal:${port}:${ENDPOINT[${member}]%%:*}" \
-    -w '\n%{http_code}' "https://${member}.grid.internal:${port}/v1/site/providers") || return 1
+    -w '\n%{http_code}' "https://${member}.grid.internal:${port}/v1/site/providers") || return
   status=${body##*$'\n'}
   echo "${status}"
   [[ ${status} == 200 ]] || return 0
-  jq -r '.providers[] | .providerId as $p | .models[] | "\($p) \(.)"' <<<"${body%$'\n'*}" | sort
+  models=$(jq -r 'if (.providers | type) == "array"
+    then .providers[] | .providerId as $p | .models[] | "\($p) \(.)"
+    else error("no providers array") end' <<<"${body%$'\n'*}") || return 97
+  [[ -z ${models} ]] || sort <<<"${models}"
 }
 
 # reads <reader> <member> <status> [<provider model>...]: <member> answers <reader> with
 # exactly this status and exactly these models, no more and no fewer.
 reads() {
-  local reader=$1 member=$2 want
+  local reader=$1 member=$2 want got
   want=$(printf '%s\n' "$3"; shift 3; (( $# == 0 )) || printf '%s\n' "$@" | sort)
-  [[ $(read_catalog "${reader}" "${member}") == "${want}" ]]
+  got=$(read_catalog "${reader}" "${member}") || return 1
+  [[ ${got} == "${want}" ]]
 }
 
 # assert_reads <reader> <member> <what> <status> [<provider model>...]
@@ -391,12 +405,18 @@ assert_reads() {
     || note "${reader} read from ${member}: $(read_catalog "${reader}" "${member}" | tr '\n' ',' || true)"
 }
 
-# refused <reader> <member>: <member> serves <reader> no catalog. It ends the handshake or
-# answers 403, whichever its listener has reached; either way nothing is read.
+# refused <reader> <member>: <member> serves <reader> no catalog. It ends the TLS handshake
+# (curl 35, or 56 when TLS 1.3 rejects the client certificate after the handshake) or
+# answers 403, whichever its listener has reached. A timeout, a refused connection, a
+# malformed 200 or any other status is not a refusal.
 refused() {
-  local out
-  out=$(read_catalog "$1" "$2" 2>/dev/null) || return 0
-  [[ ${out%%$'\n'*} != 200 ]]
+  local out rc=0
+  out=$(read_catalog "$1" "$2" 2>/dev/null) || rc=$?
+  case ${rc} in
+    0) [[ ${out%%$'\n'*} == 403 ]] ;;
+    35 | 56) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # offer <site> <provider> <model>...: <site> declares a provider serving exactly these models.
