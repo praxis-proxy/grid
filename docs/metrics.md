@@ -83,8 +83,14 @@ is described in [Polling Cross-Site Load Signals](architecture/polling-metrics.m
 | `grid_peer_signals_reachable` | gauge | `peer` | 1 while the peer's `SignalsReachable` condition is True. It holds through three unanswered rounds, as the condition does, so alert on this one to agree with the status. |
 | `grid_peer_last_success_timestamp_seconds` | gauge | `peer` | Unix time of the last successful poll of this peer. |
 | `grid_peer_catalog_total` | counter | `peer`, `outcome` | Reads of the peer's providers catalog: `replaced` when a catalog landed, `failed` when the read did not. |
+| `grid_peer_model_catalog_rejected_total` | counter | `reason` | Invalid lists. |
 | `grid_peer_catalog_refused` | gauge | `peer` | 1 while the peer's last admission refused its catalog, which its `CatalogAccepted` condition reads False. |
 | `grid_peer_catalog_cut` | gauge | `peer` | 1 while part of the peer's catalog waits past this site's share of the overlay ceiling. |
+
+`grid_peer_model_catalog_rejected_total` counts provider-record conversion
+attempts rejected for `blank`, `too_long`, `control_char`, `duplicate`, or
+`too_many` model names. Repeated admissions of the same invalid record count
+again. Its only label is the bounded reason; it has no model-name labels.
 
 Every series labelled `peer` is removed once the peer leaves the roster, so a renamed or
 deleted site does not keep stale series alive until restart.
