@@ -477,6 +477,7 @@ mod tests {
             ("a grid SNI", |dial| {
                 dial.transport = DialTransport::Tls {
                     ca_path: None,
+                    present_identity: false,
                     sni: "site-b.Grid.Internal.".to_owned(),
                 };
             }),
@@ -489,12 +490,14 @@ mod tests {
             ("a CA outside the mount", |dial| {
                 dial.transport = DialTransport::Tls {
                     ca_path: Some("/etc/praxis/tls/ca.crt".to_owned()),
+                    present_identity: false,
                     sni: "llama.models.svc".to_owned(),
                 };
             }),
             ("a CA climbing out of the mount", |dial| {
                 dial.transport = DialTransport::Tls {
                     ca_path: Some("/run/secrets/grid-backend-ca/../x/ca.crt".to_owned()),
+                    present_identity: false,
                     sni: "llama.models.svc".to_owned(),
                 };
             }),
@@ -534,6 +537,7 @@ mod tests {
         granite.address = "granite.models.svc.cluster.local:8443".to_owned();
         granite.transport = DialTransport::Tls {
             ca_path: Some("/run/secrets/grid-backend-ca/models-ca/ca.crt".to_owned()),
+            present_identity: false,
             sni: "granite.models.svc".to_owned(),
         };
         let dials = BTreeMap::from([

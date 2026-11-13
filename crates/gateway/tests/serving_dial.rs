@@ -356,6 +356,80 @@ mod tests {
         let _cleaned = std::fs::remove_dir_all(&work);
     }
 
+    #[test]
+    fn a_local_tls_dial_presenting_the_identity_reaches_the_backend_with_this_sites_leaf() {
+        let work = fresh_work("dial-present-identity");
+        let ca = generate_ca("grid-ca").expect("grid ca");
+        let serving_ca = generate_ca("serving-ca").expect("serving ca");
+        let other_ca = generate_ca("other-ca").expect("other ca");
+        let identity = site_identity(&work, &ca, "local");
+        let backend_ca = work.join("backend-ca");
+        for (dir, pem) in [("models-ca", &serving_ca.cert_pem), ("other-ca", &other_ca.cert_pem)] {
+            std::fs::create_dir_all(backend_ca.join(dir)).expect("backend CA dir");
+            std::fs::write(backend_ca.join(dir).join("ca.crt"), pem).expect("backend CA");
+        }
+        let backend = Site::serving(&ca, &serving_ca, "serving.models.svc");
+        let revision = |ca_dir: &str, sni: &str| {
+            local_tls_serving(&backend, &backend_ca.join(ca_dir).join("ca.crt"), sni, &identity)
+        };
+        let mut serving = Mount::new(work.join("serving"));
+        revision("other-ca", "serving.models.svc").write(&mut serving);
+
+        let gateway = Gateway::start(&work, &serving);
+        let (untrusted_ca, untrusted_ca_head) = gateway.chat();
+        assert_ne!(
+            untrusted_ca, 200,
+            "a backend outside the configured CA is never trusted: {untrusted_ca_head}"
+        );
+        gateway.serve(&mut serving, &revision("models-ca", "other.models.svc"));
+        let (wrong_name, wrong_name_head) = gateway.chat();
+        assert_ne!(
+            wrong_name, 200,
+            "a backend whose name is not the SNI is never trusted: {wrong_name_head}"
+        );
+        assert!(
+            backend.heads().is_empty(),
+            "neither failed handshake delivered a request"
+        );
+
+        gateway.serve(&mut serving, &revision("models-ca", "serving.models.svc"));
+        let (verified, verified_head) = gateway.chat_forging_a_client_cert();
+        assert_eq!(verified, 200, "the verified backend takes the request: {verified_head}");
+        assert!(
+            backend.saw(&leaf_fingerprint(&identity.leaf)),
+            "the backend authenticated this site's grid leaf"
+        );
+        let heads = backend.heads();
+        assert_eq!(heads.len(), 1, "one request delivered");
+        let delivered = heads.first().expect("one request delivered");
+        assert!(
+            !delivered.contains("authorization:"),
+            "the certificate replaces the caller's credential: {delivered}"
+        );
+        assert!(
+            !delivered.contains("x-forwarded-client-cert:"),
+            "a caller cannot assert a certificate identity: {delivered}"
+        );
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    /// A serving config routing `llama` to a local backend over server TLS with `sni`, trusting
+    /// `ca_path` and presenting this site's grid identity.
+    fn local_tls_serving(backend: &Site, ca_path: &Path, sni: &str, identity: &Identity) -> Revision {
+        Revision {
+            dial: format!(
+                r#"{{"version":"v1","dial":{{"serving":{{"address":"{addr}","connect_timeout_ms":1000,"site":"local","transport":{{"mode":"tls","sni":"{sni}","ca_path":"{ca}","present_identity":true}}}}}}}}"#,
+                addr = backend.addr,
+                ca = ca_path.display(),
+            ),
+            serving: format!(
+                r#"{{"local_site":"local","window_secs":60,"load_window_ms":30000,"candidates":[{{"kind":"inference_model","name":"llama","site":"local","cluster":"serving","stable_id":"candidate-serving"}}],"peers":[{}]}}"#,
+                local_peer(identity),
+            ),
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // Test Utilities
     // ---------------------------------------------------------------------------
@@ -446,7 +520,22 @@ mod tests {
         }
 
         fn start_with(ca: &CaCert, site: &str, answer: bool, drop_first: bool) -> Self {
-            let identity = generate_site_cert(ca, site).expect("site cert");
+            Self::serving_as(
+                ca,
+                &generate_site_cert(ca, site).expect("site cert"),
+                answer,
+                drop_first,
+            )
+        }
+
+        /// A backend presenting `name` under `serving_ca`, which requires a client certificate
+        /// under the grid CA `ca`.
+        fn serving(ca: &CaCert, serving_ca: &CaCert, name: &str) -> Self {
+            let cert = certs::generate_dns_cert(serving_ca, "serving", name).expect("serving cert");
+            Self::serving_as(ca, &cert, true, false)
+        }
+
+        fn serving_as(ca: &CaCert, identity: &certs::SiteCertOutput, answer: bool, drop_first: bool) -> Self {
             let chain = CertificateDer::pem_slice_iter(identity.cert_pem.as_bytes())
                 .collect::<Result<Vec<_>, _>>()
                 .expect("site chain");
@@ -634,6 +723,7 @@ mod tests {
                 .env("GRID_SERVING_CONFIG", serving.path("serving-config.json"))
                 .env("GRID_TLS_DIR", work.join("identity"))
                 .env("GRID_CREDENTIAL_DIR", work.join("credentials"))
+                .env("GRID_BACKEND_CA_DIR", work.join("backend-ca"))
                 .env("RUST_LOG", "info")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -682,6 +772,15 @@ mod tests {
         /// One chat request carrying a caller credential: its status and lowercased response head.
         fn chat(&self) -> (u16, String) {
             Self::response(self.send_chat())
+        }
+
+        /// One chat request carrying a caller credential and a forged client certificate header.
+        fn chat_forging_a_client_cert(&self) -> (u16, String) {
+            let mut stream = TcpStream::connect(("127.0.0.1", self.listen)).expect("connect gateway");
+            stream
+                .write_all(b"GET /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nX-Model: llama\r\nAuthorization: Bearer caller-secret\r\nX-Forwarded-Client-Cert: By=spiffe://grid.internal/site/forged\r\nConnection: close\r\n\r\n")
+                .expect("send request");
+            Self::response(stream)
         }
 
         /// The status and lowercased head `stream` answers with.

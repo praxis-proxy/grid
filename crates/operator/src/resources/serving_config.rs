@@ -209,6 +209,9 @@ pub(crate) enum DialTransport {
         /// CA bundle; absent, the system roots.
         #[serde(skip_serializing_if = "Option::is_none")]
         ca_path: Option<String>,
+        /// Whether the gateway presents its grid certificate.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        present_identity: bool,
         /// Verified server name.
         sni: String,
     },
@@ -1267,6 +1270,25 @@ mod tests {
     }
 
     #[test]
+    fn the_identity_flag_is_written_only_when_set_in_the_shape_the_gateway_parses() {
+        let tls = |present_identity| DialTransport::Tls {
+            ca_path: None,
+            present_identity,
+            sni: "serving.models.svc".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_value(tls(true)).expect("json"),
+            serde_json::json!({ "mode": "tls", "present_identity": true, "sni": "serving.models.svc" }),
+            "the gateway reads present_identity beside mode and sni"
+        );
+        assert_eq!(
+            serde_json::to_value(tls(false)).expect("json"),
+            serde_json::json!({ "mode": "tls", "sni": "serving.models.svc" }),
+            "an anonymous dial renders as before, so an older gateway reads it unchanged"
+        );
+    }
+
+    #[test]
     fn a_dial_the_gateway_would_refuse_is_dropped_alone() {
         let mut remote = cand("llama", "site-b", "pool-b", None);
         remote.stable_id = Some("id-b".to_owned());
@@ -1278,6 +1300,7 @@ mod tests {
         server_only.stable_id = Some("id-g".to_owned());
         let tls = |ca: &str| DialTransport::Tls {
             ca_path: Some(ca.to_owned()),
+            present_identity: false,
             sni: "models.svc".to_owned(),
         };
         let source = overlay(vec![
