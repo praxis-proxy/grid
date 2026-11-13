@@ -61,7 +61,6 @@ use crate::{
     swim_runtime::{PeerPins, SwimHandle},
 };
 
-
 // ---------------------------------------------------------------------------
 // Operator context
 // ---------------------------------------------------------------------------
@@ -1812,7 +1811,6 @@ async fn publish_signed_site_cert(
         tracing::warn!(network = name, %error, "failed to publish site cert broadcast");
     }
 }
-
 
 /// Collect the currently verified peer certificates as a complete trust snapshot.
 ///
@@ -3885,6 +3883,12 @@ fn gateway_dials(
         .iter()
         .map(|(cluster, entry)| (cluster.clone(), entry.endpoint_path.clone()))
         .collect();
+    let identified: BTreeSet<String> = resolution
+        .resolved
+        .iter()
+        .filter(|(_, entry)| entry.present_identity)
+        .map(|(cluster, _)| cluster.clone())
+        .collect();
     let endpoints: Vec<ClusterEndpointConfig> = resolution.resolved.into_values().map(|entry| entry.endpoint).collect();
     let sites: BTreeMap<&str, &str> = overlay
         .candidates
@@ -3895,6 +3899,9 @@ fn gateway_dials(
     let (mut dials, unrendered) = consumer_config::dial_specs(&endpoints, &sites, &overlay.local_site);
     refused.extend(unrendered.iter().map(|(cluster, error)| format!("{cluster}: {error}")));
     dials.retain(|cluster, dial| {
+        if let serving_config::DialTransport::Tls { present_identity, .. } = &mut dial.transport {
+            *present_identity = identified.contains(cluster);
+        }
         let path = paths.get(cluster).and_then(Option::as_deref);
         match dial_request_shape(cluster, dial, path, overlay, gw_ref) {
             Ok((base_path, credential)) => {

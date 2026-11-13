@@ -831,10 +831,7 @@ fn identity_digest(
     identity: &GridIdentity,
     affinity: &AffinitySettings,
 ) -> [u8; 32] {
-    let mutual = dial
-        .dial
-        .values()
-        .any(|dial| matches!(dial.transport, DialTransport::MutualTls { .. }));
+    let presented = dial.dial.values().any(|dial| dial.transport.presents_identity());
     let paths: BTreeSet<&str> = config
         .peers
         .iter()
@@ -847,7 +844,7 @@ fn identity_digest(
                 .values()
                 .filter_map(|dial| dial.credential.as_ref().map(|credential| credential.path.as_str())),
         )
-        .chain(mutual.then(|| identity.paths()).into_iter().flatten())
+        .chain(presented.then(|| identity.paths()).into_iter().flatten())
         // A rotated tag key re-applies the config like a renewed certificate.
         .chain(affinity.tag_key_path.as_deref())
         .collect();
@@ -2598,6 +2595,7 @@ mod tests {
             "local-tls",
             DialTransport::Tls {
                 ca_path: None,
+                present_identity: false,
                 sni: "models.local.example.com".to_owned(),
             },
         );
@@ -2615,6 +2613,7 @@ mod tests {
                 "east",
                 DialTransport::Tls {
                     ca_path: None,
+                    present_identity: false,
                     sni: "east.example.com".to_owned(),
                 },
             ),

@@ -209,6 +209,9 @@ pub(crate) enum DialTransport {
         /// CA bundle; absent, the system roots.
         #[serde(skip_serializing_if = "Option::is_none")]
         ca_path: Option<String>,
+        /// Whether the gateway presents its grid certificate.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        present_identity: bool,
         /// Verified server name.
         sni: String,
     },
@@ -1278,6 +1281,7 @@ mod tests {
         server_only.stable_id = Some("id-g".to_owned());
         let tls = |ca: &str| DialTransport::Tls {
             ca_path: Some(ca.to_owned()),
+            present_identity: false,
             sni: "models.svc".to_owned(),
         };
         let source = overlay(vec![
