@@ -254,6 +254,59 @@ tests:
         ca.crt: '{{hub fromSecret "grid-trust" "provided-trust" "ca.crt" hub}}'
     template: templates/enrollment/identity-policy.yaml
     documentIndex: 3
+- it: delivers a trust bundle copy to each named namespace
+  set:
+    mode: external
+    external.sites.site-a.secretName: provided-site-a
+    external.sites.site-a.cluster: managed-a
+    external.trustBundleSecretRef: provided-trust
+    external.delivery.enabled: true
+    external.delivery.namespace: grid-system
+    external.delivery.trustBundleCopies:
+    - namespace: ingress
+      secretName: serving-tls-cacert
+      key: cacert
+    - namespace: other
+      secretName: grid-trust
+  asserts:
+  - lengthEqual:
+      path: spec.policy-templates[0].objectDefinition.spec.object-templates
+      count: 5
+    template: templates/enrollment/identity-policy.yaml
+    documentIndex: 3
+  - equal:
+      path: spec.policy-templates[0].objectDefinition.spec.object-templates[3].objectDefinition
+      value:
+        apiVersion: v1
+        kind: Secret
+        type: Opaque
+        metadata:
+          name: serving-tls-cacert
+          namespace: ingress
+        data:
+          cacert: '{{hub fromSecret "grid-trust" "provided-trust" "ca.crt" hub}}'
+    template: templates/enrollment/identity-policy.yaml
+    documentIndex: 3
+  - equal:
+      path: spec.policy-templates[0].objectDefinition.spec.object-templates[4].objectDefinition.data
+      value:
+        ca.crt: '{{hub fromSecret "grid-trust" "provided-trust" "ca.crt" hub}}'
+    template: templates/enrollment/identity-policy.yaml
+    documentIndex: 3
+- it: delivers no trust bundle copy unless one is named
+  set:
+    mode: external
+    external.sites.site-a.secretName: provided-site-a
+    external.sites.site-a.cluster: managed-a
+    external.trustBundleSecretRef: provided-trust
+    external.delivery.enabled: true
+    external.delivery.namespace: grid-system
+  asserts:
+  - lengthEqual:
+      path: spec.policy-templates[0].objectDefinition.spec.object-templates
+      count: 3
+    template: templates/enrollment/identity-policy.yaml
+    documentIndex: 3
 - it: delivers only the public certificate from a chart configured CA
   set:
     mode: external

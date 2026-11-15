@@ -52,7 +52,7 @@ const PROVIDER_HOP_REQUEST_ID_HEADER: &str = "x-ai-routing-request-id";
 const OVERLAY_REVISION_HEADER: &str = "x-ai-routing-revision";
 /// The caller's credentials, which never leave this site: another site authorizes the hop by
 /// its mutual TLS peer and candidate, so a caller's token would only leak.
-const CALLER_CREDENTIAL_HEADERS: [http::header::HeaderName; 10] = [
+const CALLER_CREDENTIAL_HEADERS: [http::header::HeaderName; 11] = [
     http::header::AUTHORIZATION,
     http::header::PROXY_AUTHORIZATION,
     http::header::COOKIE,
@@ -63,6 +63,8 @@ const CALLER_CREDENTIAL_HEADERS: [http::header::HeaderName; 10] = [
     http::header::HeaderName::from_static("x-amz-security-token"),
     http::header::HeaderName::from_static("x-auth-token"),
     http::header::HeaderName::from_static("x-access-token"),
+    // A certificate identity only the receiving proxy may assert.
+    http::header::HeaderName::from_static("x-forwarded-client-cert"),
 ];
 /// Query parameters that carry a caller's credential, stripped from a request that leaves this
 /// site for the same reason as the headers; every other parameter is kept as sent.
@@ -187,6 +189,11 @@ fn write_credentials(ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate
         strip_caller_credentials(ctx);
         ctx.request_headers_to_set
             .push((http::header::AUTHORIZATION, token.clone()));
+        return;
+    }
+    // The server authorizes this site's certificate, so the caller's token would only leak.
+    if candidate.dial.as_deref().is_some_and(crate::dial::Dialed::identified) {
+        strip_caller_credentials(ctx);
         return;
     }
     let Some(credential) = candidate.credential.as_ref() else {
@@ -3341,6 +3348,58 @@ pub(crate) mod tests {
             "this site's credential is never selected for another site"
         );
         assert_eq!(ctx.rewritten_path.as_deref(), Some("/v1/chat/completions?trace=1"));
+    }
+
+    #[tokio::test]
+    async fn a_local_dial_authenticated_by_certificate_sends_no_authorization() {
+        praxis_tls::provider::install();
+        let dir = std::env::temp_dir().join(format!("grid-route-identified-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test io");
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let leaf = certs::generate_site_cert(&ca, "local").expect("leaf");
+        let path = |name: &str, pem: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, pem).expect("test io");
+            path.to_string_lossy().into_owned()
+        };
+        let tls = praxis_tls::ClusterTls {
+            ca: None,
+            client_cert: Some(praxis_tls::CertKeyPair {
+                cert_path: path("tls.crt", &leaf.cert_pem),
+                default: false,
+                key_path: path("tls.key", &leaf.key_pem),
+                server_names: Vec::new(),
+            }),
+            sni: Some("serving.models.svc".to_owned()),
+            verify: true,
+        };
+        let upstream = praxis_core::connectivity::Upstream {
+            address: Arc::from("10.0.0.7:8443"),
+            authority: None,
+            base_path: None,
+            connection: Arc::default(),
+            tls: Some(praxis_tls::CachedClusterTls::try_from_config(&tls).expect("client certificate")),
+        };
+        let retry = Arc::new(praxis_core::config::RetryPolicy::legacy_default());
+        let mut candidates = dialed("local", "local-pool", None);
+        candidates[0].dial = Some(Arc::new(crate::dial::Dialed::new("local-pool", upstream, retry)));
+        let _cleaned = std::fs::remove_dir_all(&dir);
+        let filter = dial_filter(candidates, "local", Some(&[]));
+        let request = llama_request("/v1/chat/completions?key=caller");
+        let mut ctx = context(&request);
+        let action = filter.on_request(&mut ctx).await.expect("routes");
+        assert!(matches!(action, FilterAction::Continue), "routes");
+        assert!(
+            ctx.request_headers_to_remove.contains(&http::header::AUTHORIZATION),
+            "the caller's credential is never forwarded"
+        );
+        assert!(
+            ctx.request_headers_to_set
+                .iter()
+                .all(|(name, _)| name != http::header::AUTHORIZATION),
+            "and the certificate needs no token beside it"
+        );
+        assert_eq!(ctx.rewritten_path.as_deref(), Some("/v1/chat/completions"));
     }
 
     #[tokio::test]

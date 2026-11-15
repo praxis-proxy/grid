@@ -831,10 +831,7 @@ fn identity_digest(
     identity: &GridIdentity,
     affinity: &AffinitySettings,
 ) -> [u8; 32] {
-    let mutual = dial
-        .dial
-        .values()
-        .any(|dial| matches!(dial.transport, DialTransport::MutualTls { .. }));
+    let presented = dial.dial.values().any(|dial| dial.transport.presents_identity());
     let paths: BTreeSet<&str> = config
         .peers
         .iter()
@@ -847,7 +844,7 @@ fn identity_digest(
                 .values()
                 .filter_map(|dial| dial.credential.as_ref().map(|credential| credential.path.as_str())),
         )
-        .chain(mutual.then(|| identity.paths()).into_iter().flatten())
+        .chain(presented.then(|| identity.paths()).into_iter().flatten())
         // A rotated tag key re-applies the config like a renewed certificate.
         .chain(affinity.tag_key_path.as_deref())
         .collect();
@@ -2465,6 +2462,52 @@ mod tests {
     }
 
     #[test]
+    fn a_local_tls_dial_presenting_the_identity_follows_a_rotated_identity() {
+        let dir = temp_dir("rotated-local");
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let first = write_identity(&dir, &ca);
+        let mut config = config(&["local"]);
+        config.peers.clear();
+        let mut dial = DialConfig::default();
+        dial.dial.insert(
+            "pool-local".to_owned(),
+            dial_spec(
+                "local",
+                DialTransport::Tls {
+                    ca_path: None,
+                    present_identity: true,
+                    sni: "serving.models.svc".to_owned(),
+                },
+            ),
+        );
+        let mut control = dial_control(&config, &dir);
+        control.apply_joined(&config, &dial).expect("applies");
+        let snapshot = control.snapshot();
+        let leaf = |pem: &str| {
+            rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes())
+                .next()
+                .expect("a leaf")
+                .expect("parses")
+                .to_vec()
+        };
+        assert_eq!(
+            presented(&snapshot.load(), "pool-local"),
+            Some(leaf(&first)),
+            "a server TLS dial told to present the identity presents this site's leaf"
+        );
+
+        let renewed = write_identity(&dir, &ca);
+        let control = Mutex::new(control);
+        renew_identity(&control, &WatchCounts::default());
+        assert_eq!(
+            presented(&snapshot.load(), "pool-local"),
+            Some(leaf(&renewed)),
+            "with no mutual TLS dial in the file, the identity is still watched and the renewed leaf presented"
+        );
+        let _cleaned = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_dial_violating_a_trust_rule_keeps_the_last_good_config() {
         let dir = temp_dir("violation");
         write_identity(&dir, &certs::generate_ca("grid-ca").expect("ca"));
@@ -2598,6 +2641,7 @@ mod tests {
             "local-tls",
             DialTransport::Tls {
                 ca_path: None,
+                present_identity: false,
                 sni: "models.local.example.com".to_owned(),
             },
         );
@@ -2615,6 +2659,7 @@ mod tests {
                 "east",
                 DialTransport::Tls {
                     ca_path: None,
+                    present_identity: false,
                     sni: "east.example.com".to_owned(),
                 },
             ),

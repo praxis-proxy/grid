@@ -29,6 +29,16 @@ rules:
       - {{ . | quote }}
       {{- end }}
     verbs: ["get"]
+  # The endpoints controller wrote a v1 Endpoints object for each of these Services while it had
+  # a selector and leaves it when the selector goes; the holder deletes it, since the mirroring
+  # controller otherwise turns it into a slice beside the holder's. Named, so nothing else is.
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    resourceNames:
+      {{- range . }}
+      - {{ . | quote }}
+      {{- end }}
+    verbs: ["get", "delete"]
   # create and list to write the holder's EndpointSlice; delete for controller-managed
   # slices left when a Service loses its selector. A ValidatingAdmissionPolicy enforces
   # that the operator deletes only those on its own Services.
