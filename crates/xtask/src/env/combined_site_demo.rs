@@ -465,9 +465,9 @@ where
     clippy::disallowed_methods,
     reason = "Sleep is required for polling with timeout functionality"
 )]
-fn poll_until<F, T>(condition: F, timeout: Duration, interval: Duration) -> Result<T, Box<dyn std::error::Error>>
+fn poll_until<F, T>(mut condition: F, timeout: Duration, interval: Duration) -> Result<T, Box<dyn std::error::Error>>
 where
-    F: Fn() -> Result<Option<T>, Box<dyn std::error::Error>>,
+    F: FnMut() -> Result<Option<T>, Box<dyn std::error::Error>>,
 {
     let start = Instant::now();
 
@@ -3056,30 +3056,54 @@ fn assert_operator_restart_recovery() -> AssertionResult {
     for cluster in CLUSTERS {
         let context = format!("kind-grid-combined-{cluster}");
 
-        // Verify operator is ready before restart
-        let initial_output = Command::new("kubectl")
-            .args([
-                "get",
-                "deployment/grid-operator",
-                "--context",
-                &context,
-                "-n",
-                "grid-system",
-                "-o",
-                "jsonpath={.status.readyReplicas}",
-            ])
-            .output()?;
+        let before_deployment = match operator_deployment_snapshot(&context) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                observed_facts.insert(
+                    format!("{cluster}_initial_deployment_error"),
+                    serde_json::Value::String(error.to_string()),
+                );
+                all_recovered = false;
+                continue;
+            },
+        };
+        let before_pods = match operator_pod_snapshot(&context) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                observed_facts.insert(
+                    format!("{cluster}_initial_pod_query_error"),
+                    serde_json::Value::String(error.to_string()),
+                );
+                observed_facts.insert(
+                    format!("{cluster}_deployment_before_restart"),
+                    operator_deployment_summary(&before_deployment),
+                );
+                all_recovered = false;
+                continue;
+            },
+        };
+        observed_facts.insert(
+            format!("{cluster}_deployment_before_restart"),
+            operator_deployment_summary(&before_deployment),
+        );
+        observed_facts.insert(
+            format!("{cluster}_pods_before_restart"),
+            serde_json::Value::Array(before_pods.clone()),
+        );
 
-        let initially_ready =
-            initial_output.status.success() && String::from_utf8_lossy(&initial_output.stdout).trim() == "1";
+        let initially_ready = operator_deployment_ready(&before_deployment)
+            && before_pods.iter().any(operator_pod_is_ready)
+            && before_pods.iter().any(|pod| operator_pod_uid(pod).is_some());
+
+        observed_facts.insert(
+            format!("{cluster}_initially_ready"),
+            serde_json::Value::Bool(initially_ready),
+        );
 
         if !initially_ready {
-            observed_facts.insert(format!("{cluster}_initially_ready"), serde_json::Value::Bool(false));
             all_recovered = false;
             continue;
         }
-
-        let before = operator_pods(&context)?;
 
         // Restart the operator
         let restart_output = Command::new("kubectl")
@@ -3094,14 +3118,15 @@ fn assert_operator_restart_recovery() -> AssertionResult {
             ])
             .output()?;
 
+        record_command_output(&mut observed_facts, &format!("{cluster}_restart"), &restart_output);
+
         if !restart_output.status.success() {
             observed_facts.insert(format!("{cluster}_restart_initiated"), serde_json::Value::Bool(false));
             all_recovered = false;
             continue;
         }
 
-        // readyReplicas can still describe the old pod, so wait for the rollout and a new pod.
-        let rolled_out = Command::new("kubectl")
+        let rollout_output = Command::new("kubectl")
             .args([
                 "rollout",
                 "status",
@@ -3112,11 +3137,75 @@ fn assert_operator_restart_recovery() -> AssertionResult {
                 "grid-system",
                 "--timeout=90s",
             ])
-            .output()?
-            .status
-            .success();
-        let after = operator_pods(&context)?;
-        let deploy_recovered = rolled_out && !after.is_empty() && after.iter().all(|pod| !before.contains(pod));
+            .output()?;
+        record_command_output(
+            &mut observed_facts,
+            &format!("{cluster}_rollout_status"),
+            &rollout_output,
+        );
+        let rollout_succeeded = rollout_output.status.success();
+        observed_facts.insert(
+            format!("{cluster}_rollout_status_succeeded"),
+            serde_json::Value::Bool(rollout_succeeded),
+        );
+
+        let mut after_deployment = serde_json::Value::Null;
+        let mut after_pods = Vec::new();
+        let mut last_observation_error = None;
+        let state_converged = poll_until(
+            || {
+                let deployment = match operator_deployment_snapshot(&context) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        last_observation_error = Some(error.to_string());
+                        return Ok(None);
+                    },
+                };
+                let pods = match operator_pod_snapshot(&context) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        last_observation_error = Some(error.to_string());
+                        return Ok(None);
+                    },
+                };
+                after_deployment = deployment;
+                after_pods = pods;
+
+                Ok(operator_restart_state_converged(&before_pods, &after_pods).then_some(()))
+            },
+            Duration::from_secs(90),
+            Duration::from_secs(2),
+        )
+        .is_ok();
+
+        observed_facts.insert(
+            format!("{cluster}_deployment_after_restart"),
+            operator_deployment_summary(&after_deployment),
+        );
+        observed_facts.insert(
+            format!("{cluster}_pods_after_restart"),
+            serde_json::Value::Array(after_pods.clone()),
+        );
+        if let Some(error) = last_observation_error {
+            observed_facts.insert(
+                format!("{cluster}_last_state_query_error"),
+                serde_json::Value::String(safe_truncate_str(&error, 512)),
+            );
+        }
+
+        let deploy_recovered = rollout_succeeded && state_converged;
+        observed_facts.insert(
+            format!("{cluster}_new_ready_pod_observed"),
+            serde_json::Value::Bool(operator_has_new_ready_pod(&before_pods, &after_pods)),
+        );
+        observed_facts.insert(
+            format!("{cluster}_old_pods_terminated"),
+            serde_json::Value::Bool(operator_old_pods_terminated(&before_pods, &after_pods)),
+        );
+        observed_facts.insert(
+            format!("{cluster}_deployment_generation_ready"),
+            serde_json::Value::Bool(operator_deployment_ready(&after_deployment)),
+        );
 
         // Local has no connectedSites: the GridNetwork and both declared peers read Active. Those
         // phases can outlive the restart, so under Local this shows availability, not resumed polling.
@@ -3250,8 +3339,32 @@ fn assert_operator_restart_recovery() -> AssertionResult {
     }
 }
 
-/// Names of the operator pods in `context`, Running or not.
-fn operator_pods(context: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+/// Return a bounded summary of the Grid operator Deployment's generation and rollout conditions.
+fn operator_deployment_snapshot(context: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let out = Command::new("kubectl")
+        .args([
+            "get",
+            "deployment/grid-operator",
+            "--context",
+            context,
+            "-n",
+            "grid-system",
+            "-o",
+            "json",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "kubectl get deployment/grid-operator failed: {}",
+            safe_truncate_str(String::from_utf8_lossy(&out.stderr).trim(), 512)
+        )
+        .into());
+    }
+    Ok(serde_json::from_slice(&out.stdout)?)
+}
+
+/// Return identity, termination, phase, and readiness for every selected operator pod.
+fn operator_pod_snapshot(context: &str) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
     let out = Command::new("kubectl")
         .args([
             "get",
@@ -3261,16 +3374,194 @@ fn operator_pods(context: &str) -> Result<Vec<String>, Box<dyn std::error::Error
             "-n",
             "grid-system",
             "-l",
-            "app.kubernetes.io/name=grid-operator",
-            "--field-selector=status.phase=Running",
+            "app.kubernetes.io/name=grid-operator,app.kubernetes.io/instance=grid-operator",
             "-o",
-            "jsonpath={.items[*].metadata.name}",
+            "json",
         ])
         .output()?;
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect())
+    if !out.status.success() {
+        return Err(format!(
+            "kubectl get grid-operator pods failed: {}",
+            safe_truncate_str(String::from_utf8_lossy(&out.stderr).trim(), 512)
+        )
+        .into());
+    }
+
+    let response: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    let items = response
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("kubectl get grid-operator pods returned no items array")?;
+
+    Ok(items.iter().map(operator_pod_summary).collect())
+}
+
+/// Summarize a pod without including container environment values or other configuration.
+fn operator_pod_summary(pod: &serde_json::Value) -> serde_json::Value {
+    let metadata = pod.get("metadata");
+    let status = pod.get("status");
+    serde_json::json!({
+        "name": metadata.and_then(|value| value.get("name")).and_then(serde_json::Value::as_str),
+        "uid": metadata.and_then(|value| value.get("uid")).and_then(serde_json::Value::as_str),
+        "creation_timestamp": metadata.and_then(|value| value.get("creationTimestamp")).and_then(serde_json::Value::as_str),
+        "deletion_timestamp": metadata.and_then(|value| value.get("deletionTimestamp")).and_then(serde_json::Value::as_str),
+        "phase": status.and_then(|value| value.get("phase")).and_then(serde_json::Value::as_str),
+        "ready": operator_raw_pod_is_ready(pod),
+        "container_statuses": status.and_then(|value| value.get("containerStatuses")).cloned(),
+    })
+}
+
+/// Report Kubernetes readiness for an unmodified Pod API response.
+fn operator_raw_pod_is_ready(pod: &serde_json::Value) -> bool {
+    let Some(metadata) = pod.get("metadata") else {
+        return false;
+    };
+    let Some(status) = pod.get("status") else {
+        return false;
+    };
+    status.get("phase").and_then(serde_json::Value::as_str) == Some("Running")
+        && metadata.get("deletionTimestamp").is_none_or(serde_json::Value::is_null)
+        && status
+            .get("conditions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|conditions| {
+                conditions.iter().any(|condition| {
+                    condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
+                        && condition.get("status").and_then(serde_json::Value::as_str) == Some("True")
+                })
+            })
+}
+
+/// Summarize only the Deployment generation, replica counters, and conditions needed for diagnosis.
+fn operator_deployment_summary(deployment: &serde_json::Value) -> serde_json::Value {
+    let metadata = deployment.get("metadata");
+    let spec = deployment.get("spec");
+    let status = deployment.get("status");
+    let conditions = status
+        .and_then(|value| value.get("conditions"))
+        .and_then(serde_json::Value::as_array)
+        .map(|conditions| {
+            conditions
+                .iter()
+                .map(|condition| {
+                    serde_json::json!({
+                        "type": condition.get("type"),
+                        "status": condition.get("status"),
+                        "reason": condition.get("reason"),
+                        "message": condition.get("message"),
+                        "last_update_time": condition.get("lastUpdateTime"),
+                        "last_transition_time": condition.get("lastTransitionTime"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+    serde_json::json!({
+        "generation": metadata.and_then(|value| value.get("generation")),
+        "observed_generation": status.and_then(|value| value.get("observedGeneration")),
+        "desired_replicas": spec.and_then(|value| value.get("replicas")),
+        "replicas": status.and_then(|value| value.get("replicas")),
+        "updated_replicas": status.and_then(|value| value.get("updatedReplicas")),
+        "ready_replicas": status.and_then(|value| value.get("readyReplicas")),
+        "available_replicas": status.and_then(|value| value.get("availableReplicas")),
+        "conditions": conditions,
+    })
+}
+
+/// Report whether the selected Deployment has observed its current generation and all replicas are available.
+fn operator_deployment_ready(deployment: &serde_json::Value) -> bool {
+    let Some(metadata) = deployment.get("metadata") else {
+        return false;
+    };
+    let Some(spec) = deployment.get("spec") else {
+        return false;
+    };
+    let Some(status) = deployment.get("status") else {
+        return false;
+    };
+    let Some(generation) = metadata.get("generation").and_then(serde_json::Value::as_u64) else {
+        return false;
+    };
+    let desired = spec.get("replicas").and_then(serde_json::Value::as_u64).unwrap_or(1);
+    desired > 0
+        && status
+            .get("observedGeneration")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|observed| observed >= generation)
+        && status
+            .get("updatedReplicas")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|updated| updated >= desired)
+        && status
+            .get("readyReplicas")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|ready| ready >= desired)
+        && status
+            .get("availableReplicas")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|available| available >= desired)
+}
+
+/// Return the pod UID when Kubernetes supplied one.
+fn operator_pod_uid(pod: &serde_json::Value) -> Option<&str> {
+    pod.get("uid").and_then(serde_json::Value::as_str)
+}
+
+/// Report whether a pod is Running, Ready, and no longer terminating.
+fn operator_pod_is_ready(pod: &serde_json::Value) -> bool {
+    pod.get("phase").and_then(serde_json::Value::as_str) == Some("Running")
+        && pod.get("deletion_timestamp").is_none_or(serde_json::Value::is_null)
+        && pod.get("ready").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+/// Require a Ready pod with a new UID before declaring Deployment recovery.
+fn operator_has_new_ready_pod(before: &[serde_json::Value], after: &[serde_json::Value]) -> bool {
+    after.iter().any(|pod| {
+        operator_pod_is_ready(pod)
+            && operator_pod_uid(pod)
+                .is_some_and(|uid| before.iter().all(|previous| operator_pod_uid(previous) != Some(uid)))
+    })
+}
+
+/// Ignore completed pods because rollout restart does not remove them.
+fn operator_pod_is_terminal(pod: &serde_json::Value) -> bool {
+    matches!(
+        pod.get("phase").and_then(serde_json::Value::as_str),
+        Some("Succeeded" | "Failed")
+    )
+}
+
+/// Require all pre-restart nonterminal pod UIDs to disappear, including terminating pods.
+fn operator_old_pods_terminated(before: &[serde_json::Value], after: &[serde_json::Value]) -> bool {
+    let mut live = before.iter().filter(|pod| !operator_pod_is_terminal(pod)).peekable();
+    live.peek().is_some()
+        && live.all(|previous| {
+            operator_pod_uid(previous).is_some_and(|uid| after.iter().all(|pod| operator_pod_uid(pod) != Some(uid)))
+        })
+}
+
+/// Require a distinct Ready replacement pod and removal of all pre-restart live pods.
+fn operator_restart_state_converged(before: &[serde_json::Value], after: &[serde_json::Value]) -> bool {
+    operator_has_new_ready_pod(before, after) && operator_old_pods_terminated(before, after)
+}
+
+/// Record a command's exit code and bounded stdout/stderr in the proof evidence.
+fn record_command_output(
+    observed_facts: &mut BTreeMap<String, serde_json::Value>,
+    prefix: &str,
+    output: &std::process::Output,
+) {
+    observed_facts.insert(
+        format!("{prefix}_exit_code"),
+        serde_json::Value::Number(output.status.code().unwrap_or(-1).into()),
+    );
+    observed_facts.insert(
+        format!("{prefix}_stdout"),
+        serde_json::Value::String(safe_truncate_str(String::from_utf8_lossy(&output.stdout).trim(), 512)),
+    );
+    observed_facts.insert(
+        format!("{prefix}_stderr"),
+        serde_json::Value::String(safe_truncate_str(String::from_utf8_lossy(&output.stderr).trim(), 512)),
+    );
 }
 
 /// Assert post-recovery soak period validates stability.
@@ -8368,6 +8659,194 @@ mod tests {
     fn cluster_constants() {
         assert_eq!(CLUSTERS.len(), 3);
         assert_eq!(CLUSTERS, &["west", "central", "east"]);
+    }
+
+    #[test]
+    fn restart_recovery_requires_new_ready_pod_and_old_pods_terminated() {
+        let before = vec![serde_json::json!({
+            "uid": "old-uid",
+            "phase": "Running",
+            "deletion_timestamp": null,
+            "ready": true
+        })];
+        let after = vec![serde_json::json!({
+            "uid": "new-uid",
+            "phase": "Running",
+            "deletion_timestamp": null,
+            "ready": true
+        })];
+
+        assert!(
+            operator_restart_state_converged(&before, &after),
+            "a distinct Ready replacement pod and removal of old live pods must converge"
+        );
+    }
+
+    #[test]
+    fn operator_pod_summary_reads_ready_condition_from_kubernetes_pod_json() {
+        let pod = serde_json::json!({
+            "metadata": {
+                "name": "grid-operator-new-abcde",
+                "uid": "new-uid",
+                "creationTimestamp": "2026-11-07T06:00:00Z"
+            },
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    {"type": "PodScheduled", "status": "True"},
+                    {"type": "Ready", "status": "True"}
+                ],
+                "containerStatuses": [
+                    {"name": "operator", "ready": true, "restartCount": 0}
+                ]
+            }
+        });
+
+        let summary = operator_pod_summary(&pod);
+
+        assert_eq!(
+            summary.get("name").and_then(serde_json::Value::as_str),
+            Some("grid-operator-new-abcde"),
+            "the Kubernetes Pod name must be retained in its summary"
+        );
+        assert_eq!(
+            summary.get("uid").and_then(serde_json::Value::as_str),
+            Some("new-uid"),
+            "the Kubernetes Pod UID must be retained for restart identity checks"
+        );
+        assert_eq!(
+            summary.get("ready").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "a Pod with Ready=True must be summarized as ready"
+        );
+        assert!(
+            operator_pod_is_ready(&summary),
+            "a Ready, non-terminating Pod must pass the readiness predicate"
+        );
+    }
+
+    #[test]
+    fn operator_pod_summary_rejects_unready_or_terminating_kubernetes_pods() {
+        let unready = serde_json::json!({
+            "metadata": {"name": "grid-operator-unready", "uid": "unready-uid"},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "False"}]
+            }
+        });
+        let terminating = serde_json::json!({
+            "metadata": {
+                "name": "grid-operator-terminating",
+                "uid": "terminating-uid",
+                "deletionTimestamp": "2026-11-07T06:00:00Z"
+            },
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+
+        assert_eq!(
+            operator_pod_summary(&unready)
+                .get("ready")
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "a Pod with Ready=False must not be summarized as ready"
+        );
+        assert_eq!(
+            operator_pod_summary(&terminating)
+                .get("ready")
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "a terminating Pod must not be summarized as ready"
+        );
+    }
+
+    #[test]
+    fn restart_recovery_waits_for_terminating_old_pod_to_disappear() {
+        let before = vec![serde_json::json!({
+            "uid": "old-uid",
+            "phase": "Running",
+            "deletion_timestamp": null,
+            "ready": true
+        })];
+        let after = vec![
+            serde_json::json!({
+                "uid": "old-uid",
+                "phase": "Running",
+                "deletion_timestamp": "2026-11-07T06:00:00Z",
+                "ready": false
+            }),
+            serde_json::json!({
+                "uid": "new-uid",
+                "phase": "Running",
+                "deletion_timestamp": null,
+                "ready": true
+            }),
+        ];
+
+        assert!(
+            operator_has_new_ready_pod(&before, &after),
+            "the replacement Pod must be Ready and have a UID not present before restart"
+        );
+        assert!(
+            !operator_old_pods_terminated(&before, &after),
+            "a terminating pre-restart Pod must still count as present"
+        );
+        assert!(
+            !operator_restart_state_converged(&before, &after),
+            "restart convergence must wait until every pre-restart Pod disappears"
+        );
+    }
+
+    #[test]
+    fn restart_recovery_ignores_retained_terminal_pods() {
+        for phase in ["Failed", "Succeeded"] {
+            let terminal = serde_json::json!({"uid": "terminal-uid", "phase": phase, "ready": false});
+            let terminal_only = vec![terminal.clone()];
+            let before = vec![
+                terminal.clone(),
+                serde_json::json!({"uid": "old-uid", "phase": "Running", "ready": true}),
+            ];
+            let after = vec![
+                terminal,
+                serde_json::json!({"uid": "new-uid", "phase": "Running", "ready": true}),
+            ];
+            assert!(
+                operator_restart_state_converged(&before, &after),
+                "a retained {phase} pod must not block convergence after the live old pod disappears"
+            );
+            assert!(
+                !operator_old_pods_terminated(&terminal_only, &after),
+                "terminal-only history must not prove replacement of a live operator pod"
+            );
+        }
+    }
+
+    #[test]
+    fn restart_recovery_rejects_empty_or_unready_pod_snapshots() {
+        let before = vec![serde_json::json!({
+            "uid": "old-uid",
+            "phase": "Running",
+            "deletion_timestamp": null,
+            "ready": true
+        })];
+        assert!(
+            !operator_restart_state_converged(&before, &[]),
+            "an empty post-restart Pod snapshot cannot prove a Ready replacement"
+        );
+        assert!(
+            !operator_restart_state_converged(
+                &before,
+                &[serde_json::json!({
+                "uid": "new-uid",
+                "phase": "Running",
+                "deletion_timestamp": null,
+                "ready": false
+                })]
+            ),
+            "an unready post-restart Pod cannot prove convergence"
+        );
     }
 
     fn test_overlay(sites: &[&str]) -> OverlayData {
