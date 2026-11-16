@@ -540,7 +540,7 @@ mod tests {
             let routed = counted(&format!("grid_route_decisions_total{{site=\"{site}\","));
             assert!(routed > 0.0, "no routing decisions for {site}:\n{metrics}");
         }
-        let refused = counted("grid_route_decisions_total{site=\"\",cluster=\"\",reason=\"not_ready\"}");
+        let refused = counted("grid_route_decisions_total{site=\"\",cluster=\"\",model=\"\",reason=\"not_ready\"}");
         assert!(refused > 0.0, "the 503s are not counted:\n{metrics}");
         let score = "grid_route_site_score{site=\"site-b\",cluster=\"pool-site-b\"} NaN";
         assert!(metrics.contains(score), "an excluded site keeps a score:\n{metrics}");

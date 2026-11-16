@@ -1019,12 +1019,12 @@ fn run(
             metric_counter(
                 &gateway_metrics,
                 "grid_route_decisions_total",
-                &[("site", "pool-a"), ("reason", "routed")]
+                &[("site", "pool-a"), ("model", VCR_MODEL), ("reason", "routed")]
             ),
             metric_counter(
                 &gateway_metrics,
                 "grid_route_decisions_total",
-                &[("site", "pool-b"), ("reason", "routed")]
+                &[("site", "pool-b"), ("model", VCR_MODEL), ("reason", "routed")]
             )
         ),
     );

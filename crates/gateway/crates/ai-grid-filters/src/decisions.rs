@@ -1,4 +1,4 @@
-//! `grid_route_decisions_total`: where `grid_site_route` sent a request, site and cluster, or why it refused.
+//! `grid_route_decisions_total`: where `grid_site_route` sent a request, by site, cluster and model, or why it refused.
 //!
 //! Counter handles are registered off the request path, so recording is one atomic add.
 
@@ -6,10 +6,12 @@ use std::sync::{Arc, LazyLock};
 
 use metrics::Counter;
 
+use crate::descriptor::{CapabilityKind, RouteCandidate};
+
 /// The counter's name.
 const METRIC: &str = "grid_route_decisions_total";
 
-/// The `reason` label: a closed set, so the series count is fixed.
+/// The `reason` label: a closed set independent of model and site counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     /// Sent to a healthy site. How it ranked is in `grid_route_site_score`.
@@ -86,7 +88,7 @@ impl Refused {
         }
     }
 
-    /// Count one refused request, under site "".
+    /// Count one refusal with empty site, cluster and model labels.
     pub(crate) fn record(self) {
         // Built on first use, after the gateway installs the recorder.
         static REFUSED: LazyLock<[Counter; 5]> = LazyLock::new(|| {
@@ -97,7 +99,7 @@ impl Refused {
                 Outcome::Shed,
                 Outcome::Fenced,
             ]
-            .map(|outcome| metrics::counter!(METRIC, "site" => "", "cluster" => "", "reason" => outcome.as_str()))
+            .map(|outcome| metrics::counter!(METRIC, "site" => "", "cluster" => "", "model" => "", "reason" => outcome.as_str()))
         });
         let index = match self.outcome() {
             Outcome::NotReady => 0,
@@ -166,16 +168,21 @@ impl FenceCause {
     }
 }
 
-/// One site's counters: routed, then fallback.
+/// One inference candidate's counters: routed, then fallback.
 #[derive(Debug)]
 pub struct SiteDecisions([Counter; 2]);
 
 impl SiteDecisions {
-    /// Register the counters for `site` and the `cluster` serving it, names from the serving config.
-    pub(crate) fn new(site: &Arc<str>, cluster: &Arc<str>) -> Self {
+    /// Register this candidate's configured site, cluster and model off the request path.
+    /// Non-inference candidates use no-op handles and publish no model series.
+    pub(crate) fn new(candidate: &RouteCandidate) -> Self {
+        if candidate.kind != CapabilityKind::InferenceModel {
+            return Self([Counter::noop(), Counter::noop()]);
+        }
+        let (site, cluster, model) = (&candidate.site, &candidate.cluster, &candidate.name);
         Self(
             [Outcome::Routed, Outcome::Fallback]
-                .map(|outcome| metrics::counter!(METRIC, "site" => Arc::clone(site), "cluster" => Arc::clone(cluster), "reason" => outcome.as_str())),
+                .map(|outcome| metrics::counter!(METRIC, "site" => Arc::clone(site), "cluster" => Arc::clone(cluster), "model" => Arc::clone(model), "reason" => outcome.as_str())),
         )
     }
 
@@ -189,7 +196,73 @@ impl SiteDecisions {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
     use super::Outcome;
+    use crate::{
+        RouteSnapshot,
+        descriptor::{CandidateConfig, validate_candidates},
+    };
+
+    #[test]
+    fn two_models_on_one_cluster_keep_independent_pre_registered_counters() {
+        let recorder = Recorded::default();
+        metrics::with_local_recorder(&recorder, || {
+            let configs: Vec<CandidateConfig> = serde_json::from_value(serde_json::json!([
+                {"kind":"inference_model","name":"llama","site":"east","cluster":"pool"},
+                {"kind":"inference_model","name":"qwen","site":"east","cluster":"pool"},
+                {"kind":"mcp_tool","name":"private-tool","site":"east","cluster":"pool"}
+            ]))
+            .unwrap_or_else(|_| std::process::abort());
+            let candidates = validate_candidates(configs).unwrap_or_else(|_| std::process::abort());
+            let snapshot = RouteSnapshot::from_static(candidates, Arc::from("east"));
+            let llama = snapshot.decisions.first().unwrap_or_else(|| std::process::abort());
+            let qwen = snapshot.decisions.get(1).unwrap_or_else(|| std::process::abort());
+            let tool = snapshot.decisions.get(2).unwrap_or_else(|| std::process::abort());
+            let registered = recorder.registrations.load(Ordering::Relaxed);
+            llama.record(false);
+            llama.record(false);
+            llama.record(true);
+            qwen.record(false);
+            tool.record(false);
+
+            assert_eq!(
+                registered, 4,
+                "two outcomes per inference candidate; tools publish no model counters"
+            );
+            assert_eq!(
+                recorder.registrations.load(Ordering::Relaxed),
+                registered,
+                "recording requests must not register metrics"
+            );
+            assert_eq!(
+                recorder.value("llama", "routed"),
+                2,
+                "llama traffic is counted once per request"
+            );
+            assert_eq!(
+                recorder.value("qwen", "routed"),
+                1,
+                "qwen traffic is separate on the same cluster"
+            );
+            assert_eq!(
+                recorder.value("llama", "fallback"),
+                1,
+                "fallbacks retain the configured model"
+            );
+            assert_eq!(
+                recorder.value("private-tool", "routed"),
+                0,
+                "tool names must not become model labels"
+            );
+        });
+    }
 
     #[test]
     fn the_fence_cause_label_is_a_closed_set() {
@@ -216,5 +289,58 @@ mod tests {
             ],
             "adding a reason is a deliberate change: update the chart README metrics section"
         );
+    }
+    // ---------------------------------------------------------------------------
+    // Test Utilities
+    // ---------------------------------------------------------------------------
+
+    /// Test-local counter handles and registration count.
+    #[derive(Default)]
+    struct Recorded {
+        /// Registered series, retaining their original labels.
+        counters: Mutex<HashMap<metrics::Key, Arc<metrics::atomics::AtomicU64>>>,
+        /// Calls to the recorder, which the request path must avoid.
+        registrations: AtomicUsize,
+    }
+
+    impl Recorded {
+        /// Read the model/outcome series, zero if it was never registered.
+        fn value(&self, model: &str, reason: &str) -> u64 {
+            self.counters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|(key, _)| {
+                    key.labels()
+                        .any(|label| label.key() == "model" && label.value() == model)
+                        && key
+                            .labels()
+                            .any(|label| label.key() == "reason" && label.value() == reason)
+                })
+                .map(|(_, value)| value.load(Ordering::Relaxed))
+                .sum()
+        }
+    }
+
+    impl metrics::Recorder for Recorded {
+        fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+        fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+            self.registrations.fetch_add(1, Ordering::Relaxed);
+            let mut counters = self.counters.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            metrics::Counter::from_arc(Arc::clone(counters.entry(key.clone()).or_default()))
+        }
+
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+
+        fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
     }
 }
