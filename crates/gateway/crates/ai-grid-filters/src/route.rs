@@ -4043,6 +4043,20 @@ pub(crate) mod tests {
     // Test Utilities
     // ---------------------------------------------------------------------------
 
+    /// The filter a control step serves: reading its `snapshot`, recording dial outcomes in its
+    /// `health`, affinity at its defaults, and its turn counter starting at zero.
+    pub(crate) fn filter_over(snapshot: Arc<ArcSwap<RouteSnapshot>>, health: Arc<ClusterHealth>) -> GridSiteRouteFilter {
+        GridSiteRouteFilter {
+            snapshot,
+            health,
+            clusters: None,
+            model_header: http::header::HeaderName::from_static("x-model"),
+            sovereignty: None,
+            affinity: Arc::default(),
+            turn: AtomicUsize::new(0),
+        }
+    }
+
     /// The request id source every test context shares.
     static IDS: LazyLock<praxis_core::id::IdGenerator> = LazyLock::new(|| praxis_core::id::IdGenerator::with_seed(0));
 

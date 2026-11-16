@@ -1087,6 +1087,18 @@ mod tests {
     use super::*;
     use crate::{descriptor::CapabilityKind, signals::llm_d::QUEUE_METRIC};
 
+    /// Requests sent, back to back, before east's share is read.
+    const EARLIER: u32 = 100;
+
+    /// Requests sent back to back after [`EARLIER`] that east's share is read over.
+    const LATER: u32 = 200;
+
+    /// The most of the later requests a site the gateway avoids may still take.
+    const AVOIDED: f64 = 0.1;
+
+    /// How far a serving east's share may stray from half.
+    const EVEN: f64 = 0.15;
+
     /// Queue depth each mock peer reports, and how often each was scraped and started.
     #[derive(Clone, Default)]
     struct Peers {
@@ -2726,6 +2738,33 @@ mod tests {
         let _cleaned = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    #[ignore = "reproduces a site answering every request with a server error keeping its share: an HTTP \
+                error response head counts as a working dial, and a site that refuses requests never fills"]
+    async fn a_site_answering_every_request_with_a_server_error_stops_taking_new_ones() {
+        let share = later_share_of_east(Answer::Status(http::StatusCode::INTERNAL_SERVER_ERROR)).await;
+        assert!(
+            share <= AVOIDED,
+            "east answered every request with 500 and still took {share:.2} of the {LATER} requests sent back to \
+             back after the first {EARLIER}, while west served all of its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_failing_site_scenario_sees_a_site_avoided() {
+        let unreachable = later_share_of_east(Answer::Nothing).await;
+        assert!(
+            unreachable <= AVOIDED,
+            "east, never connecting, took {unreachable:.2} of the last {LATER}, so the scenario cannot see a site \
+             avoided"
+        );
+        let serving = later_share_of_east(Answer::Status(http::StatusCode::OK)).await;
+        assert!(
+            (serving - 0.5).abs() <= EVEN,
+            "a serving east took {serving:.2} of the last {LATER}, not about half"
+        );
+    }
+
     #[test]
     fn the_watch_applies_the_dial_file_beside_the_serving_file() {
         let dir = temp_dir("watch-dial");
@@ -2788,5 +2827,75 @@ mod tests {
         );
         drop(grid);
         let _cleaned = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test Utilities
+    // ---------------------------------------------------------------------------
+
+    /// How east answers each request sent to it.
+    #[derive(Clone, Copy, Debug)]
+    enum Answer {
+        /// A response head with this status.
+        Status(http::StatusCode),
+        /// No response head within the connect budget: the dial never connected.
+        Nothing,
+    }
+
+    /// East's share of the last [`LATER`] requests the route filter sends back to back between dialed
+    /// east and west, east answering each with `east` and west with 200, the health tick run after each.
+    async fn later_share_of_east(east: Answer) -> f64 {
+        let dir = temp_dir(&format!("failing-{east:?}").replace(|c: char| !c.is_ascii_alphanumeric(), "-"));
+        write_identity(&dir, &certs::generate_ca("grid-ca").expect("ca"));
+        let (mut config, mut dial) = dialed_east();
+        let mut west = candidate("west");
+        west.stable_id = Some("candidate-west".to_owned());
+        config.candidates.push(west);
+        dial.dial
+            .insert("pool-west".to_owned(), dial_spec("west", mutual_tls("west")));
+        let mut control = dial_control(&config, &dir);
+        control.apply_joined(&config, &dial).expect("applies");
+        let filter: Box<dyn praxis_filter::HttpFilter> =
+            Box::new(crate::route::tests::filter_over(control.snapshot(), control.health()));
+        let request = praxis_filter::Request {
+            headers: [(
+                http::header::HeaderName::from_static("x-model"),
+                http::HeaderValue::from_static("llama"),
+            )]
+            .into_iter()
+            .collect(),
+            method: http::Method::POST,
+            uri: http::Uri::from_static("/v1/chat/completions"),
+        };
+        let mut later = 0_u32;
+        for sent in 0..EARLIER + LATER {
+            let mut head = praxis_filter::Response {
+                headers: http::HeaderMap::new(),
+                status: http::StatusCode::OK,
+            };
+            let mut ctx = crate::route::tests::context(&request);
+            let routed = filter.on_request(&mut ctx).await.expect("routes");
+            assert!(matches!(routed, praxis_filter::FilterAction::Continue), "request {sent} routes");
+            let to_east = ctx.cluster.as_deref() == Some("pool-east");
+            ctx.upstream_reached = true;
+            match (to_east, east) {
+                (true, Answer::Nothing) => {},
+                (true, Answer::Status(status)) => {
+                    head.status = status;
+                    ctx.response_header = Some(&mut head);
+                },
+                (false, _) => ctx.response_header = Some(&mut head),
+            }
+            let settled = filter.on_response(&mut ctx).await.expect("settles");
+            assert!(matches!(settled, praxis_filter::FilterAction::Continue), "request {sent} settles");
+            if control.health().update() {
+                control.refresh()(&control.store());
+            }
+            if to_east && sent >= EARLIER {
+                later = later.saturating_add(1);
+            }
+        }
+        let _cleaned = std::fs::remove_dir_all(&dir);
+        f64::from(later) / f64::from(LATER)
     }
 }
