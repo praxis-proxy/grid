@@ -133,19 +133,32 @@ this workflow: its validation and runner intentionally support only the fixed
 modes above. The GLB `--no-ingress` variant is also omitted because the
 Triggered Integration Test does not expose that topology selector.
 
-Only quick-mode qualifications have daily scheduled workflows. Full runs
-remain available for manual dispatch only; `combined-site` is also manual-only
-because its only supported mode is `--full`. Scheduled start times are UTC and
-are spaced one hour apart to avoid overlapping the approximately 30-minute
-runs. The original daily quick-GLB schedule remains enabled at 18:00
-`America/New_York` (22:00 UTC during daylight time, 23:00 UTC during standard
-time); consequently, `glb-quick` also has that legacy run.
+The quick-mode qualifications have daily scheduled workflows. The Triggered
+Integration Test also runs `combined-site` in full mode each day at 19:00 UTC,
+using the standard operator image. Its direct `glb-quick` schedule runs at
+18:00 UTC. The separate quick-mode starts are spaced one hour apart.
 
 | Scheduled workflow | Release qualification | Daily UTC start |
 |---|---|---:|
 | `Scheduled GLB Quick Qualification` | `glb-quick` | 00:00 |
 | `Scheduled Static-Weighted Qualification` | `static-weighted` | 01:00 |
 | `Scheduled llm-d Pool-Metrics Quick Qualification` | `llmd-pool-metrics-quick` | 02:00 |
+
+The manual and reusable workflow also accept `operator_image_mode` (`standard`
+or `fips`). It defaults to `standard`, and scheduled runs use `standard`. The
+optional `fips` mode builds and selects the FIPS operator image
+on a self-hosted `linux`/`fips` runner, whose kernel must report
+`/proc/sys/crypto/fips_enabled=1`; the operator's startup verification
+additionally checks OpenSSL's effective FIPS properties. FIPS mode refuses PR
+merge sources because it runs on a self-hosted runner, but it does not assess
+whether a repository branch is trusted; operators must select a trusted branch.
+The destructive disk-pruning step runs only in standard mode, so the self-hosted
+FIPS runner must be provisioned with sufficient free disk. A successful FIPS
+combined-site run qualifies Grid operator startup only, not the Praxis AI
+gateway, overlay-sync, or the whole deployment as FIPS-compliant. The image mode
+is included in the uploaded artifact name, image manifest, and job summary. FIPS
+image build/packaging checks remain separate from the standard nightly Kind
+runtime qualification.
 
 The scheduled workflows call the same reusable Triggered Integration Test
 workflow as manual runs, so source resolution, image selection, evidence

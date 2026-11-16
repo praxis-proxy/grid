@@ -37,6 +37,14 @@ on:
           - llmd-pool-metrics-quick
           - llmd-pool-metrics-full
           - operator-routing
+      operator_image_mode:
+        description: Operator image profile; FIPS runtime requires a FIPS-enabled runner
+        required: false
+        default: standard
+        type: choice
+        options:
+          - standard
+          - fips
   workflow_call:
     inputs:
       release_qualification:
@@ -53,6 +61,11 @@ on:
         required: false
         type: string
         default: ""
+      operator_image_mode:
+        description: Operator image profile; FIPS runtime requires a FIPS-enabled runner
+        required: false
+        type: string
+        default: standard
   schedule:
     # Nightly GLB quick qualification.
     - cron: "0 18 * * *"
@@ -135,6 +148,7 @@ jobs:
       qualification: ${{ steps.mode.outputs.qualification }}
       mode: ${{ steps.mode.outputs.mode }}
       membership: ${{ steps.mode.outputs.membership }}
+      operator_image_mode: ${{ steps.operator_image.outputs.mode }}
     steps:
       - name: Select release qualification
         id: selection
@@ -216,6 +230,33 @@ jobs:
             echo "membership=${MEMBERSHIP}"
           } >> "${GITHUB_OUTPUT}"
           echo "Release qualification: ${RELEASE_QUALIFICATION} -> ${QUALIFICATION} (${MODE})"
+
+      - name: Select operator image mode
+        id: operator_image
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_OPERATOR_IMAGE_MODE: ${{ inputs.operator_image_mode }}
+          QUALIFICATION: ${{ steps.mode.outputs.qualification }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == "schedule" ]]; then
+            OPERATOR_IMAGE_MODE=standard
+          else
+            OPERATOR_IMAGE_MODE="${INPUT_OPERATOR_IMAGE_MODE:-standard}"
+          fi
+          case "${OPERATOR_IMAGE_MODE}" in
+            standard|fips) ;;
+            *)
+              echo "::error::Unsupported operator image mode '${OPERATOR_IMAGE_MODE}' (expected standard or fips)"
+              exit 1
+              ;;
+          esac
+          if [[ "${OPERATOR_IMAGE_MODE}" == "fips" && "${QUALIFICATION}" != "combined-site" ]]; then
+            echo "::error::FIPS operator mode is currently supported only for the combined-site qualification."
+            exit 1
+          fi
+          echo "mode=${OPERATOR_IMAGE_MODE}" >> "${GITHUB_OUTPUT}"
+          echo "Operator image mode: ${OPERATOR_IMAGE_MODE}"
 
       - name: Validate source selector
         env:
@@ -389,6 +430,12 @@ jobs:
             echo "Resolved refs/heads/main -> ${MAIN_SHA}"
           fi
 
+      - name: Restrict FIPS mode to repository sources
+        if: steps.operator_image.outputs.mode == 'fips' && steps.source.outputs.source_kind == 'pr'
+        run: |
+          echo "::error::FIPS mode runs on a self-hosted FIPS runner and cannot execute PR merge code. Use a trusted repository branch or select standard mode."
+          exit 1
+
       - name: Write main metadata
         if: inputs.pr_number == '' && inputs.branch == ''
         run: |
@@ -435,7 +482,7 @@ jobs:
   qualification-e2e:
     name: ${{ needs.resolve-source.outputs.source_label }} ${{ needs.resolve-source.outputs.release_qualification }} E2E
     needs: resolve-source
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.resolve-source.outputs.operator_image_mode == 'fips' && fromJSON('["self-hosted","linux","fips"]') || 'ubuntu-24.04' }}
     permissions:
       contents: read
       packages: read
@@ -451,6 +498,7 @@ jobs:
       QUALIFICATION: ${{ needs.resolve-source.outputs.qualification }}
       MODE: ${{ needs.resolve-source.outputs.mode }}
       MEMBERSHIP: ${{ needs.resolve-source.outputs.membership }}
+      OPERATOR_IMAGE_MODE: ${{ needs.resolve-source.outputs.operator_image_mode }}
       EVIDENCE_DIR: ${{ github.workspace }}/evidence/${{ needs.resolve-source.outputs.release_qualification }}
       DIAGNOSTICS_DIR: ${{ github.workspace }}/diagnostics/${{ needs.resolve-source.outputs.release_qualification }}
     steps:
@@ -690,6 +738,12 @@ jobs:
           curl --version | head -1
           jq --version
 
+      - name: Test combined-site cleanup ownership
+        if: env.QUALIFICATION == 'combined-site'
+        env:
+          GRID_REPO: ${{ github.workspace }}/grid
+        run: bash "${GRID_REPO}/scripts/test-combined-site-cleanup-ownership.sh"
+
       - name: Record tool versions
         run: |
           {
@@ -711,6 +765,7 @@ jobs:
       # ----------------------------------------------------------------------
 
       - name: Free disk space
+        if: env.OPERATOR_IMAGE_MODE == 'standard'
         run: |
           echo "=== Before cleanup ==="
           df -h /
@@ -740,14 +795,15 @@ jobs:
             ARTIFACT_PREFIX="grid-main-${SHORT_SHA}"
           fi
           TAG="${TAG}-${QUALIFICATION}"
-          if [[ "${QUALIFICATION}" == "combined-site" ]]; then
-            OPERATOR_IMAGE="grid-operator-fips:${TAG}"
-          else
-            OPERATOR_IMAGE="grid-operator:${TAG}"
-          fi
+          case "${OPERATOR_IMAGE_MODE}" in
+            standard) OPERATOR_IMAGE="grid-operator:${TAG}" ;;
+            fips) OPERATOR_IMAGE="grid-operator-fips:${TAG}" ;;
+            *) echo "::error::Unknown operator image mode '${OPERATOR_IMAGE_MODE}'"; exit 1 ;;
+          esac
           {
             echo "tag=${TAG}"
             echo "operator_image=${OPERATOR_IMAGE}"
+            echo "operator_image_mode=${OPERATOR_IMAGE_MODE}"
             echo "short_sha=${SHORT_SHA}"
             echo "artifact_prefix=${ARTIFACT_PREFIX}"
           } >> "${GITHUB_OUTPUT}"
@@ -757,8 +813,18 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
+      - name: Require a FIPS-enabled host for FIPS runtime qualification
+        if: env.OPERATOR_IMAGE_MODE == 'fips'
+        run: |
+          set -euo pipefail
+          flag=/proc/sys/crypto/fips_enabled
+          if [[ ! -r "${flag}" || "$(<"${flag}")" != "1" ]]; then
+            echo "::error::FIPS operator runtime qualification requires a runner whose kernel reports ${flag}=1; use operator_image_mode=standard on ordinary GitHub-hosted runners."
+            exit 1
+          fi
+
       - name: Build Grid Operator image
-        if: env.QUALIFICATION != 'combined-site'
+        if: env.OPERATOR_IMAGE_MODE == 'standard'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: grid
@@ -771,9 +837,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=triggered-e2e-operator
 
       - name: Build Grid Operator FIPS image
-        # The shared-key combined-site topology then exercises SWIM packets
-        # through the OpenSSL backend. Hosted runners are not FIPS-mode hosts.
-        if: env.QUALIFICATION == 'combined-site'
+        if: env.OPERATOR_IMAGE_MODE == 'fips'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: grid
@@ -990,12 +1054,15 @@ jobs:
               FAILED=1
             fi
           fi
-          if [[ "${QUALIFICATION}" == "combined-site" ]]; then
-            IMAGE_DESCRIPTION=$(docker image inspect --format='{{index .Config.Labels "org.opencontainers.image.description"}}' "${operator_img}")
+          IMAGE_DESCRIPTION=$(docker image inspect --format='{{index .Config.Labels "org.opencontainers.image.description"}}' "${operator_img}")
+          if [[ "${OPERATOR_IMAGE_MODE}" == "fips" ]]; then
             if [[ "${IMAGE_DESCRIPTION}" != *"FIPS build"* ]]; then
-              echo "::error::Combined-site operator image is not labeled as a FIPS build: ${operator_img}"
+              echo "::error::FIPS mode selected but image is not labeled as a FIPS build: ${operator_img}"
               FAILED=1
             fi
+          elif [[ "${IMAGE_DESCRIPTION}" == *"FIPS build"* ]]; then
+            echo "::error::Standard mode selected but a FIPS operator image was selected: ${operator_img}"
+            FAILED=1
           fi
 
           if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" || "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
@@ -1121,13 +1188,10 @@ jobs:
           {
             echo "=== Image Manifest ==="
             echo ""
+            echo "Operator image mode: ${OPERATOR_IMAGE_MODE}"
             echo "${OPERATOR_IMAGE}"
             docker inspect --format='  ID: {{.Id}}' "${OPERATOR_IMAGE}"
             docker inspect --format='  Source revision: {{index .Config.Labels "org.opencontainers.image.revision"}}' "${OPERATOR_IMAGE}"
-            if [[ "${QUALIFICATION}" == "combined-site" ]]; then
-              echo "  Build: deploy/operator/Containerfile.fips"
-              echo "  Crypto backend: OpenSSL (fips feature; host FIPS mode is not asserted)"
-            fi
             echo ""
             if [[ "${QUALIFICATION}" == "static-weighted" || "${QUALIFICATION}" == "combined-site" || "${QUALIFICATION}" == "llmd-pool-metrics" ]]; then
               echo "grid-overlay-sync:${TAG}"
@@ -1221,6 +1285,24 @@ jobs:
           mkdir -p "${DIAGNOSTICS_DIR}"
           if [[ "${QUALIFICATION}" != "operator-routing" ]]; then
             mkdir -p "${EVIDENCE_DIR}"
+          fi
+
+      - name: Record combined-site cleanup baseline
+        if: env.QUALIFICATION == 'combined-site'
+        env:
+          GRID_REPO: ${{ github.workspace }}/grid
+        run: |
+          set -euo pipefail
+          mkdir -p "${EVIDENCE_DIR}"
+          kind get clusters > "${EVIDENCE_DIR}/kind-clusters-before.txt.tmp"
+          docker network ls --format '{{.Name}}' > "${EVIDENCE_DIR}/docker-networks-before.txt.tmp"
+          mv "${EVIDENCE_DIR}/kind-clusters-before.txt.tmp" "${EVIDENCE_DIR}/kind-clusters-before.txt"
+          mv "${EVIDENCE_DIR}/docker-networks-before.txt.tmp" "${EVIDENCE_DIR}/docker-networks-before.txt"
+          source "${GRID_REPO}/scripts/combined-site-cleanup-ownership.sh"
+          combined_site_record_kind_temp_inventory \
+            "/tmp" "${EVIDENCE_DIR}/kind-temporary-paths-before.txt"
+          if ! combined_site_baseline_is_clean "${EVIDENCE_DIR}"; then
+            exit 1
           fi
 
       - name: Record llm-d cleanup baseline
@@ -1724,12 +1806,19 @@ jobs:
           STATE_FILE="${GRID_REPO}/.forge/state.json"
           OWNED_CLUSTERS=()
           OWNED_NETWORKS=()
+          COMBINED_SITE_HELPER_LOADED=false
           NETWORK_OWNER=""
           RUN_PREFIX=""
           RUN_CLUSTER=""
           RUN_NETWORK=""
           RESOLVED_CONFIG=""
           OPERATOR_ROUTING_STATE_DIR=""
+
+          if [[ -f "${GRID_REPO}/scripts/combined-site-cleanup-ownership.sh" ]]; then
+            # shellcheck source=grid/scripts/combined-site-cleanup-ownership.sh
+            source "${GRID_REPO}/scripts/combined-site-cleanup-ownership.sh"
+            COMBINED_SITE_HELPER_LOADED=true
+          fi
 
           resolve_run_forge_state() {
             local topology_dir="$1"
@@ -1815,14 +1904,40 @@ jobs:
               fi
               ;;
             combined-site)
-              OWNED_CLUSTERS=(
-                grid-combined-west
-                grid-combined-central
-                grid-combined-east
-              )
-              OWNED_NETWORKS=(grid-combined-site-net)
               NETWORK_OWNER="grid-combined-site"
               resolve_run_forge_state "grid-combined-site"
+              COMBINED_CURRENT_CLUSTERS="${EVIDENCE_DIR}/kind-clusters-at-cleanup.txt"
+              COMBINED_CURRENT_NETWORKS="${EVIDENCE_DIR}/docker-networks-at-cleanup.txt"
+              COMBINED_CURRENT_KIND_TEMPS="${EVIDENCE_DIR}/kind-temporary-paths-at-cleanup.txt"
+              mkdir -p "${EVIDENCE_DIR}"
+              if ! kind get clusters > "${COMBINED_CURRENT_CLUSTERS}"; then
+                rm -f -- "${COMBINED_CURRENT_CLUSTERS}"
+                echo "::warning::Unable to capture current Kind inventory; preserving combined-site resources"
+                CLEANUP_RESULT="partial"
+              fi
+              if ! docker network ls --format '{{.Name}}' > "${COMBINED_CURRENT_NETWORKS}"; then
+                rm -f -- "${COMBINED_CURRENT_NETWORKS}"
+                echo "::warning::Unable to capture current Docker network inventory; preserving combined-site resources"
+                CLEANUP_RESULT="partial"
+              fi
+              if ! combined_site_record_kind_temp_inventory "/tmp" "${COMBINED_CURRENT_KIND_TEMPS}"; then
+                rm -f -- "${COMBINED_CURRENT_KIND_TEMPS}"
+                echo "::warning::Unable to capture current Kind temporary paths; preserving them"
+                CLEANUP_RESULT="partial"
+              fi
+              if [[ "${COMBINED_SITE_HELPER_LOADED}" == true ]]; then
+                combined_site_cleanup_plan "${EVIDENCE_DIR}" "${STATE_FILE}" \
+                  "${COMBINED_CURRENT_CLUSTERS}" "${COMBINED_CURRENT_NETWORKS}" \
+                  "${COMBINED_CURRENT_KIND_TEMPS}"
+                OWNED_CLUSTERS=("${COMBINED_SITE_OWNED_CLUSTERS[@]}")
+                OWNED_NETWORKS=("${COMBINED_SITE_OWNED_NETWORKS[@]}")
+                if [[ "${COMBINED_SITE_CLEANUP_RESULT}" != "success" ]]; then
+                  CLEANUP_RESULT="partial"
+                fi
+              else
+                echo "::warning::Combined-site ownership helper is absent; preserving fixed-name resources"
+                CLEANUP_RESULT="partial"
+              fi
               ;;
             llmd-pool-metrics)
               BASE_KIND="${DIAGNOSTICS_DIR}/llmd-kind-before.txt"
@@ -1941,6 +2056,34 @@ jobs:
           esac
 
           for cluster in "${OWNED_CLUSTERS[@]}"; do
+            if [[ "${QUALIFICATION}" == "combined-site" ]]; then
+              if ! current_clusters=$(kind get clusters 2>/dev/null); then
+                echo "::warning::Could not verify current Kind clusters before deleting '${cluster}'"
+                CLEANUP_RESULT="partial"
+                continue
+              fi
+              if ! grep -Fxq -- "${cluster}" <<< "${current_clusters}"; then
+                continue
+              fi
+              echo "Deleting run-owned cluster: ${cluster}"
+              if ! kind delete cluster --name "${cluster}"; then
+                echo "::warning::Failed to delete run-owned Kind cluster '${cluster}'"
+                CLEANUP_RESULT="partial"
+                continue
+              fi
+              if ! remaining_clusters=$(kind get clusters 2>/dev/null); then
+                echo "::warning::Could not verify deletion of run-owned Kind cluster '${cluster}'"
+                CLEANUP_RESULT="partial"
+                continue
+              fi
+              if grep -Fxq -- "${cluster}" <<< "${remaining_clusters}"; then
+                echo "::warning::Run-owned Kind cluster '${cluster}' remains after deletion"
+                CLEANUP_RESULT="partial"
+                continue
+              fi
+              CLEANED_CLUSTERS+=("${cluster}")
+              continue
+            fi
             if ! kind get clusters 2>/dev/null | grep -Fxq "${cluster}"; then
               continue
             fi
@@ -2032,9 +2175,26 @@ jobs:
             fi
           fi
 
-          for cluster in "${OWNED_CLUSTERS[@]}"; do
-            rm -rf "/tmp/kind-${cluster}" 2>/dev/null || true
-          done
+          if [[ "${QUALIFICATION}" == "combined-site" ]]; then
+            if [[ "${COMBINED_SITE_HELPER_LOADED}" == true ]]; then
+              REMAINING_KIND_CLUSTERS="${EVIDENCE_DIR}/kind-clusters-after-delete.txt"
+              if ! kind get clusters > "${REMAINING_KIND_CLUSTERS}"; then
+                rm -f -- "${REMAINING_KIND_CLUSTERS}"
+                echo "::warning::Unable to verify cluster removal; preserving combined-site Kind temporary files"
+                if [[ -s "${EVIDENCE_DIR}/kind-temporary-paths-at-cleanup.txt" ]]; then
+                  CLEANUP_RESULT="partial"
+                fi
+              elif ! combined_site_remove_kind_temporary_files "/tmp" "${REMAINING_KIND_CLUSTERS}" \
+                "${COMBINED_SITE_OWNED_KIND_TEMP_DIRS[@]}"; then
+                echo "::warning::Unable to safely remove temporary Kind files for verified run-owned clusters"
+                CLEANUP_RESULT="partial"
+              fi
+            fi
+          else
+            for cluster in "${OWNED_CLUSTERS[@]}"; do
+              rm -rf "/tmp/kind-${cluster}" 2>/dev/null || true
+            done
+          fi
 
           echo "result=${CLEANUP_RESULT}" >> "${GITHUB_OUTPUT}"
           echo "Cleanup: ${CLEANUP_RESULT}"
@@ -2055,7 +2215,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ${{ steps.tags.outputs.artifact_prefix || format('grid-{0}-{1}', needs.resolve-source.outputs.source_kind, needs.resolve-source.outputs.tested_sha) }}-${{ env.QUALIFICATION }}-${{ env.MODE }}-${{ env.MEMBERSHIP }}
+          name: ${{ steps.tags.outputs.artifact_prefix || format('grid-{0}-{1}', needs.resolve-source.outputs.source_kind, needs.resolve-source.outputs.tested_sha) }}-operator-${{ needs.resolve-source.outputs.operator_image_mode }}-${{ env.QUALIFICATION }}-${{ env.MODE }}-${{ env.MEMBERSHIP }}
           path: |
             ${{ env.EVIDENCE_DIR }}/
             ${{ env.DIAGNOSTICS_DIR }}/
@@ -2075,6 +2235,7 @@ jobs:
         env:
           TAG: ${{ steps.tags.outputs.tag || 'unknown' }}
           OPERATOR_IMAGE: ${{ steps.tags.outputs.operator_image || 'unknown' }}
+          OPERATOR_IMAGE_MODE: ${{ needs.resolve-source.outputs.operator_image_mode }}
           ARTIFACT_PREFIX: ${{ steps.tags.outputs.artifact_prefix || format('grid-{0}-{1}', needs.resolve-source.outputs.source_kind, needs.resolve-source.outputs.tested_sha) }}
           QUALIFICATION_RESULT: ${{ steps.qualification.outcome }}
           CLEANUP_RESULT: ${{ steps.cleanup.outputs.result || 'unknown' }}
@@ -2149,8 +2310,11 @@ jobs:
 
             echo "| **Topology** | \`${TOPOLOGY}\` at tested Grid SHA |"
             echo "| **Mode** | \`${MODE}\` |"
-            if [[ "${QUALIFICATION}" == "combined-site" ]]; then
-              echo "| **Operator crypto backend** | OpenSSL (\`fips\` feature) |"
+            echo "| **Operator image mode** | \`${OPERATOR_IMAGE_MODE}\` |"
+            if [[ "${QUALIFICATION}" == "combined-site" && "${OPERATOR_IMAGE_MODE}" == "standard" ]]; then
+              echo "| **Operator runtime scope** | Standard non-FIPS image; this run does not qualify FIPS startup or a FIPS-mode host |"
+            elif [[ "${OPERATOR_IMAGE_MODE}" == "fips" ]]; then
+              echo "| **Operator runtime scope** | FIPS startup was required on a FIPS-enabled runner; see the qualification result for whether it passed |"
             fi
             echo "| **Membership** | \`${MEMBERSHIP}\` |"
             echo "| **Qualification result** | ${QUALIFICATION_DISPLAY_RESULT} |"
@@ -2191,5 +2355,5 @@ jobs:
             echo ""
             echo "### Artifact"
             echo ""
-            echo "\`${ARTIFACT_PREFIX}-${QUALIFICATION}-${MODE}-${MEMBERSHIP}\`"
+            echo "\`${ARTIFACT_PREFIX}-operator-${OPERATOR_IMAGE_MODE}-${QUALIFICATION}-${MODE}-${MEMBERSHIP}\`"
           } >> "${GITHUB_STEP_SUMMARY}"

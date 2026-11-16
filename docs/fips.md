@@ -29,9 +29,9 @@ the pinned UBI runtime image.
 
 The standard Alpine images are unchanged. The FIPS images require a host running
 with `fips=1`; UBI's OpenSSL follows the host FIPS state and activates the
-provider. For example, a release image is
-`ghcr.io/praxis-proxy/grid-operator:0.3.0-fips`. The matching overlay-sync image
-uses the same tag suffix. These images select the FIPS code path at build time;
+provider. A release image is
+`ghcr.io/praxis-proxy/grid-operator:<version>-fips`, and the matching
+overlay-sync image uses the same tag. These images select the FIPS code path at build time;
 they do not enable FIPS mode on the host.
 
 The `fips` feature also routes certificate keygen, signing, verification, and

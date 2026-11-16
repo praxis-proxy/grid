@@ -1662,6 +1662,7 @@ fn dial_transport(ep: &ClusterEndpointConfig) -> Result<DialTransport, ConsumerC
                 .ca_secret_ref
                 .as_ref()
                 .map(|ca| backend_ca_file_path(&ca.name, ca.key.as_deref().unwrap_or("ca.crt"))),
+            present_identity: false,
             sni: rendered_sni(ep)?.to_owned(),
         }),
         TransportMode::Plaintext if transport.sni.as_deref().is_some_and(|sni| !sni.trim().is_empty()) => {
@@ -1962,6 +1963,7 @@ mod tests {
             dials["local-granite"].transport,
             DialTransport::Tls {
                 ca_path: Some("/run/secrets/grid-backend-ca/models-ca/ca.crt".to_owned()),
+                present_identity: false,
                 sni: "granite.models.svc".to_owned(),
             }
         );

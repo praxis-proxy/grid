@@ -103,6 +103,28 @@ fn resolve_local(endpoint: &str, tls: Option<serde_json::Value>) -> Resolved {
 }
 
 #[test]
+fn only_an_mtls_only_provider_behind_tls_is_dialed_with_the_present_identity() {
+    let resolve_with = |endpoint: &str, strategy: Option<&str>| {
+        let mut local = provider("prov-a", endpoint, None);
+        local.spec.auth =
+            strategy.map(|strategy| serde_json::from_value(serde_json::json!({ "strategy": strategy })).expect("auth"));
+        let providers = vec![local];
+        let sites = vec![site("site-a", None)];
+        let candidates = vec![candidate("prov-a", "site-a")];
+        let resolved = resolve(&candidates, &[], &decl(&providers, &sites, "site-a"));
+        resolved.get("prov-a").cloned().expect("a local provider resolves")
+    };
+    let serving = "https://inference.openshift-ingress.svc.cluster.local:8443/publishers/p/models/m";
+    assert!(resolve_with(serving, Some("mtls_only")).present_identity);
+    assert!(!resolve_with(serving, Some("bearer_token")).present_identity);
+    assert!(!resolve_with(serving, None).present_identity);
+    assert!(
+        !resolve_with("http://model.svc:8000", Some("mtls_only")).present_identity,
+        "plaintext has no handshake to present a certificate in"
+    );
+}
+
+#[test]
 fn a_local_endpoint_keeps_its_path_for_the_dial() {
     let got = resolve_local(
         "https://inference.openshift-ingress.svc.cluster.local/publishers/p/models/m",
