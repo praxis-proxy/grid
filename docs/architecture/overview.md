@@ -213,7 +213,7 @@ the gateway process that already owns the network hot path.
 
 ## Control-Plane Resources
 
-The implemented control plane uses four cluster-scoped CRDs:
+The default control plane uses five cluster-scoped CRDs:
 
 | CRD | Current role |
 |---|---|
@@ -221,6 +221,11 @@ The implemented control plane uses four cluster-scoped CRDs:
 | `GridSite` | Represents one participating site or cluster. Tracks discovery, gateway address, public trust material, fingerprint trust, and phase. |
 | `InferenceProvider` | Declares model capacity: model name, backend kind, endpoint, health config, auth strategy, access policy, and provider status. |
 | `AgentToolProvider` | Declares an MCP endpoint, discovers its tools, distributes tool state, and publishes tool discovery candidates. |
+| `SiteInvite` | Defines a signed enrollment invitation used when adding a Grid site. |
+
+The opt-in `AgentToAgentProvider` is an experimental sixth CRD. It declares an
+A2A agent endpoint, its Agent Card discovery policy, access controls, and
+bounded observed skill state.
 
 `AgentToolProvider` has a running reconciler that resolves `siteSelector`
 matches and probes the endpoint's MCP `tools/list` contract. The operator
@@ -233,9 +238,19 @@ model-oriented and projects only `inference_model` candidates. A deployment
 that executes MCP calls must provide a dedicated MCP-capable pipeline and a
 reachable load-balancer cluster for every tool candidate.
 
-`AgentToAgentProvider` is schema direction for A2A. Its resource type exists,
-but the operator does not yet run a controller for it. Inference remains the
-most mature reconciled and routed path today.
+`AgentToAgentProvider` is the experimental API contract for A2A. It is disabled
+from the default operator build and installation. The resource is
+intentionally limited to configuration and bounded status in this phase; its
+controller, SWIM/CRDT distribution, `a2a_skill` overlay candidates, and A2A
+data-plane route are follow-up tasks. The configured endpoint remains the
+authority even when a discovered Agent Card contains interface URLs.
+
+The resource uses JSON-RPC over HTTP(S) as its initial binding. Its optional
+card configuration can select a safe discovery URL or path and an allowlist of
+Agent Card skill IDs. A future controller stores only a bounded card subset in
+status: name/version, supported binding metadata, streaming capability, and
+skill IDs with input/output modes. Authentication and TLS references are
+resolved by the operator; secret values never enter status or mesh state.
 
 See [CRDs](crds.md) for field-level details.
 

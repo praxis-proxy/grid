@@ -2,6 +2,37 @@ suite: ClusterRole CRD template
 templates:
   - templates/clusterrole-crd.yaml
 tests:
+  - it: omits agenttoagentproviders from the default ClusterRole
+    asserts:
+      - notContains:
+          path: rules[0].resources
+          content: agenttoagentproviders
+
+  - it: omits agenttoagentproviders when the experimental profile is null
+    set:
+      experimental: null
+    asserts:
+      - notContains:
+          path: rules[0].resources
+          content: agenttoagentproviders
+
+  - it: grants A2A verbs only in the experimental profile
+    set:
+      experimental.a2a.enabled: true
+    asserts:
+      - contains:
+          path: rules[0].resources
+          content: agenttoagentproviders
+      - equal:
+          path: rules[0].verbs
+          value: ["get", "list", "watch", "patch"]
+      - contains:
+          path: rules[2].resources
+          content: agenttoagentproviders/status
+      - equal:
+          path: rules[2].verbs
+          value: ["get", "patch"]
+
   - it: grants agenttoolproviders the same verbs as gridnetworks and inferenceproviders
     asserts:
       - contains:

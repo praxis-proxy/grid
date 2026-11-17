@@ -1,4 +1,6 @@
 {{- include "grid-operator.normalize" . }}
+{{- $experimental := .Values.experimental | default dict }}
+{{- $a2aEnabled := dig "a2a" "enabled" false $experimental }}
 {{- if .Values.rbac.create }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -9,6 +11,9 @@ metadata:
 rules:
   - apiGroups: ["grid.praxis.fast"]
     resources:
+      {{- if $a2aEnabled }}
+      - agenttoagentproviders
+      {{- end }}
       - agenttoolproviders
       - gridnetworks
       - inferenceproviders
@@ -19,6 +24,9 @@ rules:
     verbs: ["get", "list", "watch", "patch", "create", "update", "delete"]
   - apiGroups: ["grid.praxis.fast"]
     resources:
+      {{- if $a2aEnabled }}
+      - agenttoagentproviders/status
+      {{- end }}
       - agenttoolproviders/status
       - gridnetworks/status
       - gridsites/status
