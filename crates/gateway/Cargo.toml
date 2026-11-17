@@ -338,16 +338,19 @@ fips = ["praxis-proxy/policy-api-key-fips"]
 policy-jwt-fips = ["praxis-proxy/policy-jwt-fips"]
 
 [dependencies]
+# cargo-machete 0.9.2 resolves inherited dependencies of a workspace-root
+# package against its parent workspace. Keep Praxis releases explicit here;
+# member crates can inherit them from this workspace normally.
 version = { path = "../version" }
-praxis-proxy = { workspace = true, features = [
+praxis-proxy = { version = "0.8.0", default-features = false, features = [
   "pingora",
   "config-reload",
   "admin-api",
   "otel",
   "spiffe",
 ] }
-praxis-filter.workspace = true
-praxis-core.workspace = true
+praxis-filter = { version = "0.8.0", package = "praxis-proxy-filter", default-features = false }
+praxis-core = { version = "0.8.0", package = "praxis-proxy-core", default-features = false }
 opentelemetry-otlp = { version = "0.33.0", default-features = false, features = [
   "tls-provider-agnostic",
 ] }
@@ -356,8 +359,8 @@ praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "4a6
 ] }
 ai-grid-filters = { path = "crates/ai-grid-filters" }
 tracing = "0.1.44"
-praxis-protocol.workspace = true
-praxis-tls.workspace = true
+praxis-protocol = { version = "0.8.0", package = "praxis-proxy-protocol", default-features = false }
+praxis-tls = { version = "0.8.0", package = "praxis-proxy-tls", default-features = false }
 tokio = { version = "1.53.1", features = ["io-util", "net", "rt", "sync", "time"] }
 tokio-rustls = { version = "0.26.5", default-features = false, features = ["logging", "tls12"] }
 httparse = "1.10.1"
@@ -375,9 +378,10 @@ httpdate = { workspace = true }
 rustls = { version = "0.23.46", features = ["ring"] }
 tokio = { version = "1.53.1", features = ["macros"] }
 
-# machete can't see these: used as `praxis` / `praxis_core` / `praxis_filter`, not their package names.
+# `praxis-proxy` is imported as `praxis`; `opentelemetry-otlp` enables the
+# TLS-provider-agnostic exporter feature used by Praxis core.
 [package.metadata.cargo-machete]
-ignored = ["opentelemetry-otlp", "praxis-proxy", "praxis-proxy-core", "praxis-proxy-filter"]
+ignored = ["opentelemetry-otlp", "praxis-proxy"]
 
 [lints]
 workspace = true
