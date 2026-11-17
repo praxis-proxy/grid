@@ -528,8 +528,8 @@ fn dedup<'overlay>(
 
 /// Inference candidates within gateway limits, deduplicated and ordered.
 ///
-/// Past the cap, lower selection groups and candidates taking new requests are
-/// kept before the rest.
+/// Past the cap, routable candidates, lower selection groups, and candidates
+/// taking new requests are kept before the rest.
 fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<ServingCandidate> {
     if overlay.candidates.is_empty() {
         return Vec::new();
@@ -544,6 +544,7 @@ fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<Servi
         );
         kept.sort_by_key(|(key, folded)| {
             (
+                folded.admission == AdmissionState::Excluded,
                 folded.selection_group,
                 folded.admission != AdmissionState::NewAndExisting,
                 *key,
@@ -1172,6 +1173,29 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.cluster == "preferred"),
             "a preferred-region candidate must survive the serving-config cap before fallback candidates"
+        );
+    }
+
+    #[test]
+    fn past_the_cap_keeps_admitted_fallbacks_before_excluded_preferred_candidates() {
+        let excluded: Vec<_> = (0..MAX_CANDIDATES)
+            .map(|i| {
+                let mut candidate = cand("llama", "site-a", &format!("down-{i:04}"), Some("none"));
+                candidate.regional_policy_group = Some(RegionalPolicyGroup::Preferred);
+                candidate
+            })
+            .collect();
+        let mut fallback = cand("llama", "site-z", "up", None);
+        fallback.regional_policy_group = Some(RegionalPolicyGroup::Fallback);
+        let mut source = overlay(vec![fallback]);
+        source.excluded = excluded;
+
+        let rendered = render(&source, &INPUTS);
+
+        assert_eq!(rendered.candidates.len(), MAX_CANDIDATES);
+        assert!(
+            rendered.candidates.iter().any(|candidate| candidate.cluster == "up"),
+            "an admitted fallback must survive the serving-config cap before excluded preferred candidates"
         );
     }
 
