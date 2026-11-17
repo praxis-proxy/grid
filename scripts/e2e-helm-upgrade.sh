@@ -122,11 +122,13 @@ CRS_BEFORE="$(for k in gridnetworks gridsites inferenceproviders; do uids "${k}.
 # Documented one-time CRD adoption for Helm < 3.17 (keep in sync with the
 # grid-operator README).
 adopt_crds() { # <release> <namespace>
-  for crd in agenttoolproviders gridnetworks gridsites inferenceproviders; do
-    kubectl --context "${CTX}" label crd "${crd}.${GROUP}" \
-      app.kubernetes.io/managed-by=Helm --overwrite
-    kubectl --context "${CTX}" annotate crd "${crd}.${GROUP}" \
-      meta.helm.sh/release-name="$1" meta.helm.sh/release-namespace="$2" --overwrite
+  for crd in agenttoolproviders gridnetworks gridsites inferenceproviders siteinvites; do
+    if ${K} get crd "${crd}.${GROUP}" >/dev/null 2>&1; then
+      kubectl --context "${CTX}" label crd "${crd}.${GROUP}" \
+        app.kubernetes.io/managed-by=Helm --overwrite
+      kubectl --context "${CTX}" annotate crd "${crd}.${GROUP}" \
+        meta.helm.sh/release-name="$1" meta.helm.sh/release-namespace="$2" --overwrite
+    fi
   done
 }
 branch_crds="$(${UPGRADE_HELM} template grid-operator "${ROOT}/charts/grid-operator" -n "${NS}" "${OPERATOR_ARGS[@]}" \
@@ -158,6 +160,11 @@ if [ "${BASE_GROUP}" = "${GROUP}" ]; then
   done <<<"${CRDS_BEFORE}"
   [ "$(wc -l <<<"${CRDS_AFTER}")" -ge "$(wc -l <<<"${CRDS_BEFORE}")" ] \
     || fail "grid CRDs disappeared across upgrade"
+  missing_crds="$(comm -23 \
+    <(sed '/^$/d' <<<"${CRDS_BEFORE}" | sort) \
+    <(sed '/^$/d' <<<"${CRDS_AFTER}" | sort))"
+  [ -z "${missing_crds}" ] || fail "a base CRD was removed or changed across upgrade:
+${missing_crds}"
   pass "existing grid CRDs kept their UIDs; branch CRDs were added ($(wc -l <<<"${CRDS_AFTER}"))"
   CRS_AFTER="$(for k in gridnetworks gridsites inferenceproviders; do uids "${k}.${GROUP}" -A; done)"
   [ "${CRS_AFTER}" = "${CRS_BEFORE}" ] || fail "CR set or UIDs changed across upgrade:
