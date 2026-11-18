@@ -648,14 +648,18 @@ type GridNetworkConsumerGatewaysItemProviderHopEndpointsItem struct {
 // The policy applies to every capability rendered for this gateway. When absent, Grid preserves the existing unconstrained routing behavior. Per-route overrides are outside this contract.
 type GridNetworkConsumerGatewaysItemRegionalPolicy struct {
 	// Unordered hard region allowlist for locked mode.
+	// This Kubernetes set contains 1–64 non-empty values without whitespace, each at most 253 characters.
 	AllowedRegions []string `json:"allowedRegions,omitempty"`
 	// Independent hard sovereignty-zone allowlist for either mode.
+	// Values use the [GridSite] sovereigntyZone token format. Matching uses the shared canonical form and is case-insensitive.
+	// [GridSite]: crate::crd::grid_site::GridSite
 	AllowedSovereigntyZones []string `json:"allowedSovereigntyZones,omitempty"`
 	// Whether affinity routing may consider candidates outside preferred regions.
 	CrossRegionFallback *GridNetworkConsumerGatewaysItemRegionalPolicyCrossRegionFallback `json:"crossRegionFallback,omitempty"`
 	// Whether regions are preferred or form a hard eligibility boundary.
 	Mode GridNetworkConsumerGatewaysItemRegionalPolicyMode `json:"mode"`
 	// Unordered preferred-region set for affinity mode.
+	// This Kubernetes set contains 1–64 non-empty values without whitespace, each at most 253 characters.
 	// When absent, the operator derives the preferred region from the trusted [GridSite] resolved through [GatewayRef::site_name].
 	// [GridSite]: crate::crd::grid_site::GridSite
 	PreferredRegions []string `json:"preferredRegions,omitempty"`
