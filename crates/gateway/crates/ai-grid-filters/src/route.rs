@@ -573,8 +573,9 @@ impl GridSiteRouteFilter {
     /// Route a request that names stored state to the site that stored it.
     ///
     /// `None` for a request that names none. A site no longer in the grid gets
-    /// 404, since the state lives only there. One that admits no new request now
-    /// gets 503.
+    /// 404, since the state lives only there. An established request may continue
+    /// on an `existing_only` candidate; a new conversation may not. A site that
+    /// admits neither gets 503.
     fn pin(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -600,11 +601,11 @@ impl GridSiteRouteFilter {
         let candidate = match pinned_target(&snapshot, holder.as_ref(), model, now_ms) {
             Target::Found(candidate) => candidate,
             Target::Gone => {
-                tracing::debug!(site = ?site, "grid_site_route: the cluster holding the state left the grid");
+                tracing::debug!(site = ?site, "grid_site_route: no live candidate matches the cluster holding the state");
                 return Ok(Some(FilterAction::Reject(Rejection::status(404))));
             },
             Target::Unavailable => {
-                tracing::debug!(site = ?site, "grid_site_route: the cluster holding the state admits no new request");
+                tracing::debug!(site = ?site, "grid_site_route: the cluster holding the state cannot serve this request");
                 return Ok(Some(FilterAction::Reject(
                     Rejection::status(503).with_header("retry-after", RETRY_AFTER_SECS),
                 )));
@@ -1036,6 +1037,13 @@ struct Holder {
     mark: Option<String>,
 }
 
+impl Holder {
+    /// Whether the holder names a tagged stored-state owner rather than a site for new placement.
+    fn is_established(&self) -> bool {
+        self.mark.is_some()
+    }
+}
+
 /// Where a request's stored state pins it, and the path to send, or the answer
 /// when the path names an id without a valid tag. A new conversation pins
 /// nowhere, `None` inside, when the local site cannot take it, so it goes to the
@@ -1079,9 +1087,9 @@ fn pinned_site(
 enum Target<'snap> {
     /// A candidate at the site that admits it.
     Found(&'snap RouteCandidate),
-    /// The site serves nothing that matches: it left the grid.
+    /// No live candidate matches the stored owner and model.
     Gone,
-    /// The site is in the grid but admits no new request now.
+    /// Matching owner candidates remain, but none can serve this request.
     Unavailable,
 }
 
@@ -1095,14 +1103,15 @@ impl<'snap> Target<'snap> {
     }
 }
 
-/// The front candidate at `holder`, anywhere when `None`, that admits a pinned
-/// request, for `model` when named.
+/// The front candidate at `holder`, anywhere when `None`, that admits this
+/// pinned request, for `model` when named.
 fn pinned_target<'snap>(
     snapshot: &'snap RouteSnapshot,
     holder: Option<&Holder>,
     model: Option<&str>,
     now_ms: i64,
 ) -> Target<'snap> {
+    let established = holder.is_some_and(Holder::is_established);
     let mut at_site = snapshot
         .candidates
         .iter()
@@ -1122,7 +1131,11 @@ fn pinned_target<'snap>(
         return Target::Gone;
     }
     at_site
-        .find(|candidate| is_admitted_for_new_request(candidate.admission_state) && !candidate.expired_at(now_ms))
+        .find(|candidate| match candidate.admission_state {
+            AdmissionState::NewAndExisting => true,
+            AdmissionState::ExistingOnly => established,
+            AdmissionState::Excluded => false,
+        })
         .map_or(Target::Unavailable, Target::Found)
 }
 
@@ -1783,6 +1796,200 @@ pub(crate) mod tests {
             site: Arc::from(site),
             mark: cluster.map(pin::cluster_mark),
         }
+    }
+
+    /// Two inference providers at `local`, with the stored-state owner first.
+    fn same_site_two_pool_filter(owner: AdmissionState, other: AdmissionState) -> GridSiteRouteFilter {
+        let candidates = one("llama", "local", "pool-a", owner)
+            .into_iter()
+            .chain(one("llama", "local", "pool-b", other))
+            .collect();
+        let mut snapshot = RouteSnapshot::from_static(candidates, Arc::from("local"));
+        snapshot.scores = vec![0.0, 0.0];
+        filter(snapshot, AffinitySettings::default())
+    }
+
+    /// A request to an API endpoint that names stored state.
+    fn state_request(method: http::Method, uri: &str, include_model: bool) -> praxis_filter::Request {
+        praxis_filter::Request {
+            headers: include_model
+                .then_some((
+                    http::header::HeaderName::from_static("x-model"),
+                    http::HeaderValue::from_static("llama"),
+                ))
+                .into_iter()
+                .collect(),
+            method,
+            uri: uri.parse().expect("the test URI is valid"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tagged_response_continues_on_its_existing_only_owner() {
+        let filter = same_site_two_pool_filter(AdmissionState::ExistingOnly, OPEN);
+        let response_id = format!("resp_{}response-1", pin::tag("local", "pool-a", None));
+        let request = state_request(http::Method::POST, "/v1/responses", true);
+        let mut ctx = context(&request);
+        let mut body = Some(Bytes::from(
+            format!(r#"{{"model":"llama","input":"continue","previous_response_id":"{response_id}"}}"#).into_bytes(),
+        ));
+
+        let body_action = filter
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .expect("reads the tagged Responses owner");
+        assert!(matches!(body_action, FilterAction::Continue), "the body is accepted");
+        let action = filter.on_request(&mut ctx).await.expect("routes the continuation");
+
+        assert!(
+            refusal(&action).is_none(),
+            "the stored response remains available during drain"
+        );
+        assert_eq!(ctx.cluster.as_deref(), Some("pool-a"), "state never moves to pool-b");
+        assert_eq!(
+            body.as_deref(),
+            Some(br#"{"model":"llama","input":"continue","previous_response_id":"resp_response-1"}"#.as_slice()),
+            "the Grid tag is removed before forwarding to the owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tagged_conversation_read_continues_on_its_existing_only_owner() {
+        let filter = same_site_two_pool_filter(AdmissionState::ExistingOnly, OPEN);
+        let conversation_id = format!("conv_{}conversation-1", pin::tag("local", "pool-a", None));
+        let request = state_request(
+            http::Method::GET,
+            &format!("/v1/conversations/{conversation_id}"),
+            false,
+        );
+        let mut ctx = context(&request);
+
+        let action = filter.on_request(&mut ctx).await.expect("routes the conversation read");
+
+        assert!(
+            refusal(&action).is_none(),
+            "the stored conversation remains available during drain"
+        );
+        assert_eq!(ctx.cluster.as_deref(), Some("pool-a"), "state never moves to pool-b");
+        assert_eq!(
+            ctx.rewritten_path.as_deref(),
+            Some("/v1/conversations/conv_conversation-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_conversation_skips_existing_only_providers() {
+        let filter = same_site_two_pool_filter(AdmissionState::ExistingOnly, OPEN);
+        let request = state_request(http::Method::POST, "/v1/conversations", false);
+        let mut ctx = context(&request);
+
+        let action = filter.on_request(&mut ctx).await.expect("routes new conversation work");
+
+        assert!(refusal(&action).is_none(), "pool-b accepts new work");
+        assert_eq!(ctx.cluster.as_deref(), Some("pool-b"), "pool-a remains ExistingOnly");
+
+        let no_new_work_filter = same_site_two_pool_filter(AdmissionState::ExistingOnly, AdmissionState::Excluded);
+        let mut no_new_work_ctx = context(&request);
+        let no_new_work_action = no_new_work_filter
+            .on_request(&mut no_new_work_ctx)
+            .await
+            .expect("answers when no provider accepts new work");
+
+        assert_eq!(refusal(&no_new_work_action).map(|(status, _)| status), Some(503));
+        assert!(no_new_work_ctx.cluster.is_none(), "new work does not use pool-a");
+    }
+
+    #[tokio::test]
+    async fn a_missing_conversation_owner_keeps_the_not_found_response() {
+        let filter = same_site_two_pool_filter(AdmissionState::ExistingOnly, OPEN);
+        let conversation_id = format!("conv_{}conversation-1", pin::tag("local", "pool-gone", None));
+        let request = state_request(
+            http::Method::GET,
+            &format!("/v1/conversations/{conversation_id}"),
+            false,
+        );
+        let mut ctx = context(&request);
+
+        let action = filter.on_request(&mut ctx).await.expect("answers a missing owner");
+
+        assert_eq!(refusal(&action).map(|(status, _)| status), Some(404));
+        assert!(
+            ctx.cluster.is_none(),
+            "a missing owner cannot fall back to another candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_conversation_tag_remains_not_found() {
+        let filter = same_site_two_pool_filter(AdmissionState::ExistingOnly, OPEN);
+        let request = state_request(
+            http::Method::GET,
+            "/v1/conversations/conv_local.not-a-mark..conversation-1",
+            false,
+        );
+        let mut ctx = context(&request);
+
+        let action = filter.on_request(&mut ctx).await.expect("rejects a malformed tag");
+
+        assert_eq!(refusal(&action).map(|(status, _)| status), Some(404));
+        assert!(ctx.cluster.is_none(), "a malformed tag cannot select a candidate");
+    }
+
+    #[test]
+    fn pinned_target_admission_distinguishes_established_state_from_new_placement() {
+        for (admission, cluster, admitted) in [
+            (OPEN, None, true),
+            (OPEN, Some("pool-a"), true),
+            (AdmissionState::ExistingOnly, None, false),
+            (AdmissionState::ExistingOnly, Some("pool-a"), true),
+            (AdmissionState::Excluded, None, false),
+            (AdmissionState::Excluded, Some("pool-a"), false),
+        ] {
+            let snapshot = RouteSnapshot::from_static(one("llama", "local", "pool-a", admission), Arc::from("local"));
+            let holder = holder("local", cluster);
+            let target = pinned_target(&snapshot, Some(&holder), Some("llama"), TEST_NOW_MS);
+            assert_eq!(
+                matches!(target, Target::Found(_)),
+                admitted,
+                "admission {admission:?}, cluster {cluster:?}"
+            );
+            if !admitted {
+                assert!(
+                    matches!(target, Target::Unavailable),
+                    "the owner is present but unavailable"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_existing_only_owner_does_not_bypass_active_model_shedding() {
+        let candidates = one("llama", "local", "pool-a", AdmissionState::ExistingOnly)
+            .into_iter()
+            .chain(one("llama", "local", "pool-b", OPEN))
+            .collect();
+        let mut snapshot = RouteSnapshot::from_static(candidates, Arc::from("local"));
+        snapshot.shedding.insert(Arc::from("llama"));
+        assert!(
+            snapshot.is_shedding("llama", TEST_NOW_MS),
+            "the model's shedding gate is active"
+        );
+        let filter = filter(snapshot, AffinitySettings::default());
+        let conversation_id = format!("conv_{}conversation-1", pin::tag("local", "pool-a", None));
+        let request = state_request(http::Method::GET, &format!("/v1/conversations/{conversation_id}"), true);
+        let mut ctx = context(&request);
+
+        let action = filter
+            .on_request(&mut ctx)
+            .await
+            .expect("checks model shedding before routing the owner");
+
+        assert_eq!(refusal(&action).map(|(status, _)| status), Some(429));
+        assert!(
+            ctx.cluster.is_none(),
+            "no owner is selected while the model is shedding"
+        );
+        assert!(ctx.upstream.is_none(), "no upstream is contacted");
     }
 
     #[test]
@@ -3749,6 +3956,37 @@ pub(crate) mod tests {
         let action = filter.on_request(&mut inside_ctx).await.expect("routes");
         assert!(refusal(&action).is_none(), "state inside the fence is reached");
         assert_eq!(inside_ctx.cluster.as_deref(), Some("local-pool"));
+    }
+
+    #[tokio::test]
+    async fn a_tagged_existing_only_owner_remains_subject_to_the_sovereignty_fence() {
+        let candidates = in_zone(one("llama", "local", "pool-a", AdmissionState::ExistingOnly), "eu");
+        let snapshot = RouteSnapshot::from_static(candidates, Arc::from("local"));
+        let filter = fencing(filter(snapshot, AffinitySettings::default()));
+        let conversation_id = format!("conv_{}conversation-1", pin::tag("local", "pool-a", None));
+        let path = format!("/v1/conversations/{conversation_id}");
+        for (zone, allowed) in [("us", false), ("eu", true)] {
+            let mut request = state_request(http::Method::GET, &path, false);
+            request.headers.insert(ZONE, http::HeaderValue::from_static(zone));
+            let mut ctx = context(&request);
+
+            let action = filter
+                .on_request(&mut ctx)
+                .await
+                .expect("checks the tagged owner's zone");
+
+            if allowed {
+                assert!(
+                    refusal(&action).is_none(),
+                    "the owner remains available inside its zone"
+                );
+                assert_eq!(ctx.cluster.as_deref(), Some("pool-a"));
+            } else {
+                assert_eq!(refusal(&action).map(|(status, _)| status), Some(403));
+                assert!(ctx.cluster.is_none(), "the owner is not selected outside the fence");
+                assert!(ctx.upstream.is_none(), "no upstream is contacted");
+            }
+        }
     }
 
     #[tokio::test]
