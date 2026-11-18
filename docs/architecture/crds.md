@@ -620,10 +620,11 @@ change policy eligibility with a request header.
 | `allowedSovereigntyZones` | both modes | Optional independent hard allowlist. A candidate must pass both this set and its regional rule; comparison uses the shared sovereignty-zone canonical form (trimmed, lowercased tokens). |
 
 `preferredRegions` and `allowedRegions` are unordered Kubernetes sets of 1–64
-non-blank values, each at most 253 characters. `allowedSovereigntyZones` uses
-the shared sovereignty-zone token grammar: ASCII letters, digits, `.`, `_`, or
-`-`, at most 63 characters; values are compared case-insensitively, so `EU`
-and `eu` denote the same zone. A valid policy with unresolved required site metadata, or with no
+non-empty values containing no whitespace, each at most 253 characters.
+`allowedSovereigntyZones` uses the shared sovereignty-zone token grammar: ASCII
+letters, digits, `.`, `_`, or `-`, at most 63 characters; values are compared
+case-insensitively, so `EU` and `eu` denote the same zone. A valid policy with
+unresolved required site metadata, or with no
 permitted candidate, publishes an authoritative empty revision and fails
 closed. An invalid policy update is rejected before it can
 replace the last-known-good revision. See the
