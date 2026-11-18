@@ -1145,6 +1145,25 @@ pub(crate) enum Action {
         evidence_dir: Option<PathBuf>,
     },
 
+    /// Qualify embedded `grid_site_route` balancing without pressure telemetry.
+    RunGridSiteRouteBalancingQualification {
+        /// Forge topology to deploy.
+        #[arg(long, default_value = "tests/e2e/topologies/grid-site-route-balancing/forge.yaml")]
+        forge_config: PathBuf,
+        /// Delete only this run's Kind cluster after the qualification.
+        #[arg(long)]
+        teardown: bool,
+        /// With `--teardown`, retain the run-owned cluster on failure for diagnosis.
+        #[arg(long, requires = "teardown")]
+        keep_on_failure: bool,
+        /// Evidence directory. Defaults to a timestamped path under the topology.
+        #[arg(long)]
+        evidence_dir: Option<PathBuf>,
+        /// Use reduced request samples while retaining every qualification gate.
+        #[arg(long)]
+        quick: bool,
+    },
+
     /// Run the distributed token-rate-limit topology with structured evidence.
     RunGridTokenRateLimitQualification {
         /// Path to the Forge environment config file.
@@ -1401,6 +1420,20 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
             teardown: *teardown,
             keep_on_failure: *keep_on_failure,
             evidence_dir: evidence_dir.clone(),
+            quick: false,
+        }),
+        Action::RunGridSiteRouteBalancingQualification {
+            forge_config,
+            teardown,
+            keep_on_failure,
+            evidence_dir,
+            quick,
+        } => operator_routing_qualification::run_site_route_balancing(&operator_routing_qualification::Options {
+            forge_config: forge_config.clone(),
+            teardown: *teardown,
+            keep_on_failure: *keep_on_failure,
+            evidence_dir: evidence_dir.clone(),
+            quick: *quick,
         }),
         Action::RunGridTokenRateLimitQualification {
             forge_config,
@@ -8113,13 +8146,32 @@ mod operator_routing_qualification_cli_tests {
         }
     }
 
+    fn site_route_config(action: Action) -> Result<PathBuf, Box<dyn Error>> {
+        if let Action::RunGridSiteRouteBalancingQualification { forge_config, .. } = action {
+            Ok(forge_config)
+        } else {
+            Err(io::Error::other("parsed env action was not site-route balancing qualification").into())
+        }
+    }
+
     #[test]
-    fn operator_routing_command_defaults_to_its_dedicated_topology() -> Result<(), Box<dyn Error>> {
+    fn site_route_command_defaults_to_its_dedicated_topology() -> Result<(), Box<dyn Error>> {
+        let action = parse_env_action(&["xtask", "env", "run-grid-site-route-balancing-qualification"])?;
+        assert_eq!(
+            site_route_config(action)?,
+            PathBuf::from("tests/e2e/topologies/grid-site-route-balancing/forge.yaml"),
+            "the qualification must use its dedicated topology"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn existing_operator_routing_command_remains_separate() -> Result<(), Box<dyn Error>> {
         let action = parse_env_action(&["xtask", "env", "run-grid-operator-routing-qualification"])?;
         assert_eq!(
             operator_routing_config(action)?,
             PathBuf::from("tests/e2e/topologies/grid-operator-routing/forge.yaml"),
-            "the default command must use the operator-routing topology"
+            "the existing Actions qualification keeps its existing topology"
         );
         Ok(())
     }
@@ -8128,7 +8180,7 @@ mod operator_routing_qualification_cli_tests {
     fn another_env_action_is_not_accepted_as_operator_routing() -> Result<(), Box<dyn Error>> {
         let action = parse_env_action(&["xtask", "env", "run-grid-static-weighted-qualification"])?;
         assert!(
-            operator_routing_config(action).is_err(),
+            site_route_config(action).is_err(),
             "the CLI test helper must reject a successfully parsed but unexpected action"
         );
         Ok(())
@@ -8139,7 +8191,7 @@ mod operator_routing_qualification_cli_tests {
         let result = Cli::try_parse_from([
             "xtask",
             "env",
-            "run-grid-operator-routing-qualification",
+            "run-grid-site-route-balancing-qualification",
             "--keep-on-failure",
         ]);
         assert!(result.is_err(), "--keep-on-failure without --teardown must be rejected");
@@ -8150,20 +8202,20 @@ mod operator_routing_qualification_cli_tests {
         let action = parse_env_action(&[
             "xtask",
             "env",
-            "run-grid-operator-routing-qualification",
+            "run-grid-site-route-balancing-qualification",
             "--forge-config",
             "custom/forge.yaml",
             "--teardown",
             "--keep-on-failure",
         ])?;
-        let Action::RunGridOperatorRoutingQualification {
+        let Action::RunGridSiteRouteBalancingQualification {
             forge_config,
             teardown,
             keep_on_failure,
             ..
         } = action
         else {
-            return Err(io::Error::other("parsed action was not operator routing qualification").into());
+            return Err(io::Error::other("parsed action was not site-route qualification").into());
         };
         assert_eq!(
             forge_config,

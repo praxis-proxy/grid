@@ -3,7 +3,7 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{HeaderName, HeaderValue, Request, Response, StatusCode, header},
+    http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, header},
     middleware::Next,
     response::IntoResponse,
 };
@@ -38,6 +38,22 @@ pub(crate) async fn inject_provider_header(
     req: Request<Body>,
     next: Next,
 ) -> Response<Body> {
+    let path = req.uri().path();
+    let inference_request = (req.method() == Method::POST
+        && matches!(path, "/v1/chat/completions" | "/v1/responses" | "/v1/conversations"))
+        || (req.method() == Method::GET
+            && ["/v1/responses/", "/v1/conversations/"]
+                .iter()
+                .any(|prefix| path.starts_with(prefix)));
+    if inference_request {
+        let request_id = req
+            .headers()
+            .get("x-qualification-request-id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.len() <= 128)
+            .map(str::to_owned);
+        state.record_inference_request(request_id);
+    }
     let provider_attribution = req.headers().get(PROVIDER_ATTRIBUTION_INPUT).cloned();
     let provider_request_id = req.headers().get(PROVIDER_REQUEST_ID_INPUT).cloned();
     let overlay_revision = req.headers().get(OVERLAY_REVISION_INPUT).cloned();
@@ -59,6 +75,25 @@ pub(crate) async fn inject_provider_header(
             .insert(HeaderName::from_static(BACKEND_OVERLAY_REVISION_CAPTURE), value);
     }
     resp
+}
+
+/// Return bounded backend receipts only when the isolated qualification opted in.
+pub(crate) fn qualification_receipts(state: &AppState) -> Response<Body> {
+    if !state.qualification_enabled() {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::empty())
+            .unwrap_or_default();
+    }
+    let (total, request_ids) = state.inference_receipts();
+    json_response(
+        StatusCode::OK,
+        &serde_json::json!({
+            "provider": state.provider_site.as_ref(),
+            "total": total,
+            "request_ids": request_ids,
+        }),
+    )
 }
 
 // ---------------------------------------------------------------------------

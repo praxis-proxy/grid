@@ -83,7 +83,10 @@ pub struct InferenceProviderSpec {
     #[serde(default, alias = "gatewayRef", skip_serializing_if = "Option::is_none")]
     pub provider_gateway: Option<String>,
 
-    /// Relative capacity used by an opt-in placement policy.
+    /// Relative provider capacity. `intelligent_route` uses it as static
+    /// `traffic_weight` when the `GridNetwork` opts into weighted placement;
+    /// `grid_site_route` also carries it as a candidate weight for its own
+    /// capacity fallback, independently of that selection policy.
     #[schemars(range(min = 1, max = 1000))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity_weight: Option<u32>,
