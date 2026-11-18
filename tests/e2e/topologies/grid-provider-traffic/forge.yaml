@@ -28,6 +28,8 @@ spec:
         gatewayImageTag: "0.7.0"
         operatorImageRepo: "ghcr.io/praxis-proxy/grid-operator"
         operatorImageTag: "v0.1.4"
+        overlaySyncImageRepo: "grid-overlay-sync"
+        overlaySyncImageTag: "provider-traffic-qualification"
 
     - name: provider-b
       stacks: [provider-b-operator-base, vcr-backend, provider-b-site, provider-gateway]
