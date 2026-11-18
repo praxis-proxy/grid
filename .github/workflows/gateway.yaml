@@ -23,6 +23,8 @@ on:
       - 'rust-toolchain.toml'
       - 'rustfmt.toml'
       - 'clippy.toml'
+      - 'scripts/check-unused-dependencies.py'
+      - 'scripts/test-gateway-dependencies.py'
       - 'deploy/gateway/Containerfile'
       - '.github/workflows/gateway.yaml'
   pull_request:
@@ -39,6 +41,8 @@ on:
       - 'rust-toolchain.toml'
       - 'rustfmt.toml'
       - 'clippy.toml'
+      - 'scripts/check-unused-dependencies.py'
+      - 'scripts/test-gateway-dependencies.py'
       - 'deploy/gateway/Containerfile'
       - '.github/workflows/gateway.yaml'
   merge_group:
@@ -85,7 +89,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-machete
-        run: cargo install cargo-machete --locked
+        # Pin the tool: newer releases may require APIs unavailable on Rust 1.96.
+        run: cargo install cargo-machete --version '=0.9.2' --locked
 
       - name: Clippy
         run: cargo clippy --manifest-path crates/gateway/Cargo.toml --workspace --all-targets -- -D warnings
@@ -94,7 +99,10 @@ jobs:
         run: cargo +"$NIGHTLY_RUSTFMT" fmt --manifest-path crates/gateway/Cargo.toml --all -- --check
 
       - name: Machete (unused dependencies)
-        run: cargo machete crates/gateway
+        run: python3 scripts/check-unused-dependencies.py crates/gateway
+
+      - name: Machete regression tests
+        run: python3 scripts/test-gateway-dependencies.py
 
       # The binary's TLS must come from the OpenSSL provider Praxis installs, so ring stays test-only.
       # openssl-sys is the positive control: an empty or failed tree must not pass.
