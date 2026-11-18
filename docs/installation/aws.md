@@ -109,6 +109,10 @@ for k in gridnetwork gridsite inferenceprovider agenttoolprovider; do
 done
 ```
 
+The A2A CRD is experimental. Install it separately only when using an operator
+image built with the `a2a` Cargo feature and an explicit opt-in chart profile
+(`--set experimental.a2a.enabled=true`).
+
 Then install the release with `--set crds.enabled=false`, since the CRDs are now the
 platform's rather than Helm's.
 
