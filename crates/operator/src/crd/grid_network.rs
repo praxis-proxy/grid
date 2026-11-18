@@ -124,6 +124,9 @@ pub struct RegionalPolicy {
 
     /// Unordered preferred-region set for affinity mode.
     ///
+    /// This Kubernetes set contains 1–64 non-empty values without whitespace,
+    /// each at most 253 characters.
+    ///
     /// When absent, the operator derives the preferred region from the trusted
     /// [`GridSite`] resolved through [`GatewayRef::site_name`].
     ///
@@ -137,6 +140,9 @@ pub struct RegionalPolicy {
     pub preferred_regions: Option<Vec<String>>,
 
     /// Unordered hard region allowlist for locked mode.
+    ///
+    /// This Kubernetes set contains 1–64 non-empty values without whitespace,
+    /// each at most 253 characters.
     #[schemars(
         length(min = 1, max = 64),
         inner(length(min = 1, max = 253), regex(pattern = r"^\S+$")),
@@ -152,6 +158,11 @@ pub struct RegionalPolicy {
     pub cross_region_fallback: Option<CrossRegionFallback>,
 
     /// Independent hard sovereignty-zone allowlist for either mode.
+    ///
+    /// Values use the [`GridSite`] `sovereigntyZone` token format. Matching
+    /// uses the shared canonical form and is case-insensitive.
+    ///
+    /// [`GridSite`]: crate::crd::grid_site::GridSite
     #[schemars(
         length(min = 1, max = 64),
         inner(length(min = 1, max = 63), regex(pattern = "^[A-Za-z0-9._-]+$")),
