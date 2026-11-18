@@ -4724,6 +4724,10 @@ fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResu
             .iter()
             .map(|(site, _)| Ok(((*site).to_owned(), read_backend_success_count(site)?)))
             .collect::<Result<_, Box<dyn std::error::Error>>>()?;
+        let gateway_posts_before: BTreeMap<String, u64> = PROVIDER_RESOURCES
+            .iter()
+            .map(|(site, _)| Ok(((*site).to_owned(), read_provider_gateway_post_count(site)?)))
+            .collect::<Result<_, Box<dyn std::error::Error>>>()?;
         let empty_receipt_boundary = embedded_serving_log_boundary()?;
         patch_provider_selector(provider_a_state, "grid258-regional-locked-withdrawn")?;
         provider_a_withdrawn = true;
@@ -4751,9 +4755,19 @@ fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResu
             .iter()
             .map(|(site, _)| Ok(((*site).to_owned(), read_backend_success_count(site)?)))
             .collect::<Result<_, Box<dyn std::error::Error>>>()?;
+        let gateway_posts_after: BTreeMap<String, u64> = PROVIDER_RESOURCES
+            .iter()
+            .map(|(site, _)| Ok(((*site).to_owned(), read_provider_gateway_post_count(site)?)))
+            .collect::<Result<_, Box<dyn std::error::Error>>>()?;
         if metrics_before != metrics_after {
             return Err(format!(
                 "a locked no-route request reached a backend: before={metrics_before:?}, after={metrics_after:?}"
+            )
+            .into());
+        }
+        if gateway_posts_before != gateway_posts_after {
+            return Err(format!(
+                "a locked no-route request reached a provider gateway: before={gateway_posts_before:?}, after={gateway_posts_after:?}"
             )
             .into());
         }
@@ -4774,6 +4788,14 @@ fn assert_regional_policy_consumers(embedded_gateway_enabled: bool) -> ProofResu
         facts.insert(
             "locked_backend_counts_after".to_owned(),
             serde_json::json!(metrics_after),
+        );
+        facts.insert(
+            "locked_provider_gateway_posts_before".to_owned(),
+            serde_json::json!(gateway_posts_before),
+        );
+        facts.insert(
+            "locked_provider_gateway_posts_after".to_owned(),
+            serde_json::json!(gateway_posts_after),
         );
 
         // `locked_previous` must be the affinity policy applied just before the lock.
@@ -5942,8 +5964,8 @@ fn assert_provider_withdrawal_lifecycle(
         // The empty revision is authoritative until providers recover. Restore the injected
         // configuration only after both consumers have proved that exact revision refuses new
         // and bound traffic; either patch is itself a new reconciliation trigger.
-        if let Some(previous) = original_provider_hop_endpoints.take() {
-            let prior = if previous.is_null() { None } else { Some(&previous) };
+        if let Some(previous) = original_provider_hop_endpoints.as_ref() {
+            let prior = if previous.is_null() { None } else { Some(previous) };
             let injected = patch_embedded_provider_hop_endpoints(prior)?;
             if injected
                 != serde_json::json!([{
@@ -5960,6 +5982,7 @@ fn assert_provider_withdrawal_lifecycle(
                 "provider_hop_metadata_restored_before_provider_restore".to_owned(),
                 serde_json::json!(true),
             );
+            original_provider_hop_endpoints = None;
         }
 
         let restored_mode = set_generated_consumer_provider_a_transport_mode(
@@ -6655,6 +6678,11 @@ fn is_kind_import_image_id(image_id: &str) -> bool {
         .is_some_and(|name| name.starts_with("import-"))
 }
 
+/// Whether runtime evidence compared its expected local config digest.
+fn source_matched(expected: Option<&str>, runtime_verification: &str) -> bool {
+    expected.is_some() && runtime_verification == "config_digest"
+}
+
 /// Prefer the inspected config digest, but compare the Pod's immutable imageID when CRI omits it.
 fn ready_pod_image_matches_config_digest(expected: &str, pod_image_id: &str, node_config_digest: Option<&str>) -> bool {
     match node_config_digest.filter(|digest| !digest.is_empty()) {
@@ -6882,7 +6910,7 @@ pub(super) fn deployment_runtime_image_evidence(
                     "nodeConfigDigest": node_config_digest.filter(|digest| !digest.is_empty()),
                     "podImageIdMatchedExpectedLocalConfig": pod_image_id_matches_expected,
                     "runtimeVerification": runtime_verification,
-                    "sourceMatched": expected.is_some(),
+                    "sourceMatched": source_matched(expected.map(String::as_str), runtime_verification),
                 }))
             })
             .collect::<Result<_, String>>()?;
@@ -7052,6 +7080,13 @@ mod tests {
         ));
         assert!(!is_kind_import_image_id("docker.io/library/grid-operator:latest"));
         assert!(!is_kind_import_image_id("docker.io/library/grid@sha256:manifest"));
+    }
+
+    #[test]
+    fn manifest_only_image_evidence_is_not_reported_as_source_matched() {
+        assert!(!source_matched(Some("sha256:expected"), "kind_import_manifest"));
+        assert!(source_matched(Some("sha256:expected"), "config_digest"));
+        assert!(!source_matched(None, "config_digest"));
     }
 
     #[test]

@@ -1532,6 +1532,60 @@ fn retain_valid_candidate_identifiers(candidates: &mut Vec<RoutingCandidate>, ne
     }
 }
 
+/// Whether a candidate admits a new request when its state is absent or explicit.
+fn admits_new_work(candidate: &RoutingCandidate) -> bool {
+    matches!(candidate.admission_state, None | Some(AdmissionState::NewAndExisting))
+}
+
+/// Whether a candidate is an affinity fallback that can take new work.
+fn is_admitted_regional_fallback(candidate: &RoutingCandidate) -> bool {
+    candidate.kind == CANDIDATE_KIND
+        && candidate.regional_policy_group == Some(RegionalPolicyGroup::Fallback)
+        && admits_new_work(candidate)
+}
+
+/// Reserve one admitted affinity fallback when retained preferred candidates cannot take new work.
+///
+/// The normal ranking deliberately places every preferred candidate before a fallback. At the
+/// overlay cap, retain one fallback for a model only by replacing a retained non-admitted
+/// candidate for that same model. This preserves the cap, inference reservation, and existing
+/// session candidates for every other model.
+fn reserve_admitted_regional_fallbacks(candidates: &[RoutingCandidate], retained: &mut [bool]) {
+    for (fallback_index, fallback) in candidates.iter().enumerate() {
+        if retained.get(fallback_index).copied().unwrap_or(false) || !is_admitted_regional_fallback(fallback) {
+            continue;
+        }
+        let new_work_survives = candidates.iter().zip(retained.iter()).any(|(candidate, retained)| {
+            *retained
+                && candidate.kind == CANDIDATE_KIND
+                && candidate.name == fallback.name
+                && admits_new_work(candidate)
+        });
+        if new_work_survives {
+            continue;
+        }
+        let replacement = candidates
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(index, candidate)| {
+                retained.get(*index).copied().unwrap_or(false)
+                    && candidate.kind == CANDIDATE_KIND
+                    && candidate.name == fallback.name
+                    && !admits_new_work(candidate)
+            })
+            .map(|(index, _)| index);
+        if let Some(replacement) = replacement {
+            if let Some(retained_replacement) = retained.get_mut(replacement) {
+                *retained_replacement = false;
+            }
+            if let Some(retained_fallback) = retained.get_mut(fallback_index) {
+                *retained_fallback = true;
+            }
+        }
+    }
+}
+
 /// Retain inference candidates, then the highest-ranked remaining capabilities.
 ///
 /// Capability-specific data planes project from the shared overlay after this
@@ -1555,16 +1609,25 @@ fn truncate_candidate_count(candidates: &mut Vec<RoutingCandidate>, network_name
     );
     let mut inference_slots = inference_count.min(MAX_OVERLAY_CANDIDATES);
     let mut other_slots = MAX_OVERLAY_CANDIDATES.saturating_sub(inference_slots);
-    candidates.retain(|candidate| {
-        let slots = if candidate.kind == CANDIDATE_KIND {
-            &mut inference_slots
-        } else {
-            &mut other_slots
-        };
-        let keep = *slots > 0;
-        *slots = slots.saturating_sub(usize::from(keep));
-        keep
-    });
+    let mut retained = candidates
+        .iter()
+        .map(|candidate| {
+            let slots = if candidate.kind == CANDIDATE_KIND {
+                &mut inference_slots
+            } else {
+                &mut other_slots
+            };
+            let keep = *slots > 0;
+            *slots = slots.saturating_sub(usize::from(keep));
+            keep
+        })
+        .collect::<Vec<_>>();
+    reserve_admitted_regional_fallbacks(candidates, &mut retained);
+    *candidates = std::mem::take(candidates)
+        .into_iter()
+        .zip(retained)
+        .filter_map(|(candidate, keep)| keep.then_some(candidate))
+        .collect();
 }
 
 /// Render an overlay using controller-owned admission states and the local
@@ -9666,6 +9729,40 @@ mod tests {
                 .map(|candidate| (candidate.kind.as_str(), candidate.name.as_str())),
             Some((CANDIDATE_KIND, "model-last-before-cap")),
             "a bounded MCP catalog must not evict an inference candidate"
+        );
+    }
+
+    #[test]
+    fn candidate_cap_keeps_an_admitted_regional_fallback_for_new_work() {
+        let mut candidates = (0..MAX_OVERLAY_CANDIDATES)
+            .map(|index| {
+                let mut candidate = bare_candidate(
+                    CANDIDATE_KIND,
+                    "llama",
+                    "site-preferred",
+                    &format!("preferred-{index:04}"),
+                    true,
+                );
+                candidate.admission_state = Some(AdmissionState::ExistingOnly);
+                candidate.regional_policy_group = Some(RegionalPolicyGroup::Preferred);
+                candidate
+            })
+            .collect::<Vec<_>>();
+        let mut fallback = bare_candidate(CANDIDATE_KIND, "llama", "site-fallback", "fallback", true);
+        fallback.admission_state = Some(AdmissionState::NewAndExisting);
+        fallback.regional_policy_group = Some(RegionalPolicyGroup::Fallback);
+        candidates.push(fallback);
+
+        truncate_candidate_count(&mut candidates, "net");
+
+        assert_eq!(candidates.len(), MAX_OVERLAY_CANDIDATES);
+        assert!(
+            candidates.iter().any(|candidate| candidate.cluster == "fallback"),
+            "a fallback that admits new work must survive when preferred candidates cannot"
+        );
+        assert!(
+            candidates.iter().any(admits_new_work),
+            "the retained model must still have a candidate for new work"
         );
     }
 

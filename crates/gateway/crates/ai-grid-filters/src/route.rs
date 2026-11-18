@@ -652,7 +652,7 @@ impl GridSiteRouteFilter {
     ///
     /// A conversation has no stored owner yet, so regional selection applies before the local
     /// preference. A local candidate can therefore win only inside the first group that admits
-    /// new work, and the chosen candidate itself must admit that work.
+    /// new work and has a healthy candidate, and the chosen candidate itself must admit that work.
     fn new_conversation_owner<'snap>(
         &self,
         snapshot: &'snap RouteSnapshot,
@@ -667,12 +667,18 @@ impl GridSiteRouteFilter {
                 && has_route(candidate, self.clusters.as_ref())
                 && skip.is_none_or(|skip| *candidate.cluster != *skip)
         };
-        let candidates = snapshot.candidates.iter().filter(|candidate| new_work(candidate));
-        let candidates = candidates.filter(|candidate| fence.is_none_or(|fence| fence.allows(candidate)));
+        let candidates = snapshot
+            .candidates
+            .iter()
+            .zip(&snapshot.scores)
+            .filter(|(candidate, _)| new_work(candidate));
+        let candidates = candidates.filter(|(candidate, _)| fence.is_none_or(|fence| fence.allows(candidate)));
         let group = candidates
             .clone()
-            .map(|candidate| candidate.selection_group)
+            .filter(|(_, score)| !score.is_nan())
+            .map(|(candidate, _)| candidate.selection_group)
             .min()
+            .or_else(|| candidates.clone().map(|(candidate, _)| candidate.selection_group).min())
             .ok_or_else(|| {
                 if fence.is_some_and(|fence| fence.enforced().is_some()) && snapshot.candidates.iter().any(new_work) {
                     Refused::Fenced
@@ -680,11 +686,19 @@ impl GridSiteRouteFilter {
                     Refused::NotReady
                 }
             })?;
-        let mut candidates = candidates.filter(|candidate| candidate.selection_group == group);
-        candidates
+        let mut candidates = candidates.filter(|(candidate, _)| candidate.selection_group == group);
+        let mut healthy = candidates.clone().filter(|(_, score)| !score.is_nan());
+        healthy
             .clone()
-            .find(|candidate| *candidate.site == *snapshot.local_site)
+            .find(|(candidate, _)| *candidate.site == *snapshot.local_site)
+            .or_else(|| healthy.next())
+            .or_else(|| {
+                candidates
+                    .clone()
+                    .find(|(candidate, _)| *candidate.site == *snapshot.local_site)
+            })
             .or_else(|| candidates.next())
+            .map(|(candidate, _)| candidate)
             .ok_or(Refused::NotReady)
     }
 
@@ -1458,7 +1472,12 @@ pub(crate) fn select_spread<'snap>(
     narrow: &impl Narrow,
 ) -> Option<Pick<'snap>> {
     let matches = matching(snapshot, kind, name, &routable);
-    let selection_group = matches.clone().map(|(candidate, ..)| candidate.selection_group).min()?;
+    let selection_group = matches
+        .clone()
+        .filter(|(_, score, _)| !score.is_nan())
+        .map(|(candidate, ..)| candidate.selection_group)
+        .min()
+        .or_else(|| matches.clone().map(|(candidate, ..)| candidate.selection_group).min())?;
     let matches = matches.filter(move |(candidate, ..)| candidate.selection_group == selection_group);
     let (front, front_score, front_decisions) = matches.clone().next()?;
     let site = |(candidate, score, decisions): Scored<'snap>| (candidate, decisions, score);
@@ -1783,6 +1802,31 @@ pub(crate) mod tests {
             Some("pool-west".to_owned()),
             "new work may use the fallback only after the preferred group no longer admits it"
         );
+    }
+
+    #[test]
+    fn selection_groups_skip_a_demoted_preferred_candidate_for_a_healthy_fallback() {
+        let mut preferred = one("llama", "east", "pool-east", AdmissionState::NewAndExisting);
+        let mut fallback = one("llama", "west", "pool-west", AdmissionState::NewAndExisting);
+        preferred[0].selection_group = 0;
+        fallback[0].selection_group = 1;
+        let mut snapshot = RouteSnapshot::from_static(
+            vec![preferred.pop().unwrap(), fallback.pop().unwrap()],
+            Arc::from("east"),
+        );
+        snapshot.scores[0] = f64::NAN;
+
+        let selected = select_spread(
+            &snapshot,
+            CapabilityKind::InferenceModel,
+            "llama",
+            0,
+            |_| true,
+            &KeepAll,
+        )
+        .expect("healthy fallback is selected");
+
+        assert_eq!(selected.candidate.cluster.as_ref(), "pool-west");
     }
 
     /// A filter over `snapshot` with affinity at `settings`.
@@ -3652,6 +3696,32 @@ pub(crate) mod tests {
             "the preferred group serves the conversation"
         );
         assert_eq!(ctx.cluster.as_deref(), Some("remote-preferred"));
+    }
+
+    #[tokio::test]
+    async fn a_model_less_conversation_prefers_a_healthy_remote_owner_over_a_demoted_local_owner() {
+        let local = one("llama", "local", "local-pool", OPEN);
+        let remote = one("llama", "remote", "remote-pool", OPEN);
+        let mut snapshot = RouteSnapshot::from_static(local.into_iter().chain(remote).collect(), Arc::from("local"));
+        snapshot.scores[0] = f64::NAN;
+        let mut filter = filter(
+            snapshot,
+            AffinitySettings {
+                enabled: false,
+                ..AffinitySettings::default()
+            },
+        );
+        filter.clusters = Some(["local-pool", "remote-pool"].into_iter().map(Arc::from).collect());
+        let request = conversation_request();
+        let mut ctx = context(&request);
+
+        let action = filter.on_request(&mut ctx).await.expect("routes");
+
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "the healthy owner serves the conversation"
+        );
+        assert_eq!(ctx.cluster.as_deref(), Some("remote-pool"));
     }
 
     #[tokio::test]
