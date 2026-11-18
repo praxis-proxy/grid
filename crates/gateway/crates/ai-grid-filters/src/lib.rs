@@ -54,7 +54,7 @@ pub use snapshot::RouteSnapshot;
 const COUNTER_HELP: [(&str, &str); 13] = [
     (
         "grid_route_decisions_total",
-        "Requests the gateway decided, by outcome. A refusal records an empty site and cluster.",
+        "Requests the gateway decided, by configured model and outcome. A refusal records an empty site, cluster and model.",
     ),
     (
         "grid_route_selections_total",

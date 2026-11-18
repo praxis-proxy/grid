@@ -46,7 +46,7 @@ pub struct RouteSnapshot {
     /// Why each candidate has no score, parallel to `candidates`.
     score_unavailable: Vec<Option<ScoreUnavailable>>,
 
-    /// Each candidate's site decision counters, parallel to `candidates`.
+    /// Each inference candidate's site/cluster/model counters, parallel to `candidates`.
     pub decisions: Vec<SiteDecisions>,
 
     /// Models answering 503 because every healthy site serving them is past full.
@@ -523,10 +523,7 @@ impl RouteSnapshot {
 
 /// Decision counters for each of `candidates`, in order.
 pub(crate) fn decisions_for(candidates: &[RouteCandidate]) -> Vec<SiteDecisions> {
-    candidates
-        .iter()
-        .map(|candidate| SiteDecisions::new(&candidate.site, &candidate.cluster))
-        .collect()
+    candidates.iter().map(SiteDecisions::new).collect()
 }
 
 /// A candidate's site and cluster, the labels of its score gauge.

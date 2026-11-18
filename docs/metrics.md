@@ -166,7 +166,7 @@ state, so two replicas agree only in steady state.
 |---|---|---|---|
 | `grid_metrics_auth_total` | counter | `result` | Gateway metrics scrape outcomes: `missing`, `allowed`, `unauthenticated`, `forbidden`, `overloaded`, and `api_error`. |
 | `grid_metrics_auth_in_flight` | gauge | | Kubernetes TokenReview and SubjectAccessReview requests currently running for scrapes. |
-| `grid_route_decisions_total` | counter | `site`, `cluster`, `reason` | Requests the gateway decided, by outcome. A refusal records an empty site and cluster. |
+| `grid_route_decisions_total` | counter | `site`, `cluster`, `model`, `reason` | Requests decided per configured model and outcome. Refusals use empty site, cluster, and model labels. |
 | `grid_route_selections_total` | counter | `path` | Decisions by the path that produced them. |
 | `grid_route_site_rho` | gauge | `site`, `cluster` | Smoothed saturation used by the draw: the comparator for an llm-d site, otherwise in-flight over the learned ceiling. |
 | `grid_route_site_rho_reported` | gauge | `site`, `cluster` | The EPP's own pool saturation, published with flow control on. For a site without an in-flight count, the comparator it is read by. Uncapped; `NaN` where neither exists. |
@@ -208,6 +208,28 @@ distinguishes an unmeasured site from one measured at zero. A `NaN` score means
 the candidate is excluded or demoted from the order. A site that leaves the
 topology reads `NaN` on all four, since the exporter keeps a series until
 restart.
+
+Route decision counters already identify the selected model. For traffic per
+model and site, query them directly rather than joining `grid_route_candidate_info`:
+
+```promql
+sum by (site, model) (
+  rate(grid_route_decisions_total{reason=~"routed|fallback"}[5m])
+)
+```
+
+Joining these counters to candidate info by site/cluster can duplicate traffic
+for multi-model clusters. Existing site-only queries should aggregate over
+`model`. The chart's ServiceMonitor still renames `cluster` to `backend`.
+
+Routed and fallback counter handles are registered from inference candidates
+when a snapshot is built, with two series per distinct `(site, cluster, model)`
+triple. The 1024-candidate limit therefore allows at most 2048 routed/fallback
+series per snapshot, plus five fixed refusal buckets. Tool names are not model
+labels. Refusals, including unknown request models, use an empty model label;
+request values never register new series. Old configurations' counter series
+follow the exporter's existing retention behavior, so this per-snapshot bound
+is not a lifetime cap across configuration changes.
 
 `grid_route_site_score_unavailable` separates a provider that has published no
 sample (`absent`) from one whose newest sample is outside the freshness window

@@ -104,7 +104,7 @@ fields of the filter's `availability` block, set from the chart's
 `grid_route_site_rho_reported`, `grid_route_site_rho_counted`, `grid_route_site_rho` and
 `grid_route_site_weight` per site and
 cluster; `grid_route_selections_total{path}` for which arm each request took;
-`grid_route_decisions_total{site,reason}` for what was routed and what was refused and why;
+`grid_route_decisions_total{site,cluster,model,reason}` for what was routed and what was refused and why;
 `grid_route_shedding{model}` while a model is shed. Every routed response names its site and
 cluster in `x-grid-site` and `x-grid-backend`.
 

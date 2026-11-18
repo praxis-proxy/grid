@@ -4,6 +4,8 @@
 mod logs;
 #[path = "support/ports.rs"]
 mod ports;
+#[path = "support/http.rs"]
+mod test_http;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -26,7 +28,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::ports::free_port;
+    use super::ports::{bound_listener, free_port};
 
     /// How long the gateway may take to start listening.
     const DEADLINE: Duration = Duration::from_secs(20);
@@ -51,19 +53,24 @@ mod tests {
     impl Gateway {
         /// Route `llama` to a local cluster whose only endpoint refuses connections.
         fn start(work: &std::path::Path) -> Self {
+            Self::start_at(work, &format!("127.0.0.1:{}", free_port()))
+        }
+
+        /// Route both configured models to `endpoint` for counter attribution tests.
+        fn start_at(work: &std::path::Path, endpoint: &str) -> Self {
             std::fs::create_dir_all(work).expect("work dir");
-            let (listen, admin, dead) = (free_port(), free_port(), free_port());
+            let (listen, admin) = (free_port(), free_port());
             let serving = work.join("serving-config.json");
             std::fs::write(
                 &serving,
-                r#"{"local_site":"local","window_secs":60,"load_window_ms":30000,"candidates":[{"kind":"inference_model","name":"llama","site":"local","cluster":"pool-local"}],"peers":[]}"#,
+                r#"{"local_site":"local","window_secs":60,"load_window_ms":30000,"candidates":[{"kind":"inference_model","name":"llama","site":"local","cluster":"pool-local"},{"kind":"inference_model","name":"qwen","site":"local","cluster":"pool-local"}],"peers":[]}"#,
             )
             .expect("serving config");
             let config = work.join("praxis.yaml");
             std::fs::write(
                 &config,
                 format!(
-                    "insecure_options:\n  allow_private_endpoints: true\nadmin:\n  metrics_address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: grid_site_route\n        model_header: X-Model\n      - filter: load_balancer\n        clusters:\n          - name: pool-local\n            endpoints: [\"127.0.0.1:{dead}\"]\n"
+                    "insecure_options:\n  allow_private_endpoints: true\nadmin:\n  metrics_address: \"127.0.0.1:{admin}\"\nlisteners:\n  - name: default\n    address: \"127.0.0.1:{listen}\"\n    filter_chains: [main]\nfilter_chains:\n  - name: main\n    filters:\n      - filter: grid_site_route\n        model_header: X-Model\n      - filter: load_balancer\n        clusters:\n          - name: pool-local\n            endpoints: [\"{endpoint}\"]\n"
                 ),
             )
             .expect("praxis config");
@@ -182,7 +189,7 @@ mod tests {
         let score = "grid_route_site_score{site=\"local\",cluster=\"pool-local\"} inf";
         assert!(metrics.contains(score), "no {score:?} in:\n{metrics}");
         // No model and an unknown model both count as bad_request.
-        let refused = "grid_route_decisions_total{site=\"\",cluster=\"\",reason=\"bad_request\"} 2";
+        let refused = "grid_route_decisions_total{site=\"\",cluster=\"\",model=\"\",reason=\"bad_request\"} 2";
         assert!(metrics.contains(refused), "no {refused:?} in:\n{metrics}");
         // Labels come from the serving config and a closed set, never from the request.
         for series in metrics
@@ -198,6 +205,10 @@ mod tests {
             assert!(
                 ["", "local"].contains(&label("site").as_str()),
                 "request-derived site: {series}"
+            );
+            assert!(
+                ["", "llama", "qwen"].contains(&label("model").as_str()),
+                "model labels must come from configuration, never an unknown request: {series}"
             );
             assert!(
                 [
@@ -221,6 +232,45 @@ mod tests {
         );
 
         drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+    #[test]
+    fn traffic_for_two_models_on_one_cluster_is_counted_without_a_join() {
+        let backend = bound_listener();
+        let endpoint = backend.local_addr().unwrap_or_else(|_| std::process::abort());
+        let server = thread::spawn(move || {
+            for stream in backend.incoming().take(3) {
+                let mut stream = stream.unwrap_or_else(|_| std::process::abort());
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap_or_else(|_| std::process::abort());
+                let _request = super::test_http::read_request(&mut stream).unwrap_or_else(|_| std::process::abort());
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                    .unwrap_or_else(|_| std::process::abort());
+            }
+        });
+        let work = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("model-decisions-{}", std::process::id()));
+        let gateway = Gateway::start_at(&work, &endpoint.to_string());
+        for model in ["llama", "llama", "qwen"] {
+            assert_eq!(
+                gateway.status("/v1/models", &format!("X-Model: {model}\r\n")),
+                200,
+                "the configured model must reach the shared backend"
+            );
+        }
+        let metrics = gateway.metrics();
+        for (model, count) in [("llama", 2), ("qwen", 1)] {
+            let series = format!(
+                "grid_route_decisions_total{{site=\"local\",cluster=\"pool-local\",model=\"{model}\",reason=\"routed\"}} {count}"
+            );
+            assert!(
+                metrics.contains(&series),
+                "model traffic must be counted directly, without a candidate-info join: {metrics}"
+            );
+        }
+        drop(gateway);
+        server.join().unwrap_or_else(|_| std::process::abort());
         let _cleaned = std::fs::remove_dir_all(&work);
     }
 }

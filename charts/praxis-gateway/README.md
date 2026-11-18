@@ -431,10 +431,26 @@ The metrics listener serves the Praxis registry, including the grid gateway's ow
 |--------|--------|---------|
 | `grid_metrics_auth_total` | `result` | Gateway metrics scrape outcomes: `missing`, `allowed`, `unauthenticated`, `forbidden`, `overloaded`, and `api_error`. |
 | `grid_metrics_auth_in_flight` | | Kubernetes TokenReview and SubjectAccessReview requests currently running for scrapes. |
-| `grid_route_decisions_total` | `site`, `cluster`, `reason` | Requests `grid_site_route` decided. `site` and `cluster` come from the serving config, and both are empty for a refusal. No label comes from the request. |
+| `grid_route_decisions_total` | `site`, `cluster`, `model`, `reason` | Requests `grid_site_route` decided. Site, cluster, and model come from the serving config; all three are empty for a refusal. No label comes from the request. |
 | `grid_route_candidate_info` | `site`, `cluster`, `model` | 1 while `grid_site_route` lists the model as a candidate at that site's cluster, 0 once it no longer does. Join a per-site series with `* on (site, cluster) group_right() (grid_route_candidate_info == 1)`, one row per model; this chart's ServiceMonitor renames `cluster` to `backend`, so join on `site` and `backend` behind it. |
 | `grid_route_site_score` | `site`, `cluster` | The queue depth the last route order used for each candidate, lower first. `inf` when unmeasured, `NaN` when excluded or demoted, or when the pair left the topology. |
 | `grid_route_site_score_unavailable` | `site`, `cluster`, `reason` | One-hot reason an otherwise routable load-publishing site has no queue score: `absent`, `stale`, or `unreadable`. Metric names are not labels. |
+
+For per-model routed traffic, use the counter's model label directly:
+
+```promql
+sum by (site, model) (
+  rate(grid_route_decisions_total{reason=~"routed|fallback"}[5m])
+)
+```
+
+Do not join this counter to `grid_route_candidate_info`: on a multi-model
+cluster that join duplicates traffic. Aggregate over `model` for site totals.
+Each snapshot pre-registers two counters per inference candidate, at most 2048
+series under the 1024-candidate limit, plus five fixed refusal buckets. Unknown
+request models add no series. Previous configurations' counters retain the
+exporter's existing retention behavior. Model names are already exposed by
+candidate info; the decision counter exposes the same configured catalog.
 
 `reason` is one of seven values, and adding one is a deliberate change:
 

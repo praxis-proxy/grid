@@ -427,7 +427,7 @@ mod tests {
                 .sum()
         };
         assert!(
-            counted("grid_route_decisions_total{site=\"\",cluster=\"\",reason=\"shed\"}") > 0.0,
+            counted("grid_route_decisions_total{site=\"\",cluster=\"\",model=\"\",reason=\"shed\"}") > 0.0,
             "shed answers are counted:\n{metrics}"
         );
         assert!(
