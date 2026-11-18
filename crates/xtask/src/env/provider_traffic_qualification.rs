@@ -2657,11 +2657,11 @@ fn capture_stack_failure(cluster: &str, stack: &str) {
     eprintln!("  [DIAG] {stack} failed on {cluster}; capturing Kubernetes state");
     let namespace = GRID_SYSTEM_NS;
     let log_target = "deployment/provider-gateway";
-    let describe_target = stack;
+    let describe_target = stack_describe_target(cluster, stack);
     for args in [
         vec!["get", "pods", "-o", "wide"],
         vec!["get", "deployments", "-o", "wide"],
-        vec!["describe", describe_target],
+        vec!["describe", &describe_target],
         vec!["get", "events", "--sort-by=.lastTimestamp"],
         vec!["logs", log_target, "--all-containers", "--tail=100"],
     ] {
@@ -2677,6 +2677,19 @@ fn capture_stack_failure(cluster: &str, stack: &str) {
             },
             Err(error) => eprintln!("  [DIAG] kubectl {} failed: {error}", args.join(" ")),
         }
+    }
+}
+
+/// Return the Kubernetes resource that a provider-traffic Forge stack creates.
+fn stack_describe_target(cluster: &str, stack: &str) -> String {
+    if stack.ends_with("-operator-base") {
+        "deployment/grid-operator".to_owned()
+    } else if stack == "vcr-backend" {
+        format!("deployment/vcr-inference-{cluster}")
+    } else if stack.ends_with("-site") {
+        format!("gridsite/{cluster}")
+    } else {
+        format!("deployment/{stack}")
     }
 }
 
@@ -6909,6 +6922,19 @@ mod tests {
         for site in ["provider-b", "provider-c"] {
             let deployments = image_evidence_deployments(site);
             assert!(!deployments.iter().any(|(key, _)| *key == "consumer_gateway"));
+        }
+    }
+
+    #[test]
+    fn stack_diagnostics_describe_the_workload_created_by_each_stack() {
+        for (stack, expected) in [
+            ("provider-a-operator-base", "deployment/grid-operator"),
+            ("vcr-backend", "deployment/vcr-inference-provider-a"),
+            ("provider-a-site", "gridsite/provider-a"),
+            ("provider-gateway", "deployment/provider-gateway"),
+            ("consumer-gateway", "deployment/consumer-gateway"),
+        ] {
+            assert_eq!(stack_describe_target("provider-a", stack), expected, "{stack}");
         }
     }
 
