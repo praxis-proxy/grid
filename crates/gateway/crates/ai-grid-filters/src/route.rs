@@ -1037,6 +1037,13 @@ struct Holder {
     mark: Option<String>,
 }
 
+impl Holder {
+    /// Whether the holder names a tagged stored-state owner rather than a site for new placement.
+    fn is_established(&self) -> bool {
+        self.mark.is_some()
+    }
+}
+
 /// Where a request's stored state pins it, and the path to send, or the answer
 /// when the path names an id without a valid tag. A new conversation pins
 /// nowhere, `None` inside, when the local site cannot take it, so it goes to the
@@ -1104,7 +1111,7 @@ fn pinned_target<'snap>(
     model: Option<&str>,
     now_ms: i64,
 ) -> Target<'snap> {
-    let established = holder.is_some_and(|holder| holder.mark.is_some());
+    let established = holder.is_some_and(Holder::is_established);
     let mut at_site = snapshot
         .candidates
         .iter()
@@ -1124,10 +1131,10 @@ fn pinned_target<'snap>(
         return Target::Gone;
     }
     at_site
-        .find(|candidate| {
-            (is_admitted_for_new_request(candidate.admission_state)
-                || (established && candidate.admission_state == AdmissionState::ExistingOnly))
-                && !candidate.expired_at(now_ms)
+        .find(|candidate| match candidate.admission_state {
+            AdmissionState::NewAndExisting => true,
+            AdmissionState::ExistingOnly => established,
+            AdmissionState::Excluded => false,
         })
         .map_or(Target::Unavailable, Target::Found)
 }
@@ -1893,8 +1900,28 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn an_invalid_conversation_owner_keeps_the_not_found_response() {
-        let filter = same_site_two_pool_filter(OPEN, OPEN);
+    async fn a_missing_conversation_owner_keeps_the_not_found_response() {
+        let filter = same_site_two_pool_filter(AdmissionState::ExistingOnly, OPEN);
+        let conversation_id = format!("conv_{}conversation-1", pin::tag("local", "pool-gone", None));
+        let request = state_request(
+            http::Method::GET,
+            &format!("/v1/conversations/{conversation_id}"),
+            false,
+        );
+        let mut ctx = context(&request);
+
+        let action = filter.on_request(&mut ctx).await.expect("answers a missing owner");
+
+        assert_eq!(refusal(&action).map(|(status, _)| status), Some(404));
+        assert!(
+            ctx.cluster.is_none(),
+            "a missing owner cannot fall back to another candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_conversation_tag_remains_not_found() {
+        let filter = same_site_two_pool_filter(AdmissionState::ExistingOnly, OPEN);
         let request = state_request(
             http::Method::GET,
             "/v1/conversations/conv_local.not-a-mark..conversation-1",
@@ -1902,10 +1929,67 @@ pub(crate) mod tests {
         );
         let mut ctx = context(&request);
 
-        let action = filter.on_request(&mut ctx).await.expect("answers an invalid owner");
+        let action = filter.on_request(&mut ctx).await.expect("rejects a malformed tag");
 
         assert_eq!(refusal(&action).map(|(status, _)| status), Some(404));
-        assert!(ctx.cluster.is_none(), "invalid ownership cannot route to a candidate");
+        assert!(ctx.cluster.is_none(), "a malformed tag cannot select a candidate");
+    }
+
+    #[test]
+    fn pinned_target_admission_distinguishes_established_state_from_new_placement() {
+        for (admission, cluster, admitted) in [
+            (OPEN, None, true),
+            (OPEN, Some("pool-a"), true),
+            (AdmissionState::ExistingOnly, None, false),
+            (AdmissionState::ExistingOnly, Some("pool-a"), true),
+            (AdmissionState::Excluded, None, false),
+            (AdmissionState::Excluded, Some("pool-a"), false),
+        ] {
+            let snapshot = RouteSnapshot::from_static(one("llama", "local", "pool-a", admission), Arc::from("local"));
+            let holder = holder("local", cluster);
+            let target = pinned_target(&snapshot, Some(&holder), Some("llama"), TEST_NOW_MS);
+            assert_eq!(
+                matches!(target, Target::Found(_)),
+                admitted,
+                "admission {admission:?}, cluster {cluster:?}"
+            );
+            if !admitted {
+                assert!(
+                    matches!(target, Target::Unavailable),
+                    "the owner is present but unavailable"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_existing_only_owner_does_not_bypass_active_model_shedding() {
+        let candidates = one("llama", "local", "pool-a", AdmissionState::ExistingOnly)
+            .into_iter()
+            .chain(one("llama", "local", "pool-b", OPEN))
+            .collect();
+        let mut snapshot = RouteSnapshot::from_static(candidates, Arc::from("local"));
+        snapshot.shedding.insert(Arc::from("llama"));
+        assert!(
+            snapshot.is_shedding("llama", TEST_NOW_MS),
+            "the model's shedding gate is active"
+        );
+        let filter = filter(snapshot, AffinitySettings::default());
+        let conversation_id = format!("conv_{}conversation-1", pin::tag("local", "pool-a", None));
+        let request = state_request(http::Method::GET, &format!("/v1/conversations/{conversation_id}"), true);
+        let mut ctx = context(&request);
+
+        let action = filter
+            .on_request(&mut ctx)
+            .await
+            .expect("checks model shedding before routing the owner");
+
+        assert_eq!(refusal(&action).map(|(status, _)| status), Some(429));
+        assert!(
+            ctx.cluster.is_none(),
+            "no owner is selected while the model is shedding"
+        );
+        assert!(ctx.upstream.is_none(), "no upstream is contacted");
     }
 
     #[test]
@@ -3872,6 +3956,37 @@ pub(crate) mod tests {
         let action = filter.on_request(&mut inside_ctx).await.expect("routes");
         assert!(refusal(&action).is_none(), "state inside the fence is reached");
         assert_eq!(inside_ctx.cluster.as_deref(), Some("local-pool"));
+    }
+
+    #[tokio::test]
+    async fn a_tagged_existing_only_owner_remains_subject_to_the_sovereignty_fence() {
+        let candidates = in_zone(one("llama", "local", "pool-a", AdmissionState::ExistingOnly), "eu");
+        let snapshot = RouteSnapshot::from_static(candidates, Arc::from("local"));
+        let filter = fencing(filter(snapshot, AffinitySettings::default()));
+        let conversation_id = format!("conv_{}conversation-1", pin::tag("local", "pool-a", None));
+        let path = format!("/v1/conversations/{conversation_id}");
+        for (zone, allowed) in [("us", false), ("eu", true)] {
+            let mut request = state_request(http::Method::GET, &path, false);
+            request.headers.insert(ZONE, http::HeaderValue::from_static(zone));
+            let mut ctx = context(&request);
+
+            let action = filter
+                .on_request(&mut ctx)
+                .await
+                .expect("checks the tagged owner's zone");
+
+            if allowed {
+                assert!(
+                    refusal(&action).is_none(),
+                    "the owner remains available inside its zone"
+                );
+                assert_eq!(ctx.cluster.as_deref(), Some("pool-a"));
+            } else {
+                assert_eq!(refusal(&action).map(|(status, _)| status), Some(403));
+                assert!(ctx.cluster.is_none(), "the owner is not selected outside the fence");
+                assert!(ctx.upstream.is_none(), "no upstream is contacted");
+            }
+        }
     }
 
     #[tokio::test]
