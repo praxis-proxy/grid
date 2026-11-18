@@ -6,6 +6,15 @@
 unmaintained = "all"
 maximum-db-staleness = "P30D"
 ignore = [
+  # Temporary acceptance of unmaintained notices, not a vulnerability waiver.
+  # Praxis core/AI/policy require chrono; AI API/store require humantime via
+  # humantime-serde. Neither advisory lists a patched version. Migration:
+  # https://github.com/praxis-proxy/grid/issues/604
+  { id = "RUSTSEC-2026-0543", reason = "chrono is transitive through Praxis core/AI/policy; migration tracked in grid#604" },
+  { id = "RUSTSEC-2026-0542", reason = "humantime is transitive through AI humantime-serde; migration tracked in grid#604" },
+  # chrono-tz is unmaintained with no patched release; cel and regorus pull it
+  # into Praxis policy builtins. Replacement is tracked in grid#604.
+  { id = "RUSTSEC-2026-0555", reason = "chrono-tz is transitive through Praxis policy builtins; no patched release; migration tracked in grid#604" },
   # PPE 0.6.0's default builtin bundle includes Limitador 0.14, which pulls
   # atomic-polyfill through postcard/heapless and paste through CEL 0.12.
   # Both are unmaintained with no patched versions; replacement needs an

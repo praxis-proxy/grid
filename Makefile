@@ -66,12 +66,13 @@ test-unit:
 lint: gateway-lint
 	cargo clippy --locked --workspace --all-targets -- -D warnings
 	cargo +$(NIGHTLY_RUSTFMT) fmt --all -- --check
-	cargo machete
+	python3 scripts/check-unused-dependencies.py
 
 gateway-lint:
 	cargo clippy --manifest-path crates/gateway/Cargo.toml --workspace --all-targets -- -D warnings
 	cargo +$(NIGHTLY_RUSTFMT) fmt --manifest-path crates/gateway/Cargo.toml --all -- --check
-	cargo machete crates/gateway
+	python3 scripts/check-unused-dependencies.py crates/gateway
+	python3 scripts/test-gateway-dependencies.py
 	@set -eu; \
 	  tree="$$(cargo tree --manifest-path crates/gateway/Cargo.toml -p gateway -e normal --target all --prefix none --format '{p}')"; \
 	  printf '%s\n' "$$tree" | grep -q '^openssl-sys ' || { echo "positive control failed: openssl-sys is not in the tree" >&2; exit 1; }; \
