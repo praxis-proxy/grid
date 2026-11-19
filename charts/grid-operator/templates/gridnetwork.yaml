@@ -52,6 +52,10 @@ spec:
       praxisConfig:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with $.Values.gateway.regionalPolicy }}
+      regionalPolicy:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
   {{- end }}
   {{- $e := $.Values.enrollment }}
   tls:

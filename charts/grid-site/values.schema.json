@@ -231,6 +231,11 @@
         "zone": {
           "type": "string"
         },
+        "sovereigntyZone": {
+          "type": "string",
+          "pattern": "^$|^[A-Za-z0-9._-]{1,63}$",
+          "description": "Sovereignty zone a gateway's fence or regionalPolicy matches this site against."
+        },
         "providerSiteLabel": {
           "type": "string"
         },
@@ -267,6 +272,7 @@
           "nextDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "The next leaf digest during a rotation." },
           "region": { "type": "string" },
           "zone": { "type": "string" },
+          "sovereigntyZone": { "type": "string", "pattern": "^$|^[A-Za-z0-9._-]{1,63}$", "description": "The peer site's sovereignty zone." },
           "signalsEndpoint": {
             "type": "object",
             "additionalProperties": false,

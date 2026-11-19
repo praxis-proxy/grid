@@ -165,10 +165,11 @@ The gateway learns a soft capacity bound from the most in-flight held with nothi
 hard bound from the least held at a demonstrated limit. It reads a request count against the
 lesser bound, never below the floor. Saturation (rho) is the nearer of that count and the EPP's
 KV-cache mean plus spread, smoothed per new sample. A site has room while rho is below 1. Among
-healthy sites with room, three or more are picked two by capacity taking the lower rho, two are
-weighted by capacity over 1 + rho, and one is taken. With no site that has room, the pick is by
-capacity among sites not full, tied on queue depth. A cluster praxis reports with no healthy
-endpoint is never picked while a healthy one is left.
+healthy sites with room, three or more are picked two by capacity, moving from the first to the
+second in proportion to the extra headroom the second has; two are weighted by capacity over
+1 + rho, and one is taken. With no site that has room, the pick is by capacity among sites not
+full, tied on queue depth. A cluster praxis reports with no healthy endpoint is never picked while
+a healthy one is left.
 
 With `availability.shedding` on, a model sheds once every healthy site serving it has been
 saturated for `full_after_ms` with work waiting (`queue_full` per serving unit, or any work
