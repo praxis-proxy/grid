@@ -558,8 +558,10 @@ impl HttpFilter for GridProviderFilter {
         {
             dialed.settle(status, reached);
         }
-        // Only this gateway says why it refused: a backend's copy would demote its own provider.
-        if let Some(response) = ctx.response_header.as_mut()
+        // Only this gateway says why it refused, so a backend's copy goes. This hook also runs on
+        // the gateway's own refusal, which never reached a backend and keeps its reason.
+        if reached
+            && let Some(response) = ctx.response_header.as_mut()
             && response.headers.remove(REFUSAL_HEADER).is_some()
         {
             ctx.response_headers_modified = true;
@@ -992,6 +994,34 @@ mod tests {
         assert!(
             !head.headers.contains_key(REFUSAL_HEADER),
             "a backend's 503 reaches the consumer as backpressure, not as a refusal"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_gateways_own_refusal_keeps_its_reason_through_the_response_hook() -> Result<(), FilterError> {
+        let filter = filter_over(&minimal());
+        let mut request = request(http::Method::POST, "/v1/chat/completions");
+        request.headers.insert(
+            http::header::HeaderName::from_static(CANDIDATE_HEADER),
+            http::HeaderValue::from_static("0badf00d"),
+        );
+        let mut ctx = context(&request);
+        ctx.peer_identity = Some(peer("site-b"));
+        let FilterAction::TerminalResponse(response) = filter.on_request(&mut ctx).await? else {
+            panic!("an unserved candidate is refused");
+        };
+        // Praxis runs the response hooks on a terminal response too, with no upstream reached.
+        let mut head = praxis_filter::Response {
+            headers: response.headers.clone(),
+            status: http::StatusCode::from_u16(response.status).expect("a status"),
+        };
+        ctx.response_header = Some(&mut head);
+        drop(filter.on_response(&mut ctx).await?);
+        assert_eq!(
+            head.headers.get(REFUSAL_HEADER).and_then(|reason| reason.to_str().ok()),
+            Some(UNSERVED_CANDIDATE),
+            "the consumer must read why it was refused"
         );
         Ok(())
     }

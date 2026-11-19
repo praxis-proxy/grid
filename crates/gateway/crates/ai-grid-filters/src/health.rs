@@ -47,8 +47,12 @@ pub struct ClusterHealth {
     /// The clusters with no healthy endpoint, or a demoted dial, as of the last tick.
     down: ArcSwap<BTreeSet<Arc<str>>>,
 
-    /// The candidates, by stable ID, their site refused as not served, as of the last tick.
-    held: ArcSwap<BTreeSet<Arc<str>>>,
+    /// The candidates, by cluster and stable ID, their site refused as not served, as of the last tick.
+    held: ArcSwap<BTreeSet<Held>>,
+
+    /// When each candidate was last refused as not served. Kept here and not on a dial, because
+    /// a provider hop can go through a cluster the gateway did not build.
+    refused: Mutex<BTreeMap<Held, u64>>,
 
     /// The applied config's dials, by cluster.
     dials: DialHealth,
@@ -80,9 +84,35 @@ impl ClusterHealth {
         self.down.load_full()
     }
 
-    /// The candidates held back as of the last [`Self::update`], by stable ID.
-    pub(crate) fn held(&self) -> Arc<BTreeSet<Arc<str>>> {
+    /// The candidates held back as of the last [`Self::update`].
+    pub(crate) fn held(&self) -> Arc<BTreeSet<Held>> {
         self.held.load_full()
+    }
+
+    /// Hold `candidate` back for a cooldown, returning whether that started a hold: its site,
+    /// reached over `cluster`, answered that it does not serve it.
+    pub(crate) fn refuse(&self, cluster: &Arc<str>, candidate: &Arc<str>) -> bool {
+        self.refuse_at(cluster, candidate, monotonic_ms())
+    }
+
+    /// [`Self::refuse`] at `now_ms`. Only that candidate is held, because the cluster's others
+    /// are served, and a refusal during a hold does not extend it.
+    pub(crate) fn refuse_at(&self, cluster: &Arc<str>, candidate: &Arc<str>, now_ms: u64) -> bool {
+        metrics::counter!("grid_dial_refusals_total", "cluster" => cluster.to_string()).increment(1);
+        let held = (Arc::clone(cluster), Arc::clone(candidate));
+        let mut refused = self.refused.lock().unwrap_or_else(PoisonError::into_inner);
+        if refused.get(&held).is_some_and(|since| held_at(*since, now_ms)) {
+            return false;
+        }
+        refused.insert(held, now_ms);
+        true
+    }
+
+    /// The candidates held back at `now_ms`, after forgetting the holds that ran out.
+    pub(crate) fn held_at(&self, now_ms: u64) -> BTreeSet<Held> {
+        let mut refused = self.refused.lock().unwrap_or_else(PoisonError::into_inner);
+        refused.retain(|_, since| held_at(*since, now_ms));
+        refused.keys().cloned().collect()
     }
 
     /// The dials' health, kept across applies.
@@ -105,7 +135,7 @@ impl ClusterHealth {
         now.extend(self.dials.demoted(now_ms));
         // Every tick: a dial that recovers from half open changes no down set.
         self.dials.export();
-        let held = self.dials.held(now_ms);
+        let held = self.held_at(now_ms);
         let held_changed = **self.held.load() != held;
         if held_changed {
             self.held.store(Arc::new(held));
@@ -118,6 +148,10 @@ impl ClusterHealth {
         true
     }
 }
+
+/// A candidate held back: its cluster and stable ID. Both, because a stable ID is a short hash
+/// of names its own site chooses, and one site must not be able to hold another's candidate.
+pub(crate) type Held = (Arc<str>, Arc<str>);
 
 /// Whether a routed request may take a dial.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,12 +194,6 @@ pub(crate) struct DialState {
     /// The cluster's failure counter, resolved once.
     failures_total: metrics::Counter,
 
-    /// When each candidate, by stable ID, was last refused as not served.
-    refused: Mutex<BTreeMap<Arc<str>, u64>>,
-
-    /// The cluster's refusal counter, resolved once.
-    refusals_total: metrics::Counter,
-
     /// The cluster's server-error counter, resolved once.
     server_errors_total: metrics::Counter,
 
@@ -178,7 +206,6 @@ impl DialState {
     pub(crate) fn new(cluster: &str, address: Arc<str>) -> Self {
         Self {
             failures_total: metrics::counter!("grid_dial_failures_total", "cluster" => cluster.to_owned()),
-            refusals_total: metrics::counter!("grid_dial_refusals_total", "cluster" => cluster.to_owned()),
             server_errors_total: metrics::counter!("grid_dial_server_errors_total", "cluster" => cluster.to_owned()),
             address,
             answers: AtomicU32::new(0),
@@ -186,7 +213,6 @@ impl DialState {
             errors: AtomicU32::new(0),
             failures: AtomicU32::new(0),
             probe_since: AtomicU64::new(0),
-            refused: Mutex::default(),
             successes: AtomicU32::new(0),
         }
     }
@@ -235,26 +261,6 @@ impl DialState {
         if failures >= DOWN_AFTER || self.down() {
             self.down_since.store(now_ms.saturating_add(1), Ordering::Relaxed);
         }
-    }
-
-    /// Hold `candidate` back for a cooldown from `now_ms`, returning whether that started a hold:
-    /// its site answered that it does not serve it. Only that candidate, because the dial's
-    /// others are served, and a refusal during a hold does not extend it.
-    pub(crate) fn refuse(&self, candidate: &Arc<str>, now_ms: u64) -> bool {
-        self.refusals_total.increment(1);
-        let mut refused = self.refused.lock().unwrap_or_else(PoisonError::into_inner);
-        if refused.get(candidate).is_some_and(|since| held_at(*since, now_ms)) {
-            return false;
-        }
-        refused.insert(Arc::clone(candidate), now_ms);
-        true
-    }
-
-    /// The candidates held back at `now_ms`, after forgetting the holds that ran out.
-    pub(crate) fn held(&self, now_ms: u64) -> Vec<Arc<str>> {
-        let mut refused = self.refused.lock().unwrap_or_else(PoisonError::into_inner);
-        refused.retain(|_, since| held_at(*since, now_ms));
-        refused.keys().cloned().collect()
     }
 
     /// Count a failure to connect that does not move the dial.
@@ -368,15 +374,6 @@ impl DialHealth {
             .map(|(cluster, _)| Arc::clone(cluster))
             .collect();
         demoted.into_iter()
-    }
-
-    /// The candidates held back at `now_ms`, by stable ID.
-    fn held(&self, now_ms: u64) -> BTreeSet<Arc<str>> {
-        self.states
-            .load()
-            .values()
-            .flat_map(|state| state.held(now_ms))
-            .collect()
     }
 
     /// Export each dial's down state.
@@ -660,22 +657,29 @@ mod tests {
 
     #[test]
     fn a_refusal_holds_back_its_candidate_for_a_cooldown_and_leaves_the_dial_up() {
-        let dial = DialState::new("east", Arc::from("east:8443"));
-        let (new, served): (Arc<str>, Arc<str>) = (Arc::from("id-new"), Arc::from("id-served"));
-        assert!(dial.refuse(&new, 1_000), "the first refusal starts a hold");
+        let health = ClusterHealth::default();
+        let dial = health.dials().state("east", "east:8443");
+        health
+            .dials()
+            .adopt(BTreeMap::from([(Arc::from("east"), Arc::clone(&dial))]));
+        let (east, new): (Arc<str>, Arc<str>) = (Arc::from("east"), Arc::from("id-new"));
+        assert!(health.refuse_at(&east, &new, 1_000), "the first refusal starts a hold");
         assert!(!dial.down(), "the dial's other candidates are served");
-        assert_eq!(dial.held(1_000), vec![Arc::clone(&new)], "only the refused candidate");
-        assert!(!dial.held(1_000).contains(&served));
+        assert_eq!(
+            health.held_at(1_000),
+            BTreeSet::from([(Arc::clone(&east), Arc::clone(&new))]),
+            "only the refused candidate, on the cluster that refused it"
+        );
         assert!(
-            !dial.refuse(&new, 1_000 + COOLDOWN_MS - 1),
+            !health.refuse_at(&east, &new, 1_000 + COOLDOWN_MS - 1),
             "a refusal during the hold does not extend it"
         );
         assert!(
-            dial.held(1_000 + COOLDOWN_MS).is_empty(),
+            health.held_at(1_000 + COOLDOWN_MS).is_empty(),
             "so the candidate is tried again a cooldown after the first"
         );
         assert!(
-            dial.refuse(&new, 1_000 + COOLDOWN_MS),
+            health.refuse_at(&east, &new, 1_000 + COOLDOWN_MS),
             "and a site that still refuses starts another hold"
         );
     }
@@ -683,15 +687,14 @@ mod tests {
     #[test]
     fn the_tick_publishes_held_candidates_and_drops_them_after_the_cooldown() {
         let health = ClusterHealth::default();
-        let dial = health.dials().state("east", "east:8443");
-        health
-            .dials()
-            .adopt(BTreeMap::from([(Arc::from("east"), Arc::clone(&dial))]));
-        let new: Arc<str> = Arc::from("id-new");
-        dial.refuse(&new, 1_000);
+        let (pool, new): (Arc<str>, Arc<str>) = (Arc::from("pool-east"), Arc::from("id-new"));
+        assert!(
+            health.refuse_at(&pool, &new, 1_000),
+            "a cluster with no dial holds a candidate too"
+        );
         assert!(health.update_at(1_000), "a held candidate is news");
-        assert_eq!(*health.held(), BTreeSet::from([Arc::clone(&new)]));
-        assert!(health.down().is_empty(), "the dial is not down");
+        assert_eq!(*health.held(), BTreeSet::from([(pool, new)]));
+        assert!(health.down().is_empty(), "no cluster is down");
         assert!(!health.update_at(2_000), "an unchanged hold is not");
         assert!(health.update_at(1_000 + COOLDOWN_MS), "the hold running out is");
         assert!(health.held().is_empty());
