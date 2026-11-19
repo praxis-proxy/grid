@@ -371,6 +371,9 @@ reqwest.workspace = true
 metrics = { workspace = true }
 openssl.workspace = true
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = { version = "0.7.0", features = ["background_threads"] }
+
 [dev-dependencies]
 # The reload test runs a real mTLS signals peer against the binary.
 certs = { path = "../certs", default-features = false, features = ["verifier"] }
