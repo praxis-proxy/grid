@@ -2,6 +2,25 @@ suite: GridSite template
 templates:
   - templates/gridsite.yaml
 tests:
+  - it: puts the site in its sovereignty zone and leaves it out when unset
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+      gridSite.region: eu-west
+      gridSite.sovereigntyZone: eu
+    asserts:
+      - equal:
+          path: spec
+          value: {gridNetworkRef: prod-grid, region: eu-west, sovereigntyZone: eu}
+
+  - it: renders no sovereignty zone by default
+    set:
+      gridNetwork.name: prod-grid
+      gridSite.name: prod-site
+    asserts:
+      - notExists:
+          path: spec.sovereigntyZone
+
   - it: translates a legacy egress value
     set:
       gridNetwork.name: prod-grid
