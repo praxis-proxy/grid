@@ -25,7 +25,10 @@ httpdate = "1.0.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = { version = "0.10.7", package = "yaml_serde" }
 serde_json = "1.0.151"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
+reqwest = { version = "0.13.4", default-features = false, features = [
+  "json",
+  "rustls-no-provider",
+] }
 metrics = "0.24.6"
 time = "0.3.0"
 openssl = "0.10.0"
