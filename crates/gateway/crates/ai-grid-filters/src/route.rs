@@ -750,12 +750,12 @@ impl GridSiteRouteFilter {
                 .get(http::header::CONTENT_ENCODING)
                 .is_none_or(|encoding| encoding.as_bytes().eq_ignore_ascii_case(b"identity"))
         });
-        let (answered, reached) = (head.is_some(), ctx.upstream_reached);
+        let (status, reached) = (head.map(|response| response.status), ctx.upstream_reached);
         let Some(state) = ctx.get_filter_state_mut::<RouteState>() else {
             return Ok(());
         };
         if let Some(dialed) = state.dialed.take() {
-            dialed.settle(answered, reached);
+            dialed.settle(status, reached);
         }
         // Keep the selected route after releasing the mutable borrow of filter state in `ctx`.
         let served = state.served.clone();
@@ -789,7 +789,7 @@ fn select_upstream(ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate) 
     }
 }
 
-/// Whether a dialed request reached a working site: `None` when the dial never owned the outcome.
+/// Whether a dialed request's connect worked: `None` when the dial never owned the outcome.
 ///
 /// Any response head proves the connect and handshake. Praxis 0.7.5 hands a filter no error
 /// kind, so a missing head counts only while it could still be a connect, DNS, TLS or
@@ -803,6 +803,16 @@ fn dial_outcome(answered: bool, reached: bool, elapsed: Duration, budget: Durati
         return Some(true);
     }
     (elapsed <= budget).then_some(false)
+}
+
+/// Whether an answer of `status` says the site itself is failing. A 503 or 504 is how a loaded
+/// site says wait, and counting those would push every site out in turn under load.
+fn site_failure(status: http::StatusCode) -> bool {
+    status.is_server_error()
+        && !matches!(
+            status,
+            http::StatusCode::SERVICE_UNAVAILABLE | http::StatusCode::GATEWAY_TIMEOUT
+        )
 }
 
 /// A request sent over a dial, whose outcome its response records.
@@ -834,11 +844,24 @@ impl InFlight {
         }
     }
 
-    /// Record the request's outcome, `answered` with a head after `reached` the upstream, and
-    /// hand back the probe it holds.
-    pub(crate) fn settle(self, answered: bool, reached: bool) {
-        if let Some(working) = dial_outcome(answered, reached, self.sent.elapsed(), self.budget) {
-            self.state.record(working, crate::health::monotonic_ms());
+    /// Record the request's outcome, answered with a head of `status` after `reached` the
+    /// upstream, and hand back the probe it holds.
+    pub(crate) fn settle(self, status: Option<http::StatusCode>, reached: bool) {
+        // Only the probe may bring a down dial back. The dial decides that from who is asking,
+        // not from a reading of its state taken here, which a concurrent demotion would outdate.
+        let now_ms = crate::health::monotonic_ms();
+        match (
+            dial_outcome(status.is_some(), reached, self.sent.elapsed(), self.budget),
+            status,
+        ) {
+            (Some(true), Some(status)) if !self.probe => self.state.observed(site_failure(status), now_ms),
+            // A down site that now says wait has not shown it can serve.
+            (Some(true), Some(status)) if site_failure(status) || !status.is_server_error() => {
+                self.state.answered(site_failure(status), now_ms);
+            },
+            (Some(false), _) if self.probe || !self.state.down() => self.state.record(false, now_ms),
+            (Some(false), _) => self.state.count_failure(),
+            _ => {},
         }
         if self.probe {
             self.state.release_probe();
@@ -4247,6 +4270,80 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn only_a_server_error_that_is_not_backpressure_speaks_against_a_site() {
+        for (status, failing) in [
+            (http::StatusCode::OK, false),
+            (http::StatusCode::TOO_MANY_REQUESTS, false),
+            (http::StatusCode::INTERNAL_SERVER_ERROR, true),
+            (http::StatusCode::BAD_GATEWAY, true),
+            (http::StatusCode::SERVICE_UNAVAILABLE, false),
+            (http::StatusCode::GATEWAY_TIMEOUT, false),
+        ] {
+            assert_eq!(site_failure(status), failing, "{status}");
+        }
+    }
+
+    /// Send one request through `filter` and answer it with `status`.
+    async fn answer(filter: &GridSiteRouteFilter, status: http::StatusCode) {
+        let request = llama_request("/v1/chat/completions");
+        let mut head = praxis_filter::Response {
+            headers: http::HeaderMap::new(),
+            status,
+        };
+        let mut ctx = context(&request);
+        drop(filter.on_request(&mut ctx).await.expect("routes"));
+        ctx.upstream_reached = true;
+        ctx.response_header = Some(&mut head);
+        drop(filter.on_response(&mut ctx).await.expect("settles"));
+    }
+
+    #[tokio::test]
+    async fn a_site_shedding_load_keeps_its_dial_and_one_answering_500_loses_it() {
+        let candidates = dialed("east", "east", Some("10.0.0.9:8443"));
+        let health = Arc::clone(candidates[0].dial.as_ref().expect("dialed").health());
+        let filter = dial_filter(candidates, "local", Some(&[]));
+        for status in [http::StatusCode::SERVICE_UNAVAILABLE, http::StatusCode::GATEWAY_TIMEOUT] {
+            for _ in 0..100 {
+                answer(&filter, status).await;
+            }
+            assert!(!health.down(), "a hundred answers of {status} say wait, not broken");
+        }
+        for _ in 0..50 {
+            answer(&filter, http::StatusCode::INTERNAL_SERVER_ERROR).await;
+        }
+        assert!(health.down(), "a window of 500 takes it down");
+    }
+
+    #[test]
+    fn while_a_dial_is_down_only_its_probe_moves_it() {
+        let candidates = dialed("east", "east", Some("10.0.0.9:8443"));
+        let dial = Arc::clone(candidates[0].dial.as_ref().expect("dialed"));
+        let health = Arc::clone(dial.health());
+        health.record(false, 0);
+        health.record(false, 0);
+        for _ in 0..2 {
+            InFlight::over(&dial, false).settle(Some(http::StatusCode::OK), true);
+        }
+        assert!(
+            health.down(),
+            "answers to requests sent before it went down do not bring it back"
+        );
+        InFlight::over(&dial, true).settle(Some(http::StatusCode::SERVICE_UNAVAILABLE), true);
+        InFlight::over(&dial, true).settle(Some(http::StatusCode::GATEWAY_TIMEOUT), true);
+        assert!(health.down(), "a probe told to wait has not shown the site can serve");
+        assert_eq!(
+            health.admit_at(crate::health::COOLDOWN_MS),
+            Admission::Probe,
+            "and it hands the probe back without another cooldown"
+        );
+        health.release_probe();
+        for _ in 0..2 {
+            InFlight::over(&dial, true).settle(Some(http::StatusCode::OK), true);
+        }
+        assert!(!health.down(), "two good probes do");
+    }
+
     #[tokio::test]
     async fn a_busy_preferred_dial_does_not_retry_in_the_affinity_fallback() {
         let mut candidates = dialed("east", "east", Some("10.0.0.9:8443"));
@@ -4569,6 +4666,23 @@ pub(crate) mod tests {
     // ---------------------------------------------------------------------------
     // Test Utilities
     // ---------------------------------------------------------------------------
+
+    /// The filter a control step serves: reading its `snapshot`, recording dial outcomes in its
+    /// `health`, affinity at its defaults, and its turn counter starting at zero.
+    pub(crate) fn filter_over(
+        snapshot: Arc<ArcSwap<RouteSnapshot>>,
+        health: Arc<ClusterHealth>,
+    ) -> GridSiteRouteFilter {
+        GridSiteRouteFilter {
+            snapshot,
+            health,
+            clusters: None,
+            model_header: http::header::HeaderName::from_static("x-model"),
+            sovereignty: None,
+            affinity: Arc::default(),
+            turn: AtomicUsize::new(0),
+        }
+    }
 
     /// The request id source every test context shares.
     static IDS: LazyLock<praxis_core::id::IdGenerator> = LazyLock::new(|| praxis_core::id::IdGenerator::with_seed(0));
