@@ -229,6 +229,8 @@ impl DialState {
             self.server_errors_total.increment(1);
         }
         if !self.down() && self.tally(server_error) {
+            // Good probes from an earlier recovery must not count toward the next one.
+            self.successes.store(0, Ordering::Relaxed);
             self.down_since.store(now_ms.saturating_add(1), Ordering::Relaxed);
         }
     }
@@ -588,6 +590,17 @@ mod tests {
         dial.answered(false, 20_000);
         dial.answered(false, 20_100);
         assert!(!dial.down(), "two good probes bring it back");
+        for _ in 0..ERRORS_DOWN {
+            dial.observed(true, 30_000);
+        }
+        assert!(dial.down(), "server errors take it down a second time");
+        dial.answered(false, 45_000);
+        assert!(
+            dial.down(),
+            "and the earlier recovery's probes do not count: one good probe is not enough"
+        );
+        dial.answered(false, 45_100);
+        assert!(!dial.down(), "two are");
     }
 
     #[test]
