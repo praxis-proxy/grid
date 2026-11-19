@@ -1033,6 +1033,22 @@ The field is optional. When absent (default), plaintext scrape failures
 produce neutral scoring immediately; TLS-configured failures fail closed once
 there is no usable last-known-good sample.
 
+### Silent sites
+
+The grid gateway marks a site silent when a full freshness window passes with
+no new load sample from it. A silent site takes no requests while any live site
+can serve the model. It routes again after two new samples. When every site is
+silent, all of them take requests and each pick counts as a fallback.
+
+The gateway cannot tell a site that is down from one whose signal path failed.
+A site that still answers requests therefore loses its share until its samples
+return, and the other sites carry that load.
+
+Alert on `grid_route_site_silent`. A steady rate of
+`grid_route_site_silent_transitions_total` is a flapping link, and a growing
+`grid_route_site_round_age_seconds` is a stalled poller. See
+[Metrics](../metrics.md).
+
 ### KV-cache affinity
 
 The operator's scoring does not route by KV-cache affinity. The
