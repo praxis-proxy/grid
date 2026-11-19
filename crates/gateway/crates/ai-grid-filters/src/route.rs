@@ -4114,7 +4114,7 @@ pub(crate) mod tests {
         east.record(false, 0);
         east.record(false, 0);
         assert_eq!(
-            east.admit_at(crate::health::COOLDOWN_MS),
+            east.admit_at(crate::health::monotonic_ms()),
             Admission::Probe,
             "another request holds the probe"
         );
@@ -4132,23 +4132,28 @@ pub(crate) mod tests {
         }
 
         let only = dial_filter(dialed("east", "east", Some("10.0.0.9:8443")), "local", Some(&[]));
-        let dial = Arc::clone(only.snapshot.load().candidates[0].dial.as_ref().expect("dialed"));
-        let probed = Arc::clone(dial.health());
-        probed.record(false, 0);
-        probed.record(false, 0);
-        let mut ctx = context(&request);
-        drop(only.on_request(&mut ctx).await.expect("routes"));
-        assert_eq!(
-            ctx.cluster.as_deref(),
-            Some("east"),
-            "a down dial still routes when it is the only one"
+        let probed = Arc::clone(
+            only.snapshot.load().candidates[0]
+                .dial
+                .as_ref()
+                .expect("dialed")
+                .health(),
         );
-        let half_open = crate::health::COOLDOWN_MS;
-        assert_eq!(probed.admit_at(half_open), Admission::Probe, "half open: one probe");
-        assert_eq!(probed.admit_at(half_open), Admission::Busy, "and only one");
-        InFlight::over(&dial, true).settle(Some(http::StatusCode::OK), true);
+        probed.record(false, 0);
+        probed.record(false, 0);
+        let mut first = context(&request);
+        drop(only.on_request(&mut first).await.expect("routes"));
+        let mut second = context(&request);
+        drop(only.on_request(&mut second).await.expect("routes"));
         assert_eq!(
-            probed.admit_at(half_open),
+            second.cluster.as_deref(),
+            Some("east"),
+            "a probed dial still routes when it is the only one"
+        );
+        first.upstream_reached = true;
+        drop(only.on_response(&mut first).await.expect("settles"));
+        assert_eq!(
+            probed.admit_at(crate::health::monotonic_ms()),
             Admission::Probe,
             "the settled probe is handed back"
         );

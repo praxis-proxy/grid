@@ -177,13 +177,8 @@ impl DialState {
         self.admit_at(monotonic_ms())
     }
 
-    /// [`Self::admit`] for a down dial at `now_ms`: no probe while it cools down, else a failing
-    /// site is probed by every request that reaches it before the next tick. A probe that never
-    /// settles lapses after a cooldown.
+    /// [`Self::admit`] for a down dial at `now_ms`. A probe that never settles lapses after a cooldown.
     pub(crate) fn admit_at(&self, now_ms: u64) -> Admission {
-        if self.demoted(now_ms) {
-            return Admission::Busy;
-        }
         let held = self.probe_since.load(Ordering::Acquire);
         if held != 0 && now_ms.saturating_add(1).saturating_sub(held) < COOLDOWN_MS {
             return Admission::Busy;
@@ -544,28 +539,6 @@ mod tests {
                 "answer {answer}: 40 percent errors is far under four in five"
             );
         }
-    }
-
-    #[test]
-    fn a_down_dial_admits_no_probe_until_its_cooldown_ends() {
-        let dial = DialState::new("east", Arc::from("east:8443"));
-        for _ in 0..ERRORS_DOWN {
-            dial.answered(true, 1_000);
-        }
-        assert_eq!(dial.admit_at(1_000), Admission::Busy, "cooling down: no probe");
-        assert_eq!(dial.admit_at(1_000 + COOLDOWN_MS - 1), Admission::Busy, "still none");
-        assert_eq!(
-            dial.admit_at(1_000 + COOLDOWN_MS),
-            Admission::Probe,
-            "half open: one probe"
-        );
-        dial.answered(true, 12_000);
-        dial.release_probe();
-        assert_eq!(
-            dial.admit_at(12_000),
-            Admission::Busy,
-            "a failed probe starts another cooldown"
-        );
     }
 
     #[test]
