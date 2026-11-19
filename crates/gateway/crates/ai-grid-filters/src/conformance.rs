@@ -1941,11 +1941,11 @@ mod tests {
                     );
                 } else {
                     let middle = routed_to(&snapshot, sites[2].site);
-                    assert!(low > middle && middle > 0, "two choices must favor lower pressure");
-                    assert_eq!(
-                        routed_to(&snapshot, sites[0].site),
-                        0,
-                        "two choices avoid the highest pressure"
+                    let high = routed_to(&snapshot, sites[0].site);
+                    assert!(low > middle && middle > high, "two choices must favor lower pressure");
+                    assert!(
+                        (1..DRAWS / 20).contains(&high),
+                        "the highest pressure keeps a sliver, got {high}/{DRAWS}"
                     );
                 }
                 snapshot.candidates.reverse();

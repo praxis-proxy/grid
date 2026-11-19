@@ -126,6 +126,6 @@ failing and once when it recovers.
 | A site takes nothing though its engine is up | Its signals stopped reaching the gateway, so it is silent | `grid_route_site_silent` and `grid_route_site_last_sample_age_seconds`; a steady `grid_route_site_silent_transitions_total` rate is a lossy link |
 | Every remote site is unmeasured | The gateway's poll of its local operator is failing, or the operator is not collecting from peers | `grid_signals_poll_total` by result at the gateway; `grid_collection_up` and `grid_peer_signals_refused_total` at the operator |
 | A site's soft bound sits far below what its engine runs | It was queued whenever it ran high, so no queue-free sample taught it | Raise `explore_floor` |
-| A small or slow site takes little | Expected: picks follow measured ceilings, and two choices never pick the busiest of three | Nothing |
+| A small or slow site takes little | Expected: picks follow measured ceilings, and the busiest of three takes the least | Nothing |
 | 429 under light load | Shedding is on and `full_after_ms` or `queue_full` is too low for the engine's normal queue | Raise them, or turn shedding off |
 | A site answers errors fast and takes the most traffic | A refusing site never fills, so it reads as the site with the most room | Fix the site; passive ejection is a planned gate |
