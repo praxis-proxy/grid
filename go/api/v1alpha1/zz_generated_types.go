@@ -1212,7 +1212,7 @@ type InferenceProviderSpec struct {
 	Auth *AuthConfig `json:"auth,omitempty"`
 	// Backend deployment category.
 	BackendKind string `json:"backendKind"`
-	// Relative capacity used by an opt-in placement policy.
+	// Relative provider capacity. intelligent_route uses it as static traffic_weight when the GridNetwork opts into weighted placement; grid_site_route also carries it as a candidate weight for its own capacity fallback, independently of that selection policy.
 	CapacityWeight *int64 `json:"capacityWeight,omitempty"`
 	// Optional routing identity used in overlay candidate site and cluster fields.
 	// When set, routing overlay candidates produced for this provider use this value instead of metadata.name:

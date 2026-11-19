@@ -143,7 +143,11 @@ spec:
                   description: Backend deployment category.
                   type: string
                 capacityWeight:
-                  description: Relative capacity used by an opt-in placement policy.
+                  description: |-
+                    Relative provider capacity. `intelligent_route` uses it as static
+                    `traffic_weight` when the `GridNetwork` opts into weighted placement;
+                    `grid_site_route` also carries it as a candidate weight for its own
+                    capacity fallback, independently of that selection policy.
                   format: uint32
                   maximum: 1000.0
                   minimum: 1.0

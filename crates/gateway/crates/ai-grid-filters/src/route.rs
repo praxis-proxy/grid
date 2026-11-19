@@ -1905,6 +1905,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn prefix_affinity_distinguishes_backend_clusters_at_the_same_site() {
+        let candidates = one("llama", "local", "provider-a", OPEN)
+            .into_iter()
+            .chain(one("llama", "local", "provider-b", OPEN))
+            .collect();
+        let mut snapshot = RouteSnapshot::from_static(candidates, Arc::from("local"));
+        snapshot.scores = vec![0.0, 0.0];
+        let filter = filter(snapshot, steady());
+        let keys = PrefixKeys::from_keys((0..4).collect());
+        filter.affinity.index.confirm(&keys, &Arc::from("provider-a"));
+
+        let live_snapshot = filter.snapshot.load();
+        let picked = filter
+            .choose(
+                &live_snapshot,
+                "llama",
+                Scope {
+                    keys: Some(&keys),
+                    fence: None,
+                },
+                None,
+            )
+            .expect("a sticky candidate is available");
+
+        assert_eq!(&*picked.candidate.site, "local");
+        assert_eq!(&*picked.candidate.cluster, "provider-a");
+    }
+
+    #[test]
     fn a_much_deeper_queue_gives_way_to_the_lighter_site() {
         // 40 keys save 0.256s of prefill, 0.128 of a queued request at 2s each.
         let filter = filter(queued(&[("a", 1.0, OPEN), ("b", 0.0, OPEN)]), steady());
