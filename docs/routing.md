@@ -724,8 +724,9 @@ The gateway learns a soft capacity bound from the most in-flight a site has held
 waiting and a hard bound from the least it held at a demonstrated limit. A request count is read
 against the lesser bound, never below the floor. Saturation is the nearer of that counted limit
 and the site's reported KV-cache fullness (mean plus spread across pods), smoothed per new sample.
-Among sites with room, three or more use two choices by capacity taking the lower saturation;
-two use a weighted pick.
+Among sites with room, three or more use two choices by capacity: the first pick stands, and the
+request moves to the second only in proportion to the extra headroom the second has, so equal
+sites split by capacity and no site with room is shut out; two use a weighted pick.
 With shedding on, a model whose every site has been at its ceiling with work waiting for
 `full_after_ms` answers 429 with Retry-After until one site has room. Every input is a raw series the
 site's operator relays from its EPP: running and waiting per endpoint, ready endpoints, KV-cache
@@ -751,8 +752,9 @@ praxis config, rendered from the chart's `praxisConfig.render.gridServing.siteRo
 The exploration floor limits relative draw weights, not final traffic shares.
 At the default 0.25, effective capacities of 10,000 and 10 become 10,000 and
 2,500, giving the smaller site 20% in a direct capacity draw. With three or
-more sites, the router samples two by these weights and selects the one with
-lower pressure; a sampling floor does not guarantee a final request share.
+more sites, the router samples two by these weights and moves to the second
+only in proportion to the extra headroom it has; a sampling floor does not
+guarantee a final request share.
 Admission and health checks still determine which sites can participate.
 
 Tune one metric against one truth: `grid_route_site_ceiling_soft` should track the largest

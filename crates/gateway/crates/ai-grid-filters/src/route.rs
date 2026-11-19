@@ -750,12 +750,12 @@ impl GridSiteRouteFilter {
                 .get(http::header::CONTENT_ENCODING)
                 .is_none_or(|encoding| encoding.as_bytes().eq_ignore_ascii_case(b"identity"))
         });
-        let (answered, reached) = (head.is_some(), ctx.upstream_reached);
+        let (status, reached) = (head.map(|response| response.status), ctx.upstream_reached);
         let Some(state) = ctx.get_filter_state_mut::<RouteState>() else {
             return Ok(());
         };
         if let Some(dialed) = state.dialed.take() {
-            dialed.settle(answered, reached);
+            dialed.settle(status, reached);
         }
         // Keep the selected route after releasing the mutable borrow of filter state in `ctx`.
         let served = state.served.clone();
@@ -789,7 +789,7 @@ fn select_upstream(ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate) 
     }
 }
 
-/// Whether a dialed request reached a working site: `None` when the dial never owned the outcome.
+/// Whether a dialed request's connect worked: `None` when the dial never owned the outcome.
 ///
 /// Any response head proves the connect and handshake. Praxis 0.7.5 hands a filter no error
 /// kind, so a missing head counts only while it could still be a connect, DNS, TLS or
@@ -803,6 +803,16 @@ fn dial_outcome(answered: bool, reached: bool, elapsed: Duration, budget: Durati
         return Some(true);
     }
     (elapsed <= budget).then_some(false)
+}
+
+/// Whether an answer of `status` says the site itself is failing. A 503 or 504 is how a loaded
+/// site says wait, and counting those would push every site out in turn under load.
+fn site_failure(status: http::StatusCode) -> bool {
+    status.is_server_error()
+        && !matches!(
+            status,
+            http::StatusCode::SERVICE_UNAVAILABLE | http::StatusCode::GATEWAY_TIMEOUT
+        )
 }
 
 /// A request sent over a dial, whose outcome its response records.
@@ -834,11 +844,24 @@ impl InFlight {
         }
     }
 
-    /// Record the request's outcome, `answered` with a head after `reached` the upstream, and
-    /// hand back the probe it holds.
-    pub(crate) fn settle(self, answered: bool, reached: bool) {
-        if let Some(working) = dial_outcome(answered, reached, self.sent.elapsed(), self.budget) {
-            self.state.record(working, crate::health::monotonic_ms());
+    /// Record the request's outcome, answered with a head of `status` after `reached` the
+    /// upstream, and hand back the probe it holds.
+    pub(crate) fn settle(self, status: Option<http::StatusCode>, reached: bool) {
+        // Only the probe may bring a down dial back. The dial decides that from who is asking,
+        // not from a reading of its state taken here, which a concurrent demotion would outdate.
+        let now_ms = crate::health::monotonic_ms();
+        match (
+            dial_outcome(status.is_some(), reached, self.sent.elapsed(), self.budget),
+            status,
+        ) {
+            (Some(true), Some(status)) if !self.probe => self.state.observed(site_failure(status), now_ms),
+            // A down site that now says wait has not shown it can serve.
+            (Some(true), Some(status)) if site_failure(status) || !status.is_server_error() => {
+                self.state.answered(site_failure(status), now_ms);
+            },
+            (Some(false), _) if self.probe || !self.state.down() => self.state.record(false, now_ms),
+            (Some(false), _) => self.state.count_failure(),
+            _ => {},
         }
         if self.probe {
             self.state.release_probe();
@@ -1655,12 +1678,18 @@ fn between_two<'snap>(first: Site<'snap>, second: Site<'snap>, turn: usize, unpu
     if unit(turn, SALTS.0) < share { first } else { second }
 }
 
-/// Two distinct picks from `sites` by capacity, taking the lower rho; exact ties go to the first.
+/// Two distinct picks from `sites` by capacity; the request moves to the second only in
+/// proportion to the extra headroom it has, so a tie never moves.
+///
+/// Taking the lighter outright sends every request to the same site until the next sample.
 fn two_choices<'snap>(sites: &Sites<'snap>, turn: usize, unpublished: f64) -> Option<Site<'snap>> {
     let capacity = |candidate: &RouteCandidate| candidate.capacity.unwrap_or(unpublished) * f64::from(candidate.weight);
     let first = weighted(sites, unit(turn, SALTS.0), None, capacity)?;
     let second = weighted(sites, unit(turn, SALTS.1), Some(first.0), capacity).unwrap_or(first);
-    Some(if second.0.rho < first.0.rho { second } else { first })
+    let headroom = |candidate: &RouteCandidate| (1.0 - candidate.rho.unwrap_or(0.0)).max(0.0);
+    let (kept, other) = (headroom(first.0), headroom(second.0));
+    let moved = if other > kept { 1.0 - kept / other } else { 0.0 };
+    Some(if unit(turn, SALTS.2) < moved { second } else { first })
 }
 
 /// The site `point` (in 0..1) lands on when `sites` are weighted by `weight`, skipping `skip`.
@@ -1687,8 +1716,8 @@ fn weighted<'snap>(
     last
 }
 
-/// Salts that make a request's two picks independent.
-const SALTS: (u64, u64) = (0x9E37_79B9_7F4A_7C15, 0xC2B2_AE3D_27D4_EB4F);
+/// Salts that make a request's two picks, and the move between them, independent.
+const SALTS: (u64, u64, u64) = (0x9E37_79B9_7F4A_7C15, 0xC2B2_AE3D_27D4_EB4F, 0x1656_67B1_9E37_79F9);
 
 /// A uniform value in [0, 1) from `turn` and `salt`, mixed so consecutive turns do not correlate.
 fn unit(turn: usize, salt: u64) -> f64 {
@@ -2819,12 +2848,110 @@ pub(crate) mod tests {
         ]);
         let taken = shares(&snapshot, 3_000, &KeepAll);
         assert_eq!(taken.get("d"), None, "rho 1 has no room");
-        let (a, c) = (taken["a"], taken["c"]);
-        assert!(a > c && c > 0, "the lighter site takes more: a {a}, c {c}");
-        assert_eq!(
-            taken.get("b"),
-            None,
-            "two distinct picks never choose the heaviest of three"
+        let (a, b, c) = (taken["a"], taken["b"], taken["c"]);
+        assert!(a > c && c > b, "the lighter site takes more: a {a}, c {c}, b {b}");
+        assert!(b > 0, "the heaviest with room takes the least, not nothing: {b}");
+    }
+
+    /// Idle sites of equal capacity, each given the saturation it reads.
+    fn reading(rhos: &[(&str, f64)]) -> RouteSnapshot {
+        let idle: Vec<_> = rhos.iter().map(|(site, _)| (*site, Some(0.0), Some(10.0))).collect();
+        let mut snapshot = loaded(&idle);
+        for candidate in &mut snapshot.candidates {
+            candidate.rho = rhos
+                .iter()
+                .find(|(site, _)| *site == candidate.site.as_ref())
+                .map(|(_, rho)| *rho);
+        }
+        snapshot
+    }
+
+    #[test]
+    fn a_leftover_saturation_does_not_starve_a_site_among_idle_ones() {
+        for rhos in [
+            [("a", 0.0), ("b", 1e-12), ("c", 0.0)],
+            [("a", 1e-47), ("b", 6e-11), ("c", 8e-11)],
+        ] {
+            let taken = shares(&reading(&rhos), 3_000, &KeepAll);
+            for (site, _) in rhos {
+                assert!(
+                    (800..=1_200).contains(taken.get(site).unwrap_or(&0)),
+                    "{site} takes about a third of {rhos:?}: {taken:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_second_pick_gains_only_by_the_headroom_it_has_over_the_first() {
+        // Of six equally likely ordered pairs, `a` keeps the two it leads and takes half of the
+        // two where it follows a site with half its headroom: a half in all, not two thirds.
+        let taken = shares(&reading(&[("a", 0.0), ("b", 0.5), ("c", 0.5)]), 3_000, &KeepAll);
+        assert!((1_350..=1_650).contains(&taken["a"]), "a takes about a half: {taken:?}");
+        for site in ["b", "c"] {
+            assert!(
+                (600..=900).contains(&taken[site]),
+                "{site} keeps about a quarter: {taken:?}"
+            );
+        }
+        let near = shares(&reading(&[("a", 0.90), ("b", 0.93), ("c", 0.96)]), 3_000, &KeepAll);
+        assert!(
+            near["a"] > near["b"] && near["b"] > near["c"] && near["c"] > 0,
+            "near the ceiling the lighter takes more and none is shut out: {near:?}"
+        );
+    }
+
+    #[test]
+    fn a_site_that_drained_takes_its_share_again_while_its_estimate_decays() {
+        let store = grid_signals::LoadStore::new(Duration::from_secs(60));
+        let mut candidates = Vec::new();
+        for site in ["a", "b", "c"] {
+            let cluster = format!("pool-{site}");
+            publish_running(&store, site, &cluster, 10.0, 1_000);
+            candidates.extend(one("llama", site, &cluster, AdmissionState::NewAndExisting));
+        }
+        let availability = AvailabilitySettings {
+            ceiling_floor: 1.0,
+            ..AvailabilitySettings::default()
+        };
+        let mut learned = Learned::default();
+        let mut inputs = Inputs {
+            signals: &store,
+            now_ms: 1_000,
+            window_ms: 500,
+            horizon_ms: 500,
+            availability: &availability,
+            learned: &mut learned,
+        };
+        let mut snapshot = RouteSnapshot::from_store(candidates.clone(), Arc::from("hub"), &mut inputs);
+        // Every site teaches the same ceiling. `a` and `c` then idle, while `b` stays full and
+        // drains only for the last twelve samples.
+        for step in 1..=45_i64 {
+            let at = 1_000 + step * 1_000;
+            for site in ["a", "b", "c"] {
+                let held = if site == "b" && step <= 33 { 10.0 } else { 0.0 };
+                publish_running(&store, site, &format!("pool-{site}"), held, at);
+            }
+            inputs.now_ms = at;
+            snapshot = RouteSnapshot::from_store(candidates.clone(), Arc::from("hub"), &mut inputs);
+        }
+        let rho = |site: &str| {
+            snapshot
+                .candidates
+                .iter()
+                .find(|c| c.site.as_ref() == site)
+                .and_then(|c| c.rho)
+        };
+        assert!(rho("a") < Some(1e-6), "the peers read idle: {:?}", rho("a"));
+        assert!(
+            rho("b") > Some(0.01) && rho("b") < Some(0.1),
+            "b still remembers a little of its load: {:?}",
+            rho("b")
+        );
+        let taken = shares(&snapshot, 3_000, &KeepAll);
+        assert!(
+            (800..=1_200).contains(taken.get("b").unwrap_or(&0)),
+            "the drained site is back to about a third: {taken:?}"
         );
     }
 
@@ -3436,6 +3563,13 @@ pub(crate) mod tests {
         let mean = (0..10_000).map(|turn| unit(turn, SALTS.0)).sum::<f64>() / 10_000.0;
         assert!((0.48..=0.52).contains(&mean), "{mean}");
         assert!((0..10_000).all(|turn| (0.0..1.0).contains(&unit(turn, SALTS.1))));
+        let both = (0..10_000)
+            .filter(|turn| unit(*turn, SALTS.0) < 0.5 && unit(*turn, SALTS.2) < 0.5)
+            .count();
+        assert!(
+            (2_350..=2_650).contains(&both),
+            "a pick and its move are independent: {both}"
+        );
         assert_ne!(random_seed(), random_seed());
     }
 
@@ -4136,6 +4270,80 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn only_a_server_error_that_is_not_backpressure_speaks_against_a_site() {
+        for (status, failing) in [
+            (http::StatusCode::OK, false),
+            (http::StatusCode::TOO_MANY_REQUESTS, false),
+            (http::StatusCode::INTERNAL_SERVER_ERROR, true),
+            (http::StatusCode::BAD_GATEWAY, true),
+            (http::StatusCode::SERVICE_UNAVAILABLE, false),
+            (http::StatusCode::GATEWAY_TIMEOUT, false),
+        ] {
+            assert_eq!(site_failure(status), failing, "{status}");
+        }
+    }
+
+    /// Send one request through `filter` and answer it with `status`.
+    async fn answer(filter: &GridSiteRouteFilter, status: http::StatusCode) {
+        let request = llama_request("/v1/chat/completions");
+        let mut head = praxis_filter::Response {
+            headers: http::HeaderMap::new(),
+            status,
+        };
+        let mut ctx = context(&request);
+        drop(filter.on_request(&mut ctx).await.expect("routes"));
+        ctx.upstream_reached = true;
+        ctx.response_header = Some(&mut head);
+        drop(filter.on_response(&mut ctx).await.expect("settles"));
+    }
+
+    #[tokio::test]
+    async fn a_site_shedding_load_keeps_its_dial_and_one_answering_500_loses_it() {
+        let candidates = dialed("east", "east", Some("10.0.0.9:8443"));
+        let health = Arc::clone(candidates[0].dial.as_ref().expect("dialed").health());
+        let filter = dial_filter(candidates, "local", Some(&[]));
+        for status in [http::StatusCode::SERVICE_UNAVAILABLE, http::StatusCode::GATEWAY_TIMEOUT] {
+            for _ in 0..100 {
+                answer(&filter, status).await;
+            }
+            assert!(!health.down(), "a hundred answers of {status} say wait, not broken");
+        }
+        for _ in 0..50 {
+            answer(&filter, http::StatusCode::INTERNAL_SERVER_ERROR).await;
+        }
+        assert!(health.down(), "a window of 500 takes it down");
+    }
+
+    #[test]
+    fn while_a_dial_is_down_only_its_probe_moves_it() {
+        let candidates = dialed("east", "east", Some("10.0.0.9:8443"));
+        let dial = Arc::clone(candidates[0].dial.as_ref().expect("dialed"));
+        let health = Arc::clone(dial.health());
+        health.record(false, 0);
+        health.record(false, 0);
+        for _ in 0..2 {
+            InFlight::over(&dial, false).settle(Some(http::StatusCode::OK), true);
+        }
+        assert!(
+            health.down(),
+            "answers to requests sent before it went down do not bring it back"
+        );
+        InFlight::over(&dial, true).settle(Some(http::StatusCode::SERVICE_UNAVAILABLE), true);
+        InFlight::over(&dial, true).settle(Some(http::StatusCode::GATEWAY_TIMEOUT), true);
+        assert!(health.down(), "a probe told to wait has not shown the site can serve");
+        assert_eq!(
+            health.admit_at(crate::health::COOLDOWN_MS),
+            Admission::Probe,
+            "and it hands the probe back without another cooldown"
+        );
+        health.release_probe();
+        for _ in 0..2 {
+            InFlight::over(&dial, true).settle(Some(http::StatusCode::OK), true);
+        }
+        assert!(!health.down(), "two good probes do");
+    }
+
     #[tokio::test]
     async fn a_busy_preferred_dial_does_not_retry_in_the_affinity_fallback() {
         let mut candidates = dialed("east", "east", Some("10.0.0.9:8443"));
@@ -4458,6 +4666,23 @@ pub(crate) mod tests {
     // ---------------------------------------------------------------------------
     // Test Utilities
     // ---------------------------------------------------------------------------
+
+    /// The filter a control step serves: reading its `snapshot`, recording dial outcomes in its
+    /// `health`, affinity at its defaults, and its turn counter starting at zero.
+    pub(crate) fn filter_over(
+        snapshot: Arc<ArcSwap<RouteSnapshot>>,
+        health: Arc<ClusterHealth>,
+    ) -> GridSiteRouteFilter {
+        GridSiteRouteFilter {
+            snapshot,
+            health,
+            clusters: None,
+            model_header: http::header::HeaderName::from_static("x-model"),
+            sovereignty: None,
+            affinity: Arc::default(),
+            turn: AtomicUsize::new(0),
+        }
+    }
 
     /// The request id source every test context shares.
     static IDS: LazyLock<praxis_core::id::IdGenerator> = LazyLock::new(|| praxis_core::id::IdGenerator::with_seed(0));
