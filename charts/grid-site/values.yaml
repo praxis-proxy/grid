@@ -52,6 +52,9 @@ gridSite:
   name: ""
   region: ""
   zone: ""
+  # -- Sovereignty zone a gateway's fence or regionalPolicy matches this site against. Empty
+  # leaves the site in no zone.
+  sovereigntyZone: ""
   providerSiteLabel: ""
 
 # -- Remote sites this site trusts, keyed by site name, one GridSite each: <network>-<name>
