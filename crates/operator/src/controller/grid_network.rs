@@ -18,12 +18,16 @@ use std::{
 
 use k8s_openapi::api::{
     apps::v1::Deployment,
-    core::v1::{ConfigMap, Secret},
+    core::v1::{ConfigMap, ObjectReference, Secret},
 };
 use kube::{
-    Client,
+    Client, Resource as _,
     api::{Api, DeleteParams, ListParams, Patch, PatchParams, Preconditions},
-    runtime::{controller::Action, reflector::ObjectRef},
+    runtime::{
+        controller::Action,
+        events::{Event, EventType, Recorder, Reporter},
+        reflector::ObjectRef,
+    },
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -2267,6 +2271,14 @@ fn reject_invalid_budget_policy(network: &GridNetwork) -> Result<(), OperatorErr
 )]
 pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Result<Action, OperatorError> {
     let name = grid_network_name(&network)?;
+    let recorder = Recorder::new(
+        ctx.client.clone(),
+        Reporter {
+            controller: "grid-network-controller".into(),
+            instance: None,
+        },
+    );
+    let object_ref = network.object_ref(&());
 
     if network.metadata.deletion_timestamp.is_some() {
         return reconcile_deleting_grid_network(&network, &ctx, name).await;
@@ -2576,6 +2588,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let budget_statuses =
         crate::crd::grid_network::resolve_budget_statuses(network.spec.budget_policy.as_ref(), &tenant_spend);
 
+    let regional_policy_events = regional_policy_transition_events(&network, &overlay_statuses);
     update_status(
         &network,
         client,
@@ -2589,6 +2602,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         budget_statuses,
     )
     .await?;
+    publish_regional_policy_events(&recorder, &object_ref, regional_policy_events).await;
     Box::pin(apply_rollup(client, &network)).await;
 
     // Auto-create or update GridSite records for remote Alive SWIM members.
@@ -3403,7 +3417,7 @@ async fn reconcile_routing_overlay_inner(
         }
 
         let timestamp = rfc3339_now();
-        let mut overlay = match routing_overlay::render_routing_overlay_with_admission(
+        let rendered_overlay = match routing_overlay::render_routing_overlay_with_admission_evidence(
             network,
             &sites,
             providers,
@@ -3412,6 +3426,7 @@ async fn reconcile_routing_overlay_inner(
             remote_model_inventories,
             grid_id,
             local_site,
+            Some(gw_ref),
             owning_site,
             metrics_arg,
             timestamp.as_deref(),
@@ -3424,7 +3439,7 @@ async fn reconcile_routing_overlay_inner(
                 routing_overlay::CandidateExpirySupport::Unsupported
             },
         ) {
-            Ok(overlay) => overlay,
+            Ok(rendered) => rendered,
             Err(error) => {
                 tracing::warn!(
                     network = network_name,
@@ -3443,6 +3458,8 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
+        let regional_policy_removed_all_candidates = rendered_overlay.regional_policy_removed_all_candidates;
+        let mut overlay = rendered_overlay.overlay;
         if let Some(deadline) = next_discovered_model_expiry(&overlay) {
             inventory_expiry_deadline =
                 Some(inventory_expiry_deadline.map_or(deadline, |current| current.min(deadline)));
@@ -3673,6 +3690,8 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
+        let (reason, message) =
+            regional_policy_empty_overlay_status(gw_ref, no_candidates, regional_policy_removed_all_candidates);
         overlay_statuses.push(OverlayRevisionStatus {
             gateway_name: gw_ref.name.clone(),
             namespace: gw_ref.namespace.clone(),
@@ -3685,8 +3704,8 @@ async fn reconcile_routing_overlay_inner(
             rendered_at: render.rendered_at,
             candidate_count: render.candidate_count,
             phase: OverlayPhase::Distributed,
-            reason: String::new(),
-            message: String::new(),
+            reason,
+            message,
             observed_generation,
         });
 
@@ -3763,6 +3782,128 @@ async fn reconcile_routing_overlay_inner(
         serving_retry,
         inventory_expiry_deadline,
     })
+}
+
+/// Status reason for an authoritative regional-policy no-route overlay.
+const REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON: &str = "RegionalPolicyNoEligibleCandidates";
+
+/// Event reason for a regional-policy recovery that restores eligible candidates.
+const REGIONAL_POLICY_RECOVERED_REASON: &str = "RegionalPolicyRecovered";
+
+/// Bounded status evidence for an authoritative no-route overlay under an
+/// active regional policy.
+///
+/// A valid policy that permits no candidates is intentionally distributed; it
+/// is not an invalid update and must not retain a prior cross-region route.
+fn regional_policy_empty_overlay_status(
+    gw_ref: &GatewayRef,
+    no_candidates: bool,
+    regional_policy_removed_all_candidates: bool,
+) -> (String, String) {
+    if no_candidates && gw_ref.regional_policy.is_some() && regional_policy_removed_all_candidates {
+        (
+            REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON.to_owned(),
+            "regional policy permits no eligible candidates; authoritative empty overlay distributed".to_owned(),
+        )
+    } else {
+        (String::new(), String::new())
+    }
+}
+
+/// A bounded, transition-only Kubernetes Event for regional-policy serving state.
+struct RegionalPolicyEvent {
+    /// Kubernetes severity for the transition.
+    type_: EventType,
+    /// Stable reason users and automation can match.
+    reason: &'static str,
+    /// Static note: policy values and inventory identifiers belong in status/logs, not Events.
+    note: &'static str,
+}
+
+/// Report entry into, and recovery from, an authoritative no-route policy revision.
+///
+/// The current `GridNetwork` object contains the status from the prior
+/// reconcile, so comparing it with the newly rendered statuses makes Events
+/// transition-only instead of emitting one on every periodic reconcile.
+fn regional_policy_transition_events(
+    network: &GridNetwork,
+    current: &[OverlayRevisionStatus],
+) -> Vec<RegionalPolicyEvent> {
+    // A GatewayRef is namespaced. Keep the namespace in the transition key so
+    // two gateways with the same name cannot suppress each other's Events.
+    let policy_gateways: BTreeSet<(&str, &str)> = network
+        .spec
+        .consumer_gateways
+        .iter()
+        .filter(|gateway| gateway.regional_policy.is_some())
+        .map(|gateway| (gateway.namespace.as_str(), gateway.name.as_str()))
+        .collect();
+    if policy_gateways.is_empty() {
+        return Vec::new();
+    }
+
+    let prior_empty: BTreeSet<(&str, &str)> = network.status.as_ref().map_or_else(BTreeSet::new, |status| {
+        status
+            .routing_map_status
+            .iter()
+            .filter(|entry| entry.reason == REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON)
+            .map(|entry| (entry.namespace.as_str(), entry.gateway_name.as_str()))
+            .collect()
+    });
+    let current_by_gateway: BTreeMap<(&str, &str), &OverlayRevisionStatus> = current
+        .iter()
+        .map(|entry| ((entry.namespace.as_str(), entry.gateway_name.as_str()), entry))
+        .collect();
+
+    policy_gateways
+        .iter()
+        .filter_map(|gateway| {
+            let was_empty = prior_empty.contains(gateway);
+            let current_status = current_by_gateway.get(gateway).copied();
+            let is_empty =
+                current_status.is_some_and(|entry| entry.reason == REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON);
+            let recovered = current_status
+                .is_some_and(|entry| entry.phase == OverlayPhase::Distributed && entry.candidate_count > 0);
+            match (was_empty, is_empty, recovered) {
+                (false, true, _) => Some(RegionalPolicyEvent {
+                    type_: EventType::Warning,
+                    reason: REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON,
+                    note: "regional policy distributed an authoritative no-route revision",
+                }),
+                (true, false, true) => Some(RegionalPolicyEvent {
+                    type_: EventType::Normal,
+                    reason: REGIONAL_POLICY_RECOVERED_REASON,
+                    note: "regional policy distributed a revision with eligible candidates",
+                }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Publish bounded, transition-only policy Events without failing a reconcile.
+async fn publish_regional_policy_events(
+    recorder: &Recorder,
+    object_ref: &ObjectReference,
+    events: Vec<RegionalPolicyEvent>,
+) {
+    for event in events {
+        if let Err(error) = recorder
+            .publish(
+                &Event {
+                    type_: event.type_,
+                    reason: event.reason.to_owned(),
+                    note: Some(event.note.to_owned()),
+                    action: "Reconcile".to_owned(),
+                    secondary: None,
+                },
+                object_ref,
+            )
+            .await
+        {
+            tracing::warn!(%error, reason = event.reason, "failed to publish GridNetwork regional-policy Event");
+        }
+    }
 }
 
 /// What one routing overlay pass produced, per gateway.
@@ -4448,19 +4589,33 @@ fn retained_overlay_status(
 ) -> OverlayRevisionStatus {
     let prior = find_prior_overlay(network, gw_ref);
     let has_prior = prior.is_some();
+    // A retained status keeps the previous distributed revision. Preserve the
+    // regional-policy no-route marker while that authoritative empty revision
+    // remains the serving revision, so a later successful distribution can
+    // emit the corresponding recovery Event.
+    let retains_regional_policy_no_route = prior.is_some_and(|entry| {
+        entry.reason == REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON
+            && matches!(entry.phase, OverlayPhase::Distributed | OverlayPhase::Retained)
+    });
     let fallback_cm =
         routing_overlay::overlay_configmap_name(network.metadata.name.as_deref().unwrap_or("unknown"), &gw_ref.name);
     let mut status = resolve_overlay_evidence(render, prior, fallback_cm);
     status.gateway_name.clone_from(&gw_ref.name);
     status.namespace.clone_from(&gw_ref.namespace);
     status.observed_generation = observed_generation;
-    reason.clone_into(&mut status.reason);
+    if retains_regional_policy_no_route {
+        REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON.clone_into(&mut status.reason);
+    } else {
+        reason.clone_into(&mut status.reason);
+    }
     status.phase = if has_prior {
         OverlayPhase::Retained
     } else {
         OverlayPhase::Error
     };
-    status.message = if has_prior {
+    status.message = if retains_regional_policy_no_route {
+        format!("{failure_message}; authoritative regional-policy no-route revision retained")
+    } else if has_prior {
         format!("{failure_message}; previous valid overlay retained")
     } else {
         format!("{failure_message}; no valid overlay has been distributed")
@@ -7235,11 +7390,11 @@ fn auto_discovered_stubs(sites: &[GridSite], network_name: &str) -> Vec<GridSite
         .iter()
         // A label is not ownership: only discovery's own objects for this network.
         .filter(|site| {
-            site.metadata
-                .labels
-                .as_ref()
-                .is_some_and(|labels| labels.get("grid.praxis.fast/network").is_some_and(|n| n == network_name))
-                && site.spec.grid_network_ref == network_name
+            site.metadata.labels.as_ref().is_some_and(|labels| {
+                labels
+                    .get("grid.praxis.fast/network")
+                    .is_some_and(|n| n == network_name)
+            }) && site.spec.grid_network_ref == network_name
                 && is_stub(site)
         })
         .cloned()
@@ -8597,6 +8752,185 @@ mod tests {
             should_warn_empty_overlay(&logged, "net/ns/gw", true),
             "reentering empty state warns"
         );
+    }
+
+    #[test]
+    fn regional_policy_status_requires_policy_eligibility_evidence() {
+        let mut gateway = make_gw_ref("gw", "grid-system");
+        gateway.regional_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "mode": "locked",
+                "allowedRegions": ["east"],
+            }))
+            .unwrap_or_else(|_| std::process::abort()),
+        );
+
+        assert_eq!(
+            regional_policy_empty_overlay_status(&gateway, true, true),
+            (
+                "RegionalPolicyNoEligibleCandidates".to_owned(),
+                "regional policy permits no eligible candidates; authoritative empty overlay distributed".to_owned(),
+            )
+        );
+        assert_eq!(
+            regional_policy_empty_overlay_status(&gateway, false, true),
+            (String::new(), String::new())
+        );
+        assert_eq!(
+            regional_policy_empty_overlay_status(&gateway, true, false),
+            (String::new(), String::new()),
+            "admission, health, or downstream consumer validation must not be reported as a policy rejection"
+        );
+        gateway.regional_policy = None;
+        assert_eq!(
+            regional_policy_empty_overlay_status(&gateway, true, true),
+            (String::new(), String::new())
+        );
+    }
+
+    #[test]
+    fn regional_policy_events_are_bounded_and_transition_only() {
+        let entry = |namespace: &str, reason: &str, candidate_count: u32| {
+            serde_json::from_value::<OverlayRevisionStatus>(serde_json::json!({
+                "gatewayName": "gw", "namespace": namespace, "configMapName": "overlay", "schemaVersion": "1.0.0",
+                "renderedRevision": "revision", "distributedRevision": "revision", "contentDigest": "revision",
+                "phase": "Distributed", "reason": reason, "candidateCount": candidate_count,
+            }))
+            .unwrap_or_else(|_| std::process::abort())
+        };
+        let mut network = base_network();
+        let mut gateway = make_gw_ref("gw", "ns");
+        gateway.regional_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "mode": "locked",
+                "allowedRegions": ["east"],
+            }))
+            .unwrap_or_else(|_| std::process::abort()),
+        );
+        network.spec.consumer_gateways = vec![gateway];
+
+        let mut entered_events =
+            regional_policy_transition_events(&network, &[entry("ns", "RegionalPolicyNoEligibleCandidates", 0)]);
+        assert_eq!(entered_events.len(), 1, "entering no-route state emits one Event");
+        let entered = entered_events.remove(0);
+        assert_eq!(entered.reason, "RegionalPolicyNoEligibleCandidates");
+        assert!(matches!(entered.type_, EventType::Warning));
+
+        network.status = Some(
+            serde_json::from_value(serde_json::json!({
+                "routingMapStatus": [{
+                    "gatewayName": "gw", "namespace": "ns", "configMapName": "overlay", "schemaVersion": "1.0.0",
+                    "renderedRevision": "old", "distributedRevision": "old", "contentDigest": "old",
+                    "phase": "Distributed", "reason": "RegionalPolicyNoEligibleCandidates", "candidateCount": 0,
+                }]
+            }))
+            .unwrap_or_else(|_| std::process::abort()),
+        );
+        assert!(
+            regional_policy_transition_events(&network, &[entry("ns", "RegionalPolicyNoEligibleCandidates", 0)])
+                .is_empty(),
+            "an unchanged no-route revision must not spam Events"
+        );
+        let mut recovered_events = regional_policy_transition_events(&network, &[entry("ns", "", 1)]);
+        assert_eq!(recovered_events.len(), 1, "recovery emits one Event");
+        let recovered = recovered_events.remove(0);
+        assert_eq!(recovered.reason, "RegionalPolicyRecovered");
+        assert!(matches!(recovered.type_, EventType::Normal));
+    }
+
+    #[test]
+    fn regional_policy_recovery_event_survives_a_retained_no_route_revision() {
+        let entry = |reason: &str, candidate_count: u32| {
+            serde_json::from_value::<OverlayRevisionStatus>(serde_json::json!({
+                "gatewayName": "gw", "namespace": "ns", "configMapName": "overlay", "schemaVersion": "1.0.0",
+                "renderedRevision": "revision", "distributedRevision": "revision", "contentDigest": "revision",
+                "phase": "Distributed", "reason": reason, "candidateCount": candidate_count,
+            }))
+            .unwrap_or_else(|_| std::process::abort())
+        };
+        let mut network = base_network();
+        let mut gateway = make_gw_ref("gw", "ns");
+        gateway.regional_policy = Some(
+            serde_json::from_value(serde_json::json!({
+                "mode": "locked",
+                "allowedRegions": ["east"],
+            }))
+            .unwrap_or_else(|_| std::process::abort()),
+        );
+        network.spec.consumer_gateways = vec![gateway.clone()];
+        network.status = Some(GridNetworkStatus {
+            routing_map_status: vec![entry(REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON, 0)],
+            ..GridNetworkStatus::default()
+        });
+
+        let retained = retained_overlay_status(
+            &network,
+            &gateway,
+            2,
+            None,
+            "GatewayMountsNotReady",
+            "gateway rollout is pending",
+        );
+        assert_eq!(retained.phase, OverlayPhase::Retained);
+        assert_eq!(retained.reason, REGIONAL_POLICY_NO_ELIGIBLE_CANDIDATES_REASON);
+        assert!(retained.message.contains("gateway rollout is pending"));
+        network.status = Some(GridNetworkStatus {
+            routing_map_status: vec![retained],
+            ..GridNetworkStatus::default()
+        });
+
+        let mut events = regional_policy_transition_events(&network, &[entry("", 1)]);
+        assert_eq!(events.len(), 1, "recovery must survive a retained no-route revision");
+        let event = events.remove(0);
+        assert_eq!(event.reason, REGIONAL_POLICY_RECOVERED_REASON);
+        assert!(matches!(event.type_, EventType::Normal));
+    }
+
+    #[test]
+    fn regional_policy_events_keep_same_named_gateways_in_separate_namespaces_distinct() {
+        let entry = |namespace: &str, reason: &str, candidate_count: u32| {
+            serde_json::from_value::<OverlayRevisionStatus>(serde_json::json!({
+                "gatewayName": "gw", "namespace": namespace, "configMapName": "overlay", "schemaVersion": "1.0.0",
+                "renderedRevision": "revision", "distributedRevision": "revision", "contentDigest": "revision",
+                "phase": "Distributed", "reason": reason, "candidateCount": candidate_count,
+            }))
+            .unwrap_or_else(|_| std::process::abort())
+        };
+        let policy = || {
+            serde_json::from_value(serde_json::json!({
+                "mode": "locked",
+                "allowedRegions": ["east"],
+            }))
+            .unwrap_or_else(|_| std::process::abort())
+        };
+        let mut network = base_network();
+        let mut namespace_a = make_gw_ref("gw", "namespace-a");
+        namespace_a.regional_policy = Some(policy());
+        let mut namespace_b = make_gw_ref("gw", "namespace-b");
+        namespace_b.regional_policy = Some(policy());
+        network.spec.consumer_gateways = vec![namespace_a, namespace_b];
+        network.status = Some(
+            serde_json::from_value(serde_json::json!({
+                "routingMapStatus": [{
+                    "gatewayName": "gw", "namespace": "namespace-a", "configMapName": "overlay", "schemaVersion": "1.0.0",
+                    "renderedRevision": "old", "distributedRevision": "old", "contentDigest": "old",
+                    "phase": "Distributed", "reason": "RegionalPolicyNoEligibleCandidates", "candidateCount": 0,
+                }]
+            }))
+            .unwrap_or_else(|_| std::process::abort()),
+        );
+
+        let events = regional_policy_transition_events(
+            &network,
+            &[
+                entry("namespace-a", "RegionalPolicyNoEligibleCandidates", 0),
+                entry("namespace-b", "RegionalPolicyNoEligibleCandidates", 0),
+            ],
+        );
+        assert_eq!(events.len(), 1, "namespace-b must enter no-route independently");
+        let event = events.first().unwrap_or_else(|| std::process::abort());
+        assert_eq!(event.reason, "RegionalPolicyNoEligibleCandidates");
+        assert!(matches!(event.type_, EventType::Warning));
     }
 
     // -----------------------------------------------------------------------
@@ -12246,6 +12580,7 @@ mod tests {
             name: name.to_owned(),
             namespace: ns.to_owned(),
             site_name: None,
+            regional_policy: None,
             model_discovery_contract_version: None,
             provider_hop_endpoints: Vec::new(),
             praxis_config: None,
