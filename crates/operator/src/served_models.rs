@@ -994,6 +994,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &scoring::ScoringWeights::default(),
             None,
             &store,

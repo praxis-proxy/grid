@@ -425,12 +425,19 @@ pub fn spawn_provider(path: PathBuf, binding: Binding, every: Duration) -> std::
 struct ProviderFilterConfig {
     /// The exact request paths a peer may call.
     allowed_paths: Vec<String>,
+
+    /// The request-path prefixes a peer may call.
+    #[serde(default)]
+    allowed_path_prefixes: Vec<String>,
 }
 
 /// Serves an admitted peer's request to the local backend its stable ID names.
 pub(crate) struct GridProviderFilter {
     /// Exact paths a peer may call.
     allowed_paths: BTreeSet<String>,
+
+    /// Path prefixes a peer may call.
+    allowed_path_prefixes: BTreeSet<String>,
 
     /// The live snapshot.
     snapshot: Arc<ArcSwap<ProviderSnapshot>>,
@@ -446,10 +453,31 @@ impl GridProviderFilter {
         if parsed.allowed_paths.is_empty() || parsed.allowed_paths.iter().any(|path| !path.starts_with('/')) {
             return Err("grid_provider: allowed_paths must name at least one absolute path".into());
         }
+        if parsed
+            .allowed_path_prefixes
+            .iter()
+            .any(|prefix| !prefix.starts_with('/') || !prefix.ends_with('/'))
+        {
+            return Err("grid_provider: allowed_path_prefixes must be absolute paths ending in '/'".into());
+        }
         Ok(Box::new(Self {
             allowed_paths: parsed.allowed_paths.into_iter().collect(),
+            allowed_path_prefixes: parsed.allowed_path_prefixes.into_iter().collect(),
             snapshot,
         }))
+    }
+
+    /// Whether `path` is admitted by the exact-path or safe-prefix contract.
+    fn allows_path(&self, path: &str) -> bool {
+        self.allowed_paths.contains(path)
+            || self.allowed_path_prefixes.iter().any(|prefix| {
+                path.strip_prefix(prefix).is_some_and(|rest| {
+                    rest.is_empty()
+                        || rest
+                            .split('/')
+                            .all(|segment| !segment.is_empty() && !matches!(segment, "." | ".."))
+                })
+            })
     }
 }
 
@@ -480,7 +508,7 @@ impl HttpFilter for GridProviderFilter {
         if !matches!(ctx.request.method, http::Method::GET | http::Method::POST) {
             return Ok(refuse("method", 405));
         }
-        if !self.allowed_paths.contains(ctx.request.uri.path()) {
+        if !self.allows_path(ctx.request.uri.path()) {
             return Ok(refuse("path", 404));
         }
         let mut named = ctx.request.headers.get_all(CANDIDATE_HEADER).iter();
@@ -550,6 +578,7 @@ fn as_serving(config: &ProviderConfig) -> GridServingConfig {
                 kind: CapabilityKind::InferenceModel,
                 name: candidate.name.clone(),
                 publishes_load: true,
+                selection_group: 0,
                 site: config.local_site.clone(),
                 stable_id: Some(candidate.stable_id.clone()),
                 weight: None,
@@ -1019,6 +1048,7 @@ mod tests {
         builder.publish(config, dial);
         let filter = GridProviderFilter {
             allowed_paths: BTreeSet::from(["/v1/chat/completions".to_owned()]),
+            allowed_path_prefixes: BTreeSet::new(),
             snapshot: Arc::clone(&builder.snapshot),
         };
         let mut request = request(http::Method::POST, "/v1/chat/completions");
@@ -1071,6 +1101,8 @@ mod tests {
             "{}",
             "allowed_paths: []",
             "allowed_paths: [v1/models]",
+            "allowed_paths: [/v1/models]\nallowed_path_prefixes: [v1/conversations/]",
+            "allowed_paths: [/v1/models]\nallowed_path_prefixes: [/v1/conversations]",
             "allowed_paths: [/a]\nextra: 1",
         ] {
             let config: serde_yaml::Value = serde_yaml::from_str(yaml).expect("yaml");
@@ -1079,6 +1111,30 @@ mod tests {
                 "{yaml} is refused"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn conversation_paths_are_limited_to_the_configured_prefix() -> Result<(), FilterError> {
+        let filter = filter_over(&minimal());
+        for (path, accepted) in [
+            ("/v1/conversations", true),
+            ("/v1/conversations/conv_abc123/items", true),
+            ("/v1/conversations//items", false),
+            ("/v1/conversations/../models", false),
+        ] {
+            let mut request = request(http::Method::POST, path);
+            request
+                .headers
+                .insert(CANDIDATE_HEADER, http::HeaderValue::from_static("ccac628c"));
+            let mut ctx = context(&request);
+            ctx.peer_identity = Some(peer("site-b"));
+            assert_eq!(
+                matches!(filter.on_request(&mut ctx).await?, FilterAction::Continue),
+                accepted,
+                "{path} must match only the conversation contract"
+            );
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1150,7 +1206,12 @@ mod tests {
         let mut builder = builder(loopback());
         builder.tick(Some(text(config).into_bytes()));
         GridProviderFilter {
-            allowed_paths: BTreeSet::from(["/v1/chat/completions".to_owned(), "/v1/models".to_owned()]),
+            allowed_paths: BTreeSet::from([
+                "/v1/chat/completions".to_owned(),
+                "/v1/conversations".to_owned(),
+                "/v1/models".to_owned(),
+            ]),
+            allowed_path_prefixes: BTreeSet::from(["/v1/conversations/".to_owned()]),
             snapshot: Arc::clone(&builder.snapshot),
         }
     }
