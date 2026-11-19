@@ -225,13 +225,22 @@ impl DialState {
         self.failures_total.increment(1);
     }
 
-    /// Count a server error answer that does not move the dial.
-    pub(crate) fn count_server_error(&self) {
-        self.server_errors_total.increment(1);
+    /// Record an answer to a request that does not hold the probe. It can take an up dial down,
+    /// and it never brings a down one back or restarts its cooldown: a request sent while the
+    /// dial was up can finish after it went down, and would otherwise undo that.
+    pub(crate) fn observed(&self, server_error: bool, now_ms: u64) {
+        self.failures.store(0, Ordering::Relaxed);
+        if server_error {
+            self.server_errors_total.increment(1);
+        }
+        if !self.down() && self.tally(server_error) {
+            self.down_since.store(now_ms.saturating_add(1), Ordering::Relaxed);
+        }
     }
 
-    /// Record an answered request at `now_ms`: the connect worked, and a server error counts
-    /// against the site. A site that refuses fast never fills, so load alone reads it as the best.
+    /// Record an answer the dial may act on in either direction, a probe's or a test's, at
+    /// `now_ms`: the connect worked, and a server error counts against the site. A site that
+    /// refuses fast never fills, so load alone reads it as the best.
     pub(crate) fn answered(&self, server_error: bool, now_ms: u64) {
         if !server_error {
             if self.down() {
@@ -579,6 +588,33 @@ mod tests {
             dial.answered(true, 32_000);
             assert!(!dial.down(), "error {answer} after recovery starts a fresh window");
         }
+    }
+
+    #[test]
+    fn an_answer_without_the_probe_never_brings_a_down_dial_back() {
+        let dial = DialState::new("east", Arc::from("east:8443"));
+        for _ in 0..ERRORS_DOWN {
+            dial.observed(true, 1_000);
+        }
+        assert!(
+            dial.demoted(1_000),
+            "server errors take an up dial down without a probe"
+        );
+        for _ in 0..UP_AFTER * 2 {
+            dial.observed(false, 1_500);
+        }
+        assert!(
+            dial.down(),
+            "good answers to requests sent before it went down do not undo that"
+        );
+        dial.observed(true, 5_000);
+        assert!(
+            !dial.demoted(1_000 + COOLDOWN_MS),
+            "and a late error does not restart its cooldown"
+        );
+        dial.answered(false, 20_000);
+        dial.answered(false, 20_100);
+        assert!(!dial.down(), "two good probes bring it back");
     }
 
     #[test]

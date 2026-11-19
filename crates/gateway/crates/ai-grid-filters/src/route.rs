@@ -752,19 +752,19 @@ impl InFlight {
     /// Record the request's outcome, answered with a head of `status` after `reached` the
     /// upstream, and hand back the probe it holds.
     pub(crate) fn settle(self, status: Option<http::StatusCode>, reached: bool) {
-        // While a dial is down only its probe moves it: a request sent before it went down proves
-        // nothing new. Every outcome is still counted.
-        let moves = self.probe || !self.state.down();
+        // Only the probe may bring a down dial back. The dial decides that from who is asking,
+        // not from a reading of its state taken here, which a concurrent demotion would outdate.
         let now_ms = crate::health::monotonic_ms();
         match (
             dial_outcome(status.is_some(), reached, self.sent.elapsed(), self.budget),
             status,
         ) {
+            (Some(true), Some(status)) if !self.probe => self.state.observed(site_failure(status), now_ms),
             // A down site that now says wait has not shown it can serve.
-            (Some(true), Some(status)) if !site_failure(status) && status.is_server_error() && self.state.down() => {},
-            (Some(true), Some(status)) if moves => self.state.answered(site_failure(status), now_ms),
-            (Some(true), Some(status)) if site_failure(status) => self.state.count_server_error(),
-            (Some(false), _) if moves => self.state.record(false, now_ms),
+            (Some(true), Some(status)) if site_failure(status) || !status.is_server_error() => {
+                self.state.answered(site_failure(status), now_ms);
+            },
+            (Some(false), _) if self.probe || !self.state.down() => self.state.record(false, now_ms),
             (Some(false), _) => self.state.count_failure(),
             _ => {},
         }
