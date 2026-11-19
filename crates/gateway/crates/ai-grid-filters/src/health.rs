@@ -26,8 +26,15 @@ const DOWN_AFTER: u32 = 2;
 /// Consecutive successes that bring a down dial back up.
 const UP_AFTER: u32 = 2;
 
+/// Answers per server-error window; it tumbles, so errors split across two windows never add.
+const ERROR_WINDOW: u32 = 50;
+
+/// Server errors in one window that take a dial down: four in five, so one caller's failing
+/// requests among everyone else's do not.
+const ERRORS_DOWN: u32 = ERROR_WINDOW / 5 * 4;
+
 /// How long a down dial is ordered last before a request may try it again, milliseconds.
-const COOLDOWN_MS: u64 = 10_000; // 10 s
+pub(crate) const COOLDOWN_MS: u64 = 10_000; // 10 s
 
 /// The process start every dial timestamp counts from.
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -111,16 +118,24 @@ pub(crate) enum Admission {
 
 /// One dial's passive health, recorded on the response path with atomics only.
 ///
-/// Down after [`DOWN_AFTER`] consecutive failures, up after [`UP_AFTER`] consecutive successes.
+/// Down after [`DOWN_AFTER`] consecutive failures to connect or [`ERRORS_DOWN`] server errors in
+/// [`ERROR_WINDOW`] answers, up after [`UP_AFTER`] consecutive successes.
 /// A down dial is ordered last, never excluded, for [`COOLDOWN_MS`]; then it is half open: one
-/// request at a time may probe it, and one more failure orders it last again.
+/// request at a time may probe it, and one more failure orders it last again. While it is down
+/// only its probe moves it.
 #[derive(Debug)]
 pub(crate) struct DialState {
     /// The address dialed, so a moved cluster starts healthy.
     address: Arc<str>,
 
+    /// Answers in the current window.
+    answers: AtomicU32,
+
     /// When the dial went down or last failed while down, plus one; 0 while up.
     down_since: AtomicU64,
+
+    /// Server errors in the current window.
+    errors: AtomicU32,
 
     /// Consecutive failures.
     failures: AtomicU32,
@@ -131,6 +146,9 @@ pub(crate) struct DialState {
     /// The cluster's failure counter, resolved once.
     failures_total: metrics::Counter,
 
+    /// The cluster's server-error counter, resolved once.
+    server_errors_total: metrics::Counter,
+
     /// Consecutive successes.
     successes: AtomicU32,
 }
@@ -140,8 +158,11 @@ impl DialState {
     pub(crate) fn new(cluster: &str, address: Arc<str>) -> Self {
         Self {
             failures_total: metrics::counter!("grid_dial_failures_total", "cluster" => cluster.to_owned()),
+            server_errors_total: metrics::counter!("grid_dial_server_errors_total", "cluster" => cluster.to_owned()),
             address,
+            answers: AtomicU32::new(0),
             down_since: AtomicU64::new(0),
+            errors: AtomicU32::new(0),
             failures: AtomicU32::new(0),
             probe_since: AtomicU64::new(0),
             successes: AtomicU32::new(0),
@@ -192,6 +213,65 @@ impl DialState {
         if failures >= DOWN_AFTER || self.down() {
             self.down_since.store(now_ms.saturating_add(1), Ordering::Relaxed);
         }
+    }
+
+    /// Count a failure to connect that does not move the dial.
+    pub(crate) fn count_failure(&self) {
+        self.failures_total.increment(1);
+    }
+
+    /// Record an answer to a request that does not hold the probe. It can take an up dial down,
+    /// and it never brings a down one back or restarts its cooldown: a request sent while the
+    /// dial was up can finish after it went down, and would otherwise undo that.
+    pub(crate) fn observed(&self, server_error: bool, now_ms: u64) {
+        self.failures.store(0, Ordering::Relaxed);
+        if server_error {
+            self.server_errors_total.increment(1);
+        }
+        if !self.down() && self.tally(server_error) {
+            // Good probes from an earlier recovery must not count toward the next one.
+            self.successes.store(0, Ordering::Relaxed);
+            self.down_since.store(now_ms.saturating_add(1), Ordering::Relaxed);
+        }
+    }
+
+    /// Record an answer the dial may act on in either direction, a probe's or a test's, at
+    /// `now_ms`: the connect worked, and a server error counts against the site. A site that
+    /// refuses fast never fills, so load alone reads it as the best.
+    pub(crate) fn answered(&self, server_error: bool, now_ms: u64) {
+        if !server_error {
+            if self.down() {
+                // Whenever it comes back up, it does so with a fresh window.
+                self.errors.store(0, Ordering::Relaxed);
+                self.answers.store(0, Ordering::Relaxed);
+            } else {
+                self.tally(false);
+            }
+            return self.record(true, now_ms);
+        }
+        self.server_errors_total.increment(1);
+        self.failures.store(0, Ordering::Relaxed);
+        self.successes.store(0, Ordering::Relaxed);
+        // A server error while down is a failed probe; while up it only counts toward the window.
+        if self.down() || self.tally(true) {
+            self.down_since.store(now_ms.saturating_add(1), Ordering::Relaxed);
+        }
+    }
+
+    /// Count one answer in the current window, returning whether its server errors reached the limit.
+    fn tally(&self, server_error: bool) -> bool {
+        let errors = if server_error {
+            self.errors.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+        } else {
+            self.errors.load(Ordering::Relaxed)
+        };
+        let answers = self.answers.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let tripped = errors >= ERRORS_DOWN;
+        if tripped || answers >= ERROR_WINDOW {
+            self.errors.store(0, Ordering::Relaxed);
+            self.answers.store(0, Ordering::Relaxed);
+        }
+        tripped
     }
 
     /// Whether the dial is down, half open included.
@@ -422,6 +502,114 @@ mod tests {
         dial.record(true, 1_700);
         assert!(!dial.down(), "two consecutive successes bring it up");
         assert!(!dial.demoted(1_700), "and it is ordered by load again");
+    }
+
+    #[test]
+    fn server_errors_take_a_dial_down_at_four_in_five_of_a_window_and_not_before() {
+        let dial = DialState::new("east", Arc::from("east:8443"));
+        for answer in 1..ERRORS_DOWN {
+            dial.answered(true, 1_000);
+            assert!(!dial.down(), "{answer} server errors are not four in five of a window");
+        }
+        dial.answered(true, 1_000);
+        assert!(dial.down(), "four in five of a window of server errors takes it down");
+        assert!(dial.demoted(1_000), "and orders it last");
+    }
+
+    #[test]
+    fn server_errors_spread_evenly_at_two_in_five_never_take_a_dial_down() {
+        let dial = DialState::new("east", Arc::from("east:8443"));
+        // One caller's failing requests among everyone else's: two answers in five, for fifty windows.
+        for answer in 0..50 * ERROR_WINDOW {
+            dial.answered(answer % 5 < 2, 1_000);
+            assert!(!dial.down(), "answer {answer}: 40 percent errors is under four in five");
+        }
+    }
+
+    #[test]
+    fn server_errors_at_random_at_two_in_five_never_take_a_dial_down() {
+        let dial = DialState::new("east", Arc::from("east:8443"));
+        // A fixed linear congruential stream: about two answers in five are errors, in no pattern.
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        for answer in 0..100_000 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            dial.answered((seed >> 33) % 5 < 2, 1_000);
+            assert!(
+                !dial.down(),
+                "answer {answer}: 40 percent errors is far under four in five"
+            );
+        }
+    }
+
+    #[test]
+    fn a_server_error_while_down_rearms_the_cooldown_and_two_good_answers_bring_it_back() {
+        let dial = DialState::new("east", Arc::from("east:8443"));
+        for _ in 0..ERRORS_DOWN {
+            dial.answered(true, 1_000);
+        }
+        assert!(!dial.demoted(1_000 + COOLDOWN_MS), "half open after the cooldown");
+        dial.answered(true, 20_000);
+        assert!(
+            dial.demoted(20_000),
+            "a probe answered with a server error orders it last again"
+        );
+        dial.answered(false, 31_000);
+        assert!(dial.down(), "one good answer is not enough");
+        dial.answered(false, 31_100);
+        assert!(!dial.down(), "two good answers bring it back");
+        for answer in 1..ERRORS_DOWN {
+            dial.answered(true, 32_000);
+            assert!(!dial.down(), "error {answer} after recovery starts a fresh window");
+        }
+    }
+
+    #[test]
+    fn an_answer_without_the_probe_never_brings_a_down_dial_back() {
+        let dial = DialState::new("east", Arc::from("east:8443"));
+        for _ in 0..ERRORS_DOWN {
+            dial.observed(true, 1_000);
+        }
+        assert!(
+            dial.demoted(1_000),
+            "server errors take an up dial down without a probe"
+        );
+        for _ in 0..UP_AFTER * 2 {
+            dial.observed(false, 1_500);
+        }
+        assert!(
+            dial.down(),
+            "good answers to requests sent before it went down do not undo that"
+        );
+        dial.observed(true, 5_000);
+        assert!(
+            !dial.demoted(1_000 + COOLDOWN_MS),
+            "and a late error does not restart its cooldown"
+        );
+        dial.answered(false, 20_000);
+        dial.answered(false, 20_100);
+        assert!(!dial.down(), "two good probes bring it back");
+        for _ in 0..ERRORS_DOWN {
+            dial.observed(true, 30_000);
+        }
+        assert!(dial.down(), "server errors take it down a second time");
+        dial.answered(false, 45_000);
+        assert!(
+            dial.down(),
+            "and the earlier recovery's probes do not count: one good probe is not enough"
+        );
+        dial.answered(false, 45_100);
+        assert!(!dial.down(), "two are");
+    }
+
+    #[test]
+    fn an_answered_server_error_is_not_a_failure_to_connect() {
+        let dial = DialState::new("east", Arc::from("east:8443"));
+        dial.record(false, 1_000);
+        dial.answered(true, 1_100);
+        dial.record(false, 1_200);
+        assert!(!dial.down(), "an answer between two failed connects proves the dial");
     }
 
     #[test]
