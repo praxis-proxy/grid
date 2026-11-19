@@ -112,10 +112,10 @@ mod tests {
             refusal.contains("x-grid-refusal: candidate"),
             "the consumer must read why it was refused:\n{refusal}"
         );
-        let served = gateway.head(&ca, &west, SERVED).expect("answered");
+        let answer = gateway.head(&ca, &west, SERVED).expect("answered");
         assert!(
-            served.starts_with("http/1.1 200") && !served.contains("x-grid-refusal"),
-            "a backend cannot speak this gateway's refusal:\n{served}"
+            answer.starts_with("http/1.1 200") && !answer.contains("x-grid-refusal"),
+            "a backend cannot speak this gateway's refusal:\n{answer}"
         );
         let served = backend.heads();
         let head = served
