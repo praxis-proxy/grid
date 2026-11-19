@@ -3663,7 +3663,7 @@ impl PeerPoller {
     /// One build-and-poll cycle; `false` means shutdown arrived while idle.
     async fn cycle(&mut self) -> bool {
         let own = Box::pin(sole_own_leaf(&self.client)).await;
-        let Some(source) = Box::pin(peer_source(
+        let Some(mut source) = Box::pin(peer_source(
             &self.client,
             self.shutdown.clone(),
             (
@@ -3677,6 +3677,8 @@ impl PeerPoller {
             tracing::warn!("peer signals poller idle: TLS material unavailable (fail closed)");
             return self.idle_until_retry().await;
         };
+        // A rebuilt collector keeps the slots its peers already hold.
+        source.slots = self.ctx.peer_slots();
         tracing::info!(
             interval_secs = self.settings.peer_interval_secs,
             source = "poll",
@@ -3906,6 +3908,7 @@ impl PeerPoller {
         let peers = self.ctx.peers();
         let heard = self.ctx.load_heard();
         heard.retain_sites(|site| identities.knows(site));
+        self.ctx.peer_slots().retain_sites(|site| identities.knows(site));
         let ttl = self.settings.peer_ttl();
         let mut answered = BTreeMap::new();
         let mut modes = BTreeMap::new();
@@ -4459,6 +4462,7 @@ async fn peer_source(
         shutdown,
         trust,
         transports: operator::signals::PeerTransports::default(),
+        slots: operator::signals::PeerSlots::default(),
         failures: operator::signals::PeerFailures::default(),
         local_site,
     })
