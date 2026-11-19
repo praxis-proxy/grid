@@ -2104,8 +2104,10 @@ const PEER_SIGNAL_NAMES: [&str; 21] = [
 ];
 
 /// Most providers a hub keeps from one peer, so a peer cannot grow the hub's series without
-/// bound. A provider keeps the slot it holds; free slots go to the first in name order.
-pub const MAX_PEER_PROVIDERS: usize = 64;
+/// bound: as many as a site may advertise and a gateway holds for one site, or a provider a
+/// site advertises could never be routed to. A provider keeps the slot it holds; free slots go
+/// to the first in name order.
+pub const MAX_PEER_PROVIDERS: usize = crate::site_providers::MAX_PROVIDERS;
 
 /// Answers in a row a peer may give with no load for a provider before its slot is released:
 /// enough that missed samples do not hand the slot to another, few enough that a removed provider
@@ -2191,7 +2193,8 @@ fn refusal(observation: &Observation) -> Option<&'static str> {
 /// keeps the slot it holds in `slots` until [`SLOT_MISSES`] answers carry no load for it. Each
 /// refusal is counted by reason.
 fn bound_peer(observations: Vec<Observation>, peer: &str, slots: &mut Slots) -> Vec<Observation> {
-    let mut kept = project_peer(observations, peer);
+    // Whole batches first: a provider whose rows were refused holds no slot with what is left.
+    let mut kept = retain_complete_batches(project_peer(observations, peer));
     let payload: std::collections::BTreeSet<&str> = kept
         .iter()
         .filter(|observation| observation.metric != grid_signals::revision::METRIC)
@@ -2201,14 +2204,18 @@ fn bound_peer(observations: Vec<Observation>, peer: &str, slots: &mut Slots) -> 
         .iter()
         .filter_map(|observation| observation.labels.get(PROVIDER_LABEL).map(String::as_str))
         .collect();
-    slots.held.retain(|provider, misses| {
-        *misses = if payload.contains(provider.as_str()) {
-            0
-        } else {
-            misses.saturating_add(1)
-        };
-        *misses < SLOT_MISSES
-    });
+    // An answer with no load at all says nothing about any one provider, and counting it would
+    // release every slot at once.
+    if !payload.is_empty() {
+        slots.held.retain(|provider, misses| {
+            *misses = if payload.contains(provider.as_str()) {
+                0
+            } else {
+                misses.saturating_add(1)
+            };
+            *misses < SLOT_MISSES
+        });
+    }
     // A held slot counts whether or not its provider is in this batch, so a missed sample
     // cannot give it away.
     let free = MAX_PEER_PROVIDERS.saturating_sub(slots.held.len());
@@ -2237,7 +2244,7 @@ fn bound_peer(observations: Vec<Observation>, peer: &str, slots: &mut Slots) -> 
         .collect();
     if waiting != slots.waiting {
         if !waiting.is_empty() {
-            tracing::warn!(peer, ?waiting, "peer providers past the cap wait for a free slot");
+            tracing::info!(peer, ?waiting, "peer providers past the cap wait for a free slot");
         }
         slots.waiting = waiting;
     }
@@ -2251,7 +2258,7 @@ fn bound_peer(observations: Vec<Observation>, peer: &str, slots: &mut Slots) -> 
     for _ in kept.len()..before {
         crate::metrics::record_peer_signal_refused(peer, "provider_cap");
     }
-    retain_complete_batches(kept)
+    kept
 }
 
 /// Apply the deliberate metric projection without hiding rejected payload rows.
@@ -2811,10 +2818,51 @@ mod tests {
         assert!(slots.held.is_empty(), "providers with no load hold nothing");
         drop(bound_peer(ready(serving()), "east", &mut slots));
         assert_eq!(slots.held.len(), MAX_PEER_PROVIDERS, "load takes the slots");
+        // One provider keeps sending load, so each answer speaks for the rest.
+        let mostly_idle = || {
+            ready(serving().take(1))
+                .into_iter()
+                .chain(serving().skip(1).map(idle))
+                .collect::<Vec<_>>()
+        };
         for _ in 0..SLOT_MISSES {
-            drop(bound_peer(serving().map(idle).collect(), "east", &mut slots));
+            drop(bound_peer(mostly_idle(), "east", &mut slots));
         }
-        assert!(slots.held.is_empty(), "and metadata alone does not keep them");
+        assert_eq!(slots.held.len(), 1, "and metadata alone does not keep them");
+    }
+
+    #[test]
+    fn an_answer_with_no_load_at_all_releases_no_slot() {
+        let metadata = parse(&revision_text())
+            .into_iter()
+            .find(|row| row.metric == grid_signals::revision::METRIC)
+            .expect("metadata");
+        let mut slots = Slots::default();
+        drop(bound_peer(ready(serving()), "east", &mut slots));
+        for _ in 0..SLOT_MISSES * 2 {
+            drop(bound_peer(Vec::new(), "east", &mut slots));
+            drop(bound_peer(vec![invalidation(&metadata)], "east", &mut slots));
+        }
+        assert_eq!(
+            slots.held.len(),
+            MAX_PEER_PROVIDERS,
+            "a peer with nothing to report keeps its slots"
+        );
+        let after = bound_peer(ready(serving().chain(["a000".to_owned()])), "east", &mut slots);
+        assert!(
+            !named(&after).contains("a000"),
+            "so an early name still waits when load returns"
+        );
+    }
+
+    #[test]
+    fn a_provider_whose_rows_are_refused_holds_no_slot() {
+        // A revision batch with one row out of range is cut to its invalidation.
+        let refused = parse(&revision_text().replace(" 2 2000", " -2 2000"));
+        let mut slots = Slots::default();
+        let kept = bound_peer(refused, "east", &mut slots);
+        assert_eq!(kept.len(), 1, "only the invalidation is relayed");
+        assert!(slots.held.is_empty(), "and what is left of the batch holds nothing");
     }
 
     #[test]
@@ -2840,9 +2888,10 @@ mod tests {
             .collect();
         let kept = bound_fresh(observations, "retail");
         assert_eq!(kept.len(), MAX_PEER_PROVIDERS);
+        let past = format!("p{MAX_PEER_PROVIDERS:03}");
         assert!(
             kept.iter()
-                .all(|o| o.labels.get(PROVIDER_LABEL).is_some_and(|p| p.as_str() < "p064")),
+                .all(|o| o.labels.get(PROVIDER_LABEL).is_some_and(|p| *p < past)),
             "the first {MAX_PEER_PROVIDERS} in name order are kept"
         );
     }
