@@ -1678,12 +1678,18 @@ fn between_two<'snap>(first: Site<'snap>, second: Site<'snap>, turn: usize, unpu
     if unit(turn, SALTS.0) < share { first } else { second }
 }
 
-/// Two distinct picks from `sites` by capacity, taking the lower rho; exact ties go to the first.
+/// Two distinct picks from `sites` by capacity; the request moves to the second only in
+/// proportion to the extra headroom it has, so a tie never moves.
+///
+/// Taking the lighter outright sends every request to the same site until the next sample.
 fn two_choices<'snap>(sites: &Sites<'snap>, turn: usize, unpublished: f64) -> Option<Site<'snap>> {
     let capacity = |candidate: &RouteCandidate| candidate.capacity.unwrap_or(unpublished) * f64::from(candidate.weight);
     let first = weighted(sites, unit(turn, SALTS.0), None, capacity)?;
     let second = weighted(sites, unit(turn, SALTS.1), Some(first.0), capacity).unwrap_or(first);
-    Some(if second.0.rho < first.0.rho { second } else { first })
+    let headroom = |candidate: &RouteCandidate| (1.0 - candidate.rho.unwrap_or(0.0)).max(0.0);
+    let (kept, other) = (headroom(first.0), headroom(second.0));
+    let moved = if other > kept { 1.0 - kept / other } else { 0.0 };
+    Some(if unit(turn, SALTS.2) < moved { second } else { first })
 }
 
 /// The site `point` (in 0..1) lands on when `sites` are weighted by `weight`, skipping `skip`.
@@ -1710,8 +1716,8 @@ fn weighted<'snap>(
     last
 }
 
-/// Salts that make a request's two picks independent.
-const SALTS: (u64, u64) = (0x9E37_79B9_7F4A_7C15, 0xC2B2_AE3D_27D4_EB4F);
+/// Salts that make a request's two picks, and the move between them, independent.
+const SALTS: (u64, u64, u64) = (0x9E37_79B9_7F4A_7C15, 0xC2B2_AE3D_27D4_EB4F, 0x1656_67B1_9E37_79F9);
 
 /// A uniform value in [0, 1) from `turn` and `salt`, mixed so consecutive turns do not correlate.
 fn unit(turn: usize, salt: u64) -> f64 {
@@ -2842,12 +2848,110 @@ pub(crate) mod tests {
         ]);
         let taken = shares(&snapshot, 3_000, &KeepAll);
         assert_eq!(taken.get("d"), None, "rho 1 has no room");
-        let (a, c) = (taken["a"], taken["c"]);
-        assert!(a > c && c > 0, "the lighter site takes more: a {a}, c {c}");
-        assert_eq!(
-            taken.get("b"),
-            None,
-            "two distinct picks never choose the heaviest of three"
+        let (a, b, c) = (taken["a"], taken["b"], taken["c"]);
+        assert!(a > c && c > b, "the lighter site takes more: a {a}, c {c}, b {b}");
+        assert!(b > 0, "the heaviest with room takes the least, not nothing: {b}");
+    }
+
+    /// Idle sites of equal capacity, each given the saturation it reads.
+    fn reading(rhos: &[(&str, f64)]) -> RouteSnapshot {
+        let idle: Vec<_> = rhos.iter().map(|(site, _)| (*site, Some(0.0), Some(10.0))).collect();
+        let mut snapshot = loaded(&idle);
+        for candidate in &mut snapshot.candidates {
+            candidate.rho = rhos
+                .iter()
+                .find(|(site, _)| *site == candidate.site.as_ref())
+                .map(|(_, rho)| *rho);
+        }
+        snapshot
+    }
+
+    #[test]
+    fn a_leftover_saturation_does_not_starve_a_site_among_idle_ones() {
+        for rhos in [
+            [("a", 0.0), ("b", 1e-12), ("c", 0.0)],
+            [("a", 1e-47), ("b", 6e-11), ("c", 8e-11)],
+        ] {
+            let taken = shares(&reading(&rhos), 3_000, &KeepAll);
+            for (site, _) in rhos {
+                assert!(
+                    (800..=1_200).contains(taken.get(site).unwrap_or(&0)),
+                    "{site} takes about a third of {rhos:?}: {taken:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_second_pick_gains_only_by_the_headroom_it_has_over_the_first() {
+        // Of six equally likely ordered pairs, `a` keeps the two it leads and takes half of the
+        // two where it follows a site with half its headroom: a half in all, not two thirds.
+        let taken = shares(&reading(&[("a", 0.0), ("b", 0.5), ("c", 0.5)]), 3_000, &KeepAll);
+        assert!((1_350..=1_650).contains(&taken["a"]), "a takes about a half: {taken:?}");
+        for site in ["b", "c"] {
+            assert!(
+                (600..=900).contains(&taken[site]),
+                "{site} keeps about a quarter: {taken:?}"
+            );
+        }
+        let near = shares(&reading(&[("a", 0.90), ("b", 0.93), ("c", 0.96)]), 3_000, &KeepAll);
+        assert!(
+            near["a"] > near["b"] && near["b"] > near["c"] && near["c"] > 0,
+            "near the ceiling the lighter takes more and none is shut out: {near:?}"
+        );
+    }
+
+    #[test]
+    fn a_site_that_drained_takes_its_share_again_while_its_estimate_decays() {
+        let store = grid_signals::LoadStore::new(Duration::from_secs(60));
+        let mut candidates = Vec::new();
+        for site in ["a", "b", "c"] {
+            let cluster = format!("pool-{site}");
+            publish_running(&store, site, &cluster, 10.0, 1_000);
+            candidates.extend(one("llama", site, &cluster, AdmissionState::NewAndExisting));
+        }
+        let availability = AvailabilitySettings {
+            ceiling_floor: 1.0,
+            ..AvailabilitySettings::default()
+        };
+        let mut learned = Learned::default();
+        let mut inputs = Inputs {
+            signals: &store,
+            now_ms: 1_000,
+            window_ms: 500,
+            horizon_ms: 500,
+            availability: &availability,
+            learned: &mut learned,
+        };
+        let mut snapshot = RouteSnapshot::from_store(candidates.clone(), Arc::from("hub"), &mut inputs);
+        // Every site teaches the same ceiling. `a` and `c` then idle, while `b` stays full and
+        // drains only for the last twelve samples.
+        for step in 1..=45_i64 {
+            let at = 1_000 + step * 1_000;
+            for site in ["a", "b", "c"] {
+                let held = if site == "b" && step <= 33 { 10.0 } else { 0.0 };
+                publish_running(&store, site, &format!("pool-{site}"), held, at);
+            }
+            inputs.now_ms = at;
+            snapshot = RouteSnapshot::from_store(candidates.clone(), Arc::from("hub"), &mut inputs);
+        }
+        let rho = |site: &str| {
+            snapshot
+                .candidates
+                .iter()
+                .find(|c| c.site.as_ref() == site)
+                .and_then(|c| c.rho)
+        };
+        assert!(rho("a") < Some(1e-6), "the peers read idle: {:?}", rho("a"));
+        assert!(
+            rho("b") > Some(0.01) && rho("b") < Some(0.1),
+            "b still remembers a little of its load: {:?}",
+            rho("b")
+        );
+        let taken = shares(&snapshot, 3_000, &KeepAll);
+        assert!(
+            (800..=1_200).contains(taken.get("b").unwrap_or(&0)),
+            "the drained site is back to about a third: {taken:?}"
         );
     }
 
@@ -3459,6 +3563,13 @@ pub(crate) mod tests {
         let mean = (0..10_000).map(|turn| unit(turn, SALTS.0)).sum::<f64>() / 10_000.0;
         assert!((0.48..=0.52).contains(&mean), "{mean}");
         assert!((0..10_000).all(|turn| (0.0..1.0).contains(&unit(turn, SALTS.1))));
+        let both = (0..10_000)
+            .filter(|turn| unit(*turn, SALTS.0) < 0.5 && unit(*turn, SALTS.2) < 0.5)
+            .count();
+        assert!(
+            (2_350..=2_650).contains(&both),
+            "a pick and its move are independent: {both}"
+        );
         assert_ne!(random_seed(), random_seed());
     }
 
