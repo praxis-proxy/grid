@@ -28,6 +28,11 @@
         "zone": {
           "description": "Availability zone.",
           "type": "string"
+        },
+        "sovereigntyZone": {
+          "description": "Sovereignty zone a gateway's fence or regionalPolicy matches this site against.",
+          "type": "string",
+          "pattern": "^$|^[A-Za-z0-9._-]{1,63}$"
         }
       }
     },
@@ -776,6 +781,10 @@
         "praxisConfig": {
           "type": "object",
           "description": "GridNetwork consumerGateways[].praxisConfig for the site gateway, validated by the CRD."
+        },
+        "regionalPolicy": {
+          "type": "object",
+          "description": "GridNetwork consumerGateways[].regionalPolicy for the site gateway, validated by the CRD."
         }
       }
     },

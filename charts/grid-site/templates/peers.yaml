@@ -31,6 +31,9 @@ spec:
   {{- with $p.zone }}
   zone: {{ . | quote }}
   {{- end }}
+  {{- with $p.sovereigntyZone }}
+  sovereigntyZone: {{ . | quote }}
+  {{- end }}
   {{- with $p.address }}
   gatewayEndpoint:
     address: {{ . | quote }}
