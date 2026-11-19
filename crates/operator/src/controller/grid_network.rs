@@ -146,6 +146,8 @@ pub struct OperatorCtx {
     pub(crate) peer_catch_up: signals::CatchUp,
     /// Each peer provider the poller has received load rows for.
     pub(crate) load_heard: signals::LoadHeard,
+    /// The provider slots each peer holds, kept across poller rebuilds.
+    pub(crate) peer_slots: signals::PeerSlots,
 
     /// This site's scraped signals, served to gateways and peers.
     pub(crate) signals: signals::SignalStore,
@@ -415,6 +417,7 @@ impl OperatorCtx {
             peer_rounds: signals::PeerRounds::default(),
             peer_catch_up: signals::CatchUp::default(),
             load_heard: signals::LoadHeard::default(),
+            peer_slots: signals::PeerSlots::default(),
             signals: signals::SignalStore::new(),
             local_providers: site_providers::LocalProviders::default(),
             peer_providers: site_providers::PeerProviders::default(),
@@ -650,6 +653,12 @@ impl OperatorCtx {
     #[must_use]
     pub fn load_heard(&self) -> signals::LoadHeard {
         self.load_heard.clone()
+    }
+
+    /// A handle to the provider slots each peer holds.
+    #[must_use]
+    pub fn peer_slots(&self) -> signals::PeerSlots {
+        self.peer_slots.clone()
     }
 
     /// A handle to who may read, for the signals listener and poller.
