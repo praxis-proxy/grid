@@ -13,6 +13,19 @@ tests:
       - hasDocuments:
           count: 0
 
+  - it: puts a peer in its sovereignty zone
+    template: templates/peers.yaml
+    set:
+      peers.hub.region: eu-west
+      peers.hub.sovereigntyZone: eu
+    asserts:
+      - equal:
+          path: spec.sovereigntyZone
+          value: eu
+      - equal:
+          path: spec.region
+          value: eu-west
+
   - it: renders one GridSite per peer in name order with its pins and probe target
     template: templates/peers.yaml
     set:

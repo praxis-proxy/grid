@@ -215,7 +215,7 @@ impl Topology {
         );
         ordered.provider_hop_clusters = Arc::clone(&self.provider_hop_clusters);
         // Without a registry only a failing dial is down: the gateway demotes no backend by guessing.
-        let ordered = ordered.demote(&health.down());
+        let ordered = ordered.demote(&health.down()).hold(&health.held());
         ordered.shed(shedding, availability).published(gauged)
     }
 }
@@ -1002,6 +1002,7 @@ fn apply_file(
                 dial_bytes.map_or_else(|| Ok(DialConfig::default()), |dial| parse_dial_config(dial_path, dial))?;
             Ok((config, dial))
         });
+    let candidate_count = parsed.as_ref().ok().map(|(config, _)| config.candidates.len());
     let (result, settled) = match parsed {
         Ok((config, dial)) => {
             let mut control = control.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1019,7 +1020,31 @@ fn apply_file(
         Err(error) => (Err(error), true),
     };
     report(&result, tally, "grid: serving config reloaded");
+    // Record every valid content revision, including a semantically reused config. A
+    // projected ConfigMap can rewrite equivalent YAML with a new content digest; the
+    // control plane correctly keeps its pollers, but qualification and operators still
+    // need evidence that this revision was accepted by the gateway.
+    if result.is_ok()
+        && let Some(candidate_count) = candidate_count
+    {
+        report_serving_revision(bytes, candidate_count);
+    }
     settled
+}
+
+/// Report one serving revision after it has been accepted by the control plane.
+pub(crate) fn report_serving_revision(bytes: &[u8], candidate_count: usize) {
+    let mut revision = String::with_capacity(64);
+    for byte in certs::sha256(bytes) {
+        for nibble in [byte >> 4, byte & 0x0F] {
+            revision.push(char::from_digit(u32::from(nibble), 16).unwrap_or('0'));
+        }
+    }
+    tracing::info!(
+        revision = %revision,
+        candidate_count,
+        "grid_serving_revision_serving"
+    );
 }
 
 /// Re-apply the last good config, which restarts the pollers once its identity files change.
@@ -1086,6 +1111,18 @@ mod tests {
 
     use super::*;
     use crate::{descriptor::CapabilityKind, signals::llm_d::QUEUE_METRIC};
+
+    /// Requests sent, back to back, before east's share is read.
+    const EARLIER: u32 = 100;
+
+    /// Requests sent back to back after [`EARLIER`] that east's share is read over.
+    const LATER: u32 = 200;
+
+    /// The most of the later requests a site the gateway avoids may still take.
+    const AVOIDED: f64 = 0.1;
+
+    /// How far a serving east's share may stray from half.
+    const EVEN: f64 = 0.15;
 
     /// Queue depth each mock peer reports, and how often each was scraped and started.
     #[derive(Clone, Default)]
@@ -1200,6 +1237,7 @@ mod tests {
             kind: CapabilityKind::InferenceModel,
             name: "llama".to_owned(),
             publishes_load: true,
+            selection_group: 0,
             site: site.to_owned(),
             stable_id: None,
             weight: None,
@@ -2726,6 +2764,62 @@ mod tests {
         let _cleaned = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn a_site_answering_every_request_with_a_server_error_stops_taking_new_ones() {
+        let share = later_share_of_east(Answer::Status(http::StatusCode::INTERNAL_SERVER_ERROR)).await;
+        assert!(
+            share <= AVOIDED,
+            "east answered every request with 500 and still took {share:.2} of the {LATER} requests sent back to \
+             back after the first {EARLIER}, while west served all of its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_holds_back_only_the_provider_its_site_does_not_serve() {
+        let (refused, served) = later_shares_of_east(Answer::Refused, Sent::BothModels).await;
+        assert!(
+            refused <= AVOIDED,
+            "east refused every request for a provider it does not serve and still took {refused:.2} of them \
+             after the first {EARLIER}"
+        );
+        assert!(
+            (served - 0.5).abs() <= EVEN,
+            "east serves the other model on the same dial and took {served:.2} of its requests, not about half: \
+             one provider's refusal must not move another's traffic"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_site_that_does_not_serve_a_provider_yet_stops_taking_its_requests() {
+        let refused = later_share_of_east(Answer::Refused).await;
+        assert!(
+            refused <= AVOIDED,
+            "east refused every request for a provider it does not serve and still took {refused:.2} of the \
+             {LATER} requests sent back to back after the first {EARLIER}"
+        );
+        let waiting = later_share_of_east(Answer::Status(http::StatusCode::SERVICE_UNAVAILABLE)).await;
+        assert!(
+            (waiting - 0.5).abs() <= EVEN,
+            "an east that only asks callers to wait took {waiting:.2} of the last {LATER}, not about half: a 503 \
+             without the refusal reason is backpressure"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_failing_site_scenario_sees_a_site_avoided() {
+        let unreachable = later_share_of_east(Answer::Nothing).await;
+        assert!(
+            unreachable <= AVOIDED,
+            "east, never connecting, took {unreachable:.2} of the last {LATER}, so the scenario cannot see a site \
+             avoided"
+        );
+        let serving = later_share_of_east(Answer::Status(http::StatusCode::OK)).await;
+        assert!(
+            (serving - 0.5).abs() <= EVEN,
+            "a serving east took {serving:.2} of the last {LATER}, not about half"
+        );
+    }
+
     #[test]
     fn the_watch_applies_the_dial_file_beside_the_serving_file() {
         let dir = temp_dir("watch-dial");
@@ -2788,5 +2882,127 @@ mod tests {
         );
         drop(grid);
         let _cleaned = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test Utilities
+    // ---------------------------------------------------------------------------
+
+    /// How east answers each request sent to it.
+    #[derive(Clone, Copy, Debug)]
+    enum Answer {
+        /// A response head with this status.
+        Status(http::StatusCode),
+        /// No response head within the connect budget: the dial never connected.
+        Nothing,
+        /// The 503 a provider gateway answers for a provider it does not serve.
+        Refused,
+    }
+
+    /// Which models the scenario's requests ask for.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Sent {
+        /// Every request asks for llama.
+        OneModel,
+        /// Requests alternate between llama and mistral, which east always answers 200.
+        BothModels,
+    }
+
+    /// East's share when every request asks for llama.
+    async fn later_share_of_east(east: Answer) -> f64 {
+        later_shares_of_east(east, Sent::OneModel).await.0
+    }
+
+    /// East's share, for llama and for mistral, of the last [`LATER`] requests per model the route
+    /// filter sends back to back between dialed east and west. East answers llama with `east`;
+    /// every other answer is 200. The health tick runs after each request.
+    async fn later_shares_of_east(east: Answer, models: Sent) -> (f64, f64) {
+        let dir = temp_dir(&format!("failing-{east:?}-{models:?}").replace(|c: char| !c.is_ascii_alphanumeric(), "-"));
+        write_identity(&dir, &certs::generate_ca("grid-ca").expect("ca"));
+        let (mut config, mut dial) = dialed_east();
+        let mut west = candidate("west");
+        west.stable_id = Some("candidate-west".to_owned());
+        config.candidates.push(west);
+        for site in ["east", "west"] {
+            let mut other = candidate(site);
+            other.name = "mistral".to_owned();
+            other.stable_id = Some(format!("mistral-{site}"));
+            config.candidates.push(other);
+        }
+        // A mutual TLS dial is a provider hop by construction.
+        dial.dial
+            .insert("pool-west".to_owned(), dial_spec("west", mutual_tls("west")));
+        let mut control = dial_control(&config, &dir);
+        control.apply_joined(&config, &dial).expect("applies");
+        let filter: Box<dyn praxis_filter::HttpFilter> =
+            Box::new(crate::route::tests::filter_over(control.snapshot(), control.health()));
+        let asking = |model: &'static str| praxis_filter::Request {
+            headers: [(
+                http::header::HeaderName::from_static("x-model"),
+                http::HeaderValue::from_static(model),
+            )]
+            .into_iter()
+            .collect(),
+            method: http::Method::POST,
+            uri: http::Uri::from_static("/v1/chat/completions"),
+        };
+        let (llama, mistral) = (asking("llama"), asking("mistral"));
+        let per_model: u32 = if models == Sent::BothModels { 2 } else { 1 };
+        let (warm, total) = (
+            EARLIER.saturating_mul(per_model),
+            EARLIER.saturating_add(LATER).saturating_mul(per_model),
+        );
+        let (mut later, mut later_other) = (0_u32, 0_u32);
+        for sent in 0..total {
+            let mut head = praxis_filter::Response {
+                headers: http::HeaderMap::new(),
+                status: http::StatusCode::OK,
+            };
+            let other = per_model == 2 && sent % 2 == 1;
+            let mut ctx = crate::route::tests::context(if other { &mistral } else { &llama });
+            let routed = filter.on_request(&mut ctx).await.expect("routes");
+            assert!(
+                matches!(routed, praxis_filter::FilterAction::Continue),
+                "request {sent} routes"
+            );
+            let to_east = ctx.cluster.as_deref() == Some("pool-east");
+            ctx.upstream_reached = true;
+            match (to_east && !other, east) {
+                (true, Answer::Nothing) => {},
+                (true, Answer::Status(status)) => {
+                    head.status = status;
+                    ctx.response_header = Some(&mut head);
+                },
+                (true, Answer::Refused) => {
+                    head.status = http::StatusCode::SERVICE_UNAVAILABLE;
+                    head.headers.insert(
+                        crate::provider::REFUSAL_HEADER,
+                        http::HeaderValue::from_static(crate::provider::UNSERVED_CANDIDATE),
+                    );
+                    ctx.response_header = Some(&mut head);
+                },
+                (false, _) => ctx.response_header = Some(&mut head),
+            }
+            let settled = filter.on_response(&mut ctx).await.expect("settles");
+            assert!(
+                matches!(settled, praxis_filter::FilterAction::Continue),
+                "request {sent} settles"
+            );
+            if control.health().update() {
+                control.refresh()(&control.store());
+            }
+            if to_east && sent >= warm {
+                if other {
+                    later_other = later_other.saturating_add(1);
+                } else {
+                    later = later.saturating_add(1);
+                }
+            }
+        }
+        let _cleaned = std::fs::remove_dir_all(&dir);
+        (
+            f64::from(later) / f64::from(LATER),
+            f64::from(later_other) / f64::from(LATER),
+        )
     }
 }

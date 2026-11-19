@@ -1158,6 +1158,104 @@ mod tests {
     }
 
     #[test]
+    fn a_regional_policy_revision_controls_site_route_and_fails_closed() {
+        let work = fresh_work("regional-policy-site-route");
+        let ca = generate_ca("grid-ca").expect("ca");
+        let identity = site_identity(&work, &ca);
+        let (east, signals, local) = (Peer::start(&ca, "east"), Peer::start(&ca, "site-a"), Plain::start());
+        let (listen, admin) = (free_port(), free_port());
+        let (mut praxis, serving_json) =
+            site_route_fixtures(listen, admin, &local.addr, &east.addr, &signals.addr, &identity);
+        praxis = praxis.replace(
+            "        model_header: X-Model\n",
+            "        model_header: X-Model\n        prefix_affinity:\n          enabled: false\n",
+        );
+
+        // The operator represents affinity's preferred and permitted fallback regions as
+        // selection groups. The remote provider is live, but it cannot bypass group zero.
+        let mut preferred: serde_yaml::Value = serde_yaml::from_str(&serving_json).expect("serving");
+        preferred["candidates"][0]["selection_group"] = serde_yaml::to_value(0_u32).expect("group zero");
+        preferred["candidates"][1]["selection_group"] = serde_yaml::to_value(1_u32).expect("group one");
+        let mut serving = Mount::new(work.join("serving"));
+        serving.write(&[(
+            "serving-config.json",
+            serde_yaml::to_string(&preferred).expect("yaml").as_bytes(),
+        )]);
+        let gateway = Gateway::start_with_config(&work, &serving, listen, admin, &praxis);
+        gateway.eventually("the gateway listens", || {
+            TcpStream::connect(("127.0.0.1", listen)).is_ok()
+        });
+
+        for request in 1..=10 {
+            assert_eq!(chat(listen, "llama", None), 200, "preferred request {request} routes");
+        }
+        assert_eq!(east.routed(), 0, "a lower policy group receives no new requests");
+        let local_before_recovery = local.requests.load(Ordering::SeqCst);
+        assert_eq!(
+            local_before_recovery, 10,
+            "the preferred local region serves every request"
+        );
+
+        // Pressure changes the preferred candidate's admission state without changing the
+        // regional groups. New work may now use the explicitly permitted fallback, but only
+        // because no group-zero candidate admits it.
+        let mut fallback = preferred.clone();
+        fallback["candidates"][0]["admission"] = serde_yaml::Value::from("existing_only");
+        gateway.serve(&mut serving, &fallback);
+        for request in 1..=10 {
+            assert_eq!(chat(listen, "llama", None), 200, "fallback request {request} routes");
+        }
+        assert_eq!(
+            local.requests.load(Ordering::SeqCst),
+            local_before_recovery,
+            "an existing-only preferred region is not selected for new work"
+        );
+        assert_eq!(
+            east.routed(),
+            10,
+            "the explicitly permitted fallback serves every request"
+        );
+
+        // A valid policy with no candidates is authoritative, not a malformed update for
+        // which last-known-good traffic may remain live.
+        let mut empty = fallback.clone();
+        empty["candidates"] = serde_yaml::Value::Sequence(Vec::new());
+        gateway.serve(&mut serving, &empty);
+        assert_ne!(
+            chat(listen, "llama", None),
+            200,
+            "an authoritative empty revision fails closed"
+        );
+        assert_eq!(east.routed(), 10, "the withdrawn fallback receives no further traffic");
+
+        // A malformed update after that valid empty revision is rejected, retaining the empty
+        // last-known-good serving state rather than resurrecting either policy group.
+        let rejected = gateway.rejected();
+        serving.write(&[("serving-config.json", br#"{"unexpected":true}"#)]);
+        gateway.eventually("the malformed serving revision is rejected", || {
+            gateway.rejected() > rejected
+        });
+        assert_ne!(
+            chat(listen, "llama", None),
+            200,
+            "a rejected update retains the empty revision"
+        );
+        assert_eq!(east.routed(), 10, "last-known-good does not restore prohibited traffic");
+
+        // A later valid revision recovers service through the current preferred group.
+        gateway.serve(&mut serving, &preferred);
+        gateway.eventually("a valid regional-policy recovery routes again", || {
+            chat(listen, "llama", None) == 200
+        });
+        assert!(
+            local.requests.load(Ordering::SeqCst) > local_before_recovery,
+            "the recovered preferred region receives new work"
+        );
+        drop(gateway);
+        let _cleaned = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
     fn a_caller_model_header_does_not_steer_the_operator_site_route_render() {
         let work = fresh_work("site-route-spoof");
         let ca = generate_ca("grid-ca").expect("ca");

@@ -139,6 +139,39 @@ tests:
           path: spec
           value: {gridNetworkRef: grid, region: us-east, zone: us-east-1a}
 
+  - it: puts this site in its sovereignty zone
+    template: templates/gridsite.yaml
+    set:
+      site: {name: east, region: us-east, sovereigntyZone: us}
+      grid.id: lab
+    asserts:
+      - equal:
+          path: spec
+          value: {gridNetworkRef: grid, region: us-east, sovereigntyZone: us}
+
+  - it: passes gateway.regionalPolicy through to the site gateway reference
+    template: templates/gridnetwork.yaml
+    set:
+      site.name: east
+      grid.id: lab
+      gateway.regionalPolicy:
+        mode: locked
+        allowedRegions: [us-east]
+        allowedSovereigntyZones: [us]
+    release:
+      namespace: grid
+    asserts:
+      - equal:
+          path: spec.consumerGateways
+          value:
+            - name: grid-gateway
+              namespace: grid
+              siteName: east
+              regionalPolicy:
+                mode: locked
+                allowedRegions: [us-east]
+                allowedSovereigntyZones: [us]
+
   - it: maps the flat values onto the SWIM and signals knobs
     template: templates/deployment.yaml
     set:

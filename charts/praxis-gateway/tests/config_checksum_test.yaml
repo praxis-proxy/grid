@@ -26,7 +26,7 @@ tests:
       # Pinned so the changed-endpoint test below compares against a real hash.
       - equal:
           path: spec.template.metadata.annotations["checksum/config"]
-          value: 16241454502a94fa26b9c34f17093de049f98952d3705519cca7d0797fcd667d
+          value: 59783c96649008b5b403ad364045155519561ce212c7301f3855f77284ad1360
 
   - it: hashes the config when render is selected explicitly
     set:
@@ -56,7 +56,7 @@ tests:
       # The 10.96.0.20 config's hash, from the first test.
       - notEqual:
           path: spec.template.metadata.annotations["checksum/config"]
-          value: 16241454502a94fa26b9c34f17093de049f98952d3705519cca7d0797fcd667d
+          value: 59783c96649008b5b403ad364045155519561ce212c7301f3855f77284ad1360
 
   - it: inline config is hashed as given
     set:

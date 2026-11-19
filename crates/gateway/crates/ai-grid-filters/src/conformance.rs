@@ -31,6 +31,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use grid_signals::LoadStore;
 
+#[cfg(test)]
+mod herding;
 mod revisions;
 
 use crate::{
@@ -234,6 +236,7 @@ fn config(spec: &SiteSpec) -> CandidateConfig {
         kind: CapabilityKind::InferenceModel,
         name: MODEL.to_owned(),
         publishes_load: true,
+        selection_group: 0,
         site: spec.site.to_owned(),
         stable_id: None,
         weight: None,
@@ -1941,11 +1944,11 @@ mod tests {
                     );
                 } else {
                     let middle = routed_to(&snapshot, sites[2].site);
-                    assert!(low > middle && middle > 0, "two choices must favor lower pressure");
-                    assert_eq!(
-                        routed_to(&snapshot, sites[0].site),
-                        0,
-                        "two choices avoid the highest pressure"
+                    let high = routed_to(&snapshot, sites[0].site);
+                    assert!(low > middle && middle > high, "two choices must favor lower pressure");
+                    assert!(
+                        (1..DRAWS / 20).contains(&high),
+                        "the highest pressure keeps a sliver, got {high}/{DRAWS}"
                     );
                 }
                 snapshot.candidates.reverse();

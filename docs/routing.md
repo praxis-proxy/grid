@@ -75,6 +75,105 @@ CR installations.
 
 ---
 
+# Regional policy: affinity, locking, and sovereignty
+
+`regionalPolicy` belongs to one `GridNetwork.spec.consumerGateways[]` entry.
+It applies to every capability in that gateway's edge-local overlay. It is not
+a request header feature: Grid resolves region and sovereignty only from the
+trusted `GridSite` named by `GatewayRef.siteName` and each candidate's owning
+`GridSite`. Caller-provided region headers never affect eligibility.
+
+The policy is evaluated **before** admission, health, freshness, queue depth,
+KV-cache pressure, and any other score. A candidate rejected by the policy is
+not emitted in the overlay or the `grid_site_route` serving config.
+
+```yaml
+apiVersion: grid.praxis.fast/v1alpha1
+kind: GridNetwork
+metadata:
+  name: regional-example
+spec:
+  consumerGateways:
+    - name: east-edge
+      namespace: ai
+      siteName: east
+      regionalPolicy:
+        mode: affinity
+        # Omit preferredRegions to use the trusted GridSite named by siteName.
+        preferredRegions: [us-east]
+        crossRegionFallback: allow
+        allowedSovereigntyZones: [us]
+```
+
+| Mode | Candidate rule | New-session behavior | When no eligible candidate remains |
+|---|---|---|---|
+| `affinity` | Candidates in `preferredRegions` form the preferred group. Other regions are excluded unless `crossRegionFallback: allow`. | Grid exhausts the preferred group before considering the fallback group; a better remote score never bypasses it. | `deny` produces an authoritative empty overlay. `allow` may use the fallback group only after no preferred candidate admits new work. |
+| `locked` | Only candidates whose region appears in non-empty `allowedRegions` are eligible. | All allowed regions compete inside one permitted group. `crossRegionFallback` is invalid. | Grid publishes an authoritative empty overlay and the consumer fails closed. |
+
+`allowedSovereigntyZones` is an additional hard gate in both modes. A candidate
+must satisfy **both** its regional rule and the sovereignty allowlist. Setting
+`GridSite.spec.sovereigntyZone` supplies trusted metadata; it does not activate
+a policy by itself.
+
+Under an active policy, missing, malformed, unknown, or conflicting required
+region/sovereignty metadata is excluded conservatively. If affinity has no
+explicit `preferredRegions` and Grid cannot resolve the gateway's trusted
+`siteName` region, it publishes no eligible route rather than trusting an
+unverified default.
+
+```yaml
+# A hard residency boundary: no candidate outside eu-west can enter the overlay.
+regionalPolicy:
+  mode: locked
+  allowedRegions: [eu-west]
+  allowedSovereigntyZones: [eu]
+```
+
+For `grid_site_route`, Grid sends an internal `selection_group` in the serving
+config. Preferred candidates receive earlier groups; an explicitly permitted
+fallback receives a later group (commonly `0` then `1`). The gateway chooses
+the lowest group that can accept new work before it considers queue depth,
+capacity, or prefix affinity. The field is omitted when its value is `0`, so an
+older serving config still parses with the default. Deploy a Grid gateway
+release that understands `selection_group` before enabling an affinity fallback
+policy on `grid_site_route`; a prior gateway rejects unknown serving-config
+fields and retains its last accepted revision.
+
+## Sessions, updates, and evidence
+
+A new valid policy revision affects subsequent routing decisions only; it does
+not terminate an in-flight request or stream. Existing sessions remain pinned
+while their chosen provider remains eligible for existing work, including
+`existing_only`. A session that previously failed over is not automatically
+moved back when the preferred region recovers. If a policy revision removes its
+provider, the binding fails closed because the state belongs to that provider;
+Grid does not silently rebind it across the policy boundary.
+
+Every semantically changed policy produces a new content-addressed overlay
+revision. A valid policy with zero candidates publishes an authoritative empty
+revision. The Kubernetes API server rejects schema-invalid policy updates before
+they reach the controller, leaving the published revision unchanged. Separately,
+a consumer rejects an invalid serving-config or overlay document and keeps its
+last-known-good revision. The `GridNetwork` status uses
+`RegionalPolicyNoEligibleCandidates` for a valid policy that has no permitted
+candidates; Grid emits a transition-only Kubernetes Warning Event with the same
+reason and a Normal `RegionalPolicyRecovered` Event on recovery.
+
+The bounded metric is:
+
+```text
+grid_regional_policy_candidates_total{mode,outcome,reason}
+```
+
+Its labels are fixed policy categories only; it never includes region names,
+provider names, request IDs, or arbitrary policy values. Structured logs carry
+candidate/site details for diagnosis without adding Prometheus cardinality.
+
+The [regional policy example](../examples/gateway/regional-policy.yaml) shows
+the `GridNetwork` fragment together with the `GridSite` metadata it relies on.
+
+---
+
 # 1. Selection groups: the foundation
 
 A **selection group** is a priority and resilience boundary.
@@ -625,8 +724,9 @@ The gateway learns a soft capacity bound from the most in-flight a site has held
 waiting and a hard bound from the least it held at a demonstrated limit. A request count is read
 against the lesser bound, never below the floor. Saturation is the nearer of that counted limit
 and the site's reported KV-cache fullness (mean plus spread across pods), smoothed per new sample.
-Among sites with room, three or more use two choices by capacity taking the lower saturation;
-two use a weighted pick.
+Among sites with room, three or more use two choices by capacity: the first pick stands, and the
+request moves to the second only in proportion to the extra headroom the second has, so equal
+sites split by capacity and no site with room is shut out; two use a weighted pick.
 With shedding on, a model whose every site has been at its ceiling with work waiting for
 `full_after_ms` answers 429 with Retry-After until one site has room. Every input is a raw series the
 site's operator relays from its EPP: running and waiting per endpoint, ready endpoints, KV-cache
@@ -652,8 +752,9 @@ praxis config, rendered from the chart's `praxisConfig.render.gridServing.siteRo
 The exploration floor limits relative draw weights, not final traffic shares.
 At the default 0.25, effective capacities of 10,000 and 10 become 10,000 and
 2,500, giving the smaller site 20% in a direct capacity draw. With three or
-more sites, the router samples two by these weights and selects the one with
-lower pressure; a sampling floor does not guarantee a final request share.
+more sites, the router samples two by these weights and moves to the second
+only in proportion to the extra headroom it has; a sampling floor does not
+guarantee a final request share.
 Admission and health checks still determine which sites can participate.
 
 Tune one metric against one truth: `grid_route_site_ceiling_soft` should track the largest

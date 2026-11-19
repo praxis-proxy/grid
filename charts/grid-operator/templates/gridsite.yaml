@@ -17,4 +17,7 @@ spec:
   {{- with .Values.site.zone }}
   zone: {{ . | quote }}
   {{- end }}
+  {{- with .Values.site.sovereigntyZone }}
+  sovereigntyZone: {{ . | quote }}
+  {{- end }}
 {{- end }}

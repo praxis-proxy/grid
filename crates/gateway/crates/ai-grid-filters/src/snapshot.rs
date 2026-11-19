@@ -27,6 +27,11 @@ pub(crate) const MIN_BACKLOG_SPELL_MS: i64 = 5_000;
 /// unmeasured included, since `total_cmp` orders a positive NaN above infinity.
 const UNHEALTHY: f64 = f64::NAN.abs();
 
+/// Score of a candidate its site refused as not served: after every candidate on a down
+/// cluster, which may have come back while this one certainly fails. `total_cmp` orders
+/// positive NaNs by payload.
+const HELD: f64 = f64::from_bits(UNHEALTHY.to_bits() | 1);
+
 /// A resolved, pre-ordered candidate list read atomically per request.
 #[derive(Debug)]
 #[expect(
@@ -401,25 +406,34 @@ impl RouteSnapshot {
     /// when none is, the request still has somewhere to go.
     #[must_use]
     pub(crate) fn demote(self, down: &BTreeSet<Arc<str>>) -> Self {
-        self.demote_where(down, |candidate| Some(&candidate.cluster))
-    }
-
-    /// This snapshot with every candidate whose `key` is in `down` ordered last.
-    fn demote_where(self, down: &BTreeSet<Arc<str>>, key: impl Fn(&RouteCandidate) -> Option<&Arc<str>>) -> Self {
         if down.is_empty() {
             return self;
         }
+        self.demote_where(UNHEALTHY, |candidate| down.contains(&candidate.cluster))
+    }
+
+    /// This snapshot with every candidate whose stable ID is in `held` ordered after all the
+    /// rest, those on a down cluster included.
+    #[must_use]
+    pub(crate) fn hold(self, held: &BTreeSet<crate::health::Held>) -> Self {
+        if held.is_empty() {
+            return self;
+        }
+        self.demote_where(HELD, |candidate| {
+            held.iter()
+                .any(|(cluster, id)| *cluster == candidate.cluster && *id == candidate.stable_id)
+        })
+    }
+
+    /// This snapshot with every candidate `demoted` picks given `score`, which orders it last.
+    fn demote_where(self, score: f64, demoted: impl Fn(&RouteCandidate) -> bool) -> Self {
         let ranked = self
             .scores
             .into_iter()
             .zip(self.candidates)
             .zip(self.score_unavailable)
             .map(|((load, candidate), score_unavailable)| {
-                let demoted = if key(&candidate).is_some_and(|key| down.contains(key)) {
-                    UNHEALTHY
-                } else {
-                    load
-                };
+                let demoted = if demoted(&candidate) { score } else { load };
                 (demoted, candidate, score_unavailable)
             })
             .collect();
@@ -1406,10 +1420,47 @@ mod tests {
             kind: CapabilityKind::InferenceModel,
             name: name.to_owned(),
             publishes_load: true,
+            selection_group: 0,
             site: site.to_owned(),
             stable_id: None,
             weight: None,
         }
+    }
+
+    #[test]
+    fn a_held_candidate_orders_after_one_on_a_down_cluster() {
+        let store = LoadStore::new(Duration::from_secs(60));
+        // site-a reads lighter, so it would lead a tie between two unhealthy scores.
+        store.ingest_at(&line("local", "site-a", 0.0, 1_000), 1_000, 1_000, "local");
+        store.ingest_at(&line("local", "site-b", 50.0, 1_000), 1_000, 1_000, "local");
+        let candidates = validate_candidates(vec![cand("m", "local", "site-a"), cand("m", "local", "site-b")]).unwrap();
+        let id = |cluster: &str| {
+            let found = candidates.iter().find(|candidate| &*candidate.cluster == cluster);
+            Arc::clone(&found.unwrap().stable_id)
+        };
+        // The second entry names site-b's ID on another cluster, and so holds nothing.
+        let held = BTreeSet::from([(Arc::from("site-a"), id("site-a")), (Arc::from("site-z"), id("site-b"))]);
+        let down = BTreeSet::from([Arc::from("site-b")]);
+        let snapshot = RouteSnapshot::from_store(
+            candidates,
+            Arc::from("local"),
+            &mut Inputs {
+                signals: &store,
+                now_ms: 1_000,
+                window_ms: 60_000,
+                horizon_ms: 60_000,
+                availability: &AvailabilitySettings::default(),
+                learned: &mut Learned::default(),
+            },
+        )
+        .demote(&down)
+        .hold(&held);
+        let order: Vec<&str> = snapshot.candidates.iter().map(|c| &*c.cluster).collect();
+        assert_eq!(
+            order,
+            ["site-b", "site-a"],
+            "a down cluster may have come back; a refused candidate certainly fails"
+        );
     }
 
     #[test]

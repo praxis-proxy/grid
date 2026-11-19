@@ -354,7 +354,7 @@ praxis-core = { version = "0.8.0", package = "praxis-proxy-core", default-featur
 opentelemetry-otlp = { version = "0.33.0", default-features = false, features = [
   "tls-provider-agnostic",
 ] }
-praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "4a6749f7f7be2c3a446fc9e58216c98659e66188", default-features = false, features = [
+praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", rev = "0c6fd76f597f90d49cbee005ec9461ce8896b0f5", default-features = false, features = [
   "opentelemetry",
 ] }
 ai-grid-filters = { path = "crates/ai-grid-filters" }
@@ -370,6 +370,9 @@ serde_json.workspace = true
 reqwest.workspace = true
 metrics = { workspace = true }
 openssl.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = { version = "0.7.0", features = ["background_threads"] }
 
 [dev-dependencies]
 # The reload test runs a real mTLS signals peer against the binary.

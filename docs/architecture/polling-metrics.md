@@ -21,7 +21,7 @@ identity. The gateway reads the operator's relay over the same mutual TLS.
 | Read | Under a byte ceiling and a time bound, so a slow or oversized peer cannot hold the poll open or exhaust memory. |
 | Store | Keyed on the verified identity, never on anything the body carries, so no peer can inject readings as another. A body label disagreeing with the verified owner is dropped. The gateway keys on the body's site label only for rows its own operator served, since that operator stamped each from the leaf it verified. |
 | Age | A row's age is the response `Date` minus the row's stamp, both from one reading of the sender's clock, so the offset between two sites' clocks never enters. The operator keeps each relayed row's age and stamps it again when it serves its gateway, with a `Date` from that same reading, so a step of its wall clock moves the stamps and the `Date` together. A row stamped more than a second past its `Date` (the `Date`'s own resolution) or more than a day before it is dropped rather than read as current: the operator counts it in `grid_peer_signals_refused_total{peer,reason="skew"}` and the gateway in `grid_signals_ingest_dropped_total{reason="skew"}`, where `skew` means a stamp out of line with its own `Date`, not an offset between sites. The gateway holds each row on its own timeline, its wall clock at start advanced by the monotonic clock only, so a step of the gateway's clock neither drops new rows as older than the held ones nor ages the held ones at once. |
-| Bound | The operator relays whole provider batches within a 4096-line target limit and a 768 KiB response limit. Each peer contributes up to 64 providers, with payload-bearing batches first. The gateway retains up to 256 provider identities per site and 4096 total, including metadata-only entries. Truncations count in grid_signals_relay_truncated_total and refused samples in grid_peer_signals_refused_total. |
+| Bound | The operator relays whole provider batches within a 4096-line target limit and a 768 KiB response limit. Each peer contributes up to 256 providers, as many as a site may advertise. A provider that has sent load keeps its slot until 12 answers from its site carry no load for it, and free slots go to payload-bearing batches first, in name order. An answer with no load at all releases nothing. The operator holds slots in memory, so after a restart or a leader change free slots go by name order again. A provider waiting for a slot is named in the operator's log. The gateway retains up to 256 provider identities per site and 4096 total, including metadata-only entries. Truncations count in grid_signals_relay_truncated_total and refused samples in grid_peer_signals_refused_total. |
 
 A gateway polls only while serving, since one that is not serving has no routing
 decision to inform. Each gateway holds one connection, to its operator, so live
@@ -165,10 +165,11 @@ The gateway learns a soft capacity bound from the most in-flight held with nothi
 hard bound from the least held at a demonstrated limit. It reads a request count against the
 lesser bound, never below the floor. Saturation (rho) is the nearer of that count and the EPP's
 KV-cache mean plus spread, smoothed per new sample. A site has room while rho is below 1. Among
-healthy sites with room, three or more are picked two by capacity taking the lower rho, two are
-weighted by capacity over 1 + rho, and one is taken. With no site that has room, the pick is by
-capacity among sites not full, tied on queue depth. A cluster praxis reports with no healthy
-endpoint is never picked while a healthy one is left.
+healthy sites with room, three or more are picked two by capacity, moving from the first to the
+second in proportion to the extra headroom the second has; two are weighted by capacity over
+1 + rho, and one is taken. With no site that has room, the pick is by capacity among sites not
+full, tied on queue depth. A cluster praxis reports with no healthy endpoint is never picked while
+a healthy one is left.
 
 With `availability.shedding` on, a model sheds once every healthy site serving it has been
 saturated for `full_after_ms` with work waiting (`queue_full` per serving unit, or any work

@@ -28,6 +28,11 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 pub use control::{Binding, ReloadOutcome, Tuning};
+
+/// Report the initial serving revision after the gateway has accepted its mounted file.
+pub fn report_serving_revision(bytes: &[u8], candidate_count: usize) {
+    control::report_serving_revision(bytes, candidate_count);
+}
 pub use decisions::SiteDecisions;
 // The routing model and the snapshot builder are the crate's control-plane API:
 // the gateway's refresh step orders candidates by live load and swaps the
@@ -45,13 +50,13 @@ pub use provider::{
 pub use serving::{
     AvailabilitySettings, CredentialStrategy, DIAL_FILE, DialConfig, DialCredential, DialSpec, DialTransport,
     DialVersion, GridRuntime, GridServingConfig, PeerServingConfig, dial_config_path, load_dial_config,
-    load_serving_config, spawn_grid_routing,
+    load_serving_config, load_serving_config_with_bytes, spawn_grid_routing,
 };
 pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;
 
 /// Grid counters the gateway emits, with the help text a scrape shows.
-const COUNTER_HELP: [(&str, &str); 13] = [
+const COUNTER_HELP: [(&str, &str); 15] = [
     (
         "grid_route_decisions_total",
         "Requests the gateway decided, by outcome. A refusal records an empty site and cluster.",
@@ -88,7 +93,15 @@ const COUNTER_HELP: [(&str, &str); 13] = [
     ),
     (
         "grid_dial_failures_total",
-        "Dialed requests that got no response, or a gateway error no grid gateway attributed, by cluster.",
+        "Dialed requests that got no response head within the connect budget, by cluster.",
+    ),
+    (
+        "grid_dial_refusals_total",
+        "Requests a provider gateway refused because its site does not serve the provider, by cluster. One orders that provider last for 10 seconds and leaves the dial up.",
+    ),
+    (
+        "grid_dial_server_errors_total",
+        "Dialed requests the site answered with a server error other than 503 or 504, by cluster.",
     ),
     (
         "grid_provider_requests_total",

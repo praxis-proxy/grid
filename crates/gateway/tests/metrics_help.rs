@@ -7,7 +7,7 @@
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     /// Names `describe_metrics` documents, which a scrape must explain.
-    const DOCUMENTED: [&str; 42] = [
+    const DOCUMENTED: [&str; 44] = [
         "grid_route_decisions_total",
         "grid_route_fenced_total",
         "grid_route_selections_total",
@@ -22,6 +22,8 @@ mod tests {
         "grid_serving_dial_shadowed_clusters",
         "grid_dial_down",
         "grid_dial_failures_total",
+        "grid_dial_refusals_total",
+        "grid_dial_server_errors_total",
         "grid_route_site_silent_transitions_total",
         "grid_route_site_rho",
         "grid_route_site_rho_reported",
@@ -116,6 +118,8 @@ mod tests {
         }
         metrics::gauge!("grid_dial_down", "cluster" => "east").set(0.0);
         metrics::counter!("grid_dial_failures_total", "cluster" => "east").increment(1);
+        metrics::counter!("grid_dial_refusals_total", "cluster" => "east").increment(1);
+        metrics::counter!("grid_dial_server_errors_total", "cluster" => "east").increment(1);
         metrics::counter!("grid_provider_requests_total", "result" => "served").increment(1);
         metrics::counter!("grid_provider_config_reload_total", "result" => "applied").increment(1);
 
@@ -154,8 +158,8 @@ mod tests {
                 name.bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte == b'_' || byte.is_ascii_digit())
             })
-            // The provider filter registers under its own name, which is not a metric.
-            .filter(|name| *name != "grid_provider")
+            // These are names used by filters, not Prometheus metrics.
+            .filter(|name| !matches!(*name, "grid_provider" | "grid_serving_revision_serving"))
             .collect();
         emitted.sort_unstable();
         emitted.dedup();

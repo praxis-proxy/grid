@@ -39,6 +39,13 @@ pub const PROVIDER_FILE: &str = "provider.json";
 /// Seconds a peer should wait before retrying a candidate this site does not serve now.
 const RETRY_AFTER_SECS: &str = "5";
 
+/// Response header naming why this gateway refused a request with 503, so a consumer can tell a
+/// provider this site does not serve from a site asking it to wait.
+pub(crate) const REFUSAL_HEADER: &str = "x-grid-refusal";
+
+/// The [`REFUSAL_HEADER`] value for a candidate this site does not serve.
+pub(crate) const UNSERVED_CANDIDATE: &str = "candidate";
+
 /// Request header naming the candidate a consumer picked.
 const CANDIDATE_HEADER: &str = "x-ai-routing-candidate";
 
@@ -425,12 +432,19 @@ pub fn spawn_provider(path: PathBuf, binding: Binding, every: Duration) -> std::
 struct ProviderFilterConfig {
     /// The exact request paths a peer may call.
     allowed_paths: Vec<String>,
+
+    /// The request-path prefixes a peer may call.
+    #[serde(default)]
+    allowed_path_prefixes: Vec<String>,
 }
 
 /// Serves an admitted peer's request to the local backend its stable ID names.
 pub(crate) struct GridProviderFilter {
     /// Exact paths a peer may call.
     allowed_paths: BTreeSet<String>,
+
+    /// Path prefixes a peer may call.
+    allowed_path_prefixes: BTreeSet<String>,
 
     /// The live snapshot.
     snapshot: Arc<ArcSwap<ProviderSnapshot>>,
@@ -446,10 +460,31 @@ impl GridProviderFilter {
         if parsed.allowed_paths.is_empty() || parsed.allowed_paths.iter().any(|path| !path.starts_with('/')) {
             return Err("grid_provider: allowed_paths must name at least one absolute path".into());
         }
+        if parsed
+            .allowed_path_prefixes
+            .iter()
+            .any(|prefix| !prefix.starts_with('/') || !prefix.ends_with('/'))
+        {
+            return Err("grid_provider: allowed_path_prefixes must be absolute paths ending in '/'".into());
+        }
         Ok(Box::new(Self {
             allowed_paths: parsed.allowed_paths.into_iter().collect(),
+            allowed_path_prefixes: parsed.allowed_path_prefixes.into_iter().collect(),
             snapshot,
         }))
+    }
+
+    /// Whether `path` is admitted by the exact-path or safe-prefix contract.
+    fn allows_path(&self, path: &str) -> bool {
+        self.allowed_paths.contains(path)
+            || self.allowed_path_prefixes.iter().any(|prefix| {
+                path.strip_prefix(prefix).is_some_and(|rest| {
+                    rest.is_empty()
+                        || rest
+                            .split('/')
+                            .all(|segment| !segment.is_empty() && !matches!(segment, "." | ".."))
+                })
+            })
     }
 }
 
@@ -480,7 +515,7 @@ impl HttpFilter for GridProviderFilter {
         if !matches!(ctx.request.method, http::Method::GET | http::Method::POST) {
             return Ok(refuse("method", 405));
         }
-        if !self.allowed_paths.contains(ctx.request.uri.path()) {
+        if !self.allows_path(ctx.request.uri.path()) {
             return Ok(refuse("path", 404));
         }
         let mut named = ctx.request.headers.get_all(CANDIDATE_HEADER).iter();
@@ -491,7 +526,7 @@ impl HttpFilter for GridProviderFilter {
             return Ok(refuse("malformed", 400));
         };
         let Some(Served { cluster, dialed }) = snapshot.by_id.get(id) else {
-            return Ok(refuse("candidate", 503));
+            return Ok(refuse(UNSERVED_CANDIDATE, 503));
         };
         forward_only_allowed(ctx);
         // A credentialed backend gets the dial's own token, never anything a peer sent.
@@ -515,12 +550,21 @@ impl HttpFilter for GridProviderFilter {
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let (answered, reached) = (ctx.response_header.is_some(), ctx.upstream_reached);
+        let status = ctx.response_header.as_deref().map(|response| response.status);
+        let reached = ctx.upstream_reached;
         if let Some(dialed) = ctx
             .get_filter_state_mut::<ProviderState>()
             .and_then(|state| state.dialed.take())
         {
-            dialed.settle(answered, reached);
+            dialed.settle(status, reached);
+        }
+        // Only this gateway says why it refused, so a backend's copy goes. This hook also runs on
+        // the gateway's own refusal, which never reached a backend and keeps its reason.
+        if reached
+            && let Some(response) = ctx.response_header.as_mut()
+            && response.headers.remove(REFUSAL_HEADER).is_some()
+        {
+            ctx.response_headers_modified = true;
         }
         Ok(FilterAction::Continue)
     }
@@ -549,6 +593,7 @@ fn as_serving(config: &ProviderConfig) -> GridServingConfig {
                 kind: CapabilityKind::InferenceModel,
                 name: candidate.name.clone(),
                 publishes_load: true,
+                selection_group: 0,
                 site: config.local_site.clone(),
                 stable_id: Some(candidate.stable_id.clone()),
                 weight: None,
@@ -607,7 +652,7 @@ fn forward_only_allowed(ctx: &mut HttpFilterContext<'_>) {
     }
 }
 
-/// A refusal with `status`, counted by `reason`; a 503 carries Retry-After.
+/// A refusal with `status`, counted by `reason`; a 503 carries Retry-After and its reason.
 fn refuse(reason: &'static str, status: u16) -> FilterAction {
     metrics::counter!("grid_provider_requests_total", "result" => reason).increment(1);
     let mut response = TerminalResponse::new(status);
@@ -617,6 +662,7 @@ fn refuse(reason: &'static str, status: u16) -> FilterAction {
             http::header::RETRY_AFTER,
             http::HeaderValue::from_static(RETRY_AFTER_SECS),
         );
+        headers.insert(REFUSAL_HEADER, http::HeaderValue::from_static(reason));
         response = response.with_headers(headers);
     }
     FilterAction::TerminalResponse(Box::new(response))
@@ -883,6 +929,14 @@ mod tests {
                         status == 503,
                         "{what}: only an unserved candidate says when to retry"
                     );
+                    assert_eq!(
+                        response
+                            .headers
+                            .get(REFUSAL_HEADER)
+                            .and_then(|reason| reason.to_str().ok()),
+                        (status == 503).then_some(UNSERVED_CANDIDATE),
+                        "{what}: only an unserved candidate says so"
+                    );
                 },
                 FilterAction::Continue => {
                     assert_eq!(status, 0, "{what} must be refused");
@@ -911,6 +965,96 @@ mod tests {
             "two candidate headers name no one backend"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_backend_cannot_speak_this_gateways_refusal() -> Result<(), FilterError> {
+        let filter = filter_over(&minimal());
+        let mut request = request(http::Method::POST, "/v1/chat/completions");
+        request.headers.insert(
+            http::header::HeaderName::from_static(CANDIDATE_HEADER),
+            http::HeaderValue::from_static("ccac628c"),
+        );
+        let mut head = praxis_filter::Response {
+            headers: http::HeaderMap::new(),
+            status: http::StatusCode::SERVICE_UNAVAILABLE,
+        };
+        head.headers
+            .insert(REFUSAL_HEADER, http::HeaderValue::from_static(UNSERVED_CANDIDATE));
+        let mut ctx = context(&request);
+        ctx.peer_identity = Some(peer("site-b"));
+        assert!(
+            matches!(filter.on_request(&mut ctx).await?, FilterAction::Continue),
+            "served"
+        );
+        ctx.upstream_reached = true;
+        ctx.response_header = Some(&mut head);
+        drop(filter.on_response(&mut ctx).await?);
+        assert!(ctx.response_headers_modified, "the backend's copy is removed");
+        assert!(
+            !head.headers.contains_key(REFUSAL_HEADER),
+            "a backend's 503 reaches the consumer as backpressure, not as a refusal"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_gateways_own_refusal_keeps_its_reason_through_the_response_hook() -> Result<(), FilterError> {
+        let filter = filter_over(&minimal());
+        let mut request = request(http::Method::POST, "/v1/chat/completions");
+        request.headers.insert(
+            http::header::HeaderName::from_static(CANDIDATE_HEADER),
+            http::HeaderValue::from_static("0badf00d"),
+        );
+        let mut ctx = context(&request);
+        ctx.peer_identity = Some(peer("site-b"));
+        let FilterAction::TerminalResponse(response) = filter.on_request(&mut ctx).await? else {
+            panic!("an unserved candidate is refused");
+        };
+        // Praxis runs the response hooks on a terminal response too, with no upstream reached.
+        let mut head = praxis_filter::Response {
+            headers: response.headers.clone(),
+            status: http::StatusCode::from_u16(response.status).expect("a status"),
+        };
+        ctx.response_header = Some(&mut head);
+        drop(filter.on_response(&mut ctx).await?);
+        assert_eq!(
+            head.headers.get(REFUSAL_HEADER).and_then(|reason| reason.to_str().ok()),
+            Some(UNSERVED_CANDIDATE),
+            "the consumer must read why it was refused"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_backend_answering_server_errors_takes_its_dial_down() -> Result<(), FilterError> {
+        let filter = filter_over(&minimal());
+        let mut request = request(http::Method::POST, "/v1/chat/completions");
+        request.headers.insert(
+            http::header::HeaderName::from_static(CANDIDATE_HEADER),
+            http::HeaderValue::from_static("ccac628c"),
+        );
+        let health = Arc::clone(filter.snapshot.load().by_id["ccac628c"].dialed.health());
+        for sent in 1..=50 {
+            assert!(!health.down(), "up before answer {sent}");
+            let mut head = praxis_filter::Response {
+                headers: http::HeaderMap::new(),
+                status: http::StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            let mut ctx = context(&request);
+            ctx.peer_identity = Some(peer("site-b"));
+            assert!(
+                matches!(filter.on_request(&mut ctx).await?, FilterAction::Continue),
+                "served"
+            );
+            ctx.upstream_reached = true;
+            ctx.response_header = Some(&mut head);
+            drop(filter.on_response(&mut ctx).await?);
+            if health.down() {
+                return Ok(());
+            }
+        }
+        panic!("fifty answers of 500 left the backend's dial up");
     }
 
     #[tokio::test]
@@ -987,6 +1131,7 @@ mod tests {
         builder.publish(config, dial);
         let filter = GridProviderFilter {
             allowed_paths: BTreeSet::from(["/v1/chat/completions".to_owned()]),
+            allowed_path_prefixes: BTreeSet::new(),
             snapshot: Arc::clone(&builder.snapshot),
         };
         let mut request = request(http::Method::POST, "/v1/chat/completions");
@@ -1039,6 +1184,8 @@ mod tests {
             "{}",
             "allowed_paths: []",
             "allowed_paths: [v1/models]",
+            "allowed_paths: [/v1/models]\nallowed_path_prefixes: [v1/conversations/]",
+            "allowed_paths: [/v1/models]\nallowed_path_prefixes: [/v1/conversations]",
             "allowed_paths: [/a]\nextra: 1",
         ] {
             let config: serde_yaml::Value = serde_yaml::from_str(yaml).expect("yaml");
@@ -1047,6 +1194,30 @@ mod tests {
                 "{yaml} is refused"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn conversation_paths_are_limited_to_the_configured_prefix() -> Result<(), FilterError> {
+        let filter = filter_over(&minimal());
+        for (path, accepted) in [
+            ("/v1/conversations", true),
+            ("/v1/conversations/conv_abc123/items", true),
+            ("/v1/conversations//items", false),
+            ("/v1/conversations/../models", false),
+        ] {
+            let mut request = request(http::Method::POST, path);
+            request
+                .headers
+                .insert(CANDIDATE_HEADER, http::HeaderValue::from_static("ccac628c"));
+            let mut ctx = context(&request);
+            ctx.peer_identity = Some(peer("site-b"));
+            assert_eq!(
+                matches!(filter.on_request(&mut ctx).await?, FilterAction::Continue),
+                accepted,
+                "{path} must match only the conversation contract"
+            );
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1118,7 +1289,12 @@ mod tests {
         let mut builder = builder(loopback());
         builder.tick(Some(text(config).into_bytes()));
         GridProviderFilter {
-            allowed_paths: BTreeSet::from(["/v1/chat/completions".to_owned(), "/v1/models".to_owned()]),
+            allowed_paths: BTreeSet::from([
+                "/v1/chat/completions".to_owned(),
+                "/v1/conversations".to_owned(),
+                "/v1/models".to_owned(),
+            ]),
+            allowed_path_prefixes: BTreeSet::from(["/v1/conversations/".to_owned()]),
             snapshot: Arc::clone(&builder.snapshot),
         }
     }

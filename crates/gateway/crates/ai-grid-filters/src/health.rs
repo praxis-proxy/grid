@@ -7,7 +7,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
-        Arc, LazyLock,
+        Arc, LazyLock, Mutex, PoisonError,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Instant,
@@ -26,8 +26,15 @@ const DOWN_AFTER: u32 = 2;
 /// Consecutive successes that bring a down dial back up.
 const UP_AFTER: u32 = 2;
 
+/// Answers per server-error window; it tumbles, so errors split across two windows never add.
+const ERROR_WINDOW: u32 = 50;
+
+/// Server errors in one window that take a dial down: four in five, so one caller's failing
+/// requests among everyone else's do not.
+const ERRORS_DOWN: u32 = ERROR_WINDOW / 5 * 4;
+
 /// How long a down dial is ordered last before a request may try it again, milliseconds.
-const COOLDOWN_MS: u64 = 10_000; // 10 s
+pub(crate) const COOLDOWN_MS: u64 = 10_000; // 10 s
 
 /// The process start every dial timestamp counts from.
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -39,6 +46,13 @@ pub struct ClusterHealth {
     registry: ArcSwapOption<HashMap<Arc<str>, ClusterHealthState>>,
     /// The clusters with no healthy endpoint, or a demoted dial, as of the last tick.
     down: ArcSwap<BTreeSet<Arc<str>>>,
+
+    /// The candidates, by cluster and stable ID, their site refused as not served, as of the last tick.
+    held: ArcSwap<BTreeSet<Held>>,
+
+    /// When each candidate was last refused as not served. Kept here and not on a dial, because
+    /// a provider hop can go through a cluster the gateway did not build.
+    refused: Mutex<BTreeMap<Held, u64>>,
 
     /// The applied config's dials, by cluster.
     dials: DialHealth,
@@ -70,12 +84,44 @@ impl ClusterHealth {
         self.down.load_full()
     }
 
+    /// The candidates held back as of the last [`Self::update`].
+    pub(crate) fn held(&self) -> Arc<BTreeSet<Held>> {
+        self.held.load_full()
+    }
+
+    /// Hold `candidate` back for a cooldown, returning whether that started a hold: its site,
+    /// reached over `cluster`, answered that it does not serve it.
+    pub(crate) fn refuse(&self, cluster: &Arc<str>, candidate: &Arc<str>) -> bool {
+        self.refuse_at(cluster, candidate, monotonic_ms())
+    }
+
+    /// [`Self::refuse`] at `now_ms`. Only that candidate is held, because the cluster's others
+    /// are served, and a refusal during a hold does not extend it.
+    pub(crate) fn refuse_at(&self, cluster: &Arc<str>, candidate: &Arc<str>, now_ms: u64) -> bool {
+        metrics::counter!("grid_dial_refusals_total", "cluster" => cluster.to_string()).increment(1);
+        let held = (Arc::clone(cluster), Arc::clone(candidate));
+        let mut refused = self.refused.lock().unwrap_or_else(PoisonError::into_inner);
+        if refused.get(&held).is_some_and(|since| held_at(*since, now_ms)) {
+            return false;
+        }
+        refused.insert(held, now_ms);
+        true
+    }
+
+    /// The candidates held back at `now_ms`, after forgetting the holds that ran out.
+    pub(crate) fn held_at(&self, now_ms: u64) -> BTreeSet<Held> {
+        let mut refused = self.refused.lock().unwrap_or_else(PoisonError::into_inner);
+        refused.retain(|_, since| held_at(*since, now_ms));
+        refused.keys().cloned().collect()
+    }
+
     /// The dials' health, kept across applies.
     pub(crate) fn dials(&self) -> &DialHealth {
         &self.dials
     }
 
-    /// Recompute the down set from the registry and the dials, returning whether it changed.
+    /// Recompute the down and held sets from the registry and the dials, returning whether
+    /// either changed.
     pub(crate) fn update(&self) -> bool {
         self.update_at(monotonic_ms())
     }
@@ -89,14 +135,23 @@ impl ClusterHealth {
         now.extend(self.dials.demoted(now_ms));
         // Every tick: a dial that recovers from half open changes no down set.
         self.dials.export();
+        let held = self.held_at(now_ms);
+        let held_changed = **self.held.load() != held;
+        if held_changed {
+            self.held.store(Arc::new(held));
+        }
         if **self.down.load() == now {
-            return false;
+            return held_changed;
         }
         tracing::info!(down = ?now, "grid: backend clusters with no healthy endpoint changed");
         self.down.store(Arc::new(now));
         true
     }
 }
+
+/// A candidate held back: its cluster and stable ID. Both, because a stable ID is a short hash
+/// of names its own site chooses, and one site must not be able to hold another's candidate.
+pub(crate) type Held = (Arc<str>, Arc<str>);
 
 /// Whether a routed request may take a dial.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,16 +166,24 @@ pub(crate) enum Admission {
 
 /// One dial's passive health, recorded on the response path with atomics only.
 ///
-/// Down after [`DOWN_AFTER`] consecutive failures, up after [`UP_AFTER`] consecutive successes.
+/// Down after [`DOWN_AFTER`] consecutive failures to connect or [`ERRORS_DOWN`] server errors in
+/// [`ERROR_WINDOW`] answers, up after [`UP_AFTER`] consecutive successes.
 /// A down dial is ordered last, never excluded, for [`COOLDOWN_MS`]; then it is half open: one
-/// request at a time may probe it, and one more failure orders it last again.
+/// request at a time may probe it, and one more failure orders it last again. While it is down
+/// only its probe moves it.
 #[derive(Debug)]
 pub(crate) struct DialState {
     /// The address dialed, so a moved cluster starts healthy.
     address: Arc<str>,
 
+    /// Answers in the current window.
+    answers: AtomicU32,
+
     /// When the dial went down or last failed while down, plus one; 0 while up.
     down_since: AtomicU64,
+
+    /// Server errors in the current window.
+    errors: AtomicU32,
 
     /// Consecutive failures.
     failures: AtomicU32,
@@ -131,6 +194,9 @@ pub(crate) struct DialState {
     /// The cluster's failure counter, resolved once.
     failures_total: metrics::Counter,
 
+    /// The cluster's server-error counter, resolved once.
+    server_errors_total: metrics::Counter,
+
     /// Consecutive successes.
     successes: AtomicU32,
 }
@@ -140,8 +206,11 @@ impl DialState {
     pub(crate) fn new(cluster: &str, address: Arc<str>) -> Self {
         Self {
             failures_total: metrics::counter!("grid_dial_failures_total", "cluster" => cluster.to_owned()),
+            server_errors_total: metrics::counter!("grid_dial_server_errors_total", "cluster" => cluster.to_owned()),
             address,
+            answers: AtomicU32::new(0),
             down_since: AtomicU64::new(0),
+            errors: AtomicU32::new(0),
             failures: AtomicU32::new(0),
             probe_since: AtomicU64::new(0),
             successes: AtomicU32::new(0),
@@ -192,6 +261,65 @@ impl DialState {
         if failures >= DOWN_AFTER || self.down() {
             self.down_since.store(now_ms.saturating_add(1), Ordering::Relaxed);
         }
+    }
+
+    /// Count a failure to connect that does not move the dial.
+    pub(crate) fn count_failure(&self) {
+        self.failures_total.increment(1);
+    }
+
+    /// Record an answer to a request that does not hold the probe. It can take an up dial down,
+    /// and it never brings a down one back or restarts its cooldown: a request sent while the
+    /// dial was up can finish after it went down, and would otherwise undo that.
+    pub(crate) fn observed(&self, server_error: bool, now_ms: u64) {
+        self.failures.store(0, Ordering::Relaxed);
+        if server_error {
+            self.server_errors_total.increment(1);
+        }
+        if !self.down() && self.tally(server_error) {
+            // Good probes from an earlier recovery must not count toward the next one.
+            self.successes.store(0, Ordering::Relaxed);
+            self.down_since.store(now_ms.saturating_add(1), Ordering::Relaxed);
+        }
+    }
+
+    /// Record an answer the dial may act on in either direction, a probe's or a test's, at
+    /// `now_ms`: the connect worked, and a server error counts against the site. A site that
+    /// refuses fast never fills, so load alone reads it as the best.
+    pub(crate) fn answered(&self, server_error: bool, now_ms: u64) {
+        if !server_error {
+            if self.down() {
+                // Whenever it comes back up, it does so with a fresh window.
+                self.errors.store(0, Ordering::Relaxed);
+                self.answers.store(0, Ordering::Relaxed);
+            } else {
+                self.tally(false);
+            }
+            return self.record(true, now_ms);
+        }
+        self.server_errors_total.increment(1);
+        self.failures.store(0, Ordering::Relaxed);
+        self.successes.store(0, Ordering::Relaxed);
+        // A server error while down is a failed probe; while up it only counts toward the window.
+        if self.down() || self.tally(true) {
+            self.down_since.store(now_ms.saturating_add(1), Ordering::Relaxed);
+        }
+    }
+
+    /// Count one answer in the current window, returning whether its server errors reached the limit.
+    fn tally(&self, server_error: bool) -> bool {
+        let errors = if server_error {
+            self.errors.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+        } else {
+            self.errors.load(Ordering::Relaxed)
+        };
+        let answers = self.answers.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let tripped = errors >= ERRORS_DOWN;
+        if tripped || answers >= ERROR_WINDOW {
+            self.errors.store(0, Ordering::Relaxed);
+            self.answers.store(0, Ordering::Relaxed);
+        }
+        tripped
     }
 
     /// Whether the dial is down, half open included.
@@ -260,6 +388,11 @@ impl DialHealth {
     }
 }
 
+/// Whether a refusal at `since` still holds its candidate back at `now_ms`.
+fn held_at(since: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(since) < COOLDOWN_MS
+}
+
 /// Milliseconds since the process started, on a clock that never goes back.
 pub(crate) fn monotonic_ms() -> u64 {
     u64::try_from(EPOCH.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -281,7 +414,6 @@ fn down_clusters(registry: &HashMap<Arc<str>, ClusterHealthState>) -> BTreeSet<A
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {
-    use std::sync::Mutex;
 
     use praxis_core::health::{ClusterHealthEntry, EndpointHealth};
 
@@ -422,6 +554,159 @@ mod tests {
         dial.record(true, 1_700);
         assert!(!dial.down(), "two consecutive successes bring it up");
         assert!(!dial.demoted(1_700), "and it is ordered by load again");
+    }
+
+    #[test]
+    fn server_errors_take_a_dial_down_at_four_in_five_of_a_window_and_not_before() {
+        let dial = DialState::new("east", Arc::from("east:8443"));
+        for answer in 1..ERRORS_DOWN {
+            dial.answered(true, 1_000);
+            assert!(!dial.down(), "{answer} server errors are not four in five of a window");
+        }
+        dial.answered(true, 1_000);
+        assert!(dial.down(), "four in five of a window of server errors takes it down");
+        assert!(dial.demoted(1_000), "and orders it last");
+    }
+
+    #[test]
+    fn server_errors_spread_evenly_at_two_in_five_never_take_a_dial_down() {
+        let dial = DialState::new("east", Arc::from("east:8443"));
+        // One caller's failing requests among everyone else's: two answers in five, for fifty windows.
+        for answer in 0..50 * ERROR_WINDOW {
+            dial.answered(answer % 5 < 2, 1_000);
+            assert!(!dial.down(), "answer {answer}: 40 percent errors is under four in five");
+        }
+    }
+
+    #[test]
+    fn server_errors_at_random_at_two_in_five_never_take_a_dial_down() {
+        let dial = DialState::new("east", Arc::from("east:8443"));
+        // A fixed linear congruential stream: about two answers in five are errors, in no pattern.
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        for answer in 0..100_000 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            dial.answered((seed >> 33) % 5 < 2, 1_000);
+            assert!(
+                !dial.down(),
+                "answer {answer}: 40 percent errors is far under four in five"
+            );
+        }
+    }
+
+    #[test]
+    fn a_server_error_while_down_rearms_the_cooldown_and_two_good_answers_bring_it_back() {
+        let dial = DialState::new("east", Arc::from("east:8443"));
+        for _ in 0..ERRORS_DOWN {
+            dial.answered(true, 1_000);
+        }
+        assert!(!dial.demoted(1_000 + COOLDOWN_MS), "half open after the cooldown");
+        dial.answered(true, 20_000);
+        assert!(
+            dial.demoted(20_000),
+            "a probe answered with a server error orders it last again"
+        );
+        dial.answered(false, 31_000);
+        assert!(dial.down(), "one good answer is not enough");
+        dial.answered(false, 31_100);
+        assert!(!dial.down(), "two good answers bring it back");
+        for answer in 1..ERRORS_DOWN {
+            dial.answered(true, 32_000);
+            assert!(!dial.down(), "error {answer} after recovery starts a fresh window");
+        }
+    }
+
+    #[test]
+    fn an_answer_without_the_probe_never_brings_a_down_dial_back() {
+        let dial = DialState::new("east", Arc::from("east:8443"));
+        for _ in 0..ERRORS_DOWN {
+            dial.observed(true, 1_000);
+        }
+        assert!(
+            dial.demoted(1_000),
+            "server errors take an up dial down without a probe"
+        );
+        for _ in 0..UP_AFTER * 2 {
+            dial.observed(false, 1_500);
+        }
+        assert!(
+            dial.down(),
+            "good answers to requests sent before it went down do not undo that"
+        );
+        dial.observed(true, 5_000);
+        assert!(
+            !dial.demoted(1_000 + COOLDOWN_MS),
+            "and a late error does not restart its cooldown"
+        );
+        dial.answered(false, 20_000);
+        dial.answered(false, 20_100);
+        assert!(!dial.down(), "two good probes bring it back");
+        for _ in 0..ERRORS_DOWN {
+            dial.observed(true, 30_000);
+        }
+        assert!(dial.down(), "server errors take it down a second time");
+        dial.answered(false, 45_000);
+        assert!(
+            dial.down(),
+            "and the earlier recovery's probes do not count: one good probe is not enough"
+        );
+        dial.answered(false, 45_100);
+        assert!(!dial.down(), "two are");
+    }
+
+    #[test]
+    fn a_refusal_holds_back_its_candidate_for_a_cooldown_and_leaves_the_dial_up() {
+        let health = ClusterHealth::default();
+        let dial = health.dials().state("east", "east:8443");
+        health
+            .dials()
+            .adopt(BTreeMap::from([(Arc::from("east"), Arc::clone(&dial))]));
+        let (east, new): (Arc<str>, Arc<str>) = (Arc::from("east"), Arc::from("id-new"));
+        assert!(health.refuse_at(&east, &new, 1_000), "the first refusal starts a hold");
+        assert!(!dial.down(), "the dial's other candidates are served");
+        assert_eq!(
+            health.held_at(1_000),
+            BTreeSet::from([(Arc::clone(&east), Arc::clone(&new))]),
+            "only the refused candidate, on the cluster that refused it"
+        );
+        assert!(
+            !health.refuse_at(&east, &new, 1_000 + COOLDOWN_MS - 1),
+            "a refusal during the hold does not extend it"
+        );
+        assert!(
+            health.held_at(1_000 + COOLDOWN_MS).is_empty(),
+            "so the candidate is tried again a cooldown after the first"
+        );
+        assert!(
+            health.refuse_at(&east, &new, 1_000 + COOLDOWN_MS),
+            "and a site that still refuses starts another hold"
+        );
+    }
+
+    #[test]
+    fn the_tick_publishes_held_candidates_and_drops_them_after_the_cooldown() {
+        let health = ClusterHealth::default();
+        let (pool, new): (Arc<str>, Arc<str>) = (Arc::from("pool-east"), Arc::from("id-new"));
+        assert!(
+            health.refuse_at(&pool, &new, 1_000),
+            "a cluster with no dial holds a candidate too"
+        );
+        assert!(health.update_at(1_000), "a held candidate is news");
+        assert_eq!(*health.held(), BTreeSet::from([(pool, new)]));
+        assert!(health.down().is_empty(), "no cluster is down");
+        assert!(!health.update_at(2_000), "an unchanged hold is not");
+        assert!(health.update_at(1_000 + COOLDOWN_MS), "the hold running out is");
+        assert!(health.held().is_empty());
+    }
+
+    #[test]
+    fn an_answered_server_error_is_not_a_failure_to_connect() {
+        let dial = DialState::new("east", Arc::from("east:8443"));
+        dial.record(false, 1_000);
+        dial.answered(true, 1_100);
+        dial.record(false, 1_200);
+        assert!(!dial.down(), "an answer between two failed connects proves the dial");
     }
 
     #[test]
