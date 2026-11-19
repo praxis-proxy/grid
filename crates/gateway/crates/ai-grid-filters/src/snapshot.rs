@@ -404,6 +404,12 @@ impl RouteSnapshot {
         self.demote_where(down, |candidate| Some(&candidate.cluster))
     }
 
+    /// This snapshot with every candidate whose stable ID is in `held` ordered after all the rest.
+    #[must_use]
+    pub(crate) fn hold(self, held: &BTreeSet<Arc<str>>) -> Self {
+        self.demote_where(held, |candidate| Some(&candidate.stable_id))
+    }
+
     /// This snapshot with every candidate whose `key` is in `down` ordered last.
     fn demote_where(self, down: &BTreeSet<Arc<str>>, key: impl Fn(&RouteCandidate) -> Option<&Arc<str>>) -> Self {
         if down.is_empty() {

@@ -536,7 +536,7 @@ impl GridSiteRouteFilter {
             tags_state |= state.responses;
             state.responses = tags_state;
             state.served = Some((Arc::clone(&candidate.site), Arc::clone(&candidate.cluster)));
-            state.dialed = InFlight::of(candidate, false);
+            state.dialed = InFlight::of(candidate, false, snapshot);
             if let Some(keys) = keys {
                 self.affinity.index.record(&keys, &candidate.cluster);
                 state.recorded = Some((keys, Arc::clone(&candidate.cluster)));
@@ -714,7 +714,7 @@ impl GridSiteRouteFilter {
         with_state(ctx, |state| {
             state.responses = true;
             state.served = Some((Arc::clone(&candidate.site), Arc::clone(&candidate.cluster)));
-            state.dialed = InFlight::of(candidate, probe);
+            state.dialed = InFlight::of(candidate, probe, snapshot);
         });
         select_upstream(ctx, candidate);
         write_provider_context(ctx, candidate, snapshot)?;
@@ -751,10 +751,21 @@ impl GridSiteRouteFilter {
                 .is_none_or(|encoding| encoding.as_bytes().eq_ignore_ascii_case(b"identity"))
         });
         let (status, reached) = (head.map(|response| response.status), ctx.upstream_reached);
+        // A provider gateway that does not serve the candidate says so, apart from asking to wait.
+        let refused = head.is_some_and(|response| {
+            response.status == http::StatusCode::SERVICE_UNAVAILABLE
+                && response
+                    .headers
+                    .get(crate::provider::REFUSAL_HEADER)
+                    .is_some_and(|reason| reason.as_bytes() == crate::provider::UNSERVED_CANDIDATE.as_bytes())
+        });
         let Some(state) = ctx.get_filter_state_mut::<RouteState>() else {
             return Ok(());
         };
         if let Some(dialed) = state.dialed.take() {
+            if refused {
+                dialed.refused();
+            }
             dialed.settle(status, reached);
         }
         // Keep the selected route after releasing the mutable borrow of filter state in `ctx`.
@@ -820,6 +831,8 @@ fn site_failure(status: http::StatusCode) -> bool {
 pub(crate) struct InFlight {
     /// The longest the dial's connect attempts can take.
     budget: Duration,
+    /// The cluster and stable ID a provider gateway was asked for, `None` on any other dial.
+    hop: Option<(Arc<str>, Arc<str>)>,
     /// Whether this request holds the down dial's one probe.
     probe: bool,
     /// When the request was routed.
@@ -830,17 +843,40 @@ pub(crate) struct InFlight {
 
 impl InFlight {
     /// The request routed to `candidate`, `None` when it is not dialed.
-    fn of(candidate: &RouteCandidate, probe: bool) -> Option<Self> {
-        candidate.dial.as_deref().map(|dial| Self::over(dial, probe))
+    fn of(candidate: &RouteCandidate, probe: bool, snapshot: &RouteSnapshot) -> Option<Self> {
+        let hop = snapshot
+            .provider_hop_clusters
+            .contains(candidate.cluster.as_ref())
+            .then(|| (Arc::clone(&candidate.cluster), Arc::clone(&candidate.stable_id)));
+        candidate.dial.as_deref().map(|dial| Self {
+            hop,
+            ..Self::over(dial, probe)
+        })
     }
 
     /// A request sent over `dial` now, holding its probe when `probe`.
     pub(crate) fn over(dial: &crate::dial::Dialed, probe: bool) -> Self {
         Self {
             budget: dial.connect_budget(),
+            hop: None,
             probe,
             sent: Instant::now(),
             state: Arc::clone(dial.health()),
+        }
+    }
+
+    /// Hold back the candidate a provider gateway said its site does not serve. Only a provider
+    /// gateway is believed, and only about the candidate it was asked for.
+    fn refused(&self) {
+        let Some((cluster, candidate)) = &self.hop else {
+            return;
+        };
+        if self.state.refuse(candidate, crate::health::monotonic_ms()) {
+            tracing::warn!(
+                cluster = %cluster,
+                candidate = %candidate,
+                "grid_site_route: the site does not serve this candidate; ordering it last for a cooldown"
+            );
         }
     }
 
@@ -4313,6 +4349,32 @@ pub(crate) mod tests {
             answer(&filter, http::StatusCode::INTERNAL_SERVER_ERROR).await;
         }
         assert!(health.down(), "a window of 500 takes it down");
+    }
+
+    #[tokio::test]
+    async fn only_a_provider_gateway_is_believed_about_what_its_site_serves() {
+        let candidates = dialed("east", "east", Some("10.0.0.9:8443"));
+        let health = Arc::clone(candidates[0].dial.as_ref().expect("dialed").health());
+        let filter = dial_filter(candidates, "local", Some(&[]));
+        let request = llama_request("/v1/chat/completions");
+        let mut head = praxis_filter::Response {
+            headers: http::HeaderMap::new(),
+            status: http::StatusCode::SERVICE_UNAVAILABLE,
+        };
+        head.headers.insert(
+            crate::provider::REFUSAL_HEADER,
+            http::HeaderValue::from_static(crate::provider::UNSERVED_CANDIDATE),
+        );
+        let mut ctx = context(&request);
+        drop(filter.on_request(&mut ctx).await.expect("routes"));
+        ctx.upstream_reached = true;
+        ctx.response_header = Some(&mut head);
+        drop(filter.on_response(&mut ctx).await.expect("settles"));
+        assert!(
+            health.held(crate::health::monotonic_ms()).is_empty(),
+            "a dial that is no provider hop sent the refusal reason: from it a 503 is backpressure"
+        );
+        assert!(!health.down());
     }
 
     #[test]
