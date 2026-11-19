@@ -32,6 +32,11 @@ ignore = [
   { id = "RUSTSEC-2026-0403", reason = "upstream header-serde pins zstd-safe 7; no compatible fixed release available" },
   # This allocator-shim issue is wasm32-only; grid-gateway is a native binary.
   { id = "RUSTSEC-2026-0410", reason = "wasm32-only allocator issue; grid-gateway does not target wasm32" },
+  # These are transitive dependencies of the pinned Praxis stack. The advisories
+  # mark all versions unmaintained and do not provide safe replacements.
+  { id = "RUSTSEC-2026-0542", reason = "transitive humantime dependency; no safe upgrade available" },
+  { id = "RUSTSEC-2026-0543", reason = "transitive chrono dependency; no safe upgrade available" },
+  { id = "RUSTSEC-2026-0555", reason = "transitive chrono-tz dependency; no safe upgrade available" },
 ]
 
 [licenses]

@@ -1271,6 +1271,7 @@ mod tests {
                     kind: CapabilityKind::InferenceModel,
                     name: "llama".to_owned(),
                     publishes_load: true,
+                    selection_group: 0,
                     site: dial.site.clone(),
                     stable_id: Some(format!("candidate-{cluster}")),
                     weight: None,
