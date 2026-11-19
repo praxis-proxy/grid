@@ -2739,8 +2739,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "reproduces a site answering every request with a server error keeping its share: an HTTP \
-                error response head counts as a working dial, and a site that refuses requests never fills"]
     async fn a_site_answering_every_request_with_a_server_error_stops_taking_new_ones() {
         let share = later_share_of_east(Answer::Status(http::StatusCode::INTERNAL_SERVER_ERROR)).await;
         assert!(
@@ -2875,7 +2873,10 @@ mod tests {
             };
             let mut ctx = crate::route::tests::context(&request);
             let routed = filter.on_request(&mut ctx).await.expect("routes");
-            assert!(matches!(routed, praxis_filter::FilterAction::Continue), "request {sent} routes");
+            assert!(
+                matches!(routed, praxis_filter::FilterAction::Continue),
+                "request {sent} routes"
+            );
             let to_east = ctx.cluster.as_deref() == Some("pool-east");
             ctx.upstream_reached = true;
             match (to_east, east) {
@@ -2887,7 +2888,10 @@ mod tests {
                 (false, _) => ctx.response_header = Some(&mut head),
             }
             let settled = filter.on_response(&mut ctx).await.expect("settles");
-            assert!(matches!(settled, praxis_filter::FilterAction::Continue), "request {sent} settles");
+            assert!(
+                matches!(settled, praxis_filter::FilterAction::Continue),
+                "request {sent} settles"
+            );
             if control.health().update() {
                 control.refresh()(&control.store());
             }

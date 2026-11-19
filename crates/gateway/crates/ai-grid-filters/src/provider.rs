@@ -515,12 +515,13 @@ impl HttpFilter for GridProviderFilter {
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let (answered, reached) = (ctx.response_header.is_some(), ctx.upstream_reached);
+        let status = ctx.response_header.as_deref().map(|response| response.status);
+        let reached = ctx.upstream_reached;
         if let Some(dialed) = ctx
             .get_filter_state_mut::<ProviderState>()
             .and_then(|state| state.dialed.take())
         {
-            dialed.settle(answered, reached);
+            dialed.settle(status, reached);
         }
         Ok(FilterAction::Continue)
     }
@@ -911,6 +912,37 @@ mod tests {
             "two candidate headers name no one backend"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_backend_answering_server_errors_takes_its_dial_down() -> Result<(), FilterError> {
+        let filter = filter_over(&minimal());
+        let mut request = request(http::Method::POST, "/v1/chat/completions");
+        request.headers.insert(
+            http::header::HeaderName::from_static(CANDIDATE_HEADER),
+            http::HeaderValue::from_static("ccac628c"),
+        );
+        let health = Arc::clone(filter.snapshot.load().by_id["ccac628c"].dialed.health());
+        for sent in 1..=50 {
+            assert!(!health.down(), "up before answer {sent}");
+            let mut head = praxis_filter::Response {
+                headers: http::HeaderMap::new(),
+                status: http::StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            let mut ctx = context(&request);
+            ctx.peer_identity = Some(peer("site-b"));
+            assert!(
+                matches!(filter.on_request(&mut ctx).await?, FilterAction::Continue),
+                "served"
+            );
+            ctx.upstream_reached = true;
+            ctx.response_header = Some(&mut head);
+            drop(filter.on_response(&mut ctx).await?);
+            if health.down() {
+                return Ok(());
+            }
+        }
+        panic!("fifty answers of 500 left the backend's dial up");
     }
 
     #[tokio::test]
