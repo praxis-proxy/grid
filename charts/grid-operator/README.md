@@ -311,7 +311,7 @@ namespace names in `metricsListener.fromNamespaces`, and on OpenShift defaults t
 | `gateway.allowSystemNamespace` | bool | `false` | Allow `gateway.namespace` to be `default`, `kube-*`, or `openshift-*`. |
 | `gateway.port` | string | `""` | Site gateway Service port override. Empty uses the first Service `spec.ports` entry, with `8080` as the fallback if no usable port exists. Maps to `GRID_GATEWAY_PORT`. |
 | `gateway.praxisConfig` | object | `{}` | `consumerGateways[].praxisConfig` for the site gateway on the rendered GridNetwork, as the CRD takes it. Empty renders no block. |
-| `gateway.regionalPolicy` | object | `{}` | `consumerGateways[].regionalPolicy` for the site gateway on the rendered GridNetwork, as the CRD takes it: the regions and sovereignty zones the gateway may route to. Empty renders no block. |
+| `gateway.regionalPolicy` | object | `{}` | `consumerGateways[].regionalPolicy` for the site gateway on the rendered GridNetwork, as the CRD takes it: preferred regions and fallback behavior in affinity mode, allowed regions in locked mode, and an optional hard sovereignty-zone allowlist in either mode. Empty renders no block. |
 | `gateway.discoveryEnabled` | bool | `true` | Discover and advertise a LoadBalancer address for the site gateway. Maps to `GRID_GATEWAY_DISCOVERY_ENABLED`. |
 | `modelDiscovery.intervalSeconds` | int or string | `""` | Seconds between discovery rounds, 1 to 2592000, as `GRID_MODEL_DISCOVERY_INTERVAL_SECS`. Empty keeps the operator's 60s. |
 | `modelDiscovery.timeoutSeconds` | int or string | `""` | Seconds one provider poll may take, 1 to 3600, as `GRID_MODEL_DISCOVERY_TIMEOUT_SECS`. Empty keeps the operator's 5s. |
