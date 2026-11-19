@@ -25,6 +25,11 @@ use tracing::info;
 mod metrics_listener;
 mod provider_preflight;
 
+/// glibc keeps freed stream buffers resident; musl returns them and needs no change.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// Log line emitted once tracing is up; the startup test waits for it.
 const STARTUP_MESSAGE: &str = "starting grid-gateway";
 /// OTel-standard environment variable used as the OTLP endpoint fallback.

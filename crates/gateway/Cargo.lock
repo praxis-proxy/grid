@@ -1609,6 +1609,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "tikv-jemallocator",
  "tokio",
  "tokio-rustls",
  "tracing",
