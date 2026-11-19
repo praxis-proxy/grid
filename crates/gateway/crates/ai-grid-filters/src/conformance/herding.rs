@@ -43,14 +43,27 @@ struct Serving {
     waiting: usize,
 }
 
-/// The most requests waiting at any one site, after [`WARM_UP_MS`], while `arriving` requests per
-/// step are routed between `sites` by the real selection over snapshots [`POLL_MS`] apart.
+/// How many starting points a run is repeated over. The loop is chaotic enough that one starting
+/// point can pass where the next queues a hundred, so a single run proves nothing.
+const PHASES: usize = 5;
+
+/// The most requests waiting at any one site over [`PHASES`] runs of [`peak_waiting_from`].
 fn peak_waiting(sites: &[SiteSpec], arriving: usize) -> usize {
+    (0..PHASES)
+        .map(|phase| peak_waiting_from(sites, arriving, phase * 7_919))
+        .max()
+        .unwrap_or(0)
+}
+
+/// The most requests waiting at any one site, after [`WARM_UP_MS`], while `arriving` requests per
+/// step are routed between `sites` by the real selection over snapshots [`POLL_MS`] apart, the
+/// first request being turn `first_turn`.
+fn peak_waiting_from(sites: &[SiteSpec], arriving: usize, first_turn: usize) -> usize {
     let mut grid = Harness::new(HORIZON_MS);
     // Teach every ceiling with one sample holding its slots and nothing waiting.
     let mut snapshot = grid.refresh(sites, NOW_MS, |site| site.capacity, 0.0);
     let mut serving: Vec<Serving> = sites.iter().map(|_| Serving::default()).collect();
-    let (mut turn, mut peak) = (0_usize, 0_usize);
+    let (mut turn, mut peak) = (first_turn, 0_usize);
     for step in 1..=DURATION_MS / STEP_MS {
         let at = NOW_MS + step * STEP_MS;
         let arriving = if at - NOW_MS < IDLE_MS { 0 } else { arriving };
@@ -120,12 +133,14 @@ fn equal(names: &[&'static str]) -> Vec<SiteSpec> {
 }
 
 #[test]
-fn three_equal_sites_at_two_thirds_of_capacity_build_no_queue() {
-    // Three sites of 40 slots and 2 s requests serve 60 a second; 4 a step is 40 a second.
-    let peak = peak_waiting(&equal(&["a", "b", "c"]), 4);
-    // Taking the lighter of two outright leaves about a hundred waiting here; a soft pick, a handful.
+fn three_equal_sites_at_half_of_capacity_build_no_queue() {
+    // Three sites of 40 slots and 2 s requests serve 60 a second; 3 a step is 30 a second.
+    // Taking the lighter of two outright leaves 17 waiting here. Above about two thirds of
+    // capacity a queue forms under either rule, because a site showing any queue is left out
+    // until the next snapshot and the rest cannot carry its share.
+    let peak = peak_waiting(&equal(&["a", "b", "c"]), 3);
     assert!(
-        peak <= SLOTS / 4,
-        "with a third of every site free, a queue of {peak} at one site is the pick herding"
+        peak <= SLOTS / 10,
+        "with half of every site free, a queue of {peak} at one site is the pick herding"
     );
 }
