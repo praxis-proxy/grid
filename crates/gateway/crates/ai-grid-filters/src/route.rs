@@ -752,17 +752,20 @@ impl InFlight {
     /// Record the request's outcome, answered with a head of `status` after `reached` the
     /// upstream, and hand back the probe it holds.
     pub(crate) fn settle(self, status: Option<http::StatusCode>, reached: bool) {
-        // A request sent before the dial went down, or past its probe, proves nothing new.
-        if self.state.down() && !self.probe {
-            return;
-        }
+        // While a dial is down only its probe moves it: a request sent before it went down proves
+        // nothing new. Every outcome is still counted.
+        let moves = self.probe || !self.state.down();
         let now_ms = crate::health::monotonic_ms();
         match (
             dial_outcome(status.is_some(), reached, self.sent.elapsed(), self.budget),
             status,
         ) {
-            (Some(true), Some(status)) => self.state.answered(site_failure(status), now_ms),
-            (Some(false), _) => self.state.record(false, now_ms),
+            // A down site that now says wait has not shown it can serve.
+            (Some(true), Some(status)) if !site_failure(status) && status.is_server_error() && self.state.down() => {},
+            (Some(true), Some(status)) if moves => self.state.answered(site_failure(status), now_ms),
+            (Some(true), Some(status)) if site_failure(status) => self.state.count_server_error(),
+            (Some(false), _) if moves => self.state.record(false, now_ms),
+            (Some(false), _) => self.state.count_failure(),
             _ => {},
         }
         if self.probe {
@@ -3818,6 +3821,15 @@ pub(crate) mod tests {
             health.down(),
             "answers to requests sent before it went down do not bring it back"
         );
+        InFlight::over(&dial, true).settle(Some(http::StatusCode::SERVICE_UNAVAILABLE), true);
+        InFlight::over(&dial, true).settle(Some(http::StatusCode::GATEWAY_TIMEOUT), true);
+        assert!(health.down(), "a probe told to wait has not shown the site can serve");
+        assert_eq!(
+            health.admit_at(crate::health::COOLDOWN_MS),
+            Admission::Probe,
+            "and it hands the probe back without another cooldown"
+        );
+        health.release_probe();
         for _ in 0..2 {
             InFlight::over(&dial, true).settle(Some(http::StatusCode::OK), true);
         }

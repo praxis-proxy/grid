@@ -220,6 +220,16 @@ impl DialState {
         }
     }
 
+    /// Count a failure to connect that does not move the dial.
+    pub(crate) fn count_failure(&self) {
+        self.failures_total.increment(1);
+    }
+
+    /// Count a server error answer that does not move the dial.
+    pub(crate) fn count_server_error(&self) {
+        self.server_errors_total.increment(1);
+    }
+
     /// Record an answered request at `now_ms`: the connect worked, and a server error counts
     /// against the site. A site that refuses fast never fills, so load alone reads it as the best.
     pub(crate) fn answered(&self, server_error: bool, now_ms: u64) {
@@ -489,29 +499,29 @@ mod tests {
     }
 
     #[test]
-    fn server_errors_take_a_dial_down_at_half_a_window_and_not_before() {
+    fn server_errors_take_a_dial_down_at_four_in_five_of_a_window_and_not_before() {
         let dial = DialState::new("east", Arc::from("east:8443"));
         for answer in 1..ERRORS_DOWN {
             dial.answered(true, 1_000);
-            assert!(!dial.down(), "{answer} server errors are not half of a window");
+            assert!(!dial.down(), "{answer} server errors are not four in five of a window");
         }
         dial.answered(true, 1_000);
-        assert!(dial.down(), "half of a window of server errors takes it down");
+        assert!(dial.down(), "four in five of a window of server errors takes it down");
         assert!(dial.demoted(1_000), "and orders it last");
     }
 
     #[test]
-    fn server_errors_spread_thinner_than_half_never_take_a_dial_down() {
+    fn server_errors_spread_evenly_at_two_in_five_never_take_a_dial_down() {
         let dial = DialState::new("east", Arc::from("east:8443"));
         // One caller's failing requests among everyone else's: two answers in five, for fifty windows.
         for answer in 0..50 * ERROR_WINDOW {
             dial.answered(answer % 5 < 2, 1_000);
-            assert!(!dial.down(), "answer {answer}: 40 percent errors is under half");
+            assert!(!dial.down(), "answer {answer}: 40 percent errors is under four in five");
         }
     }
 
     #[test]
-    fn server_errors_at_random_under_half_never_take_a_dial_down() {
+    fn server_errors_at_random_at_two_in_five_never_take_a_dial_down() {
         let dial = DialState::new("east", Arc::from("east:8443"));
         // A fixed linear congruential stream: about two answers in five are errors, in no pattern.
         let mut seed = 0x2545_F491_4F6C_DD1D_u64;
