@@ -2792,8 +2792,12 @@ mod tests {
             MAX_PEER_PROVIDERS,
             "its provider takes the slot up again"
         );
-        for _ in 1..SLOT_MISSES {
-            drop(bound_peer(ready(without_last()), "retail", &mut slots));
+        for answer in 1..SLOT_MISSES {
+            let missed = bound_peer(ready(without_last()), "retail", &mut slots);
+            assert!(
+                !named(&missed).contains("a000"),
+                "its return reset the count: answer {answer} without it still gives nothing away"
+            );
         }
         let gone = bound_peer(ready(without_last()), "retail", &mut slots);
         assert!(
@@ -2852,6 +2856,40 @@ mod tests {
         assert!(
             !named(&after).contains("a000"),
             "so an early name still waits when load returns"
+        );
+    }
+
+    #[test]
+    fn a_provider_whose_rows_stay_refused_loses_its_slot_to_one_that_waits() {
+        // `model` holds a slot, then every later batch of its has a row out of range.
+        let good = parse(&revision_text());
+        let refused = || parse(&revision_text().replace(" 2 2000", " -2 2000"));
+        let others = || serving().take(MAX_PEER_PROVIDERS - 1);
+        let mut slots = Slots::default();
+        let first: Vec<_> = good.into_iter().chain(ready(others())).collect();
+        drop(bound_peer(first, "east", &mut slots));
+        assert_eq!(
+            slots.held.len(),
+            MAX_PEER_PROVIDERS,
+            "the cap is full, with `model` in it"
+        );
+        let waiting = || {
+            refused()
+                .into_iter()
+                .chain(ready(others().chain(["zz-new".to_owned()])))
+                .collect::<Vec<_>>()
+        };
+        for answer in 1..SLOT_MISSES {
+            let kept = bound_peer(waiting(), "east", &mut slots);
+            assert!(
+                !named(&kept).contains("zz-new"),
+                "answer {answer}: the slot is still held"
+            );
+        }
+        let kept = bound_peer(waiting(), "east", &mut slots);
+        assert!(
+            named(&kept).contains("zz-new"),
+            "rows that stay refused do not keep the slot from a provider that waits"
         );
     }
 
