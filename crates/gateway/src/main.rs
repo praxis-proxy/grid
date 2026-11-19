@@ -265,7 +265,7 @@ fn start_grid_routing(
     binding: ai_grid_filters::Binding,
     registry: &mut praxis_filter::FilterRegistry,
 ) -> Result<ai_grid_filters::GridRuntime, praxis_filter::FilterError> {
-    let config = ai_grid_filters::load_serving_config(path)?;
+    let (config, initial_bytes) = ai_grid_filters::load_serving_config_with_bytes(path)?;
     let dial = ai_grid_filters::load_dial_config(&ai_grid_filters::dial_config_path(std::path::Path::new(path)))
         .unwrap_or_else(|error| {
             tracing::warn!(%error, "grid: dial file unreadable at startup; serving without dials");
@@ -286,6 +286,10 @@ fn start_grid_routing(
         runtime.health(),
         runtime.tuning(),
     )?;
+    // Report the exact revision already accepted by `spawn_grid_routing` before the watcher can
+    // observe a later projected ConfigMap revision. Subsequent receipts are emitted only after
+    // `apply_file` accepts their own bytes.
+    ai_grid_filters::report_serving_revision(&initial_bytes, config.candidates.len());
     // The operator rewrites the file on membership and topology changes.
     runtime
         .watch(path, SERVING_RELOAD_INTERVAL)

@@ -154,8 +154,8 @@ mod tests {
                 name.bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte == b'_' || byte.is_ascii_digit())
             })
-            // The provider filter registers under its own name, which is not a metric.
-            .filter(|name| *name != "grid_provider")
+            // These are names used by filters, not Prometheus metrics.
+            .filter(|name| !matches!(*name, "grid_provider" | "grid_serving_revision_serving"))
             .collect();
         emitted.sort_unstable();
         emitted.dedup();
